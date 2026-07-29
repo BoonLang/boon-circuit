@@ -1,10 +1,11 @@
 use super::{
     ApplicationTransfer, CheckpointBatch, ContentArtifact, ContentArtifactBinding,
     ContentArtifactId, ContentArtifactManifest, ContentArtifactOwnerId, ContentArtifactRetention,
-    DurableChange, DurableCollectionId, DurableContentArtifactChange, DurableOutboxChange,
-    DurableOutboxItem, DurableOutboxState, DurableOwner, DurableRowId, OutboxItemId, RestoreImage,
-    StoredList, StoredMap, StoredRow, StoredScalar, StoredSet, StoredValue,
-    validate_application_transfer, validate_content_artifact_manifest,
+    DurableChange, DurableCollectionId, DurableCollectionOwner, DurableContentArtifactChange,
+    DurableOutboxChange, DurableOutboxItem, DurableOutboxState, DurableOwner, DurableRowId,
+    OutboxItemId, RestoreImage, StoredList, StoredMap, StoredRow, StoredScalar, StoredSet,
+    StoredValue, StoredValueShell, validate_application_transfer,
+    validate_content_artifact_manifest,
 };
 use boon_plan::{
     ApplicationIdentity, EffectId, EffectInvocationId, MemoryId, MemoryLeafId, MigrationEdgeId,
@@ -14,9 +15,9 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-const RESTORE_IMAGE_FORMAT: u32 = 11;
-const APPLICATION_TRANSFER_FORMAT: u32 = 9;
-const CHECKPOINT_BATCH_FORMAT: u32 = 11;
+const RESTORE_IMAGE_FORMAT: u32 = 12;
+const APPLICATION_TRANSFER_FORMAT: u32 = 10;
+const CHECKPOINT_BATCH_FORMAT: u32 = 12;
 const OUTBOX_RECORD_FORMAT: u32 = 5;
 const BLOB_RECORD_FORMAT: u32 = 1;
 const STORED_NUMBER: u8 = 20;
@@ -28,6 +29,8 @@ const STORED_TAG: u8 = 25;
 const STORED_BLOB_REFERENCE: u8 = 26;
 const STORED_MAP: u8 = 27;
 const STORED_SET: u8 = 28;
+const STORED_CHILD_AUTHORITY: u8 = 29;
+const MAP_METADATA_FORMAT: u32 = 1;
 pub const INLINE_BYTES_THRESHOLD: usize = 16 * 1024;
 const DEFAULT_MAX_TOTAL_BYTES: usize = 80 * 1024 * 1024;
 type CborEncoder<'a> = Encoder<&'a mut Vec<u8>>;
@@ -530,7 +533,7 @@ pub(crate) fn scalar_component_blob_references(
 
 pub(crate) fn encode_map_entry_component(
     key: &StoredValue,
-    value: &StoredValue,
+    value: &StoredValueShell,
 ) -> Result<EncodedComponent, CodecError> {
     let mut bytes = Vec::new();
     let mut blobs = BTreeMap::new();
@@ -538,7 +541,7 @@ pub(crate) fn encode_map_entry_component(
     let mut encoder = Encoder::new(&mut bytes);
     encoder.array(2).map_err(encode_error)?;
     encode_component_value(&mut encoder, key, 0, &mut blobs, &mut references)?;
-    encode_component_value(&mut encoder, value, 0, &mut blobs, &mut references)?;
+    encode_component_shell(&mut encoder, value, 0, &mut blobs, &mut references)?;
     Ok(EncodedComponent {
         bytes,
         blobs,
@@ -550,13 +553,13 @@ pub(crate) fn decode_map_entry_component(
     bytes: &[u8],
     limits: DecodeLimits,
     blobs: &BTreeMap<BlobDigest, BlobRecord>,
-) -> Result<(StoredValue, StoredValue), CodecError> {
+) -> Result<(StoredValue, StoredValueShell), CodecError> {
     component_size(bytes, limits, "stored map entry")?;
     let mut decoder = Decoder::new(bytes);
     expect_array(&mut decoder, 2, "stored map entry")?;
     let mut references = BTreeMap::new();
     let key = decode_component_value(&mut decoder, limits, 0, Some(blobs), &mut references)?;
-    let value = decode_component_value(&mut decoder, limits, 0, Some(blobs), &mut references)?;
+    let value = decode_component_shell(&mut decoder, limits, 0, Some(blobs), &mut references)?;
     reject_trailing(&decoder, bytes, "stored map entry")?;
     Ok((key, value))
 }
@@ -570,9 +573,89 @@ pub(crate) fn map_entry_component_blob_references(
     expect_array(&mut decoder, 2, "stored map entry")?;
     let mut references = BTreeMap::new();
     decode_component_value(&mut decoder, limits, 0, None, &mut references)?;
-    decode_component_value(&mut decoder, limits, 0, None, &mut references)?;
+    decode_component_shell(&mut decoder, limits, 0, None, &mut references)?;
     reject_trailing(&decoder, bytes, "stored map entry")?;
     Ok(references)
+}
+
+pub(crate) fn encode_collection_id_component(
+    collection_id: &DurableCollectionId,
+) -> Result<Vec<u8>, CodecError> {
+    let mut bytes = Vec::new();
+    encode_durable_collection_id(&mut Encoder::new(&mut bytes), collection_id)?;
+    Ok(bytes)
+}
+
+pub(crate) fn decode_collection_id_component(
+    bytes: &[u8],
+    limits: DecodeLimits,
+) -> Result<DurableCollectionId, CodecError> {
+    component_size(bytes, limits, "durable collection ID")?;
+    let mut decoder = Decoder::new(bytes);
+    let collection_id = decode_durable_collection_id(&mut decoder, limits)?;
+    reject_trailing(&decoder, bytes, "durable collection ID")?;
+    Ok(collection_id)
+}
+
+pub(crate) fn encode_map_metadata_component(
+    touched: bool,
+    revision: u64,
+    next_key_generation: u64,
+    key_generations: &BTreeMap<StoredValue, u64>,
+) -> Result<Vec<u8>, CodecError> {
+    let mut bytes = Vec::new();
+    let mut encoder = Encoder::new(&mut bytes);
+    encoder
+        .array(5)
+        .and_then(|encoder| encoder.u32(MAP_METADATA_FORMAT))
+        .and_then(|encoder| encoder.bool(touched))
+        .and_then(|encoder| encoder.u64(revision))
+        .and_then(|encoder| encoder.u64(next_key_generation))
+        .and_then(|encoder| encoder.map(key_generations.len() as u64))
+        .map_err(encode_error)?;
+    for (key, generation) in key_generations {
+        if !key.is_key_safe() {
+            return Err(CodecError::new(
+                "stored map metadata contains a non-key-safe key",
+            ));
+        }
+        encode_value(&mut encoder, key, 0)?;
+        encoder.u64(*generation).map_err(encode_error)?;
+    }
+    Ok(bytes)
+}
+
+pub(crate) fn decode_map_metadata_component(
+    bytes: &[u8],
+    limits: DecodeLimits,
+) -> Result<(bool, u64, u64, BTreeMap<StoredValue, u64>), CodecError> {
+    component_size(bytes, limits, "map metadata")?;
+    let mut decoder = Decoder::new(bytes);
+    expect_array(&mut decoder, 5, "map metadata")?;
+    if decoder.u32().map_err(decode_error)? != MAP_METADATA_FORMAT {
+        return Err(CodecError::new("unsupported map metadata format"));
+    }
+    let touched = decoder.bool().map_err(decode_error)?;
+    let revision = decoder.u64().map_err(decode_error)?;
+    let next_key_generation = decoder.u64().map_err(decode_error)?;
+    let count = collection_len(&mut decoder, limits, "map key generations", false)?;
+    let mut key_generations = BTreeMap::new();
+    for _ in 0..count {
+        let key = decode_value(&mut decoder, limits, 0)?;
+        if !key.is_key_safe() {
+            return Err(CodecError::new(
+                "stored map metadata contains a non-key-safe key",
+            ));
+        }
+        let generation = decoder.u64().map_err(decode_error)?;
+        if key_generations.insert(key, generation).is_some() {
+            return Err(CodecError::new(
+                "stored map metadata repeats a key generation",
+            ));
+        }
+    }
+    reject_trailing(&decoder, bytes, "map metadata")?;
+    Ok((touched, revision, next_key_generation, key_generations))
 }
 
 pub(crate) fn encode_set_item_component(
@@ -1034,28 +1117,38 @@ fn encode_durable_change(
             collection_id,
             revision,
             key,
+            key_generation,
+            next_key_generation,
             value,
         } => {
             encoder
-                .array(5)
+                .array(7)
                 .and_then(|encoder| encoder.u8(8))
                 .map_err(encode_error)?;
             encode_durable_collection_id(encoder, collection_id)?;
-            encoder.u64(*revision).map_err(encode_error)?;
+            encoder
+                .u64(*revision)
+                .and_then(|encoder| encoder.u64(*key_generation))
+                .and_then(|encoder| encoder.u64(*next_key_generation))
+                .map_err(encode_error)?;
             encode_value(encoder, key, 0)?;
-            encode_value(encoder, value, 0)?;
+            encode_stored_value_shell(encoder, value, 0)?;
         }
         DurableChange::MapRemove {
             collection_id,
             revision,
             key,
+            next_key_generation,
         } => {
             encoder
-                .array(4)
+                .array(5)
                 .and_then(|encoder| encoder.u8(9))
                 .map_err(encode_error)?;
             encode_durable_collection_id(encoder, collection_id)?;
-            encoder.u64(*revision).map_err(encode_error)?;
+            encoder
+                .u64(*revision)
+                .and_then(|encoder| encoder.u64(*next_key_generation))
+                .map_err(encode_error)?;
             encode_value(encoder, key, 0)?;
         }
         DurableChange::DeleteMap { collection_id } => {
@@ -1164,15 +1257,18 @@ fn decode_durable_change(
             collection_id: decode_durable_collection_id(decoder, limits)?,
             value: decode_map(decoder, limits)?,
         }),
-        (8, 5) => Ok(DurableChange::MapUpsert {
+        (8, 7) => Ok(DurableChange::MapUpsert {
             collection_id: decode_durable_collection_id(decoder, limits)?,
             revision: decoder.u64().map_err(decode_error)?,
+            key_generation: decoder.u64().map_err(decode_error)?,
+            next_key_generation: decoder.u64().map_err(decode_error)?,
             key: decode_value(decoder, limits, 0)?,
-            value: decode_value(decoder, limits, 0)?,
+            value: decode_stored_value_shell(decoder, limits, 0)?,
         }),
-        (9, 4) => Ok(DurableChange::MapRemove {
+        (9, 5) => Ok(DurableChange::MapRemove {
             collection_id: decode_durable_collection_id(decoder, limits)?,
             revision: decoder.u64().map_err(decode_error)?,
+            next_key_generation: decoder.u64().map_err(decode_error)?,
             key: decode_value(decoder, limits, 0)?,
         }),
         (10, 2) => Ok(DurableChange::DeleteMap {
@@ -1284,19 +1380,55 @@ fn encode_durable_collection_id(
     encoder: &mut CborEncoder<'_>,
     collection_id: &DurableCollectionId,
 ) -> Result<(), CodecError> {
-    encoder.array(2).map_err(encode_error)?;
+    encoder.array(3).map_err(encode_error)?;
     encode_digest(encoder, collection_id.memory_id.as_bytes())?;
-    encode_durable_owner(encoder, &collection_id.owner)
+    encode_durable_owner(encoder, &collection_id.owner)?;
+    encoder
+        .array(collection_id.collection_ancestors.len() as u64)
+        .map_err(encode_error)?;
+    for ancestor in &collection_id.collection_ancestors {
+        encoder.array(3).map_err(encode_error)?;
+        encode_digest(encoder, ancestor.parent_memory_id.as_bytes())?;
+        encode_value(encoder, &ancestor.key, 0)?;
+        encoder.u64(ancestor.generation).map_err(encode_error)?;
+    }
+    Ok(())
 }
 
 fn decode_durable_collection_id(
     decoder: &mut Decoder<'_>,
     limits: DecodeLimits,
 ) -> Result<DurableCollectionId, CodecError> {
-    expect_array(decoder, 2, "durable collection ID")?;
+    expect_array(decoder, 3, "durable collection ID")?;
+    let memory_id = MemoryId(decode_digest(decoder)?);
+    let owner = decode_durable_owner(decoder, limits)?;
+    let ancestor_count = collection_len(decoder, limits, "durable collection owner route", true)?;
+    if ancestor_count > super::MAX_DURABLE_OWNER_DEPTH {
+        return Err(CodecError::new(
+            "durable collection owner route exceeds depth limit",
+        ));
+    }
+    let mut collection_ancestors = Vec::with_capacity(ancestor_count);
+    for _ in 0..ancestor_count {
+        expect_array(decoder, 3, "durable collection owner")?;
+        let parent_memory_id = MemoryId(decode_digest(decoder)?);
+        let key = decode_value(decoder, limits, 0)?;
+        let generation = decoder.u64().map_err(decode_error)?;
+        if generation == 0 || !key.is_key_safe() {
+            return Err(CodecError::new(
+                "durable collection owner has an invalid key generation",
+            ));
+        }
+        collection_ancestors.push(DurableCollectionOwner {
+            parent_memory_id,
+            key,
+            generation,
+        });
+    }
     Ok(DurableCollectionId {
-        memory_id: MemoryId(decode_digest(decoder)?),
-        owner: decode_durable_owner(decoder, limits)?,
+        memory_id,
+        owner,
+        collection_ancestors,
     })
 }
 
@@ -1638,27 +1770,45 @@ fn decode_list(decoder: &mut Decoder<'_>, limits: DecodeLimits) -> Result<Stored
 
 fn encode_map(encoder: &mut CborEncoder<'_>, map: &StoredMap) -> Result<(), CodecError> {
     encoder
-        .array(3)
+        .array(5)
         .and_then(|encoder| encoder.bool(map.touched))
         .and_then(|encoder| encoder.u64(map.revision))
-        .and_then(|encoder| encoder.map(map.entries.len() as u64))
+        .and_then(|encoder| encoder.u64(map.next_key_generation))
+        .and_then(|encoder| encoder.map(map.key_generations.len() as u64))
+        .map_err(encode_error)?;
+    for (key, generation) in &map.key_generations {
+        encode_value(encoder, key, 0)?;
+        encoder.u64(*generation).map_err(encode_error)?;
+    }
+    encoder
+        .map(map.entries.len() as u64)
         .map_err(encode_error)?;
     for (key, value) in &map.entries {
         encode_value(encoder, key, 0)?;
-        encode_value(encoder, value, 0)?;
+        encode_stored_value_shell(encoder, value, 0)?;
     }
     Ok(())
 }
 
 fn decode_map(decoder: &mut Decoder<'_>, limits: DecodeLimits) -> Result<StoredMap, CodecError> {
-    expect_array(decoder, 3, "stored map")?;
+    expect_array(decoder, 5, "stored map")?;
     let touched = decoder.bool().map_err(decode_error)?;
     let revision = decoder.u64().map_err(decode_error)?;
+    let next_key_generation = decoder.u64().map_err(decode_error)?;
+    let generation_count = collection_len(decoder, limits, "stored map key generations", false)?;
+    let mut key_generations = BTreeMap::new();
+    for _ in 0..generation_count {
+        let key = decode_value(decoder, limits, 0)?;
+        let generation = decoder.u64().map_err(decode_error)?;
+        if key_generations.insert(key, generation).is_some() {
+            return Err(CodecError::new("stored map repeats a key generation"));
+        }
+    }
     let entry_count = collection_len(decoder, limits, "stored map entries", false)?;
     let mut entries = BTreeMap::new();
     for _ in 0..entry_count {
         let key = decode_value(decoder, limits, 0)?;
-        let value = decode_value(decoder, limits, 0)?;
+        let value = decode_stored_value_shell(decoder, limits, 0)?;
         if entries.insert(key, value).is_some() {
             return Err(CodecError::new("stored map repeats a key"));
         }
@@ -1666,6 +1816,8 @@ fn decode_map(decoder: &mut Decoder<'_>, limits: DecodeLimits) -> Result<StoredM
     Ok(StoredMap {
         touched,
         revision,
+        next_key_generation,
+        key_generations,
         entries,
     })
 }
@@ -1886,6 +2038,111 @@ fn encode_component_value(
     Ok(())
 }
 
+fn encode_component_shell(
+    encoder: &mut CborEncoder<'_>,
+    value: &StoredValueShell,
+    depth: usize,
+    blobs: &mut BTreeMap<BlobDigest, BlobRecord>,
+    references: &mut BTreeMap<BlobDigest, u64>,
+) -> Result<(), CodecError> {
+    if depth > 64 {
+        return Err(CodecError::new(
+            "stored value shell nesting exceeds encoder limit",
+        ));
+    }
+    match value {
+        StoredValueShell::Bytes(value) if value.len() > INLINE_BYTES_THRESHOLD => {
+            let digest = BlobDigest::of(value);
+            let count = references.entry(digest).or_default();
+            *count = count
+                .checked_add(1)
+                .ok_or_else(|| CodecError::new("blob reference count overflow"))?;
+            match blobs.entry(digest) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(BlobRecord {
+                        digest,
+                        length: value.len() as u64,
+                        reference_count: 1,
+                        bytes: value.to_vec(),
+                    });
+                }
+                std::collections::btree_map::Entry::Occupied(mut entry) => {
+                    let record = entry.get_mut();
+                    if record.bytes != *value {
+                        return Err(CodecError::new("blob digest collision"));
+                    }
+                    record.reference_count = record
+                        .reference_count
+                        .checked_add(1)
+                        .ok_or_else(|| CodecError::new("blob reference count overflow"))?;
+                }
+            }
+            encoder
+                .array(3)
+                .and_then(|encoder| encoder.u8(STORED_BLOB_REFERENCE))
+                .and_then(|encoder| encoder.bytes(&digest.0))
+                .and_then(|encoder| encoder.u64(value.len() as u64))
+                .map_err(encode_error)?;
+        }
+        StoredValueShell::Number(value) => encode_exact_number(encoder, value)?,
+        StoredValueShell::Text(value) => {
+            encoder
+                .array(2)
+                .and_then(|encoder| encoder.u8(STORED_TEXT))
+                .and_then(|encoder| encoder.str(value))
+                .map_err(encode_error)?;
+        }
+        StoredValueShell::Bytes(value) => {
+            encoder
+                .array(2)
+                .and_then(|encoder| encoder.u8(STORED_BYTES))
+                .and_then(|encoder| encoder.bytes(value))
+                .map_err(encode_error)?;
+        }
+        StoredValueShell::List(values) => {
+            encoder
+                .array(2)
+                .and_then(|encoder| encoder.u8(STORED_LIST))
+                .and_then(|encoder| encoder.array(values.len() as u64))
+                .map_err(encode_error)?;
+            for value in values {
+                encode_component_shell(encoder, value, depth + 1, blobs, references)?;
+            }
+        }
+        StoredValueShell::Object(fields) => {
+            encoder
+                .array(2)
+                .and_then(|encoder| encoder.u8(STORED_OBJECT))
+                .and_then(|encoder| encoder.map(fields.len() as u64))
+                .map_err(encode_error)?;
+            for (name, value) in fields {
+                encoder.str(name).map_err(encode_error)?;
+                encode_component_shell(encoder, value, depth + 1, blobs, references)?;
+            }
+        }
+        StoredValueShell::Tag { tag, fields } => {
+            encoder
+                .array(3)
+                .and_then(|encoder| encoder.u8(STORED_TAG))
+                .and_then(|encoder| encoder.str(tag))
+                .and_then(|encoder| encoder.map(fields.len() as u64))
+                .map_err(encode_error)?;
+            for (name, value) in fields {
+                encoder.str(name).map_err(encode_error)?;
+                encode_component_shell(encoder, value, depth + 1, blobs, references)?;
+            }
+        }
+        StoredValueShell::ChildAuthority(collection_id) => {
+            encoder
+                .array(2)
+                .and_then(|encoder| encoder.u8(STORED_CHILD_AUTHORITY))
+                .map_err(encode_error)?;
+            encode_durable_collection_id(encoder, collection_id)?;
+        }
+    }
+    Ok(())
+}
+
 fn decode_component_value(
     decoder: &mut Decoder<'_>,
     limits: DecodeLimits,
@@ -1996,6 +2253,103 @@ fn decode_component_value(
             "unknown stored value tag {tag} with array length {len}"
         ))),
     }
+}
+
+fn decode_component_shell(
+    decoder: &mut Decoder<'_>,
+    limits: DecodeLimits,
+    depth: usize,
+    blobs: Option<&BTreeMap<BlobDigest, BlobRecord>>,
+    references: &mut BTreeMap<BlobDigest, u64>,
+) -> Result<StoredValueShell, CodecError> {
+    if depth > limits.max_value_depth {
+        return Err(CodecError::new(
+            "stored value shell nesting exceeds decode limit",
+        ));
+    }
+    let len = definite_len(decoder.array().map_err(decode_error)?, "stored value shell")?;
+    let tag = decoder.u8().map_err(decode_error)?;
+    match (tag, len) {
+        (STORED_NUMBER, 4) => decode_exact_number(decoder).map(StoredValueShell::Number),
+        (STORED_TEXT, 2) => Ok(StoredValueShell::Text(decode_text(decoder, limits)?)),
+        (STORED_BYTES, 2) => {
+            let bytes = decoder.bytes().map_err(decode_error)?;
+            if bytes.len() > limits.max_blob_bytes {
+                return Err(CodecError::new("stored byte value exceeds decode limit"));
+            }
+            Ok(StoredValueShell::Bytes(bytes.to_vec().into()))
+        }
+        (STORED_LIST, 2) => {
+            let count = collection_len(decoder, limits, "stored value shell list", true)?;
+            let mut values = Vec::with_capacity(count);
+            for _ in 0..count {
+                values.push(decode_component_shell(
+                    decoder,
+                    limits,
+                    depth + 1,
+                    blobs,
+                    references,
+                )?);
+            }
+            Ok(StoredValueShell::List(values))
+        }
+        (STORED_OBJECT, 2) => Ok(StoredValueShell::Object(decode_component_shell_fields(
+            decoder,
+            limits,
+            depth + 1,
+            blobs,
+            references,
+        )?)),
+        (STORED_TAG, 3) => Ok(StoredValueShell::Tag {
+            tag: decode_text(decoder, limits)?,
+            fields: decode_component_shell_fields(decoder, limits, depth + 1, blobs, references)?,
+        }),
+        (STORED_CHILD_AUTHORITY, 2) => Ok(StoredValueShell::ChildAuthority(
+            decode_durable_collection_id(decoder, limits)?,
+        )),
+        (STORED_BLOB_REFERENCE, 3) => {
+            let digest = BlobDigest(decode_digest(decoder)?);
+            let length = decoder.u64().map_err(decode_error)?;
+            let count = references.entry(digest).or_default();
+            *count = count
+                .checked_add(1)
+                .ok_or_else(|| CodecError::new("blob reference count overflow"))?;
+            let Some(blobs) = blobs else {
+                return Ok(StoredValueShell::Bytes(Vec::new().into()));
+            };
+            let record = blobs
+                .get(&digest)
+                .ok_or_else(|| CodecError::new("stored value references a missing blob"))?;
+            if record.length != length {
+                return Err(CodecError::new(
+                    "stored value blob length does not match blob metadata",
+                ));
+            }
+            Ok(StoredValueShell::Bytes(record.bytes.clone().into()))
+        }
+        _ => Err(CodecError::new(format!(
+            "unknown stored value shell tag {tag} with array length {len}"
+        ))),
+    }
+}
+
+fn decode_component_shell_fields(
+    decoder: &mut Decoder<'_>,
+    limits: DecodeLimits,
+    depth: usize,
+    blobs: Option<&BTreeMap<BlobDigest, BlobRecord>>,
+    references: &mut BTreeMap<BlobDigest, u64>,
+) -> Result<BTreeMap<String, StoredValueShell>, CodecError> {
+    let count = collection_len(decoder, limits, "stored value shell fields", false)?;
+    let mut fields = BTreeMap::new();
+    for _ in 0..count {
+        let name = decode_text(decoder, limits)?;
+        let value = decode_component_shell(decoder, limits, depth, blobs, references)?;
+        if fields.insert(name, value).is_some() {
+            return Err(CodecError::new("stored value shell repeats a record field"));
+        }
+    }
+    Ok(fields)
 }
 
 fn decode_component_fields(
@@ -2182,6 +2536,146 @@ fn decode_value(
     }
 }
 
+fn encode_stored_value_shell(
+    encoder: &mut CborEncoder<'_>,
+    value: &StoredValueShell,
+    depth: usize,
+) -> Result<(), CodecError> {
+    if depth > 64 {
+        return Err(CodecError::new(
+            "stored value shell nesting exceeds encoder limit",
+        ));
+    }
+    match value {
+        StoredValueShell::Number(value) => encode_exact_number(encoder, value)?,
+        StoredValueShell::Text(value) => {
+            encoder
+                .array(2)
+                .and_then(|encoder| encoder.u8(STORED_TEXT))
+                .and_then(|encoder| encoder.str(value))
+                .map_err(encode_error)?;
+        }
+        StoredValueShell::Bytes(value) => {
+            encoder
+                .array(2)
+                .and_then(|encoder| encoder.u8(STORED_BYTES))
+                .and_then(|encoder| encoder.bytes(value))
+                .map_err(encode_error)?;
+        }
+        StoredValueShell::List(values) => {
+            encoder
+                .array(2)
+                .and_then(|encoder| encoder.u8(STORED_LIST))
+                .and_then(|encoder| encoder.array(values.len() as u64))
+                .map_err(encode_error)?;
+            for value in values {
+                encode_stored_value_shell(encoder, value, depth + 1)?;
+            }
+        }
+        StoredValueShell::Object(fields) => {
+            encoder
+                .array(2)
+                .and_then(|encoder| encoder.u8(STORED_OBJECT))
+                .map_err(encode_error)?;
+            encode_stored_value_shell_fields(encoder, fields, depth + 1)?;
+        }
+        StoredValueShell::Tag { tag, fields } => {
+            encoder
+                .array(3)
+                .and_then(|encoder| encoder.u8(STORED_TAG))
+                .and_then(|encoder| encoder.str(tag))
+                .map_err(encode_error)?;
+            encode_stored_value_shell_fields(encoder, fields, depth + 1)?;
+        }
+        StoredValueShell::ChildAuthority(collection_id) => {
+            encoder
+                .array(2)
+                .and_then(|encoder| encoder.u8(STORED_CHILD_AUTHORITY))
+                .map_err(encode_error)?;
+            encode_durable_collection_id(encoder, collection_id)?;
+        }
+    }
+    Ok(())
+}
+
+fn decode_stored_value_shell(
+    decoder: &mut Decoder<'_>,
+    limits: DecodeLimits,
+    depth: usize,
+) -> Result<StoredValueShell, CodecError> {
+    if depth > limits.max_value_depth {
+        return Err(CodecError::new(
+            "stored value shell nesting exceeds decode limit",
+        ));
+    }
+    let len = definite_len(decoder.array().map_err(decode_error)?, "stored value shell")?;
+    let tag = decoder.u8().map_err(decode_error)?;
+    match (tag, len) {
+        (STORED_NUMBER, 4) => decode_exact_number(decoder).map(StoredValueShell::Number),
+        (STORED_TEXT, 2) => Ok(StoredValueShell::Text(decode_text(decoder, limits)?)),
+        (STORED_BYTES, 2) => {
+            let bytes = decoder.bytes().map_err(decode_error)?;
+            if bytes.len() > limits.max_blob_bytes {
+                return Err(CodecError::new("stored byte value exceeds decode limit"));
+            }
+            Ok(StoredValueShell::Bytes(bytes.to_vec().into()))
+        }
+        (STORED_LIST, 2) => {
+            let count = collection_len(decoder, limits, "stored value shell list", true)?;
+            let mut values = Vec::with_capacity(count);
+            for _ in 0..count {
+                values.push(decode_stored_value_shell(decoder, limits, depth + 1)?);
+            }
+            Ok(StoredValueShell::List(values))
+        }
+        (STORED_OBJECT, 2) => Ok(StoredValueShell::Object(decode_stored_value_shell_fields(
+            decoder,
+            limits,
+            depth + 1,
+        )?)),
+        (STORED_TAG, 3) => Ok(StoredValueShell::Tag {
+            tag: decode_text(decoder, limits)?,
+            fields: decode_stored_value_shell_fields(decoder, limits, depth + 1)?,
+        }),
+        (STORED_CHILD_AUTHORITY, 2) => Ok(StoredValueShell::ChildAuthority(
+            decode_durable_collection_id(decoder, limits)?,
+        )),
+        _ => Err(CodecError::new(format!(
+            "unknown stored value shell tag {tag} with array length {len}"
+        ))),
+    }
+}
+
+fn encode_stored_value_shell_fields(
+    encoder: &mut CborEncoder<'_>,
+    fields: &BTreeMap<String, StoredValueShell>,
+    depth: usize,
+) -> Result<(), CodecError> {
+    encoder.map(fields.len() as u64).map_err(encode_error)?;
+    for (name, value) in fields {
+        encoder.str(name).map_err(encode_error)?;
+        encode_stored_value_shell(encoder, value, depth)?;
+    }
+    Ok(())
+}
+
+fn decode_stored_value_shell_fields(
+    decoder: &mut Decoder<'_>,
+    limits: DecodeLimits,
+    depth: usize,
+) -> Result<BTreeMap<String, StoredValueShell>, CodecError> {
+    let count = collection_len(decoder, limits, "stored value shell fields", false)?;
+    let mut fields = BTreeMap::new();
+    for _ in 0..count {
+        let name = decode_text(decoder, limits)?;
+        let value = decode_stored_value_shell(decoder, limits, depth)?;
+        if fields.insert(name, value).is_some() {
+            return Err(CodecError::new("stored value shell repeats a record field"));
+        }
+    }
+    Ok(fields)
+}
+
 fn encode_value_fields(
     encoder: &mut CborEncoder<'_>,
     fields: &BTreeMap<String, StoredValue>,
@@ -2337,6 +2831,18 @@ mod tests {
         .unwrap()
     }
 
+    fn map_memory(name: &str) -> MemoryId {
+        MemoryId::from_identity(
+            &MemoryOwnerPath {
+                canonical_module: "codec".to_owned(),
+                named_owner_path: "store".to_owned(),
+            },
+            name,
+            MemoryKind::Map,
+        )
+        .unwrap()
+    }
+
     fn outbox_item(turn_sequence: u64) -> DurableOutboxItem {
         let effect = EffectId::from_host_operation("Test/send").unwrap();
         DurableOutboxItem::pending(
@@ -2381,6 +2887,58 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("non-key-safe")
+        );
+    }
+
+    #[test]
+    fn nested_collection_shell_and_owner_route_round_trip_canonically() {
+        let parent_memory = map_memory("orders");
+        let key = StoredValue::Text("order-a".to_owned());
+        let child_id = DurableCollectionId {
+            memory_id: map_memory("orders.lines"),
+            owner: DurableOwner::default(),
+            collection_ancestors: vec![DurableCollectionOwner {
+                parent_memory_id: parent_memory,
+                key: key.clone(),
+                generation: 7,
+            }],
+        };
+        let map = StoredMap {
+            touched: true,
+            revision: 9,
+            next_key_generation: 8,
+            key_generations: BTreeMap::from([(key.clone(), 7)]),
+            entries: BTreeMap::from([(
+                key.clone(),
+                StoredValueShell::Object(BTreeMap::from([(
+                    "lines".to_owned(),
+                    StoredValueShell::ChildAuthority(child_id.clone()),
+                )])),
+            )]),
+        };
+
+        let mut bytes = Vec::new();
+        encode_map(&mut Encoder::new(&mut bytes), &map).unwrap();
+        assert_eq!(
+            decode_map(&mut Decoder::new(&bytes), DecodeLimits::default()).unwrap(),
+            map
+        );
+        let encoded_id = encode_collection_id_component(&child_id).unwrap();
+        assert_eq!(
+            decode_collection_id_component(&encoded_id, DecodeLimits::default()).unwrap(),
+            child_id
+        );
+
+        let shell = map.entries.get(&key).unwrap();
+        let encoded_entry = encode_map_entry_component(&key, shell).unwrap();
+        assert_eq!(
+            decode_map_entry_component(
+                &encoded_entry.bytes,
+                DecodeLimits::default(),
+                &encoded_entry.blobs,
+            )
+            .unwrap(),
+            (key, shell.clone())
         );
     }
 

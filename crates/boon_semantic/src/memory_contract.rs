@@ -582,7 +582,7 @@ fn collection_statement_path(
     execution: &SemanticExecutionGraphV1,
     expression: SemanticExprId,
 ) -> Result<Option<String>, SemanticMemoryError> {
-    let mut candidates = Vec::<String>::new();
+    let mut candidates = Vec::<(String, SemanticExprId)>::new();
     for statement in &execution.statements {
         let Some(root) = statement.value else {
             continue;
@@ -598,22 +598,142 @@ fn collection_statement_path(
             _ => None,
         };
         if let Some(path) = path {
-            candidates.push(path);
+            candidates.push((path, root));
         }
     }
-    let max_depth = candidates.iter().map(|path| path.split('.').count()).max();
+    let max_depth = candidates
+        .iter()
+        .map(|(path, _)| path.split('.').count())
+        .max();
     let Some(max_depth) = max_depth else {
         return Ok(None);
     };
-    candidates.retain(|path| path.split('.').count() == max_depth);
-    candidates.sort();
-    candidates.dedup();
-    match candidates.as_slice() {
+    candidates.retain(|(path, _)| path.split('.').count() == max_depth);
+    let mut resolved = candidates
+        .into_iter()
+        .map(|(path, root)| {
+            let route = expression_structural_route(execution, root, expression)?;
+            Ok(if route.is_empty() {
+                path
+            } else {
+                format!("{path}.@authority:{}", route.join("/"))
+            })
+        })
+        .collect::<Result<Vec<_>, SemanticMemoryError>>()?;
+    resolved.sort();
+    resolved.dedup();
+    match resolved.as_slice() {
         [path] => Ok(Some(path.clone())),
         _ => Err(SemanticMemoryError::new(format!(
-            "collection authority expression {expression} is contained by multiple equally specific named fields {candidates:?}; bind each authority beneath one unique named field"
+            "collection authority expression {expression} is contained by multiple equally specific named authority paths {resolved:?}; construct each authority beneath one unique parent"
         ))),
     }
+}
+
+fn expression_structural_route(
+    execution: &SemanticExecutionGraphV1,
+    root: SemanticExprId,
+    target: SemanticExprId,
+) -> Result<Vec<String>, SemanticMemoryError> {
+    if root == target {
+        return Ok(Vec::new());
+    }
+    let mut pending = vec![(root, Vec::<String>::new(), BTreeSet::new())];
+    let mut routes = Vec::new();
+    let mut visits = 0_usize;
+    let visit_limit = execution.expressions.len().saturating_mul(8).max(64);
+    while let Some((expression_id, route, mut active)) = pending.pop() {
+        visits = visits.saturating_add(1);
+        if visits > visit_limit {
+            return Err(SemanticMemoryError::new(format!(
+                "collection authority route from {root} to {target} exceeds the bounded semantic graph walk"
+            )));
+        }
+        if !active.insert(expression_id) {
+            return Err(SemanticMemoryError::new(format!(
+                "collection authority route from {root} to {target} contains a semantic cycle at {expression_id}"
+            )));
+        }
+        let expression = require_expression(execution, expression_id)?;
+        for (index, child) in expression_children(execution, &expression.kind)?
+            .into_iter()
+            .enumerate()
+            .rev()
+        {
+            let mut child_route = route.clone();
+            child_route.push(expression_child_route_segment(expression, index));
+            if child == target {
+                routes.push(child_route);
+                if routes.len() > 1 {
+                    return Err(SemanticMemoryError::new(format!(
+                        "collection authority expression {target} is reachable through multiple structural parents beneath {root}"
+                    )));
+                }
+            } else {
+                pending.push((child, child_route, active.clone()));
+            }
+        }
+    }
+    routes.pop().ok_or_else(|| {
+        SemanticMemoryError::new(format!(
+            "collection authority expression {target} is not reachable from named root {root}"
+        ))
+    })
+}
+
+fn expression_child_route_segment(expression: &SemanticExpression, index: usize) -> String {
+    match &expression.kind {
+        SemanticExpressionKind::TaggedObject { fields, .. }
+        | SemanticExpressionKind::Object(fields) => fields
+            .get(index)
+            .map(|field| format!("field:{}", authority_path_segment(&field.name)))
+            .unwrap_or_else(|| format!("field:{index}")),
+        SemanticExpressionKind::Call { arguments, .. } => arguments
+            .get(index)
+            .map(|argument| {
+                format!(
+                    "arg:{}:{}",
+                    argument.ordinal,
+                    authority_path_segment(&argument.name)
+                )
+            })
+            .unwrap_or_else(|| format!("arg:{index}")),
+        SemanticExpressionKind::Map { .. } => format!("entry:{index}"),
+        SemanticExpressionKind::MapEntry { .. } => match index {
+            0 => "key".to_owned(),
+            1 => "value".to_owned(),
+            _ => format!("entry-child:{index}"),
+        },
+        SemanticExpressionKind::List { .. } => format!("list-item:{index}"),
+        SemanticExpressionKind::Set { .. } => format!("set-item:{index}"),
+        SemanticExpressionKind::Block { bindings, .. } if index < bindings.len() => {
+            format!("binding:{index}")
+        }
+        SemanticExpressionKind::Block { .. } => "result".to_owned(),
+        SemanticExpressionKind::Then { .. } => match index {
+            0 => "input".to_owned(),
+            1 => "output".to_owned(),
+            _ => format!("then-child:{index}"),
+        },
+        SemanticExpressionKind::When { .. } => match index {
+            0 => "input".to_owned(),
+            _ => format!("arm:{}", index - 1),
+        },
+        _ => format!("child:{index}"),
+    }
+}
+
+fn authority_path_segment(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-') {
+            output.push(char::from(byte));
+        } else {
+            use std::fmt::Write as _;
+            let _ = write!(output, "%{byte:02X}");
+        }
+    }
+    output
 }
 
 fn exact_reactive_binding<'a>(

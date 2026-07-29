@@ -116,10 +116,18 @@ pub struct CollectionAuthorityProducerScope {
     pub call_instance_id: DistributedCallInstanceId,
 }
 
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct CollectionOwnerInstance {
+    pub parent_authority: PlanCollectionAuthorityId,
+    pub key: Value,
+    pub generation: u64,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct CollectionAuthorityAddress {
     pub authority: PlanCollectionAuthorityId,
     pub owner_ancestors: Vec<OwnerInstanceRow>,
+    pub collection_ancestors: Vec<CollectionOwnerInstance>,
     pub producer: Option<CollectionAuthorityProducerScope>,
 }
 
@@ -977,6 +985,106 @@ impl OwnerInstanceInterner {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct CollectionOwnerRouteId(u32);
+
+impl CollectionOwnerRouteId {
+    const ROOT: Self = Self(0);
+}
+
+#[derive(Clone, Debug)]
+struct CollectionOwnerRouteNode {
+    parent: CollectionOwnerRouteId,
+    owner: Option<CollectionOwnerInstance>,
+    depth: u32,
+}
+
+#[derive(Clone, Debug)]
+struct CollectionOwnerRouteInterner {
+    nodes: Vec<CollectionOwnerRouteNode>,
+    ids: BTreeMap<(CollectionOwnerRouteId, CollectionOwnerInstance), CollectionOwnerRouteId>,
+}
+
+impl Default for CollectionOwnerRouteInterner {
+    fn default() -> Self {
+        Self {
+            nodes: vec![CollectionOwnerRouteNode {
+                parent: CollectionOwnerRouteId::ROOT,
+                owner: None,
+                depth: 0,
+            }],
+            ids: BTreeMap::new(),
+        }
+    }
+}
+
+impl CollectionOwnerRouteInterner {
+    fn intern_child(
+        &mut self,
+        parent: CollectionOwnerRouteId,
+        owner: CollectionOwnerInstance,
+    ) -> Result<CollectionOwnerRouteId, Error> {
+        if owner.generation == 0 {
+            return Err(Error::InvalidPlan(
+                "collection owner generations must be positive".to_owned(),
+            ));
+        }
+        if let Some(id) = self.ids.get(&(parent, owner.clone())).copied() {
+            return Ok(id);
+        }
+        let parent_depth = self.node(parent)?.depth;
+        let depth = parent_depth
+            .checked_add(1)
+            .ok_or_else(|| Error::InvalidPlan("collection owner depth overflow".to_owned()))?;
+        if depth > 256 {
+            return Err(Error::InvalidPlan(
+                "collection owner route exceeds the checked nesting bound of 256".to_owned(),
+            ));
+        }
+        let raw_id = u32::try_from(self.nodes.len()).map_err(|_| {
+            Error::InvalidPlan("collection owner route ID space exhausted".to_owned())
+        })?;
+        let id = CollectionOwnerRouteId(raw_id);
+        self.nodes.push(CollectionOwnerRouteNode {
+            parent,
+            owner: Some(owner.clone()),
+            depth,
+        });
+        self.ids.insert((parent, owner), id);
+        Ok(id)
+    }
+
+    fn route(&self, route: CollectionOwnerRouteId) -> Result<Vec<CollectionOwnerInstance>, Error> {
+        let depth = usize::try_from(self.node(route)?.depth).map_err(|_| {
+            Error::InvalidPlan("collection owner route depth does not fit usize".to_owned())
+        })?;
+        let mut owners = vec![None; depth];
+        let mut next = route;
+        while next != CollectionOwnerRouteId::ROOT {
+            let node = self.node(next)?;
+            let index = usize::try_from(node.depth - 1).map_err(|_| {
+                Error::InvalidPlan("collection owner route index does not fit usize".to_owned())
+            })?;
+            owners[index] = node.owner.clone();
+            next = node.parent;
+        }
+        owners
+            .into_iter()
+            .map(|owner| {
+                owner.ok_or_else(|| {
+                    Error::InvalidPlan("collection owner route contains a missing owner".to_owned())
+                })
+            })
+            .collect()
+    }
+
+    fn node(&self, route: CollectionOwnerRouteId) -> Result<&CollectionOwnerRouteNode, Error> {
+        self.nodes.get(route.0 as usize).ok_or_else(|| {
+            Error::InvalidPlan(format!("unknown collection owner route ID {}", route.0))
+        })
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ActiveTrigger {
     cause: TriggerCause,
@@ -1111,6 +1219,9 @@ pub enum AuthorityDelta {
         row: RowId,
         next_key: u64,
     },
+    CreateMap {
+        address: CollectionAuthorityAddress,
+    },
     MapUpsert {
         address: CollectionAuthorityAddress,
         revision: u64,
@@ -1122,6 +1233,12 @@ pub enum AuthorityDelta {
         revision: u64,
         key: Value,
     },
+    DeleteMap {
+        address: CollectionAuthorityAddress,
+    },
+    CreateSet {
+        address: CollectionAuthorityAddress,
+    },
     SetAdd {
         address: CollectionAuthorityAddress,
         revision: u64,
@@ -1131,6 +1248,9 @@ pub enum AuthorityDelta {
         address: CollectionAuthorityAddress,
         revision: u64,
         item: Value,
+    },
+    DeleteSet {
+        address: CollectionAuthorityAddress,
     },
 }
 
@@ -1444,6 +1564,8 @@ pub struct ListAuthority {
 pub struct MapAuthority {
     pub touched: bool,
     pub revision: u64,
+    pub next_key_generation: u64,
+    pub key_generations: BTreeMap<Value, u64>,
     pub entries: BTreeMap<Value, Value>,
 }
 
@@ -6372,10 +6494,14 @@ fn authority_delta_is_producer_local(
         AuthorityDelta::ReplaceList { list_id, .. } => ownership.lists.contains(list_id),
         AuthorityDelta::InsertRow { row, .. } => ownership.lists.contains(&row.id.list),
         AuthorityDelta::RemoveRow { row, .. } => ownership.lists.contains(&row.list),
-        AuthorityDelta::MapUpsert { address, .. }
+        AuthorityDelta::CreateMap { address }
+        | AuthorityDelta::MapUpsert { address, .. }
         | AuthorityDelta::MapRemove { address, .. }
+        | AuthorityDelta::DeleteMap { address }
+        | AuthorityDelta::CreateSet { address }
         | AuthorityDelta::SetAdd { address, .. }
-        | AuthorityDelta::SetRemove { address, .. } => address.producer.is_some(),
+        | AuthorityDelta::SetRemove { address, .. }
+        | AuthorityDelta::DeleteSet { address } => address.producer.is_some(),
     }
 }
 
@@ -7224,6 +7350,7 @@ type PlanLocalBindings = BTreeMap<(PlanStaticOwnerId, PlanLocalId), EvalValue>;
 #[derive(Clone, Copy)]
 struct ExpressionContext<'a> {
     row: Option<RowId>,
+    collection_owner: CollectionOwnerRouteId,
     event: Option<&'a SourceEvent>,
     output: Option<FieldId>,
     consumer: Option<Consumer>,
@@ -7408,6 +7535,20 @@ struct RowOwnedCallState<'event, 'plan> {
     arguments: DistributedCurrentCallArguments,
 }
 
+struct MapLiteralEvaluationState<'event, 'plan> {
+    address: CollectionAuthorityAddress,
+    entries: &'plan [boon_plan::PlanRowMapEntry],
+    next_entry: usize,
+    context: ExpressionContext<'event>,
+}
+
+struct MapUpsertEvaluationState<'event> {
+    expression: PlanRowExpressionId,
+    key: PlanRowExpressionId,
+    value: PlanRowExpressionId,
+    context: ExpressionContext<'event>,
+}
+
 enum ExpressionTask<'event, 'plan> {
     Evaluate {
         expression: PlanRowExpressionId,
@@ -7417,6 +7558,30 @@ enum ExpressionTask<'event, 'plan> {
         expression: PlanRowExpressionId,
         value_base: usize,
         context: ExpressionContext<'event>,
+    },
+    MapLiteralNext {
+        state: Box<MapLiteralEvaluationState<'event, 'plan>>,
+    },
+    MapLiteralAfterKey {
+        state: Box<MapLiteralEvaluationState<'event, 'plan>>,
+    },
+    MapLiteralAfterValue {
+        state: Box<MapLiteralEvaluationState<'event, 'plan>>,
+        key: Value,
+        generation: u64,
+    },
+    MapUpsertAfterReceiver {
+        state: MapUpsertEvaluationState<'event>,
+    },
+    MapUpsertAfterKey {
+        state: MapUpsertEvaluationState<'event>,
+        address: CollectionAuthorityAddress,
+    },
+    MapUpsertAfterValue {
+        state: MapUpsertEvaluationState<'event>,
+        address: CollectionAuthorityAddress,
+        key: Value,
+        generation: u64,
     },
     ObjectMaterializeNext {
         state: Box<ObjectMaterializationState<'event, 'plan>>,
@@ -8398,6 +8563,30 @@ fn schedule_builtin_operands<'event, 'plan>(
     Ok(())
 }
 
+fn direct_map_upsert_entry(
+    arena: &PlanRowExpressionArena,
+    expression: PlanRowExpressionId,
+) -> Result<Option<(PlanRowExpressionId, PlanRowExpressionId)>, Error> {
+    let PlanRowExpressionNode::Object { fields } = arena
+        .node(expression)
+        .map_err(|error| Error::InvalidPlan(error.to_string()))?
+    else {
+        return Ok(None);
+    };
+    if fields.len() != 2 || fields.iter().any(|field| field.spread) {
+        return Ok(None);
+    }
+    let key = fields
+        .iter()
+        .find(|field| field.name == "key")
+        .map(|field| field.value);
+    let value = fields
+        .iter()
+        .find(|field| field.name == "value")
+        .map(|field| field.value);
+    Ok(key.zip(value))
+}
+
 trait IntoExpressionId {
     fn into_expression_id(self) -> PlanRowExpressionId;
 }
@@ -8481,6 +8670,7 @@ pub struct MachineInstance {
     lists: BTreeMap<ListId, ListState>,
     collection_authorities: BTreeMap<CollectionAuthorityAddress, CollectionAuthorityState>,
     collection_producers: BTreeMap<CollectionProducerSite, CollectionProducerCandidate>,
+    collection_owner_routes: CollectionOwnerRouteInterner,
     ordered_indexes: BTreeMap<PlanListIndexId, OrderedIndex>,
     dirty_ordered_indexes: BTreeSet<PlanListIndexId>,
     dirty_ordered_index_rows: BTreeMap<PlanListIndexId, BTreeSet<RowId>>,
@@ -9108,6 +9298,7 @@ impl MachineInstanceBuilder {
                 lists: BTreeMap::new(),
                 collection_authorities: BTreeMap::new(),
                 collection_producers: BTreeMap::new(),
+                collection_owner_routes: CollectionOwnerRouteInterner::default(),
                 ordered_indexes: BTreeMap::new(),
                 dirty_ordered_indexes: BTreeSet::new(),
                 dirty_ordered_index_rows: BTreeMap::new(),
@@ -9777,10 +9968,17 @@ impl MachineBuildTask {
                 let address = self
                     .session_mut()
                     .runtime_collection_address(&collection_id)?;
-                let entries = map
-                    .entries
+                let mut entries = BTreeMap::new();
+                for (key, value) in map.entries {
+                    entries.insert(
+                        runtime_value(key)?,
+                        self.session_mut().runtime_value_from_stored_shell(value)?,
+                    );
+                }
+                let key_generations = map
+                    .key_generations
                     .into_iter()
-                    .map(|(key, value)| Ok((runtime_value(key)?, runtime_value(value)?)))
+                    .map(|(key, generation)| Ok((runtime_value(key)?, generation)))
                     .collect::<Result<BTreeMap<_, _>, Error>>()?;
                 if build
                     .translated_maps
@@ -9789,6 +9987,8 @@ impl MachineBuildTask {
                         MapAuthority {
                             touched: map.touched,
                             revision: map.revision,
+                            next_key_generation: map.next_key_generation,
+                            key_generations,
                             entries,
                         },
                     )
@@ -10063,7 +10263,10 @@ impl MachineBuildTask {
                     CollectionAuthorityState::Set(authority),
                 )?;
             }
-            AuthorityRestorePhase::Complete => return Ok(true),
+            AuthorityRestorePhase::Complete => {
+                self.session_mut().validate_collection_authority_tree()?;
+                return Ok(true);
+            }
         }
         Ok(false)
     }
@@ -13243,7 +13446,12 @@ impl MachineInstance {
             let entries = map
                 .entries
                 .iter()
-                .map(|(key, value)| Ok((stored_value(key)?, stored_value(value)?)))
+                .map(|(key, value)| Ok((stored_value(key)?, self.stored_value_shell(value)?)))
+                .collect::<Result<BTreeMap<_, _>, Error>>()?;
+            let key_generations = map
+                .key_generations
+                .iter()
+                .map(|(key, generation)| Ok((stored_value(key)?, *generation)))
                 .collect::<Result<BTreeMap<_, _>, Error>>()?;
             if maps
                 .insert(
@@ -13251,6 +13459,8 @@ impl MachineInstance {
                     boon_persistence::StoredMap {
                         touched: map.touched && !include_untouched_values,
                         revision: map.revision,
+                        next_key_generation: map.next_key_generation,
+                        key_generations,
                         entries,
                     },
                 )
@@ -13343,10 +13553,14 @@ impl MachineInstance {
                 AuthorityDelta::RemoveRow { row, .. } => {
                     self.metadata.durable_lists.contains(&row.list)
                 }
-                AuthorityDelta::MapUpsert { address, .. }
+                AuthorityDelta::CreateMap { address }
+                | AuthorityDelta::MapUpsert { address, .. }
                 | AuthorityDelta::MapRemove { address, .. }
+                | AuthorityDelta::DeleteMap { address }
+                | AuthorityDelta::CreateSet { address }
                 | AuthorityDelta::SetAdd { address, .. }
-                | AuthorityDelta::SetRemove { address, .. } => {
+                | AuthorityDelta::SetRemove { address, .. }
+                | AuthorityDelta::DeleteSet { address } => {
                     address.producer.is_none()
                         && self
                             .metadata
@@ -13476,6 +13690,22 @@ impl MachineInstance {
                         next_order_token: list.next_order_token,
                     })
                 }
+                AuthorityDelta::CreateMap { address } => {
+                    self.require_durable_collection_kind(
+                        address.authority,
+                        boon_plan::MemoryKind::Map,
+                    )?;
+                    Ok(boon_persistence::DurableChange::SetMap {
+                        collection_id: self.durable_collection_id(address)?,
+                        value: boon_persistence::StoredMap {
+                            touched: false,
+                            revision: 0,
+                            next_key_generation: 1,
+                            key_generations: BTreeMap::new(),
+                            entries: BTreeMap::new(),
+                        },
+                    })
+                }
                 AuthorityDelta::MapUpsert {
                     address,
                     revision,
@@ -13490,7 +13720,21 @@ impl MachineInstance {
                         collection_id: self.durable_collection_id(address)?,
                         revision: *revision,
                         key: stored_value(key)?,
-                        value: stored_value(value)?,
+                        key_generation: self
+                            .collection_map(address)?
+                            .key_generations
+                            .get(key)
+                            .copied()
+                            .ok_or_else(|| {
+                                Error::InvalidPlan(format!(
+                                    "durable MAP authority {} has no generation for its upserted key",
+                                    address.authority.0
+                                ))
+                            })?,
+                        next_key_generation: self
+                            .collection_map(address)?
+                            .next_key_generation,
+                        value: self.stored_value_shell(value)?,
                     })
                 }
                 AuthorityDelta::MapRemove {
@@ -13506,6 +13750,32 @@ impl MachineInstance {
                         collection_id: self.durable_collection_id(address)?,
                         revision: *revision,
                         key: stored_value(key)?,
+                        next_key_generation: self
+                            .collection_map(address)?
+                            .next_key_generation,
+                    })
+                }
+                AuthorityDelta::DeleteMap { address } => {
+                    self.require_durable_collection_kind(
+                        address.authority,
+                        boon_plan::MemoryKind::Map,
+                    )?;
+                    Ok(boon_persistence::DurableChange::DeleteMap {
+                        collection_id: self.durable_collection_id(address)?,
+                    })
+                }
+                AuthorityDelta::CreateSet { address } => {
+                    self.require_durable_collection_kind(
+                        address.authority,
+                        boon_plan::MemoryKind::Set,
+                    )?;
+                    Ok(boon_persistence::DurableChange::SetSet {
+                        collection_id: self.durable_collection_id(address)?,
+                        value: boon_persistence::StoredSet {
+                            touched: false,
+                            revision: 0,
+                            items: BTreeSet::new(),
+                        },
                     })
                 }
                 AuthorityDelta::SetAdd {
@@ -13536,6 +13806,15 @@ impl MachineInstance {
                         collection_id: self.durable_collection_id(address)?,
                         revision: *revision,
                         item: stored_value(item)?,
+                    })
+                }
+                AuthorityDelta::DeleteSet { address } => {
+                    self.require_durable_collection_kind(
+                        address.authority,
+                        boon_plan::MemoryKind::Set,
+                    )?;
+                    Ok(boon_persistence::DurableChange::DeleteSet {
+                        collection_id: self.durable_collection_id(address)?,
                     })
                 }
             })
@@ -15428,10 +15707,52 @@ impl MachineInstance {
                 address.authority.0
             )));
         }
+        let collection_ancestors = address
+            .collection_ancestors
+            .iter()
+            .map(|owner| {
+                let (parent_memory_id, parent_metadata) = self
+                    .metadata
+                    .durable_collection_by_authority
+                    .get(&owner.parent_authority)
+                    .ok_or_else(|| {
+                        Error::InvalidPlan(format!(
+                            "parent collection authority {} has no stable persistence identity",
+                            owner.parent_authority.0
+                        ))
+                    })?;
+                if parent_metadata.kind != boon_plan::MemoryKind::Map {
+                    return Err(Error::InvalidPlan(format!(
+                        "collection authority {} is owned by non-MAP authority {}",
+                        address.authority.0, owner.parent_authority.0
+                    )));
+                }
+                Ok(boon_persistence::DurableCollectionOwner {
+                    parent_memory_id: *parent_memory_id,
+                    key: stored_value(&owner.key)?,
+                    generation: owner.generation,
+                })
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
         Ok(boon_persistence::DurableCollectionId {
             memory_id: *memory_id,
             owner: durable_owner_for_rows(&self.plan, &address.owner_ancestors)?,
+            collection_ancestors,
         })
+    }
+
+    fn collection_map(&self, address: &CollectionAuthorityAddress) -> Result<&MapAuthority, Error> {
+        match self.collection_authorities.get(address) {
+            Some(CollectionAuthorityState::Map(authority)) => Ok(authority),
+            Some(CollectionAuthorityState::Set(_)) => Err(Error::InvalidPlan(format!(
+                "collection authority {} is SET, expected MAP",
+                address.authority.0
+            ))),
+            None => Err(Error::InvalidPlan(format!(
+                "collection authority {} has no live MAP state",
+                address.authority.0
+            ))),
+        }
     }
 
     fn runtime_collection_address(
@@ -15467,10 +15788,124 @@ impl MachineInstance {
                 collection_id.memory_id
             )));
         }
+        let collection_ancestors = collection_id
+            .collection_ancestors
+            .iter()
+            .map(|owner| {
+                let parent = self
+                    .metadata
+                    .durable_collection_by_memory
+                    .get(&owner.parent_memory_id)
+                    .ok_or_else(|| {
+                        Error::InvalidPlan(format!(
+                            "collection owner route contains unknown parent memory {}",
+                            owner.parent_memory_id
+                        ))
+                    })?;
+                if parent.kind != boon_plan::MemoryKind::Map {
+                    return Err(Error::InvalidPlan(format!(
+                        "collection owner route names non-MAP parent memory {}",
+                        owner.parent_memory_id
+                    )));
+                }
+                Ok(CollectionOwnerInstance {
+                    parent_authority: parent.authority,
+                    key: runtime_value(owner.key.clone())?,
+                    generation: owner.generation,
+                })
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
         Ok(CollectionAuthorityAddress {
             authority: metadata.authority,
             owner_ancestors,
+            collection_ancestors,
             producer: None,
+        })
+    }
+
+    fn stored_value_shell(
+        &self,
+        value: &Value,
+    ) -> Result<boon_persistence::StoredValueShell, Error> {
+        Ok(match value {
+            Value::Number(value) => boon_persistence::StoredValueShell::Number(value.clone()),
+            Value::Text(value) => boon_persistence::StoredValueShell::Text(value.clone()),
+            Value::Bytes(value) => boon_persistence::StoredValueShell::Bytes(value.clone()),
+            Value::List(values) => boon_persistence::StoredValueShell::List(
+                values
+                    .iter()
+                    .map(|value| self.stored_value_shell(value))
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+            Value::Record(fields) => boon_persistence::StoredValueShell::Object(
+                fields
+                    .iter()
+                    .map(|(name, value)| Ok((name.clone(), self.stored_value_shell(value)?)))
+                    .collect::<Result<BTreeMap<_, _>, Error>>()?,
+            ),
+            Value::Tag { tag, fields } => boon_persistence::StoredValueShell::Tag {
+                tag: tag.clone(),
+                fields: fields
+                    .iter()
+                    .map(|(name, value)| Ok((name.clone(), self.stored_value_shell(value)?)))
+                    .collect::<Result<BTreeMap<_, _>, Error>>()?,
+            },
+            Value::CollectionAuthority { address } => {
+                boon_persistence::StoredValueShell::ChildAuthority(
+                    self.durable_collection_id(address)?,
+                )
+            }
+            Value::Map(_) | Value::Set(_) => {
+                return Err(Error::Evaluation(
+                    "durable MAP values must store nested collections as authority edges, not snapshots"
+                        .to_owned(),
+                ));
+            }
+            Value::MappedRow { .. } | Value::Row { .. } => {
+                return Err(Error::Evaluation(
+                    "row handles and derived mapped rows are not durable MAP values".to_owned(),
+                ));
+            }
+            Value::HostBound { .. } => {
+                return Err(Error::Evaluation(
+                    "host-bound values are transient and cannot be persisted".to_owned(),
+                ));
+            }
+        })
+    }
+
+    fn runtime_value_from_stored_shell(
+        &self,
+        value: boon_persistence::StoredValueShell,
+    ) -> Result<Value, Error> {
+        Ok(match value {
+            boon_persistence::StoredValueShell::Number(value) => Value::Number(value),
+            boon_persistence::StoredValueShell::Text(value) => Value::Text(value),
+            boon_persistence::StoredValueShell::Bytes(value) => Value::Bytes(value),
+            boon_persistence::StoredValueShell::List(values) => Value::List(
+                values
+                    .into_iter()
+                    .map(|value| self.runtime_value_from_stored_shell(value))
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+            boon_persistence::StoredValueShell::Object(fields) => Value::Record(
+                fields
+                    .into_iter()
+                    .map(|(name, value)| Ok((name, self.runtime_value_from_stored_shell(value)?)))
+                    .collect::<Result<BTreeMap<_, _>, Error>>()?,
+            ),
+            boon_persistence::StoredValueShell::Tag { tag, fields } => Value::Tag {
+                tag,
+                fields: fields
+                    .into_iter()
+                    .map(|(name, value)| Ok((name, self.runtime_value_from_stored_shell(value)?)))
+                    .collect::<Result<BTreeMap<_, _>, Error>>()?,
+            },
+            boon_persistence::StoredValueShell::ChildAuthority(collection_id) => {
+                Value::CollectionAuthority {
+                    address: self.runtime_collection_address(&collection_id)?,
+                }
+            }
         })
     }
 
@@ -19533,6 +19968,7 @@ impl MachineInstance {
                     key.expression,
                     ExpressionContext {
                         row: Some(row),
+                        collection_owner: CollectionOwnerRouteId::ROOT,
                         event: None,
                         output: None,
                         consumer: None,
@@ -20177,6 +20613,27 @@ impl MachineInstance {
                         )));
                     }
                 }
+                let generations = authority
+                    .key_generations
+                    .values()
+                    .copied()
+                    .collect::<BTreeSet<_>>();
+                if authority.next_key_generation == 0
+                    || authority
+                        .entries
+                        .keys()
+                        .ne(authority.key_generations.keys())
+                    || generations.len() != authority.key_generations.len()
+                    || generations.contains(&0)
+                    || generations
+                        .last()
+                        .is_some_and(|generation| *generation >= authority.next_key_generation)
+                {
+                    return Err(Error::InvalidPlan(format!(
+                        "restored MAP authority {} has invalid key generations",
+                        address.authority.0
+                    )));
+                }
                 authority.revision
             }
             CollectionAuthorityState::Set(authority) => {
@@ -20210,6 +20667,101 @@ impl MachineInstance {
         Ok(())
     }
 
+    fn validate_collection_authority_tree(&self) -> Result<(), Error> {
+        for (address, state) in &self.collection_authorities {
+            let mut authorities = address
+                .collection_ancestors
+                .iter()
+                .map(|owner| owner.parent_authority)
+                .collect::<BTreeSet<_>>();
+            if authorities.len() != address.collection_ancestors.len()
+                || !authorities.insert(address.authority)
+            {
+                return Err(Error::InvalidPlan(format!(
+                    "collection authority {} forms a static authority cycle",
+                    address.authority.0
+                )));
+            }
+            for owner in &address.collection_ancestors {
+                if owner.generation == 0 || !runtime_value_to_data(&owner.key)?.is_key_safe() {
+                    return Err(Error::InvalidPlan(format!(
+                        "collection authority {} has an invalid MAP-key owner",
+                        address.authority.0
+                    )));
+                }
+            }
+            let Some(owner) = address.collection_ancestors.last() else {
+                continue;
+            };
+            let parent = CollectionAuthorityAddress {
+                authority: owner.parent_authority,
+                owner_ancestors: address.owner_ancestors.clone(),
+                collection_ancestors: address.collection_ancestors
+                    [..address.collection_ancestors.len() - 1]
+                    .to_vec(),
+                producer: address.producer,
+            };
+            let Some(CollectionAuthorityState::Map(parent_state)) =
+                self.collection_authorities.get(&parent)
+            else {
+                return Err(Error::InvalidPlan(format!(
+                    "collection authority {} has no live owning MAP authority {}",
+                    address.authority.0, owner.parent_authority.0
+                )));
+            };
+            if parent_state.key_generations.get(&owner.key) != Some(&owner.generation)
+                || !parent_state.entries.contains_key(&owner.key)
+            {
+                return Err(Error::InvalidPlan(format!(
+                    "collection authority {} belongs to a stale MAP key generation",
+                    address.authority.0
+                )));
+            }
+            let attached = parent_state
+                .entries
+                .get(&owner.key)
+                .map(Self::value_collection_authorities)
+                .is_some_and(|children| children.contains(address));
+            if !attached {
+                return Err(Error::InvalidPlan(format!(
+                    "collection authority {} is not attached by its declared parent MAP value",
+                    address.authority.0
+                )));
+            }
+            if matches!(state, CollectionAuthorityState::Set(_))
+                && self.collection_authorities.keys().any(|candidate| {
+                    candidate.collection_ancestors.len() > address.collection_ancestors.len()
+                        && candidate
+                            .collection_ancestors
+                            .starts_with(&address.collection_ancestors)
+                        && candidate.collection_ancestors[address.collection_ancestors.len()]
+                            .parent_authority
+                            == address.authority
+                })
+            {
+                return Err(Error::InvalidPlan(format!(
+                    "SET authority {} owns a nested collection despite key-safe SET item semantics",
+                    address.authority.0
+                )));
+            }
+        }
+        for (address, state) in &self.collection_authorities {
+            if let CollectionAuthorityState::Map(authority) = state {
+                for (key, value) in &authority.entries {
+                    let generation =
+                        authority.key_generations.get(key).copied().ok_or_else(|| {
+                            Error::InvalidPlan(format!(
+                                "MAP authority {} contains a key without a generation",
+                                address.authority.0
+                            ))
+                        })?;
+                    self.validate_map_value_authorities(address, key, generation, value)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn collection_authority_address(
         &self,
         authority: PlanCollectionAuthorityId,
@@ -20227,6 +20779,9 @@ impl MachineInstance {
         Ok(CollectionAuthorityAddress {
             authority,
             owner_ancestors,
+            collection_ancestors: self
+                .collection_owner_routes
+                .route(context.collection_owner)?,
             producer,
         })
     }
@@ -20307,9 +20862,16 @@ impl MachineInstance {
             CollectionAuthorityState::Map(MapAuthority {
                 touched: false,
                 revision: 0,
+                next_key_generation: 1,
+                key_generations: BTreeMap::new(),
                 entries: BTreeMap::new(),
             }),
         );
+        if work.emit {
+            work.authority_deltas.push(AuthorityDelta::CreateMap {
+                address: address.clone(),
+            });
+        }
         Ok(())
     }
 
@@ -20337,7 +20899,277 @@ impl MachineInstance {
                 items: BTreeSet::new(),
             }),
         );
+        if work.emit {
+            work.authority_deltas.push(AuthorityDelta::CreateSet {
+                address: address.clone(),
+            });
+        }
         Ok(())
+    }
+
+    fn ensure_map_key_generation(
+        &mut self,
+        address: &CollectionAuthorityAddress,
+        key: &Value,
+        work: &mut Work,
+    ) -> Result<u64, Error> {
+        let authority = match self.collection_authorities.get(address) {
+            Some(CollectionAuthorityState::Map(authority)) => authority,
+            _ => {
+                return Err(Error::InvalidPlan(format!(
+                    "MAP authority {} disappeared before key-scope allocation",
+                    address.authority.0
+                )));
+            }
+        };
+        if let Some(generation) = authority.key_generations.get(key).copied() {
+            if generation == 0 {
+                return Err(Error::InvalidPlan(format!(
+                    "MAP authority {} contains a zero key generation",
+                    address.authority.0
+                )));
+            }
+            return Ok(generation);
+        }
+        if authority.entries.contains_key(key) {
+            return Err(Error::InvalidPlan(format!(
+                "MAP authority {} contains a key without a live generation",
+                address.authority.0
+            )));
+        }
+
+        self.record_collection_authority_undo(address, work);
+        let Some(CollectionAuthorityState::Map(authority)) =
+            self.collection_authorities.get_mut(address)
+        else {
+            unreachable!("validated MAP authority changed kind")
+        };
+        let generation = authority.next_key_generation;
+        if generation == 0 {
+            return Err(Error::InvalidPlan(format!(
+                "MAP authority {} exhausted its key generation space",
+                address.authority.0
+            )));
+        }
+        authority.next_key_generation = generation.checked_add(1).ok_or_else(|| {
+            Error::Evaluation(format!(
+                "MAP authority {} key generation overflow",
+                address.authority.0
+            ))
+        })?;
+        authority.key_generations.insert(key.clone(), generation);
+        Ok(generation)
+    }
+
+    fn validate_map_value_authorities(
+        &self,
+        address: &CollectionAuthorityAddress,
+        key: &Value,
+        generation: u64,
+        value: &Value,
+    ) -> Result<(), Error> {
+        let expected = CollectionOwnerInstance {
+            parent_authority: address.authority,
+            key: key.clone(),
+            generation,
+        };
+        let mut pending = vec![value];
+        let mut visited = 0_usize;
+        while let Some(value) = pending.pop() {
+            visited = visited.saturating_add(1);
+            if visited > MAX_VALUE_MATERIALIZATION_CONTINUATIONS {
+                return Err(Error::Evaluation(
+                    "MAP value exceeds the checked nested-authority validation bound".to_owned(),
+                ));
+            }
+            match value {
+                Value::CollectionAuthority { address: child } => {
+                    let parent_depth = address.collection_ancestors.len();
+                    let attached = child.producer == address.producer
+                        && child.owner_ancestors.starts_with(&address.owner_ancestors)
+                        && child.collection_ancestors.get(..parent_depth)
+                            == Some(address.collection_ancestors.as_slice())
+                        && child.collection_ancestors.get(parent_depth) == Some(&expected);
+                    if !attached {
+                        return Err(Error::Evaluation(format!(
+                            "collection authority {} is not constructed in MAP authority {} key generation {}",
+                            child.authority.0, address.authority.0, generation
+                        )));
+                    }
+                    if !self.collection_authorities.contains_key(child) {
+                        return Err(Error::Evaluation(format!(
+                            "collection authority {} escaped after its owning MAP key generation was retired",
+                            child.authority.0
+                        )));
+                    }
+                }
+                Value::List(values) => pending.extend(values),
+                Value::Record(fields)
+                | Value::MappedRow { fields, .. }
+                | Value::Tag { fields, .. } => pending.extend(fields.values()),
+                Value::Row { fields, .. } => pending.extend(fields.values()),
+                Value::HostBound { visible, .. } => pending.push(visible),
+                Value::Map(entries) => {
+                    for (key, value) in entries {
+                        pending.push(key);
+                        pending.push(value);
+                    }
+                }
+                Value::Set(items) => pending.extend(items),
+                Value::Number(_) | Value::Text(_) | Value::Bytes(_) => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn value_collection_authorities(value: &Value) -> BTreeSet<CollectionAuthorityAddress> {
+        let mut addresses = BTreeSet::new();
+        let mut pending = vec![value];
+        while let Some(value) = pending.pop() {
+            match value {
+                Value::CollectionAuthority { address } => {
+                    addresses.insert(address.clone());
+                }
+                Value::List(values) => pending.extend(values),
+                Value::Record(fields)
+                | Value::MappedRow { fields, .. }
+                | Value::Tag { fields, .. } => pending.extend(fields.values()),
+                Value::Row { fields, .. } => pending.extend(fields.values()),
+                Value::HostBound { visible, .. } => pending.push(visible),
+                Value::Map(entries) => {
+                    for (key, value) in entries {
+                        pending.push(key);
+                        pending.push(value);
+                    }
+                }
+                Value::Set(items) => pending.extend(items),
+                Value::Number(_) | Value::Text(_) | Value::Bytes(_) => {}
+            }
+        }
+        addresses
+    }
+
+    fn retire_collection_authorities(
+        &mut self,
+        predicate: impl Fn(&CollectionAuthorityAddress) -> bool,
+        work: &mut Work,
+    ) {
+        let mut retired = self
+            .collection_authorities
+            .keys()
+            .filter(|address| predicate(address))
+            .cloned()
+            .collect::<Vec<_>>();
+        retired.sort_by_key(|address| std::cmp::Reverse(address.collection_ancestors.len()));
+        let retired_set = retired.iter().cloned().collect::<BTreeSet<_>>();
+        let mut consumers = BTreeSet::new();
+        for address in &retired {
+            consumers.extend(
+                self.dynamic_dependencies
+                    .by_collection
+                    .get(address)
+                    .into_iter()
+                    .flatten()
+                    .copied(),
+            );
+        }
+        for ((address, _), dependents) in &self.dynamic_dependencies.by_map_key {
+            if retired_set.contains(address) {
+                consumers.extend(dependents.iter().copied());
+            }
+        }
+        for ((address, _), dependents) in &self.dynamic_dependencies.by_set_item {
+            if retired_set.contains(address) {
+                consumers.extend(dependents.iter().copied());
+            }
+        }
+        self.propagate_dirty(
+            consumers
+                .into_iter()
+                .map(DirtyPropagationTask::MarkConsumer),
+            work,
+        );
+
+        let producer_sites = self
+            .collection_producers
+            .keys()
+            .filter(|site| retired_set.contains(site.address()))
+            .cloned()
+            .collect::<Vec<_>>();
+        for site in producer_sites {
+            self.record_collection_producer_undo(&site, work);
+            self.collection_producers.remove(&site);
+        }
+        for address in retired {
+            self.record_collection_authority_undo(&address, work);
+            let retired = self.collection_authorities.remove(&address);
+            if work.emit {
+                match retired {
+                    Some(CollectionAuthorityState::Map(_)) => {
+                        work.authority_deltas
+                            .push(AuthorityDelta::DeleteMap { address });
+                    }
+                    Some(CollectionAuthorityState::Set(_)) => {
+                        work.authority_deltas
+                            .push(AuthorityDelta::DeleteSet { address });
+                    }
+                    None => {}
+                }
+            }
+        }
+    }
+
+    fn retire_collection_authority_tree(
+        &mut self,
+        root: &CollectionAuthorityAddress,
+        work: &mut Work,
+    ) {
+        self.retire_collection_authorities(
+            |candidate| {
+                candidate == root
+                    || (candidate.producer == root.producer
+                        && candidate.owner_ancestors.starts_with(&root.owner_ancestors)
+                        && candidate
+                            .collection_ancestors
+                            .starts_with(&root.collection_ancestors)
+                        && candidate
+                            .collection_ancestors
+                            .get(root.collection_ancestors.len())
+                            .is_some_and(|owner| owner.parent_authority == root.authority))
+            },
+            work,
+        );
+    }
+
+    fn retire_map_key_collections(
+        &mut self,
+        address: &CollectionAuthorityAddress,
+        key: &Value,
+        generation: u64,
+        work: &mut Work,
+    ) {
+        let owner = CollectionOwnerInstance {
+            parent_authority: address.authority,
+            key: key.clone(),
+            generation,
+        };
+        self.retire_collection_authorities(
+            |candidate| {
+                candidate.producer == address.producer
+                    && candidate
+                        .owner_ancestors
+                        .starts_with(&address.owner_ancestors)
+                    && candidate
+                        .collection_ancestors
+                        .get(..address.collection_ancestors.len())
+                        == Some(address.collection_ancestors.as_slice())
+                    && candidate
+                        .collection_ancestors
+                        .get(address.collection_ancestors.len())
+                        == Some(&owner)
+            },
+            work,
+        );
     }
 
     fn update_collection_producer(
@@ -20475,6 +21307,8 @@ impl MachineInstance {
             return Ok(());
         }
         work.consume(1)?;
+        let generation = self.ensure_map_key_generation(address, &key, work)?;
+        self.validate_map_value_authorities(address, &key, generation, &value)?;
         self.record_collection_authority_undo(address, work);
         let current_revision = match self.collection_authorities.get(address) {
             Some(CollectionAuthorityState::Map(authority)) => authority.revision,
@@ -20486,6 +21320,10 @@ impl MachineInstance {
             }
         };
         let revision = self.next_collection_revision(current_revision, work)?;
+        let previous = match self.collection_authorities.get(address) {
+            Some(CollectionAuthorityState::Map(authority)) => authority.entries.get(&key).cloned(),
+            _ => unreachable!("validated MAP authority changed kind"),
+        };
         let changed = {
             let Some(CollectionAuthorityState::Map(authority)) =
                 self.collection_authorities.get_mut(address)
@@ -20500,6 +21338,19 @@ impl MachineInstance {
             }
             changed
         };
+        if changed {
+            let retained = Self::value_collection_authorities(&value);
+            for retired in previous
+                .as_ref()
+                .map(Self::value_collection_authorities)
+                .unwrap_or_default()
+                .difference(&retained)
+                .cloned()
+                .collect::<Vec<_>>()
+            {
+                self.retire_collection_authority_tree(&retired, work);
+            }
+        }
         if changed && work.emit {
             work.authority_deltas.push(AuthorityDelta::MapUpsert {
                 address: address.clone(),
@@ -20540,19 +21391,29 @@ impl MachineInstance {
             }
         };
         let revision = self.next_collection_revision(current_revision, work)?;
-        let changed = {
+        let (changed, generation) = {
             let Some(CollectionAuthorityState::Map(authority)) =
                 self.collection_authorities.get_mut(address)
             else {
                 unreachable!("validated MAP authority changed kind")
             };
             let changed = authority.entries.remove(&key).is_some();
+            let generation = authority.key_generations.remove(&key);
             if changed {
                 authority.revision = revision;
                 authority.touched |= work.emit;
             }
-            changed
+            (changed, generation)
         };
+        if changed && generation.is_none() {
+            return Err(Error::InvalidPlan(format!(
+                "MAP authority {} removed a key without a live generation",
+                address.authority.0
+            )));
+        }
+        if let Some(generation) = generation {
+            self.retire_map_key_collections(address, &key, generation, work);
+        }
         if changed && work.emit {
             work.authority_deltas.push(AuthorityDelta::MapRemove {
                 address: address.clone(),
@@ -21152,7 +22013,11 @@ impl MachineInstance {
                         revision,
                         item: self.resolve_boundary_value(item)?,
                     },
-                    delta @ AuthorityDelta::RemoveRow { .. } => delta,
+                    delta @ AuthorityDelta::RemoveRow { .. }
+                    | delta @ AuthorityDelta::CreateMap { .. }
+                    | delta @ AuthorityDelta::DeleteMap { .. }
+                    | delta @ AuthorityDelta::CreateSet { .. }
+                    | delta @ AuthorityDelta::DeleteSet { .. } => delta,
                 })
             })
             .collect::<Result<Vec<_>, Error>>()?;
@@ -21931,6 +22796,7 @@ impl MachineInstance {
                 value_ref: value_ref.clone(),
                 context: ExpressionContext {
                     row,
+                    collection_owner: CollectionOwnerRouteId::ROOT,
                     event,
                     output,
                     consumer,
@@ -22050,6 +22916,7 @@ impl MachineInstance {
                 expression,
                 context: ExpressionContext {
                     row,
+                    collection_owner: CollectionOwnerRouteId::ROOT,
                     event,
                     output,
                     consumer,
@@ -22487,6 +23354,61 @@ impl MachineInstance {
                                     function,
                                     input,
                                     args,
+                                } if *function == PlanRowBuiltin::MapUpsert => {
+                                    function
+                                        .validate_call(*input, args)
+                                        .map_err(|error| Error::InvalidPlan(error.to_string()))?;
+                                    let receiver = (*input).ok_or_else(|| {
+                                        Error::InvalidPlan(
+                                            "Map/upsert has no compiled input".to_owned(),
+                                        )
+                                    })?;
+                                    let entry = args
+                                        .iter()
+                                        .find(|argument| argument.name == "entry")
+                                        .map(|argument| argument.value)
+                                        .ok_or_else(|| {
+                                            Error::InvalidPlan(
+                                                "Map/upsert has no compiled entry operand"
+                                                    .to_owned(),
+                                            )
+                                        })?;
+                                    if let Some((key, value)) =
+                                        direct_map_upsert_entry(&plan.row_expressions, entry)?
+                                    {
+                                        stack.push_task(
+                                            ExpressionTask::MapUpsertAfterReceiver {
+                                                state: MapUpsertEvaluationState {
+                                                    expression,
+                                                    key,
+                                                    value,
+                                                    context,
+                                                },
+                                            },
+                                        )?;
+                                        stack.push_task(ExpressionTask::Evaluate {
+                                            expression: receiver,
+                                            context: ExpressionContext {
+                                                consumer: None,
+                                                ..context
+                                            },
+                                        })?;
+                                    } else {
+                                        let value_base = stack.values.len();
+                                        stack.push_task(ExpressionTask::BuiltinAfterOperands {
+                                            expression,
+                                            value_base,
+                                            context,
+                                        })?;
+                                        schedule_builtin_operands(
+                                            &mut stack, *function, *input, args, context,
+                                        )?;
+                                    }
+                                }
+                                PlanRowExpressionNode::BuiltinCall {
+                                    function,
+                                    input,
+                                    args,
                                 } if matches!(
                                     function,
                                     PlanRowBuiltin::BoolAnd | PlanRowBuiltin::BoolOr
@@ -22532,6 +23454,25 @@ impl MachineInstance {
                                     schedule_builtin_operands(
                                         &mut stack, *function, *input, args, context,
                                     )?;
+                                }
+                                PlanRowExpressionNode::MapLiteral { authority, entries } => {
+                                    let address =
+                                        self.collection_authority_address(*authority, context)?;
+                                    self.ensure_map_authority(&address, work)?;
+                                    if !work.emit && self.collection_map(&address)?.touched {
+                                        stack.push_value(EvalValue::Value(
+                                            self.collection_authority_handle(&address)?,
+                                        ))?;
+                                        return Ok(());
+                                    }
+                                    stack.push_task(ExpressionTask::MapLiteralNext {
+                                        state: Box::new(MapLiteralEvaluationState {
+                                            address,
+                                            entries,
+                                            next_entry: 0,
+                                            context,
+                                        }),
+                                    })?;
                                 }
                                 PlanRowExpressionNode::Select { input, .. } => {
                                     stack.push_task(ExpressionTask::SelectAfterInput {
@@ -22617,6 +23558,207 @@ impl MachineInstance {
                                 work,
                             )?;
                             stack.push_value(value)?;
+                        }
+                        ExpressionTask::MapLiteralNext { mut state } => {
+                            let Some(entry) = state.entries.get(state.next_entry) else {
+                                let value = self.collection_authority_handle(&state.address)?;
+                                stack.push_value(EvalValue::Value(value))?;
+                                return Ok(());
+                            };
+                            let expression = entry.key;
+                            let context = state.context;
+                            state.next_entry += 1;
+                            stack.push_task(ExpressionTask::MapLiteralAfterKey { state })?;
+                            stack.push_task(ExpressionTask::Evaluate {
+                                expression,
+                                context,
+                            })?;
+                        }
+                        ExpressionTask::MapLiteralAfterKey { state } => {
+                            let key = match stack.pop_value()? {
+                                EvalValue::Absent => {
+                                    stack.push_value(EvalValue::Absent)?;
+                                    return Ok(());
+                                }
+                                value => self.materialize_eval(value)?,
+                            };
+                            let data_key = runtime_value_to_data(&key)?;
+                            if !data_key.is_key_safe() {
+                                return Err(Error::Evaluation(
+                                    "MAP literal key is not key-safe".to_owned(),
+                                ));
+                            }
+                            let generation =
+                                self.ensure_map_key_generation(&state.address, &key, work)?;
+                            let collection_owner = self.collection_owner_routes.intern_child(
+                                state.context.collection_owner,
+                                CollectionOwnerInstance {
+                                    parent_authority: state.address.authority,
+                                    key: key.clone(),
+                                    generation,
+                                },
+                            )?;
+                            let entry = state
+                                .entries
+                                .get(state.next_entry.saturating_sub(1))
+                                .ok_or_else(|| {
+                                    Error::InvalidPlan(
+                                        "MAP literal lost its active entry".to_owned(),
+                                    )
+                                })?;
+                            let expression = entry.value;
+                            let context = ExpressionContext {
+                                collection_owner,
+                                ..state.context
+                            };
+                            stack.push_task(ExpressionTask::MapLiteralAfterValue {
+                                state,
+                                key,
+                                generation,
+                            })?;
+                            stack.push_task(ExpressionTask::Evaluate {
+                                expression,
+                                context,
+                            })?;
+                        }
+                        ExpressionTask::MapLiteralAfterValue {
+                            state,
+                            key,
+                            generation,
+                        } => {
+                            let value = match stack.pop_value()? {
+                                EvalValue::Absent => {
+                                    stack.push_value(EvalValue::Absent)?;
+                                    return Ok(());
+                                }
+                                value => self.materialize_eval(value)?,
+                            };
+                            self.validate_map_value_authorities(
+                                &state.address,
+                                &key,
+                                generation,
+                                &value,
+                            )?;
+                            let entry = u32::try_from(state.next_entry.saturating_sub(1)).map_err(
+                                |_| {
+                                    Error::InvalidPlan(
+                                        "MAP literal entry count exceeds authority identity space"
+                                            .to_owned(),
+                                    )
+                                },
+                            )?;
+                            let site = CollectionProducerSite::MapLiteral {
+                                address: state.address.clone(),
+                                entry,
+                            };
+                            let candidate = CollectionProducerCandidate::MapUpsert {
+                                key: key.clone(),
+                                value: value.clone(),
+                            };
+                            if self.update_collection_producer(site, candidate, work)? {
+                                self.submit_map_upsert(&state.address, key, value, work)?;
+                            }
+                            stack.push_task(ExpressionTask::MapLiteralNext { state })?;
+                        }
+                        ExpressionTask::MapUpsertAfterReceiver { state } => {
+                            let receiver = match stack.pop_value()? {
+                                EvalValue::Absent => {
+                                    stack.push_value(EvalValue::Absent)?;
+                                    return Ok(());
+                                }
+                                value => self.materialize_eval(value)?,
+                            };
+                            let Value::CollectionAuthority { address } = receiver else {
+                                return Err(Error::Evaluation(
+                                    "Map/upsert requires a live MAP authority".to_owned(),
+                                ));
+                            };
+                            if !matches!(
+                                self.collection_authorities.get(&address),
+                                Some(CollectionAuthorityState::Map(_))
+                            ) {
+                                return Err(Error::Evaluation(
+                                    "Map/upsert requires a live MAP authority".to_owned(),
+                                ));
+                            }
+                            let expression = state.key;
+                            let context = state.context;
+                            stack
+                                .push_task(ExpressionTask::MapUpsertAfterKey { state, address })?;
+                            stack.push_task(ExpressionTask::Evaluate {
+                                expression,
+                                context,
+                            })?;
+                        }
+                        ExpressionTask::MapUpsertAfterKey { state, address } => {
+                            let key = match stack.pop_value()? {
+                                EvalValue::Absent => {
+                                    stack.push_value(EvalValue::Absent)?;
+                                    return Ok(());
+                                }
+                                value => self.materialize_eval(value)?,
+                            };
+                            if !runtime_value_to_data(&key)?.is_key_safe() {
+                                return Err(Error::Evaluation(
+                                    "Map/upsert key is not key-safe".to_owned(),
+                                ));
+                            }
+                            let generation =
+                                self.ensure_map_key_generation(&address, &key, work)?;
+                            let collection_owner = self.collection_owner_routes.intern_child(
+                                state.context.collection_owner,
+                                CollectionOwnerInstance {
+                                    parent_authority: address.authority,
+                                    key: key.clone(),
+                                    generation,
+                                },
+                            )?;
+                            let expression = state.value;
+                            let context = ExpressionContext {
+                                collection_owner,
+                                ..state.context
+                            };
+                            stack.push_task(ExpressionTask::MapUpsertAfterValue {
+                                state,
+                                address,
+                                key,
+                                generation,
+                            })?;
+                            stack.push_task(ExpressionTask::Evaluate {
+                                expression,
+                                context,
+                            })?;
+                        }
+                        ExpressionTask::MapUpsertAfterValue {
+                            state,
+                            address,
+                            key,
+                            generation,
+                        } => {
+                            let value = match stack.pop_value()? {
+                                EvalValue::Absent => {
+                                    stack.push_value(EvalValue::Absent)?;
+                                    return Ok(());
+                                }
+                                value => self.materialize_eval(value)?,
+                            };
+                            self.validate_map_value_authorities(
+                                &address, &key, generation, &value,
+                            )?;
+                            let site = CollectionProducerSite::Builtin {
+                                address: address.clone(),
+                                expression: state.expression,
+                            };
+                            let candidate = CollectionProducerCandidate::MapUpsert {
+                                key: key.clone(),
+                                value: value.clone(),
+                            };
+                            if self.update_collection_producer(site, candidate, work)? {
+                                self.submit_map_upsert(&address, key, value, work)?;
+                            }
+                            stack.push_value(EvalValue::Value(
+                                self.collection_authority_handle(&address)?,
+                            ))?;
                         }
                         ExpressionTask::ObjectMaterializeNext { mut state } => {
                             let Some(field) = state.fields.get(state.next_field) else {
@@ -23026,6 +24168,7 @@ impl MachineInstance {
                                         item,
                                         ExpressionContext {
                                             row: None,
+                                            collection_owner: CollectionOwnerRouteId::ROOT,
                                             event: state.event,
                                             output: None,
                                             consumer: state.consumer,
@@ -23801,6 +24944,7 @@ impl MachineInstance {
                                             expression,
                                             ExpressionContext {
                                                 row: Some(row),
+                                                collection_owner: CollectionOwnerRouteId::ROOT,
                                                 event,
                                                 output: Some(field),
                                                 consumer: Some(consumer),
@@ -24032,6 +25176,7 @@ impl MachineInstance {
                                         });
                                     let mut context = ExpressionContext {
                                         row,
+                                        collection_owner: CollectionOwnerRouteId::ROOT,
                                         event,
                                         output,
                                         consumer,
@@ -24094,6 +25239,7 @@ impl MachineInstance {
                                     };
                                     let context = ExpressionContext {
                                         row: None,
+                                        collection_owner: CollectionOwnerRouteId::ROOT,
                                         event,
                                         output,
                                         consumer,
@@ -26746,6 +27892,7 @@ impl MachineInstance {
                             state.next_key += 1;
                             let context = ExpressionContext {
                                 row: Some(state.row),
+                                collection_owner: CollectionOwnerRouteId::ROOT,
                                 event: None,
                                 output: None,
                                 consumer: None,
@@ -29180,6 +30327,7 @@ impl MachineInstance {
                         remove.gate,
                         ExpressionContext {
                             row: Some(row),
+                            collection_owner: CollectionOwnerRouteId::ROOT,
                             event,
                             output: None,
                             consumer: None,
@@ -29202,6 +30350,7 @@ impl MachineInstance {
                         remove.predicate,
                         ExpressionContext {
                             row: Some(row),
+                            collection_owner: CollectionOwnerRouteId::ROOT,
                             event,
                             output: None,
                             consumer: None,
@@ -31269,7 +32418,11 @@ fn report_authority_deltas(deltas: Vec<AuthorityDelta>) -> Vec<AuthorityDelta> {
                 index,
                 next_key,
             },
-            delta @ AuthorityDelta::RemoveRow { .. } => delta,
+            delta @ AuthorityDelta::RemoveRow { .. }
+            | delta @ AuthorityDelta::CreateMap { .. }
+            | delta @ AuthorityDelta::DeleteMap { .. }
+            | delta @ AuthorityDelta::CreateSet { .. }
+            | delta @ AuthorityDelta::DeleteSet { .. } => delta,
             AuthorityDelta::MapUpsert {
                 address,
                 revision,
@@ -31458,6 +32611,10 @@ fn authority_delta_logical_bytes(delta: &AuthorityDelta) -> u64 {
             .saturating_add(8)
             .saturating_add(8),
         AuthorityDelta::RemoveRow { .. } => 24 + 8,
+        AuthorityDelta::CreateMap { .. }
+        | AuthorityDelta::DeleteMap { .. }
+        | AuthorityDelta::CreateSet { .. }
+        | AuthorityDelta::DeleteSet { .. } => 24,
         AuthorityDelta::MapUpsert { key, value, .. } => 24_u64
             .saturating_add(value_tree_stats(key).logical_payload_bytes)
             .saturating_add(value_tree_stats(value).logical_payload_bytes),
@@ -32394,11 +33551,6 @@ store: [
         LIST {}
         |> List/append(item: seed |> THEN { [value: TEXT { grandchild }] })
 ]
-outputs: [
-    parents: store.parents
-    children: store.children
-    grandchildren: store.grandchildren
-]
 "#,
             TargetProfile::SoftwareDefault,
             ProgramRole::Server,
@@ -32410,6 +33562,7 @@ outputs: [
             .list_slots
             .iter()
             .map(|slot| slot.list_id)
+            .take(3)
             .collect::<Vec<_>>();
         assert_eq!(list_ids.len(), 3);
         let mut session = MachineInstance::new(plan.clone(), SessionOptions::default()).unwrap();
@@ -32501,6 +33654,7 @@ store: [
         };
         let reconciliation_context = ExpressionContext {
             row: None,
+            collection_owner: CollectionOwnerRouteId::ROOT,
             event: None,
             output: None,
             consumer: None,

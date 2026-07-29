@@ -10,7 +10,7 @@ use std::fmt;
 mod codec;
 mod migration;
 
-pub use boon_data::{Bytes, Value as StoredValue};
+pub use boon_data::{Bytes, ExactNumber, Value as StoredValue};
 
 #[cfg(any(target_arch = "wasm32", test))]
 mod web;
@@ -69,7 +69,9 @@ pub struct StoredList {
 pub struct StoredMap {
     pub touched: bool,
     pub revision: u64,
-    pub entries: BTreeMap<StoredValue, StoredValue>,
+    pub next_key_generation: u64,
+    pub key_generations: BTreeMap<StoredValue, u64>,
+    pub entries: BTreeMap<StoredValue, StoredValueShell>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -137,6 +139,29 @@ pub struct DurableOwner {
 pub struct DurableCollectionId {
     pub memory_id: MemoryId,
     pub owner: DurableOwner,
+    pub collection_ancestors: Vec<DurableCollectionOwner>,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct DurableCollectionOwner {
+    pub parent_memory_id: MemoryId,
+    pub key: StoredValue,
+    pub generation: u64,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum StoredValueShell {
+    Number(ExactNumber),
+    Text(String),
+    Bytes(Bytes),
+    List(Vec<StoredValueShell>),
+    Object(BTreeMap<String, StoredValueShell>),
+    Tag {
+        tag: String,
+        fields: BTreeMap<String, StoredValueShell>,
+    },
+    ChildAuthority(DurableCollectionId),
 }
 
 fn hash_durable_owner(hasher: &mut Sha256, owner: &DurableOwner) {
@@ -346,12 +371,15 @@ pub enum DurableChange {
         collection_id: DurableCollectionId,
         revision: u64,
         key: StoredValue,
-        value: StoredValue,
+        key_generation: u64,
+        next_key_generation: u64,
+        value: StoredValueShell,
     },
     MapRemove {
         collection_id: DurableCollectionId,
         revision: u64,
         key: StoredValue,
+        next_key_generation: u64,
     },
     DeleteMap {
         collection_id: DurableCollectionId,
@@ -1426,7 +1454,6 @@ fn apply_changes(image: &mut RestoreImage, changes: &[DurableChange]) -> Result<
                 value,
             } => {
                 validate_collection_id(collection_id)?;
-                validate_collection_owner_against_image(image, collection_id)?;
                 validate_map(collection_id, value)?;
                 if image.scalars.contains_key(&collection_id.memory_id)
                     || image.lists.contains_key(&collection_id.memory_id)
@@ -1446,10 +1473,11 @@ fn apply_changes(image: &mut RestoreImage, changes: &[DurableChange]) -> Result<
                 collection_id,
                 revision,
                 key,
+                key_generation,
+                next_key_generation,
                 value,
             } => {
                 validate_collection_id(collection_id)?;
-                validate_collection_owner_against_image(image, collection_id)?;
                 let map = image.maps.get_mut(collection_id).ok_or_else(|| {
                     StoreError::InvalidAuthority(format!(
                         "cannot upsert into missing map {}",
@@ -1459,15 +1487,18 @@ fn apply_changes(image: &mut RestoreImage, changes: &[DurableChange]) -> Result<
                 advance_collection_revision(collection_id, map.revision, revision, "map")?;
                 map.revision = *revision;
                 map.touched = true;
+                map.next_key_generation = *next_key_generation;
+                map.key_generations.insert(key.clone(), *key_generation);
                 map.entries.insert(key.clone(), value.clone());
+                validate_map(collection_id, map)?;
             }
             DurableChange::MapRemove {
                 collection_id,
                 revision,
                 key,
+                next_key_generation,
             } => {
                 validate_collection_id(collection_id)?;
-                validate_collection_owner_against_image(image, collection_id)?;
                 let map = image.maps.get_mut(collection_id).ok_or_else(|| {
                     StoreError::InvalidAuthority(format!(
                         "cannot remove from missing map {}",
@@ -1481,8 +1512,16 @@ fn apply_changes(image: &mut RestoreImage, changes: &[DurableChange]) -> Result<
                         collection_id.memory_id
                     )));
                 }
+                if map.key_generations.remove(key).is_none() {
+                    return Err(StoreError::InvalidAuthority(format!(
+                        "map {} does not contain a generation for the removed key",
+                        collection_id.memory_id
+                    )));
+                }
                 map.revision = *revision;
                 map.touched = true;
+                map.next_key_generation = *next_key_generation;
+                validate_map(collection_id, map)?;
             }
             DurableChange::DeleteMap { collection_id } => {
                 image.maps.remove(collection_id);
@@ -1492,7 +1531,6 @@ fn apply_changes(image: &mut RestoreImage, changes: &[DurableChange]) -> Result<
                 value,
             } => {
                 validate_collection_id(collection_id)?;
-                validate_collection_owner_against_image(image, collection_id)?;
                 validate_set(collection_id, value)?;
                 if image.scalars.contains_key(&collection_id.memory_id)
                     || image.lists.contains_key(&collection_id.memory_id)
@@ -1514,7 +1552,6 @@ fn apply_changes(image: &mut RestoreImage, changes: &[DurableChange]) -> Result<
                 item,
             } => {
                 validate_collection_id(collection_id)?;
-                validate_collection_owner_against_image(image, collection_id)?;
                 let set = image.sets.get_mut(collection_id).ok_or_else(|| {
                     StoreError::InvalidAuthority(format!(
                         "cannot add to missing set {}",
@@ -1537,7 +1574,6 @@ fn apply_changes(image: &mut RestoreImage, changes: &[DurableChange]) -> Result<
                 item,
             } => {
                 validate_collection_id(collection_id)?;
-                validate_collection_owner_against_image(image, collection_id)?;
                 let set = image.sets.get_mut(collection_id).ok_or_else(|| {
                     StoreError::InvalidAuthority(format!(
                         "cannot remove from missing set {}",
@@ -1559,6 +1595,7 @@ fn apply_changes(image: &mut RestoreImage, changes: &[DurableChange]) -> Result<
             }
         }
     }
+    validate_collection_authority_graph(image)?;
     Ok(())
 }
 
@@ -2217,7 +2254,25 @@ fn advance_collection_revision(
 }
 
 fn validate_collection_id(collection_id: &DurableCollectionId) -> Result<(), StoreError> {
-    validate_durable_owner(&collection_id.owner, true).map_err(StoreError::InvalidAuthority)
+    validate_durable_owner(&collection_id.owner, true).map_err(StoreError::InvalidAuthority)?;
+    let mut memories = collection_id
+        .collection_ancestors
+        .iter()
+        .map(|owner| owner.parent_memory_id)
+        .collect::<BTreeSet<_>>();
+    if memories.len() != collection_id.collection_ancestors.len()
+        || !memories.insert(collection_id.memory_id)
+        || collection_id
+            .collection_ancestors
+            .iter()
+            .any(|owner| owner.generation == 0 || !owner.key.is_key_safe())
+    {
+        return Err(StoreError::InvalidAuthority(format!(
+            "collection {} has an invalid or cyclic collection-owner route",
+            collection_id.memory_id
+        )));
+    }
+    Ok(())
 }
 
 fn validate_collection_owner_against_image(
@@ -2248,15 +2303,187 @@ fn validate_collection_owner_against_image(
             )));
         }
     }
+    for (depth, owner) in collection_id.collection_ancestors.iter().enumerate() {
+        let parent_id = DurableCollectionId {
+            memory_id: owner.parent_memory_id,
+            owner: collection_id.owner.clone(),
+            collection_ancestors: collection_id.collection_ancestors[..depth].to_vec(),
+        };
+        let parent = image.maps.get(&parent_id).ok_or_else(|| {
+            StoreError::InvalidAuthority(format!(
+                "collection {} owner references missing parent MAP {}",
+                collection_id.memory_id, owner.parent_memory_id
+            ))
+        })?;
+        if parent.key_generations.get(&owner.key) != Some(&owner.generation) {
+            return Err(StoreError::InvalidAuthority(format!(
+                "collection {} owner references stale parent MAP key generation",
+                collection_id.memory_id
+            )));
+        }
+        let attached_memory_id = collection_id
+            .collection_ancestors
+            .get(depth + 1)
+            .map_or(collection_id.memory_id, |next| next.parent_memory_id);
+        let attached_id = DurableCollectionId {
+            memory_id: attached_memory_id,
+            owner: collection_id.owner.clone(),
+            collection_ancestors: collection_id.collection_ancestors[..=depth].to_vec(),
+        };
+        let attached = parent
+            .entries
+            .get(&owner.key)
+            .map(stored_shell_child_authorities)
+            .is_some_and(|children| children.contains(&attached_id));
+        if !attached {
+            return Err(StoreError::InvalidAuthority(format!(
+                "collection {} is not attached by its parent MAP value shell",
+                collection_id.memory_id
+            )));
+        }
+    }
     Ok(())
 }
 
-fn validate_map(collection_id: &DurableCollectionId, _map: &StoredMap) -> Result<(), StoreError> {
-    validate_collection_id(collection_id)
+fn validate_map(collection_id: &DurableCollectionId, map: &StoredMap) -> Result<(), StoreError> {
+    validate_collection_id(collection_id)?;
+    let generations = map
+        .key_generations
+        .values()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if map.next_key_generation == 0
+        || map.entries.keys().ne(map.key_generations.keys())
+        || generations.len() != map.key_generations.len()
+        || generations.contains(&0)
+        || generations
+            .last()
+            .is_some_and(|generation| *generation >= map.next_key_generation)
+    {
+        return Err(StoreError::InvalidAuthority(format!(
+            "map {} has invalid key generations",
+            collection_id.memory_id
+        )));
+    }
+    for shell in map.entries.values() {
+        validate_stored_value_shell(shell, 0)?;
+    }
+    Ok(())
 }
 
 fn validate_set(collection_id: &DurableCollectionId, _set: &StoredSet) -> Result<(), StoreError> {
     validate_collection_id(collection_id)
+}
+
+fn validate_stored_value_shell(shell: &StoredValueShell, depth: usize) -> Result<(), StoreError> {
+    if depth > MAX_DURABLE_OWNER_DEPTH {
+        return Err(StoreError::InvalidAuthority(
+            "stored MAP value shell exceeds the authority nesting bound".to_owned(),
+        ));
+    }
+    match shell {
+        StoredValueShell::List(values) => {
+            for value in values {
+                validate_stored_value_shell(value, depth + 1)?;
+            }
+        }
+        StoredValueShell::Object(fields) | StoredValueShell::Tag { fields, .. } => {
+            for value in fields.values() {
+                validate_stored_value_shell(value, depth + 1)?;
+            }
+        }
+        StoredValueShell::ChildAuthority(collection_id) => {
+            validate_collection_id(collection_id)?;
+        }
+        StoredValueShell::Number(_) | StoredValueShell::Text(_) | StoredValueShell::Bytes(_) => {}
+    }
+    Ok(())
+}
+
+fn stored_shell_child_authorities(shell: &StoredValueShell) -> BTreeSet<DurableCollectionId> {
+    let mut children = BTreeSet::new();
+    let mut pending = vec![shell];
+    while let Some(shell) = pending.pop() {
+        match shell {
+            StoredValueShell::List(values) => pending.extend(values),
+            StoredValueShell::Object(fields) | StoredValueShell::Tag { fields, .. } => {
+                pending.extend(fields.values())
+            }
+            StoredValueShell::ChildAuthority(collection_id) => {
+                children.insert(collection_id.clone());
+            }
+            StoredValueShell::Number(_)
+            | StoredValueShell::Text(_)
+            | StoredValueShell::Bytes(_) => {}
+        }
+    }
+    children
+}
+
+fn validate_collection_authority_graph(image: &RestoreImage) -> Result<(), StoreError> {
+    let mut attachments = BTreeMap::<DurableCollectionId, u64>::new();
+    for (collection_id, map) in &image.maps {
+        validate_map(collection_id, map)?;
+        validate_collection_owner_against_image(image, collection_id)?;
+    }
+    for (collection_id, set) in &image.sets {
+        validate_set(collection_id, set)?;
+        validate_collection_owner_against_image(image, collection_id)?;
+    }
+    for (parent_id, map) in &image.maps {
+        for (key, shell) in &map.entries {
+            let generation = map.key_generations.get(key).copied().ok_or_else(|| {
+                StoreError::InvalidAuthority(format!(
+                    "map {} contains a value without a key generation",
+                    parent_id.memory_id
+                ))
+            })?;
+            for child_id in stored_shell_child_authorities(shell) {
+                let exists = usize::from(image.maps.contains_key(&child_id))
+                    + usize::from(image.sets.contains_key(&child_id));
+                if exists != 1 {
+                    return Err(StoreError::InvalidAuthority(format!(
+                        "map {} references missing or ambiguous child collection {}",
+                        parent_id.memory_id, child_id.memory_id
+                    )));
+                }
+                let Some(owner) = child_id.collection_ancestors.last() else {
+                    return Err(StoreError::InvalidAuthority(format!(
+                        "map {} references child collection {} without a parent route",
+                        parent_id.memory_id, child_id.memory_id
+                    )));
+                };
+                if child_id.owner != parent_id.owner
+                    || child_id.collection_ancestors[..child_id.collection_ancestors.len() - 1]
+                        != parent_id.collection_ancestors
+                    || owner.parent_memory_id != parent_id.memory_id
+                    || owner.key != *key
+                    || owner.generation != generation
+                {
+                    return Err(StoreError::InvalidAuthority(format!(
+                        "map {} child collection {} disagrees with its typed parent edge",
+                        parent_id.memory_id, child_id.memory_id
+                    )));
+                }
+                let count = attachments.entry(child_id).or_default();
+                *count = count.checked_add(1).ok_or_else(|| {
+                    StoreError::InvalidAuthority(
+                        "collection authority attachment count overflow".to_owned(),
+                    )
+                })?;
+            }
+        }
+    }
+    for collection_id in image.maps.keys().chain(image.sets.keys()) {
+        let expected = u64::from(!collection_id.collection_ancestors.is_empty());
+        if attachments.get(collection_id).copied().unwrap_or(0) != expected {
+            return Err(StoreError::InvalidAuthority(format!(
+                "collection {} does not have exactly one typed parent edge",
+                collection_id.memory_id
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn validate_authority_kinds_disjoint(image: &RestoreImage) -> Result<(), StoreError> {
@@ -2434,12 +2661,11 @@ fn validate_initial_image(image: &RestoreImage) -> Result<(), StoreError> {
     }
     for (collection_id, map) in &image.maps {
         validate_map(collection_id, map)?;
-        validate_collection_owner_against_image(image, collection_id)?;
     }
     for (collection_id, set) in &image.sets {
         validate_set(collection_id, set)?;
-        validate_collection_owner_against_image(image, collection_id)?;
     }
+    validate_collection_authority_graph(image)?;
     validate_authority_kinds_disjoint(image)?;
     validate_outbox(&image.outbox)?;
     validate_content_artifact_manifest(&image.content_artifact_manifest)?;
@@ -2803,33 +3029,45 @@ fn hash_changes(hasher: &mut Sha256, changes: &[DurableChange]) {
                 hash_durable_collection_id(hasher, collection_id);
                 hasher.update([u8::from(value.touched)]);
                 hasher.update(value.revision.to_be_bytes());
+                hasher.update(value.next_key_generation.to_be_bytes());
+                hasher.update((value.key_generations.len() as u64).to_be_bytes());
+                for (key, generation) in &value.key_generations {
+                    hash_stored_value(hasher, key);
+                    hasher.update(generation.to_be_bytes());
+                }
                 hasher.update((value.entries.len() as u64).to_be_bytes());
                 for (key, value) in &value.entries {
                     hash_stored_value(hasher, key);
-                    hash_stored_value(hasher, value);
+                    hash_stored_value_shell(hasher, value);
                 }
             }
             DurableChange::MapUpsert {
                 collection_id,
                 revision,
                 key,
+                key_generation,
+                next_key_generation,
                 value,
             } => {
                 hasher.update([8]);
                 hash_durable_collection_id(hasher, collection_id);
                 hasher.update(revision.to_be_bytes());
                 hash_stored_value(hasher, key);
-                hash_stored_value(hasher, value);
+                hasher.update(key_generation.to_be_bytes());
+                hasher.update(next_key_generation.to_be_bytes());
+                hash_stored_value_shell(hasher, value);
             }
             DurableChange::MapRemove {
                 collection_id,
                 revision,
                 key,
+                next_key_generation,
             } => {
                 hasher.update([9]);
                 hash_durable_collection_id(hasher, collection_id);
                 hasher.update(revision.to_be_bytes());
                 hash_stored_value(hasher, key);
+                hasher.update(next_key_generation.to_be_bytes());
             }
             DurableChange::DeleteMap { collection_id } => {
                 hasher.update([10]);
@@ -2879,6 +3117,12 @@ fn hash_changes(hasher: &mut Sha256, changes: &[DurableChange]) {
 fn hash_durable_collection_id(hasher: &mut Sha256, collection_id: &DurableCollectionId) {
     hasher.update(collection_id.memory_id.as_bytes());
     hash_durable_owner(hasher, &collection_id.owner);
+    hasher.update((collection_id.collection_ancestors.len() as u64).to_be_bytes());
+    for owner in &collection_id.collection_ancestors {
+        hasher.update(owner.parent_memory_id.as_bytes());
+        hash_stored_value(hasher, &owner.key);
+        hasher.update(owner.generation.to_be_bytes());
+    }
 }
 
 fn hash_outbox_changes(hasher: &mut Sha256, changes: &[DurableOutboxChange]) {
@@ -3025,13 +3269,7 @@ fn hash_stored_value(hasher: &mut Sha256, value: &StoredValue) {
     match value {
         StoredValue::Number(value) => {
             hasher.update([20]);
-            hasher.update([value.sign() as u8]);
-            let numerator = value.numerator_magnitude_bytes();
-            let denominator = value.denominator_bytes();
-            hasher.update((numerator.len() as u64).to_be_bytes());
-            hasher.update(numerator);
-            hasher.update((denominator.len() as u64).to_be_bytes());
-            hasher.update(denominator);
+            hash_exact_number(hasher, value);
         }
         StoredValue::Text(value) => {
             hasher.update([21]);
@@ -3072,6 +3310,62 @@ fn hash_stored_value(hasher: &mut Sha256, value: &StoredValue) {
             for item in items {
                 hash_stored_value(hasher, item);
             }
+        }
+    }
+}
+
+fn hash_exact_number(hasher: &mut Sha256, value: &ExactNumber) {
+    hasher.update([value.sign() as u8]);
+    let numerator = value.numerator_magnitude_bytes();
+    let denominator = value.denominator_bytes();
+    hasher.update((numerator.len() as u64).to_be_bytes());
+    hasher.update(numerator);
+    hasher.update((denominator.len() as u64).to_be_bytes());
+    hasher.update(denominator);
+}
+
+fn hash_stored_value_shell(hasher: &mut Sha256, value: &StoredValueShell) {
+    match value {
+        StoredValueShell::Number(value) => {
+            hasher.update([0]);
+            hash_exact_number(hasher, value);
+        }
+        StoredValueShell::Text(value) => {
+            hasher.update([1]);
+            hash_text(hasher, value);
+        }
+        StoredValueShell::Bytes(value) => {
+            hasher.update([2]);
+            hasher.update((value.len() as u64).to_be_bytes());
+            hasher.update(value);
+        }
+        StoredValueShell::List(values) => {
+            hasher.update([3]);
+            hasher.update((values.len() as u64).to_be_bytes());
+            for value in values {
+                hash_stored_value_shell(hasher, value);
+            }
+        }
+        StoredValueShell::Object(fields) => {
+            hasher.update([4]);
+            hasher.update((fields.len() as u64).to_be_bytes());
+            for (name, value) in fields {
+                hash_text(hasher, name);
+                hash_stored_value_shell(hasher, value);
+            }
+        }
+        StoredValueShell::Tag { tag, fields } => {
+            hasher.update([5]);
+            hash_text(hasher, tag);
+            hasher.update((fields.len() as u64).to_be_bytes());
+            for (name, value) in fields {
+                hash_text(hasher, name);
+                hash_stored_value_shell(hasher, value);
+            }
+        }
+        StoredValueShell::ChildAuthority(collection_id) => {
+            hasher.update([6]);
+            hash_durable_collection_id(hasher, collection_id);
         }
     }
 }
@@ -3232,6 +3526,18 @@ mod tests {
         .unwrap()
     }
 
+    fn map_memory(name: &str) -> MemoryId {
+        MemoryId::from_identity(
+            &MemoryOwnerPath {
+                canonical_module: "counter".to_owned(),
+                named_owner_path: "store".to_owned(),
+            },
+            name,
+            MemoryKind::Map,
+        )
+        .unwrap()
+    }
+
     fn seeded_driver() -> InMemoryDriver {
         let mut driver = InMemoryDriver::default();
         driver.seed(RestoreImage::empty(application(), 1, [1; 32]));
@@ -3323,6 +3629,91 @@ mod tests {
             .seal()
         };
         assert_ne!(batch(change(1)).checksum, batch(change(2)).checksum);
+    }
+
+    #[test]
+    fn nested_collection_graph_requires_one_live_typed_parent_edge() {
+        let parent_memory = map_memory("orders");
+        let child_memory = map_memory("orders.lines");
+        let key = StoredValue::Text("order-a".to_owned());
+        let parent_id = DurableCollectionId {
+            memory_id: parent_memory,
+            owner: DurableOwner::default(),
+            collection_ancestors: Vec::new(),
+        };
+        let child_id = DurableCollectionId {
+            memory_id: child_memory,
+            owner: DurableOwner::default(),
+            collection_ancestors: vec![DurableCollectionOwner {
+                parent_memory_id: parent_memory,
+                key: key.clone(),
+                generation: 1,
+            }],
+        };
+        let parent = StoredMap {
+            touched: false,
+            revision: 0,
+            next_key_generation: 2,
+            key_generations: BTreeMap::from([(key.clone(), 1)]),
+            entries: BTreeMap::from([(
+                key.clone(),
+                StoredValueShell::Object(BTreeMap::from([(
+                    "lines".to_owned(),
+                    StoredValueShell::ChildAuthority(child_id.clone()),
+                )])),
+            )]),
+        };
+        let child_key = StoredValue::Text("sku-a".to_owned());
+        let child = StoredMap {
+            touched: false,
+            revision: 0,
+            next_key_generation: 2,
+            key_generations: BTreeMap::from([(child_key.clone(), 1)]),
+            entries: BTreeMap::from([(
+                child_key,
+                StoredValueShell::Number(ExactNumber::from_i64(1)),
+            )]),
+        };
+        let mut image = RestoreImage::empty(application(), 1, [1; 32]);
+        image.maps.insert(parent_id.clone(), parent);
+        image.maps.insert(child_id.clone(), child);
+        validate_initial_image(&image).unwrap();
+
+        let mut missing_child = image.clone();
+        missing_child.maps.remove(&child_id);
+        assert!(
+            validate_initial_image(&missing_child)
+                .unwrap_err()
+                .to_string()
+                .contains("missing or ambiguous child")
+        );
+
+        let mut stale_generation = image.clone();
+        let stale_id = DurableCollectionId {
+            collection_ancestors: vec![DurableCollectionOwner {
+                parent_memory_id: parent_memory,
+                key,
+                generation: 2,
+            }],
+            ..child_id.clone()
+        };
+        let child = stale_generation.maps.remove(&child_id).expect("child map");
+        stale_generation
+            .maps
+            .get_mut(&parent_id)
+            .expect("parent map")
+            .entries
+            .insert(
+                StoredValue::Text("order-a".to_owned()),
+                StoredValueShell::ChildAuthority(stale_id.clone()),
+            );
+        stale_generation.maps.insert(stale_id, child);
+        assert!(
+            validate_initial_image(&stale_generation)
+                .unwrap_err()
+                .to_string()
+                .contains("stale parent MAP key generation")
+        );
     }
 
     #[test]

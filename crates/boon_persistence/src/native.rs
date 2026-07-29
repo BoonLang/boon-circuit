@@ -1,25 +1,26 @@
 use super::codec::{
-    BlobDigest, BlobRecord, EncodedComponent, decode_blob_record, decode_map_entry_component,
-    decode_outbox_record, decode_row_component, decode_scalar_component, decode_set_item_component,
-    encode_blob_record, encode_map_entry_component, encode_outbox_record, encode_row_component,
-    encode_scalar_component, encode_set_item_component, map_entry_component_blob_references,
-    row_component_blob_references, scalar_component_blob_references,
-    set_item_component_blob_references,
+    BlobDigest, BlobRecord, EncodedComponent, decode_blob_record, decode_collection_id_component,
+    decode_map_entry_component, decode_map_metadata_component, decode_outbox_record,
+    decode_row_component, decode_scalar_component, decode_set_item_component, encode_blob_record,
+    encode_collection_id_component, encode_map_entry_component, encode_map_metadata_component,
+    encode_outbox_record, encode_row_component, encode_scalar_component, encode_set_item_component,
+    map_entry_component_blob_references, row_component_blob_references,
+    scalar_component_blob_references, set_item_component_blob_references,
 };
 use super::{
     ActivationAck, ActivationBatch, ApplicationTransfer, BarrierAck, CheckpointBatch, CommitAck,
     CompactAck, ContentArtifact, ContentArtifactBinding, ContentArtifactId,
     ContentArtifactManifest, ContentArtifactOwnerId, ContentArtifactRetention, DecodeLimits,
-    DurableChange, DurableCollectionId, DurableOutboxItem, DurableOwner, DurableRowId,
-    ExportApplicationRequest, LoadContentArtifactRequest, OutboxItemId, PersistenceCommand,
-    PersistenceDriver, PersistenceInspectorSnapshot, PersistenceResult, PutContentArtifactAck,
+    DurableChange, DurableCollectionId, DurableOutboxItem, ExportApplicationRequest,
+    LoadContentArtifactRequest, OutboxItemId, PersistenceCommand, PersistenceDriver,
+    PersistenceInspectorSnapshot, PersistenceResult, PutContentArtifactAck,
     PutContentArtifactRequest, ResetApplicationAck, ResetApplicationBatch, RestoreImage,
     ShutdownAck, StoreError, StoredList, StoredMap, StoredRow, StoredSet, StoredValue,
-    apply_durable_content_artifact_changes, encode_restore_image, exact_content_artifact_closure,
-    hash_application, inspector_snapshot_with_artifacts, validate_activation,
-    validate_application_transfer, validate_checkpoint, validate_content_artifact,
-    validate_content_artifact_manifest, validate_content_artifact_storage, validate_initial_image,
-    validate_list,
+    StoredValueShell, apply_durable_content_artifact_changes, encode_restore_image,
+    exact_content_artifact_closure, hash_application, inspector_snapshot_with_artifacts,
+    validate_activation, validate_application_transfer, validate_checkpoint,
+    validate_content_artifact, validate_content_artifact_manifest,
+    validate_content_artifact_storage, validate_initial_image, validate_list,
 };
 use boon_plan::{ApplicationIdentity, MemoryId, MigrationEdgeId};
 use minicbor::{Decoder, Encoder};
@@ -86,6 +87,14 @@ struct ListRecord {
 struct CollectionRecord {
     touched: bool,
     revision: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MapRecord {
+    touched: bool,
+    revision: u64,
+    next_key_generation: u64,
+    key_generations: BTreeMap<StoredValue, u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -259,13 +268,15 @@ impl RedbDriver {
                 let collection_id = collection_from_key(key, "map")?;
                 let bytes = value.value();
                 add_decode_bytes(&mut decoded_bytes, bytes.len(), self.limits)?;
-                let record = decode_collection_record(bytes, self.limits, "map metadata")?;
+                let record = decode_map_record(bytes, self.limits)?;
                 if maps
                     .insert(
                         collection_id,
                         StoredMap {
                             touched: record.touched,
                             revision: record.revision,
+                            next_key_generation: record.next_key_generation,
+                            key_generations: record.key_generations,
                             entries: BTreeMap::new(),
                         },
                     )
@@ -411,9 +422,7 @@ impl RedbDriver {
             content_artifact_manifest,
         };
         super::validate_authority_kinds_disjoint(&image)?;
-        for collection_id in image.maps.keys().chain(image.sets.keys()) {
-            super::validate_collection_owner_against_image(&image, collection_id)?;
-        }
+        super::validate_collection_authority_graph(&image)?;
         Ok(Some(image))
     }
 
@@ -1965,17 +1974,18 @@ fn apply_changes(
                 collection_id,
                 revision,
                 key,
+                key_generation,
+                next_key_generation,
                 value,
             } => {
                 validate_collection_owner_tables(lists, rows, app, collection_id, limits, blobs)?;
                 let mut record =
-                    load_collection_record(maps, app, collection_id, limits, "map metadata")?
-                        .ok_or_else(|| {
-                            StoreError::InvalidAuthority(format!(
-                                "cannot upsert into missing map {}",
-                                collection_id.memory_id
-                            ))
-                        })?;
+                    load_map_record(maps, app, collection_id, limits)?.ok_or_else(|| {
+                        StoreError::InvalidAuthority(format!(
+                            "cannot upsert into missing map {}",
+                            collection_id.memory_id
+                        ))
+                    })?;
                 super::advance_collection_revision(
                     collection_id,
                     record.revision,
@@ -1985,22 +1995,25 @@ fn apply_changes(
                 save_map_entry(map_entries, app, collection_id, key, value, limits, blobs)?;
                 record.touched = true;
                 record.revision = *revision;
-                save_collection_record(maps, app, collection_id, record)?;
+                record.next_key_generation = *next_key_generation;
+                record.key_generations.insert(key.clone(), *key_generation);
+                validate_map_record(collection_id, &record)?;
+                save_map_record(maps, app, collection_id, &record)?;
             }
             DurableChange::MapRemove {
                 collection_id,
                 revision,
                 key,
+                next_key_generation,
             } => {
                 validate_collection_owner_tables(lists, rows, app, collection_id, limits, blobs)?;
                 let mut record =
-                    load_collection_record(maps, app, collection_id, limits, "map metadata")?
-                        .ok_or_else(|| {
-                            StoreError::InvalidAuthority(format!(
-                                "cannot remove from missing map {}",
-                                collection_id.memory_id
-                            ))
-                        })?;
+                    load_map_record(maps, app, collection_id, limits)?.ok_or_else(|| {
+                        StoreError::InvalidAuthority(format!(
+                            "cannot remove from missing map {}",
+                            collection_id.memory_id
+                        ))
+                    })?;
                 super::advance_collection_revision(
                     collection_id,
                     record.revision,
@@ -2010,7 +2023,15 @@ fn apply_changes(
                 delete_map_entry(map_entries, app, collection_id, key, limits, blobs)?;
                 record.touched = true;
                 record.revision = *revision;
-                save_collection_record(maps, app, collection_id, record)?;
+                record.next_key_generation = *next_key_generation;
+                if record.key_generations.remove(key).is_none() {
+                    return Err(StoreError::InvalidAuthority(format!(
+                        "map {} has no key generation for the removed key",
+                        collection_id.memory_id
+                    )));
+                }
+                validate_map_record(collection_id, &record)?;
+                save_map_record(maps, app, collection_id, &record)?;
             }
             DurableChange::DeleteMap { collection_id } => {
                 delete_map(maps, map_entries, app, collection_id, limits, blobs)?;
@@ -2152,6 +2173,41 @@ fn save_collection_record(
     Ok(())
 }
 
+fn load_map_record(
+    table: &Table<'_, &[u8], &[u8]>,
+    app: &[u8; 32],
+    collection_id: &DurableCollectionId,
+    limits: DecodeLimits,
+) -> Result<Option<MapRecord>, StoreError> {
+    let key = collection_storage_key(app, collection_id)?;
+    table
+        .get(key.as_slice())
+        .map_err(backend)?
+        .map(|value| decode_map_record(value.value(), limits))
+        .transpose()
+}
+
+fn save_map_record(
+    table: &mut Table<'_, &[u8], &[u8]>,
+    app: &[u8; 32],
+    collection_id: &DurableCollectionId,
+    record: &MapRecord,
+) -> Result<(), StoreError> {
+    validate_map_record(collection_id, record)?;
+    let key = collection_storage_key(app, collection_id)?;
+    let bytes = encode_map_metadata_component(
+        record.touched,
+        record.revision,
+        record.next_key_generation,
+        &record.key_generations,
+    )
+    .map_err(codec)?;
+    table
+        .insert(key.as_slice(), bytes.as_slice())
+        .map_err(backend)?;
+    Ok(())
+}
+
 fn collection_memory_exists(
     table: &Table<'_, &[u8], &[u8]>,
     app: &[u8; 32],
@@ -2211,7 +2267,7 @@ fn save_map_entry(
     app: &[u8; 32],
     collection_id: &DurableCollectionId,
     key_value: &StoredValue,
-    value: &StoredValue,
+    value: &StoredValueShell,
     limits: DecodeLimits,
     blobs: &mut BTreeMap<BlobDigest, BlobRecord>,
 ) -> Result<(), StoreError> {
@@ -2380,13 +2436,15 @@ fn replace_map(
     for (key, value) in &map.entries {
         save_map_entry(entries, app, collection_id, key, value, limits, blobs)?;
     }
-    save_collection_record(
+    save_map_record(
         maps,
         app,
         collection_id,
-        CollectionRecord {
+        &MapRecord {
             touched: map.touched,
             revision: map.revision,
+            next_key_generation: map.next_key_generation,
+            key_generations: map.key_generations.clone(),
         },
     )
 }
@@ -2982,6 +3040,47 @@ fn encode_collection_record(record: CollectionRecord) -> Result<Vec<u8>, StoreEr
     Ok(bytes)
 }
 
+fn decode_map_record(bytes: &[u8], limits: DecodeLimits) -> Result<MapRecord, StoreError> {
+    let (touched, revision, next_key_generation, key_generations) =
+        decode_map_metadata_component(bytes, limits).map_err(codec)?;
+    let record = MapRecord {
+        touched,
+        revision,
+        next_key_generation,
+        key_generations,
+    };
+    validate_map_record_metadata(&record).map_err(corrupt)?;
+    Ok(record)
+}
+
+fn validate_map_record(
+    collection_id: &DurableCollectionId,
+    record: &MapRecord,
+) -> Result<(), StoreError> {
+    validate_map_record_metadata(record).map_err(|message| {
+        StoreError::InvalidAuthority(format!("map {} {message}", collection_id.memory_id))
+    })
+}
+
+fn validate_map_record_metadata(record: &MapRecord) -> Result<(), String> {
+    let generations = record
+        .key_generations
+        .values()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    if record.next_key_generation == 0
+        || generations.len() != record.key_generations.len()
+        || generations.contains(&0)
+        || generations
+            .last()
+            .is_some_and(|generation| *generation >= record.next_key_generation)
+        || record.key_generations.keys().any(|key| !key.is_key_safe())
+    {
+        return Err("has invalid key generations".to_owned());
+    }
+    Ok(())
+}
+
 fn decode_collection_record(
     bytes: &[u8],
     limits: DecodeLimits,
@@ -3144,59 +3243,19 @@ fn collection_storage_key(
     collection_id: &DurableCollectionId,
 ) -> Result<Vec<u8>, StoreError> {
     super::validate_collection_id(collection_id)?;
-    let depth: u16 = collection_id
-        .owner
-        .ancestors
-        .len()
-        .try_into()
-        .map_err(|_| StoreError::InvalidAuthority("collection owner depth overflow".to_owned()))?;
-    let mut key = Vec::with_capacity(66 + usize::from(depth) * 48);
+    let encoded = encode_collection_id_component(collection_id).map_err(codec)?;
+    let mut key = Vec::with_capacity(32 + encoded.len());
     key.extend_from_slice(app);
-    key.extend_from_slice(collection_id.memory_id.as_bytes());
-    key.extend_from_slice(&depth.to_be_bytes());
-    for row in &collection_id.owner.ancestors {
-        key.extend_from_slice(row.list_memory_id.as_bytes());
-        key.extend_from_slice(&row.row_key.to_be_bytes());
-        key.extend_from_slice(&row.row_generation.to_be_bytes());
-    }
+    key.extend_from_slice(&encoded);
     Ok(key)
 }
 
 fn collection_from_key(key: &[u8], label: &str) -> Result<DurableCollectionId, StoreError> {
-    if key.len() < 66 {
+    if key.len() <= 32 {
         return Err(corrupt(format!("invalid {label} key")));
     }
-    let mut memory = [0; 32];
-    memory.copy_from_slice(&key[32..64]);
-    let depth = usize::from(u16::from_be_bytes([key[64], key[65]]));
-    let expected = 66usize
-        .checked_add(
-            depth
-                .checked_mul(48)
-                .ok_or_else(|| corrupt(format!("{label} key depth overflow")))?,
-        )
-        .ok_or_else(|| corrupt(format!("{label} key length overflow")))?;
-    if key.len() != expected || depth > super::MAX_DURABLE_OWNER_DEPTH {
-        return Err(corrupt(format!("invalid {label} key length")));
-    }
-    let mut ancestors = Vec::with_capacity(depth);
-    for chunk in key[66..].chunks_exact(48) {
-        let mut list_memory = [0; 32];
-        list_memory.copy_from_slice(&chunk[..32]);
-        let mut row_key = [0; 8];
-        row_key.copy_from_slice(&chunk[32..40]);
-        let mut row_generation = [0; 8];
-        row_generation.copy_from_slice(&chunk[40..48]);
-        ancestors.push(DurableRowId {
-            list_memory_id: MemoryId(list_memory),
-            row_key: u64::from_be_bytes(row_key),
-            row_generation: u64::from_be_bytes(row_generation),
-        });
-    }
-    let collection_id = DurableCollectionId {
-        memory_id: MemoryId(memory),
-        owner: DurableOwner { ancestors },
-    };
+    let collection_id =
+        decode_collection_id_component(&key[32..], DecodeLimits::default()).map_err(codec)?;
     super::validate_collection_id(&collection_id)?;
     Ok(collection_id)
 }

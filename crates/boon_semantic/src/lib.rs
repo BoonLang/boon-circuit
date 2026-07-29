@@ -5740,26 +5740,15 @@ FUNCTION selectable_row(row) {
             "semantic-tagged-when-out-contract.bn",
             r#"
 store: [
-    request: SOURCE
+    responses: LIST {
+        [name: TEXT { content-type }, value: BYTES {}]
+    }
     response:
-        NotRequested |> HOLD response {
-            request |> THEN {
-                Http/request(
-                    endpoint: request.endpoint
-                    method: request.method
-                    path_segments: request.path_segments
-                    query: request.query
-                    headers: request.headers
-                    body: request.body
-                    connect_timeout_ms: request.connect_timeout_ms
-                    overall_timeout_ms: request.overall_timeout_ms
-                )
-            }
-        }
+        responses |> List/page(size: 20, after: Start)
     visible_headers:
         response |> WHEN {
-            HttpSucceeded =>
-                response.headers
+            Page =>
+                response.items
                 |> List/filter(item, if: True)
             __ => LIST {}
         }
@@ -5774,7 +5763,7 @@ store: [
             checked.report.diagnostics
         );
         let checked = checked.program.expect("tagged WHEN checked program");
-        let headers_read = checked
+        let payload_read = checked
             .expressions
             .iter()
             .find(|expression| {
@@ -5783,13 +5772,13 @@ store: [
                     boon_typecheck::CheckedExpressionKind::Read {
                         projection,
                         ..
-                    } if projection == &["headers"]
+                    } if projection == &["items"]
                 )
             })
-            .expect("arm-local headers read");
+            .expect("arm-local tagged payload read");
         assert!(
-            matches!(headers_read.flow_type.ty, Type::List(_)),
-            "checked read must retain its arm-local payload type: {headers_read:#?}"
+            matches!(payload_read.flow_type.ty, Type::List(_)),
+            "checked read must retain its arm-local payload type: {payload_read:#?}"
         );
         let producer_roots = resolve_producer_roots(&checked, &[]).unwrap();
         let out_net = out_net::OutNet::<OutPortContractV1>::try_build_with(

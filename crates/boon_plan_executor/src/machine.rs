@@ -13028,7 +13028,7 @@ impl MachineInstance {
             let values = rows
                 .into_iter()
                 .map(|row| {
-                    let value = if self.metadata.row_computations.contains_key(&value_field) {
+                    let value = if self.row_field_has_computation(row, value_field) {
                         self.ensure_row_field(row, value_field, event, work)?
                     } else {
                         self.row_value(row, value_field)?
@@ -13055,7 +13055,7 @@ impl MachineInstance {
             let mut record = BTreeMap::new();
             for output_field in fields {
                 let field = output_list_field(output_fields, list, &output_field.name)?;
-                let value = if self.metadata.row_computations.contains_key(&field) {
+                let value = if self.row_field_has_computation(row, field) {
                     self.ensure_row_field(row, field, event, work)?
                 } else {
                     self.row_value(row, field)?
@@ -13092,7 +13092,7 @@ impl MachineInstance {
                 for output_field in fields {
                     let field = output_list_field(output_fields, row.list, &output_field.name)?;
                     self.register_row_dependency(consumer, row, field);
-                    let value = if self.metadata.row_computations.contains_key(&field) {
+                    let value = if self.row_field_has_computation(row, field) {
                         self.ensure_row_field(row, field, event, work)?
                     } else {
                         self.row_value(row, field)?
@@ -13116,7 +13116,7 @@ impl MachineInstance {
                     } else {
                         let field = output_list_field(output_fields, row.list, &output_field.name)?;
                         self.register_row_dependency(consumer, row, field);
-                        if self.metadata.row_computations.contains_key(&field) {
+                        if self.row_field_has_computation(row, field) {
                             self.ensure_row_field(row, field, event, work)?
                         } else {
                             self.row_value(row, field)?
@@ -13248,7 +13248,7 @@ impl MachineInstance {
         work.consume(rows.len().try_into().unwrap_or(u64::MAX))?;
         let mut values = Vec::with_capacity(rows.len());
         for row in rows {
-            let value = if self.metadata.row_computations.contains_key(&field) {
+            let value = if self.row_field_has_computation(row, field) {
                 self.ensure_row_field(row, field, None, &mut work)?
             } else {
                 self.row_value(row, field)?
@@ -17543,6 +17543,11 @@ impl MachineInstance {
             .get(&(row.list, field))
             .copied()
             .unwrap_or(field)
+    }
+
+    fn row_field_has_computation(&self, row: RowId, field: FieldId) -> bool {
+        let field = self.resolve_row_field_alias(row, field);
+        self.metadata.row_computations.contains_key(&field)
     }
 
     fn row_field_availability(&self, row: RowId, field: FieldId) -> RowFieldAvailability {
@@ -24128,7 +24133,7 @@ impl MachineInstance {
                                 return Ok(());
                             };
                             state.next_field += 1;
-                            if self.metadata.row_computations.contains_key(&field) {
+                            if self.row_field_has_computation(state.row, field) {
                                 let row = state.row;
                                 let event = state.event;
                                 stack.push_task(ExpressionTask::PageRowMaterializeAfterField {
@@ -30009,6 +30014,80 @@ outputs: [
                 .map(BTreeSet::len)
                 .sum::<usize>(),
             fanout
+        );
+    }
+
+    #[test]
+    fn range_map_row_state_initializers_read_constructor_values_before_derived_values() {
+        let compiled = boon_compiler::compile_source_text_to_machine_plan_for_role(
+            "range-map-row-state-initializer-internal.bn",
+            r#"
+FUNCTION stateful_row(seed) {
+    [
+        tick: SOURCE
+        held:
+            seed |> HOLD held {
+                tick |> THEN { held + 1 }
+            }
+        value:
+            held + 10
+    ]
+}
+
+rows:
+    List/range(from: 0, to: 2)
+    |> List/map(item, new: stateful_row(seed: item))
+"#,
+            TargetProfile::SoftwareDefault,
+            ProgramRole::Server,
+        )
+        .expect("range/map row-local state fixture compiles");
+
+        let mut session = MachineInstance::new(compiled.plan, SessionOptions::default())
+            .expect("row-local state initializes from the constructor value");
+        let Value::List(rows) = session.root_value_current("rows").unwrap() else {
+            panic!("range/map fixture did not publish a row list");
+        };
+        assert_eq!(rows.len(), 3);
+
+        let ((list, _), authority_value) = session
+            .metadata
+            .list_authority_fields
+            .iter()
+            .find(|((list, name), authority)| {
+                name == "value"
+                    && session
+                        .metadata
+                        .list_fields_by_name
+                        .get(&(*list, name.clone()))
+                        .is_some_and(|fields| {
+                            fields.iter().any(|field| {
+                                field != *authority
+                                    && session.metadata.row_computations.contains_key(field)
+                            })
+                        })
+            })
+            .expect("fixture has a value authority with a separate current computation");
+        let Value::List(values) = session
+            .inspect_list_field_current(*list, *authority_value, 3)
+            .expect("an authority-shaped output reference resolves to its current computation")
+        else {
+            panic!("row field inspection did not return a list");
+        };
+        let values = values
+            .into_iter()
+            .map(|value| match value {
+                Value::Record(mut fields) => fields.remove("value").unwrap(),
+                other => panic!("row field inspection returned {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            values,
+            vec![
+                Value::integer(0).unwrap(),
+                Value::integer(1).unwrap(),
+                Value::integer(2).unwrap(),
+            ]
         );
     }
 

@@ -8499,10 +8499,7 @@ fn cells_rows_are_typed_visible_range_materializations() {
             .filter(|field| field.role.is_authority())
             .map(|field| field.name.as_str())
             .collect::<Vec<_>>(),
-        // `editing_text` has both stable list authority and the canonical
-        // state authority for its internally named `draft` HOLD.
         [
-            "editing_text",
             "address",
             "default_formula",
             "display_text",
@@ -8516,6 +8513,56 @@ fn cells_rows_are_typed_visible_range_materializations() {
             "value",
         ]
     );
+    let value_authority = cells_slot
+        .row_fields
+        .iter()
+        .find(|field| field.name == "value" && field.role.is_authority())
+        .map(|field| field.field_id)
+        .expect("Cells range constructor value authority");
+    let value_current = cells_slot
+        .row_fields
+        .iter()
+        .find(|field| field.name == "value" && field.role.is_value())
+        .map(|field| field.field_id)
+        .expect("Cells public current value");
+    assert_ne!(value_authority, value_current);
+    for state_label in ["cells.editing_text", "cells.formula_text"] {
+        let state = compiled
+            .plan
+            .debug_map
+            .state_slots
+            .iter()
+            .find(|state| state.label == state_label)
+            .and_then(|state| state.id.strip_prefix("state:"))
+            .and_then(|id| id.parse::<usize>().ok())
+            .map(boon_plan::StateId)
+            .unwrap_or_else(|| panic!("missing Cells state `{state_label}`"));
+        let initializer = compiled
+            .plan
+            .storage_layout
+            .scalar_slots
+            .iter()
+            .find(|slot| slot.state_id == state)
+            .and_then(|slot| match slot.initializer {
+                boon_plan::ScalarInitializerPlan::Expression { expression } => Some(expression),
+                boon_plan::ScalarInitializerPlan::Constant { .. } => None,
+            })
+            .unwrap_or_else(|| panic!("Cells state `{state_label}` has no expression initializer"));
+        let mut inputs = Vec::new();
+        compiled
+            .plan
+            .row_expressions
+            .visit_inputs(initializer, &mut |input| inputs.push(input))
+            .unwrap();
+        assert!(
+            inputs.contains(&ValueRef::Field(value_authority)),
+            "Cells state `{state_label}` initializer lost its range constructor input: {inputs:#?}"
+        );
+        assert!(
+            !inputs.contains(&ValueRef::Field(value_current)),
+            "Cells state `{state_label}` initializer recursively reads the derived public value: {inputs:#?}"
+        );
+    }
     let demand_current_fields = compiled
         .plan
         .regions

@@ -10270,13 +10270,27 @@ impl<'a> ExecutableRowLowerer<'a> {
         }
         let list_id = plan_list_id(state_row.list);
         let program = self.program;
-        let field_id = |field_name: &str| {
-            row_input_field_id_for_list_id(program, list_id, field_name).ok_or_else(|| {
+        let list_name = program
+            .lists
+            .iter()
+            .find(|list| plan_list_id(list.id) == list_id)
+            .map(|list| list.name.as_str())
+            .ok_or_else(|| {
                 PlanError::new(format!(
-                    "{state_label} local {}:{} member `{field_name}` has no exact target-row authority field",
-                    erased_owner.0, local.0
+                    "{state_label} local {}:{} references missing target list {}",
+                    erased_owner.0, local.0, list_id.0
                 ))
-            })
+            })?;
+        let authority_fields = list_authority_field_ids(program);
+        let field_id = |field_name: &str| {
+            storage_input_field_id(program, list_name, field_name, &authority_fields).ok_or_else(
+                || {
+                    PlanError::new(format!(
+                        "{state_label} local {}:{} member `{field_name}` has no exact target-row constructor field",
+                        erased_owner.0, local.0
+                    ))
+                },
+            )
         };
         if let Some((first, nested)) = projection.split_first() {
             let mut value = self.intern(PlanRowExpressionNode::Field {

@@ -12,7 +12,7 @@ expect_cell = { address = "B1", value = "15", formula = "=add(A1,A2)" }
 [[step]]
 id = "select-b1-shows-formula-in-bar"
 user_action = { kind = "click", target = "B1 cell" }
-expected_source_event = { source = "cell.sources.editor.select", address = "B1" }
+expected_source_event = { source = "cells.sources.editor.select", address = "B1", target_key = 2, target_generation = 1 }
 expect_cell = { address = "B1", value = "15", formula = "=add(A1,A2)", editing_text = "=add(A1,A2)", editing = false }
 expect_semantic_delta_contains = ["FieldSet:store.selected_address"]
 expect_render_delta_contains = ["InvalidateDocument"]
@@ -30,7 +30,7 @@ expect_cell = { address = "D1", value = "", formula = "" }
 [[step]]
 id = "select-a4-for-literal-entry"
 user_action = { kind = "click", target = "A4 cell" }
-expected_source_event = { source = "cell.sources.editor.select", address = "A4" }
+expected_source_event = { source = "cells.sources.editor.select", address = "A4", target_key = 79, target_generation = 1 }
 expect_cell = { address = "A4", value = "", formula = "", editing_text = "", editing = false }
 expect_semantic_delta_contains = ["FieldSet:store.selected_address"]
 expect_render_delta_contains = ["InvalidateDocument"]
@@ -40,7 +40,7 @@ expect_render_delta_contains = ["InvalidateDocument"]
 [[step]]
 id = "type-a4-literal-20"
 user_action = { kind = "type_text", target = "formula bar", text = "20" }
-expected_source_event = { source = "cell.sources.editor.change", address = "A4", text = "20" }
+expected_source_event = { source = "cells.sources.editor.change", address = "A4", text = "20", target_key = 79, target_generation = 1 }
 expect_cell = { address = "A4", value = "", formula = "", editing_text = "20", editing = true }
 expect_semantic_delta_contains = ["FieldSet:editing_text", "FieldSet:editing"]
 expect_render_delta_contains = ["InvalidateDocument"]
@@ -48,7 +48,7 @@ expect_render_delta_contains = ["InvalidateDocument"]
 [[step]]
 id = "commit-a4-literal-20"
 user_action = { kind = "key_down", target = "formula bar", key = "Enter", text = "20" }
-expected_source_event = { source = "cell.sources.editor.commit", address = "A4", key = "Enter", text = "20" }
+expected_source_event = { source = "cells.sources.editor.commit", address = "A4", key = "Enter", text = "20", target_key = 79, target_generation = 1 }
 expect_cell = { address = "A4", value = "20", formula = "20", editing_text = "20", editing = false }
 expect_semantic_delta_contains = ["FieldSet:formula_text", "FieldSet:value"]
   [step.expect_root_text]
@@ -57,7 +57,7 @@ expect_semantic_delta_contains = ["FieldSet:formula_text", "FieldSet:value"]
 [[step]]
 id = "select-c1-for-formula-update"
 user_action = { kind = "click", target = "C1 cell" }
-expected_source_event = { source = "cell.sources.editor.select", address = "C1" }
+expected_source_event = { source = "cells.sources.editor.select", address = "C1", target_key = 3, target_generation = 1 }
 expect_cell = { address = "C1", value = "30", formula = "=sum(A1:A3)", editing_text = "=sum(A1:A3)", editing = false }
 expect_semantic_delta_contains = ["FieldSet:store.selected_address"]
 expect_render_delta_contains = ["InvalidateDocument"]
@@ -67,7 +67,7 @@ expect_render_delta_contains = ["InvalidateDocument"]
 [[step]]
 id = "commit-c1-formula-bar-sum-through-a4"
 user_action = { kind = "key_down", target = "formula bar", key = "Enter", text = "=sum(A1:A4)" }
-expected_source_event = { source = "cell.sources.editor.commit", address = "C1", key = "Enter", text = "=sum(A1:A4)" }
+expected_source_event = { source = "cells.sources.editor.commit", address = "C1", key = "Enter", text = "=sum(A1:A4)", target_key = 3, target_generation = 1 }
 expect_cell = { address = "C1", value = "50", formula = "=sum(A1:A4)", editing_text = "=sum(A1:A4)", editing = false }
 expect_recomputed = ["C1"]
 expect_semantic_delta_contains = ["FieldSet:formula_text", "FieldSet:value"]
@@ -78,7 +78,7 @@ expect_render_delta_contains = ["InvalidateDocument"]
 [[step]]
 id = "select-a1-for-literal-edit"
 user_action = { kind = "click", target = "A1 cell" }
-expected_source_event = { source = "cell.sources.editor.select", address = "A1" }
+expected_source_event = { source = "cells.sources.editor.select", address = "A1", target_key = 1, target_generation = 1 }
 expect_cell = { address = "A1", value = "5", formula = "5", editing_text = "5", editing = false }
 expect_semantic_delta_contains = ["FieldSet:store.selected_address"]
 expect_render_delta_contains = ["InvalidateDocument"]
@@ -88,7 +88,7 @@ expect_render_delta_contains = ["InvalidateDocument"]
 [[step]]
 id = "edit-a1-literal"
 user_action = { kind = "type_text", target = "formula bar", text = "41" }
-expected_source_event = { source = "cell.sources.editor.change", address = "A1", text = "41" }
+expected_source_event = { source = "cells.sources.editor.change", address = "A1", text = "41", target_key = 1, target_generation = 1 }
 expect_cell = { address = "A1", editing_text = "41", editing = true }
 expect_semantic_delta_contains = ["FieldSet:editing_text", "FieldSet:editing"]
 expect_render_delta_contains = ["InvalidateDocument"]
@@ -96,7 +96,7 @@ expect_render_delta_contains = ["InvalidateDocument"]
 [[step]]
 id = "commit-a1-literal"
 user_action = { kind = "key_down", target = "formula bar", key = "Enter" }
-expected_source_event = { source = "cell.sources.editor.commit", address = "A1", text = "41" }
+expected_source_event = { source = "cells.sources.editor.commit", address = "A1", text = "41", target_key = 1, target_generation = 1 }
 expect_cell = { address = "A1", value = "41", formula = "41", editing = false }
 expect_semantic_delta_contains = ["FieldSet:formula_text", "FieldSet:value"]
 expect_render_delta_contains = ["InvalidateDocument"]
@@ -104,7 +104,7 @@ expect_render_delta_contains = ["InvalidateDocument"]
 [[step]]
 id = "edit-a1-cancel-draft"
 user_action = { kind = "type_text", target = "formula bar", text = "123" }
-expected_source_event = { source = "cell.sources.editor.change", address = "A1", text = "123" }
+expected_source_event = { source = "cells.sources.editor.change", address = "A1", text = "123", target_key = 1, target_generation = 1 }
 expect_cell = { address = "A1", value = "41", formula = "41", editing_text = "123", editing = true }
 expect_semantic_delta_contains = ["FieldSet:editing_text", "FieldSet:editing"]
 expect_render_delta_contains = ["InvalidateDocument"]
@@ -112,7 +112,7 @@ expect_render_delta_contains = ["InvalidateDocument"]
 [[step]]
 id = "cancel-a1-draft"
 user_action = { kind = "key_down", target = "formula bar", key = "Escape" }
-expected_source_event = { source = "cell.sources.editor.cancel", address = "A1" }
+expected_source_event = { source = "cells.sources.editor.cancel", address = "A1", target_key = 1, target_generation = 1 }
 expect_cell = { address = "A1", value = "41", formula = "41", editing_text = "41", editing = false }
 expect_semantic_delta_contains = ["FieldSet:editing_text", "FieldSet:editing"]
 expect_render_delta_contains = ["InvalidateDocument"]
@@ -120,7 +120,7 @@ expect_render_delta_contains = ["InvalidateDocument"]
 [[step]]
 id = "select-b1-for-formula-edit"
 user_action = { kind = "click", target = "B1 cell" }
-expected_source_event = { source = "cell.sources.editor.select", address = "B1" }
+expected_source_event = { source = "cells.sources.editor.select", address = "B1", target_key = 2, target_generation = 1 }
 expect_cell = { address = "B1", value = "51", formula = "=add(A1,A2)", editing_text = "=add(A1,A2)", editing = false }
 expect_semantic_delta_contains = ["FieldSet:store.selected_address"]
 expect_render_delta_contains = ["InvalidateDocument"]
@@ -130,7 +130,7 @@ expect_render_delta_contains = ["InvalidateDocument"]
 [[step]]
 id = "commit-b1-formula"
 user_action = { kind = "key_down", target = "formula bar", key = "Enter", text = "=A1+1" }
-expected_source_event = { source = "cell.sources.editor.commit", address = "B1", text = "=A1+1" }
+expected_source_event = { source = "cells.sources.editor.commit", address = "B1", text = "=A1+1", target_key = 2, target_generation = 1 }
 expect_cell = { address = "B1", value = "42", formula = "=A1+1" }
 expect_recomputed = ["B1"]
 expect_semantic_delta_contains = ["FieldSet:formula_text", "FieldSet:value"]
@@ -139,7 +139,7 @@ expect_render_delta_contains = ["InvalidateDocument"]
 [[step]]
 id = "select-a1-for-dependent-update"
 user_action = { kind = "click", target = "A1 cell" }
-expected_source_event = { source = "cell.sources.editor.select", address = "A1" }
+expected_source_event = { source = "cells.sources.editor.select", address = "A1", target_key = 1, target_generation = 1 }
 expect_cell = { address = "A1", value = "41", formula = "41", editing_text = "41", editing = false }
 expect_semantic_delta_contains = ["FieldSet:store.selected_address"]
 expect_render_delta_contains = ["InvalidateDocument"]
@@ -149,7 +149,7 @@ expect_render_delta_contains = ["InvalidateDocument"]
 [[step]]
 id = "change-a1-updates-b1"
 user_action = { kind = "key_down", target = "formula bar", key = "Enter", text = "99" }
-expected_source_event = { source = "cell.sources.editor.commit", address = "A1", text = "99" }
+expected_source_event = { source = "cells.sources.editor.commit", address = "A1", text = "99", target_key = 1, target_generation = 1 }
 expect_cell = { address = "B1", value = "100" }
 expect_recomputed = ["A1", "B1", "C1"]
 expect_semantic_delta_contains = ["FieldSet:formula_text", "FieldSet:value"]
@@ -158,7 +158,7 @@ expect_render_delta_contains = ["InvalidateDocument"]
 [[step]]
 id = "cycle-error"
 user_action = { kind = "key_down", target = "formula bar", key = "Enter", text = "=B1+1" }
-expected_source_event = { source = "cell.sources.editor.commit", address = "A1", text = "=B1+1" }
+expected_source_event = { source = "cells.sources.editor.commit", address = "A1", text = "=B1+1", target_key = 1, target_generation = 1 }
 expect_error = { address = "A1", error = "cycle_error" }
 expect_semantic_delta_contains = ["FieldSet:formula_text", "FieldSet:value"]
 expect_render_delta_contains = ["InvalidateDocument"]
@@ -166,7 +166,7 @@ expect_render_delta_contains = ["InvalidateDocument"]
 [[step]]
 id = "select-b1-for-cycle-break"
 user_action = { kind = "click", target = "B1 cell" }
-expected_source_event = { source = "cell.sources.editor.select", address = "B1" }
+expected_source_event = { source = "cells.sources.editor.select", address = "B1", target_key = 2, target_generation = 1 }
 expect_cell = { address = "B1", value = "cycle_error", formula = "=A1+1", editing_text = "=A1+1", editing = false }
 expect_semantic_delta_contains = ["FieldSet:store.selected_address"]
 expect_render_delta_contains = ["InvalidateDocument"]
@@ -176,7 +176,7 @@ expect_render_delta_contains = ["InvalidateDocument"]
 [[step]]
 id = "replace-b1-formula-removes-stale-cycle-edge"
 user_action = { kind = "key_down", target = "formula bar", key = "Enter", text = "5" }
-expected_source_event = { source = "cell.sources.editor.commit", address = "B1", text = "5" }
+expected_source_event = { source = "cells.sources.editor.commit", address = "B1", text = "5", target_key = 2, target_generation = 1 }
 expect_cell = { address = "B1", value = "5", formula = "5", editing = false }
 expect_recomputed = ["A1", "B1", "C1"]
 expect_semantic_delta_contains = ["FieldSet:formula_text", "FieldSet:value"]
@@ -189,7 +189,7 @@ expect_cell = { address = "A1", value = "6", formula = "=B1+1", editing = false 
 [[step]]
 id = "select-a1-after-cycle-break"
 user_action = { kind = "click", target = "A1 cell" }
-expected_source_event = { source = "cell.sources.editor.select", address = "A1" }
+expected_source_event = { source = "cells.sources.editor.select", address = "A1", target_key = 1, target_generation = 1 }
 expect_cell = { address = "A1", value = "6", formula = "=B1+1", editing_text = "=B1+1", editing = false }
 expect_semantic_delta_contains = ["FieldSet:store.selected_address"]
 expect_render_delta_contains = ["InvalidateDocument"]
@@ -199,7 +199,7 @@ expect_render_delta_contains = ["InvalidateDocument"]
 [[step]]
 id = "change-a1-after-edge-replacement-does-not-recompute-b1"
 user_action = { kind = "key_down", target = "formula bar", key = "Enter", text = "10" }
-expected_source_event = { source = "cell.sources.editor.commit", address = "A1", text = "10" }
+expected_source_event = { source = "cells.sources.editor.commit", address = "A1", text = "10", target_key = 1, target_generation = 1 }
 expect_cell = { address = "A1", value = "10", formula = "10", editing = false }
 expect_recomputed = ["A1", "C1"]
 expect_semantic_delta_contains = ["FieldSet:formula_text", "FieldSet:value"]
@@ -208,7 +208,7 @@ expect_render_delta_contains = ["InvalidateDocument"]
 [[step]]
 id = "select-c1-for-fanout-formula"
 user_action = { kind = "click", target = "C1 cell" }
-expected_source_event = { source = "cell.sources.editor.select", address = "C1" }
+expected_source_event = { source = "cells.sources.editor.select", address = "C1", target_key = 3, target_generation = 1 }
 expect_cell = { address = "C1", value = "55", formula = "=sum(A1:A4)", editing_text = "=sum(A1:A4)", editing = false }
 expect_semantic_delta_contains = ["FieldSet:store.selected_address"]
 expect_render_delta_contains = ["InvalidateDocument"]
@@ -218,7 +218,7 @@ expect_render_delta_contains = ["InvalidateDocument"]
 [[step]]
 id = "commit-c1-fanout-formula"
 user_action = { kind = "key_down", target = "formula bar", key = "Enter", text = "=A1+1" }
-expected_source_event = { source = "cell.sources.editor.commit", address = "C1", text = "=A1+1" }
+expected_source_event = { source = "cells.sources.editor.commit", address = "C1", text = "=A1+1", target_key = 3, target_generation = 1 }
 expect_cell = { address = "C1", value = "11", formula = "=A1+1", editing = false }
 expect_recomputed = ["C1"]
 expect_semantic_delta_contains = ["FieldSet:formula_text", "FieldSet:value"]
@@ -227,7 +227,7 @@ expect_render_delta_contains = ["InvalidateDocument"]
 [[step]]
 id = "select-d1-for-fanout-formula"
 user_action = { kind = "click", target = "D1 cell" }
-expected_source_event = { source = "cell.sources.editor.select", address = "D1" }
+expected_source_event = { source = "cells.sources.editor.select", address = "D1", target_key = 4, target_generation = 1 }
 expect_cell = { address = "D1", value = "", formula = "", editing_text = "", editing = false }
 expect_semantic_delta_contains = ["FieldSet:store.selected_address"]
 expect_render_delta_contains = ["InvalidateDocument"]
@@ -237,7 +237,7 @@ expect_render_delta_contains = ["InvalidateDocument"]
 [[step]]
 id = "commit-d1-fanout-formula"
 user_action = { kind = "key_down", target = "formula bar", key = "Enter", text = "=A1+2" }
-expected_source_event = { source = "cell.sources.editor.commit", address = "D1", text = "=A1+2" }
+expected_source_event = { source = "cells.sources.editor.commit", address = "D1", text = "=A1+2", target_key = 4, target_generation = 1 }
 expect_cell = { address = "D1", value = "12", formula = "=A1+2", editing = false }
 expect_recomputed = ["D1"]
 expect_semantic_delta_contains = ["FieldSet:formula_text", "FieldSet:value"]
@@ -246,7 +246,7 @@ expect_render_delta_contains = ["InvalidateDocument"]
 [[step]]
 id = "select-j1-for-visible-grid-edge"
 user_action = { kind = "click", target = "J1 cell" }
-expected_source_event = { source = "cell.sources.editor.select", address = "J1" }
+expected_source_event = { source = "cells.sources.editor.select", address = "J1", target_key = 10, target_generation = 1 }
 expect_cell = { address = "J1", value = "", formula = "", editing_text = "", editing = false }
 expect_semantic_delta_contains = ["FieldSet:store.selected_address"]
 expect_render_delta_contains = ["InvalidateDocument"]
@@ -256,7 +256,7 @@ expect_render_delta_contains = ["InvalidateDocument"]
 [[step]]
 id = "commit-j1-visible-grid-edge"
 user_action = { kind = "key_down", target = "formula bar", key = "Enter", text = "7" }
-expected_source_event = { source = "cell.sources.editor.commit", address = "J1", text = "7" }
+expected_source_event = { source = "cells.sources.editor.commit", address = "J1", text = "7", target_key = 10, target_generation = 1 }
 expect_cell = { address = "J1", value = "7", formula = "7", editing = false }
 expect_recomputed = ["J1"]
 expect_semantic_delta_contains = ["FieldSet:formula_text", "FieldSet:value"]
@@ -265,7 +265,7 @@ expect_render_delta_contains = ["InvalidateDocument"]
 [[step]]
 id = "select-a1-for-fanout-recompute"
 user_action = { kind = "click", target = "A1 cell" }
-expected_source_event = { source = "cell.sources.editor.select", address = "A1" }
+expected_source_event = { source = "cells.sources.editor.select", address = "A1", target_key = 1, target_generation = 1 }
 expect_cell = { address = "A1", value = "10", formula = "10", editing_text = "10", editing = false }
 expect_semantic_delta_contains = ["FieldSet:store.selected_address"]
 expect_render_delta_contains = ["InvalidateDocument"]
@@ -275,7 +275,7 @@ expect_render_delta_contains = ["InvalidateDocument"]
 [[step]]
 id = "change-a1-fanout-recomputes-dependents-only"
 user_action = { kind = "key_down", target = "formula bar", key = "Enter", text = "20" }
-expected_source_event = { source = "cell.sources.editor.commit", address = "A1", text = "20" }
+expected_source_event = { source = "cells.sources.editor.commit", address = "A1", text = "20", target_key = 1, target_generation = 1 }
 expect_cell = { address = "C1", value = "21" }
 expect_recomputed = ["A1", "C1", "D1"]
 expect_semantic_delta_contains = ["FieldSet:formula_text", "FieldSet:value"]

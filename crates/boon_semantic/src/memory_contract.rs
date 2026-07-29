@@ -1216,7 +1216,12 @@ fn attach_draining_markers(
         let candidate_bindings = reactive
             .bindings
             .iter()
-            .filter(|binding| binding.producer == expression.id)
+            .filter(|binding| {
+                binding.owner == marker.owner
+                    && ((binding.producer == marker.marker && binding.value == marker.marker_value)
+                        || (binding.producer == marker.input
+                            && binding.value == marker.input_value))
+            })
             .map(|binding| binding.id)
             .collect::<BTreeSet<_>>();
         let candidates = memories
@@ -1898,6 +1903,15 @@ fn validate_no_ordinary_draining_reads(
         .iter()
         .filter(|read| reachable.contains(&read.expression))
     {
+        if matches!(
+            require_expression(execution, read.expression)?.kind,
+            SemanticExpressionKind::Drain { .. }
+        ) {
+            // DRAIN has an erased read target so executable lowering can
+            // consume the predecessor authority, but collect_drains validates
+            // it as an explicit migration edge rather than an ordinary read.
+            continue;
+        }
         let (binding, projection) = match &read.target {
             SemanticReadTargetV1::Binding {
                 binding,

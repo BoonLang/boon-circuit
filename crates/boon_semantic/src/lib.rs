@@ -872,14 +872,6 @@ impl SemanticProgram {
                 &self.resolved_out_graph,
             )
             .map_err(|error| SemanticError::new(error.to_string()))?;
-        self.view_binding_graph
-            .validate(
-                &self.execution_graph,
-                &self.resource_graph,
-                &self.reactive_graph,
-                &self.lowering_contract,
-            )
-            .map_err(|error| SemanticError::new(error.to_string()))?;
         self.scope_storage_graph
             .validate(
                 &self.checked_program,
@@ -888,6 +880,15 @@ impl SemanticProgram {
                 &self.reactive_graph,
                 &self.lowering_contract,
                 &self.resolved_out_graph,
+            )
+            .map_err(|error| SemanticError::new(error.to_string()))?;
+        self.view_binding_graph
+            .validate(
+                &self.execution_graph,
+                &self.resource_graph,
+                &self.reactive_graph,
+                &self.scope_storage_graph,
+                &self.lowering_contract,
             )
             .map_err(|error| SemanticError::new(error.to_string()))?;
         self.memory_graph
@@ -2439,13 +2440,6 @@ pub fn elaborate(
         &resolved_out_graph,
     )
     .map_err(|error| SemanticError::new(error.to_string()))?;
-    let view_binding_graph = build_semantic_view_binding_graph(
-        &execution_graph,
-        &resource_graph,
-        &reactive_graph,
-        &lowering_contract,
-    )
-    .map_err(|error| SemanticError::new(error.to_string()))?;
     let scope_storage_graph = build_semantic_scope_storage_graph(
         &checked_program,
         &execution_graph,
@@ -2453,6 +2447,14 @@ pub fn elaborate(
         &reactive_graph,
         &lowering_contract,
         &resolved_out_graph,
+    )
+    .map_err(|error| SemanticError::new(error.to_string()))?;
+    let view_binding_graph = build_semantic_view_binding_graph(
+        &execution_graph,
+        &resource_graph,
+        &reactive_graph,
+        &scope_storage_graph,
+        &lowering_contract,
     )
     .map_err(|error| SemanticError::new(error.to_string()))?;
     let memory_graph = build_semantic_memory_graph(

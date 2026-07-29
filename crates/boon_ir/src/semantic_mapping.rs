@@ -4440,7 +4440,13 @@ pub(super) fn map_semantic_storage_join(
     let locals = map_storage_locals(execution, storage_graph, ids, &storage_ids, &fields)?;
     let bindings = map_storage_bindings(storage_graph, ids, reactive, &storage_ids, &fields)?;
     let sources = map_storage_sources(resource_graph, storage_graph, ids, reactive, &storage_ids)?;
-    let reads = map_storage_reads(reactive_graph, reactive, &storage_ids, &external_references)?;
+    let reads = map_storage_reads(
+        reactive_graph,
+        reactive,
+        &storage_ids,
+        &bindings,
+        &external_references,
+    )?;
     let row_values = storage_graph
         .row_values
         .iter()
@@ -5153,25 +5159,50 @@ fn map_storage_binding_target(
             })
         }
         SemanticStorageBindingTargetV1::Source { source } => {
-            let MappedSemanticBindingTarget::Source {
-                executable,
-                runtime,
-            } = &mapped.target
-            else {
-                return Err(format!(
-                    "storage binding {} is a source but staged target is {:?}",
-                    mapped.id, mapped.target
-                ));
-            };
-            if *executable != ids.source(*source)? || *runtime != ids.runtime_source(*source)? {
-                return Err(format!(
-                    "storage binding {} source {} differs from its staged allocation",
-                    mapped.id, source
-                ));
+            let executable = ids.source(*source)?;
+            let runtime = ids.runtime_source(*source)?;
+            match &mapped.target {
+                MappedSemanticBindingTarget::Source {
+                    executable: staged_executable,
+                    runtime: staged_runtime,
+                } => {
+                    if *staged_executable != executable || *staged_runtime != runtime {
+                        return Err(format!(
+                            "storage binding {} source {} differs from its staged allocation",
+                            mapped.id, source
+                        ));
+                    }
+                }
+                MappedSemanticBindingTarget::Field {
+                    field: reactive_field,
+                } => {
+                    let field = storage_ids.reactive_field(*reactive_field)?;
+                    let definition = fields
+                        .get(field.as_usize())
+                        .filter(|candidate| candidate.id == field)
+                        .ok_or_else(|| {
+                            format!(
+                                "storage binding {} direct source alias references missing FieldId {field}",
+                                mapped.id
+                            )
+                        })?;
+                    if !definition.resource_only {
+                        return Err(format!(
+                            "storage binding {} redirects non-resource FieldId {field} to source {source}",
+                            mapped.id
+                        ));
+                    }
+                }
+                _ => {
+                    return Err(format!(
+                        "storage binding {} is a source but staged target is {:?}",
+                        mapped.id, mapped.target
+                    ));
+                }
             }
             Ok(ErasedBindingTarget::Source {
-                executable: *executable,
-                runtime: *runtime,
+                executable,
+                runtime,
             })
         }
         SemanticStorageBindingTargetV1::State {
@@ -5623,6 +5654,7 @@ fn map_storage_reads(
     reactive_graph: &SemanticReactiveGraphV1,
     reactive: &MappedSemanticReactive,
     storage_ids: &SemanticStorageToErasedMap,
+    bindings: &[ErasedBinding],
     external_references: &[MappedSemanticExternalReference],
 ) -> Result<Vec<MappedSemanticStorageRead>, String> {
     if reactive_graph.reads.len() != reactive.reads.len() {
@@ -5646,10 +5678,44 @@ fn map_storage_reads(
                 MappedSemanticReadTarget::Binding {
                     binding,
                     projection,
-                } => MappedSemanticStorageReadTarget::Binding {
-                    binding: storage_ids.binding(*binding)?,
-                    projection: projection.clone(),
-                },
+                } => {
+                    let binding = storage_ids.binding(*binding)?;
+                    let storage_binding = bindings
+                        .get(binding.as_usize())
+                        .filter(|candidate| candidate.id == binding)
+                        .ok_or_else(|| {
+                            format!(
+                                "semantic read {} maps to missing storage binding {binding}",
+                                semantic.id
+                            )
+                        })?;
+                    match storage_binding.target {
+                        ErasedBindingTarget::Source { runtime: _, .. } => {
+                            // Source payload reads are already explicit in the
+                            // semantic graph. A plain binding read that joins a
+                            // source is therefore a structural resource facade;
+                            // its object path is routing metadata, not a runtime
+                            // payload projection.
+                            MappedSemanticStorageReadTarget::Binding {
+                                binding,
+                                projection: Vec::new(),
+                            }
+                        }
+                        ErasedBindingTarget::State { runtime: state, .. } => {
+                            MappedSemanticStorageReadTarget::StateProjection {
+                                binding,
+                                state,
+                                projection: projection.clone(),
+                            }
+                        }
+                        ErasedBindingTarget::Value { .. } => {
+                            MappedSemanticStorageReadTarget::Binding {
+                                binding,
+                                projection: projection.clone(),
+                            }
+                        }
+                    }
+                }
                 MappedSemanticReadTarget::SourcePayload {
                     binding,
                     source,

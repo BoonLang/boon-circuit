@@ -1442,6 +1442,7 @@ impl<'a> ReactiveBuilder<'a> {
         let view_captures = self.build_view_captures(
             &output_values,
             &fields,
+            &bindings,
             &reads,
             &mut triggers,
             &pulse_states,
@@ -2038,6 +2039,26 @@ impl<'a> ReactiveBuilder<'a> {
                         }
                     }
                 }
+                SemanticExpressionKind::Drain {
+                    target, projection, ..
+                } => {
+                    let binding = self.resolve_decl_binding(*target, expression, bindings)?;
+                    match binding.target {
+                        SemanticBindingTargetV1::State { state } => {
+                            SemanticReadTargetV1::StateProjection {
+                                binding: binding.id,
+                                state,
+                                projection: projection.clone(),
+                            }
+                        }
+                        SemanticBindingTargetV1::Field { .. }
+                        | SemanticBindingTargetV1::Source { .. }
+                        | SemanticBindingTargetV1::List { .. } => SemanticReadTargetV1::Binding {
+                            binding: binding.id,
+                            projection: projection.clone(),
+                        },
+                    }
+                }
                 SemanticExpressionKind::LocalRead {
                     binding,
                     declaration,
@@ -2560,6 +2581,19 @@ impl<'a> ReactiveBuilder<'a> {
                     continue;
                 }
             };
+            if materialized.is_none()
+                && self
+                    .expressions
+                    .expression(binding.producer)?
+                    .provenance
+                    .direct_resource_origin()
+                    .is_some()
+            {
+                // A direct alias of a SOURCE is routing metadata. It retains
+                // its structural field/binding identity for semantic tools,
+                // but it must not become an executable scalar derivation.
+                continue;
+            }
             fields.push((binding, field, materialized));
         }
         let hold_body_statements = self.hold_body_statement_ids();
@@ -3268,6 +3302,7 @@ impl<'a> ReactiveBuilder<'a> {
         &self,
         outputs: &[SemanticOutputValueV1],
         fields: &[SemanticFieldV1],
+        bindings: &[SemanticBindingV1],
         reads: &[SemanticReadBindingV1],
         triggers: &mut TriggerResolver<'_>,
         pulse_states: &BTreeMap<SemanticPulseBatchId, SemanticStateId>,
@@ -3284,9 +3319,25 @@ impl<'a> ReactiveBuilder<'a> {
         for output in outputs {
             for expression in self.reachable_expressions(output.expression)? {
                 if let Some(read) = reads_by_expression.get(&expression) {
-                    let target = match read.target {
+                    let target = match &read.target {
                         SemanticReadTargetV1::SourcePayload { source, .. } => {
-                            SemanticViewCaptureTargetV1::Source { source }
+                            SemanticViewCaptureTargetV1::Source { source: *source }
+                        }
+                        SemanticReadTargetV1::Binding { binding, .. } => {
+                            let binding = bindings
+                                .get(binding.as_usize())
+                                .filter(|candidate| candidate.id == *binding)
+                                .ok_or_else(|| {
+                                    SemanticReactiveError::new(format!(
+                                        "view capture read {} references missing binding {binding}",
+                                        read.id
+                                    ))
+                                })?;
+                            if let SemanticBindingTargetV1::Source { source } = binding.target {
+                                SemanticViewCaptureTargetV1::Source { source }
+                            } else {
+                                SemanticViewCaptureTargetV1::Read { read: read.id }
+                            }
                         }
                         _ => SemanticViewCaptureTargetV1::Read { read: read.id },
                     };

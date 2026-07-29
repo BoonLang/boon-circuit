@@ -2009,6 +2009,13 @@ fn collect_capture_requests(
                 ))
             })?;
         if source.row != Some(target_row) {
+            if *owner == target_owner && *local == target_local {
+                // A state initialized inside the same map that constructs its
+                // target row reads through that row's constructor authority.
+                // It is not detached lexical state and must not allocate a
+                // transient capture column between predecessor and target.
+                return Ok(());
+            }
             if !owner_descends_from(target_owner, *owner, owners)? {
                 if owner_descends_from(*owner, target_owner, owners)? {
                     return Ok(());
@@ -2151,6 +2158,53 @@ fn classify_resource_only_fields(
     Ok(())
 }
 
+fn source_for_resource_origin(
+    resources: &SemanticResourceGraphV1,
+    origin: &SemanticValueOrigin,
+) -> Result<Option<SemanticSourceId>, SemanticScopeStorageError> {
+    match origin {
+        SemanticValueOrigin::Source { source, .. } => {
+            require_source(resources, *source)?;
+            Ok(Some(*source))
+        }
+        SemanticValueOrigin::ProducerSource {
+            function,
+            producer,
+            identity,
+            owner,
+        } => {
+            let matches = resources
+                .sources
+                .iter()
+                .filter(|source| {
+                    source.owner == Some(*owner)
+                        && matches!(
+                            source.origin,
+                            SemanticSourceOrigin::ProducerInvocation {
+                                function: candidate_function,
+                                producer: candidate_producer,
+                                identity: candidate_identity,
+                            } if candidate_function == *function
+                                && candidate_producer == *producer
+                                && candidate_identity == *identity
+                        )
+                })
+                .map(|source| source.id)
+                .collect::<Vec<_>>();
+            let [source] = matches.as_slice() else {
+                return Err(SemanticScopeStorageError::new(format!(
+                    "producer source provenance resolves to {} semantic sources",
+                    matches.len()
+                )));
+            };
+            Ok(Some(*source))
+        }
+        SemanticValueOrigin::Runtime
+        | SemanticValueOrigin::State { .. }
+        | SemanticValueOrigin::MaterializationLocal { .. } => Ok(None),
+    }
+}
+
 struct StorageProvenanceResolver<'a> {
     execution: &'a SemanticExecutionGraphV1,
     resources: &'a SemanticResourceGraphV1,
@@ -2189,19 +2243,34 @@ impl StorageProvenanceResolver<'_> {
             .transpose()?
             .unwrap_or(false);
         let item_path = storage_field_item_path(&definition);
-        let has_separate_value = definition.role == SemanticStorageFieldRoleV1::ListAuthority
-            && definition
+        let separate_values = if definition.role == SemanticStorageFieldRoleV1::ListAuthority {
+            definition
                 .row
                 .zip(item_path.as_ref())
-                .is_some_and(|(row, path)| {
-                    self.fields.iter().any(|candidate| {
-                        candidate.id != definition.id
-                            && candidate.row == Some(row)
-                            && candidate.role == SemanticStorageFieldRoleV1::Value
-                            && storage_field_item_path(candidate).as_ref() == Some(path)
-                    })
-                });
-        let result = if has_separate_value {
+                .map(|(row, path)| {
+                    self.fields
+                        .iter()
+                        .filter(|candidate| {
+                            candidate.id != definition.id
+                                && candidate.row == Some(row)
+                                && candidate.role == SemanticStorageFieldRoleV1::Value
+                                && storage_field_item_path(candidate).as_ref() == Some(path)
+                        })
+                        .map(|candidate| candidate.id)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let mut has_materialized_separate_value = false;
+        for value in separate_values {
+            if !self.field_is_source_only(value)? {
+                has_materialized_separate_value = true;
+                break;
+            }
+        }
+        let result = if has_materialized_separate_value {
             false
         } else {
             match (definition.row, item_path, definition.producer) {
@@ -2235,39 +2304,8 @@ impl StorageProvenanceResolver<'_> {
         let mut has_source = false;
         for member in &provenance.members {
             match &member.origin {
-                SemanticValueOrigin::Source { source, .. } => {
-                    require_source(self.resources, *source)?;
-                    has_source = true;
-                }
-                SemanticValueOrigin::ProducerSource {
-                    function,
-                    producer,
-                    identity,
-                    owner,
-                } => {
-                    let matches = self
-                        .resources
-                        .sources
-                        .iter()
-                        .filter(|source| {
-                            source.owner == Some(*owner)
-                                && matches!(
-                                    source.origin,
-                                    SemanticSourceOrigin::ProducerInvocation {
-                                        function: candidate_function,
-                                        producer: candidate_producer,
-                                        identity: candidate_identity,
-                                    } if candidate_function == *function
-                                        && candidate_producer == *producer
-                                        && candidate_identity == *identity
-                                )
-                        })
-                        .count();
-                    if matches != 1 {
-                        return Err(SemanticScopeStorageError::new(format!(
-                            "producer source provenance resolves to {matches} semantic sources"
-                        )));
-                    }
+                SemanticValueOrigin::Source { .. } | SemanticValueOrigin::ProducerSource { .. } => {
+                    source_for_resource_origin(self.resources, &member.origin)?;
                     has_source = true;
                 }
                 SemanticValueOrigin::MaterializationLocal {
@@ -2606,9 +2644,25 @@ fn build_storage_bindings(
             let target = match binding.target {
                 SemanticBindingTargetV1::Field { field } => {
                     let storage = storage_field_for_reactive(fields, field)?;
-                    SemanticStorageBindingTargetV1::Value {
-                        field: storage.id,
-                        row: storage.row,
+                    let direct_source = if storage.resource_only
+                        && binding.flow_type.mode == FlowMode::TickPresent
+                    {
+                        require_expression(execution, binding.producer)?
+                            .provenance
+                            .direct_resource_origin()
+                            .map(|origin| source_for_resource_origin(resources, origin))
+                            .transpose()?
+                            .flatten()
+                    } else {
+                        None
+                    };
+                    if let Some(source) = direct_source {
+                        SemanticStorageBindingTargetV1::Source { source }
+                    } else {
+                        SemanticStorageBindingTargetV1::Value {
+                            field: storage.id,
+                            row: storage.row,
+                        }
                     }
                 }
                 SemanticBindingTargetV1::Source { source } => {
@@ -2695,23 +2749,38 @@ fn build_storage_bindings(
                     }
                 }
             };
-            let diagnostic_path = match target {
-                SemanticStorageBindingTargetV1::Value { field, .. }
-                | SemanticStorageBindingTargetV1::List { field, .. } => fields
-                    .get(field.as_usize())
-                    .filter(|candidate| candidate.id == field)
-                    .map(|field| field.diagnostic_path.clone())
-                    .ok_or_else(|| {
-                        SemanticScopeStorageError::new(format!(
-                            "binding {} references missing storage field {field}",
-                            binding.id
-                        ))
-                    })?,
-                SemanticStorageBindingTargetV1::Source { source } => {
-                    require_source(resources, source)?.semantic_path.clone()
-                }
-                SemanticStorageBindingTargetV1::State { state, .. } => {
-                    require_state(resources, state)?.path.clone()
+            let redirected_field_path = match (binding.target, &target) {
+                (
+                    SemanticBindingTargetV1::Field { field },
+                    SemanticStorageBindingTargetV1::Source { .. },
+                ) => Some(
+                    storage_field_for_reactive(fields, field)?
+                        .diagnostic_path
+                        .clone(),
+                ),
+                _ => None,
+            };
+            let diagnostic_path = if let Some(path) = redirected_field_path {
+                path
+            } else {
+                match target {
+                    SemanticStorageBindingTargetV1::Value { field, .. }
+                    | SemanticStorageBindingTargetV1::List { field, .. } => fields
+                        .get(field.as_usize())
+                        .filter(|candidate| candidate.id == field)
+                        .map(|field| field.diagnostic_path.clone())
+                        .ok_or_else(|| {
+                            SemanticScopeStorageError::new(format!(
+                                "binding {} references missing storage field {field}",
+                                binding.id
+                            ))
+                        })?,
+                    SemanticStorageBindingTargetV1::Source { source } => {
+                        require_source(resources, source)?.semantic_path.clone()
+                    }
+                    SemanticStorageBindingTargetV1::State { state, .. } => {
+                        require_state(resources, state)?.path.clone()
+                    }
                 }
             };
             require_expression(execution, binding.producer)?;
@@ -3400,7 +3469,22 @@ fn named_value_target_flow_type(
         SemanticNamedValueStorageTargetV1::Source { binding, source } => {
             require_source(resources, *source)?;
             let binding = require_reactive_binding(reactive, *binding)?;
-            if binding.target != (SemanticBindingTargetV1::Source { source: *source }) {
+            let direct_alias = match binding.target {
+                SemanticBindingTargetV1::Field { .. } => {
+                    let expression = require_expression(execution, binding.producer)?;
+                    expression
+                        .provenance
+                        .direct_resource_origin()
+                        .map(|origin| source_for_resource_origin(resources, origin))
+                        .transpose()?
+                        .flatten()
+                        == Some(*source)
+                }
+                _ => false,
+            };
+            if binding.target != (SemanticBindingTargetV1::Source { source: *source })
+                && !direct_alias
+            {
                 return Err(SemanticScopeStorageError::new(format!(
                     "named-value source {source} does not match reactive binding {}",
                     binding.id

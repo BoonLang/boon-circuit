@@ -160,6 +160,21 @@ impl SemanticValueProvenance {
             }]
     }
 
+    pub(crate) fn direct_resource_origin(&self) -> Option<&SemanticValueOrigin> {
+        let [member] = self.members.as_slice() else {
+            return None;
+        };
+        if !member.path.is_empty()
+            || !matches!(
+                &member.origin,
+                SemanticValueOrigin::Source { .. } | SemanticValueOrigin::ProducerSource { .. }
+            )
+        {
+            return None;
+        }
+        Some(&member.origin)
+    }
+
     pub(crate) fn projected(&self, projection: &[String]) -> Self {
         if projection.is_empty() {
             return self.clone();

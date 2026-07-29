@@ -8,8 +8,10 @@ use crate::{
     SemanticBindingId, SemanticCallId, SemanticCallableId, SemanticCallableKind, SemanticCaptureId,
     SemanticExecutionGraphV1, SemanticExprId, SemanticExpression, SemanticExpressionKind,
     SemanticLoweringContractV1, SemanticOutputContractId, SemanticOutputContractKindV1,
-    SemanticReactiveGraphV1, SemanticReadId, SemanticResourceGraphV1, SemanticRowBinding,
-    SemanticScopeId, SemanticSourceId, SemanticValueId, SemanticViewCaptureTargetV1,
+    SemanticReactiveGraphV1, SemanticReadBindingV1, SemanticReadId, SemanticReadTargetV1,
+    SemanticResourceGraphV1, SemanticRowBinding, SemanticScopeId, SemanticScopeStorageGraphV1,
+    SemanticSourceId, SemanticStorageLocalMemberTargetV1, SemanticValueId,
+    SemanticViewCaptureTargetV1,
 };
 use boon_contract::SourceBundleDigestV1;
 use boon_typecheck::{CheckedCallableKind, DeclId, Type};
@@ -210,9 +212,11 @@ pub fn build_semantic_view_binding_graph(
     execution: &SemanticExecutionGraphV1,
     resources: &SemanticResourceGraphV1,
     reactive: &SemanticReactiveGraphV1,
+    storage: &SemanticScopeStorageGraphV1,
     lowering: &SemanticLoweringContractV1,
 ) -> Result<SemanticViewBindingGraphV1, SemanticViewBindingError> {
-    let mut graph = derive_semantic_view_binding_graph(execution, resources, reactive, lowering)?;
+    let mut graph =
+        derive_semantic_view_binding_graph(execution, resources, reactive, storage, lowering)?;
     graph.digest = semantic_view_binding_graph_digest(&graph)?;
     Ok(graph)
 }
@@ -223,6 +227,7 @@ impl SemanticViewBindingGraphV1 {
         execution: &SemanticExecutionGraphV1,
         resources: &SemanticResourceGraphV1,
         reactive: &SemanticReactiveGraphV1,
+        storage: &SemanticScopeStorageGraphV1,
         lowering: &SemanticLoweringContractV1,
     ) -> Result<(), SemanticViewBindingError> {
         if self.schema != SEMANTIC_VIEW_BINDING_GRAPH_SCHEMA_V1
@@ -237,7 +242,8 @@ impl SemanticViewBindingGraphV1 {
                 "semantic view-binding digest does not match its canonical payload",
             ));
         }
-        let expected = build_semantic_view_binding_graph(execution, resources, reactive, lowering)?;
+        let expected =
+            build_semantic_view_binding_graph(execution, resources, reactive, storage, lowering)?;
         if self != &expected {
             return Err(SemanticViewBindingError::new(
                 "semantic view-binding graph differs from exact semantic roots and captures",
@@ -247,10 +253,124 @@ impl SemanticViewBindingGraphV1 {
     }
 }
 
+fn exact_storage_event_source(
+    storage: &SemanticScopeStorageGraphV1,
+    read: &SemanticReadBindingV1,
+) -> Result<Option<SemanticSourceId>, SemanticViewBindingError> {
+    let SemanticReadTargetV1::MaterializationLocal {
+        owner,
+        local,
+        projection,
+    } = &read.target
+    else {
+        return Ok(None);
+    };
+    if projection.is_empty() {
+        return Ok(None);
+    }
+    let locals = storage
+        .locals
+        .iter()
+        .filter(|candidate| candidate.owner == *owner && candidate.local == *local)
+        .collect::<Vec<_>>();
+    let [local] = locals.as_slice() else {
+        return Err(SemanticViewBindingError::new(format!(
+            "view read {} materialization local {owner}:{local} resolves to {} exact storage locals",
+            read.id,
+            locals.len()
+        )));
+    };
+
+    let exact_sources = local
+        .members
+        .iter()
+        .filter(|member| member.path == *projection)
+        .filter_map(|member| match member.target {
+            SemanticStorageLocalMemberTargetV1::Source(source) => Some(source),
+            SemanticStorageLocalMemberTargetV1::Field(_)
+            | SemanticStorageLocalMemberTargetV1::State(_) => None,
+        })
+        .collect::<Vec<_>>();
+    match exact_sources.as_slice() {
+        [source] => return Ok(Some(*source)),
+        [] => {}
+        _ => {
+            return Err(SemanticViewBindingError::new(format!(
+                "view read {} projection `{}` resolves to {} exact storage sources",
+                read.id,
+                projection.join("."),
+                exact_sources.len()
+            )));
+        }
+    }
+
+    let ancestor_fields = local
+        .members
+        .iter()
+        .filter(|member| projection.starts_with(member.path.as_slice()))
+        .filter_map(|member| match member.target {
+            SemanticStorageLocalMemberTargetV1::Field(field) => Some((member.path.len(), field)),
+            SemanticStorageLocalMemberTargetV1::Source(_)
+            | SemanticStorageLocalMemberTargetV1::State(_) => None,
+        })
+        .collect::<Vec<_>>();
+    let Some(longest) = ancestor_fields.iter().map(|(depth, _)| *depth).max() else {
+        return Ok(None);
+    };
+    let fields = ancestor_fields
+        .iter()
+        .filter(|(depth, _)| *depth == longest)
+        .map(|(_, field)| *field)
+        .collect::<Vec<_>>();
+    let [field] = fields.as_slice() else {
+        return Err(SemanticViewBindingError::new(format!(
+            "view read {} projection `{}` resolves to {} longest storage fields",
+            read.id,
+            projection.join("."),
+            fields.len()
+        )));
+    };
+    let field = storage
+        .fields
+        .get(field.as_usize())
+        .filter(|candidate| candidate.id == *field)
+        .ok_or_else(|| {
+            SemanticViewBindingError::new(format!(
+                "view read {} references missing storage field {field}",
+                read.id
+            ))
+        })?;
+    if !field.resource_only {
+        return Ok(None);
+    }
+
+    let descendants = local
+        .members
+        .iter()
+        .filter(|member| member.path.starts_with(projection.as_slice()))
+        .filter_map(|member| match member.target {
+            SemanticStorageLocalMemberTargetV1::Source(source) => Some(source),
+            SemanticStorageLocalMemberTargetV1::Field(_)
+            | SemanticStorageLocalMemberTargetV1::State(_) => None,
+        })
+        .collect::<Vec<_>>();
+    match descendants.as_slice() {
+        [source] => Ok(Some(*source)),
+        [] => Ok(None),
+        _ => Err(SemanticViewBindingError::new(format!(
+            "view read {} resource-only projection `{}` contains {} exact storage sources",
+            read.id,
+            projection.join("."),
+            descendants.len()
+        ))),
+    }
+}
+
 fn derive_semantic_view_binding_graph(
     execution: &SemanticExecutionGraphV1,
     resources: &SemanticResourceGraphV1,
     reactive: &SemanticReactiveGraphV1,
+    storage: &SemanticScopeStorageGraphV1,
     lowering: &SemanticLoweringContractV1,
 ) -> Result<SemanticViewBindingGraphV1, SemanticViewBindingError> {
     let mut roots = Vec::new();
@@ -433,7 +553,7 @@ fn derive_semantic_view_binding_graph(
                     .collect::<Vec<_>>();
                 captures.sort_by_key(|capture| capture.id);
                 for capture in captures {
-                    let (target, diagnostic_path) = match capture.target {
+                    let (target, leaf_capture_target, diagnostic_path) = match capture.target {
                         SemanticViewCaptureTargetV1::Read { read } => {
                             let read_definition = reactive
                                 .reads
@@ -453,10 +573,31 @@ fn derive_semantic_view_binding_graph(
                                     capture.id
                                 )));
                             }
-                            (
-                                SemanticViewBindingTargetV1::Data { read },
-                                format!("read:{read}"),
-                            )
+                            if let Some(source) =
+                                exact_storage_event_source(storage, read_definition)?
+                            {
+                                let source_definition = resources
+                                    .sources
+                                    .get(source.as_usize())
+                                    .filter(|candidate| candidate.id == source)
+                                    .ok_or_else(|| {
+                                        SemanticViewBindingError::new(format!(
+                                            "view capture {} storage route references missing semantic source {source}",
+                                            capture.id
+                                        ))
+                                    })?;
+                                (
+                                    SemanticViewBindingTargetV1::Event { source },
+                                    SemanticViewCaptureTargetV1::Source { source },
+                                    source_definition.semantic_path.clone(),
+                                )
+                            } else {
+                                (
+                                    SemanticViewBindingTargetV1::Data { read },
+                                    capture.target,
+                                    format!("read:{read}"),
+                                )
+                            }
                         }
                         SemanticViewCaptureTargetV1::Source { source } => {
                             let source_definition = resources
@@ -471,6 +612,7 @@ fn derive_semantic_view_binding_graph(
                                 })?;
                             (
                                 SemanticViewBindingTargetV1::Event { source },
+                                capture.target,
                                 source_definition.semantic_path.clone(),
                             )
                         }
@@ -507,7 +649,7 @@ fn derive_semantic_view_binding_graph(
                         execution,
                         call_argument.value,
                         capture.expression,
-                        capture.target,
+                        leaf_capture_target,
                         &parameter.name,
                         &diagnostic_path,
                         output.contract,
@@ -1259,6 +1401,7 @@ document: Document/new(
                 semantic.execution_graph(),
                 semantic.resource_graph(),
                 semantic.reactive_graph(),
+                semantic.scope_storage_graph(),
                 semantic.lowering_contract(),
             )
             .expect("fresh view graph validates");
@@ -1395,6 +1538,7 @@ document: Document/new(
                     semantic.execution_graph(),
                     semantic.resource_graph(),
                     semantic.reactive_graph(),
+                    semantic.scope_storage_graph(),
                     semantic.lowering_contract(),
                 )
                 .is_err()

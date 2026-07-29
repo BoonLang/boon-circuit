@@ -3413,7 +3413,11 @@ fn build_state_resources(
             expression: state.expression,
             expression_members,
             initial: state.initial,
-            flow_type: checked_state.flow_type.clone(),
+            // Checked state definitions inside generic helpers intentionally
+            // retain their lexical type variables. A semantic state is an
+            // occurrence in a concrete call frame, so persistence and runtime
+            // storage must use the contextualized expression type.
+            flow_type: value.flow_type.clone(),
             kind: checked_state.kind,
             binding_path: state.binding_path.clone(),
             declared_path,

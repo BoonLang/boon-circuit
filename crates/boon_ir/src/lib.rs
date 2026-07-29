@@ -3068,11 +3068,27 @@ fn verify_erased_scope_index(program: &ErasedProgram) -> Result<(), String> {
                 executable,
                 runtime,
             } => {
-                if !program.executable.sources.iter().any(|source| {
-                    source.id == executable && source.declaration == binding.declaration
-                }) || !program.sources.iter().any(|source| {
-                    source.id == runtime && source.executable_source_id == Some(executable)
-                }) {
+                let executable_source = program
+                    .executable
+                    .sources
+                    .iter()
+                    .find(|source| source.id == executable);
+                let declaration_matches = executable_source.is_some_and(|source| {
+                    source.declaration == binding.declaration
+                        || matches!(
+                            &expression.kind,
+                            ExecutableExpressionKind::CanonicalRead {
+                                target,
+                                projection,
+                                ..
+                            } if *target == source.declaration && projection.is_empty()
+                        )
+                });
+                if !declaration_matches
+                    || !program.sources.iter().any(|source| {
+                        source.id == runtime && source.executable_source_id == Some(executable)
+                    })
+                {
                     return Err(format!(
                         "storage binding {} has an invalid source allocation",
                         binding.id

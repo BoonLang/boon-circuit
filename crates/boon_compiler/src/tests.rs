@@ -54,6 +54,38 @@ fn source_compilation_is_bound_to_semantic_and_verification_manifests() {
 }
 
 #[test]
+fn dependency_cycle_recovery_lowers_to_an_explicit_private_fault_boundary() {
+    let compiled = compile_fixture_source_text_to_machine_plan(
+        "dependency-cycle-boundary.bn",
+        r#"
+value:
+    Dependency/catch_cycle(
+        value: Ready
+        on_cycle: CycleError
+    )
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+
+    let boundary = compiled
+        .plan
+        .row_expressions
+        .iter()
+        .find_map(|(_, node)| match node {
+            boon_plan::PlanRowExpressionNode::CatchCycle { input, on_cycle } => {
+                Some((*input, *on_cycle))
+            }
+            _ => None,
+        })
+        .expect("Dependency/catch_cycle must survive as an executor-owned boundary");
+    assert_ne!(
+        boundary.0, boundary.1,
+        "normal and application fallback values must remain distinct"
+    );
+}
+
+#[test]
 fn nested_row_fields_with_repeated_leaf_names_keep_distinct_authorities() {
     let parsed = parse_source(
         "nested-row-authority-fields.bn",

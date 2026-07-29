@@ -6717,12 +6717,16 @@ struct ObjectRowSpreadState<'event, 'plan> {
 }
 
 #[derive(Clone, Copy)]
-enum WorkLimitCatchKind {
+enum ExpressionCatchKind<'event> {
     Page,
+    Cycle {
+        on_cycle: PlanRowExpressionId,
+        context: ExpressionContext<'event>,
+    },
 }
 
-struct ExpressionCatchFrame {
-    kind: WorkLimitCatchKind,
+struct ExpressionCatchFrame<'event> {
+    kind: ExpressionCatchKind<'event>,
     task_depth: usize,
     value_depth: usize,
     binding_depth: usize,
@@ -6731,6 +6735,7 @@ struct ExpressionCatchFrame {
     detached_index_depth: usize,
     ordered_index_evaluation_depth: usize,
     access_cleanup_depth: usize,
+    flush_depth: usize,
     list_access_flush_started: bool,
 }
 
@@ -7350,6 +7355,7 @@ enum ExpressionTask<'event, 'plan> {
     },
     FinishListAccessDependenciesFlush,
     FinishWorkLimitCatch,
+    FinishCycleCatch,
     FinishFlush,
     FinishFlushBoundary,
     SelectAfterInput {
@@ -7852,6 +7858,7 @@ fn schedule_apply_operands<'event, 'plan>(
         PlanRowExpressionNode::Absent
         | PlanRowExpressionNode::Flush { .. }
         | PlanRowExpressionNode::FlushBoundary { .. }
+        | PlanRowExpressionNode::CatchCycle { .. }
         | PlanRowExpressionNode::Intrinsic { .. }
         | PlanRowExpressionNode::Field { .. }
         | PlanRowExpressionNode::Constant { .. }
@@ -20258,6 +20265,30 @@ impl MachineInstance {
                                         context,
                                     })?;
                                 }
+                                PlanRowExpressionNode::CatchCycle { input, on_cycle } => {
+                                    catch_frames.push(ExpressionCatchFrame {
+                                        kind: ExpressionCatchKind::Cycle {
+                                            on_cycle: *on_cycle,
+                                            context,
+                                        },
+                                        task_depth: stack.tasks.len(),
+                                        value_depth: stack.values.len(),
+                                        binding_depth: binding_undos.len(),
+                                        currentness_depth: currentness_targets.len(),
+                                        authority_depth: work.active_value_list_authorities.len(),
+                                        detached_index_depth: detached_ordered_index_order.len(),
+                                        ordered_index_evaluation_depth: ordered_index_evaluations
+                                            .len(),
+                                        access_cleanup_depth: access_cleanups.len(),
+                                        flush_depth: flush_frames.len(),
+                                        list_access_flush_started,
+                                    });
+                                    stack.push_task(ExpressionTask::FinishCycleCatch)?;
+                                    stack.push_task(ExpressionTask::Evaluate {
+                                        expression: *input,
+                                        context,
+                                    })?;
+                                }
                                 PlanRowExpressionNode::Intrinsic { intrinsic } => stack
                                     .push_value(private_presence_eval(
                                         &self.eval_intrinsic_presence(*intrinsic),
@@ -20521,7 +20552,7 @@ impl MachineInstance {
                                 }
                                 PlanRowExpressionNode::ListPage { page } => {
                                     catch_frames.push(ExpressionCatchFrame {
-                                        kind: WorkLimitCatchKind::Page,
+                                        kind: ExpressionCatchKind::Page,
                                         task_depth: stack.tasks.len(),
                                         value_depth: stack.values.len(),
                                         binding_depth: binding_undos.len(),
@@ -20531,6 +20562,7 @@ impl MachineInstance {
                                         ordered_index_evaluation_depth: ordered_index_evaluations
                                             .len(),
                                         access_cleanup_depth: access_cleanups.len(),
+                                        flush_depth: flush_frames.len(),
                                         list_access_flush_started,
                                     });
                                     stack.push_task(ExpressionTask::FinishWorkLimitCatch)?;
@@ -20541,7 +20573,7 @@ impl MachineInstance {
                                 }
                                 PlanRowExpressionNode::BoundedListPage { page } => {
                                     catch_frames.push(ExpressionCatchFrame {
-                                        kind: WorkLimitCatchKind::Page,
+                                        kind: ExpressionCatchKind::Page,
                                         task_depth: stack.tasks.len(),
                                         value_depth: stack.values.len(),
                                         binding_depth: binding_undos.len(),
@@ -20551,6 +20583,7 @@ impl MachineInstance {
                                         ordered_index_evaluation_depth: ordered_index_evaluations
                                             .len(),
                                         access_cleanup_depth: access_cleanups.len(),
+                                        flush_depth: flush_frames.len(),
                                         list_access_flush_started,
                                     });
                                     stack.push_task(ExpressionTask::FinishWorkLimitCatch)?;
@@ -24969,11 +25002,29 @@ impl MachineInstance {
                             list_access_flush_started = false;
                         }
                         ExpressionTask::FinishWorkLimitCatch => {
-                            catch_frames.pop().ok_or_else(|| {
+                            let frame = catch_frames.pop().ok_or_else(|| {
                                 Error::InvalidPlan(
                                     "page WorkLimit catch continuation disappeared".to_owned(),
                                 )
                             })?;
+                            if !matches!(frame.kind, ExpressionCatchKind::Page) {
+                                return Err(Error::InvalidPlan(
+                                    "page WorkLimit catch closed a cycle boundary".to_owned(),
+                                ));
+                            }
+                        }
+                        ExpressionTask::FinishCycleCatch => {
+                            let frame = catch_frames.pop().ok_or_else(|| {
+                                Error::InvalidPlan(
+                                    "dependency cycle catch continuation disappeared".to_owned(),
+                                )
+                            })?;
+                            if !matches!(frame.kind, ExpressionCatchKind::Cycle { .. }) {
+                                return Err(Error::InvalidPlan(
+                                    "dependency cycle catch closed a page WorkLimit boundary"
+                                        .to_owned(),
+                                ));
+                            }
                         }
                         ExpressionTask::FinishFlush => {
                             let payload = self.materialize_eval(stack.pop_value()?)?;
@@ -25719,9 +25770,19 @@ impl MachineInstance {
                     }
                 }
                 if let Err(error) = task_result {
-                    if matches!(error, Error::WorkBudgetExceeded { .. })
-                        && let Some(frame) = catch_frames.pop()
-                    {
+                    let catch_index = catch_frames.iter().rposition(|frame| {
+                        matches!(
+                            (&frame.kind, &error),
+                            (ExpressionCatchKind::Page, Error::WorkBudgetExceeded { .. })
+                                | (
+                                    ExpressionCatchKind::Cycle { .. },
+                                    Error::Cycle { .. } | Error::ListCycle { .. }
+                                )
+                        )
+                    });
+                    if let Some(catch_index) = catch_index {
+                        let frame = catch_frames.remove(catch_index);
+                        catch_frames.truncate(catch_index);
                         stack.tasks.truncate(frame.task_depth);
                         stack.values.truncate(frame.value_depth);
                         while binding_undos.len() > frame.binding_depth {
@@ -25768,17 +25829,24 @@ impl MachineInstance {
                                 record_access_metrics(work, cleanup.metrics, 0);
                             }
                         }
+                        flush_frames.truncate(frame.flush_depth);
                         if list_access_flush_started && !frame.list_access_flush_started {
                             self.list_access_flush_in_progress = false;
                             list_access_flush_started = false;
                         }
-                        work.metrics.access_work_limit_failure_count = work
-                            .metrics
-                            .access_work_limit_failure_count
-                            .saturating_add(1);
                         match frame.kind {
-                            WorkLimitCatchKind::Page => {
+                            ExpressionCatchKind::Page => {
+                                work.metrics.access_work_limit_failure_count = work
+                                    .metrics
+                                    .access_work_limit_failure_count
+                                    .saturating_add(1);
                                 stack.push_value(page_terminal_variant("PageWorkLimitExceeded"))?;
+                            }
+                            ExpressionCatchKind::Cycle { on_cycle, context } => {
+                                stack.push_task(ExpressionTask::Evaluate {
+                                    expression: on_cycle,
+                                    context,
+                                })?;
                             }
                         }
                         continue;
@@ -26115,6 +26183,7 @@ impl MachineInstance {
             PlanRowExpressionNode::Absent
             | PlanRowExpressionNode::Flush { .. }
             | PlanRowExpressionNode::FlushBoundary { .. }
+            | PlanRowExpressionNode::CatchCycle { .. }
             | PlanRowExpressionNode::Intrinsic { .. }
             | PlanRowExpressionNode::Field { .. }
             | PlanRowExpressionNode::Constant { .. }

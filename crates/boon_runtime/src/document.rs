@@ -150,6 +150,7 @@ pub(crate) struct DocumentRuntime {
     expression_ops: Vec<Arc<DocumentExprOp>>,
     routes: BTreeMap<SourceId, String>,
     field_names: BTreeMap<FieldId, Vec<String>>,
+    row_fields_by_name: BTreeMap<(ListId, String), FieldId>,
     field_state_aliases: BTreeMap<FieldId, boon_plan::StateId>,
     field_owners: BTreeMap<FieldId, ListId>,
     list_scopes: BTreeMap<ListId, ScopeId>,
@@ -250,6 +251,7 @@ impl DocumentRuntime {
             .map(|route| (route.source_id, route.path.clone()))
             .collect();
         let field_names = field_name_index(&machine);
+        let row_fields_by_name = row_field_name_index(&machine);
         let field_state_aliases = field_state_alias_index(&machine);
         let field_owners = machine
             .storage_layout
@@ -291,6 +293,7 @@ impl DocumentRuntime {
             expression_ops,
             routes,
             field_names,
+            row_fields_by_name,
             field_state_aliases,
             field_owners,
             list_scopes,
@@ -2706,27 +2709,39 @@ impl<'a> Evaluator<'a> {
                     fields.remove(&name).unwrap_or(EvalValue::Absent)
                 }
                 EvalValue::Row { id, fields, .. } => {
-                    let field = fields.keys().find(|field| {
-                        self.runtime
-                            .field_names
-                            .get(field)
-                            .is_some_and(|names| names.iter().any(|candidate| candidate == &name))
-                    });
-                    let field = field.copied().or_else(|| {
-                        self.runtime.field_names.iter().find_map(|(field, names)| {
-                            (id.is_none()
-                                || id.is_some_and(|row| {
-                                    self.runtime.field_owners.get(field) == Some(&row.list)
-                                }))
-                            .then(|| {
-                                names
-                                    .iter()
-                                    .any(|candidate| candidate == &name)
+                    let field = id
+                        .and_then(|row| {
+                            self.runtime
+                                .row_fields_by_name
+                                .get(&(row.list, name.clone()))
+                                .copied()
+                        })
+                        .or_else(|| {
+                            fields.keys().find_map(|field| {
+                                self.runtime
+                                    .field_names
+                                    .get(field)
+                                    .is_some_and(|names| {
+                                        names.iter().any(|candidate| candidate == &name)
+                                    })
                                     .then_some(*field)
                             })
-                            .flatten()
                         })
-                    });
+                        .or_else(|| {
+                            self.runtime.field_names.iter().find_map(|(field, names)| {
+                                (id.is_none()
+                                    || id.is_some_and(|row| {
+                                        self.runtime.field_owners.get(field) == Some(&row.list)
+                                    }))
+                                .then(|| {
+                                    names
+                                        .iter()
+                                        .any(|candidate| candidate == &name)
+                                        .then_some(*field)
+                                })
+                                .flatten()
+                            })
+                        });
                     id.zip(field)
                         .and_then(|(row, field)| {
                             self.read_target(ValueTarget::RowField { row, field }).ok()
@@ -5668,7 +5683,48 @@ fn field_name_index(plan: &MachinePlan) -> BTreeMap<FieldId, Vec<String>> {
             names.push(name.to_owned());
         }
     }
+    for slot in &plan.storage_layout.list_slots {
+        for field in &slot.row_fields {
+            let names = result.entry(field.field_id).or_default();
+            if !names.iter().any(|candidate| candidate == &field.name) {
+                names.push(field.name.clone());
+            }
+        }
+    }
     result
+}
+
+fn row_field_name_index(plan: &MachinePlan) -> BTreeMap<(ListId, String), FieldId> {
+    let mut preferred = BTreeMap::<(ListId, String), (u8, FieldId)>::new();
+    for slot in &plan.storage_layout.list_slots {
+        for field in &slot.row_fields {
+            index_row_field_name(&mut preferred, slot.list_id, field);
+        }
+    }
+    preferred
+        .into_iter()
+        .map(|(key, (_, field))| (key, field))
+        .collect()
+}
+
+fn index_row_field_name(
+    preferred: &mut BTreeMap<(ListId, String), (u8, FieldId)>,
+    list: ListId,
+    field: &boon_plan::PlanListRowField,
+) {
+    let rank = match field.role {
+        boon_plan::PlanListRowFieldRole::Value => 3,
+        boon_plan::PlanListRowFieldRole::ValueAuthority => 2,
+        boon_plan::PlanListRowFieldRole::Authority => 1,
+        boon_plan::PlanListRowFieldRole::Capture => 0,
+    };
+    let key = (list, field.name.clone());
+    if preferred
+        .get(&key)
+        .is_none_or(|(current_rank, _)| rank > *current_rank)
+    {
+        preferred.insert(key, (rank, field.field_id));
+    }
 }
 
 fn field_state_alias_index(plan: &MachinePlan) -> BTreeMap<FieldId, boon_plan::StateId> {
@@ -6756,5 +6812,41 @@ mod tests {
         );
         assert_eq!(style.get("min_width"), Some(&StyleValue::Number(230.0)));
         assert_eq!(style.get("max_width"), Some(&StyleValue::Number(552.0)));
+    }
+
+    #[test]
+    fn canonical_row_name_index_prefers_public_current_value_over_authority() {
+        use boon_plan::{PlanListRowField, PlanListRowFieldRole};
+
+        let authority = PlanListRowField {
+            field_id: FieldId(10),
+            name: "items".to_owned(),
+            role: PlanListRowFieldRole::Authority,
+        };
+        let value = PlanListRowField {
+            field_id: FieldId(11),
+            name: "items".to_owned(),
+            role: PlanListRowFieldRole::Value,
+        };
+        let other_list = PlanListRowField {
+            field_id: FieldId(12),
+            name: "items".to_owned(),
+            role: PlanListRowFieldRole::ValueAuthority,
+        };
+        let mut preferred = BTreeMap::new();
+
+        index_row_field_name(&mut preferred, ListId(0), &authority);
+        index_row_field_name(&mut preferred, ListId(0), &value);
+        index_row_field_name(&mut preferred, ListId(0), &authority);
+        index_row_field_name(&mut preferred, ListId(1), &other_list);
+
+        assert_eq!(
+            preferred.get(&(ListId(0), "items".to_owned())),
+            Some(&(3, FieldId(11)))
+        );
+        assert_eq!(
+            preferred.get(&(ListId(1), "items".to_owned())),
+            Some(&(2, FieldId(12)))
+        );
     }
 }

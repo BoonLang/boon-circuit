@@ -4734,6 +4734,7 @@ fn is_operator_lexeme(lexeme: &str) -> bool {
             | "List/any"
             | "List/is_not_empty"
             | "List/latest"
+            | "Dependency/catch_cycle"
             | "Text/empty"
             | "Text/join"
             | "Text/concat"

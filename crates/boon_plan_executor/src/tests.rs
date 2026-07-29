@@ -6332,6 +6332,191 @@ fn recursive_derived_reentry_returns_typed_cycle_error() {
 }
 
 #[test]
+fn explicit_dependency_cycle_boundary_returns_application_tag_and_recovers() {
+    let mut row_expressions = PlanRowExpressionArena::new();
+    let use_reference = row_field(&mut row_expressions, ValueRef::Field(FieldId(10)));
+    let target_index = row_field(&mut row_expressions, ValueRef::Field(FieldId(11)));
+    let referenced_result = row(
+        &mut row_expressions,
+        PlanRowExpressionNode::ListGetField {
+            list_id: ListId(0),
+            index: target_index,
+            field: FieldId(13),
+        },
+    );
+    let cycle_tag = row_constant(&mut row_expressions, PlanConstantId(0));
+    let caught_reference = row(
+        &mut row_expressions,
+        PlanRowExpressionNode::CatchCycle {
+            input: referenced_result,
+            on_cycle: cycle_tag,
+        },
+    );
+    let literal = row_field(&mut row_expressions, ValueRef::Field(FieldId(12)));
+    let result = row(
+        &mut row_expressions,
+        PlanRowExpressionNode::Select {
+            input: use_reference,
+            arms: vec![
+                PlanRowSelectArm {
+                    pattern: PlanRowSelectPattern::Tag {
+                        name: "True".to_owned(),
+                    },
+                    value: caught_reference,
+                },
+                PlanRowSelectArm {
+                    pattern: PlanRowSelectPattern::Wildcard,
+                    value: literal,
+                },
+            ],
+        },
+    );
+    let list = ListStorageSlot {
+        id: PlanStorageId(0),
+        list_id: ListId(0),
+        scope_id: Some(ScopeId(0)),
+        row_fields: vec![
+            PlanListRowField {
+                field_id: FieldId(10),
+                name: "use_reference".to_owned(),
+                role: PlanListRowFieldRole::Authority,
+            },
+            PlanListRowField {
+                field_id: FieldId(11),
+                name: "target_index".to_owned(),
+                role: PlanListRowFieldRole::Authority,
+            },
+            PlanListRowField {
+                field_id: FieldId(12),
+                name: "literal".to_owned(),
+                role: PlanListRowFieldRole::Authority,
+            },
+            PlanListRowField {
+                field_id: FieldId(13),
+                name: "result".to_owned(),
+                role: PlanListRowFieldRole::Value,
+            },
+        ],
+        capacity: None,
+        hidden_key_type: "Key".to_owned(),
+        has_generation: true,
+        initializer_kind: ListInitializerKind::RecordLiteral,
+        range: None,
+        initial_rows: vec![
+            PlanInitialListRow {
+                fields: vec![
+                    PlanInitialListField {
+                        name: "use_reference".to_owned(),
+                        field_id: Some(FieldId(10)),
+                        initializer: initial(truth_constant(true)),
+                    },
+                    PlanInitialListField {
+                        name: "target_index".to_owned(),
+                        field_id: Some(FieldId(11)),
+                        initializer: initial(number_constant(1)),
+                    },
+                    PlanInitialListField {
+                        name: "literal".to_owned(),
+                        field_id: Some(FieldId(12)),
+                        initializer: initial(number_constant(7)),
+                    },
+                ],
+            },
+            PlanInitialListRow {
+                fields: vec![
+                    PlanInitialListField {
+                        name: "use_reference".to_owned(),
+                        field_id: Some(FieldId(10)),
+                        initializer: initial(truth_constant(true)),
+                    },
+                    PlanInitialListField {
+                        name: "target_index".to_owned(),
+                        field_id: Some(FieldId(11)),
+                        initializer: initial(number_constant(0)),
+                    },
+                    PlanInitialListField {
+                        name: "literal".to_owned(),
+                        field_id: Some(FieldId(12)),
+                        initializer: initial(number_constant(5)),
+                    },
+                ],
+            },
+        ],
+    };
+    let computation = PlanOp {
+        id: PlanOpId(0),
+        kind: PlanOpKind::DerivedValue {
+            derived_kind: PlanDerivedKind::Pure,
+            startup_recompute: false,
+            materialization: None,
+            expression: Some(PlanDerivedExpression::RowExpression { expression: result }),
+        },
+        inputs: vec![
+            ValueRef::Field(FieldId(10)),
+            ValueRef::Field(FieldId(11)),
+            ValueRef::Field(FieldId(12)),
+            ValueRef::List(ListId(0)),
+        ],
+        output: Some(ValueRef::Field(FieldId(13))),
+        indexed: true,
+        unresolved_executable_ref_count: 0,
+    };
+    let mut session = MachineInstance::new(
+        plan(
+            RootOutputDemand::Selected(Vec::new()),
+            row_expressions,
+            vec![constant(0, tag_constant("CycleError"))],
+            Vec::new(),
+            Vec::new(),
+            vec![list],
+            vec![computation],
+            Vec::new(),
+            vec![(ListId(0), "rows")],
+            vec![
+                (FieldId(10), "rows.use_reference"),
+                (FieldId(11), "rows.target_index"),
+                (FieldId(12), "rows.literal"),
+                (FieldId(13), "rows.result"),
+            ],
+        ),
+        SessionOptions::default(),
+    )
+    .unwrap();
+    let rows = session.list_rows(ListId(0));
+    let target = |row| ValueTarget::RowField {
+        row,
+        field: FieldId(13),
+    };
+
+    assert_eq!(
+        session.project_current(&[target(rows[0])]).unwrap()[&target(rows[0])],
+        Value::Tag {
+            tag: "CycleError".to_owned(),
+            fields: BTreeMap::new(),
+        }
+    );
+    assert_eq!(
+        session.project_current(&[target(rows[1])]).unwrap()[&target(rows[1])],
+        Value::Tag {
+            tag: "CycleError".to_owned(),
+            fields: BTreeMap::new(),
+        }
+    );
+
+    session
+        .test_set_row_field(rows[1], FieldId(10), Value::truth(false))
+        .unwrap();
+    assert_eq!(
+        session.project_current(&[target(rows[0])]).unwrap()[&target(rows[0])],
+        number(5)
+    );
+    assert_eq!(
+        session.project_current(&[target(rows[1])]).unwrap()[&target(rows[1])],
+        number(5)
+    );
+}
+
+#[test]
 fn remove_then_append_allocates_a_new_row_identity() {
     let mut row_expressions = PlanRowExpressionArena::new();
     let list = ListStorageSlot {

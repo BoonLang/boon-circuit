@@ -36,12 +36,16 @@ FUNCTION default_formula_for_address(address) {
 }
 
 FUNCTION cell_result(target_address) {
-    cells
-    |> List/find(item, if: item.address == target_address)
-    |> WHEN {
-        Found[value] => value.result
-        NotFound => MissingReference[address: target_address]
-    }
+    Dependency/catch_cycle(
+        value:
+            cells
+            |> List/find(item, if: item.address == target_address)
+            |> WHEN {
+                Found[value] => value.result
+                NotFound => MissingReference[address: target_address]
+            }
+        on_cycle: CycleError
+    )
 }
 
 FUNCTION reference_or_number(text) {
@@ -345,6 +349,7 @@ FUNCTION formula_result_value(result) {
         MissingReference[address] => TEXT { missing_ref }
         TypeError => TEXT { type_error }
         DivisionByZero => TEXT { div_by_zero }
+        CycleError => TEXT { cycle_error }
     }
 }
 
@@ -356,5 +361,6 @@ FUNCTION formula_result_error(result) {
         MissingReference[address] => TEXT { missing_ref }
         TypeError => TEXT { type_error }
         DivisionByZero => TEXT { div_by_zero }
+        CycleError => TEXT { cycle_error }
     }
 }

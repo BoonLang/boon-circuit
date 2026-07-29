@@ -1936,6 +1936,9 @@ fn distributed_call_expression_is_safe(
             PlanRowExpressionNode::ListRowField { row, list_id, .. } => {
                 child_is_valid(row) && row_bindings.iter().any(|binding| binding.list == *list_id)
             }
+            PlanRowExpressionNode::CatchCycle { input, on_cycle } => {
+                child_is_valid(input) && child_is_valid(on_cycle)
+            }
             // A lexical boundary proves that no live control carrier crosses
             // the distributed cut. Its ordinary payload/result is validated
             // by the surrounding typed argument contract.
@@ -7175,6 +7178,13 @@ pub enum PlanRowExpressionNode {
     FlushBoundary {
         input: PlanRowExpressionId,
     },
+    /// Explicit private-fault boundary. A derived dependency cycle raised
+    /// while evaluating `input` is translated into the ordinary application
+    /// value produced by `on_cycle`. No private fault is materialized.
+    CatchCycle {
+        input: PlanRowExpressionId,
+        on_cycle: PlanRowExpressionId,
+    },
     Intrinsic {
         intrinsic: PlanIntrinsic,
     },
@@ -7439,6 +7449,10 @@ impl PlanRowExpressionNode {
             | Self::ListSum { input }
             | Self::ObjectField { object: input, .. }
             | Self::ListRowField { row: input, .. } => visitor(*input),
+            Self::CatchCycle { input, on_cycle } => {
+                visitor(*input);
+                visitor(*on_cycle);
+            }
             Self::TextToNumber { input, radix } => {
                 visitor(*input);
                 if let Some(radix) = radix {
@@ -7641,6 +7655,10 @@ impl PlanRowExpressionNode {
             | Self::ListSum { input }
             | Self::ObjectField { object: input, .. }
             | Self::ListRowField { row: input, .. } => visitor(input),
+            Self::CatchCycle { input, on_cycle } => {
+                visitor(input);
+                visitor(on_cycle);
+            }
             Self::TextToNumber { input, radix } => {
                 visitor(input);
                 if let Some(radix) = radix {

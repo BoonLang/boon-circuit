@@ -79,6 +79,10 @@ fn visit_row_node_children_mut(
         | PlanRowExpressionNode::ListSum { input }
         | PlanRowExpressionNode::ObjectField { object: input, .. }
         | PlanRowExpressionNode::ListRowField { row: input, .. } => visitor(input),
+        PlanRowExpressionNode::CatchCycle { input, on_cycle } => {
+            visitor(input);
+            visitor(on_cycle);
+        }
         PlanRowExpressionNode::TextToNumber { input, radix } => {
             visitor(input);
             if let Some(radix) = radix {
@@ -12072,6 +12076,10 @@ fn plan_builtin_expression(
         "List/sum" => input
             .or_else(|| named(&["input", "list"]))
             .map(|input| PlanRowExpressionNode::ListSum { input }),
+        "Dependency/catch_cycle" => input
+            .or_else(|| named(&["value"]))
+            .zip(named(&["on_cycle"]))
+            .map(|(input, on_cycle)| PlanRowExpressionNode::CatchCycle { input, on_cycle }),
         "List/get" | "List/latest" | "List/count" | "List/length" | "List/is_not_empty"
         | "List/take" => input.or_else(|| named(&["input", "list"])).map(|input| {
             PlanRowExpressionNode::BuiltinCall {
@@ -12126,6 +12134,18 @@ fn row_expression_value_type(
         PlanRowExpressionNode::Flush { payload }
         | PlanRowExpressionNode::FlushBoundary { input: payload } => {
             row_expression_value_type(program, index, arena, constants, *payload)?
+        }
+        PlanRowExpressionNode::CatchCycle { input, on_cycle } => {
+            let input_type = row_expression_value_type(program, index, arena, constants, *input)?;
+            let cycle_type =
+                row_expression_value_type(program, index, arena, constants, *on_cycle)?;
+            match (input_type, cycle_type) {
+                (Some(input_type), Some(cycle_type)) if input_type == cycle_type => {
+                    Some(input_type)
+                }
+                (Some(_), Some(_)) => Some(PlanValueType::Data),
+                (input_type, cycle_type) => input_type.or(cycle_type),
+            }
         }
         PlanRowExpressionNode::Intrinsic { .. } => Some(PlanValueType::Tag),
         PlanRowExpressionNode::Field { input } => {

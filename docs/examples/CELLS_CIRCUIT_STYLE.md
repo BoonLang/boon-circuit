@@ -185,6 +185,11 @@ grammar scanning uses `Text/find`, `Text/starts_with`, and one-based
 success and failure as ordinary tagged data until the cell derives its visible
 `value` and `error` text.
 
+Runtime-dependent reference cycles cross the private engine-fault boundary
+only through `Dependency/catch_cycle(value:, on_cycle:)`. Cells supplies the
+ordinary `CycleError` Tag explicitly; the private cycle fault is never a cell
+value, match arm, persisted value, or wire value.
+
 `CellExpression/parse(text)` returns a small formula AST or a deterministic error.
 `CellExpression/dependencies(ast)` returns a set of domain cell addresses. `CellExpression/eval`
 reads values by domain address through the runtime's dependency-aware reader and

@@ -2119,7 +2119,7 @@ fn scenario_expectations(step: &ScenarioFileStep) -> RuntimeResult<Vec<ScenarioE
         expectations.push(ScenarioExpectation::RecomputedRows {
             list: "cells".to_owned(),
             key_field: "address".to_owned(),
-            field: "value".to_owned(),
+            field: "display_text".to_owned(),
             keys: step.expect_recomputed.clone(),
         });
     }

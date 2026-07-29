@@ -19109,6 +19109,10 @@ fn contextual_key_type() -> Type {
     Type::Var(CONTEXTUAL_KEY_VAR)
 }
 
+fn dependency_catch_type() -> Type {
+    Type::Var(CONTEXTUAL_ITEM_VAR)
+}
+
 fn found_or_not_found_type(item: Type) -> Type {
     Type::VariantSet(vec![
         Variant::Tagged {
@@ -19393,6 +19397,15 @@ impl Default for BuiltinSignatureRegistry {
             vec![
                 required_parameter("input", Type::Text),
                 required_parameter("needle", Type::Text),
+            ],
+            None,
+        );
+        register(
+            "Dependency/catch_cycle",
+            dependency_catch_type(),
+            vec![
+                required_parameter("value", dependency_catch_type()),
+                required_parameter("on_cycle", dependency_catch_type()),
             ],
             None,
         );

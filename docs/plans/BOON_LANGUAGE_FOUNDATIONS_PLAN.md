@@ -185,6 +185,12 @@ compiler, transport, and host faults use private fault channels until a
 boundary deliberately translates them into a specific closed application Tag.
 They are not a privileged public `Error` value kind.
 
+`Dependency/catch_cycle(value:, on_cycle:)` is the explicit recovery boundary
+for a runtime-dependent derived/list cycle. Its `on_cycle` argument is an
+ordinary application value, normally a member of the result's closed Tag set;
+the private cycle fault itself is never matchable, stored, persisted, or
+serialized. Other engine faults remain terminal.
+
 The flag-day migration removes public/runtime ambiguity from the current
 `Value::Bool`, `Value::Null`, and `Value::Error` representations:
 

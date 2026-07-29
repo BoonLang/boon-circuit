@@ -480,6 +480,8 @@ fn derive_semantic_view_binding_graph(
                     parameter_bindings,
                 },
             )?;
+            let diagnostic_kind =
+                canonical_view_kind(&expression.flow_type.ty).unwrap_or_else(|| function.clone());
             let node_id = SemanticViewNodeId(nodes.len());
             nodes.push(SemanticViewNodeV1 {
                 id: node_id,
@@ -488,7 +490,7 @@ fn derive_semantic_view_binding_graph(
                 value: expression.value_id,
                 call: *call,
                 callable: *callable,
-                diagnostic_kind: function.clone(),
+                diagnostic_kind: diagnostic_kind.clone(),
             });
 
             let callable_definition = require_callable(execution, *callable)?;
@@ -681,7 +683,7 @@ fn derive_semantic_view_binding_graph(
                             additional_projection: leaf.additional_projection,
                             route_scope,
                             row,
-                            diagnostic_node: function.clone(),
+                            diagnostic_node: diagnostic_kind.clone(),
                             diagnostic_attribute: parameter.name.clone(),
                             diagnostic_path: diagnostic_path.clone(),
                         });
@@ -701,6 +703,19 @@ fn derive_semantic_view_binding_graph(
         bindings,
         digest: SemanticViewBindingGraphDigestV1([0; 32]),
     })
+}
+
+fn canonical_view_kind(ty: &Type) -> Option<String> {
+    let Type::Object(shape) = ty else {
+        return None;
+    };
+    let Some(Type::VariantSet(variants)) = shape.fields.get("kind") else {
+        return None;
+    };
+    match variants.as_slice() {
+        [boon_typecheck::Variant::Tag(tag)] => Some(tag.clone()),
+        _ => None,
+    }
 }
 
 struct ViewConstructorCallIdentity<'a> {

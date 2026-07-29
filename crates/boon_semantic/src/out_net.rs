@@ -943,18 +943,44 @@ where
                 .unwrap_or(&checked_call.result);
             let instantiated_result =
                 apply_checked_type_substitutions(&result_scheme.ty, &type_substitutions);
-            let result_type = if !crate::out_contract_type_is_resolved(&instantiated_result)
-                && crate::out_contract_type_is_resolved(&checked_call.result.ty)
-            {
-                checked_call.result.ty.clone()
-            } else {
-                instantiated_result
-            };
+            let checked_result = boon_typecheck::specialize_checked_call_result(
+                &instantiated_result,
+                &checked_call.result.ty,
+            );
+            let expression_result = self
+                .program
+                .expressions
+                .get(checked_call.expression.0 as usize)
+                .filter(|expression| expression.id == checked_call.expression)
+                .map(|expression| {
+                    apply_checked_type_substitutions(&expression.flow_type.ty, &type_substitutions)
+                })
+                .unwrap_or_else(|| checked_result.clone());
+            let occurrence_result =
+                boon_typecheck::specialize_checked_call_result(&checked_result, &expression_result);
+            let enclosing_result = checked_call
+                .owner_callable
+                .and_then(|owner| self.signature_by_id.get(&owner).copied())
+                .filter(|owner| owner.result_expression == Some(checked_call.expression))
+                .and_then(|_| {
+                    parent.map(|parent| self.call_instances[parent.as_usize()].result.clone())
+                });
+            let result_type = enclosing_result
+                .as_ref()
+                .map(|enclosing| {
+                    boon_typecheck::specialize_checked_call_result(
+                        &occurrence_result,
+                        &enclosing.ty,
+                    )
+                })
+                .unwrap_or(occurrence_result);
             let result = FlowType {
                 // The callable signature supplies the generic result type, but
                 // temporal gating is occurrence-specific and has already been
                 // resolved on the checked call.
-                mode: checked_call.result.mode,
+                mode: enclosing_result
+                    .map(|enclosing| enclosing.mode)
+                    .unwrap_or(checked_call.result.mode),
                 ty: result_type,
             };
             self.call_instances.push(OutCallInstance {

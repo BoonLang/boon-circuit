@@ -5514,9 +5514,23 @@ impl<'a> CheckedProgramBuilder<'a> {
                     .map(|flow_type| flow_type.ty.clone())
             })
             .flatten();
-        let result_type = if type_is_recursively_closed(&instantiated_result)
-            || !type_is_recursively_closed(&call.result.ty)
-        {
+        // A root call expression is a concrete instantiation site. The
+        // syntax-wide scheme remains open inside its callable, but the exact
+        // structural result inferred at this occurrence must not be widened
+        // back to that open scheme merely because the scheme carries field
+        // requirements instead of a row-remainder TypeVar.
+        // Calls owned by another callable deliberately do not use this path:
+        // their expression is shared by every outer instantiation and must
+        // remain generic.
+        let concrete_root_result = call
+            .owner_callable
+            .is_none()
+            .then(|| specialize_checked_call_result(&instantiated_result, &call.result.ty));
+        let result_type = if let Some(concrete) = concrete_root_result {
+            concrete
+        } else if type_is_recursively_closed(&instantiated_result) {
+            authoritative_result.unwrap_or(instantiated_result)
+        } else if !type_is_recursively_closed(&call.result.ty) {
             authoritative_result.unwrap_or(instantiated_result)
         } else {
             instantiated_result
@@ -11773,7 +11787,7 @@ fn checked_type_contains_var(ty: &Type) -> bool {
     }
 }
 
-fn type_is_recursively_closed(ty: &Type) -> bool {
+pub fn type_is_recursively_closed(ty: &Type) -> bool {
     match ty {
         Type::Text
         | Type::Number
@@ -17962,9 +17976,8 @@ impl<'a> Checker<'a> {
         if let Some(expr_id) =
             statement_pipeline_final_expr_id(statement, &self.program.expressions)
                 .or_else(|| direct_statement_value_expr_id(statement, &self.program.expressions))
-            && let Some(expr) = self.program.expressions.get(expr_id)
             && let Some(ty) =
-                static_expr_type_from_bindings(expr, &self.program.expressions, bindings)
+                self.static_expr_type_for_pipeline_expr(expr_id, active_functions, bindings)
         {
             return Some(ty);
         }
@@ -18212,8 +18225,118 @@ impl<'a> Checker<'a> {
         bindings: &dyn StaticBindingLookup,
     ) -> Option<Type> {
         let expr = self.program.expressions.get(expr_id)?;
-        static_expr_type_from_bindings(expr, &self.program.expressions, bindings)
+        self.static_when_type_with_bindings(expr_id, active_functions, bindings)
+            .or_else(|| self.static_user_call_type_with_bindings(expr, active_functions, bindings))
+            .or_else(|| static_expr_type_from_bindings(expr, &self.program.expressions, bindings))
             .or_else(|| self.static_expr_type(expr, active_functions))
+    }
+
+    fn static_user_call_type_with_bindings(
+        &self,
+        expression: &AstExpr,
+        active_functions: &mut BTreeSet<String>,
+        caller_bindings: &dyn StaticBindingLookup,
+    ) -> Option<Type> {
+        let (function, pipe_input, arguments) = match &expression.kind {
+            AstExprKind::Call { function, args, .. } => (function.as_str(), None, args.as_slice()),
+            AstExprKind::Pipe {
+                input, op, args, ..
+            } => (
+                op.as_str(),
+                Some(expression.linked_input.unwrap_or(*input)),
+                args.as_slice(),
+            ),
+            _ => return None,
+        };
+        let parameters = self.function_args_by_name.get(function)?;
+        let statement = self.function_statements.get(function).copied()?;
+        if !active_functions.insert(function.to_owned()) {
+            return None;
+        }
+        let mut bindings = self.user_function_static_bindings(function);
+        for parameter in parameters
+            .iter()
+            .filter(|parameter| parameter.kind == AstParameterKind::Value)
+        {
+            let Some(argument) =
+                function_call_argument_expr(parameters, &parameter.name, pipe_input, arguments)
+            else {
+                active_functions.remove(function);
+                return None;
+            };
+            let Some(argument_type) = self.static_expr_type_for_pipeline_expr(
+                argument,
+                active_functions,
+                caller_bindings,
+            ) else {
+                active_functions.remove(function);
+                return None;
+            };
+            bindings.insert(parameter.name.clone(), argument_type);
+        }
+        let result =
+            self.function_body_return_type_with_bindings(statement, active_functions, &bindings);
+        active_functions.remove(function);
+        result
+    }
+
+    fn static_when_type_with_bindings(
+        &self,
+        expression: usize,
+        active_functions: &mut BTreeSet<String>,
+        bindings: &dyn StaticBindingLookup,
+    ) -> Option<Type> {
+        let checked = self.program.expressions.get(expression)?;
+        let input = match &checked.kind {
+            AstExprKind::When { input, .. } => *input,
+            AstExprKind::Pipe { input, op, .. } if op == "WHILE" => *input,
+            _ => return None,
+        };
+        let selector = self
+            .program
+            .expressions
+            .get(checked.linked_input.unwrap_or(input))?;
+        let selector_path = pattern_selector_path(Some(selector));
+        let selector_type =
+            self.static_expr_type_for_pipeline_expr(selector.id, active_functions, bindings);
+        let reachable = reachable_static_when_arms(
+            expression,
+            &self.program.expressions,
+            selector_type.as_ref(),
+        );
+        let mut result = None;
+        for arm in reachable {
+            let narrowed = arm
+                .selector_type
+                .as_ref()
+                .and_then(|selector_type| narrowed_pattern_binding(selector_type, &arm.pattern))
+                .or_else(|| arm.catch_all.then(|| arm.selector_type.clone()).flatten())
+                .or_else(|| {
+                    selector_type.as_ref().and_then(|selector_type| {
+                        narrowed_pattern_binding(selector_type, &arm.pattern)
+                    })
+                });
+            let mut arm_bindings = StaticBindingOverlay::new(bindings);
+            if let (Some(path), Some(narrowed)) = (&selector_path, narrowed) {
+                arm_bindings.insert(path.clone(), narrowed.clone());
+                if let Some(name) = path.rsplit('.').next() {
+                    arm_bindings.insert(name.to_owned(), narrowed);
+                }
+            }
+            let arm_type = self.static_expr_type_for_pipeline_expr(
+                arm.output,
+                active_functions,
+                &arm_bindings,
+            )?;
+            if matches!(arm_type, Type::Absent) {
+                continue;
+            }
+            result = Some(match result {
+                Some(existing) => widen_structural_type(&existing, &arm_type),
+                None => arm_type,
+            });
+        }
+        result
     }
 
     fn static_block_return_type(
@@ -26501,6 +26624,113 @@ fn merge_forwarded_parameter_type(caller: &Type, required: &Type) -> Type {
             Type::List(Box::new(merge_forwarded_parameter_type(caller, required)))
         }
         _ => merge_canonical_row_type(caller, required),
+    }
+}
+
+pub fn specialize_checked_call_result(instantiated: &Type, occurrence: &Type) -> Type {
+    if is_value_placeholder_type(occurrence) {
+        return instantiated.clone();
+    }
+    if is_value_placeholder_type(instantiated) {
+        return occurrence.clone();
+    }
+    match (instantiated, occurrence) {
+        (Type::List(instantiated), Type::List(occurrence)) => Type::List(Box::new(
+            specialize_checked_call_result(instantiated, occurrence),
+        )),
+        (
+            Type::Map {
+                key: instantiated_key,
+                value: instantiated_value,
+            },
+            Type::Map {
+                key: occurrence_key,
+                value: occurrence_value,
+            },
+        ) => Type::Map {
+            key: Box::new(specialize_checked_call_result(
+                instantiated_key,
+                occurrence_key,
+            )),
+            value: Box::new(specialize_checked_call_result(
+                instantiated_value,
+                occurrence_value,
+            )),
+        },
+        (Type::Set(instantiated), Type::Set(occurrence)) => Type::Set(Box::new(
+            specialize_checked_call_result(instantiated, occurrence),
+        )),
+        (Type::Object(instantiated), Type::Object(occurrence)) => {
+            let mut fields = instantiated.fields.clone();
+            for (name, occurrence_type) in occurrence.ordered_fields() {
+                fields
+                    .entry(name.clone())
+                    .and_modify(|instantiated_type| {
+                        *instantiated_type =
+                            specialize_checked_call_result(instantiated_type, occurrence_type);
+                    })
+                    .or_insert_with(|| occurrence_type.clone());
+            }
+            Type::Object(ObjectShape {
+                fields,
+                field_order: object_field_order_for_widened_shapes(instantiated, occurrence),
+                // These are two descriptions of the same concrete
+                // occurrence. Either side proving the record complete closes
+                // it; unlike requirement widening, openness is not additive.
+                open: instantiated.open && occurrence.open,
+            })
+        }
+        (Type::VariantSet(instantiated), Type::VariantSet(occurrence)) => {
+            let mut variants = instantiated.clone();
+            for occurrence_variant in occurrence {
+                let Variant::Tagged {
+                    tag,
+                    fields: occurrence_fields,
+                } = occurrence_variant
+                else {
+                    if !variants.contains(occurrence_variant) {
+                        variants.push(occurrence_variant.clone());
+                    }
+                    continue;
+                };
+                let Some(existing) = variants.iter_mut().find(
+                    |variant| matches!(variant, Variant::Tagged { tag: candidate, .. } if candidate == tag),
+                ) else {
+                    variants.push(occurrence_variant.clone());
+                    continue;
+                };
+                let Variant::Tagged {
+                    fields: instantiated_fields,
+                    ..
+                } = existing
+                else {
+                    unreachable!("tagged occurrence matched a tagged variant")
+                };
+                let Type::Object(specialized) = specialize_checked_call_result(
+                    &Type::Object(instantiated_fields.clone()),
+                    &Type::Object(occurrence_fields.clone()),
+                ) else {
+                    unreachable!("tagged payload specialization is an object")
+                };
+                *instantiated_fields = specialized;
+            }
+            variants.sort_by_key(variant_sort_key);
+            Type::VariantSet(variants)
+        }
+        (Type::Union(instantiated), Type::Union(occurrence))
+            if instantiated.len() == occurrence.len() =>
+        {
+            Type::Union(
+                instantiated
+                    .iter()
+                    .zip(occurrence)
+                    .map(|(instantiated, occurrence)| {
+                        specialize_checked_call_result(instantiated, occurrence)
+                    })
+                    .collect(),
+            )
+        }
+        (_, occurrence) => occurrence.clone(),
     }
 }
 

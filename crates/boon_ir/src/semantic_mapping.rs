@@ -8211,9 +8211,13 @@ fn runtime_type_matches_scheme(
                     && matches(&actual_result.ty, &scheme_result.ty, bindings)
             }
             (boon_typecheck::Type::Object(actual), boon_typecheck::Type::Object(scheme)) => {
-                actual.open == scheme.open
-                    && actual.field_order == scheme.field_order
-                    && actual.fields.len() == scheme.fields.len()
+                // Checked calls retain their syntax-wide structural contract,
+                // while each semantic call instance carries the exact
+                // occurrence flow. A concrete occurrence may close an open
+                // row or add fields proven by that occurrence, but it may not
+                // discard or widen any field required by the checked contract.
+                (!actual.open || scheme.open)
+                    && actual.fields.len() >= scheme.fields.len()
                     && scheme.fields.iter().all(|(name, scheme)| {
                         actual
                             .fields
@@ -8226,33 +8230,40 @@ fn runtime_type_matches_scheme(
                 boon_typecheck::Type::VariantSet(scheme),
             ) => {
                 actual.len() == scheme.len()
-                    && actual
-                        .iter()
-                        .zip(scheme)
-                        .all(|(actual, scheme)| match (actual, scheme) {
-                            (
-                                boon_typecheck::Variant::Tag(actual),
-                                boon_typecheck::Variant::Tag(scheme),
-                            ) => actual == scheme,
-                            (
-                                boon_typecheck::Variant::Tagged {
-                                    tag: actual_tag,
-                                    fields: actual,
-                                },
-                                boon_typecheck::Variant::Tagged {
-                                    tag: scheme_tag,
-                                    fields: scheme,
-                                },
-                            ) => {
-                                actual_tag == scheme_tag
-                                    && matches(
-                                        &boon_typecheck::Type::Object(actual.clone()),
-                                        &boon_typecheck::Type::Object(scheme.clone()),
-                                        bindings,
-                                    )
-                            }
-                            _ => false,
-                        })
+                    && scheme.iter().all(|scheme_variant| match scheme_variant {
+                        boon_typecheck::Variant::Tag(scheme_tag) => {
+                            actual.iter().any(|actual_variant| {
+                                matches!(
+                                    actual_variant,
+                                    boon_typecheck::Variant::Tag(actual_tag)
+                                        if actual_tag == scheme_tag
+                                )
+                            })
+                        }
+                        boon_typecheck::Variant::Tagged {
+                            tag: scheme_tag,
+                            fields: scheme_fields,
+                        } => {
+                            let Some(boon_typecheck::Variant::Tagged {
+                                fields: actual_fields,
+                                ..
+                            }) = actual.iter().find(|actual_variant| {
+                                matches!(
+                                    actual_variant,
+                                    boon_typecheck::Variant::Tagged { tag, .. }
+                                        if tag == scheme_tag
+                                )
+                            })
+                            else {
+                                return false;
+                            };
+                            matches(
+                                &boon_typecheck::Type::Object(actual_fields.clone()),
+                                &boon_typecheck::Type::Object(scheme_fields.clone()),
+                                bindings,
+                            )
+                        }
+                    })
             }
             (boon_typecheck::Type::Union(actual), boon_typecheck::Type::Union(scheme)) => {
                 actual.len() == scheme.len()

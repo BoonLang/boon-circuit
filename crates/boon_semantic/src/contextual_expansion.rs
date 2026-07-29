@@ -2058,14 +2058,17 @@ pub(crate) fn derive_semantic_execution_graph(
                 && (matches!(expression.kind, SemanticExpressionKind::Source { .. })
                     || expression.effect.emits_source)
         }) {
-            let origin = arena
+            let _origin = arena
                 .checked_expression_origins
                 .get(expression.id.as_usize())
                 .filter(|origin| origin.expression == expression.id)
                 .ok_or(ExpansionError::MissingExpression(
                     expression.checked_expr_id,
                 ))?;
-            let key = (checked_source.id, expression.owner, origin.call_instance);
+            // A checked resource plus its structural owner is the executable
+            // identity. Transparent wrapper frames are debug provenance only
+            // and must not split one owned SOURCE into multiple resources.
+            let key = (checked_source.id, expression.owner, None);
             candidates_by_instance
                 .entry(key)
                 .or_insert_with(Vec::new)
@@ -2177,14 +2180,16 @@ pub(crate) fn derive_semantic_execution_graph(
                     SemanticExpressionKind::Hold { .. } | SemanticExpressionKind::Latest { .. }
                 ) || expression.effect.writes_state)
         }) {
-            let origin = arena
+            let _origin = arena
                 .checked_expression_origins
                 .get(expression.id.as_usize())
                 .filter(|origin| origin.expression == expression.id)
                 .ok_or(ExpansionError::MissingExpression(
                     expression.checked_expr_id,
                 ))?;
-            let key = (checked_state.id, expression.owner, origin.call_instance);
+            // Stateful wrapper depth does not participate in runtime identity;
+            // distinct call sites already have distinct structural owners.
+            let key = (checked_state.id, expression.owner, None);
             candidates_by_instance
                 .entry(key)
                 .or_insert_with(Vec::new)
@@ -3003,25 +3008,17 @@ fn remap_checked_resource_ids(
         .iter()
         .map(|state| (provisional_semantic_state_id(state.id), state.id))
         .collect::<BTreeMap<_, _>>();
-    let source_instance = |checked, owner, frame| {
-        [(owner, frame), (None, frame), (None, None)]
-            .into_iter()
-            .find_map(|(candidate_owner, candidate_frame)| {
-                semantic_sources
-                    .get(&(checked, candidate_owner, candidate_frame))
-                    .copied()
-                    .map(|source| (source, candidate_owner))
-            })
+    let source_instance = |checked, owner| {
+        semantic_sources
+            .get(&(checked, owner, None))
+            .copied()
+            .map(|source| (source, owner))
     };
-    let state_instance = |checked, owner, frame| {
-        [(owner, frame), (None, frame), (None, None)]
-            .into_iter()
-            .find_map(|(candidate_owner, candidate_frame)| {
-                semantic_states
-                    .get(&(checked, candidate_owner, candidate_frame))
-                    .copied()
-                    .map(|state| (state, candidate_owner))
-            })
+    let state_instance = |checked, owner| {
+        semantic_states
+            .get(&(checked, owner, None))
+            .copied()
+            .map(|state| (state, owner))
     };
 
     if origins.len() != expressions.len() {
@@ -3052,10 +3049,22 @@ fn remap_checked_resource_ids(
                         ))
                     })?;
                     let (resolved, resolved_owner) =
-                        source_instance(checked, *owner, frame).ok_or_else(|| {
+                        source_instance(checked, *owner).ok_or_else(|| {
+                            let available = semantic_sources
+                                .iter()
+                                .filter_map(
+                                    |((candidate, candidate_owner, candidate_frame), source)| {
+                                        (*candidate == checked).then_some((
+                                            *candidate_owner,
+                                            *candidate_frame,
+                                            *source,
+                                        ))
+                                    },
+                                )
+                                .collect::<Vec<_>>();
                             ExpansionError::InvalidLocalBindings(format!(
-                                "expression {} has no semantic source instance for checked source {:?} and owner {:?}",
-                                expression.id, checked, owner
+                                "expression {} has no semantic source instance for checked source {:?}, owner {:?}, frame {:?}; available instances: {available:?}",
+                                expression.id, checked, owner, frame
                             ))
                         })?;
                     *source = resolved;
@@ -3069,10 +3078,22 @@ fn remap_checked_resource_ids(
                         ))
                     })?;
                     let (resolved, resolved_owner) =
-                        state_instance(checked, *owner, frame).ok_or_else(|| {
+                        state_instance(checked, *owner).ok_or_else(|| {
+                            let available = semantic_states
+                                .iter()
+                                .filter_map(
+                                    |((candidate, candidate_owner, candidate_frame), state)| {
+                                        (*candidate == checked).then_some((
+                                            *candidate_owner,
+                                            *candidate_frame,
+                                            *state,
+                                        ))
+                                    },
+                                )
+                                .collect::<Vec<_>>();
                             ExpansionError::InvalidLocalBindings(format!(
-                                "expression {} has no semantic state instance for checked state {:?} and owner {:?}",
-                                expression.id, checked, owner
+                                "expression {} has no semantic state instance for checked state {:?}, owner {:?}, frame {:?}; available instances: {available:?}",
+                                expression.id, checked, owner, frame
                             ))
                         })?;
                     *state = resolved;
@@ -3097,8 +3118,9 @@ fn remap_checked_resource_ids(
                         expression.id, source.source
                     ))
                 })?;
-            source.source = source_instance(checked, expression.owner, frame)
-                .map(|(source, _)| source)
+            source.source = [expression.owner, None]
+                .into_iter()
+                .find_map(|owner| source_instance(checked, owner).map(|(source, _)| source))
                 .ok_or_else(|| {
                     let available = semantic_sources
                         .iter()
@@ -5087,6 +5109,9 @@ impl<'a> SemanticExpressionBuilder<'a> {
                 .result_expression
                 .ok_or(ExpansionError::MissingFunctionResult(callable.decl_id))?;
             let call_owner = self.out_net.owner_for_call(instance).or(owner);
+            let concrete_result = self.out_net.call_instances[instance.as_usize()]
+                .result
+                .clone();
             let result = self.expand_with_inherited_owner(
                 ScopedCheckedExpr {
                     expression: result,
@@ -5096,6 +5121,11 @@ impl<'a> SemanticExpressionBuilder<'a> {
                 },
                 call_owner,
             )?;
+            // User calls erase their wrapper expression, so the expanded body
+            // is the call occurrence. Give that occurrence the checked,
+            // call-local result instead of leaving the callable's open
+            // structural scheme on the shared body syntax.
+            self.expressions[result.as_usize()].flow_type = concrete_result.clone();
             let result_expression = callable
                 .result_expression
                 .ok_or(ExpansionError::MissingFunctionResult(callable.decl_id))?;
@@ -5105,7 +5135,7 @@ impl<'a> SemanticExpressionBuilder<'a> {
                 boundary_expression,
                 result,
                 call_owner,
-                Some(callable.result.clone()),
+                Some(concrete_result),
             );
         }
         if !matches!(checked_call.context_binding, CheckedContextBinding::None) {

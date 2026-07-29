@@ -1982,7 +1982,8 @@ impl SemanticExecutionGraphV1 {
                     || expression_definition.flow_type != expected_flow_type
                 {
                     return Err(format!(
-                        "expression {expression} call contract differs from semantic call {call}"
+                        "expression {expression} call contract differs from semantic call {call}: expression result {result:?}, call result {:?}, expression flow {:?}, resolved instance flow {expected_flow_type:?}",
+                        call_definition.result, expression_definition.flow_type,
                     ));
                 }
                 if resolved_instance.provenance.call_id != Some(call_definition.checked_call)

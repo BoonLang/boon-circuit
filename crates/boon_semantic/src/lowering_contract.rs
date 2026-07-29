@@ -1861,12 +1861,22 @@ fn exact_visual_contract_known(
                 || call_definition.function != *function
                 || callable_definition.name != *name
                 || call_definition.result != *result
-                || callable_definition.result != *result
                 || call_definition.checked_expression != expression.checked_expr_id
                 || !exact_formals
             {
                 return Err(SemanticLoweringContractError::new(format!(
-                    "visual constructor expression {expression_id} lacks exact builtin callable/formal identity"
+                    "visual constructor expression {expression_id} lacks exact builtin callable/formal identity: \
+                     callable kind={callable_kind:?}/{:?}, call callable={}/{callable}, \
+                     function={:?}/{function:?}, name={:?}/{name:?}, \
+                     call result={:?}/{result:?}, \
+                     checked expression={:?}/{:?}, exact formals={exact_formals}",
+                    callable_definition.kind,
+                    call_definition.callable,
+                    call_definition.function,
+                    callable_definition.name,
+                    call_definition.result,
+                    call_definition.checked_expression,
+                    expression.checked_expr_id,
                 )));
             }
             if resolved_visual_type(&result.ty) {

@@ -1306,7 +1306,7 @@ document: Document/new(
         binding.node_kind == "Button"
             && binding.attr == "press"
             && binding.target == ViewBindingTarget::Source { source: remove.id }
-    }));
+    }), "{:#?}", ir.view_bindings);
 }
 
 #[test]

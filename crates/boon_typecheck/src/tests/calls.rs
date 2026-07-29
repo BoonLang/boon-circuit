@@ -4399,6 +4399,63 @@ tasks:
 }
 
 #[test]
+fn conditional_generic_row_helpers_specialize_to_closed_map_items() {
+    let parsed = boon_parser::parse_source(
+        "conditional-generic-row-helpers.bn",
+        r#"
+store: [
+    seed: LIST { [key: TEXT { one }, kind: Selectable] }
+    rows:
+        seed |> List/map(item, new: wrapped_row(row: item))
+]
+
+FUNCTION wrapped_row(row) {
+    row.kind |> WHEN {
+        Selectable => selectable_row(row: row)
+        __ => row
+    }
+}
+
+FUNCTION selectable_row(row) {
+    [
+        key: row.key
+        kind: Selectable
+        controls: [remove: SOURCE]
+        selected: True
+    ]
+}
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+    assert!(
+        !output.report.has_errors(),
+        "diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+    let program = output.program.expect("conditional row helpers are checked");
+    let rows = program
+        .declarations
+        .iter()
+        .find(|declaration| declaration.name == "rows")
+        .expect("rows declaration");
+    let Type::List(item) = &rows.flow_type.ty else {
+        panic!(
+            "rows is not a list: {:?}; calls={:#?}",
+            rows.flow_type, program.calls
+        );
+    };
+    let Type::Object(item) = item.as_ref() else {
+        panic!("rows item is not an object: {item:?}");
+    };
+    assert!(
+        !item.open,
+        "concrete map item remained open: {item:#?}; calls={:#?}",
+        program.calls
+    );
+}
+
+#[test]
 fn static_when_specialization_visits_only_reachable_ordered_variant_arms() {
     let parsed = boon_parser::parse_source(
         "static-when-reachability.bn",

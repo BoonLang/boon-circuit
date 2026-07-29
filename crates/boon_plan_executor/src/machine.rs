@@ -17358,6 +17358,18 @@ impl MachineInstance {
                 batch.id.0
             )));
         }
+        let mutations = self
+            .metadata
+            .mutations_by_pulse
+            .get(&batch.id)
+            .cloned()
+            .unwrap_or_default();
+        if mutations.iter().map(|op| op.id).collect::<Vec<_>>() != batch.list_mutation_ops {
+            return Err(Error::InvalidPlan(format!(
+                "verified fused pulse batch {} changed its preserved list-mutation inventory",
+                batch.id.0
+            )));
+        }
 
         for _ in 0..count {
             work.consume(1)?;
@@ -17379,6 +17391,8 @@ impl MachineInstance {
                     )));
                 }
             };
+            let pending_mutation_start = work.pending_list_mutations.len();
+            self.stage_mutation_batch(&mutations, trigger.source_event, trigger, work)?;
             let changed = self.commit_pulse_state_updates(candidates, work)?;
             if changed
                 .iter()
@@ -17390,6 +17404,28 @@ impl MachineInstance {
             {
                 return Err(Error::InvalidPlan(format!(
                     "verified fused pulse batch {} escaped its recurrence state",
+                    batch.id.0
+                )));
+            }
+            if work
+                .flushed_state_candidates
+                .contains_key(&(state, trigger.active.target))
+                || work.flushed_state_candidates.contains_key(&(state, None))
+            {
+                work.pending_list_mutations.truncate(pending_mutation_start);
+                return Err(Error::InvalidPlan(format!(
+                    "verified fused pulse batch {} reached FLUSH before its list-mutation commit",
+                    batch.id.0
+                )));
+            }
+            self.commit_pending_list_mutations(work)?;
+            if work
+                .flushed_state_candidates
+                .contains_key(&(state, trigger.active.target))
+                || work.flushed_state_candidates.contains_key(&(state, None))
+            {
+                return Err(Error::InvalidPlan(format!(
+                    "verified fused pulse batch {} reached FLUSH during its list-mutation commit",
                     batch.id.0
                 )));
             }

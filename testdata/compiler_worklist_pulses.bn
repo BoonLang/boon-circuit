@@ -1,6 +1,6 @@
 store: [
     run: SOURCE
-    worklist: LIST[9] {
+    worklist: LIST[17] {
         [value: 1]
     }
     result:

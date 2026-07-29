@@ -16,7 +16,7 @@ pub use boon_document_model::{
 pub use document::*;
 pub use host::*;
 
-pub const PLAN_MAJOR_VERSION: u32 = 8;
+pub const PLAN_MAJOR_VERSION: u32 = 9;
 pub const PLAN_MINOR_VERSION: u32 = 0;
 pub const PERSISTENCE_FORMAT_VERSION: u32 = 5;
 pub const DEFAULT_PERSISTENCE_SCHEMA_VERSION: u64 = 1;
@@ -5586,7 +5586,8 @@ pub enum PlanPulseFusionEligibility {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanPulseFusionProof {
-    FrozenTargetBoundedFullTraceEmptySideLanes,
+    FrozenRuntimeTargetGuardedFullTraceEmptySideLanes,
+    FrozenRuntimeTargetGuardedFullTracePreservedListMutations,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -12975,12 +12976,19 @@ fn pulse_execution_contract_failure(plan: &MachinePlan) -> Option<String> {
                         batch.id.0
                     ));
                 };
-                if *proof != PlanPulseFusionProof::FrozenTargetBoundedFullTraceEmptySideLanes
+                let proof_matches_inventory = match proof {
+                    PlanPulseFusionProof::FrozenRuntimeTargetGuardedFullTraceEmptySideLanes => {
+                        batch.list_mutation_ops.is_empty()
+                    }
+                    PlanPulseFusionProof::FrozenRuntimeTargetGuardedFullTracePreservedListMutations => {
+                        !batch.list_mutation_ops.is_empty()
+                    }
+                };
+                if !proof_matches_inventory
                     || activation.is_none_or(|activation| {
                         activation.id != activation_id || !activation.states.contains(&state)
                     })
                     || batch.state_update_ops.as_slice() != [*state_update_op]
-                    || !batch.list_mutation_ops.is_empty()
                 {
                     return Some(format!(
                         "pulse batch {} verified fusion changed its recurrence inventory",

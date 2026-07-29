@@ -294,6 +294,12 @@ pub enum VerifiedPulseFusionStatusV1 {
 
 /// Exact semantic identities and proof policies admitted by the current
 /// activation-local recurrence optimization.
+///
+/// The verifier binds the frozen count expression and the semantic slice.
+/// The concrete count is checked against the selected target profile by the
+/// executor before it initializes activation state or commits a microturn.
+/// A verified list-mutation lane is preserved in full; only routing from the
+/// otherwise-unobserved recurrence state may be elided.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct VerifiedPulseFusionFactV1 {
     pub activation: SemanticActivationId,
@@ -307,19 +313,20 @@ pub struct VerifiedPulseFusionFactV1 {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VerifiedPulseFusionCountPolicyV1 {
-    FrozenAndTargetBoundedBeforeFirstMicroturn,
+    FrozenAndRuntimeTargetGuardedBeforeFirstMicroturn,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VerifiedPulseFusionTracePolicyV1 {
     PreserveCommittedStateDeltasAndEmissionRoutes,
+    PreserveCommittedStateAndListDeltasAndEmissionRoutes,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VerifiedPulseFusionElisionPolicyV1 {
-    UnobservedRecurrenceStateAndEmptySideLanes,
+    ElideOnlyUnobservedRecurrenceStateRouting,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -328,7 +335,6 @@ pub enum PulseFusionIneligibilityV1 {
     NoActivationLocalState,
     StateUpdateCardinality,
     StateUpdateTargetMismatch,
-    ListMutation,
     HostEffect,
     Flush,
     StateHasReactiveObservers,
@@ -348,7 +354,6 @@ impl PulseFusionIneligibilityV1 {
             Self::StateUpdateTargetMismatch => {
                 "pulse recurrence update does not target its activation-local state"
             }
-            Self::ListMutation => "pulse microturn mutates list authority",
             Self::HostEffect => "pulse microturn schedules a host effect",
             Self::Flush => "pulse microturn may execute FLUSH",
             Self::StateHasReactiveObservers => {
@@ -902,11 +907,12 @@ fn verify_semantic_program(
     Ok(verification_manifest)
 }
 
-/// Prove the narrow full-trace fusion class without recognizing source names.
+/// Prove the narrow full-trace fusion classes without recognizing source names.
 ///
 /// The executor still evaluates and commits every microturn and publishes its
-/// semantic deltas/emission routes. The fact authorizes only elimination of
-/// recurrence-state routing and side lanes proven empty.
+/// semantic state/list deltas and emission routes. The fact authorizes only
+/// elimination of recurrence-state routing; host effects, FLUSH, distributed
+/// invocations, and foreign recurrence-state observers remain ineligible.
 fn derive_pulse_fusion_decisions(
     semantic_program: &SemanticProgram,
 ) -> Result<Vec<VerifiedPulseFusionDecisionV1>, VerifyError> {
@@ -958,9 +964,6 @@ fn derive_pulse_fusion_decisions(
                 reasons.insert(PulseFusionIneligibilityV1::StateUpdateTargetMismatch);
             }
 
-            if !batch.list_mutations.is_empty() {
-                reasons.insert(PulseFusionIneligibilityV1::ListMutation);
-            }
             if !batch.host_effect_schedules.is_empty() {
                 reasons.insert(PulseFusionIneligibilityV1::HostEffect);
             }
@@ -1015,6 +1018,19 @@ fn derive_pulse_fusion_decisions(
                     })?;
                 accounted_arms.insert(update.trigger);
             }
+            for mutation_id in &batch.list_mutations {
+                let mutation = graph
+                    .list_mutations
+                    .get(mutation_id.as_usize())
+                    .filter(|mutation| mutation.id == *mutation_id)
+                    .ok_or_else(|| {
+                        VerifyError::new(format!(
+                            "pulse batch {} references missing list mutation {}",
+                            batch.id, mutation_id
+                        ))
+                    })?;
+                accounted_arms.insert(exact_list_mutation_trigger(graph, mutation)?.id);
+            }
             for derived_id in &batch.derived_values {
                 let derived = graph
                     .derived_values
@@ -1041,11 +1057,14 @@ fn derive_pulse_fusion_decisions(
                         state,
                         state_update_arm,
                         count_policy:
-                            VerifiedPulseFusionCountPolicyV1::FrozenAndTargetBoundedBeforeFirstMicroturn,
-                        trace_policy:
-                            VerifiedPulseFusionTracePolicyV1::PreserveCommittedStateDeltasAndEmissionRoutes,
+                            VerifiedPulseFusionCountPolicyV1::FrozenAndRuntimeTargetGuardedBeforeFirstMicroturn,
+                        trace_policy: if batch.list_mutations.is_empty() {
+                            VerifiedPulseFusionTracePolicyV1::PreserveCommittedStateDeltasAndEmissionRoutes
+                        } else {
+                            VerifiedPulseFusionTracePolicyV1::PreserveCommittedStateAndListDeltasAndEmissionRoutes
+                        },
                         elision_policy:
-                            VerifiedPulseFusionElisionPolicyV1::UnobservedRecurrenceStateAndEmptySideLanes,
+                            VerifiedPulseFusionElisionPolicyV1::ElideOnlyUnobservedRecurrenceStateRouting,
                     },
                 }
             } else {
@@ -1060,6 +1079,49 @@ fn derive_pulse_fusion_decisions(
             })
         })
         .collect()
+}
+
+fn exact_list_mutation_trigger<'a>(
+    graph: &'a boon_semantic::SemanticReactiveGraphV1,
+    mutation: &boon_semantic::SemanticListMutationV1,
+) -> Result<&'a boon_semantic::SemanticTriggerOwnedArmV1, VerifyError> {
+    let (gate, gate_value, output, output_value) = match mutation.kind {
+        boon_semantic::SemanticListMutationKindV1::Append {
+            gate,
+            gate_value,
+            item,
+            item_value,
+        } => (gate, gate_value, item, item_value),
+        boon_semantic::SemanticListMutationKindV1::Remove {
+            gate,
+            gate_value,
+            predicate,
+            predicate_value,
+            ..
+        } => (gate, gate_value, predicate, predicate_value),
+    };
+    let matches = graph
+        .trigger_arms
+        .iter()
+        .filter(|trigger| {
+            trigger.cause == mutation.cause
+                && trigger.gate_expression == gate
+                && trigger.gate_value == gate_value
+                && trigger.owner == mutation.owner
+                && trigger.route_scope == mutation.route_scope
+                && trigger.row_scope == mutation.row_scope
+                && trigger.output_expression == output
+                && trigger.output_value == output_value
+        })
+        .collect::<Vec<_>>();
+    let [trigger] = matches.as_slice() else {
+        return Err(VerifyError::new(format!(
+            "pulse list mutation {} resolves to {} exact trigger arms",
+            mutation.id,
+            matches.len()
+        )));
+    };
+    Ok(*trigger)
 }
 
 fn validate_pulse_fusion_decisions(
@@ -1540,7 +1602,7 @@ FUNCTION fibonacci(position) {
         };
         assert_eq!(
             fact.count_policy,
-            VerifiedPulseFusionCountPolicyV1::FrozenAndTargetBoundedBeforeFirstMicroturn
+            VerifiedPulseFusionCountPolicyV1::FrozenAndRuntimeTargetGuardedBeforeFirstMicroturn
         );
         assert_eq!(
             fact.trace_policy,
@@ -1548,7 +1610,7 @@ FUNCTION fibonacci(position) {
         );
         assert_eq!(
             fact.elision_policy,
-            VerifiedPulseFusionElisionPolicyV1::UnobservedRecurrenceStateAndEmptySideLanes
+            VerifiedPulseFusionElisionPolicyV1::ElideOnlyUnobservedRecurrenceStateRouting
         );
         let encoded = serde_json::to_vec(&manifest).unwrap();
         let decoded: VerificationManifestV1 = serde_json::from_slice(&encoded).unwrap();

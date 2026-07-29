@@ -289,7 +289,7 @@ fn canonical_fibonacci_pulses_cross_the_verified_ir_spine() {
             activation,
             state,
             state_update_arm_index: 0,
-            proof: boon_ir::PulseFusionProof::FrozenTargetBoundedFullTraceEmptySideLanes,
+            proof: boon_ir::PulseFusionProof::FrozenRuntimeTargetGuardedFullTraceEmptySideLanes,
         } if *activation == batch.enclosing_activation.unwrap()
             && *state == batch.state.unwrap()
     ));
@@ -363,7 +363,8 @@ fn canonical_fibonacci_pulses_lower_into_a_verified_machine_plan() {
         &batch.fusion,
         boon_plan::PlanPulseFusionEligibility::VerifiedActivationLocalRecurrence {
             state_update_op,
-            proof: boon_plan::PlanPulseFusionProof::FrozenTargetBoundedFullTraceEmptySideLanes,
+            proof:
+                boon_plan::PlanPulseFusionProof::FrozenRuntimeTargetGuardedFullTraceEmptySideLanes,
         } if *state_update_op == batch.state_update_ops[0]
     ));
     let verification = boon_plan::verify_plan(plan).expect("verified plan report");
@@ -399,7 +400,8 @@ fn verified_pulse_fusion_is_explicit_on_every_bounded_target_profile() {
         assert!(matches!(
             &batch.fusion,
             boon_plan::PlanPulseFusionEligibility::VerifiedActivationLocalRecurrence {
-                proof: boon_plan::PlanPulseFusionProof::FrozenTargetBoundedFullTraceEmptySideLanes,
+                proof:
+                    boon_plan::PlanPulseFusionProof::FrozenRuntimeTargetGuardedFullTraceEmptySideLanes,
                 ..
             }
         ));
@@ -467,6 +469,101 @@ fn source_fibonacci_pulse_activation_has_distinct_start_and_emission_causes() {
 }
 
 #[test]
+fn compiler_worklist_carries_a_verified_preserved_list_mutation_lane() {
+    let source = include_str!("../../../testdata/compiler_worklist_pulses.bn");
+    let parsed =
+        boon_parser::parse_source("compiler-worklist-pulses.bn", source).expect("parsed worklist");
+    let checked = boon_typecheck::check_program(&parsed);
+    assert!(
+        !checked.report.has_errors(),
+        "diagnostics: {:#?}",
+        checked.report.diagnostics
+    );
+    let semantic = boon_semantic::elaborate(checked.program.expect("checked worklist"), &[])
+        .expect("semantic worklist");
+    let verified =
+        boon_verify::verify_explicit_contracts(semantic).expect("verified compiler worklist");
+    let [decision] = verified
+        .verification_manifest()
+        .pulse_fusion_decisions
+        .as_slice()
+    else {
+        panic!("compiler worklist must have one fusion decision");
+    };
+    let boon_verify::VerifiedPulseFusionStatusV1::Eligible { fact } = &decision.status else {
+        panic!("compiler worklist list lane must be verifier-eligible");
+    };
+    assert_eq!(
+        fact.count_policy,
+        boon_verify::VerifiedPulseFusionCountPolicyV1::FrozenAndRuntimeTargetGuardedBeforeFirstMicroturn
+    );
+    assert_eq!(
+        fact.trace_policy,
+        boon_verify::VerifiedPulseFusionTracePolicyV1::PreserveCommittedStateAndListDeltasAndEmissionRoutes
+    );
+    assert_eq!(
+        fact.elision_policy,
+        boon_verify::VerifiedPulseFusionElisionPolicyV1::ElideOnlyUnobservedRecurrenceStateRouting
+    );
+
+    let ir = boon_ir::erase_and_lower(verified).expect("erased compiler worklist");
+    let [batch] = ir.pulse_batches() else {
+        panic!("compiler worklist must lower one pulse batch");
+    };
+    assert_eq!(batch.list_mutations.len(), 1);
+    assert!(matches!(
+        batch.fusion,
+        boon_ir::PulseFusionEligibility::VerifiedActivationLocalRecurrence {
+            proof:
+                boon_ir::PulseFusionProof::FrozenRuntimeTargetGuardedFullTracePreservedListMutations,
+            ..
+        }
+    ));
+
+    let mut plan = boon_compiler::compile_source_text_to_machine_plan_for_role(
+        "compiler-worklist-pulses.bn",
+        source,
+        boon_plan::TargetProfile::SoftwareBounded,
+        boon_plan::ProgramRole::Server,
+    )
+    .expect("compiled worklist plan")
+    .plan;
+    let [batch] = plan.pulse_batches.as_slice() else {
+        panic!("compiler worklist must compile one pulse batch");
+    };
+    assert_eq!(batch.list_mutation_ops.len(), 1);
+    assert!(matches!(
+        batch.fusion,
+        boon_plan::PlanPulseFusionEligibility::VerifiedActivationLocalRecurrence {
+            proof:
+                boon_plan::PlanPulseFusionProof::FrozenRuntimeTargetGuardedFullTracePreservedListMutations,
+            ..
+        }
+    ));
+    assert_eq!(
+        boon_plan::verify_plan(&plan)
+            .expect("verified worklist plan")
+            .status,
+        "pass"
+    );
+
+    let state_update_op = plan.pulse_batches[0].state_update_ops[0];
+    plan.pulse_batches[0].fusion =
+        boon_plan::PlanPulseFusionEligibility::VerifiedActivationLocalRecurrence {
+            state_update_op,
+            proof:
+                boon_plan::PlanPulseFusionProof::FrozenRuntimeTargetGuardedFullTraceEmptySideLanes,
+        };
+    let forged = boon_plan::verify_plan(&plan).expect("forged plan report");
+    assert_eq!(forged.status, "fail");
+    assert!(forged.checks.iter().any(|check| {
+        check.id == "pulse-execution-contract-canonical-and-resolved"
+            && !check.pass
+            && check.detail.contains("changed its recurrence inventory")
+    }));
+}
+
+#[test]
 fn flush_and_persistent_state_produce_explicit_fusion_rejection_diagnostics() {
     let compiled = boon_compiler::compile_source_text_to_machine_plan_for_role(
         "ineligible-flush-pulses.bn",
@@ -518,7 +615,8 @@ store: [
     forged.pulse_batches[0].fusion =
         boon_plan::PlanPulseFusionEligibility::VerifiedActivationLocalRecurrence {
             state_update_op,
-            proof: boon_plan::PlanPulseFusionProof::FrozenTargetBoundedFullTraceEmptySideLanes,
+            proof:
+                boon_plan::PlanPulseFusionProof::FrozenRuntimeTargetGuardedFullTraceEmptySideLanes,
         };
     let verification = boon_plan::verify_plan(&forged).expect("forged plan verification report");
     assert_eq!(verification.status, "fail");

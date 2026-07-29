@@ -9245,17 +9245,34 @@ fn map_pulse_batches(
             let fusion = match &fusion_decision.status {
                 boon_verify::VerifiedPulseFusionStatusV1::Eligible { fact } => {
                     if fact.count_policy
-                        != boon_verify::VerifiedPulseFusionCountPolicyV1::FrozenAndTargetBoundedBeforeFirstMicroturn
-                        || fact.trace_policy
-                            != boon_verify::VerifiedPulseFusionTracePolicyV1::PreserveCommittedStateDeltasAndEmissionRoutes
+                        != boon_verify::VerifiedPulseFusionCountPolicyV1::FrozenAndRuntimeTargetGuardedBeforeFirstMicroturn
                         || fact.elision_policy
-                            != boon_verify::VerifiedPulseFusionElisionPolicyV1::UnobservedRecurrenceStateAndEmptySideLanes
+                            != boon_verify::VerifiedPulseFusionElisionPolicyV1::ElideOnlyUnobservedRecurrenceStateRouting
                     {
                         return Err(format!(
                             "verified pulse-fusion fact for batch {} uses an unsupported proof policy",
                             batch.id
                         ));
                     }
+                    let proof = match (
+                        fact.trace_policy,
+                        batch.list_mutations.is_empty(),
+                    ) {
+                        (
+                            boon_verify::VerifiedPulseFusionTracePolicyV1::PreserveCommittedStateDeltasAndEmissionRoutes,
+                            true,
+                        ) => crate::PulseFusionProof::FrozenRuntimeTargetGuardedFullTraceEmptySideLanes,
+                        (
+                            boon_verify::VerifiedPulseFusionTracePolicyV1::PreserveCommittedStateAndListDeltasAndEmissionRoutes,
+                            false,
+                        ) => crate::PulseFusionProof::FrozenRuntimeTargetGuardedFullTracePreservedListMutations,
+                        _ => {
+                            return Err(format!(
+                                "verified pulse-fusion fact for batch {} changed its list-mutation trace policy",
+                                batch.id
+                            ));
+                        }
+                    };
                     let activation = crate::ActivationId(fact.activation.as_usize());
                     let state = ids.runtime_state(fact.state)?;
                     if enclosing_activation != Some(activation) || batch.state != Some(fact.state) {
@@ -9298,8 +9315,7 @@ fn map_pulse_batches(
                         activation,
                         state,
                         state_update_arm_index,
-                        proof:
-                            crate::PulseFusionProof::FrozenTargetBoundedFullTraceEmptySideLanes,
+                        proof,
                     }
                 }
                 boon_verify::VerifiedPulseFusionStatusV1::Ineligible { reasons } => {

@@ -15707,7 +15707,7 @@ fn compiler_pass_progress_uses_fused_scheduler_with_baseline_trace_equivalence()
 }
 
 #[test]
-fn compiler_worklist_executes_bounded_pulses_and_keeps_fusion_fail_closed() {
+fn compiler_worklist_preserves_list_mutations_through_verified_pulse_fusion() {
     let compiled = compile_server_source(
         "compiler-worklist-pulses.bn",
         include_str!("../../../testdata/compiler_worklist_pulses.bn"),
@@ -15718,13 +15718,16 @@ fn compiler_worklist_executes_bounded_pulses_and_keeps_fusion_fail_closed() {
         panic!("compiler worklist must own one bounded pulse batch");
     };
     assert_eq!(batch.list_mutation_ops.len(), 1);
-    let PlanPulseFusionEligibility::Ineligible { diagnostics } = &batch.fusion else {
-        panic!("list mutation must keep pulse fusion fail-closed");
-    };
     assert!(
-        diagnostics
-            .iter()
-            .any(|diagnostic| diagnostic.contains("mutates list authority"))
+        matches!(
+            &batch.fusion,
+            PlanPulseFusionEligibility::VerifiedActivationLocalRecurrence {
+                proof:
+                    PlanPulseFusionProof::FrozenRuntimeTargetGuardedFullTracePreservedListMutations,
+                ..
+            }
+        ),
+        "the verified proof must preserve the exact list-mutation lane: {batch:?}"
     );
     assert!(
         matches!(&batch.start, PlanPulseStart::Triggered { .. }),
@@ -15762,8 +15765,34 @@ fn compiler_worklist_executes_bounded_pulses_and_keeps_fusion_fail_closed() {
         })
         .expect("baseline compiler worklist turn");
     assert_same_semantic_turn(&automatic_turn, &baseline_turn);
-    assert_eq!(automatic_turn.metrics.verified_pulse_fusion_batch_count, 0);
+    assert_eq!(automatic_turn.metrics.verified_pulse_fusion_batch_count, 1);
+    assert_eq!(
+        automatic_turn.metrics.verified_pulse_fusion_microturn_count,
+        8
+    );
+    assert_eq!(
+        automatic_turn
+            .metrics
+            .verified_pulse_fusion_scheduler_boundary_elision_count,
+        8
+    );
     assert_eq!(baseline_turn.metrics.verified_pulse_fusion_batch_count, 0);
+    assert_eq!(baseline_turn.metrics.baseline_pulse_batch_count, 1);
+    assert_eq!(baseline_turn.metrics.baseline_pulse_microturn_count, 8);
+    assert_eq!(
+        automatic_turn
+            .authority_deltas
+            .iter()
+            .filter(|delta| {
+                matches!(
+                    delta,
+                    AuthorityDelta::ReplaceList { .. } | AuthorityDelta::InsertRow { .. }
+                )
+            })
+            .count(),
+        8,
+        "verified fusion must publish every worklist append"
+    );
     assert_eq!(
         automatic
             .root_value_current("store.result")
@@ -15774,6 +15803,88 @@ fn compiler_worklist_executes_bounded_pulses_and_keeps_fusion_fail_closed() {
         automatic.root_value_current("store.result").unwrap(),
         baseline.root_value_current("store.result").unwrap()
     );
+    assert_eq!(automatic.snapshot().unwrap(), baseline.snapshot().unwrap());
+    assert_eq!(
+        automatic.authority_snapshot().unwrap(),
+        baseline.authority_snapshot().unwrap()
+    );
+
+    let automatic_second = automatic
+        .apply(SourceEvent {
+            sequence: 2,
+            source,
+            route: route_token(&automatic, source, None),
+            target: None,
+            payload: SourcePayload::default(),
+        })
+        .expect("second fused compiler worklist activation");
+    let baseline_second = baseline
+        .apply(SourceEvent {
+            sequence: 2,
+            source,
+            route: route_token(&baseline, source, None),
+            target: None,
+            payload: SourcePayload::default(),
+        })
+        .expect("second baseline compiler worklist activation");
+    assert_same_semantic_turn(&automatic_second, &baseline_second);
+    assert_eq!(
+        automatic_second
+            .authority_deltas
+            .iter()
+            .filter(|delta| {
+                matches!(
+                    delta,
+                    AuthorityDelta::ReplaceList { .. } | AuthorityDelta::InsertRow { .. }
+                )
+            })
+            .count(),
+        8,
+        "the second activation must preserve another eight ordered appends"
+    );
+    assert_eq!(
+        automatic
+            .root_value_current("store.result")
+            .expect("second compiler worklist result"),
+        number(36),
+        "the recurrence HOLD must restart for each source occurrence"
+    );
+    assert_eq!(automatic.snapshot().unwrap(), baseline.snapshot().unwrap());
+    assert_eq!(
+        automatic.authority_snapshot().unwrap(),
+        baseline.authority_snapshot().unwrap()
+    );
+
+    let automatic_before_capacity_error = automatic.snapshot().unwrap();
+    let baseline_before_capacity_error = baseline.snapshot().unwrap();
+    let automatic_error = automatic
+        .apply(SourceEvent {
+            sequence: 3,
+            source,
+            route: route_token(&automatic, source, None),
+            target: None,
+            payload: SourcePayload::default(),
+        })
+        .expect_err("third fused activation must exceed the exact list capacity");
+    let baseline_error = baseline
+        .apply(SourceEvent {
+            sequence: 3,
+            source,
+            route: route_token(&baseline, source, None),
+            target: None,
+            payload: SourcePayload::default(),
+        })
+        .expect_err("third baseline activation must exceed the exact list capacity");
+    assert_eq!(automatic_error.to_string(), baseline_error.to_string());
+    assert!(
+        automatic_error.to_string().contains("capacity"),
+        "unexpected worklist capacity error: {automatic_error}"
+    );
+    assert_eq!(
+        automatic.snapshot().unwrap(),
+        automatic_before_capacity_error
+    );
+    assert_eq!(baseline.snapshot().unwrap(), baseline_before_capacity_error);
     assert_eq!(automatic.snapshot().unwrap(), baseline.snapshot().unwrap());
     assert_eq!(
         automatic.authority_snapshot().unwrap(),

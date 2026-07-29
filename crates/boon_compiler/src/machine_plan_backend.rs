@@ -5338,12 +5338,6 @@ pub(crate) fn compile_typed_program_with_distributed_context(
                 state_update_arm_index,
                 proof,
             } => {
-                if *proof != ir::PulseFusionProof::FrozenTargetBoundedFullTraceEmptySideLanes {
-                    return Err(PlanError::new(format!(
-                        "pulse batch {} verified fusion fact uses an unsupported proof policy",
-                        batch.id
-                    )));
-                }
                 if batch.enclosing_activation != Some(*activation) || batch.state != Some(*state) {
                     return Err(PlanError::new(format!(
                         "pulse batch {} verified fusion fact changed its activation-local state",
@@ -5367,7 +5361,14 @@ pub(crate) fn compile_typed_program_with_distributed_context(
                 }
                 PlanPulseFusionEligibility::VerifiedActivationLocalRecurrence {
                     state_update_op,
-                    proof: PlanPulseFusionProof::FrozenTargetBoundedFullTraceEmptySideLanes,
+                    proof: match proof {
+                        ir::PulseFusionProof::FrozenRuntimeTargetGuardedFullTraceEmptySideLanes => {
+                            PlanPulseFusionProof::FrozenRuntimeTargetGuardedFullTraceEmptySideLanes
+                        }
+                        ir::PulseFusionProof::FrozenRuntimeTargetGuardedFullTracePreservedListMutations => {
+                            PlanPulseFusionProof::FrozenRuntimeTargetGuardedFullTracePreservedListMutations
+                        }
+                    },
                 }
             }
             ir::PulseFusionEligibility::Ineligible { diagnostics } => {

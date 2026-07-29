@@ -1200,6 +1200,7 @@ pub enum ExecutableExpressionKind {
     Call {
         callable_kind: ExecutableCallableKind,
         name: String,
+        intrinsic: Option<boon_typecheck::CheckedIntrinsicV1>,
         instance: usize,
         arguments: Vec<ExecutableCallArgument>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]

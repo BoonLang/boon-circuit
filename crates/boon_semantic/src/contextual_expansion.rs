@@ -1362,6 +1362,7 @@ fn semantic_call_inventory(
             callable: semantic_callable,
             owner_callable,
             function: call.function.clone(),
+            intrinsic: call.intrinsic,
             external_identity: callable.external_identity,
             entries,
             contexts,
@@ -5223,6 +5224,7 @@ impl<'a> SemanticExpressionBuilder<'a> {
                 callable_kind: kind,
                 name: callable.name.clone(),
                 function: checked_call.function.clone(),
+                intrinsic: checked_call.intrinsic,
                 role: checked_call.role,
                 effect: callable.effect,
                 result: checked_call.result.clone(),
@@ -5553,7 +5555,69 @@ impl<'a> SemanticExpressionBuilder<'a> {
             }
         }
         values.dedup();
-        values
+        let mut updates = Vec::with_capacity(values.len());
+        for value in values {
+            let continues_previous = updates
+                .last()
+                .copied()
+                .is_some_and(|previous| self.checked_pipeline_input(value) == Some(previous));
+            if continues_previous {
+                updates.pop();
+            }
+            updates.push(value);
+        }
+        updates
+    }
+
+    fn checked_pipeline_input(&self, expression: CheckedExprId) -> Option<CheckedExprId> {
+        match &self.lookup.expression(self.program, expression)?.kind {
+            CheckedExpressionKind::Call { call } => self
+                .lookup
+                .call(self.program, *call)?
+                .entries
+                .iter()
+                .find_map(|entry| match entry {
+                    boon_typecheck::CheckedCallEntry::Input {
+                        value,
+                        from_pipe: true,
+                        ..
+                    } => Some(*value),
+                    boon_typecheck::CheckedCallEntry::Input { .. }
+                    | boon_typecheck::CheckedCallEntry::FreshOut { .. }
+                    | boon_typecheck::CheckedCallEntry::ForwardOut { .. } => None,
+                }),
+            CheckedExpressionKind::Draining { input }
+            | CheckedExpressionKind::Hold { initial: input, .. }
+            | CheckedExpressionKind::When { input, .. }
+            | CheckedExpressionKind::While { input, .. }
+            | CheckedExpressionKind::Then { input, .. } => Some(*input),
+            CheckedExpressionKind::Read { .. }
+            | CheckedExpressionKind::Passed { .. }
+            | CheckedExpressionKind::ExternalRead { .. }
+            | CheckedExpressionKind::Drain { .. }
+            | CheckedExpressionKind::Text { .. }
+            | CheckedExpressionKind::TextTemplate { .. }
+            | CheckedExpressionKind::Number { .. }
+            | CheckedExpressionKind::BytesByte { .. }
+            | CheckedExpressionKind::Absent
+            | CheckedExpressionKind::Flush { .. }
+            | CheckedExpressionKind::Tag { .. }
+            | CheckedExpressionKind::TaggedObject { .. }
+            | CheckedExpressionKind::Source
+            | CheckedExpressionKind::Latest { .. }
+            | CheckedExpressionKind::Infix { .. }
+            | CheckedExpressionKind::MatchArm { .. }
+            | CheckedExpressionKind::Block { .. }
+            | CheckedExpressionKind::Object { .. }
+            | CheckedExpressionKind::List { .. }
+            | CheckedExpressionKind::Bytes { .. }
+            | CheckedExpressionKind::Delimiter
+            | CheckedExpressionKind::Invalid { .. }
+            | CheckedExpressionKind::MapEntry { .. }
+            | CheckedExpressionKind::Map { .. }
+            | CheckedExpressionKind::Set { .. }
+            | CheckedExpressionKind::Bits { .. } => None,
+        }
     }
 
     fn project(

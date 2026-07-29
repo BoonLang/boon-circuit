@@ -3247,6 +3247,18 @@ fn ast_pipe_expr_kind(
         .get(pipe + 1)
         .cloned()
         .unwrap_or_else(|| "pipe".to_owned());
+    if op == "."
+        && pipe + 3 == tokens.len()
+        && tokens.get(pipe + 2).is_some_and(|field| is_name(field))
+    {
+        return AstExprKind::Pipe {
+            input,
+            op: format!("Field/{}", tokens[pipe + 2]),
+            args: Vec::new(),
+            pass: None,
+            arms: Vec::new(),
+        };
+    }
     if op == "DRAINING" && pipe + 2 == tokens.len() {
         return AstExprKind::Draining { input };
     }
@@ -4264,6 +4276,7 @@ fn validate_source_syntax(path: &str, ast: &AstProgram) -> Result<(), ParseError
             let op = window[1].as_str();
             if window[0] == "|>"
                 && pipeline_operator_requires_call_parentheses(op)
+                && !pipeline_field_projection(&item.symbols, index)
                 && item.symbols.get(index + 2).map(String::as_str) != Some("(")
             {
                 return Err(error(
@@ -4456,6 +4469,15 @@ fn pipeline_operator_requires_call_parentheses(operator: &str) -> bool {
         operator,
         "HOLD" | "LATEST" | "WHEN" | "WHILE" | "THEN" | "DRAIN" | "DRAINING" | "SOURCE"
     )
+}
+
+fn pipeline_field_projection(symbols: &[String], pipe: usize) -> bool {
+    symbols.get(pipe).map(String::as_str) == Some("|>")
+        && symbols.get(pipe + 1).map(String::as_str) == Some(".")
+        && symbols.get(pipe + 2).is_some_and(|field| is_name(field))
+        && symbols
+            .get(pipe + 3)
+            .is_none_or(|next| next.as_str() == "|>")
 }
 
 fn validate_reserved_standard_namespaces(
@@ -6029,6 +6051,26 @@ value: |> Number/abs()
             error
                 .message
                 .contains("pipeline continuation has no preceding value")
+        );
+    }
+
+    #[test]
+    fn pipeline_field_projection_has_exact_syntax_and_keeps_call_parentheses_strict() {
+        let parsed =
+            parse_source("field-projection.bn", "value: [answer: 42] |> .answer\n").unwrap();
+        assert!(parsed.ast.expressions.iter().any(|expression| {
+            matches!(
+                &expression.kind,
+                AstExprKind::Pipe { op, .. } if op == "Field/answer"
+            )
+        }));
+
+        let error = parse_source("missing-call-parentheses.bn", "value: 7 |> Number/abs\n")
+            .expect_err("ordinary pipeline functions still require a call");
+        assert!(
+            error
+                .message
+                .contains("pipeline function `Number/abs` must be called with parentheses")
         );
     }
 

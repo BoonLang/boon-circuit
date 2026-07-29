@@ -1178,6 +1178,7 @@ pub struct CheckedCallableSignature {
     pub scope_id: LexicalScopeId,
     pub kind: CheckedCallableKind,
     pub name: String,
+    pub intrinsic: Option<CheckedIntrinsicV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_identity: Option<CheckedExternalDeclarationIdentityV1>,
     pub parameters: Vec<CheckedParameter>,
@@ -1194,6 +1195,24 @@ pub struct CheckedCallableSignature {
     pub result_expression: Option<CheckedExprId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contextual_operation: Option<CheckedContextualOperation>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckedIntrinsicV1 {
+    StreamPulses,
+    StreamSkip,
+}
+
+fn checked_intrinsic_v1(kind: CheckedCallableKind, name: &str) -> Option<CheckedIntrinsicV1> {
+    if kind != CheckedCallableKind::Builtin {
+        return None;
+    }
+    match name {
+        "Stream/pulses" => Some(CheckedIntrinsicV1::StreamPulses),
+        "Stream/skip" => Some(CheckedIntrinsicV1::StreamSkip),
+        _ => None,
+    }
 }
 
 impl CheckedCallableSignature {
@@ -1271,6 +1290,7 @@ pub struct CheckedCall {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_callable: Option<DeclId>,
     pub function: String,
+    pub intrinsic: Option<CheckedIntrinsicV1>,
     pub entries: Vec<CheckedCallEntry>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub contexts: Vec<CheckedCallContext>,
@@ -2427,6 +2447,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                     scope_id: scope,
                     kind: CheckedCallableKind::User,
                     name: name.clone(),
+                    intrinsic: None,
                     external_identity: None,
                     parameters: checked_parameters.clone(),
                     contexts: Vec::new(),
@@ -2876,6 +2897,7 @@ impl<'a> CheckedProgramBuilder<'a> {
             scope_id: LexicalScopeId(0),
             kind,
             name: name.to_owned(),
+            intrinsic: checked_intrinsic_v1(kind, name),
             external_identity: if kind == CheckedCallableKind::External {
                 self.external_identities.get(name).copied()
             } else {
@@ -3292,6 +3314,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                     .and_then(|owner| self.signature(owner))
                     .map(|owner| owner.decl_id),
                 function: signature.name.clone(),
+                intrinsic: signature.intrinsic,
                 entries,
                 contexts,
                 context_binding,
@@ -7116,6 +7139,49 @@ impl<'a> CheckedProgramBuilder<'a> {
                             .insert((scope_id, name.clone()), declaration);
                     }
                 }
+                AstStatementKind::Hold {
+                    field: None,
+                    name: Some(name),
+                } if statement.expr.is_some_and(|expression| {
+                    self.program
+                        .expressions
+                        .get(expression)
+                        .is_some_and(|expression| {
+                            matches!(expression.kind, AstExprKind::Hold { .. })
+                        })
+                }) && !self
+                    .lexical_owner(scope_id)
+                    .and_then(|owner| {
+                        self.declarations
+                            .iter()
+                            .find(|declaration| declaration.id == owner)
+                    })
+                    .is_some_and(|owner| {
+                        matches!(
+                            owner.kind,
+                            CheckedDeclarationKind::Field | CheckedDeclarationKind::Hold
+                        )
+                    }) =>
+                {
+                    let declaration = self.allocate_decl();
+                    self.statement_declarations
+                        .insert(statement.id, declaration);
+                    self.declarations.push(CheckedDeclaration {
+                        id: declaration,
+                        scope_id,
+                        name: name.clone(),
+                        kind: CheckedDeclarationKind::Hold,
+                        flow_type: unknown_flow_type(),
+                        value: statement.expr.map(|expr| CheckedExprId(expr as u32)),
+                        body_scope: None,
+                        span: checked_statement_span(statement),
+                    });
+                    self.occurrences.push(SemanticOccurrence {
+                        target: declaration,
+                        kind: SemanticOccurrenceKind::Declaration,
+                        span: checked_statement_span(statement),
+                    });
+                }
                 AstStatementKind::Field { name }
                 | AstStatementKind::Source {
                     field: Some(name), ..
@@ -7255,11 +7321,9 @@ impl<'a> CheckedProgramBuilder<'a> {
                         .iter()
                         .find(|candidate| candidate.id == declaration)
                         .is_some_and(|candidate| {
-                            candidate.name != *alias
-                                && matches!(
-                                    candidate.kind,
-                                    CheckedDeclarationKind::Field | CheckedDeclarationKind::Hold
-                                )
+                            candidate.kind == CheckedDeclarationKind::Hold
+                                || (candidate.kind == CheckedDeclarationKind::Field
+                                    && candidate.name != *alias)
                         })
                     && let Some(previous) = self
                         .scope_declarations
@@ -8096,10 +8160,18 @@ impl<'a> CheckedProgramBuilder<'a> {
                                         })
                                 })
                     );
+                    let function_invocation = matches!(
+                        &input.kind,
+                        CheckedExpressionKind::Read { target, .. }
+                            if self.declaration(*target).is_some_and(|declaration| {
+                                declaration.kind == CheckedDeclarationKind::ValueParameter
+                            })
+                    );
                     if !matches!(
                         input.flow_type.mode,
                         FlowMode::TickPresent | FlowMode::PresentOrAbsent
                     ) && !state_transition
+                        && !function_invocation
                         && !matches!(input.flow_type.ty, Type::Unknown)
                         && !is_open_object_type(&input.flow_type.ty)
                     {
@@ -23318,6 +23390,10 @@ fn collect_hold_update_exprs(
     updates: &mut Vec<usize>,
 ) {
     for child in &statement.children {
+        let continuation = child
+            .expr
+            .is_some_and(|expr_id| expr_is_pipeline_continuation(expr_id, expressions));
+        let update_start = updates.len();
         if child.expr.is_some_and(|expr_id| {
             matches!(
                 expressions.get(expr_id).map(|expr| &expr.kind),
@@ -23329,6 +23405,9 @@ fn collect_hold_update_exprs(
             }
         } else {
             updates.extend(statement_update_value_exprs(child, expressions));
+        }
+        if continuation && update_start > 0 && updates.len() > update_start {
+            updates.remove(update_start - 1);
         }
     }
 }

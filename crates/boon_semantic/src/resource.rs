@@ -5013,6 +5013,7 @@ kept: mapped |> List/retain(item, if: True)
                         callable_kind: crate::SemanticCallableKind::Builtin,
                         name: "List/chunk".to_owned(),
                         function: "List/chunk".to_owned(),
+                        intrinsic: None,
                         role: boon_typecheck::ProgramRole::Client,
                         effect: boon_typecheck::CheckedEffectSummary::default(),
                         result: FlowType {
@@ -5187,6 +5188,7 @@ kept: mapped |> List/retain(item, if: True)
                     callable_kind: crate::SemanticCallableKind::Builtin,
                     name: "List/chunk".to_owned(),
                     function: "List/chunk".to_owned(),
+                    intrinsic: None,
                     role: boon_typecheck::ProgramRole::Client,
                     effect: boon_typecheck::CheckedEffectSummary::default(),
                     result: FlowType {

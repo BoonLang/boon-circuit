@@ -40,6 +40,7 @@ visible:
         .iter()
         .find(|call| call.function == "Stream/pulses")
         .expect("checked pulse call");
+    assert_eq!(pulses.intrinsic, Some(CheckedIntrinsicV1::StreamPulses));
     assert_eq!(pulses.result.mode, FlowMode::PresentOrAbsent);
     assert_eq!(pulses.result.ty, tag_type("Pulse"));
     let skip = program
@@ -47,8 +48,94 @@ visible:
         .iter()
         .find(|call| call.function == "Stream/skip")
         .expect("checked stream skip call");
+    assert_eq!(skip.intrinsic, Some(CheckedIntrinsicV1::StreamSkip));
     assert_eq!(skip.result.mode, FlowMode::PresentOrAbsent);
     assert!(matches!(skip.result.ty, Type::Object(_)));
+}
+
+#[test]
+fn canonical_fibonacci_has_one_checked_hold_state() {
+    let parsed = boon_parser::parse_source(
+        "checked-fibonacci-pulses.bn",
+        r#"
+value: fibonacci(position: 10)
+
+FUNCTION fibonacci(position) {
+    position
+    |> THEN {
+        position |> WHILE {
+            1 => 1
+
+            n =>
+                [previous: 0, current: 1]
+                |> HOLD state {
+                    n - 1
+                    |> Stream/pulses()
+                    |> THEN {
+                        [
+                            previous: state.current
+                            current: state.previous + state.current
+                        ]
+                    }
+                }
+                |> Stream/skip(count: n - 1)
+                |> .current
+        }
+    }
+}
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+    assert!(
+        !output.report.has_errors(),
+        "diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+    let program = output.program.expect("checked Fibonacci pulse function");
+    assert_eq!(
+        program.states.len(),
+        1,
+        "canonical HOLD must own one checked state: {:#?}",
+        program.states
+    );
+    let state = &program.states[0];
+    assert_eq!(
+        program
+            .declarations
+            .iter()
+            .find(|declaration| declaration.id == state.declaration)
+            .map(|declaration| declaration.name.as_str()),
+        Some("state")
+    );
+    assert!(program.statements.iter().any(|statement| {
+        statement.id == state.statement
+            && statement
+                .resources
+                .contains(&CheckedResourceBinding::State { state: state.id })
+    }));
+}
+
+#[test]
+fn ordinary_continuous_values_remain_invalid_then_triggers() {
+    let parsed = boon_parser::parse_source(
+        "continuous-then.bn",
+        r#"
+value:
+    1
+    |> THEN {
+        2
+    }
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+    assert!(output.report.has_errors());
+    assert!(output.report.diagnostics.iter().any(|diagnostic| {
+        diagnostic
+            .message
+            .contains("`THEN` requires a tick-present-or-absent value")
+    }));
 }
 
 #[test]

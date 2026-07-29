@@ -7726,6 +7726,7 @@ fn map_expression_kind(
         SemanticExpressionKind::Call {
             callable_kind,
             name,
+            intrinsic,
             instance,
             arguments,
             contexts,
@@ -7738,6 +7739,7 @@ fn map_expression_kind(
                     SemanticCallableKind::External => ExecutableCallableKind::External,
                 },
                 name: name.clone(),
+                intrinsic: *intrinsic,
                 instance: ids.call_instance(*instance)?,
                 arguments: arguments
                     .iter()
@@ -8177,6 +8179,7 @@ fn validate_call_expression(
         callable_kind,
         name,
         function,
+        intrinsic,
         role,
         effect,
         result,
@@ -8209,6 +8212,7 @@ fn validate_call_expression(
         || *callable_kind != expected_kind
         || name != &callable_definition.name
         || function != &call_definition.function
+        || *intrinsic != call_definition.intrinsic
         || *role != call_definition.role
         || *effect != call_definition.effect
         || result != &call_definition.result

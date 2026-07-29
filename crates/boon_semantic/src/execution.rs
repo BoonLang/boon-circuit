@@ -13,10 +13,10 @@ use boon_typecheck::{
     CheckedCallContextKind, CheckedCallId, CheckedCallableKind, CheckedContextBinding,
     CheckedContextTypeSubstitution, CheckedContextualOperation, CheckedEffectSummary,
     CheckedEvaluationScope, CheckedExprId, CheckedExternalDeclarationIdentityV1,
-    CheckedMatchPattern, CheckedParameterKind, CheckedParameterRequirement, CheckedProgram,
-    CheckedResourceBinding, CheckedScopeKind, CheckedSourceId, CheckedSpan, CheckedStateId,
-    CheckedStatementId, CheckedStatementKind, CheckedTypeSubstitution, ContextFormalId, DeclId,
-    FlowType, LexicalScopeId, ProgramRole, Type,
+    CheckedIntrinsicV1, CheckedMatchPattern, CheckedParameterKind, CheckedParameterRequirement,
+    CheckedProgram, CheckedResourceBinding, CheckedScopeKind, CheckedSourceId, CheckedSpan,
+    CheckedStateId, CheckedStatementId, CheckedStatementKind, CheckedTypeSubstitution,
+    ContextFormalId, DeclId, FlowType, LexicalScopeId, ProgramRole, Type,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -369,6 +369,7 @@ pub struct SemanticCall {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_callable: Option<SemanticCallableId>,
     pub function: String,
+    pub intrinsic: Option<CheckedIntrinsicV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub external_identity: Option<CheckedExternalDeclarationIdentityV1>,
     pub entries: Vec<SemanticCallEntry>,
@@ -497,6 +498,7 @@ pub enum SemanticExpressionKind {
         callable_kind: SemanticCallableKind,
         name: String,
         function: String,
+        intrinsic: Option<CheckedIntrinsicV1>,
         role: ProgramRole,
         effect: CheckedEffectSummary,
         result: FlowType,
@@ -1749,6 +1751,7 @@ impl SemanticExecutionGraphV1 {
                 callable_kind,
                 name,
                 function,
+                intrinsic,
                 role,
                 effect,
                 result,
@@ -1783,6 +1786,7 @@ impl SemanticExecutionGraphV1 {
                     || *callable_kind != expected_kind
                     || name != &callable_definition.name
                     || function != &call_definition.function
+                    || *intrinsic != call_definition.intrinsic
                     || *role != call_definition.role
                     || *effect != callable_definition.effect
                     || result != &call_definition.result

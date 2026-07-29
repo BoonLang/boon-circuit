@@ -721,6 +721,7 @@ dependencies = [
  "num-integer",
  "num-traits",
  "serde",
+ "serde_json",
  "wasm-bindgen-test",
 ]
 

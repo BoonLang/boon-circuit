@@ -1776,6 +1776,7 @@ fn resolved_visual_type(ty: &Type) -> bool {
         Type::Text
         | Type::Number
         | Type::Bytes(_)
+        | Type::Bits { .. }
         | Type::Absent
         | Type::VariantSet(_)
         | Type::Object(_)
@@ -1813,6 +1814,7 @@ fn semantic_expression_children(kind: &SemanticExpressionKind) -> Vec<SemanticEx
         | SemanticExpressionKind::Drain { .. }
         | SemanticExpressionKind::Text(_)
         | SemanticExpressionKind::Number(_)
+        | SemanticExpressionKind::Bits(_)
         | SemanticExpressionKind::BytesByte(_)
         | SemanticExpressionKind::Absent
         | SemanticExpressionKind::Tag(_)
@@ -1868,7 +1870,7 @@ fn semantic_expression_children(kind: &SemanticExpressionKind) -> Vec<SemanticEx
 
 fn type_is_closed_host_data(data_type: &Type) -> bool {
     match data_type {
-        Type::Text | Type::Number | Type::Bytes(_) => true,
+        Type::Text | Type::Number | Type::Bytes(_) | Type::Bits { .. } => true,
         Type::VariantSet(variants) => variants.iter().all(|variant| match variant {
             Variant::Tag(_) => true,
             Variant::Tagged { fields, .. } => {

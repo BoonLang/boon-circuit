@@ -439,6 +439,11 @@ fn hash_value(
                 hash_value(hasher, item, identities)?;
             }
         }
+        Value::Bits(value) => {
+            hasher.update([14]);
+            hasher.update(value.width().to_be_bytes());
+            hasher.update(value.bytes());
+        }
     }
     Ok(())
 }

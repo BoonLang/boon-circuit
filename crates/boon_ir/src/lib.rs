@@ -1158,6 +1158,7 @@ pub enum ExecutableExpressionKind {
     Set {
         items: Vec<ExecutableExprId>,
     },
+    Bits(boon_data::Bits),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -3380,7 +3381,8 @@ fn distributed_type_is_closed(data_type: &boon_typecheck::Type) -> bool {
     match data_type {
         boon_typecheck::Type::Text
         | boon_typecheck::Type::Number
-        | boon_typecheck::Type::Bytes(_) => true,
+        | boon_typecheck::Type::Bytes(_)
+        | boon_typecheck::Type::Bits { .. } => true,
         boon_typecheck::Type::Object(shape) => {
             !shape.open && shape.fields.values().all(distributed_type_is_closed)
         }
@@ -4270,6 +4272,7 @@ fn runtime_type_contains_var(ty: &boon_typecheck::Type) -> bool {
         boon_typecheck::Type::Text
         | boon_typecheck::Type::Number
         | boon_typecheck::Type::Bytes(_)
+        | boon_typecheck::Type::Bits { .. }
         | boon_typecheck::Type::Absent
         | boon_typecheck::Type::RenderContract
         | boon_typecheck::Type::UnresolvedShape { .. }
@@ -4316,6 +4319,7 @@ pub fn executable_expression_children(kind: &ExecutableExpressionKind) -> Vec<Ex
         | ExecutableExpressionKind::Drain { .. }
         | ExecutableExpressionKind::Text(_)
         | ExecutableExpressionKind::Number(_)
+        | ExecutableExpressionKind::Bits(_)
         | ExecutableExpressionKind::BytesByte(_)
         | ExecutableExpressionKind::Absent
         | ExecutableExpressionKind::Tag(_)
@@ -4750,6 +4754,7 @@ fn executable_list_item_field_names(
             | ExecutableExpressionKind::Drain { .. }
             | ExecutableExpressionKind::Text(_)
             | ExecutableExpressionKind::Number(_)
+            | ExecutableExpressionKind::Bits(_)
             | ExecutableExpressionKind::BytesByte(_)
             | ExecutableExpressionKind::Absent
             | ExecutableExpressionKind::Tag(_)

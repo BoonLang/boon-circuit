@@ -746,6 +746,16 @@ impl ExactNumber {
         })
     }
 
+    /// Returns the exact whole-number value without imposing a machine-word
+    /// bound. Fixed-width BITS conversion uses this path so arbitrary widths
+    /// never route through u64 storage.
+    pub fn to_bigint_exact(&self) -> Result<BigInt, ExactNumberError> {
+        if !self.is_whole() {
+            return Err(ExactNumberError::new(format!("Number {self} is not whole")));
+        }
+        Ok(self.numerator.clone())
+    }
+
     /// Explicit host/render boundary conversion. Boon arithmetic never calls
     /// this method.
     pub fn to_f64_host_rounded(&self) -> Result<f64, ExactNumberError> {

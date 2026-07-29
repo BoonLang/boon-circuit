@@ -3286,6 +3286,7 @@ fn type_to_data_plan(ty: &Type) -> Option<DataTypePlan> {
         Type::Bytes(boon_typecheck::BytesType::Fixed(length)) => Some(DataTypePlan::Bytes {
             fixed_len: u64::try_from(*length).ok(),
         }),
+        Type::Bits { width } => Some(DataTypePlan::Bits { width: *width }),
         Type::Object(shape) if !shape.open => Some(DataTypePlan::Record {
             fields: object_fields(shape)?,
             open: false,

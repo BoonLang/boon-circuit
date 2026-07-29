@@ -695,6 +695,12 @@ impl<'a> DocumentCompiler<'a> {
                     DocumentConstantValue::Number { coefficient, scale },
                 ))
             }
+            ir::ExecutableExpressionKind::Bits(value) => Ok(self.constant_expr(
+                compiler_id,
+                DocumentConstantValue::Bits {
+                    value: value.clone(),
+                },
+            )),
             ir::ExecutableExpressionKind::BytesByte(value) => Ok(self.constant_expr(
                 compiler_id,
                 DocumentConstantValue::Bytes {
@@ -1505,6 +1511,12 @@ impl<'a> DocumentCompiler<'a> {
             let constant = self.push_constant(DocumentConstantValue::Number { coefficient, scale });
             return Ok(DocumentPattern::Constant { constant });
         }
+        if let CheckedMatchPattern::Bits { value } = pattern {
+            let constant = self.push_constant(DocumentConstantValue::Bits {
+                value: value.clone(),
+            });
+            return Ok(DocumentPattern::Constant { constant });
+        }
         match pattern {
             CheckedMatchPattern::Tag { name, .. } => Ok(DocumentPattern::Tag {
                 tag: self.intern_name(name),
@@ -1512,7 +1524,8 @@ impl<'a> DocumentCompiler<'a> {
             CheckedMatchPattern::Wildcard
             | CheckedMatchPattern::Binding { .. }
             | CheckedMatchPattern::Number { .. }
-            | CheckedMatchPattern::Text { .. } => unreachable!(),
+            | CheckedMatchPattern::Text { .. }
+            | CheckedMatchPattern::Bits { .. } => unreachable!(),
         }
     }
 
@@ -2692,6 +2705,7 @@ fn value_class_for_type(ty: &Type) -> DocumentValueClass {
         Type::Text
         | Type::Number
         | Type::Bytes(_)
+        | Type::Bits { .. }
         | Type::Absent
         | Type::VariantSet(_)
         | Type::Function { .. }

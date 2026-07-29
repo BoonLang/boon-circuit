@@ -3179,6 +3179,7 @@ fn semantic_expression_children(
         | SemanticExpressionKind::Drain { .. }
         | SemanticExpressionKind::Text(_)
         | SemanticExpressionKind::Number(_)
+        | SemanticExpressionKind::Bits(_)
         | SemanticExpressionKind::BytesByte(_)
         | SemanticExpressionKind::Absent
         | SemanticExpressionKind::Tag(_)

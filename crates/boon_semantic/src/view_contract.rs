@@ -938,6 +938,7 @@ fn expression_children(
         | SemanticExpressionKind::Drain { .. }
         | SemanticExpressionKind::Text(_)
         | SemanticExpressionKind::Number(_)
+        | SemanticExpressionKind::Bits(_)
         | SemanticExpressionKind::BytesByte(_)
         | SemanticExpressionKind::Absent
         | SemanticExpressionKind::Tag(_)
@@ -1046,6 +1047,7 @@ fn render_tree_formal(ty: &Type) -> bool {
         Type::Text
         | Type::Number
         | Type::Bytes(_)
+        | Type::Bits { .. }
         | Type::Object(_)
         | Type::VariantSet(_)
         | Type::Map { .. }

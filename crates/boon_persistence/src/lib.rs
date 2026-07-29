@@ -10,7 +10,7 @@ use std::fmt;
 mod codec;
 mod migration;
 
-pub use boon_data::{Bytes, ExactNumber, Value as StoredValue};
+pub use boon_data::{Bits, Bytes, ExactNumber, Value as StoredValue};
 
 #[cfg(any(target_arch = "wasm32", test))]
 mod web;
@@ -155,6 +155,7 @@ pub enum StoredValueShell {
     Number(ExactNumber),
     Text(String),
     Bytes(Bytes),
+    Bits(Bits),
     List(Vec<StoredValueShell>),
     Object(BTreeMap<String, StoredValueShell>),
     Tag {
@@ -2395,7 +2396,10 @@ fn validate_stored_value_shell(shell: &StoredValueShell, depth: usize) -> Result
         StoredValueShell::ChildAuthority(collection_id) => {
             validate_collection_id(collection_id)?;
         }
-        StoredValueShell::Number(_) | StoredValueShell::Text(_) | StoredValueShell::Bytes(_) => {}
+        StoredValueShell::Number(_)
+        | StoredValueShell::Text(_)
+        | StoredValueShell::Bytes(_)
+        | StoredValueShell::Bits(_) => {}
     }
     Ok(())
 }
@@ -2414,7 +2418,8 @@ fn stored_shell_child_authorities(shell: &StoredValueShell) -> BTreeSet<DurableC
             }
             StoredValueShell::Number(_)
             | StoredValueShell::Text(_)
-            | StoredValueShell::Bytes(_) => {}
+            | StoredValueShell::Bytes(_)
+            | StoredValueShell::Bits(_) => {}
         }
     }
     children
@@ -3353,6 +3358,11 @@ fn hash_stored_value(hasher: &mut Sha256, value: &StoredValue) {
                 hash_stored_value(hasher, item);
             }
         }
+        StoredValue::Bits(value) => {
+            hasher.update([30]);
+            hasher.update(value.width().to_be_bytes());
+            hasher.update(value.bytes());
+        }
     }
 }
 
@@ -3408,6 +3418,11 @@ fn hash_stored_value_shell(hasher: &mut Sha256, value: &StoredValueShell) {
         StoredValueShell::ChildAuthority(collection_id) => {
             hasher.update([6]);
             hash_durable_collection_id(hasher, collection_id);
+        }
+        StoredValueShell::Bits(value) => {
+            hasher.update([7]);
+            hasher.update(value.width().to_be_bytes());
+            hasher.update(value.bytes());
         }
     }
 }

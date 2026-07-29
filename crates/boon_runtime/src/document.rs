@@ -1506,6 +1506,7 @@ enum EvalValue {
     Number(ExactNumber),
     Text(String),
     Bytes(Bytes),
+    Bits(boon_data::Bits),
     Record(BTreeMap<String, EvalValue>),
     MappedRow {
         id: RowId,
@@ -2172,6 +2173,7 @@ impl<'a> Evaluator<'a> {
                 })?)
             }
             DocumentConstantValue::Bytes { value } => EvalValue::Bytes(value.clone().into()),
+            DocumentConstantValue::Bits { value } => EvalValue::Bits(value.clone()),
             DocumentConstantValue::Tag { name } => {
                 EvalValue::Tag(self.name(*name)?.to_owned(), BTreeMap::new())
             }
@@ -3781,6 +3783,7 @@ impl EvalValue {
             Self::Number(value) => value.to_string(),
             Self::Text(value) => value.clone(),
             Self::Bytes(value) => String::from_utf8_lossy(value).into_owned(),
+            Self::Bits(_) => String::new(),
             Self::Record(fields) => fields
                 .get("text")
                 .map(Self::text)
@@ -3806,6 +3809,7 @@ impl EvalValue {
             Self::Number(value) => !value.is_zero(),
             Self::Text(value) => !value.is_empty(),
             Self::Bytes(value) => !value.is_empty(),
+            Self::Bits(_) => false,
             Self::Tag(tag, fields) if fields.is_empty() && tag == "False" => false,
             Self::Tag(tag, fields) if fields.is_empty() && tag == "True" => true,
             Self::Record(value) | Self::Tag(_, value) => !value.is_empty(),
@@ -3849,6 +3853,7 @@ fn inline_content_text(value: &EvalValue) -> Option<String> {
         | EvalValue::List(_)
         | EvalValue::Map(_)
         | EvalValue::Set(_)
+        | EvalValue::Bits(_)
         | EvalValue::RuntimeList { .. }
         | EvalValue::Row { .. }
         | EvalValue::Source(_)
@@ -3886,6 +3891,7 @@ fn guard_value(value: &EvalValue) -> Option<Value> {
         EvalValue::Number(value) => Some(Value::Number(value.clone())),
         EvalValue::Text(value) => Some(Value::Text(value.clone())),
         EvalValue::Bytes(value) => Some(Value::Bytes(value.clone())),
+        EvalValue::Bits(value) => Some(Value::Bits(value.clone())),
         EvalValue::Record(fields) => fields
             .iter()
             .map(|(name, value)| Some((name.clone(), guard_value(value)?)))
@@ -3941,6 +3947,7 @@ fn machine_value_to_eval(value: Value) -> EvalValue {
         Value::Number(value) => EvalValue::Number(value),
         Value::Text(value) => EvalValue::Text(value),
         Value::Bytes(value) => EvalValue::Bytes(value),
+        Value::Bits(value) => EvalValue::Bits(value),
         Value::List(values) => {
             EvalValue::List(values.into_iter().map(machine_value_to_eval).collect())
         }

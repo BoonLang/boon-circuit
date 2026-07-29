@@ -580,6 +580,7 @@ pub enum SemanticExpressionKind {
     Set {
         items: Vec<SemanticExprId>,
     },
+    Bits(boon_data::Bits),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1994,6 +1995,7 @@ impl SemanticExecutionGraphV1 {
             | SemanticExpressionKind::Drain { .. }
             | SemanticExpressionKind::Text(_)
             | SemanticExpressionKind::Number(_)
+            | SemanticExpressionKind::Bits(_)
             | SemanticExpressionKind::BytesByte(_)
             | SemanticExpressionKind::Absent
             | SemanticExpressionKind::Tag(_)

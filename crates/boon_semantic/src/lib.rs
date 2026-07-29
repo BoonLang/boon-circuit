@@ -1843,6 +1843,7 @@ fn semantic_expression_depends_on_role(
             | SemanticExpressionKind::ElementState { .. }
             | SemanticExpressionKind::Text(_)
             | SemanticExpressionKind::Number(_)
+            | SemanticExpressionKind::Bits(_)
             | SemanticExpressionKind::BytesByte(_)
             | SemanticExpressionKind::Absent
             | SemanticExpressionKind::Tag(_)
@@ -3842,6 +3843,7 @@ fn out_contract_type_contains_empty_list_placeholder(ty: &boon_typecheck::Type) 
             .any(out_contract_type_contains_empty_list_placeholder),
         boon_typecheck::Type::Var(_)
         | boon_typecheck::Type::Unknown
+        | boon_typecheck::Type::Bits { .. }
         | boon_typecheck::Type::Text
         | boon_typecheck::Type::Number
         | boon_typecheck::Type::Bytes(_)
@@ -4366,6 +4368,7 @@ fn out_contract_type_is_resolved(ty: &boon_typecheck::Type) -> bool {
         boon_typecheck::Type::Text
         | boon_typecheck::Type::Number
         | boon_typecheck::Type::Bytes(_)
+        | boon_typecheck::Type::Bits { .. }
         | boon_typecheck::Type::Absent
         | boon_typecheck::Type::RenderContract => true,
     }
@@ -4629,6 +4632,7 @@ fn checked_expression_children_for_call_analysis(
         | Kind::Drain { .. }
         | Kind::Text { .. }
         | Kind::Number { .. }
+        | Kind::Bits { .. }
         | Kind::BytesByte { .. }
         | Kind::Absent
         | Kind::Tag { .. }
@@ -4671,6 +4675,7 @@ fn runtime_type_contains_var(ty: &boon_typecheck::Type) -> bool {
         boon_typecheck::Type::Text
         | boon_typecheck::Type::Number
         | boon_typecheck::Type::Bytes(_)
+        | boon_typecheck::Type::Bits { .. }
         | boon_typecheck::Type::Absent
         | boon_typecheck::Type::RenderContract
         | boon_typecheck::Type::UnresolvedShape { .. }

@@ -3062,6 +3062,7 @@ fn checked_expression_dependency(
         CheckedExpressionKind::Text { .. }
         | CheckedExpressionKind::TextTemplate { .. }
         | CheckedExpressionKind::Number { .. }
+        | CheckedExpressionKind::Bits { .. }
         | CheckedExpressionKind::BytesByte { .. }
         | CheckedExpressionKind::Absent
         | CheckedExpressionKind::Flush { .. }
@@ -4427,6 +4428,7 @@ fn semantic_expression_dependency(
         }
         SemanticExpressionKind::Text(_)
         | SemanticExpressionKind::Number(_)
+        | SemanticExpressionKind::Bits(_)
         | SemanticExpressionKind::BytesByte(_)
         | SemanticExpressionKind::Absent
         | SemanticExpressionKind::Flush { .. }

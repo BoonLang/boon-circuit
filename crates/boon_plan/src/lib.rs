@@ -18,7 +18,7 @@ pub use host::*;
 
 pub const PLAN_MAJOR_VERSION: u32 = 6;
 pub const PLAN_MINOR_VERSION: u32 = 0;
-pub const PERSISTENCE_FORMAT_VERSION: u32 = 4;
+pub const PERSISTENCE_FORMAT_VERSION: u32 = 5;
 pub const DEFAULT_PERSISTENCE_SCHEMA_VERSION: u64 = 1;
 pub const INLINE_BYTE_CONSTANT_LIMIT: usize = 1024;
 
@@ -332,6 +332,9 @@ pub enum DataTypePlan {
     Set {
         item: Box<DataTypePlan>,
     },
+    Bits {
+        width: u32,
+    },
 }
 
 impl DataTypePlan {
@@ -375,7 +378,9 @@ impl DataTypePlan {
                     _ => Self::Union { members },
                 }
             }
-            Self::Number | Self::Text | Self::Bytes { .. } | Self::Unknown => self.clone(),
+            Self::Number | Self::Text | Self::Bytes { .. } | Self::Bits { .. } | Self::Unknown => {
+                self.clone()
+            }
         }
     }
 
@@ -1384,7 +1389,10 @@ fn distributed_data_type_is_supported(data_type: &DataTypePlan) -> bool {
             !members.is_empty() && members.iter().all(distributed_data_type_is_supported)
         }
         DataTypePlan::Unknown => false,
-        DataTypePlan::Number | DataTypePlan::Text | DataTypePlan::Bytes { .. } => true,
+        DataTypePlan::Number
+        | DataTypePlan::Text
+        | DataTypePlan::Bytes { .. }
+        | DataTypePlan::Bits { .. } => true,
     }
 }
 
@@ -3352,7 +3360,10 @@ fn data_type_contains_unknown(data_type: &DataTypePlan) -> bool {
         }
         DataTypePlan::Set { item } => data_type_contains_unknown(item),
         DataTypePlan::Union { members } => members.iter().any(data_type_contains_unknown),
-        DataTypePlan::Number | DataTypePlan::Text | DataTypePlan::Bytes { .. } => false,
+        DataTypePlan::Number
+        | DataTypePlan::Text
+        | DataTypePlan::Bytes { .. }
+        | DataTypePlan::Bits { .. } => false,
     }
 }
 
@@ -3755,6 +3766,9 @@ pub enum MigrationExpressionPlan {
     Match {
         input: Box<MigrationExpressionPlan>,
         arms: Vec<MigrationMatchArmPlan>,
+    },
+    Bits {
+        value: boon_data::Bits,
     },
 }
 
@@ -4311,6 +4325,7 @@ fn canonicalize_migration_expression(
         | MigrationExpressionPlan::Parameter { .. }
         | MigrationExpressionPlan::Text { .. }
         | MigrationExpressionPlan::Number { .. }
+        | MigrationExpressionPlan::Bits { .. }
         | MigrationExpressionPlan::Variant { .. } => {}
     }
     Ok(())
@@ -4610,6 +4625,7 @@ fn validate_migration_expression(
         }
         MigrationExpressionPlan::Text { .. }
         | MigrationExpressionPlan::Number { .. }
+        | MigrationExpressionPlan::Bits { .. }
         | MigrationExpressionPlan::Variant { .. } => {}
     }
     Ok(())
@@ -5466,6 +5482,9 @@ pub enum PlanConstantValue {
     Data {
         value: boon_data::Value,
     },
+    Bits {
+        value: boon_data::Bits,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -5615,6 +5634,9 @@ pub enum PlanValueType {
     Tag,
     Data,
     Unknown,
+    Bits {
+        width: u32,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -9021,6 +9043,7 @@ pub enum PlanRowSelectPattern {
     Text { value: String },
     Number { value: ExactNumber },
     Wildcard,
+    Bits { value: boon_data::Bits },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -10004,6 +10027,9 @@ fn plan_value_type_matches_data_type(actual: PlanValueType, expected: &DataTypeP
                 if expected_len.is_none() || *expected_len == fixed_len)
         }
         PlanValueType::Tag => matches!(expected, DataTypePlan::Variant { .. }),
+        PlanValueType::Bits { width } => {
+            matches!(expected, DataTypePlan::Bits { width: expected } if *expected == width)
+        }
         PlanValueType::Data | PlanValueType::Unknown => true,
     }
 }
@@ -10022,6 +10048,9 @@ fn constant_value_matches_data_type(actual: &PlanConstantValue, expected: &DataT
                 if fixed_len.is_none() || *fixed_len == Some(*byte_len))
         }
         PlanConstantValue::Tag { name } => data_type_accepts_fieldless_tag(expected, name),
+        PlanConstantValue::Bits { value } => {
+            matches!(expected, DataTypePlan::Bits { width } if *width == value.width())
+        }
         PlanConstantValue::Data { .. } => true,
     }
 }
@@ -12085,7 +12114,10 @@ fn data_type_is_closed(data_type: &DataTypePlan) -> bool {
         DataTypePlan::Union { members } => {
             !members.is_empty() && members.iter().all(data_type_is_closed)
         }
-        DataTypePlan::Number | DataTypePlan::Text | DataTypePlan::Bytes { .. } => true,
+        DataTypePlan::Number
+        | DataTypePlan::Text
+        | DataTypePlan::Bytes { .. }
+        | DataTypePlan::Bits { .. } => true,
     }
 }
 
@@ -13162,6 +13194,7 @@ fn byte_constants_match_hashes(constants: &[PlanConstant]) -> bool {
         PlanConstantValue::Text { .. }
         | PlanConstantValue::Number { .. }
         | PlanConstantValue::Tag { .. }
+        | PlanConstantValue::Bits { .. }
         | PlanConstantValue::Data { .. } => true,
     })
 }

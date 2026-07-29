@@ -71,6 +71,7 @@ fn semantic_data_type(value: &boon_typecheck::Type) -> crate::SemanticDataType {
                 fixed_len: Some(*fixed_len),
             }
         }
+        boon_typecheck::Type::Bits { width } => crate::SemanticDataType::Bits { width: *width },
         boon_typecheck::Type::Absent => crate::SemanticDataType::Unknown {
             reason: "private absence is not semantic data".to_owned(),
         },
@@ -7638,6 +7639,7 @@ fn map_expression_kind(
             }
         }
         SemanticExpressionKind::Number(value) => ExecutableExpressionKind::Number(value.clone()),
+        SemanticExpressionKind::Bits(value) => ExecutableExpressionKind::Bits(value.clone()),
         SemanticExpressionKind::BytesByte(value) => ExecutableExpressionKind::BytesByte(*value),
         SemanticExpressionKind::Absent => ExecutableExpressionKind::Absent,
         SemanticExpressionKind::Flush { payload } => ExecutableExpressionKind::Flush {
@@ -7991,6 +7993,7 @@ fn runtime_type_contains_var(ty: &boon_typecheck::Type) -> bool {
         boon_typecheck::Type::Text
         | boon_typecheck::Type::Number
         | boon_typecheck::Type::Bytes(_)
+        | boon_typecheck::Type::Bits { .. }
         | boon_typecheck::Type::Absent
         | boon_typecheck::Type::RenderContract
         | boon_typecheck::Type::UnresolvedShape { .. }

@@ -3542,6 +3542,7 @@ fn format_inspection_value(value: &Value, depth: usize) -> String {
             format!("\"{bounded}\"")
         }
         Value::Bytes(value) => format!("Bytes[{}]", value.len()),
+        Value::Bits(value) => value.to_string(),
         Value::List(values) => {
             let mut parts = values
                 .iter()

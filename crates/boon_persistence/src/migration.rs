@@ -766,6 +766,7 @@ fn stored_value_from_shell(value: &StoredValueShell) -> Result<StoredValue, Migr
         StoredValueShell::Number(value) => StoredValue::Number(value.clone()),
         StoredValueShell::Text(value) => StoredValue::Text(value.clone()),
         StoredValueShell::Bytes(value) => StoredValue::Bytes(value.clone()),
+        StoredValueShell::Bits(value) => StoredValue::Bits(value.clone()),
         StoredValueShell::List(values) => StoredValue::List(
             values
                 .iter()
@@ -799,6 +800,7 @@ fn stored_value_shell_from_value(value: StoredValue) -> Result<StoredValueShell,
         StoredValue::Number(value) => StoredValueShell::Number(value),
         StoredValue::Text(value) => StoredValueShell::Text(value),
         StoredValue::Bytes(value) => StoredValueShell::Bytes(value),
+        StoredValue::Bits(value) => StoredValueShell::Bits(value),
         StoredValue::List(values) => StoredValueShell::List(
             values
                 .into_iter()
@@ -902,6 +904,7 @@ fn evaluate_expression(
             Ok(StoredValue::Text(text))
         }
         MigrationExpressionPlan::Number { value } => Ok(StoredValue::Number(value.clone())),
+        MigrationExpressionPlan::Bits { value } => Ok(StoredValue::Bits(value.clone())),
         MigrationExpressionPlan::Variant { tag } => Ok(StoredValue::tag(tag)),
         MigrationExpressionPlan::Tagged { tag, fields } => Ok(StoredValue::Tag {
             tag: tag.clone(),
@@ -1027,6 +1030,9 @@ fn migration_value_text(value: &StoredValue) -> Result<String, MigrationError> {
         StoredValue::Set(_) => Err(MigrationError::Evaluation(
             "SET cannot be interpolated into text".to_owned(),
         )),
+        StoredValue::Bits(_) => Err(MigrationError::Evaluation(
+            "BITS cannot be interpolated into text".to_owned(),
+        )),
     }
 }
 
@@ -1044,6 +1050,9 @@ fn stored_value_matches_pattern(
         }
         boon_plan::PlanRowSelectPattern::Text { value: expected } => {
             matches!(value, StoredValue::Text(value) if value == expected)
+        }
+        boon_plan::PlanRowSelectPattern::Bits { value: expected } => {
+            matches!(value, StoredValue::Bits(value) if value == expected)
         }
     }
 }
@@ -1331,6 +1340,7 @@ fn stored_tag(value: &StoredValue) -> &str {
         StoredValue::Number(_) => "Number",
         StoredValue::Text(value) => value,
         StoredValue::Bytes(_) => "Bytes",
+        StoredValue::Bits(_) => "Bits",
         StoredValue::List(_) => "List",
         StoredValue::Object(_) => "Object",
         StoredValue::Map(_) => "Map",

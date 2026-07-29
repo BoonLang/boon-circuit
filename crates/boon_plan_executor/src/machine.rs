@@ -165,6 +165,7 @@ pub enum Value {
     },
     Map(BTreeMap<Value, Value>),
     Set(BTreeSet<Value>),
+    Bits(boon_data::Bits),
 }
 
 #[cfg(feature = "phase0-instrumentation")]
@@ -281,6 +282,7 @@ fn value_tree_stats(value: &Value) -> ValueTreeStats {
             Value::Number(_) => stats.add_value(8),
             Value::Text(value) => stats.add_value(sized_payload_bytes(value.len())),
             Value::Bytes(value) => stats.add_value(sized_payload_bytes(value.len())),
+            Value::Bits(value) => stats.add_value(sized_payload_bytes(value.bytes().len())),
             Value::List(values) => {
                 stats.add_value(8);
                 for value in values {
@@ -400,6 +402,7 @@ impl Clone for Value {
             Value::Number(value) => Value::Number(value.clone()),
             Value::Text(value) => Value::Text(value.clone()),
             Value::Bytes(value) => Value::Bytes(value.clone()),
+            Value::Bits(value) => Value::Bits(value.clone()),
             Value::List(values) => Value::List(values.clone()),
             Value::Record(fields) => Value::Record(fields.clone()),
             Value::Tag { tag, fields } => Value::Tag {
@@ -576,7 +579,7 @@ impl Value {
                 .iter()
                 .any(|(key, value)| key.contains_host_binding() || value.contains_host_binding()),
             Self::Set(items) => items.iter().any(Self::contains_host_binding),
-            Self::Number(_) | Self::Text(_) | Self::Bytes(_) => false,
+            Self::Number(_) | Self::Text(_) | Self::Bytes(_) | Self::Bits(_) => false,
         }
     }
 
@@ -593,7 +596,7 @@ impl Value {
                 key.contains_collection_authority() || value.contains_collection_authority()
             }),
             Self::Set(items) => items.iter().any(Self::contains_collection_authority),
-            Self::Number(_) | Self::Text(_) | Self::Bytes(_) => false,
+            Self::Number(_) | Self::Text(_) | Self::Bytes(_) | Self::Bits(_) => false,
         }
     }
 
@@ -643,7 +646,7 @@ impl Value {
             Self::Set(items) => {
                 Self::Set(items.into_iter().map(Self::into_visible_facade).collect())
             }
-            value @ (Self::Number(_) | Self::Text(_) | Self::Bytes(_)) => value,
+            value @ (Self::Number(_) | Self::Text(_) | Self::Bytes(_) | Self::Bits(_)) => value,
         }
     }
 }
@@ -5475,6 +5478,7 @@ fn constant_value(value: &PlanConstantValue) -> Result<Value, Error> {
         PlanConstantValue::Tag { name } => Ok(Value::tag(name)),
         PlanConstantValue::Data { value } => Ok(runtime_value_from_data(value)),
         PlanConstantValue::Number { value } => Ok(Value::Number(value.clone())),
+        PlanConstantValue::Bits { value } => Ok(Value::Bits(value.clone())),
         PlanConstantValue::Bytes {
             byte_len,
             inline_bytes,
@@ -5499,6 +5503,7 @@ fn runtime_value_from_data(value: &boon_data::Value) -> Value {
         boon_data::Value::Number(value) => Value::Number(value.clone()),
         boon_data::Value::Text(value) => Value::Text(value.clone()),
         boon_data::Value::Bytes(value) => Value::Bytes(value.clone()),
+        boon_data::Value::Bits(value) => Value::Bits(value.clone()),
         boon_data::Value::List(values) => {
             Value::List(values.iter().map(runtime_value_from_data).collect())
         }
@@ -5532,6 +5537,7 @@ fn runtime_value_to_data(value: &Value) -> Result<boon_data::Value, Error> {
         Value::Number(value) => boon_data::Value::Number(value.clone()),
         Value::Text(value) => boon_data::Value::Text(value.clone()),
         Value::Bytes(value) => boon_data::Value::Bytes(value.clone()),
+        Value::Bits(value) => boon_data::Value::Bits(value.clone()),
         Value::List(values) => boon_data::Value::List(
             values
                 .iter()
@@ -5730,6 +5736,7 @@ pub(crate) fn stored_value(value: &Value) -> Result<boon_persistence::StoredValu
         Value::Number(value) => Ok(boon_persistence::StoredValue::Number(value.clone())),
         Value::Text(value) => Ok(boon_persistence::StoredValue::Text(value.clone())),
         Value::Bytes(value) => Ok(boon_persistence::StoredValue::Bytes(value.clone())),
+        Value::Bits(value) => Ok(boon_persistence::StoredValue::Bits(value.clone())),
         Value::List(values) => values
             .iter()
             .map(stored_value)
@@ -5914,6 +5921,7 @@ fn runtime_value_kind(value: &Value) -> &'static str {
         Value::Number(_) => "Number",
         Value::Text(_) => "Text",
         Value::Bytes(_) => "Bytes",
+        Value::Bits(_) => "Bits",
         Value::List(_) => "List",
         Value::Record(_) => "Record",
         Value::Tag { .. } => "Tag",
@@ -5968,6 +5976,7 @@ pub(crate) fn runtime_value(value: boon_persistence::StoredValue) -> Result<Valu
         boon_persistence::StoredValue::Number(value) => Ok(Value::Number(value)),
         boon_persistence::StoredValue::Text(value) => Ok(Value::Text(value)),
         boon_persistence::StoredValue::Bytes(value) => Ok(Value::Bytes(value)),
+        boon_persistence::StoredValue::Bits(value) => Ok(Value::Bits(value)),
         boon_persistence::StoredValue::List(values) => values
             .into_iter()
             .map(runtime_value)
@@ -6633,7 +6642,7 @@ fn validate_flush_payload_value(value: &Value) -> Result<(), Error> {
     let mut pending = fields.values().collect::<Vec<_>>();
     while let Some(value) = pending.pop() {
         match value {
-            Value::Number(_) | Value::Text(_) | Value::Bytes(_) => {}
+            Value::Number(_) | Value::Text(_) | Value::Bytes(_) | Value::Bits(_) => {}
             Value::Record(fields) | Value::Tag { fields, .. } => {
                 pending.extend(fields.values());
             }
@@ -15872,6 +15881,7 @@ impl MachineInstance {
             Value::Number(value) => boon_persistence::StoredValueShell::Number(value.clone()),
             Value::Text(value) => boon_persistence::StoredValueShell::Text(value.clone()),
             Value::Bytes(value) => boon_persistence::StoredValueShell::Bytes(value.clone()),
+            Value::Bits(value) => boon_persistence::StoredValueShell::Bits(value.clone()),
             Value::List(values) => boon_persistence::StoredValueShell::List(
                 values
                     .iter()
@@ -15923,6 +15933,7 @@ impl MachineInstance {
             boon_persistence::StoredValueShell::Number(value) => Value::Number(value),
             boon_persistence::StoredValueShell::Text(value) => Value::Text(value),
             boon_persistence::StoredValueShell::Bytes(value) => Value::Bytes(value),
+            boon_persistence::StoredValueShell::Bits(value) => Value::Bits(value),
             boon_persistence::StoredValueShell::List(values) => Value::List(
                 values
                     .into_iter()
@@ -21060,7 +21071,7 @@ impl MachineInstance {
                     }
                 }
                 Value::Set(items) => pending.extend(items),
-                Value::Number(_) | Value::Text(_) | Value::Bytes(_) => {}
+                Value::Number(_) | Value::Text(_) | Value::Bytes(_) | Value::Bits(_) => {}
             }
         }
         Ok(())
@@ -21109,7 +21120,7 @@ impl MachineInstance {
                     }
                 }
                 Value::Set(items) => pending.extend(items),
-                Value::Number(_) | Value::Text(_) | Value::Bytes(_) => {}
+                Value::Number(_) | Value::Text(_) | Value::Bytes(_) | Value::Bits(_) => {}
             }
         }
         Ok(())
@@ -21167,7 +21178,7 @@ impl MachineInstance {
                     }
                 }
                 Value::Set(items) => pending.extend(items),
-                Value::Number(_) | Value::Text(_) | Value::Bytes(_) => {}
+                Value::Number(_) | Value::Text(_) | Value::Bytes(_) | Value::Bits(_) => {}
             }
         }
         addresses
@@ -21885,7 +21896,9 @@ impl MachineInstance {
                         .map(|item| resolve(session, item, active, depth + 1))
                         .collect::<Result<BTreeSet<_>, _>>()?,
                 ),
-                value @ (Value::Number(_) | Value::Text(_) | Value::Bytes(_)) => value,
+                value @ (Value::Number(_) | Value::Text(_) | Value::Bytes(_) | Value::Bits(_)) => {
+                    value
+                }
             })
         }
 
@@ -21971,7 +21984,7 @@ impl MachineInstance {
                             visit(session, item, active, addresses, depth + 1)?;
                         }
                     }
-                    Value::Number(_) | Value::Text(_) | Value::Bytes(_) => {}
+                    Value::Number(_) | Value::Text(_) | Value::Bytes(_) | Value::Bits(_) => {}
                 }
                 Ok(())
             }
@@ -31268,7 +31281,7 @@ pub(crate) fn normalize_host_output_value(value: Value) -> Result<Value, Error> 
         Value::CollectionAuthority { .. } => Err(Error::Evaluation(
             "host outputs cannot expose a live collection authority".to_owned(),
         )),
-        Value::Number(_) | Value::Text(_) | Value::Bytes(_) => Ok(value),
+        Value::Number(_) | Value::Text(_) | Value::Bytes(_) | Value::Bits(_) => Ok(value),
     }
 }
 
@@ -31316,7 +31329,8 @@ fn normalize_effect_intent_value(value: Value) -> Result<Value, Error> {
         value @ Value::HostBound { .. }
         | value @ Value::Number(_)
         | value @ Value::Text(_)
-        | value @ Value::Bytes(_) => Ok(value),
+        | value @ Value::Bytes(_)
+        | value @ Value::Bits(_) => Ok(value),
         Value::CollectionAuthority { .. } => Err(Error::Evaluation(
             "effect intents cannot expose a live collection authority".to_owned(),
         )),
@@ -31837,6 +31851,9 @@ fn value_to_text(value: &Value) -> Result<String, Error> {
         Value::Text(value) => Ok(value.clone()),
         Value::Bytes(bytes) => String::from_utf8(bytes.to_vec())
             .map_err(|error| Error::Evaluation(format!("invalid UTF-8: {error}"))),
+        Value::Bits(_) => Err(Error::Evaluation(
+            "BITS has no implicit TEXT conversion; use an explicit Bits conversion".to_owned(),
+        )),
         Value::Tag { tag, fields } if fields.is_empty() => Ok(tag.clone()),
         Value::List(_)
         | Value::Record(_)
@@ -32322,6 +32339,9 @@ fn select_pattern_matches(pattern: &PlanRowSelectPattern, value: &Value) -> bool
         }
         PlanRowSelectPattern::Number { value: expected } => {
             value == &Value::Number(expected.clone())
+        }
+        PlanRowSelectPattern::Bits { value: expected } => {
+            value.visible() == &Value::Bits(expected.clone())
         }
         PlanRowSelectPattern::Wildcard => true,
     }

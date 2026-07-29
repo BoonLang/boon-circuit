@@ -1,5 +1,5 @@
 use boon_contract::SourceBundleDigestV1;
-use boon_data::{ExactNumber, ExactRoundingRule, MAX_NUMBER_TEXT_DIGITS, Value as DataValue};
+use boon_data::{Bits, ExactNumber, ExactRoundingRule, MAX_NUMBER_TEXT_DIGITS, Value as DataValue};
 pub use boon_document_model::ProgramRole;
 use boon_parser::{
     AstCallArg, AstCallArgKind, AstDrainPath, AstExpr, AstExprKind, AstMatchPattern, AstParameter,
@@ -47,6 +47,11 @@ pub enum Type {
     },
     /// Canonical SET authority view.
     Set(Box<Type>),
+    /// A fixed-width raw bit sequence. Width is part of the static type and is
+    /// never inferred from a numeric context.
+    Bits {
+        width: u32,
+    },
 }
 
 impl EqUnifyValue for Type {}
@@ -103,6 +108,9 @@ pub enum TypeDisplayNode {
     },
     Set {
         item: Box<TypeDisplayNode>,
+    },
+    Bits {
+        width: u32,
     },
 }
 
@@ -608,6 +616,9 @@ pub enum CheckedMatchPattern {
     Binding {
         name: String,
     },
+    Bits {
+        value: Bits,
+    },
 }
 
 impl From<&AstMatchPattern> for CheckedMatchPattern {
@@ -619,6 +630,14 @@ impl From<&AstMatchPattern> for CheckedMatchPattern {
             },
             AstMatchPattern::Text { value } => Self::Text {
                 value: value.clone(),
+            },
+            AstMatchPattern::Bits {
+                width,
+                radix,
+                digits,
+            } => Self::Bits {
+                value: Bits::parse_encoded(*width, *radix, digits)
+                    .unwrap_or_else(|_| Bits::zero(*width).expect("parser accepts positive width")),
             },
             AstMatchPattern::Tag { name, fields } => Self::Tag {
                 name: name.clone(),
@@ -846,6 +865,9 @@ pub enum CheckedExpressionKind {
     },
     Set {
         items: Vec<CheckedExprId>,
+    },
+    Bits {
+        value: Bits,
     },
 }
 
@@ -1995,6 +2017,7 @@ impl<'a> CheckedProgramBuilder<'a> {
             "validate_exact_pipeline_inputs",
             builder.validate_exact_pipeline_inputs()
         );
+        checked_program_phase!("validate_bits_literals", builder.validate_bits_literals());
         checked_program_phase!(
             "collect_user_signatures",
             builder.collect_user_signatures(&program.ast.statements)
@@ -2178,6 +2201,40 @@ impl<'a> CheckedProgramBuilder<'a> {
         let valid = diagnostics.is_empty();
         self.diagnostics.extend(diagnostics);
         valid
+    }
+
+    fn validate_bits_literals(&mut self) {
+        for expression in &self.program.expressions {
+            let literal = match &expression.kind {
+                AstExprKind::BitsLiteral {
+                    width,
+                    radix,
+                    digits,
+                } => Some((*width, *radix, digits.as_str())),
+                AstExprKind::MatchArm {
+                    pattern:
+                        AstMatchPattern::Bits {
+                            width,
+                            radix,
+                            digits,
+                        },
+                    ..
+                } => Some((*width, *radix, digits.as_str())),
+                _ => None,
+            };
+            let Some((width, radix, digits)) = literal else {
+                continue;
+            };
+            if let Err(error) = Bits::parse_encoded(width, radix, digits) {
+                self.diagnostics.push(TypeDiagnostic {
+                    severity: DiagnosticSeverity::Error,
+                    line: expression.line,
+                    start: expression.start,
+                    end: expression.end,
+                    message: error.to_string(),
+                });
+            }
+        }
     }
 
     fn exact_pipeline_input(&self, expr: &AstExpr, raw_input: usize) -> Option<usize> {
@@ -4466,6 +4523,7 @@ impl<'a> CheckedProgramBuilder<'a> {
             | AstExprKind::StringLiteral(_)
             | AstExprKind::TextLiteral(_)
             | AstExprKind::Number(_)
+            | AstExprKind::BitsLiteral { .. }
             | AstExprKind::ByteLiteral { .. }
             | AstExprKind::Tag(_)
             | AstExprKind::Source
@@ -5499,6 +5557,7 @@ impl<'a> CheckedProgramBuilder<'a> {
             | AstExprKind::TextLiteral(_)
             | AstExprKind::TextTemplate { .. }
             | AstExprKind::Number(_)
+            | AstExprKind::BitsLiteral { .. }
             | AstExprKind::ByteLiteral { .. }
             | AstExprKind::BytesLiteral { .. }
             | AstExprKind::Tag(_)
@@ -5746,6 +5805,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                 | AstExprKind::TextLiteral(_)
                 | AstExprKind::TextTemplate { .. } => Type::Text,
                 AstExprKind::Number(_) => Type::Number,
+                AstExprKind::BitsLiteral { width, .. } => Type::Bits { width },
                 AstExprKind::ByteLiteral { .. } => Type::Bytes(BytesType::Fixed(1)),
                 AstExprKind::BytesLiteral { size, .. } => Type::Bytes(match size {
                     BytesSizeSyntax::Fixed(size) => BytesType::Fixed(size),
@@ -6526,6 +6586,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                 other @ (Type::Text
                 | Type::Number
                 | Type::Bytes(_)
+                | Type::Bits { .. }
                 | Type::Absent
                 | Type::List(_)
                 | Type::Map { .. }
@@ -8377,6 +8438,7 @@ impl<'a> CheckedProgramBuilder<'a> {
             | CheckedExpressionKind::Drain { .. }
             | CheckedExpressionKind::Text { .. }
             | CheckedExpressionKind::Number { .. }
+            | CheckedExpressionKind::Bits { .. }
             | CheckedExpressionKind::BytesByte { .. }
             | CheckedExpressionKind::Absent
             | CheckedExpressionKind::Tag { .. }
@@ -8543,6 +8605,14 @@ impl<'a> CheckedProgramBuilder<'a> {
             },
             AstExprKind::Number(value) => CheckedExpressionKind::Number {
                 value: value.clone(),
+            },
+            AstExprKind::BitsLiteral {
+                width,
+                radix,
+                digits,
+            } => CheckedExpressionKind::Bits {
+                value: Bits::parse_encoded(*width, *radix, digits)
+                    .unwrap_or_else(|_| Bits::zero(*width).expect("parser accepts positive width")),
             },
             AstExprKind::ByteLiteral { value, .. } => {
                 CheckedExpressionKind::BytesByte { value: *value }
@@ -9091,6 +9161,7 @@ enum CheckedOrderSemanticExpression {
     Text(String),
     TextTemplate(Vec<CheckedOrderSemanticTextSegment>),
     Number(String),
+    Bits(Bits),
     Tag(String),
     Call {
         function: String,
@@ -9484,6 +9555,9 @@ impl<'a> CheckedOrderAnalyzer<'a> {
             CheckedExpressionKind::Number { value } => {
                 Some(CheckedOrderSemanticExpression::Number(value.clone()))
             }
+            CheckedExpressionKind::Bits { value } => {
+                Some(CheckedOrderSemanticExpression::Bits(value.clone()))
+            }
             CheckedExpressionKind::Absent | CheckedExpressionKind::Flush { .. } => None,
             CheckedExpressionKind::Tag { name } => {
                 Some(CheckedOrderSemanticExpression::Tag(name.clone()))
@@ -9753,6 +9827,7 @@ impl<'a> CheckedOrderAnalyzer<'a> {
             }
             CheckedExpressionKind::Text { .. }
             | CheckedExpressionKind::Number { .. }
+            | CheckedExpressionKind::Bits { .. }
             | CheckedExpressionKind::BytesByte { .. }
             | CheckedExpressionKind::Tag { .. }
             | CheckedExpressionKind::ExternalRead { .. } => true,
@@ -9923,6 +9998,7 @@ impl<'a> CheckedOrderAnalyzer<'a> {
             | CheckedExpressionKind::Read { .. }
             | CheckedExpressionKind::Text { .. }
             | CheckedExpressionKind::Number { .. }
+            | CheckedExpressionKind::Bits { .. }
             | CheckedExpressionKind::BytesByte { .. }
             | CheckedExpressionKind::Absent
             | CheckedExpressionKind::Tag { .. }
@@ -10418,6 +10494,7 @@ fn validate_source_payload_shape_table(
             Type::Text
             | Type::Number
             | Type::Bytes(_)
+            | Type::Bits { .. }
             | Type::List(_)
             | Type::Map { .. }
             | Type::Set(_)
@@ -11135,6 +11212,7 @@ fn alpha_normalize_context_type(
         Type::Text
         | Type::Number
         | Type::Bytes(_)
+        | Type::Bits { .. }
         | Type::Absent
         | Type::RenderContract
         | Type::UnresolvedShape { .. }
@@ -11223,6 +11301,7 @@ fn pass_scheme_type_with_fallback(ty: &Type, fallback: &Type) -> Type {
         Type::Text
         | Type::Number
         | Type::Bytes(_)
+        | Type::Bits { .. }
         | Type::Absent
         | Type::RenderContract
         | Type::Var(_) => ty.clone(),
@@ -11296,9 +11375,12 @@ fn freshen_checked_scheme_type(ty: &Type, next_var: &mut u32) -> Type {
                 .map(|member| freshen_checked_scheme_type(member, next_var))
                 .collect(),
         ),
-        Type::Text | Type::Number | Type::Bytes(_) | Type::Absent | Type::RenderContract => {
-            ty.clone()
-        }
+        Type::Text
+        | Type::Number
+        | Type::Bytes(_)
+        | Type::Bits { .. }
+        | Type::Absent
+        | Type::RenderContract => ty.clone(),
     }
 }
 
@@ -11394,6 +11476,7 @@ fn instantiate_checked_type_scheme_for_call(
         Type::Text
         | Type::Number
         | Type::Bytes(_)
+        | Type::Bits { .. }
         | Type::Absent
         | Type::RenderContract
         | Type::UnresolvedShape { .. }
@@ -11429,6 +11512,7 @@ fn checked_type_contains_var(ty: &Type) -> bool {
         Type::Text
         | Type::Number
         | Type::Bytes(_)
+        | Type::Bits { .. }
         | Type::Absent
         | Type::RenderContract
         | Type::UnresolvedShape { .. }
@@ -11438,7 +11522,12 @@ fn checked_type_contains_var(ty: &Type) -> bool {
 
 fn type_is_recursively_closed(ty: &Type) -> bool {
     match ty {
-        Type::Text | Type::Number | Type::Bytes(_) | Type::Absent | Type::RenderContract => true,
+        Type::Text
+        | Type::Number
+        | Type::Bytes(_)
+        | Type::Bits { .. }
+        | Type::Absent
+        | Type::RenderContract => true,
         Type::List(item) => type_is_recursively_closed(item),
         Type::Map { key, value } => {
             type_is_recursively_closed(key) && type_is_recursively_closed(value)
@@ -11557,6 +11646,7 @@ fn substitute_checked_type_inner(
         Type::Text
         | Type::Number
         | Type::Bytes(_)
+        | Type::Bits { .. }
         | Type::Absent
         | Type::RenderContract
         | Type::UnresolvedShape { .. }
@@ -11948,6 +12038,7 @@ fn direct_expression_children(expr: &AstExpr) -> Vec<usize> {
         AstExprKind::StringLiteral(_)
         | AstExprKind::TextLiteral(_)
         | AstExprKind::Number(_)
+        | AstExprKind::BitsLiteral { .. }
         | AstExprKind::ByteLiteral { .. }
         | AstExprKind::Tag(_)
         | AstExprKind::Drain { .. }
@@ -12144,7 +12235,7 @@ fn flush_payload_type_is_closed_tag_algebra(ty: &Type) -> bool {
 
 fn flush_payload_field_type_is_closed(ty: &Type) -> bool {
     match ty {
-        Type::Text | Type::Number | Type::Bytes(_) => true,
+        Type::Text | Type::Number | Type::Bytes(_) | Type::Bits { .. } => true,
         Type::VariantSet(variants) => {
             !variants.is_empty()
                 && variants.iter().all(|variant| match variant {
@@ -12765,7 +12856,7 @@ fn role_namespace(role: ProgramRole) -> &'static str {
 
 fn external_data_type_is_closed(ty: &Type) -> bool {
     match ty {
-        Type::Text | Type::Number | Type::Bytes(_) => true,
+        Type::Text | Type::Number | Type::Bytes(_) | Type::Bits { .. } => true,
         Type::Object(shape) => {
             !shape.open && shape.fields.values().all(external_data_type_is_closed)
         }
@@ -12796,7 +12887,7 @@ fn external_data_type_is_closed(ty: &Type) -> bool {
 /// for MAP keys and SET items.
 pub fn type_is_map_key_safe(ty: &Type) -> bool {
     match ty {
-        Type::Number | Type::Text | Type::Bytes(_) => true,
+        Type::Number | Type::Text | Type::Bytes(_) | Type::Bits { .. } => true,
         Type::VariantSet(variants) => {
             !variants.is_empty()
                 && variants.iter().all(|variant| match variant {
@@ -12838,7 +12929,12 @@ fn type_may_contain_collection_authority(ty: &Type) -> bool {
         Type::Function { .. } | Type::UnresolvedShape { .. } | Type::Var(_) | Type::Unknown => {
             false
         }
-        Type::Text | Type::Number | Type::Bytes(_) | Type::Absent | Type::RenderContract => false,
+        Type::Text
+        | Type::Number
+        | Type::Bytes(_)
+        | Type::Bits { .. }
+        | Type::Absent
+        | Type::RenderContract => false,
     }
 }
 
@@ -14560,6 +14656,7 @@ impl<'a> Checker<'a> {
             | AstExprKind::TextLiteral(_)
             | AstExprKind::TextTemplate { .. } => Type::Text,
             AstExprKind::Number(_) => Type::Number,
+            AstExprKind::BitsLiteral { width, .. } => Type::Bits { width: *width },
             AstExprKind::ByteLiteral { .. } => Type::Bytes(BytesType::Fixed(1)),
             AstExprKind::BytesLiteral { size, items } => {
                 self.infer_bytes_literal(expr, size, items)
@@ -16758,6 +16855,7 @@ impl<'a> Checker<'a> {
             }
             AstExprKind::StringLiteral(_) | AstExprKind::TextLiteral(_) => Some(Type::Text),
             AstExprKind::Number(_) => Some(Type::Number),
+            AstExprKind::BitsLiteral { width, .. } => Some(Type::Bits { width: *width }),
             AstExprKind::ByteLiteral { .. } => Some(Type::Bytes(BytesType::Fixed(1))),
             AstExprKind::BytesLiteral { size, items } => Some(static_bytes_literal_type(
                 size,
@@ -18464,7 +18562,7 @@ fn statement_contains_output_authority(statement: &AstStatement) -> bool {
 
 fn host_output_type_is_closed(ty: &Type) -> bool {
     match ty {
-        Type::Text | Type::Number | Type::Bytes(_) => true,
+        Type::Text | Type::Number | Type::Bytes(_) | Type::Bits { .. } => true,
         Type::VariantSet(variants) => variants.iter().all(|variant| match variant {
             Variant::Tag(_) => true,
             Variant::Tagged { fields, .. } => {
@@ -18877,6 +18975,7 @@ fn collect_expr_user_function_calls(
         | AstExprKind::StringLiteral(_)
         | AstExprKind::TextLiteral(_)
         | AstExprKind::Number(_)
+        | AstExprKind::BitsLiteral { .. }
         | AstExprKind::ByteLiteral { .. }
         | AstExprKind::Tag(_)
         | AstExprKind::Source
@@ -19177,6 +19276,10 @@ fn checked_match_pattern_compatibility(
             CheckedMatchPattern::Wildcard | CheckedMatchPattern::Binding { .. } => Some(true),
             CheckedMatchPattern::Number { .. } => Some(matches!(selector, Type::Number)),
             CheckedMatchPattern::Text { .. } => Some(matches!(selector, Type::Text)),
+            CheckedMatchPattern::Bits { value } => Some(matches!(
+                selector,
+                Type::Bits { width } if *width == value.width()
+            )),
             CheckedMatchPattern::Tag { .. } => Some(matches!(selector, Type::VariantSet(_))),
         },
     }
@@ -19193,6 +19296,9 @@ fn incompatible_checked_match_pattern_message(
         }
         CheckedMatchPattern::Text { value } => {
             format!("exact text pattern `TEXT {{ {value} }}` cannot match selector type {selector}")
+        }
+        CheckedMatchPattern::Bits { value } => {
+            format!("exact bit pattern `{value}` cannot match selector type {selector}")
         }
         CheckedMatchPattern::Tag { name, .. } if selector == "TEXT" => format!(
             "tag pattern `{name}` cannot match selector type TEXT\nuse `TEXT {{ {name} }}` to match exact text"
@@ -19413,6 +19519,13 @@ fn static_key_value(program: &ParsedProgram, expr_id: usize) -> Option<DataValue
                 Some(DataValue::Text(value.clone()))
             }
             AstExprKind::ByteLiteral { value, .. } => Some(DataValue::Bytes(vec![*value].into())),
+            AstExprKind::BitsLiteral {
+                width,
+                radix,
+                digits,
+            } => Bits::parse_encoded(*width, *radix, digits)
+                .ok()
+                .map(DataValue::Bits),
             AstExprKind::BytesLiteral { items, .. } => {
                 let mut bytes = Vec::new();
                 for item in items {
@@ -21093,6 +21206,7 @@ fn boon_facing_type_display_tree_with_depth(
         Type::Text => scalar_type_display_node("TEXT"),
         Type::Number => scalar_type_display_node("NUMBER"),
         Type::Bytes(bytes) => scalar_type_display_node(bytes_type_label(bytes)),
+        Type::Bits { width } => TypeDisplayNode::Bits { width: *width },
         Type::Absent => scalar_type_display_node("ABSENT"),
         Type::RenderContract => TypeDisplayNode::Object {
             fields: vec![TypeDisplayField {
@@ -21222,6 +21336,7 @@ fn boon_facing_type_label_with_depth(
         Type::Text => "TEXT".to_owned(),
         Type::Number => "NUMBER".to_owned(),
         Type::Bytes(bytes) => bytes_type_label(bytes),
+        Type::Bits { width } => format!("BITS[{width}]"),
         Type::Absent => "ABSENT".to_owned(),
         Type::RenderContract => document_render_contract_label(compact),
         Type::Unknown | Type::Var(_) => "VALUE".to_owned(),
@@ -21670,6 +21785,7 @@ fn concrete_type_conflict(left: &Type, right: &Type) -> bool {
         | (Type::Number, Type::Number)
         | (Type::RenderContract, Type::RenderContract) => false,
         (Type::Bytes(left), Type::Bytes(right)) => bytes_type_conflict(left, right),
+        (Type::Bits { width: left }, Type::Bits { width: right }) => left != right,
         (Type::VariantSet(_), Type::VariantSet(_)) => false,
         (Type::Object(left), Type::Object(right)) => {
             left.fields.iter().any(|(field, left_type)| {
@@ -21725,6 +21841,7 @@ fn type_is_assignable_to(actual: &Type, expected: &Type) -> bool {
             .any(|expected| type_is_assignable_to(actual, expected)),
         (Type::Text, Type::Text) | (Type::Number, Type::Number) => true,
         (Type::Bytes(actual), Type::Bytes(expected)) => bytes_type_assignable(actual, expected),
+        (Type::Bits { width: actual }, Type::Bits { width: expected }) => actual == expected,
         (actual, expected) if type_accepts_true_false(expected) => type_accepts_true_false(actual),
         (Type::RenderContract, Type::RenderContract) => true,
         (actual, Type::RenderContract) => is_renderable_type(actual),
@@ -21780,6 +21897,7 @@ pub fn resolved_type_is_assignable_to(actual: &Type, expected: &Type) -> bool {
         | (Type::Absent, Type::Absent)
         | (Type::RenderContract, Type::RenderContract) => true,
         (Type::Bytes(actual), Type::Bytes(expected)) => bytes_type_assignable(actual, expected),
+        (Type::Bits { width: actual }, Type::Bits { width: expected }) => actual == expected,
         (actual, Type::RenderContract) => is_renderable_type(actual),
         (Type::List(actual), Type::List(expected)) => {
             resolved_type_is_assignable_to(actual, expected)
@@ -22023,6 +22141,7 @@ fn checked_inline_list_authority_root(
             | CheckedExpressionKind::Text { .. }
             | CheckedExpressionKind::TextTemplate { .. }
             | CheckedExpressionKind::Number { .. }
+            | CheckedExpressionKind::Bits { .. }
             | CheckedExpressionKind::BytesByte { .. }
             | CheckedExpressionKind::Absent
             | CheckedExpressionKind::Flush { .. }
@@ -22963,7 +23082,9 @@ fn reachable_static_when_arms(
                 });
                 break;
             }
-            AstMatchPattern::Number { .. } | AstMatchPattern::Text { .. } => {}
+            AstMatchPattern::Number { .. }
+            | AstMatchPattern::Text { .. }
+            | AstMatchPattern::Bits { .. } => {}
             AstMatchPattern::Tag { .. } => unreachable!(),
             AstMatchPattern::Invalid { .. } => {
                 unreachable!("invalid match patterns are rejected by boon_parser")
@@ -23102,6 +23223,7 @@ fn simple_expr_type(expr: &AstExpr, expressions: &[AstExpr]) -> Type {
         | AstExprKind::TextLiteral(_)
         | AstExprKind::TextTemplate { .. } => Type::Text,
         AstExprKind::Number(_) => Type::Number,
+        AstExprKind::BitsLiteral { width, .. } => Type::Bits { width: *width },
         AstExprKind::ByteLiteral { .. } => Type::Bytes(BytesType::Fixed(1)),
         AstExprKind::BytesLiteral { size, items } => {
             static_bytes_literal_type(size, items, expressions, |expr| {
@@ -23459,6 +23581,7 @@ fn expr_contains_render_constructor_seen(
         | AstExprKind::TextLiteral(_)
         | AstExprKind::ByteLiteral { .. }
         | AstExprKind::Number(_)
+        | AstExprKind::BitsLiteral { .. }
         | AstExprKind::Tag(_)
         | AstExprKind::Source
         | AstExprKind::Latest { .. }
@@ -23691,6 +23814,7 @@ fn collect_param_requirements_expr(
         | AstExprKind::StringLiteral(_)
         | AstExprKind::TextLiteral(_)
         | AstExprKind::Number(_)
+        | AstExprKind::BitsLiteral { .. }
         | AstExprKind::ByteLiteral { .. }
         | AstExprKind::Tag(_)
         | AstExprKind::Source
@@ -24333,6 +24457,7 @@ fn static_expr_type_from_bindings(
         }
         AstExprKind::StringLiteral(_) | AstExprKind::TextLiteral(_) => Some(Type::Text),
         AstExprKind::Number(_) => Some(Type::Number),
+        AstExprKind::BitsLiteral { width, .. } => Some(Type::Bits { width: *width }),
         AstExprKind::ByteLiteral { .. } => Some(Type::Bytes(BytesType::Fixed(1))),
         AstExprKind::BytesLiteral { size, items } => Some(static_bytes_literal_type(
             size,
@@ -25108,7 +25233,8 @@ fn pattern_variable_names(pattern: &AstMatchPattern) -> Vec<String> {
         AstMatchPattern::Tag { fields, .. } => fields.clone(),
         AstMatchPattern::Wildcard
         | AstMatchPattern::Number { .. }
-        | AstMatchPattern::Text { .. } => Vec::new(),
+        | AstMatchPattern::Text { .. }
+        | AstMatchPattern::Bits { .. } => Vec::new(),
         AstMatchPattern::Invalid { .. } => {
             unreachable!("invalid match patterns are rejected by boon_parser")
         }
@@ -25173,6 +25299,9 @@ fn widen_structural_type(left: &Type, right: &Type) -> Type {
             }
             _ => Type::Bytes(BytesType::Dynamic),
         },
+        (Type::Bits { width: left }, Type::Bits { width: right }) if left == right => {
+            Type::Bits { width: *left }
+        }
         (Type::List(left), Type::List(right)) => {
             Type::List(Box::new(widen_structural_type(left, right)))
         }
@@ -25996,6 +26125,7 @@ impl<'a> CheckedSourceProvenanceResolver<'a> {
             | CheckedExpressionKind::Text { .. }
             | CheckedExpressionKind::TextTemplate { .. }
             | CheckedExpressionKind::Number { .. }
+            | CheckedExpressionKind::Bits { .. }
             | CheckedExpressionKind::BytesByte { .. }
             | CheckedExpressionKind::Absent
             | CheckedExpressionKind::Tag { .. }
@@ -26134,6 +26264,7 @@ impl<'a> CheckedSourceProvenanceResolver<'a> {
             | CheckedExpressionKind::Text { .. }
             | CheckedExpressionKind::TextTemplate { .. }
             | CheckedExpressionKind::Number { .. }
+            | CheckedExpressionKind::Bits { .. }
             | CheckedExpressionKind::BytesByte { .. }
             | CheckedExpressionKind::Absent
             | CheckedExpressionKind::Flush { .. }
@@ -26446,6 +26577,7 @@ fn checked_projection_to_expression(
             | CheckedExpressionKind::Drain { .. }
             | CheckedExpressionKind::Text { .. }
             | CheckedExpressionKind::Number { .. }
+            | CheckedExpressionKind::Bits { .. }
             | CheckedExpressionKind::BytesByte { .. }
             | CheckedExpressionKind::Absent
             | CheckedExpressionKind::Tag { .. }
@@ -26598,6 +26730,7 @@ fn checked_expression_children(
         | CheckedExpressionKind::Drain { .. }
         | CheckedExpressionKind::Text { .. }
         | CheckedExpressionKind::Number { .. }
+        | CheckedExpressionKind::Bits { .. }
         | CheckedExpressionKind::BytesByte { .. }
         | CheckedExpressionKind::Absent
         | CheckedExpressionKind::Tag { .. }
@@ -26927,6 +27060,7 @@ impl<'a> CheckedAuthorityAnalyzer<'a> {
             | CheckedExpressionKind::Bytes { .. }
             | CheckedExpressionKind::Text { .. }
             | CheckedExpressionKind::Number { .. }
+            | CheckedExpressionKind::Bits { .. }
             | CheckedExpressionKind::BytesByte { .. }
             | CheckedExpressionKind::Absent
             | CheckedExpressionKind::Tag { .. }
@@ -27810,6 +27944,7 @@ fn collect_contextual_binding_field_requirements(
         | AstExprKind::StringLiteral(_)
         | AstExprKind::TextLiteral(_)
         | AstExprKind::Number(_)
+        | AstExprKind::BitsLiteral { .. }
         | AstExprKind::ByteLiteral { .. }
         | AstExprKind::Tag(_)
         | AstExprKind::Source
@@ -29348,6 +29483,7 @@ fn type_contains_renderable(ty: &Type) -> bool {
         Type::Text
         | Type::Number
         | Type::Bytes(_)
+        | Type::Bits { .. }
         | Type::Absent
         | Type::Var(_)
         | Type::Unknown
@@ -29373,6 +29509,7 @@ fn type_contains_no_element(ty: &Type) -> bool {
         Type::Text
         | Type::Number
         | Type::Bytes(_)
+        | Type::Bits { .. }
         | Type::Absent
         | Type::RenderContract
         | Type::Var(_)
@@ -29397,6 +29534,7 @@ fn type_contains_absence(ty: &Type) -> bool {
         Type::Text
         | Type::Number
         | Type::Bytes(_)
+        | Type::Bits { .. }
         | Type::RenderContract
         | Type::Var(_)
         | Type::Unknown
@@ -29482,6 +29620,7 @@ fn collect_type_vars(ty: &Type, vars: &mut BTreeSet<TypeVar>) {
         Type::Text
         | Type::Number
         | Type::Bytes(_)
+        | Type::Bits { .. }
         | Type::Absent
         | Type::RenderContract
         | Type::Unknown

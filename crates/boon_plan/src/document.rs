@@ -254,6 +254,7 @@ pub enum DocumentConstantValue {
     Number { coefficient: i64, scale: u32 },
     Bytes { value: Vec<u8> },
     Tag { name: DocumentNameId },
+    Bits { value: boon_data::Bits },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

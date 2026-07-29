@@ -3,7 +3,7 @@
 //! This format is for process and network boundaries. In-process Boon graphs
 //! should continue to pass `Value` directly without serialization.
 //!
-//! # Version 4 format
+//! # Version 5 format
 //!
 //! Every message starts with `BWV` followed by the one-byte format version.
 //! Values use a one-byte tag. Lengths and collection counts use minimal
@@ -12,12 +12,13 @@
 //! Lists preserve item order. Object and Tag payload keys must be strictly
 //! increasing in Rust `String` order. MAP entries and SET items must be
 //! strictly increasing in canonical [`Value`] order and must use key-safe
-//! values. Tag names use the same length-prefixed text representation as
-//! object keys.
+//! values. BITS stores its positive width followed by exactly `ceil(width/8)`
+//! canonical big-endian bytes. Tag names use the same length-prefixed text
+//! representation as object keys.
 
 #![forbid(unsafe_code)]
 
-use boon_data::{ExactNumber, ExactNumberSign, Value};
+use boon_data::{Bits, ExactNumber, ExactNumberSign, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
@@ -41,7 +42,7 @@ pub use session_control::{
 };
 
 const MAGIC: [u8; 3] = *b"BWV";
-pub const FORMAT_VERSION: u8 = 4;
+pub const FORMAT_VERSION: u8 = 5;
 pub const HEADER: [u8; 4] = [MAGIC[0], MAGIC[1], MAGIC[2], FORMAT_VERSION];
 
 /// The protocol-owned same-origin WebSocket path for Client/Session traffic.
@@ -57,6 +58,7 @@ const VALUE_OBJECT: u8 = 4;
 const VALUE_TAG: u8 = 5;
 const VALUE_MAP: u8 = 6;
 const VALUE_SET: u8 = 7;
+const VALUE_BITS: u8 = 8;
 
 /// Resource limits applied to both encoding and decoding.
 ///
@@ -70,6 +72,7 @@ pub struct Limits {
     pub max_collection_length: usize,
     pub max_text_bytes: usize,
     pub max_byte_string_bytes: usize,
+    pub max_bits_bytes: usize,
     pub max_number_component_bytes: usize,
 }
 
@@ -82,6 +85,7 @@ impl Default for Limits {
             max_collection_length: 1_000_000,
             max_text_bytes: 1024 * 1024,
             max_byte_string_bytes: 8 * 1024 * 1024,
+            max_bits_bytes: 128 * 1024,
             max_number_component_bytes: 128 * 1024,
         }
     }
@@ -95,6 +99,7 @@ pub enum LimitKind {
     CollectionLength,
     TextBytes,
     ByteStringBytes,
+    BitsBytes,
     NumberComponentBytes,
 }
 
@@ -110,6 +115,7 @@ pub enum WireError {
     VarintOverflow,
     LengthOverflow,
     NonCanonicalNumber,
+    NonCanonicalBits,
     NonCanonicalMapOrder,
     NonCanonicalValueOrder,
     InvalidMapKey,
@@ -143,6 +149,9 @@ impl fmt::Display for WireError {
             }
             Self::NonCanonicalNumber => {
                 formatter.write_str("Boon wire number is not canonically encoded")
+            }
+            Self::NonCanonicalBits => {
+                formatter.write_str("Boon wire BITS value is not canonically encoded")
             }
             Self::NonCanonicalMapOrder => {
                 formatter.write_str("Boon wire map keys are not strictly increasing")
@@ -312,6 +321,17 @@ impl Encoder {
                 }
                 Ok(())
             }
+            Value::Bits(bits) => {
+                self.byte(VALUE_BITS)?;
+                let width = usize::try_from(bits.width()).map_err(|_| WireError::LengthOverflow)?;
+                self.length(width)?;
+                check_limit(
+                    LimitKind::BitsBytes,
+                    bits.bytes().len(),
+                    self.limits.max_bits_bytes,
+                )?;
+                self.write(bits.bytes())
+            }
         }
     }
 
@@ -448,6 +468,21 @@ impl Decoder<'_> {
                 }
                 Ok(Value::Set(items))
             }
+            VALUE_BITS => {
+                let width = self.length()?;
+                let width = u32::try_from(width).map_err(|_| WireError::NonCanonicalBits)?;
+                let byte_length =
+                    usize::try_from(width.div_ceil(8)).map_err(|_| WireError::LengthOverflow)?;
+                check_limit(
+                    LimitKind::BitsBytes,
+                    byte_length,
+                    self.limits.max_bits_bytes,
+                )?;
+                let bytes = self.read(byte_length)?.to_vec();
+                Bits::from_canonical_bytes(width, bytes)
+                    .map(Value::Bits)
+                    .map_err(|_| WireError::NonCanonicalBits)
+            }
             tag => Err(WireError::UnknownTag(tag)),
         }
     }
@@ -575,6 +610,10 @@ mod tests {
 
     fn all_shapes() -> Value {
         Value::Object(BTreeMap::from([
+            (
+                "bits".into(),
+                Value::Bits(Bits::parse_encoded(12, 16, "a3").unwrap()),
+            ),
             ("bytes".into(), Value::Bytes(vec![0, 127, 128, 255].into())),
             (
                 "error".into(),
@@ -646,7 +685,7 @@ mod tests {
         let second = Value::Object(reordered);
 
         let golden = vec![
-            b'B', b'W', b'V', 4, 4, 2, 1, b'a', 5, 4, b'T', b'r', b'u', b'e', 0, 1, b'z', 5, 2,
+            b'B', b'W', b'V', 5, 4, 2, 1, b'a', 5, 4, b'T', b'r', b'u', b'e', 0, 1, b'z', 5, 2,
             b'O', b'k', 1, 1, b'n', 0, 2, 1, 3, 1, 2,
         ];
         assert_eq!(encode(&first).unwrap(), golden);
@@ -656,12 +695,12 @@ mod tests {
 
     #[test]
     fn rejects_malformed_headers_tags_and_trailing_bytes() {
-        assert_eq!(decode(b"bad\x04\x00"), Err(WireError::InvalidMagic));
+        assert_eq!(decode(b"bad\x05\x00"), Err(WireError::InvalidMagic));
         assert_eq!(
             decode(b"BWV\x01\x00"),
             Err(WireError::UnsupportedVersion(1))
         );
-        assert_eq!(decode(b"BWV\x04\xff"), Err(WireError::UnknownTag(0xff)));
+        assert_eq!(decode(b"BWV\x05\xff"), Err(WireError::UnknownTag(0xff)));
         let zero = Value::integer(0).unwrap();
         let mut trailing = encode(&zero).unwrap();
         assert_eq!(decode(&trailing), Ok(zero));
@@ -671,27 +710,27 @@ mod tests {
 
     #[test]
     fn rejects_invalid_text_varints_and_numbers() {
-        assert_eq!(decode(b"BWV\x04\x01\x01\xff"), Err(WireError::InvalidUtf8));
+        assert_eq!(decode(b"BWV\x05\x01\x01\xff"), Err(WireError::InvalidUtf8));
         assert_eq!(
-            decode(b"BWV\x04\x01\x80\x00"),
+            decode(b"BWV\x05\x01\x80\x00"),
             Err(WireError::NonCanonicalVarint)
         );
 
-        let mut overflowing = b"BWV\x04\x01".to_vec();
+        let mut overflowing = b"BWV\x05\x01".to_vec();
         overflowing.extend_from_slice(&[0xff; 9]);
         overflowing.push(0x02);
         assert_eq!(decode(&overflowing), Err(WireError::VarintOverflow));
 
         assert_eq!(
-            decode(b"BWV\x04\x00\x09\x00\x01\x01"),
+            decode(b"BWV\x05\x00\x09\x00\x01\x01"),
             Err(WireError::NonCanonicalNumber)
         );
         assert_eq!(
-            decode(b"BWV\x04\x00\x02\x01\x02\x01\x04"),
+            decode(b"BWV\x05\x00\x02\x01\x02\x01\x04"),
             Err(WireError::NonCanonicalNumber)
         );
         assert_eq!(
-            decode(b"BWV\x04\x00\x01\x00\x01\x02"),
+            decode(b"BWV\x05\x00\x01\x00\x01\x02"),
             Err(WireError::NonCanonicalNumber)
         );
         assert_eq!(
@@ -702,10 +741,10 @@ mod tests {
 
     #[test]
     fn rejects_noncanonical_map_key_order_and_duplicates() {
-        let out_of_order = b"BWV\x04\x04\x02\x01b\x05\x00\x00\x01a\x05\x00\x00";
+        let out_of_order = b"BWV\x05\x04\x02\x01b\x05\x00\x00\x01a\x05\x00\x00";
         assert_eq!(decode(out_of_order), Err(WireError::NonCanonicalMapOrder));
 
-        let duplicate = b"BWV\x04\x04\x02\x01a\x05\x00\x00\x01a\x05\x00\x00";
+        let duplicate = b"BWV\x05\x04\x02\x01a\x05\x00\x00\x01a\x05\x00\x00";
         assert_eq!(decode(duplicate), Err(WireError::NonCanonicalMapOrder));
     }
 
@@ -719,18 +758,44 @@ mod tests {
         let invalid_set = Value::Set(BTreeSet::from([Value::List(Vec::new())]));
         assert_eq!(encode(&invalid_set), Err(WireError::InvalidSetItem));
 
-        let duplicate_map_key = b"BWV\x04\x06\x02\x01\x01a\x01\x01v\x01\x01a\x01\x01w";
+        let duplicate_map_key = b"BWV\x05\x06\x02\x01\x01a\x01\x01v\x01\x01a\x01\x01w";
         assert_eq!(
             decode(duplicate_map_key),
             Err(WireError::NonCanonicalValueOrder)
         );
-        let descending_set = b"BWV\x04\x07\x02\x01\x01b\x01\x01a";
+        let descending_set = b"BWV\x05\x07\x02\x01\x01b\x01\x01a";
         assert_eq!(
             decode(descending_set),
             Err(WireError::NonCanonicalValueOrder)
         );
-        let unsafe_set_item = b"BWV\x04\x07\x01\x03\x00";
+        let unsafe_set_item = b"BWV\x05\x07\x01\x03\x00";
         assert_eq!(decode(unsafe_set_item), Err(WireError::InvalidSetItem));
+    }
+
+    #[test]
+    fn bits_width_and_bytes_are_canonical_and_bounded() {
+        let value = Value::Bits(Bits::parse_encoded(9, 16, "101").unwrap());
+        let encoded = encode(&value).unwrap();
+        assert_eq!(encoded, b"BWV\x05\x08\x09\x01\x01");
+        assert_eq!(decode(&encoded).unwrap(), value);
+        assert_eq!(decode(b"BWV\x05\x08\x00"), Err(WireError::NonCanonicalBits));
+        assert_eq!(
+            decode(b"BWV\x05\x08\x09\x81\x01"),
+            Err(WireError::NonCanonicalBits)
+        );
+        assert!(matches!(
+            encode_with_limits(
+                &value,
+                Limits {
+                    max_bits_bytes: 1,
+                    ..Limits::default()
+                }
+            ),
+            Err(WireError::LimitExceeded {
+                kind: LimitKind::BitsBytes,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -738,6 +803,7 @@ mod tests {
         let value = Value::List(vec![
             Value::Text("abcd".into()),
             Value::Bytes(vec![1, 2, 3, 4].into()),
+            Value::Bits(Bits::parse_encoded(16, 16, "beef").unwrap()),
             Value::List(vec![Value::tag("Null")]),
         ]);
         let encoded = encode(&value).unwrap();
@@ -784,6 +850,13 @@ mod tests {
                     ..Limits::default()
                 },
                 LimitKind::ByteStringBytes,
+            ),
+            (
+                Limits {
+                    max_bits_bytes: 1,
+                    ..Limits::default()
+                },
+                LimitKind::BitsBytes,
             ),
         ];
 

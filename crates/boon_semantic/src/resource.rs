@@ -1190,6 +1190,7 @@ fn expression_record_field_names(
             | SemanticExpressionKind::Text(_)
             | SemanticExpressionKind::TextTemplate { .. }
             | SemanticExpressionKind::Number(_)
+            | SemanticExpressionKind::Bits(_)
             | SemanticExpressionKind::BytesByte(_)
             | SemanticExpressionKind::Absent
             | SemanticExpressionKind::Tag(_)
@@ -1390,6 +1391,7 @@ fn semantic_type_contains_collection_authority(ty: &Type) -> bool {
         Type::Text
         | Type::Number
         | Type::Bytes(_)
+        | Type::Bits { .. }
         | Type::Absent
         | Type::RenderContract
         | Type::Function { .. }
@@ -1660,6 +1662,9 @@ fn semantic_static_data(
                                     format!("invalid finite Number `{value}`: {error}")
                                 })?,
                         );
+                    }
+                    SemanticExpressionKind::Bits(value) => {
+                        values.push(boon_data::Value::Bits(value.clone()));
                     }
                     SemanticExpressionKind::BytesByte(value) => {
                         values.push(boon_data::Value::Bytes(boon_data::Bytes::copy_from_slice(
@@ -2756,6 +2761,7 @@ fn collect_lineage_leaves(
                 SemanticExpressionKind::Text(_)
                 | SemanticExpressionKind::TextTemplate { .. }
                 | SemanticExpressionKind::Number(_)
+                | SemanticExpressionKind::Bits(_)
                 | SemanticExpressionKind::BytesByte(_)
                 | SemanticExpressionKind::Absent
                 | SemanticExpressionKind::Tag(_)
@@ -2879,6 +2885,7 @@ fn collect_lineage_leaves(
             | SemanticExpressionKind::Text(_)
             | SemanticExpressionKind::TextTemplate { .. }
             | SemanticExpressionKind::Number(_)
+            | SemanticExpressionKind::Bits(_)
             | SemanticExpressionKind::BytesByte(_)
             | SemanticExpressionKind::Tag(_)
             | SemanticExpressionKind::TaggedObject { .. }
@@ -4560,6 +4567,7 @@ fn semantic_expression_children(kind: &SemanticExpressionKind) -> Vec<SemanticEx
         | SemanticExpressionKind::Drain { .. }
         | SemanticExpressionKind::Text(_)
         | SemanticExpressionKind::Number(_)
+        | SemanticExpressionKind::Bits(_)
         | SemanticExpressionKind::BytesByte(_)
         | SemanticExpressionKind::Absent
         | SemanticExpressionKind::Tag(_)

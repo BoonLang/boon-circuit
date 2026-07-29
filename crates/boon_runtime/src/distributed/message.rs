@@ -212,6 +212,7 @@ fn estimated_value_bytes(value: &Value) -> Option<usize> {
         Value::Number(_) => Some(16),
         Value::Text(value) => 16usize.checked_add(value.len()),
         Value::Bytes(value) => 16usize.checked_add(value.len()),
+        Value::Bits(value) => 20usize.checked_add(value.bytes().len()),
         Value::List(values) => values.iter().try_fold(16usize, |total, value| {
             total.checked_add(estimated_value_bytes(value)?)
         }),

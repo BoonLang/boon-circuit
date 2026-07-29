@@ -1760,6 +1760,42 @@ outputs: [
 }
 
 #[test]
+fn compiler_lowers_fixed_width_bits_through_the_verified_artifact_spine() {
+    let compiled = compile_fixture_source_text_to_machine_plan(
+        "bits-output.bn",
+        r#"
+store: [
+    opcode: BITS[7] { 2u0110011 }
+]
+
+outputs: [
+    opcode: store.opcode
+]
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+
+    assert!(compiled.ir.executable.expressions.iter().any(|expression| {
+        matches!(
+            &expression.kind,
+            boon_ir::ExecutableExpressionKind::Bits(value)
+                if value.width() == 7
+                    && value.to_string() == "BITS[7] { 2u0110011 }"
+        )
+    }));
+    assert!(compiled.plan.constants.iter().any(|constant| {
+        matches!(
+            &constant.value,
+            boon_plan::PlanConstantValue::Bits { value }
+                if value.width() == 7
+                    && value.to_string() == "BITS[7] { 2u0110011 }"
+        )
+    }));
+    assert_eq!(verify_plan(&compiled.plan).unwrap().status, "pass");
+}
+
+#[test]
 fn omitted_order_direction_erases_to_an_ascending_typed_index() {
     let compiled = compile_fixture_source_text_to_machine_plan(
         "default-order-direction.bn",

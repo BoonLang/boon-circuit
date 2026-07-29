@@ -7,9 +7,9 @@ registry_owner = "boon_parser"
 
 [[feature]]
 id = "bits_fixed_width_literals"
-stage = "planned"
-parser_expectation = "reject"
-fixture = "examples/language_surface/future/bits_fixed_width_literals.bn"
+stage = "current"
+parser_expectation = "accept"
+fixture = "examples/language_surface/current/bits_fixed_width_literals.bn"
 
 [[feature]]
 id = "closed_truth_tags"
@@ -43,9 +43,9 @@ fixture = "examples/language_surface/current/immutable_bytes.bn"
 
 [[feature]]
 id = "map_literals"
-stage = "planned"
-parser_expectation = "reject"
-fixture = "examples/language_surface/future/map_literals.bn"
+stage = "current"
+parser_expectation = "accept"
+fixture = "examples/language_surface/current/map_literals.bn"
 
 [[feature]]
 id = "one_based_positions"
@@ -67,9 +67,9 @@ fixture = "examples/language_surface/current/record_and_list_literals.bn"
 
 [[feature]]
 id = "set_literals"
-stage = "planned"
-parser_expectation = "reject"
-fixture = "examples/language_surface/future/set_literals.bn"
+stage = "current"
+parser_expectation = "accept"
+fixture = "examples/language_surface/current/set_literals.bn"
 
 [[feature]]
 id = "structured_out_and_pass"

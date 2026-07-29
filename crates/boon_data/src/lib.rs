@@ -3,6 +3,10 @@
 #![forbid(unsafe_code)]
 
 pub use bytes::Bytes;
+mod bits;
+pub use bits::{
+    Bits, BitsArithmeticFailure, BitsDirection, BitsError, BitsInterpretation, MAX_BITS_WIDTH,
+};
 mod number;
 pub use number::{
     ExactNumber, ExactNumberError, ExactNumberParseError, ExactNumberParseReason,
@@ -228,6 +232,9 @@ pub enum Value {
     },
     Map(BTreeMap<Value, Value>),
     Set(BTreeSet<Value>),
+    /// Canonical fixed-width raw bit sequence. Appended so existing binary
+    /// discriminants remain stable while the Phase 4 schema version advances.
+    Bits(Bits),
 }
 
 impl Value {
@@ -260,7 +267,7 @@ impl Value {
     /// for canonical MAP keys and SET items.
     pub fn is_key_safe(&self) -> bool {
         match self {
-            Self::Number(_) | Self::Text(_) | Self::Bytes(_) => true,
+            Self::Number(_) | Self::Text(_) | Self::Bytes(_) | Self::Bits(_) => true,
             Self::Object(fields) => fields.values().all(Self::is_key_safe),
             Self::Tag { fields, .. } => fields.values().all(Self::is_key_safe),
             Self::List(_) | Self::Map(_) | Self::Set(_) => false,

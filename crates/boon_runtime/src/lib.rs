@@ -2153,6 +2153,9 @@ fn scenario_value_text(value: &Value) -> RuntimeResult<String> {
         Value::Number(value) => Ok(value.to_string()),
         Value::Text(value) => Ok(value.clone()),
         Value::Bytes(value) => Ok(String::from_utf8(value.to_vec())?),
+        Value::Bits(_) => {
+            Err("scenario text expectation targeted BITS without an explicit conversion".into())
+        }
         Value::Tag { tag, fields } if fields.is_empty() => Ok(tag.clone()),
         Value::List(_)
         | Value::Record(_)

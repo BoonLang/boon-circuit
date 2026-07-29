@@ -1013,6 +1013,7 @@ pub(crate) fn erase_runtime_type_vars(ty: &Type) -> Type {
         Type::Text
         | Type::Number
         | Type::Bytes(_)
+        | Type::Bits { .. }
         | Type::Absent
         | Type::RenderContract
         | Type::UnresolvedShape { .. }
@@ -2619,6 +2620,7 @@ fn arena_expression_children(kind: &SemanticExpressionKind) -> Vec<SemanticExprI
         | SemanticExpressionKind::Drain { .. }
         | SemanticExpressionKind::Text(_)
         | SemanticExpressionKind::Number(_)
+        | SemanticExpressionKind::Bits(_)
         | SemanticExpressionKind::BytesByte(_)
         | SemanticExpressionKind::Absent
         | SemanticExpressionKind::Tag(_)
@@ -3351,6 +3353,7 @@ fn rebase_expression_kind(
         | SemanticExpressionKind::Drain { .. }
         | SemanticExpressionKind::Text(_)
         | SemanticExpressionKind::Number(_)
+        | SemanticExpressionKind::Bits(_)
         | SemanticExpressionKind::BytesByte(_)
         | SemanticExpressionKind::Absent
         | SemanticExpressionKind::Tag(_)
@@ -4312,6 +4315,7 @@ impl<'a> SemanticExpressionBuilder<'a> {
             | SemanticExpressionKind::Text(_)
             | SemanticExpressionKind::TextTemplate { .. }
             | SemanticExpressionKind::Number(_)
+            | SemanticExpressionKind::Bits(_)
             | SemanticExpressionKind::BytesByte(_)
             | SemanticExpressionKind::Absent
             | SemanticExpressionKind::Tag(_)
@@ -4852,6 +4856,7 @@ impl<'a> SemanticExpressionBuilder<'a> {
                 }
             }
             CheckedExpressionKind::Number { value } => SemanticExpressionKind::Number(value),
+            CheckedExpressionKind::Bits { value } => SemanticExpressionKind::Bits(value),
             CheckedExpressionKind::BytesByte { value } => SemanticExpressionKind::BytesByte(value),
             CheckedExpressionKind::Absent => SemanticExpressionKind::Absent,
             CheckedExpressionKind::Flush { payload } => SemanticExpressionKind::Flush {

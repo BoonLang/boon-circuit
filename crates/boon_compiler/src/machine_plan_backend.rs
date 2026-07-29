@@ -1501,6 +1501,7 @@ fn plan_value_type_from_semantic_data_type(data_type: &DataTypePlan) -> PlanValu
         DataTypePlan::Bytes { fixed_len } => PlanValueType::Bytes {
             fixed_len: *fixed_len,
         },
+        DataTypePlan::Bits { width } => PlanValueType::Bits { width: *width },
         DataTypePlan::Variant { .. } => PlanValueType::Tag,
         DataTypePlan::Record { .. }
         | DataTypePlan::List { .. }
@@ -1518,6 +1519,9 @@ fn deterministic_fresh_constant(data_type: &DataTypePlan) -> Option<PlanConstant
         }),
         DataTypePlan::Number => Some(PlanConstantValue::Number {
             value: ExactNumber::zero(),
+        }),
+        DataTypePlan::Bits { width } => Some(PlanConstantValue::Bits {
+            value: boon_data::Bits::zero(*width).ok()?,
         }),
         DataTypePlan::Bytes {
             fixed_len: None | Some(0),
@@ -1869,6 +1873,7 @@ fn plan_row_expression_static_data(
                     inline_bytes: None, ..
                 } => None,
                 PlanConstantValue::Tag { name } => Some(boon_data::Value::tag(name)),
+                PlanConstantValue::Bits { value } => Some(boon_data::Value::Bits(value.clone())),
                 PlanConstantValue::Data { value } => Some(value.clone()),
             }
         }
@@ -1964,6 +1969,7 @@ fn semantic_data_type_plan(value: &ir::SemanticDataType) -> DataTypePlan {
         ir::SemanticDataType::Bytes { fixed_len } => DataTypePlan::Bytes {
             fixed_len: fixed_len.map(|len| len as u64),
         },
+        ir::SemanticDataType::Bits { width } => DataTypePlan::Bits { width: *width },
         ir::SemanticDataType::Variant { variants } => DataTypePlan::Variant {
             variants: variants
                 .iter()
@@ -2508,6 +2514,7 @@ fn data_type_plan_from_typecheck_type(ty: &boon_typecheck::Type) -> Option<DataT
             Type::Bytes(BytesType::Fixed(len)) => DataTypePlan::Bytes {
                 fixed_len: Some((*len).try_into().ok()?),
             },
+            Type::Bits { width } => DataTypePlan::Bits { width: *width },
             Type::VariantSet(variants) => DataTypePlan::Variant {
                 variants: variants
                     .iter()
@@ -2998,6 +3005,9 @@ impl ExecutableMigrationExpressionLowerer<'_> {
                     ))
                 })?,
             }),
+            ir::ExecutableExpressionKind::Bits(value) => {
+                Ok(MigrationExpressionPlan::Bits { value })
+            }
             ir::ExecutableExpressionKind::BytesByte(value) => {
                 Ok(MigrationExpressionPlan::Number {
                     value: ExactNumber::from_i64(i64::from(value)),
@@ -6503,6 +6513,7 @@ fn plan_value_type_is_concrete(value_type: PlanValueType) -> bool {
         PlanValueType::Text
             | PlanValueType::Number
             | PlanValueType::Bytes { .. }
+            | PlanValueType::Bits { .. }
             | PlanValueType::Tag
             | PlanValueType::Data
     )
@@ -6551,6 +6562,9 @@ fn inferred_executable_expression_value_type_inner(
         ir::ExecutableExpressionKind::Text(_)
         | ir::ExecutableExpressionKind::TextTemplate { .. } => Some(PlanValueType::Text),
         ir::ExecutableExpressionKind::Number(_) => Some(PlanValueType::Number),
+        ir::ExecutableExpressionKind::Bits(value) => Some(PlanValueType::Bits {
+            width: value.width(),
+        }),
         ir::ExecutableExpressionKind::BytesByte(_) => {
             Some(PlanValueType::Bytes { fixed_len: Some(1) })
         }
@@ -6710,6 +6724,7 @@ fn plan_value_type_from_typecheck_type(ty: &boon_typecheck::Type) -> Option<Plan
                 fixed_len: Some(*len as u64),
             })
         }
+        boon_typecheck::Type::Bits { width } => Some(PlanValueType::Bits { width: *width }),
         boon_typecheck::Type::VariantSet(_) => Some(PlanValueType::Tag),
         _ => None,
     }
@@ -8517,6 +8532,7 @@ fn plan_typed_list_index_key(
                     (PlanListIndexKeyKind::ClosedTag { type_id }, tags)
                 }
                 DataTypePlan::Bytes { .. }
+                | DataTypePlan::Bits { .. }
                 | DataTypePlan::Record { .. }
                 | DataTypePlan::List { .. }
                 | DataTypePlan::Map { .. }
@@ -10651,6 +10667,9 @@ impl<'a> ExecutableRowLowerer<'a> {
                     })?,
                 })?
             }
+            ir::ExecutableExpressionKind::Bits(value) => {
+                self.constant(PlanConstantValue::Bits { value })?
+            }
             ir::ExecutableExpressionKind::BytesByte(value) => self.bytes_constant(vec![value])?,
             ir::ExecutableExpressionKind::Absent => self.intern(PlanRowExpressionNode::Absent)?,
             ir::ExecutableExpressionKind::Flush { payload } => {
@@ -12038,6 +12057,9 @@ fn executable_select_pattern(
         CheckedMatchPattern::Text { value } => PlanRowSelectPattern::Text {
             value: value.clone(),
         },
+        CheckedMatchPattern::Bits { value } => PlanRowSelectPattern::Bits {
+            value: value.clone(),
+        },
         CheckedMatchPattern::Tag { name, .. } => PlanRowSelectPattern::Tag { name: name.clone() },
     })
 }
@@ -12341,6 +12363,9 @@ fn row_expression_value_type(
                     fixed_len: Some(*byte_len),
                 }),
                 PlanConstantValue::Tag { .. } => Some(PlanValueType::Tag),
+                PlanConstantValue::Bits { value } => Some(PlanValueType::Bits {
+                    width: value.width(),
+                }),
                 PlanConstantValue::Data { .. } => Some(PlanValueType::Data),
             }),
         PlanRowExpressionNode::TextTrim { .. }

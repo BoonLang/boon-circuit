@@ -1016,7 +1016,7 @@ fn ensure_closed_memory_type(data_type: &Type, context: &str) -> Result<(), Sema
 
 fn type_is_closed_memory_data(data_type: &Type) -> bool {
     match data_type {
-        Type::Text | Type::Number | Type::Bytes(_) => true,
+        Type::Text | Type::Number | Type::Bytes(_) | Type::Bits { .. } => true,
         Type::VariantSet(variants) => variants.iter().all(|variant| match variant {
             Variant::Tag(_) => true,
             Variant::Tagged { fields, .. } => {
@@ -1311,6 +1311,7 @@ fn expression_children(
         | SemanticExpressionKind::Drain { .. }
         | SemanticExpressionKind::Text(_)
         | SemanticExpressionKind::Number(_)
+        | SemanticExpressionKind::Bits(_)
         | SemanticExpressionKind::BytesByte(_)
         | SemanticExpressionKind::Absent
         | SemanticExpressionKind::Tag(_)
@@ -2427,6 +2428,7 @@ impl SemanticMigrationPurityChecker<'_> {
             }
             SemanticExpressionKind::Text(_)
             | SemanticExpressionKind::Number(_)
+            | SemanticExpressionKind::Bits(_)
             | SemanticExpressionKind::BytesByte(_)
             | SemanticExpressionKind::Tag(_) => Ok(()),
             SemanticExpressionKind::TextTemplate { segments } => {

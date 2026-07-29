@@ -262,10 +262,10 @@ pub struct LanguageFeatureSpec {
 pub const LANGUAGE_FEATURE_REGISTRY: &[LanguageFeatureSpec] = &[
     LanguageFeatureSpec {
         id: "bits_fixed_width_literals",
-        stage: LanguageFeatureStage::Planned,
-        parse_expectation: LanguageFeatureParseExpectation::Reject,
+        stage: LanguageFeatureStage::Current,
+        parse_expectation: LanguageFeatureParseExpectation::Accept,
         spellings: &["BITS"],
-        summary: "fixed-width BITS[N] literals are planned and rejected today",
+        summary: "fixed-width BITS[N] literals with one encoded nonnegative integer token",
     },
     LanguageFeatureSpec {
         id: "closed_truth_tags",
@@ -615,6 +615,11 @@ pub enum AstMatchPattern {
     Invalid {
         message: String,
     },
+    Bits {
+        width: u32,
+        radix: u32,
+        digits: String,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -727,6 +732,11 @@ pub enum AstExprKind {
     SetLiteral {
         #[serde(default)]
         items: Vec<usize>,
+    },
+    BitsLiteral {
+        width: u32,
+        radix: u32,
+        digits: String,
     },
 }
 
@@ -1878,22 +1888,61 @@ fn consume_arrow_as_map_entry(expression: usize, expressions: &mut [AstExpr]) {
 }
 
 fn statement_structure_owner(expr_id: usize, expressions: &[AstExpr]) -> usize {
-    let Some(expression) = expressions.get(expr_id) else {
+    fn structural_children(expression: &AstExpr) -> Vec<usize> {
+        match &expression.kind {
+            AstExprKind::MatchArm {
+                output: Some(output),
+                ..
+            }
+            | AstExprKind::Arrow {
+                output: Some(output),
+                ..
+            } => vec![*output],
+            AstExprKind::Object(fields) | AstExprKind::TaggedObject { fields, .. } => {
+                fields.iter().map(|field| field.value).collect()
+            }
+            AstExprKind::ListLiteral { items, .. }
+            | AstExprKind::BytesLiteral { items, .. }
+            | AstExprKind::SetLiteral { items } => items.clone(),
+            AstExprKind::MapLiteral { entries } => entries.clone(),
+            AstExprKind::MapEntry { key, value } => vec![*key, *value],
+            AstExprKind::Call { args, .. } => args.iter().map(|argument| argument.value).collect(),
+            AstExprKind::Pipe { input, args, .. } => std::iter::once(*input)
+                .chain(args.iter().map(|argument| argument.value))
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    let Some(root) = expressions.get(expr_id) else {
         return expr_id;
     };
-    match &expression.kind {
-        AstExprKind::MatchArm {
-            output: Some(output),
-            ..
-        }
-        | AstExprKind::Arrow {
-            output: Some(output),
-            ..
-        } if expression_owns_statement_children(*output, expressions) => {
-            statement_structure_owner(*output, expressions)
-        }
-        _ => expr_id,
+    let root_end = root.end;
+    let mut current = expr_id;
+    let mut visited = BTreeSet::new();
+    while visited.insert(current) {
+        let Some(expression) = expressions.get(current) else {
+            break;
+        };
+        let Some(child) = structural_children(expression)
+            .into_iter()
+            .filter(|child| {
+                expressions.get(*child).is_some_and(|candidate| {
+                    candidate.end == root_end
+                        && expression_owns_statement_children(*child, expressions)
+                })
+            })
+            .max_by_key(|child| {
+                expressions
+                    .get(*child)
+                    .map_or((0, 0), |candidate| (candidate.start, candidate.id))
+            })
+        else {
+            break;
+        };
+        current = child;
     }
+    current
 }
 
 fn expression_owns_statement_children(expr_id: usize, expressions: &[AstExpr]) -> bool {
@@ -2622,6 +2671,13 @@ fn ast_expr_kind(
             value,
         };
     }
+    if let Some((width, radix, digits)) = ast_bits_literal(tokens, item, source) {
+        return AstExprKind::BitsLiteral {
+            width,
+            radix,
+            digits,
+        };
+    }
     if let Some(arrow) = find_top_level_token(tokens, "=>") {
         let pattern = &tokens[..arrow];
         return AstExprKind::Arrow {
@@ -2806,6 +2862,13 @@ fn ast_match_pattern(tokens: &[String], item: &ParserItem, source: &str) -> AstM
     if let Some(value) = text_literal_value(tokens, item, source) {
         return AstMatchPattern::Text { value };
     }
+    if let Some((width, radix, digits)) = ast_bits_literal(tokens, item, source) {
+        return AstMatchPattern::Bits {
+            width,
+            radix,
+            digits,
+        };
+    }
     if tokens.len() == 1 && matches!(tokens[0].as_str(), "FLUSH" | "FLUSHED" | "SKIP" | "SOURCE") {
         return AstMatchPattern::Invalid {
             message: "private flow-control states cannot be matched as public values".to_owned(),
@@ -2923,10 +2986,7 @@ fn invalid_match_pattern_message(tokens: &[String]) -> String {
         Some("SET") => {
             "SET patterns are unsupported; use explicit set operations before matching".to_owned()
         }
-        Some("BITS") => {
-            "BITS patterns are unavailable until fixed-width BITS literals are implemented"
-                .to_owned()
-        }
+        Some("BITS") => "BITS patterns must be one exact fixed-width BITS literal".to_owned(),
         Some("BYTES" | "NUMBER" | "TEXT") => {
             "runtime type patterns are unsupported; match an exact literal or an ordinary Tag"
                 .to_owned()
@@ -3091,6 +3151,88 @@ fn parse_byte_literal_parts(base: &str, suffix: &str) -> Result<(u8, String, u8)
         ));
     }
     Ok((radix, digits.to_owned(), value as u8))
+}
+
+fn ast_bits_literal(
+    tokens: &[String],
+    item: &ParserItem,
+    source: &str,
+) -> Option<(u32, u32, String)> {
+    let (width, radix, digits, _, _) = parse_bits_literal_tokens(tokens).ok()?;
+    let (start, end) = span_for_tokens(tokens, item)?;
+    if source
+        .get(start..end)
+        .is_none_or(|literal| !literal.contains(&format!("{radix}u{digits}")))
+    {
+        return None;
+    }
+    Some((width, radix, digits))
+}
+
+fn parse_bits_literal_tokens(
+    tokens: &[String],
+) -> Result<(u32, u32, String, usize, usize), String> {
+    if tokens.first().map(String::as_str) != Some("BITS") {
+        return Err("fixed-width bit literals start with `BITS`".to_owned());
+    }
+    if tokens.get(1).map(String::as_str) != Some("[") {
+        return Err("BITS requires a positive compile-time width in `BITS[N]`".to_owned());
+    }
+    let width_close =
+        matching_close(tokens, 1).ok_or_else(|| "BITS width is missing closing `]`".to_owned())?;
+    let width = match &tokens[2..width_close] {
+        [width] => width
+            .parse::<u32>()
+            .map_err(|_| "BITS width must be one positive compile-time integer".to_owned())?,
+        _ => {
+            return Err("BITS width must be one positive compile-time integer".to_owned());
+        }
+    };
+    if width == 0 {
+        return Err("BITS width must be positive; `BITS[0]` is invalid".to_owned());
+    }
+    let body_open = width_close + 1;
+    if tokens.get(body_open).map(String::as_str) != Some("{") {
+        return Err("BITS width must be followed by `{ radixudigits }`".to_owned());
+    }
+    let body_close = matching_close(tokens, body_open)
+        .ok_or_else(|| "BITS literal is missing closing `}`".to_owned())?;
+    if body_close + 1 != tokens.len() {
+        return Err("BITS literal must contain exactly one encoded integer token".to_owned());
+    }
+    let [base, suffix] = &tokens[body_open + 1..body_close] else {
+        return Err("BITS body must contain exactly one token such as `2u1010`".to_owned());
+    };
+    let radix = base
+        .parse::<u32>()
+        .map_err(|_| "BITS literal radix must be an integer from 2 through 36".to_owned())?;
+    if !(2..=36).contains(&radix) {
+        return Err(format!(
+            "BITS literal radix must be between 2 and 36, found {radix}"
+        ));
+    }
+    let Some(digits) = suffix.strip_prefix('u') else {
+        return Err("BITS literal must use explicit radix notation such as `16uFF`".to_owned());
+    };
+    if digits.is_empty() {
+        return Err("BITS literal must include digits after `u`".to_owned());
+    }
+    let normalized = digits.chars().filter(|ch| *ch != '_').collect::<String>();
+    if normalized.is_empty() {
+        return Err("BITS literal must include at least one non-underscore digit".to_owned());
+    }
+    if !normalized.chars().all(|ch| ch.is_digit(radix)) {
+        return Err(format!(
+            "BITS literal `{radix}u{digits}` contains digits outside radix {radix}"
+        ));
+    }
+    Ok((
+        width,
+        radix,
+        digits.to_owned(),
+        body_open + 1,
+        body_open + 2,
+    ))
 }
 
 fn ast_pipe_expr_kind(
@@ -4157,6 +4299,7 @@ fn validate_source_syntax(path: &str, ast: &AstProgram) -> Result<(), ParseError
         }
     }
     validate_drain_syntax(path, ast, &text_literal_spans)?;
+    validate_bits_syntax(path, ast, &text_literal_spans)?;
     validate_bytes_syntax(path, ast, &text_literal_spans)?;
     Ok(())
 }
@@ -4574,11 +4717,110 @@ fn validate_bytes_syntax(
         {
             continue;
         }
+        if ast.expressions.iter().any(|expression| {
+            matches!(expression.kind, AstExprKind::BitsLiteral { .. })
+                && base_token.start >= expression.start
+                && suffix_token.end <= expression.end
+        }) {
+            continue;
+        }
         parse_byte_literal_parts(&base_token.lexeme, &suffix_token.lexeme)
             .map_err(|message| error(path, base_token.line, base_token.column, message.as_str()))?;
     }
     for item in &ast.items {
         validate_bytes_item_syntax(path, ast, item, text_literal_spans)?;
+    }
+    Ok(())
+}
+
+fn validate_bits_syntax(
+    path: &str,
+    ast: &AstProgram,
+    text_literal_spans: &[(usize, usize)],
+) -> Result<(), ParseError> {
+    for item in &ast.items {
+        for bits_index in item
+            .symbols
+            .iter()
+            .enumerate()
+            .filter_map(|(index, symbol)| (symbol == "BITS").then_some(index))
+        {
+            let token_start = item
+                .symbol_spans
+                .get(bits_index)
+                .map(|(start, _)| *start)
+                .unwrap_or(item.start);
+            if text_literal_spans
+                .iter()
+                .any(|(start, end)| token_start >= *start && token_start <= *end)
+            {
+                continue;
+            }
+            let candidate = &item.symbols[bits_index..];
+            let width_close = candidate
+                .get(1)
+                .filter(|token| token.as_str() == "[")
+                .and_then(|_| matching_close(candidate, 1));
+            let body_close = width_close
+                .and_then(|close| (candidate.get(close + 1)?.as_str() == "{").then_some(close + 1))
+                .and_then(|open| matching_close(candidate, open));
+            let literal_end = body_close.map_or(candidate.len(), |close| close + 1);
+            let literal = &candidate[..literal_end];
+            let (_, radix, digits, base_index, suffix_index) =
+                parse_bits_literal_tokens(literal)
+                    .map_err(|message| error(path, item.line, item.indent + 1, message.as_str()))?;
+            let semantic_tokens = ast
+                .tokens
+                .iter()
+                .filter(|token| {
+                    !matches!(token.kind, AstTokenKind::Comment | AstTokenKind::Newline)
+                })
+                .collect::<Vec<_>>();
+            let raw_bits_index = semantic_tokens
+                .iter()
+                .position(|token| token.start == token_start && token.lexeme == "BITS")
+                .ok_or_else(|| {
+                    error(
+                        path,
+                        item.line,
+                        item.indent + 1,
+                        "BITS literal token span is unavailable",
+                    )
+                })?;
+            let base_token = semantic_tokens
+                .get(raw_bits_index + base_index)
+                .ok_or_else(|| {
+                    error(
+                        path,
+                        item.line,
+                        item.indent + 1,
+                        "BITS literal base token is unavailable",
+                    )
+                })?;
+            let suffix_token = semantic_tokens
+                .get(raw_bits_index + suffix_index)
+                .ok_or_else(|| {
+                    error(
+                        path,
+                        item.line,
+                        item.indent + 1,
+                        "BITS literal digit token is unavailable",
+                    )
+                })?;
+            if base_token
+                .start
+                .checked_add(base_token.lexeme.len())
+                .is_none_or(|end| end != suffix_token.start)
+            {
+                return Err(error(
+                    path,
+                    item.line,
+                    item.indent + 1,
+                    "BITS body must contain one adjacent encoded integer token such as `2u1010`; whitespace and fragments are invalid",
+                ));
+            }
+            let _ = (radix, digits);
+        }
     }
     Ok(())
 }
@@ -6228,6 +6470,60 @@ result:
                 .iter()
                 .any(|expression| matches!(expression.kind, AstExprKind::Arrow { .. }))
         );
+    }
+
+    #[test]
+    fn bits_literals_and_exact_patterns_preserve_static_width_and_encoding() {
+        let parsed = parse_source(
+            "bits-literals.bn",
+            r#"
+opcode: BITS[7] { 2u011_0011 }
+kind:
+    opcode |> WHEN {
+        BITS[7] { 16u33 } => Register
+        __ => Unknown
+    }
+"#,
+        )
+        .unwrap();
+        assert!(parsed.expressions.iter().any(|expression| {
+            matches!(
+                &expression.kind,
+                AstExprKind::BitsLiteral {
+                    width: 7,
+                    radix: 2,
+                    digits,
+                } if digits == "011_0011"
+            )
+        }));
+        assert!(parsed.expressions.iter().any(|expression| {
+            matches!(
+                &expression.kind,
+                AstExprKind::MatchArm {
+                    pattern: AstMatchPattern::Bits {
+                        width: 7,
+                        radix: 16,
+                        digits,
+                    },
+                    ..
+                } if digits == "33"
+            )
+        }));
+    }
+
+    #[test]
+    fn bits_literal_syntax_rejects_zero_width_fragments_signs_and_bad_digits() {
+        for (source, expected) in [
+            ("value: BITS[0] { 2u0 }", "positive"),
+            ("value: BITS[__] { 2u0 }", "compile-time integer"),
+            ("value: BITS[8] { 2 u1010 }", "adjacent"),
+            ("value: BITS[8] { 2u10 2u10 }", "exactly one token"),
+            ("value: BITS[8] { - 2u1 }", "exactly one token"),
+            ("value: BITS[8] { 2u012 }", "outside radix"),
+        ] {
+            let error = parse_source("invalid-bits.bn", source).unwrap_err();
+            assert!(error.message.contains(expected), "{source}: {error}");
+        }
     }
 
     #[test]

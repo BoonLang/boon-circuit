@@ -100,6 +100,9 @@ pub enum SemanticDataType {
     Union {
         members: Vec<SemanticDataType>,
     },
+    Bits {
+        width: u32,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

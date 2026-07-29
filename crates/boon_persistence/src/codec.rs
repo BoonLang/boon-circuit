@@ -1,5 +1,5 @@
 use super::{
-    ApplicationTransfer, CheckpointBatch, ContentArtifact, ContentArtifactBinding,
+    ApplicationTransfer, Bits, CheckpointBatch, ContentArtifact, ContentArtifactBinding,
     ContentArtifactId, ContentArtifactManifest, ContentArtifactOwnerId, ContentArtifactRetention,
     DurableChange, DurableCollectionId, DurableCollectionOwner, DurableContentArtifactChange,
     DurableOutboxChange, DurableOutboxItem, DurableOutboxState, DurableOwner, DurableRowId,
@@ -15,10 +15,10 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-const RESTORE_IMAGE_FORMAT: u32 = 12;
-const APPLICATION_TRANSFER_FORMAT: u32 = 10;
-const CHECKPOINT_BATCH_FORMAT: u32 = 12;
-const OUTBOX_RECORD_FORMAT: u32 = 5;
+const RESTORE_IMAGE_FORMAT: u32 = 13;
+const APPLICATION_TRANSFER_FORMAT: u32 = 11;
+const CHECKPOINT_BATCH_FORMAT: u32 = 13;
+const OUTBOX_RECORD_FORMAT: u32 = 6;
 const BLOB_RECORD_FORMAT: u32 = 1;
 const STORED_NUMBER: u8 = 20;
 const STORED_TEXT: u8 = 21;
@@ -30,6 +30,7 @@ const STORED_BLOB_REFERENCE: u8 = 26;
 const STORED_MAP: u8 = 27;
 const STORED_SET: u8 = 28;
 const STORED_CHILD_AUTHORITY: u8 = 29;
+const STORED_BITS: u8 = 30;
 const MAP_METADATA_FORMAT: u32 = 1;
 pub const INLINE_BYTES_THRESHOLD: usize = 16 * 1024;
 const DEFAULT_MAX_TOTAL_BYTES: usize = 80 * 1024 * 1024;
@@ -1974,6 +1975,9 @@ fn encode_component_value(
                 .and_then(|encoder| encoder.bytes(value))
                 .map_err(encode_error)?;
         }
+        StoredValue::Bits(value) => {
+            encode_bits(encoder, value)?;
+        }
         StoredValue::List(values) => {
             encoder
                 .array(2)
@@ -2099,6 +2103,9 @@ fn encode_component_shell(
                 .and_then(|encoder| encoder.bytes(value))
                 .map_err(encode_error)?;
         }
+        StoredValueShell::Bits(value) => {
+            encode_bits(encoder, value)?;
+        }
         StoredValueShell::List(values) => {
             encoder
                 .array(2)
@@ -2165,6 +2172,7 @@ fn decode_component_value(
             }
             Ok(StoredValue::Bytes(bytes.to_vec().into()))
         }
+        (STORED_BITS, 3) => decode_bits(decoder, limits).map(StoredValue::Bits),
         (STORED_LIST, 2) => {
             let count = collection_len(decoder, limits, "stored value list", true)?;
             let mut values = Vec::with_capacity(count);
@@ -2279,6 +2287,7 @@ fn decode_component_shell(
             }
             Ok(StoredValueShell::Bytes(bytes.to_vec().into()))
         }
+        (STORED_BITS, 3) => decode_bits(decoder, limits).map(StoredValueShell::Bits),
         (STORED_LIST, 2) => {
             let count = collection_len(decoder, limits, "stored value shell list", true)?;
             let mut values = Vec::with_capacity(count);
@@ -2399,6 +2408,9 @@ fn encode_value(
                 .and_then(|encoder| encoder.bytes(value))
                 .map_err(encode_error)?;
         }
+        StoredValue::Bits(value) => {
+            encode_bits(encoder, value)?;
+        }
         StoredValue::List(values) => {
             encoder
                 .array(2)
@@ -2475,6 +2487,7 @@ fn decode_value(
             }
             Ok(StoredValue::Bytes(bytes.to_vec().into()))
         }
+        (STORED_BITS, 3) => decode_bits(decoder, limits).map(StoredValue::Bits),
         (STORED_LIST, 2) => {
             let count = collection_len(decoder, limits, "stored value list", true)?;
             let mut values = Vec::with_capacity(count);
@@ -2562,6 +2575,9 @@ fn encode_stored_value_shell(
                 .and_then(|encoder| encoder.bytes(value))
                 .map_err(encode_error)?;
         }
+        StoredValueShell::Bits(value) => {
+            encode_bits(encoder, value)?;
+        }
         StoredValueShell::List(values) => {
             encoder
                 .array(2)
@@ -2620,6 +2636,7 @@ fn decode_stored_value_shell(
             }
             Ok(StoredValueShell::Bytes(bytes.to_vec().into()))
         }
+        (STORED_BITS, 3) => decode_bits(decoder, limits).map(StoredValueShell::Bits),
         (STORED_LIST, 2) => {
             let count = collection_len(decoder, limits, "stored value shell list", true)?;
             let mut values = Vec::with_capacity(count);
@@ -2799,6 +2816,26 @@ fn decode_exact_number(decoder: &mut Decoder<'_>) -> Result<boon_data::ExactNumb
     let numerator = decoder.bytes().map_err(decode_error)?;
     let denominator = decoder.bytes().map_err(decode_error)?;
     boon_data::ExactNumber::from_canonical_bytes(sign, numerator, denominator)
+        .map_err(|error| CodecError::new(error.to_string()))
+}
+
+fn encode_bits(encoder: &mut CborEncoder<'_>, value: &Bits) -> Result<(), CodecError> {
+    encoder
+        .array(3)
+        .and_then(|encoder| encoder.u8(STORED_BITS))
+        .and_then(|encoder| encoder.u32(value.width()))
+        .and_then(|encoder| encoder.bytes(value.bytes()))
+        .map_err(encode_error)?;
+    Ok(())
+}
+
+fn decode_bits(decoder: &mut Decoder<'_>, limits: DecodeLimits) -> Result<Bits, CodecError> {
+    let width = decoder.u32().map_err(decode_error)?;
+    let bytes = decoder.bytes().map_err(decode_error)?;
+    if bytes.len() > limits.max_blob_bytes {
+        return Err(CodecError::new("stored BITS value exceeds decode limit"));
+    }
+    Bits::from_canonical_bytes(width, bytes.to_vec())
         .map_err(|error| CodecError::new(error.to_string()))
 }
 

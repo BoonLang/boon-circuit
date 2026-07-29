@@ -1140,6 +1140,13 @@ pub enum PulseFlushPolicy {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PulseStart {
+    Startup,
+    Triggered { arms: Vec<TriggerOwnedArm> },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PulseBatch {
     pub id: PulseBatchId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1150,6 +1157,7 @@ pub struct PulseBatch {
     pub hold_expression: Option<ExecutableExprId>,
     pub call_expression: ExecutableExprId,
     pub count_expression: ExecutableExprId,
+    pub start: PulseStart,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transition_expression: Option<ExecutableExprId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -1784,6 +1784,12 @@ impl<'a> DocumentCompiler<'a> {
                         "document path `{exact_path}` reads transient payload from source {source:?}; retain the event value in HOLD before rendering it"
                     )));
                 }
+                ValueRef::Pulse(pulse) => {
+                    return Err(PlanError::new(format!(
+                        "document path `{exact_path}` reads transient pulse batch {}; retain its value in HOLD before rendering it",
+                        pulse.0
+                    )));
+                }
                 ValueRef::Constant(_) | ValueRef::DistributedImport(_) => None,
             };
             if let Some(expression) = exact {

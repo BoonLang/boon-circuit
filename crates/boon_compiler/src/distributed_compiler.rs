@@ -146,7 +146,9 @@ enum DistributedReferenceFlow {
 
 fn distributed_flow_for_value_ref(value: &ValueRef) -> DistributedReferenceFlow {
     match value {
-        ValueRef::Source(_) | ValueRef::SourcePayload { .. } => DistributedReferenceFlow::Event,
+        ValueRef::Source(_) | ValueRef::SourcePayload { .. } | ValueRef::Pulse(_) => {
+            DistributedReferenceFlow::Event
+        }
         ValueRef::State(_)
         | ValueRef::StateProjection { .. }
         | ValueRef::Field(_)

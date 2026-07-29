@@ -16,6 +16,14 @@ fn plan_state_id(value: ir::StateId) -> StateId {
     StateId(value.0)
 }
 
+fn plan_activation_id(value: ir::ActivationId) -> PlanActivationId {
+    PlanActivationId(value.0)
+}
+
+fn plan_pulse_batch_id(value: ir::PulseBatchId) -> PlanPulseBatchId {
+    PlanPulseBatchId(value.0)
+}
+
 fn plan_list_id(value: ir::ListId) -> ListId {
     ListId(value.0)
 }
@@ -849,9 +857,46 @@ fn plan_event_cause_owner(
                 })?;
             plan_state_owner(program, state)
         }
-        ir::EventCause::Pulse(pulse_id) => Err(PlanError::new(format!(
-            "event cause references pulse batch {pulse_id}, but MachinePlan pulse execution is not implemented"
-        ))),
+        ir::EventCause::Pulse(pulse_id) => {
+            let pulse = program
+                .pulse_batches()
+                .get(pulse_id.as_usize())
+                .filter(|pulse| pulse.id == pulse_id)
+                .ok_or_else(|| {
+                    PlanError::new(format!(
+                        "event cause references missing pulse batch {pulse_id}"
+                    ))
+                })?;
+            if let Some(state_id) = pulse.state {
+                let state = program
+                    .state_cells
+                    .get(state_id.as_usize())
+                    .filter(|state| state.id == state_id)
+                    .ok_or_else(|| {
+                        PlanError::new(format!(
+                            "pulse batch {pulse_id} references missing state {state_id}"
+                        ))
+                    })?;
+                plan_state_owner(program, state)
+            } else {
+                let expression = program
+                    .executable
+                    .expressions
+                    .get(pulse.call_expression.as_usize())
+                    .filter(|expression| expression.id == pulse.call_expression)
+                    .ok_or_else(|| {
+                        PlanError::new(format!(
+                            "pulse batch {pulse_id} references missing call expression {}",
+                            pulse.call_expression
+                        ))
+                    })?;
+                plan_owner_for_static_owner(
+                    program,
+                    expression.owner,
+                    &format!("pulse batch {pulse_id}"),
+                )
+            }
+        }
     }
 }
 
@@ -2659,6 +2704,7 @@ fn plan_value_type_for_value_ref(
                 },
             }
         }
+        ValueRef::Pulse(_) => PlanValueType::Tag,
         ValueRef::Constant(_) | ValueRef::List(_) | ValueRef::DistributedImport(_) => return None,
     })
 }
@@ -3980,6 +4026,16 @@ fn persistence_plan(
                     ir::SemanticMemoryRuntimeBacking::RootState { state_id, .. }
                     | ir::SemanticMemoryRuntimeBacking::IndexedState { state_id, .. } => {
                         transient_producer_states.contains(&plan_state_id(state_id))
+                            || program
+                                .state_cells
+                                .get(state_id.as_usize())
+                                .filter(|state| state.id == state_id)
+                                .is_some_and(|state| {
+                                    matches!(
+                                        state.lifetime,
+                                        ir::StateCellLifetimeV1::ActivationLocal { .. }
+                                    )
+                                })
                     }
                     ir::SemanticMemoryRuntimeBacking::List { list_id, .. } => {
                         transient_producer_lists.contains(&plan_list_id(list_id))
@@ -4157,6 +4213,26 @@ pub(crate) fn compile_typed_program_with_distributed_context(
 
     let mut row_expressions = PlanRowExpressionArena::new();
     let mut constants = Vec::new();
+    let activations = program
+        .activations()
+        .iter()
+        .map(|activation| {
+            Ok(PlanActivation {
+                id: plan_activation_id(activation.id),
+                owner: plan_owner_for_static_owner(
+                    program,
+                    activation.static_owner,
+                    &format!("activation {}", activation.id),
+                )?,
+                states: activation
+                    .states
+                    .iter()
+                    .copied()
+                    .map(plan_state_id)
+                    .collect(),
+            })
+        })
+        .collect::<Result<Vec<_>, PlanError>>()?;
     let migration_storage_defaults = program
         .state_cells
         .iter()
@@ -4240,6 +4316,30 @@ pub(crate) fn compile_typed_program_with_distributed_context(
             scope_id: plan_scope_id(state.scope_id),
             indexed: state.indexed,
             indexed_field_id: plan_indexed_state_field(program, state)?,
+            lifetime: match state.lifetime {
+                ir::StateCellLifetimeV1::Persistent => PlanStateLifetime::Persistent,
+                ir::StateCellLifetimeV1::ActivationLocal { then_expression } => {
+                    let activation = program
+                        .activations()
+                        .iter()
+                        .find(|activation| activation.then_expression == then_expression)
+                        .ok_or_else(|| {
+                            PlanError::new(format!(
+                                "activation-local state `{}` has no activation for THEN {}",
+                                state.path, then_expression
+                            ))
+                        })?;
+                    if !activation.states.contains(&state.id) {
+                        return Err(PlanError::new(format!(
+                            "activation {} does not own activation-local state `{}`",
+                            activation.id, state.path
+                        )));
+                    }
+                    PlanStateLifetime::ActivationLocal {
+                        activation: plan_activation_id(activation.id),
+                    }
+                }
+            },
             initializer,
         });
     }
@@ -5017,6 +5117,244 @@ pub(crate) fn compile_typed_program_with_distributed_context(
             }
         }
     }
+    let update_op_ids = regions
+        .iter()
+        .find(|region| region.kind == RegionKind::StateUpdates)
+        .map(|region| region.ops.iter().map(|op| op.id).collect::<Vec<_>>())
+        .unwrap_or_default();
+    if update_op_ids.len() != program.state_update_arms.len() {
+        return Err(PlanError::new(format!(
+            "MachinePlan owns {} state-update ops for {} erased state-update arms",
+            update_op_ids.len(),
+            program.state_update_arms.len()
+        )));
+    }
+    let mutation_ops_by_site = regions
+        .iter()
+        .find(|region| region.kind == RegionKind::ListMutations)
+        .into_iter()
+        .flat_map(|region| &region.ops)
+        .filter_map(|op| match &op.kind {
+            PlanOpKind::ListMutation {
+                mutation: PlanListMutation::Append(append),
+            } => Some((append.site, op.id)),
+            PlanOpKind::ListMutation {
+                mutation: PlanListMutation::Remove(remove),
+            } => Some((remove.site, op.id)),
+            _ => None,
+        })
+        .collect::<BTreeMap<_, _>>();
+    let derived_ops_by_output = regions
+        .iter()
+        .find(|region| region.kind == RegionKind::DerivedEvaluation)
+        .into_iter()
+        .flat_map(|region| &region.ops)
+        .filter_map(|op| op.output.clone().map(|output| (output, op.id)))
+        .collect::<BTreeMap<_, _>>();
+    let mut pulse_batches = Vec::with_capacity(program.pulse_batches().len());
+    for batch in program.pulse_batches() {
+        let pulse_ref = ValueRef::Pulse(plan_pulse_batch_id(batch.id));
+        let owner = plan_event_cause_owner(program, ir::EventCause::Pulse(batch.id))?;
+        let mut count_inputs = Vec::new();
+        let count = ExecutableRowLowerer::new(
+            program,
+            &index,
+            &mut row_expressions,
+            &mut constants,
+            &mut count_inputs,
+        )
+        .with_list_indexes(&mut list_indexes)
+        .lower(batch.count_expression)
+        .map_err(|error| {
+            PlanError::new(format!(
+                "pulse batch {} count failed exact lowering: {error}",
+                batch.id
+            ))
+        })?;
+        let start = match &batch.start {
+            ir::PulseStart::Startup => PlanPulseStart::Startup,
+            ir::PulseStart::Triggered { arms } => {
+                if arms.is_empty() {
+                    return Err(PlanError::new(format!(
+                        "pulse batch {} has an empty triggered start",
+                        batch.id
+                    )));
+                }
+                let arms = arms
+                    .iter()
+                    .map(|arm| {
+                        if matches!(arm.cause, ir::EventCause::Pulse(_)) {
+                            return Err(PlanError::new(format!(
+                                "pulse batch {} has a pulse-recursive start",
+                                batch.id
+                            )));
+                        }
+                        let (trigger, cause_path) =
+                            event_cause_value_ref(program, arm.cause)?;
+                        let mut inputs = vec![trigger.clone()];
+                        let gate = ExecutableRowLowerer::new(
+                            program,
+                            &index,
+                            &mut row_expressions,
+                            &mut constants,
+                            &mut inputs,
+                        )
+                        .with_list_indexes(&mut list_indexes)
+                        .with_event_trigger(&trigger)
+                        .lower(arm.gate_expression_id)
+                        .map_err(|error| {
+                            PlanError::new(format!(
+                                "pulse batch {} start from `{cause_path}` failed exact gate lowering: {error}",
+                                batch.id
+                            ))
+                        })?;
+                        Ok(PlanPulseStartArm { trigger, gate })
+                    })
+                    .collect::<Result<Vec<_>, PlanError>>()?;
+                PlanPulseStart::Triggered { arms }
+            }
+        };
+        let state_update_ops = batch
+            .state_update_arms
+            .iter()
+            .map(|arm| {
+                program
+                    .state_update_arms
+                    .iter()
+                    .position(|candidate| candidate == arm)
+                    .and_then(|index| update_op_ids.get(index).copied())
+                    .ok_or_else(|| {
+                        PlanError::new(format!(
+                            "pulse batch {} lost state-update arm for state {}",
+                            batch.id, arm.state
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>, PlanError>>()?;
+        let list_mutation_ops = batch
+            .list_mutations
+            .iter()
+            .filter(|mutation| list_mutation_owns_authority(program, mutation))
+            .map(|mutation| {
+                mutation_ops_by_site
+                    .get(&mutation.site.as_usize())
+                    .copied()
+                    .ok_or_else(|| {
+                        PlanError::new(format!(
+                            "pulse batch {} lost list-mutation site {}",
+                            batch.id, mutation.site
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>, PlanError>>()?;
+        let derived_ops = batch
+            .derived_value_indices
+            .iter()
+            .map(|derived_index| {
+                let derived = program.derived_values.get(*derived_index).ok_or_else(|| {
+                    PlanError::new(format!(
+                        "pulse batch {} references missing derived value index {}",
+                        batch.id, derived_index
+                    ))
+                })?;
+                let output = index.resolve(&derived.path).ok_or_else(|| {
+                    PlanError::new(format!(
+                        "pulse batch {} derived value `{}` has no typed output",
+                        batch.id, derived.path
+                    ))
+                })?;
+                derived_ops_by_output.get(&output).copied().ok_or_else(|| {
+                    PlanError::new(format!(
+                        "pulse batch {} derived value `{}` has no MachinePlan op",
+                        batch.id, derived.path
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, PlanError>>()?;
+        let mut emission_routes = batch
+            .emission_routes
+            .iter()
+            .filter(|_| !derived_ops.is_empty())
+            .map(|route| {
+                let filter = match route.filter {
+                    ir::PulseEmissionFilter::Passthrough => PlanPulseEmissionFilter::Passthrough,
+                    ir::PulseEmissionFilter::Skip {
+                        count_expression, ..
+                    } => {
+                        let mut inputs = Vec::new();
+                        let count = ExecutableRowLowerer::new(
+                            program,
+                            &index,
+                            &mut row_expressions,
+                            &mut constants,
+                            &mut inputs,
+                        )
+                        .with_list_indexes(&mut list_indexes)
+                        .lower(count_expression)
+                        .map_err(|error| {
+                            PlanError::new(format!(
+                                "pulse batch {} Stream/skip count failed exact lowering: {error}",
+                                batch.id
+                            ))
+                        })?;
+                        PlanPulseEmissionFilter::Skip { count }
+                    }
+                };
+                Ok(PlanPulseEmissionRoute {
+                    derived_ops: derived_ops.clone(),
+                    filter,
+                })
+            })
+            .collect::<Result<Vec<_>, PlanError>>()?;
+        if emission_routes.is_empty() && !derived_ops.is_empty() {
+            emission_routes.push(PlanPulseEmissionRoute {
+                derived_ops: derived_ops.clone(),
+                filter: PlanPulseEmissionFilter::Passthrough,
+            });
+        }
+        if !state_update_ops.is_empty()
+            && !state_update_ops.iter().all(|op| {
+                regions
+                    .iter()
+                    .flat_map(|region| &region.ops)
+                    .find(|candidate| candidate.id == *op)
+                    .is_some_and(|candidate| {
+                        matches!(
+                            &candidate.kind,
+                            PlanOpKind::StateUpdate { trigger, .. } if trigger == &pulse_ref
+                        )
+                    })
+            })
+        {
+            return Err(PlanError::new(format!(
+                "pulse batch {} state-update inventory contains a non-pulse op",
+                batch.id
+            )));
+        }
+        pulse_batches.push(PlanPulseBatch {
+            id: plan_pulse_batch_id(batch.id),
+            owner,
+            enclosing_activation: batch.enclosing_activation.map(plan_activation_id),
+            state: batch.state.map(plan_state_id),
+            start,
+            count,
+            state_update_ops,
+            list_mutation_ops,
+            derived_ops,
+            emission_routes,
+            schedule: match batch.schedule {
+                ir::PulseSchedule::StageArbitrateCommitPublishBeforeNext => {
+                    PlanPulseSchedule::StageArbitrateCommitPublishBeforeNext
+                }
+            },
+            flush_policy: match batch.flush_policy {
+                ir::PulseFlushPolicy::DiscardCurrentStopRemainingKeepPriorCommits => {
+                    PlanPulseFlushPolicy::DiscardCurrentStopRemainingKeepPriorCommits
+                }
+            },
+            semantic_slice_digest: batch.semantic_slice_digest,
+        });
+    }
     let outputs = output_root_plans(program, document.as_ref(), &index)?;
     let host_ports = host_port_plans(program, &outputs)?;
     match program_role {
@@ -5148,6 +5486,8 @@ pub(crate) fn compile_typed_program_with_distributed_context(
         row_expressions,
         constants,
         source_routes,
+        activations,
+        pulse_batches,
         storage_layout: StorageLayout {
             scalar_slots,
             list_slots,
@@ -5317,6 +5657,19 @@ fn collect_machine_plan_row_expression_roots(
             }
         }
     }
+    for batch in &plan.pulse_batches {
+        roots.push(batch.count);
+        if let PlanPulseStart::Triggered { arms } = &batch.start {
+            roots.extend(arms.iter().map(|arm| arm.gate));
+        }
+        roots.extend(batch.emission_routes.iter().filter_map(|route| {
+            if let PlanPulseEmissionFilter::Skip { count } = route.filter {
+                Some(count)
+            } else {
+                None
+            }
+        }));
+    }
     for op in plan.regions.iter().flat_map(|region| &region.ops) {
         match &op.kind {
             PlanOpKind::DerivedValue {
@@ -5418,6 +5771,19 @@ fn remap_machine_plan_row_expression_roots(
         for expression in &mut document.expressions {
             if let DocumentExprOp::RuntimeExpression { expression, .. } = &mut expression.op {
                 remap(expression);
+            }
+        }
+    }
+    for batch in &mut plan.pulse_batches {
+        remap(&mut batch.count);
+        if let PlanPulseStart::Triggered { arms } = &mut batch.start {
+            for arm in arms {
+                remap(&mut arm.gate);
+            }
+        }
+        for route in &mut batch.emission_routes {
+            if let PlanPulseEmissionFilter::Skip { count } = &mut route.filter {
+                remap(count);
             }
         }
     }
@@ -9920,19 +10286,23 @@ fn source_event_transform_expression(
     })
 }
 
-fn event_cause_path(program: &ErasedProgram, cause: ir::EventCause) -> Option<&str> {
+fn event_cause_path(program: &ErasedProgram, cause: ir::EventCause) -> Option<String> {
     match cause {
         ir::EventCause::Source(source_id) => program
             .sources
             .get(source_id.as_usize())
             .filter(|source| source.id == source_id)
-            .map(|source| source.path.as_str()),
+            .map(|source| source.path.clone()),
         ir::EventCause::State(state_id) => program
             .state_cells
             .get(state_id.as_usize())
             .filter(|state| state.id == state_id)
-            .map(|state| state.path.as_str()),
-        ir::EventCause::Pulse(_) => None,
+            .map(|state| state.path.clone()),
+        ir::EventCause::Pulse(pulse_id) => program
+            .pulse_batches()
+            .get(pulse_id.as_usize())
+            .filter(|pulse| pulse.id == pulse_id)
+            .map(|_| format!("$pulse.p{}", pulse_id.as_usize())),
     }
 }
 
@@ -9941,16 +10311,11 @@ fn event_cause_value_ref(
     cause: ir::EventCause,
 ) -> Result<(ValueRef, String), PlanError> {
     let path = event_cause_path(program, cause)
-        .ok_or_else(|| PlanError::new(format!("event cause {cause:?} has no runtime resource")))?
-        .to_owned();
+        .ok_or_else(|| PlanError::new(format!("event cause {cause:?} has no runtime resource")))?;
     let value = match cause {
         ir::EventCause::Source(source_id) => ValueRef::Source(plan_source_id(source_id)),
         ir::EventCause::State(state_id) => ValueRef::State(plan_state_id(state_id)),
-        ir::EventCause::Pulse(pulse_id) => {
-            return Err(PlanError::new(format!(
-                "event cause references pulse batch {pulse_id}, but MachinePlan pulse execution is not implemented"
-            )));
-        }
+        ir::EventCause::Pulse(pulse_id) => ValueRef::Pulse(plan_pulse_batch_id(pulse_id)),
     };
     Ok((value, path))
 }
@@ -10023,6 +10388,7 @@ struct ExecutableRowLowerer<'a> {
     constants: &'a mut Vec<PlanConstant>,
     inputs: &'a mut Vec<ValueRef>,
     list_indexes: Option<&'a mut Vec<PlanListIndex>>,
+    event_trigger: Option<ValueRef>,
     event_row: Option<(SourceId, ListId)>,
     active_state_update: Option<ir::ExecutableStateId>,
     state_initializer: Option<ir::StateId>,
@@ -10055,6 +10421,7 @@ impl<'a> ExecutableRowLowerer<'a> {
             constants,
             inputs,
             list_indexes: None,
+            event_trigger: None,
             event_row: None,
             active_state_update: None,
             state_initializer: None,
@@ -10080,6 +10447,7 @@ impl<'a> ExecutableRowLowerer<'a> {
     }
 
     fn with_event_trigger(mut self, trigger: &ValueRef) -> Self {
+        self.event_trigger = Some(trigger.clone());
         self.event_row = match trigger {
             ValueRef::Source(source_id) => self
                 .program
@@ -12150,6 +12518,30 @@ impl<'a> ExecutableRowLowerer<'a> {
         }
         if function == "List/page" {
             return self.lower_list_page(input, args);
+        }
+        if let Some(field) = function.strip_prefix("Field/") {
+            let input = input
+                .or_else(|| {
+                    args.iter()
+                        .find(|argument| argument.name == "input")
+                        .map(|argument| argument.value)
+                })
+                .ok_or_else(|| {
+                    PlanError::new(format!(
+                        "typed field projection `{function}` has no exact input"
+                    ))
+                })?;
+            return self.project_field(input, field.to_owned());
+        }
+        if function == "Stream/pulses"
+            && let Some(ValueRef::Pulse(pulse)) = self.event_trigger.as_ref()
+        {
+            return self.value_ref(ValueRef::Pulse(*pulse));
+        }
+        if function == "Stream/skip" && matches!(self.event_trigger, Some(ValueRef::Pulse(_))) {
+            return input.ok_or_else(|| {
+                PlanError::new("pulse-owned Stream/skip has no exact stream input")
+            });
         }
         plan_builtin_expression(self.arena, function, input, args)
     }

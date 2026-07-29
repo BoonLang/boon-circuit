@@ -16,7 +16,7 @@ pub use boon_document_model::{
 pub use document::*;
 pub use host::*;
 
-pub const PLAN_MAJOR_VERSION: u32 = 6;
+pub const PLAN_MAJOR_VERSION: u32 = 7;
 pub const PLAN_MINOR_VERSION: u32 = 0;
 pub const PERSISTENCE_FORMAT_VERSION: u32 = 5;
 pub const DEFAULT_PERSISTENCE_SCHEMA_VERSION: u64 = 1;
@@ -82,6 +82,19 @@ impl TargetProfile {
             Self::SoftwareDefault => "software_default",
             Self::SoftwareBounded => "software_bounded",
             Self::FpgaTodomvc => "fpga_todomvc",
+        }
+    }
+
+    /// Maximum baseline pulse microturns admitted by one causal activation.
+    ///
+    /// Pulse counts are sampled dynamically, so static plan verification
+    /// cannot always prove the concrete bound. Every executor must apply this
+    /// target-owned ceiling before beginning the first microturn.
+    pub const fn max_pulses_per_activation(self) -> u64 {
+        match self {
+            Self::SoftwareDefault => 1_000_000,
+            Self::SoftwareBounded => 65_536,
+            Self::FpgaTodomvc => 65_535,
         }
     }
 
@@ -154,6 +167,8 @@ plan_usize_ids!(
     PlanListIndexId,
     PlanCollectionAuthorityId,
     PlanRowExpressionId,
+    PlanActivationId,
+    PlanPulseBatchId,
 );
 
 macro_rules! plan_digest_ids {
@@ -1406,7 +1421,10 @@ fn distributed_external_value_ref_is_supported(value: &ValueRef) -> bool {
                     .all(|part| distributed_name_is_canonical(part))
         }
         ValueRef::DistributedImport(_) => true,
-        ValueRef::Source(_) | ValueRef::SourcePayload { .. } | ValueRef::List(_) => false,
+        ValueRef::Source(_)
+        | ValueRef::SourcePayload { .. }
+        | ValueRef::Pulse(_)
+        | ValueRef::List(_) => false,
     }
 }
 
@@ -5365,6 +5383,10 @@ pub struct MachinePlan {
     pub row_expressions: PlanRowExpressionArena,
     pub constants: Vec<PlanConstant>,
     pub source_routes: Vec<SourceRoute>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub activations: Vec<PlanActivation>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pulse_batches: Vec<PlanPulseBatch>,
     pub storage_layout: StorageLayout,
     pub regions: Vec<OperationRegion>,
     pub dirty_plan: DirtyPlan,
@@ -5506,7 +5528,84 @@ pub struct ScalarStorageSlot {
     pub indexed: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub indexed_field_id: Option<FieldId>,
+    pub lifetime: PlanStateLifetime,
     pub initializer: ScalarInitializerPlan,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PlanStateLifetime {
+    Persistent,
+    ActivationLocal { activation: PlanActivationId },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PlanActivation {
+    pub id: PlanActivationId,
+    pub owner: PlanOwner,
+    pub states: Vec<StateId>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanPulseSchedule {
+    StageArbitrateCommitPublishBeforeNext,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanPulseFlushPolicy {
+    DiscardCurrentStopRemainingKeepPriorCommits,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PlanPulseStart {
+    Startup,
+    Triggered { arms: Vec<PlanPulseStartArm> },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PlanPulseStartArm {
+    pub trigger: ValueRef,
+    pub gate: PlanRowExpressionId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PlanPulseBatch {
+    pub id: PlanPulseBatchId,
+    pub owner: PlanOwner,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enclosing_activation: Option<PlanActivationId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<StateId>,
+    pub start: PlanPulseStart,
+    pub count: PlanRowExpressionId,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub state_update_ops: Vec<PlanOpId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub list_mutation_ops: Vec<PlanOpId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub derived_ops: Vec<PlanOpId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub emission_routes: Vec<PlanPulseEmissionRoute>,
+    pub schedule: PlanPulseSchedule,
+    pub flush_policy: PlanPulseFlushPolicy,
+    pub semantic_slice_digest: [u8; 32],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PlanPulseEmissionRoute {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub derived_ops: Vec<PlanOpId>,
+    pub filter: PlanPulseEmissionFilter,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PlanPulseEmissionFilter {
+    Passthrough,
+    Skip { count: PlanRowExpressionId },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -6702,6 +6801,12 @@ impl<'a, 'plan> TypedListViewNormalizer<'a, 'plan> {
                     type_fingerprint,
                     field_path,
                 }
+            }
+            ValueRef::Pulse(pulse) => {
+                return Err(PlanError::new(format!(
+                    "pulse batch {} cannot be captured in a typed-list index fingerprint",
+                    pulse.0
+                )));
             }
             ValueRef::Field(field) => self.field_reference(field)?,
             ValueRef::List(list) => self.list_reference(list)?,
@@ -9532,6 +9637,7 @@ pub enum ValueRef {
         state_id: StateId,
         field_path: Vec<String>,
     },
+    Pulse(PlanPulseBatchId),
     Field(FieldId),
     List(ListId),
     Constant(PlanConstantId),
@@ -10422,7 +10528,7 @@ fn producer_result_type_is_compatible(
         ValueRef::DistributedImport(import_id) => {
             distributed_import_data_type(plan, *import_id).is_none_or(|actual| actual == expected)
         }
-        ValueRef::Source(_) | ValueRef::SourcePayload { .. } => false,
+        ValueRef::Source(_) | ValueRef::SourcePayload { .. } | ValueRef::Pulse(_) => false,
     }
 }
 
@@ -10776,6 +10882,18 @@ pub fn verify_plan(plan: &MachinePlan) -> Result<PlanVerification, PlanError> {
             "{} structurally owned scalar state slots",
             plan.storage_layout.scalar_slots.len()
         ),
+    });
+    let pulse_contract_failure = pulse_execution_contract_failure(plan);
+    checks.push(PlanCheck {
+        id: "pulse-execution-contract-canonical-and-resolved".to_owned(),
+        pass: pulse_contract_failure.is_none(),
+        detail: pulse_contract_failure.unwrap_or_else(|| {
+            format!(
+                "{} activation site(s), {} baseline pulse batch(es)",
+                plan.activations.len(),
+                plan.pulse_batches.len()
+            )
+        }),
     });
     checks.push(PlanCheck {
         id: "remote-calls-have-structural-owners".to_owned(),
@@ -12400,6 +12518,459 @@ fn scalar_storage_owners_resolve(plan: &MachinePlan) -> bool {
     })
 }
 
+fn pulse_expression_input_resolves(plan: &MachinePlan, input: &ValueRef) -> bool {
+    match input {
+        ValueRef::Source(source)
+        | ValueRef::SourcePayload {
+            source_id: source, ..
+        } => plan
+            .source_routes
+            .iter()
+            .any(|route| route.source_id == *source),
+        ValueRef::State(state)
+        | ValueRef::StateProjection {
+            state_id: state, ..
+        } => plan
+            .storage_layout
+            .scalar_slots
+            .iter()
+            .any(|slot| slot.state_id == *state),
+        ValueRef::Field(field) => {
+            plan.storage_layout
+                .list_slots
+                .iter()
+                .any(|slot| slot.contains_row_field(*field))
+                || plan
+                    .regions
+                    .iter()
+                    .flat_map(|region| &region.ops)
+                    .any(|op| op.output == Some(ValueRef::Field(*field)))
+        }
+        ValueRef::List(list) => plan
+            .storage_layout
+            .list_slots
+            .iter()
+            .any(|slot| slot.list_id == *list),
+        ValueRef::Constant(constant) => plan.constants.iter().any(|item| item.id == *constant),
+        ValueRef::DistributedImport(import) => {
+            distributed_import_data_type(plan, *import).is_some()
+        }
+        ValueRef::Pulse(_) => false,
+    }
+}
+
+fn pulse_expression_failure(
+    plan: &MachinePlan,
+    expression: PlanRowExpressionId,
+    diagnostic: &str,
+) -> Option<String> {
+    let validation = validate_runtime_row_expression(
+        plan,
+        expression,
+        std::iter::empty::<(PlanStaticOwnerId, PlanLocalId)>(),
+    );
+    if !validation.locals_resolve || !validation.list_fields_resolve || !validation.cpu_evaluable {
+        return Some(format!(
+            "{diagnostic} expression {} is not a closed CPU expression: {}",
+            expression.0,
+            validation
+                .detail
+                .unwrap_or_else(|| "runtime expression validation failed".to_owned())
+        ));
+    }
+    let mut invalid = BTreeSet::new();
+    if plan
+        .row_expressions
+        .visit_inputs(expression, &mut |input| {
+            if !pulse_expression_input_resolves(plan, &input) {
+                invalid.insert(input);
+            }
+        })
+        .is_err()
+    {
+        return Some(format!(
+            "{diagnostic} references invalid row expression {}",
+            expression.0
+        ));
+    }
+    (!invalid.is_empty()).then(|| {
+        format!(
+            "{diagnostic} expression {} has unresolved or pulse-recursive inputs {invalid:?}",
+            expression.0
+        )
+    })
+}
+
+fn pulse_execution_contract_failure(plan: &MachinePlan) -> Option<String> {
+    let operations = plan
+        .regions
+        .iter()
+        .flat_map(|region| region.ops.iter().map(move |op| (op.id, (region.kind, op))))
+        .collect::<BTreeMap<_, _>>();
+    let activation_local_slots = plan
+        .storage_layout
+        .scalar_slots
+        .iter()
+        .filter(|slot| matches!(slot.lifetime, PlanStateLifetime::ActivationLocal { .. }))
+        .map(|slot| slot.id)
+        .collect::<BTreeSet<_>>();
+    if plan
+        .persistence
+        .memory
+        .iter()
+        .any(|memory| activation_local_slots.contains(&memory.runtime_slot))
+    {
+        return Some("activation-local state appears in durable persistence memory".to_owned());
+    }
+
+    let mut activation_states = BTreeMap::<StateId, PlanActivationId>::new();
+    for (index, activation) in plan.activations.iter().enumerate() {
+        if activation.id.0 != index
+            || !plan_owner_resolves(plan, &activation.owner)
+            || !activation.states.windows(2).all(|pair| pair[0] < pair[1])
+        {
+            return Some(format!(
+                "activation {} has a noncanonical ID, owner, or state order",
+                activation.id.0
+            ));
+        }
+        if activation.states.is_empty() {
+            return Some(format!("activation {} owns no state", activation.id.0));
+        }
+        for state in &activation.states {
+            let Some(slot) = plan
+                .storage_layout
+                .scalar_slots
+                .iter()
+                .find(|slot| slot.state_id == *state)
+            else {
+                return Some(format!(
+                    "activation {} references missing state {}",
+                    activation.id.0, state.0
+                ));
+            };
+            if slot.lifetime
+                != (PlanStateLifetime::ActivationLocal {
+                    activation: activation.id,
+                })
+                || activation_states.insert(*state, activation.id).is_some()
+            {
+                return Some(format!(
+                    "activation {} does not uniquely match state {} lifetime",
+                    activation.id.0, state.0
+                ));
+            }
+        }
+    }
+    for slot in &plan.storage_layout.scalar_slots {
+        match slot.lifetime {
+            PlanStateLifetime::Persistent if activation_states.contains_key(&slot.state_id) => {
+                return Some(format!(
+                    "persistent state {} appears in an activation",
+                    slot.state_id.0
+                ));
+            }
+            PlanStateLifetime::ActivationLocal { activation }
+                if activation_states.get(&slot.state_id) != Some(&activation) =>
+            {
+                return Some(format!(
+                    "activation-local state {} has no matching activation {}",
+                    slot.state_id.0, activation.0
+                ));
+            }
+            PlanStateLifetime::Persistent | PlanStateLifetime::ActivationLocal { .. } => {}
+        }
+    }
+
+    let mut claimed_update_ops = BTreeSet::new();
+    let mut claimed_mutation_ops = BTreeSet::new();
+    let mut claimed_derived_ops = BTreeSet::new();
+    for (index, batch) in plan.pulse_batches.iter().enumerate() {
+        if batch.id.0 != index
+            || !plan_owner_resolves(plan, &batch.owner)
+            || digest_is_zero(&batch.semantic_slice_digest)
+        {
+            return Some(format!(
+                "pulse batch {} has a noncanonical ID, owner, or semantic digest",
+                batch.id.0
+            ));
+        }
+        if let Some(error) = pulse_expression_failure(
+            plan,
+            batch.count,
+            &format!("pulse batch {} count", batch.id.0),
+        ) {
+            return Some(error);
+        }
+        match &batch.start {
+            PlanPulseStart::Startup => {
+                let mut event_inputs = Vec::new();
+                if plan
+                    .row_expressions
+                    .visit_inputs(batch.count, &mut |input| {
+                        if matches!(input, ValueRef::Source(_) | ValueRef::SourcePayload { .. }) {
+                            event_inputs.push(input);
+                        }
+                    })
+                    .is_err()
+                    || !event_inputs.is_empty()
+                {
+                    return Some(format!(
+                        "startup pulse batch {} count depends on an event input",
+                        batch.id.0
+                    ));
+                }
+            }
+            PlanPulseStart::Triggered { arms } => {
+                if arms.is_empty() {
+                    return Some(format!(
+                        "pulse batch {} has an empty triggered start",
+                        batch.id.0
+                    ));
+                }
+                let mut unique = BTreeSet::new();
+                for arm in arms {
+                    let trigger_resolves = match &arm.trigger {
+                        ValueRef::Source(source) => plan
+                            .source_routes
+                            .iter()
+                            .any(|route| route.source_id == *source),
+                        ValueRef::State(state) => plan
+                            .storage_layout
+                            .scalar_slots
+                            .iter()
+                            .any(|slot| slot.state_id == *state),
+                        ValueRef::SourcePayload { .. }
+                        | ValueRef::StateProjection { .. }
+                        | ValueRef::Pulse(_)
+                        | ValueRef::Field(_)
+                        | ValueRef::List(_)
+                        | ValueRef::Constant(_)
+                        | ValueRef::DistributedImport(_) => false,
+                    };
+                    if !trigger_resolves || !unique.insert((arm.trigger.clone(), arm.gate)) {
+                        return Some(format!(
+                            "pulse batch {} has an unresolved or duplicate start arm",
+                            batch.id.0
+                        ));
+                    }
+                    if let Some(error) = pulse_expression_failure(
+                        plan,
+                        arm.gate,
+                        &format!("pulse batch {} start gate", batch.id.0),
+                    ) {
+                        return Some(error);
+                    }
+                }
+            }
+        }
+
+        let activation = batch.enclosing_activation.and_then(|id| {
+            plan.activations
+                .get(id.0)
+                .filter(|activation| activation.id == id)
+        });
+        if batch.enclosing_activation.is_some() != activation.is_some() {
+            return Some(format!(
+                "pulse batch {} references a missing activation",
+                batch.id.0
+            ));
+        }
+        if let Some(state) = batch.state {
+            let Some(slot) = plan
+                .storage_layout
+                .scalar_slots
+                .iter()
+                .find(|slot| slot.state_id == state)
+            else {
+                return Some(format!(
+                    "pulse batch {} references missing state {}",
+                    batch.id.0, state.0
+                ));
+            };
+            match slot.lifetime {
+                PlanStateLifetime::Persistent if batch.enclosing_activation.is_some() => {
+                    return Some(format!(
+                        "pulse batch {} encloses persistent state {} in an activation",
+                        batch.id.0, state.0
+                    ));
+                }
+                PlanStateLifetime::ActivationLocal {
+                    activation: state_activation,
+                } if batch.enclosing_activation != Some(state_activation)
+                    || activation.is_none_or(|activation| !activation.states.contains(&state)) =>
+                {
+                    return Some(format!(
+                        "pulse batch {} state {} does not match its activation",
+                        batch.id.0, state.0
+                    ));
+                }
+                PlanStateLifetime::Persistent | PlanStateLifetime::ActivationLocal { .. } => {}
+            }
+        }
+
+        for op_id in &batch.state_update_ops {
+            let Some((kind, op)) = operations.get(op_id) else {
+                return Some(format!(
+                    "pulse batch {} references missing state-update op {}",
+                    batch.id.0, op_id.0
+                ));
+            };
+            if *kind != RegionKind::StateUpdates
+                || !matches!(
+                    &op.kind,
+                    PlanOpKind::StateUpdate {
+                        trigger: ValueRef::Pulse(pulse),
+                        ..
+                    } if *pulse == batch.id
+                )
+                || !claimed_update_ops.insert(*op_id)
+            {
+                return Some(format!(
+                    "pulse batch {} state-update op {} has the wrong kind, trigger, or owner",
+                    batch.id.0, op_id.0
+                ));
+            }
+        }
+        if batch.state.is_some_and(|state| {
+            !batch.state_update_ops.iter().any(|op_id| {
+                operations
+                    .get(op_id)
+                    .is_some_and(|(_, op)| op.output == Some(ValueRef::State(state)))
+            })
+        }) {
+            return Some(format!(
+                "pulse batch {} does not update its owning state",
+                batch.id.0
+            ));
+        }
+        for op_id in &batch.list_mutation_ops {
+            let Some((kind, op)) = operations.get(op_id) else {
+                return Some(format!(
+                    "pulse batch {} references missing list-mutation op {}",
+                    batch.id.0, op_id.0
+                ));
+            };
+            let trigger = match &op.kind {
+                PlanOpKind::ListMutation {
+                    mutation: PlanListMutation::Append(append),
+                } => &append.trigger,
+                PlanOpKind::ListMutation {
+                    mutation: PlanListMutation::Remove(remove),
+                } => &remove.trigger,
+                _ => {
+                    return Some(format!(
+                        "pulse batch {} op {} is not a list mutation",
+                        batch.id.0, op_id.0
+                    ));
+                }
+            };
+            if *kind != RegionKind::ListMutations
+                || trigger != &ValueRef::Pulse(batch.id)
+                || !claimed_mutation_ops.insert(*op_id)
+            {
+                return Some(format!(
+                    "pulse batch {} list-mutation op {} has the wrong trigger or owner",
+                    batch.id.0, op_id.0
+                ));
+            }
+        }
+        for op_id in &batch.derived_ops {
+            let Some((kind, op)) = operations.get(op_id) else {
+                return Some(format!(
+                    "pulse batch {} references missing derived op {}",
+                    batch.id.0, op_id.0
+                ));
+            };
+            let pulse_arm = matches!(
+                &op.kind,
+                PlanOpKind::DerivedValue {
+                    expression: Some(PlanDerivedExpression::SourceEventTransform { arms, .. }),
+                    ..
+                } if arms
+                    .iter()
+                    .any(|arm| arm.trigger == ValueRef::Pulse(batch.id))
+            );
+            if *kind != RegionKind::DerivedEvaluation
+                || !pulse_arm
+                || !claimed_derived_ops.insert(*op_id)
+            {
+                return Some(format!(
+                    "pulse batch {} derived op {} has the wrong trigger or owner",
+                    batch.id.0, op_id.0
+                ));
+            }
+        }
+        let mut routed = BTreeSet::new();
+        for route in &batch.emission_routes {
+            if route.derived_ops.is_empty()
+                || !route
+                    .derived_ops
+                    .iter()
+                    .all(|op| batch.derived_ops.contains(op))
+            {
+                return Some(format!(
+                    "pulse batch {} has an empty or foreign emission route",
+                    batch.id.0
+                ));
+            }
+            routed.extend(route.derived_ops.iter().copied());
+            if let PlanPulseEmissionFilter::Skip { count } = route.filter
+                && let Some(error) = pulse_expression_failure(
+                    plan,
+                    count,
+                    &format!("pulse batch {} skip count", batch.id.0),
+                )
+            {
+                return Some(error);
+            }
+        }
+        if routed != batch.derived_ops.iter().copied().collect() {
+            return Some(format!(
+                "pulse batch {} emission routes do not cover its derived ops",
+                batch.id.0
+            ));
+        }
+    }
+
+    for op in plan.regions.iter().flat_map(|region| &region.ops) {
+        match &op.kind {
+            PlanOpKind::StateUpdate {
+                trigger: ValueRef::Pulse(_),
+                ..
+            } if !claimed_update_ops.contains(&op.id) => {
+                return Some(format!("pulse state-update op {} is unclaimed", op.id.0));
+            }
+            PlanOpKind::ListMutation {
+                mutation: PlanListMutation::Append(append),
+            } if matches!(append.trigger, ValueRef::Pulse(_))
+                && !claimed_mutation_ops.contains(&op.id) =>
+            {
+                return Some(format!("pulse append op {} is unclaimed", op.id.0));
+            }
+            PlanOpKind::ListMutation {
+                mutation: PlanListMutation::Remove(remove),
+            } if matches!(remove.trigger, ValueRef::Pulse(_))
+                && !claimed_mutation_ops.contains(&op.id) =>
+            {
+                return Some(format!("pulse remove op {} is unclaimed", op.id.0));
+            }
+            PlanOpKind::DerivedValue {
+                expression: Some(PlanDerivedExpression::SourceEventTransform { arms, .. }),
+                ..
+            } if arms
+                .iter()
+                .any(|arm| matches!(arm.trigger, ValueRef::Pulse(_)))
+                && !claimed_derived_ops.contains(&op.id) =>
+            {
+                return Some(format!("pulse derived op {} is unclaimed", op.id.0));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 fn remote_call_owners_resolve(plan: &MachinePlan) -> bool {
     plan.distributed_endpoint.as_ref().is_none_or(|endpoint| {
         endpoint
@@ -12582,7 +13153,7 @@ fn runtime_output_ref_resolves(plan: &MachinePlan, value: &ValueRef) -> bool {
         ValueRef::DistributedImport(import_id) => {
             distributed_import_data_type(plan, *import_id).is_some()
         }
-        ValueRef::Source(_) | ValueRef::SourcePayload { .. } => false,
+        ValueRef::Source(_) | ValueRef::SourcePayload { .. } | ValueRef::Pulse(_) => false,
     }
 }
 
@@ -13292,6 +13863,7 @@ fn state_update_trigger_is_supported(op: &PlanOp) -> bool {
             op.inputs.contains(trigger) && source_inputs == BTreeSet::from([*source])
         }
         ValueRef::State(_) => op.inputs.contains(trigger) && source_inputs.is_empty(),
+        ValueRef::Pulse(_) => op.inputs.contains(trigger) && source_inputs.is_empty(),
         ValueRef::Field(_)
         | ValueRef::StateProjection { .. }
         | ValueRef::SourcePayload { .. }
@@ -13470,8 +14042,10 @@ fn cpu_plan_executor_supports_derived_value_op(
                 && row_expression_refs_resolve(arena, op, *default)
                 && !arms.is_empty()
                 && arms.iter().all(|arm| {
-                    matches!(&arm.trigger, ValueRef::Source(_) | ValueRef::State(_))
-                        && op.inputs.contains(&arm.trigger)
+                    matches!(
+                        &arm.trigger,
+                        ValueRef::Source(_) | ValueRef::State(_) | ValueRef::Pulse(_)
+                    ) && op.inputs.contains(&arm.trigger)
                         && root_row_expression_cpu_evaluable(arena, arm.value)
                         && row_expression_refs_resolve(arena, op, arm.value)
                 })
@@ -13814,7 +14388,7 @@ fn initial_expression_input_resolves(plan: &MachinePlan, input: &ValueRef) -> bo
         ValueRef::DistributedImport(import) => {
             distributed_import_data_type(plan, *import).is_some()
         }
-        ValueRef::Source(_) | ValueRef::SourcePayload { .. } => false,
+        ValueRef::Source(_) | ValueRef::SourcePayload { .. } | ValueRef::Pulse(_) => false,
     }
 }
 
@@ -14172,8 +14746,10 @@ fn derived_expression_refs_resolve_for_op(
         PlanDerivedExpression::SourceEventTransform { default, arms, .. } => {
             row_expression_refs_resolve(arena, op, *default)
                 && arms.iter().all(|arm| {
-                    matches!(&arm.trigger, ValueRef::Source(_) | ValueRef::State(_))
-                        && op.inputs.contains(&arm.trigger)
+                    matches!(
+                        &arm.trigger,
+                        ValueRef::Source(_) | ValueRef::State(_) | ValueRef::Pulse(_)
+                    ) && op.inputs.contains(&arm.trigger)
                         && row_expression_refs_resolve(arena, op, arm.value)
                 })
         }

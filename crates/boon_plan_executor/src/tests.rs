@@ -193,6 +193,8 @@ fn plan(
         row_expressions,
         constants,
         source_routes: routes,
+        activations: Vec::new(),
+        pulse_batches: Vec::new(),
         storage_layout: StorageLayout {
             scalar_slots,
             list_slots,
@@ -298,6 +300,7 @@ fn number_slot(state: usize, constant: usize) -> ScalarStorageSlot {
         scope_id: None,
         indexed: false,
         indexed_field_id: None,
+        lifetime: PlanStateLifetime::Persistent,
         initializer: ScalarInitializerPlan::Constant {
             constant_id: PlanConstantId(constant),
         },
@@ -1310,6 +1313,7 @@ fn dynamic_row_dependencies_invalidate_consumers_across_lists() {
         scope_id: Some(ScopeId(0)),
         indexed: true,
         indexed_field_id: Some(FieldId(11)),
+        lifetime: PlanStateLifetime::Persistent,
         initializer: ScalarInitializerPlan::Expression {
             expression: row_field(&mut row_expressions, ValueRef::Field(FieldId(12))),
         },
@@ -1547,6 +1551,7 @@ fn unscoped_source_updates_every_row_owned_by_indexed_state() {
         scope_id: Some(ScopeId(0)),
         indexed: true,
         indexed_field_id: Some(FieldId(11)),
+        lifetime: PlanStateLifetime::Persistent,
         initializer: ScalarInitializerPlan::Expression {
             expression: row_field(&mut row_expressions, ValueRef::Field(FieldId(12))),
         },
@@ -6173,6 +6178,7 @@ fn source_transform_keeps_precommit_state_for_the_event_turn() {
         scope_id: None,
         indexed: false,
         indexed_field_id: None,
+        lifetime: PlanStateLifetime::Persistent,
         initializer: ScalarInitializerPlan::Constant {
             constant_id: PlanConstantId(0),
         },
@@ -6770,6 +6776,7 @@ fn indexed_override_does_not_materialize_the_whole_default_list() {
         scope_id: Some(ScopeId(0)),
         indexed: true,
         indexed_field_id: Some(FieldId(0)),
+        lifetime: PlanStateLifetime::Persistent,
         initializer: ScalarInitializerPlan::Constant {
             constant_id: PlanConstantId(0),
         },
@@ -7911,6 +7918,7 @@ fn flushed_state_chain_suppresses_dispatch_without_cancelling_prior_effect() {
         scope_id: None,
         indexed: false,
         indexed_field_id: None,
+        lifetime: PlanStateLifetime::Persistent,
         initializer: ScalarInitializerPlan::Constant {
             constant_id: PlanConstantId(constant),
         },
@@ -8012,6 +8020,7 @@ fn flushed_state_chain_discards_staged_list_mutation() {
         scope_id: None,
         indexed: false,
         indexed_field_id: None,
+        lifetime: PlanStateLifetime::Persistent,
         initializer: ScalarInitializerPlan::Constant {
             constant_id: PlanConstantId(0),
         },
@@ -14820,6 +14829,7 @@ fn detached_capture_materialization_plan(declaration: DetachedCaptureDeclaration
         scope_id: Some(ScopeId(1)),
         indexed: true,
         indexed_field_id: Some(FieldId(22)),
+        lifetime: PlanStateLifetime::Persistent,
         initializer: ScalarInitializerPlan::Expression {
             expression: row_field(&mut row_expressions, ValueRef::Field(capture_field)),
         },
@@ -15225,4 +15235,444 @@ store: [
     assert_eq!(first, second);
     assert!(first.contains("Bits/get"), "unexpected error: {first}");
     assert!(first.contains("position 9"), "unexpected error: {first}");
+}
+
+#[test]
+fn canonical_fibonacci_executes_frozen_baseline_pulses_and_discards_local_hold() {
+    let compiled = compile_server_source(
+        "fibonacci-pulses.bn",
+        r#"
+value: fibonacci(position: 10)
+
+FUNCTION fibonacci(position) {
+    position
+    |> THEN {
+        position |> WHILE {
+            1 => 1
+
+            n =>
+                [previous: 0, current: 1]
+                |> HOLD state {
+                    n - 1
+                    |> Stream/pulses()
+                    |> THEN {
+                        [
+                            previous: state.current
+                            current: state.previous + state.current
+                        ]
+                    }
+                }
+                |> Stream/skip(count: n - 1)
+                |> .current
+        }
+    }
+}
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .expect("compiled canonical Fibonacci");
+    let [slot] = compiled.plan.storage_layout.scalar_slots.as_slice() else {
+        panic!("canonical Fibonacci must own one activation-local HOLD");
+    };
+    assert!(matches!(
+        slot.lifetime,
+        PlanStateLifetime::ActivationLocal { .. }
+    ));
+
+    let mut session =
+        MachineInstance::new(compiled.plan, SessionOptions::default()).expect("pulse runtime");
+    assert_eq!(
+        session
+            .root_value_current("value")
+            .expect("Fibonacci value"),
+        number(55)
+    );
+    assert!(
+        session
+            .snapshot()
+            .expect("public snapshot")
+            .states
+            .is_empty(),
+        "activation-local HOLD must not survive startup"
+    );
+    assert!(
+        session
+            .authority_snapshot()
+            .expect("authority snapshot")
+            .states
+            .is_empty(),
+        "activation-local HOLD must not enter restorable authority"
+    );
+}
+
+#[test]
+fn source_triggered_fibonacci_resets_local_hold_and_skip_only_filters_emissions() {
+    let compiled = compile_server_source(
+        "source-fibonacci-pulses.bn",
+        r#"
+store: [
+    input: SOURCE
+    position:
+        1 |> HOLD position {
+            input.value |> THEN {
+                input.value |> Text/to_number()
+                |> WHEN {
+                    Parsed[value] => value
+                    InvalidNumber[reason, position] => 1
+                }
+            }
+        }
+    value: fibonacci(position: position)
+]
+
+FUNCTION fibonacci(position) {
+    position
+    |> THEN {
+        position |> WHILE {
+            1 => 1
+
+            n =>
+                [previous: 0, current: 1]
+                |> HOLD state {
+                    n - 1
+                    |> Stream/pulses()
+                    |> THEN {
+                        [
+                            previous: state.current
+                            current: state.previous + state.current
+                        ]
+                    }
+                }
+                |> Stream/skip(count: n - 1)
+                |> .current
+        }
+    }
+}
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .expect("compiled source-triggered Fibonacci");
+    let source = source_id(&compiled.plan, "store.input");
+    let output = field_id(&compiled.plan, "store.value");
+    let local_state = compiled
+        .plan
+        .storage_layout
+        .scalar_slots
+        .iter()
+        .find(|slot| matches!(slot.lifetime, PlanStateLifetime::ActivationLocal { .. }))
+        .expect("activation-local Fibonacci HOLD")
+        .state_id;
+    let mut session =
+        MachineInstance::new(compiled.plan, SessionOptions::default()).expect("pulse runtime");
+
+    let apply_position = |session: &mut MachineInstance, sequence, position: &str| {
+        session
+            .apply(SourceEvent {
+                sequence,
+                source,
+                route: route_token(session, source, None),
+                target: None,
+                payload: SourcePayload {
+                    fields: BTreeMap::from([(
+                        "value".to_owned(),
+                        Value::Text(position.to_owned()),
+                    )]),
+                    ..SourcePayload::default()
+                },
+            })
+            .expect("source pulse turn")
+    };
+
+    let ten = apply_position(&mut session, 1, "10");
+    assert_eq!(
+        session.root_value_current("store.value").unwrap(),
+        number(55)
+    );
+    let ten_local_commits = ten
+        .deltas
+        .iter()
+        .filter(|delta| {
+            matches!(
+                delta,
+                Delta::SetValue {
+                    target: ValueTarget::State(state),
+                    ..
+                } if *state == local_state
+            )
+        })
+        .count();
+    assert_eq!(
+        ten_local_commits, 10,
+        "initializer plus nine successful microturn commits remain observable"
+    );
+    assert_eq!(
+        ten.deltas
+            .iter()
+            .filter(|delta| {
+                matches!(
+                    delta,
+                    Delta::SetValue {
+                        target: ValueTarget::Field(field),
+                        ..
+                    } if *field == output
+                )
+            })
+            .count(),
+        1,
+        "Stream/skip must suppress only the first nine downstream emissions"
+    );
+    assert!(ten.authority_deltas.iter().all(|delta| {
+        !matches!(
+            delta,
+            AuthorityDelta::SetRoot { state, .. } if *state == local_state
+        )
+    }));
+
+    let five = apply_position(&mut session, 2, "5");
+    assert_eq!(
+        session.root_value_current("store.value").unwrap(),
+        number(5),
+        "the second source occurrence must restart from [0, 1]"
+    );
+    assert_eq!(
+        five.deltas
+            .iter()
+            .filter(|delta| {
+                matches!(
+                    delta,
+                    Delta::SetValue {
+                        target: ValueTarget::State(state),
+                        ..
+                    } if *state == local_state
+                )
+            })
+            .count(),
+        5,
+        "the reset activation owns one initializer and four commits"
+    );
+    assert!(
+        session
+            .snapshot()
+            .unwrap()
+            .states
+            .get(&local_state)
+            .is_none()
+            && session
+                .authority_snapshot()
+                .unwrap()
+                .states
+                .get(&local_state)
+                .is_none()
+    );
+}
+
+#[test]
+fn flushing_pulse_discards_its_candidate_and_keeps_prior_microturn_commits() {
+    let compiled = compile_server_source(
+        "flushing-pulses.bn",
+        r#"
+store: [
+    start: SOURCE
+    state:
+        [previous: 0, current: 1]
+        |> HOLD memory {
+            start |> THEN {
+                8
+                |> Stream/pulses()
+                |> THEN {
+                    memory.current |> WHEN {
+                        3 => FLUSH { Stopped }
+                        seen => [
+                            previous: seen
+                            current: memory.previous + seen
+                        ]
+                    }
+                }
+            }
+        }
+    value:
+        state
+        |> Stream/skip(count: 2)
+        |> .current
+]
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .expect("compiled flushing pulse batch");
+    let source = source_id(&compiled.plan, "store.start");
+    let output = field_id(&compiled.plan, "store.value");
+    let pulse_state = state_id(&compiled.plan, "store.state");
+    assert!(matches!(
+        compiled
+            .plan
+            .storage_layout
+            .scalar_slots
+            .iter()
+            .find(|slot| slot.state_id == pulse_state)
+            .expect("pulse state slot")
+            .lifetime,
+        PlanStateLifetime::Persistent
+    ));
+    let mut session =
+        MachineInstance::new(compiled.plan, SessionOptions::default()).expect("pulse runtime");
+    let turn = session
+        .apply(SourceEvent {
+            sequence: 1,
+            source,
+            route: route_token(&session, source, None),
+            target: None,
+            payload: SourcePayload::default(),
+        })
+        .expect("FLUSH stops the batch without failing the source turn");
+
+    assert_eq!(
+        session.root_value_current("store.value").unwrap(),
+        number(3)
+    );
+    let committed = turn
+        .authority_deltas
+        .iter()
+        .filter_map(|delta| match delta {
+            AuthorityDelta::SetRoot { state, value } if *state == pulse_state => Some(value),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        committed.len(),
+        3,
+        "three successful pulses commit before the fourth FLUSH"
+    );
+    assert_eq!(
+        committed.last().and_then(|value| match value {
+            Value::Record(fields) => fields.get("current"),
+            _ => None,
+        }),
+        Some(&number(3))
+    );
+    assert_eq!(
+        turn.deltas
+            .iter()
+            .filter(|delta| {
+                matches!(
+                    delta,
+                    Delta::SetValue {
+                        target: ValueTarget::Field(field),
+                        ..
+                    } if *field == output
+                )
+            })
+            .count(),
+        1,
+        "the flushing pulse and all remaining pulses emit nothing downstream"
+    );
+    assert_eq!(
+        session
+            .authority_snapshot()
+            .unwrap()
+            .states
+            .get(&pulse_state)
+            .map(|state| &state.value),
+        committed.last().copied()
+    );
+}
+
+#[test]
+fn pulse_count_is_sampled_once_before_the_first_microturn() {
+    let compiled = compile_server_source(
+        "frozen-pulse-count.bn",
+        r#"
+store: [
+    start: SOURCE
+    count:
+        5 |> HOLD count {
+            start |> THEN {
+                count
+                |> Stream/pulses()
+                |> THEN { count - 1 }
+            }
+        }
+]
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .expect("compiled self-decrementing pulse count");
+    let source = source_id(&compiled.plan, "store.start");
+    let count_state = state_id(&compiled.plan, "store.count");
+    let mut session =
+        MachineInstance::new(compiled.plan, SessionOptions::default()).expect("pulse runtime");
+    let turn = session
+        .apply(SourceEvent {
+            sequence: 1,
+            source,
+            route: route_token(&session, source, None),
+            target: None,
+            payload: SourcePayload::default(),
+        })
+        .expect("bounded pulse turn");
+
+    assert_eq!(
+        session.root_value_current("store.count").unwrap(),
+        number(0),
+        "the batch must execute all five frozen pulses even as its count state changes"
+    );
+    assert_eq!(
+        turn.authority_deltas
+            .iter()
+            .filter(|delta| {
+                matches!(
+                    delta,
+                    AuthorityDelta::SetRoot { state, .. } if *state == count_state
+                )
+            })
+            .count(),
+        5,
+        "each successful baseline microturn publishes before the next"
+    );
+}
+
+#[test]
+fn target_profile_rejects_an_oversized_pulse_batch_before_any_microturn() {
+    let limit = TargetProfile::SoftwareBounded.max_pulses_per_activation();
+    let compiled = compile_server_source(
+        "bounded-pulse-limit.bn",
+        &format!(
+            r#"
+store: [
+    start: SOURCE
+    count:
+        {} |> HOLD count {{
+            start |> THEN {{
+                count
+                |> Stream/pulses()
+                |> THEN {{ count - 1 }}
+            }}
+        }}
+]
+"#,
+            limit + 1
+        ),
+        TargetProfile::SoftwareBounded,
+    )
+    .expect("compiled dynamically bounded pulse batch");
+    let source = source_id(&compiled.plan, "store.start");
+    let mut session =
+        MachineInstance::new(compiled.plan, SessionOptions::default()).expect("pulse runtime");
+    let error = session
+        .apply(SourceEvent {
+            sequence: 1,
+            source,
+            route: route_token(&session, source, None),
+            target: None,
+            payload: SourcePayload::default(),
+        })
+        .expect_err("target pulse limit must fail closed");
+    assert!(
+        error.to_string().contains("activation limit"),
+        "unexpected error: {error}"
+    );
+    assert_eq!(
+        session.root_value_current("store.count").unwrap(),
+        number(i64::try_from(limit + 1).unwrap()),
+        "no pulse candidate may commit before the bound is checked"
+    );
 }

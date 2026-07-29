@@ -28,8 +28,9 @@ use boon_plan::{
     PlanListIndexKey, PlanListIndexKeyKind, PlanListIndexKeyMultiplicity, PlanListMap,
     PlanListMaterialization, PlanListMutation, PlanListPage, PlanListProjection, PlanLocalId,
     PlanMaterializedRowFieldCopy, PlanOp, PlanOpId, PlanOpKind, PlanOrderDirection,
-    PlanOrderOperationKind, PlanOwner, PlanRowBuiltin, PlanRowCallArg, PlanRowExpressionArena,
-    PlanRowExpressionId, PlanRowExpressionNode, PlanRowObjectField, PlanRowSelectPattern,
+    PlanOrderOperationKind, PlanOwner, PlanPulseBatch, PlanPulseBatchId, PlanPulseEmissionFilter,
+    PlanPulseStart, PlanRowBuiltin, PlanRowCallArg, PlanRowExpressionArena, PlanRowExpressionId,
+    PlanRowExpressionNode, PlanRowObjectField, PlanRowSelectPattern, PlanStateLifetime,
     PlanStaticOwnerId, PlanTransientCollection, PlanTransientCollectionKind,
     PlanTransientCollectionResult, PlanTransientCollectionStep, PlanValueListAuthority,
     ProducerFunctionInstancePlan, RemoteCallSiteId, RemoteCallSitePlan, RootOutputDemand,
@@ -682,6 +683,7 @@ pub struct SourceEvent {
 enum TriggerCause {
     Source(SourceId),
     State(StateId),
+    Pulse(PlanPulseBatchId),
     Effect(EffectInvocationId),
 }
 
@@ -4317,6 +4319,7 @@ struct Metadata {
     indexed_state_field: BTreeMap<StateId, FieldId>,
     indexed_state_owner: BTreeMap<StateId, ListId>,
     state_owners: BTreeMap<StateId, PlanOwner>,
+    state_lifetimes: BTreeMap<StateId, PlanStateLifetime>,
     list_by_scope: BTreeMap<ScopeId, ListId>,
     list_fields_by_name: BTreeMap<(ListId, String), Vec<FieldId>>,
     list_authority_fields: BTreeMap<(ListId, String), FieldId>,
@@ -4339,9 +4342,15 @@ struct Metadata {
     routes: BTreeMap<SourceId, SourceRoute>,
     updates_by_source: BTreeMap<SourceId, Vec<Arc<PlanOp>>>,
     updates_by_state: BTreeMap<StateId, Vec<Arc<PlanOp>>>,
+    updates_by_pulse: BTreeMap<PlanPulseBatchId, Vec<Arc<PlanOp>>>,
     effect_updates_by_id: BTreeMap<PlanOpId, Arc<PlanOp>>,
     mutations_by_source: BTreeMap<SourceId, Vec<Arc<PlanOp>>>,
     mutations_by_state: BTreeMap<StateId, Vec<Arc<PlanOp>>>,
+    mutations_by_pulse: BTreeMap<PlanPulseBatchId, Vec<Arc<PlanOp>>>,
+    pulse_batches: BTreeMap<PlanPulseBatchId, PlanPulseBatch>,
+    startup_pulses: Vec<PlanPulseBatchId>,
+    pulses_by_source: BTreeMap<SourceId, Vec<PlanPulseBatchId>>,
+    pulses_by_state: BTreeMap<StateId, Vec<PlanPulseBatchId>>,
     source_derived_by_source: BTreeMap<SourceId, BTreeSet<FieldId>>,
     state_derived_by_state: BTreeMap<StateId, BTreeSet<FieldId>>,
     source_derived_lists_by_source: BTreeMap<SourceId, BTreeSet<ListId>>,
@@ -4755,6 +4764,12 @@ impl Metadata {
             .iter()
             .map(|slot| (slot.state_id, slot.owner.clone()))
             .collect::<BTreeMap<_, _>>();
+        let state_lifetimes = plan
+            .storage_layout
+            .scalar_slots
+            .iter()
+            .map(|slot| (slot.state_id, slot.lifetime))
+            .collect::<BTreeMap<_, _>>();
         for slot in plan
             .storage_layout
             .scalar_slots
@@ -4795,6 +4810,7 @@ impl Metadata {
         let mut state_derived_lists_by_state = BTreeMap::<StateId, BTreeSet<ListId>>::new();
         let mut updates_by_source = BTreeMap::<SourceId, Vec<Arc<PlanOp>>>::new();
         let mut updates_by_state = BTreeMap::<StateId, Vec<Arc<PlanOp>>>::new();
+        let mut updates_by_pulse = BTreeMap::<PlanPulseBatchId, Vec<Arc<PlanOp>>>::new();
         let mut effect_updates_by_id = BTreeMap::<PlanOpId, Arc<PlanOp>>::new();
         let mut session_info_root_fields = BTreeSet::new();
         let mut session_info_row_fields = BTreeSet::new();
@@ -4832,6 +4848,7 @@ impl Metadata {
                                             .or_default()
                                             .insert(field);
                                     }
+                                    ValueRef::Pulse(_) => {}
                                     _ => {
                                         return Err(Error::InvalidPlan(format!(
                                             "source-event transform field {} has a non-event arm trigger",
@@ -4867,6 +4884,7 @@ impl Metadata {
                                             .or_default()
                                             .insert(list);
                                     }
+                                    ValueRef::Pulse(_) => {}
                                     _ => {
                                         return Err(Error::InvalidPlan(format!(
                                             "source-event transform list {} has a non-event arm trigger",
@@ -4927,6 +4945,10 @@ impl Metadata {
                             .entry(*state)
                             .or_default()
                             .push(Arc::clone(&op)),
+                        ValueRef::Pulse(pulse) => updates_by_pulse
+                            .entry(*pulse)
+                            .or_default()
+                            .push(Arc::clone(&op)),
                         _ => {
                             return Err(Error::InvalidPlan(format!(
                                 "update op {} has a non-event trigger",
@@ -4945,9 +4967,13 @@ impl Metadata {
         for ops in updates_by_state.values_mut() {
             sort_update_ops_by_dependencies(ops);
         }
+        for ops in updates_by_pulse.values_mut() {
+            sort_update_ops_by_dependencies(ops);
+        }
         mutations.sort_by_key(|op| op.id);
         let mut mutations_by_source = BTreeMap::<SourceId, Vec<Arc<PlanOp>>>::new();
         let mut mutations_by_state = BTreeMap::<StateId, Vec<Arc<PlanOp>>>::new();
+        let mut mutations_by_pulse = BTreeMap::<PlanPulseBatchId, Vec<Arc<PlanOp>>>::new();
         for mutation in &mutations {
             let trigger = match &mutation.kind {
                 PlanOpKind::ListMutation {
@@ -4966,6 +4992,7 @@ impl Metadata {
             let operations = match trigger {
                 ValueRef::Source(source) => mutations_by_source.entry(*source).or_default(),
                 ValueRef::State(state) => mutations_by_state.entry(*state).or_default(),
+                ValueRef::Pulse(pulse) => mutations_by_pulse.entry(*pulse).or_default(),
                 trigger => {
                     return Err(Error::InvalidPlan(format!(
                         "mutation op {} has non-event trigger {trigger:?}",
@@ -4985,6 +5012,55 @@ impl Metadata {
         }
         for operations in mutations_by_state.values_mut() {
             operations.sort_by_key(|operation| operation.id);
+        }
+        for operations in mutations_by_pulse.values_mut() {
+            operations.sort_by_key(|operation| operation.id);
+        }
+
+        let pulse_batches = plan
+            .pulse_batches
+            .iter()
+            .cloned()
+            .map(|batch| (batch.id, batch))
+            .collect::<BTreeMap<_, _>>();
+        if pulse_batches.len() != plan.pulse_batches.len() {
+            return Err(Error::InvalidPlan(
+                "pulse batch identities are not unique".to_owned(),
+            ));
+        }
+        let mut startup_pulses = Vec::new();
+        let mut pulses_by_source = BTreeMap::<SourceId, Vec<PlanPulseBatchId>>::new();
+        let mut pulses_by_state = BTreeMap::<StateId, Vec<PlanPulseBatchId>>::new();
+        for batch in pulse_batches.values() {
+            match &batch.start {
+                PlanPulseStart::Startup => startup_pulses.push(batch.id),
+                PlanPulseStart::Triggered { arms } => {
+                    for arm in arms {
+                        let batches = match &arm.trigger {
+                            ValueRef::Source(source) => {
+                                pulses_by_source.entry(*source).or_default()
+                            }
+                            ValueRef::State(state) => pulses_by_state.entry(*state).or_default(),
+                            _ => {
+                                return Err(Error::InvalidPlan(format!(
+                                    "pulse batch {} has a non-event start trigger",
+                                    batch.id.0
+                                )));
+                            }
+                        };
+                        if !batches.contains(&batch.id) {
+                            batches.push(batch.id);
+                        }
+                    }
+                }
+            }
+        }
+        startup_pulses.sort();
+        for batches in pulses_by_source.values_mut() {
+            batches.sort();
+        }
+        for batches in pulses_by_state.values_mut() {
+            batches.sort();
         }
 
         let published: BTreeSet<FieldId> = match &plan.demand.root_derived_outputs {
@@ -5233,6 +5309,7 @@ impl Metadata {
             indexed_state_field,
             indexed_state_owner,
             state_owners,
+            state_lifetimes,
             list_by_scope,
             list_fields_by_name,
             list_authority_fields,
@@ -5255,9 +5332,15 @@ impl Metadata {
             routes,
             updates_by_source,
             updates_by_state,
+            updates_by_pulse,
             effect_updates_by_id,
             mutations_by_source,
             mutations_by_state,
+            mutations_by_pulse,
+            pulse_batches,
+            startup_pulses,
+            pulses_by_source,
+            pulses_by_state,
             source_derived_by_source,
             state_derived_by_state,
             source_derived_lists_by_source,
@@ -6177,6 +6260,7 @@ struct Work {
     dirty_states: HashSet<StateId>,
     active_trigger: Option<ActiveTrigger>,
     active_state_routes: HashSet<(StateId, OwnerInstanceId)>,
+    active_pulse_routes: HashSet<(PlanPulseBatchId, OwnerInstanceId)>,
     dirty_consumers: HashSet<Consumer>,
     pending_effect_reconciliations: BTreeSet<EffectConsumer>,
     effect_reconciliation_sequence: Option<u64>,
@@ -6211,6 +6295,26 @@ struct Work {
     legacy_runtime_counter_start: LegacyRuntimeCounterStart,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum LiveActivationState {
+    Root { state: StateId },
+    Indexed { state: StateId, row: RowId },
+}
+
+#[derive(Clone, Debug)]
+struct FrozenPulseEmissionRoute {
+    derived_ops: Vec<PlanOpId>,
+    skip: u64,
+}
+
+#[derive(Clone, Debug)]
+struct PendingPulseStateUpdate {
+    state: StateId,
+    row: Option<RowId>,
+    field: Option<FieldId>,
+    value: Value,
+}
+
 impl Work {
     fn with_limit(work_limit: Option<u64>) -> Self {
         Self {
@@ -6236,6 +6340,7 @@ impl Work {
         self.dirty_states.clear();
         self.active_trigger = None;
         self.active_state_routes.clear();
+        self.active_pulse_routes.clear();
         self.dirty_consumers.clear();
         self.pending_effect_reconciliations.clear();
         self.effect_reconciliation_sequence = None;
@@ -6302,6 +6407,7 @@ impl Work {
         self.updated_transient_effects.clear();
         self.pending_list_mutations.clear();
         self.flushed_state_candidates.clear();
+        self.active_pulse_routes.clear();
         self.distributed_context_undo = None;
         self.effect_activation_undo.clear();
         self.detached_producer_leases.clear();
@@ -8967,6 +9073,8 @@ pub struct MachineInstance {
         BTreeMap<(ImportId, DistributedCallInstanceId), DistributedCurrentCallResult>,
     distributed_current_call_demands: DistributedCurrentCallDemands,
     root_states: BTreeMap<StateId, PrivatePresence<Value>>,
+    activation_root_states: BTreeMap<StateId, PrivatePresence<Value>>,
+    activation_row_states: BTreeMap<(RowId, StateId), PrivatePresence<Value>>,
     root_fields: BTreeMap<FieldId, DerivedCell>,
     derived_lists: BTreeMap<ListId, DerivedListCell>,
     lists: BTreeMap<ListId, ListState>,
@@ -9191,6 +9299,7 @@ pub enum MachineBuildPhase {
     RuntimeState,
     RootDefaults,
     OrderedIndexes,
+    StartupPulses,
     PublishedCurrentness,
     Failed,
     Complete,
@@ -9226,6 +9335,11 @@ struct IndexedDefaultsCursor {
 #[derive(Default)]
 struct RootDefaultsCursor {
     slot: usize,
+}
+
+#[derive(Default)]
+struct StartupPulsesCursor {
+    next: usize,
 }
 
 #[derive(Default)]
@@ -9393,6 +9507,7 @@ enum MachineBuildState {
     RuntimeState(RuntimeStateBuild),
     RootDefaults(RootDefaultsCursor),
     OrderedIndexes(OrderedIndexImageBuild),
+    StartupPulses(StartupPulsesCursor),
     PublishedCurrentness(PublishedCurrentnessBuild),
     Failed,
     Complete,
@@ -9596,6 +9711,8 @@ impl MachineInstanceBuilder {
                 row_owned_call_results: BTreeMap::new(),
                 distributed_current_call_demands: BTreeMap::new(),
                 root_states: BTreeMap::new(),
+                activation_root_states: BTreeMap::new(),
+                activation_row_states: BTreeMap::new(),
                 root_fields: BTreeMap::new(),
                 derived_lists: BTreeMap::new(),
                 lists: BTreeMap::new(),
@@ -9902,9 +10019,9 @@ impl MachineBuildTask {
                                 self.session_mut()
                                     .publish_ordered_index_image(prepared, &mut work);
                                 self.work = work;
-                                let currentness =
-                                    PublishedCurrentnessBuild::new(self.session_mut());
-                                self.state = MachineBuildState::PublishedCurrentness(currentness);
+                                self.state = MachineBuildState::StartupPulses(
+                                    StartupPulsesCursor::default(),
+                                );
                                 break;
                             };
                             let mut work = std::mem::take(&mut self.work);
@@ -9987,6 +10104,32 @@ impl MachineBuildTask {
                         self.state = MachineBuildState::OrderedIndexes(build);
                     }
                 }
+                MachineBuildState::StartupPulses(mut cursor) => {
+                    while remaining != 0 {
+                        let batch = self
+                            .session_mut()
+                            .metadata
+                            .startup_pulses
+                            .get(cursor.next)
+                            .copied();
+                        let Some(batch) = batch else {
+                            let currentness = PublishedCurrentnessBuild::new(self.session_mut());
+                            self.state = MachineBuildState::PublishedCurrentness(currentness);
+                            break;
+                        };
+                        let mut work = std::mem::take(&mut self.work);
+                        let result = self
+                            .session_mut()
+                            .execute_startup_pulse_batch(batch, &mut work);
+                        self.work = work;
+                        result?;
+                        cursor.next += 1;
+                        self.finish_step(&mut remaining);
+                    }
+                    if matches!(self.state, MachineBuildState::Complete) {
+                        self.state = MachineBuildState::StartupPulses(cursor);
+                    }
+                }
                 MachineBuildState::PublishedCurrentness(mut build) => {
                     let mut finished = false;
                     while remaining != 0 {
@@ -10056,6 +10199,7 @@ impl MachineBuildTask {
             MachineBuildState::RuntimeState(_) => MachineBuildPhase::RuntimeState,
             MachineBuildState::RootDefaults(_) => MachineBuildPhase::RootDefaults,
             MachineBuildState::OrderedIndexes(_) => MachineBuildPhase::OrderedIndexes,
+            MachineBuildState::StartupPulses(_) => MachineBuildPhase::StartupPulses,
             MachineBuildState::PublishedCurrentness(_) => MachineBuildPhase::PublishedCurrentness,
             MachineBuildState::Failed => MachineBuildPhase::Failed,
             MachineBuildState::Complete => MachineBuildPhase::Complete,
@@ -10135,7 +10279,9 @@ impl MachineBuildTask {
                 .get(cursor.slot)
                 .cloned()?;
             cursor.slot += 1;
-            if !slot.indexed && matches!(slot.initializer, ScalarInitializerPlan::Expression { .. })
+            if !slot.indexed
+                && matches!(slot.lifetime, PlanStateLifetime::Persistent)
+                && matches!(slot.initializer, ScalarInitializerPlan::Expression { .. })
             {
                 return Some(slot);
             }
@@ -11495,7 +11641,9 @@ impl MachineInstance {
             .cloned()
             .collect::<Vec<_>>();
         for slot in scalar_slots.iter().filter(|slot| {
-            !slot.indexed && matches!(slot.initializer, ScalarInitializerPlan::Constant { .. })
+            !slot.indexed
+                && matches!(slot.lifetime, PlanStateLifetime::Persistent)
+                && matches!(slot.initializer, ScalarInitializerPlan::Constant { .. })
         }) {
             let value = self.initial_slot_value(slot)?;
             self.root_states
@@ -11522,7 +11670,9 @@ impl MachineInstance {
         }
 
         for slot in scalar_slots.iter().filter(|slot| {
-            !slot.indexed && matches!(slot.initializer, ScalarInitializerPlan::Expression { .. })
+            !slot.indexed
+                && matches!(slot.lifetime, PlanStateLifetime::Persistent)
+                && matches!(slot.initializer, ScalarInitializerPlan::Expression { .. })
         }) {
             let ScalarInitializerPlan::Expression { expression } = &slot.initializer else {
                 unreachable!("expression initializer was filtered above")
@@ -13467,6 +13617,7 @@ impl MachineInstance {
             .iter()
             .filter(|slot| {
                 !slot.indexed
+                    && matches!(slot.lifetime, PlanStateLifetime::Persistent)
                     && !self
                         .metadata
                         .producer_function_instances
@@ -14864,7 +15015,9 @@ impl MachineInstance {
             self.derived_lists.insert(*list, DerivedListCell::default());
         }
         for slot in &self.plan.storage_layout.scalar_slots {
-            if slot.indexed || matches!(slot.initializer, ScalarInitializerPlan::Expression { .. })
+            if slot.indexed
+                || !matches!(slot.lifetime, PlanStateLifetime::Persistent)
+                || matches!(slot.initializer, ScalarInitializerPlan::Expression { .. })
             {
                 continue;
             }
@@ -14931,6 +15084,7 @@ impl MachineInstance {
             .scalar_slots
             .iter()
             .filter(|slot| self.metadata.indexed_state_owner.get(&slot.state_id) == Some(&row.list))
+            .filter(|slot| matches!(slot.lifetime, PlanStateLifetime::Persistent))
             .filter(|slot| {
                 self.metadata
                     .indexed_state_field
@@ -15171,6 +15325,7 @@ impl MachineInstance {
             .scalar_slots
             .iter()
             .filter(|slot| self.metadata.indexed_state_owner.get(&slot.state_id) == Some(&row.list))
+            .filter(|slot| matches!(slot.lifetime, PlanStateLifetime::Persistent))
             .cloned()
             .collect::<Vec<_>>();
         for slot in slots {
@@ -16510,11 +16665,695 @@ impl MachineInstance {
             for op in updates.iter().filter(|op| update_branch_has_effect(op)) {
                 self.execute_update(op, row, &trigger, work)?;
             }
+            self.commit_pending_list_mutations(work)?;
             self.collect_distributed_invocations_for_trigger(&trigger, work)?;
+            self.route_triggered_pulse_batches(&trigger, work)?;
             Ok(())
         })();
         work.active_trigger = previous_trigger;
         work.active_state_routes.remove(&route_key);
+        result
+    }
+
+    fn route_triggered_pulse_batches(
+        &mut self,
+        origin: &TriggerFrame<'_>,
+        work: &mut Work,
+    ) -> Result<(), Error> {
+        let batches = match origin.active.cause {
+            TriggerCause::Source(source) => self
+                .metadata
+                .pulses_by_source
+                .get(&source)
+                .cloned()
+                .unwrap_or_default(),
+            TriggerCause::State(state) => self
+                .metadata
+                .pulses_by_state
+                .get(&state)
+                .cloned()
+                .unwrap_or_default(),
+            TriggerCause::Pulse(_) | TriggerCause::Effect(_) => Vec::new(),
+        };
+        for batch_id in batches {
+            let batch = self
+                .metadata
+                .pulse_batches
+                .get(&batch_id)
+                .cloned()
+                .ok_or_else(|| Error::InvalidPlan(format!("missing pulse batch {}", batch_id.0)))?;
+            let PlanPulseStart::Triggered { arms } = &batch.start else {
+                return Err(Error::InvalidPlan(format!(
+                    "startup pulse batch {} appeared in an event start index",
+                    batch.id.0
+                )));
+            };
+            let mut admitted = false;
+            for arm in arms
+                .iter()
+                .filter(|arm| Self::trigger_accepts(&arm.trigger, &origin.active))
+            {
+                let evaluated = self.eval_row_expression(
+                    arm.gate,
+                    origin.active.target,
+                    origin.source_event,
+                    None,
+                    None,
+                    &mut PlanLocalBindings::new(),
+                    work,
+                )?;
+                if matches!(
+                    self.materialize_private_presence(evaluated)?,
+                    PrivatePresence::Absent
+                ) {
+                    continue;
+                }
+                if admitted {
+                    return Err(Error::InvalidPlan(format!(
+                        "pulse batch {} admitted more than one start arm",
+                        batch.id.0
+                    )));
+                }
+                admitted = true;
+            }
+            if admitted && self.execute_pulse_batch(&batch, origin, work)? {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    fn execute_startup_pulse_batch(
+        &mut self,
+        batch_id: PlanPulseBatchId,
+        work: &mut Work,
+    ) -> Result<(), Error> {
+        let batch = self
+            .metadata
+            .pulse_batches
+            .get(&batch_id)
+            .cloned()
+            .ok_or_else(|| Error::InvalidPlan(format!("missing pulse batch {}", batch_id.0)))?;
+        if !matches!(batch.start, PlanPulseStart::Startup) {
+            return Err(Error::InvalidPlan(format!(
+                "triggered pulse batch {} appeared in the startup index",
+                batch.id.0
+            )));
+        }
+        if !batch.owner.ancestors.is_empty() {
+            return Err(Error::InvalidPlan(format!(
+                "startup pulse batch {} requires a repeated owner",
+                batch.id.0
+            )));
+        }
+        let owner = self
+            .owner_instances
+            .intern_rows(batch.owner.static_owner, [])?;
+        let origin = TriggerFrame {
+            active: ActiveTrigger {
+                cause: TriggerCause::Pulse(batch.id),
+                owner_plan: batch.owner.clone(),
+                owner,
+                target: None,
+                sequence: 0,
+            },
+            source_event: None,
+        };
+        self.execute_pulse_batch(&batch, &origin, work)?;
+        Ok(())
+    }
+
+    fn evaluate_pulse_quantity(
+        &mut self,
+        expression: PlanRowExpressionId,
+        diagnostic: &str,
+        trigger: &TriggerFrame<'_>,
+        work: &mut Work,
+    ) -> Result<u64, Error> {
+        let evaluated = self.eval_row_expression(
+            expression,
+            trigger.active.target,
+            trigger.source_event,
+            None,
+            None,
+            &mut PlanLocalBindings::new(),
+            work,
+        )?;
+        let value = self.materialize_eval(evaluated)?;
+        let Value::Number(number) = value else {
+            return Err(Error::Evaluation(format!(
+                "{diagnostic} must evaluate to a whole non-negative Number"
+            )));
+        };
+        let value = number.to_u64_exact().map_err(|error| {
+            Error::Evaluation(format!(
+                "{diagnostic} must evaluate to a whole non-negative Number: {error}"
+            ))
+        })?;
+        let limit = self.plan.target_profile.max_pulses_per_activation();
+        if value > limit {
+            return Err(Error::Evaluation(format!(
+                "{diagnostic} {value} exceeds target {} activation limit {limit}",
+                self.plan.target_profile.as_str()
+            )));
+        }
+        Ok(value)
+    }
+
+    fn freeze_pulse_emission_routes(
+        &mut self,
+        batch: &PlanPulseBatch,
+        trigger: &TriggerFrame<'_>,
+        work: &mut Work,
+    ) -> Result<Vec<FrozenPulseEmissionRoute>, Error> {
+        batch
+            .emission_routes
+            .iter()
+            .map(|route| {
+                let skip = match route.filter {
+                    PlanPulseEmissionFilter::Passthrough => 0,
+                    PlanPulseEmissionFilter::Skip { count } => self.evaluate_pulse_quantity(
+                        count,
+                        &format!("pulse batch {} skip count", batch.id.0),
+                        trigger,
+                        work,
+                    )?,
+                };
+                Ok(FrozenPulseEmissionRoute {
+                    derived_ops: route.derived_ops.clone(),
+                    skip,
+                })
+            })
+            .collect()
+    }
+
+    fn initialize_pulse_activation_states(
+        &mut self,
+        batch: &PlanPulseBatch,
+        trigger: &TriggerFrame<'_>,
+        work: &mut Work,
+    ) -> Result<Vec<LiveActivationState>, Error> {
+        let Some(activation_id) = batch.enclosing_activation else {
+            return Ok(Vec::new());
+        };
+        let activation = self
+            .plan
+            .activations
+            .get(activation_id.0)
+            .filter(|activation| activation.id == activation_id)
+            .cloned()
+            .ok_or_else(|| {
+                Error::InvalidPlan(format!(
+                    "pulse batch {} references missing activation {}",
+                    batch.id.0, activation_id.0
+                ))
+            })?;
+        let mut live = Vec::with_capacity(activation.states.len());
+        for state in activation.states {
+            let slot = self
+                .plan
+                .storage_layout
+                .scalar_slots
+                .iter()
+                .find(|slot| slot.state_id == state)
+                .cloned()
+                .ok_or_else(|| {
+                    Error::InvalidPlan(format!(
+                        "activation {} references missing state {}",
+                        activation_id.0, state.0
+                    ))
+                })?;
+            if slot.lifetime
+                != (PlanStateLifetime::ActivationLocal {
+                    activation: activation_id,
+                })
+            {
+                return Err(Error::InvalidPlan(format!(
+                    "activation {} state {} has the wrong lifetime",
+                    activation_id.0, state.0
+                )));
+            }
+            let row = if slot.indexed {
+                Some(trigger.active.target.ok_or_else(|| {
+                    Error::Evaluation(format!(
+                        "activation-local indexed state {} has no row target",
+                        state.0
+                    ))
+                })?)
+            } else {
+                None
+            };
+            let output = slot.indexed_field_id;
+            let presence = match slot.initializer {
+                ScalarInitializerPlan::Constant { constant_id } => {
+                    let value = self
+                        .metadata
+                        .constants
+                        .get(&constant_id)
+                        .cloned()
+                        .ok_or_else(|| {
+                            Error::InvalidPlan(format!(
+                                "activation-local state {} references missing constant {}",
+                                state.0, constant_id.0
+                            ))
+                        })?;
+                    PrivatePresence::Present(value)
+                }
+                ScalarInitializerPlan::Expression { expression } => {
+                    let evaluated = self.eval_row_expression(
+                        expression,
+                        row,
+                        trigger.source_event,
+                        output,
+                        None,
+                        &mut PlanLocalBindings::new(),
+                        work,
+                    )?;
+                    self.materialize_private_presence(evaluated)?
+                }
+            };
+            if let Some(row) = row {
+                let field = output.ok_or_else(|| {
+                    Error::InvalidPlan(format!(
+                        "activation-local indexed state {} has no field",
+                        state.0
+                    ))
+                })?;
+                let key = (row, state);
+                if self
+                    .activation_row_states
+                    .insert(key, presence.clone())
+                    .is_some()
+                {
+                    return Err(Error::Evaluation(format!(
+                        "activation-local indexed state {} overlapped itself",
+                        state.0
+                    )));
+                }
+                live.push(LiveActivationState::Indexed { state, row });
+                if let PrivatePresence::Present(value) = presence {
+                    work.dirty_states.insert(state);
+                    if work.emit {
+                        work.deltas.push(Delta::SetValue {
+                            target: ValueTarget::RowField { row, field },
+                            value,
+                        });
+                    }
+                    self.invalidate_row_field(row, field, work);
+                    self.route_state_transition(state, trigger, Some(row), work)?;
+                }
+            } else {
+                if self
+                    .activation_root_states
+                    .insert(state, presence.clone())
+                    .is_some()
+                {
+                    return Err(Error::Evaluation(format!(
+                        "activation-local state {} overlapped itself",
+                        state.0
+                    )));
+                }
+                live.push(LiveActivationState::Root { state });
+                if let PrivatePresence::Present(value) = presence {
+                    work.dirty_states.insert(state);
+                    if work.emit {
+                        work.deltas.push(Delta::SetValue {
+                            target: ValueTarget::State(state),
+                            value,
+                        });
+                    }
+                    self.invalidate_root_state_dependents(state, work);
+                    self.route_state_transition(state, trigger, None, work)?;
+                }
+            }
+        }
+        Ok(live)
+    }
+
+    fn discard_pulse_activation_states(&mut self, live: &[LiveActivationState], work: &mut Work) {
+        for state in live {
+            match *state {
+                LiveActivationState::Root { state } => {
+                    self.activation_root_states.remove(&state);
+                    work.dirty_states.remove(&state);
+                    work.flushed_state_candidates.remove(&(state, None));
+                }
+                LiveActivationState::Indexed { state, row, .. } => {
+                    self.activation_row_states.remove(&(row, state));
+                    work.dirty_states.remove(&state);
+                    work.flushed_state_candidates.remove(&(state, Some(row)));
+                }
+            }
+        }
+    }
+
+    fn record_pulse_flush(
+        &mut self,
+        state: StateId,
+        row: Option<RowId>,
+        payload: Value,
+        work: &mut Work,
+    ) -> Result<(), Error> {
+        validate_flush_payload_value(&payload)?;
+        let key = (state, row);
+        if let Some(previous) = work.flushed_state_candidates.get(&key)
+            && previous != &payload
+        {
+            return Err(Error::Evaluation(format!(
+                "state {} received conflicting FLUSH payloads in one pulse",
+                state.0
+            )));
+        }
+        work.flushed_state_candidates.insert(key, payload);
+        if let Some(row) = row {
+            let field = *self
+                .metadata
+                .indexed_state_field
+                .get(&state)
+                .ok_or_else(|| {
+                    Error::InvalidPlan(format!("indexed state {} has no FieldId", state.0))
+                })?;
+            self.invalidate_row_field(row, field, work);
+        } else {
+            self.invalidate_root_state_dependents(state, work);
+        }
+        Ok(())
+    }
+
+    fn evaluate_pulse_state_updates(
+        &mut self,
+        updates: &[Arc<PlanOp>],
+        trigger: &TriggerFrame<'_>,
+        work: &mut Work,
+    ) -> Result<ControlOutcome<Vec<PendingPulseStateUpdate>>, Error> {
+        let mut candidates = BTreeMap::<(StateId, Option<RowId>), PendingPulseStateUpdate>::new();
+        for op in updates.iter().filter(|op| !update_branch_has_effect(op)) {
+            let Some(ValueRef::State(state)) = op.output else {
+                return Err(Error::InvalidPlan(format!(
+                    "pulse update op {} has no state output",
+                    op.id.0
+                )));
+            };
+            let row = if op.indexed {
+                Some(trigger.active.target.ok_or_else(|| {
+                    Error::Evaluation(format!(
+                        "indexed pulse update op {} has no row target",
+                        op.id.0
+                    ))
+                })?)
+            } else {
+                None
+            };
+            match self.evaluate_update(op, row, trigger.source_event, work)? {
+                ControlOutcome::Normal(Some(value)) => {
+                    work.flushed_state_candidates.remove(&(state, row));
+                    let field = row
+                        .map(|_| {
+                            self.metadata
+                                .indexed_state_field
+                                .get(&state)
+                                .copied()
+                                .ok_or_else(|| {
+                                    Error::InvalidPlan(format!(
+                                        "indexed state {} has no FieldId",
+                                        state.0
+                                    ))
+                                })
+                        })
+                        .transpose()?;
+                    let candidate = PendingPulseStateUpdate {
+                        state,
+                        row,
+                        field,
+                        value,
+                    };
+                    if let Some(previous) = candidates.insert((state, row), candidate.clone())
+                        && previous.value != candidate.value
+                    {
+                        return Err(Error::Evaluation(format!(
+                            "pulse microturn produced conflicting candidates for state {}",
+                            state.0
+                        )));
+                    }
+                }
+                ControlOutcome::Normal(None) => {}
+                ControlOutcome::Flushed(payload) => {
+                    self.record_pulse_flush(state, row, payload.clone(), work)?;
+                    return Ok(ControlOutcome::Flushed(payload));
+                }
+            }
+        }
+        Ok(ControlOutcome::Normal(candidates.into_values().collect()))
+    }
+
+    fn commit_pulse_state_updates(
+        &mut self,
+        candidates: Vec<PendingPulseStateUpdate>,
+        work: &mut Work,
+    ) -> Result<Vec<(StateId, Option<RowId>)>, Error> {
+        let mut changed = Vec::new();
+        for candidate in candidates {
+            let activation_local = matches!(
+                self.metadata.state_lifetimes.get(&candidate.state),
+                Some(PlanStateLifetime::ActivationLocal { .. })
+            );
+            let did_change = if let Some(row) = candidate.row {
+                let field = candidate.field.ok_or_else(|| {
+                    Error::InvalidPlan(format!(
+                        "indexed pulse state {} has no field",
+                        candidate.state.0
+                    ))
+                })?;
+                if activation_local {
+                    self.set_activation_row_state(
+                        row,
+                        candidate.state,
+                        field,
+                        candidate.value,
+                        work,
+                    )?
+                } else {
+                    self.record_row_field_undo(row, field, work);
+                    let was_touched = self.touched_row_fields.contains(&(row, field));
+                    self.touched_row_fields.insert((row, field));
+                    let did_change =
+                        self.set_row_authority_field(row, field, candidate.value.clone(), work)?;
+                    if did_change || !was_touched {
+                        work.authority_deltas.push(AuthorityDelta::SetRowField {
+                            row,
+                            owner_ancestors: self.row_owner_rows(row)?,
+                            materialization_origin: self.row_materialization_origin_rows(row)?,
+                            field,
+                            value: candidate.value,
+                        });
+                    }
+                    did_change
+                }
+            } else if activation_local {
+                self.set_activation_root_state(candidate.state, candidate.value, work)?
+            } else {
+                self.record_root_undo(candidate.state, work);
+                let was_touched = self.touched_root_states.contains(&candidate.state);
+                self.touched_root_states.insert(candidate.state);
+                let did_change =
+                    self.set_root_state(candidate.state, candidate.value.clone(), work);
+                if did_change || !was_touched {
+                    work.authority_deltas.push(AuthorityDelta::SetRoot {
+                        state: candidate.state,
+                        value: candidate.value,
+                    });
+                }
+                did_change
+            };
+            if did_change {
+                changed.push((candidate.state, candidate.row));
+            }
+        }
+        Ok(changed)
+    }
+
+    fn emit_pulse_derived_ops(
+        &mut self,
+        routes: &[FrozenPulseEmissionRoute],
+        emission_ordinal: u64,
+        trigger: &TriggerFrame<'_>,
+        work: &mut Work,
+    ) -> Result<(), Error> {
+        let admitted = routes
+            .iter()
+            .filter(|route| emission_ordinal >= route.skip)
+            .flat_map(|route| route.derived_ops.iter().copied())
+            .collect::<BTreeSet<_>>();
+        let operations = admitted
+            .iter()
+            .map(|op_id| {
+                self.metadata
+                    .currentness_ops
+                    .get(op_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        Error::InvalidPlan(format!(
+                            "pulse derived op {} is not a currentness operation",
+                            op_id.0
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+        for op in &operations {
+            match op.output {
+                Some(ValueRef::Field(field)) if op.indexed => {
+                    let row = trigger.active.target.ok_or_else(|| {
+                        Error::Evaluation(format!(
+                            "indexed pulse derived op {} has no row target",
+                            op.id.0
+                        ))
+                    })?;
+                    self.mark_row_dirty(row, field, work);
+                }
+                Some(ValueRef::Field(field)) => self.mark_root_dirty(field, work),
+                Some(ValueRef::List(list)) => self.mark_list_dirty(list, work),
+                _ => {
+                    return Err(Error::InvalidPlan(format!(
+                        "pulse derived op {} has no field or list output",
+                        op.id.0
+                    )));
+                }
+            }
+        }
+        for op in &operations {
+            match op.output {
+                Some(ValueRef::Field(field)) if op.indexed => {
+                    let row = trigger.active.target.ok_or_else(|| {
+                        Error::Evaluation(format!(
+                            "indexed pulse derived op {} has no row target",
+                            op.id.0
+                        ))
+                    })?;
+                    self.ensure_row_field_presence(row, field, trigger.source_event, work)?;
+                }
+                Some(ValueRef::Field(field)) => {
+                    self.ensure_root_field_presence(field, trigger.source_event, work)?;
+                }
+                Some(ValueRef::List(list)) => {
+                    self.ensure_list_presence(list, trigger.source_event, work)?;
+                }
+                _ => unreachable!("pulse output was validated above"),
+            }
+        }
+        Ok(())
+    }
+
+    fn execute_pulse_microturn(
+        &mut self,
+        batch: &PlanPulseBatch,
+        routes: &[FrozenPulseEmissionRoute],
+        emission_ordinal: u64,
+        trigger: &TriggerFrame<'_>,
+        work: &mut Work,
+    ) -> Result<bool, Error> {
+        work.consume(1)?;
+        let updates = self
+            .metadata
+            .updates_by_pulse
+            .get(&batch.id)
+            .cloned()
+            .unwrap_or_default();
+        let candidates = match self.evaluate_pulse_state_updates(&updates, trigger, work)? {
+            ControlOutcome::Normal(candidates) => candidates,
+            ControlOutcome::Flushed(_) => return Ok(true),
+        };
+        let pending_mutation_start = work.pending_list_mutations.len();
+        let mutations = self
+            .metadata
+            .mutations_by_pulse
+            .get(&batch.id)
+            .cloned()
+            .unwrap_or_default();
+        self.stage_mutation_batch(&mutations, trigger.source_event, trigger, work)?;
+        for op in updates.iter().filter(|op| update_branch_has_effect(op)) {
+            self.stage_effect_invocation(op, trigger.active.target, trigger, work)?;
+        }
+        let changed = self.commit_pulse_state_updates(candidates, work)?;
+        if batch.state.is_some_and(|state| {
+            work.flushed_state_candidates
+                .contains_key(&(state, trigger.active.target))
+                || work.flushed_state_candidates.contains_key(&(state, None))
+        }) {
+            work.pending_list_mutations.truncate(pending_mutation_start);
+            return Ok(true);
+        }
+        self.commit_pending_list_mutations(work)?;
+        for (state, row) in changed {
+            self.route_state_transition(state, trigger, row, work)?;
+        }
+        if batch.state.is_some_and(|state| {
+            work.flushed_state_candidates
+                .contains_key(&(state, trigger.active.target))
+                || work.flushed_state_candidates.contains_key(&(state, None))
+        }) {
+            return Ok(true);
+        }
+        self.emit_pulse_derived_ops(routes, emission_ordinal, trigger, work)?;
+        self.reconcile_dirty_effects(work)?;
+        self.collect_distributed_invocations_for_trigger(trigger, work)?;
+        Ok(false)
+    }
+
+    fn execute_pulse_batch(
+        &mut self,
+        batch: &PlanPulseBatch,
+        origin: &TriggerFrame<'_>,
+        work: &mut Work,
+    ) -> Result<bool, Error> {
+        let owner =
+            instantiate_plan_owner(&batch.owner, &origin.active, &mut self.owner_instances)?;
+        let route_key = (batch.id, owner);
+        if !work.active_pulse_routes.insert(route_key) {
+            return Err(Error::InvalidPlan(format!(
+                "pulse activation cycle re-entered batch {}",
+                batch.id.0
+            )));
+        }
+        let active = ActiveTrigger {
+            cause: TriggerCause::Pulse(batch.id),
+            owner_plan: batch.owner.clone(),
+            owner,
+            target: origin.active.target,
+            sequence: origin.active.sequence,
+        };
+        let previous_trigger = work.active_trigger.replace(active.clone());
+        let trigger = TriggerFrame {
+            active,
+            source_event: origin.source_event,
+        };
+        let mut live = Vec::new();
+        let result = (|| {
+            let count = self.evaluate_pulse_quantity(
+                batch.count,
+                &format!("pulse batch {} count", batch.id.0),
+                &trigger,
+                work,
+            )?;
+            let routes = self.freeze_pulse_emission_routes(batch, &trigger, work)?;
+            live = self.initialize_pulse_activation_states(batch, &trigger, work)?;
+            let mut emission_ordinal = 0_u64;
+            if batch.enclosing_activation.is_some() && batch.state.is_some() {
+                self.emit_pulse_derived_ops(&routes, emission_ordinal, &trigger, work)?;
+                self.reconcile_dirty_effects(work)?;
+                self.collect_distributed_invocations_for_trigger(&trigger, work)?;
+                emission_ordinal = emission_ordinal.saturating_add(1);
+            }
+            for _ in 0..count {
+                if self.execute_pulse_microturn(batch, &routes, emission_ordinal, &trigger, work)? {
+                    return Ok(true);
+                }
+                emission_ordinal = emission_ordinal.saturating_add(1);
+            }
+            Ok(false)
+        })();
+        self.discard_pulse_activation_states(&live, work);
+        work.active_trigger = previous_trigger;
+        work.active_pulse_routes.remove(&route_key);
         result
     }
 
@@ -17113,9 +17952,10 @@ impl MachineInstance {
         }
 
         self.commit_pending_list_mutations(work)?;
+        self.collect_distributed_invocations_for_trigger(&trigger, work)?;
+        self.route_triggered_pulse_batches(&trigger, work)?;
         self.ensure_demanded_current(demanded_targets, Some(event), work)?;
         self.reconcile_dirty_effects(work)?;
-        self.collect_distributed_invocations_for_trigger(&trigger, work)?;
         Ok(())
     }
 
@@ -17342,6 +18182,10 @@ impl MachineInstance {
                 );
             }
         };
+        let activation_local = matches!(
+            self.metadata.state_lifetimes.get(&state),
+            Some(PlanStateLifetime::ActivationLocal { .. })
+        );
         if op.indexed {
             let row = row.ok_or_else(|| {
                 Error::InvalidEvent(format!("indexed update op {} has no row target", op.id.0))
@@ -17353,6 +18197,13 @@ impl MachineInstance {
                 .ok_or_else(|| {
                     Error::InvalidPlan(format!("indexed state {} has no FieldId", state.0))
                 })?;
+            if activation_local {
+                let changed = self.set_activation_row_state(row, state, field, value, work)?;
+                if changed {
+                    self.route_state_transition(state, trigger, Some(row), work)?;
+                }
+                return Ok(());
+            }
             self.record_row_field_undo(row, field, work);
             let was_touched = !self.touched_row_fields.insert((row, field));
             let changed = self.set_row_authority_field(row, field, value.clone(), work)?;
@@ -17369,6 +18220,13 @@ impl MachineInstance {
                 self.route_state_transition(state, trigger, Some(row), work)?;
             }
         } else {
+            if activation_local {
+                let changed = self.set_activation_root_state(state, value, work)?;
+                if changed {
+                    self.route_state_transition(state, trigger, row, work)?;
+                }
+                return Ok(());
+            }
             self.record_root_undo(state, work);
             let was_touched = !self.touched_root_states.insert(state);
             let changed = self.set_root_state(state, value.clone(), work);
@@ -19370,6 +20228,84 @@ impl MachineInstance {
         }
         self.invalidate_root_state_dependents(state, work);
         true
+    }
+
+    fn set_activation_root_state(
+        &mut self,
+        state: StateId,
+        value: Value,
+        work: &mut Work,
+    ) -> Result<bool, Error> {
+        if !matches!(
+            self.metadata.state_lifetimes.get(&state),
+            Some(PlanStateLifetime::ActivationLocal { .. })
+        ) {
+            return Err(Error::InvalidPlan(format!(
+                "persistent state {} reached activation-local storage",
+                state.0
+            )));
+        }
+        if !self.activation_root_states.contains_key(&state) {
+            return Err(Error::Evaluation(format!(
+                "activation-local state {} was updated outside its activation",
+                state.0
+            )));
+        }
+        if self.activation_root_states.get(&state) == Some(&PrivatePresence::Present(value.clone()))
+        {
+            return Ok(false);
+        }
+        self.activation_root_states
+            .insert(state, PrivatePresence::Present(value.clone()));
+        work.dirty_states.insert(state);
+        if work.emit {
+            work.deltas.push(Delta::SetValue {
+                target: ValueTarget::State(state),
+                value,
+            });
+        }
+        self.invalidate_root_state_dependents(state, work);
+        Ok(true)
+    }
+
+    fn set_activation_row_state(
+        &mut self,
+        row: RowId,
+        state: StateId,
+        field: FieldId,
+        value: Value,
+        work: &mut Work,
+    ) -> Result<bool, Error> {
+        if !matches!(
+            self.metadata.state_lifetimes.get(&state),
+            Some(PlanStateLifetime::ActivationLocal { .. })
+        ) {
+            return Err(Error::InvalidPlan(format!(
+                "persistent indexed state {} reached activation-local storage",
+                state.0
+            )));
+        }
+        let key = (row, state);
+        if !self.activation_row_states.contains_key(&key) {
+            return Err(Error::Evaluation(format!(
+                "activation-local indexed state {} was updated outside its activation",
+                state.0
+            )));
+        }
+        if self.activation_row_states.get(&key) == Some(&PrivatePresence::Present(value.clone())) {
+            return Ok(false);
+        }
+        self.activation_row_states
+            .insert(key, PrivatePresence::Present(value.clone()));
+        work.dirty_states.insert(state);
+        if work.emit {
+            work.deltas.push(Delta::SetValue {
+                target: ValueTarget::RowField { row, field },
+                value,
+            });
+        }
+        self.invalidate_row_field(row, field, work);
+        Ok(true)
     }
 
     fn invalidate_root_state_dependents(&mut self, state: StateId, work: &mut Work) {
@@ -22426,10 +23362,29 @@ impl MachineInstance {
                 })
             })
             .collect::<Result<Vec<_>, Error>>()?;
-        let deltas = report_deltas(deltas);
+        let deltas =
+            report_deltas_preserving(deltas, |target| self.activation_local_delta_target(target));
         let authority_deltas = report_authority_deltas(authority_deltas);
         record_delta_metrics(&mut work.metrics, &deltas, &authority_deltas);
         Ok((deltas, authority_deltas))
+    }
+
+    fn activation_local_delta_target(&self, target: &ValueTarget) -> bool {
+        let state = match target {
+            ValueTarget::State(state) => Some(*state),
+            ValueTarget::RowField { field, .. } => self
+                .metadata
+                .indexed_state_field
+                .iter()
+                .find_map(|(state, candidate)| (candidate == field).then_some(*state)),
+            ValueTarget::Field(_) => None,
+        };
+        state.is_some_and(|state| {
+            matches!(
+                self.metadata.state_lifetimes.get(&state),
+                Some(PlanStateLifetime::ActivationLocal { .. })
+            )
+        })
     }
 
     fn materialize_eval(&mut self, value: EvalValue) -> Result<Value, Error> {
@@ -24628,6 +25583,32 @@ impl MachineInstance {
                                 } => {
                                     let mut selected = None;
                                     if let Some(ActiveTrigger {
+                                        cause: TriggerCause::Pulse(pulse),
+                                        target,
+                                        ..
+                                    }) = &work.active_trigger
+                                        && let Some(arm) = arms.iter().find(|arm| {
+                                            matches!(
+                                                &arm.trigger,
+                                                ValueRef::Pulse(trigger) if trigger == pulse
+                                            )
+                                        })
+                                    {
+                                        let triggered = match (*target, context.event) {
+                                            (Some(row), _) => Some(row),
+                                            (None, Some(event)) => event.target,
+                                            (None, None) => None,
+                                        };
+                                        selected = Some((
+                                            arm.value,
+                                            exact_expression_row(
+                                                context.row,
+                                                triggered,
+                                                "pulse event transform",
+                                            )?,
+                                        ));
+                                    }
+                                    if let Some(ActiveTrigger {
                                         cause: TriggerCause::State(state),
                                         target,
                                         ..
@@ -25200,6 +26181,17 @@ impl MachineInstance {
                                         .unwrap_or(EvalValue::Absent);
                                     stack.push_value(value)?;
                                 }
+                                ValueRef::Pulse(pulse) => {
+                                    let active =
+                                        work.active_trigger.as_ref().is_some_and(|trigger| {
+                                            trigger.cause == TriggerCause::Pulse(*pulse)
+                                        });
+                                    if active {
+                                        stack.push_value(EvalValue::Value(Value::tag("Pulse")))?;
+                                    } else {
+                                        stack.push_value(EvalValue::Absent)?;
+                                    }
+                                }
                                 ValueRef::Constant(constant) => {
                                     let value = self
                                         .metadata
@@ -25398,7 +26390,26 @@ impl MachineInstance {
                                         },
                                     )?;
                                 self.register_row_dependency(context.consumer, row, field);
-                                stack.push_value(EvalValue::Value(self.row_value(row, field)?))?;
+                                if matches!(
+                                    self.metadata.state_lifetimes.get(&state),
+                                    Some(PlanStateLifetime::ActivationLocal { .. })
+                                ) {
+                                    let value = self
+                                        .activation_row_states
+                                        .get(&(row, state))
+                                        .map(private_presence_eval)
+                                        .ok_or_else(|| {
+                                            Error::Evaluation(format!(
+                                                "activation-local indexed state {} has no private presence",
+                                                state.0
+                                            ))
+                                        })?;
+                                    stack.push_value(value)?;
+                                } else {
+                                    stack.push_value(EvalValue::Value(
+                                        self.row_value(row, field)?,
+                                    ))?;
+                                }
                             } else {
                                 if let Some(payload) =
                                     work.flushed_state_candidates.get(&(state, None)).cloned()
@@ -25407,14 +26418,23 @@ impl MachineInstance {
                                     return Ok(());
                                 }
                                 self.register_root_state_dependency(context.consumer, state);
-                                let value = self
-                                    .root_states
+                                let storage = if matches!(
+                                    self.metadata.state_lifetimes.get(&state),
+                                    Some(PlanStateLifetime::ActivationLocal { .. })
+                                ) {
+                                    &self.activation_root_states
+                                } else {
+                                    &self.root_states
+                                };
+                                let value = storage
                                     .get(&state)
                                     .map(private_presence_eval)
                                     .ok_or_else(|| {
                                         Error::Evaluation(format!(
-                                            "root state {} has no private presence",
-                                            state.0
+                                            "root state {} has no private presence (activation_local={}, active_trigger={:?})",
+                                            state.0,
+                                            std::ptr::eq(storage, &self.activation_root_states),
+                                            work.active_trigger.as_ref().map(|trigger| trigger.cause),
                                         ))
                                     })?;
                                 stack.push_value(value)?;
@@ -31589,6 +32609,7 @@ impl MachineInstance {
         match (trigger, active.cause) {
             (ValueRef::Source(trigger), TriggerCause::Source(source)) => *trigger == source,
             (ValueRef::State(trigger), TriggerCause::State(state)) => *trigger == state,
+            (ValueRef::Pulse(trigger), TriggerCause::Pulse(pulse)) => *trigger == pulse,
             (
                 ValueRef::SourcePayload { .. }
                 | ValueRef::StateProjection { .. }
@@ -31598,7 +32619,7 @@ impl MachineInstance {
                 | ValueRef::DistributedImport(_),
                 _,
             ) => false,
-            (ValueRef::Source(_) | ValueRef::State(_), _) => false,
+            (ValueRef::Source(_) | ValueRef::State(_) | ValueRef::Pulse(_), _) => false,
         }
     }
 
@@ -33556,8 +34577,16 @@ fn base64_digit(digit: u8) -> Result<u8, Error> {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn report_deltas(deltas: Vec<Delta>) -> Vec<Delta> {
-    coalesce_deltas(deltas)
+    report_deltas_preserving(deltas, |_| false)
+}
+
+fn report_deltas_preserving(
+    deltas: Vec<Delta>,
+    preserve: impl Fn(&ValueTarget) -> bool,
+) -> Vec<Delta> {
+    coalesce_deltas_preserving(deltas, preserve)
         .into_iter()
         .map(|delta| match delta {
             Delta::SetValue { target, value } => Delta::SetValue {
@@ -33858,13 +34887,20 @@ fn take_report_deltas(work: &mut Work) -> (Vec<Delta>, Vec<AuthorityDelta>) {
     (deltas, authority_deltas)
 }
 
-fn coalesce_deltas(deltas: Vec<Delta>) -> Vec<Delta> {
+fn coalesce_deltas_preserving(
+    deltas: Vec<Delta>,
+    preserve: impl Fn(&ValueTarget) -> bool,
+) -> Vec<Delta> {
     let mut output = Vec::with_capacity(deltas.len());
     let mut positions = BTreeMap::<ValueTarget, usize>::new();
     let mut import_positions = BTreeMap::<ImportId, usize>::new();
     for delta in deltas {
         match delta {
             Delta::SetValue { target, value } => {
+                if preserve(&target) {
+                    output.push(Delta::SetValue { target, value });
+                    continue;
+                }
                 if let Some(position) = positions.get(&target).copied() {
                     output[position] = Delta::SetValue { target, value };
                 } else {

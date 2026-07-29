@@ -29,6 +29,8 @@ fn empty_plan() -> MachinePlan {
         row_expressions: PlanRowExpressionArena::new(),
         constants: Vec::new(),
         source_routes: Vec::new(),
+        activations: Vec::new(),
+        pulse_batches: Vec::new(),
         storage_layout: StorageLayout {
             scalar_slots: Vec::new(),
             list_slots: Vec::new(),
@@ -475,6 +477,7 @@ fn plan_verifier_rejects_malformed_row_builtin_calls() {
         scope_id: None,
         indexed: false,
         indexed_field_id: None,
+        lifetime: PlanStateLifetime::Persistent,
         initializer: ScalarInitializerPlan::Expression { expression },
     });
 
@@ -793,6 +796,7 @@ fn session_producer_plan_with_owned_resources(graph: &DistributedGraphPlan) -> M
         scope_id: None,
         indexed: false,
         indexed_field_id: None,
+        lifetime: PlanStateLifetime::Persistent,
         initializer: ScalarInitializerPlan::Expression {
             expression: argument_expression,
         },

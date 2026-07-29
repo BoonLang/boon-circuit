@@ -2649,6 +2649,20 @@ pub(super) fn map_semantic_reactive(
         &reactive_ids,
         &mut referenced_trigger_ids,
     )?;
+    for batch in &graph.pulse_batches {
+        if let boon_semantic::SemanticPulseStartV1::Triggered { arms } = &batch.start {
+            for arm in arms {
+                let trigger = reactive_ids.trigger(*arm)?;
+                trigger_arms.get(trigger.0).ok_or_else(|| {
+                    format!(
+                        "semantic pulse batch {} start maps to missing trigger {}",
+                        batch.id, arm
+                    )
+                })?;
+                referenced_trigger_ids.insert(trigger);
+            }
+        }
+    }
     let dependency_uses = graph
         .dependency_uses
         .iter()
@@ -4376,7 +4390,7 @@ impl MappedSemanticReactive {
             .collect::<BTreeSet<_>>();
         if self.referenced_trigger_ids != expected_triggers {
             return Err(format!(
-                "mapped reactive records reference trigger IDs {:?}, expected exact set {:?}",
+                "mapped reactive and pulse records reference trigger IDs {:?}, expected exact set {:?}",
                 self.referenced_trigger_ids, expected_triggers
             ));
         }
@@ -8979,10 +8993,7 @@ fn map_pulse_batches(
                 .transition_output
                 .map(|expression| ids.expression(expression))
                 .transpose()?;
-            let trigger_arms = batch
-                .trigger_arms
-                .iter()
-                .map(|trigger_id| {
+            let map_trigger_arm = |trigger_id: &boon_semantic::SemanticTriggerArmId| {
                     let semantic = graph
                         .trigger_arms
                         .get(trigger_id.as_usize())
@@ -9010,7 +9021,31 @@ fn map_pulse_batches(
                         ));
                     }
                     Ok(mapped)
-                })
+                };
+            let start = match &batch.start {
+                boon_semantic::SemanticPulseStartV1::Startup => crate::PulseStart::Startup,
+                boon_semantic::SemanticPulseStartV1::Triggered { arms } => {
+                    let arms = arms
+                        .iter()
+                        .map(&map_trigger_arm)
+                        .collect::<Result<Vec<_>, String>>()?;
+                    if arms.is_empty()
+                        || arms
+                            .iter()
+                            .any(|arm| matches!(arm.cause, crate::EventCause::Pulse(_)))
+                    {
+                        return Err(format!(
+                            "semantic pulse batch {} has an empty or pulse-recursive start",
+                            batch.id
+                        ));
+                    }
+                    crate::PulseStart::Triggered { arms }
+                }
+            };
+            let trigger_arms = batch
+                .trigger_arms
+                .iter()
+                .map(map_trigger_arm)
                 .collect::<Result<Vec<_>, String>>()?;
             let state_update_arms = batch
                 .state_update_arms
@@ -9192,6 +9227,7 @@ fn map_pulse_batches(
                 hold_expression,
                 call_expression,
                 count_expression,
+                start,
                 transition_expression,
                 transition_output,
                 trigger_arms,

@@ -2086,7 +2086,10 @@ impl<'a> Evaluator<'a> {
                 ValueRef::DistributedImport(import) => {
                     self.record_dependency(DocumentDependency::DistributedImport(import));
                 }
-                ValueRef::Source(_) | ValueRef::SourcePayload { .. } | ValueRef::Constant(_) => {}
+                ValueRef::Source(_)
+                | ValueRef::SourcePayload { .. }
+                | ValueRef::Pulse(_)
+                | ValueRef::Constant(_) => {}
             })
             .map_err(|error| DocumentError::InvalidPlan(error.to_string()))?;
         machine_plan

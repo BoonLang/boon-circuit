@@ -286,6 +286,13 @@ pub enum SemanticPulseFlushPolicyV1 {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SemanticPulseStartV1 {
+    Startup,
+    Triggered { arms: Vec<SemanticTriggerArmId> },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SemanticPulseBatchV1 {
     pub id: SemanticPulseBatchId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -301,6 +308,7 @@ pub struct SemanticPulseBatchV1 {
     pub call_value: SemanticValueId,
     pub count_expression: SemanticExprId,
     pub count_value: SemanticValueId,
+    pub start: SemanticPulseStartV1,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transition_expression: Option<SemanticExprId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -636,6 +644,8 @@ struct RawCallInvocationSchedule {
 struct RawPulseBatch {
     id: SemanticPulseBatchId,
     enclosing_then: Option<SemanticExprId>,
+    start_then: Option<SemanticExprId>,
+    start_expression: Option<SemanticExprId>,
     state: Option<SemanticStateId>,
     hold_expression: Option<SemanticExprId>,
     hold_value: Option<SemanticValueId>,
@@ -648,6 +658,15 @@ struct RawPulseBatch {
     transition_output: Option<SemanticExprId>,
     flush_roots: Vec<SemanticExprId>,
     emission_routes: Vec<SemanticPulseEmissionRouteV1>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct RawPulseTransition {
+    batch_index: usize,
+    transition: SemanticExprId,
+    output: SemanticExprId,
+    start_then: Option<SemanticExprId>,
+    start_expression: Option<SemanticExprId>,
 }
 
 fn semantic_pulse_batch_digest_v1(
@@ -828,6 +847,8 @@ impl<'a> ReactiveBuilder<'a> {
             batches.push(RawPulseBatch {
                 id: SemanticPulseBatchId(0),
                 enclosing_then: None,
+                start_then: None,
+                start_expression: None,
                 state: None,
                 hold_expression: None,
                 hold_value: None,
@@ -870,40 +891,72 @@ impl<'a> ReactiveBuilder<'a> {
                 continue;
             };
             for update in updates {
-                let transition = self.expressions.expression(*update)?;
-                let SemanticExpressionKind::Then {
-                    input,
-                    output: Some(output),
-                } = &transition.kind
-                else {
-                    continue;
-                };
-                let Some(batch_index) = batch_by_expression.get(input).copied() else {
-                    continue;
-                };
-                let batch = &mut batches[batch_index];
-                if batch.state.is_some() {
-                    return Err(SemanticReactiveError::new(format!(
-                        "semantic pulse batch {} is owned by multiple HOLD transitions",
-                        batch.id
-                    )));
-                }
-                batch.state = Some(state.id);
-                batch.hold_expression = Some(state.expression);
-                batch.hold_value = Some(hold.value_id);
-                batch.enclosing_then = match state.lifetime {
-                    crate::SemanticStateLifetimeV1::Persistent => None,
-                    crate::SemanticStateLifetimeV1::ActivationLocal { then_expression } => {
-                        Some(then_expression)
+                for transition in self.pulse_transitions_in_update(*update, &batch_by_expression)? {
+                    let batch = &mut batches[transition.batch_index];
+                    if batch.state.is_some() {
+                        return Err(SemanticReactiveError::new(format!(
+                            "semantic pulse batch {} is owned by multiple HOLD transitions",
+                            batch.id
+                        )));
                     }
-                };
-                batch.transition_expression = Some(*update);
-                batch.transition_output = Some(*output);
-                batch.flush_roots = self.flush_roots(*output)?;
-                batch.emission_routes = self.pulse_emission_routes(state.expression, &parents)?;
+                    batch.state = Some(state.id);
+                    batch.hold_expression = Some(state.expression);
+                    batch.hold_value = Some(hold.value_id);
+                    batch.enclosing_then = match state.lifetime {
+                        crate::SemanticStateLifetimeV1::Persistent => None,
+                        crate::SemanticStateLifetimeV1::ActivationLocal { then_expression } => {
+                            Some(then_expression)
+                        }
+                    };
+                    batch.start_then = transition.start_then;
+                    batch.start_expression = transition.start_expression;
+                    batch.transition_expression = Some(transition.transition);
+                    batch.transition_output = Some(transition.output);
+                    batch.flush_roots = self.flush_roots(transition.output)?;
+                    batch.emission_routes =
+                        self.pulse_emission_routes(state.expression, &parents)?;
+                }
             }
         }
         Ok(batches)
+    }
+
+    fn pulse_transitions_in_update(
+        &self,
+        root: SemanticExprId,
+        batch_by_expression: &BTreeMap<SemanticExprId, usize>,
+    ) -> Result<Vec<RawPulseTransition>, SemanticReactiveError> {
+        let mut pending = vec![(root, None::<(SemanticExprId, SemanticExprId)>)];
+        let mut visited = BTreeSet::new();
+        let mut transitions = BTreeSet::new();
+        while let Some((expression_id, start)) = pending.pop() {
+            if !visited.insert((expression_id, start)) {
+                continue;
+            }
+            let expression = self.expressions.expression(expression_id)?;
+            if let SemanticExpressionKind::Then { input, output } = &expression.kind {
+                if let (Some(batch_index), Some(output)) =
+                    (batch_by_expression.get(input).copied(), *output)
+                {
+                    transitions.insert(RawPulseTransition {
+                        batch_index,
+                        transition: expression_id,
+                        output,
+                        start_then: start.map(|value| value.0),
+                        start_expression: start.map(|value| value.1),
+                    });
+                }
+                pending.push((*input, start));
+                if let Some(output) = output {
+                    pending.push((*output, Some((expression_id, *input))));
+                }
+                continue;
+            }
+            for child in semantic_expression_children(&expression.kind, self.execution)? {
+                pending.push((child, start));
+            }
+        }
+        Ok(transitions.into_iter().collect())
     }
 
     fn pulse_emission_routes(
@@ -1047,6 +1100,7 @@ impl<'a> ReactiveBuilder<'a> {
         &self,
         batches: Vec<RawPulseBatch>,
         activation_ids: &BTreeMap<SemanticExprId, SemanticActivationId>,
+        starts: &BTreeMap<SemanticPulseBatchId, SemanticPulseStartV1>,
         trigger_arms: &[SemanticTriggerOwnedArmV1],
         all_state_update_arms: &[SemanticStateUpdateArmV1],
         list_mutations: &[SemanticListMutationV1],
@@ -1125,6 +1179,12 @@ impl<'a> ReactiveBuilder<'a> {
                 call_value: raw.call_value,
                 count_expression: raw.count_expression,
                 count_value: raw.count_value,
+                start: starts.get(&raw.id).cloned().ok_or_else(|| {
+                    SemanticReactiveError::new(format!(
+                        "semantic pulse batch {} lost its activation start",
+                        raw.id
+                    ))
+                })?,
                 transition_expression: raw.transition_expression,
                 transition_output: raw.transition_output,
                 trigger_arms,
@@ -1150,7 +1210,7 @@ impl<'a> ReactiveBuilder<'a> {
         let fields = self.build_fields()?;
         let bindings = self.build_bindings(&fields)?;
         let reads = self.build_reads(&bindings)?;
-        let raw_pulse_batches = self.build_raw_pulse_batches()?;
+        let mut raw_pulse_batches = self.build_raw_pulse_batches()?;
         let (activations, activation_ids) = self.build_activation_sites(&raw_pulse_batches)?;
         let pulse_by_expression = raw_pulse_batches
             .iter()
@@ -1165,6 +1225,11 @@ impl<'a> ReactiveBuilder<'a> {
             .iter()
             .filter_map(|batch| batch.state.map(|state| (batch.id, state)))
             .collect::<BTreeMap<_, _>>();
+        let pulse_activation_expressions = raw_pulse_batches
+            .iter()
+            .flat_map(|batch| [batch.enclosing_then, batch.start_then])
+            .flatten()
+            .collect::<BTreeSet<_>>();
         let mut triggers = TriggerResolver::new(
             self.execution,
             self.resources,
@@ -1175,11 +1240,39 @@ impl<'a> ReactiveBuilder<'a> {
             &self.parameter_inputs,
             &pulse_by_expression,
             &pulse_states,
+            &pulse_activation_expressions,
         )?;
+
+        let mut raw_pulse_starts = BTreeMap::<SemanticPulseBatchId, Vec<RawTriggerArm>>::new();
+        for batch in &raw_pulse_batches {
+            let start_expression = match (batch.start_expression, batch.enclosing_then) {
+                (Some(start_expression), _) => start_expression,
+                (None, Some(then_expression)) => activations
+                    .iter()
+                    .find(|activation| activation.then_expression == then_expression)
+                    .map(|activation| activation.input_expression)
+                    .ok_or_else(|| {
+                        SemanticReactiveError::new(format!(
+                            "semantic pulse batch {} lost activation input {}",
+                            batch.id, then_expression
+                        ))
+                    })?,
+                (None, None) => batch.count_expression,
+            };
+            raw_pulse_starts.insert(
+                batch.id,
+                triggers.trigger_arms_for_expression(start_expression)?,
+            );
+        }
 
         let raw_state_arms = self.build_state_update_arms(&mut triggers)?;
         let raw_mutations = self.build_list_mutations(&mut triggers)?;
-        let raw_derived = self.build_raw_derived_values(&fields, &bindings, &mut triggers)?;
+        let mut raw_derived = self.build_raw_derived_values(&fields, &bindings, &mut triggers)?;
+        self.bind_pulse_emission_derived_values(
+            &mut raw_pulse_batches,
+            &mut raw_derived,
+            &mut triggers,
+        )?;
         let raw_call_invocations =
             self.build_call_invocation_schedules(&bindings, &mut triggers)?;
 
@@ -1200,6 +1293,11 @@ impl<'a> ReactiveBuilder<'a> {
                 raw_call_invocations
                     .iter()
                     .flat_map(|schedule| schedule.invocation_arms.iter().cloned()),
+            )
+            .chain(
+                raw_pulse_starts
+                    .values()
+                    .flat_map(|arms| arms.iter().cloned()),
             )
             .collect::<BTreeSet<_>>();
         let trigger_ids = trigger_keys
@@ -1224,6 +1322,29 @@ impl<'a> ReactiveBuilder<'a> {
                 output_value: arm.output_value,
             })
             .collect::<Vec<_>>();
+        let pulse_starts = raw_pulse_starts
+            .into_iter()
+            .map(|(pulse, arms)| {
+                let start = if arms.is_empty() {
+                    SemanticPulseStartV1::Startup
+                } else {
+                    SemanticPulseStartV1::Triggered {
+                        arms: arms
+                            .iter()
+                            .map(|arm| {
+                                trigger_ids.get(arm).copied().ok_or_else(|| {
+                                    SemanticReactiveError::new(format!(
+                                        "semantic pulse batch {} lost a canonical start trigger",
+                                        pulse
+                                    ))
+                                })
+                            })
+                            .collect::<Result<Vec<_>, _>>()?,
+                    }
+                };
+                Ok((pulse, start))
+            })
+            .collect::<Result<BTreeMap<_, _>, SemanticReactiveError>>()?;
 
         let state_update_arms = raw_state_arms
             .into_iter()
@@ -1328,6 +1449,7 @@ impl<'a> ReactiveBuilder<'a> {
         let pulse_batches = self.finish_pulse_batches(
             raw_pulse_batches,
             &activation_ids,
+            &pulse_starts,
             &trigger_arms,
             &state_update_arms,
             &list_mutations,
@@ -2331,6 +2453,109 @@ impl<'a> ReactiveBuilder<'a> {
         Ok(result)
     }
 
+    fn bind_pulse_emission_derived_values(
+        &self,
+        pulse_batches: &mut [RawPulseBatch],
+        derived_values: &mut [RawDerivedValue],
+        triggers: &mut TriggerResolver<'_>,
+    ) -> Result<(), SemanticReactiveError> {
+        for batch in pulse_batches {
+            let consumers = batch
+                .emission_routes
+                .iter()
+                .filter_map(|route| route.consumer)
+                .collect::<BTreeSet<_>>();
+            let mut matched_existing_route = false;
+            let mut inferred_skip_routes =
+                BTreeMap::<SemanticExprId, SemanticPulseEmissionRouteV1>::new();
+            for derived in derived_values.iter_mut() {
+                let reachable = self.reachable_expressions(derived.producer)?;
+                let mut owns_emission = consumers
+                    .iter()
+                    .any(|consumer| reachable.contains(consumer));
+                matched_existing_route |= owns_emission;
+                if let Some(state) = batch.state {
+                    for expression in &reachable {
+                        let SemanticExpressionKind::Call {
+                            call,
+                            intrinsic: Some(CheckedIntrinsicV1::StreamSkip),
+                            arguments,
+                            ..
+                        } = &self.expressions.expression(*expression)?.kind
+                        else {
+                            continue;
+                        };
+                        let streams = arguments
+                            .iter()
+                            .filter(|argument| argument.name == "stream")
+                            .collect::<Vec<_>>();
+                        let [stream] = streams.as_slice() else {
+                            return Err(SemanticReactiveError::new(format!(
+                                "semantic Stream/skip expression {expression} resolves to {} stream arguments",
+                                streams.len()
+                            )));
+                        };
+                        if !triggers
+                            .event_causes_for_expression(stream.value)?
+                            .contains(&SemanticEventCauseV1::State(state))
+                        {
+                            continue;
+                        }
+                        let counts = arguments
+                            .iter()
+                            .filter(|argument| argument.name == "count")
+                            .collect::<Vec<_>>();
+                        let [count] = counts.as_slice() else {
+                            return Err(SemanticReactiveError::new(format!(
+                                "semantic Stream/skip expression {expression} resolves to {} count arguments",
+                                counts.len()
+                            )));
+                        };
+                        inferred_skip_routes.insert(
+                            *expression,
+                            SemanticPulseEmissionRouteV1 {
+                                consumer: Some(*expression),
+                                filter: SemanticPulseEmissionFilterV1::Skip {
+                                    call: *call,
+                                    expression: *expression,
+                                    count_expression: count.value,
+                                    count_value: self.expressions.value(count.value)?,
+                                },
+                            },
+                        );
+                        owns_emission = true;
+                    }
+                }
+                if !owns_emission {
+                    continue;
+                }
+                if let Some(state) = batch.state {
+                    derived
+                        .trigger_arms
+                        .retain(|arm| arm.cause != SemanticEventCauseV1::State(state));
+                }
+                derived.trigger_arms.push(triggers.arm(
+                    SemanticEventCauseV1::Pulse(batch.id),
+                    batch.call_expression,
+                    derived.producer,
+                )?);
+                derived.trigger_arms.sort();
+                derived.trigger_arms.dedup();
+                derived.causes = derived
+                    .trigger_arms
+                    .iter()
+                    .map(|arm| arm.cause)
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect();
+            }
+            if !matched_existing_route && !inferred_skip_routes.is_empty() {
+                batch.emission_routes = inferred_skip_routes.into_values().collect();
+            }
+        }
+        Ok(())
+    }
+
     fn hold_body_statement_ids(&self) -> BTreeSet<SemanticStatementId> {
         let mut pending = self
             .execution
@@ -3065,6 +3290,7 @@ struct TriggerResolver<'a> {
     parameter_inputs: &'a BTreeMap<SemanticExprId, Vec<SemanticExprId>>,
     pulse_by_expression: &'a BTreeMap<SemanticExprId, SemanticPulseBatchId>,
     pulse_states: &'a BTreeMap<SemanticPulseBatchId, SemanticStateId>,
+    pulse_activation_expressions: &'a BTreeSet<SemanticExprId>,
     causes_cache: BTreeMap<SemanticExprId, BTreeSet<SemanticEventCauseV1>>,
 }
 
@@ -3197,6 +3423,7 @@ impl<'a> TriggerResolver<'a> {
         parameter_inputs: &'a BTreeMap<SemanticExprId, Vec<SemanticExprId>>,
         pulse_by_expression: &'a BTreeMap<SemanticExprId, SemanticPulseBatchId>,
         pulse_states: &'a BTreeMap<SemanticPulseBatchId, SemanticStateId>,
+        pulse_activation_expressions: &'a BTreeSet<SemanticExprId>,
     ) -> Result<Self, SemanticReactiveError> {
         for source in &resources.sources {
             if execution
@@ -3234,6 +3461,7 @@ impl<'a> TriggerResolver<'a> {
             parameter_inputs,
             pulse_by_expression,
             pulse_states,
+            pulse_activation_expressions,
             causes_cache: BTreeMap::new(),
         })
     }
@@ -3246,7 +3474,7 @@ impl<'a> TriggerResolver<'a> {
             return Ok(cached.clone());
         }
         let mut causes = BTreeSet::new();
-        self.collect_event_causes(root, &mut BTreeSet::new(), &mut causes)?;
+        self.collect_event_causes(root, None, &mut BTreeSet::new(), &mut causes)?;
         self.causes_cache.insert(root, causes.clone());
         Ok(causes)
     }
@@ -3254,10 +3482,11 @@ impl<'a> TriggerResolver<'a> {
     fn collect_event_causes(
         &mut self,
         id: SemanticExprId,
+        terminal: Option<SemanticExprId>,
         visited: &mut BTreeSet<SemanticExprId>,
         causes: &mut BTreeSet<SemanticEventCauseV1>,
     ) -> Result<(), SemanticReactiveError> {
-        if !visited.insert(id) {
+        if terminal == Some(id) || !visited.insert(id) {
             return Ok(());
         }
         let expression = self.expressions.expression(id)?;
@@ -3267,9 +3496,20 @@ impl<'a> TriggerResolver<'a> {
             return Ok(());
         }
         match &expression.kind {
+            // The input event owns activation of the bounded pulse batch.  It
+            // is not also a direct emission from the activated expression:
+            // initial HOLD publication and each admitted microturn are
+            // represented by the Pulse cause inside the output.
+            SemanticExpressionKind::Then {
+                input,
+                output: Some(output),
+                ..
+            } if self.pulse_activation_expressions.contains(&id) => {
+                self.collect_event_causes(*output, Some(*input), visited, causes)?;
+            }
             SemanticExpressionKind::CanonicalRead { target, .. } => {
                 let binding = self.exact_binding_for_decl(*target, expression)?;
-                self.collect_event_causes(binding.producer, visited, causes)?;
+                self.collect_event_causes(binding.producer, terminal, visited, causes)?;
             }
             SemanticExpressionKind::LocalRead { binding, .. } => {
                 let (_, producer) = self.local_values.get(binding).copied().ok_or_else(|| {
@@ -3278,7 +3518,7 @@ impl<'a> TriggerResolver<'a> {
                         id, binding
                     ))
                 })?;
-                self.collect_event_causes(producer, visited, causes)?;
+                self.collect_event_causes(producer, terminal, visited, causes)?;
             }
             SemanticExpressionKind::FunctionParameter { parameter, .. } => {
                 let inputs = self.parameter_inputs.get(&id).ok_or_else(|| {
@@ -3288,12 +3528,12 @@ impl<'a> TriggerResolver<'a> {
                     ))
                 })?;
                 for input in inputs {
-                    self.collect_event_causes(*input, visited, causes)?;
+                    self.collect_event_causes(*input, terminal, visited, causes)?;
                 }
             }
             _ => {
                 for child in semantic_expression_children(&expression.kind, self.execution)? {
-                    self.collect_event_causes(child, visited, causes)?;
+                    self.collect_event_causes(child, terminal, visited, causes)?;
                 }
             }
         }
@@ -3564,6 +3804,12 @@ impl<'a> TriggerResolver<'a> {
                 }
             }
             SemanticExpressionKind::Then { input, output } => {
+                if self.pulse_activation_expressions.contains(&id) {
+                    if let Some(output) = output {
+                        self.collect_trigger_arms(*output, Some(*input), visited, arms)?;
+                    }
+                    return Ok(());
+                }
                 let input_arms = self.trigger_arms_before(*input, terminal)?;
                 if !input_arms.is_empty() {
                     // Exact THEN identity rule: when no output expression is

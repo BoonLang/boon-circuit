@@ -366,6 +366,111 @@ fn exact_storage_event_source(
     }
 }
 
+fn semantic_read_diagnostic_path(
+    resources: &SemanticResourceGraphV1,
+    storage: &SemanticScopeStorageGraphV1,
+    read: &SemanticReadBindingV1,
+) -> Result<Option<String>, SemanticViewBindingError> {
+    let append = |base: &str, projection: &[String]| {
+        if projection.is_empty() {
+            base.to_owned()
+        } else {
+            format!("{base}.{}", projection.join("."))
+        }
+    };
+    match &read.target {
+        SemanticReadTargetV1::Binding {
+            binding,
+            projection,
+        } => {
+            let candidates = storage
+                .bindings
+                .iter()
+                .filter(|candidate| candidate.binding == *binding)
+                .collect::<Vec<_>>();
+            let [binding] = candidates.as_slice() else {
+                return Err(SemanticViewBindingError::new(format!(
+                    "view read {} binding {binding} resolves to {} exact storage bindings",
+                    read.id,
+                    candidates.len()
+                )));
+            };
+            Ok(Some(append(&binding.diagnostic_path, projection)))
+        }
+        SemanticReadTargetV1::SourcePayload {
+            source,
+            payload_projection,
+            projection,
+            ..
+        } => {
+            let source = resources
+                .sources
+                .get(source.as_usize())
+                .filter(|candidate| candidate.id == *source)
+                .ok_or_else(|| {
+                    SemanticViewBindingError::new(format!(
+                        "view read {} references missing source {source}",
+                        read.id
+                    ))
+                })?;
+            let mut full_projection = payload_projection.clone();
+            full_projection.extend(projection.clone());
+            Ok(Some(append(&source.semantic_path, &full_projection)))
+        }
+        SemanticReadTargetV1::StateProjection {
+            state, projection, ..
+        } => {
+            let state = resources
+                .states
+                .get(state.as_usize())
+                .filter(|candidate| candidate.id == *state)
+                .ok_or_else(|| {
+                    SemanticViewBindingError::new(format!(
+                        "view read {} references missing state {state}",
+                        read.id
+                    ))
+                })?;
+            Ok(Some(append(&state.path, projection)))
+        }
+        SemanticReadTargetV1::MaterializationLocal {
+            owner,
+            local,
+            projection,
+        } => {
+            let candidates = storage
+                .locals
+                .iter()
+                .filter(|candidate| candidate.owner == *owner && candidate.local == *local)
+                .collect::<Vec<_>>();
+            let [local] = candidates.as_slice() else {
+                return Err(SemanticViewBindingError::new(format!(
+                    "view read {} materialization local {owner}:{local} resolves to {} exact storage locals",
+                    read.id,
+                    candidates.len()
+                )));
+            };
+            let Some(row) = local.row else {
+                return Ok(None);
+            };
+            let list = resources
+                .lists
+                .get(row.list.as_usize())
+                .filter(|candidate| candidate.id == row.list && candidate.row_scope == row.scope)
+                .ok_or_else(|| {
+                    SemanticViewBindingError::new(format!(
+                        "view read {} local row {}/{} references missing list storage",
+                        read.id, row.list, row.scope
+                    ))
+                })?;
+            Ok(Some(append(&list.semantic_path, projection)))
+        }
+        SemanticReadTargetV1::External { canonical_path, .. } => Ok(Some(canonical_path.clone())),
+        SemanticReadTargetV1::Local { .. }
+        | SemanticReadTargetV1::ElementState { .. }
+        | SemanticReadTargetV1::FunctionParameter { .. } => Ok(None),
+    }
+}
+
 fn derive_semantic_view_binding_graph(
     execution: &SemanticExecutionGraphV1,
     resources: &SemanticResourceGraphV1,
@@ -555,7 +660,9 @@ fn derive_semantic_view_binding_graph(
                     .collect::<Vec<_>>();
                 captures.sort_by_key(|capture| capture.id);
                 for capture in captures {
-                    let (target, leaf_capture_target, diagnostic_path) = match capture.target {
+                    let (target, leaf_capture_target, diagnostic_path, resource_row) = match capture
+                        .target
+                    {
                         SemanticViewCaptureTargetV1::Read { read } => {
                             let read_definition = reactive
                                 .reads
@@ -588,16 +695,28 @@ fn derive_semantic_view_binding_graph(
                                             capture.id
                                         ))
                                     })?;
+                                let resource_row = source_definition
+                                    .target_list
+                                    .zip(source_definition.row_scope)
+                                    .map(|(list, scope)| SemanticRowBinding { list, scope });
                                 (
                                     SemanticViewBindingTargetV1::Event { source },
                                     SemanticViewCaptureTargetV1::Source { source },
                                     source_definition.semantic_path.clone(),
+                                    resource_row,
                                 )
                             } else {
+                                let diagnostic_path = semantic_read_diagnostic_path(
+                                    resources,
+                                    storage,
+                                    read_definition,
+                                )?
+                                .unwrap_or_else(|| format!("read:{read}"));
                                 (
                                     SemanticViewBindingTargetV1::Data { read },
                                     capture.target,
-                                    format!("read:{read}"),
+                                    diagnostic_path,
+                                    None,
                                 )
                             }
                         }
@@ -612,10 +731,15 @@ fn derive_semantic_view_binding_graph(
                                         capture.id
                                     ))
                                 })?;
+                            let resource_row = source_definition
+                                .target_list
+                                .zip(source_definition.row_scope)
+                                .map(|(list, scope)| SemanticRowBinding { list, scope });
                             (
                                 SemanticViewBindingTargetV1::Event { source },
                                 capture.target,
                                 source_definition.semantic_path.clone(),
+                                resource_row,
                             )
                         }
                         SemanticViewCaptureTargetV1::Field { .. } => continue,
@@ -628,23 +752,25 @@ fn derive_semantic_view_binding_graph(
                         )));
                     }
                     let route_scope = expression_route_scope(execution, capture.expression)?;
-                    let row = capture
-                        .row_scope
-                        .map(|scope| {
-                            resources
-                                .row_scopes
-                                .get(scope.as_usize())
-                                .filter(|candidate| candidate.id == scope)
-                                .map(|row| SemanticRowBinding {
-                                    list: row.list,
-                                    scope,
-                                })
-                                .ok_or_else(|| {
-                                    SemanticViewBindingError::new(format!(
-                                        "view capture {} references missing row scope {scope}",
-                                        capture.id
-                                    ))
-                                })
+                    let row = resource_row
+                        .map(Ok)
+                        .or_else(|| {
+                            capture.row_scope.map(|scope| {
+                                resources
+                                    .row_scopes
+                                    .get(scope.as_usize())
+                                    .filter(|candidate| candidate.id == scope)
+                                    .map(|row| SemanticRowBinding {
+                                        list: row.list,
+                                        scope,
+                                    })
+                                    .ok_or_else(|| {
+                                        SemanticViewBindingError::new(format!(
+                                            "view capture {} references missing row scope {scope}",
+                                            capture.id
+                                        ))
+                                    })
+                            })
                         })
                         .transpose()?;
                     let leaf_bindings = binding_leaf_metadata(
@@ -652,6 +778,7 @@ fn derive_semantic_view_binding_graph(
                         call_argument.value,
                         capture.expression,
                         leaf_capture_target,
+                        function,
                         &parameter.name,
                         &diagnostic_path,
                         output.contract,
@@ -849,6 +976,7 @@ struct BindingLeafTraversal<'a> {
     execution: &'a SemanticExecutionGraphV1,
     capture: SemanticExprId,
     capture_target: SemanticViewCaptureTargetV1,
+    constructor: &'a str,
     source_fallback_attribute: &'a str,
     contract: SemanticOutputContractKindV1,
     result: BTreeSet<SemanticViewBindingLeaf>,
@@ -860,6 +988,7 @@ fn binding_leaf_metadata(
     root: SemanticExprId,
     capture: SemanticExprId,
     capture_target: SemanticViewCaptureTargetV1,
+    constructor: &str,
     argument: &str,
     diagnostic_path: &str,
     contract: SemanticOutputContractKindV1,
@@ -887,6 +1016,7 @@ fn binding_leaf_metadata(
         execution,
         capture,
         capture_target,
+        constructor,
         source_fallback_attribute,
         contract,
         result: BTreeSet::new(),
@@ -958,6 +1088,17 @@ impl BindingLeafTraversal<'_> {
             return Ok(());
         }
         if id == self.capture {
+            if matches!(mode, BindingLeafMode::Events { .. })
+                && !matches!(
+                    self.capture_target,
+                    SemanticViewCaptureTargetV1::Source { .. }
+                )
+            {
+                return Err(SemanticViewBindingError::new(format!(
+                    "Element constructor `{}` argument `element.events` has no concrete SOURCE leaves; event expression {id} resolves to data",
+                    self.constructor
+                )));
+            }
             let (attribute, read_kind) = match &mode {
                 BindingLeafMode::Data { attribute, kind } => (attribute.as_str(), *kind),
                 BindingLeafMode::Element => ("element", SemanticViewBindingKindV1::Data),

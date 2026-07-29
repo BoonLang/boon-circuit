@@ -1077,13 +1077,18 @@ impl SemanticToExecutableMap {
             .collect::<Vec<_>>();
         let call_expressions = allocate_call_expressions(graph, &expressions)?;
         let mut producer_functions = BTreeMap::new();
-        for function in &graph.functions {
-            let executable = exact_map(
+        for (index, function) in graph.functions.iter().enumerate() {
+            // A semantic callable is a syntax-wide definition. A producer
+            // function is one concrete materialized occurrence and therefore
+            // needs its own executable identity even when several occurrences
+            // share the same callable.
+            exact_map(
                 &callables,
                 function.callable.as_usize(),
                 "semantic producer callable",
                 function.callable,
             )?;
+            let executable = FunctionId(index);
             if producer_functions
                 .insert(function.producer, executable)
                 .is_some()
@@ -1373,14 +1378,14 @@ impl SemanticToExecutableMap {
         self.runtime_sources
             .get(&id)
             .copied()
-            .ok_or_else(|| format!("semantic source {id} has no runtime mapping"))
+            .ok_or_else(|| format!("semantic runtime source {id} has no executable mapping"))
     }
 
     fn runtime_state(&self, id: SemanticStateId) -> Result<StateId, String> {
         self.runtime_states
             .get(&id)
             .copied()
-            .ok_or_else(|| format!("semantic state {id} has no runtime mapping"))
+            .ok_or_else(|| format!("semantic runtime state {id} has no executable mapping"))
     }
 }
 
@@ -2200,14 +2205,8 @@ fn validate_erased_resource_metadata(
         }
     }
     for producer in &graph.producer_resources {
-        let callable = ids.callable(producer.callable)?;
-        let expected = ids.producer_function(producer.function)?;
-        if callable != expected {
-            return Err(format!(
-                "semantic producer resource callable {} maps to function {}, expected producer {}",
-                producer.callable, callable, producer.function
-            ));
-        }
+        ids.callable(producer.callable)?;
+        ids.producer_function(producer.function)?;
         ids.statement(producer.result_statement)?;
         if let Some(source) = producer.invocation_source {
             ids.source(source)?;
@@ -3310,7 +3309,7 @@ fn map_reactive_read(
             parameter,
             projection,
         } => MappedSemanticReadTarget::FunctionParameter {
-            parameter: ids.parameter(*parameter)?,
+            parameter: executable_parameter_for_occurrence(execution, ids, expression, *parameter)?,
             projection: projection.clone(),
         },
     };
@@ -4033,12 +4032,7 @@ fn map_reactive_producer_instance(
         ));
     }
     let function_id = ids.producer_function(instance.function)?;
-    if function_id != ids.callable(instance.callable)? {
-        return Err(format!(
-            "semantic producer instance {} function and callable map differently",
-            producer_identity_text(instance.identity)
-        ));
-    }
+    ids.callable(instance.callable)?;
     let arguments = instance
         .parameters
         .iter()
@@ -4080,9 +4074,13 @@ fn map_reactive_producer_instance(
                     )
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            ids.parameter(parameter.parameter)?;
             Ok(ProducerFunctionArgument {
                 name: parameter.name.clone(),
-                parameter: ids.parameter(parameter.parameter)?,
+                parameter: ExecutableParameterId {
+                    function: function_id,
+                    ordinal: parameter.parameter.ordinal,
+                },
                 flow_type: parameter.flow_type.clone(),
                 input_expressions,
             })
@@ -7970,9 +7968,38 @@ fn map_expression_kind(
             parameter,
             projection,
         } => ExecutableExpressionKind::FunctionParameter {
-            parameter: ids.parameter(*parameter)?,
+            parameter: executable_parameter_for_occurrence(graph, ids, expression, *parameter)?,
             projection: projection.clone(),
         },
+    })
+}
+
+fn executable_parameter_for_occurrence(
+    graph: &SemanticExecutionGraphV1,
+    ids: &SemanticToExecutableMap,
+    expression: &SemanticExpression,
+    parameter: SemanticParameterId,
+) -> Result<ExecutableParameterId, String> {
+    ids.parameter(parameter)?;
+    let functions = graph
+        .functions
+        .iter()
+        .filter(|function| {
+            function.parameters.iter().any(|candidate| {
+                candidate.id == parameter && candidate.input_expressions.contains(&expression.id)
+            })
+        })
+        .collect::<Vec<_>>();
+    let [function] = functions.as_slice() else {
+        return Err(format!(
+            "semantic function-parameter expression {} resolves to {} exact producer occurrences",
+            expression.id,
+            functions.len()
+        ));
+    };
+    Ok(ExecutableParameterId {
+        function: ids.producer_function(function.producer)?,
+        ordinal: parameter.ordinal,
     })
 }
 
@@ -8009,14 +8036,8 @@ fn map_value_member(
                 identity,
                 owner,
             } => {
-                let executable_function = ids.callable(*function)?;
-                let expected = ids.producer_function(*producer)?;
-                if executable_function != expected {
-                    return Err(format!(
-                        "semantic producer source function {} does not map to producer {}",
-                        function, producer
-                    ));
-                }
+                ids.callable(*function)?;
+                let executable_function = ids.producer_function(*producer)?;
                 ExecutableValueOrigin::ProducerSource {
                     function: executable_function,
                     identity: *identity,
@@ -8691,14 +8712,8 @@ fn map_source(
                 producer,
                 identity,
             } => {
-                let executable_function = ids.callable(function)?;
-                let expected = ids.producer_function(producer)?;
-                if executable_function != expected {
-                    return Err(format!(
-                        "semantic source {} function {} does not map to producer {}",
-                        source.id, function, producer
-                    ));
-                }
+                ids.callable(function)?;
+                let executable_function = ids.producer_function(producer)?;
                 ExecutableSourceOrigin::ProducerInvocation {
                     function: executable_function,
                     identity,
@@ -8764,14 +8779,8 @@ fn map_function(
             function.producer, function.name, callable.id, callable.name
         ));
     }
-    let id = ids.callable(function.callable)?;
-    let expected = ids.producer_function(function.producer)?;
-    if id != expected {
-        return Err(format!(
-            "semantic callable {} does not map to producer {}",
-            function.callable, function.producer
-        ));
-    }
+    ids.callable(function.callable)?;
+    let id = ids.producer_function(function.producer)?;
     for parameter in &function.parameters {
         let callable_parameter = callable
             .parameters
@@ -8817,7 +8826,7 @@ fn map_function(
         parameters: function
             .parameters
             .iter()
-            .map(|parameter| map_function_parameter(ids, parameter))
+            .map(|parameter| map_function_parameter(ids, id, parameter))
             .collect::<Result<Vec<_>, _>>()?,
         result_type: function.result_type.clone(),
         root: ids.expression(function.root)?,
@@ -8830,10 +8839,15 @@ fn map_function(
 
 fn map_function_parameter(
     ids: &SemanticToExecutableMap,
+    function: FunctionId,
     parameter: &SemanticFunctionParameter,
 ) -> Result<ExecutableFunctionParameter, String> {
+    ids.parameter(parameter.id)?;
     Ok(ExecutableFunctionParameter {
-        id: ids.parameter(parameter.id)?,
+        id: ExecutableParameterId {
+            function,
+            ordinal: parameter.id.ordinal,
+        },
         name: parameter.name.clone(),
         flow_type: parameter.flow_type.clone(),
     })
@@ -11503,10 +11517,18 @@ mod tests {
             })
             .expect("fixture has an unrelated spare expression");
 
-        let mut duplicate = valid.clone();
-        duplicate.expressions[spare_index].kind = call_expression.kind.clone();
-        let error = map_semantic_execution(&duplicate, semantic.resource_graph()).unwrap_err();
-        assert!(error.contains("defined by both expressions"), "{error}");
+        let mut inconsistent = valid.clone();
+        inconsistent.expressions[spare_index].kind = call_expression.kind.clone();
+        let SemanticExpressionKind::Call {
+            callable: mutated_callable,
+            ..
+        } = &mut inconsistent.expressions[spare_index].kind
+        else {
+            unreachable!()
+        };
+        *mutated_callable = SemanticCallableId(usize::MAX);
+        let error = map_semantic_execution(&inconsistent, semantic.resource_graph()).unwrap_err();
+        assert!(error.contains("inconsistent call, callable"), "{error}");
 
         let mut dangling = valid.clone();
         dangling.expressions[spare_index].kind = SemanticExpressionKind::ElementState {
@@ -11971,7 +11993,7 @@ result: identity(value: 1)
     }
 
     #[test]
-    fn producer_function_ids_are_derived_from_all_callable_identity() {
+    fn producer_function_ids_are_dense_per_materialized_occurrence() {
         let parsed = boon_parser::parse_source(
             "semantic-producer-callable-map.bn",
             r#"
@@ -12006,13 +12028,10 @@ seed: 0
         let mapped = map_semantic_execution(semantic.execution_graph(), semantic.resource_graph())
             .expect("producer fixture maps");
         let function = &semantic.execution_graph().functions[0];
-        let expected = mapped.id_map.callable(function.callable).unwrap();
-        assert_eq!(
-            mapped.id_map.producer_function(function.producer).unwrap(),
-            expected
-        );
+        mapped.id_map.callable(function.callable).unwrap();
+        let expected = mapped.id_map.producer_function(function.producer).unwrap();
         assert_eq!(mapped.executable.functions[0].id, expected);
-        assert_eq!(expected, FunctionId(function.callable.as_usize()));
+        assert_eq!(expected, FunctionId(function.producer.as_usize()));
         mapped.validate_totality().unwrap();
 
         let resources = map_semantic_resources(

@@ -263,6 +263,24 @@ store: [
             boon_typecheck::Type::Number,
         ),
     );
+    environment.external_identities.insert(
+        "Client/store.increment".to_owned(),
+        boon_typecheck::CheckedExternalDeclarationIdentityV1 {
+            producer_role: boon_typecheck::ProgramRole::Client,
+            producer_source_bundle_digest_v1: parsed.source_bundle_digest_v1,
+            producer_declaration: boon_typecheck::DeclId(41),
+            kind: boon_typecheck::CheckedExternalDeclarationKind::Value,
+        },
+    );
+    environment.external_identities.insert(
+        "Server/double".to_owned(),
+        boon_typecheck::CheckedExternalDeclarationIdentityV1 {
+            producer_role: boon_typecheck::ProgramRole::Server,
+            producer_source_bundle_digest_v1: parsed.source_bundle_digest_v1,
+            producer_declaration: boon_typecheck::DeclId(42),
+            kind: boon_typecheck::CheckedExternalDeclarationKind::Callable,
+        },
+    );
 
     let checked =
         boon_typecheck::check_runtime_program_profiled_with_external_types(&parsed, &environment)

@@ -2299,7 +2299,7 @@ struct ExactResourceInstanceContext<'a> {
 fn exact_resource_instance_expression(
     context: ExactResourceInstanceContext<'_>,
     candidates: &[SemanticExprId],
-) -> Result<(SemanticExprId, SemanticStatementId), ExpansionError> {
+) -> Result<(SemanticExprId, Option<SemanticStatementId>), ExpansionError> {
     let ExactResourceInstanceContext {
         expressions,
         origins,
@@ -2485,14 +2485,53 @@ fn exact_resource_instance_expression(
         }
     };
     let Some(anchor) = anchor else {
-        let occurrence = candidates.first().and_then(|(candidate, _)| {
-            expressions
-                .get(candidate.as_usize())
-                .zip(origins.get(candidate.as_usize()))
-                .map(|(expression, origin)| (expression.owner, origin.call_instance))
-        });
+        if let [candidate] = candidates.as_slice() {
+            // Function-local resources inside contextual materializations do
+            // not have a pre-existing root semantic statement. Preserve the
+            // exact occurrence and let the caller create its declaration
+            // statement from the checked statement identity.
+            return Ok((candidate.0, None));
+        }
+        let occurrence = candidates
+            .iter()
+            .filter_map(|(candidate, statement)| {
+                expressions
+                    .get(candidate.as_usize())
+                    .zip(origins.get(candidate.as_usize()))
+                    .map(|(expression, origin)| {
+                        (
+                            *candidate,
+                            expression.owner,
+                            origin.call_instance,
+                            origin.owning_statement,
+                            statement.map(|statement| statement.id),
+                        )
+                    })
+            })
+            .collect::<Vec<_>>();
+        let materialization_owners = materializations
+            .iter()
+            .map(|materialization| (materialization.id, materialization.owner))
+            .collect::<Vec<_>>();
+        let materialize_expressions = expressions
+            .iter()
+            .filter_map(|expression| {
+                let SemanticExpressionKind::Materialize { materialization } = expression.kind
+                else {
+                    return None;
+                };
+                Some((
+                    expression.id,
+                    materialization,
+                    expression.owner,
+                    origins
+                        .get(expression.id.as_usize())
+                        .and_then(|origin| origin.owning_statement),
+                ))
+            })
+            .collect::<Vec<_>>();
         return Err(ExpansionError::InvalidLocalBindings(format!(
-            "checked {resource_kind} {checked_id} occurrence {occurrence:?} has {} semantic use copies and no exact semantic declaration statement",
+            "checked {resource_kind} {checked_id} occurrences {occurrence:?} have {} semantic use copies and no exact semantic declaration statement; materialization owners: {materialization_owners:?}; materialize expressions: {materialize_expressions:?}",
             candidates.len(),
         )));
     };
@@ -2502,12 +2541,12 @@ fn exact_resource_instance_expression(
         .map(|(expression, _)| *expression)
         .collect::<Vec<_>>();
     if let [definition_site] = definition_sites.as_slice() {
-        return Ok((*definition_site, anchor));
+        return Ok((*definition_site, Some(anchor)));
     }
     if definition_sites.is_empty()
         && let [candidate] = candidates.as_slice()
     {
-        return Ok((candidate.0, anchor));
+        return Ok((candidate.0, Some(anchor)));
     }
     let [definition_site] = definition_sites.as_slice() else {
         return Err(ExpansionError::InvalidLocalBindings(format!(
@@ -2516,7 +2555,7 @@ fn exact_resource_instance_expression(
             definition_sites.len()
         )));
     };
-    Ok((*definition_site, anchor))
+    Ok((*definition_site, Some(anchor)))
 }
 
 fn ensure_statement_owned_expression(
@@ -2691,7 +2730,7 @@ fn ensure_resource_definition_statement(
     arena: &mut SemanticExpressionArena,
     statements: &mut Vec<SemanticStatement>,
     expression: SemanticExprId,
-    suggested_statement: SemanticStatementId,
+    suggested_statement: Option<SemanticStatementId>,
     checked_statement: boon_typecheck::CheckedStatementId,
     declaration: DeclId,
     checked_binding: CheckedResourceBinding,
@@ -2706,9 +2745,11 @@ fn ensure_resource_definition_statement(
                 "resource expression {expression} has no exact semantic origin"
             ))
         })?;
-    let suggested_definition = statements
-        .get(suggested_statement.as_usize())
-        .filter(|statement| statement.id == suggested_statement);
+    let suggested_definition = suggested_statement.and_then(|suggested_statement| {
+        statements
+            .get(suggested_statement.as_usize())
+            .filter(|statement| statement.id == suggested_statement)
+    });
     let resource_needs_distinct_producer_statement =
         matches!(&checked_binding, CheckedResourceBinding::State { .. })
             && suggested_definition.is_some_and(|statement| {
@@ -2722,10 +2763,11 @@ fn ensure_resource_definition_statement(
         .map(|root| arena_expression_reaches(arena, root, expression))
         .transpose()?
         .unwrap_or(true);
-    if suggested_definition.is_some_and(|statement| {
-        statement.declaration == Some(declaration)
+    if let Some(suggested_statement) = suggested_definition.and_then(|statement| {
+        (statement.declaration == Some(declaration)
             && !resource_needs_distinct_producer_statement
-            && suggested_reaches_expression
+            && suggested_reaches_expression)
+            .then_some(statement.id)
     }) {
         let checked_expression = arena
             .expressions

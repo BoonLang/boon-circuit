@@ -2,18 +2,21 @@
 
 use super::codec::{
     BlobDigest, BlobRecord, EncodedComponent, decode_row_component, decode_scalar_component,
-    encode_blob_record, encode_outbox_record, encode_row_component, encode_scalar_component,
+    encode_blob_record, encode_map_entry_component, encode_outbox_record, encode_row_component,
+    encode_scalar_component, encode_set_item_component,
 };
 #[cfg(target_arch = "wasm32")]
 use super::codec::{
-    decode_blob_record, decode_outbox_record, row_component_blob_references,
-    scalar_component_blob_references,
+    decode_blob_record, decode_map_entry_component, decode_outbox_record,
+    decode_set_item_component, map_entry_component_blob_references, row_component_blob_references,
+    scalar_component_blob_references, set_item_component_blob_references,
 };
 use super::{
     ActivationBatch, CheckpointBatch, ContentArtifact, ContentArtifactBinding, ContentArtifactId,
     ContentArtifactManifest, ContentArtifactOwnerId, ContentArtifactRetention, DecodeLimits,
-    DurableChange, DurableOutboxChange, OutboxItemId, PersistenceResult, RestoreImage, StoreError,
-    StoredRow, encode_restore_image, validate_content_artifact,
+    DurableChange, DurableCollectionId, DurableOutboxChange, DurableOwner, DurableRowId,
+    OutboxItemId, PersistenceResult, RestoreImage, StoreError, StoredRow, StoredValue,
+    encode_restore_image, validate_content_artifact,
 };
 use boon_plan::{ApplicationIdentity, MemoryId, MigrationEdgeId};
 use minicbor::{Decoder, Encoder};
@@ -28,10 +31,10 @@ use super::{
     CompactRequest, DurableContentArtifactChange, ExportApplicationRequest, InspectRequest,
     LoadContentArtifactRequest, PersistenceCommand, PersistenceInspectorSnapshot,
     PutContentArtifactAck, PutContentArtifactRequest, ResetApplicationAck, ResetApplicationBatch,
-    RestoreRequest, ShutdownAck, StoredList, apply_durable_content_artifact_changes,
-    exact_content_artifact_closure, inspector_snapshot_with_artifacts,
-    validate_application_transfer, validate_content_artifact_manifest,
-    validate_content_artifact_storage,
+    RestoreRequest, ShutdownAck, StoredList, StoredMap, StoredSet,
+    apply_durable_content_artifact_changes, exact_content_artifact_closure,
+    inspector_snapshot_with_artifacts, validate_application_transfer,
+    validate_content_artifact_manifest, validate_content_artifact_storage,
 };
 #[cfg(target_arch = "wasm32")]
 use futures::channel::{mpsc, oneshot};
@@ -54,8 +57,8 @@ use wasm_bindgen_futures::{JsFuture, spawn_local};
 #[cfg(target_arch = "wasm32")]
 use web_sys::{DomException, StorageManager, WorkerGlobalScope};
 
-const DATABASE_VERSION: u32 = 4;
-const COMPONENT_FORMAT: u32 = 3;
+const DATABASE_VERSION: u32 = 5;
+const COMPONENT_FORMAT: u32 = 4;
 const MAX_CHECKPOINT_RECORDS_PER_APPLICATION: usize = 64;
 const DEFAULT_UPGRADE_TIMEOUT_MS: u32 = 15_000;
 const STORAGE_STATUS_TIMEOUT_MS: u32 = 2_000;
@@ -73,6 +76,10 @@ const META: &str = "meta";
 const SLOTS: &str = "slots";
 const LISTS: &str = "lists";
 const ROWS: &str = "rows";
+const MAPS: &str = "maps";
+const MAP_ENTRIES: &str = "map_entries";
+const SETS: &str = "sets";
+const SET_ITEMS: &str = "set_items";
 const CHECKPOINTS: &str = "checkpoints";
 const MIGRATIONS: &str = "migrations";
 const OUTBOX: &str = "outbox";
@@ -80,11 +87,15 @@ const BLOBS: &str = "blobs";
 const ARTIFACTS: &str = "artifacts";
 const ARTIFACT_OWNERS: &str = "artifact_owners";
 
-const STORE_NAMES: [&str; 10] = [
+const STORE_NAMES: [&str; 14] = [
     META,
     SLOTS,
     LISTS,
     ROWS,
+    MAPS,
+    MAP_ENTRIES,
+    SETS,
+    SET_ITEMS,
     CHECKPOINTS,
     MIGRATIONS,
     OUTBOX,
@@ -92,11 +103,15 @@ const STORE_NAMES: [&str; 10] = [
     ARTIFACTS,
     ARTIFACT_OWNERS,
 ];
-const LOAD_STORES: [&str; 9] = [
+const LOAD_STORES: [&str; 13] = [
     META,
     SLOTS,
     LISTS,
     ROWS,
+    MAPS,
+    MAP_ENTRIES,
+    SETS,
+    SET_ITEMS,
     MIGRATIONS,
     OUTBOX,
     BLOBS,
@@ -428,6 +443,12 @@ struct ListRecord {
     rows: Vec<ListRowRef>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CollectionRecord {
+    touched: bool,
+    revision: u64,
+}
+
 #[derive(Clone, Copy)]
 enum CheckpointKind {
     Checkpoint = 0,
@@ -477,7 +498,16 @@ impl SparseTransactionPlan {
             plan.include_authority_change(change);
         }
         if !batch.deleted_memory.is_empty() {
-            plan.stores.extend([SLOTS, LISTS, ROWS, BLOBS]);
+            plan.stores.extend([
+                SLOTS,
+                LISTS,
+                ROWS,
+                MAPS,
+                MAP_ENTRIES,
+                SETS,
+                SET_ITEMS,
+                BLOBS,
+            ]);
         }
         if !batch.completed_migration_edges.is_empty() {
             plan.stores.insert(MIGRATIONS);
@@ -495,18 +525,38 @@ impl SparseTransactionPlan {
         self.stores.insert(BLOBS);
         match change {
             DurableChange::SetScalar { .. } => {
-                self.stores.extend([SLOTS, LISTS]);
+                self.stores.extend([SLOTS, LISTS, MAPS, SETS]);
             }
             DurableChange::DeleteScalar { .. } => {
                 self.stores.insert(SLOTS);
             }
             DurableChange::SetList { .. } | DurableChange::SetRowField { .. } => {
-                self.stores.extend([SLOTS, LISTS, ROWS]);
+                self.stores.extend([SLOTS, LISTS, ROWS, MAPS, SETS]);
             }
             DurableChange::InsertRow { .. }
             | DurableChange::RemoveRow { .. }
             | DurableChange::DeleteList { .. } => {
                 self.stores.extend([LISTS, ROWS]);
+            }
+            DurableChange::SetMap { .. } => {
+                self.stores
+                    .extend([SLOTS, LISTS, ROWS, MAPS, MAP_ENTRIES, SETS]);
+            }
+            DurableChange::MapUpsert { .. } | DurableChange::MapRemove { .. } => {
+                self.stores.extend([MAPS, MAP_ENTRIES, LISTS, ROWS]);
+            }
+            DurableChange::DeleteMap { .. } => {
+                self.stores.extend([MAPS, MAP_ENTRIES]);
+            }
+            DurableChange::SetSet { .. } => {
+                self.stores
+                    .extend([SLOTS, LISTS, ROWS, MAPS, SETS, SET_ITEMS]);
+            }
+            DurableChange::SetAdd { .. } | DurableChange::SetRemove { .. } => {
+                self.stores.extend([SETS, SET_ITEMS, LISTS, ROWS]);
+            }
+            DurableChange::DeleteSet { .. } => {
+                self.stores.extend([SETS, SET_ITEMS]);
             }
         }
     }
@@ -638,6 +688,34 @@ fn decode_list_record(
         rows,
     };
     validate_list_record(&record)?;
+    Ok(record)
+}
+
+fn encode_collection_record(record: CollectionRecord) -> Result<Vec<u8>, ComponentCodecError> {
+    let mut bytes = Vec::new();
+    Encoder::new(&mut bytes)
+        .array(3)
+        .and_then(|encoder| encoder.u32(COMPONENT_FORMAT))
+        .and_then(|encoder| encoder.bool(record.touched))
+        .and_then(|encoder| encoder.u64(record.revision))
+        .map_err(encode_error)?;
+    Ok(bytes)
+}
+
+fn decode_collection_record(
+    bytes: &[u8],
+    limits: DecodeLimits,
+    label: &str,
+) -> Result<CollectionRecord, ComponentCodecError> {
+    component_size(bytes, limits, label)?;
+    let mut decoder = Decoder::new(bytes);
+    expect_array(&mut decoder, 3, label)?;
+    expect_format(&mut decoder, label)?;
+    let record = CollectionRecord {
+        touched: decoder.bool().map_err(decode_error)?,
+        revision: decoder.u64().map_err(decode_error)?,
+    };
+    reject_trailing(&decoder, bytes, label)?;
     Ok(record)
 }
 
@@ -1006,6 +1084,42 @@ fn row_storage_key(application: &ApplicationIdentity, memory: MemoryId, row: Row
     )
 }
 
+fn collection_storage_key(
+    application: &ApplicationIdentity,
+    collection_id: &DurableCollectionId,
+) -> Result<String, StoreError> {
+    super::validate_collection_id(collection_id)?;
+    let depth: u16 = collection_id
+        .owner
+        .ancestors
+        .len()
+        .try_into()
+        .map_err(|_| StoreError::InvalidAuthority("collection owner depth overflow".to_owned()))?;
+    let mut key = format!(
+        "{}{}{:04x}",
+        application_storage_key(application),
+        encode_hex(collection_id.memory_id.as_bytes()),
+        depth,
+    );
+    for row in &collection_id.owner.ancestors {
+        key.push_str(&encode_hex(row.list_memory_id.as_bytes()));
+        key.push_str(&format!("{:016x}{:016x}", row.row_key, row.row_generation));
+    }
+    Ok(key)
+}
+
+fn collection_item_storage_key(
+    application: &ApplicationIdentity,
+    collection_id: &DurableCollectionId,
+    item_digest: [u8; 32],
+) -> Result<String, StoreError> {
+    Ok(format!(
+        "{}{}",
+        collection_storage_key(application, collection_id)?,
+        encode_hex(&item_digest),
+    ))
+}
+
 fn checkpoint_storage_key(application: &ApplicationIdentity, epoch: u64) -> String {
     format!("{}{:016x}", application_storage_key(application), epoch)
 }
@@ -1134,6 +1248,60 @@ fn row_from_storage_key(key: &str) -> Result<(MemoryId, RowRef), StoreError> {
     Ok((memory, row))
 }
 
+fn collection_from_storage_key(key: &str, label: &str) -> Result<DurableCollectionId, StoreError> {
+    if key.len() < 132 {
+        return Err(corrupt(format!("invalid {label} key")));
+    }
+    let memory_id = MemoryId(decode_hex_digest(&key[64..128])?);
+    let depth = usize::from(decode_hex_u16(&key[128..132])?);
+    let expected = 132usize
+        .checked_add(
+            depth
+                .checked_mul(96)
+                .ok_or_else(|| corrupt(format!("{label} key depth overflow")))?,
+        )
+        .ok_or_else(|| corrupt(format!("{label} key length overflow")))?;
+    if key.len() != expected || depth > super::MAX_DURABLE_OWNER_DEPTH {
+        return Err(corrupt(format!("invalid {label} key length")));
+    }
+    let mut ancestors = Vec::with_capacity(depth);
+    for chunk in key[132..].as_bytes().chunks_exact(96) {
+        let chunk =
+            std::str::from_utf8(chunk).map_err(|_| corrupt(format!("{label} key is not UTF-8")))?;
+        ancestors.push(DurableRowId {
+            list_memory_id: MemoryId(decode_hex_digest(&chunk[..64])?),
+            row_key: decode_hex_u64(&chunk[64..80])?,
+            row_generation: decode_hex_u64(&chunk[80..96])?,
+        });
+    }
+    let collection_id = DurableCollectionId {
+        memory_id,
+        owner: DurableOwner { ancestors },
+    };
+    super::validate_collection_id(&collection_id)?;
+    Ok(collection_id)
+}
+
+fn collection_item_from_storage_key(
+    key: &str,
+    label: &str,
+) -> Result<(DurableCollectionId, [u8; 32]), StoreError> {
+    if key.len() < 196 {
+        return Err(corrupt(format!("invalid {label} key")));
+    }
+    let split = key.len() - 64;
+    Ok((
+        collection_from_storage_key(&key[..split], label)?,
+        decode_hex_digest(&key[split..])?,
+    ))
+}
+
+fn stored_value_digest(value: &StoredValue) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    super::hash_stored_value(&mut hasher, value);
+    hasher.finalize().into()
+}
+
 fn encode_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut encoded = String::with_capacity(bytes.len() * 2);
@@ -1176,6 +1344,17 @@ fn decode_hex_u64(value: &str) -> Result<u64, StoreError> {
     u64::from_str_radix(value, 16).map_err(|_| corrupt("invalid u64 storage key component"))
 }
 
+fn decode_hex_u16(value: &str) -> Result<u16, StoreError> {
+    if value.len() != 4
+        || !value
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return Err(corrupt("invalid hexadecimal u16 storage key component"));
+    }
+    u16::from_str_radix(value, 16).map_err(|_| corrupt("invalid u16 storage key component"))
+}
+
 fn codec_backend(error: impl fmt::Display) -> StoreError {
     StoreError::Backend(format!("durable CBOR: {error}"))
 }
@@ -1196,6 +1375,8 @@ struct RawLoadedApplication {
     scalars: BTreeMap<MemoryId, super::StoredScalar>,
     row_records: BTreeMap<(MemoryId, RowRef), StoredRow>,
     list_records: BTreeMap<MemoryId, Vec<u8>>,
+    maps: BTreeMap<DurableCollectionId, StoredMap>,
+    sets: BTreeMap<DurableCollectionId, StoredSet>,
     completed_migration_edges: BTreeSet<MigrationEdgeId>,
     outbox: BTreeMap<OutboxItemId, super::DurableOutboxItem>,
     content_artifact_manifest: ContentArtifactManifest,
@@ -1943,6 +2124,24 @@ fn restore_image_admission_cost(image: &RestoreImage) -> BrowserPersistenceAdmis
     for list in image.lists.values() {
         cost.add(stored_list_admission_cost(list));
     }
+    for map in image.maps.values() {
+        let mut map_cost = BrowserPersistenceAdmissionCost::from_parts(64, 1);
+        for (key, value) in &map.entries {
+            map_cost.add_change(
+                64usize
+                    .saturating_add(stored_value_bytes(key, 0))
+                    .saturating_add(stored_value_bytes(value, 0)),
+            );
+        }
+        cost.add(map_cost);
+    }
+    for set in image.sets.values() {
+        let mut set_cost = BrowserPersistenceAdmissionCost::from_parts(64, 1);
+        for item in &set.items {
+            set_cost.add_change(64usize.saturating_add(stored_value_bytes(item, 0)));
+        }
+        cost.add(set_cost);
+    }
     for item in image.outbox.values() {
         cost.add_change(64usize.saturating_add(outbox_item_bytes(item)));
     }
@@ -1985,6 +2184,32 @@ fn durable_change_admission_cost(change: &DurableChange) -> BrowserPersistenceAd
             .saturating_add(stored_value_bytes(value, 0)),
         DurableChange::InsertRow { row, .. } => 128usize.saturating_add(stored_row_bytes(row)),
         DurableChange::RemoveRow { .. } => 112,
+        DurableChange::SetMap { value, .. } => {
+            let mut cost = BrowserPersistenceAdmissionCost::from_parts(64, 1);
+            for (key, value) in &value.entries {
+                cost.add_change(
+                    64usize
+                        .saturating_add(stored_value_bytes(key, 0))
+                        .saturating_add(stored_value_bytes(value, 0)),
+                );
+            }
+            return cost;
+        }
+        DurableChange::MapUpsert { key, value, .. } => 96usize
+            .saturating_add(stored_value_bytes(key, 0))
+            .saturating_add(stored_value_bytes(value, 0)),
+        DurableChange::MapRemove { key, .. } => 80usize.saturating_add(stored_value_bytes(key, 0)),
+        DurableChange::DeleteMap { .. } | DurableChange::DeleteSet { .. } => 64,
+        DurableChange::SetSet { value, .. } => {
+            let mut cost = BrowserPersistenceAdmissionCost::from_parts(64, 1);
+            for item in &value.items {
+                cost.add_change(64usize.saturating_add(stored_value_bytes(item, 0)));
+            }
+            return cost;
+        }
+        DurableChange::SetAdd { item, .. } | DurableChange::SetRemove { item, .. } => {
+            80usize.saturating_add(stored_value_bytes(item, 0))
+        }
     };
     BrowserPersistenceAdmissionCost::from_parts(payload_bytes, 1)
 }
@@ -2056,6 +2281,14 @@ fn stored_value_bytes(value: &super::StoredValue, depth: usize) -> usize {
         super::StoredValue::Bytes(value) => 24usize.saturating_add(value.len()),
         super::StoredValue::List(values) => values.iter().fold(24, |bytes, value| {
             bytes.saturating_add(stored_value_bytes(value, depth + 1))
+        }),
+        super::StoredValue::Map(entries) => entries.iter().fold(24, |bytes, (key, value)| {
+            bytes
+                .saturating_add(stored_value_bytes(key, depth + 1))
+                .saturating_add(stored_value_bytes(value, depth + 1))
+        }),
+        super::StoredValue::Set(items) => items.iter().fold(24, |bytes, item| {
+            bytes.saturating_add(stored_value_bytes(item, depth + 1))
         }),
         super::StoredValue::Object(fields) => fields.iter().fold(24, |bytes, (name, value)| {
             bytes
@@ -2550,6 +2783,10 @@ impl IndexedDbBackend {
             SLOTS,
             LISTS,
             ROWS,
+            MAPS,
+            MAP_ENTRIES,
+            SETS,
+            SET_ITEMS,
             MIGRATIONS,
             OUTBOX,
             BLOBS,
@@ -2653,6 +2890,8 @@ impl IndexedDbBackend {
                     CHECKPOINTS,
                     SLOTS,
                     ROWS,
+                    MAP_ENTRIES,
+                    SET_ITEMS,
                     BLOBS,
                     ARTIFACTS,
                     ARTIFACT_OWNERS,
@@ -2911,9 +3150,25 @@ async fn apply_sparse_changes(
                     &memory_storage_key(application, *memory_id),
                 )
                 .await?
+                    || collection_memory_exists_sparse(
+                        transaction,
+                        MAPS,
+                        application,
+                        *memory_id,
+                        limits,
+                    )
+                    .await?
+                    || collection_memory_exists_sparse(
+                        transaction,
+                        SETS,
+                        application,
+                        *memory_id,
+                        limits,
+                    )
+                    .await?
                 {
                     return Err(StoreError::InvalidAuthority(format!(
-                        "memory {memory_id} is already a list"
+                        "memory {memory_id} already has a non-scalar authority kind"
                     )));
                 }
                 let key = memory_storage_key(application, *memory_id);
@@ -2940,9 +3195,25 @@ async fn apply_sparse_changes(
                     &memory_storage_key(application, *memory_id),
                 )
                 .await?
+                    || collection_memory_exists_sparse(
+                        transaction,
+                        MAPS,
+                        application,
+                        *memory_id,
+                        limits,
+                    )
+                    .await?
+                    || collection_memory_exists_sparse(
+                        transaction,
+                        SETS,
+                        application,
+                        *memory_id,
+                        limits,
+                    )
+                    .await?
                 {
                     return Err(StoreError::InvalidAuthority(format!(
-                        "memory {memory_id} is already a scalar"
+                        "memory {memory_id} already has a non-list authority kind"
                     )));
                 }
                 super::validate_list(*memory_id, value)?;
@@ -2964,9 +3235,25 @@ async fn apply_sparse_changes(
                     &memory_storage_key(application, *memory_id),
                 )
                 .await?
+                    || collection_memory_exists_sparse(
+                        transaction,
+                        MAPS,
+                        application,
+                        *memory_id,
+                        limits,
+                    )
+                    .await?
+                    || collection_memory_exists_sparse(
+                        transaction,
+                        SETS,
+                        application,
+                        *memory_id,
+                        limits,
+                    )
+                    .await?
                 {
                     return Err(StoreError::InvalidAuthority(format!(
-                        "memory {memory_id} is already a scalar"
+                        "memory {memory_id} already has a non-list authority kind"
                     )));
                 }
                 let mut list =
@@ -3177,6 +3464,245 @@ async fn apply_sparse_changes(
             DurableChange::DeleteList { memory_id } => {
                 delete_list_sparse(transaction, application, *memory_id, limits).await?;
             }
+            DurableChange::SetMap {
+                collection_id,
+                value,
+            } => {
+                if store_key_exists(
+                    transaction,
+                    SLOTS,
+                    &memory_storage_key(application, collection_id.memory_id),
+                )
+                .await?
+                    || store_key_exists(
+                        transaction,
+                        LISTS,
+                        &memory_storage_key(application, collection_id.memory_id),
+                    )
+                    .await?
+                    || collection_memory_exists_sparse(
+                        transaction,
+                        SETS,
+                        application,
+                        collection_id.memory_id,
+                        limits,
+                    )
+                    .await?
+                {
+                    return Err(StoreError::InvalidAuthority(format!(
+                        "memory {} already has a non-map authority kind",
+                        collection_id.memory_id
+                    )));
+                }
+                validate_collection_owner_sparse(transaction, application, collection_id, limits)
+                    .await?;
+                replace_map_sparse(transaction, application, collection_id, value, limits).await?;
+            }
+            DurableChange::MapUpsert {
+                collection_id,
+                revision,
+                key,
+                value,
+            } => {
+                validate_collection_owner_sparse(transaction, application, collection_id, limits)
+                    .await?;
+                let mut record = load_collection_record_sparse(
+                    transaction,
+                    MAPS,
+                    application,
+                    collection_id,
+                    limits,
+                    "map metadata",
+                )
+                .await?
+                .ok_or_else(|| {
+                    StoreError::InvalidAuthority(format!(
+                        "cannot upsert into missing map {}",
+                        collection_id.memory_id
+                    ))
+                })?;
+                super::advance_collection_revision(
+                    collection_id,
+                    record.revision,
+                    revision,
+                    "map",
+                )?;
+                save_map_entry_sparse(transaction, application, collection_id, key, value, limits)
+                    .await?;
+                record.touched = true;
+                record.revision = *revision;
+                save_collection_record_sparse(
+                    transaction,
+                    MAPS,
+                    application,
+                    collection_id,
+                    record,
+                )
+                .await?;
+            }
+            DurableChange::MapRemove {
+                collection_id,
+                revision,
+                key,
+            } => {
+                validate_collection_owner_sparse(transaction, application, collection_id, limits)
+                    .await?;
+                let mut record = load_collection_record_sparse(
+                    transaction,
+                    MAPS,
+                    application,
+                    collection_id,
+                    limits,
+                    "map metadata",
+                )
+                .await?
+                .ok_or_else(|| {
+                    StoreError::InvalidAuthority(format!(
+                        "cannot remove from missing map {}",
+                        collection_id.memory_id
+                    ))
+                })?;
+                super::advance_collection_revision(
+                    collection_id,
+                    record.revision,
+                    revision,
+                    "map",
+                )?;
+                delete_map_entry_sparse(transaction, application, collection_id, key, limits)
+                    .await?;
+                record.touched = true;
+                record.revision = *revision;
+                save_collection_record_sparse(
+                    transaction,
+                    MAPS,
+                    application,
+                    collection_id,
+                    record,
+                )
+                .await?;
+            }
+            DurableChange::DeleteMap { collection_id } => {
+                delete_map_sparse(transaction, application, collection_id, limits).await?;
+            }
+            DurableChange::SetSet {
+                collection_id,
+                value,
+            } => {
+                if store_key_exists(
+                    transaction,
+                    SLOTS,
+                    &memory_storage_key(application, collection_id.memory_id),
+                )
+                .await?
+                    || store_key_exists(
+                        transaction,
+                        LISTS,
+                        &memory_storage_key(application, collection_id.memory_id),
+                    )
+                    .await?
+                    || collection_memory_exists_sparse(
+                        transaction,
+                        MAPS,
+                        application,
+                        collection_id.memory_id,
+                        limits,
+                    )
+                    .await?
+                {
+                    return Err(StoreError::InvalidAuthority(format!(
+                        "memory {} already has a non-set authority kind",
+                        collection_id.memory_id
+                    )));
+                }
+                validate_collection_owner_sparse(transaction, application, collection_id, limits)
+                    .await?;
+                replace_set_sparse(transaction, application, collection_id, value, limits).await?;
+            }
+            DurableChange::SetAdd {
+                collection_id,
+                revision,
+                item,
+            } => {
+                validate_collection_owner_sparse(transaction, application, collection_id, limits)
+                    .await?;
+                let mut record = load_collection_record_sparse(
+                    transaction,
+                    SETS,
+                    application,
+                    collection_id,
+                    limits,
+                    "set metadata",
+                )
+                .await?
+                .ok_or_else(|| {
+                    StoreError::InvalidAuthority(format!(
+                        "cannot add to missing set {}",
+                        collection_id.memory_id
+                    ))
+                })?;
+                super::advance_collection_revision(
+                    collection_id,
+                    record.revision,
+                    revision,
+                    "set",
+                )?;
+                save_set_item_sparse(transaction, application, collection_id, item, true, limits)
+                    .await?;
+                record.touched = true;
+                record.revision = *revision;
+                save_collection_record_sparse(
+                    transaction,
+                    SETS,
+                    application,
+                    collection_id,
+                    record,
+                )
+                .await?;
+            }
+            DurableChange::SetRemove {
+                collection_id,
+                revision,
+                item,
+            } => {
+                validate_collection_owner_sparse(transaction, application, collection_id, limits)
+                    .await?;
+                let mut record = load_collection_record_sparse(
+                    transaction,
+                    SETS,
+                    application,
+                    collection_id,
+                    limits,
+                    "set metadata",
+                )
+                .await?
+                .ok_or_else(|| {
+                    StoreError::InvalidAuthority(format!(
+                        "cannot remove from missing set {}",
+                        collection_id.memory_id
+                    ))
+                })?;
+                super::advance_collection_revision(
+                    collection_id,
+                    record.revision,
+                    revision,
+                    "set",
+                )?;
+                delete_set_item_sparse(transaction, application, collection_id, item, limits)
+                    .await?;
+                record.touched = true;
+                record.revision = *revision;
+                save_collection_record_sparse(
+                    transaction,
+                    SETS,
+                    application,
+                    collection_id,
+                    record,
+                )
+                .await?;
+            }
+            DurableChange::DeleteSet { collection_id } => {
+                delete_set_sparse(transaction, application, collection_id, limits).await?;
+            }
         }
     }
     Ok(())
@@ -3237,6 +3763,385 @@ async fn apply_sparse_outbox_changes(
 }
 
 #[cfg(target_arch = "wasm32")]
+async fn collection_memory_exists_sparse(
+    transaction: &Transaction,
+    store: &'static str,
+    application: &ApplicationIdentity,
+    memory: MemoryId,
+    limits: DecodeLimits,
+) -> Result<bool, StoreError> {
+    let prefix = memory_storage_key(application, memory);
+    for (key, _) in scan_prefix(transaction, store, &prefix, limits).await? {
+        if collection_from_storage_key(&key, store)?.memory_id == memory {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn validate_collection_owner_sparse(
+    transaction: &Transaction,
+    application: &ApplicationIdentity,
+    collection_id: &DurableCollectionId,
+    limits: DecodeLimits,
+) -> Result<(), StoreError> {
+    super::validate_collection_id(collection_id)?;
+    for (depth, owner_row) in collection_id.owner.ancestors.iter().enumerate() {
+        let list =
+            load_list_record_sparse(transaction, application, owner_row.list_memory_id, limits)
+                .await?
+                .ok_or_else(|| {
+                    StoreError::InvalidAuthority(format!(
+                        "collection {} owner references missing list {}",
+                        collection_id.memory_id, owner_row.list_memory_id
+                    ))
+                })?;
+        let row_ref = RowRef {
+            key: owner_row.row_key,
+            generation: owner_row.row_generation,
+        };
+        if !list.rows.iter().any(|candidate| candidate.row == row_ref) {
+            return Err(StoreError::InvalidAuthority(format!(
+                "collection {} owner references missing row {}:{}",
+                collection_id.memory_id, owner_row.row_key, owner_row.row_generation
+            )));
+        }
+        let storage_key = row_storage_key(application, owner_row.list_memory_id, row_ref);
+        let bytes = read_store_bytes(transaction, ROWS, &storage_key)
+            .await?
+            .ok_or_else(|| corrupt("collection owner list references a missing row payload"))?;
+        let row = decode_sparse_row(
+            transaction,
+            application,
+            owner_row.list_memory_id,
+            row_ref,
+            &bytes,
+            limits,
+        )
+        .await?;
+        if row.owner.ancestors.as_slice() != &collection_id.owner.ancestors[..=depth] {
+            return Err(StoreError::InvalidAuthority(format!(
+                "collection {} owner ancestry disagrees with row {}:{}",
+                collection_id.memory_id, owner_row.row_key, owner_row.row_generation
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn load_collection_record_sparse(
+    transaction: &Transaction,
+    store: &'static str,
+    application: &ApplicationIdentity,
+    collection_id: &DurableCollectionId,
+    limits: DecodeLimits,
+    label: &str,
+) -> Result<Option<CollectionRecord>, StoreError> {
+    let key = collection_storage_key(application, collection_id)?;
+    read_store_bytes(transaction, store, &key)
+        .await?
+        .map(|bytes| decode_collection_record(&bytes, limits, label).map_err(codec_backend))
+        .transpose()
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn save_collection_record_sparse(
+    transaction: &Transaction,
+    store: &'static str,
+    application: &ApplicationIdentity,
+    collection_id: &DurableCollectionId,
+    record: CollectionRecord,
+) -> Result<(), StoreError> {
+    apply_mutations(
+        transaction,
+        vec![StoreMutation::Put {
+            store,
+            key: collection_storage_key(application, collection_id)?,
+            value: encode_collection_record(record).map_err(codec_backend)?,
+        }],
+    )
+    .await
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn save_map_entry_sparse(
+    transaction: &Transaction,
+    application: &ApplicationIdentity,
+    collection_id: &DurableCollectionId,
+    key_value: &StoredValue,
+    value: &StoredValue,
+    limits: DecodeLimits,
+) -> Result<(), StoreError> {
+    let key =
+        collection_item_storage_key(application, collection_id, stored_value_digest(key_value))?;
+    let old = read_store_bytes(transaction, MAP_ENTRIES, &key).await?;
+    if let Some(bytes) = old.as_deref() {
+        let references =
+            map_entry_component_blob_references(bytes, limits).map_err(codec_backend)?;
+        let blobs = load_referenced_blobs(transaction, application, &references, limits).await?;
+        let (stored_key, _) =
+            decode_map_entry_component(bytes, limits, &blobs).map_err(codec_backend)?;
+        if stored_key != *key_value {
+            return Err(StoreError::InvalidAuthority(
+                "MAP key digest collides with different canonical key".to_owned(),
+            ));
+        }
+    }
+    let encoded = encode_map_entry_component(key_value, value).map_err(codec_backend)?;
+    replace_encoded_component(
+        transaction,
+        application,
+        MAP_ENTRIES,
+        key,
+        old,
+        Some(encoded),
+        limits,
+    )
+    .await
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn delete_map_entry_sparse(
+    transaction: &Transaction,
+    application: &ApplicationIdentity,
+    collection_id: &DurableCollectionId,
+    key_value: &StoredValue,
+    limits: DecodeLimits,
+) -> Result<(), StoreError> {
+    let key =
+        collection_item_storage_key(application, collection_id, stored_value_digest(key_value))?;
+    let old = read_store_bytes(transaction, MAP_ENTRIES, &key)
+        .await?
+        .ok_or_else(|| {
+            StoreError::InvalidAuthority(format!(
+                "map {} does not contain the removed key",
+                collection_id.memory_id
+            ))
+        })?;
+    let references = map_entry_component_blob_references(&old, limits).map_err(codec_backend)?;
+    let blobs = load_referenced_blobs(transaction, application, &references, limits).await?;
+    let (stored_key, _) =
+        decode_map_entry_component(&old, limits, &blobs).map_err(codec_backend)?;
+    if stored_key != *key_value {
+        return Err(StoreError::InvalidAuthority(
+            "MAP key digest collides with different canonical key".to_owned(),
+        ));
+    }
+    replace_encoded_component(
+        transaction,
+        application,
+        MAP_ENTRIES,
+        key,
+        Some(old),
+        None,
+        limits,
+    )
+    .await
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn save_set_item_sparse(
+    transaction: &Transaction,
+    application: &ApplicationIdentity,
+    collection_id: &DurableCollectionId,
+    item: &StoredValue,
+    reject_existing: bool,
+    limits: DecodeLimits,
+) -> Result<(), StoreError> {
+    let key = collection_item_storage_key(application, collection_id, stored_value_digest(item))?;
+    let old = read_store_bytes(transaction, SET_ITEMS, &key).await?;
+    if let Some(bytes) = old.as_deref() {
+        let references =
+            set_item_component_blob_references(bytes, limits).map_err(codec_backend)?;
+        let blobs = load_referenced_blobs(transaction, application, &references, limits).await?;
+        let stored_item =
+            decode_set_item_component(bytes, limits, &blobs).map_err(codec_backend)?;
+        if stored_item != *item {
+            return Err(StoreError::InvalidAuthority(
+                "SET item digest collides with different canonical item".to_owned(),
+            ));
+        }
+        if reject_existing {
+            return Err(StoreError::InvalidAuthority(format!(
+                "set {} already contains the added item",
+                collection_id.memory_id
+            )));
+        }
+    }
+    let encoded = encode_set_item_component(item).map_err(codec_backend)?;
+    replace_encoded_component(
+        transaction,
+        application,
+        SET_ITEMS,
+        key,
+        old,
+        Some(encoded),
+        limits,
+    )
+    .await
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn delete_set_item_sparse(
+    transaction: &Transaction,
+    application: &ApplicationIdentity,
+    collection_id: &DurableCollectionId,
+    item: &StoredValue,
+    limits: DecodeLimits,
+) -> Result<(), StoreError> {
+    let key = collection_item_storage_key(application, collection_id, stored_value_digest(item))?;
+    let old = read_store_bytes(transaction, SET_ITEMS, &key)
+        .await?
+        .ok_or_else(|| {
+            StoreError::InvalidAuthority(format!(
+                "set {} does not contain the removed item",
+                collection_id.memory_id
+            ))
+        })?;
+    let references = set_item_component_blob_references(&old, limits).map_err(codec_backend)?;
+    let blobs = load_referenced_blobs(transaction, application, &references, limits).await?;
+    let stored_item = decode_set_item_component(&old, limits, &blobs).map_err(codec_backend)?;
+    if stored_item != *item {
+        return Err(StoreError::InvalidAuthority(
+            "SET item digest collides with different canonical item".to_owned(),
+        ));
+    }
+    replace_encoded_component(
+        transaction,
+        application,
+        SET_ITEMS,
+        key,
+        Some(old),
+        None,
+        limits,
+    )
+    .await
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn delete_collection_items_sparse(
+    transaction: &Transaction,
+    application: &ApplicationIdentity,
+    store: &'static str,
+    collection_id: &DurableCollectionId,
+    limits: DecodeLimits,
+) -> Result<(), StoreError> {
+    let prefix = collection_storage_key(application, collection_id)?;
+    for (key, old) in scan_prefix(transaction, store, &prefix, limits).await? {
+        let (stored_id, _) = collection_item_from_storage_key(&key, store)?;
+        if stored_id != *collection_id {
+            return Err(corrupt(format!(
+                "{store} range returned another collection identity"
+            )));
+        }
+        replace_encoded_component(
+            transaction,
+            application,
+            store,
+            key,
+            Some(old),
+            None,
+            limits,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn replace_map_sparse(
+    transaction: &Transaction,
+    application: &ApplicationIdentity,
+    collection_id: &DurableCollectionId,
+    map: &StoredMap,
+    limits: DecodeLimits,
+) -> Result<(), StoreError> {
+    super::validate_map(collection_id, map)?;
+    delete_collection_items_sparse(transaction, application, MAP_ENTRIES, collection_id, limits)
+        .await?;
+    for (key, value) in &map.entries {
+        save_map_entry_sparse(transaction, application, collection_id, key, value, limits).await?;
+    }
+    save_collection_record_sparse(
+        transaction,
+        MAPS,
+        application,
+        collection_id,
+        CollectionRecord {
+            touched: map.touched,
+            revision: map.revision,
+        },
+    )
+    .await
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn replace_set_sparse(
+    transaction: &Transaction,
+    application: &ApplicationIdentity,
+    collection_id: &DurableCollectionId,
+    set: &StoredSet,
+    limits: DecodeLimits,
+) -> Result<(), StoreError> {
+    super::validate_set(collection_id, set)?;
+    delete_collection_items_sparse(transaction, application, SET_ITEMS, collection_id, limits)
+        .await?;
+    for item in &set.items {
+        save_set_item_sparse(transaction, application, collection_id, item, false, limits).await?;
+    }
+    save_collection_record_sparse(
+        transaction,
+        SETS,
+        application,
+        collection_id,
+        CollectionRecord {
+            touched: set.touched,
+            revision: set.revision,
+        },
+    )
+    .await
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn delete_map_sparse(
+    transaction: &Transaction,
+    application: &ApplicationIdentity,
+    collection_id: &DurableCollectionId,
+    limits: DecodeLimits,
+) -> Result<(), StoreError> {
+    apply_mutations(
+        transaction,
+        vec![StoreMutation::Delete {
+            store: MAPS,
+            key: collection_storage_key(application, collection_id)?,
+        }],
+    )
+    .await?;
+    delete_collection_items_sparse(transaction, application, MAP_ENTRIES, collection_id, limits)
+        .await
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn delete_set_sparse(
+    transaction: &Transaction,
+    application: &ApplicationIdentity,
+    collection_id: &DurableCollectionId,
+    limits: DecodeLimits,
+) -> Result<(), StoreError> {
+    apply_mutations(
+        transaction,
+        vec![StoreMutation::Delete {
+            store: SETS,
+            key: collection_storage_key(application, collection_id)?,
+        }],
+    )
+    .await?;
+    delete_collection_items_sparse(transaction, application, SET_ITEMS, collection_id, limits).await
+}
+
+#[cfg(target_arch = "wasm32")]
 async fn replace_list_sparse(
     transaction: &Transaction,
     application: &ApplicationIdentity,
@@ -3292,7 +4197,25 @@ async fn delete_memory_sparse(
     limits: DecodeLimits,
 ) -> Result<(), StoreError> {
     delete_scalar_sparse(transaction, application, memory, limits).await?;
-    delete_list_sparse(transaction, application, memory, limits).await
+    delete_list_sparse(transaction, application, memory, limits).await?;
+    let prefix = memory_storage_key(application, memory);
+    let map_ids = scan_prefix(transaction, MAPS, &prefix, limits)
+        .await?
+        .into_iter()
+        .map(|(key, _)| collection_from_storage_key(&key, "map"))
+        .collect::<Result<Vec<_>, _>>()?;
+    for collection_id in map_ids {
+        delete_map_sparse(transaction, application, &collection_id, limits).await?;
+    }
+    let set_ids = scan_prefix(transaction, SETS, &prefix, limits)
+        .await?
+        .into_iter()
+        .map(|(key, _)| collection_from_storage_key(&key, "set"))
+        .collect::<Result<Vec<_>, _>>()?;
+    for collection_id in set_ids {
+        delete_set_sparse(transaction, application, &collection_id, limits).await?;
+    }
+    Ok(())
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -3498,6 +4421,8 @@ fn component_blob_references(
     match store {
         SLOTS => scalar_component_blob_references(bytes, limits).map_err(codec_backend),
         ROWS => row_component_blob_references(bytes, limits).map_err(codec_backend),
+        MAP_ENTRIES => map_entry_component_blob_references(bytes, limits).map_err(codec_backend),
+        SET_ITEMS => set_item_component_blob_references(bytes, limits).map_err(codec_backend),
         _ => Err(corrupt(format!(
             "store {store} does not contain blob-bearing components"
         ))),
@@ -3657,6 +4582,10 @@ async fn inspect_application(
     let scalar_count = count_prefix(transaction, SLOTS, &prefix, limits).await?;
     let list_count = count_prefix(transaction, LISTS, &prefix, limits).await?;
     let row_count = count_prefix(transaction, ROWS, &prefix, limits).await?;
+    let map_count = count_prefix(transaction, MAPS, &prefix, limits).await?;
+    let map_entry_count = count_prefix(transaction, MAP_ENTRIES, &prefix, limits).await?;
+    let set_count = count_prefix(transaction, SETS, &prefix, limits).await?;
+    let set_item_count = count_prefix(transaction, SET_ITEMS, &prefix, limits).await?;
     let completed_migration_count = count_prefix(transaction, MIGRATIONS, &prefix, limits).await?;
     let mut outbox = BTreeMap::new();
     let mut decoded_bytes = 0usize;
@@ -3690,6 +4619,10 @@ async fn inspect_application(
     snapshot.scalar_count = scalar_count;
     snapshot.list_count = list_count;
     snapshot.row_count = row_count;
+    snapshot.map_count = map_count;
+    snapshot.map_entry_count = map_entry_count;
+    snapshot.set_count = set_count;
+    snapshot.set_item_count = set_item_count;
     snapshot.encoded_value_bytes = None;
     snapshot.completed_migration_count = completed_migration_count;
     Ok(Some(snapshot))
@@ -3713,6 +4646,18 @@ async fn stage_blob_reclamation(
         merge_blob_references(
             &mut actual,
             &row_component_blob_references(&bytes, limits).map_err(codec_backend)?,
+        )?;
+    }
+    for (_, bytes) in scan_prefix(transaction, MAP_ENTRIES, &prefix, limits).await? {
+        merge_blob_references(
+            &mut actual,
+            &map_entry_component_blob_references(&bytes, limits).map_err(codec_backend)?,
+        )?;
+    }
+    for (_, bytes) in scan_prefix(transaction, SET_ITEMS, &prefix, limits).await? {
+        merge_blob_references(
+            &mut actual,
+            &set_item_component_blob_references(&bytes, limits).map_err(codec_backend)?,
         )?;
     }
 
@@ -4192,6 +5137,120 @@ async fn load_application_raw_cooperatively(
     })
     .await?;
 
+    let mut maps = BTreeMap::new();
+    scan_prefix_cooperatively(transaction, MAPS, &prefix, limits, metrics, |page| {
+        for (key, bytes) in page {
+            add_decode_bytes(&mut decoded_bytes, bytes.len(), limits)?;
+            let collection_id = collection_from_storage_key(&key, "map")?;
+            if scalars.contains_key(&collection_id.memory_id)
+                || list_records.contains_key(&collection_id.memory_id)
+            {
+                return Err(corrupt(
+                    "one memory key has both map and scalar/list authority",
+                ));
+            }
+            let record =
+                decode_collection_record(&bytes, limits, "map metadata").map_err(codec_backend)?;
+            if maps
+                .insert(
+                    collection_id,
+                    StoredMap {
+                        touched: record.touched,
+                        revision: record.revision,
+                        entries: BTreeMap::new(),
+                    },
+                )
+                .is_some()
+            {
+                return Err(corrupt("duplicate map collection key"));
+            }
+        }
+        Ok(())
+    })
+    .await?;
+    scan_prefix_cooperatively(transaction, MAP_ENTRIES, &prefix, limits, metrics, |page| {
+        for (storage_key, bytes) in page {
+            add_decode_bytes(&mut decoded_bytes, bytes.len(), limits)?;
+            let (collection_id, key_digest) =
+                collection_item_from_storage_key(&storage_key, "map entry")?;
+            let map = maps
+                .get_mut(&collection_id)
+                .ok_or_else(|| corrupt("map entry has no authority metadata"))?;
+            merge_blob_references(
+                &mut actual_blob_references,
+                &map_entry_component_blob_references(&bytes, limits).map_err(codec_backend)?,
+            )?;
+            let (key, value) =
+                decode_map_entry_component(&bytes, limits, &blobs).map_err(codec_backend)?;
+            if stored_value_digest(&key) != key_digest {
+                return Err(corrupt("map entry key digest does not match its payload"));
+            }
+            if map.entries.insert(key, value).is_some() {
+                return Err(corrupt("map authority repeats a canonical key"));
+            }
+        }
+        Ok(())
+    })
+    .await?;
+
+    let mut sets = BTreeMap::new();
+    scan_prefix_cooperatively(transaction, SETS, &prefix, limits, metrics, |page| {
+        for (key, bytes) in page {
+            add_decode_bytes(&mut decoded_bytes, bytes.len(), limits)?;
+            let collection_id = collection_from_storage_key(&key, "set")?;
+            if scalars.contains_key(&collection_id.memory_id)
+                || list_records.contains_key(&collection_id.memory_id)
+                || maps
+                    .keys()
+                    .any(|candidate| candidate.memory_id == collection_id.memory_id)
+            {
+                return Err(corrupt(
+                    "one memory key has both set and another authority kind",
+                ));
+            }
+            let record =
+                decode_collection_record(&bytes, limits, "set metadata").map_err(codec_backend)?;
+            if sets
+                .insert(
+                    collection_id,
+                    StoredSet {
+                        touched: record.touched,
+                        revision: record.revision,
+                        items: BTreeSet::new(),
+                    },
+                )
+                .is_some()
+            {
+                return Err(corrupt("duplicate set collection key"));
+            }
+        }
+        Ok(())
+    })
+    .await?;
+    scan_prefix_cooperatively(transaction, SET_ITEMS, &prefix, limits, metrics, |page| {
+        for (storage_key, bytes) in page {
+            add_decode_bytes(&mut decoded_bytes, bytes.len(), limits)?;
+            let (collection_id, item_digest) =
+                collection_item_from_storage_key(&storage_key, "set item")?;
+            let set = sets
+                .get_mut(&collection_id)
+                .ok_or_else(|| corrupt("set item has no authority metadata"))?;
+            merge_blob_references(
+                &mut actual_blob_references,
+                &set_item_component_blob_references(&bytes, limits).map_err(codec_backend)?,
+            )?;
+            let item = decode_set_item_component(&bytes, limits, &blobs).map_err(codec_backend)?;
+            if stored_value_digest(&item) != item_digest {
+                return Err(corrupt("set item digest does not match its payload"));
+            }
+            if !set.items.insert(item) {
+                return Err(corrupt("set authority repeats a canonical item"));
+            }
+        }
+        Ok(())
+    })
+    .await?;
+
     let mut completed_migration_edges = BTreeSet::new();
     scan_prefix_cooperatively(transaction, MIGRATIONS, &prefix, limits, metrics, |page| {
         for (key, bytes) in page {
@@ -4295,6 +5354,8 @@ async fn load_application_raw_cooperatively(
         scalars,
         row_records,
         list_records,
+        maps,
+        sets,
         completed_migration_edges,
         outbox,
         content_artifact_manifest,
@@ -4402,6 +5463,8 @@ async fn assemble_restore_image_cooperatively(
         scalars,
         mut row_records,
         list_records,
+        maps,
+        sets,
         completed_migration_edges,
         outbox,
         content_artifact_manifest,
@@ -4550,7 +5613,7 @@ async fn assemble_restore_image_cooperatively(
         return Err(corrupt("row store contains unreferenced authority"));
     }
 
-    Ok(RestoreImage {
+    let image = RestoreImage {
         application: meta.application,
         schema_version: meta.schema_version,
         schema_hash: meta.schema_hash,
@@ -4558,10 +5621,17 @@ async fn assemble_restore_image_cooperatively(
         through_turn_sequence: meta.through_turn_sequence,
         scalars,
         lists,
+        maps,
+        sets,
         completed_migration_edges,
         outbox,
         content_artifact_manifest,
-    })
+    };
+    for collection_id in image.maps.keys().chain(image.sets.keys()) {
+        super::validate_collection_owner_against_image(&image, collection_id)?;
+    }
+    super::validate_authority_kinds_disjoint(&image)?;
+    Ok(image)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -4656,6 +5726,104 @@ async fn load_application(
         return Err(corrupt("row store contains unreferenced authority"));
     }
 
+    let mut maps = BTreeMap::new();
+    for (key, bytes) in scan_prefix(transaction, MAPS, &prefix, limits).await? {
+        add_decode_bytes(&mut decoded_bytes, bytes.len(), limits)?;
+        let collection_id = collection_from_storage_key(&key, "map")?;
+        if scalars.contains_key(&collection_id.memory_id)
+            || lists.contains_key(&collection_id.memory_id)
+        {
+            return Err(corrupt(
+                "one memory key has both map and scalar/list authority",
+            ));
+        }
+        let record =
+            decode_collection_record(&bytes, limits, "map metadata").map_err(codec_backend)?;
+        if maps
+            .insert(
+                collection_id,
+                StoredMap {
+                    touched: record.touched,
+                    revision: record.revision,
+                    entries: BTreeMap::new(),
+                },
+            )
+            .is_some()
+        {
+            return Err(corrupt("duplicate map collection key"));
+        }
+    }
+    for (storage_key, bytes) in scan_prefix(transaction, MAP_ENTRIES, &prefix, limits).await? {
+        add_decode_bytes(&mut decoded_bytes, bytes.len(), limits)?;
+        let (collection_id, key_digest) =
+            collection_item_from_storage_key(&storage_key, "map entry")?;
+        let map = maps
+            .get_mut(&collection_id)
+            .ok_or_else(|| corrupt("map entry has no authority metadata"))?;
+        merge_blob_references(
+            &mut actual_blob_references,
+            &map_entry_component_blob_references(&bytes, limits).map_err(codec_backend)?,
+        )?;
+        let (key, value) =
+            decode_map_entry_component(&bytes, limits, &blobs).map_err(codec_backend)?;
+        if stored_value_digest(&key) != key_digest {
+            return Err(corrupt("map entry key digest does not match its payload"));
+        }
+        if map.entries.insert(key, value).is_some() {
+            return Err(corrupt("map authority repeats a canonical key"));
+        }
+    }
+
+    let mut sets = BTreeMap::new();
+    for (key, bytes) in scan_prefix(transaction, SETS, &prefix, limits).await? {
+        add_decode_bytes(&mut decoded_bytes, bytes.len(), limits)?;
+        let collection_id = collection_from_storage_key(&key, "set")?;
+        if scalars.contains_key(&collection_id.memory_id)
+            || lists.contains_key(&collection_id.memory_id)
+            || maps
+                .keys()
+                .any(|candidate| candidate.memory_id == collection_id.memory_id)
+        {
+            return Err(corrupt(
+                "one memory key has both set and another authority kind",
+            ));
+        }
+        let record =
+            decode_collection_record(&bytes, limits, "set metadata").map_err(codec_backend)?;
+        if sets
+            .insert(
+                collection_id,
+                StoredSet {
+                    touched: record.touched,
+                    revision: record.revision,
+                    items: BTreeSet::new(),
+                },
+            )
+            .is_some()
+        {
+            return Err(corrupt("duplicate set collection key"));
+        }
+    }
+    for (storage_key, bytes) in scan_prefix(transaction, SET_ITEMS, &prefix, limits).await? {
+        add_decode_bytes(&mut decoded_bytes, bytes.len(), limits)?;
+        let (collection_id, item_digest) =
+            collection_item_from_storage_key(&storage_key, "set item")?;
+        let set = sets
+            .get_mut(&collection_id)
+            .ok_or_else(|| corrupt("set item has no authority metadata"))?;
+        merge_blob_references(
+            &mut actual_blob_references,
+            &set_item_component_blob_references(&bytes, limits).map_err(codec_backend)?,
+        )?;
+        let item = decode_set_item_component(&bytes, limits, &blobs).map_err(codec_backend)?;
+        if stored_value_digest(&item) != item_digest {
+            return Err(corrupt("set item digest does not match its payload"));
+        }
+        if !set.items.insert(item) {
+            return Err(corrupt("set authority repeats a canonical item"));
+        }
+    }
+
     let mut completed_migration_edges = BTreeSet::new();
     for (key, bytes) in scan_prefix(transaction, MIGRATIONS, &prefix, limits).await? {
         if key.len() != 128 || bytes.len() != 8 {
@@ -4694,10 +5862,16 @@ async fn load_application(
         through_turn_sequence: meta.through_turn_sequence,
         scalars,
         lists,
+        maps,
+        sets,
         completed_migration_edges,
         outbox,
         content_artifact_manifest,
     };
+    for collection_id in image.maps.keys().chain(image.sets.keys()) {
+        super::validate_collection_owner_against_image(&image, collection_id)?;
+    }
+    super::validate_authority_kinds_disjoint(&image)?;
     Ok(Some(LoadedApplication { image, meta }))
 }
 
@@ -4976,6 +6150,58 @@ fn stage_initial_image(image: &RestoreImage) -> Result<Vec<StoreMutation>, Store
         }
     }
 
+    for (collection_id, map) in &image.maps {
+        super::validate_map(collection_id, map)?;
+        mutations.push(StoreMutation::Put {
+            store: MAPS,
+            key: collection_storage_key(application, collection_id)?,
+            value: encode_collection_record(CollectionRecord {
+                touched: map.touched,
+                revision: map.revision,
+            })
+            .map_err(codec_backend)?,
+        });
+        for (key, value) in &map.entries {
+            mutations.push(StoreMutation::Put {
+                store: MAP_ENTRIES,
+                key: collection_item_storage_key(
+                    application,
+                    collection_id,
+                    stored_value_digest(key),
+                )?,
+                value: encode_map_entry_component(key, value)
+                    .map_err(codec_backend)?
+                    .bytes,
+            });
+        }
+    }
+
+    for (collection_id, set) in &image.sets {
+        super::validate_set(collection_id, set)?;
+        mutations.push(StoreMutation::Put {
+            store: SETS,
+            key: collection_storage_key(application, collection_id)?,
+            value: encode_collection_record(CollectionRecord {
+                touched: set.touched,
+                revision: set.revision,
+            })
+            .map_err(codec_backend)?,
+        });
+        for item in &set.items {
+            mutations.push(StoreMutation::Put {
+                store: SET_ITEMS,
+                key: collection_item_storage_key(
+                    application,
+                    collection_id,
+                    stored_value_digest(item),
+                )?,
+                value: encode_set_item_component(item)
+                    .map_err(codec_backend)?
+                    .bytes,
+            });
+        }
+    }
+
     for edge in &image.completed_migration_edges {
         mutations.push(StoreMutation::Put {
             store: MIGRATIONS,
@@ -5024,6 +6250,22 @@ fn collect_image_blobs(
             &mut blobs,
             encode_row_component(row).map_err(codec_backend)?,
         )?;
+    }
+    for map in image.maps.values() {
+        for (key, value) in &map.entries {
+            merge_encoded_blobs(
+                &mut blobs,
+                encode_map_entry_component(key, value).map_err(codec_backend)?,
+            )?;
+        }
+    }
+    for set in image.sets.values() {
+        for item in &set.items {
+            merge_encoded_blobs(
+                &mut blobs,
+                encode_set_item_component(item).map_err(codec_backend)?,
+            )?;
+        }
     }
     Ok(blobs)
 }
@@ -5487,9 +6729,9 @@ mod tests {
                 digest(&checkpoint_bytes),
             ),
             (
-                "df1c27a02b2140ec2ef767f96c4bf8e029c6d83c2c2dbde75805be3b5ea2dc75".to_owned(),
-                "8d8e37e06a2d136f6d0151c59c4e030d089e6ef14ffdb60958d8ce7a39682340".to_owned(),
-                "64c5f402d461a4f5b952dd27d2b617f92f8e61044404a96255fd05989a02b9e3".to_owned(),
+                "2699634605fb7ea40d40627e44ca6ca11d31291b1db27338d1425ab4c426d4eb".to_owned(),
+                "94cba5122854af7b277545ffa417136c2437282110b55c33cf9bc2583135ab89".to_owned(),
+                "5ba7fd1f2d466facc7581da2a1c06ffc54d4256c7118e8fabc8dbe04f351d4d7".to_owned(),
             )
         );
     }
@@ -5651,6 +6893,8 @@ mod tests {
                 SLOTS,
                 LISTS,
                 ROWS,
+                MAPS,
+                SETS,
                 CHECKPOINTS,
                 OUTBOX,
                 BLOBS,
@@ -5681,6 +6925,10 @@ mod tests {
                 SLOTS,
                 LISTS,
                 ROWS,
+                MAPS,
+                MAP_ENTRIES,
+                SETS,
+                SET_ITEMS,
                 CHECKPOINTS,
                 MIGRATIONS,
                 BLOBS,

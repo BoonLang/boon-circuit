@@ -10136,6 +10136,30 @@ fn map_semantic_memory(
                         row_scope_id: Some(row.scope),
                     }
                 }
+                boon_semantic::SemanticMemoryBackingV1::Collection { expression, owner } => {
+                    let semantic_expression =
+                        semantic_execution_expression(execution, expression)?;
+                    let kind_matches = matches!(
+                        (kind, &semantic_expression.kind),
+                        (
+                            crate::SemanticMemoryKind::Map,
+                            SemanticExpressionKind::Map { .. }
+                        ) | (
+                            crate::SemanticMemoryKind::Set,
+                            SemanticExpressionKind::Set { .. }
+                        )
+                    );
+                    if !kind_matches || semantic_expression.owner != owner {
+                        return Err(format!(
+                            "semantic memory {} collection backing does not match kind {:?} and owner {:?}",
+                            memory.id, memory.identity.kind, owner
+                        ));
+                    }
+                    crate::SemanticMemoryRuntimeBacking::Collection {
+                        expression: ids.expression(expression)?,
+                        owner,
+                    }
+                }
             };
             let status = match memory.status {
                 boon_semantic::SemanticMemoryStatusV1::Active => {
@@ -10274,6 +10298,8 @@ const fn map_semantic_memory_kind(
             crate::SemanticMemoryKind::IndexedField
         }
         boon_semantic::SemanticMemoryKindV1::ListOwner => crate::SemanticMemoryKind::ListOwner,
+        boon_semantic::SemanticMemoryKindV1::Map => crate::SemanticMemoryKind::Map,
+        boon_semantic::SemanticMemoryKindV1::Set => crate::SemanticMemoryKind::Set,
     }
 }
 

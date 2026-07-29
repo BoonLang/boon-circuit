@@ -1,17 +1,20 @@
 use super::codec::{
-    BlobDigest, BlobRecord, EncodedComponent, decode_blob_record, decode_outbox_record,
-    decode_row_component, decode_scalar_component, encode_blob_record, encode_outbox_record,
-    encode_row_component, encode_scalar_component, row_component_blob_references,
-    scalar_component_blob_references,
+    BlobDigest, BlobRecord, EncodedComponent, decode_blob_record, decode_map_entry_component,
+    decode_outbox_record, decode_row_component, decode_scalar_component, decode_set_item_component,
+    encode_blob_record, encode_map_entry_component, encode_outbox_record, encode_row_component,
+    encode_scalar_component, encode_set_item_component, map_entry_component_blob_references,
+    row_component_blob_references, scalar_component_blob_references,
+    set_item_component_blob_references,
 };
 use super::{
     ActivationAck, ActivationBatch, ApplicationTransfer, BarrierAck, CheckpointBatch, CommitAck,
     CompactAck, ContentArtifact, ContentArtifactBinding, ContentArtifactId,
     ContentArtifactManifest, ContentArtifactOwnerId, ContentArtifactRetention, DecodeLimits,
-    DurableChange, DurableOutboxItem, ExportApplicationRequest, LoadContentArtifactRequest,
-    OutboxItemId, PersistenceCommand, PersistenceDriver, PersistenceInspectorSnapshot,
-    PersistenceResult, PutContentArtifactAck, PutContentArtifactRequest, ResetApplicationAck,
-    ResetApplicationBatch, RestoreImage, ShutdownAck, StoreError, StoredList, StoredRow,
+    DurableChange, DurableCollectionId, DurableOutboxItem, DurableOwner, DurableRowId,
+    ExportApplicationRequest, LoadContentArtifactRequest, OutboxItemId, PersistenceCommand,
+    PersistenceDriver, PersistenceInspectorSnapshot, PersistenceResult, PutContentArtifactAck,
+    PutContentArtifactRequest, ResetApplicationAck, ResetApplicationBatch, RestoreImage,
+    ShutdownAck, StoreError, StoredList, StoredMap, StoredRow, StoredSet, StoredValue,
     apply_durable_content_artifact_changes, encode_restore_image, exact_content_artifact_closure,
     hash_application, inspector_snapshot_with_artifacts, validate_activation,
     validate_application_transfer, validate_checkpoint, validate_content_artifact,
@@ -33,6 +36,10 @@ const META: TableDefinition<&[u8], &[u8]> = TableDefinition::new("META");
 const SLOTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("SLOTS");
 const LISTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("LISTS");
 const ROWS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("ROWS");
+const MAPS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("MAPS");
+const MAP_ENTRIES: TableDefinition<&[u8], &[u8]> = TableDefinition::new("MAP_ENTRIES");
+const SETS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("SETS");
+const SET_ITEMS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("SET_ITEMS");
 const CHECKPOINTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("CHECKPOINTS");
 const MIGRATIONS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("MIGRATIONS");
 const OUTBOX: TableDefinition<&[u8], &[u8]> = TableDefinition::new("OUTBOX");
@@ -40,7 +47,7 @@ const BLOBS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("BLOBS");
 const ARTIFACTS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("ARTIFACTS");
 const ARTIFACT_OWNERS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("ARTIFACT_OWNERS");
 
-const COMPONENT_FORMAT: u32 = 3;
+const COMPONENT_FORMAT: u32 = 4;
 const MAX_CHECKPOINT_RECORDS_PER_APPLICATION: usize = 64;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -73,6 +80,12 @@ struct ListRecord {
     next_key: u64,
     next_order_token: u128,
     rows: Vec<ListRowRef>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CollectionRecord {
+    touched: bool,
+    revision: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -234,6 +247,117 @@ impl RedbDriver {
             }
         }
 
+        let mut maps = BTreeMap::new();
+        {
+            let map_table = transaction.open_table(MAPS).map_err(backend)?;
+            for entry in map_table.iter().map_err(backend)? {
+                let (key, value) = entry.map_err(backend)?;
+                let key = key.value();
+                if !key.starts_with(&app) {
+                    continue;
+                }
+                let collection_id = collection_from_key(key, "map")?;
+                let bytes = value.value();
+                add_decode_bytes(&mut decoded_bytes, bytes.len(), self.limits)?;
+                let record = decode_collection_record(bytes, self.limits, "map metadata")?;
+                if maps
+                    .insert(
+                        collection_id,
+                        StoredMap {
+                            touched: record.touched,
+                            revision: record.revision,
+                            entries: BTreeMap::new(),
+                        },
+                    )
+                    .is_some()
+                {
+                    return Err(corrupt("duplicate map collection key"));
+                }
+            }
+            let entry_table = transaction.open_table(MAP_ENTRIES).map_err(backend)?;
+            for entry in entry_table.iter().map_err(backend)? {
+                let (storage_key, value) = entry.map_err(backend)?;
+                let storage_key = storage_key.value();
+                if !storage_key.starts_with(&app) {
+                    continue;
+                }
+                let (collection_id, key_digest) =
+                    collection_item_from_key(storage_key, "map entry")?;
+                let map = maps
+                    .get_mut(&collection_id)
+                    .ok_or_else(|| corrupt("map entry has no authority metadata"))?;
+                let bytes = value.value();
+                add_decode_bytes(&mut decoded_bytes, bytes.len(), self.limits)?;
+                merge_blob_references(
+                    &mut actual_blob_references,
+                    &map_entry_component_blob_references(bytes, self.limits).map_err(codec)?,
+                )?;
+                let (key, value) =
+                    decode_map_entry_component(bytes, self.limits, &blobs).map_err(codec)?;
+                if stored_value_digest(&key) != key_digest {
+                    return Err(corrupt("map entry key digest does not match its payload"));
+                }
+                if map.entries.insert(key, value).is_some() {
+                    return Err(corrupt("map authority repeats a canonical key"));
+                }
+            }
+        }
+
+        let mut sets = BTreeMap::new();
+        {
+            let set_table = transaction.open_table(SETS).map_err(backend)?;
+            for entry in set_table.iter().map_err(backend)? {
+                let (key, value) = entry.map_err(backend)?;
+                let key = key.value();
+                if !key.starts_with(&app) {
+                    continue;
+                }
+                let collection_id = collection_from_key(key, "set")?;
+                let bytes = value.value();
+                add_decode_bytes(&mut decoded_bytes, bytes.len(), self.limits)?;
+                let record = decode_collection_record(bytes, self.limits, "set metadata")?;
+                if sets
+                    .insert(
+                        collection_id,
+                        StoredSet {
+                            touched: record.touched,
+                            revision: record.revision,
+                            items: BTreeSet::new(),
+                        },
+                    )
+                    .is_some()
+                {
+                    return Err(corrupt("duplicate set collection key"));
+                }
+            }
+            let item_table = transaction.open_table(SET_ITEMS).map_err(backend)?;
+            for entry in item_table.iter().map_err(backend)? {
+                let (storage_key, value) = entry.map_err(backend)?;
+                let storage_key = storage_key.value();
+                if !storage_key.starts_with(&app) {
+                    continue;
+                }
+                let (collection_id, item_digest) =
+                    collection_item_from_key(storage_key, "set item")?;
+                let set = sets
+                    .get_mut(&collection_id)
+                    .ok_or_else(|| corrupt("set item has no authority metadata"))?;
+                let bytes = value.value();
+                add_decode_bytes(&mut decoded_bytes, bytes.len(), self.limits)?;
+                merge_blob_references(
+                    &mut actual_blob_references,
+                    &set_item_component_blob_references(bytes, self.limits).map_err(codec)?,
+                )?;
+                let item = decode_set_item_component(bytes, self.limits, &blobs).map_err(codec)?;
+                if stored_value_digest(&item) != item_digest {
+                    return Err(corrupt("set item digest does not match its payload"));
+                }
+                if !set.items.insert(item) {
+                    return Err(corrupt("set authority repeats a canonical item"));
+                }
+            }
+        }
+
         let mut completed_migration_edges = BTreeSet::new();
         {
             let table = transaction.open_table(MIGRATIONS).map_err(backend)?;
@@ -272,7 +396,7 @@ impl RedbDriver {
         validate_content_artifact_storage(&content_artifact_manifest, &content_artifacts)?;
         validate_blob_reference_counts(&blobs, &actual_blob_references)?;
 
-        Ok(Some(RestoreImage {
+        let image = RestoreImage {
             application: meta.application,
             schema_version: meta.schema_version,
             schema_hash: meta.schema_hash,
@@ -280,10 +404,17 @@ impl RedbDriver {
             through_turn_sequence: meta.through_turn_sequence,
             scalars,
             lists,
+            maps,
+            sets,
             completed_migration_edges,
             outbox,
             content_artifact_manifest,
-        }))
+        };
+        super::validate_authority_kinds_disjoint(&image)?;
+        for collection_id in image.maps.keys().chain(image.sets.keys()) {
+            super::validate_collection_owner_against_image(&image, collection_id)?;
+        }
+        Ok(Some(image))
     }
 
     fn initialize(&self, image: RestoreImage) -> Result<CommitAck, StoreError> {
@@ -323,6 +454,10 @@ impl RedbDriver {
             let mut slots = transaction.open_table(SLOTS).map_err(backend)?;
             let mut lists = transaction.open_table(LISTS).map_err(backend)?;
             let mut rows = transaction.open_table(ROWS).map_err(backend)?;
+            let mut maps = transaction.open_table(MAPS).map_err(backend)?;
+            let mut map_entries = transaction.open_table(MAP_ENTRIES).map_err(backend)?;
+            let mut sets = transaction.open_table(SETS).map_err(backend)?;
+            let mut set_items = transaction.open_table(SET_ITEMS).map_err(backend)?;
             let mut migrations = transaction.open_table(MIGRATIONS).map_err(backend)?;
             let mut outbox = transaction.open_table(OUTBOX).map_err(backend)?;
             let mut blob_table = transaction.open_table(BLOBS).map_err(backend)?;
@@ -346,6 +481,28 @@ impl RedbDriver {
                     &app,
                     *memory,
                     list,
+                    self.limits,
+                    &mut candidate_blobs,
+                )?;
+            }
+            for (collection_id, map) in &image.maps {
+                replace_map(
+                    &mut maps,
+                    &mut map_entries,
+                    &app,
+                    collection_id,
+                    map,
+                    self.limits,
+                    &mut candidate_blobs,
+                )?;
+            }
+            for (collection_id, set) in &image.sets {
+                replace_set(
+                    &mut sets,
+                    &mut set_items,
+                    &app,
+                    collection_id,
+                    set,
                     self.limits,
                     &mut candidate_blobs,
                 )?;
@@ -437,6 +594,10 @@ impl RedbDriver {
                 let mut slots = transaction.open_table(SLOTS).map_err(backend)?;
                 let mut lists = transaction.open_table(LISTS).map_err(backend)?;
                 let mut rows = transaction.open_table(ROWS).map_err(backend)?;
+                let mut maps = transaction.open_table(MAPS).map_err(backend)?;
+                let mut map_entries = transaction.open_table(MAP_ENTRIES).map_err(backend)?;
+                let mut sets = transaction.open_table(SETS).map_err(backend)?;
+                let mut set_items = transaction.open_table(SET_ITEMS).map_err(backend)?;
                 let mut blob_table = transaction.open_table(BLOBS).map_err(backend)?;
                 let current_blobs = load_blobs_write(&blob_table, &app, self.limits)?;
                 let mut candidate_blobs = current_blobs.clone();
@@ -444,6 +605,10 @@ impl RedbDriver {
                     &mut slots,
                     &mut lists,
                     &mut rows,
+                    &mut maps,
+                    &mut map_entries,
+                    &mut sets,
+                    &mut set_items,
                     &app,
                     &batch.changes,
                     self.limits,
@@ -514,6 +679,16 @@ impl RedbDriver {
             delete_prefix(&mut transaction.open_table(SLOTS).map_err(backend)?, &app)?;
             delete_prefix(&mut transaction.open_table(LISTS).map_err(backend)?, &app)?;
             delete_prefix(&mut transaction.open_table(ROWS).map_err(backend)?, &app)?;
+            delete_prefix(&mut transaction.open_table(MAPS).map_err(backend)?, &app)?;
+            delete_prefix(
+                &mut transaction.open_table(MAP_ENTRIES).map_err(backend)?,
+                &app,
+            )?;
+            delete_prefix(&mut transaction.open_table(SETS).map_err(backend)?, &app)?;
+            delete_prefix(
+                &mut transaction.open_table(SET_ITEMS).map_err(backend)?,
+                &app,
+            )?;
             delete_prefix(
                 &mut transaction.open_table(MIGRATIONS).map_err(backend)?,
                 &app,
@@ -634,6 +809,10 @@ impl RedbDriver {
             let mut slots = transaction.open_table(SLOTS).map_err(backend)?;
             let mut lists = transaction.open_table(LISTS).map_err(backend)?;
             let mut rows = transaction.open_table(ROWS).map_err(backend)?;
+            let mut maps = transaction.open_table(MAPS).map_err(backend)?;
+            let mut map_entries = transaction.open_table(MAP_ENTRIES).map_err(backend)?;
+            let mut sets = transaction.open_table(SETS).map_err(backend)?;
+            let mut set_items = transaction.open_table(SET_ITEMS).map_err(backend)?;
             let mut blob_table = transaction.open_table(BLOBS).map_err(backend)?;
             let current_blobs = load_blobs_write(&blob_table, &app, self.limits)?;
             let mut candidate_blobs = current_blobs.clone();
@@ -641,6 +820,10 @@ impl RedbDriver {
                 &mut slots,
                 &mut lists,
                 &mut rows,
+                &mut maps,
+                &mut map_entries,
+                &mut sets,
+                &mut set_items,
                 &app,
                 &batch.authority_changes,
                 self.limits,
@@ -651,6 +834,10 @@ impl RedbDriver {
                     &mut slots,
                     &mut lists,
                     &mut rows,
+                    &mut maps,
+                    &mut map_entries,
+                    &mut sets,
+                    &mut set_items,
                     &app,
                     *memory,
                     self.limits,
@@ -733,6 +920,14 @@ impl RedbDriver {
             prefix_stats(&transaction.open_table(LISTS).map_err(backend)?, &app)?;
         let (row_count, row_bytes) =
             prefix_stats(&transaction.open_table(ROWS).map_err(backend)?, &app)?;
+        let (map_count, map_bytes) =
+            prefix_stats(&transaction.open_table(MAPS).map_err(backend)?, &app)?;
+        let (map_entry_count, map_entry_bytes) =
+            prefix_stats(&transaction.open_table(MAP_ENTRIES).map_err(backend)?, &app)?;
+        let (set_count, set_bytes) =
+            prefix_stats(&transaction.open_table(SETS).map_err(backend)?, &app)?;
+        let (set_item_count, set_item_bytes) =
+            prefix_stats(&transaction.open_table(SET_ITEMS).map_err(backend)?, &app)?;
         let (completed_migration_count, migration_bytes) =
             prefix_stats(&transaction.open_table(MIGRATIONS).map_err(backend)?, &app)?;
         let (_, meta_bytes) = prefix_stats(&transaction.open_table(META).map_err(backend)?, &app)?;
@@ -751,6 +946,10 @@ impl RedbDriver {
             scalar_bytes,
             list_bytes,
             row_bytes,
+            map_bytes,
+            map_entry_bytes,
+            set_bytes,
+            set_item_bytes,
             migration_bytes,
             meta_bytes,
             checkpoint_bytes,
@@ -801,6 +1000,10 @@ impl RedbDriver {
             scalar_count,
             list_count,
             row_count,
+            map_count,
+            map_entry_count,
+            set_count,
+            set_item_count,
             content_artifact_count: outbox_snapshot.content_artifact_count,
             content_artifact_bytes: outbox_snapshot.content_artifact_bytes,
             content_artifact_owner_count: outbox_snapshot.content_artifact_owner_count,
@@ -834,8 +1037,18 @@ impl RedbDriver {
             {
                 let slots = transaction.open_table(SLOTS).map_err(backend)?;
                 let rows = transaction.open_table(ROWS).map_err(backend)?;
+                let map_entries = transaction.open_table(MAP_ENTRIES).map_err(backend)?;
+                let set_items = transaction.open_table(SET_ITEMS).map_err(backend)?;
                 let mut blob_table = transaction.open_table(BLOBS).map_err(backend)?;
-                reclaim_blobs(&slots, &rows, &mut blob_table, &app, self.limits)?;
+                reclaim_blobs(
+                    &slots,
+                    &rows,
+                    &map_entries,
+                    &set_items,
+                    &mut blob_table,
+                    &app,
+                    self.limits,
+                )?;
             }
             {
                 let artifact_owners = transaction.open_table(ARTIFACT_OWNERS).map_err(backend)?;
@@ -996,6 +1209,8 @@ impl RedbDriver {
 fn reclaim_blobs(
     slots: &Table<'_, &[u8], &[u8]>,
     rows: &Table<'_, &[u8], &[u8]>,
+    map_entries: &Table<'_, &[u8], &[u8]>,
+    set_items: &Table<'_, &[u8], &[u8]>,
     blob_table: &mut Table<'_, &[u8], &[u8]>,
     app: &[u8; 32],
     limits: DecodeLimits,
@@ -1016,6 +1231,24 @@ fn reclaim_blobs(
             merge_blob_references(
                 &mut actual,
                 &row_component_blob_references(value.value(), limits).map_err(codec)?,
+            )?;
+        }
+    }
+    for entry in map_entries.iter().map_err(backend)? {
+        let (key, value) = entry.map_err(backend)?;
+        if key.value().starts_with(app) {
+            merge_blob_references(
+                &mut actual,
+                &map_entry_component_blob_references(value.value(), limits).map_err(codec)?,
+            )?;
+        }
+    }
+    for entry in set_items.iter().map_err(backend)? {
+        let (key, value) = entry.map_err(backend)?;
+        if key.value().starts_with(app) {
+            merge_blob_references(
+                &mut actual,
+                &set_item_component_blob_references(value.value(), limits).map_err(codec)?,
             )?;
         }
     }
@@ -1089,6 +1322,10 @@ fn create_tables(transaction: &WriteTransaction) -> Result<(), StoreError> {
     transaction.open_table(SLOTS).map_err(backend)?;
     transaction.open_table(LISTS).map_err(backend)?;
     transaction.open_table(ROWS).map_err(backend)?;
+    transaction.open_table(MAPS).map_err(backend)?;
+    transaction.open_table(MAP_ENTRIES).map_err(backend)?;
+    transaction.open_table(SETS).map_err(backend)?;
+    transaction.open_table(SET_ITEMS).map_err(backend)?;
     transaction.open_table(CHECKPOINTS).map_err(backend)?;
     transaction.open_table(MIGRATIONS).map_err(backend)?;
     transaction.open_table(OUTBOX).map_err(backend)?;
@@ -1508,6 +1745,10 @@ fn apply_changes(
     slots: &mut Table<'_, &[u8], &[u8]>,
     lists: &mut Table<'_, &[u8], &[u8]>,
     rows: &mut Table<'_, &[u8], &[u8]>,
+    maps: &mut Table<'_, &[u8], &[u8]>,
+    map_entries: &mut Table<'_, &[u8], &[u8]>,
+    sets: &mut Table<'_, &[u8], &[u8]>,
+    set_items: &mut Table<'_, &[u8], &[u8]>,
     app: &[u8; 32],
     changes: &[DurableChange],
     limits: DecodeLimits,
@@ -1516,9 +1757,12 @@ fn apply_changes(
     for change in changes {
         match change {
             DurableChange::SetScalar { memory_id, value } => {
-                if list_exists(lists, app, *memory_id)? {
+                if list_exists(lists, app, *memory_id)?
+                    || collection_memory_exists(maps, app, *memory_id, "map")?
+                    || collection_memory_exists(sets, app, *memory_id, "set")?
+                {
                     return Err(StoreError::InvalidAuthority(format!(
-                        "memory {memory_id} is already a list"
+                        "memory {memory_id} already has a non-scalar authority kind"
                     )));
                 }
                 save_scalar(slots, app, *memory_id, value, limits, blobs)?;
@@ -1527,9 +1771,12 @@ fn apply_changes(
                 delete_scalar(slots, app, *memory_id, limits, blobs)?;
             }
             DurableChange::SetList { memory_id, value } => {
-                if slot_exists(slots, app, *memory_id)? {
+                if slot_exists(slots, app, *memory_id)?
+                    || collection_memory_exists(maps, app, *memory_id, "map")?
+                    || collection_memory_exists(sets, app, *memory_id, "set")?
+                {
                     return Err(StoreError::InvalidAuthority(format!(
-                        "memory {memory_id} is already a scalar"
+                        "memory {memory_id} already has a non-list authority kind"
                     )));
                 }
                 validate_list(*memory_id, value)?;
@@ -1545,9 +1792,12 @@ fn apply_changes(
                 field_id,
                 value,
             } => {
-                if slot_exists(slots, app, *memory_id)? {
+                if slot_exists(slots, app, *memory_id)?
+                    || collection_memory_exists(maps, app, *memory_id, "map")?
+                    || collection_memory_exists(sets, app, *memory_id, "set")?
+                {
                     return Err(StoreError::InvalidAuthority(format!(
-                        "memory {memory_id} is already a scalar"
+                        "memory {memory_id} already has a non-list authority kind"
                     )));
                 }
                 let mut list = load_list(lists, app, *memory_id, limits)?.unwrap_or(ListRecord {
@@ -1695,6 +1945,145 @@ fn apply_changes(
             DurableChange::DeleteList { memory_id } => {
                 delete_list(lists, rows, app, *memory_id, limits, blobs)?;
             }
+            DurableChange::SetMap {
+                collection_id,
+                value,
+            } => {
+                if slot_exists(slots, app, collection_id.memory_id)?
+                    || list_exists(lists, app, collection_id.memory_id)?
+                    || collection_memory_exists(sets, app, collection_id.memory_id, "set")?
+                {
+                    return Err(StoreError::InvalidAuthority(format!(
+                        "memory {} already has a non-map authority kind",
+                        collection_id.memory_id
+                    )));
+                }
+                validate_collection_owner_tables(lists, rows, app, collection_id, limits, blobs)?;
+                replace_map(maps, map_entries, app, collection_id, value, limits, blobs)?;
+            }
+            DurableChange::MapUpsert {
+                collection_id,
+                revision,
+                key,
+                value,
+            } => {
+                validate_collection_owner_tables(lists, rows, app, collection_id, limits, blobs)?;
+                let mut record =
+                    load_collection_record(maps, app, collection_id, limits, "map metadata")?
+                        .ok_or_else(|| {
+                            StoreError::InvalidAuthority(format!(
+                                "cannot upsert into missing map {}",
+                                collection_id.memory_id
+                            ))
+                        })?;
+                super::advance_collection_revision(
+                    collection_id,
+                    record.revision,
+                    revision,
+                    "map",
+                )?;
+                save_map_entry(map_entries, app, collection_id, key, value, limits, blobs)?;
+                record.touched = true;
+                record.revision = *revision;
+                save_collection_record(maps, app, collection_id, record)?;
+            }
+            DurableChange::MapRemove {
+                collection_id,
+                revision,
+                key,
+            } => {
+                validate_collection_owner_tables(lists, rows, app, collection_id, limits, blobs)?;
+                let mut record =
+                    load_collection_record(maps, app, collection_id, limits, "map metadata")?
+                        .ok_or_else(|| {
+                            StoreError::InvalidAuthority(format!(
+                                "cannot remove from missing map {}",
+                                collection_id.memory_id
+                            ))
+                        })?;
+                super::advance_collection_revision(
+                    collection_id,
+                    record.revision,
+                    revision,
+                    "map",
+                )?;
+                delete_map_entry(map_entries, app, collection_id, key, limits, blobs)?;
+                record.touched = true;
+                record.revision = *revision;
+                save_collection_record(maps, app, collection_id, record)?;
+            }
+            DurableChange::DeleteMap { collection_id } => {
+                delete_map(maps, map_entries, app, collection_id, limits, blobs)?;
+            }
+            DurableChange::SetSet {
+                collection_id,
+                value,
+            } => {
+                if slot_exists(slots, app, collection_id.memory_id)?
+                    || list_exists(lists, app, collection_id.memory_id)?
+                    || collection_memory_exists(maps, app, collection_id.memory_id, "map")?
+                {
+                    return Err(StoreError::InvalidAuthority(format!(
+                        "memory {} already has a non-set authority kind",
+                        collection_id.memory_id
+                    )));
+                }
+                validate_collection_owner_tables(lists, rows, app, collection_id, limits, blobs)?;
+                replace_set(sets, set_items, app, collection_id, value, limits, blobs)?;
+            }
+            DurableChange::SetAdd {
+                collection_id,
+                revision,
+                item,
+            } => {
+                validate_collection_owner_tables(lists, rows, app, collection_id, limits, blobs)?;
+                let mut record =
+                    load_collection_record(sets, app, collection_id, limits, "set metadata")?
+                        .ok_or_else(|| {
+                            StoreError::InvalidAuthority(format!(
+                                "cannot add to missing set {}",
+                                collection_id.memory_id
+                            ))
+                        })?;
+                super::advance_collection_revision(
+                    collection_id,
+                    record.revision,
+                    revision,
+                    "set",
+                )?;
+                save_set_item(set_items, app, collection_id, item, limits, blobs)?;
+                record.touched = true;
+                record.revision = *revision;
+                save_collection_record(sets, app, collection_id, record)?;
+            }
+            DurableChange::SetRemove {
+                collection_id,
+                revision,
+                item,
+            } => {
+                validate_collection_owner_tables(lists, rows, app, collection_id, limits, blobs)?;
+                let mut record =
+                    load_collection_record(sets, app, collection_id, limits, "set metadata")?
+                        .ok_or_else(|| {
+                            StoreError::InvalidAuthority(format!(
+                                "cannot remove from missing set {}",
+                                collection_id.memory_id
+                            ))
+                        })?;
+                super::advance_collection_revision(
+                    collection_id,
+                    record.revision,
+                    revision,
+                    "set",
+                )?;
+                delete_set_item(set_items, app, collection_id, item, limits, blobs)?;
+                record.touched = true;
+                record.revision = *revision;
+                save_collection_record(sets, app, collection_id, record)?;
+            }
+            DurableChange::DeleteSet { collection_id } => {
+                delete_set(sets, set_items, app, collection_id, limits, blobs)?;
+            }
         }
     }
     Ok(())
@@ -1734,17 +2123,376 @@ fn replace_list(
     save_list(lists, app, memory, &record)
 }
 
+fn load_collection_record(
+    table: &Table<'_, &[u8], &[u8]>,
+    app: &[u8; 32],
+    collection_id: &DurableCollectionId,
+    limits: DecodeLimits,
+    label: &str,
+) -> Result<Option<CollectionRecord>, StoreError> {
+    let key = collection_storage_key(app, collection_id)?;
+    table
+        .get(key.as_slice())
+        .map_err(backend)?
+        .map(|value| decode_collection_record(value.value(), limits, label))
+        .transpose()
+}
+
+fn save_collection_record(
+    table: &mut Table<'_, &[u8], &[u8]>,
+    app: &[u8; 32],
+    collection_id: &DurableCollectionId,
+    record: CollectionRecord,
+) -> Result<(), StoreError> {
+    let key = collection_storage_key(app, collection_id)?;
+    let bytes = encode_collection_record(record)?;
+    table
+        .insert(key.as_slice(), bytes.as_slice())
+        .map_err(backend)?;
+    Ok(())
+}
+
+fn collection_memory_exists(
+    table: &Table<'_, &[u8], &[u8]>,
+    app: &[u8; 32],
+    memory_id: MemoryId,
+    label: &str,
+) -> Result<bool, StoreError> {
+    for entry in table.iter().map_err(backend)? {
+        let (key, _) = entry.map_err(backend)?;
+        let key = key.value();
+        if key.starts_with(app) && collection_from_key(key, label)?.memory_id == memory_id {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn validate_collection_owner_tables(
+    lists: &Table<'_, &[u8], &[u8]>,
+    rows: &Table<'_, &[u8], &[u8]>,
+    app: &[u8; 32],
+    collection_id: &DurableCollectionId,
+    limits: DecodeLimits,
+    blobs: &BTreeMap<BlobDigest, BlobRecord>,
+) -> Result<(), StoreError> {
+    super::validate_collection_id(collection_id)?;
+    for (depth, owner_row) in collection_id.owner.ancestors.iter().enumerate() {
+        let list = load_list(lists, app, owner_row.list_memory_id, limits)?.ok_or_else(|| {
+            StoreError::InvalidAuthority(format!(
+                "collection {} owner references missing list {}",
+                collection_id.memory_id, owner_row.list_memory_id
+            ))
+        })?;
+        let row_ref = RowRef {
+            key: owner_row.row_key,
+            generation: owner_row.row_generation,
+        };
+        if !list.rows.iter().any(|candidate| candidate.row == row_ref) {
+            return Err(StoreError::InvalidAuthority(format!(
+                "collection {} owner references missing row {}:{}",
+                collection_id.memory_id, owner_row.row_key, owner_row.row_generation
+            )));
+        }
+        let row = load_row(rows, app, owner_row.list_memory_id, row_ref, limits, blobs)?
+            .ok_or_else(|| corrupt("collection owner list references a missing row payload"))?;
+        if row.owner.ancestors.as_slice() != &collection_id.owner.ancestors[..=depth] {
+            return Err(StoreError::InvalidAuthority(format!(
+                "collection {} owner ancestry disagrees with row {}:{}",
+                collection_id.memory_id, owner_row.row_key, owner_row.row_generation
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn save_map_entry(
+    entries: &mut Table<'_, &[u8], &[u8]>,
+    app: &[u8; 32],
+    collection_id: &DurableCollectionId,
+    key_value: &StoredValue,
+    value: &StoredValue,
+    limits: DecodeLimits,
+    blobs: &mut BTreeMap<BlobDigest, BlobRecord>,
+) -> Result<(), StoreError> {
+    let key = collection_item_storage_key(app, collection_id, stored_value_digest(key_value))?;
+    let old_references = entries
+        .get(key.as_slice())
+        .map_err(backend)?
+        .map(|stored| {
+            let (stored_key, _) =
+                decode_map_entry_component(stored.value(), limits, blobs).map_err(codec)?;
+            if stored_key != *key_value {
+                return Err(StoreError::InvalidAuthority(
+                    "MAP key digest collides with different canonical key".to_owned(),
+                ));
+            }
+            map_entry_component_blob_references(stored.value(), limits).map_err(codec)
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let encoded = encode_map_entry_component(key_value, value).map_err(codec)?;
+    apply_component_blob_delta(blobs, &old_references, Some(&encoded))?;
+    entries
+        .insert(key.as_slice(), encoded.bytes.as_slice())
+        .map_err(backend)?;
+    Ok(())
+}
+
+fn delete_map_entry(
+    entries: &mut Table<'_, &[u8], &[u8]>,
+    app: &[u8; 32],
+    collection_id: &DurableCollectionId,
+    key_value: &StoredValue,
+    limits: DecodeLimits,
+    blobs: &mut BTreeMap<BlobDigest, BlobRecord>,
+) -> Result<(), StoreError> {
+    let key = collection_item_storage_key(app, collection_id, stored_value_digest(key_value))?;
+    let stored = entries
+        .get(key.as_slice())
+        .map_err(backend)?
+        .map(|value| value.value().to_vec())
+        .ok_or_else(|| {
+            StoreError::InvalidAuthority(format!(
+                "map {} does not contain the removed key",
+                collection_id.memory_id
+            ))
+        })?;
+    let (stored_key, _) = decode_map_entry_component(&stored, limits, blobs).map_err(codec)?;
+    if stored_key != *key_value {
+        return Err(StoreError::InvalidAuthority(
+            "MAP key digest collides with different canonical key".to_owned(),
+        ));
+    }
+    let references = map_entry_component_blob_references(&stored, limits).map_err(codec)?;
+    apply_component_blob_delta(blobs, &references, None)?;
+    entries.remove(key.as_slice()).map_err(backend)?;
+    Ok(())
+}
+
+fn save_set_item(
+    items: &mut Table<'_, &[u8], &[u8]>,
+    app: &[u8; 32],
+    collection_id: &DurableCollectionId,
+    item: &StoredValue,
+    limits: DecodeLimits,
+    blobs: &mut BTreeMap<BlobDigest, BlobRecord>,
+) -> Result<(), StoreError> {
+    let key = collection_item_storage_key(app, collection_id, stored_value_digest(item))?;
+    if let Some(stored) = items.get(key.as_slice()).map_err(backend)? {
+        let stored_item =
+            decode_set_item_component(stored.value(), limits, blobs).map_err(codec)?;
+        if stored_item != *item {
+            return Err(StoreError::InvalidAuthority(
+                "SET item digest collides with different canonical item".to_owned(),
+            ));
+        }
+        return Err(StoreError::InvalidAuthority(format!(
+            "set {} already contains the added item",
+            collection_id.memory_id
+        )));
+    }
+    let encoded = encode_set_item_component(item).map_err(codec)?;
+    apply_component_blob_delta(blobs, &BTreeMap::new(), Some(&encoded))?;
+    items
+        .insert(key.as_slice(), encoded.bytes.as_slice())
+        .map_err(backend)?;
+    Ok(())
+}
+
+fn delete_set_item(
+    items: &mut Table<'_, &[u8], &[u8]>,
+    app: &[u8; 32],
+    collection_id: &DurableCollectionId,
+    item: &StoredValue,
+    limits: DecodeLimits,
+    blobs: &mut BTreeMap<BlobDigest, BlobRecord>,
+) -> Result<(), StoreError> {
+    let key = collection_item_storage_key(app, collection_id, stored_value_digest(item))?;
+    let stored = items
+        .get(key.as_slice())
+        .map_err(backend)?
+        .map(|value| value.value().to_vec())
+        .ok_or_else(|| {
+            StoreError::InvalidAuthority(format!(
+                "set {} does not contain the removed item",
+                collection_id.memory_id
+            ))
+        })?;
+    let stored_item = decode_set_item_component(&stored, limits, blobs).map_err(codec)?;
+    if stored_item != *item {
+        return Err(StoreError::InvalidAuthority(
+            "SET item digest collides with different canonical item".to_owned(),
+        ));
+    }
+    let references = set_item_component_blob_references(&stored, limits).map_err(codec)?;
+    apply_component_blob_delta(blobs, &references, None)?;
+    items.remove(key.as_slice()).map_err(backend)?;
+    Ok(())
+}
+
+fn delete_collection_items(
+    items: &mut Table<'_, &[u8], &[u8]>,
+    app: &[u8; 32],
+    collection_id: &DurableCollectionId,
+    limits: DecodeLimits,
+    blobs: &mut BTreeMap<BlobDigest, BlobRecord>,
+    map_entries: bool,
+) -> Result<(), StoreError> {
+    let prefix = collection_storage_key(app, collection_id)?;
+    let entries = items
+        .iter()
+        .map_err(backend)?
+        .map(|entry| {
+            entry
+                .map(|(key, value)| (key.value().to_vec(), value.value().to_vec()))
+                .map_err(backend)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    for (key, bytes) in entries {
+        if key.starts_with(&prefix) {
+            if key.len() != prefix.len() + 32 {
+                return Err(corrupt("collection item key has invalid length"));
+            }
+            let references = if map_entries {
+                map_entry_component_blob_references(&bytes, limits).map_err(codec)?
+            } else {
+                set_item_component_blob_references(&bytes, limits).map_err(codec)?
+            };
+            apply_component_blob_delta(blobs, &references, None)?;
+            items.remove(key.as_slice()).map_err(backend)?;
+        }
+    }
+    Ok(())
+}
+
+fn replace_map(
+    maps: &mut Table<'_, &[u8], &[u8]>,
+    entries: &mut Table<'_, &[u8], &[u8]>,
+    app: &[u8; 32],
+    collection_id: &DurableCollectionId,
+    map: &StoredMap,
+    limits: DecodeLimits,
+    blobs: &mut BTreeMap<BlobDigest, BlobRecord>,
+) -> Result<(), StoreError> {
+    super::validate_map(collection_id, map)?;
+    delete_collection_items(entries, app, collection_id, limits, blobs, true)?;
+    for (key, value) in &map.entries {
+        save_map_entry(entries, app, collection_id, key, value, limits, blobs)?;
+    }
+    save_collection_record(
+        maps,
+        app,
+        collection_id,
+        CollectionRecord {
+            touched: map.touched,
+            revision: map.revision,
+        },
+    )
+}
+
+fn replace_set(
+    sets: &mut Table<'_, &[u8], &[u8]>,
+    items: &mut Table<'_, &[u8], &[u8]>,
+    app: &[u8; 32],
+    collection_id: &DurableCollectionId,
+    set: &StoredSet,
+    limits: DecodeLimits,
+    blobs: &mut BTreeMap<BlobDigest, BlobRecord>,
+) -> Result<(), StoreError> {
+    super::validate_set(collection_id, set)?;
+    delete_collection_items(items, app, collection_id, limits, blobs, false)?;
+    for item in &set.items {
+        let key = collection_item_storage_key(app, collection_id, stored_value_digest(item))?;
+        let encoded = encode_set_item_component(item).map_err(codec)?;
+        apply_component_blob_delta(blobs, &BTreeMap::new(), Some(&encoded))?;
+        items
+            .insert(key.as_slice(), encoded.bytes.as_slice())
+            .map_err(backend)?;
+    }
+    save_collection_record(
+        sets,
+        app,
+        collection_id,
+        CollectionRecord {
+            touched: set.touched,
+            revision: set.revision,
+        },
+    )
+}
+
+fn delete_map(
+    maps: &mut Table<'_, &[u8], &[u8]>,
+    entries: &mut Table<'_, &[u8], &[u8]>,
+    app: &[u8; 32],
+    collection_id: &DurableCollectionId,
+    limits: DecodeLimits,
+    blobs: &mut BTreeMap<BlobDigest, BlobRecord>,
+) -> Result<(), StoreError> {
+    let key = collection_storage_key(app, collection_id)?;
+    maps.remove(key.as_slice()).map_err(backend)?;
+    delete_collection_items(entries, app, collection_id, limits, blobs, true)
+}
+
+fn delete_set(
+    sets: &mut Table<'_, &[u8], &[u8]>,
+    items: &mut Table<'_, &[u8], &[u8]>,
+    app: &[u8; 32],
+    collection_id: &DurableCollectionId,
+    limits: DecodeLimits,
+    blobs: &mut BTreeMap<BlobDigest, BlobRecord>,
+) -> Result<(), StoreError> {
+    let key = collection_storage_key(app, collection_id)?;
+    sets.remove(key.as_slice()).map_err(backend)?;
+    delete_collection_items(items, app, collection_id, limits, blobs, false)
+}
+
 fn delete_memory(
     slots: &mut Table<'_, &[u8], &[u8]>,
     lists: &mut Table<'_, &[u8], &[u8]>,
     rows: &mut Table<'_, &[u8], &[u8]>,
+    maps: &mut Table<'_, &[u8], &[u8]>,
+    map_entries: &mut Table<'_, &[u8], &[u8]>,
+    sets: &mut Table<'_, &[u8], &[u8]>,
+    set_items: &mut Table<'_, &[u8], &[u8]>,
     app: &[u8; 32],
     memory: MemoryId,
     limits: DecodeLimits,
     blobs: &mut BTreeMap<BlobDigest, BlobRecord>,
 ) -> Result<(), StoreError> {
     delete_scalar(slots, app, memory, limits, blobs)?;
-    delete_list(lists, rows, app, memory, limits, blobs)
+    delete_list(lists, rows, app, memory, limits, blobs)?;
+    let map_ids = maps
+        .iter()
+        .map_err(backend)?
+        .map(|entry| entry.map(|(key, _)| key.value().to_vec()).map_err(backend))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|key| key.starts_with(app))
+        .map(|key| collection_from_key(&key, "map"))
+        .collect::<Result<Vec<_>, _>>()?;
+    for collection_id in map_ids
+        .iter()
+        .filter(|collection| collection.memory_id == memory)
+    {
+        delete_map(maps, map_entries, app, collection_id, limits, blobs)?;
+    }
+    let set_ids = sets
+        .iter()
+        .map_err(backend)?
+        .map(|entry| entry.map(|(key, _)| key.value().to_vec()).map_err(backend))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|key| key.starts_with(app))
+        .map(|key| collection_from_key(&key, "set"))
+        .collect::<Result<Vec<_>, _>>()?;
+    for collection_id in set_ids
+        .iter()
+        .filter(|collection| collection.memory_id == memory)
+    {
+        delete_set(sets, set_items, app, collection_id, limits, blobs)?;
+    }
+    Ok(())
 }
 
 fn delete_list(
@@ -2223,6 +2971,34 @@ fn decode_list_record(bytes: &[u8], limits: DecodeLimits) -> Result<ListRecord, 
     Ok(record)
 }
 
+fn encode_collection_record(record: CollectionRecord) -> Result<Vec<u8>, StoreError> {
+    let mut bytes = Vec::new();
+    Encoder::new(&mut bytes)
+        .array(3)
+        .and_then(|encoder| encoder.u32(COMPONENT_FORMAT))
+        .and_then(|encoder| encoder.bool(record.touched))
+        .and_then(|encoder| encoder.u64(record.revision))
+        .map_err(cbor_encode)?;
+    Ok(bytes)
+}
+
+fn decode_collection_record(
+    bytes: &[u8],
+    limits: DecodeLimits,
+    label: &str,
+) -> Result<CollectionRecord, StoreError> {
+    component_size(bytes, limits, label)?;
+    let mut decoder = Decoder::new(bytes);
+    expect_array(&mut decoder, 3, label)?;
+    expect_format(&mut decoder, label)?;
+    let record = CollectionRecord {
+        touched: decoder.bool().map_err(cbor_decode)?,
+        revision: decoder.u64().map_err(cbor_decode)?,
+    };
+    reject_trailing(&decoder, bytes, label)?;
+    Ok(record)
+}
+
 fn encode_checkpoint_record(record: &CheckpointRecord) -> Result<Vec<u8>, StoreError> {
     let mut bytes = Vec::new();
     let mut encoder = Encoder::new(&mut bytes);
@@ -2361,6 +3137,98 @@ fn row_storage_key(app: &[u8; 32], memory: MemoryId, row: RowRef) -> [u8; 80] {
     key[64..72].copy_from_slice(&row.key.to_be_bytes());
     key[72..80].copy_from_slice(&row.generation.to_be_bytes());
     key
+}
+
+fn collection_storage_key(
+    app: &[u8; 32],
+    collection_id: &DurableCollectionId,
+) -> Result<Vec<u8>, StoreError> {
+    super::validate_collection_id(collection_id)?;
+    let depth: u16 = collection_id
+        .owner
+        .ancestors
+        .len()
+        .try_into()
+        .map_err(|_| StoreError::InvalidAuthority("collection owner depth overflow".to_owned()))?;
+    let mut key = Vec::with_capacity(66 + usize::from(depth) * 48);
+    key.extend_from_slice(app);
+    key.extend_from_slice(collection_id.memory_id.as_bytes());
+    key.extend_from_slice(&depth.to_be_bytes());
+    for row in &collection_id.owner.ancestors {
+        key.extend_from_slice(row.list_memory_id.as_bytes());
+        key.extend_from_slice(&row.row_key.to_be_bytes());
+        key.extend_from_slice(&row.row_generation.to_be_bytes());
+    }
+    Ok(key)
+}
+
+fn collection_from_key(key: &[u8], label: &str) -> Result<DurableCollectionId, StoreError> {
+    if key.len() < 66 {
+        return Err(corrupt(format!("invalid {label} key")));
+    }
+    let mut memory = [0; 32];
+    memory.copy_from_slice(&key[32..64]);
+    let depth = usize::from(u16::from_be_bytes([key[64], key[65]]));
+    let expected = 66usize
+        .checked_add(
+            depth
+                .checked_mul(48)
+                .ok_or_else(|| corrupt(format!("{label} key depth overflow")))?,
+        )
+        .ok_or_else(|| corrupt(format!("{label} key length overflow")))?;
+    if key.len() != expected || depth > super::MAX_DURABLE_OWNER_DEPTH {
+        return Err(corrupt(format!("invalid {label} key length")));
+    }
+    let mut ancestors = Vec::with_capacity(depth);
+    for chunk in key[66..].chunks_exact(48) {
+        let mut list_memory = [0; 32];
+        list_memory.copy_from_slice(&chunk[..32]);
+        let mut row_key = [0; 8];
+        row_key.copy_from_slice(&chunk[32..40]);
+        let mut row_generation = [0; 8];
+        row_generation.copy_from_slice(&chunk[40..48]);
+        ancestors.push(DurableRowId {
+            list_memory_id: MemoryId(list_memory),
+            row_key: u64::from_be_bytes(row_key),
+            row_generation: u64::from_be_bytes(row_generation),
+        });
+    }
+    let collection_id = DurableCollectionId {
+        memory_id: MemoryId(memory),
+        owner: DurableOwner { ancestors },
+    };
+    super::validate_collection_id(&collection_id)?;
+    Ok(collection_id)
+}
+
+fn collection_item_storage_key(
+    app: &[u8; 32],
+    collection_id: &DurableCollectionId,
+    item_digest: [u8; 32],
+) -> Result<Vec<u8>, StoreError> {
+    let mut key = collection_storage_key(app, collection_id)?;
+    key.extend_from_slice(&item_digest);
+    Ok(key)
+}
+
+fn collection_item_from_key(
+    key: &[u8],
+    label: &str,
+) -> Result<(DurableCollectionId, [u8; 32]), StoreError> {
+    if key.len() < 98 {
+        return Err(corrupt(format!("invalid {label} key")));
+    }
+    let split = key.len() - 32;
+    let collection_id = collection_from_key(&key[..split], label)?;
+    let mut digest = [0; 32];
+    digest.copy_from_slice(&key[split..]);
+    Ok((collection_id, digest))
+}
+
+fn stored_value_digest(value: &StoredValue) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    super::hash_stored_value(&mut hasher, value);
+    hasher.finalize().into()
 }
 
 fn checkpoint_storage_key(app: &[u8; 32], epoch: u64) -> [u8; 40] {
@@ -2705,10 +3573,14 @@ mod tests {
                     "BLOBS".to_owned(),
                     "CHECKPOINTS".to_owned(),
                     "LISTS".to_owned(),
+                    "MAPS".to_owned(),
+                    "MAP_ENTRIES".to_owned(),
                     "META".to_owned(),
                     "MIGRATIONS".to_owned(),
                     "OUTBOX".to_owned(),
                     "ROWS".to_owned(),
+                    "SETS".to_owned(),
+                    "SET_ITEMS".to_owned(),
                     "SLOTS".to_owned(),
                 ])
             );

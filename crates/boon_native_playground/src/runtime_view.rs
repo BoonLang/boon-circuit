@@ -84,6 +84,8 @@ struct AuthorityPlanCounts {
     scalar: u32,
     indexed_field: u32,
     list: u32,
+    map: u32,
+    set: u32,
     effect_contract: u32,
 }
 
@@ -1257,6 +1259,8 @@ impl RuntimeView {
                 scalar_count: self.authority_plan_counts.scalar,
                 indexed_field_count: self.authority_plan_counts.indexed_field,
                 list_count: self.authority_plan_counts.list,
+                map_count: self.authority_plan_counts.map,
+                set_count: self.authority_plan_counts.set,
                 effect_contract_count: self.authority_plan_counts.effect_contract,
             },
             stored,
@@ -3304,6 +3308,20 @@ fn authority_plan_counts(plan: &MachinePlan) -> AuthorityPlanCounts {
                 .count(),
         ),
         list: saturating_u32(plan.persistence.lists.len()),
+        map: saturating_u32(
+            plan.persistence
+                .collections
+                .iter()
+                .filter(|memory| memory.kind == MemoryKind::Map)
+                .count(),
+        ),
+        set: saturating_u32(
+            plan.persistence
+                .collections
+                .iter()
+                .filter(|memory| memory.kind == MemoryKind::Set)
+                .count(),
+        ),
         effect_contract: saturating_u32(plan.persistence.effect_outbox.len()),
     }
 }
@@ -3317,6 +3335,8 @@ fn authority_selections(
             MemoryKind::Scalar => AuthoritySelectionKind::Scalar,
             MemoryKind::IndexedField => AuthoritySelectionKind::IndexedField,
             MemoryKind::List => AuthoritySelectionKind::List,
+            MemoryKind::Map => AuthoritySelectionKind::Map,
+            MemoryKind::Set => AuthoritySelectionKind::Set,
         };
         selections.insert(
             memory.semantic_path.clone(),
@@ -3354,6 +3374,24 @@ fn authority_selections(
                 },
             );
         }
+    }
+    for collection in &plan.persistence.collections {
+        selections.insert(
+            collection.semantic_path.clone(),
+            AuthoritySelection {
+                semantic_path: collection.semantic_path.clone(),
+                memory_id: *collection.memory_id.as_bytes(),
+                kind: match collection.kind {
+                    MemoryKind::Map => AuthoritySelectionKind::Map,
+                    MemoryKind::Set => AuthoritySelectionKind::Set,
+                    MemoryKind::Scalar | MemoryKind::IndexedField | MemoryKind::List => {
+                        continue;
+                    }
+                },
+                row: None,
+                leaf_id: None,
+            },
+        );
     }
     selections
 }

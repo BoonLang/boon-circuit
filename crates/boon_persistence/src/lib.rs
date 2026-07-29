@@ -65,6 +65,20 @@ pub struct StoredList {
     pub rows: Vec<StoredRow>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StoredMap {
+    pub touched: bool,
+    pub revision: u64,
+    pub entries: BTreeMap<StoredValue, StoredValue>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StoredSet {
+    pub touched: bool,
+    pub revision: u64,
+    pub items: BTreeSet<StoredValue>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[repr(transparent)]
 pub struct OutboxItemId(pub [u8; 32]);
@@ -114,9 +128,15 @@ pub struct DurableRowId {
     pub row_generation: u64,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct DurableOwner {
     pub ancestors: Vec<DurableRowId>,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct DurableCollectionId {
+    pub memory_id: MemoryId,
+    pub owner: DurableOwner,
 }
 
 fn hash_durable_owner(hasher: &mut Sha256, owner: &DurableOwner) {
@@ -244,6 +264,8 @@ pub struct RestoreImage {
     pub through_turn_sequence: u64,
     pub scalars: BTreeMap<MemoryId, StoredScalar>,
     pub lists: BTreeMap<MemoryId, StoredList>,
+    pub maps: BTreeMap<DurableCollectionId, StoredMap>,
+    pub sets: BTreeMap<DurableCollectionId, StoredSet>,
     pub completed_migration_edges: BTreeSet<MigrationEdgeId>,
     pub outbox: BTreeMap<OutboxItemId, DurableOutboxItem>,
     #[serde(default)]
@@ -264,6 +286,8 @@ impl RestoreImage {
             through_turn_sequence: 0,
             scalars: BTreeMap::new(),
             lists: BTreeMap::new(),
+            maps: BTreeMap::new(),
+            sets: BTreeMap::new(),
             completed_migration_edges: BTreeSet::new(),
             outbox: BTreeMap::new(),
             content_artifact_manifest: ContentArtifactManifest::default(),
@@ -313,6 +337,41 @@ pub enum DurableChange {
     },
     DeleteList {
         memory_id: MemoryId,
+    },
+    SetMap {
+        collection_id: DurableCollectionId,
+        value: StoredMap,
+    },
+    MapUpsert {
+        collection_id: DurableCollectionId,
+        revision: u64,
+        key: StoredValue,
+        value: StoredValue,
+    },
+    MapRemove {
+        collection_id: DurableCollectionId,
+        revision: u64,
+        key: StoredValue,
+    },
+    DeleteMap {
+        collection_id: DurableCollectionId,
+    },
+    SetSet {
+        collection_id: DurableCollectionId,
+        value: StoredSet,
+    },
+    SetAdd {
+        collection_id: DurableCollectionId,
+        revision: u64,
+        item: StoredValue,
+    },
+    SetRemove {
+        collection_id: DurableCollectionId,
+        revision: u64,
+        item: StoredValue,
+    },
+    DeleteSet {
+        collection_id: DurableCollectionId,
     },
 }
 
@@ -392,14 +451,39 @@ impl ActivationBatch {
         for (memory_id, list) in &candidate.lists {
             validate_list(*memory_id, list)?;
         }
+        for (collection_id, map) in &candidate.maps {
+            validate_collection_id(collection_id)?;
+            validate_map(collection_id, map)?;
+        }
+        for (collection_id, set) in &candidate.sets {
+            validate_collection_id(collection_id)?;
+            validate_set(collection_id, set)?;
+        }
         validate_content_artifact_manifest(&candidate.content_artifact_manifest)?;
-        if candidate
-            .scalars
+        let map_memory_ids = candidate
+            .maps
             .keys()
-            .any(|memory| candidate.lists.contains_key(memory))
+            .map(|collection| collection.memory_id)
+            .collect::<BTreeSet<_>>();
+        let set_memory_ids = candidate
+            .sets
+            .keys()
+            .map(|collection| collection.memory_id)
+            .collect::<BTreeSet<_>>();
+        if candidate.scalars.keys().any(|memory| {
+            candidate.lists.contains_key(memory)
+                || map_memory_ids.contains(memory)
+                || set_memory_ids.contains(memory)
+        }) || candidate
+            .lists
+            .keys()
+            .any(|memory| map_memory_ids.contains(memory) || set_memory_ids.contains(memory))
+            || map_memory_ids
+                .iter()
+                .any(|memory| set_memory_ids.contains(memory))
         {
             return Err(StoreError::InvalidAuthority(
-                "candidate uses one memory ID as both scalar and list".to_owned(),
+                "candidate uses one memory ID for more than one authority kind".to_owned(),
             ));
         }
         if current.outbox != candidate.outbox {
@@ -425,14 +509,37 @@ impl ActivationBatch {
                 });
             }
         }
+        for (collection_id, value) in &candidate.maps {
+            if current.maps.get(collection_id) != Some(value) {
+                authority_changes.push(DurableChange::SetMap {
+                    collection_id: collection_id.clone(),
+                    value: value.clone(),
+                });
+            }
+        }
+        for (collection_id, value) in &candidate.sets {
+            if current.sets.get(collection_id) != Some(value) {
+                authority_changes.push(DurableChange::SetSet {
+                    collection_id: collection_id.clone(),
+                    value: value.clone(),
+                });
+            }
+        }
         let deleted_memory = current
             .scalars
             .keys()
             .chain(current.lists.keys())
-            .filter(|memory| {
-                !candidate.scalars.contains_key(memory) && !candidate.lists.contains_key(memory)
-            })
             .copied()
+            .chain(current.maps.keys().map(|collection| collection.memory_id))
+            .chain(current.sets.keys().map(|collection| collection.memory_id))
+            .filter(|memory| {
+                !candidate.scalars.contains_key(memory)
+                    && !candidate.lists.contains_key(memory)
+                    && !map_memory_ids.contains(memory)
+                    && !set_memory_ids.contains(memory)
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
             .collect::<Vec<_>>();
         let completed_migration_edges = candidate
             .completed_migration_edges
@@ -717,6 +824,10 @@ pub struct PersistenceInspectorSnapshot {
     pub scalar_count: usize,
     pub list_count: usize,
     pub row_count: usize,
+    pub map_count: usize,
+    pub map_entry_count: usize,
+    pub set_count: usize,
+    pub set_item_count: usize,
     pub content_artifact_count: usize,
     pub content_artifact_bytes: u64,
     #[serde(default)]
@@ -1133,9 +1244,18 @@ fn apply_changes(image: &mut RestoreImage, changes: &[DurableChange]) -> Result<
     for change in changes {
         match change {
             DurableChange::SetScalar { memory_id, value } => {
-                if image.lists.contains_key(memory_id) {
+                if image.lists.contains_key(memory_id)
+                    || image
+                        .maps
+                        .keys()
+                        .any(|collection| collection.memory_id == *memory_id)
+                    || image
+                        .sets
+                        .keys()
+                        .any(|collection| collection.memory_id == *memory_id)
+                {
                     return Err(StoreError::InvalidAuthority(format!(
-                        "memory {memory_id} is already a list"
+                        "memory {memory_id} already has a non-scalar authority kind"
                     )));
                 }
                 image.scalars.insert(*memory_id, value.clone());
@@ -1145,9 +1265,18 @@ fn apply_changes(image: &mut RestoreImage, changes: &[DurableChange]) -> Result<
             }
             DurableChange::SetList { memory_id, value } => {
                 validate_list(*memory_id, value)?;
-                if image.scalars.contains_key(memory_id) {
+                if image.scalars.contains_key(memory_id)
+                    || image
+                        .maps
+                        .keys()
+                        .any(|collection| collection.memory_id == *memory_id)
+                    || image
+                        .sets
+                        .keys()
+                        .any(|collection| collection.memory_id == *memory_id)
+                {
                     return Err(StoreError::InvalidAuthority(format!(
-                        "memory {memory_id} is already a scalar"
+                        "memory {memory_id} already has a non-list authority kind"
                     )));
                 }
                 image.lists.insert(*memory_id, value.clone());
@@ -1291,6 +1420,142 @@ fn apply_changes(image: &mut RestoreImage, changes: &[DurableChange]) -> Result<
             }
             DurableChange::DeleteList { memory_id } => {
                 image.lists.remove(memory_id);
+            }
+            DurableChange::SetMap {
+                collection_id,
+                value,
+            } => {
+                validate_collection_id(collection_id)?;
+                validate_collection_owner_against_image(image, collection_id)?;
+                validate_map(collection_id, value)?;
+                if image.scalars.contains_key(&collection_id.memory_id)
+                    || image.lists.contains_key(&collection_id.memory_id)
+                    || image
+                        .sets
+                        .keys()
+                        .any(|candidate| candidate.memory_id == collection_id.memory_id)
+                {
+                    return Err(StoreError::InvalidAuthority(format!(
+                        "memory {} already has a non-map authority kind",
+                        collection_id.memory_id
+                    )));
+                }
+                image.maps.insert(collection_id.clone(), value.clone());
+            }
+            DurableChange::MapUpsert {
+                collection_id,
+                revision,
+                key,
+                value,
+            } => {
+                validate_collection_id(collection_id)?;
+                validate_collection_owner_against_image(image, collection_id)?;
+                let map = image.maps.get_mut(collection_id).ok_or_else(|| {
+                    StoreError::InvalidAuthority(format!(
+                        "cannot upsert into missing map {}",
+                        collection_id.memory_id
+                    ))
+                })?;
+                advance_collection_revision(collection_id, map.revision, revision, "map")?;
+                map.revision = *revision;
+                map.touched = true;
+                map.entries.insert(key.clone(), value.clone());
+            }
+            DurableChange::MapRemove {
+                collection_id,
+                revision,
+                key,
+            } => {
+                validate_collection_id(collection_id)?;
+                validate_collection_owner_against_image(image, collection_id)?;
+                let map = image.maps.get_mut(collection_id).ok_or_else(|| {
+                    StoreError::InvalidAuthority(format!(
+                        "cannot remove from missing map {}",
+                        collection_id.memory_id
+                    ))
+                })?;
+                advance_collection_revision(collection_id, map.revision, revision, "map")?;
+                if map.entries.remove(key).is_none() {
+                    return Err(StoreError::InvalidAuthority(format!(
+                        "map {} does not contain the removed key",
+                        collection_id.memory_id
+                    )));
+                }
+                map.revision = *revision;
+                map.touched = true;
+            }
+            DurableChange::DeleteMap { collection_id } => {
+                image.maps.remove(collection_id);
+            }
+            DurableChange::SetSet {
+                collection_id,
+                value,
+            } => {
+                validate_collection_id(collection_id)?;
+                validate_collection_owner_against_image(image, collection_id)?;
+                validate_set(collection_id, value)?;
+                if image.scalars.contains_key(&collection_id.memory_id)
+                    || image.lists.contains_key(&collection_id.memory_id)
+                    || image
+                        .maps
+                        .keys()
+                        .any(|candidate| candidate.memory_id == collection_id.memory_id)
+                {
+                    return Err(StoreError::InvalidAuthority(format!(
+                        "memory {} already has a non-set authority kind",
+                        collection_id.memory_id
+                    )));
+                }
+                image.sets.insert(collection_id.clone(), value.clone());
+            }
+            DurableChange::SetAdd {
+                collection_id,
+                revision,
+                item,
+            } => {
+                validate_collection_id(collection_id)?;
+                validate_collection_owner_against_image(image, collection_id)?;
+                let set = image.sets.get_mut(collection_id).ok_or_else(|| {
+                    StoreError::InvalidAuthority(format!(
+                        "cannot add to missing set {}",
+                        collection_id.memory_id
+                    ))
+                })?;
+                advance_collection_revision(collection_id, set.revision, revision, "set")?;
+                if !set.items.insert(item.clone()) {
+                    return Err(StoreError::InvalidAuthority(format!(
+                        "set {} already contains the added item",
+                        collection_id.memory_id
+                    )));
+                }
+                set.revision = *revision;
+                set.touched = true;
+            }
+            DurableChange::SetRemove {
+                collection_id,
+                revision,
+                item,
+            } => {
+                validate_collection_id(collection_id)?;
+                validate_collection_owner_against_image(image, collection_id)?;
+                let set = image.sets.get_mut(collection_id).ok_or_else(|| {
+                    StoreError::InvalidAuthority(format!(
+                        "cannot remove from missing set {}",
+                        collection_id.memory_id
+                    ))
+                })?;
+                advance_collection_revision(collection_id, set.revision, revision, "set")?;
+                if !set.items.remove(item) {
+                    return Err(StoreError::InvalidAuthority(format!(
+                        "set {} does not contain the removed item",
+                        collection_id.memory_id
+                    )));
+                }
+                set.revision = *revision;
+                set.touched = true;
+            }
+            DurableChange::DeleteSet { collection_id } => {
+                image.sets.remove(collection_id);
             }
         }
     }
@@ -1896,6 +2161,12 @@ fn apply_activation_to_image(
     for memory in &batch.deleted_memory {
         candidate.scalars.remove(memory);
         candidate.lists.remove(memory);
+        candidate
+            .maps
+            .retain(|collection, _| collection.memory_id != *memory);
+        candidate
+            .sets
+            .retain(|collection, _| collection.memory_id != *memory);
     }
     candidate
         .completed_migration_edges
@@ -1927,6 +2198,91 @@ fn advance_list_revision(
         )));
     }
     list.revision = next_revision;
+    Ok(())
+}
+
+fn advance_collection_revision(
+    collection_id: &DurableCollectionId,
+    current_revision: u64,
+    next_revision: &u64,
+    kind: &str,
+) -> Result<(), StoreError> {
+    if *next_revision < current_revision {
+        return Err(StoreError::InvalidAuthority(format!(
+            "{kind} {} revision moved backwards from {current_revision} to {next_revision}",
+            collection_id.memory_id
+        )));
+    }
+    Ok(())
+}
+
+fn validate_collection_id(collection_id: &DurableCollectionId) -> Result<(), StoreError> {
+    validate_durable_owner(&collection_id.owner, true).map_err(StoreError::InvalidAuthority)
+}
+
+fn validate_collection_owner_against_image(
+    image: &RestoreImage,
+    collection_id: &DurableCollectionId,
+) -> Result<(), StoreError> {
+    for (depth, owner_row) in collection_id.owner.ancestors.iter().enumerate() {
+        let list = image.lists.get(&owner_row.list_memory_id).ok_or_else(|| {
+            StoreError::InvalidAuthority(format!(
+                "collection {} owner references missing list {}",
+                collection_id.memory_id, owner_row.list_memory_id
+            ))
+        })?;
+        let row = list
+            .rows
+            .iter()
+            .find(|row| row.key == owner_row.row_key && row.generation == owner_row.row_generation)
+            .ok_or_else(|| {
+                StoreError::InvalidAuthority(format!(
+                    "collection {} owner references missing row {}:{}",
+                    collection_id.memory_id, owner_row.row_key, owner_row.row_generation
+                ))
+            })?;
+        if row.owner.ancestors.as_slice() != &collection_id.owner.ancestors[..=depth] {
+            return Err(StoreError::InvalidAuthority(format!(
+                "collection {} owner ancestry disagrees with row {}:{}",
+                collection_id.memory_id, owner_row.row_key, owner_row.row_generation
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_map(collection_id: &DurableCollectionId, _map: &StoredMap) -> Result<(), StoreError> {
+    validate_collection_id(collection_id)
+}
+
+fn validate_set(collection_id: &DurableCollectionId, _set: &StoredSet) -> Result<(), StoreError> {
+    validate_collection_id(collection_id)
+}
+
+fn validate_authority_kinds_disjoint(image: &RestoreImage) -> Result<(), StoreError> {
+    let mut kinds = BTreeMap::<MemoryId, &'static str>::new();
+    let mut insert = |memory_id: MemoryId, kind: &'static str| {
+        if let Some(previous) = kinds.insert(memory_id, kind)
+            && previous != kind
+        {
+            return Err(StoreError::InvalidAuthority(format!(
+                "memory {memory_id} is stored as both {previous} and {kind}"
+            )));
+        }
+        Ok(())
+    };
+    for memory_id in image.scalars.keys().copied() {
+        insert(memory_id, "scalar")?;
+    }
+    for memory_id in image.lists.keys().copied() {
+        insert(memory_id, "list")?;
+    }
+    for collection_id in image.maps.keys() {
+        insert(collection_id.memory_id, "map")?;
+    }
+    for collection_id in image.sets.keys() {
+        insert(collection_id.memory_id, "set")?;
+    }
     Ok(())
 }
 
@@ -2076,6 +2432,15 @@ fn validate_initial_image(image: &RestoreImage) -> Result<(), StoreError> {
     for (memory_id, list) in &image.lists {
         validate_list(*memory_id, list)?;
     }
+    for (collection_id, map) in &image.maps {
+        validate_map(collection_id, map)?;
+        validate_collection_owner_against_image(image, collection_id)?;
+    }
+    for (collection_id, set) in &image.sets {
+        validate_set(collection_id, set)?;
+        validate_collection_owner_against_image(image, collection_id)?;
+    }
+    validate_authority_kinds_disjoint(image)?;
     validate_outbox(&image.outbox)?;
     validate_content_artifact_manifest(&image.content_artifact_manifest)?;
     if !image.content_artifact_manifest.bindings.is_empty() {
@@ -2097,6 +2462,8 @@ fn validate_reset(batch: &ResetApplicationBatch) -> Result<(), StoreError> {
     }
     if !batch.default_image.scalars.is_empty()
         || !batch.default_image.lists.is_empty()
+        || !batch.default_image.maps.is_empty()
+        || !batch.default_image.sets.is_empty()
         || !batch.default_image.completed_migration_edges.is_empty()
         || !batch.default_image.outbox.is_empty()
         || !batch
@@ -2428,8 +2795,90 @@ fn hash_changes(hasher: &mut Sha256, changes: &[DurableChange]) {
                 hasher.update([6]);
                 hasher.update(memory_id.as_bytes());
             }
+            DurableChange::SetMap {
+                collection_id,
+                value,
+            } => {
+                hasher.update([7]);
+                hash_durable_collection_id(hasher, collection_id);
+                hasher.update([u8::from(value.touched)]);
+                hasher.update(value.revision.to_be_bytes());
+                hasher.update((value.entries.len() as u64).to_be_bytes());
+                for (key, value) in &value.entries {
+                    hash_stored_value(hasher, key);
+                    hash_stored_value(hasher, value);
+                }
+            }
+            DurableChange::MapUpsert {
+                collection_id,
+                revision,
+                key,
+                value,
+            } => {
+                hasher.update([8]);
+                hash_durable_collection_id(hasher, collection_id);
+                hasher.update(revision.to_be_bytes());
+                hash_stored_value(hasher, key);
+                hash_stored_value(hasher, value);
+            }
+            DurableChange::MapRemove {
+                collection_id,
+                revision,
+                key,
+            } => {
+                hasher.update([9]);
+                hash_durable_collection_id(hasher, collection_id);
+                hasher.update(revision.to_be_bytes());
+                hash_stored_value(hasher, key);
+            }
+            DurableChange::DeleteMap { collection_id } => {
+                hasher.update([10]);
+                hash_durable_collection_id(hasher, collection_id);
+            }
+            DurableChange::SetSet {
+                collection_id,
+                value,
+            } => {
+                hasher.update([11]);
+                hash_durable_collection_id(hasher, collection_id);
+                hasher.update([u8::from(value.touched)]);
+                hasher.update(value.revision.to_be_bytes());
+                hasher.update((value.items.len() as u64).to_be_bytes());
+                for item in &value.items {
+                    hash_stored_value(hasher, item);
+                }
+            }
+            DurableChange::SetAdd {
+                collection_id,
+                revision,
+                item,
+            } => {
+                hasher.update([12]);
+                hash_durable_collection_id(hasher, collection_id);
+                hasher.update(revision.to_be_bytes());
+                hash_stored_value(hasher, item);
+            }
+            DurableChange::SetRemove {
+                collection_id,
+                revision,
+                item,
+            } => {
+                hasher.update([13]);
+                hash_durable_collection_id(hasher, collection_id);
+                hasher.update(revision.to_be_bytes());
+                hash_stored_value(hasher, item);
+            }
+            DurableChange::DeleteSet { collection_id } => {
+                hasher.update([14]);
+                hash_durable_collection_id(hasher, collection_id);
+            }
         }
     }
+}
+
+fn hash_durable_collection_id(hasher: &mut Sha256, collection_id: &DurableCollectionId) {
+    hasher.update(collection_id.memory_id.as_bytes());
+    hash_durable_owner(hasher, &collection_id.owner);
 }
 
 fn hash_outbox_changes(hasher: &mut Sha256, changes: &[DurableOutboxChange]) {
@@ -2687,6 +3136,10 @@ fn inspector_snapshot(image: &RestoreImage) -> PersistenceInspectorSnapshot {
         scalar_count: image.scalars.len(),
         list_count: image.lists.len(),
         row_count: image.lists.values().map(|list| list.rows.len()).sum(),
+        map_count: image.maps.len(),
+        map_entry_count: image.maps.values().map(|map| map.entries.len()).sum(),
+        set_count: image.sets.len(),
+        set_item_count: image.sets.values().map(|set| set.items.len()).sum(),
         content_artifact_count: 0,
         content_artifact_bytes: 0,
         content_artifact_owner_count: image.content_artifact_manifest.bindings.len(),

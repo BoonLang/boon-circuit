@@ -13,7 +13,7 @@ pub use boon_runtime::{
 };
 
 const MAGIC: [u8; 4] = *b"BNIP";
-const VERSION: u16 = 13;
+const VERSION: u16 = 14;
 const HEADER_BYTES: usize = MAGIC.len() + 2 + 1;
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const MAX_STRING_BYTES: usize = 8 * 1024 * 1024;
@@ -321,6 +321,8 @@ pub enum AuthoritySelectionKind {
     Scalar = 1,
     IndexedField = 2,
     List = 3,
+    Map = 4,
+    Set = 5,
 }
 
 impl AuthoritySelectionKind {
@@ -329,6 +331,8 @@ impl AuthoritySelectionKind {
             1 => Ok(Self::Scalar),
             2 => Ok(Self::IndexedField),
             3 => Ok(Self::List),
+            4 => Ok(Self::Map),
+            5 => Ok(Self::Set),
             _ => Err(ProtocolError::InvalidEnum(
                 "authority selection kind",
                 value,
@@ -509,6 +513,8 @@ pub struct AuthoritySummary {
     pub scalar_count: u32,
     pub indexed_field_count: u32,
     pub list_count: u32,
+    pub map_count: u32,
+    pub set_count: u32,
     pub effect_contract_count: u32,
 }
 
@@ -1664,6 +1670,8 @@ impl Encoder {
         self.u32(snapshot.authority.scalar_count);
         self.u32(snapshot.authority.indexed_field_count);
         self.u32(snapshot.authority.list_count);
+        self.u32(snapshot.authority.map_count);
+        self.u32(snapshot.authority.set_count);
         self.u32(snapshot.authority.effect_contract_count);
 
         match snapshot.stored.as_ref() {
@@ -2281,6 +2289,8 @@ impl<'a> Decoder<'a> {
             scalar_count: self.u32()?,
             indexed_field_count: self.u32()?,
             list_count: self.u32()?,
+            map_count: self.u32()?,
+            set_count: self.u32()?,
             effect_contract_count: self.u32()?,
         };
         let stored = match self.u8()? {

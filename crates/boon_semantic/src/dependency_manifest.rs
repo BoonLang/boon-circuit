@@ -1053,13 +1053,26 @@ impl DependencyOwnerIndex {
 
         let mut memory_owner = Vec::with_capacity(memory.memories.len());
         for memory in &memory.memories {
-            let binding = memory.backing.binding();
-            memory_owner.push(*binding_owner.get(binding.as_usize()).ok_or_else(|| {
-                CallableDependencyManifestError::new(format!(
-                    "semantic memory {} backing references missing binding {binding}",
-                    memory.id
-                ))
-            })?);
+            let owner = match memory.backing {
+                SemanticMemoryBackingV1::State { binding, .. }
+                | SemanticMemoryBackingV1::List { binding, .. } => {
+                    *binding_owner.get(binding.as_usize()).ok_or_else(|| {
+                        CallableDependencyManifestError::new(format!(
+                            "semantic memory {} backing references missing binding {binding}",
+                            memory.id
+                        ))
+                    })?
+                }
+                SemanticMemoryBackingV1::Collection { expression, .. } => {
+                    *expression_owner.get(expression.as_usize()).ok_or_else(|| {
+                        CallableDependencyManifestError::new(format!(
+                            "semantic memory {} backing references missing expression {expression}",
+                            memory.id
+                        ))
+                    })?
+                }
+            };
+            memory_owner.push(owner);
         }
 
         Ok(Self {
@@ -7131,19 +7144,36 @@ fn inventory_memory(
             SemanticDependencyEntityDomainV1::SemanticMemory,
             region.id.as_usize(),
         );
-        let mut references = vec![
-            dependency_entity(binding_entity(region.backing.binding())),
-            dependency_entity(indexed_entity(
-                SemanticDependencyEntityDomainV1::SemanticStorageField,
-                region.backing.storage_field().as_usize(),
-            )),
-        ];
+        let mut references = Vec::new();
         match region.backing {
-            SemanticMemoryBackingV1::State { state, .. } => {
+            SemanticMemoryBackingV1::State {
+                binding,
+                storage_field,
+                state,
+                ..
+            } => {
+                references.push(dependency_entity(binding_entity(binding)));
+                references.push(dependency_entity(indexed_entity(
+                    SemanticDependencyEntityDomainV1::SemanticStorageField,
+                    storage_field.as_usize(),
+                )));
                 references.push(dependency_entity(state_entity(state)));
             }
-            SemanticMemoryBackingV1::List { list, .. } => {
+            SemanticMemoryBackingV1::List {
+                binding,
+                storage_field,
+                list,
+                ..
+            } => {
+                references.push(dependency_entity(binding_entity(binding)));
+                references.push(dependency_entity(indexed_entity(
+                    SemanticDependencyEntityDomainV1::SemanticStorageField,
+                    storage_field.as_usize(),
+                )));
                 references.push(dependency_entity(list_entity(list)));
+            }
+            SemanticMemoryBackingV1::Collection { expression, .. } => {
+                references.push(dependency_entity(expression_entity(expression)));
             }
         }
         if let SemanticMemoryStatusV1::Draining { marker } = region.status {

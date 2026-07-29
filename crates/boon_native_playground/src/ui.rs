@@ -827,12 +827,14 @@ fn add_persistence_inspector(frame: &mut DocumentFrame, state: &PersistenceUiSta
                 },
             );
             format!(
-                "Authority  turn {} / source {}\nDeclared   {} scalar, {} indexed, {} list\nStored     {stored}\nPending    {pending}; queue {} + {} reserved\nDurable    epoch {}, turn {}\nTimings    enqueue {}us, encode {}us, commit {}us\n            barrier {}us, restore {}us, migrate {}us, rebuild {}us\nSchema     v{} {}\nWorker     {}{}",
+                "Authority  turn {} / source {}\nDeclared   {} scalar, {} indexed, {} list, {} map, {} set\nStored     {stored}\nPending    {pending}; queue {} + {} reserved\nDurable    epoch {}, turn {}\nTimings    enqueue {}us, encode {}us, commit {}us\n            barrier {}us, restore {}us, migrate {}us, rebuild {}us\nSchema     v{} {}\nWorker     {}{}",
                 snapshot.authority.runtime_turn_sequence,
                 snapshot.authority.source_event_sequence,
                 snapshot.authority.scalar_count,
                 snapshot.authority.indexed_field_count,
                 snapshot.authority.list_count,
+                snapshot.authority.map_count,
+                snapshot.authority.set_count,
                 snapshot.pending.queue_depth,
                 snapshot.pending.reserved_slots,
                 snapshot.durable.epoch,

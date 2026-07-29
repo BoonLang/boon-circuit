@@ -18,7 +18,7 @@ pub use host::*;
 
 pub const PLAN_MAJOR_VERSION: u32 = 6;
 pub const PLAN_MINOR_VERSION: u32 = 0;
-pub const PERSISTENCE_FORMAT_VERSION: u32 = 3;
+pub const PERSISTENCE_FORMAT_VERSION: u32 = 4;
 pub const DEFAULT_PERSISTENCE_SCHEMA_VERSION: u64 = 1;
 pub const INLINE_BYTE_CONSTANT_LIMIT: usize = 1024;
 
@@ -291,6 +291,8 @@ pub enum MemoryKind {
     Scalar,
     IndexedField,
     List,
+    Map,
+    Set,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -3480,6 +3482,57 @@ impl ListMemoryPlan {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CollectionMemoryPlan {
+    pub authority: PlanCollectionAuthorityId,
+    pub memory_id: MemoryId,
+    pub kind: MemoryKind,
+    pub semantic_path: String,
+    pub data_type: DataTypePlan,
+    pub type_fingerprint: [u8; 32],
+    pub owner: MemoryOwnerPath,
+    pub runtime_owner: PlanOwner,
+}
+
+impl CollectionMemoryPlan {
+    pub fn new(
+        authority: PlanCollectionAuthorityId,
+        kind: MemoryKind,
+        semantic_path: impl Into<String>,
+        data_type: DataTypePlan,
+        owner: MemoryOwnerPath,
+        runtime_owner: PlanOwner,
+    ) -> Result<Self, PlanError> {
+        let semantic_path = semantic_path.into();
+        let data_type = data_type.canonicalized();
+        let kind_matches = matches!(
+            (kind, &data_type),
+            (MemoryKind::Map, DataTypePlan::Map { .. })
+                | (MemoryKind::Set, DataTypePlan::Set { .. })
+        );
+        if !kind_matches || data_type_contains_unknown(&data_type) {
+            return Err(PlanError::new(
+                "collection memory kind requires one canonical closed MAP or SET data type",
+            ));
+        }
+        if runtime_owner.static_owner.is_root() && !runtime_owner.ancestors.is_empty() {
+            return Err(PlanError::new(
+                "root collection memory owner cannot retain row ancestors",
+            ));
+        }
+        Ok(Self {
+            authority,
+            memory_id: MemoryId::from_identity(&owner, &semantic_path, kind)?,
+            kind,
+            semantic_path,
+            type_fingerprint: data_type_fingerprint(&data_type)?,
+            data_type,
+            owner,
+            runtime_owner,
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MigrationTransferKindPlan {
@@ -3883,6 +3936,8 @@ pub struct PersistencePlan {
     pub memory: Vec<MemoryPlan>,
     pub lists: Vec<ListMemoryPlan>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub collections: Vec<CollectionMemoryPlan>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub effect_outbox: Vec<EffectOutboxSchema>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub migration_recipes: Vec<MigrationRecipePlan>,
@@ -3899,11 +3954,30 @@ impl PersistencePlan {
         lists: Vec<ListMemoryPlan>,
         migration_edges: Vec<MigrationEdgePlan>,
     ) -> Result<Self, PlanError> {
-        Self::new_with_migrations(
+        Self::new_with_collections(
             application,
             schema_version,
             memory,
             lists,
+            Vec::new(),
+            migration_edges,
+        )
+    }
+
+    pub fn new_with_collections(
+        application: &ApplicationPlan,
+        schema_version: u64,
+        memory: Vec<MemoryPlan>,
+        lists: Vec<ListMemoryPlan>,
+        collections: Vec<CollectionMemoryPlan>,
+        migration_edges: Vec<MigrationEdgePlan>,
+    ) -> Result<Self, PlanError> {
+        Self::new_with_collections_and_migrations(
+            application,
+            schema_version,
+            memory,
+            lists,
+            collections,
             Vec::new(),
             None,
             migration_edges,
@@ -3919,7 +3993,7 @@ impl PersistencePlan {
         current_migration_recipe_id: Option<MigrationRecipeId>,
         migration_edges: Vec<MigrationEdgePlan>,
     ) -> Result<Self, PlanError> {
-        Self::new_with_migrations_and_effect_outbox(
+        Self::new_with_collections_and_migrations(
             application,
             schema_version,
             memory,
@@ -3932,11 +4006,60 @@ impl PersistencePlan {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub fn new_with_collections_and_migrations(
+        application: &ApplicationPlan,
+        schema_version: u64,
+        memory: Vec<MemoryPlan>,
+        lists: Vec<ListMemoryPlan>,
+        collections: Vec<CollectionMemoryPlan>,
+        migration_recipes: Vec<MigrationRecipePlan>,
+        current_migration_recipe_id: Option<MigrationRecipeId>,
+        migration_edges: Vec<MigrationEdgePlan>,
+    ) -> Result<Self, PlanError> {
+        Self::new_with_migrations_effect_outbox_and_collections(
+            application,
+            schema_version,
+            memory,
+            lists,
+            collections,
+            Vec::new(),
+            migration_recipes,
+            current_migration_recipe_id,
+            migration_edges,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_migrations_and_effect_outbox(
+        application: &ApplicationPlan,
+        schema_version: u64,
+        memory: Vec<MemoryPlan>,
+        lists: Vec<ListMemoryPlan>,
+        effect_outbox: Vec<EffectOutboxSchema>,
+        migration_recipes: Vec<MigrationRecipePlan>,
+        current_migration_recipe_id: Option<MigrationRecipeId>,
+        migration_edges: Vec<MigrationEdgePlan>,
+    ) -> Result<Self, PlanError> {
+        Self::new_with_migrations_effect_outbox_and_collections(
+            application,
+            schema_version,
+            memory,
+            lists,
+            Vec::new(),
+            effect_outbox,
+            migration_recipes,
+            current_migration_recipe_id,
+            migration_edges,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_migrations_effect_outbox_and_collections(
         application: &ApplicationPlan,
         schema_version: u64,
         mut memory: Vec<MemoryPlan>,
         mut lists: Vec<ListMemoryPlan>,
+        mut collections: Vec<CollectionMemoryPlan>,
         mut effect_outbox: Vec<EffectOutboxSchema>,
         mut migration_recipes: Vec<MigrationRecipePlan>,
         current_migration_recipe_id: Option<MigrationRecipeId>,
@@ -3955,6 +4078,7 @@ impl PersistencePlan {
         for list in &mut lists {
             list.row_fields.sort_by_key(|leaf| leaf.leaf_id);
         }
+        collections.sort_by_key(|collection| collection.memory_id);
         effect_outbox.sort_by_key(|schema| schema.effect_id);
         migration_recipes.sort_by_key(|recipe| recipe.migration_recipe_id);
         migration_edges.sort_by_key(|edge| edge.migration_edge_id);
@@ -3966,6 +4090,7 @@ impl PersistencePlan {
             migration_catalog_hash: [0; 32],
             memory,
             lists,
+            collections,
             effect_outbox,
             migration_recipes,
             current_migration_recipe_id,
@@ -10038,9 +10163,10 @@ pub fn verify_plan(plan: &MachinePlan) -> Result<PlanVerification, PlanError> {
         id: "persistence-identities-unique".to_owned(),
         pass: persistence_identities_unique(&plan.persistence),
         detail: format!(
-            "{} scalar/indexed memory node(s), {} list memory node(s), {} migration recipe(s), {} migration edge(s)",
+            "{} scalar/indexed memory node(s), {} list memory node(s), {} collection memory node(s), {} migration recipe(s), {} migration edge(s)",
             plan.persistence.memory.len(),
             plan.persistence.lists.len(),
+            plan.persistence.collections.len(),
             plan.persistence.migration_recipes.len(),
             plan.persistence.migration_edges.len()
         ),
@@ -10059,7 +10185,7 @@ pub fn verify_plan(plan: &MachinePlan) -> Result<PlanVerification, PlanError> {
         id: "persistence-runtime-slots-consistent".to_owned(),
         pass: persistence_runtime_slots_consistent(plan),
         detail:
-            "active persistence memory maps uniquely to executable slots and authoritative row fields"
+            "active persistence memory maps uniquely to executable slots, collection authorities, and authoritative row fields"
                 .to_owned(),
     });
     let list_authority_failure = list_authority_fields_failure(plan);
@@ -11209,6 +11335,17 @@ fn persistence_identities_unique(persistence: &PersistencePlan) -> bool {
         .iter()
         .map(|memory| memory.memory_id)
         .chain(persistence.lists.iter().map(|list| list.memory_id))
+        .chain(
+            persistence
+                .collections
+                .iter()
+                .map(|collection| collection.memory_id),
+        )
+        .collect::<Vec<_>>();
+    let collection_authorities = persistence
+        .collections
+        .iter()
+        .map(|collection| collection.authority)
         .collect::<Vec<_>>();
     let leaf_ids = persistence
         .memory
@@ -11232,6 +11369,12 @@ fn persistence_identities_unique(persistence: &PersistencePlan) -> bool {
         .map(|recipe| recipe.migration_recipe_id)
         .collect::<Vec<_>>();
     memory_ids.iter().copied().collect::<BTreeSet<_>>().len() == memory_ids.len()
+        && collection_authorities
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .len()
+            == collection_authorities.len()
         && leaf_ids.iter().copied().collect::<BTreeSet<_>>().len() == leaf_ids.len()
         && recipe_ids.iter().copied().collect::<BTreeSet<_>>().len() == recipe_ids.len()
         && edge_ids.iter().copied().collect::<BTreeSet<_>>().len() == edge_ids.len()
@@ -11263,6 +11406,22 @@ fn persistence_identities_match(persistence: &PersistencePlan) -> Result<bool, P
             {
                 return Ok(false);
             }
+        }
+    }
+    for collection in &persistence.collections {
+        if collection.memory_id
+            != MemoryId::from_identity(
+                &collection.owner,
+                &collection.semantic_path,
+                collection.kind,
+            )?
+            || !matches!(
+                (collection.kind, &collection.data_type),
+                (MemoryKind::Map, DataTypePlan::Map { .. })
+                    | (MemoryKind::Set, DataTypePlan::Set { .. })
+            )
+        {
+            return Ok(false);
         }
     }
     for recipe in &persistence.migration_recipes {
@@ -11313,6 +11472,11 @@ fn persistence_type_fingerprints_match(persistence: &PersistencePlan) -> Result<
             if leaf.type_fingerprint != data_type_fingerprint(&leaf.data_type)? {
                 return Ok(false);
             }
+        }
+    }
+    for collection in &persistence.collections {
+        if collection.type_fingerprint != data_type_fingerprint(&collection.data_type)? {
+            return Ok(false);
         }
     }
     Ok(true)
@@ -12010,6 +12174,52 @@ fn persistence_runtime_slots_consistent(plan: &MachinePlan) -> bool {
 
     linked_slots.len() == plan.persistence.memory.len() + plan.persistence.lists.len()
         && linked_durable_indexed_fields == durable_indexed_fields
+        && collection_authorities_consistent(plan)
+}
+
+fn collection_authorities_consistent(plan: &MachinePlan) -> bool {
+    let planned = plan
+        .persistence
+        .collections
+        .iter()
+        .map(|collection| (collection.authority, collection.kind))
+        .collect::<BTreeMap<_, _>>();
+    if planned.len() != plan.persistence.collections.len()
+        || plan
+            .persistence
+            .collections
+            .iter()
+            .any(|collection| !plan_owner_resolves(plan, &collection.runtime_owner))
+    {
+        return false;
+    }
+
+    let mut observed = BTreeMap::new();
+    let mut duplicate = false;
+    if visit_plan_row_expressions(plan, &mut |_, expression| {
+        let authority = match expression {
+            PlanRowExpressionNode::MapLiteral { authority, .. } => {
+                Some((*authority, MemoryKind::Map))
+            }
+            PlanRowExpressionNode::SetLiteral { authority, .. } => {
+                Some((*authority, MemoryKind::Set))
+            }
+            _ => None,
+        };
+        if let Some((authority, kind)) = authority
+            && observed.insert(authority, kind).is_some()
+        {
+            duplicate = true;
+        }
+    })
+    .is_err()
+    {
+        return false;
+    }
+    !duplicate
+        && planned
+            .iter()
+            .all(|(authority, kind)| observed.get(authority) == Some(kind))
 }
 
 fn persistence_ordering_is_deterministic(persistence: &PersistencePlan) -> bool {
@@ -12042,6 +12252,19 @@ fn persistence_ordering_is_deterministic(persistence: &PersistencePlan) -> bool 
                     .row_fields
                     .iter()
                     .all(|leaf| leaf.data_type.is_canonical())
+        })
+        && persistence
+            .collections
+            .windows(2)
+            .all(|pair| pair[0].memory_id < pair[1].memory_id)
+        && persistence.collections.iter().all(|collection| {
+            collection.data_type.is_canonical()
+                && !data_type_contains_unknown(&collection.data_type)
+                && matches!(
+                    (collection.kind, &collection.data_type),
+                    (MemoryKind::Map, DataTypePlan::Map { .. })
+                        | (MemoryKind::Set, DataTypePlan::Set { .. })
+                )
         })
         && persistence
             .effect_outbox
@@ -12208,12 +12431,36 @@ impl CanonicalListMemorySchema {
 }
 
 #[derive(Serialize)]
+struct CanonicalCollectionMemorySchema {
+    memory_id: MemoryId,
+    kind: MemoryKind,
+    semantic_path: String,
+    data_type: DataTypePlan,
+    type_fingerprint: [u8; 32],
+    owner: MemoryOwnerPath,
+}
+
+impl CanonicalCollectionMemorySchema {
+    fn from_collection(collection: &CollectionMemoryPlan) -> Self {
+        Self {
+            memory_id: collection.memory_id,
+            kind: collection.kind,
+            semantic_path: collection.semantic_path.clone(),
+            data_type: collection.data_type.canonicalized(),
+            type_fingerprint: collection.type_fingerprint,
+            owner: collection.owner.clone(),
+        }
+    }
+}
+
+#[derive(Serialize)]
 struct CanonicalPersistenceSchema<'a> {
     application: &'a ApplicationIdentity,
     format_version: u32,
     schema_version: u64,
     memory: Vec<CanonicalMemorySchema>,
     lists: Vec<CanonicalListMemorySchema>,
+    collections: Vec<CanonicalCollectionMemorySchema>,
     effect_outbox: &'a [EffectOutboxSchema],
 }
 
@@ -12236,12 +12483,19 @@ pub fn persistence_schema_hash(
         .map(CanonicalListMemorySchema::from_list)
         .collect::<Vec<_>>();
     lists.sort_by_key(|list| list.memory_id);
+    let mut collections = persistence
+        .collections
+        .iter()
+        .map(CanonicalCollectionMemorySchema::from_collection)
+        .collect::<Vec<_>>();
+    collections.sort_by_key(|collection| collection.memory_id);
     canonical_sha256(&CanonicalPersistenceSchema {
         application: &application.identity,
         format_version: persistence.format_version,
         schema_version: persistence.schema_version,
         memory,
         lists,
+        collections,
         effect_outbox: &persistence.effect_outbox,
     })
 }

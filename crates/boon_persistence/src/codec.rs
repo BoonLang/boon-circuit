@@ -1,10 +1,10 @@
 use super::{
     ApplicationTransfer, CheckpointBatch, ContentArtifact, ContentArtifactBinding,
     ContentArtifactId, ContentArtifactManifest, ContentArtifactOwnerId, ContentArtifactRetention,
-    DurableChange, DurableContentArtifactChange, DurableOutboxChange, DurableOutboxItem,
-    DurableOutboxState, DurableOwner, DurableRowId, OutboxItemId, RestoreImage, StoredList,
-    StoredRow, StoredScalar, StoredValue, validate_application_transfer,
-    validate_content_artifact_manifest,
+    DurableChange, DurableCollectionId, DurableContentArtifactChange, DurableOutboxChange,
+    DurableOutboxItem, DurableOutboxState, DurableOwner, DurableRowId, OutboxItemId, RestoreImage,
+    StoredList, StoredMap, StoredRow, StoredScalar, StoredSet, StoredValue,
+    validate_application_transfer, validate_content_artifact_manifest,
 };
 use boon_plan::{
     ApplicationIdentity, EffectId, EffectInvocationId, MemoryId, MemoryLeafId, MigrationEdgeId,
@@ -14,9 +14,9 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-const RESTORE_IMAGE_FORMAT: u32 = 10;
-const APPLICATION_TRANSFER_FORMAT: u32 = 8;
-const CHECKPOINT_BATCH_FORMAT: u32 = 10;
+const RESTORE_IMAGE_FORMAT: u32 = 11;
+const APPLICATION_TRANSFER_FORMAT: u32 = 9;
+const CHECKPOINT_BATCH_FORMAT: u32 = 11;
 const OUTBOX_RECORD_FORMAT: u32 = 5;
 const BLOB_RECORD_FORMAT: u32 = 1;
 const STORED_NUMBER: u8 = 20;
@@ -98,7 +98,7 @@ pub fn encode_restore_image(image: &RestoreImage) -> Result<Vec<u8>, CodecError>
     let mut bytes = Vec::new();
     let mut encoder = Encoder::new(&mut bytes);
     encoder
-        .array(11)
+        .array(13)
         .and_then(|encoder| encoder.u32(RESTORE_IMAGE_FORMAT))
         .map_err(encode_error)?;
     encode_application(&mut encoder, &image.application)?;
@@ -123,6 +123,18 @@ pub fn encode_restore_image(image: &RestoreImage) -> Result<Vec<u8>, CodecError>
     for (memory, list) in &image.lists {
         encode_digest(&mut encoder, memory.as_bytes())?;
         encode_list(&mut encoder, list)?;
+    }
+
+    encoder.map(image.maps.len() as u64).map_err(encode_error)?;
+    for (collection_id, map) in &image.maps {
+        encode_durable_collection_id(&mut encoder, collection_id)?;
+        encode_map(&mut encoder, map)?;
+    }
+
+    encoder.map(image.sets.len() as u64).map_err(encode_error)?;
+    for (collection_id, set) in &image.sets {
+        encode_durable_collection_id(&mut encoder, collection_id)?;
+        encode_set(&mut encoder, set)?;
     }
 
     encoder
@@ -152,7 +164,7 @@ pub fn decode_restore_image(
     let mut decoder = Decoder::new(bytes);
     let root_len = definite_len(decoder.array().map_err(decode_error)?, "restore image")?;
     let format = decoder.u32().map_err(decode_error)?;
-    if (format, root_len) != (RESTORE_IMAGE_FORMAT, 11) {
+    if (format, root_len) != (RESTORE_IMAGE_FORMAT, 13) {
         return Err(CodecError::new(format!(
             "unsupported restore image format {format} with {root_len} fields"
         )));
@@ -180,6 +192,26 @@ pub fn decode_restore_image(
         let list = decode_list(&mut decoder, limits)?;
         if lists.insert(memory, list).is_some() {
             return Err(CodecError::new("restore image repeats a list memory ID"));
+        }
+    }
+
+    let map_count = collection_len(&mut decoder, limits, "map authority map", false)?;
+    let mut maps = BTreeMap::new();
+    for _ in 0..map_count {
+        let collection_id = decode_durable_collection_id(&mut decoder, limits)?;
+        let map = decode_map(&mut decoder, limits)?;
+        if maps.insert(collection_id, map).is_some() {
+            return Err(CodecError::new("restore image repeats a map collection ID"));
+        }
+    }
+
+    let set_count = collection_len(&mut decoder, limits, "set authority map", false)?;
+    let mut sets = BTreeMap::new();
+    for _ in 0..set_count {
+        let collection_id = decode_durable_collection_id(&mut decoder, limits)?;
+        let set = decode_set(&mut decoder, limits)?;
+        if sets.insert(collection_id, set).is_some() {
+            return Err(CodecError::new("restore image repeats a set collection ID"));
         }
     }
 
@@ -218,6 +250,8 @@ pub fn decode_restore_image(
         through_turn_sequence,
         scalars,
         lists,
+        maps,
+        sets,
         completed_migration_edges,
         outbox,
         content_artifact_manifest,
@@ -491,6 +525,96 @@ pub(crate) fn scalar_component_blob_references(
     let mut references = BTreeMap::new();
     decode_component_value(&mut decoder, limits, 0, None, &mut references)?;
     reject_trailing(&decoder, bytes, "stored scalar")?;
+    Ok(references)
+}
+
+pub(crate) fn encode_map_entry_component(
+    key: &StoredValue,
+    value: &StoredValue,
+) -> Result<EncodedComponent, CodecError> {
+    let mut bytes = Vec::new();
+    let mut blobs = BTreeMap::new();
+    let mut references = BTreeMap::new();
+    let mut encoder = Encoder::new(&mut bytes);
+    encoder.array(2).map_err(encode_error)?;
+    encode_component_value(&mut encoder, key, 0, &mut blobs, &mut references)?;
+    encode_component_value(&mut encoder, value, 0, &mut blobs, &mut references)?;
+    Ok(EncodedComponent {
+        bytes,
+        blobs,
+        references,
+    })
+}
+
+pub(crate) fn decode_map_entry_component(
+    bytes: &[u8],
+    limits: DecodeLimits,
+    blobs: &BTreeMap<BlobDigest, BlobRecord>,
+) -> Result<(StoredValue, StoredValue), CodecError> {
+    component_size(bytes, limits, "stored map entry")?;
+    let mut decoder = Decoder::new(bytes);
+    expect_array(&mut decoder, 2, "stored map entry")?;
+    let mut references = BTreeMap::new();
+    let key = decode_component_value(&mut decoder, limits, 0, Some(blobs), &mut references)?;
+    let value = decode_component_value(&mut decoder, limits, 0, Some(blobs), &mut references)?;
+    reject_trailing(&decoder, bytes, "stored map entry")?;
+    Ok((key, value))
+}
+
+pub(crate) fn map_entry_component_blob_references(
+    bytes: &[u8],
+    limits: DecodeLimits,
+) -> Result<BTreeMap<BlobDigest, u64>, CodecError> {
+    component_size(bytes, limits, "stored map entry")?;
+    let mut decoder = Decoder::new(bytes);
+    expect_array(&mut decoder, 2, "stored map entry")?;
+    let mut references = BTreeMap::new();
+    decode_component_value(&mut decoder, limits, 0, None, &mut references)?;
+    decode_component_value(&mut decoder, limits, 0, None, &mut references)?;
+    reject_trailing(&decoder, bytes, "stored map entry")?;
+    Ok(references)
+}
+
+pub(crate) fn encode_set_item_component(
+    item: &StoredValue,
+) -> Result<EncodedComponent, CodecError> {
+    let mut bytes = Vec::new();
+    let mut blobs = BTreeMap::new();
+    let mut references = BTreeMap::new();
+    let mut encoder = Encoder::new(&mut bytes);
+    encoder.array(1).map_err(encode_error)?;
+    encode_component_value(&mut encoder, item, 0, &mut blobs, &mut references)?;
+    Ok(EncodedComponent {
+        bytes,
+        blobs,
+        references,
+    })
+}
+
+pub(crate) fn decode_set_item_component(
+    bytes: &[u8],
+    limits: DecodeLimits,
+    blobs: &BTreeMap<BlobDigest, BlobRecord>,
+) -> Result<StoredValue, CodecError> {
+    component_size(bytes, limits, "stored set item")?;
+    let mut decoder = Decoder::new(bytes);
+    expect_array(&mut decoder, 1, "stored set item")?;
+    let mut references = BTreeMap::new();
+    let item = decode_component_value(&mut decoder, limits, 0, Some(blobs), &mut references)?;
+    reject_trailing(&decoder, bytes, "stored set item")?;
+    Ok(item)
+}
+
+pub(crate) fn set_item_component_blob_references(
+    bytes: &[u8],
+    limits: DecodeLimits,
+) -> Result<BTreeMap<BlobDigest, u64>, CodecError> {
+    component_size(bytes, limits, "stored set item")?;
+    let mut decoder = Decoder::new(bytes);
+    expect_array(&mut decoder, 1, "stored set item")?;
+    let mut references = BTreeMap::new();
+    decode_component_value(&mut decoder, limits, 0, None, &mut references)?;
+    reject_trailing(&decoder, bytes, "stored set item")?;
     Ok(references)
 }
 
@@ -895,6 +1019,96 @@ fn encode_durable_change(
                 .map_err(encode_error)?;
             encode_digest(encoder, memory_id.as_bytes())?;
         }
+        DurableChange::SetMap {
+            collection_id,
+            value,
+        } => {
+            encoder
+                .array(3)
+                .and_then(|encoder| encoder.u8(7))
+                .map_err(encode_error)?;
+            encode_durable_collection_id(encoder, collection_id)?;
+            encode_map(encoder, value)?;
+        }
+        DurableChange::MapUpsert {
+            collection_id,
+            revision,
+            key,
+            value,
+        } => {
+            encoder
+                .array(5)
+                .and_then(|encoder| encoder.u8(8))
+                .map_err(encode_error)?;
+            encode_durable_collection_id(encoder, collection_id)?;
+            encoder.u64(*revision).map_err(encode_error)?;
+            encode_value(encoder, key, 0)?;
+            encode_value(encoder, value, 0)?;
+        }
+        DurableChange::MapRemove {
+            collection_id,
+            revision,
+            key,
+        } => {
+            encoder
+                .array(4)
+                .and_then(|encoder| encoder.u8(9))
+                .map_err(encode_error)?;
+            encode_durable_collection_id(encoder, collection_id)?;
+            encoder.u64(*revision).map_err(encode_error)?;
+            encode_value(encoder, key, 0)?;
+        }
+        DurableChange::DeleteMap { collection_id } => {
+            encoder
+                .array(2)
+                .and_then(|encoder| encoder.u8(10))
+                .map_err(encode_error)?;
+            encode_durable_collection_id(encoder, collection_id)?;
+        }
+        DurableChange::SetSet {
+            collection_id,
+            value,
+        } => {
+            encoder
+                .array(3)
+                .and_then(|encoder| encoder.u8(11))
+                .map_err(encode_error)?;
+            encode_durable_collection_id(encoder, collection_id)?;
+            encode_set(encoder, value)?;
+        }
+        DurableChange::SetAdd {
+            collection_id,
+            revision,
+            item,
+        } => {
+            encoder
+                .array(4)
+                .and_then(|encoder| encoder.u8(12))
+                .map_err(encode_error)?;
+            encode_durable_collection_id(encoder, collection_id)?;
+            encoder.u64(*revision).map_err(encode_error)?;
+            encode_value(encoder, item, 0)?;
+        }
+        DurableChange::SetRemove {
+            collection_id,
+            revision,
+            item,
+        } => {
+            encoder
+                .array(4)
+                .and_then(|encoder| encoder.u8(13))
+                .map_err(encode_error)?;
+            encode_durable_collection_id(encoder, collection_id)?;
+            encoder.u64(*revision).map_err(encode_error)?;
+            encode_value(encoder, item, 0)?;
+        }
+        DurableChange::DeleteSet { collection_id } => {
+            encoder
+                .array(2)
+                .and_then(|encoder| encoder.u8(14))
+                .map_err(encode_error)?;
+            encode_durable_collection_id(encoder, collection_id)?;
+        }
     }
     Ok(())
 }
@@ -945,6 +1159,41 @@ fn decode_durable_change(
         }),
         (6, 2) => Ok(DurableChange::DeleteList {
             memory_id: MemoryId(decode_digest(decoder)?),
+        }),
+        (7, 3) => Ok(DurableChange::SetMap {
+            collection_id: decode_durable_collection_id(decoder, limits)?,
+            value: decode_map(decoder, limits)?,
+        }),
+        (8, 5) => Ok(DurableChange::MapUpsert {
+            collection_id: decode_durable_collection_id(decoder, limits)?,
+            revision: decoder.u64().map_err(decode_error)?,
+            key: decode_value(decoder, limits, 0)?,
+            value: decode_value(decoder, limits, 0)?,
+        }),
+        (9, 4) => Ok(DurableChange::MapRemove {
+            collection_id: decode_durable_collection_id(decoder, limits)?,
+            revision: decoder.u64().map_err(decode_error)?,
+            key: decode_value(decoder, limits, 0)?,
+        }),
+        (10, 2) => Ok(DurableChange::DeleteMap {
+            collection_id: decode_durable_collection_id(decoder, limits)?,
+        }),
+        (11, 3) => Ok(DurableChange::SetSet {
+            collection_id: decode_durable_collection_id(decoder, limits)?,
+            value: decode_set(decoder, limits)?,
+        }),
+        (12, 4) => Ok(DurableChange::SetAdd {
+            collection_id: decode_durable_collection_id(decoder, limits)?,
+            revision: decoder.u64().map_err(decode_error)?,
+            item: decode_value(decoder, limits, 0)?,
+        }),
+        (13, 4) => Ok(DurableChange::SetRemove {
+            collection_id: decode_durable_collection_id(decoder, limits)?,
+            revision: decoder.u64().map_err(decode_error)?,
+            item: decode_value(decoder, limits, 0)?,
+        }),
+        (14, 2) => Ok(DurableChange::DeleteSet {
+            collection_id: decode_durable_collection_id(decoder, limits)?,
         }),
         _ => Err(CodecError::new(format!(
             "unknown durable change tag {tag} with array length {len}"
@@ -1029,6 +1278,26 @@ fn decode_durable_owner(
         });
     }
     Ok(DurableOwner { ancestors })
+}
+
+fn encode_durable_collection_id(
+    encoder: &mut CborEncoder<'_>,
+    collection_id: &DurableCollectionId,
+) -> Result<(), CodecError> {
+    encoder.array(2).map_err(encode_error)?;
+    encode_digest(encoder, collection_id.memory_id.as_bytes())?;
+    encode_durable_owner(encoder, &collection_id.owner)
+}
+
+fn decode_durable_collection_id(
+    decoder: &mut Decoder<'_>,
+    limits: DecodeLimits,
+) -> Result<DurableCollectionId, CodecError> {
+    expect_array(decoder, 2, "durable collection ID")?;
+    Ok(DurableCollectionId {
+        memory_id: MemoryId(decode_digest(decoder)?),
+        owner: decode_durable_owner(decoder, limits)?,
+    })
 }
 
 fn encode_optional_durable_owner(
@@ -1364,6 +1633,71 @@ fn decode_list(decoder: &mut Decoder<'_>, limits: DecodeLimits) -> Result<Stored
         next_key,
         next_order_token,
         rows,
+    })
+}
+
+fn encode_map(encoder: &mut CborEncoder<'_>, map: &StoredMap) -> Result<(), CodecError> {
+    encoder
+        .array(3)
+        .and_then(|encoder| encoder.bool(map.touched))
+        .and_then(|encoder| encoder.u64(map.revision))
+        .and_then(|encoder| encoder.map(map.entries.len() as u64))
+        .map_err(encode_error)?;
+    for (key, value) in &map.entries {
+        encode_value(encoder, key, 0)?;
+        encode_value(encoder, value, 0)?;
+    }
+    Ok(())
+}
+
+fn decode_map(decoder: &mut Decoder<'_>, limits: DecodeLimits) -> Result<StoredMap, CodecError> {
+    expect_array(decoder, 3, "stored map")?;
+    let touched = decoder.bool().map_err(decode_error)?;
+    let revision = decoder.u64().map_err(decode_error)?;
+    let entry_count = collection_len(decoder, limits, "stored map entries", false)?;
+    let mut entries = BTreeMap::new();
+    for _ in 0..entry_count {
+        let key = decode_value(decoder, limits, 0)?;
+        let value = decode_value(decoder, limits, 0)?;
+        if entries.insert(key, value).is_some() {
+            return Err(CodecError::new("stored map repeats a key"));
+        }
+    }
+    Ok(StoredMap {
+        touched,
+        revision,
+        entries,
+    })
+}
+
+fn encode_set(encoder: &mut CborEncoder<'_>, set: &StoredSet) -> Result<(), CodecError> {
+    encoder
+        .array(3)
+        .and_then(|encoder| encoder.bool(set.touched))
+        .and_then(|encoder| encoder.u64(set.revision))
+        .and_then(|encoder| encoder.array(set.items.len() as u64))
+        .map_err(encode_error)?;
+    for item in &set.items {
+        encode_value(encoder, item, 0)?;
+    }
+    Ok(())
+}
+
+fn decode_set(decoder: &mut Decoder<'_>, limits: DecodeLimits) -> Result<StoredSet, CodecError> {
+    expect_array(decoder, 3, "stored set")?;
+    let touched = decoder.bool().map_err(decode_error)?;
+    let revision = decoder.u64().map_err(decode_error)?;
+    let item_count = collection_len(decoder, limits, "stored set items", true)?;
+    let mut items = BTreeSet::new();
+    for _ in 0..item_count {
+        if !items.insert(decode_value(decoder, limits, 0)?) {
+            return Err(CodecError::new("stored set repeats an item"));
+        }
+    }
+    Ok(StoredSet {
+        touched,
+        revision,
+        items,
     })
 }
 

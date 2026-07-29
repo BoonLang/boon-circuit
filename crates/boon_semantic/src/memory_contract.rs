@@ -12,7 +12,8 @@ use crate::{
     SemanticListId, SemanticLoweringContractV1, SemanticMaterializationId, SemanticMigrationId,
     SemanticReactiveGraphV1, SemanticReadTargetV1, SemanticResourceGraphV1, SemanticRowBinding,
     SemanticScopeStorageGraphV1, SemanticSelectKind, SemanticSourceUnitId, SemanticStateId,
-    SemanticStorageBindingTargetV1, SemanticStorageFieldId, SemanticValueOrigin,
+    SemanticStatementKind, SemanticStorageBindingTargetV1, SemanticStorageFieldId,
+    SemanticValueOrigin, StaticOwnerId,
 };
 use boon_contract::SourceBundleDigestV1;
 use boon_typecheck::{
@@ -97,6 +98,8 @@ pub enum SemanticMemoryKindV1 {
     RootScalar,
     IndexedField,
     ListOwner,
+    Map,
+    Set,
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -134,18 +137,27 @@ pub enum SemanticMemoryBackingV1 {
         list: SemanticListId,
         row: SemanticRowBinding,
     },
+    Collection {
+        expression: SemanticExprId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner: Option<StaticOwnerId>,
+    },
 }
 
 impl SemanticMemoryBackingV1 {
-    pub const fn binding(self) -> SemanticBindingId {
+    pub const fn binding(self) -> Option<SemanticBindingId> {
         match self {
-            Self::State { binding, .. } | Self::List { binding, .. } => binding,
+            Self::State { binding, .. } | Self::List { binding, .. } => Some(binding),
+            Self::Collection { .. } => None,
         }
     }
 
-    pub const fn storage_field(self) -> SemanticStorageFieldId {
+    pub const fn storage_field(self) -> Option<SemanticStorageFieldId> {
         match self {
-            Self::State { storage_field, .. } | Self::List { storage_field, .. } => storage_field,
+            Self::State { storage_field, .. } | Self::List { storage_field, .. } => {
+                Some(storage_field)
+            }
+            Self::Collection { .. } => None,
         }
     }
 
@@ -153,6 +165,7 @@ impl SemanticMemoryBackingV1 {
         match self {
             Self::State { row, .. } => row,
             Self::List { row, .. } => Some(row),
+            Self::Collection { .. } => None,
         }
     }
 }
@@ -282,7 +295,9 @@ pub(crate) fn build_semantic_memory_graph(
 
     let reachable = reachable_semantic_expressions(execution)?;
     validate_checked_marker_equivalence(checked, execution, &reachable)?;
-    let mut memories = build_memories(resources, reactive, storage, lowering)?;
+    let mut memories = build_memories(
+        execution, &reachable, resources, reactive, storage, lowering,
+    )?;
     attach_draining_markers(execution, reactive, storage, &reachable, &mut memories)?;
     let drains = collect_drains(
         execution, resources, reactive, storage, &reachable, &memories,
@@ -327,12 +342,16 @@ impl SemanticMemoryGraphV1 {
 }
 
 fn build_memories(
+    execution: &SemanticExecutionGraphV1,
+    reachable: &BTreeSet<SemanticExprId>,
     resources: &SemanticResourceGraphV1,
     reactive: &SemanticReactiveGraphV1,
     storage: &SemanticScopeStorageGraphV1,
     lowering: &SemanticLoweringContractV1,
 ) -> Result<Vec<SemanticMemoryV1>, SemanticMemoryError> {
-    let mut memories = Vec::with_capacity(resources.states.len() + resources.lists.len());
+    let mut memories = Vec::with_capacity(
+        resources.states.len() + resources.lists.len() + execution.expressions.len(),
+    );
     let mut identities = BTreeMap::<SemanticMemoryIdentityV1, String>::new();
 
     for state in resources.states.iter().filter(|state| state.published) {
@@ -493,7 +512,108 @@ fn build_memories(
         });
     }
 
+    for expression in execution
+        .expressions
+        .iter()
+        .filter(|expression| reachable.contains(&expression.id))
+    {
+        let kind = match expression.kind {
+            SemanticExpressionKind::Map { .. } => SemanticMemoryKindV1::Map,
+            SemanticExpressionKind::Set { .. } => SemanticMemoryKindV1::Set,
+            _ => continue,
+        };
+        // An empty collection can remain intentionally unconstrained when it
+        // is used only as a runtime authority. It does not become durable
+        // schema until the compiler can prove its complete key/item/value
+        // type.
+        if !type_is_closed_memory_data(&expression.flow_type.ty) {
+            continue;
+        }
+        let origin = execution
+            .checked_expression_origins
+            .get(expression.id.as_usize())
+            .filter(|origin| origin.expression == expression.id)
+            .ok_or_else(|| {
+                SemanticMemoryError::new(format!(
+                    "collection authority expression {} has no exact checked origin",
+                    expression.id
+                ))
+            })?;
+        let semantic_path = collection_statement_path(execution, expression.id)?.ok_or_else(|| {
+            SemanticMemoryError::new(format!(
+                "collection authority expression {} has no stable named semantic path; bind it beneath one named field",
+                expression.id
+            ))
+        })?;
+        let (source_unit, canonical_module) =
+            exact_source_unit(lowering, origin.checked_span.line, &semantic_path)?;
+        let identity = SemanticMemoryIdentityV1 {
+            source_unit,
+            canonical_module,
+            owner_path: semantic_parent_path(&semantic_path)?,
+            semantic_path,
+            kind,
+        };
+        insert_memory_identity(
+            &mut identities,
+            &identity,
+            format!("collection expression {}", expression.id),
+        )?;
+        memories.push(SemanticMemoryV1 {
+            id: SemanticMemoryId(memories.len()),
+            leaves: vec![SemanticMemoryLeafV1 {
+                projection: Vec::new(),
+                data_type: expression.flow_type.ty.clone(),
+            }],
+            identity,
+            backing: SemanticMemoryBackingV1::Collection {
+                expression: expression.id,
+                owner: expression.owner,
+            },
+            data_type: expression.flow_type.ty.clone(),
+            status: SemanticMemoryStatusV1::Active,
+        });
+    }
+
     Ok(memories)
+}
+
+fn collection_statement_path(
+    execution: &SemanticExecutionGraphV1,
+    expression: SemanticExprId,
+) -> Result<Option<String>, SemanticMemoryError> {
+    let mut candidates = Vec::<String>::new();
+    for statement in &execution.statements {
+        let Some(root) = statement.value else {
+            continue;
+        };
+        if !expression_reaches(execution, root, expression)? {
+            continue;
+        }
+        let path = match &statement.kind {
+            SemanticStatementKind::Field { path, .. } => Some(path.clone()),
+            SemanticStatementKind::Source { path, .. }
+            | SemanticStatementKind::Hold { path, .. }
+            | SemanticStatementKind::List { path, .. } => path.clone(),
+            _ => None,
+        };
+        if let Some(path) = path {
+            candidates.push(path);
+        }
+    }
+    let max_depth = candidates.iter().map(|path| path.split('.').count()).max();
+    let Some(max_depth) = max_depth else {
+        return Ok(None);
+    };
+    candidates.retain(|path| path.split('.').count() == max_depth);
+    candidates.sort();
+    candidates.dedup();
+    match candidates.as_slice() {
+        [path] => Ok(Some(path.clone())),
+        _ => Err(SemanticMemoryError::new(format!(
+            "collection authority expression {expression} is contained by multiple equally specific named fields {candidates:?}; bind each authority beneath one unique named field"
+        ))),
+    }
 }
 
 fn exact_reactive_binding<'a>(
@@ -874,7 +994,12 @@ fn attach_draining_markers(
             .collect::<BTreeSet<_>>();
         let candidates = memories
             .iter()
-            .filter(|memory| candidate_bindings.contains(&memory.backing.binding()))
+            .filter(|memory| {
+                memory
+                    .backing
+                    .binding()
+                    .is_some_and(|binding| candidate_bindings.contains(&binding))
+            })
             .map(|memory| memory.id)
             .collect::<Vec<_>>();
         let [memory_id] = candidates.as_slice() else {
@@ -1200,7 +1325,7 @@ fn memory_for_storage_binding<'a>(
 ) -> Result<&'a SemanticMemoryV1, SemanticMemoryError> {
     let matches = memories
         .iter()
-        .filter(|memory| memory.backing.binding() == storage.binding)
+        .filter(|memory| memory.backing.binding() == Some(storage.binding))
         .filter(|memory| match (memory.backing, &storage.target) {
             (
                 SemanticMemoryBackingV1::State {
@@ -1521,15 +1646,20 @@ fn validate_no_ordinary_draining_reads(
     let mut definition_members = BTreeMap::new();
     for memory_id in &draining {
         let memory = require_memory(memories, *memory_id)?;
+        let binding_id = memory.backing.binding().ok_or_else(|| {
+            SemanticMemoryError::new(format!(
+                "collection memory `{}` cannot be DRAINING",
+                memory.identity.semantic_path
+            ))
+        })?;
         let binding = reactive
             .bindings
-            .get(memory.backing.binding().as_usize())
-            .filter(|binding| binding.id == memory.backing.binding())
+            .get(binding_id.as_usize())
+            .filter(|binding| binding.id == binding_id)
             .ok_or_else(|| {
                 SemanticMemoryError::new(format!(
                     "semantic memory `{}` references missing reactive binding {}",
-                    memory.identity.semantic_path,
-                    memory.backing.binding()
+                    memory.identity.semantic_path, binding_id
                 ))
             })?;
         definition_members.insert(*memory_id, expression_subtree(execution, binding.producer)?);
@@ -1560,7 +1690,7 @@ fn validate_no_ordinary_draining_reads(
         let storage_binding = exact_storage_binding(storage, binding)?;
         let candidates = memories
             .iter()
-            .filter(|memory| memory.backing.binding() == storage_binding.binding)
+            .filter(|memory| memory.backing.binding() == Some(storage_binding.binding))
             .map(|memory| memory.id)
             .collect::<Vec<_>>();
         for memory_id in candidates {
@@ -1731,6 +1861,12 @@ fn lower_migration_edges(
                         input: input.expression,
                     },
                 )
+            }
+            SemanticMemoryKindV1::Map | SemanticMemoryKindV1::Set => {
+                return Err(SemanticMemoryError::new(format!(
+                    "collection memory `{}` cannot be a DRAIN migration destination",
+                    destination.identity.semantic_path
+                )));
             }
         };
 
@@ -2386,7 +2522,9 @@ fn validate_memory_shape(
             &format!("semantic memory `{}`", memory.identity.semantic_path),
         )?;
         let expected_leaves = match memory.identity.kind {
-            SemanticMemoryKindV1::ListOwner => vec![SemanticMemoryLeafV1 {
+            SemanticMemoryKindV1::ListOwner
+            | SemanticMemoryKindV1::Map
+            | SemanticMemoryKindV1::Set => vec![SemanticMemoryLeafV1 {
                 projection: Vec::new(),
                 data_type: memory.data_type.clone(),
             }],
@@ -2401,34 +2539,31 @@ fn validate_memory_shape(
             )));
         }
 
-        let storage_field = require_storage_field(storage, memory.backing.storage_field())?;
-        if storage_field.flow_type.ty != memory.data_type {
-            return Err(SemanticMemoryError::new(format!(
-                "semantic memory `{}` type differs from storage field {}",
-                memory.identity.semantic_path,
-                memory.backing.storage_field()
-            )));
-        }
-        let reactive_binding = reactive
-            .bindings
-            .get(memory.backing.binding().as_usize())
-            .filter(|binding| binding.id == memory.backing.binding())
-            .ok_or_else(|| {
-                SemanticMemoryError::new(format!(
-                    "semantic memory `{}` references missing reactive binding {}",
-                    memory.identity.semantic_path,
-                    memory.backing.binding()
-                ))
-            })?;
-        let storage_binding = exact_storage_binding(storage, reactive_binding.id)?;
-
         match memory.backing {
             SemanticMemoryBackingV1::State {
+                binding,
                 storage_field,
                 state,
                 row,
-                ..
             } => {
+                let field = require_storage_field(storage, storage_field)?;
+                if field.flow_type.ty != memory.data_type {
+                    return Err(SemanticMemoryError::new(format!(
+                        "semantic memory `{}` type differs from storage field {storage_field}",
+                        memory.identity.semantic_path
+                    )));
+                }
+                let reactive_binding = reactive
+                    .bindings
+                    .get(binding.as_usize())
+                    .filter(|candidate| candidate.id == binding)
+                    .ok_or_else(|| {
+                        SemanticMemoryError::new(format!(
+                            "semantic memory `{}` references missing reactive binding {binding}",
+                            memory.identity.semantic_path
+                        ))
+                    })?;
+                let storage_binding = exact_storage_binding(storage, binding)?;
                 let resource = require_state(resources, state)?;
                 if !resource.published
                     || resource.flow_type.ty != memory.data_type
@@ -2464,11 +2599,29 @@ fn validate_memory_shape(
                 }
             }
             SemanticMemoryBackingV1::List {
+                binding,
                 storage_field,
                 list,
                 row,
-                ..
             } => {
+                let field = require_storage_field(storage, storage_field)?;
+                if field.flow_type.ty != memory.data_type {
+                    return Err(SemanticMemoryError::new(format!(
+                        "semantic memory `{}` type differs from storage field {storage_field}",
+                        memory.identity.semantic_path
+                    )));
+                }
+                let reactive_binding = reactive
+                    .bindings
+                    .get(binding.as_usize())
+                    .filter(|candidate| candidate.id == binding)
+                    .ok_or_else(|| {
+                        SemanticMemoryError::new(format!(
+                            "semantic memory `{}` references missing reactive binding {binding}",
+                            memory.identity.semantic_path
+                        ))
+                    })?;
+                let storage_binding = exact_storage_binding(storage, binding)?;
                 let resource = require_list(resources, list)?;
                 if memory.identity.kind != SemanticMemoryKindV1::ListOwner
                     || memory.data_type != Type::List(Box::new(resource.item_type.clone()))
@@ -2487,6 +2640,31 @@ fn validate_memory_shape(
                 {
                     return Err(SemanticMemoryError::new(format!(
                         "semantic list memory `{}` does not exactly join resource, reactive, and storage authority",
+                        memory.identity.semantic_path
+                    )));
+                }
+            }
+            SemanticMemoryBackingV1::Collection { expression, owner } => {
+                let expression = require_expression(execution, expression)?;
+                let kind_matches = matches!(
+                    (memory.identity.kind, &expression.kind, &memory.data_type),
+                    (
+                        SemanticMemoryKindV1::Map,
+                        SemanticExpressionKind::Map { .. },
+                        Type::Map { .. }
+                    ) | (
+                        SemanticMemoryKindV1::Set,
+                        SemanticExpressionKind::Set { .. },
+                        Type::Set(_)
+                    )
+                );
+                if !kind_matches
+                    || expression.owner != owner
+                    || expression.flow_type.ty != memory.data_type
+                    || !matches!(memory.status, SemanticMemoryStatusV1::Active)
+                {
+                    return Err(SemanticMemoryError::new(format!(
+                        "semantic collection memory `{}` does not exactly join its executable authority, owner, type, and active status",
                         memory.identity.semantic_path
                     )));
                 }

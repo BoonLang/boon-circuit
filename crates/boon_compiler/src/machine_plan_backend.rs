@@ -1720,7 +1720,8 @@ fn migration_identity_source_constant(
     let source_state_id = match source_memory.runtime_backing {
         ir::SemanticMemoryRuntimeBacking::RootState { state_id, .. }
         | ir::SemanticMemoryRuntimeBacking::IndexedState { state_id, .. } => state_id,
-        ir::SemanticMemoryRuntimeBacking::List { .. } => return None,
+        ir::SemanticMemoryRuntimeBacking::List { .. }
+        | ir::SemanticMemoryRuntimeBacking::Collection { .. } => return None,
     };
     let source_state = program
         .state_cells
@@ -2015,6 +2016,8 @@ fn semantic_memory_kind(kind: ir::SemanticMemoryKind) -> MemoryKind {
         ir::SemanticMemoryKind::RootScalar => MemoryKind::Scalar,
         ir::SemanticMemoryKind::IndexedField => MemoryKind::IndexedField,
         ir::SemanticMemoryKind::ListOwner => MemoryKind::List,
+        ir::SemanticMemoryKind::Map => MemoryKind::Map,
+        ir::SemanticMemoryKind::Set => MemoryKind::Set,
     }
 }
 
@@ -2069,7 +2072,8 @@ fn semantic_memory_is_transient_effect_result(
         | ir::SemanticMemoryRuntimeBacking::IndexedState {
             state_id, field_id, ..
         } => (state_id, field_id),
-        ir::SemanticMemoryRuntimeBacking::List { .. } => return false,
+        ir::SemanticMemoryRuntimeBacking::List { .. }
+        | ir::SemanticMemoryRuntimeBacking::Collection { .. } => return false,
     };
     transient_effect_result_targets.contains(&ValueRef::State(plan_state_id(state_id)))
         || field_id.is_some_and(|field_id| {
@@ -2084,9 +2088,10 @@ fn state_for_semantic_memory<'a>(
     let state_id = match memory.runtime_backing {
         ir::SemanticMemoryRuntimeBacking::RootState { state_id, .. }
         | ir::SemanticMemoryRuntimeBacking::IndexedState { state_id, .. } => state_id,
-        ir::SemanticMemoryRuntimeBacking::List { .. } => {
+        ir::SemanticMemoryRuntimeBacking::List { .. }
+        | ir::SemanticMemoryRuntimeBacking::Collection { .. } => {
             return Err(PlanError::new(format!(
-                "semantic memory `{}` has list backing where state backing is required",
+                "semantic memory `{}` has non-state backing where state backing is required",
                 memory.identity.semantic_path
             )));
         }
@@ -2110,7 +2115,8 @@ fn scalar_slot_for_semantic_memory<'a>(
     let state_id = match memory.runtime_backing {
         ir::SemanticMemoryRuntimeBacking::RootState { state_id, .. }
         | ir::SemanticMemoryRuntimeBacking::IndexedState { state_id, .. } => state_id,
-        ir::SemanticMemoryRuntimeBacking::List { .. } => {
+        ir::SemanticMemoryRuntimeBacking::List { .. }
+        | ir::SemanticMemoryRuntimeBacking::Collection { .. } => {
             return Err(PlanError::new(format!(
                 "semantic memory `{}` has no scalar runtime backing",
                 memory.identity.semantic_path
@@ -2142,9 +2148,9 @@ fn semantic_scalar_memory_plan(
         )));
     }
     let kind = semantic_memory_kind(memory.identity.kind);
-    if kind == MemoryKind::List {
+    if !matches!(kind, MemoryKind::Scalar | MemoryKind::IndexedField) {
         return Err(PlanError::new(
-            "list semantic memory cannot use scalar plan",
+            "non-scalar semantic memory cannot use scalar plan",
         ));
     }
     if slot.indexed != (kind == MemoryKind::IndexedField) {
@@ -2415,6 +2421,38 @@ fn semantic_list_memory_plan(
         list.hidden_key_type.clone(),
         list.has_generation,
         row_fields,
+    )
+}
+
+fn semantic_collection_memory_plan(
+    program: &ErasedProgram,
+    memory: &ir::SemanticMemory,
+) -> Result<CollectionMemoryPlan, PlanError> {
+    let ir::SemanticMemoryRuntimeBacking::Collection { expression, owner } = memory.runtime_backing
+    else {
+        return Err(PlanError::new(format!(
+            "semantic collection memory `{}` has no collection runtime backing",
+            memory.identity.semantic_path
+        )));
+    };
+    let kind = semantic_memory_kind(memory.identity.kind);
+    if !matches!(kind, MemoryKind::Map | MemoryKind::Set) {
+        return Err(PlanError::new(format!(
+            "semantic collection memory `{}` has non-collection kind {kind:?}",
+            memory.identity.semantic_path
+        )));
+    }
+    CollectionMemoryPlan::new(
+        PlanCollectionAuthorityId(expression.as_usize()),
+        kind,
+        memory.identity.semantic_path.clone(),
+        semantic_data_type_plan(&memory.data_type),
+        semantic_memory_owner(memory),
+        plan_owner_for_static_owner(
+            program,
+            owner,
+            &format!("collection memory `{}`", memory.identity.semantic_path),
+        )?,
     )
 }
 
@@ -3871,6 +3909,7 @@ fn persistence_plan(
 ) -> Result<PersistencePlan, PlanError> {
     let mut memory = Vec::new();
     let mut lists = Vec::new();
+    let mut collections = Vec::new();
     let durable_semantic_memory = program
         .semantic_memory
         .iter()
@@ -3888,6 +3927,7 @@ fn persistence_plan(
                     ir::SemanticMemoryRuntimeBacking::List { list_id, .. } => {
                         transient_producer_lists.contains(&plan_list_id(list_id))
                     }
+                    ir::SemanticMemoryRuntimeBacking::Collection { .. } => false,
                 }
         })
         .collect::<Vec<_>>();
@@ -3913,6 +3953,9 @@ fn persistence_plan(
                 false,
                 Some(&durable_indexed_memory),
             )?),
+            ir::SemanticMemoryKind::Map | ir::SemanticMemoryKind::Set => {
+                collections.push(semantic_collection_memory_plan(program, semantic_memory)?);
+            }
         }
     }
     for predecessor in migration_predecessors {
@@ -3938,11 +3981,12 @@ fn persistence_plan(
     let current_migration_recipe_id = current_recipe.map(|recipe| recipe.migration_recipe_id);
     let (migration_recipes, migration_edges) =
         merge_migration_catalog(migration_predecessors, current_recipe, schema_version)?;
-    PersistencePlan::new_with_migrations_and_effect_outbox(
+    PersistencePlan::new_with_migrations_effect_outbox_and_collections(
         application,
         schema_version,
         memory,
         lists,
+        collections,
         effect_outbox,
         migration_recipes,
         current_migration_recipe_id,

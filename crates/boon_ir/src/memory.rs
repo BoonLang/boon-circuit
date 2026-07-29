@@ -1,4 +1,6 @@
-use super::{ExprId, FieldId, ListId, ScopeId, SemanticMemoryId, StateId};
+use super::{
+    ExecutableExprId, ExprId, FieldId, ListId, ScopeId, SemanticMemoryId, StateId, StaticOwnerId,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -7,6 +9,8 @@ pub enum SemanticMemoryKind {
     RootScalar,
     IndexedField,
     ListOwner,
+    Map,
+    Set,
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -56,6 +60,10 @@ pub enum SemanticMemoryRuntimeBacking {
     List {
         list_id: ListId,
         row_scope_id: Option<ScopeId>,
+    },
+    Collection {
+        expression: ExecutableExprId,
+        owner: Option<StaticOwnerId>,
     },
 }
 

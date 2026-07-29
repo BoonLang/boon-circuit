@@ -4130,6 +4130,13 @@ struct DurableListRuntimeMetadata {
 }
 
 #[derive(Clone, Debug)]
+struct DurableCollectionRuntimeMetadata {
+    authority: PlanCollectionAuthorityId,
+    kind: boon_plan::MemoryKind,
+    runtime_owner: PlanOwner,
+}
+
+#[derive(Clone, Debug)]
 struct Metadata {
     constants: BTreeMap<PlanConstantId, Value>,
     field_labels: BTreeMap<FieldId, String>,
@@ -4180,6 +4187,11 @@ struct Metadata {
     durable_lists: BTreeSet<ListId>,
     durable_root_state_by_memory: BTreeMap<boon_plan::MemoryId, StateId>,
     durable_list_by_memory: BTreeMap<boon_plan::MemoryId, DurableListRuntimeMetadata>,
+    durable_collection_by_memory: BTreeMap<boon_plan::MemoryId, DurableCollectionRuntimeMetadata>,
+    durable_collection_by_authority: BTreeMap<
+        PlanCollectionAuthorityId,
+        (boon_plan::MemoryId, DurableCollectionRuntimeMetadata),
+    >,
     session_info_root_fields: BTreeSet<FieldId>,
     session_info_row_fields: BTreeSet<FieldId>,
     published: BTreeSet<FieldId>,
@@ -4946,6 +4958,33 @@ impl Metadata {
                 )));
             }
         }
+        let mut durable_collection_by_memory = BTreeMap::new();
+        let mut durable_collection_by_authority = BTreeMap::new();
+        for memory in &plan.persistence.collections {
+            let metadata = DurableCollectionRuntimeMetadata {
+                authority: memory.authority,
+                kind: memory.kind,
+                runtime_owner: memory.runtime_owner.clone(),
+            };
+            if durable_collection_by_memory
+                .insert(memory.memory_id, metadata.clone())
+                .is_some()
+            {
+                return Err(Error::InvalidPlan(format!(
+                    "persistent collection memory {} is declared more than once",
+                    memory.memory_id
+                )));
+            }
+            if durable_collection_by_authority
+                .insert(memory.authority, (memory.memory_id, metadata))
+                .is_some()
+            {
+                return Err(Error::InvalidPlan(format!(
+                    "persistent collection authority {} is declared more than once",
+                    memory.authority.0
+                )));
+            }
+        }
         let indexed_state_fields = indexed_state_field
             .values()
             .copied()
@@ -5064,6 +5103,8 @@ impl Metadata {
             durable_lists,
             durable_root_state_by_memory,
             durable_list_by_memory,
+            durable_collection_by_memory,
+            durable_collection_by_authority,
             session_info_root_fields,
             session_info_row_fields,
             published,
@@ -8756,6 +8797,8 @@ struct AuthorityRestoreBuild {
 enum DurableRestorePhase {
     Scalars,
     Lists,
+    Maps,
+    Sets,
     Complete,
 }
 
@@ -8775,9 +8818,19 @@ struct DurableRestoreBuild {
     scalars:
         std::collections::btree_map::IntoIter<boon_plan::MemoryId, boon_persistence::StoredScalar>,
     lists: std::collections::btree_map::IntoIter<boon_plan::MemoryId, boon_persistence::StoredList>,
+    maps: std::collections::btree_map::IntoIter<
+        boon_persistence::DurableCollectionId,
+        boon_persistence::StoredMap,
+    >,
+    sets: std::collections::btree_map::IntoIter<
+        boon_persistence::DurableCollectionId,
+        boon_persistence::StoredSet,
+    >,
     current_list: Option<DurableListTranslateBuild>,
     states: BTreeMap<StateId, ScalarAuthority>,
     translated_lists: BTreeMap<ListId, ListAuthority>,
+    translated_maps: BTreeMap<CollectionAuthorityAddress, MapAuthority>,
+    translated_sets: BTreeMap<CollectionAuthorityAddress, SetAuthority>,
     phase: DurableRestorePhase,
 }
 
@@ -8981,9 +9034,13 @@ impl DurableRestoreBuild {
             through_turn_sequence: image.through_turn_sequence,
             scalars: image.scalars.into_iter(),
             lists: image.lists.into_iter(),
+            maps: image.maps.into_iter(),
+            sets: image.sets.into_iter(),
             current_list: None,
             states: BTreeMap::new(),
             translated_lists: BTreeMap::new(),
+            translated_maps: BTreeMap::new(),
+            translated_sets: BTreeMap::new(),
             phase: DurableRestorePhase::Scalars,
         }
     }
@@ -8993,8 +9050,8 @@ impl DurableRestoreBuild {
             through_turn_sequence: self.through_turn_sequence,
             states: std::mem::take(&mut self.states),
             lists: std::mem::take(&mut self.translated_lists),
-            maps: BTreeMap::new(),
-            sets: BTreeMap::new(),
+            maps: std::mem::take(&mut self.translated_maps),
+            sets: std::mem::take(&mut self.translated_sets),
         }
     }
 }
@@ -9691,7 +9748,105 @@ impl MachineBuildTask {
                     build.current_list =
                         Some(self.begin_durable_list_translation(memory_id, list)?);
                 } else {
+                    build.phase = DurableRestorePhase::Maps;
+                }
+            }
+            DurableRestorePhase::Maps => {
+                let Some((collection_id, map)) = build.maps.next() else {
+                    build.phase = DurableRestorePhase::Sets;
+                    return Ok(false);
+                };
+                let kind = self
+                    .session_mut()
+                    .metadata
+                    .durable_collection_by_memory
+                    .get(&collection_id.memory_id)
+                    .map(|metadata| metadata.kind)
+                    .ok_or_else(|| {
+                        Error::InvalidPlan(format!(
+                            "restore image contains unknown map memory {}",
+                            collection_id.memory_id
+                        ))
+                    })?;
+                if kind != boon_plan::MemoryKind::Map {
+                    return Err(Error::InvalidPlan(format!(
+                        "restore image stores non-map memory {} as MAP",
+                        collection_id.memory_id
+                    )));
+                }
+                let address = self
+                    .session_mut()
+                    .runtime_collection_address(&collection_id)?;
+                let entries = map
+                    .entries
+                    .into_iter()
+                    .map(|(key, value)| Ok((runtime_value(key)?, runtime_value(value)?)))
+                    .collect::<Result<BTreeMap<_, _>, Error>>()?;
+                if build
+                    .translated_maps
+                    .insert(
+                        address,
+                        MapAuthority {
+                            touched: map.touched,
+                            revision: map.revision,
+                            entries,
+                        },
+                    )
+                    .is_some()
+                {
+                    return Err(Error::InvalidPlan(format!(
+                        "restore image repeats map memory {} in one owner scope",
+                        collection_id.memory_id
+                    )));
+                }
+            }
+            DurableRestorePhase::Sets => {
+                let Some((collection_id, set)) = build.sets.next() else {
                     build.phase = DurableRestorePhase::Complete;
+                    return Ok(false);
+                };
+                let kind = self
+                    .session_mut()
+                    .metadata
+                    .durable_collection_by_memory
+                    .get(&collection_id.memory_id)
+                    .map(|metadata| metadata.kind)
+                    .ok_or_else(|| {
+                        Error::InvalidPlan(format!(
+                            "restore image contains unknown set memory {}",
+                            collection_id.memory_id
+                        ))
+                    })?;
+                if kind != boon_plan::MemoryKind::Set {
+                    return Err(Error::InvalidPlan(format!(
+                        "restore image stores non-set memory {} as SET",
+                        collection_id.memory_id
+                    )));
+                }
+                let address = self
+                    .session_mut()
+                    .runtime_collection_address(&collection_id)?;
+                let items = set
+                    .items
+                    .into_iter()
+                    .map(runtime_value)
+                    .collect::<Result<BTreeSet<_>, Error>>()?;
+                if build
+                    .translated_sets
+                    .insert(
+                        address,
+                        SetAuthority {
+                            touched: set.touched,
+                            revision: set.revision,
+                            items,
+                        },
+                    )
+                    .is_some()
+                {
+                    return Err(Error::InvalidPlan(format!(
+                        "restore image repeats set memory {} in one owner scope",
+                        collection_id.memory_id
+                    )));
                 }
             }
             DurableRestorePhase::Complete => return Ok(true),
@@ -13079,6 +13234,64 @@ impl MachineInstance {
             lists.insert(list_memory.memory_id, stored);
         }
 
+        let mut maps = BTreeMap::new();
+        for (address, map) in &authority.maps {
+            if !include_untouched_values && !map.touched {
+                continue;
+            }
+            let collection_id = self.durable_collection_id(address)?;
+            let entries = map
+                .entries
+                .iter()
+                .map(|(key, value)| Ok((stored_value(key)?, stored_value(value)?)))
+                .collect::<Result<BTreeMap<_, _>, Error>>()?;
+            if maps
+                .insert(
+                    collection_id,
+                    boon_persistence::StoredMap {
+                        touched: map.touched && !include_untouched_values,
+                        revision: map.revision,
+                        entries,
+                    },
+                )
+                .is_some()
+            {
+                return Err(Error::InvalidPlan(
+                    "multiple runtime MAP authorities resolve to one durable collection identity"
+                        .to_owned(),
+                ));
+            }
+        }
+
+        let mut sets = BTreeMap::new();
+        for (address, set) in &authority.sets {
+            if !include_untouched_values && !set.touched {
+                continue;
+            }
+            let collection_id = self.durable_collection_id(address)?;
+            let items = set
+                .items
+                .iter()
+                .map(stored_value)
+                .collect::<Result<BTreeSet<_>, Error>>()?;
+            if sets
+                .insert(
+                    collection_id,
+                    boon_persistence::StoredSet {
+                        touched: set.touched && !include_untouched_values,
+                        revision: set.revision,
+                        items,
+                    },
+                )
+                .is_some()
+            {
+                return Err(Error::InvalidPlan(
+                    "multiple runtime SET authorities resolve to one durable collection identity"
+                        .to_owned(),
+                ));
+            }
+        }
+
         Ok(boon_persistence::RestoreImage {
             application: self.plan.application.identity.clone(),
             schema_version: self.plan.persistence.schema_version,
@@ -13091,6 +13304,8 @@ impl MachineInstance {
             },
             scalars,
             lists,
+            maps,
+            sets,
             completed_migration_edges,
             outbox: BTreeMap::new(),
             content_artifact_manifest: boon_persistence::ContentArtifactManifest::default(),
@@ -13128,10 +13343,16 @@ impl MachineInstance {
                 AuthorityDelta::RemoveRow { row, .. } => {
                     self.metadata.durable_lists.contains(&row.list)
                 }
-                AuthorityDelta::MapUpsert { .. }
-                | AuthorityDelta::MapRemove { .. }
-                | AuthorityDelta::SetAdd { .. }
-                | AuthorityDelta::SetRemove { .. } => false,
+                AuthorityDelta::MapUpsert { address, .. }
+                | AuthorityDelta::MapRemove { address, .. }
+                | AuthorityDelta::SetAdd { address, .. }
+                | AuthorityDelta::SetRemove { address, .. } => {
+                    address.producer.is_none()
+                        && self
+                            .metadata
+                            .durable_collection_by_authority
+                            .contains_key(&address.authority)
+                }
             })
             .filter(|delta| {
                 process_local
@@ -13255,15 +13476,94 @@ impl MachineInstance {
                         next_order_token: list.next_order_token,
                     })
                 }
-                AuthorityDelta::MapUpsert { .. }
-                | AuthorityDelta::MapRemove { .. }
-                | AuthorityDelta::SetAdd { .. }
-                | AuthorityDelta::SetRemove { .. } => Err(Error::InvalidPlan(
-                    "collection authority delta reached legacy scalar/list persistence lowering"
-                        .to_owned(),
-                )),
+                AuthorityDelta::MapUpsert {
+                    address,
+                    revision,
+                    key,
+                    value,
+                } => {
+                    self.require_durable_collection_kind(
+                        address.authority,
+                        boon_plan::MemoryKind::Map,
+                    )?;
+                    Ok(boon_persistence::DurableChange::MapUpsert {
+                        collection_id: self.durable_collection_id(address)?,
+                        revision: *revision,
+                        key: stored_value(key)?,
+                        value: stored_value(value)?,
+                    })
+                }
+                AuthorityDelta::MapRemove {
+                    address,
+                    revision,
+                    key,
+                } => {
+                    self.require_durable_collection_kind(
+                        address.authority,
+                        boon_plan::MemoryKind::Map,
+                    )?;
+                    Ok(boon_persistence::DurableChange::MapRemove {
+                        collection_id: self.durable_collection_id(address)?,
+                        revision: *revision,
+                        key: stored_value(key)?,
+                    })
+                }
+                AuthorityDelta::SetAdd {
+                    address,
+                    revision,
+                    item,
+                } => {
+                    self.require_durable_collection_kind(
+                        address.authority,
+                        boon_plan::MemoryKind::Set,
+                    )?;
+                    Ok(boon_persistence::DurableChange::SetAdd {
+                        collection_id: self.durable_collection_id(address)?,
+                        revision: *revision,
+                        item: stored_value(item)?,
+                    })
+                }
+                AuthorityDelta::SetRemove {
+                    address,
+                    revision,
+                    item,
+                } => {
+                    self.require_durable_collection_kind(
+                        address.authority,
+                        boon_plan::MemoryKind::Set,
+                    )?;
+                    Ok(boon_persistence::DurableChange::SetRemove {
+                        collection_id: self.durable_collection_id(address)?,
+                        revision: *revision,
+                        item: stored_value(item)?,
+                    })
+                }
             })
             .collect()
+    }
+
+    fn require_durable_collection_kind(
+        &self,
+        authority: PlanCollectionAuthorityId,
+        expected: boon_plan::MemoryKind,
+    ) -> Result<(), Error> {
+        let (_, metadata) = self
+            .metadata
+            .durable_collection_by_authority
+            .get(&authority)
+            .ok_or_else(|| {
+                Error::InvalidPlan(format!(
+                    "collection authority {} has no stable persistence identity",
+                    authority.0
+                ))
+            })?;
+        if metadata.kind != expected {
+            return Err(Error::InvalidPlan(format!(
+                "collection authority {} persistence kind is {:?}, expected {expected:?}",
+                authority.0, metadata.kind
+            )));
+        }
+        Ok(())
     }
 
     fn persistence_list(&self, list_id: ListId) -> Result<&boon_plan::ListMemoryPlan, Error> {
@@ -15094,6 +15394,84 @@ impl MachineInstance {
         owner: &OwnerInstanceRoute,
     ) -> Result<boon_persistence::DurableOwner, Error> {
         durable_owner_for_rows(&self.plan, &owner.ancestors)
+    }
+
+    fn durable_collection_id(
+        &self,
+        address: &CollectionAuthorityAddress,
+    ) -> Result<boon_persistence::DurableCollectionId, Error> {
+        if address.producer.is_some() {
+            return Err(Error::InvalidPlan(format!(
+                "producer-local collection authority {} cannot enter durable persistence",
+                address.authority.0
+            )));
+        }
+        let (memory_id, metadata) = self
+            .metadata
+            .durable_collection_by_authority
+            .get(&address.authority)
+            .ok_or_else(|| {
+                Error::InvalidPlan(format!(
+                    "collection authority {} has no stable persistence identity",
+                    address.authority.0
+                ))
+            })?;
+        if address.owner_ancestors.len() != metadata.runtime_owner.ancestors.len()
+            || address
+                .owner_ancestors
+                .iter()
+                .zip(&metadata.runtime_owner.ancestors)
+                .any(|(actual, expected)| actual.list != expected.list)
+        {
+            return Err(Error::InvalidPlan(format!(
+                "collection authority {} runtime owner does not match its persistence owner",
+                address.authority.0
+            )));
+        }
+        Ok(boon_persistence::DurableCollectionId {
+            memory_id: *memory_id,
+            owner: durable_owner_for_rows(&self.plan, &address.owner_ancestors)?,
+        })
+    }
+
+    fn runtime_collection_address(
+        &self,
+        collection_id: &boon_persistence::DurableCollectionId,
+    ) -> Result<CollectionAuthorityAddress, Error> {
+        let metadata = self
+            .metadata
+            .durable_collection_by_memory
+            .get(&collection_id.memory_id)
+            .ok_or_else(|| {
+                Error::InvalidPlan(format!(
+                    "restore image contains unknown collection memory {}",
+                    collection_id.memory_id
+                ))
+            })?;
+        if collection_id.owner.ancestors.len() != metadata.runtime_owner.ancestors.len() {
+            return Err(Error::InvalidPlan(format!(
+                "collection memory {} owner has {} rows, expected {}",
+                collection_id.memory_id,
+                collection_id.owner.ancestors.len(),
+                metadata.runtime_owner.ancestors.len()
+            )));
+        }
+        let owner_ancestors = self.runtime_owner_rows(&collection_id.owner)?;
+        if owner_ancestors
+            .iter()
+            .zip(&metadata.runtime_owner.ancestors)
+            .any(|(actual, expected)| actual.list != expected.list)
+        {
+            return Err(Error::InvalidPlan(format!(
+                "collection memory {} owner resolves through the wrong list path",
+                collection_id.memory_id
+            )));
+        }
+        Ok(CollectionAuthorityAddress {
+            authority: metadata.authority,
+            owner_ancestors,
+            producer: None,
+        })
     }
 
     fn runtime_owner_rows(

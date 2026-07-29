@@ -2961,3 +2961,51 @@ fn runtime_lowering_binds_named_root_hold_to_exact_executable_state() {
             .any(|state| { state.id == executable && state.declaration == binding.declaration })
     );
 }
+
+#[test]
+fn erased_ir_rejects_invalid_nested_collection_ownership_before_lowering() {
+    for (name, source, expected) in [
+        (
+            "ir-nested-authority-second-parent.bn",
+            r#"
+child: MAP { TEXT { sku } => 1 }
+parents: LIST {
+    [name: A, child: child]
+    [name: B, child: child]
+}
+"#,
+            "second parent",
+        ),
+        (
+            "ir-nested-authority-cycle.bn",
+            r#"
+nodes: MAP {}
+cyclic:
+    nodes
+    |> Map/upsert(entry: [key: TEXT { node }, value: nodes])
+"#,
+            "ownership cycle",
+        ),
+        (
+            "ir-nested-authority-lifetime.bn",
+            r#"
+rows: LIST {
+    [child: MAP { TEXT { sku } => 1 }]
+}
+escaped:
+    rows
+    |> List/map(item, new:
+        MAP { TEXT { copy } => item.child }
+    )
+"#,
+            "escapes its owner",
+        ),
+    ] {
+        let parsed = boon_parser::parse_source(name, source).unwrap();
+        let error = lower(&parsed).expect_err("invalid nested authority must not reach erased IR");
+        assert!(
+            error.to_string().contains(expected),
+            "{name} lowered with the wrong rejection: {error}"
+        );
+    }
+}

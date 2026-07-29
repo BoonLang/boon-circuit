@@ -577,6 +577,7 @@ fn build_memories(
             structural_owner_rows: collection_structural_owner_rows(
                 execution,
                 resources,
+                reactive,
                 expression.id,
             )?,
             data_type: expression.flow_type.ty.clone(),
@@ -590,6 +591,7 @@ fn build_memories(
 fn collection_structural_owner_rows(
     execution: &SemanticExecutionGraphV1,
     resources: &SemanticResourceGraphV1,
+    reactive: &SemanticReactiveGraphV1,
     target: SemanticExprId,
 ) -> Result<Vec<SemanticRowBinding>, SemanticMemoryError> {
     let mut candidates = Vec::<(SemanticRowBinding, SemanticExprId)>::new();
@@ -617,13 +619,28 @@ fn collection_structural_owner_rows(
             | crate::SemanticListInitializerV1::Range { .. } => {}
         }
     }
+    for mutation in &reactive.list_mutations {
+        let crate::SemanticListMutationKindV1::Append { item, .. } = &mutation.kind else {
+            continue;
+        };
+        if expression_reaches(execution, *item, target)? {
+            let list = require_list(resources, mutation.list)?;
+            candidates.push((
+                SemanticRowBinding {
+                    list: list.id,
+                    scope: list.row_scope,
+                },
+                *item,
+            ));
+        }
+    }
     candidates.sort();
     candidates.dedup();
 
     for pair in candidates.windows(2) {
         if pair[0].0 == pair[1].0 {
             return Err(SemanticMemoryError::new(format!(
-                "collection authority expression {target} is constructed beneath multiple initial occurrences of list {}",
+                "collection authority expression {target} is constructed beneath multiple occurrence sites of list {}",
                 pair[0].0.list
             )));
         }
@@ -652,7 +669,7 @@ fn collection_structural_owner_rows(
                 && !expression_reaches(execution, right_root, left_root)?
             {
                 return Err(SemanticMemoryError::new(format!(
-                    "collection authority expression {target} has incomparable initial LIST occurrence parents"
+                    "collection authority expression {target} has incomparable LIST occurrence parents"
                 )));
             }
         }
@@ -2861,8 +2878,12 @@ fn validate_memory_shape(
             }
             SemanticMemoryBackingV1::Collection { expression, owner } => {
                 let expression = require_expression(execution, expression)?;
-                let expected_owner_rows =
-                    collection_structural_owner_rows(execution, resources, expression.id)?;
+                let expected_owner_rows = collection_structural_owner_rows(
+                    execution,
+                    resources,
+                    reactive,
+                    expression.id,
+                )?;
                 let kind_matches = matches!(
                     (memory.identity.kind, &expression.kind, &memory.data_type),
                     (

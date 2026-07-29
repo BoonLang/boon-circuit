@@ -13487,6 +13487,10 @@ impl<'a> Checker<'a> {
         self.diagnostics.extend(deferred_style_diagnostics);
         self.diagnostics
             .extend(validate_checked_match_patterns(&checked_program));
+        self.diagnostics
+            .extend(validate_checked_collection_authority_attachments(
+                &checked_program,
+            ));
         let source_payload_shape_table = checked_source_payload_shape_table(&checked_program);
         if let Err(error) = refresh_named_value_types_from_checked_program(
             &mut named_value_type_table,
@@ -26600,6 +26604,574 @@ fn checked_expression_children(
         | CheckedExpressionKind::Source
         | CheckedExpressionKind::Delimiter
         | CheckedExpressionKind::Invalid { .. } => Vec::new(),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct CheckedAuthorityOriginKey {
+    /// The executable construction or call site in the current dynamic scope.
+    site: CheckedExprId,
+    /// The exact constructor within that site. This distinguishes two fresh
+    /// authorities returned by one user call.
+    constructor: CheckedExprId,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum CheckedAuthorityParentKind {
+    MapKey,
+    ListOccurrence,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct CheckedAuthorityParentSite {
+    kind: CheckedAuthorityParentKind,
+    authority: CheckedAuthorityOriginKey,
+    attachment: CheckedExprId,
+}
+
+struct CheckedAuthorityAnalyzer<'a> {
+    expressions: BTreeMap<CheckedExprId, &'a CheckedExpression>,
+    declarations: BTreeMap<DeclId, &'a CheckedDeclaration>,
+    calls: BTreeMap<CheckedCallId, &'a CheckedCall>,
+    callables: BTreeMap<DeclId, &'a CheckedCallableSignature>,
+    scopes: BTreeMap<LexicalScopeId, &'a CheckedScope>,
+}
+
+impl<'a> CheckedAuthorityAnalyzer<'a> {
+    fn new(program: &'a CheckedProgram) -> Self {
+        Self {
+            expressions: program
+                .expressions
+                .iter()
+                .map(|expression| (expression.id, expression))
+                .collect(),
+            declarations: program
+                .declarations
+                .iter()
+                .map(|declaration| (declaration.id, declaration))
+                .collect(),
+            calls: program.calls.iter().map(|call| (call.id, call)).collect(),
+            callables: program
+                .callables
+                .iter()
+                .map(|callable| (callable.decl_id, callable))
+                .collect(),
+            scopes: program
+                .scopes
+                .iter()
+                .map(|scope| (scope.id, scope))
+                .collect(),
+        }
+    }
+
+    fn origins(&self, expression: CheckedExprId) -> BTreeMap<CheckedAuthorityOriginKey, bool> {
+        self.origins_inner(
+            expression,
+            &BTreeMap::new(),
+            None,
+            None,
+            &mut BTreeSet::new(),
+        )
+    }
+
+    /// Returns root collection authorities carried by one value. The boolean
+    /// is true when the value borrows an authority from an owner scope rather
+    /// than constructing a fresh authority at the returned site.
+    fn origins_inner(
+        &self,
+        expression: CheckedExprId,
+        substitutions: &BTreeMap<DeclId, CheckedExprId>,
+        fresh_site: Option<CheckedExprId>,
+        callable_scope: Option<LexicalScopeId>,
+        active: &mut BTreeSet<(CheckedExprId, Option<CheckedExprId>)>,
+    ) -> BTreeMap<CheckedAuthorityOriginKey, bool> {
+        let Some(expression_node) = self.expressions.get(&expression).copied() else {
+            return BTreeMap::new();
+        };
+        if !type_may_contain_collection_authority(&expression_node.flow_type.ty)
+            || !active.insert((expression, fresh_site))
+        {
+            return BTreeMap::new();
+        }
+
+        let mut result = BTreeMap::new();
+        let mut merge = |extra: BTreeMap<CheckedAuthorityOriginKey, bool>| {
+            for (origin, borrowed) in extra {
+                result
+                    .entry(origin)
+                    .and_modify(|existing| *existing |= borrowed)
+                    .or_insert(borrowed);
+            }
+        };
+        let recurse = |child,
+                       substitutions: &BTreeMap<DeclId, CheckedExprId>,
+                       fresh_site,
+                       callable_scope,
+                       active: &mut BTreeSet<_>| {
+            self.origins_inner(child, substitutions, fresh_site, callable_scope, active)
+        };
+
+        match &expression_node.kind {
+            CheckedExpressionKind::List { .. }
+            | CheckedExpressionKind::Map { .. }
+            | CheckedExpressionKind::Set { .. } => {
+                result.insert(
+                    CheckedAuthorityOriginKey {
+                        site: fresh_site.unwrap_or(expression),
+                        constructor: expression,
+                    },
+                    false,
+                );
+            }
+            CheckedExpressionKind::Read { target, .. } => {
+                if let Some(actual) = substitutions.get(target).copied() {
+                    merge(recurse(actual, substitutions, None, None, active));
+                } else if let Some(declaration) = self.declarations.get(target)
+                    && let Some(value) = declaration.value
+                {
+                    let local_to_callable = callable_scope
+                        .is_some_and(|scope| self.scope_descends_from(declaration.scope_id, scope));
+                    merge(recurse(
+                        value,
+                        substitutions,
+                        local_to_callable.then_some(fresh_site).flatten(),
+                        callable_scope.filter(|_| local_to_callable),
+                        active,
+                    ));
+                } else {
+                    result.insert(
+                        CheckedAuthorityOriginKey {
+                            site: expression,
+                            constructor: expression,
+                        },
+                        true,
+                    );
+                }
+            }
+            CheckedExpressionKind::Call { call } => {
+                let Some(call) = self.calls.get(call).copied() else {
+                    result.insert(
+                        CheckedAuthorityOriginKey {
+                            site: expression,
+                            constructor: expression,
+                        },
+                        true,
+                    );
+                    active.remove(&(expression, fresh_site));
+                    return result;
+                };
+                match call.function.as_str() {
+                    "List/map" | "List/range" => {
+                        result.insert(
+                            CheckedAuthorityOriginKey {
+                                site: fresh_site.unwrap_or(expression),
+                                constructor: expression,
+                            },
+                            false,
+                        );
+                    }
+                    "Map/upsert" | "Map/remove" | "Set/add" | "Set/remove" | "List/append"
+                    | "List/filter" | "List/retain" | "List/remove" | "List/sort_by"
+                    | "List/then_by" | "List/take" => {
+                        if let Some(receiver) = checked_call_pipe_input(call) {
+                            merge(recurse(
+                                receiver,
+                                substitutions,
+                                fresh_site,
+                                callable_scope,
+                                active,
+                            ));
+                        }
+                    }
+                    "Map/get" => {
+                        result.insert(
+                            CheckedAuthorityOriginKey {
+                                site: fresh_site.unwrap_or(expression),
+                                constructor: expression,
+                            },
+                            true,
+                        );
+                    }
+                    _ => {
+                        let callable = self.callables.get(&call.callable).copied();
+                        if let Some(callable) =
+                            callable.filter(|callable| callable.kind == CheckedCallableKind::User)
+                            && let Some(output) = callable.result_expression
+                        {
+                            let mut nested_substitutions = substitutions.clone();
+                            for entry in &call.entries {
+                                if let CheckedCallEntry::Input { formal, value, .. } = entry {
+                                    nested_substitutions.insert(*formal, *value);
+                                }
+                            }
+                            merge(recurse(
+                                output,
+                                &nested_substitutions,
+                                Some(fresh_site.unwrap_or(expression)),
+                                Some(callable.scope_id),
+                                active,
+                            ));
+                        } else {
+                            result.insert(
+                                CheckedAuthorityOriginKey {
+                                    site: fresh_site.unwrap_or(expression),
+                                    constructor: expression,
+                                },
+                                true,
+                            );
+                        }
+                    }
+                }
+            }
+            CheckedExpressionKind::TaggedObject { fields, .. }
+            | CheckedExpressionKind::Object { fields } => {
+                for field in fields {
+                    merge(recurse(
+                        field.value,
+                        substitutions,
+                        fresh_site,
+                        callable_scope,
+                        active,
+                    ));
+                }
+            }
+            CheckedExpressionKind::Latest { branches } => {
+                for branch in branches {
+                    merge(recurse(
+                        *branch,
+                        substitutions,
+                        fresh_site,
+                        callable_scope,
+                        active,
+                    ));
+                }
+            }
+            CheckedExpressionKind::When { arms, .. }
+            | CheckedExpressionKind::While { arms, .. } => {
+                for arm in arms {
+                    merge(recurse(
+                        *arm,
+                        substitutions,
+                        fresh_site,
+                        callable_scope,
+                        active,
+                    ));
+                }
+            }
+            CheckedExpressionKind::Then { output, .. } => {
+                if let Some(output) = output {
+                    merge(recurse(
+                        *output,
+                        substitutions,
+                        fresh_site,
+                        callable_scope,
+                        active,
+                    ));
+                }
+            }
+            CheckedExpressionKind::MatchArm { output, .. } => {
+                if let Some(output) = output {
+                    merge(recurse(
+                        *output,
+                        substitutions,
+                        fresh_site,
+                        callable_scope,
+                        active,
+                    ));
+                }
+            }
+            CheckedExpressionKind::Block { result: output, .. } => {
+                if let Some(output) = output {
+                    merge(recurse(
+                        *output,
+                        substitutions,
+                        fresh_site,
+                        callable_scope,
+                        active,
+                    ));
+                }
+            }
+            CheckedExpressionKind::Draining { input }
+            | CheckedExpressionKind::Hold { initial: input, .. } => {
+                merge(recurse(
+                    *input,
+                    substitutions,
+                    fresh_site,
+                    callable_scope,
+                    active,
+                ));
+            }
+            CheckedExpressionKind::MapEntry { value, .. } => {
+                merge(recurse(
+                    *value,
+                    substitutions,
+                    fresh_site,
+                    callable_scope,
+                    active,
+                ));
+            }
+            CheckedExpressionKind::Passed { .. }
+            | CheckedExpressionKind::ExternalRead { .. }
+            | CheckedExpressionKind::Drain { .. } => {
+                result.insert(
+                    CheckedAuthorityOriginKey {
+                        site: expression,
+                        constructor: expression,
+                    },
+                    true,
+                );
+            }
+            CheckedExpressionKind::Flush { .. }
+            | CheckedExpressionKind::Infix { .. }
+            | CheckedExpressionKind::TextTemplate { .. }
+            | CheckedExpressionKind::Bytes { .. }
+            | CheckedExpressionKind::Text { .. }
+            | CheckedExpressionKind::Number { .. }
+            | CheckedExpressionKind::BytesByte { .. }
+            | CheckedExpressionKind::Absent
+            | CheckedExpressionKind::Tag { .. }
+            | CheckedExpressionKind::Source
+            | CheckedExpressionKind::Delimiter
+            | CheckedExpressionKind::Invalid { .. } => {}
+        }
+        active.remove(&(expression, fresh_site));
+        result
+    }
+
+    fn scope_descends_from(&self, mut scope: LexicalScopeId, ancestor: LexicalScopeId) -> bool {
+        let mut visited = BTreeSet::new();
+        while visited.insert(scope) {
+            if scope == ancestor {
+                return true;
+            }
+            let Some(parent) = self.scopes.get(&scope).and_then(|scope| scope.parent) else {
+                return false;
+            };
+            scope = parent;
+        }
+        false
+    }
+
+    fn structurally_contains(&self, root: CheckedExprId, target: CheckedExprId) -> bool {
+        let mut pending = vec![root];
+        let mut visited = BTreeSet::new();
+        while let Some(expression) = pending.pop() {
+            if expression == target {
+                return true;
+            }
+            if !visited.insert(expression) {
+                continue;
+            }
+            let Some(expression) = self.expressions.get(&expression) else {
+                continue;
+            };
+            pending.extend(checked_expression_children(&expression.kind, &self.calls));
+        }
+        false
+    }
+}
+
+fn checked_call_pipe_input(call: &CheckedCall) -> Option<CheckedExprId> {
+    call.entries.iter().find_map(|entry| match entry {
+        CheckedCallEntry::Input {
+            value,
+            from_pipe: true,
+            ..
+        } => Some(*value),
+        CheckedCallEntry::Input {
+            from_pipe: false, ..
+        }
+        | CheckedCallEntry::FreshOut { .. }
+        | CheckedCallEntry::ForwardOut { .. } => None,
+    })
+}
+
+fn checked_call_named_input(call: &CheckedCall, name: &str) -> Option<CheckedExprId> {
+    call.entries.iter().find_map(|entry| match entry {
+        CheckedCallEntry::Input {
+            name: candidate,
+            value,
+            ..
+        } if candidate == name => Some(*value),
+        CheckedCallEntry::Input { .. }
+        | CheckedCallEntry::FreshOut { .. }
+        | CheckedCallEntry::ForwardOut { .. } => None,
+    })
+}
+
+fn validate_checked_collection_authority_attachments(
+    program: &CheckedProgram,
+) -> Vec<TypeDiagnostic> {
+    let analyzer = CheckedAuthorityAnalyzer::new(program);
+    let mut diagnostics = Vec::new();
+    let mut seen_diagnostics = BTreeSet::<(CheckedExprId, String)>::new();
+    let mut parents =
+        BTreeMap::<CheckedAuthorityOriginKey, BTreeSet<CheckedAuthorityParentSite>>::new();
+    let mut graph =
+        BTreeMap::<CheckedAuthorityOriginKey, BTreeSet<CheckedAuthorityOriginKey>>::new();
+
+    let mut attach = |root: CheckedExprId,
+                      parent: CheckedAuthorityParentSite,
+                      diagnostics: &mut Vec<TypeDiagnostic>| {
+        let origins = analyzer.origins(root);
+        for (origin, borrowed) in origins {
+            let message = if origin == parent.authority
+                || checked_authority_graph_reaches(&graph, parent.authority, origin)
+            {
+                Some(
+                    "nested collection authority attachment forms an ownership cycle; construct nested LIST, SET, or MAP authorities only inside an acyclic parent value"
+                        .to_owned(),
+                )
+            } else if borrowed {
+                Some(
+                    "nested collection authority escapes its owner or is reattached from an existing owner; construct a fresh LIST, SET, or MAP authority inside this parent value"
+                        .to_owned(),
+                )
+            } else if !analyzer.structurally_contains(root, origin.site) {
+                Some(
+                    "collection authority is attached beneath a second parent or beyond its owner lifetime; construct it inside this MAP value or LIST occurrence"
+                        .to_owned(),
+                )
+            } else {
+                None
+            };
+            if let Some(message) = message
+                && seen_diagnostics.insert((root, message.clone()))
+            {
+                diagnostics.push(checked_authority_diagnostic(program, root, message));
+            }
+
+            let origin_parents = parents.entry(origin).or_default();
+            origin_parents.insert(parent);
+            if origin_parents.len() > 1 {
+                let message =
+                    "collection authority has more than one structural parent; each nested authority must belong to exactly one MAP key or LIST occurrence"
+                        .to_owned();
+                if seen_diagnostics.insert((root, message.clone())) {
+                    diagnostics.push(checked_authority_diagnostic(program, root, message));
+                }
+            }
+            graph.entry(origin).or_default().insert(parent.authority);
+        }
+    };
+
+    for expression in &program.expressions {
+        match &expression.kind {
+            CheckedExpressionKind::Map { entries } => {
+                let parent = CheckedAuthorityOriginKey {
+                    site: expression.id,
+                    constructor: expression.id,
+                };
+                for entry in entries {
+                    let Some(CheckedExpression {
+                        kind: CheckedExpressionKind::MapEntry { value, .. },
+                        ..
+                    }) = analyzer.expressions.get(entry).copied()
+                    else {
+                        continue;
+                    };
+                    attach(
+                        *value,
+                        CheckedAuthorityParentSite {
+                            kind: CheckedAuthorityParentKind::MapKey,
+                            authority: parent,
+                            attachment: *entry,
+                        },
+                        &mut diagnostics,
+                    );
+                }
+            }
+            CheckedExpressionKind::List { items, .. } => {
+                let parent = CheckedAuthorityOriginKey {
+                    site: expression.id,
+                    constructor: expression.id,
+                };
+                for item in items {
+                    attach(
+                        *item,
+                        CheckedAuthorityParentSite {
+                            kind: CheckedAuthorityParentKind::ListOccurrence,
+                            authority: parent,
+                            attachment: *item,
+                        },
+                        &mut diagnostics,
+                    );
+                }
+            }
+            CheckedExpressionKind::Call { call } => {
+                let Some(call) = analyzer.calls.get(call).copied() else {
+                    continue;
+                };
+                let Some(receiver) = checked_call_pipe_input(call) else {
+                    continue;
+                };
+                let parent_origins = analyzer.origins(receiver);
+                let attachment = match call.function.as_str() {
+                    "Map/upsert" => checked_call_named_input(call, "entry")
+                        .map(|root| (CheckedAuthorityParentKind::MapKey, root)),
+                    "List/append" => checked_call_named_input(call, "item")
+                        .map(|root| (CheckedAuthorityParentKind::ListOccurrence, root)),
+                    _ => None,
+                };
+                let Some((kind, root)) = attachment else {
+                    continue;
+                };
+                for authority in parent_origins.keys().copied() {
+                    attach(
+                        root,
+                        CheckedAuthorityParentSite {
+                            kind,
+                            authority,
+                            attachment: expression.id,
+                        },
+                        &mut diagnostics,
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    diagnostics
+}
+
+fn checked_authority_graph_reaches(
+    graph: &BTreeMap<CheckedAuthorityOriginKey, BTreeSet<CheckedAuthorityOriginKey>>,
+    root: CheckedAuthorityOriginKey,
+    target: CheckedAuthorityOriginKey,
+) -> bool {
+    let mut pending = vec![root];
+    let mut visited = BTreeSet::new();
+    while let Some(origin) = pending.pop() {
+        if origin == target {
+            return true;
+        }
+        if visited.insert(origin)
+            && let Some(parents) = graph.get(&origin)
+        {
+            pending.extend(parents.iter().copied());
+        }
+    }
+    false
+}
+
+fn checked_authority_diagnostic(
+    program: &CheckedProgram,
+    expression: CheckedExprId,
+    message: String,
+) -> TypeDiagnostic {
+    let span = program
+        .expressions
+        .get(expression.0 as usize)
+        .filter(|candidate| candidate.id == expression)
+        .map(|expression| expression.span)
+        .unwrap_or_default();
+    TypeDiagnostic {
+        severity: DiagnosticSeverity::Error,
+        line: span.line,
+        start: span.start,
+        end: span.end,
+        message,
     }
 }
 

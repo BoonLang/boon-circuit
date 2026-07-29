@@ -414,6 +414,206 @@ document: Document/new(
 }
 
 #[test]
+fn appended_list_occurrences_construct_fresh_nested_authorities() {
+    let compiled = boon_compiler::compile_source_text_to_machine_plan(
+        "appended-nested-list-authority-lifecycle.bn",
+        r#"
+store: [
+    add: SOURCE
+    remove: SOURCE
+    rows:
+        LIST {}
+        |> List/append(item:
+            add
+            |> THEN {
+                [
+                    id: add.id
+                    lines: MAP { add.sku => 1 }
+                ]
+            }
+        )
+        |> List/remove(item, when:
+            remove
+            |> THEN { item.id == remove.id }
+        )
+    observed_lines:
+        rows
+        |> List/map(item, new:
+            item.lines
+            |> Map/get(key: item.id)
+        )
+]
+
+document: Document/new(
+    root: Element/label(element: [], style: [], label: TEXT { appended nested authority })
+)
+"#,
+        TargetProfile::SoftwareBounded,
+    )
+    .unwrap();
+    let plan = compiled.plan;
+    let add = source_id(&plan, "store.add");
+    let remove = source_id(&plan, "store.remove");
+    let rows = list_id(&plan, "store.rows");
+    let mut session = MachineInstance::new(plan.clone(), SessionOptions::default()).unwrap();
+    let initial = session.semantic_value_image().unwrap();
+    let application = initial.application.clone();
+    let schema_hash = initial.schema_hash;
+    let mut persistence = InMemoryDriver::default();
+    let initialized = persistence.execute(PersistenceCommand::Initialize(initial));
+    assert!(
+        matches!(initialized, PersistenceResult::Initialized(Ok(_))),
+        "dynamic LIST authority initialization failed: {initialized:?}"
+    );
+
+    for (sequence, id) in [(1, "row-a"), (2, "row-b")] {
+        let turn = session
+            .apply(source_event(
+                &session,
+                sequence,
+                add,
+                BTreeMap::from([
+                    ("id".to_owned(), Value::Text(id.to_owned())),
+                    ("sku".to_owned(), Value::Text(id.to_owned())),
+                ]),
+            ))
+            .unwrap();
+        let checkpoint = CheckpointBatch {
+            application: application.clone(),
+            schema_hash,
+            base_epoch: sequence - 1,
+            next_epoch: sequence,
+            first_turn_sequence: sequence,
+            last_turn_sequence: sequence,
+            changes: turn.durable_changes,
+            outbox_changes: Vec::new(),
+            content_artifact_changes: Vec::new(),
+            checksum: [0; 32],
+        }
+        .seal();
+        assert!(matches!(
+            persistence.execute(PersistenceCommand::Commit(checkpoint)),
+            PersistenceResult::Committed(Ok(_))
+        ));
+    }
+    session.root_value_current("store.observed_lines").unwrap();
+    let appended = session.authority_snapshot().unwrap();
+    let appended_rows = appended.lists.get(&rows).unwrap();
+    assert_eq!(appended_rows.rows.len(), 2);
+    assert_eq!(appended.maps.len(), 2);
+    let owner_rows = appended
+        .maps
+        .keys()
+        .map(|address| {
+            assert!(address.collection_ancestors.is_empty());
+            let owner = address.owner_ancestors.last().unwrap();
+            assert_eq!(owner.list, rows);
+            (owner.key, owner.generation)
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(owner_rows, BTreeSet::from([(1, 1), (2, 1)]));
+
+    let removed = session
+        .apply(source_event(
+            &session,
+            3,
+            remove,
+            BTreeMap::from([("id".to_owned(), Value::Text("row-a".to_owned()))]),
+        ))
+        .unwrap();
+    let removed_checkpoint = CheckpointBatch {
+        application: application.clone(),
+        schema_hash,
+        base_epoch: 2,
+        next_epoch: 3,
+        first_turn_sequence: 3,
+        last_turn_sequence: 3,
+        changes: removed.durable_changes.clone(),
+        outbox_changes: Vec::new(),
+        content_artifact_changes: Vec::new(),
+        checksum: [0; 32],
+    }
+    .seal();
+    assert!(matches!(
+        persistence.execute(PersistenceCommand::Commit(removed_checkpoint)),
+        PersistenceResult::Committed(Ok(_))
+    ));
+    assert!(
+        removed
+            .authority_deltas
+            .iter()
+            .any(|delta| matches!(delta, AuthorityDelta::DeleteMap { .. }))
+    );
+    let after_remove = session.authority_snapshot().unwrap();
+    assert_eq!(after_remove.maps.len(), 1);
+    assert_eq!(
+        after_remove
+            .maps
+            .keys()
+            .next()
+            .unwrap()
+            .owner_ancestors
+            .last()
+            .unwrap()
+            .key,
+        2
+    );
+
+    let reinserted_turn = session
+        .apply(source_event(
+            &session,
+            4,
+            add,
+            BTreeMap::from([
+                ("id".to_owned(), Value::Text("row-a".to_owned())),
+                ("sku".to_owned(), Value::Text("row-a".to_owned())),
+            ]),
+        ))
+        .unwrap();
+    let reinserted_checkpoint = CheckpointBatch {
+        application: application.clone(),
+        schema_hash,
+        base_epoch: 3,
+        next_epoch: 4,
+        first_turn_sequence: 4,
+        last_turn_sequence: 4,
+        changes: reinserted_turn.durable_changes,
+        outbox_changes: Vec::new(),
+        content_artifact_changes: Vec::new(),
+        checksum: [0; 32],
+    }
+    .seal();
+    assert!(matches!(
+        persistence.execute(PersistenceCommand::Commit(reinserted_checkpoint)),
+        PersistenceResult::Committed(Ok(_))
+    ));
+    let reinserted = session.authority_snapshot().unwrap();
+    assert_eq!(reinserted.maps.len(), 2);
+    assert_eq!(
+        reinserted
+            .maps
+            .keys()
+            .map(|address| address.owner_ancestors.last().unwrap().key)
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([2, 3])
+    );
+
+    let durable = persistence
+        .image(&application)
+        .cloned()
+        .expect("checkpointed appended nested authorities");
+    assert_eq!(durable.maps.len(), 2);
+    let restored = MachineInstanceBuilder::new(plan, SessionOptions::default())
+        .unwrap()
+        .restore_durable(durable)
+        .unwrap()
+        .build()
+        .unwrap();
+    assert_eq!(restored.list_row_snapshots(rows).unwrap().len(), 2);
+    assert_eq!(restored.authority_snapshot().unwrap().maps.len(), 2);
+}
+
+#[test]
 fn removing_and_reinserting_a_map_key_retires_the_old_nested_generation() {
     let compiled = boon_compiler::compile_source_text_to_machine_plan(
         "nested-map-authority-lifecycle.bn",

@@ -1254,6 +1254,26 @@ pub enum AuthorityDelta {
     },
 }
 
+fn authority_delta_collection_address(
+    delta: &AuthorityDelta,
+) -> Option<&CollectionAuthorityAddress> {
+    match delta {
+        AuthorityDelta::CreateMap { address }
+        | AuthorityDelta::MapUpsert { address, .. }
+        | AuthorityDelta::MapRemove { address, .. }
+        | AuthorityDelta::DeleteMap { address }
+        | AuthorityDelta::CreateSet { address }
+        | AuthorityDelta::SetAdd { address, .. }
+        | AuthorityDelta::SetRemove { address, .. }
+        | AuthorityDelta::DeleteSet { address } => Some(address),
+        AuthorityDelta::SetRoot { .. }
+        | AuthorityDelta::SetRowField { .. }
+        | AuthorityDelta::ReplaceList { .. }
+        | AuthorityDelta::InsertRow { .. }
+        | AuthorityDelta::RemoveRow { .. } => None,
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TurnMetrics {
     pub dirty_state_count: usize,
@@ -8624,7 +8644,11 @@ enum PendingListMutation {
         sequence: u64,
         owner: OwnerInstanceId,
         list: ListId,
-        fields: BTreeMap<FieldId, Value>,
+        append: boon_plan::PlanListAppend,
+        row: Option<RowId>,
+        event: Option<SourceEvent>,
+        flush_state: Option<StateId>,
+        flush_target: Option<RowId>,
     },
     Remove {
         site: usize,
@@ -8672,6 +8696,7 @@ pub struct MachineInstance {
     collection_authorities: BTreeMap<CollectionAuthorityAddress, CollectionAuthorityState>,
     collection_producers: BTreeMap<CollectionProducerSite, CollectionProducerCandidate>,
     collection_owner_routes: CollectionOwnerRouteInterner,
+    active_collection_owner_rows: Option<Vec<OwnerInstanceRow>>,
     ordered_indexes: BTreeMap<PlanListIndexId, OrderedIndex>,
     dirty_ordered_indexes: BTreeSet<PlanListIndexId>,
     dirty_ordered_index_rows: BTreeMap<PlanListIndexId, BTreeSet<RowId>>,
@@ -9300,6 +9325,7 @@ impl MachineInstanceBuilder {
                 collection_authorities: BTreeMap::new(),
                 collection_producers: BTreeMap::new(),
                 collection_owner_routes: CollectionOwnerRouteInterner::default(),
+                active_collection_owner_rows: None,
                 ordered_indexes: BTreeMap::new(),
                 dirty_ordered_indexes: BTreeSet::new(),
                 dirty_ordered_index_rows: BTreeMap::new(),
@@ -13428,8 +13454,8 @@ impl MachineInstance {
                 }
             } else if include_untouched_values {
                 stored.touched = true;
-                stored.next_key = list.next_key;
-                stored.next_order_token = list.next_order_token;
+                stored.next_key = list.next_key.max(1);
+                stored.next_order_token = list.next_order_token.max(1);
                 for row in &mut stored.rows {
                     row.touched_fields.clear();
                     row.source_order_token = list
@@ -20782,11 +20808,14 @@ impl MachineInstance {
         authority: PlanCollectionAuthorityId,
         context: ExpressionContext<'_>,
     ) -> Result<CollectionAuthorityAddress, Error> {
-        let owner_ancestors = context
-            .row
-            .map(|row| self.row_owner_rows(row))
-            .transpose()?
-            .unwrap_or_default();
+        let owner_ancestors = match &self.active_collection_owner_rows {
+            Some(owner_rows) => owner_rows.clone(),
+            None => context
+                .row
+                .map(|row| self.row_owner_rows(row))
+                .transpose()?
+                .unwrap_or_default(),
+        };
         let producer = self
             .active_producer_lease
             .as_ref()
@@ -21035,6 +21064,86 @@ impl MachineInstance {
             }
         }
         Ok(())
+    }
+
+    fn validate_list_occurrence_value_authorities<'a>(
+        &self,
+        owner_rows: &[OwnerInstanceRow],
+        values: impl IntoIterator<Item = &'a Value>,
+    ) -> Result<(), Error> {
+        let mut pending = values.into_iter().collect::<Vec<_>>();
+        let mut visited = 0_usize;
+        while let Some(value) = pending.pop() {
+            visited = visited.saturating_add(1);
+            if visited > MAX_VALUE_MATERIALIZATION_CONTINUATIONS {
+                return Err(Error::Evaluation(
+                    "LIST occurrence exceeds the checked nested-authority validation bound"
+                        .to_owned(),
+                ));
+            }
+            match value {
+                Value::CollectionAuthority { address } => {
+                    if address.owner_ancestors != owner_rows {
+                        return Err(Error::Evaluation(format!(
+                            "collection authority {} is not constructed in its owning LIST occurrence",
+                            address.authority.0
+                        )));
+                    }
+                    if !self.collection_authorities.contains_key(address) {
+                        return Err(Error::Evaluation(format!(
+                            "collection authority {} escaped after its owning LIST occurrence was retired",
+                            address.authority.0
+                        )));
+                    }
+                }
+                Value::List(values) => pending.extend(values),
+                Value::Record(fields)
+                | Value::MappedRow { fields, .. }
+                | Value::Tag { fields, .. } => pending.extend(fields.values()),
+                Value::Row { fields, .. } => pending.extend(fields.values()),
+                Value::HostBound { visible, .. } => pending.push(visible),
+                Value::Map(entries) => {
+                    for (key, value) in entries {
+                        pending.push(key);
+                        pending.push(value);
+                    }
+                }
+                Value::Set(items) => pending.extend(items),
+                Value::Number(_) | Value::Text(_) | Value::Bytes(_) => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn discard_unattached_collection_authorities(
+        &mut self,
+        owner_rows: &[OwnerInstanceRow],
+        work: &mut Work,
+    ) {
+        let discarded = self
+            .collection_authorities
+            .keys()
+            .filter(|address| address.owner_ancestors == owner_rows)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if discarded.is_empty() {
+            return;
+        }
+        work.authority_deltas.retain(|delta| {
+            authority_delta_collection_address(delta)
+                .is_none_or(|address| !discarded.contains(address))
+        });
+        work.pending_collection_operations.retain(|key, _| {
+            let address = match key {
+                PendingCollectionOperationKey::Map { address, .. }
+                | PendingCollectionOperationKey::Set { address, .. } => address,
+            };
+            !discarded.contains(address)
+        });
+        let emitting = work.emit;
+        work.emit = false;
+        self.retire_collection_authorities(|address| discarded.contains(address), work);
+        work.emit = emitting;
     }
 
     fn value_collection_authorities(value: &Value) -> BTreeSet<CollectionAuthorityAddress> {
@@ -30209,12 +30318,93 @@ impl MachineInstance {
             match mutation {
                 PendingListMutation::Append {
                     list,
-                    fields,
                     owner,
+                    append,
+                    row,
+                    event,
+                    flush_state,
+                    flush_target,
                     ..
                 } => {
                     let owner_ancestry = self.owner_instances.owner_ancestry(owner)?;
-                    self.append_row_with_owner_prefix(list, fields, owner_ancestry, None, work)?;
+                    let row_key = self
+                        .lists
+                        .get(&list)
+                        .map(|list| list.next_key.max(1))
+                        .ok_or_else(|| Error::Evaluation(format!("list {} is missing", list.0)))?;
+                    let reserved_row = RowId {
+                        list,
+                        key: row_key,
+                        generation: 1,
+                    };
+                    let mut occurrence_owner_rows =
+                        self.owner_instances.ancestry_rows(owner_ancestry)?;
+                    occurrence_owner_rows.push(OwnerInstanceRow {
+                        list,
+                        key: reserved_row.key,
+                        generation: reserved_row.generation,
+                    });
+                    let previous_owner_rows = self
+                        .active_collection_owner_rows
+                        .replace(occurrence_owner_rows.clone());
+                    let item = self.eval_row_expression(
+                        append.item,
+                        row,
+                        event.as_ref(),
+                        None,
+                        None,
+                        &mut PlanLocalBindings::new(),
+                        work,
+                    );
+                    self.active_collection_owner_rows = previous_owner_rows;
+                    let item = item?;
+                    let item = match item {
+                        EvalValue::Flushed(payload) => {
+                            self.discard_unattached_collection_authorities(
+                                &occurrence_owner_rows,
+                                work,
+                            );
+                            let propagated = flush_state.is_some_and(|state| {
+                                work.flushed_state_candidates
+                                    .get(&(state, flush_target))
+                                    .or_else(|| work.flushed_state_candidates.get(&(state, None)))
+                                    == Some(&payload)
+                            });
+                            if !propagated {
+                                return Err(Error::Evaluation(format!(
+                                    "list mutation site {} produced FLUSH without an owning state activation",
+                                    append.site
+                                )));
+                            }
+                            continue;
+                        }
+                        EvalValue::Absent => {
+                            self.discard_unattached_collection_authorities(
+                                &occurrence_owner_rows,
+                                work,
+                            );
+                            continue;
+                        }
+                        item => item,
+                    };
+                    let fields =
+                        self.materialize_append_item(list, &append, item, event.as_ref(), work)?;
+                    self.validate_list_occurrence_value_authorities(
+                        &occurrence_owner_rows,
+                        fields.values(),
+                    )?;
+                    let appended = self.append_row_with_owner_prefix(
+                        list,
+                        fields,
+                        owner_ancestry,
+                        None,
+                        work,
+                    )?;
+                    if appended != reserved_row {
+                        return Err(Error::InvalidPlan(format!(
+                            "append occurrence reservation {reserved_row:?} committed as {appended:?}"
+                        )));
+                    }
                 }
                 PendingListMutation::Remove { rows, .. } => {
                     for row in rows {
@@ -30257,7 +30447,9 @@ impl MachineInstance {
                 if !Self::trigger_accepts(&append.trigger, &trigger.active) {
                     return Ok(ControlOutcome::Normal(None));
                 }
-                let row = event.and_then(|event| event.target);
+                let row = event
+                    .and_then(|event| event.target)
+                    .or(trigger.active.target);
                 let gate = self.eval_row_expression(
                     append.gate,
                     row,
@@ -30276,37 +30468,26 @@ impl MachineInstance {
                 if !eval_value_is_present(&gate) {
                     return Ok(ControlOutcome::Normal(None));
                 }
-                let item = self.eval_row_expression(
-                    append.item,
-                    row,
-                    event,
-                    None,
-                    None,
-                    &mut PlanLocalBindings::new(),
-                    work,
-                )?;
-                let item = match item {
-                    EvalValue::Flushed(payload) => {
-                        return Ok(ControlOutcome::Flushed(payload));
-                    }
-                    item => item,
-                };
-                if !eval_value_is_present(&item) {
-                    return Ok(ControlOutcome::Normal(None));
-                }
-                let fields = self.materialize_append_item(list, append, item, event, work)?;
                 let owner = instantiate_plan_owner(
                     &append.owner,
                     &trigger.active,
                     &mut self.owner_instances,
                 )?;
+                let flush_state = match append.trigger {
+                    ValueRef::State(state) => Some(state),
+                    _ => None,
+                };
                 Ok(ControlOutcome::Normal(Some(PendingListMutation::Append {
                     site: append.site,
                     ordinal: append.ordinal,
                     sequence: trigger.active.sequence,
                     owner,
                     list,
-                    fields,
+                    append: append.clone(),
+                    row,
+                    event: event.cloned(),
+                    flush_state,
+                    flush_target: trigger.active.target,
                 })))
             }
             PlanListMutation::Remove(remove) => {

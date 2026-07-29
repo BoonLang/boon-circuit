@@ -3050,13 +3050,9 @@ impl ExecutableMigrationExpressionLowerer<'_> {
                         .collect::<Result<Vec<_>, PlanError>>()?,
                 })
             }
-            ir::ExecutableExpressionKind::Number(value) => Ok(MigrationExpressionPlan::Number {
-                value: value.parse::<ExactNumber>().map_err(|error| {
-                    PlanError::new(format!(
-                        "migration numeric literal `{value}` is not an exact canonical Number: {error}"
-                    ))
-                })?,
-            }),
+            ir::ExecutableExpressionKind::Number(value) => {
+                Ok(MigrationExpressionPlan::Number { value })
+            }
             ir::ExecutableExpressionKind::Bits(value) => {
                 Ok(MigrationExpressionPlan::Bits { value })
             }
@@ -4159,7 +4155,6 @@ pub(crate) fn compile_typed_program_with_distributed_context(
     migration_predecessors: &[MigrationPredecessorBinding],
     distributed: &DistributedMachineContext,
 ) -> Result<MachinePlan, PlanError> {
-    validate_number_literals(program)?;
     let effects = effect_contracts(program)?;
     let mut effect_outbox = effect_outbox_schemas(&effects)?;
     let authority_field_ids = list_authority_field_ids(program);
@@ -6584,27 +6579,13 @@ pub(crate) fn lower_distributed_invocation_gate(
         })
 }
 
-fn validate_number_literals(program: &ErasedProgram) -> Result<(), PlanError> {
-    for expression in &program.executable.expressions {
-        let ir::ExecutableExpressionKind::Number(literal) = &expression.kind else {
-            continue;
-        };
-        literal.parse::<ExactNumber>().map_err(|error| {
-            PlanError::new(format!(
-                "numeric literal `{literal}` is not a finite canonical Number: {error}"
-            ))
-        })?;
-    }
-    Ok(())
-}
-
 fn initial_constant_value(value: &InitialValue) -> Option<PlanConstantValue> {
     match value {
         InitialValue::Text { value } => Some(PlanConstantValue::Text {
             value: value.clone(),
         }),
         InitialValue::Number { value } => Some(PlanConstantValue::Number {
-            value: value.parse().ok()?,
+            value: value.clone(),
         }),
         InitialValue::Bytes { bytes, .. } => {
             let mut hasher = Sha256::new();
@@ -6675,10 +6656,9 @@ fn constant_executable_expression_value_inner(
         ir::ExecutableExpressionKind::Text(value) => Some(PlanConstantValue::Text {
             value: value.clone(),
         }),
-        ir::ExecutableExpressionKind::Number(value) => value
-            .parse()
-            .ok()
-            .map(|value| PlanConstantValue::Number { value }),
+        ir::ExecutableExpressionKind::Number(value) => Some(PlanConstantValue::Number {
+            value: value.clone(),
+        }),
         ir::ExecutableExpressionKind::BytesByte(value) => bytes_plan_constant(&[*value]),
         ir::ExecutableExpressionKind::Absent => None,
         ir::ExecutableExpressionKind::Tag(value) => Some(PlanConstantValue::Tag {
@@ -11108,13 +11088,7 @@ impl<'a> ExecutableRowLowerer<'a> {
                 self.intern(PlanRowExpressionNode::TextConcat { parts })?
             }
             ir::ExecutableExpressionKind::Number(value) => {
-                self.constant(PlanConstantValue::Number {
-                    value: value.parse().map_err(|error| {
-                        PlanError::new(format!(
-                            "executable Number `{value}` is not finite: {error}"
-                        ))
-                    })?,
-                })?
+                self.constant(PlanConstantValue::Number { value })?
             }
             ir::ExecutableExpressionKind::Bits(value) => {
                 self.constant(PlanConstantValue::Bits { value })?
@@ -12635,11 +12609,7 @@ fn executable_select_pattern(
             PlanRowSelectPattern::Wildcard
         }
         CheckedMatchPattern::Number { value } => PlanRowSelectPattern::Number {
-            value: value.parse::<ExactNumber>().map_err(|error| {
-                PlanError::new(format!(
-                    "checked numeric match pattern `{value}` is not finite: {error}"
-                ))
-            })?,
+            value: value.clone(),
         },
         CheckedMatchPattern::Text { value } => PlanRowSelectPattern::Text {
             value: value.clone(),

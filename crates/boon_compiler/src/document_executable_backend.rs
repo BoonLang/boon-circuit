@@ -688,13 +688,12 @@ impl<'a> DocumentCompiler<'a> {
             ir::ExecutableExpressionKind::TextTemplate { segments } => {
                 self.compile_text_template(compiler_id, segments, context)
             }
-            ir::ExecutableExpressionKind::Number(value) => {
-                let (coefficient, scale) = parse_decimal(value)?;
-                Ok(self.constant_expr(
-                    compiler_id,
-                    DocumentConstantValue::Number { coefficient, scale },
-                ))
-            }
+            ir::ExecutableExpressionKind::Number(value) => Ok(self.constant_expr(
+                compiler_id,
+                DocumentConstantValue::Number {
+                    value: value.clone(),
+                },
+            )),
             ir::ExecutableExpressionKind::Bits(value) => Ok(self.constant_expr(
                 compiler_id,
                 DocumentConstantValue::Bits {
@@ -1507,8 +1506,9 @@ impl<'a> DocumentCompiler<'a> {
             return Ok(DocumentPattern::Constant { constant });
         }
         if let CheckedMatchPattern::Number { value } = pattern {
-            let (coefficient, scale) = parse_decimal(value)?;
-            let constant = self.push_constant(DocumentConstantValue::Number { coefficient, scale });
+            let constant = self.push_constant(DocumentConstantValue::Number {
+                value: value.clone(),
+            });
             return Ok(DocumentPattern::Constant { constant });
         }
         if let CheckedMatchPattern::Bits { value } = pattern {
@@ -2644,47 +2644,6 @@ fn exact_block_binding_order<'a>(
         ordered.push(binding);
     }
     Ok(ordered)
-}
-
-fn parse_decimal(value: &str) -> Result<(i64, u32), PlanError> {
-    let value = value.replace('_', "");
-    let (base, exponent) = value
-        .split_once(['e', 'E'])
-        .map(|(base, exponent)| {
-            exponent
-                .parse::<i32>()
-                .map(|exponent| (base, exponent))
-                .map_err(|_| PlanError::new(format!("invalid document number `{value}`")))
-        })
-        .transpose()?
-        .unwrap_or((value.as_str(), 0));
-    let negative = base.starts_with('-');
-    let unsigned = base.trim_start_matches(['-', '+']);
-    let (whole, fraction) = unsigned.split_once('.').unwrap_or((unsigned, ""));
-    if whole.is_empty() && fraction.is_empty() {
-        return Err(PlanError::new(format!("invalid document number `{value}`")));
-    }
-    let digits = format!("{whole}{fraction}");
-    let mut coefficient = digits
-        .parse::<i64>()
-        .map_err(|_| PlanError::new(format!("document number `{value}` exceeds i64")))?;
-    if negative {
-        coefficient = coefficient
-            .checked_neg()
-            .ok_or_else(|| PlanError::new(format!("document number `{value}` exceeds i64")))?;
-    }
-    let mut scale = fraction.len() as i32 - exponent;
-    if scale < 0 {
-        coefficient = coefficient
-            .checked_mul(10_i64.pow((-scale) as u32))
-            .ok_or_else(|| PlanError::new(format!("document number `{value}` exceeds i64")))?;
-        scale = 0;
-    }
-    while scale > 0 && coefficient % 10 == 0 {
-        coefficient /= 10;
-        scale -= 1;
-    }
-    Ok((coefficient, scale as u32))
 }
 
 fn value_class_for_type(ty: &Type) -> DocumentValueClass {

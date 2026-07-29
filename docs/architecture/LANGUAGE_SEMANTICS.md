@@ -46,6 +46,13 @@ Execution profiles bound numerator and denominator bits, parsed and formatted
 digits, and arithmetic work. Exceeding a bound fails deterministically; it
 does not truncate, approximate, wrap, or silently switch semantics.
 
+The parser retains source spelling only in `ParsedProgram`. The typechecker
+parses every numeric literal and exact numeric match pattern under the
+canonical compiler resource profile. `CheckedProgram`, `SemanticProgram`,
+`ErasedProgram`, `MachinePlan`, and retained-document constants all carry the
+same normalized exact rational value. No backend reparses a literal or narrows
+document constants to a fixed decimal lane.
+
 Whole-number operations are explicit:
 
 - `Number/floor()` returns the greatest whole Number no greater than its input.

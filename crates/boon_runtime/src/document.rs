@@ -2168,13 +2168,7 @@ impl<'a> Evaluator<'a> {
             .value;
         Ok(match value {
             DocumentConstantValue::Text { value } => EvalValue::Text(value.clone()),
-            DocumentConstantValue::Number { coefficient, scale } => {
-                EvalValue::Number(format!("{coefficient}e-{scale}").parse().map_err(|error| {
-                    DocumentError::InvalidPlan(format!(
-                        "document Number constant is invalid: {error}"
-                    ))
-                })?)
-            }
+            DocumentConstantValue::Number { value } => EvalValue::Number(value.clone()),
             DocumentConstantValue::Bytes { value } => EvalValue::Bytes(value.clone().into()),
             DocumentConstantValue::Bits { value } => EvalValue::Bits(value.clone()),
             DocumentConstantValue::Tag { name } => {

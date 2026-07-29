@@ -16,7 +16,7 @@ pub use boon_document_model::{
 pub use document::*;
 pub use host::*;
 
-pub const PLAN_MAJOR_VERSION: u32 = 9;
+pub const PLAN_MAJOR_VERSION: u32 = 10;
 pub const PLAN_MINOR_VERSION: u32 = 0;
 pub const PERSISTENCE_FORMAT_VERSION: u32 = 5;
 pub const DEFAULT_PERSISTENCE_SCHEMA_VERSION: u64 = 1;

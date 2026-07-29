@@ -472,7 +472,7 @@ pub enum SemanticExpressionKind {
     TextTemplate {
         segments: Vec<SemanticTextSegment>,
     },
-    Number(String),
+    Number(boon_data::ExactNumber),
     BytesByte(u8),
     /// Private flow absence. It has no public data representation.
     Absent,

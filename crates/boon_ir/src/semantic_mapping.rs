@@ -11417,7 +11417,11 @@ mod tests {
             .expressions
             .iter()
             .position(|expression| {
-                matches!(&expression.kind, SemanticExpressionKind::Number(value) if value == "0")
+                matches!(
+                    &expression.kind,
+                    SemanticExpressionKind::Number(value)
+                        if value == &boon_data::ExactNumber::zero()
+                )
             })
             .expect("fixture has an unrelated spare expression");
 
@@ -11646,7 +11650,13 @@ result: identity(value: 1)
         let read = wrong_value_kind
             .expressions
             .iter_mut()
-            .find(|expression| matches!(&expression.kind, SemanticExpressionKind::Number(value) if value == "1"))
+            .find(|expression| {
+                matches!(
+                    &expression.kind,
+                    SemanticExpressionKind::Number(value)
+                        if value == &boon_data::ExactNumber::one()
+                )
+            })
             .expect("fixture has a read replacement expression");
         read.kind = SemanticExpressionKind::ExternalRead {
             canonical_path: "Server/value".to_owned(),
@@ -11660,7 +11670,13 @@ result: identity(value: 1)
         let read = exact_value
             .expressions
             .iter_mut()
-            .find(|expression| matches!(&expression.kind, SemanticExpressionKind::Number(value) if value == "1"))
+            .find(|expression| {
+                matches!(
+                    &expression.kind,
+                    SemanticExpressionKind::Number(value)
+                        if value == &boon_data::ExactNumber::one()
+                )
+            })
             .expect("fixture has a read replacement expression");
         read.kind = SemanticExpressionKind::ExternalRead {
             canonical_path: "Server/value".to_owned(),

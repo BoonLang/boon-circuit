@@ -2655,6 +2655,35 @@ outputs: [
 }
 
 #[test]
+fn retained_document_constants_preserve_the_same_exact_number_domain() {
+    let compiled = compile_fixture_source_text_to_machine_plan(
+        "exact-document-number.bn",
+        r#"
+document: Document/new(
+    root: Element/label(
+        element: []
+        style: [width: 9007199254740993123456789]
+        label: TEXT { exact }
+    )
+)
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    let expected = "9007199254740993123456789"
+        .parse::<boon_plan::ExactNumber>()
+        .unwrap();
+    let document = compiled.plan.document.as_ref().expect("document plan");
+    assert!(document.constants.iter().any(|constant| {
+        matches!(
+            &constant.value,
+            boon_plan::DocumentConstantValue::Number { value } if value == &expected
+        )
+    }));
+    assert_eq!(verify_plan(&compiled.plan).unwrap().status, "pass");
+}
+
+#[test]
 fn output_root_identity_ignores_formatting_and_unrelated_declarations() {
     let compact = compile_fixture_source_text_to_machine_plan(
         "stable-output.bn",

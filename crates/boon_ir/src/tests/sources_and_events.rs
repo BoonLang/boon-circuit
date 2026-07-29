@@ -2187,7 +2187,7 @@ store: [
     assert_eq!(
         rows[1].fields[1].value,
         InitialValue::Number {
-            value: "9".to_owned()
+            value: boon_data::ExactNumber::from_i64(9)
         }
     );
 }

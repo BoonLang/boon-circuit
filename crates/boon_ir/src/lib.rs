@@ -874,7 +874,7 @@ pub enum InitialValue {
         value: String,
     },
     Number {
-        value: String,
+        value: boon_data::ExactNumber,
     },
     Bytes {
         bytes: Vec<u8>,
@@ -1310,7 +1310,7 @@ pub enum ExecutableExpressionKind {
     TextTemplate {
         segments: Vec<ExecutableTextSegment>,
     },
-    Number(String),
+    Number(boon_data::ExactNumber),
     BytesByte(u8),
     /// Private flow absence. It cannot be materialized as public data.
     Absent,

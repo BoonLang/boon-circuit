@@ -1,6 +1,6 @@
 use crate::{
-    FieldId, ImportId, ListId, MachinePlan, PlanLocalId, PlanRowExpressionId, PlanStaticOwnerId,
-    ScopeId, SourceId, StateId,
+    ExactNumber, FieldId, ImportId, ListId, MachinePlan, PlanLocalId, PlanRowExpressionId,
+    PlanStaticOwnerId, ScopeId, SourceId, StateId,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -251,7 +251,7 @@ pub struct DocumentConstant {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DocumentConstantValue {
     Text { value: String },
-    Number { coefficient: i64, scale: u32 },
+    Number { value: ExactNumber },
     Bytes { value: Vec<u8> },
     Tag { name: DocumentNameId },
     Bits { value: boon_data::Bits },

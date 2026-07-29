@@ -5907,7 +5907,7 @@ mod tests {
 
     #[derive(Clone, Debug, Eq, PartialEq)]
     enum BodyShape {
-        Number(String),
+        Number(boon_data::ExactNumber),
         Infix(Box<BodyShape>, String, Box<BodyShape>),
         Local(SemanticMaterializationLocalId, Vec<String>),
         Project(Box<BodyShape>, Vec<String>),

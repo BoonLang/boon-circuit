@@ -191,7 +191,7 @@ pub enum SemanticInitialValueV1 {
         value: String,
     },
     Number {
-        value: String,
+        value: boon_data::ExactNumber,
     },
     Bytes {
         bytes: Vec<u8>,
@@ -1404,9 +1404,7 @@ fn semantic_type_contains_collection_authority(ty: &Type) -> bool {
 
 fn semantic_initial_value_from_data(value: boon_data::Value) -> SemanticInitialValueV1 {
     match value {
-        boon_data::Value::Number(value) => SemanticInitialValueV1::Number {
-            value: value.to_string(),
-        },
+        boon_data::Value::Number(value) => SemanticInitialValueV1::Number { value },
         boon_data::Value::Text(value) => SemanticInitialValueV1::Text { value },
         boon_data::Value::Bytes(bytes) => SemanticInitialValueV1::Bytes {
             fixed_len: Some(bytes.len()),
@@ -1655,14 +1653,7 @@ fn semantic_static_data(
                         values.push(boon_data::Value::Text(value.clone()));
                     }
                     SemanticExpressionKind::Number(value) => {
-                        values.push(
-                            value
-                                .parse::<boon_data::ExactNumber>()
-                                .map(boon_data::Value::Number)
-                                .map_err(|error| {
-                                    format!("invalid finite Number `{value}`: {error}")
-                                })?,
-                        );
+                        values.push(boon_data::Value::Number(value.clone()));
                     }
                     SemanticExpressionKind::Bits(value) => {
                         values.push(boon_data::Value::Bits(value.clone()));
@@ -5179,7 +5170,7 @@ kept: mapped |> List/retain(item, if: True)
             synthetic_expression(
                 2,
                 Type::Number,
-                SemanticExpressionKind::Number("2".to_owned()),
+                SemanticExpressionKind::Number(boon_data::ExactNumber::from_i64(2)),
             ),
             synthetic_expression(
                 3,

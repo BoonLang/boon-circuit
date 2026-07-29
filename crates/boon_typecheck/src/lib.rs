@@ -614,7 +614,7 @@ pub struct CheckedSpan {
 pub enum CheckedMatchPattern {
     Wildcard,
     Number {
-        value: String,
+        value: ExactNumber,
     },
     Text {
         value: String,
@@ -630,36 +630,6 @@ pub enum CheckedMatchPattern {
     Bits {
         value: Bits,
     },
-}
-
-impl From<&AstMatchPattern> for CheckedMatchPattern {
-    fn from(pattern: &AstMatchPattern) -> Self {
-        match pattern {
-            AstMatchPattern::Wildcard => Self::Wildcard,
-            AstMatchPattern::Number { value } => Self::Number {
-                value: value.clone(),
-            },
-            AstMatchPattern::Text { value } => Self::Text {
-                value: value.clone(),
-            },
-            AstMatchPattern::Bits {
-                width,
-                radix,
-                digits,
-            } => Self::Bits {
-                value: Bits::parse_encoded(*width, *radix, digits)
-                    .unwrap_or_else(|_| Bits::zero(*width).expect("parser accepts positive width")),
-            },
-            AstMatchPattern::Tag { name, fields } => Self::Tag {
-                name: name.clone(),
-                fields: fields.clone(),
-            },
-            AstMatchPattern::Binding { name } => Self::Binding { name: name.clone() },
-            AstMatchPattern::Invalid { .. } => {
-                unreachable!("invalid match patterns are rejected by boon_parser")
-            }
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -787,7 +757,7 @@ pub enum CheckedExpressionKind {
         segments: Vec<CheckedTextSegment>,
     },
     Number {
-        value: String,
+        value: ExactNumber,
     },
     BytesByte {
         value: u8,
@@ -1722,6 +1692,7 @@ struct CheckedProgramBuilder<'a> {
     checked_flow_inference_cache: BTreeMap<usize, (u64, FlowType)>,
     validate_checked_projections: bool,
     source_payload_shape_table: Vec<SourcePayloadSyntaxShapeEntry>,
+    exact_number_literals: BTreeMap<usize, ExactNumber>,
     diagnostics: Vec<TypeDiagnostic>,
 }
 
@@ -2042,11 +2013,16 @@ impl<'a> CheckedProgramBuilder<'a> {
             checked_flow_inference_cache: BTreeMap::new(),
             validate_checked_projections: false,
             source_payload_shape_table: source_payload_shape_table.to_vec(),
+            exact_number_literals: BTreeMap::new(),
             diagnostics: Vec::new(),
         };
         let exact_pipeline_inputs_valid = checked_program_phase!(
             "validate_exact_pipeline_inputs",
             builder.validate_exact_pipeline_inputs()
+        );
+        checked_program_phase!(
+            "validate_exact_number_literals",
+            builder.validate_exact_number_literals()
         );
         checked_program_phase!("validate_bits_literals", builder.validate_bits_literals());
         checked_program_phase!(
@@ -2267,6 +2243,65 @@ impl<'a> CheckedProgramBuilder<'a> {
                 });
             }
         }
+    }
+
+    fn validate_exact_number_literals(&mut self) {
+        for expression in &self.program.expressions {
+            let literal = match &expression.kind {
+                AstExprKind::Number(value) => Some(value.as_str()),
+                AstExprKind::MatchArm {
+                    pattern: AstMatchPattern::Number { value },
+                    ..
+                } => Some(value.as_str()),
+                _ => None,
+            };
+            let Some(literal) = literal else {
+                continue;
+            };
+            match ExactNumber::parse_strict(literal, None) {
+                Ok(value) => {
+                    self.exact_number_literals.insert(expression.id, value);
+                }
+                Err(error) => self.diagnostics.push(TypeDiagnostic {
+                    severity: DiagnosticSeverity::Error,
+                    line: expression.line,
+                    start: expression.start,
+                    end: expression.end,
+                    message: format!("invalid exact Number literal `{literal}`: {error}"),
+                }),
+            }
+        }
+    }
+
+    fn checked_match_pattern(
+        &self,
+        expression: usize,
+        pattern: &AstMatchPattern,
+    ) -> Option<CheckedMatchPattern> {
+        Some(match pattern {
+            AstMatchPattern::Wildcard => CheckedMatchPattern::Wildcard,
+            AstMatchPattern::Number { .. } => CheckedMatchPattern::Number {
+                value: self.exact_number_literals.get(&expression)?.clone(),
+            },
+            AstMatchPattern::Text { value } => CheckedMatchPattern::Text {
+                value: value.clone(),
+            },
+            AstMatchPattern::Bits {
+                width,
+                radix,
+                digits,
+            } => CheckedMatchPattern::Bits {
+                value: Bits::parse_encoded(*width, *radix, digits).ok()?,
+            },
+            AstMatchPattern::Tag { name, fields } => CheckedMatchPattern::Tag {
+                name: name.clone(),
+                fields: fields.clone(),
+            },
+            AstMatchPattern::Binding { name } => {
+                CheckedMatchPattern::Binding { name: name.clone() }
+            }
+            AstMatchPattern::Invalid { .. } => return None,
+        })
     }
 
     fn exact_pipeline_input(&self, expr: &AstExpr, raw_input: usize) -> Option<usize> {
@@ -8781,17 +8816,26 @@ impl<'a> CheckedProgramBuilder<'a> {
                     })
                     .collect(),
             },
-            AstExprKind::Number(value) => CheckedExpressionKind::Number {
-                value: value.clone(),
-            },
+            AstExprKind::Number(_) => self
+                .exact_number_literals
+                .get(&expr.id)
+                .cloned()
+                .map_or_else(
+                    || CheckedExpressionKind::Invalid {
+                        tokens: vec!["invalid_exact_number_literal".to_owned()],
+                    },
+                    |value| CheckedExpressionKind::Number { value },
+                ),
             AstExprKind::BitsLiteral {
                 width,
                 radix,
                 digits,
-            } => CheckedExpressionKind::Bits {
-                value: Bits::parse_encoded(*width, *radix, digits)
-                    .unwrap_or_else(|_| Bits::zero(*width).expect("parser accepts positive width")),
-            },
+            } => Bits::parse_encoded(*width, *radix, digits).map_or_else(
+                |_| CheckedExpressionKind::Invalid {
+                    tokens: vec!["invalid_bits_literal".to_owned()],
+                },
+                |value| CheckedExpressionKind::Bits { value },
+            ),
             AstExprKind::ByteLiteral { value, .. } => {
                 CheckedExpressionKind::BytesByte { value: *value }
             }
@@ -8879,14 +8923,23 @@ impl<'a> CheckedProgramBuilder<'a> {
                 op: op.clone(),
                 right: id(*right),
             },
-            AstExprKind::MatchArm { pattern, output } => CheckedExpressionKind::MatchArm {
-                pattern: pattern.into(),
-                bindings: pattern_variable_names(pattern)
-                    .into_iter()
-                    .filter_map(|name| self.pattern_declarations.get(&(expr.id, name)).copied())
-                    .collect(),
-                output: output.map(id),
-            },
+            AstExprKind::MatchArm { pattern, output } => {
+                self.checked_match_pattern(expr.id, pattern).map_or_else(
+                    || CheckedExpressionKind::Invalid {
+                        tokens: vec!["invalid_match_pattern".to_owned()],
+                    },
+                    |checked_pattern| CheckedExpressionKind::MatchArm {
+                        pattern: checked_pattern,
+                        bindings: pattern_variable_names(pattern)
+                            .into_iter()
+                            .filter_map(|name| {
+                                self.pattern_declarations.get(&(expr.id, name)).copied()
+                            })
+                            .collect(),
+                        output: output.map(id),
+                    },
+                )
+            }
             AstExprKind::Block { bindings, result } => CheckedExpressionKind::Block {
                 bindings: bindings
                     .iter()
@@ -9338,7 +9391,7 @@ enum CheckedOrderSemanticExpression {
     },
     Text(String),
     TextTemplate(Vec<CheckedOrderSemanticTextSegment>),
-    Number(String),
+    Number(ExactNumber),
     Bits(Bits),
     Tag(String),
     Call {
@@ -26927,20 +26980,19 @@ fn duration_milliseconds(expression: usize, expressions: &[AstExpr]) -> Option<u
     if tag != "Duration" {
         return None;
     }
-    let (scale, value) = fields.iter().find_map(|field| {
+    fields.iter().find_map(|field| {
         let scale = match field.name.as_str() {
-            "milliseconds" => 1.0,
-            "seconds" => 1_000.0,
+            "milliseconds" => 1,
+            "seconds" => 1_000,
             _ => return None,
         };
         let AstExprKind::Number(value) = &expressions.get(field.value)?.kind else {
             return None;
         };
-        value.parse::<f64>().ok().map(|value| (scale, value))
-    })?;
-    let milliseconds = value * scale;
-    (milliseconds.is_finite() && milliseconds >= 0.0 && milliseconds <= u64::MAX as f64)
-        .then(|| milliseconds.round() as u64)
+        ExactNumber::parse_strict(value, None)
+            .ok()
+            .and_then(|value| exact_duration_milliseconds(&value, scale))
+    })
 }
 
 fn checked_duration_milliseconds(
@@ -26957,10 +27009,10 @@ fn checked_duration_milliseconds(
     if tag != "Duration" {
         return None;
     }
-    let (scale, value) = fields.iter().find_map(|field| {
+    fields.iter().find_map(|field| {
         let scale = match field.name.as_str() {
-            "milliseconds" => 1.0,
-            "seconds" => 1_000.0,
+            "milliseconds" => 1,
+            "seconds" => 1_000,
             _ => return None,
         };
         let CheckedExpressionKind::Number { value } = &expressions
@@ -26970,11 +27022,16 @@ fn checked_duration_milliseconds(
         else {
             return None;
         };
-        value.parse::<f64>().ok().map(|value| (scale, value))
-    })?;
-    let milliseconds = value * scale;
-    (milliseconds.is_finite() && milliseconds >= 0.0 && milliseconds <= u64::MAX as f64)
-        .then(|| milliseconds.round() as u64)
+        exact_duration_milliseconds(value, scale)
+    })
+}
+
+fn exact_duration_milliseconds(value: &ExactNumber, scale: u64) -> Option<u64> {
+    value
+        .checked_mul(&ExactNumber::from_u64(scale))
+        .ok()?
+        .to_u64_exact()
+        .ok()
 }
 
 fn exact_checked_source_read(

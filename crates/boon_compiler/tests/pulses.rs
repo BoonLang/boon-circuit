@@ -67,6 +67,49 @@ FUNCTION fibonacci(position) {
 }
 "#;
 
+const LIST_FIBONACCI: &str = r#"
+positions: LIST {
+    1
+    2
+    3
+}
+
+sequence:
+    positions
+    |> List/map(item, new: [
+        position: item
+        value: fibonacci(position: item)
+    ])
+
+selected:
+    sequence
+    |> List/get(position: 3)
+
+FUNCTION fibonacci(position) {
+    position
+    |> THEN {
+        position |> WHILE {
+            1 => 1
+
+            n =>
+                [previous: 0, current: 1]
+                |> HOLD state {
+                    n - 1
+                    |> Stream/pulses()
+                    |> THEN {
+                        [
+                            previous: state.current
+                            current: state.previous + state.current
+                        ]
+                    }
+                }
+                |> Stream/skip(count: n - 1)
+                |> .current
+        }
+    }
+}
+"#;
+
 #[test]
 fn bounded_pulse_stream_contracts_are_public_to_compiler_consumers() {
     let parsed = boon_parser::parse_source(
@@ -378,6 +421,69 @@ fn canonical_fibonacci_pulses_lower_into_a_verified_machine_plan() {
             .expect("deterministic binary")
             .is_empty()
     );
+}
+
+#[test]
+fn list_materialized_fibonacci_owns_activation_local_state_per_row() {
+    let parsed =
+        boon_parser::parse_source("list-fibonacci-pulses.bn", LIST_FIBONACCI).expect("parsed");
+    let checked = boon_typecheck::check_program(&parsed);
+    assert!(
+        !checked.report.has_errors(),
+        "diagnostics: {:#?}",
+        checked.report.diagnostics
+    );
+    let semantic = boon_semantic::elaborate(checked.program.expect("checked"), &[])
+        .expect("semantic Fibonacci list");
+    let verified = boon_verify::verify_explicit_contracts(semantic).expect("verified");
+    let ir = boon_ir::erase_and_lower(verified).expect("erased");
+    assert_eq!(ir.state_cells.len(), 1);
+    assert!(ir.state_cells[0].indexed);
+    assert!(matches!(
+        ir.state_cells[0].lifetime,
+        boon_ir::StateCellLifetimeV1::ActivationLocal { .. }
+    ));
+
+    let compiled = boon_compiler::compile_source_text_to_machine_plan_for_role(
+        "list-fibonacci-pulses.bn",
+        LIST_FIBONACCI,
+        boon_plan::TargetProfile::SoftwareDefault,
+        boon_plan::ProgramRole::Server,
+    )
+    .expect("compiled list Fibonacci MachinePlan");
+    let plan = &compiled.plan;
+    assert_eq!(plan.activations.len(), 1);
+    assert_eq!(plan.pulse_batches.len(), 1);
+    assert!(
+        plan.storage_layout
+            .scalar_slots
+            .iter()
+            .any(|slot| slot.indexed
+                && matches!(
+                    slot.lifetime,
+                    boon_plan::PlanStateLifetime::ActivationLocal { .. }
+                ))
+    );
+    let [batch] = plan.pulse_batches.as_slice() else {
+        panic!("one list-backed pulse batch");
+    };
+    let mut count_inputs = Vec::new();
+    plan.row_expressions
+        .visit_inputs(batch.count, &mut |input| count_inputs.push(input))
+        .expect("list-backed pulse count inputs");
+    let position_authority = plan
+        .storage_layout
+        .list_slots
+        .iter()
+        .flat_map(|slot| &slot.row_fields)
+        .find(|field| field.name == "position" && field.role.is_authority())
+        .map(|field| field.field_id)
+        .expect("position authority field");
+    assert!(
+        count_inputs.contains(&boon_plan::ValueRef::Field(position_authority)),
+        "pulse count must capture the source item through the target position field: {count_inputs:?}"
+    );
+    boon_plan::verify_plan(plan).expect("verified list Fibonacci plan");
 }
 
 #[test]

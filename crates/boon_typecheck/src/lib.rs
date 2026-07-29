@@ -5484,21 +5484,42 @@ impl<'a> CheckedProgramBuilder<'a> {
             );
         }
 
-        let instantiated_result = substitute_checked_type(&signature.result.ty, &substitutions);
-        let result_type = if !type_is_recursively_closed(&instantiated_result)
-            && type_is_recursively_closed(&call.result.ty)
+        let mut result_instantiation = substitutions.clone();
+        if type_is_recursively_closed(&call.result.ty) {
+            // Some result variables are determined by call-local syntax rather
+            // than a value parameter (for example, the width argument to
+            // `Bits/slice`). Seed only result variables that argument
+            // instantiation has not already bound. A result variable already
+            // bound to an enclosing generic parameter must remain generic here;
+            // replacing the whole result with a prior closed inference would
+            // specialize the callable body to one unrelated call site.
+            let mut result_substitutions = BTreeMap::new();
+            unify_checked_type_pattern(
+                &signature.result.ty,
+                &call.result.ty,
+                &mut result_substitutions,
+            );
+            for (variable, value) in result_substitutions {
+                result_instantiation.entry(variable).or_insert(value);
+            }
+        }
+        let instantiated_result =
+            substitute_checked_type(&signature.result.ty, &result_instantiation);
+        let authoritative_result = self
+            .authoritative_expr_types
+            .contains(&(call.expression.0 as usize))
+            .then(|| {
+                self.inferred_expr_types
+                    .get(&(call.expression.0 as usize))
+                    .map(|flow_type| flow_type.ty.clone())
+            })
+            .flatten();
+        let result_type = if type_is_recursively_closed(&instantiated_result)
+            || !type_is_recursively_closed(&call.result.ty)
         {
-            call.result.ty.clone()
+            authoritative_result.unwrap_or(instantiated_result)
         } else {
-            self.authoritative_expr_types
-                .contains(&(call.expression.0 as usize))
-                .then(|| {
-                    self.inferred_expr_types
-                        .get(&(call.expression.0 as usize))
-                        .map(|flow_type| flow_type.ty.clone())
-                })
-                .flatten()
-                .unwrap_or(instantiated_result)
+            instantiated_result
         };
         let result = FlowType {
             mode: self.instantiate_checked_call_result_mode(&signature, &call),

@@ -4410,7 +4410,8 @@ pub(crate) fn compile_typed_program_with_distributed_context(
         .collect::<BTreeSet<_>>();
     let mut derived_ops = Vec::new();
     let mut materialized_row_outputs = BTreeSet::new();
-    for derived in &program.derived_values {
+    let mut split_pulse_outputs = BTreeMap::<usize, Vec<ValueRef>>::new();
+    for (derived_index, derived) in program.derived_values.iter().enumerate() {
         let derived_output = derived_output_ref(derived, &scalar_fields)?;
         if projection_owned_outputs.contains(&derived_output) {
             continue;
@@ -4460,9 +4461,18 @@ pub(crate) fn compile_typed_program_with_distributed_context(
                 derived.path
             )));
         }
+        let event_owned_sources = derived
+            .trigger_arms
+            .iter()
+            .filter_map(|arm| event_cause_path(program, arm.cause))
+            .collect::<BTreeSet<_>>();
         let mut inputs = Vec::new();
-        let mut unresolved =
-            resolve_paths(&index, &derived.sources, &mut inputs, &mut unresolved_refs);
+        let mut unresolved = derived
+            .sources
+            .iter()
+            .filter(|path| !event_owned_sources.contains(path.as_str()))
+            .map(|path| resolve_path(&index, path, &mut inputs, &mut unresolved_refs))
+            .sum();
         let mut expression = derived_expression_for_value(
             program,
             derived,
@@ -4523,6 +4533,16 @@ pub(crate) fn compile_typed_program_with_distributed_context(
                 .iter()
                 .map(|field| field.output)
                 .collect::<BTreeSet<_>>();
+            if !deferred_outputs.is_empty() {
+                split_pulse_outputs.insert(
+                    derived_index,
+                    deferred_outputs
+                        .iter()
+                        .copied()
+                        .map(ValueRef::Field)
+                        .collect(),
+                );
+            }
             let omitted_fields = state_fields
                 .keys()
                 .cloned()
@@ -4530,6 +4550,11 @@ pub(crate) fn compile_typed_program_with_distributed_context(
                 .chain(deferred_names.iter().cloned())
                 .collect::<BTreeSet<_>>();
             strip_materialized_non_value_fields(&mut inner, &omitted_fields, &mut row_expressions)?;
+            if !state_dependent_fields.is_empty()
+                && detach_startup_pulse_materialization(program, &mut inner, &row_expressions)?
+            {
+                inputs.retain(|input| !matches!(input, ValueRef::Pulse(_)));
+            }
             for state in state_fields.values() {
                 if derived_expression_reads_state(&inner, *state, &row_expressions)? {
                     return Err(PlanError::new(format!(
@@ -5151,21 +5176,25 @@ pub(crate) fn compile_typed_program_with_distributed_context(
         let pulse_ref = ValueRef::Pulse(plan_pulse_batch_id(batch.id));
         let owner = plan_event_cause_owner(program, ir::EventCause::Pulse(batch.id))?;
         let mut count_inputs = Vec::new();
-        let count = ExecutableRowLowerer::new(
+        let mut count_lowerer = ExecutableRowLowerer::new(
             program,
             &index,
             &mut row_expressions,
             &mut constants,
             &mut count_inputs,
         )
-        .with_list_indexes(&mut list_indexes)
-        .lower(batch.count_expression)
-        .map_err(|error| {
-            PlanError::new(format!(
-                "pulse batch {} count failed exact lowering: {error}",
-                batch.id
-            ))
-        })?;
+        .with_list_indexes(&mut list_indexes);
+        if let Some(state) = batch.state {
+            count_lowerer = count_lowerer.with_state_initializer(state);
+        }
+        let count = count_lowerer
+            .lower(batch.count_expression)
+            .map_err(|error| {
+                PlanError::new(format!(
+                    "pulse batch {} count failed exact lowering: {error}",
+                    batch.id
+                ))
+            })?;
         let start = match &batch.start {
             ir::PulseStart::Startup => PlanPulseStart::Startup,
             ir::PulseStart::Triggered { arms } => {
@@ -5187,7 +5216,7 @@ pub(crate) fn compile_typed_program_with_distributed_context(
                         let (trigger, cause_path) =
                             event_cause_value_ref(program, arm.cause)?;
                         let mut inputs = vec![trigger.clone()];
-                        let gate = ExecutableRowLowerer::new(
+                        let mut gate_lowerer = ExecutableRowLowerer::new(
                             program,
                             &index,
                             &mut row_expressions,
@@ -5195,9 +5224,11 @@ pub(crate) fn compile_typed_program_with_distributed_context(
                             &mut inputs,
                         )
                         .with_list_indexes(&mut list_indexes)
-                        .with_event_trigger(&trigger)
-                        .lower(arm.gate_expression_id)
-                        .map_err(|error| {
+                        .with_event_trigger(&trigger);
+                        if let Some(state) = batch.state {
+                            gate_lowerer = gate_lowerer.with_state_initializer(state);
+                        }
+                        let gate = gate_lowerer.lower(arm.gate_expression_id).map_err(|error| {
                             PlanError::new(format!(
                                 "pulse batch {} start from `{cause_path}` failed exact gate lowering: {error}",
                                 batch.id
@@ -5242,30 +5273,36 @@ pub(crate) fn compile_typed_program_with_distributed_context(
                     })
             })
             .collect::<Result<Vec<_>, PlanError>>()?;
-        let derived_ops = batch
-            .derived_value_indices
-            .iter()
-            .map(|derived_index| {
-                let derived = program.derived_values.get(*derived_index).ok_or_else(|| {
-                    PlanError::new(format!(
-                        "pulse batch {} references missing derived value index {}",
-                        batch.id, derived_index
-                    ))
-                })?;
-                let output = index.resolve(&derived.path).ok_or_else(|| {
+        let mut derived_ops = Vec::new();
+        for derived_index in &batch.derived_value_indices {
+            let derived = program.derived_values.get(*derived_index).ok_or_else(|| {
+                PlanError::new(format!(
+                    "pulse batch {} references missing derived value index {}",
+                    batch.id, derived_index
+                ))
+            })?;
+            let outputs = if let Some(outputs) = split_pulse_outputs.get(derived_index) {
+                outputs.clone()
+            } else {
+                vec![index.resolve(&derived.path).ok_or_else(|| {
                     PlanError::new(format!(
                         "pulse batch {} derived value `{}` has no typed output",
                         batch.id, derived.path
                     ))
-                })?;
-                derived_ops_by_output.get(&output).copied().ok_or_else(|| {
+                })?]
+            };
+            for output in outputs {
+                let op_id = derived_ops_by_output.get(&output).copied().ok_or_else(|| {
                     PlanError::new(format!(
-                        "pulse batch {} derived value `{}` has no MachinePlan op",
+                        "pulse batch {} derived value `{}` output {output:?} has no MachinePlan op",
                         batch.id, derived.path
                     ))
-                })
-            })
-            .collect::<Result<Vec<_>, PlanError>>()?;
+                })?;
+                if !derived_ops.contains(&op_id) {
+                    derived_ops.push(op_id);
+                }
+            }
+        }
         let mut emission_routes = batch
             .emission_routes
             .iter()
@@ -5277,16 +5314,18 @@ pub(crate) fn compile_typed_program_with_distributed_context(
                         count_expression, ..
                     } => {
                         let mut inputs = Vec::new();
-                        let count = ExecutableRowLowerer::new(
+                        let mut count_lowerer = ExecutableRowLowerer::new(
                             program,
                             &index,
                             &mut row_expressions,
                             &mut constants,
                             &mut inputs,
                         )
-                        .with_list_indexes(&mut list_indexes)
-                        .lower(count_expression)
-                        .map_err(|error| {
+                        .with_list_indexes(&mut list_indexes);
+                        if let Some(state) = batch.state {
+                            count_lowerer = count_lowerer.with_state_initializer(state);
+                        }
+                        let count = count_lowerer.lower(count_expression).map_err(|error| {
                             PlanError::new(format!(
                                 "pulse batch {} Stream/skip count failed exact lowering: {error}",
                                 batch.id
@@ -7778,32 +7817,70 @@ fn state_dependent_materialized_row_fields(
             )
         })
         .collect::<Vec<_>>();
+    let target_derived_values = program
+        .derived_values
+        .iter()
+        .enumerate()
+        .filter(|(_, derived)| {
+            derived
+                .materialized_list_id
+                .is_some_and(|list| plan_list_id(list) == target_list)
+        })
+        .map(|(index, _)| index)
+        .collect::<BTreeSet<_>>();
+    let pulse_triggers = program
+        .pulse_batches()
+        .iter()
+        .filter(|batch| {
+            batch
+                .state
+                .is_some_and(|state| target_states.contains(&plan_state_id(state)))
+                && batch
+                    .derived_value_indices
+                    .iter()
+                    .any(|index| target_derived_values.contains(index))
+        })
+        .map(|batch| ValueRef::Pulse(plan_pulse_batch_id(batch.id)))
+        .collect::<Vec<_>>();
 
     let mut trial = Vec::new();
     for (name, output, producer) in candidates {
-        let mut trial_arena = arena.clone();
-        let mut trial_constants = constants.clone();
-        let mut trial_indexes = list_indexes.clone();
-        let mut trial_inputs = Vec::new();
-        let Ok(_expression) = ExecutableRowLowerer::new(
-            program,
-            index,
-            &mut trial_arena,
-            &mut trial_constants,
-            &mut trial_inputs,
-        )
-        .with_list_indexes(&mut trial_indexes)
-        .lower(producer) else {
+        let mut lowered = None;
+        for event_trigger in std::iter::once(None).chain(pulse_triggers.iter().cloned().map(Some)) {
+            let mut trial_arena = arena.clone();
+            let mut trial_constants = constants.clone();
+            let mut trial_indexes = list_indexes.clone();
+            let mut trial_inputs = Vec::new();
+            let mut lowerer = ExecutableRowLowerer::new(
+                program,
+                index,
+                &mut trial_arena,
+                &mut trial_constants,
+                &mut trial_inputs,
+            )
+            .with_list_indexes(&mut trial_indexes);
+            if let Some(trigger) = event_trigger.as_ref() {
+                lowerer = lowerer.with_event_trigger(trigger);
+            }
+            match lowerer.lower(producer) {
+                Ok(_) => {
+                    lowered = Some((event_trigger, trial_inputs));
+                    break;
+                }
+                Err(_) => {}
+            }
+        }
+        let Some((event_trigger, trial_inputs)) = lowered else {
             continue;
         };
         let dependencies = trial_inputs.into_iter().collect::<BTreeSet<_>>();
-        trial.push((name, output, producer, dependencies));
+        trial.push((name, output, producer, dependencies, event_trigger));
     }
 
     let mut deferred = BTreeSet::new();
     loop {
         let before = deferred.len();
-        for (_, output, _, dependencies) in &trial {
+        for (_, output, _, dependencies, _) in &trial {
             if dependencies.iter().any(|dependency| match dependency {
                 ValueRef::State(state) => target_states.contains(state),
                 ValueRef::StateProjection { state_id, .. } => target_states.contains(state_id),
@@ -7829,31 +7906,38 @@ fn state_dependent_materialized_row_fields(
         })
         .collect::<Vec<_>>();
     let mut result = Vec::new();
-    for (name, output, producer, _) in trial {
+    for (name, output, producer, _, event_trigger) in trial {
         if !include_state_independent && !deferred.contains(&output) {
             continue;
         }
         let mut inputs = Vec::new();
-        let mut expression =
-            ExecutableRowLowerer::new(program, index, arena, constants, &mut inputs)
-                .with_list_indexes(list_indexes)
-                .lower(producer)
-                .map_err(|error| {
-                    PlanError::new(format!(
-                        "materialized list {} state-dependent field `{name}` failed exact lowering: {error}",
-                        target_list.0
-                    ))
-                })?;
+        let mut lowerer = ExecutableRowLowerer::new(program, index, arena, constants, &mut inputs)
+            .with_list_indexes(list_indexes);
+        if let Some(trigger) = event_trigger.as_ref() {
+            lowerer = lowerer.with_event_trigger(trigger);
+        }
+        let mut expression = lowerer.lower(producer).map_err(|error| {
+            PlanError::new(format!(
+                "materialized list {} state-dependent field `{name}` failed exact lowering: {error}",
+                target_list.0
+            ))
+        })?;
         let local = if arena.contextual_locals_resolve(expression)? {
             None
         } else {
             let mut resolved = None;
             for materialization in &materializations {
+                let owner = PlanStaticOwnerId(materialization.owner.as_usize());
+                let row_local = PlanLocalId(materialization.row_local.0 as usize);
+                if materialization.source_list_id.is_none()
+                    && arena.contextual_locals_resolve_with(expression, owner, row_local)?
+                {
+                    resolved = Some(PlanMaterializedRowLocal { owner, row_local });
+                    break;
+                }
                 let Some(source_list) = materialization.source_list_id.map(plan_list_id) else {
                     continue;
                 };
-                let owner = PlanStaticOwnerId(materialization.owner.as_usize());
-                let row_local = PlanLocalId(materialization.row_local.0 as usize);
                 let candidate = retarget_materialized_source_local(
                     program,
                     arena,
@@ -8019,6 +8103,48 @@ fn strip_materialized_non_value_fields(
         | PlanDerivedExpression::ValueCompare { .. } => {}
     }
     Ok(())
+}
+
+fn detach_startup_pulse_materialization(
+    program: &ErasedProgram,
+    expression: &mut PlanDerivedExpression,
+    arena: &PlanRowExpressionArena,
+) -> Result<bool, PlanError> {
+    let PlanDerivedExpression::SourceEventTransform { default, arms, .. } = expression else {
+        return Ok(false);
+    };
+    if !matches!(arena.node(*default)?, PlanRowExpressionNode::Absent) {
+        return Ok(false);
+    }
+    let Some(first) = arms.first() else {
+        return Ok(false);
+    };
+    let startup_pulse_arm = |arm: &PlanSourceEventTransformArm| {
+        let ValueRef::Pulse(pulse) = arm.trigger else {
+            return false;
+        };
+        program
+            .pulse_batches()
+            .get(pulse.0)
+            .filter(|batch| plan_pulse_batch_id(batch.id) == pulse)
+            .is_some_and(|batch| matches!(batch.start, ir::PulseStart::Startup))
+    };
+    if !startup_pulse_arm(first)
+        || arms
+            .iter()
+            .any(|arm| !startup_pulse_arm(arm) || arm.value != first.value)
+    {
+        return Ok(false);
+    }
+    if !arena.contextual_locals_resolve(first.value)? {
+        return Err(PlanError::new(
+            "startup pulse materialization seed retains unresolved contextual locals",
+        ));
+    }
+    *expression = PlanDerivedExpression::RowExpression {
+        expression: first.value,
+    };
+    Ok(true)
 }
 
 fn strip_materialized_non_value_row_fields(
@@ -10784,7 +10910,8 @@ impl<'a> ExecutableRowLowerer<'a> {
                     "{state_label} local {}:{} has no exact materialization",
                     erased_owner.0, local.0
                 ))
-            })?;
+            })?
+            .clone();
         let capture_fields = self
             .program
             .scope_index
@@ -10862,6 +10989,70 @@ impl<'a> ExecutableRowLowerer<'a> {
                 },
             )
         };
+        let body = self
+            .program
+            .executable
+            .expressions
+            .get(materialization.body.as_usize())
+            .filter(|expression| expression.id == materialization.body)
+            .ok_or_else(|| {
+                PlanError::new(format!(
+                    "{state_label} local {}:{} references missing materialization body {}",
+                    erased_owner.0, local.0, materialization.body.0
+                ))
+            })?;
+        let mut target_paths = body
+            .provenance
+            .members
+            .iter()
+            .filter_map(|member| match &member.origin {
+                ir::ExecutableValueOrigin::MaterializationLocal {
+                    owner,
+                    local: candidate,
+                    projection: source_projection,
+                } if *owner == erased_owner
+                    && *candidate == local
+                    && projection.starts_with(source_projection) =>
+                {
+                    let mut target = member.path.clone();
+                    target.extend_from_slice(&projection[source_projection.len()..]);
+                    Some((source_projection.len(), target))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if let Some(depth) = target_paths.iter().map(|(depth, _)| *depth).max() {
+            target_paths.retain(|(candidate, _)| *candidate == depth);
+            let candidates = target_paths
+                .into_iter()
+                .map(|(_, path)| path)
+                .collect::<BTreeSet<_>>();
+            if candidates.len() != 1 {
+                return Err(PlanError::new(format!(
+                    "{state_label} local {}:{} projection `{}` maps to {} target-row constructor paths",
+                    erased_owner.0,
+                    local.0,
+                    projection.join("."),
+                    candidates.len()
+                )));
+            }
+            let target = candidates
+                .iter()
+                .next()
+                .expect("one target-row constructor path remains");
+            let (field_name, nested) = target
+                .split_first()
+                .map_or(("value", &[][..]), |(field, nested)| {
+                    (field.as_str(), nested)
+                });
+            let mut value = self.intern(PlanRowExpressionNode::Field {
+                input: ValueRef::Field(field_id(field_name)?),
+            })?;
+            for field in nested {
+                value = self.project_field(value, field.clone())?;
+            }
+            return Ok(value);
+        }
         if let Some((first, nested)) = projection.split_first() {
             let mut value = self.intern(PlanRowExpressionNode::Field {
                 input: ValueRef::Field(field_id(first)?),
@@ -13684,18 +13875,6 @@ fn unresolved_region_op_count(
         .iter()
         .filter(|op| op.unresolved_executable_ref_count > 0)
         .count())
-}
-
-fn resolve_paths(
-    index: &ValueIndex,
-    paths: &[String],
-    refs: &mut Vec<ValueRef>,
-    unresolved: &mut BTreeSet<String>,
-) -> usize {
-    paths
-        .iter()
-        .map(|path| resolve_path(index, path, refs, unresolved))
-        .sum()
 }
 
 fn resolve_path(

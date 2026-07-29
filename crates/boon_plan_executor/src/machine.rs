@@ -16646,13 +16646,13 @@ impl MachineInstance {
                 .cloned()
                 .unwrap_or_default();
             for field in &derived {
-                self.mark_root_dirty(*field, work);
+                self.mark_state_derived_field_dirty(*field, row, work)?;
             }
             for list in &derived_lists {
                 self.mark_list_dirty(*list, work);
             }
             for field in &derived {
-                self.ensure_root_field_presence(*field, None, work)?;
+                self.ensure_state_derived_field_presence(*field, row, work)?;
             }
             for list in &derived_lists {
                 self.ensure_list_presence(*list, None, work)?;
@@ -16668,13 +16668,13 @@ impl MachineInstance {
                 self.execute_update(op, row, &trigger, work)?;
             }
             for field in &derived {
-                self.mark_root_dirty(*field, work);
+                self.mark_state_derived_field_dirty(*field, row, work)?;
             }
             for list in &derived_lists {
                 self.mark_list_dirty(*list, work);
             }
             for field in &derived {
-                self.ensure_root_field_presence(*field, None, work)?;
+                self.ensure_state_derived_field_presence(*field, row, work)?;
             }
             for list in &derived_lists {
                 self.ensure_list_presence(*list, None, work)?;
@@ -16697,6 +16697,58 @@ impl MachineInstance {
         work.active_trigger = previous_trigger;
         work.active_state_routes.remove(&route_key);
         result
+    }
+
+    fn mark_state_derived_field_dirty(
+        &mut self,
+        field: FieldId,
+        row: Option<RowId>,
+        work: &mut Work,
+    ) -> Result<(), Error> {
+        if let Some(owner) = self.metadata.row_field_owner.get(&field).copied() {
+            let row = row.ok_or_else(|| {
+                Error::InvalidPlan(format!(
+                    "row-owned derived field {} has no state-transition row",
+                    field.0
+                ))
+            })?;
+            if row.list != owner {
+                return Err(Error::InvalidPlan(format!(
+                    "row-owned derived field {} belongs to list {}, not transition row list {}",
+                    field.0, owner.0, row.list.0
+                )));
+            }
+            self.mark_row_dirty(row, field, work);
+        } else {
+            self.mark_root_dirty(field, work);
+        }
+        Ok(())
+    }
+
+    fn ensure_state_derived_field_presence(
+        &mut self,
+        field: FieldId,
+        row: Option<RowId>,
+        work: &mut Work,
+    ) -> Result<(), Error> {
+        if let Some(owner) = self.metadata.row_field_owner.get(&field).copied() {
+            let row = row.ok_or_else(|| {
+                Error::InvalidPlan(format!(
+                    "row-owned derived field {} has no state-transition row",
+                    field.0
+                ))
+            })?;
+            if row.list != owner {
+                return Err(Error::InvalidPlan(format!(
+                    "row-owned derived field {} belongs to list {}, not transition row list {}",
+                    field.0, owner.0, row.list.0
+                )));
+            }
+            self.ensure_row_field_presence(row, field, None, work)?;
+        } else {
+            self.ensure_root_field_presence(field, None, work)?;
+        }
+        Ok(())
     }
 
     fn route_triggered_pulse_batches(
@@ -16784,11 +16836,35 @@ impl MachineInstance {
                 batch.id.0
             )));
         }
-        if !batch.owner.ancestors.is_empty() {
-            return Err(Error::InvalidPlan(format!(
-                "startup pulse batch {} requires a repeated owner",
-                batch.id.0
-            )));
+        if let Some(leaf) = batch.owner.ancestors.last() {
+            self.ensure_list_presence(leaf.list, None, work)?;
+            let mut targets = Vec::new();
+            for row in self.list_row_ids(leaf.list) {
+                let owners = self.row_owner_rows(row)?;
+                if owners.len() == batch.owner.ancestors.len()
+                    && owners
+                        .iter()
+                        .zip(&batch.owner.ancestors)
+                        .all(|(actual, expected)| actual.list == expected.list)
+                {
+                    targets.push(row);
+                }
+            }
+            for row in targets {
+                let owner = self.owner_instance_for_row(&batch.owner, row)?;
+                let origin = TriggerFrame {
+                    active: ActiveTrigger {
+                        cause: TriggerCause::Pulse(batch.id),
+                        owner_plan: batch.owner.clone(),
+                        owner,
+                        target: Some(row),
+                        sequence: 0,
+                    },
+                    source_event: None,
+                };
+                self.execute_pulse_batch(&batch, &origin, work)?;
+            }
+            return Ok(());
         }
         let owner = self
             .owner_instances
@@ -26576,8 +26652,16 @@ impl MachineInstance {
                                         .map(private_presence_eval)
                                         .ok_or_else(|| {
                                             Error::Evaluation(format!(
-                                                "activation-local indexed state {} has no private presence",
-                                                state.0
+                                                "activation-local indexed state {} has no private presence for row {}:{}:{} (active_trigger={:?}, consumer={:?}, output={:?})",
+                                                state.0,
+                                                row.list.0,
+                                                row.key,
+                                                row.generation,
+                                                work.active_trigger
+                                                    .as_ref()
+                                                    .map(|trigger| trigger.cause),
+                                                context.consumer,
+                                                context.output,
                                             ))
                                         })?;
                                     stack.push_value(value)?;

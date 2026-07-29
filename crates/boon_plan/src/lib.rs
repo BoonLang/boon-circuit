@@ -12911,12 +12911,38 @@ fn pulse_execution_contract_failure(plan: &MachinePlan) -> Option<String> {
                     .iter()
                     .any(|arm| arm.trigger == ValueRef::Pulse(batch.id))
             );
+            let indexed_materialized_field = matches!(
+                (&op.kind, &op.output, batch.state, batch.owner.ancestors.last()),
+                (
+                    PlanOpKind::DerivedValue {
+                        expression:
+                            Some(PlanDerivedExpression::MaterializedRowField { .. }),
+                        ..
+                    },
+                    Some(ValueRef::Field(field)),
+                    Some(state),
+                    Some(owner),
+                ) if op.indexed
+                    && op.inputs.iter().any(|input| {
+                        matches!(
+                            input,
+                            ValueRef::State(candidate)
+                                | ValueRef::StateProjection {
+                                    state_id: candidate,
+                                    ..
+                                } if *candidate == state
+                        )
+                    })
+                    && plan.storage_layout.list_slots.iter().any(|slot| {
+                        slot.list_id == owner.list && slot.contains_row_field(*field)
+                    })
+            );
             if *kind != RegionKind::DerivedEvaluation
-                || !pulse_arm
+                || (!pulse_arm && !indexed_materialized_field)
                 || !claimed_derived_ops.insert(*op_id)
             {
                 return Some(format!(
-                    "pulse batch {} derived op {} has the wrong trigger or owner",
+                    "pulse batch {} derived op {} has the wrong trigger or indexed materialized owner",
                     batch.id.0, op_id.0
                 ));
             }

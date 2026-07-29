@@ -15332,6 +15332,97 @@ FUNCTION fibonacci(position) {
 }
 
 #[test]
+fn list_materialized_fibonacci_executes_one_private_activation_per_row() {
+    let compiled = compile_server_source(
+        "list-fibonacci-pulses.bn",
+        r#"
+positions: LIST {
+    1
+    2
+    3
+}
+
+sequence:
+    positions
+    |> List/map(item, new: [
+        position: item
+        value: fibonacci(position: item)
+    ])
+
+FUNCTION fibonacci(position) {
+    position
+    |> THEN {
+        position |> WHILE {
+            1 => 1
+
+            n =>
+                [previous: 0, current: 1]
+                |> HOLD state {
+                    n - 1
+                    |> Stream/pulses()
+                    |> THEN {
+                        [
+                            previous: state.current
+                            current: state.previous + state.current
+                        ]
+                    }
+                }
+                |> Stream/skip(count: n - 1)
+                |> .current
+        }
+    }
+}
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .expect("compiled list-backed Fibonacci");
+    let sequence = list_id(&compiled.plan, "sequence");
+    let value = compiled
+        .plan
+        .storage_layout
+        .list_slots
+        .iter()
+        .find(|slot| slot.list_id == sequence)
+        .expect("sequence storage")
+        .row_fields
+        .iter()
+        .find(|field| field.name == "value" && field.role == PlanListRowFieldRole::Value)
+        .map(|field| field.field_id)
+        .expect("sequence derived value field");
+
+    let mut session =
+        MachineInstance::new(compiled.plan, SessionOptions::default()).expect("pulse runtime");
+    assert_eq!(
+        session.startup_metrics().verified_pulse_fusion_batch_count,
+        3
+    );
+    assert_eq!(
+        session
+            .startup_metrics()
+            .verified_pulse_fusion_microturn_count,
+        3
+    );
+    assert_eq!(session.startup_metrics().baseline_pulse_batch_count, 0);
+    let rows = session
+        .list_row_snapshots_current(sequence)
+        .expect("current Fibonacci rows");
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.fields.get(&value).cloned())
+            .collect::<Vec<_>>(),
+        vec![Some(number(1)), Some(number(1)), Some(number(2))]
+    );
+    assert!(
+        session
+            .snapshot()
+            .expect("public snapshot")
+            .states
+            .is_empty(),
+        "per-row activation-local HOLD state must not survive startup"
+    );
+}
+
+#[test]
 fn source_triggered_fibonacci_resets_local_hold_and_skip_only_filters_emissions() {
     let compiled = compile_server_source(
         "source-fibonacci-pulses.bn",

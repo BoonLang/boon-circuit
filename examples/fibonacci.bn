@@ -1,17 +1,22 @@
--- A small immutable table keeps this example focused on LIST, List/get,
--- List/map, function calls, and text interpolation.
-fibonacci: LIST {
-    [position: 1, value: 1]
-    [position: 2, value: 1]
-    [position: 3, value: 2]
-    [position: 4, value: 3]
-    [position: 5, value: 5]
-    [position: 6, value: 8]
-    [position: 7, value: 13]
-    [position: 8, value: 21]
-    [position: 9, value: 34]
-    [position: 10, value: 55]
+positions: LIST {
+    1
+    2
+    3
+    4
+    5
+    6
+    7
+    8
+    9
+    10
 }
+
+sequence:
+    positions
+    |> List/map(item, new: [
+        position: item
+        value: fibonacci(position: item)
+    ])
 
 document: Document/new(
     root: Element/container(
@@ -31,19 +36,43 @@ document: Document/new(
                 Element/label(
                     element: []
                     style: [height: 30, font: [size: 16, color: Oklch[lightness:0.38,chroma:0.10,hue:250]]]
-                    label: fibonacci_result(sequence: fibonacci)
+                    label: fibonacci_result(sequence: sequence)
                 )
                 Element/stripe(
                     element: []
                     direction: Column
                     gap: 2
                     style: [width: Fill]
-                    items: fibonacci |> List/map(item, new: fibonacci_row(item: item))
+                    items: sequence |> List/map(item, new: fibonacci_row(item: item))
                 )
             }
         )
     )
 )
+
+FUNCTION fibonacci(position) {
+    position
+    |> THEN {
+        position |> WHILE {
+            1 => 1
+
+            n =>
+                [previous: 0, current: 1]
+                |> HOLD state {
+                    n - 1
+                    |> Stream/pulses()
+                    |> THEN {
+                        [
+                            previous: state.current
+                            current: state.previous + state.current
+                        ]
+                    }
+                }
+                |> Stream/skip(count: n - 1)
+                |> .current
+        }
+    }
+}
 
 FUNCTION fibonacci_result(sequence) {
     BLOCK {
@@ -66,7 +95,7 @@ FUNCTION fibonacci_row(item) {
         style: [width: Fill, height: 24, padding: [left: 8, right: 8], background: [color: Oklch[lightness:0.975]]]
         items: LIST {
             Element/label(element: [], style: [width: 120, height: 22, font: [size: 13, color: Oklch[lightness:0.48]]], label: TEXT { n = {item.position} })
-            Element/label(element: [], style: [width: 160, height: 22, font: [size: 13, color: Oklch[lightness:0.22]]], label: item.value)
+            Element/label(element: [], style: [width: 160, height: 22, font: [size: 13, color: Oklch[lightness:0.22]]], label: item.value |> Number/to_text())
         }
     )
 }

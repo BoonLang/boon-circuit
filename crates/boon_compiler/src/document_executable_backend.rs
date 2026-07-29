@@ -711,10 +711,40 @@ impl<'a> DocumentCompiler<'a> {
                 value_class_for_type(&expression.flow_type.ty),
                 DocumentExprOp::Absent,
             )),
-            ir::ExecutableExpressionKind::Flush { .. }
-            | ir::ExecutableExpressionKind::FlushBoundary { .. } => Err(PlanError::new(format!(
-                "FLUSH control at executable expression {compiler_id} cannot be materialized as retained document data"
+            ir::ExecutableExpressionKind::Flush { .. } => Err(PlanError::new(format!(
+                "live FLUSH control at executable expression {compiler_id} cannot be materialized as retained document data"
             ))),
+            ir::ExecutableExpressionKind::FlushBoundary { .. } => {
+                let runtime_expression = lower_document_runtime_expression(
+                    self.program,
+                    self.value_index,
+                    self.row_expressions,
+                    self.machine_constants,
+                    expression.id,
+                )
+                .map_err(|error| {
+                    PlanError::new(format!(
+                        "FLUSH boundary at executable expression {compiler_id} cannot be lowered as retained document data: {error}"
+                    ))
+                })?;
+                let bindings = context
+                    .materialization_locals
+                    .iter()
+                    .map(|((owner, local), parameter)| DocumentRuntimeLocalBinding {
+                        owner: PlanStaticOwnerId(owner.0),
+                        local: PlanLocalId(local.0 as usize),
+                        parameter: *parameter,
+                    })
+                    .collect();
+                Ok(self.push_expr(
+                    compiler_id,
+                    value_class_for_type(&expression.flow_type.ty),
+                    DocumentExprOp::RuntimeExpression {
+                        expression: runtime_expression,
+                        bindings,
+                    },
+                ))
+            }
             ir::ExecutableExpressionKind::Tag(value) => self.compile_tag(compiler_id, value),
             ir::ExecutableExpressionKind::TaggedObject { tag, fields } => {
                 self.compile_record_fields(compiler_id, Some(tag), fields, context)

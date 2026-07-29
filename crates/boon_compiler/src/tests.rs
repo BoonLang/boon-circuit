@@ -8007,6 +8007,31 @@ document: Document/new(
 }
 
 #[test]
+fn retained_document_can_consume_a_function_flush_boundary() {
+    let path = example_path("examples/fibonacci.bn");
+    let compiled = compile_source_path_to_machine_plan(&path, TargetProfile::SoftwareDefault)
+        .expect("compiled retained FLUSH boundary");
+
+    let document = compiled.plan.document.as_ref().expect("retained document");
+    assert!(
+        document.expressions.iter().any(|expression| {
+            matches!(
+                expression.op,
+                DocumentExprOp::RuntimeExpression {
+                    expression: runtime_expression,
+                    ..
+                } if matches!(
+                    row_node(&compiled.plan.row_expressions, runtime_expression),
+                    PlanRowExpressionNode::FlushBoundary { .. }
+                )
+            )
+        }),
+        "function FLUSH boundary must remain an exact runtime expression"
+    );
+    assert!(boon_plan::verify_plan(&compiled.plan).is_ok());
+}
+
+#[test]
 fn document_ids_are_stable_across_identical_compilation() {
     let path = example_path("examples/counter.bn");
     let first = compile_source_path_to_machine_plan(&path, TargetProfile::SoftwareDefault).unwrap();

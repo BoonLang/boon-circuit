@@ -117,6 +117,120 @@ FUNCTION fibonacci(position) {
 }
 
 #[test]
+fn fibonacci_called_from_list_map_keeps_scalar_result_in_nested_calls() {
+    let parsed = boon_parser::parse_source(
+        "checked-list-fibonacci-pulses.bn",
+        r#"
+positions: LIST {
+    1
+    2
+    3
+}
+
+sequence:
+    positions
+    |> List/map(item, new: [
+        position: item
+        value: fibonacci(position: item)
+    ])
+
+selected:
+    fibonacci_result(sequence: sequence)
+
+FUNCTION fibonacci(position) {
+    position
+    |> THEN {
+        position |> WHILE {
+            1 => 1
+
+            n =>
+                [previous: 0, current: 1]
+                |> HOLD state {
+                    n - 1
+                    |> Stream/pulses()
+                    |> THEN {
+                        [
+                            previous: state.current
+                            current: state.previous + state.current
+                        ]
+                    }
+                }
+                |> Stream/skip(count: n - 1)
+                |> .current
+        }
+    }
+}
+
+FUNCTION fibonacci_result(sequence) {
+    sequence
+    |> List/get(position: 3)
+}
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+    assert!(
+        !output.report.has_errors(),
+        "diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+    let program = output.program.expect("checked list Fibonacci program");
+    let fibonacci = program
+        .callables
+        .iter()
+        .find(|callable| callable.name == "fibonacci")
+        .expect("Fibonacci callable");
+    assert_eq!(fibonacci.result.ty, Type::Number);
+
+    let get = program
+        .calls
+        .iter()
+        .find(|call| call.function == "List/get")
+        .expect("nested List/get call");
+    let get_expression = program
+        .expressions
+        .iter()
+        .find(|expression| expression.id == get.expression)
+        .expect("nested List/get expression");
+    assert_eq!(get.result, get_expression.flow_type);
+    assert!(matches!(
+        found_payload_type(&get.result.ty),
+        Some(Type::Var(_))
+    ));
+    assert!(matches!(
+        found_payload_type(
+            &program
+                .callables
+                .iter()
+                .find(|callable| callable.name == "fibonacci_result")
+                .expect("generic Fibonacci result callable")
+                .result
+                .ty
+        ),
+        Some(Type::Var(_))
+    ));
+    let result_call = program
+        .calls
+        .iter()
+        .find(|call| call.function == "fibonacci_result")
+        .expect("root Fibonacci result call");
+    assert!(matches!(
+        &result_call.result.ty,
+        Type::VariantSet(variants)
+            if variants.iter().any(|variant| matches!(
+                variant,
+                Variant::Tagged { tag, fields }
+                    if tag == "Found"
+                        && matches!(
+                            fields.fields.get("value"),
+                            Some(Type::Object(value))
+                                if value.fields.get("value") == Some(&Type::Number)
+                        )
+            ))
+    ));
+}
+
+#[test]
 fn ordinary_continuous_values_remain_invalid_then_triggers() {
     let parsed = boon_parser::parse_source(
         "continuous-then.bn",

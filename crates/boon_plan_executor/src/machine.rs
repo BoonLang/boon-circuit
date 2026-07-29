@@ -29,13 +29,13 @@ use boon_plan::{
     PlanListMaterialization, PlanListMutation, PlanListPage, PlanListProjection, PlanLocalId,
     PlanMaterializedRowFieldCopy, PlanOp, PlanOpId, PlanOpKind, PlanOrderDirection,
     PlanOrderOperationKind, PlanOwner, PlanPulseBatch, PlanPulseBatchId, PlanPulseEmissionFilter,
-    PlanPulseStart, PlanRowBuiltin, PlanRowCallArg, PlanRowExpressionArena, PlanRowExpressionId,
-    PlanRowExpressionNode, PlanRowObjectField, PlanRowSelectPattern, PlanStateLifetime,
-    PlanStaticOwnerId, PlanTransientCollection, PlanTransientCollectionKind,
-    PlanTransientCollectionResult, PlanTransientCollectionStep, PlanValueListAuthority,
-    ProducerFunctionInstancePlan, RemoteCallSiteId, RemoteCallSitePlan, RootOutputDemand,
-    ScalarInitializerPlan, ScalarStorageSlot, ScopeId, SourceId, SourcePayloadField, SourceRoute,
-    SourceRouteToken, StateId, ValueRef, verify_plan,
+    PlanPulseFusionEligibility, PlanPulseStart, PlanRowBuiltin, PlanRowCallArg,
+    PlanRowExpressionArena, PlanRowExpressionId, PlanRowExpressionNode, PlanRowObjectField,
+    PlanRowSelectPattern, PlanStateLifetime, PlanStaticOwnerId, PlanTransientCollection,
+    PlanTransientCollectionKind, PlanTransientCollectionResult, PlanTransientCollectionStep,
+    PlanValueListAuthority, ProducerFunctionInstancePlan, RemoteCallSiteId, RemoteCallSitePlan,
+    RootOutputDemand, ScalarInitializerPlan, ScalarStorageSlot, ScopeId, SourceId,
+    SourcePayloadField, SourceRoute, SourceRouteToken, StateId, ValueRef, verify_plan,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1439,6 +1439,18 @@ pub struct TurnMetrics {
     /// Wall-clock nanoseconds spent in the complete public root/list
     /// `*_with_metrics` read path through value boundary materialization.
     pub elapsed_boundary_ns: u64,
+    /// Pulse batches executed through the verifier-owned recurrence fast path.
+    pub verified_pulse_fusion_batch_count: u64,
+    /// Semantic microturns executed inside verifier-owned fused batches.
+    pub verified_pulse_fusion_microturn_count: u64,
+    /// General scheduler boundaries bypassed after the verifier proved that
+    /// recurrence-state routing, list staging, effects, and distributed work
+    /// cannot escape the fused microturn.
+    pub verified_pulse_fusion_scheduler_boundary_elision_count: u64,
+    /// Pulse batches executed through the canonical general scheduler.
+    pub baseline_pulse_batch_count: u64,
+    /// Semantic microturns executed through the canonical general scheduler.
+    pub baseline_pulse_microturn_count: u64,
     pub work_unit_count: u64,
     pub recomputed_targets: Vec<ValueTarget>,
 }
@@ -1733,6 +1745,13 @@ impl DistributedImportUpdate {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PulseExecutionMode {
+    #[default]
+    VerifiedFusion,
+    Baseline,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SessionOptions {
     pub require_monotonic_sequences: bool,
@@ -1750,6 +1769,10 @@ pub struct SessionOptions {
     /// Host-private Session/tenant/authorization identity. Scoped hosts set a
     /// stable fingerprint for the lifetime in which their cursors are valid.
     pub cursor_scope_fingerprint: Option<CursorScopeFingerprint>,
+    /// The production default consumes verifier-owned fusion facts. Baseline
+    /// mode exists for differential semantic verification, not as a second
+    /// language/runtime contract.
+    pub pulse_execution_mode: PulseExecutionMode,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1785,6 +1808,7 @@ impl Default for SessionOptions {
             list_access_work_limits: AccessWorkLimits::default(),
             cursor_sealing_key: None,
             cursor_scope_fingerprint: None,
+            pulse_execution_mode: PulseExecutionMode::VerifiedFusion,
         }
     }
 }
@@ -17252,6 +17276,10 @@ impl MachineInstance {
         work: &mut Work,
     ) -> Result<bool, Error> {
         work.consume(1)?;
+        work.metrics.baseline_pulse_microturn_count = work
+            .metrics
+            .baseline_pulse_microturn_count
+            .saturating_add(1);
         let updates = self
             .metadata
             .updates_by_pulse
@@ -17299,6 +17327,80 @@ impl MachineInstance {
         Ok(false)
     }
 
+    fn execute_verified_fused_pulse_microturns(
+        &mut self,
+        batch: &PlanPulseBatch,
+        state_update_op: PlanOpId,
+        routes: &[FrozenPulseEmissionRoute],
+        count: u64,
+        emission_ordinal: &mut u64,
+        trigger: &TriggerFrame<'_>,
+        work: &mut Work,
+    ) -> Result<(), Error> {
+        let state = batch.state.ok_or_else(|| {
+            Error::InvalidPlan(format!(
+                "verified fused pulse batch {} has no recurrence state",
+                batch.id.0
+            ))
+        })?;
+        let updates = self
+            .metadata
+            .updates_by_pulse
+            .get(&batch.id)
+            .cloned()
+            .unwrap_or_default();
+        if updates.as_slice().len() != 1
+            || updates[0].id != state_update_op
+            || update_branch_has_effect(&updates[0])
+        {
+            return Err(Error::InvalidPlan(format!(
+                "verified fused pulse batch {} changed its pure recurrence update",
+                batch.id.0
+            )));
+        }
+
+        for _ in 0..count {
+            work.consume(1)?;
+            work.metrics.verified_pulse_fusion_microturn_count = work
+                .metrics
+                .verified_pulse_fusion_microturn_count
+                .saturating_add(1);
+            work.metrics
+                .verified_pulse_fusion_scheduler_boundary_elision_count = work
+                .metrics
+                .verified_pulse_fusion_scheduler_boundary_elision_count
+                .saturating_add(1);
+            let candidates = match self.evaluate_pulse_state_updates(&updates, trigger, work)? {
+                ControlOutcome::Normal(candidates) => candidates,
+                ControlOutcome::Flushed(_) => {
+                    return Err(Error::InvalidPlan(format!(
+                        "verified fused pulse batch {} reached FLUSH",
+                        batch.id.0
+                    )));
+                }
+            };
+            let changed = self.commit_pulse_state_updates(candidates, work)?;
+            if changed
+                .iter()
+                .any(|(changed_state, _)| *changed_state != state)
+                || work
+                    .flushed_state_candidates
+                    .keys()
+                    .any(|(flushed_state, _)| *flushed_state == state)
+            {
+                return Err(Error::InvalidPlan(format!(
+                    "verified fused pulse batch {} escaped its recurrence state",
+                    batch.id.0
+                )));
+            }
+            self.emit_pulse_derived_ops(routes, *emission_ordinal, trigger, work)?;
+            self.reconcile_dirty_effects(work)?;
+            self.collect_distributed_invocations_for_trigger(trigger, work)?;
+            *emission_ordinal = emission_ordinal.saturating_add(1);
+        }
+        Ok(())
+    }
+
     fn execute_pulse_batch(
         &mut self,
         batch: &PlanPulseBatch,
@@ -17343,11 +17445,49 @@ impl MachineInstance {
                 self.collect_distributed_invocations_for_trigger(&trigger, work)?;
                 emission_ordinal = emission_ordinal.saturating_add(1);
             }
-            for _ in 0..count {
-                if self.execute_pulse_microturn(batch, &routes, emission_ordinal, &trigger, work)? {
-                    return Ok(true);
+            let fused_update = match (self.options.pulse_execution_mode, &batch.fusion) {
+                (
+                    PulseExecutionMode::VerifiedFusion,
+                    PlanPulseFusionEligibility::VerifiedActivationLocalRecurrence {
+                        state_update_op,
+                        ..
+                    },
+                ) => Some(*state_update_op),
+                (
+                    PulseExecutionMode::VerifiedFusion | PulseExecutionMode::Baseline,
+                    PlanPulseFusionEligibility::VerifiedActivationLocalRecurrence { .. }
+                    | PlanPulseFusionEligibility::Ineligible { .. },
+                ) => None,
+            };
+            if let Some(state_update_op) = fused_update {
+                work.metrics.verified_pulse_fusion_batch_count = work
+                    .metrics
+                    .verified_pulse_fusion_batch_count
+                    .saturating_add(1);
+                self.execute_verified_fused_pulse_microturns(
+                    batch,
+                    state_update_op,
+                    &routes,
+                    count,
+                    &mut emission_ordinal,
+                    &trigger,
+                    work,
+                )?;
+            } else {
+                work.metrics.baseline_pulse_batch_count =
+                    work.metrics.baseline_pulse_batch_count.saturating_add(1);
+                for _ in 0..count {
+                    if self.execute_pulse_microturn(
+                        batch,
+                        &routes,
+                        emission_ordinal,
+                        &trigger,
+                        work,
+                    )? {
+                        return Ok(true);
+                    }
+                    emission_ordinal = emission_ordinal.saturating_add(1);
                 }
-                emission_ordinal = emission_ordinal.saturating_add(1);
             }
             Ok(false)
         })();

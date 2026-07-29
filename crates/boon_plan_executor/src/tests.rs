@@ -31,6 +31,14 @@ fn number(value: i64) -> Value {
     Value::integer(value).unwrap()
 }
 
+fn assert_same_semantic_turn(left: &Turn, right: &Turn) {
+    let mut left = left.clone();
+    let mut right = right.clone();
+    left.metrics = TurnMetrics::default();
+    right.metrics = TurnMetrics::default();
+    assert_eq!(left, right);
+}
+
 fn stored_number(value: i64) -> boon_persistence::StoredValue {
     boon_persistence::StoredValue::integer(value).unwrap()
 }
@@ -15238,7 +15246,7 @@ store: [
 }
 
 #[test]
-fn canonical_fibonacci_executes_frozen_baseline_pulses_and_discards_local_hold() {
+fn canonical_fibonacci_executes_verified_fusion_and_discards_local_hold() {
     let compiled = compile_server_source(
         "fibonacci-pulses.bn",
         r#"
@@ -15278,9 +15286,27 @@ FUNCTION fibonacci(position) {
         slot.lifetime,
         PlanStateLifetime::ActivationLocal { .. }
     ));
+    let [batch] = compiled.plan.pulse_batches.as_slice() else {
+        panic!("canonical Fibonacci must own one pulse batch");
+    };
+    assert!(matches!(
+        &batch.fusion,
+        PlanPulseFusionEligibility::VerifiedActivationLocalRecurrence { .. }
+    ));
 
     let mut session =
         MachineInstance::new(compiled.plan, SessionOptions::default()).expect("pulse runtime");
+    assert_eq!(
+        session.startup_metrics().verified_pulse_fusion_batch_count,
+        1
+    );
+    assert_eq!(
+        session
+            .startup_metrics()
+            .verified_pulse_fusion_microturn_count,
+        9
+    );
+    assert_eq!(session.startup_metrics().baseline_pulse_batch_count, 0);
     assert_eq!(
         session
             .root_value_current("value")
@@ -15384,6 +15410,9 @@ FUNCTION fibonacci(position) {
     };
 
     let ten = apply_position(&mut session, 1, "10");
+    assert_eq!(ten.metrics.verified_pulse_fusion_batch_count, 1);
+    assert_eq!(ten.metrics.verified_pulse_fusion_microturn_count, 9);
+    assert_eq!(ten.metrics.baseline_pulse_batch_count, 0);
     assert_eq!(
         session.root_value_current("store.value").unwrap(),
         number(55)
@@ -15429,6 +15458,9 @@ FUNCTION fibonacci(position) {
     }));
 
     let five = apply_position(&mut session, 2, "5");
+    assert_eq!(five.metrics.verified_pulse_fusion_batch_count, 1);
+    assert_eq!(five.metrics.verified_pulse_fusion_microturn_count, 4);
+    assert_eq!(five.metrics.baseline_pulse_batch_count, 0);
     assert_eq!(
         session.root_value_current("store.value").unwrap(),
         number(5),
@@ -15463,6 +15495,214 @@ FUNCTION fibonacci(position) {
                 .states
                 .get(&local_state)
                 .is_none()
+    );
+}
+
+#[test]
+fn verified_pulse_fusion_matches_baseline_for_repeated_fibonacci_traces() {
+    let compiled = compile_server_source(
+        "pulse-fusion-differential.bn",
+        r#"
+store: [
+    input: SOURCE
+    position:
+        1 |> HOLD position {
+            input.value |> THEN {
+                input.value |> Text/to_number()
+                |> WHEN {
+                    Parsed[value] => value
+                    InvalidNumber[reason, position] => 1
+                }
+            }
+        }
+    value: fibonacci(position: position)
+]
+
+FUNCTION fibonacci(position) {
+    position
+    |> THEN {
+        position |> WHILE {
+            1 => 1
+
+            n =>
+                [previous: 0, current: 1]
+                |> HOLD state {
+                    n - 1
+                    |> Stream/pulses()
+                    |> THEN {
+                        [
+                            previous: state.current
+                            current: state.previous + state.current
+                        ]
+                    }
+                }
+                |> Stream/skip(count: n - 1)
+                |> .current
+        }
+    }
+}
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .expect("compiled pulse-fusion differential");
+    assert!(matches!(
+        &compiled.plan.pulse_batches[0].fusion,
+        PlanPulseFusionEligibility::VerifiedActivationLocalRecurrence { .. }
+    ));
+    let source = source_id(&compiled.plan, "store.input");
+    let plan = compiled.plan;
+    let mut fused =
+        MachineInstance::new(plan.clone(), SessionOptions::default()).expect("fused runtime");
+    let mut baseline = MachineInstance::new(
+        plan,
+        SessionOptions {
+            pulse_execution_mode: PulseExecutionMode::Baseline,
+            ..SessionOptions::default()
+        },
+    )
+    .expect("baseline runtime");
+
+    assert_eq!(
+        fused
+            .root_value_current("store.value")
+            .map_err(|error| error.to_string()),
+        baseline
+            .root_value_current("store.value")
+            .map_err(|error| error.to_string())
+    );
+    assert_eq!(fused.snapshot().unwrap(), baseline.snapshot().unwrap());
+    assert_eq!(
+        fused.authority_snapshot().unwrap(),
+        baseline.authority_snapshot().unwrap()
+    );
+
+    for (sequence, position) in [10_i64, 5, 13, 2, 10].into_iter().enumerate() {
+        let sequence = u64::try_from(sequence + 1).unwrap();
+        let payload = SourcePayload {
+            fields: BTreeMap::from([("value".to_owned(), Value::Text(position.to_string()))]),
+            ..SourcePayload::default()
+        };
+        let fused_turn = fused
+            .apply(SourceEvent {
+                sequence,
+                source,
+                route: route_token(&fused, source, None),
+                target: None,
+                payload: payload.clone(),
+            })
+            .expect("fused Fibonacci turn");
+        let baseline_turn = baseline
+            .apply(SourceEvent {
+                sequence,
+                source,
+                route: route_token(&baseline, source, None),
+                target: None,
+                payload,
+            })
+            .expect("baseline Fibonacci turn");
+
+        assert_same_semantic_turn(&fused_turn, &baseline_turn);
+        assert_eq!(fused_turn.metrics.verified_pulse_fusion_batch_count, 1);
+        assert_eq!(
+            fused_turn.metrics.verified_pulse_fusion_microturn_count,
+            u64::try_from(position - 1).unwrap()
+        );
+        assert_eq!(fused_turn.metrics.baseline_pulse_batch_count, 0);
+        assert_eq!(baseline_turn.metrics.verified_pulse_fusion_batch_count, 0);
+        assert_eq!(baseline_turn.metrics.baseline_pulse_batch_count, 1);
+        assert_eq!(
+            baseline_turn.metrics.baseline_pulse_microturn_count,
+            u64::try_from(position - 1).unwrap()
+        );
+        assert_eq!(
+            fused.root_value_current("store.value").unwrap(),
+            baseline.root_value_current("store.value").unwrap()
+        );
+        assert_eq!(fused.snapshot().unwrap(), baseline.snapshot().unwrap());
+        assert_eq!(
+            fused.authority_snapshot().unwrap(),
+            baseline.authority_snapshot().unwrap()
+        );
+    }
+}
+
+#[test]
+fn compiler_pass_progress_uses_fused_scheduler_with_baseline_trace_equivalence() {
+    let compiled = compile_server_source(
+        "compiler-pass-progress-pulses.bn",
+        include_str!("../../../testdata/compiler_pass_progress_pulses.bn"),
+        TargetProfile::SoftwareBounded,
+    )
+    .expect("compiled compiler-pass pulse fixture");
+    assert!(matches!(
+        &compiled.plan.pulse_batches[0].fusion,
+        PlanPulseFusionEligibility::VerifiedActivationLocalRecurrence { .. }
+    ));
+    let source = source_id(&compiled.plan, "store.run");
+    let plan = compiled.plan;
+    let mut fused =
+        MachineInstance::new(plan.clone(), SessionOptions::default()).expect("fused pass");
+    let mut baseline = MachineInstance::new(
+        plan,
+        SessionOptions {
+            pulse_execution_mode: PulseExecutionMode::Baseline,
+            ..SessionOptions::default()
+        },
+    )
+    .expect("baseline pass");
+
+    let fused_turn = fused
+        .apply(SourceEvent {
+            sequence: 1,
+            source,
+            route: route_token(&fused, source, None),
+            target: None,
+            payload: SourcePayload::default(),
+        })
+        .expect("fused compiler-pass turn");
+    let baseline_turn = baseline
+        .apply(SourceEvent {
+            sequence: 1,
+            source,
+            route: route_token(&baseline, source, None),
+            target: None,
+            payload: SourcePayload::default(),
+        })
+        .expect("baseline compiler-pass turn");
+    assert_same_semantic_turn(&fused_turn, &baseline_turn);
+    assert_eq!(fused_turn.metrics.verified_pulse_fusion_batch_count, 1);
+    assert_eq!(
+        fused_turn.metrics.verified_pulse_fusion_microturn_count,
+        512
+    );
+    assert_eq!(
+        fused_turn
+            .metrics
+            .verified_pulse_fusion_scheduler_boundary_elision_count,
+        512
+    );
+    assert_eq!(fused_turn.metrics.baseline_pulse_microturn_count, 0);
+    assert_eq!(baseline_turn.metrics.baseline_pulse_batch_count, 1);
+    assert_eq!(baseline_turn.metrics.baseline_pulse_microturn_count, 512);
+    assert_eq!(
+        baseline_turn
+            .metrics
+            .verified_pulse_fusion_scheduler_boundary_elision_count,
+        0
+    );
+
+    let result = fused
+        .root_value_current("store.result")
+        .expect("compiler-pass result");
+    assert_eq!(result, number(131_328));
+    assert_eq!(
+        fused.root_value_current("store.result").unwrap(),
+        baseline.root_value_current("store.result").unwrap()
+    );
+    assert_eq!(fused.snapshot().unwrap(), baseline.snapshot().unwrap());
+    assert_eq!(
+        fused.authority_snapshot().unwrap(),
+        baseline.authority_snapshot().unwrap()
     );
 }
 
@@ -15513,8 +15753,22 @@ store: [
             .lifetime,
         PlanStateLifetime::Persistent
     ));
+    assert!(matches!(
+        &compiled.plan.pulse_batches[0].fusion,
+        PlanPulseFusionEligibility::Ineligible { diagnostics }
+            if diagnostics.iter().any(|diagnostic| diagnostic.contains("FLUSH"))
+    ));
+    let plan = compiled.plan;
     let mut session =
-        MachineInstance::new(compiled.plan, SessionOptions::default()).expect("pulse runtime");
+        MachineInstance::new(plan.clone(), SessionOptions::default()).expect("pulse runtime");
+    let mut baseline = MachineInstance::new(
+        plan,
+        SessionOptions {
+            pulse_execution_mode: PulseExecutionMode::Baseline,
+            ..SessionOptions::default()
+        },
+    )
+    .expect("baseline pulse runtime");
     let turn = session
         .apply(SourceEvent {
             sequence: 1,
@@ -15524,6 +15778,24 @@ store: [
             payload: SourcePayload::default(),
         })
         .expect("FLUSH stops the batch without failing the source turn");
+    let baseline_turn = baseline
+        .apply(SourceEvent {
+            sequence: 1,
+            source,
+            route: route_token(&baseline, source, None),
+            target: None,
+            payload: SourcePayload::default(),
+        })
+        .expect("baseline FLUSH turn");
+    assert_same_semantic_turn(&turn, &baseline_turn);
+    assert_eq!(session.snapshot().unwrap(), baseline.snapshot().unwrap());
+    assert_eq!(
+        session.authority_snapshot().unwrap(),
+        baseline.authority_snapshot().unwrap()
+    );
+    assert_eq!(turn.metrics.verified_pulse_fusion_batch_count, 0);
+    assert_eq!(turn.metrics.baseline_pulse_batch_count, 1);
+    assert_eq!(turn.metrics.baseline_pulse_microturn_count, 4);
 
     assert_eq!(
         session.root_value_current("store.value").unwrap(),
@@ -15609,6 +15881,9 @@ store: [
             payload: SourcePayload::default(),
         })
         .expect("bounded pulse turn");
+    assert_eq!(turn.metrics.verified_pulse_fusion_batch_count, 0);
+    assert_eq!(turn.metrics.baseline_pulse_batch_count, 1);
+    assert_eq!(turn.metrics.baseline_pulse_microturn_count, 5);
 
     assert_eq!(
         session.root_value_current("store.count").unwrap(),
@@ -15639,24 +15914,47 @@ fn target_profile_rejects_an_oversized_pulse_batch_before_any_microturn() {
             r#"
 store: [
     start: SOURCE
-    count:
-        {} |> HOLD count {{
-            start |> THEN {{
-                count
-                |> Stream/pulses()
-                |> THEN {{ count - 1 }}
-            }}
+    result:
+        start |> THEN {{
+            run_bounded(count: {})
         }}
 ]
+
+FUNCTION run_bounded(count) {{
+    count
+    |> THEN {{
+        [value: 0]
+        |> HOLD progress {{
+            count
+            |> Stream/pulses()
+            |> THEN {{ [value: progress.value + 1] }}
+        }}
+        |> Stream/skip(count: count)
+        |> .value
+    }}
+}}
 "#,
             limit + 1
         ),
         TargetProfile::SoftwareBounded,
     )
-    .expect("compiled dynamically bounded pulse batch");
+    .expect("compiled target-bounded fusion candidate");
+    assert!(matches!(
+        &compiled.plan.pulse_batches[0].fusion,
+        PlanPulseFusionEligibility::VerifiedActivationLocalRecurrence { .. }
+    ));
     let source = source_id(&compiled.plan, "store.start");
+    let plan = compiled.plan;
     let mut session =
-        MachineInstance::new(compiled.plan, SessionOptions::default()).expect("pulse runtime");
+        MachineInstance::new(plan.clone(), SessionOptions::default()).expect("pulse runtime");
+    let mut baseline = MachineInstance::new(
+        plan,
+        SessionOptions {
+            pulse_execution_mode: PulseExecutionMode::Baseline,
+            ..SessionOptions::default()
+        },
+    )
+    .expect("baseline pulse runtime");
     let error = session
         .apply(SourceEvent {
             sequence: 1,
@@ -15666,13 +15964,33 @@ store: [
             payload: SourcePayload::default(),
         })
         .expect_err("target pulse limit must fail closed");
+    let baseline_error = baseline
+        .apply(SourceEvent {
+            sequence: 1,
+            source,
+            route: route_token(&baseline, source, None),
+            target: None,
+            payload: SourcePayload::default(),
+        })
+        .expect_err("baseline target pulse limit must fail closed");
+    assert_eq!(error.to_string(), baseline_error.to_string());
+    assert_eq!(session.snapshot().unwrap(), baseline.snapshot().unwrap());
+    assert_eq!(
+        session.authority_snapshot().unwrap(),
+        baseline.authority_snapshot().unwrap()
+    );
     assert!(
         error.to_string().contains("activation limit"),
         "unexpected error: {error}"
     );
     assert_eq!(
-        session.root_value_current("store.count").unwrap(),
-        number(i64::try_from(limit + 1).unwrap()),
-        "no pulse candidate may commit before the bound is checked"
+        session
+            .root_value_current("store.result")
+            .expect_err("oversized batch must publish no result")
+            .to_string(),
+        baseline
+            .root_value_current("store.result")
+            .expect_err("baseline oversized batch must publish no result")
+            .to_string()
     );
 }

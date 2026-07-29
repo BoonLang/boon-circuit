@@ -1,0 +1,27 @@
+store: [
+    run: SOURCE
+    result:
+        run |> THEN {
+            process_pass(count: 512)
+        }
+]
+
+FUNCTION process_pass(count) {
+    count
+    |> THEN {
+        [remaining: count, processed: 0, checksum: 0]
+        |> HOLD progress {
+            count
+            |> Stream/pulses()
+            |> THEN {
+                [
+                    remaining: progress.remaining - 1
+                    processed: progress.processed + 1
+                    checksum: progress.checksum + progress.remaining
+                ]
+            }
+        }
+        |> Stream/skip(count: count)
+        |> .checksum
+    }
+}

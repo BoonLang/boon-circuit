@@ -8921,17 +8921,39 @@ fn map_pulse_batches(
     graph: &SemanticReactiveGraphV1,
     ids: &SemanticToExecutableMap,
     storage: &MappedSemanticStorage,
+    fusion_decisions: &[boon_verify::VerifiedPulseFusionDecisionV1],
 ) -> Result<Vec<crate::PulseBatch>, String> {
     require_dense(
         graph.pulse_batches.iter().map(|batch| batch.id.as_usize()),
         "semantic pulse batch",
     )?;
+    if fusion_decisions.len() != graph.pulse_batches.len() {
+        return Err(format!(
+            "verification manifest has {} pulse-fusion decisions for {} semantic pulse batches",
+            fusion_decisions.len(),
+            graph.pulse_batches.len()
+        ));
+    }
     graph
         .pulse_batches
         .iter()
         .enumerate()
         .map(|(index, batch)| {
             let id = crate::PulseBatchId(index);
+            let fusion_decision = fusion_decisions.get(index).ok_or_else(|| {
+                format!(
+                    "verification manifest is missing pulse-fusion decision {}",
+                    batch.id
+                )
+            })?;
+            if fusion_decision.pulse_batch != batch.id
+                || fusion_decision.semantic_slice_digest != batch.slice_digest
+            {
+                return Err(format!(
+                    "pulse-fusion decision {} does not bind semantic pulse batch {} and its exact slice digest",
+                    fusion_decision.pulse_batch, batch.id
+                ));
+            }
             let enclosing_activation = batch
                 .enclosing_activation
                 .map(|activation| {
@@ -9220,6 +9242,75 @@ fn map_pulse_batches(
                     Ok(crate::PulseEmissionRoute { consumer, filter })
                 })
                 .collect::<Result<Vec<_>, String>>()?;
+            let fusion = match &fusion_decision.status {
+                boon_verify::VerifiedPulseFusionStatusV1::Eligible { fact } => {
+                    if fact.count_policy
+                        != boon_verify::VerifiedPulseFusionCountPolicyV1::FrozenAndTargetBoundedBeforeFirstMicroturn
+                        || fact.trace_policy
+                            != boon_verify::VerifiedPulseFusionTracePolicyV1::PreserveCommittedStateDeltasAndEmissionRoutes
+                        || fact.elision_policy
+                            != boon_verify::VerifiedPulseFusionElisionPolicyV1::UnobservedRecurrenceStateAndEmptySideLanes
+                    {
+                        return Err(format!(
+                            "verified pulse-fusion fact for batch {} uses an unsupported proof policy",
+                            batch.id
+                        ));
+                    }
+                    let activation = crate::ActivationId(fact.activation.as_usize());
+                    let state = ids.runtime_state(fact.state)?;
+                    if enclosing_activation != Some(activation) || batch.state != Some(fact.state) {
+                        return Err(format!(
+                            "verified pulse-fusion fact for batch {} changed its activation-local state",
+                            batch.id
+                        ));
+                    }
+                    let state_update_arm_index = batch
+                        .state_update_arms
+                        .iter()
+                        .position(|arm| *arm == fact.state_update_arm)
+                        .ok_or_else(|| {
+                            format!(
+                                "verified pulse-fusion fact for batch {} references missing update arm {}",
+                                batch.id, fact.state_update_arm
+                            )
+                        })?;
+                    let update = graph
+                        .state_update_arms
+                        .get(fact.state_update_arm.as_usize())
+                        .filter(|arm| arm.id == fact.state_update_arm)
+                        .ok_or_else(|| {
+                            format!(
+                                "verified pulse-fusion fact for batch {} lost update arm {}",
+                                batch.id, fact.state_update_arm
+                            )
+                        })?;
+                    if update.state != fact.state
+                        || state_update_arms
+                            .get(state_update_arm_index)
+                            .is_none_or(|arm| arm.state != state)
+                    {
+                        return Err(format!(
+                            "verified pulse-fusion fact for batch {} changed its recurrence target",
+                            batch.id
+                        ));
+                    }
+                    crate::PulseFusionEligibility::VerifiedActivationLocalRecurrence {
+                        activation,
+                        state,
+                        state_update_arm_index,
+                        proof:
+                            crate::PulseFusionProof::FrozenTargetBoundedFullTraceEmptySideLanes,
+                    }
+                }
+                boon_verify::VerifiedPulseFusionStatusV1::Ineligible { reasons } => {
+                    crate::PulseFusionEligibility::Ineligible {
+                        diagnostics: reasons
+                            .iter()
+                            .map(|reason| reason.diagnostic().to_owned())
+                            .collect(),
+                    }
+                }
+            };
             Ok(crate::PulseBatch {
                 id,
                 enclosing_activation,
@@ -9247,6 +9338,7 @@ fn map_pulse_batches(
                         crate::PulseFlushPolicy::DiscardCurrentStopRemainingKeepPriorCommits
                     }
                 },
+                fusion,
                 semantic_slice_digest: batch.slice_digest.0,
             })
         })
@@ -9262,6 +9354,7 @@ pub(super) fn finish_verified_semantic_lowering(
     view_binding_graph: &boon_semantic::SemanticViewBindingGraphV1,
     scope_storage_graph: &SemanticScopeStorageGraphV1,
     memory_graph: &boon_semantic::SemanticMemoryGraphV1,
+    pulse_fusion_decisions: &[boon_verify::VerifiedPulseFusionDecisionV1],
     mapped: MappedSemanticExecution,
     resources: MappedSemanticResources,
 ) -> Result<crate::ErasedProgramFields, String> {
@@ -9333,7 +9426,12 @@ pub(super) fn finish_verified_semantic_lowering(
         &view_bindings,
     )?;
     let activations = map_activation_sites(reactive_graph, &mapped.id_map)?;
-    let pulse_batches = map_pulse_batches(reactive_graph, &mapped.id_map, &storage)?;
+    let pulse_batches = map_pulse_batches(
+        reactive_graph,
+        &mapped.id_map,
+        &storage,
+        pulse_fusion_decisions,
+    )?;
 
     let MappedSemanticExecution {
         executable,

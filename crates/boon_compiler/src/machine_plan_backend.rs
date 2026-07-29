@@ -5331,6 +5331,51 @@ pub(crate) fn compile_typed_program_with_distributed_context(
                 batch.id
             )));
         }
+        let fusion = match &batch.fusion {
+            ir::PulseFusionEligibility::VerifiedActivationLocalRecurrence {
+                activation,
+                state,
+                state_update_arm_index,
+                proof,
+            } => {
+                if *proof != ir::PulseFusionProof::FrozenTargetBoundedFullTraceEmptySideLanes {
+                    return Err(PlanError::new(format!(
+                        "pulse batch {} verified fusion fact uses an unsupported proof policy",
+                        batch.id
+                    )));
+                }
+                if batch.enclosing_activation != Some(*activation) || batch.state != Some(*state) {
+                    return Err(PlanError::new(format!(
+                        "pulse batch {} verified fusion fact changed its activation-local state",
+                        batch.id
+                    )));
+                }
+                let state_update_op = state_update_ops
+                    .get(*state_update_arm_index)
+                    .copied()
+                    .ok_or_else(|| {
+                        PlanError::new(format!(
+                            "pulse batch {} verified fusion fact references missing update arm index {}",
+                            batch.id, state_update_arm_index
+                        ))
+                    })?;
+                if state_update_ops.len() != 1 {
+                    return Err(PlanError::new(format!(
+                        "pulse batch {} verified fusion fact requires exactly one update op",
+                        batch.id
+                    )));
+                }
+                PlanPulseFusionEligibility::VerifiedActivationLocalRecurrence {
+                    state_update_op,
+                    proof: PlanPulseFusionProof::FrozenTargetBoundedFullTraceEmptySideLanes,
+                }
+            }
+            ir::PulseFusionEligibility::Ineligible { diagnostics } => {
+                PlanPulseFusionEligibility::Ineligible {
+                    diagnostics: diagnostics.clone(),
+                }
+            }
+        };
         pulse_batches.push(PlanPulseBatch {
             id: plan_pulse_batch_id(batch.id),
             owner,
@@ -5352,6 +5397,7 @@ pub(crate) fn compile_typed_program_with_distributed_context(
                     PlanPulseFlushPolicy::DiscardCurrentStopRemainingKeepPriorCommits
                 }
             },
+            fusion,
             semantic_slice_digest: batch.semantic_slice_digest,
         });
     }

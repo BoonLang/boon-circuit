@@ -6,7 +6,8 @@ pub use bundle::*;
 
 use boon_semantic::{
     CallableDependencyManifestDigestV1, CheckedProgramDigestV1, DependencyClassifierSchemaDigestV1,
-    SemanticProgram, SemanticProgramDigestV1,
+    SemanticActivationId, SemanticEventCauseV1, SemanticProgram, SemanticProgramDigestV1,
+    SemanticPulseBatchDigestV1, SemanticPulseBatchId, SemanticStateId, SemanticStateUpdateArmId,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -269,11 +270,105 @@ impl RequiredObligationManifestV1 {
     }
 }
 
+/// Canonical verifier output for one exact semantic pulse slice.
+///
+/// Downstream optimizers may consume only `Eligible`; ineligible batches
+/// remain valid programs and execute the baseline scheduler.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct VerifiedPulseFusionDecisionV1 {
+    pub pulse_batch: SemanticPulseBatchId,
+    pub semantic_slice_digest: SemanticPulseBatchDigestV1,
+    pub status: VerifiedPulseFusionStatusV1,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum VerifiedPulseFusionStatusV1 {
+    Eligible {
+        fact: VerifiedPulseFusionFactV1,
+    },
+    Ineligible {
+        reasons: Vec<PulseFusionIneligibilityV1>,
+    },
+}
+
+/// Exact semantic identities and proof policies admitted by the current
+/// activation-local recurrence optimization.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct VerifiedPulseFusionFactV1 {
+    pub activation: SemanticActivationId,
+    pub state: SemanticStateId,
+    pub state_update_arm: SemanticStateUpdateArmId,
+    pub count_policy: VerifiedPulseFusionCountPolicyV1,
+    pub trace_policy: VerifiedPulseFusionTracePolicyV1,
+    pub elision_policy: VerifiedPulseFusionElisionPolicyV1,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerifiedPulseFusionCountPolicyV1 {
+    FrozenAndTargetBoundedBeforeFirstMicroturn,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerifiedPulseFusionTracePolicyV1 {
+    PreserveCommittedStateDeltasAndEmissionRoutes,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerifiedPulseFusionElisionPolicyV1 {
+    UnobservedRecurrenceStateAndEmptySideLanes,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PulseFusionIneligibilityV1 {
+    NoActivationLocalState,
+    StateUpdateCardinality,
+    StateUpdateTargetMismatch,
+    ListMutation,
+    HostEffect,
+    Flush,
+    StateHasReactiveObservers,
+    DistributedInvocation,
+    UnaccountedPulseConsumer,
+}
+
+impl PulseFusionIneligibilityV1 {
+    pub const fn diagnostic(self) -> &'static str {
+        match self {
+            Self::NoActivationLocalState => {
+                "pulse state is not owned by one enclosing causal activation"
+            }
+            Self::StateUpdateCardinality => {
+                "pulse batch does not have exactly one recurrence state update"
+            }
+            Self::StateUpdateTargetMismatch => {
+                "pulse recurrence update does not target its activation-local state"
+            }
+            Self::ListMutation => "pulse microturn mutates list authority",
+            Self::HostEffect => "pulse microturn schedules a host effect",
+            Self::Flush => "pulse microturn may execute FLUSH",
+            Self::StateHasReactiveObservers => {
+                "pulse recurrence state has reactive observers outside the fused batch"
+            }
+            Self::DistributedInvocation => "pulse microturn may schedule a distributed invocation",
+            Self::UnaccountedPulseConsumer => {
+                "pulse batch has a consumer outside its recurrence update and emission routes"
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct VerificationManifestV1 {
     pub schema: String,
     pub requirements: RequiredObligationManifestV1,
     pub accepted_obligation_evidence_core_by_id: Vec<AcceptedObligationEvidenceCoreV1>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pulse_fusion_decisions: Vec<VerifiedPulseFusionDecisionV1>,
     pub manifest_digest: VerificationManifestDigestV1,
 }
 
@@ -300,6 +395,7 @@ impl VerificationManifestV1 {
         for evidence in &self.accepted_obligation_evidence_core_by_id {
             validate_accepted_evidence(&self.requirements, evidence)?;
         }
+        validate_pulse_fusion_decisions(&self.pulse_fusion_decisions)?;
         if self.manifest_digest != verification_manifest_digest(self)? {
             return Err(VerifyError::new(
                 "verification manifest digest does not match its canonical payload",
@@ -742,11 +838,8 @@ impl ContractVerifiedProgram {
     }
 
     #[doc(hidden)]
-    pub fn into_lowering_parts(self) -> (SemanticProgram, VerificationManifestDigestV1) {
-        (
-            self.semantic_program,
-            self.verification_manifest.manifest_digest,
-        )
+    pub fn into_lowering_parts(self) -> (SemanticProgram, VerificationManifestV1) {
+        (self.semantic_program, self.verification_manifest)
     }
 }
 
@@ -801,11 +894,205 @@ fn verify_semantic_program(
         schema: VERIFICATION_MANIFEST_SCHEMA_V1.to_owned(),
         requirements,
         accepted_obligation_evidence_core_by_id: Vec::new(),
+        pulse_fusion_decisions: derive_pulse_fusion_decisions(semantic_program)?,
         manifest_digest: VerificationManifestDigestV1([0; 32]),
     };
     verification_manifest.manifest_digest = verification_manifest_digest(&verification_manifest)?;
     verification_manifest.validate()?;
     Ok(verification_manifest)
+}
+
+/// Prove the narrow full-trace fusion class without recognizing source names.
+///
+/// The executor still evaluates and commits every microturn and publishes its
+/// semantic deltas/emission routes. The fact authorizes only elimination of
+/// recurrence-state routing and side lanes proven empty.
+fn derive_pulse_fusion_decisions(
+    semantic_program: &SemanticProgram,
+) -> Result<Vec<VerifiedPulseFusionDecisionV1>, VerifyError> {
+    let graph = semantic_program.reactive_graph();
+    graph
+        .pulse_batches
+        .iter()
+        .map(|batch| {
+            let mut reasons = BTreeSet::new();
+
+            let activation_state =
+                batch
+                    .enclosing_activation
+                    .zip(batch.state)
+                    .and_then(|(activation_id, state)| {
+                        graph
+                            .activations
+                            .get(activation_id.as_usize())
+                            .filter(|activation| {
+                                activation.id == activation_id && activation.states.contains(&state)
+                            })
+                            .map(|_| (activation_id, state))
+                    });
+            if activation_state.is_none() {
+                reasons.insert(PulseFusionIneligibilityV1::NoActivationLocalState);
+            }
+
+            let update_arm = if batch.state_update_arms.len() == 1 {
+                let update_id = batch.state_update_arms[0];
+                Some(
+                    graph
+                        .state_update_arms
+                        .get(update_id.as_usize())
+                        .filter(|arm| arm.id == update_id)
+                        .ok_or_else(|| {
+                            VerifyError::new(format!(
+                                "pulse batch {} references missing state-update arm {}",
+                                batch.id, update_id
+                            ))
+                        })?,
+                )
+            } else {
+                reasons.insert(PulseFusionIneligibilityV1::StateUpdateCardinality);
+                None
+            };
+            if let (Some((_, state)), Some(update_arm)) = (activation_state, update_arm)
+                && update_arm.state != state
+            {
+                reasons.insert(PulseFusionIneligibilityV1::StateUpdateTargetMismatch);
+            }
+
+            if !batch.list_mutations.is_empty() {
+                reasons.insert(PulseFusionIneligibilityV1::ListMutation);
+            }
+            if !batch.host_effect_schedules.is_empty() {
+                reasons.insert(PulseFusionIneligibilityV1::HostEffect);
+            }
+            if !batch.flush_roots.is_empty() {
+                reasons.insert(PulseFusionIneligibilityV1::Flush);
+            }
+
+            if let Some((_, state)) = activation_state {
+                let state_cause = SemanticEventCauseV1::State(state);
+                let has_observer = graph
+                    .trigger_arms
+                    .iter()
+                    .any(|arm| arm.cause == state_cause)
+                    || graph
+                        .dependencies
+                        .iter()
+                        .any(|edge| edge.from == state_cause)
+                    || graph
+                        .list_mutations
+                        .iter()
+                        .any(|mutation| mutation.cause == state_cause)
+                    || graph
+                        .derived_values
+                        .iter()
+                        .any(|derived| derived.causes.contains(&state_cause));
+                if has_observer {
+                    reasons.insert(PulseFusionIneligibilityV1::StateHasReactiveObservers);
+                }
+            }
+
+            let pulse_arms = batch.trigger_arms.iter().copied().collect::<BTreeSet<_>>();
+            if graph.call_invocations.iter().any(|invocation| {
+                invocation
+                    .invocation_arms
+                    .iter()
+                    .any(|arm| pulse_arms.contains(arm))
+            }) {
+                reasons.insert(PulseFusionIneligibilityV1::DistributedInvocation);
+            }
+
+            let mut accounted_arms = BTreeSet::new();
+            for update_id in &batch.state_update_arms {
+                let update = graph
+                    .state_update_arms
+                    .get(update_id.as_usize())
+                    .filter(|arm| arm.id == *update_id)
+                    .ok_or_else(|| {
+                        VerifyError::new(format!(
+                            "pulse batch {} references missing state-update arm {}",
+                            batch.id, update_id
+                        ))
+                    })?;
+                accounted_arms.insert(update.trigger);
+            }
+            for derived_id in &batch.derived_values {
+                let derived = graph
+                    .derived_values
+                    .get(derived_id.as_usize())
+                    .filter(|derived| derived.id == *derived_id)
+                    .ok_or_else(|| {
+                        VerifyError::new(format!(
+                            "pulse batch {} references missing derived value {}",
+                            batch.id, derived_id
+                        ))
+                    })?;
+                accounted_arms.extend(derived.trigger_arms.iter().copied());
+            }
+            if pulse_arms != accounted_arms {
+                reasons.insert(PulseFusionIneligibilityV1::UnaccountedPulseConsumer);
+            }
+
+            let status = if reasons.is_empty() {
+                let (activation, state) = activation_state.expect("checked above");
+                let state_update_arm = update_arm.expect("checked above").id;
+                VerifiedPulseFusionStatusV1::Eligible {
+                    fact: VerifiedPulseFusionFactV1 {
+                        activation,
+                        state,
+                        state_update_arm,
+                        count_policy:
+                            VerifiedPulseFusionCountPolicyV1::FrozenAndTargetBoundedBeforeFirstMicroturn,
+                        trace_policy:
+                            VerifiedPulseFusionTracePolicyV1::PreserveCommittedStateDeltasAndEmissionRoutes,
+                        elision_policy:
+                            VerifiedPulseFusionElisionPolicyV1::UnobservedRecurrenceStateAndEmptySideLanes,
+                    },
+                }
+            } else {
+                VerifiedPulseFusionStatusV1::Ineligible {
+                    reasons: reasons.into_iter().collect(),
+                }
+            };
+            Ok(VerifiedPulseFusionDecisionV1 {
+                pulse_batch: batch.id,
+                semantic_slice_digest: batch.slice_digest,
+                status,
+            })
+        })
+        .collect()
+}
+
+fn validate_pulse_fusion_decisions(
+    decisions: &[VerifiedPulseFusionDecisionV1],
+) -> Result<(), VerifyError> {
+    let ids = decisions
+        .iter()
+        .map(|decision| decision.pulse_batch)
+        .collect::<Vec<_>>();
+    require_strictly_sorted_unique("pulse-fusion decision", &ids)?;
+    for decision in decisions {
+        if decision
+            .semantic_slice_digest
+            .0
+            .iter()
+            .all(|byte| *byte == 0)
+        {
+            return Err(VerifyError::new(format!(
+                "pulse-fusion decision {} has a zero semantic slice digest",
+                decision.pulse_batch
+            )));
+        }
+        if let VerifiedPulseFusionStatusV1::Ineligible { reasons } = &decision.status {
+            if reasons.is_empty() {
+                return Err(VerifyError::new(format!(
+                    "ineligible pulse-fusion decision {} has no diagnostic reason",
+                    decision.pulse_batch
+                )));
+            }
+            require_strictly_sorted_unique("pulse-fusion ineligibility reason", reasons)?;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -871,6 +1158,8 @@ struct VerificationManifestDigestPayloadV1<'a> {
     schema: &'a str,
     requirements: &'a RequiredObligationManifestV1,
     accepted_obligation_evidence_core_by_id: &'a [AcceptedObligationEvidenceCoreV1],
+    #[serde(skip_serializing_if = "slice_is_empty")]
+    pulse_fusion_decisions: &'a [VerifiedPulseFusionDecisionV1],
 }
 
 fn verification_manifest_digest_payload(
@@ -880,7 +1169,12 @@ fn verification_manifest_digest_payload(
         schema: &manifest.schema,
         requirements: &manifest.requirements,
         accepted_obligation_evidence_core_by_id: &manifest.accepted_obligation_evidence_core_by_id,
+        pulse_fusion_decisions: &manifest.pulse_fusion_decisions,
     }
+}
+
+fn slice_is_empty<T>(value: &&[T]) -> bool {
+    value.is_empty()
 }
 
 fn verification_manifest_canonical_bytes(
@@ -961,6 +1255,48 @@ mod tests {
 
     fn empty_manifest() -> VerificationManifestV1 {
         let semantic = elaborate(checked_fixture(), &[]).unwrap();
+        verify_explicit_contracts(semantic)
+            .unwrap()
+            .verification_manifest()
+            .clone()
+    }
+
+    fn fibonacci_fusion_manifest() -> VerificationManifestV1 {
+        let parsed = boon_parser::parse_source(
+            "verify-fibonacci-fusion.bn",
+            r#"
+value: fibonacci(position: 10)
+
+FUNCTION fibonacci(position) {
+    position
+    |> THEN {
+        position |> WHILE {
+            1 => 1
+
+            n =>
+                [previous: 0, current: 1]
+                |> HOLD state {
+                    n - 1
+                    |> Stream/pulses()
+                    |> THEN {
+                        [
+                            previous: state.current
+                            current: state.previous + state.current
+                        ]
+                    }
+                }
+                |> Stream/skip(count: n - 1)
+                |> .current
+        }
+    }
+}
+"#,
+        )
+        .unwrap();
+        let checked = boon_typecheck::check_program(&parsed)
+            .program
+            .expect("valid Fibonacci verifier fixture");
+        let semantic = elaborate(checked, &[]).unwrap();
         verify_explicit_contracts(semantic)
             .unwrap()
             .verification_manifest()
@@ -1058,6 +1394,7 @@ mod tests {
             schema: VERIFICATION_MANIFEST_SCHEMA_V1.to_owned(),
             requirements,
             accepted_obligation_evidence_core_by_id: Vec::new(),
+            pulse_fusion_decisions: Vec::new(),
             manifest_digest: VerificationManifestDigestV1::from_bytes([0; 32]),
         };
         rebind_manifest(&mut manifest);
@@ -1172,6 +1509,7 @@ mod tests {
             schema: VERIFICATION_MANIFEST_SCHEMA_V1.to_owned(),
             requirements,
             accepted_obligation_evidence_core_by_id: evidence,
+            pulse_fusion_decisions: Vec::new(),
             manifest_digest: VerificationManifestDigestV1::from_bytes([0; 32]),
         };
         rebind_manifest(&mut manifest);
@@ -1189,6 +1527,70 @@ mod tests {
         assert!(manifest.requirements.required_obligation_ids.is_empty());
         assert!(manifest.accepted_obligation_evidence_core_by_id.is_empty());
         manifest.validate().unwrap();
+    }
+
+    #[test]
+    fn pulse_fusion_decisions_are_canonical_and_manifest_digest_bound() {
+        let manifest = fibonacci_fusion_manifest();
+        let [decision] = manifest.pulse_fusion_decisions.as_slice() else {
+            panic!("canonical Fibonacci must have one pulse-fusion decision");
+        };
+        let VerifiedPulseFusionStatusV1::Eligible { fact } = &decision.status else {
+            panic!("canonical Fibonacci must be fusion eligible");
+        };
+        assert_eq!(
+            fact.count_policy,
+            VerifiedPulseFusionCountPolicyV1::FrozenAndTargetBoundedBeforeFirstMicroturn
+        );
+        assert_eq!(
+            fact.trace_policy,
+            VerifiedPulseFusionTracePolicyV1::PreserveCommittedStateDeltasAndEmissionRoutes
+        );
+        assert_eq!(
+            fact.elision_policy,
+            VerifiedPulseFusionElisionPolicyV1::UnobservedRecurrenceStateAndEmptySideLanes
+        );
+        let encoded = serde_json::to_vec(&manifest).unwrap();
+        let decoded: VerificationManifestV1 = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded, manifest);
+        decoded.validate().unwrap();
+        assert!(
+            decision
+                .semantic_slice_digest
+                .0
+                .iter()
+                .any(|byte| *byte != 0)
+        );
+
+        let mut stale = manifest.clone();
+        stale.pulse_fusion_decisions[0].status = VerifiedPulseFusionStatusV1::Ineligible {
+            reasons: vec![PulseFusionIneligibilityV1::NoActivationLocalState],
+        };
+        assert!(
+            stale
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("verification manifest digest does not match")
+        );
+
+        let mut empty_reasons = manifest.clone();
+        empty_reasons.pulse_fusion_decisions[0].status = VerifiedPulseFusionStatusV1::Ineligible {
+            reasons: Vec::new(),
+        };
+        assert_rejected_after_rebinding(
+            empty_reasons,
+            "ineligible pulse-fusion decision 0 has no diagnostic reason",
+        );
+
+        let mut duplicate = manifest;
+        duplicate
+            .pulse_fusion_decisions
+            .push(duplicate.pulse_fusion_decisions[0].clone());
+        assert_rejected_after_rebinding(
+            duplicate,
+            "pulse-fusion decision values must be strictly sorted and unique",
+        );
     }
 
     #[test]

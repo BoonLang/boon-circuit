@@ -1147,6 +1147,26 @@ pub enum PulseStart {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PulseFusionEligibility {
+    VerifiedActivationLocalRecurrence {
+        activation: ActivationId,
+        state: StateId,
+        state_update_arm_index: usize,
+        proof: PulseFusionProof,
+    },
+    Ineligible {
+        diagnostics: Vec<String>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PulseFusionProof {
+    FrozenTargetBoundedFullTraceEmptySideLanes,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PulseBatch {
     pub id: PulseBatchId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1178,6 +1198,7 @@ pub struct PulseBatch {
     pub emission_routes: Vec<PulseEmissionRoute>,
     pub schedule: PulseSchedule,
     pub flush_policy: PulseFlushPolicy,
+    pub fusion: PulseFusionEligibility,
     pub semantic_slice_digest: [u8; 32],
 }
 
@@ -1988,8 +2009,8 @@ pub enum ViewBindingKind {
 pub fn erase_and_lower(
     verified: boon_verify::ContractVerifiedProgram,
 ) -> Result<ErasedProgram, String> {
-    let (semantic, verification_manifest_digest) = verified.into_lowering_parts();
-    erase_semantic_program(semantic, verification_manifest_digest).map(|(program, _)| program)
+    let (semantic, verification_manifest) = verified.into_lowering_parts();
+    erase_semantic_program(semantic, verification_manifest).map(|(program, _)| program)
 }
 
 /// Atomically erases the exact three-role semantic bundle owned by one
@@ -2040,7 +2061,7 @@ pub fn erase_and_lower_bundle(
                 role.namespace()
             ));
         }
-        let (mut program, ids) = erase_semantic_program(semantic, manifest.manifest_digest)?;
+        let (mut program, ids) = erase_semantic_program(semantic, manifest)?;
         validate_erased_bundle_role_crossings(
             role,
             &mut program,
@@ -2081,9 +2102,19 @@ pub fn erase_and_lower_bundle(
 
 fn erase_semantic_program(
     semantic: boon_semantic::SemanticProgram,
-    verification_manifest_digest: boon_verify::VerificationManifestDigestV1,
+    verification_manifest: boon_verify::VerificationManifestV1,
 ) -> Result<(ErasedProgram, semantic_mapping::SemanticToExecutableMap), String> {
     semantic.validate().map_err(|error| error.to_string())?;
+    verification_manifest
+        .validate()
+        .map_err(|error| error.to_string())?;
+    if verification_manifest.requirements.semantic_program_digest != semantic.digest() {
+        return Err(
+            "verification manifest semantic digest differs from its semantic program".to_owned(),
+        );
+    }
+    let verification_manifest_digest = verification_manifest.manifest_digest;
+    let pulse_fusion_decisions = verification_manifest.pulse_fusion_decisions;
     let (
         source_bundle_digest_v1,
         execution_graph,
@@ -2104,6 +2135,7 @@ fn erase_semantic_program(
         view_binding_graph,
         scope_storage_graph,
         memory_graph,
+        &pulse_fusion_decisions,
     )?;
     let erased = ErasedProgram {
         fields,
@@ -2260,6 +2292,7 @@ fn lower_verified_semantic_execution(
     view_binding_graph: boon_semantic::SemanticViewBindingGraphV1,
     scope_storage_graph: boon_semantic::SemanticScopeStorageGraphV1,
     memory_graph: boon_semantic::SemanticMemoryGraphV1,
+    pulse_fusion_decisions: &[boon_verify::VerifiedPulseFusionDecisionV1],
 ) -> Result<
     (
         ErasedProgramFields,
@@ -2283,6 +2316,7 @@ fn lower_verified_semantic_execution(
         &view_binding_graph,
         &scope_storage_graph,
         &memory_graph,
+        pulse_fusion_decisions,
         mapped,
         resources,
     )?;

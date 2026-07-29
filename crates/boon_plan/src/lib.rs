@@ -16,7 +16,7 @@ pub use boon_document_model::{
 pub use document::*;
 pub use host::*;
 
-pub const PLAN_MAJOR_VERSION: u32 = 7;
+pub const PLAN_MAJOR_VERSION: u32 = 8;
 pub const PLAN_MINOR_VERSION: u32 = 0;
 pub const PERSISTENCE_FORMAT_VERSION: u32 = 5;
 pub const DEFAULT_PERSISTENCE_SCHEMA_VERSION: u64 = 1;
@@ -5572,6 +5572,24 @@ pub struct PlanPulseStartArm {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PlanPulseFusionEligibility {
+    VerifiedActivationLocalRecurrence {
+        state_update_op: PlanOpId,
+        proof: PlanPulseFusionProof,
+    },
+    Ineligible {
+        diagnostics: Vec<String>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanPulseFusionProof {
+    FrozenTargetBoundedFullTraceEmptySideLanes,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PlanPulseBatch {
     pub id: PlanPulseBatchId,
     pub owner: PlanOwner,
@@ -5591,6 +5609,7 @@ pub struct PlanPulseBatch {
     pub emission_routes: Vec<PlanPulseEmissionRoute>,
     pub schedule: PlanPulseSchedule,
     pub flush_policy: PlanPulseFlushPolicy,
+    pub fusion: PlanPulseFusionEligibility,
     pub semantic_slice_digest: [u8; 32],
 }
 
@@ -12930,6 +12949,116 @@ fn pulse_execution_contract_failure(plan: &MachinePlan) -> Option<String> {
                 "pulse batch {} emission routes do not cover its derived ops",
                 batch.id.0
             ));
+        }
+        match &batch.fusion {
+            PlanPulseFusionEligibility::Ineligible { diagnostics } => {
+                if diagnostics.is_empty()
+                    || diagnostics
+                        .iter()
+                        .any(|diagnostic| diagnostic.trim().is_empty())
+                    || diagnostics.iter().collect::<BTreeSet<_>>().len() != diagnostics.len()
+                {
+                    return Some(format!(
+                        "pulse batch {} has invalid fusion ineligibility diagnostics",
+                        batch.id.0
+                    ));
+                }
+            }
+            PlanPulseFusionEligibility::VerifiedActivationLocalRecurrence {
+                state_update_op,
+                proof,
+            } => {
+                let (Some(activation_id), Some(state)) = (batch.enclosing_activation, batch.state)
+                else {
+                    return Some(format!(
+                        "pulse batch {} verified fusion has no activation-local state",
+                        batch.id.0
+                    ));
+                };
+                if *proof != PlanPulseFusionProof::FrozenTargetBoundedFullTraceEmptySideLanes
+                    || activation.is_none_or(|activation| {
+                        activation.id != activation_id || !activation.states.contains(&state)
+                    })
+                    || batch.state_update_ops.as_slice() != [*state_update_op]
+                    || !batch.list_mutation_ops.is_empty()
+                {
+                    return Some(format!(
+                        "pulse batch {} verified fusion changed its recurrence inventory",
+                        batch.id.0
+                    ));
+                }
+                let Some((kind, update)) = operations.get(state_update_op) else {
+                    return Some(format!(
+                        "pulse batch {} verified fusion references missing update op {}",
+                        batch.id.0, state_update_op.0
+                    ));
+                };
+                if *kind != RegionKind::StateUpdates
+                    || update.output != Some(ValueRef::State(state))
+                    || !matches!(
+                        &update.kind,
+                        PlanOpKind::StateUpdate {
+                            trigger: ValueRef::Pulse(pulse),
+                            value: Some(_),
+                            effect: None,
+                        } if *pulse == batch.id
+                    )
+                {
+                    return Some(format!(
+                        "pulse batch {} verified fusion update op {} is not a pure recurrence",
+                        batch.id.0, state_update_op.0
+                    ));
+                }
+
+                let state_trigger = ValueRef::State(state);
+                let operation_observes_state = plan
+                    .regions
+                    .iter()
+                    .flat_map(|region| &region.ops)
+                    .any(|op| match &op.kind {
+                        PlanOpKind::StateUpdate { trigger, .. } => trigger == &state_trigger,
+                        PlanOpKind::ListMutation {
+                            mutation: PlanListMutation::Append(append),
+                        } => append.trigger == state_trigger,
+                        PlanOpKind::ListMutation {
+                            mutation: PlanListMutation::Remove(remove),
+                        } => remove.trigger == state_trigger,
+                        PlanOpKind::DerivedValue {
+                            expression:
+                                Some(PlanDerivedExpression::SourceEventTransform { arms, .. }),
+                            ..
+                        } => arms.iter().any(|arm| arm.trigger == state_trigger),
+                        PlanOpKind::SourceRoute
+                        | PlanOpKind::DerivedValue { .. }
+                        | PlanOpKind::ListProjection { .. }
+                        | PlanOpKind::DependencyEdge => false,
+                    });
+                let pulse_starts_from_state = plan.pulse_batches.iter().any(|candidate| {
+                    matches!(
+                        &candidate.start,
+                        PlanPulseStart::Triggered { arms }
+                            if arms.iter().any(|arm| arm.trigger == state_trigger)
+                    )
+                });
+                let distributed_observes_state_or_pulse =
+                    plan.distributed_endpoint.as_ref().is_some_and(|endpoint| {
+                        endpoint.endpoint.remote_call_sites.iter().any(|call| {
+                            call.invocation_arms.iter().any(|arm| {
+                                arm.trigger == state_trigger
+                                    || arm.trigger == ValueRef::Pulse(batch.id)
+                            })
+                        })
+                    });
+                if operation_observes_state
+                    || pulse_starts_from_state
+                    || distributed_observes_state_or_pulse
+                {
+                    return Some(format!(
+                        "pulse batch {} verified fusion recurrence state has an observable route",
+                        batch.id.0
+                    ));
+                }
+            }
         }
     }
 

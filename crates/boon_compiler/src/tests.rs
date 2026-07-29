@@ -1587,7 +1587,7 @@ store: [
     input: SOURCE
     result:
         input.key |> WHEN {
-            Enter => TEXT { saved }
+            TEXT { Enter } => TEXT { saved }
             __ => SKIP
         }
 ]
@@ -3314,8 +3314,246 @@ fn indexed_list_persistence_covers_every_executor_authority_field() {
         .flat_map(|row| &row.fields)
         .filter_map(|field| field.field_id)
         .collect::<std::collections::BTreeSet<_>>();
+    let edit_state = list_memory
+        .row_fields
+        .iter()
+        .find(|field| field.semantic_path == "store.todos.edit_text")
+        .and_then(|field| field.runtime_field_id)
+        .expect("indexed edit state persistence field");
+    let edit_authority = list_memory
+        .row_fields
+        .iter()
+        .find(|field| field.semantic_path == "store.todos.@authority:edit_text")
+        .and_then(|field| field.runtime_field_id)
+        .expect("edit constructor authority persistence field");
+    let mut constructor_names = std::collections::BTreeSet::new();
 
     assert!(initial_fields.is_subset(&stable_fields));
+    assert!(
+        list_slot
+            .row_fields
+            .iter()
+            .filter(|field| field.role.is_authority())
+            .all(|field| constructor_names.insert(field.name.as_str())),
+        "constructor authority names must be unique: {:#?}",
+        list_slot.row_fields
+    );
+    assert_ne!(edit_state, edit_authority);
+    assert_eq!(
+        list_slot
+            .row_fields
+            .iter()
+            .find(|field| field.field_id == edit_state)
+            .map(|field| field.role),
+        Some(PlanListRowFieldRole::Value)
+    );
+    assert_eq!(
+        list_slot
+            .row_fields
+            .iter()
+            .filter(|field| field.name == "edit_text" && field.role.is_authority())
+            .map(|field| field.field_id)
+            .collect::<Vec<_>>(),
+        vec![edit_authority]
+    );
+    for name in ["title", "completed", "edit_text"] {
+        assert_eq!(
+            list_slot
+                .row_fields
+                .iter()
+                .filter(|field| field.name == name && field.role.is_value())
+                .count(),
+            1,
+            "{name} must have one public row value identity"
+        );
+        assert_eq!(
+            list_slot
+                .row_fields
+                .iter()
+                .filter(|field| field.name == name && field.role.is_authority())
+                .count(),
+            1,
+            "{name} must have one constructor authority identity"
+        );
+    }
+    let completed_value = list_slot
+        .row_fields
+        .iter()
+        .find(|field| field.name == "completed" && field.role.is_value())
+        .map(|field| field.field_id)
+        .expect("completed public value field");
+    assert_eq!(
+        crate::machine_plan_backend::row_input_field_id_for_list_id(
+            &compiled.ir,
+            list_slot.list_id,
+            "completed",
+        ),
+        Some(completed_value),
+        "row reads must use the current public value rather than constructor authority"
+    );
+    let debug_id = |entries: &[boon_plan::DebugEntry], label: &str, prefix: &str| {
+        entries
+            .iter()
+            .find(|entry| entry.label == label)
+            .and_then(|entry| entry.id.strip_prefix(prefix))
+            .and_then(|id| id.parse::<usize>().ok())
+            .unwrap_or_else(|| panic!("missing debug identity `{prefix}<id>` for `{label}`"))
+    };
+    let toggle_source = boon_plan::SourceId(debug_id(
+        &compiled.plan.debug_map.source_routes,
+        "store.sources.toggle_all_checkbox.events.click",
+        "source:",
+    ));
+    let completed_state = boon_plan::StateId(debug_id(
+        &compiled.plan.debug_map.state_slots,
+        "store.todos.completed",
+        "state:",
+    ));
+    let all_completed_field = FieldId(debug_id(
+        &compiled.plan.debug_map.derived_values,
+        "store.all_completed",
+        "field:",
+    ));
+    let store_field = FieldId(debug_id(&compiled.plan.debug_map.fields, "store", "field:"));
+    let toggle_update = compiled
+        .plan
+        .regions
+        .iter()
+        .flat_map(|region| &region.ops)
+        .find_map(|op| match &op.kind {
+            PlanOpKind::StateUpdate {
+                trigger: ValueRef::Source(source),
+                value: Some(value),
+                ..
+            } if *source == toggle_source
+                && op.output == Some(ValueRef::State(completed_state)) =>
+            {
+                Some(*value)
+            }
+            _ => None,
+        })
+        .expect("toggle-all completed update");
+    let mut toggle_inputs = Vec::new();
+    compiled
+        .plan
+        .row_expressions
+        .visit_value_refs(toggle_update, &mut |input| {
+            toggle_inputs.push(input.clone())
+        })
+        .unwrap();
+    assert!(
+        toggle_inputs.contains(&ValueRef::Field(all_completed_field)),
+        "toggle-all update must read the exact derived leaf: {toggle_inputs:#?}"
+    );
+    assert!(
+        !toggle_inputs.contains(&ValueRef::Field(store_field)),
+        "toggle-all update must not materialize the structural store root: {toggle_inputs:#?}"
+    );
+    let selected_filter_state = boon_plan::StateId(debug_id(
+        &compiled.plan.debug_map.state_slots,
+        "store.selected_filter",
+        "state:",
+    ));
+    let visible_todos_list = boon_plan::ListId(debug_id(
+        &compiled.plan.debug_map.list_slots,
+        "store.visible_todos",
+        "list:",
+    ));
+    let visible_filter = compiled
+        .plan
+        .regions
+        .iter()
+        .flat_map(|region| &region.ops)
+        .find(|op| {
+            op.output == Some(ValueRef::List(visible_todos_list))
+                && matches!(
+                    &op.kind,
+                    PlanOpKind::DerivedValue {
+                        materialization: Some(_),
+                        ..
+                    }
+                )
+        })
+        .expect("visible-todo filter rematerialization");
+    assert!(
+        visible_filter
+            .inputs
+            .contains(&ValueRef::State(selected_filter_state)),
+        "the retained view must be current with its root filter state"
+    );
+    assert!(
+        compiled
+            .plan
+            .regions
+            .iter()
+            .flat_map(|region| &region.ops)
+            .all(|op| {
+                op.output != Some(ValueRef::List(visible_todos_list))
+                    || !matches!(&op.kind, PlanOpKind::ListMutation { .. })
+            }),
+        "a cross-list retained view is derived currentness, not list authority mutation"
+    );
+    let clear_completed_source = boon_plan::SourceId(debug_id(
+        &compiled.plan.debug_map.source_routes,
+        "store.sources.clear_completed_button.events.press",
+        "source:",
+    ));
+    let authority_remove = compiled
+        .plan
+        .regions
+        .iter()
+        .flat_map(|region| &region.ops)
+        .find_map(|op| match &op.kind {
+            PlanOpKind::ListMutation {
+                mutation: PlanListMutation::Remove(remove),
+            } if op.output == Some(ValueRef::List(list_slot.list_id))
+                && remove.trigger == ValueRef::Source(clear_completed_source) =>
+            {
+                Some(remove)
+            }
+            _ => None,
+        })
+        .expect("clear-completed authority removal");
+    assert_eq!(
+        authority_remove.owner.static_owner,
+        boon_plan::PlanStaticOwnerId::ROOT,
+        "a root event owns list-authority activation independently of row-local predicates"
+    );
+    assert!(
+        authority_remove.owner.ancestors.is_empty(),
+        "a root event must not require a row trigger ancestor"
+    );
+    assert_ne!(
+        authority_remove.local_owner,
+        boon_plan::PlanStaticOwnerId::ROOT,
+        "the authority predicate must retain its contextual row owner"
+    );
+    let row_remove_source = boon_plan::SourceId(debug_id(
+        &compiled.plan.debug_map.source_routes,
+        "store.todos.sources.remove_todo_button.events.press",
+        "source:",
+    ));
+    let row_remove = compiled
+        .plan
+        .regions
+        .iter()
+        .flat_map(|region| &region.ops)
+        .find_map(|op| match &op.kind {
+            PlanOpKind::ListMutation {
+                mutation: PlanListMutation::Remove(remove),
+            } if op.output == Some(ValueRef::List(list_slot.list_id))
+                && remove.trigger == ValueRef::Source(row_remove_source) =>
+            {
+                Some(remove)
+            }
+            _ => None,
+        })
+        .expect("row-owned delete authority removal");
+    assert_eq!(
+        row_remove.owner.ancestors.len(),
+        1,
+        "a row-owned delete event must retain its exact source-row activation"
+    );
     assert!(
         list_memory
             .row_fields
@@ -4317,7 +4555,7 @@ store: [
         |> Text/concat(with: payload_value, separator: ":")
     request:
         LATEST {
-            elements.ready.event.press |> WHEN {
+            elements.ready.event.press |> THEN { True } |> WHEN {
                 True => fingerprint
                 False => SKIP
             }

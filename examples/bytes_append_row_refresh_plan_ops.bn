@@ -2,7 +2,7 @@ store: [
     add_row: SOURCE
     row_label_to_add:
         add_row.key |> WHEN {
-            Enter =>
+            TEXT { Enter } =>
                 add_row.text |> Text/trim() |> WHEN {
                     TEXT {} => SKIP
                     label => label

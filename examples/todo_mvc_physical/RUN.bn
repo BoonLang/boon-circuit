@@ -44,7 +44,7 @@ store: [
             }
         }
     title_to_save: elements.new_todo_title_text_input.events.key_down.key |> WHEN {
-        Enter =>
+        TEXT { Enter } =>
             new_todo_text |> Text/trim() |> WHEN {
                 TEXT {} => SKIP
                 title => title
@@ -115,8 +115,8 @@ FUNCTION new_todo(title, initial_completed) {
                     todo_elements.todo_title_element.events.double_click |> THEN { True }
                     todo_elements.editing_todo_title_element.events.key_down.key
                         |> WHEN {
-                            Enter => False
-                            Escape => False
+                            TEXT { Enter } => False
+                            TEXT { Escape } => False
                             __ => SKIP
                         }
                     todo_elements.editing_todo_title_element.events.blur |> THEN { False }

@@ -16,7 +16,7 @@ store: [
         Idle |> HOLD screen {
             key.key |> THEN {
                 key.key |> WHEN {
-                    Enter => enabled |> WHEN {
+                    TEXT { Enter } => enabled |> WHEN {
                         True => Accepted
                         False => Denied
                     }
@@ -28,7 +28,7 @@ store: [
         1 |> HOLD zoom {
             key.key |> THEN {
                 key.key |> WHEN {
-                    Enter => enabled |> WHEN {
+                    TEXT { Enter } => enabled |> WHEN {
                         True => 11.5
                         False => SKIP
                     }

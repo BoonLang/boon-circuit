@@ -806,6 +806,34 @@ fn plan_source_owner(
     Ok(owner)
 }
 
+fn plan_event_cause_owner(
+    program: &ErasedProgram,
+    cause: ir::EventCause,
+) -> Result<PlanOwner, PlanError> {
+    match cause {
+        ir::EventCause::Source(source_id) => {
+            let source = program
+                .sources
+                .get(source_id.as_usize())
+                .filter(|source| source.id == source_id)
+                .ok_or_else(|| {
+                    PlanError::new(format!("event cause references missing source {source_id}"))
+                })?;
+            plan_source_owner(program, source)
+        }
+        ir::EventCause::State(state_id) => {
+            let state = program
+                .state_cells
+                .get(state_id.as_usize())
+                .filter(|state| state.id == state_id)
+                .ok_or_else(|| {
+                    PlanError::new(format!("event cause references missing state {state_id}"))
+                })?;
+            plan_state_owner(program, state)
+        }
+    }
+}
+
 fn plan_source_row_projections(
     program: &ErasedProgram,
     source: &ir::SourcePort,
@@ -3883,6 +3911,20 @@ fn persistence_plan(
     )
 }
 
+fn list_mutation_owns_authority(program: &ErasedProgram, mutation: &ir::ListMutation) -> bool {
+    match mutation.kind {
+        ListMutationKind::Append { .. } => true,
+        ListMutationKind::Remove {
+            owner, row_local, ..
+        } => program.materializations.iter().any(|materialization| {
+            materialization.owner == owner
+                && materialization.row_local == row_local
+                && materialization.source_list_id == Some(mutation.list_id)
+                && materialization.target_list_id == Some(mutation.list_id)
+        }),
+    }
+}
+
 pub fn compile_typed_program(
     program: &ErasedProgram,
     target_profile: TargetProfile,
@@ -4128,6 +4170,7 @@ pub(crate) fn compile_typed_program_with_distributed_context(
     let mutation_owned_lists = program
         .list_mutations
         .iter()
+        .filter(|mutation| list_mutation_owns_authority(program, mutation))
         .map(|mutation| plan_list_id(mutation.list_id))
         .collect::<BTreeSet<_>>();
     let mut derived_ops = Vec::new();
@@ -4137,9 +4180,43 @@ pub(crate) fn compile_typed_program_with_distributed_context(
         if projection_owned_outputs.contains(&derived_output) {
             continue;
         }
-        if matches!(derived_output, ValueRef::List(list)
-            if mutation_owned_lists.contains(&list))
+        if let ValueRef::List(target_list) = derived_output
+            && mutation_owned_lists.contains(&target_list)
         {
+            let state_fields = materialized_state_fields(program, target_list)?;
+            for field in state_dependent_materialized_row_fields(
+                program,
+                target_list,
+                &state_fields,
+                &index,
+                &mut row_expressions,
+                &mut constants,
+                &mut list_indexes,
+                true,
+            )? {
+                if !materialized_row_outputs.insert(field.output) {
+                    return Err(PlanError::new(format!(
+                        "materialized row field {} has more than one demand-current computation",
+                        field.output.0
+                    )));
+                }
+                derived_ops.push(op(
+                    &mut next_op,
+                    PlanOpKind::DerivedValue {
+                        derived_kind: PlanDerivedKind::Pure,
+                        startup_recompute: false,
+                        expression: Some(PlanDerivedExpression::MaterializedRowField {
+                            local: field.local,
+                            expression: field.expression,
+                        }),
+                        materialization: None,
+                    },
+                    field.inputs,
+                    Some(ValueRef::Field(field.output)),
+                    true,
+                    0,
+                ));
+            }
             continue;
         }
         if derived.kind == DerivedValueKind::ListView && derived.materialized_list_id.is_none() {
@@ -4198,6 +4275,7 @@ pub(crate) fn compile_typed_program_with_distributed_context(
                     &mut row_expressions,
                     &mut constants,
                     &mut list_indexes,
+                    false,
                 )?
             } else {
                 Vec::new()
@@ -4500,6 +4578,7 @@ pub(crate) fn compile_typed_program_with_distributed_context(
     let list_mutation_ops = program
         .list_mutations
         .iter()
+        .filter(|list_mutation| list_mutation_owns_authority(program, list_mutation))
         .map(|list_mutation| {
             let (trigger, cause_path) = event_cause_value_ref(program, list_mutation.cause)?;
             let mut inputs = vec![trigger.clone()];
@@ -4601,14 +4680,7 @@ pub(crate) fn compile_typed_program_with_distributed_context(
                     PlanListMutation::Append(PlanListAppend {
                         site: list_mutation.site.as_usize(),
                         ordinal: list_mutation.ordinal,
-                        owner: plan_owner_for_static_owner(
-                            program,
-                            list_mutation.owner,
-                            &format!(
-                                "list {} append site {} from `{cause_path}`",
-                                list_mutation.list_id, list_mutation.site
-                            ),
-                        )?,
+                        owner: plan_event_cause_owner(program, list_mutation.cause)?,
                         trigger,
                         gate,
                         item,
@@ -4659,14 +4731,7 @@ pub(crate) fn compile_typed_program_with_distributed_context(
                     PlanListMutation::Remove(PlanListRemove {
                         site: list_mutation.site.as_usize(),
                         ordinal: list_mutation.ordinal,
-                        owner: plan_owner_for_static_owner(
-                            program,
-                            list_mutation.owner,
-                            &format!(
-                                "list {} removal site {} from `{cause_path}`",
-                                list_mutation.list_id, list_mutation.site
-                            ),
-                        )?,
+                        owner: plan_event_cause_owner(program, list_mutation.cause)?,
                         trigger,
                         gate,
                         local_owner: owner,
@@ -6689,6 +6754,7 @@ fn row_field_id_for_list_field(
         .iter()
         .find(|list| list.name == list_name)
         .map(|list| list.id)?;
+    let exact_path = format!("{list_name}.{field_name}");
     program
         .scope_index
         .fields
@@ -6697,8 +6763,25 @@ fn row_field_id_for_list_field(
             erased_field_is_runtime_row_storage(program, field)
                 && field.row.map(|row| row.list) == Some(list)
                 && field.name == field_name
+                && field.diagnostic_path == exact_path
         })
-        .min_by_key(|field| (erased_row_field_depth(program, field), field.id))
+        .min_by_key(|field| {
+            let value_priority = if field.role.is_value()
+                && !(field.role.is_authority()
+                    && erased_constructor_authority_has_separate_value(program, field))
+            {
+                0
+            } else if field.role.is_value() {
+                1
+            } else {
+                2
+            };
+            (
+                value_priority,
+                erased_row_field_depth(program, field),
+                field.id,
+            )
+        })
         .map(|field| plan_field_id(field.id))
 }
 
@@ -6771,7 +6854,7 @@ fn storage_input_field_id(
         .or_else(|| row_field_id_for_list_field(program, list_name, field_name))
 }
 
-fn row_input_field_id_for_list_id(
+pub(super) fn row_input_field_id_for_list_id(
     program: &ErasedProgram,
     list_id: ListId,
     field_name: &str,
@@ -6780,11 +6863,56 @@ fn row_input_field_id_for_list_id(
         .lists
         .iter()
         .find(|list| plan_list_id(list.id) == list_id)?;
-    let authority_field_ids = list_authority_field_ids(program);
-    storage_input_field_id(program, &list.name, field_name, &authority_field_ids)
+    row_field_id_for_list_field(program, &list.name, field_name)
+}
+
+fn indexed_state_field_ids(program: &ErasedProgram) -> BTreeSet<FieldId> {
+    program
+        .semantic_memory
+        .iter()
+        .filter_map(|memory| match memory.runtime_backing {
+            ir::SemanticMemoryRuntimeBacking::IndexedState {
+                field_id: Some(field_id),
+                ..
+            } => Some(plan_field_id(field_id)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn erased_field_is_list_constructor_authority(
+    program: &ErasedProgram,
+    field: &ir::ErasedFieldDef,
+    indexed_state_fields: &BTreeSet<FieldId>,
+) -> bool {
+    if !field.role.is_authority() || indexed_state_fields.contains(&plan_field_id(field.id)) {
+        return false;
+    }
+    !field.parent.is_some_and(|parent| {
+        program
+            .scope_index
+            .fields
+            .get(parent.as_usize())
+            .filter(|candidate| candidate.id == parent)
+            .is_some_and(|parent| parent.row == field.row && parent.role.is_authority())
+    })
+}
+
+fn erased_constructor_authority_has_separate_value(
+    program: &ErasedProgram,
+    field: &ir::ErasedFieldDef,
+) -> bool {
+    program.scope_index.fields.iter().any(|candidate| {
+        candidate.id != field.id
+            && candidate.row == field.row
+            && candidate.diagnostic_path == field.diagnostic_path
+            && candidate.role.is_value()
+            && erased_field_is_runtime_row_storage(program, candidate)
+    })
 }
 
 fn list_row_fields(program: &ErasedProgram, list: &boon_ir::ListMemory) -> Vec<PlanListRowField> {
+    let indexed_state_fields = indexed_state_field_ids(program);
     program
         .scope_index
         .fields
@@ -6796,34 +6924,37 @@ fn list_row_fields(program: &ErasedProgram, list: &boon_ir::ListMemory) -> Vec<P
         .map(|field| PlanListRowField {
             field_id: plan_field_id(field.id),
             name: field.name.clone(),
-            role: match field.role {
-                ir::ErasedFieldRole::Value => PlanListRowFieldRole::Value,
-                ir::ErasedFieldRole::ListAuthority => PlanListRowFieldRole::Authority,
-                ir::ErasedFieldRole::ValueAuthority => PlanListRowFieldRole::ValueAuthority,
-                ir::ErasedFieldRole::Capture => PlanListRowFieldRole::Capture,
+            role: if field.role == ir::ErasedFieldRole::Capture {
+                PlanListRowFieldRole::Capture
+            } else {
+                let constructor_authority = erased_field_is_list_constructor_authority(
+                    program,
+                    field,
+                    &indexed_state_fields,
+                );
+                let value = field.role.is_value()
+                    && !(constructor_authority
+                        && erased_constructor_authority_has_separate_value(program, field));
+                match (value, constructor_authority) {
+                    (true, true) => PlanListRowFieldRole::ValueAuthority,
+                    (false, true) => PlanListRowFieldRole::Authority,
+                    // Nested structural authorities and indexed HOLD
+                    // authorities remain exact row values. Only top-level list
+                    // schema fields participate in record construction.
+                    (_, false) => PlanListRowFieldRole::Value,
+                }
             },
         })
         .collect()
 }
 
 fn list_authority_field_ids(program: &ErasedProgram) -> BTreeMap<(String, String), FieldId> {
-    let indexed_fields = program
-        .semantic_memory
-        .iter()
-        .filter_map(|memory| match memory.runtime_backing {
-            ir::SemanticMemoryRuntimeBacking::IndexedState {
-                field_id: Some(field_id),
-                ..
-            } => Some(plan_field_id(field_id)),
-            _ => None,
-        })
-        .collect::<BTreeSet<_>>();
+    let indexed_fields = indexed_state_field_ids(program);
     let mut fields = BTreeMap::<(String, String), (u8, usize, FieldId)>::new();
-    for field in program
-        .scope_index
-        .fields
-        .iter()
-        .filter(|field| field.role.is_authority())
+    for field in
+        program.scope_index.fields.iter().filter(|field| {
+            erased_field_is_list_constructor_authority(program, field, &indexed_fields)
+        })
     {
         let Some(row) = field.row else {
             continue;
@@ -6837,11 +6968,7 @@ fn list_authority_field_ids(program: &ErasedProgram) -> BTreeMap<(String, String
         };
         let key = (list.name.clone(), field.name.clone());
         let field_id = plan_field_id(field.id);
-        let candidate = (
-            u8::from(!indexed_fields.contains(&field_id)),
-            erased_row_field_depth(program, field),
-            field_id,
-        );
+        let candidate = (0, 0, field_id);
         match fields.get(&key) {
             Some(current) if *current <= candidate => {}
             _ => {
@@ -6923,6 +7050,12 @@ fn materialized_output_field<'a>(
     target_list: ListId,
     name: &str,
 ) -> Result<&'a ir::ErasedFieldDef, PlanError> {
+    let list_name = program
+        .lists
+        .iter()
+        .find(|list| plan_list_id(list.id) == target_list)
+        .map(|list| list.name.as_str())
+        .ok_or_else(|| PlanError::new(format!("materialized list {} is missing", target_list.0)))?;
     let fields = program
         .scope_index
         .fields
@@ -6930,6 +7063,7 @@ fn materialized_output_field<'a>(
         .filter(|field| {
             erased_field_is_runtime_row_storage(program, field)
                 && field.row.map(|row| plan_list_id(row.list)) == Some(target_list)
+                && erased_field_is_direct_list_member(field, list_name)
                 && field.name == name
                 && field.role.is_value()
         })
@@ -6949,6 +7083,12 @@ fn materialized_output_fields(
     target_list: ListId,
     state_fields: &BTreeMap<String, StateId>,
 ) -> Result<BTreeMap<String, FieldId>, PlanError> {
+    let list_name = program
+        .lists
+        .iter()
+        .find(|list| plan_list_id(list.id) == target_list)
+        .map(|list| list.name.as_str())
+        .ok_or_else(|| PlanError::new(format!("materialized list {} is missing", target_list.0)))?;
     let names = program
         .scope_index
         .fields
@@ -6956,6 +7096,7 @@ fn materialized_output_fields(
         .filter(|field| {
             erased_field_is_runtime_row_storage(program, field)
                 && field.row.map(|row| plan_list_id(row.list)) == Some(target_list)
+                && erased_field_is_direct_list_member(field, list_name)
                 && field.role.is_value()
                 && !field.resource_only
                 && !state_fields.contains_key(&field.name)
@@ -7048,11 +7189,18 @@ fn state_dependent_materialized_row_fields(
     arena: &mut PlanRowExpressionArena,
     constants: &mut Vec<PlanConstant>,
     list_indexes: &mut Vec<PlanListIndex>,
+    include_state_independent: bool,
 ) -> Result<Vec<MaterializedRowFieldPlan>, PlanError> {
     let target_states = state_fields.values().copied().collect::<BTreeSet<_>>();
-    if target_states.is_empty() {
+    if target_states.is_empty() && !include_state_independent {
         return Ok(Vec::new());
     }
+    let list_name = program
+        .lists
+        .iter()
+        .find(|list| plan_list_id(list.id) == target_list)
+        .map(|list| list.name.as_str())
+        .ok_or_else(|| PlanError::new(format!("materialized list {} is missing", target_list.0)))?;
     let candidates = program
         .scope_index
         .fields
@@ -7060,6 +7208,7 @@ fn state_dependent_materialized_row_fields(
         .filter(|field| {
             erased_field_is_runtime_row_storage(program, field)
                 && field.row.map(|row| plan_list_id(row.list)) == Some(target_list)
+                && erased_field_is_direct_list_member(field, list_name)
                 && field.role == ir::ErasedFieldRole::Value
                 && !field.resource_only
                 && !state_fields.contains_key(&field.name)
@@ -7127,7 +7276,7 @@ fn state_dependent_materialized_row_fields(
         .collect::<Vec<_>>();
     let mut result = Vec::new();
     for (name, output, producer, _) in trial {
-        if !deferred.contains(&output) {
+        if !include_state_independent && !deferred.contains(&output) {
             continue;
         }
         let mut inputs = Vec::new();
@@ -9025,10 +9174,10 @@ fn materialized_list_row_field_copies(
     if source_lists.is_empty() {
         return Ok(Vec::new());
     }
-    let target_fields = list_row_fields_by_name(program, target_list);
+    let target_fields = materialized_copy_target_fields_by_name(program, target_list);
     let mut copies = Vec::new();
     for source_list in source_lists {
-        let source_fields = list_row_fields_by_name(program, source_list);
+        let source_fields = materialized_copy_source_fields_by_name(program, source_list);
         let before = copies.len();
         for (name, target_field) in &target_fields {
             if let Some(source_field) = source_fields.get(name) {
@@ -9049,13 +9198,16 @@ fn materialized_list_row_field_copies(
     Ok(copies)
 }
 
-fn list_row_fields_by_name(program: &ErasedProgram, list_id: ListId) -> BTreeMap<String, FieldId> {
+fn top_level_materialized_data_field_names(
+    program: &ErasedProgram,
+    list_id: ListId,
+) -> BTreeSet<String> {
     let Some(list) = program
         .lists
         .iter()
         .find(|list| plan_list_id(list.id) == list_id)
     else {
-        return BTreeMap::new();
+        return BTreeSet::new();
     };
     program
         .scope_index
@@ -9064,8 +9216,59 @@ fn list_row_fields_by_name(program: &ErasedProgram, list_id: ListId) -> BTreeMap
         .filter(|field| {
             erased_field_is_runtime_row_storage(program, field)
                 && field.row.map(|row| row.list) == Some(list.id)
+                && erased_field_is_direct_list_member(field, &list.name)
+                && !erased_field_contains_resource(program, field)
         })
-        .map(|field| (field.name.clone(), plan_field_id(field.id)))
+        .map(|field| field.name.clone())
+        .collect()
+}
+
+fn erased_field_is_direct_list_member(field: &ir::ErasedFieldDef, list_name: &str) -> bool {
+    field
+        .diagnostic_path
+        .strip_prefix(list_name)
+        .and_then(|suffix| suffix.strip_prefix('.'))
+        .is_some_and(|suffix| !suffix.is_empty() && !suffix.contains('.'))
+}
+
+fn erased_field_contains_resource(program: &ErasedProgram, field: &ir::ErasedFieldDef) -> bool {
+    let prefix = format!("{}.", field.diagnostic_path);
+    program
+        .sources
+        .iter()
+        .any(|source| source.path == field.diagnostic_path || source.path.starts_with(&prefix))
+}
+
+fn materialized_copy_source_fields_by_name(
+    program: &ErasedProgram,
+    list_id: ListId,
+) -> BTreeMap<String, FieldId> {
+    top_level_materialized_data_field_names(program, list_id)
+        .into_iter()
+        .filter_map(|name| {
+            row_input_field_id_for_list_id(program, list_id, &name).map(|field| (name, field))
+        })
+        .collect()
+}
+
+fn materialized_copy_target_fields_by_name(
+    program: &ErasedProgram,
+    list_id: ListId,
+) -> BTreeMap<String, FieldId> {
+    let Some(list) = program
+        .lists
+        .iter()
+        .find(|list| plan_list_id(list.id) == list_id)
+    else {
+        return BTreeMap::new();
+    };
+    let authority_fields = list_authority_field_ids(program);
+    top_level_materialized_data_field_names(program, list_id)
+        .into_iter()
+        .filter_map(|name| {
+            storage_input_field_id(program, &list.name, &name, &authority_fields)
+                .map(|field| (name, field))
+        })
         .collect()
 }
 
@@ -10949,6 +11152,16 @@ impl<'a> ExecutableRowLowerer<'a> {
                     .ok_or_else(|| {
                         PlanError::new(format!("erased read references missing {storage_binding}"))
                     })?;
+                if !projection.is_empty() {
+                    let exact_path = if binding.diagnostic_path.is_empty() {
+                        projection.join(".")
+                    } else {
+                        format!("{}.{}", binding.diagnostic_path, projection.join("."))
+                    };
+                    if let Some(value) = self.index.resolve(&exact_path) {
+                        return self.value_ref(value);
+                    }
+                }
                 let value = match binding.target {
                     ir::ErasedBindingTarget::Source { runtime, .. } => {
                         if !projection.is_empty() {
@@ -12938,7 +13151,7 @@ impl ValueIndex {
         })
     }
 
-    fn resolve(&self, path: &str) -> Option<ValueRef> {
+    pub(super) fn resolve(&self, path: &str) -> Option<ValueRef> {
         self.by_path
             .get(path)
             .cloned()

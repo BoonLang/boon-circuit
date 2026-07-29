@@ -176,7 +176,7 @@ store: [
                 elements.admin.database_schema.events.press |> THEN { AdminDatabaseSchema }
                 elements.admin.database_migrations.events.press |> THEN { AdminDatabaseMigrations }
                 elements.search.events.key_down.key |> WHEN {
-                    Enter => search_results_available |> WHEN {
+                    TEXT { Enter } => search_results_available |> WHEN {
                         True => search_highlight |> WHEN {
                             FordeStationResult => PublicStation
                             FordeFerryResult => PublicStation
@@ -216,20 +216,20 @@ store: [
                 elements.navigation.search.events.press |> THEN { FordeStationResult }
                 elements.search.events.change |> THEN { FordeStationResult }
                 elements.search.events.key_down.key |> WHEN {
-                    ArrowDown => search_highlight |> WHEN {
+                    TEXT { ArrowDown } => search_highlight |> WHEN {
                         FordeStationResult => FordeFerryResult
                         FordeFerryResult => FordePlaceResult
                         FordePlaceResult => Line100Result
                         Line100Result => FordeStationResult
                     }
-                    ArrowUp => search_highlight |> WHEN {
+                    TEXT { ArrowUp } => search_highlight |> WHEN {
                         FordeStationResult => Line100Result
                         FordeFerryResult => FordeStationResult
                         FordePlaceResult => FordeFerryResult
                         Line100Result => FordePlaceResult
                     }
-                    Enter => SKIP
-                    Escape => SKIP
+                    TEXT { Enter } => SKIP
+                    TEXT { Escape } => SKIP
                     __ => FordeStationResult
                 }
             }
@@ -260,7 +260,7 @@ store: [
             LATEST {
                 elements.search_submit.events.press |> THEN { search_query }
                 elements.search.events.key_down.key |> WHEN {
-                    Enter => search_query
+                    TEXT { Enter } => search_query
                     __ => SKIP
                 }
             }
@@ -279,10 +279,10 @@ store: [
                 elements.search_result.forde_place.events.press |> THEN { Closed }
                 elements.search_result.line_100.events.press |> THEN { Closed }
                 elements.search.events.key_down.key |> WHEN {
-                    Escape => Closed
-                    ArrowDown => SKIP
-                    ArrowUp => SKIP
-                    Enter => Closed
+                    TEXT { Escape } => Closed
+                    TEXT { ArrowDown } => SKIP
+                    TEXT { ArrowUp } => SKIP
+                    TEXT { Enter } => Closed
                     __ => Ready
                 }
                 transport.search.loading |> THEN { Loading }
@@ -318,7 +318,7 @@ store: [
                 elements.station.trondheim.events.press |> THEN { Trondheim }
                 elements.station.bodo.events.press |> THEN { Bodo }
                 elements.search.events.key_down.key |> WHEN {
-                    Enter => search_results_available |> WHEN {
+                    TEXT { Enter } => search_results_available |> WHEN {
                         True => search_highlight |> WHEN {
                             FordeStationResult => Forde
                             FordeFerryResult => FordeFerry
@@ -343,7 +343,7 @@ store: [
                 elements.search_result.forde_station.events.press |> THEN { Loading }
                 elements.search_result.forde_ferry.events.press |> THEN { Loading }
                 elements.search.events.key_down.key |> WHEN {
-                    Enter => search_results_available |> WHEN {
+                    TEXT { Enter } => search_results_available |> WHEN {
                         True => search_highlight |> WHEN {
                             FordeStationResult => Loading
                             FordeFerryResult => Loading
@@ -378,7 +378,7 @@ store: [
                 elements.search_result.forde_station.events.press |> THEN { Departures }
                 elements.search_result.forde_ferry.events.press |> THEN { Departures }
                 elements.search.events.key_down.key |> WHEN {
-                    Enter => search_results_available |> WHEN {
+                    TEXT { Enter } => search_results_available |> WHEN {
                         True => search_highlight |> WHEN {
                             FordeStationResult => Departures
                             FordeFerryResult => Departures
@@ -403,7 +403,7 @@ store: [
                 elements.search_result.forde_station.events.press |> THEN { Loading }
                 elements.search_result.forde_ferry.events.press |> THEN { Loading }
                 elements.search.events.key_down.key |> WHEN {
-                    Enter => search_results_available |> WHEN {
+                    TEXT { Enter } => search_results_available |> WHEN {
                         True => search_highlight |> WHEN {
                             FordeStationResult => Loading
                             FordeFerryResult => Loading
@@ -439,7 +439,7 @@ store: [
                 elements.search_result.forde_station.events.press |> THEN { Loading }
                 elements.search_result.forde_ferry.events.press |> THEN { Loading }
                 elements.search.events.key_down.key |> WHEN {
-                    Enter => search_results_available |> WHEN {
+                    TEXT { Enter } => search_results_available |> WHEN {
                         True => search_highlight |> WHEN {
                             FordeStationResult => Loading
                             FordeFerryResult => Loading
@@ -537,7 +537,7 @@ store: [
                 elements.station.trondheim.events.press |> THEN { 11.5 }
                 elements.station.bodo.events.press |> THEN { 11.5 }
                 elements.search.events.key_down.key |> WHEN {
-                    Enter => search_results_available |> WHEN {
+                    TEXT { Enter } => search_results_available |> WHEN {
                         True => search_highlight |> WHEN {
                             FordeStationResult => 11.5
                             FordeFerryResult => 11.5

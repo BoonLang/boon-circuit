@@ -370,7 +370,7 @@ elements: [
 zoom_step:
     0 |> HOLD zoom_step {
         elements.keyboard_capture.key |> WHEN {
-            W => zoom_step * 2
+            TEXT { W } => zoom_step * 2
             __ => SKIP
         }
     }
@@ -877,7 +877,7 @@ store: [
         |> Text/concat(with: payload_value, separator: ":")
     request:
         LATEST {
-            elements.ready.event.press |> WHEN {
+            elements.ready.event.press |> THEN { True } |> WHEN {
                 True => fingerprint
                 False => SKIP
             }
@@ -1853,7 +1853,7 @@ store: [
     highlighted:
         First |> HOLD highlighted {
             elements.search.events.key_down.key |> WHEN {
-                ArrowDown => highlighted |> WHEN {
+                TEXT { ArrowDown } => highlighted |> WHEN {
                     First => Second
                     Second => First
                 }
@@ -2081,6 +2081,56 @@ store: [
             .map(|field| field.name.as_str())
             .collect::<BTreeSet<_>>(),
         BTreeSet::from(["members", "name"])
+    );
+}
+
+#[test]
+fn derived_append_uses_its_event_trigger_without_promoting_state_dependencies() {
+    let source = r#"
+store: [
+    elements: [input: [events: [change: SOURCE, key_down: SOURCE]]]
+    text:
+        Text/empty() |> HOLD text {
+            LATEST {
+                elements.input.events.change.text
+                candidate |> THEN { Text/empty() }
+            }
+        }
+    candidate:
+        elements.input.events.key_down.key |> WHEN {
+            TEXT { Enter } => text |> Text/trim() |> WHEN {
+                TEXT {} => SKIP
+                value => value
+            }
+            __ => SKIP
+        }
+    rows:
+        LIST {}
+        |> List/append(item: candidate |> THEN {
+            [title: candidate, completed: False]
+        })
+]
+"#;
+    let parsed = boon_parser::parse_source("event-derived-append.bn", source).unwrap();
+    let ir = lower(&parsed).expect("event-derived append must have one exact trigger");
+    let list = ir
+        .lists
+        .iter()
+        .find(|list| list.name == "store.rows")
+        .expect("rows list memory");
+    let append = ir
+        .list_mutations
+        .iter()
+        .filter(|mutation| {
+            mutation.list_id == list.id && matches!(mutation.kind, ListMutationKind::Append { .. })
+        })
+        .collect::<Vec<_>>();
+    let [append] = append.as_slice() else {
+        panic!("expected one append mutation, got {append:#?}");
+    };
+    assert_eq!(
+        event_cause_path_owned(append.cause, &ir.sources, &ir.state_cells).as_deref(),
+        Ok("store.elements.input.events.key_down")
     );
 }
 

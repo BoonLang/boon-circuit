@@ -193,7 +193,9 @@ impl<'a> DocumentCompiler<'a> {
                 }
                 ir::ErasedBindingTarget::Value {
                     field: Some(field), ..
-                } => Some(GlobalValue::Field(FieldId(field.0))),
+                } if !matches!(binding.flow_type.ty, Type::Object(_)) => {
+                    Some(GlobalValue::Field(FieldId(field.0)))
+                }
                 ir::ErasedBindingTarget::Value { .. } => {
                     Some(GlobalValue::Inline(binding.producer))
                 }
@@ -1728,6 +1730,60 @@ impl<'a> DocumentCompiler<'a> {
             self.record_compiled_path(&joined_path(path, projection), expression);
             return Ok(expression);
         }
+        let exact_path = joined_path(path, projection);
+        if !projection.is_empty()
+            && let Some(exact) = self.value_index.resolve(&exact_path)
+        {
+            let exact = match exact {
+                ValueRef::State(state) => Some(self.push_expr(
+                    compiler_id,
+                    final_class,
+                    DocumentExprOp::Read {
+                        read: DocumentRead::State { state },
+                    },
+                )),
+                ValueRef::StateProjection {
+                    state_id,
+                    field_path,
+                } => {
+                    let base = self.push_expr(
+                        compiler_id,
+                        DocumentValueClass::DynamicScalar,
+                        DocumentExprOp::Read {
+                            read: DocumentRead::State { state: state_id },
+                        },
+                    );
+                    Some(self.project_fields(compiler_id, base, &field_path, final_class))
+                }
+                ValueRef::Field(field) => Some(self.push_expr(
+                    compiler_id,
+                    final_class,
+                    DocumentExprOp::Read {
+                        read: DocumentRead::Field { field },
+                    },
+                )),
+                ValueRef::List(list) => Some(self.push_expr(
+                    compiler_id,
+                    final_class,
+                    DocumentExprOp::Read {
+                        read: DocumentRead::List { list },
+                    },
+                )),
+                ValueRef::Source(source)
+                | ValueRef::SourcePayload {
+                    source_id: source, ..
+                } => {
+                    return Err(PlanError::new(format!(
+                        "document path `{exact_path}` reads transient payload from source {source:?}; retain the event value in HOLD before rendering it"
+                    )));
+                }
+                ValueRef::Constant(_) | ValueRef::DistributedImport(_) => None,
+            };
+            if let Some(expression) = exact {
+                self.record_compiled_path(&exact_path, expression);
+                return Ok(expression);
+            }
+        }
         if let GlobalValue::Source(source) = global
             && !projection.is_empty()
         {
@@ -1768,7 +1824,7 @@ impl<'a> DocumentCompiler<'a> {
             ),
         };
         let expression = self.project_fields(compiler_id, base, projection, final_class);
-        self.record_compiled_path(&joined_path(path, projection), expression);
+        self.record_compiled_path(&exact_path, expression);
         Ok(expression)
     }
 

@@ -1370,7 +1370,8 @@ impl<'a> ReactiveBuilder<'a> {
     ) -> Result<Vec<RawStateUpdateArm>, SemanticReactiveError> {
         let mut result = BTreeSet::new();
         for state in &self.resources.states {
-            for trigger in triggers.trigger_arms_for_expression(state.expression)? {
+            let state_triggers = triggers.trigger_arms_for_expression(state.expression)?;
+            for trigger in state_triggers {
                 let same_state_family = match trigger.cause {
                     SemanticEventCauseV1::State(cause) => self
                         .resources
@@ -2638,11 +2639,34 @@ impl<'a> TriggerResolver<'a> {
     ) -> Result<BTreeSet<SemanticEventCauseV1>, SemanticReactiveError> {
         let mut causes = BTreeSet::new();
         if let SemanticExpressionKind::CanonicalRead {
-            source: Some(source),
+            target,
+            projection,
+            source,
             ..
         } = &expression.kind
         {
-            causes.insert(SemanticEventCauseV1::Source(source.source));
+            if let Some(source) = source {
+                causes.insert(SemanticEventCauseV1::Source(source.source));
+                return Ok(causes);
+            }
+            let binding = self.exact_binding_for_decl(*target, expression)?;
+            match binding.target {
+                SemanticBindingTargetV1::Source { source } => {
+                    causes.insert(SemanticEventCauseV1::Source(source));
+                }
+                SemanticBindingTargetV1::State { state } => {
+                    causes.insert(SemanticEventCauseV1::State(state));
+                }
+                SemanticBindingTargetV1::Field { .. } | SemanticBindingTargetV1::List { .. }
+                    if projection.is_empty() =>
+                {
+                    return Ok(causes);
+                }
+                SemanticBindingTargetV1::Field { .. } | SemanticBindingTargetV1::List { .. } => {}
+            }
+            if !causes.is_empty() {
+                return Ok(causes);
+            }
         }
         for member in &expression.provenance.members {
             match member.origin {
@@ -2677,8 +2701,18 @@ impl<'a> TriggerResolver<'a> {
                         }
                     }
                 }
-                SemanticValueOrigin::Runtime | SemanticValueOrigin::MaterializationLocal { .. } => {
+                SemanticValueOrigin::MaterializationLocal {
+                    owner,
+                    local,
+                    ref projection,
+                } => {
+                    if let Some(source) =
+                        self.materialization_local_source(owner, local, projection)?
+                    {
+                        causes.insert(SemanticEventCauseV1::Source(source));
+                    }
                 }
+                SemanticValueOrigin::Runtime => {}
             }
         }
         if matches!(expression.kind, SemanticExpressionKind::Source { .. }) {
@@ -2745,6 +2779,61 @@ impl<'a> TriggerResolver<'a> {
         Ok(causes)
     }
 
+    fn materialization_local_source(
+        &self,
+        owner: StaticOwnerId,
+        local: SemanticMaterializationLocalId,
+        projection: &[String],
+    ) -> Result<Option<SemanticSourceId>, SemanticReactiveError> {
+        if projection.is_empty() {
+            return Ok(None);
+        }
+        let source_lists = self
+            .execution
+            .materializations
+            .iter()
+            .filter(|materialization| {
+                materialization.owner == owner && materialization.row_local == local
+            })
+            .filter_map(|materialization| materialization.source_list_id)
+            .collect::<BTreeSet<_>>();
+        let mut matches = BTreeSet::new();
+        for list_id in source_lists {
+            let list = self
+                .resources
+                .lists
+                .get(list_id.as_usize())
+                .filter(|list| list.id == list_id)
+                .ok_or_else(|| {
+                    SemanticReactiveError::new(format!(
+                        "materialization owner {owner} local {} references missing source list {list_id}",
+                        local.0
+                    ))
+                })?;
+            let path = format!("{}.{}", list.semantic_path, projection.join("."));
+            matches.extend(
+                self.resources
+                    .sources
+                    .iter()
+                    .filter(|source| {
+                        source.target_list == Some(list_id) && source.semantic_path == path
+                    })
+                    .map(|source| source.id),
+            );
+        }
+        let matches = matches.into_iter().collect::<Vec<_>>();
+        match matches.as_slice() {
+            [] => Ok(None),
+            [source] => Ok(Some(*source)),
+            _ => Err(SemanticReactiveError::new(format!(
+                "materialization owner {owner} local {} projection `{}` resolves to {} sources",
+                local.0,
+                projection.join("."),
+                matches.len()
+            ))),
+        }
+    }
+
     fn trigger_arms_for_expression(
         &mut self,
         root: SemanticExprId,
@@ -2776,10 +2865,10 @@ impl<'a> TriggerResolver<'a> {
                 arms: select_arms,
                 ..
             } => {
-                let causes = self.event_causes_for_expression(*input)?;
-                if !causes.is_empty() {
-                    for cause in causes {
-                        arms.insert(self.arm(cause, *input, id)?);
+                let input_arms = self.trigger_arms_before(*input, terminal)?;
+                if !input_arms.is_empty() {
+                    for input_arm in input_arms {
+                        arms.insert(self.arm(input_arm.cause, *input, id)?);
                     }
                     return Ok(());
                 }
@@ -2788,13 +2877,13 @@ impl<'a> TriggerResolver<'a> {
                 }
             }
             SemanticExpressionKind::Then { input, output } => {
-                let causes = self.event_causes_for_expression(*input)?;
-                if !causes.is_empty() {
+                let input_arms = self.trigger_arms_before(*input, terminal)?;
+                if !input_arms.is_empty() {
                     // Exact THEN identity rule: when no output expression is
                     // present, the gated input is itself the arm output.
                     let arm_output = output.unwrap_or(*input);
-                    for cause in causes {
-                        arms.insert(self.arm(cause, *input, arm_output)?);
+                    for input_arm in input_arms {
+                        arms.insert(self.arm(input_arm.cause, *input, arm_output)?);
                     }
                     return Ok(());
                 }
@@ -2929,6 +3018,18 @@ impl<'a> TriggerResolver<'a> {
                             },
                         )?);
                     }
+                }
+            }
+            SemanticExpressionKind::FunctionParameter { parameter, .. } => {
+                let causes = self.event_causes_for_expression(id)?;
+                if causes.is_empty() && !self.parameter_inputs.contains_key(&id) {
+                    return Err(SemanticReactiveError::new(format!(
+                        "trigger traversal parameter expression {} ({:?}) has no exact producer input inventory",
+                        id, parameter
+                    )));
+                }
+                for cause in causes {
+                    arms.insert(self.arm(cause, id, id)?);
                 }
             }
             _ => {

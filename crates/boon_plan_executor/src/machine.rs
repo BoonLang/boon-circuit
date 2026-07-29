@@ -4013,6 +4013,8 @@ struct Metadata {
     root_field_by_name: BTreeMap<String, Vec<FieldId>>,
     root_state_by_exact_name: BTreeMap<String, Vec<StateId>>,
     root_state_by_name: BTreeMap<String, Vec<StateId>>,
+    root_list_by_exact_name: BTreeMap<String, Vec<ListId>>,
+    root_list_by_name: BTreeMap<String, Vec<ListId>>,
     routes: BTreeMap<SourceId, SourceRoute>,
     updates_by_source: BTreeMap<SourceId, Vec<Arc<PlanOp>>>,
     updates_by_state: BTreeMap<StateId, Vec<Arc<PlanOp>>>,
@@ -4654,6 +4656,26 @@ impl Metadata {
             fields.sort();
             fields.dedup();
         }
+        let mut root_list_by_exact_name = BTreeMap::<String, Vec<ListId>>::new();
+        let mut root_list_by_name = BTreeMap::<String, Vec<ListId>>::new();
+        for (id, label) in debug_labels(&plan.debug_map.list_slots, "list:") {
+            let list = ListId(id);
+            root_list_by_exact_name
+                .entry(label.clone())
+                .or_default()
+                .push(list);
+            for name in debug_name_variants(&label) {
+                root_list_by_name.entry(name).or_default().push(list);
+            }
+        }
+        for lists in root_list_by_exact_name.values_mut() {
+            lists.sort();
+            lists.dedup();
+        }
+        for lists in root_list_by_name.values_mut() {
+            lists.sort();
+            lists.dedup();
+        }
 
         let routes = plan
             .source_routes
@@ -4844,6 +4866,8 @@ impl Metadata {
             root_field_by_name,
             root_state_by_exact_name,
             root_state_by_name,
+            root_list_by_exact_name,
+            root_list_by_name,
             routes,
             updates_by_source,
             updates_by_state,
@@ -12873,6 +12897,10 @@ impl MachineInstance {
         {
             return self.public_root_state_value(state, name);
         }
+        if let Some(list) = unique_root_name(&self.metadata.root_list_by_exact_name, name, "list")?
+        {
+            return self.list_value_current(list);
+        }
         if !name.starts_with("store.") {
             let qualified = format!("store.{name}");
             if let Some(field) =
@@ -12886,19 +12914,30 @@ impl MachineInstance {
             {
                 return self.public_root_state_value(state, &qualified);
             }
+            if let Some(list) =
+                unique_root_name(&self.metadata.root_list_by_exact_name, &qualified, "list")?
+            {
+                return self.list_value_current(list);
+            }
         }
 
         let local = local_name(name);
         let fields = self.metadata.root_field_by_name.get(local);
         let states = self.metadata.root_state_by_name.get(local);
-        match (fields.map(Vec::as_slice), states.map(Vec::as_slice)) {
-            (Some([field]), None) => {
+        let lists = self.metadata.root_list_by_name.get(local);
+        match (
+            fields.map(Vec::as_slice),
+            states.map(Vec::as_slice),
+            lists.map(Vec::as_slice),
+        ) {
+            (Some([field]), None, None) => {
                 let field = *field;
                 let mut work = self.fresh_work();
                 self.ensure_root_field(field, None, &mut work)
             }
-            (None, Some([state])) => self.public_root_state_value(*state, name),
-            (None, None) => Err(Error::InvalidPlan(format!("no root value `{name}`"))),
+            (None, Some([state]), None) => self.public_root_state_value(*state, name),
+            (None, None, Some([list])) => self.list_value_current(*list),
+            (None, None, None) => Err(Error::InvalidPlan(format!("no root value `{name}`"))),
             _ => Err(Error::InvalidPlan(format!(
                 "root value name `{name}` is ambiguous"
             ))),
@@ -15578,11 +15617,12 @@ impl MachineInstance {
             None
         };
         let value = match self.evaluate_update(op, row, trigger.source_event, work)? {
-            ControlOutcome::Normal(value) => {
+            ControlOutcome::Normal(Some(value)) => {
                 work.flushed_state_candidates
                     .remove(&(state, candidate_row));
                 value
             }
+            ControlOutcome::Normal(None) => return Ok(()),
             ControlOutcome::Flushed(payload) => {
                 return self.propagate_flushed_state_candidate(
                     state,
@@ -15671,10 +15711,11 @@ impl MachineInstance {
         let mut pending = Vec::with_capacity(rows.len());
         for row in rows {
             match self.evaluate_update(op, Some(*row), Some(event), work)? {
-                ControlOutcome::Normal(value) => {
+                ControlOutcome::Normal(Some(value)) => {
                     work.flushed_state_candidates.remove(&(state, Some(*row)));
                     pending.push((*row, value));
                 }
+                ControlOutcome::Normal(None) => {}
                 ControlOutcome::Flushed(payload) => {
                     let source_trigger = self.source_trigger_frame(event)?;
                     let trigger = self.trigger_for_state_target(state, &source_trigger, *row)?;
@@ -17482,6 +17523,12 @@ impl MachineInstance {
         else {
             return field;
         };
+        if state.fields.contains_key(&field)
+            || state.default_fields.contains(&field)
+            || state.derived.contains_key(&field)
+        {
+            return field;
+        }
         if let Some(authority) = self
             .metadata
             .deferred_value_aliases
@@ -17490,12 +17537,6 @@ impl MachineInstance {
             && state.fields.contains_key(&authority)
         {
             return authority;
-        }
-        if state.fields.contains_key(&field)
-            || state.default_fields.contains(&field)
-            || state.derived.contains_key(&field)
-        {
-            return field;
         }
         self.metadata
             .deferred_authority_aliases
@@ -26650,7 +26691,7 @@ impl MachineInstance {
         row: Option<RowId>,
         event: Option<&SourceEvent>,
         work: &mut Work,
-    ) -> Result<ControlOutcome<Value>, Error> {
+    ) -> Result<ControlOutcome<Option<Value>>, Error> {
         let PlanOpKind::StateUpdate {
             value: Some(expression),
             effect: None,
@@ -26673,7 +26714,11 @@ impl MachineInstance {
         )?;
         match value {
             EvalValue::Flushed(payload) => Ok(ControlOutcome::Flushed(payload)),
-            value => self.materialize_eval(value).map(ControlOutcome::Normal),
+            EvalValue::Absent => Ok(ControlOutcome::Normal(None)),
+            value => self
+                .materialize_eval(value)
+                .map(Some)
+                .map(ControlOutcome::Normal),
         }
     }
 

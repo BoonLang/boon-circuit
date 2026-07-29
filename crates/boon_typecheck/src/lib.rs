@@ -13185,6 +13185,8 @@ impl<'a> Checker<'a> {
         let deferred_style_diagnostics =
             validate_deferred_style_constraints(&checked_program, &self.deferred_style_constraints);
         self.diagnostics.extend(deferred_style_diagnostics);
+        self.diagnostics
+            .extend(validate_checked_match_patterns(&checked_program));
         let source_payload_shape_table = checked_source_payload_shape_table(&checked_program);
         if let Err(error) = refresh_named_value_types_from_checked_program(
             &mut named_value_type_table,
@@ -18688,6 +18690,97 @@ fn pattern_variant(pattern: &AstMatchPattern) -> Option<Variant> {
         AstMatchPattern::Tag { name, .. } => Some(Variant::Tag(name.clone())),
         _ => None,
     }
+}
+
+fn checked_match_pattern_compatibility(
+    pattern: &CheckedMatchPattern,
+    selector: &Type,
+) -> Option<bool> {
+    match selector {
+        selector if is_value_placeholder_type(selector) => None,
+        Type::Union(members) => {
+            let mut unresolved = false;
+            for member in members {
+                match checked_match_pattern_compatibility(pattern, member) {
+                    Some(true) => return Some(true),
+                    Some(false) => {}
+                    None => unresolved = true,
+                }
+            }
+            (!unresolved).then_some(false)
+        }
+        _ => match pattern {
+            CheckedMatchPattern::Wildcard | CheckedMatchPattern::Binding { .. } => Some(true),
+            CheckedMatchPattern::Number { .. } => Some(matches!(selector, Type::Number)),
+            CheckedMatchPattern::Text { .. } => Some(matches!(selector, Type::Text)),
+            CheckedMatchPattern::Tag { .. } => Some(matches!(selector, Type::VariantSet(_))),
+        },
+    }
+}
+
+fn incompatible_checked_match_pattern_message(
+    pattern: &CheckedMatchPattern,
+    selector: &Type,
+) -> String {
+    let selector = boon_facing_type_label(selector);
+    match pattern {
+        CheckedMatchPattern::Number { value } => {
+            format!("number pattern `{value}` cannot match selector type {selector}")
+        }
+        CheckedMatchPattern::Text { value } => {
+            format!("exact text pattern `TEXT {{ {value} }}` cannot match selector type {selector}")
+        }
+        CheckedMatchPattern::Tag { name, .. } if selector == "TEXT" => format!(
+            "tag pattern `{name}` cannot match selector type TEXT\nuse `TEXT {{ {name} }}` to match exact text"
+        ),
+        CheckedMatchPattern::Tag { name, .. } => {
+            format!("tag pattern `{name}` cannot match selector type {selector}")
+        }
+        CheckedMatchPattern::Wildcard | CheckedMatchPattern::Binding { .. } => {
+            unreachable!("catch-all and invalid patterns are never statically incompatible")
+        }
+    }
+}
+
+fn validate_checked_match_patterns(program: &CheckedProgram) -> Vec<TypeDiagnostic> {
+    let expressions = program
+        .expressions
+        .iter()
+        .map(|expression| (expression.id, expression))
+        .collect::<BTreeMap<_, _>>();
+    let mut diagnostics = Vec::new();
+    for expression in &program.expressions {
+        let (input, arms) = match &expression.kind {
+            CheckedExpressionKind::When { input, arms }
+            | CheckedExpressionKind::While { input, arms } => (*input, arms),
+            _ => continue,
+        };
+        let Some(selector) = expressions
+            .get(&input)
+            .map(|expression| &expression.flow_type.ty)
+        else {
+            continue;
+        };
+        for arm in arms {
+            let Some(arm) = expressions.get(arm) else {
+                continue;
+            };
+            let CheckedExpressionKind::MatchArm { pattern, .. } = &arm.kind else {
+                continue;
+            };
+            if checked_match_pattern_compatibility(pattern, selector) != Some(false) {
+                continue;
+            }
+            diagnostics.push(TypeDiagnostic {
+                severity: DiagnosticSeverity::Error,
+                line: arm.span.line,
+                start: arm.span.start,
+                end: arm.span.end,
+                message: incompatible_checked_match_pattern_message(pattern, selector),
+            });
+        }
+    }
+    diagnostics
 }
 
 fn pattern_selector_path(expr: Option<&AstExpr>) -> Option<String> {

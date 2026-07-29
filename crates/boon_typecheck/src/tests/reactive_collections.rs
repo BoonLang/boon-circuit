@@ -579,7 +579,7 @@ store: [
     fingerprint: TEXT { request }
     request:
         LATEST {
-            elements.ready.event.press |> WHEN {
+            elements.ready.event.press |> THEN { True } |> WHEN {
                 True => fingerprint
                 False => SKIP
             }

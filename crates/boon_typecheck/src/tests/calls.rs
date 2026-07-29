@@ -56,6 +56,51 @@ store: [
 }
 
 #[test]
+fn exact_text_pattern_matches_keyboard_text_and_bare_tag_is_rejected() {
+    let exact_text = boon_parser::parse_source(
+        "checked-key-text-pattern.bn",
+        r#"
+store: [
+    elements: [input: [events: [key_down: SOURCE]]]
+    submitted:
+        elements.input.events.key_down.key |> WHEN {
+            TEXT { Enter } => True
+            __ => False
+        }
+]
+"#,
+    )
+    .unwrap();
+    let output = check_program(&exact_text);
+    assert!(
+        !output.report.has_errors(),
+        "exact keyboard text diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+
+    let bare_tag = boon_parser::parse_source(
+        "rejected-key-tag-pattern.bn",
+        r#"
+store: [
+    elements: [input: [events: [key_down: SOURCE]]]
+    submitted:
+        elements.input.events.key_down.key |> WHEN {
+            Enter => True
+            __ => False
+        }
+]
+"#,
+    )
+    .unwrap();
+    let output = check_program(&bare_tag);
+    assert!(output.report.has_errors());
+    assert!(output.report.diagnostics.iter().any(|diagnostic| {
+        diagnostic.message
+            == "tag pattern `Enter` cannot match selector type TEXT\nuse `TEXT { Enter }` to match exact text"
+    }));
+}
+
+#[test]
 fn checked_resources_use_dense_identity_and_exact_source_reads() {
     let parsed = boon_parser::parse_source(
         "checked-resource-identity.bn",

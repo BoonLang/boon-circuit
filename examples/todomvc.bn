@@ -32,7 +32,7 @@ store: [
 
     title_to_add:
         sources.new_todo_input.events.key_down.key |> WHEN {
-            Enter =>
+            TEXT { Enter } =>
                 new_todo_text |> Text/trim() |> WHEN {
                     TEXT {} => SKIP
                     title => title
@@ -126,7 +126,7 @@ FUNCTION new_todo(todo, store) {
             todo.title |> HOLD title {
                 LATEST {
                     sources.editing_todo_title_element.events.key_down.key |> WHEN {
-                        Enter =>
+                        TEXT { Enter } =>
                             edit_text |> Text/trim() |> WHEN {
                                 TEXT {} => title
                                 trimmed => trimmed
@@ -156,7 +156,7 @@ FUNCTION new_todo(todo, store) {
                             }
                     }
                     sources.editing_todo_title_element.events.key_down.key |> WHEN {
-                        Escape => title
+                        TEXT { Escape } => title
                         __ => SKIP
                     }
                 }
@@ -179,8 +179,8 @@ FUNCTION new_todo(todo, store) {
                 LATEST {
                     sources.todo_title_element.events.double_click |> THEN { True }
                     sources.editing_todo_title_element.events.key_down.key |> WHEN {
-                        Enter => False
-                        Escape => False
+                        TEXT { Enter } => False
+                        TEXT { Escape } => False
                         __ => SKIP
                     }
                     sources.editing_todo_title_element.events.blur |> THEN { False }

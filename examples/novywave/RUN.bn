@@ -182,11 +182,11 @@ store: [
                 }
             }
             elements.keyboard_capture.key |> WHEN {
-                W => real_signal_page_request_fingerprint
-                S => real_signal_page_request_fingerprint
-                A => real_signal_page_request_fingerprint
-                D => real_signal_page_request_fingerprint
-                R => real_signal_page_request_fingerprint
+                TEXT { W } => real_signal_page_request_fingerprint
+                TEXT { S } => real_signal_page_request_fingerprint
+                TEXT { A } => real_signal_page_request_fingerprint
+                TEXT { D } => real_signal_page_request_fingerprint
+                TEXT { R } => real_signal_page_request_fingerprint
                 __ => SKIP
             }
         }
@@ -352,11 +352,11 @@ store: [
             elements.pan_left |> THEN { comparison_signal_page_request_fingerprint }
             elements.pan_right |> THEN { comparison_signal_page_request_fingerprint }
             elements.keyboard_capture.key |> WHEN {
-                W => comparison_signal_page_request_fingerprint
-                S => comparison_signal_page_request_fingerprint
-                A => comparison_signal_page_request_fingerprint
-                D => comparison_signal_page_request_fingerprint
-                R => comparison_signal_page_request_fingerprint
+                TEXT { W } => comparison_signal_page_request_fingerprint
+                TEXT { S } => comparison_signal_page_request_fingerprint
+                TEXT { A } => comparison_signal_page_request_fingerprint
+                TEXT { D } => comparison_signal_page_request_fingerprint
+                TEXT { R } => comparison_signal_page_request_fingerprint
                 __ => SKIP
             }
         }
@@ -2364,8 +2364,8 @@ store: [
         selected_timeline_zoom_center_default |> HOLD zoom_center_keyboard_value {
             LATEST {
                 elements.keyboard_capture.key |> WHEN {
-                    Z => selected_timeline_range_start
-                    R => selected_timeline_zoom_center_default
+                    TEXT { Z } => selected_timeline_range_start
+                    TEXT { R } => selected_timeline_zoom_center_default
                     __ => SKIP
                 }
                 elements.select_counter_file |> THEN { selected_timeline_zoom_center_default }
@@ -2381,8 +2381,8 @@ store: [
         selected_timeline_zoom_center_default |> HOLD selected_timeline_zoom_center_value {
             LATEST {
                 elements.keyboard_capture.key |> WHEN {
-                    Z => zoom_center_keyboard_value
-                    R => zoom_center_keyboard_value
+                    TEXT { Z } => zoom_center_keyboard_value
+                    TEXT { R } => zoom_center_keyboard_value
                     __ => SKIP
                 }
                 elements.zoom_reset |> THEN { selected_timeline_zoom_center_default }
@@ -2403,8 +2403,8 @@ store: [
             LATEST {
                 elements.waveform_hover.pointer_x |> THEN { Number/project_time(pointer_x: elements.waveform_hover.pointer_x, pointer_width: elements.waveform_hover.pointer_width, viewport_start: viewport_label_start, viewport_end: viewport_label_end, fallback: selected_timeline_zoom_center_value) }
                 elements.keyboard_capture.key |> WHEN {
-                    Z => zoom_center_keyboard_value
-                    R => zoom_center_keyboard_value
+                    TEXT { Z } => zoom_center_keyboard_value
+                    TEXT { R } => zoom_center_keyboard_value
                     __ => SKIP
                 }
                 elements.zoom_reset |> THEN { selected_timeline_zoom_center_default }
@@ -2440,10 +2440,10 @@ store: [
             elements.marker_jump |> THEN { selected_timeline_cursor_default }
             elements.zoom_reset |> THEN { selected_timeline_cursor_default }
             elements.keyboard_capture.key |> WHEN {
-                D => selected_timeline_cursor_default
-                Q => selected_timeline_cursor_left
-                R => selected_timeline_cursor_default
-                E => selected_timeline_cursor_right
+                TEXT { D } => selected_timeline_cursor_default
+                TEXT { Q } => selected_timeline_cursor_left
+                TEXT { R } => selected_timeline_cursor_default
+                TEXT { E } => selected_timeline_cursor_right
                 __ => SKIP
             }
             elements.select_counter_file |> THEN { selected_timeline_cursor_default }
@@ -3050,15 +3050,15 @@ store: [
                 }
                 elements.zoom_reset |> THEN { 0 }
                 elements.keyboard_capture.key |> WHEN {
-                    W => zoom_step >= 3 |> WHEN {
+                    TEXT { W } => zoom_step >= 3 |> WHEN {
                         True => 3
                         False => zoom_step + 1
                     }
-                    S => zoom_step <= -2 |> WHEN {
+                    TEXT { S } => zoom_step <= -2 |> WHEN {
                         True => -2
                         False => zoom_step - 1
                     }
-                    R => 0
+                    TEXT { R } => 0
                     __ => SKIP
                 }
                 elements.select_counter_file |> THEN { 0 }
@@ -3087,11 +3087,11 @@ store: [
                 elements.pan_right |> THEN { RightWindow }
                 elements.zoom_reset |> THEN { Center }
                 elements.keyboard_capture.key |> WHEN {
-                    A => LeftWindow
-                    D => RightWindow
-                    R => Center
-                    Q => RightWindow
-                    E => RightWindow
+                    TEXT { A } => LeftWindow
+                    TEXT { D } => RightWindow
+                    TEXT { R } => Center
+                    TEXT { Q } => RightWindow
+                    TEXT { E } => RightWindow
                     __ => SKIP
                 }
                 elements.select_counter_file |> THEN { Center }
@@ -3802,13 +3802,13 @@ store: [
                 elements.cursor_left |> THEN { TEXT { DATA_36NS } }
                 elements.cursor_right |> THEN { TEXT { DATA_48NS } }
                 elements.keyboard_capture.key |> WHEN {
-                    W => TEXT { DATA_CLOSE }
-                    S => TEXT { DATA_WIDE }
-                    R => TEXT { DATA_FIT }
-                    Q => TEXT { DATA_36NS }
-                    E => TEXT { DATA_48NS }
-                    D => TEXT { DATA_RIGHT }
-                    A => TEXT { DATA_LEFT }
+                    TEXT { W } => TEXT { DATA_CLOSE }
+                    TEXT { S } => TEXT { DATA_WIDE }
+                    TEXT { R } => TEXT { DATA_FIT }
+                    TEXT { Q } => TEXT { DATA_36NS }
+                    TEXT { E } => TEXT { DATA_48NS }
+                    TEXT { D } => TEXT { DATA_RIGHT }
+                    TEXT { A } => TEXT { DATA_LEFT }
                     __ => SKIP
                 }
                 elements.load_default_file |> THEN { TEXT { A_FIT } }
@@ -3835,13 +3835,13 @@ store: [
                 }
                 elements.cursor_left |> THEN { TEXT { A_0S } }
                 elements.keyboard_capture.key |> WHEN {
-                    D => TEXT { A_FIT }
-                    Q => TEXT { A_0S }
-                    S => TEXT { A_0S }
-                    W => TEXT { A_0S }
-                    R => TEXT { A_FIT }
-                    E => TEXT { A_150S }
-                    A => TEXT { A_0S }
+                    TEXT { D } => TEXT { A_FIT }
+                    TEXT { Q } => TEXT { A_0S }
+                    TEXT { S } => TEXT { A_0S }
+                    TEXT { W } => TEXT { A_0S }
+                    TEXT { R } => TEXT { A_FIT }
+                    TEXT { E } => TEXT { A_150S }
+                    TEXT { A } => TEXT { A_0S }
                     __ => SKIP
                 }
                 elements.stale_response_probe |> THEN { TEXT { A_FIT } }

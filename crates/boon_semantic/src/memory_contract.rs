@@ -684,7 +684,10 @@ fn type_is_closed_memory_data(data_type: &Type) -> bool {
             }
         }),
         Type::Object(shape) => !shape.open && shape.fields.values().all(type_is_closed_memory_data),
-        Type::List(item) => type_is_closed_memory_data(item),
+        Type::List(item) | Type::Set(item) => type_is_closed_memory_data(item),
+        Type::Map { key, value } => {
+            type_is_closed_memory_data(key) && type_is_closed_memory_data(value)
+        }
         Type::Union(members) => {
             !members.is_empty() && members.iter().all(type_is_closed_memory_data)
         }
@@ -1011,6 +1014,7 @@ fn expression_children(
             .chain(output.iter().copied())
             .collect(),
         SemanticExpressionKind::Infix { left, right, .. } => vec![*left, *right],
+        SemanticExpressionKind::MapEntry { key, value } => vec![*key, *value],
         SemanticExpressionKind::MatchArm { output, .. } => output.iter().copied().collect(),
         SemanticExpressionKind::Block { bindings, result } => bindings
             .iter()
@@ -1018,7 +1022,9 @@ fn expression_children(
             .chain(std::iter::once(*result))
             .collect(),
         SemanticExpressionKind::List { items, .. }
-        | SemanticExpressionKind::Bytes { items, .. } => items.clone(),
+        | SemanticExpressionKind::Bytes { items, .. }
+        | SemanticExpressionKind::Map { entries: items }
+        | SemanticExpressionKind::Set { items } => items.clone(),
     })
 }
 
@@ -2088,11 +2094,17 @@ impl SemanticMigrationPurityChecker<'_> {
                 Ok(())
             }
             SemanticExpressionKind::List { items, .. }
-            | SemanticExpressionKind::Bytes { items, .. } => {
+            | SemanticExpressionKind::Bytes { items, .. }
+            | SemanticExpressionKind::Map { entries: items }
+            | SemanticExpressionKind::Set { items } => {
                 for item in items {
                     self.check(*item)?;
                 }
                 Ok(())
+            }
+            SemanticExpressionKind::MapEntry { key, value } => {
+                self.check(*key)?;
+                self.check(*value)
             }
             SemanticExpressionKind::Infix { left, right, .. } => {
                 self.check(*left)?;

@@ -570,6 +570,16 @@ pub enum SemanticExpressionKind {
         parameter: SemanticParameterId,
         projection: Vec<String>,
     },
+    MapEntry {
+        key: SemanticExprId,
+        value: SemanticExprId,
+    },
+    Map {
+        entries: Vec<SemanticExprId>,
+    },
+    Set {
+        items: Vec<SemanticExprId>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1924,6 +1934,10 @@ impl SemanticExecutionGraphV1 {
                 self.require_expression(*left, context("left operand"))?;
                 self.require_expression(*right, context("right operand"))?;
             }
+            SemanticExpressionKind::MapEntry { key, value } => {
+                self.require_expression(*key, context("map key"))?;
+                self.require_expression(*value, context("map value"))?;
+            }
             SemanticExpressionKind::MatchArm { output, .. } => {
                 if let Some(output) = output {
                     self.require_expression(*output, context("match output"))?;
@@ -1945,7 +1959,9 @@ impl SemanticExecutionGraphV1 {
                 self.require_expression(*result, context("block result"))?;
             }
             SemanticExpressionKind::List { items, .. }
-            | SemanticExpressionKind::Bytes { items, .. } => {
+            | SemanticExpressionKind::Bytes { items, .. }
+            | SemanticExpressionKind::Map { entries: items }
+            | SemanticExpressionKind::Set { items } => {
                 for item in items {
                     self.require_expression(*item, context("item"))?;
                 }

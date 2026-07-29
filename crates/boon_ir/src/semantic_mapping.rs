@@ -100,6 +100,13 @@ fn semantic_data_type(value: &boon_typecheck::Type) -> crate::SemanticDataType {
         boon_typecheck::Type::List(item) => crate::SemanticDataType::List {
             item: Box::new(semantic_data_type(item)),
         },
+        boon_typecheck::Type::Map { key, value } => crate::SemanticDataType::Map {
+            key: Box::new(semantic_data_type(key)),
+            value: Box::new(semantic_data_type(value)),
+        },
+        boon_typecheck::Type::Set(item) => crate::SemanticDataType::Set {
+            item: Box::new(semantic_data_type(item)),
+        },
         boon_typecheck::Type::Union(members) => crate::SemanticDataType::Union {
             members: members.iter().map(semantic_data_type).collect(),
         },
@@ -7753,6 +7760,22 @@ fn map_expression_kind(
                 .map(|item| ids.expression(*item))
                 .collect::<Result<Vec<_>, _>>()?,
         },
+        SemanticExpressionKind::MapEntry { key, value } => ExecutableExpressionKind::MapEntry {
+            key: ids.expression(*key)?,
+            value: ids.expression(*value)?,
+        },
+        SemanticExpressionKind::Map { entries } => ExecutableExpressionKind::Map {
+            entries: entries
+                .iter()
+                .map(|entry| ids.expression(*entry))
+                .collect::<Result<Vec<_>, _>>()?,
+        },
+        SemanticExpressionKind::Set { items } => ExecutableExpressionKind::Set {
+            items: items
+                .iter()
+                .map(|item| ids.expression(*item))
+                .collect::<Result<Vec<_>, _>>()?,
+        },
         SemanticExpressionKind::Bytes { fixed_size, items } => ExecutableExpressionKind::Bytes {
             fixed_size: *fixed_size,
             items: items
@@ -7947,6 +7970,10 @@ fn runtime_type_contains_var(ty: &boon_typecheck::Type) -> bool {
     match ty {
         boon_typecheck::Type::Var(_) => true,
         boon_typecheck::Type::List(item) => runtime_type_contains_var(item),
+        boon_typecheck::Type::Map { key, value } => {
+            runtime_type_contains_var(key) || runtime_type_contains_var(value)
+        }
+        boon_typecheck::Type::Set(item) => runtime_type_contains_var(item),
         boon_typecheck::Type::Function { args, result } => {
             args.iter().any(runtime_type_contains_var) || runtime_type_contains_var(&result.ty)
         }

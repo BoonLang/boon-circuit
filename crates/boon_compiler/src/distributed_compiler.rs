@@ -3293,6 +3293,13 @@ fn type_to_data_plan(ty: &Type) -> Option<DataTypePlan> {
         Type::List(item) => Some(DataTypePlan::List {
             item: Box::new(type_to_data_plan(item)?),
         }),
+        Type::Map { key, value } => Some(DataTypePlan::Map {
+            key: Box::new(type_to_data_plan(key)?),
+            value: Box::new(type_to_data_plan(value)?),
+        }),
+        Type::Set(item) => Some(DataTypePlan::Set {
+            item: Box::new(type_to_data_plan(item)?),
+        }),
         Type::Union(members) => Some(
             DataTypePlan::Union {
                 members: members

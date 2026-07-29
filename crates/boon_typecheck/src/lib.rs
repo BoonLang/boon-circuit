@@ -40,6 +40,13 @@ pub enum Type {
     /// payload. Appended to preserve every existing serialized type
     /// discriminant.
     Union(Vec<Type>),
+    /// Canonical MAP authority view: one key type and one committed value type.
+    Map {
+        key: Box<Type>,
+        value: Box<Type>,
+    },
+    /// Canonical SET authority view.
+    Set(Box<Type>),
 }
 
 impl EqUnifyValue for Type {}
@@ -89,6 +96,13 @@ pub enum TypeDisplayNode {
         name: Option<String>,
         args: Vec<TypeDisplayFunctionArg>,
         result: Box<TypeDisplayNode>,
+    },
+    Map {
+        key: Box<TypeDisplayNode>,
+        value: Box<TypeDisplayNode>,
+    },
+    Set {
+        item: Box<TypeDisplayNode>,
     },
 }
 
@@ -822,6 +836,16 @@ pub enum CheckedExpressionKind {
     Delimiter,
     Invalid {
         tokens: Vec<String>,
+    },
+    MapEntry {
+        key: CheckedExprId,
+        value: CheckedExprId,
+    },
+    Map {
+        entries: Vec<CheckedExprId>,
+    },
+    Set {
+        items: Vec<CheckedExprId>,
     },
 }
 
@@ -4321,6 +4345,60 @@ impl<'a> CheckedProgramBuilder<'a> {
                     recurse(*item, expected_item.clone(), target, active);
                 }
             }
+            AstExprKind::SetLiteral { items } => {
+                let expected_item = expected.as_ref().and_then(|expected| match expected {
+                    Type::Set(item) => Some((**item).clone()),
+                    _ => None,
+                });
+                for item in items {
+                    recurse(*item, expected_item.clone(), target, active);
+                }
+            }
+            AstExprKind::MapLiteral { entries } => {
+                let expected_entry = expected.as_ref().and_then(|expected| match expected {
+                    Type::Map { key, value } => {
+                        Some(Type::Object(ObjectShape::from_ordered_fields(
+                            [
+                                ("key".to_owned(), key.as_ref().clone()),
+                                ("value".to_owned(), value.as_ref().clone()),
+                            ],
+                            false,
+                        )))
+                    }
+                    _ => None,
+                });
+                for entry in entries {
+                    recurse(*entry, expected_entry.clone(), target, active);
+                }
+            }
+            AstExprKind::MapEntry { key, value } => {
+                let expected_shape = expected.as_ref().and_then(|expected| match expected {
+                    Type::Object(shape) => Some(shape),
+                    _ => None,
+                });
+                recurse(
+                    *key,
+                    expected_shape
+                        .and_then(|shape| shape.fields.get("key"))
+                        .cloned(),
+                    target,
+                    active,
+                );
+                recurse(
+                    *value,
+                    expected_shape
+                        .and_then(|shape| shape.fields.get("value"))
+                        .cloned(),
+                    target,
+                    active,
+                );
+            }
+            AstExprKind::Arrow { left, output, .. } => {
+                recurse(*left, None, target, active);
+                if let Some(output) = output {
+                    recurse(*output, expected, target, active);
+                }
+            }
             AstExprKind::Then { input, output } => {
                 recurse(expr.linked_input.unwrap_or(*input), None, target, active);
                 if let Some(output) = output {
@@ -5427,6 +5505,10 @@ impl<'a> CheckedProgramBuilder<'a> {
             | AstExprKind::TaggedObject { .. }
             | AstExprKind::Object(_)
             | AstExprKind::ListLiteral { .. }
+            | AstExprKind::MapEntry { .. }
+            | AstExprKind::MapLiteral { .. }
+            | AstExprKind::SetLiteral { .. }
+            | AstExprKind::Arrow { .. }
             | AstExprKind::Infix { .. }
             | AstExprKind::Delimiter
             | AstExprKind::Unknown(_) => FlowMode::Continuous,
@@ -5723,6 +5805,64 @@ impl<'a> CheckedProgramBuilder<'a> {
                             .unwrap_or_else(open_object_type),
                     ))
                 }
+                AstExprKind::SetLiteral { items } => {
+                    let fallback_item = match &fallback.ty {
+                        Type::Set(item) => Some((**item).clone()),
+                        _ => None,
+                    };
+                    Type::Set(Box::new(
+                        items
+                            .into_iter()
+                            .map(|item| self.infer_checked_expr_flow(item, active).ty)
+                            .reduce(|existing, extra| widen_structural_type(&existing, &extra))
+                            .or(fallback_item)
+                            .unwrap_or(Type::Unknown),
+                    ))
+                }
+                AstExprKind::MapEntry { key, value } => {
+                    Type::Object(ObjectShape::from_ordered_fields(
+                        [
+                            (
+                                "key".to_owned(),
+                                self.infer_checked_expr_flow(key, active).ty,
+                            ),
+                            (
+                                "value".to_owned(),
+                                self.infer_checked_expr_flow(value, active).ty,
+                            ),
+                        ],
+                        false,
+                    ))
+                }
+                AstExprKind::MapLiteral { entries } => {
+                    let mut key_type: Option<Type> = None;
+                    let mut value_type: Option<Type> = None;
+                    for entry in entries {
+                        let Type::Object(shape) = self.infer_checked_expr_flow(entry, active).ty
+                        else {
+                            continue;
+                        };
+                        if let Some(key) = shape.fields.get("key") {
+                            key_type = Some(key_type.map_or_else(
+                                || key.clone(),
+                                |existing| widen_structural_type(&existing, key),
+                            ));
+                        }
+                        if let Some(value) = shape.fields.get("value") {
+                            value_type = Some(value_type.map_or_else(
+                                || value.clone(),
+                                |existing| widen_structural_type(&existing, value),
+                            ));
+                        }
+                    }
+                    Type::Map {
+                        key: Box::new(key_type.unwrap_or(Type::Unknown)),
+                        value: Box::new(value_type.unwrap_or(Type::Unknown)),
+                    }
+                }
+                AstExprKind::Arrow { output, .. } => output
+                    .map(|output| self.infer_checked_expr_flow(output, active).ty)
+                    .unwrap_or(Type::Unknown),
                 AstExprKind::Identifier(name) => {
                     self.checked_read_type(expr_id, &[name], active, fallback.ty.clone())
                 }
@@ -6387,7 +6527,9 @@ impl<'a> CheckedProgramBuilder<'a> {
                 | Type::Number
                 | Type::Bytes(_)
                 | Type::Absent
-                | Type::List(_)) => {
+                | Type::List(_)
+                | Type::Map { .. }
+                | Type::Set(_)) => {
                     if self.validate_checked_projections {
                         self.contextual_type_diagnostic(
                             expr_id,
@@ -8201,7 +8343,10 @@ impl<'a> CheckedProgramBuilder<'a> {
                 fields.iter().map(|field| field.value).collect()
             }
             CheckedExpressionKind::List { items, .. }
-            | CheckedExpressionKind::Bytes { items, .. } => items.clone(),
+            | CheckedExpressionKind::Bytes { items, .. }
+            | CheckedExpressionKind::Set { items } => items.clone(),
+            CheckedExpressionKind::Map { entries } => entries.clone(),
+            CheckedExpressionKind::MapEntry { key, value } => vec![*key, *value],
             CheckedExpressionKind::TextTemplate { segments } => segments
                 .iter()
                 .filter_map(|segment| match segment {
@@ -8528,6 +8673,19 @@ impl<'a> CheckedProgramBuilder<'a> {
             AstExprKind::Delimiter => CheckedExpressionKind::Delimiter,
             AstExprKind::Unknown(tokens) => CheckedExpressionKind::Invalid {
                 tokens: tokens.clone(),
+            },
+            AstExprKind::Arrow { .. } => CheckedExpressionKind::Invalid {
+                tokens: vec!["unconsumed_arrow".to_owned()],
+            },
+            AstExprKind::MapEntry { key, value } => CheckedExpressionKind::MapEntry {
+                key: id(*key),
+                value: id(*value),
+            },
+            AstExprKind::MapLiteral { entries } => CheckedExpressionKind::Map {
+                entries: entries.iter().copied().map(id).collect(),
+            },
+            AstExprKind::SetLiteral { items } => CheckedExpressionKind::Set {
+                items: items.iter().copied().map(id).collect(),
             },
         }
     }
@@ -9450,6 +9608,9 @@ impl<'a> CheckedOrderAnalyzer<'a> {
             | CheckedExpressionKind::Block { result: None, .. }
             | CheckedExpressionKind::Object { .. }
             | CheckedExpressionKind::List { .. }
+            | CheckedExpressionKind::MapEntry { .. }
+            | CheckedExpressionKind::Map { .. }
+            | CheckedExpressionKind::Set { .. }
             | CheckedExpressionKind::BytesByte { .. }
             | CheckedExpressionKind::Bytes { .. }
             | CheckedExpressionKind::Delimiter
@@ -9595,6 +9756,16 @@ impl<'a> CheckedOrderAnalyzer<'a> {
             | CheckedExpressionKind::BytesByte { .. }
             | CheckedExpressionKind::Tag { .. }
             | CheckedExpressionKind::ExternalRead { .. } => true,
+            CheckedExpressionKind::MapEntry { key, value } => {
+                self.expression_is_total(*key, frames, active)
+                    && self.expression_is_total(*value, frames, active)
+            }
+            CheckedExpressionKind::Map { entries } => entries
+                .iter()
+                .all(|entry| self.expression_is_total(*entry, frames, active)),
+            CheckedExpressionKind::Set { items } => items
+                .iter()
+                .all(|item| self.expression_is_total(*item, frames, active)),
             CheckedExpressionKind::Absent
             | CheckedExpressionKind::Flush { .. }
             | CheckedExpressionKind::Passed { .. }
@@ -9742,7 +9913,10 @@ impl<'a> CheckedOrderAnalyzer<'a> {
                 .chain(result.iter().copied())
                 .collect(),
             CheckedExpressionKind::List { items, .. }
-            | CheckedExpressionKind::Bytes { items, .. } => items.clone(),
+            | CheckedExpressionKind::Bytes { items, .. }
+            | CheckedExpressionKind::Set { items } => items.clone(),
+            CheckedExpressionKind::Map { entries } => entries.clone(),
+            CheckedExpressionKind::MapEntry { key, value } => vec![*key, *value],
             CheckedExpressionKind::Passed { .. }
             | CheckedExpressionKind::ExternalRead { .. }
             | CheckedExpressionKind::Drain { .. }
@@ -10245,6 +10419,8 @@ fn validate_source_payload_shape_table(
             | Type::Number
             | Type::Bytes(_)
             | Type::List(_)
+            | Type::Map { .. }
+            | Type::Set(_)
             | Type::VariantSet(_)
             | Type::Union(_)
             | Type::Absent
@@ -10908,6 +11084,13 @@ fn alpha_normalize_context_type(
         Type::List(item) => Type::List(Box::new(alpha_normalize_context_type(
             item, variables, next_var,
         ))),
+        Type::Map { key, value } => Type::Map {
+            key: Box::new(alpha_normalize_context_type(key, variables, next_var)),
+            value: Box::new(alpha_normalize_context_type(value, variables, next_var)),
+        },
+        Type::Set(item) => Type::Set(Box::new(alpha_normalize_context_type(
+            item, variables, next_var,
+        ))),
         Type::Function { args, result } => Type::Function {
             args: args
                 .iter()
@@ -10994,6 +11177,11 @@ fn pass_scheme_type_with_fallback(ty: &Type, fallback: &Type) -> Type {
             open: shape.open,
         }),
         Type::List(item) => Type::List(Box::new(pass_scheme_type_with_fallback(item, fallback))),
+        Type::Map { key, value } => Type::Map {
+            key: Box::new(pass_scheme_type_with_fallback(key, fallback)),
+            value: Box::new(pass_scheme_type_with_fallback(value, fallback)),
+        },
+        Type::Set(item) => Type::Set(Box::new(pass_scheme_type_with_fallback(item, fallback))),
         Type::Function { args, result } => Type::Function {
             args: args
                 .iter()
@@ -11065,6 +11253,11 @@ fn freshen_checked_scheme_type(ty: &Type, next_var: &mut u32) -> Type {
             open: shape.open,
         }),
         Type::List(item) => Type::List(Box::new(freshen_checked_scheme_type(item, next_var))),
+        Type::Map { key, value } => Type::Map {
+            key: Box::new(freshen_checked_scheme_type(key, next_var)),
+            value: Box::new(freshen_checked_scheme_type(value, next_var)),
+        },
+        Type::Set(item) => Type::Set(Box::new(freshen_checked_scheme_type(item, next_var))),
         Type::Function { args, result } => Type::Function {
             args: args
                 .iter()
@@ -11124,6 +11317,17 @@ fn instantiate_checked_type_scheme_for_call(
             }))
         }
         Type::List(item) => Type::List(Box::new(instantiate_checked_type_scheme_for_call(
+            item, call, call_vars, next_var,
+        ))),
+        Type::Map { key, value } => Type::Map {
+            key: Box::new(instantiate_checked_type_scheme_for_call(
+                key, call, call_vars, next_var,
+            )),
+            value: Box::new(instantiate_checked_type_scheme_for_call(
+                value, call, call_vars, next_var,
+            )),
+        },
+        Type::Set(item) => Type::Set(Box::new(instantiate_checked_type_scheme_for_call(
             item, call, call_vars, next_var,
         ))),
         Type::Function { args, result } => Type::Function {
@@ -11209,6 +11413,10 @@ fn checked_type_contains_var(ty: &Type) -> bool {
     match ty {
         Type::Var(_) => true,
         Type::List(item) => checked_type_contains_var(item),
+        Type::Map { key, value } => {
+            checked_type_contains_var(key) || checked_type_contains_var(value)
+        }
+        Type::Set(item) => checked_type_contains_var(item),
         Type::Function { args, result } => {
             args.iter().any(checked_type_contains_var) || checked_type_contains_var(&result.ty)
         }
@@ -11232,6 +11440,10 @@ fn type_is_recursively_closed(ty: &Type) -> bool {
     match ty {
         Type::Text | Type::Number | Type::Bytes(_) | Type::Absent | Type::RenderContract => true,
         Type::List(item) => type_is_recursively_closed(item),
+        Type::Map { key, value } => {
+            type_is_recursively_closed(key) && type_is_recursively_closed(value)
+        }
+        Type::Set(item) => type_is_recursively_closed(item),
         Type::Function { args, result } => {
             args.iter().all(type_is_recursively_closed) && type_is_recursively_closed(&result.ty)
         }
@@ -11274,6 +11486,15 @@ fn substitute_checked_type_inner(
             substituted
         }
         Type::List(item) => Type::List(Box::new(substitute_checked_type_inner(
+            item,
+            substitutions,
+            active,
+        ))),
+        Type::Map { key, value } => Type::Map {
+            key: Box::new(substitute_checked_type_inner(key, substitutions, active)),
+            value: Box::new(substitute_checked_type_inner(value, substitutions, active)),
+        },
+        Type::Set(item) => Type::Set(Box::new(substitute_checked_type_inner(
             item,
             substitutions,
             active,
@@ -11631,6 +11852,8 @@ fn statement_body_container_expression(
                 AstExprKind::Block { .. }
                     | AstExprKind::Object(_)
                     | AstExprKind::ListLiteral { .. }
+                    | AstExprKind::MapLiteral { .. }
+                    | AstExprKind::SetLiteral { .. }
             )
         })
     }
@@ -11654,9 +11877,14 @@ fn statement_body_container_expression(
 
 fn direct_expression_children(expr: &AstExpr) -> Vec<usize> {
     match &expr.kind {
-        AstExprKind::BytesLiteral { items, .. } | AstExprKind::ListLiteral { items, .. } => {
-            items.clone()
-        }
+        AstExprKind::BytesLiteral { items, .. }
+        | AstExprKind::ListLiteral { items, .. }
+        | AstExprKind::SetLiteral { items } => items.clone(),
+        AstExprKind::MapLiteral { entries } => entries.clone(),
+        AstExprKind::MapEntry { key, value } => vec![*key, *value],
+        AstExprKind::Arrow { left, output, .. } => std::iter::once(*left)
+            .chain(output.iter().copied())
+            .collect(),
         AstExprKind::TextTemplate { segments } => segments
             .iter()
             .filter_map(|segment| match segment {
@@ -11929,6 +12157,8 @@ fn flush_payload_field_type_is_closed(ty: &Type) -> bool {
         | Type::UnresolvedShape { .. }
         | Type::Absent
         | Type::List(_)
+        | Type::Map { .. }
+        | Type::Set(_)
         | Type::Function { .. }
         | Type::RenderContract => false,
     }
@@ -12524,6 +12754,10 @@ fn external_data_type_is_closed(ty: &Type) -> bool {
             !shape.open && shape.fields.values().all(external_data_type_is_closed)
         }
         Type::List(item) => external_data_type_is_closed(item),
+        Type::Map { key, value } => {
+            external_data_type_is_closed(key) && external_data_type_is_closed(value)
+        }
+        Type::Set(item) => external_data_type_is_closed(item),
         Type::VariantSet(variants) => variants.iter().all(|variant| match variant {
             Variant::Tag(_) => true,
             Variant::Tagged { fields, .. } => {
@@ -12539,6 +12773,34 @@ fn external_data_type_is_closed(ty: &Type) -> bool {
         | Type::UnresolvedShape { .. }
         | Type::Var(_)
         | Type::Unknown => false,
+    }
+}
+
+/// Whether a checked value has the closed, canonical representation required
+/// for MAP keys and SET items.
+pub fn type_is_map_key_safe(ty: &Type) -> bool {
+    match ty {
+        Type::Number | Type::Text | Type::Bytes(_) => true,
+        Type::VariantSet(variants) => {
+            !variants.is_empty()
+                && variants.iter().all(|variant| match variant {
+                    Variant::Tag(_) => true,
+                    Variant::Tagged { fields, .. } => {
+                        !fields.open && fields.fields.values().all(type_is_map_key_safe)
+                    }
+                })
+        }
+        Type::Object(shape) => !shape.open && shape.fields.values().all(type_is_map_key_safe),
+        Type::Absent
+        | Type::RenderContract
+        | Type::List(_)
+        | Type::Function { .. }
+        | Type::UnresolvedShape { .. }
+        | Type::Var(_)
+        | Type::Unknown
+        | Type::Union(_)
+        | Type::Map { .. }
+        | Type::Set(_) => false,
     }
 }
 
@@ -14300,6 +14562,63 @@ impl<'a> Checker<'a> {
                     })
                     .unwrap_or_else(|| Type::List(Box::new(open_object_type())))
             }
+            AstExprKind::MapEntry { key, value } => {
+                let key = self.ensure_expr(*key).ty;
+                let value = self.ensure_expr(*value).ty;
+                if !type_is_map_key_safe(&key) && key != Type::Unknown {
+                    self.diagnostics.push(self.diagnostic_for_expr(
+                        expr.id,
+                        format!(
+                            "MAP keys must be closed canonical NUMBER, TEXT, BYTES, BITS, Tag, or object data; found {key:?}"
+                        ),
+                    ));
+                }
+                Type::Object(ObjectShape::from_ordered_fields(
+                    [("key".to_owned(), key), ("value".to_owned(), value)],
+                    false,
+                ))
+            }
+            AstExprKind::MapLiteral { entries } => {
+                let mut key_type: Option<Type> = None;
+                let mut value_type: Option<Type> = None;
+                for entry in entries {
+                    let Type::Object(shape) = self.ensure_expr(*entry).ty else {
+                        continue;
+                    };
+                    if let Some(key) = shape.fields.get("key") {
+                        key_type = Some(key_type.map_or_else(
+                            || key.clone(),
+                            |existing| widen_structural_type(&existing, key),
+                        ));
+                    }
+                    if let Some(value) = shape.fields.get("value") {
+                        value_type = Some(value_type.map_or_else(
+                            || value.clone(),
+                            |existing| widen_structural_type(&existing, value),
+                        ));
+                    }
+                }
+                Type::Map {
+                    key: Box::new(key_type.unwrap_or(Type::Unknown)),
+                    value: Box::new(value_type.unwrap_or(Type::Unknown)),
+                }
+            }
+            AstExprKind::SetLiteral { items } => {
+                let item_type = items
+                    .iter()
+                    .map(|item| self.ensure_expr(*item).ty)
+                    .reduce(|existing, extra| widen_structural_type(&existing, &extra))
+                    .unwrap_or(Type::Unknown);
+                if !type_is_map_key_safe(&item_type) && item_type != Type::Unknown {
+                    self.diagnostics.push(self.diagnostic_for_expr(
+                        expr.id,
+                        format!(
+                            "SET items must be closed canonical NUMBER, TEXT, BYTES, BITS, Tag, or object data; found {item_type:?}"
+                        ),
+                    ));
+                }
+                Type::Set(Box::new(item_type))
+            }
             AstExprKind::Call { function, args, .. }
                 if external_function_role(function).is_some() =>
             {
@@ -14615,6 +14934,13 @@ impl<'a> Checker<'a> {
                 self.expr_type_var(expr.id)
             }
             AstExprKind::Path(parts) => self.type_for_path(expr.id, parts),
+            AstExprKind::Arrow { .. } => {
+                self.diagnostics.push(self.diagnostic_for_expr(
+                    expr.id,
+                    "unconsumed `=>` expression reached type checking".to_owned(),
+                ));
+                Type::Unknown
+            }
         };
         FlowType {
             mode: self.flow_mode_for_expr(expr),
@@ -18032,6 +18358,10 @@ fn host_output_type_is_closed(ty: &Type) -> bool {
         }),
         Type::Object(shape) => !shape.open && shape.fields.values().all(host_output_type_is_closed),
         Type::List(item) => host_output_type_is_closed(item),
+        Type::Map { key, value } => {
+            host_output_type_is_closed(key) && host_output_type_is_closed(value)
+        }
+        Type::Set(item) => host_output_type_is_closed(item),
         Type::Union(members) => {
             !members.is_empty() && members.iter().all(host_output_type_is_closed)
         }
@@ -18395,6 +18725,26 @@ fn collect_expr_user_function_calls(
                 collect_expr_user_function_calls(*item, expressions, user_functions, calls);
             }
         }
+        AstExprKind::ListLiteral { items, .. } | AstExprKind::SetLiteral { items } => {
+            for item in items {
+                collect_expr_user_function_calls(*item, expressions, user_functions, calls);
+            }
+        }
+        AstExprKind::MapLiteral { entries } => {
+            for entry in entries {
+                collect_expr_user_function_calls(*entry, expressions, user_functions, calls);
+            }
+        }
+        AstExprKind::MapEntry { key, value } => {
+            collect_expr_user_function_calls(*key, expressions, user_functions, calls);
+            collect_expr_user_function_calls(*value, expressions, user_functions, calls);
+        }
+        AstExprKind::Arrow { left, output, .. } => {
+            collect_expr_user_function_calls(*left, expressions, user_functions, calls);
+            if let Some(output) = output {
+                collect_expr_user_function_calls(*output, expressions, user_functions, calls);
+            }
+        }
         AstExprKind::TextTemplate { segments } => {
             for value in segments.iter().filter_map(|segment| match segment {
                 AstTextSegment::Static { .. } => None,
@@ -18416,7 +18766,6 @@ fn collect_expr_user_function_calls(
         | AstExprKind::Tag(_)
         | AstExprKind::Source
         | AstExprKind::Latest { .. }
-        | AstExprKind::ListLiteral { .. }
         | AstExprKind::Delimiter
         | AstExprKind::Unknown(_)
         | AstExprKind::Flush { payload: None }
@@ -20514,6 +20863,25 @@ fn boon_facing_type_display_tree_with_depth(
                 max_depth,
             )),
         },
+        Type::Map { key, value } => TypeDisplayNode::Map {
+            key: Box::new(boon_facing_type_display_tree_with_depth(
+                key,
+                depth + 1,
+                max_depth,
+            )),
+            value: Box::new(boon_facing_type_display_tree_with_depth(
+                value,
+                depth + 1,
+                max_depth,
+            )),
+        },
+        Type::Set(item) => TypeDisplayNode::Set {
+            item: Box::new(boon_facing_type_display_tree_with_depth(
+                item,
+                depth + 1,
+                max_depth,
+            )),
+        },
         Type::Function { args, result } => TypeDisplayNode::Function {
             name: None,
             args: args
@@ -20615,6 +20983,15 @@ fn boon_facing_type_label_with_depth(
                 boon_facing_type_label_with_depth(item, depth + 1, compact, max_depth)
             )
         }
+        Type::Map { key, value } => format!(
+            "MAP<{}, {}>",
+            boon_facing_type_label_with_depth(key, depth + 1, compact, max_depth),
+            boon_facing_type_label_with_depth(value, depth + 1, compact, max_depth)
+        ),
+        Type::Set(item) => format!(
+            "SET<{}>",
+            boon_facing_type_label_with_depth(item, depth + 1, compact, max_depth)
+        ),
         Type::Function { args, result } => {
             let args = args
                 .iter()
@@ -21407,6 +21784,9 @@ fn checked_inline_list_authority_root(
             | CheckedExpressionKind::Block { result: None, .. }
             | CheckedExpressionKind::Object { .. }
             | CheckedExpressionKind::Bytes { .. }
+            | CheckedExpressionKind::MapEntry { .. }
+            | CheckedExpressionKind::Map { .. }
+            | CheckedExpressionKind::Set { .. }
             | CheckedExpressionKind::Delimiter
             | CheckedExpressionKind::Invalid { .. } => return None,
         };
@@ -22791,6 +23171,22 @@ fn expr_contains_render_constructor_seen(
         AstExprKind::BytesLiteral { items, .. } => items
             .iter()
             .any(|item| expr_contains_render_constructor_seen(*item, expressions, seen)),
+        AstExprKind::ListLiteral { items, .. } | AstExprKind::SetLiteral { items } => items
+            .iter()
+            .any(|item| expr_contains_render_constructor_seen(*item, expressions, seen)),
+        AstExprKind::MapLiteral { entries } => entries
+            .iter()
+            .any(|entry| expr_contains_render_constructor_seen(*entry, expressions, seen)),
+        AstExprKind::MapEntry { key, value } => {
+            expr_contains_render_constructor_seen(*key, expressions, seen)
+                || expr_contains_render_constructor_seen(*value, expressions, seen)
+        }
+        AstExprKind::Arrow { left, output, .. } => {
+            expr_contains_render_constructor_seen(*left, expressions, seen)
+                || output.is_some_and(|output| {
+                    expr_contains_render_constructor_seen(output, expressions, seen)
+                })
+        }
         AstExprKind::TextTemplate { segments } => segments.iter().any(|segment| match segment {
             AstTextSegment::Static { .. } => false,
             AstTextSegment::Dynamic { value } => {
@@ -22801,8 +23197,7 @@ fn expr_contains_render_constructor_seen(
             payload: Some(payload),
         } => expr_contains_render_constructor_seen(*payload, expressions, seen),
         AstExprKind::Tag(tag) if tag == "NoElement" => true,
-        AstExprKind::ListLiteral { .. }
-        | AstExprKind::Identifier(_)
+        AstExprKind::Identifier(_)
         | AstExprKind::Path(_)
         | AstExprKind::Drain { .. }
         | AstExprKind::StringLiteral(_)
@@ -22987,6 +23382,42 @@ fn collect_param_requirements_expr(
                 collect_param_requirements_expr(*item, expressions, params, requirements, None);
             }
         }
+        AstExprKind::ListLiteral { items, .. } | AstExprKind::SetLiteral { items } => {
+            let item_expected = expected.as_ref().and_then(|expected| match expected {
+                Type::List(item) | Type::Set(item) => Some(item.as_ref().clone()),
+                _ => None,
+            });
+            for item in items {
+                collect_param_requirements_expr(
+                    *item,
+                    expressions,
+                    params,
+                    requirements,
+                    item_expected.clone(),
+                );
+            }
+        }
+        AstExprKind::MapLiteral { entries } => {
+            for entry in entries {
+                collect_param_requirements_expr(*entry, expressions, params, requirements, None);
+            }
+        }
+        AstExprKind::MapEntry { key, value } => {
+            collect_param_requirements_expr(*key, expressions, params, requirements, None);
+            collect_param_requirements_expr(*value, expressions, params, requirements, None);
+        }
+        AstExprKind::Arrow { left, output, .. } => {
+            collect_param_requirements_expr(*left, expressions, params, requirements, None);
+            if let Some(output) = output {
+                collect_param_requirements_expr(
+                    *output,
+                    expressions,
+                    params,
+                    requirements,
+                    expected,
+                );
+            }
+        }
         AstExprKind::TextTemplate { segments } => {
             for value in segments.iter().filter_map(|segment| match segment {
                 AstTextSegment::Static { .. } => None,
@@ -23009,7 +23440,6 @@ fn collect_param_requirements_expr(
         | AstExprKind::Tag(_)
         | AstExprKind::Source
         | AstExprKind::Latest { .. }
-        | AstExprKind::ListLiteral { .. }
         | AstExprKind::Delimiter
         | AstExprKind::Unknown(_)
         | AstExprKind::Flush { payload: None }
@@ -25291,6 +25721,20 @@ impl<'a> CheckedSourceProvenanceResolver<'a> {
                     resolved.extend(self.expression_sources(*result, projection, visiting));
                 }
             }
+            CheckedExpressionKind::MapEntry { key, value } => {
+                resolved.extend(self.expression_sources(*key, &[], visiting));
+                resolved.extend(self.expression_sources(*value, projection, visiting));
+            }
+            CheckedExpressionKind::Map { entries } => {
+                for entry in entries {
+                    resolved.extend(self.expression_sources(*entry, projection, visiting));
+                }
+            }
+            CheckedExpressionKind::Set { items } => {
+                for item in items {
+                    resolved.extend(self.expression_sources(*item, projection, visiting));
+                }
+            }
             CheckedExpressionKind::List { .. }
             | CheckedExpressionKind::Passed { .. }
             | CheckedExpressionKind::ExternalRead { .. }
@@ -25426,6 +25870,9 @@ impl<'a> CheckedSourceProvenanceResolver<'a> {
             }
             CheckedExpressionKind::TaggedObject { .. }
             | CheckedExpressionKind::Object { .. }
+            | CheckedExpressionKind::MapEntry { .. }
+            | CheckedExpressionKind::Map { .. }
+            | CheckedExpressionKind::Set { .. }
             | CheckedExpressionKind::Passed { .. }
             | CheckedExpressionKind::ExternalRead { .. }
             | CheckedExpressionKind::Drain { .. }
@@ -25722,8 +26169,15 @@ fn checked_projection_to_expression(
                 .or_else(|| result.and_then(|result| direct(result, visiting))),
             CheckedExpressionKind::List { items, .. }
             | CheckedExpressionKind::Bytes { items, .. }
+            | CheckedExpressionKind::Set { items }
             | CheckedExpressionKind::Latest { branches: items } => {
                 items.iter().find_map(|item| direct(*item, visiting))
+            }
+            CheckedExpressionKind::Map { entries } => {
+                entries.iter().find_map(|entry| direct(*entry, visiting))
+            }
+            CheckedExpressionKind::MapEntry { key, value } => {
+                direct(*key, visiting).or_else(|| direct(*value, visiting))
             }
             CheckedExpressionKind::TextTemplate { segments } => {
                 segments.iter().find_map(|segment| match segment {
@@ -25871,9 +26325,11 @@ fn checked_expression_children(
             .map(|binding| binding.value)
             .chain(result.iter().copied())
             .collect(),
-        CheckedExpressionKind::List { items, .. } | CheckedExpressionKind::Bytes { items, .. } => {
-            items.clone()
-        }
+        CheckedExpressionKind::List { items, .. }
+        | CheckedExpressionKind::Bytes { items, .. }
+        | CheckedExpressionKind::Set { items } => items.clone(),
+        CheckedExpressionKind::Map { entries } => entries.clone(),
+        CheckedExpressionKind::MapEntry { key, value } => vec![*key, *value],
         CheckedExpressionKind::TextTemplate { segments } => segments
             .iter()
             .filter_map(|segment| match segment {
@@ -26441,9 +26897,11 @@ fn collect_contextual_binding_field_requirements(
                 );
             }
         }
-        AstExprKind::ListLiteral { items, .. } | AstExprKind::BytesLiteral { items, .. } => {
+        AstExprKind::ListLiteral { items, .. }
+        | AstExprKind::BytesLiteral { items, .. }
+        | AstExprKind::SetLiteral { items } => {
             let item_expected = match expected.as_ref() {
-                Some(Type::List(item)) => Some((**item).clone()),
+                Some(Type::List(item)) | Some(Type::Set(item)) => Some((**item).clone()),
                 _ => None,
             };
             for item in items {
@@ -26451,6 +26909,51 @@ fn collect_contextual_binding_field_requirements(
                     *item,
                     binding,
                     item_expected.clone(),
+                    expressions,
+                    requirements,
+                );
+            }
+        }
+        AstExprKind::MapLiteral { entries } => {
+            for entry in entries {
+                collect_contextual_binding_field_requirements(
+                    *entry,
+                    binding,
+                    None,
+                    expressions,
+                    requirements,
+                );
+            }
+        }
+        AstExprKind::MapEntry { key, value } => {
+            collect_contextual_binding_field_requirements(
+                *key,
+                binding,
+                None,
+                expressions,
+                requirements,
+            );
+            collect_contextual_binding_field_requirements(
+                *value,
+                binding,
+                None,
+                expressions,
+                requirements,
+            );
+        }
+        AstExprKind::Arrow { left, output, .. } => {
+            collect_contextual_binding_field_requirements(
+                *left,
+                binding,
+                None,
+                expressions,
+                requirements,
+            );
+            if let Some(output) = output {
+                collect_contextual_binding_field_requirements(
+                    *output,
+                    binding,
+                    expected,
                     expressions,
                     requirements,
                 );
@@ -28008,6 +28511,10 @@ fn type_contains_renderable(ty: &Type) -> bool {
         ty if is_document_render_object_type(ty) => true,
         ty if is_no_element_type(ty) => true,
         Type::List(item) => type_contains_renderable(item),
+        Type::Map { key, value } => {
+            type_contains_renderable(key) || type_contains_renderable(value)
+        }
+        Type::Set(item) => type_contains_renderable(item),
         Type::Object(shape) => shape.fields.values().any(type_contains_renderable),
         Type::VariantSet(variants) => variants.iter().any(|variant| match variant {
             Variant::Tag(_) => false,
@@ -28029,6 +28536,10 @@ fn type_contains_no_element(ty: &Type) -> bool {
     match ty {
         ty if is_no_element_type(ty) => true,
         Type::List(item) => type_contains_no_element(item),
+        Type::Map { key, value } => {
+            type_contains_no_element(key) || type_contains_no_element(value)
+        }
+        Type::Set(item) => type_contains_no_element(item),
         Type::Object(shape) => shape.fields.values().any(type_contains_no_element),
         Type::VariantSet(variants) => variants.iter().any(|variant| match variant {
             Variant::Tag(_) => false,
@@ -28051,6 +28562,8 @@ fn type_contains_absence(ty: &Type) -> bool {
     match ty {
         Type::Absent => true,
         Type::List(item) => type_contains_absence(item),
+        Type::Map { key, value } => type_contains_absence(key) || type_contains_absence(value),
+        Type::Set(item) => type_contains_absence(item),
         Type::Object(shape) => shape.fields.values().any(type_contains_absence),
         Type::VariantSet(variants) => variants.iter().any(|variant| match variant {
             Variant::Tag(_) => false,
@@ -28113,6 +28626,11 @@ fn collect_type_vars(ty: &Type, vars: &mut BTreeSet<TypeVar>) {
             vars.insert(*var);
         }
         Type::List(item) => collect_type_vars(item, vars),
+        Type::Map { key, value } => {
+            collect_type_vars(key, vars);
+            collect_type_vars(value, vars);
+        }
+        Type::Set(item) => collect_type_vars(item, vars),
         Type::Function { args, result } => {
             for arg in args {
                 collect_type_vars(arg, vars);

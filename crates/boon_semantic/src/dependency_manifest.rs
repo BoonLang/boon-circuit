@@ -3062,6 +3062,9 @@ fn checked_expression_dependency(
         | CheckedExpressionKind::Block { .. }
         | CheckedExpressionKind::Object { .. }
         | CheckedExpressionKind::List { .. }
+        | CheckedExpressionKind::MapEntry { .. }
+        | CheckedExpressionKind::Map { .. }
+        | CheckedExpressionKind::Set { .. }
         | CheckedExpressionKind::Bytes { .. }
         | CheckedExpressionKind::Delimiter => (
             SemanticDependencyChannelV1::StructuralRepresentation,
@@ -4290,6 +4293,15 @@ fn semantic_expression_dependency(
                 Vec::new(),
             )
         }
+        SemanticExpressionKind::MapEntry { key, value } => {
+            references.push(dependency_entity(expression_entity(*key)));
+            references.push(dependency_entity(expression_entity(*value)));
+            (
+                SemanticDependencyChannelV1::StructuralRepresentation,
+                vec![SemanticDependencyRoleV1::FixedDefinition],
+                Vec::new(),
+            )
+        }
         SemanticExpressionKind::MatchArm { output, .. } => {
             references.extend(output.map(expression_entity).map(dependency_entity));
             (
@@ -4342,7 +4354,9 @@ fn semantic_expression_dependency(
             )
         }
         SemanticExpressionKind::List { items, .. }
-        | SemanticExpressionKind::Bytes { items, .. } => {
+        | SemanticExpressionKind::Bytes { items, .. }
+        | SemanticExpressionKind::Map { entries: items }
+        | SemanticExpressionKind::Set { items } => {
             references.extend(
                 items
                     .iter()

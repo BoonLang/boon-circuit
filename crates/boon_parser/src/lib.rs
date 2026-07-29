@@ -706,6 +706,28 @@ pub enum AstExprKind {
     },
     Delimiter,
     Unknown(Vec<String>),
+    /// Delimiter-safe intermediate for `left => right`.
+    ///
+    /// Structural linking resolves this into either a selector `MatchArm` or a
+    /// `MapEntry`; an unconsumed arrow is rejected before a ParsedProgram can
+    /// be produced.
+    Arrow {
+        left: usize,
+        pattern: AstMatchPattern,
+        output: Option<usize>,
+    },
+    MapEntry {
+        key: usize,
+        value: usize,
+    },
+    MapLiteral {
+        #[serde(default)]
+        entries: Vec<usize>,
+    },
+    SetLiteral {
+        #[serde(default)]
+        items: Vec<usize>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1396,6 +1418,7 @@ pub fn parse_ast(path: &str, source: &str) -> Result<AstProgram, ParseError> {
     let items = parser_items(&item_lines, &text_body_line_ranges);
     let mut expressions = Vec::new();
     let mut statements = ast_statement_tree(&items, &mut expressions, source);
+    resolve_statement_arrow_contexts(&statements, &mut expressions, ArrowContext::None);
     link_multiline_expression_structure(&mut statements, &mut expressions);
     normalize_unlinked_unary_negation(&mut expressions);
     validate_pipeline_inputs(path, source, &expressions)?;
@@ -1408,6 +1431,40 @@ pub fn parse_ast(path: &str, source: &str) -> Result<AstProgram, ParseError> {
     };
     validate_match_patterns(path, &ast)?;
     Ok(ast)
+}
+
+#[derive(Clone, Copy)]
+enum ArrowContext {
+    None,
+    Selector,
+    Map,
+}
+
+fn resolve_statement_arrow_contexts(
+    statements: &[AstStatement],
+    expressions: &mut [AstExpr],
+    context: ArrowContext,
+) {
+    for statement in statements {
+        if let Some(expression) = statement.expr {
+            match context {
+                ArrowContext::None => {}
+                ArrowContext::Selector => consume_arrow_as_match_arm(expression, expressions),
+                ArrowContext::Map => consume_arrow_as_map_entry(expression, expressions),
+            }
+        }
+        let child_context = statement
+            .expr
+            .map(|expression| statement_structure_owner(expression, expressions))
+            .and_then(|owner| expressions.get(owner))
+            .map_or(ArrowContext::None, |expression| match &expression.kind {
+                AstExprKind::When { .. } => ArrowContext::Selector,
+                AstExprKind::Pipe { op, .. } if op == "WHILE" => ArrowContext::Selector,
+                AstExprKind::MapLiteral { .. } => ArrowContext::Map,
+                _ => ArrowContext::None,
+            });
+        resolve_statement_arrow_contexts(&statement.children, expressions, child_context);
+    }
 }
 
 fn link_multiline_expression_structure(
@@ -1508,6 +1565,10 @@ fn pipeline_placeholder_target(expr_id: usize, expressions: &[AstExpr]) -> Optio
         AstExprKind::MatchArm {
             output: Some(output),
             ..
+        }
+        | AstExprKind::Arrow {
+            output: Some(output),
+            ..
         } => return pipeline_placeholder_target(*output, expressions),
         _ => return None,
     };
@@ -1527,11 +1588,15 @@ fn statement_child_pipeline_input(
 ) -> Option<usize> {
     let owner = statement_structure_owner(statement.expr?, expressions);
     match &expressions.get(owner)?.kind {
-        AstExprKind::MatchArm { output, .. } | AstExprKind::Then { output, .. } => *output,
+        AstExprKind::MatchArm { output, .. }
+        | AstExprKind::Arrow { output, .. }
+        | AstExprKind::Then { output, .. } => *output,
         AstExprKind::Block { .. }
         | AstExprKind::Object(_)
         | AstExprKind::ListLiteral { .. }
         | AstExprKind::BytesLiteral { .. }
+        | AstExprKind::MapLiteral { .. }
+        | AstExprKind::SetLiteral { .. }
         | AstExprKind::Flush { .. }
         | AstExprKind::Hold { .. }
         | AstExprKind::Latest { .. }
@@ -1569,6 +1634,9 @@ fn replace_statement_inline_output(
     };
     match &mut expression.kind {
         AstExprKind::MatchArm {
+            output: arm_output, ..
+        }
+        | AstExprKind::Arrow {
             output: arm_output, ..
         }
         | AstExprKind::Then {
@@ -1619,21 +1687,45 @@ fn validate_pipeline_inputs(
 fn materialize_statement_structure(statement: &mut AstStatement, expressions: &mut [AstExpr]) {
     let child_values = statement_sequence_values(&statement.children, expressions);
     let child_result = child_values.last().copied();
-    let child_arms = statement
-        .children
+
+    let Some(expr_id) = statement.expr else {
+        return;
+    };
+    let expr_id = statement_structure_owner(expr_id, expressions);
+    let selector_parent = expressions.get(expr_id).is_some_and(|expression| {
+        matches!(expression.kind, AstExprKind::When { .. })
+            || matches!(&expression.kind, AstExprKind::Pipe { op, .. } if op == "WHILE")
+    });
+    let map_parent = expressions
+        .get(expr_id)
+        .is_some_and(|expression| matches!(expression.kind, AstExprKind::MapLiteral { .. }));
+    if selector_parent {
+        for child in &child_values {
+            consume_arrow_as_match_arm(*child, expressions);
+        }
+    } else if map_parent {
+        for child in &child_values {
+            consume_arrow_as_map_entry(*child, expressions);
+        }
+    }
+    let child_arms = child_values
         .iter()
-        .filter_map(|child| child.expr)
+        .copied()
         .filter(|expr_id| {
             expressions
                 .get(*expr_id)
                 .is_some_and(|expr| matches!(expr.kind, AstExprKind::MatchArm { .. }))
         })
         .collect::<Vec<_>>();
-
-    let Some(expr_id) = statement.expr else {
-        return;
-    };
-    let expr_id = statement_structure_owner(expr_id, expressions);
+    let map_entries = child_values
+        .iter()
+        .copied()
+        .filter(|expr_id| {
+            expressions
+                .get(*expr_id)
+                .is_some_and(|expr| matches!(expr.kind, AstExprKind::MapEntry { .. }))
+        })
+        .collect::<Vec<_>>();
     let block_bindings = statement
         .children
         .iter()
@@ -1686,7 +1778,9 @@ fn materialize_statement_structure(statement: &mut AstStatement, expressions: &m
                 *arms = child_arms;
             }
         }
-        AstExprKind::Then { output, .. } | AstExprKind::MatchArm { output, .. } => {
+        AstExprKind::Then { output, .. }
+        | AstExprKind::MatchArm { output, .. }
+        | AstExprKind::Arrow { output, .. } => {
             if output.is_none() {
                 *output = child_result;
             }
@@ -1712,7 +1806,74 @@ fn materialize_statement_structure(statement: &mut AstStatement, expressions: &m
         AstExprKind::ListLiteral { items, .. } if items.is_empty() => {
             *items = child_values;
         }
+        AstExprKind::SetLiteral { items } if items.is_empty() => {
+            *items = child_values;
+        }
+        AstExprKind::MapLiteral { entries } if entries.is_empty() => {
+            *entries = map_entries;
+        }
         _ => {}
+    }
+}
+
+fn consume_arrow_as_match_arm(expression: usize, expressions: &mut [AstExpr]) {
+    let Some(AstExprKind::Arrow {
+        left,
+        pattern,
+        output,
+    }) = expressions
+        .get(expression)
+        .map(|expression| expression.kind.clone())
+    else {
+        return;
+    };
+    discard_pattern_expression_tree(left, expressions);
+    if let Some(expression) = expressions.get_mut(expression) {
+        expression.kind = AstExprKind::MatchArm { pattern, output };
+    }
+}
+
+fn discard_pattern_expression_tree(root: usize, expressions: &mut [AstExpr]) {
+    let mut pending = vec![root];
+    let mut visited = BTreeSet::new();
+    while let Some(expression) = pending.pop() {
+        if !visited.insert(expression) {
+            continue;
+        }
+        let children = expressions
+            .get(expression)
+            .map(|expression| match &expression.kind {
+                AstExprKind::TaggedObject { fields, .. } | AstExprKind::Object(fields) => {
+                    fields.iter().map(|field| field.value).collect()
+                }
+                AstExprKind::ListLiteral { items, .. }
+                | AstExprKind::BytesLiteral { items, .. }
+                | AstExprKind::SetLiteral { items } => items.clone(),
+                AstExprKind::MapLiteral { entries } => entries.clone(),
+                AstExprKind::MapEntry { key, value } => vec![*key, *value],
+                _ => Vec::new(),
+            })
+            .unwrap_or_default();
+        pending.extend(children);
+        if let Some(expression) = expressions.get_mut(expression) {
+            expression.kind = AstExprKind::Delimiter;
+        }
+    }
+}
+
+fn consume_arrow_as_map_entry(expression: usize, expressions: &mut [AstExpr]) {
+    let Some(AstExprKind::Arrow {
+        left,
+        output: Some(value),
+        ..
+    }) = expressions
+        .get(expression)
+        .map(|expression| expression.kind.clone())
+    else {
+        return;
+    };
+    if let Some(expression) = expressions.get_mut(expression) {
+        expression.kind = AstExprKind::MapEntry { key: left, value };
     }
 }
 
@@ -1722,6 +1883,10 @@ fn statement_structure_owner(expr_id: usize, expressions: &[AstExpr]) -> usize {
     };
     match &expression.kind {
         AstExprKind::MatchArm {
+            output: Some(output),
+            ..
+        }
+        | AstExprKind::Arrow {
             output: Some(output),
             ..
         } if expression_owns_statement_children(*output, expressions) => {
@@ -1739,6 +1904,8 @@ fn expression_owns_statement_children(expr_id: usize, expressions: &[AstExpr]) -
                 | AstExprKind::Object(_)
                 | AstExprKind::ListLiteral { .. }
                 | AstExprKind::BytesLiteral { .. }
+                | AstExprKind::MapLiteral { .. }
+                | AstExprKind::SetLiteral { .. }
                 | AstExprKind::Flush { .. }
                 | AstExprKind::Hold { .. }
                 | AstExprKind::Latest { .. }
@@ -1774,12 +1941,15 @@ fn statement_value_expression(statement: &AstStatement, expressions: &[AstExpr])
                     | AstExprKind::Object(_)
                     | AstExprKind::ListLiteral { .. }
                     | AstExprKind::BytesLiteral { .. }
+                    | AstExprKind::MapLiteral { .. }
+                    | AstExprKind::SetLiteral { .. }
                     | AstExprKind::Flush { .. }
                     | AstExprKind::Hold { .. }
                     | AstExprKind::Latest { .. }
                     | AstExprKind::When { .. }
                     | AstExprKind::Then { .. }
                     | AstExprKind::MatchArm { .. }
+                    | AstExprKind::Arrow { .. }
             ) || matches!(&expr.kind, AstExprKind::Pipe { op, .. } if op == "WHILE")
         })
     {
@@ -2454,7 +2624,8 @@ fn ast_expr_kind(
     }
     if let Some(arrow) = find_top_level_token(tokens, "=>") {
         let pattern = &tokens[..arrow];
-        return AstExprKind::MatchArm {
+        return AstExprKind::Arrow {
+            left: parse_ast_expr(pattern, item, expressions, source),
             pattern: ast_match_pattern(pattern, item, source),
             output: (!tokens[arrow + 1..].is_empty())
                 .then(|| parse_ast_expr(&tokens[arrow + 1..], item, expressions, source)),
@@ -2508,6 +2679,16 @@ fn ast_expr_kind(
         return AstExprKind::ListLiteral {
             capacity: ast_list_capacity(tokens),
             items: ast_list_items(tokens, item, expressions, source),
+        };
+    }
+    if tokens.first().map(String::as_str) == Some("MAP") {
+        return AstExprKind::MapLiteral {
+            entries: ast_map_entries(tokens, item, expressions, source),
+        };
+    }
+    if tokens.first().map(String::as_str) == Some("SET") {
+        return AstExprKind::SetLiteral {
+            items: ast_collection_items(tokens, item, expressions, source),
         };
     }
     if let Some((size, items)) = ast_bytes_literal(tokens, item, expressions, source) {
@@ -3224,7 +3405,11 @@ fn parse_inline_match_arms(
     split_top_level(&tokens[open + 1..close], ",")
         .into_iter()
         .filter(|part| part.iter().any(|token| token == "=>"))
-        .map(|part| parse_ast_expr(&part, item, expressions, source))
+        .map(|part| {
+            let expression = parse_ast_expr(&part, item, expressions, source);
+            consume_arrow_as_match_arm(expression, expressions);
+            expression
+        })
         .collect()
 }
 
@@ -3727,6 +3912,15 @@ fn ast_list_items(
     expressions: &mut Vec<AstExpr>,
     source: &str,
 ) -> Vec<usize> {
+    ast_collection_items(tokens, item, expressions, source)
+}
+
+fn ast_collection_items(
+    tokens: &[String],
+    item: &ParserItem,
+    expressions: &mut Vec<AstExpr>,
+    source: &str,
+) -> Vec<usize> {
     let Some(open) = tokens.iter().position(|token| token == "{") else {
         return Vec::new();
     };
@@ -3740,6 +3934,32 @@ fn ast_list_items(
         .into_iter()
         .filter(|part| !part.is_empty())
         .map(|part| parse_ast_expr(&part, item, expressions, source))
+        .collect()
+}
+
+fn ast_map_entries(
+    tokens: &[String],
+    item: &ParserItem,
+    expressions: &mut Vec<AstExpr>,
+    source: &str,
+) -> Vec<usize> {
+    let Some(open) = tokens.iter().position(|token| token == "{") else {
+        return Vec::new();
+    };
+    let Some(close) = matching_close(tokens, open) else {
+        return Vec::new();
+    };
+    if close <= open + 1 {
+        return Vec::new();
+    }
+    split_top_level(&tokens[open + 1..close], ",")
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let expression = parse_ast_expr(&part, item, expressions, source);
+            consume_arrow_as_map_entry(expression, expressions);
+            expression
+        })
         .collect()
 }
 
@@ -3943,6 +4163,19 @@ fn validate_source_syntax(path: &str, ast: &AstProgram) -> Result<(), ParseError
 
 fn validate_match_patterns(path: &str, ast: &AstProgram) -> Result<(), ParseError> {
     for expression in &ast.expressions {
+        if matches!(expression.kind, AstExprKind::Arrow { .. }) {
+            let column = ast
+                .tokens
+                .iter()
+                .find(|token| token.line == expression.line && token.start >= expression.start)
+                .map_or(1, |token| token.column);
+            return Err(error(
+                path,
+                expression.line,
+                column,
+                "`=>` must be an entry of `MAP { ... }` or an arm of `WHEN`/`WHILE`",
+            ));
+        }
         let AstExprKind::MatchArm {
             pattern: AstMatchPattern::Invalid { message },
             ..
@@ -5925,6 +6158,76 @@ store: [
             })
         }
         assert!(contains_bounded_rows(&parsed.ast.statements));
+    }
+
+    #[test]
+    fn map_and_set_ast_keep_dynamic_keys_separate_from_match_arms() {
+        let parsed = parse_ast(
+            "map-set-structure.bn",
+            r#"
+settings: MAP {
+    TEXT { theme } => [enabled: True]
+    selected.id => selected.value
+}
+tags: SET {
+    TEXT { alpha }
+    Ready
+}
+result:
+    status |> WHEN {
+        Ready => settings
+        __ => MAP {}
+    }
+"#,
+        )
+        .unwrap();
+
+        let populated_map = parsed
+            .expressions
+            .iter()
+            .find_map(|expression| match &expression.kind {
+                AstExprKind::MapLiteral { entries } if entries.len() == 2 => Some(entries),
+                _ => None,
+            })
+            .expect("populated MAP literal");
+        assert!(populated_map.iter().all(|entry| {
+            matches!(
+                parsed.expressions[*entry].kind,
+                AstExprKind::MapEntry { .. }
+            )
+        }));
+        assert!(parsed.expressions.iter().any(|expression| {
+            matches!(
+                &expression.kind,
+                AstExprKind::MapEntry { key, .. }
+                    if matches!(
+                        &parsed.expressions[*key].kind,
+                        AstExprKind::Path(parts) if parts == &["selected", "id"]
+                    )
+            )
+        }));
+
+        let set_items = parsed
+            .expressions
+            .iter()
+            .find_map(|expression| match &expression.kind {
+                AstExprKind::SetLiteral { items } if items.len() == 2 => Some(items),
+                _ => None,
+            })
+            .expect("SET literal");
+        assert_eq!(set_items.len(), 2);
+        assert!(
+            parsed
+                .expressions
+                .iter()
+                .any(|expression| matches!(expression.kind, AstExprKind::MatchArm { .. }))
+        );
+        assert!(
+            !parsed
+                .expressions
+                .iter()
+                .any(|expression| matches!(expression.kind, AstExprKind::Arrow { .. }))
+        );
     }
 
     #[test]

@@ -3235,9 +3235,12 @@ fn semantic_expression_children(
             .chain(output.iter().copied())
             .collect(),
         SemanticExpressionKind::Infix { left, right, .. } => vec![*left, *right],
+        SemanticExpressionKind::MapEntry { key, value } => vec![*key, *value],
         SemanticExpressionKind::MatchArm { output, .. } => output.iter().copied().collect(),
         SemanticExpressionKind::List { items, .. }
-        | SemanticExpressionKind::Bytes { items, .. } => items.clone(),
+        | SemanticExpressionKind::Bytes { items, .. }
+        | SemanticExpressionKind::Map { entries: items }
+        | SemanticExpressionKind::Set { items } => items.clone(),
     })
 }
 

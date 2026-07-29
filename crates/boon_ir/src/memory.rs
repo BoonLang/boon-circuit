@@ -77,6 +77,13 @@ pub enum SemanticDataType {
     List {
         item: Box<SemanticDataType>,
     },
+    Map {
+        key: Box<SemanticDataType>,
+        value: Box<SemanticDataType>,
+    },
+    Set {
+        item: Box<SemanticDataType>,
+    },
     Unknown {
         reason: String,
     },

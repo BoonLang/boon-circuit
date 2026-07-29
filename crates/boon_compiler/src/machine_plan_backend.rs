@@ -1491,9 +1491,11 @@ fn plan_value_type_from_semantic_data_type(data_type: &DataTypePlan) -> PlanValu
             fixed_len: *fixed_len,
         },
         DataTypePlan::Variant { .. } => PlanValueType::Tag,
-        DataTypePlan::Record { .. } | DataTypePlan::List { .. } | DataTypePlan::Union { .. } => {
-            PlanValueType::Data
-        }
+        DataTypePlan::Record { .. }
+        | DataTypePlan::List { .. }
+        | DataTypePlan::Map { .. }
+        | DataTypePlan::Set { .. }
+        | DataTypePlan::Union { .. } => PlanValueType::Data,
         DataTypePlan::Unknown => PlanValueType::Unknown,
     }
 }
@@ -1523,7 +1525,10 @@ fn deterministic_fresh_constant(data_type: &DataTypePlan) -> Option<PlanConstant
             })
         }
         DataTypePlan::Union { members } => members.first().and_then(deterministic_fresh_constant),
-        DataTypePlan::Record { .. } | DataTypePlan::List { .. } => None,
+        DataTypePlan::Record { .. }
+        | DataTypePlan::List { .. }
+        | DataTypePlan::Map { .. }
+        | DataTypePlan::Set { .. } => None,
         DataTypePlan::Bytes { fixed_len: Some(_) } | DataTypePlan::Unknown => None,
     }
 }
@@ -1977,6 +1982,13 @@ fn semantic_data_type_plan(value: &ir::SemanticDataType) -> DataTypePlan {
         }
         .canonicalized(),
         ir::SemanticDataType::List { item } => DataTypePlan::List {
+            item: Box::new(semantic_data_type_plan(item)),
+        },
+        ir::SemanticDataType::Map { key, value } => DataTypePlan::Map {
+            key: Box::new(semantic_data_type_plan(key)),
+            value: Box::new(semantic_data_type_plan(value)),
+        },
+        ir::SemanticDataType::Set { item } => DataTypePlan::Set {
             item: Box::new(semantic_data_type_plan(item)),
         },
         ir::SemanticDataType::Union { members } => DataTypePlan::Union {
@@ -2446,6 +2458,13 @@ fn data_type_plan_from_typecheck_type(ty: &boon_typecheck::Type) -> Option<DataT
                 open: shape.open,
             },
             Type::List(item) => DataTypePlan::List {
+                item: Box::new(data_type_plan_from_typecheck_type(item)?),
+            },
+            Type::Map { key, value } => DataTypePlan::Map {
+                key: Box::new(data_type_plan_from_typecheck_type(key)?),
+                value: Box::new(data_type_plan_from_typecheck_type(value)?),
+            },
+            Type::Set(item) => DataTypePlan::Set {
                 item: Box::new(data_type_plan_from_typecheck_type(item)?),
             },
             Type::Union(members) => DataTypePlan::Union {
@@ -2925,6 +2944,11 @@ impl ExecutableMigrationExpressionLowerer<'_> {
                         .collect::<Result<Vec<_>, _>>()?,
                 })
             }
+            ir::ExecutableExpressionKind::MapEntry { .. }
+            | ir::ExecutableExpressionKind::Map { .. }
+            | ir::ExecutableExpressionKind::Set { .. } => Err(PlanError::new(format!(
+                "MAP/SET expression {expr_id} reached migration lowering before canonical collection migration support"
+            ))),
             ir::ExecutableExpressionKind::Bytes { items, .. } => {
                 Ok(MigrationExpressionPlan::Bytes {
                     items: items
@@ -6502,6 +6526,9 @@ fn inferred_executable_expression_value_type_inner(
         | ir::ExecutableExpressionKind::MatchArm { .. }
         | ir::ExecutableExpressionKind::Object(_)
         | ir::ExecutableExpressionKind::List { .. }
+        | ir::ExecutableExpressionKind::MapEntry { .. }
+        | ir::ExecutableExpressionKind::Map { .. }
+        | ir::ExecutableExpressionKind::Set { .. }
         | ir::ExecutableExpressionKind::Bytes {
             fixed_size: None, ..
         }
@@ -8389,6 +8416,8 @@ fn plan_typed_list_index_key(
                 DataTypePlan::Bytes { .. }
                 | DataTypePlan::Record { .. }
                 | DataTypePlan::List { .. }
+                | DataTypePlan::Map { .. }
+                | DataTypePlan::Set { .. }
                 | DataTypePlan::Union { .. }
                 | DataTypePlan::Unknown => return Ok(None),
             }
@@ -10828,6 +10857,14 @@ impl<'a> ExecutableRowLowerer<'a> {
                     .map(|item| self.lower_scoped(item, owner))
                     .collect::<Result<Vec<_>, _>>()?;
                 self.intern(PlanRowExpressionNode::ListLiteral { items })?
+            }
+            ir::ExecutableExpressionKind::MapEntry { .. }
+            | ir::ExecutableExpressionKind::Map { .. }
+            | ir::ExecutableExpressionKind::Set { .. } => {
+                return Err(PlanError::new(format!(
+                    "MAP/SET executable expression {} reached row lowering before collection authority lowering",
+                    root.0
+                )));
             }
             ir::ExecutableExpressionKind::Bytes { .. } => {
                 self.bytes_constant(executable_static_bytes(self.program, root).ok_or_else(

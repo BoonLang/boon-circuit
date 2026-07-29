@@ -1825,12 +1825,18 @@ fn semantic_expression_depends_on_role(
                 pending.push(*left);
                 pending.push(*right);
             }
+            SemanticExpressionKind::MapEntry { key, value } => {
+                pending.push(*key);
+                pending.push(*value);
+            }
             SemanticExpressionKind::MatchArm {
                 output: Some(output),
                 ..
             } => pending.push(*output),
             SemanticExpressionKind::List { items, .. }
-            | SemanticExpressionKind::Bytes { items, .. } => {
+            | SemanticExpressionKind::Bytes { items, .. }
+            | SemanticExpressionKind::Map { entries: items }
+            | SemanticExpressionKind::Set { items } => {
                 pending.extend(items.iter().copied());
             }
             SemanticExpressionKind::ExternalRead { .. }
@@ -3808,6 +3814,11 @@ fn out_contract_type_contains_empty_list_placeholder(ty: &boon_typecheck::Type) 
     match ty {
         boon_typecheck::Type::UnresolvedShape { reason } => reason == "empty list item",
         boon_typecheck::Type::List(item) => out_contract_type_contains_empty_list_placeholder(item),
+        boon_typecheck::Type::Map { key, value } => {
+            out_contract_type_contains_empty_list_placeholder(key)
+                || out_contract_type_contains_empty_list_placeholder(value)
+        }
+        boon_typecheck::Type::Set(item) => out_contract_type_contains_empty_list_placeholder(item),
         boon_typecheck::Type::Function { args, result } => {
             args.iter()
                 .any(out_contract_type_contains_empty_list_placeholder)
@@ -4330,6 +4341,10 @@ fn out_contract_type_is_resolved(ty: &boon_typecheck::Type) -> bool {
         | boon_typecheck::Type::Unknown
         | boon_typecheck::Type::UnresolvedShape { .. } => false,
         boon_typecheck::Type::List(item) => out_contract_type_is_resolved(item),
+        boon_typecheck::Type::Map { key, value } => {
+            out_contract_type_is_resolved(key) && out_contract_type_is_resolved(value)
+        }
+        boon_typecheck::Type::Set(item) => out_contract_type_is_resolved(item),
         boon_typecheck::Type::Union(members) => {
             !members.is_empty() && members.iter().all(out_contract_type_is_resolved)
         }
@@ -4597,13 +4612,17 @@ fn checked_expression_children_for_call_analysis(
             children
         }
         Kind::Infix { left, right, .. } => vec![*left, *right],
+        Kind::MapEntry { key, value } => vec![*key, *value],
         Kind::MatchArm { output, .. } => output.iter().copied().collect(),
         Kind::Block { bindings, result } => bindings
             .iter()
             .map(|binding| binding.value)
             .chain(result.iter().copied())
             .collect(),
-        Kind::List { items, .. } | Kind::Bytes { items, .. } => items.clone(),
+        Kind::List { items, .. }
+        | Kind::Bytes { items, .. }
+        | Kind::Map { entries: items }
+        | Kind::Set { items } => items.clone(),
         Kind::Read { .. }
         | Kind::Passed { .. }
         | Kind::ExternalRead { .. }
@@ -4632,6 +4651,10 @@ fn runtime_type_contains_var(ty: &boon_typecheck::Type) -> bool {
     match ty {
         boon_typecheck::Type::Var(_) => true,
         boon_typecheck::Type::List(item) => runtime_type_contains_var(item),
+        boon_typecheck::Type::Map { key, value } => {
+            runtime_type_contains_var(key) || runtime_type_contains_var(value)
+        }
+        boon_typecheck::Type::Set(item) => runtime_type_contains_var(item),
         boon_typecheck::Type::Union(members) => members.iter().any(runtime_type_contains_var),
         boon_typecheck::Type::Function { args, result } => {
             args.iter().any(runtime_type_contains_var) || runtime_type_contains_var(&result.ty)

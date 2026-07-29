@@ -966,6 +966,11 @@ pub(crate) fn erase_runtime_type_vars(ty: &Type) -> Type {
     match ty {
         Type::Var(_) => Type::Unknown,
         Type::List(item) => Type::List(Box::new(erase_runtime_type_vars(item))),
+        Type::Map { key, value } => Type::Map {
+            key: Box::new(erase_runtime_type_vars(key)),
+            value: Box::new(erase_runtime_type_vars(value)),
+        },
+        Type::Set(item) => Type::Set(Box::new(erase_runtime_type_vars(item))),
         Type::Function { args, result } => Type::Function {
             args: args.iter().map(erase_runtime_type_vars).collect(),
             result: Box::new(boon_typecheck::FlowType {
@@ -1100,6 +1105,42 @@ fn concrete_structural_type(
                         .is_some_and(|expression| expression.flow_type.ty == first)
                 })
                 .then(|| Type::List(Box::new(first)))
+        }
+        SemanticExpressionKind::Map { entries } if !entries.is_empty() => {
+            let first = expressions.get(entries[0].as_usize())?;
+            let Type::Object(first_shape) = &first.flow_type.ty else {
+                return None;
+            };
+            let key = first_shape.fields.get("key")?.clone();
+            let value = first_shape.fields.get("value")?.clone();
+            entries
+                .iter()
+                .skip(1)
+                .all(|entry| {
+                    expressions.get(entry.as_usize()).is_some_and(|expression| {
+                        let Type::Object(shape) = &expression.flow_type.ty else {
+                            return false;
+                        };
+                        shape.fields.get("key") == Some(&key)
+                            && shape.fields.get("value") == Some(&value)
+                    })
+                })
+                .then(|| Type::Map {
+                    key: Box::new(key),
+                    value: Box::new(value),
+                })
+        }
+        SemanticExpressionKind::Set { items } if !items.is_empty() => {
+            let first = expressions.get(items[0].as_usize())?.flow_type.ty.clone();
+            items
+                .iter()
+                .skip(1)
+                .all(|item| {
+                    expressions
+                        .get(item.as_usize())
+                        .is_some_and(|expression| expression.flow_type.ty == first)
+                })
+                .then(|| Type::Set(Box::new(first)))
         }
         SemanticExpressionKind::Block { result, .. } => expressions
             .get(result.as_usize())
@@ -2617,6 +2658,7 @@ fn arena_expression_children(kind: &SemanticExpressionKind) -> Vec<SemanticExprI
             std::iter::once(*input).chain(*output).collect()
         }
         SemanticExpressionKind::Infix { left, right, .. } => vec![*left, *right],
+        SemanticExpressionKind::MapEntry { key, value } => vec![*key, *value],
         SemanticExpressionKind::MatchArm { output, .. } => output.iter().copied().collect(),
         SemanticExpressionKind::Block { bindings, result } => bindings
             .iter()
@@ -2624,7 +2666,9 @@ fn arena_expression_children(kind: &SemanticExpressionKind) -> Vec<SemanticExprI
             .chain(std::iter::once(*result))
             .collect(),
         SemanticExpressionKind::List { items, .. }
-        | SemanticExpressionKind::Bytes { items, .. } => items.clone(),
+        | SemanticExpressionKind::Bytes { items, .. }
+        | SemanticExpressionKind::Map { entries: items }
+        | SemanticExpressionKind::Set { items } => items.clone(),
     }
 }
 
@@ -3387,13 +3431,19 @@ fn rebase_expression_kind(
             rebase(left);
             rebase(right);
         }
+        SemanticExpressionKind::MapEntry { key, value } => {
+            rebase(key);
+            rebase(value);
+        }
         SemanticExpressionKind::MatchArm { output, .. } => {
             if let Some(output) = output {
                 rebase(output);
             }
         }
         SemanticExpressionKind::List { items, .. }
-        | SemanticExpressionKind::Bytes { items, .. } => {
+        | SemanticExpressionKind::Bytes { items, .. }
+        | SemanticExpressionKind::Map { entries: items }
+        | SemanticExpressionKind::Set { items } => {
             for item in items {
                 rebase(item);
             }
@@ -4272,6 +4322,9 @@ impl<'a> SemanticExpressionBuilder<'a> {
             | SemanticExpressionKind::Infix { .. }
             | SemanticExpressionKind::MatchArm { output: None, .. }
             | SemanticExpressionKind::List { .. }
+            | SemanticExpressionKind::MapEntry { .. }
+            | SemanticExpressionKind::Map { .. }
+            | SemanticExpressionKind::Set { .. }
             | SemanticExpressionKind::Bytes { .. }
             | SemanticExpressionKind::Delimiter
             | SemanticExpressionKind::FunctionParameter { .. } => runtime_value_provenance(),
@@ -4928,6 +4981,26 @@ impl<'a> SemanticExpressionBuilder<'a> {
             ),
             CheckedExpressionKind::List { capacity, items } => SemanticExpressionKind::List {
                 capacity,
+                items: self.expand_many(scoped.frame, scoped.value_frame, items)?,
+            },
+            CheckedExpressionKind::MapEntry { key, value } => SemanticExpressionKind::MapEntry {
+                key: self.expand(ScopedCheckedExpr {
+                    expression: key,
+                    frame: scoped.frame,
+                    evaluation_port: None,
+                    value_frame: scoped.value_frame,
+                })?,
+                value: self.expand(ScopedCheckedExpr {
+                    expression: value,
+                    frame: scoped.frame,
+                    evaluation_port: None,
+                    value_frame: scoped.value_frame,
+                })?,
+            },
+            CheckedExpressionKind::Map { entries } => SemanticExpressionKind::Map {
+                entries: self.expand_many(scoped.frame, scoped.value_frame, entries)?,
+            },
+            CheckedExpressionKind::Set { items } => SemanticExpressionKind::Set {
                 items: self.expand_many(scoped.frame, scoped.value_frame, items)?,
             },
             CheckedExpressionKind::Bytes { fixed_size, items } => SemanticExpressionKind::Bytes {

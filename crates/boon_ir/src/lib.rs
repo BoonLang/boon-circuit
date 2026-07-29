@@ -1145,6 +1145,16 @@ pub enum ExecutableExpressionKind {
         parameter: ExecutableParameterId,
         projection: Vec<String>,
     },
+    MapEntry {
+        key: ExecutableExprId,
+        value: ExecutableExprId,
+    },
+    Map {
+        entries: Vec<ExecutableExprId>,
+    },
+    Set {
+        items: Vec<ExecutableExprId>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -3372,6 +3382,10 @@ fn distributed_type_is_closed(data_type: &boon_typecheck::Type) -> bool {
             !shape.open && shape.fields.values().all(distributed_type_is_closed)
         }
         boon_typecheck::Type::List(item) => distributed_type_is_closed(item),
+        boon_typecheck::Type::Map { key, value } => {
+            distributed_type_is_closed(key) && distributed_type_is_closed(value)
+        }
+        boon_typecheck::Type::Set(item) => distributed_type_is_closed(item),
         boon_typecheck::Type::Union(members) => {
             !members.is_empty() && members.iter().all(distributed_type_is_closed)
         }
@@ -4233,6 +4247,10 @@ fn runtime_type_contains_var(ty: &boon_typecheck::Type) -> bool {
     match ty {
         boon_typecheck::Type::Var(_) => true,
         boon_typecheck::Type::List(item) => runtime_type_contains_var(item),
+        boon_typecheck::Type::Map { key, value } => {
+            runtime_type_contains_var(key) || runtime_type_contains_var(value)
+        }
+        boon_typecheck::Type::Set(item) => runtime_type_contains_var(item),
         boon_typecheck::Type::Union(members) => members.iter().any(runtime_type_contains_var),
         boon_typecheck::Type::Function { args, result } => {
             args.iter().any(runtime_type_contains_var) || runtime_type_contains_var(&result.ty)
@@ -4339,9 +4357,12 @@ pub fn executable_expression_children(kind: &ExecutableExpressionKind) -> Vec<Ex
             .chain(output.iter().copied())
             .collect(),
         ExecutableExpressionKind::Infix { left, right, .. } => vec![*left, *right],
+        ExecutableExpressionKind::MapEntry { key, value } => vec![*key, *value],
         ExecutableExpressionKind::MatchArm { output, .. } => output.iter().copied().collect(),
         ExecutableExpressionKind::List { items, .. }
-        | ExecutableExpressionKind::Bytes { items, .. } => items.clone(),
+        | ExecutableExpressionKind::Bytes { items, .. }
+        | ExecutableExpressionKind::Map { entries: items }
+        | ExecutableExpressionKind::Set { items } => items.clone(),
     }
 }
 
@@ -4732,6 +4753,9 @@ fn executable_list_item_field_names(
             | ExecutableExpressionKind::Source { .. }
             | ExecutableExpressionKind::Call { .. }
             | ExecutableExpressionKind::Infix { .. }
+            | ExecutableExpressionKind::MapEntry { .. }
+            | ExecutableExpressionKind::Map { .. }
+            | ExecutableExpressionKind::Set { .. }
             | ExecutableExpressionKind::Bytes { .. }
             | ExecutableExpressionKind::Delimiter
             | ExecutableExpressionKind::MaterializationLocal { .. }

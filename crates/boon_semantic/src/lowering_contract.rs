@@ -1770,7 +1770,8 @@ fn resolved_visual_type(ty: &Type) -> bool {
         Type::Unknown | Type::UnresolvedShape { .. } | Type::Var(_) | Type::Function { .. } => {
             false
         }
-        Type::List(item) => resolved_visual_type(item),
+        Type::List(item) | Type::Set(item) => resolved_visual_type(item),
+        Type::Map { key, value } => resolved_visual_type(key) && resolved_visual_type(value),
         Type::Union(members) => !members.is_empty() && members.iter().all(resolved_visual_type),
         Type::Text
         | Type::Number
@@ -1851,6 +1852,7 @@ fn semantic_expression_children(kind: &SemanticExpressionKind) -> Vec<SemanticEx
             .chain(output.iter().copied())
             .collect(),
         SemanticExpressionKind::Infix { left, right, .. } => vec![*left, *right],
+        SemanticExpressionKind::MapEntry { key, value } => vec![*key, *value],
         SemanticExpressionKind::MatchArm { output, .. } => output.iter().copied().collect(),
         SemanticExpressionKind::Block { bindings, result } => bindings
             .iter()
@@ -1858,7 +1860,9 @@ fn semantic_expression_children(kind: &SemanticExpressionKind) -> Vec<SemanticEx
             .chain(std::iter::once(*result))
             .collect(),
         SemanticExpressionKind::List { items, .. }
-        | SemanticExpressionKind::Bytes { items, .. } => items.clone(),
+        | SemanticExpressionKind::Bytes { items, .. }
+        | SemanticExpressionKind::Map { entries: items }
+        | SemanticExpressionKind::Set { items } => items.clone(),
     }
 }
 
@@ -1872,7 +1876,10 @@ fn type_is_closed_host_data(data_type: &Type) -> bool {
             }
         }),
         Type::Object(shape) => !shape.open && shape.fields.values().all(type_is_closed_host_data),
-        Type::List(item) => type_is_closed_host_data(item),
+        Type::List(item) | Type::Set(item) => type_is_closed_host_data(item),
+        Type::Map { key, value } => {
+            type_is_closed_host_data(key) && type_is_closed_host_data(value)
+        }
         Type::Union(members) => !members.is_empty() && members.iter().all(type_is_closed_host_data),
         Type::Absent
         | Type::Function { .. }

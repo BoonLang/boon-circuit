@@ -946,6 +946,11 @@ impl<'a> DocumentCompiler<'a> {
                 let class = list_value_class(&items, &self.expressions);
                 Ok(self.push_expr(compiler_id, class, DocumentExprOp::List { items }))
             }
+            ir::ExecutableExpressionKind::MapEntry { .. }
+            | ir::ExecutableExpressionKind::Map { .. }
+            | ir::ExecutableExpressionKind::Set { .. } => Err(PlanError::new(format!(
+                "MAP/SET expression {compiler_id} reached retained-document lowering before collection authority lowering"
+            ))),
             ir::ExecutableExpressionKind::Bytes { items, .. } => {
                 let bytes = items
                     .iter()
@@ -2669,7 +2674,9 @@ fn value_class_for_type(ty: &Type) -> DocumentValueClass {
         Type::List(item) if matches!(item.as_ref(), Type::RenderContract) => {
             DocumentValueClass::ChildList
         }
-        Type::List(_) | Type::Object(_) => DocumentValueClass::DynamicStructure,
+        Type::List(_) | Type::Map { .. } | Type::Set(_) | Type::Object(_) => {
+            DocumentValueClass::DynamicStructure
+        }
         Type::Union(members) => {
             if members.iter().all(|member| {
                 matches!(

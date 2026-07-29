@@ -1192,6 +1192,9 @@ fn expression_record_field_names(
             | SemanticExpressionKind::Call { .. }
             | SemanticExpressionKind::Materialize { .. }
             | SemanticExpressionKind::Infix { .. }
+            | SemanticExpressionKind::MapEntry { .. }
+            | SemanticExpressionKind::Map { .. }
+            | SemanticExpressionKind::Set { .. }
             | SemanticExpressionKind::Bytes { .. }
             | SemanticExpressionKind::Delimiter
             | SemanticExpressionKind::MaterializationLocal { .. }
@@ -2714,6 +2717,9 @@ fn collect_lineage_leaves(
                 | SemanticExpressionKind::Tag(_)
                 | SemanticExpressionKind::Infix { .. }
                 | SemanticExpressionKind::List { .. }
+                | SemanticExpressionKind::MapEntry { .. }
+                | SemanticExpressionKind::Map { .. }
+                | SemanticExpressionKind::Set { .. }
                 | SemanticExpressionKind::Bytes { .. }
                 | SemanticExpressionKind::Delimiter => {
                     return Err(format!(
@@ -2836,6 +2842,9 @@ fn collect_lineage_leaves(
             | SemanticExpressionKind::Call { .. }
             | SemanticExpressionKind::Infix { .. }
             | SemanticExpressionKind::Object(_)
+            | SemanticExpressionKind::MapEntry { .. }
+            | SemanticExpressionKind::Map { .. }
+            | SemanticExpressionKind::Set { .. }
             | SemanticExpressionKind::Bytes { .. }
             | SemanticExpressionKind::Delimiter => {
                 return Err(format!(
@@ -4546,6 +4555,7 @@ fn semantic_expression_children(kind: &SemanticExpressionKind) -> Vec<SemanticEx
             std::iter::once(*input).chain(*output).collect()
         }
         SemanticExpressionKind::Infix { left, right, .. } => vec![*left, *right],
+        SemanticExpressionKind::MapEntry { key, value } => vec![*key, *value],
         SemanticExpressionKind::MatchArm { output, .. } => output.iter().copied().collect(),
         SemanticExpressionKind::Block { bindings, result } => bindings
             .iter()
@@ -4553,7 +4563,9 @@ fn semantic_expression_children(kind: &SemanticExpressionKind) -> Vec<SemanticEx
             .chain(std::iter::once(*result))
             .collect(),
         SemanticExpressionKind::List { items, .. }
-        | SemanticExpressionKind::Bytes { items, .. } => items.clone(),
+        | SemanticExpressionKind::Bytes { items, .. }
+        | SemanticExpressionKind::Map { entries: items }
+        | SemanticExpressionKind::Set { items } => items.clone(),
     }
 }
 

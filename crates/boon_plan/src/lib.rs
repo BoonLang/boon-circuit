@@ -322,6 +322,13 @@ pub enum DataTypePlan {
     Union {
         members: Vec<DataTypePlan>,
     },
+    Map {
+        key: Box<DataTypePlan>,
+        value: Box<DataTypePlan>,
+    },
+    Set {
+        item: Box<DataTypePlan>,
+    },
 }
 
 impl DataTypePlan {
@@ -341,6 +348,13 @@ impl DataTypePlan {
                 open: *open,
             },
             Self::List { item } => Self::List {
+                item: Box::new(item.canonicalized()),
+            },
+            Self::Map { key, value } => Self::Map {
+                key: Box::new(key.canonicalized()),
+                value: Box::new(value.canonicalized()),
+            },
+            Self::Set { item } => Self::Set {
                 item: Box::new(item.canonicalized()),
             },
             Self::Union { members } => {
@@ -1359,6 +1373,10 @@ fn distributed_data_type_is_supported(data_type: &DataTypePlan) -> bool {
         }),
         DataTypePlan::Record { fields, open } => !open && fields_supported(fields),
         DataTypePlan::List { item } => distributed_data_type_is_supported(item),
+        DataTypePlan::Map { key, value } => {
+            distributed_data_type_is_supported(key) && distributed_data_type_is_supported(value)
+        }
+        DataTypePlan::Set { item } => distributed_data_type_is_supported(item),
         DataTypePlan::Union { members } => {
             !members.is_empty() && members.iter().all(distributed_data_type_is_supported)
         }
@@ -3322,6 +3340,10 @@ fn data_type_contains_unknown(data_type: &DataTypePlan) -> bool {
             .iter()
             .any(|field| data_type_contains_unknown(&field.data_type)),
         DataTypePlan::List { item } => data_type_contains_unknown(item),
+        DataTypePlan::Map { key, value } => {
+            data_type_contains_unknown(key) || data_type_contains_unknown(value)
+        }
+        DataTypePlan::Set { item } => data_type_contains_unknown(item),
         DataTypePlan::Union { members } => members.iter().any(data_type_contains_unknown),
         DataTypePlan::Number | DataTypePlan::Text | DataTypePlan::Bytes { .. } => false,
     }
@@ -11665,6 +11687,8 @@ fn data_type_is_closed(data_type: &DataTypePlan) -> bool {
                     .all(|field| data_type_is_closed(&field.data_type))
         }),
         DataTypePlan::List { item } => data_type_is_closed(item),
+        DataTypePlan::Map { key, value } => data_type_is_closed(key) && data_type_is_closed(value),
+        DataTypePlan::Set { item } => data_type_is_closed(item),
         DataTypePlan::Union { members } => {
             !members.is_empty() && members.iter().all(data_type_is_closed)
         }

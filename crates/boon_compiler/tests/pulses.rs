@@ -30,6 +30,26 @@ fn bounded_pulse_stream_contracts_are_public_to_compiler_consumers() {
         assert_eq!(call.intrinsic, Some(intrinsic));
         assert_eq!(call.result.mode, boon_typecheck::FlowMode::PresentOrAbsent);
     }
+    let semantic = boon_semantic::elaborate(checked, &[]).expect("semantic pulse stream");
+    let verified = boon_verify::verify_explicit_contracts(semantic).expect("verified pulse stream");
+    let ir = boon_ir::erase_and_lower(verified).expect("erased pulse stream");
+    assert!(ir.activations().is_empty());
+    let [batch] = ir.pulse_batches() else {
+        panic!("one typed Stream/pulses call must lower to one baseline pulse batch");
+    };
+    assert_eq!(batch.id, boon_ir::PulseBatchId(0));
+    assert_eq!(batch.state, None);
+    assert_eq!(batch.hold_expression, None);
+    assert_eq!(batch.enclosing_activation, None);
+    assert!(batch.state_update_arms.is_empty());
+    assert_ne!(batch.semantic_slice_digest, [0; 32]);
+    assert!(matches!(
+        ir.executable.expressions[batch.call_expression.as_usize()].kind,
+        boon_ir::ExecutableExpressionKind::Call {
+            intrinsic: Some(boon_typecheck::CheckedIntrinsicV1::StreamPulses),
+            ..
+        }
+    ));
 }
 
 #[test]
@@ -132,4 +152,73 @@ FUNCTION fibonacci(position) {
         }));
     }
     assert_eq!(ir.state_cells.len(), 1);
+    let boon_ir::StateCellLifetimeV1::ActivationLocal { then_expression } =
+        ir.state_cells[0].lifetime
+    else {
+        panic!("Fibonacci HOLD must be scoped to its enclosing THEN activation");
+    };
+    assert!(matches!(
+        ir.executable.expressions[then_expression.as_usize()].kind,
+        boon_ir::ExecutableExpressionKind::Then { .. }
+    ));
+    assert_ne!(then_expression, hold_updates[0]);
+
+    let [activation] = ir.activations() else {
+        panic!("activation-local Fibonacci HOLD must own one activation site");
+    };
+    assert_eq!(activation.id, boon_ir::ActivationId(0));
+    assert_eq!(activation.then_expression, then_expression);
+    assert_eq!(activation.states, vec![ir.state_cells[0].id]);
+
+    let [batch] = ir.pulse_batches() else {
+        panic!("canonical Fibonacci must own one baseline pulse batch");
+    };
+    assert_eq!(batch.id, boon_ir::PulseBatchId(0));
+    assert_eq!(batch.enclosing_activation, Some(activation.id));
+    assert_eq!(batch.state, Some(ir.state_cells[0].id));
+    assert_eq!(
+        batch.hold_expression,
+        Some(
+            ir.executable
+                .expressions
+                .iter()
+                .find(|expression| {
+                    matches!(
+                        expression.kind,
+                        boon_ir::ExecutableExpressionKind::Hold { .. }
+                    )
+                })
+                .expect("canonical HOLD expression")
+                .id
+        )
+    );
+    assert_eq!(
+        batch.schedule,
+        boon_ir::PulseSchedule::StageArbitrateCommitPublishBeforeNext
+    );
+    assert_eq!(
+        batch.flush_policy,
+        boon_ir::PulseFlushPolicy::DiscardCurrentStopRemainingKeepPriorCommits
+    );
+    assert!(!batch.trigger_arms.is_empty());
+    assert!(
+        batch
+            .trigger_arms
+            .iter()
+            .all(|arm| arm.cause == boon_ir::EventCause::Pulse(batch.id))
+    );
+    assert_eq!(batch.state_update_arms.len(), 1);
+    assert_eq!(
+        batch.state_update_arms[0].cause,
+        boon_ir::EventCause::Pulse(batch.id)
+    );
+    assert_eq!(batch.state_update_arms[0].state, ir.state_cells[0].id);
+    assert!(ir.state_updates().contains(&batch.state_update_arms[0]));
+    assert!(
+        batch
+            .emission_routes
+            .iter()
+            .any(|route| matches!(route.filter, boon_ir::PulseEmissionFilter::Skip { .. }))
+    );
+    assert_ne!(batch.semantic_slice_digest, [0; 32]);
 }

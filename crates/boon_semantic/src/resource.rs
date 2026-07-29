@@ -280,6 +280,7 @@ pub struct SemanticStateResourceV1 {
     pub hold_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<StaticOwnerId>,
+    pub lifetime: crate::SemanticStateLifetimeV1,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub owner_ancestry: Vec<StaticOwnerId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3309,6 +3310,7 @@ fn build_state_resources(
             published: is_published,
             hold_name,
             owner: state.owner,
+            lifetime: state.lifetime,
             owner_ancestry: owner_ancestry(state.owner, &execution.static_owners)?,
             target_list,
             row_scope,

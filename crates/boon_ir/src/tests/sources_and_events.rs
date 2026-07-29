@@ -2057,7 +2057,13 @@ store: [
         unreachable!();
     };
     assert_eq!(
-        event_cause_path_owned(append.cause, &ir.sources, &ir.state_cells).as_deref(),
+        event_cause_path_owned(
+            append.cause,
+            &ir.sources,
+            &ir.state_cells,
+            &ir.pulse_batches,
+        )
+        .as_deref(),
         Ok("store.elements.create")
     );
     let authority_fields = ir
@@ -2129,7 +2135,13 @@ store: [
         panic!("expected one append mutation, got {append:#?}");
     };
     assert_eq!(
-        event_cause_path_owned(append.cause, &ir.sources, &ir.state_cells).as_deref(),
+        event_cause_path_owned(
+            append.cause,
+            &ir.sources,
+            &ir.state_cells,
+            &ir.pulse_batches,
+        )
+        .as_deref(),
         Ok("store.elements.input.events.key_down")
     );
 }
@@ -2574,7 +2586,13 @@ FUNCTION entry_view(entry) {
         unreachable!();
     };
     assert_eq!(
-        event_cause_path_owned(append.cause, &ir.sources, &ir.state_cells).as_deref(),
+        event_cause_path_owned(
+            append.cause,
+            &ir.sources,
+            &ir.state_cells,
+            &ir.pulse_batches,
+        )
+        .as_deref(),
         Ok("store.add")
     );
     let item = &ir.executable.expressions[item.as_usize()];
@@ -2639,7 +2657,13 @@ fn effect_result_append_keeps_state_trigger_and_exact_record_schema() {
         .find(|mutation| mutation.list_id == list.id)
         .expect("credentials append mutation");
     assert_eq!(
-        event_cause_path_owned(append.cause, &ir.sources, &ir.state_cells).as_deref(),
+        event_cause_path_owned(
+            append.cause,
+            &ir.sources,
+            &ir.state_cells,
+            &ir.pulse_batches,
+        )
+        .as_deref(),
         Ok("store.registration_result")
     );
     let ListMutationKind::Append { .. } = &append.kind else {
@@ -2749,7 +2773,7 @@ FUNCTION new_row(initial_completed) {
         .iter()
         .filter(|arm| arm.state == completed_state.id)
         .map(|arm| {
-            event_cause_path_owned(arm.cause, &ir.sources, &ir.state_cells)
+            event_cause_path_owned(arm.cause, &ir.sources, &ir.state_cells, &ir.pulse_batches)
                 .expect("mapped row cause path")
         })
         .collect::<BTreeSet<_>>();
@@ -2854,7 +2878,7 @@ fn todomvc_completed_state_has_only_its_declared_event_causes() {
         .iter()
         .filter(|arm| arm.state == completed.id)
         .map(|arm| {
-            event_cause_path_owned(arm.cause, &ir.sources, &ir.state_cells)
+            event_cause_path_owned(arm.cause, &ir.sources, &ir.state_cells, &ir.pulse_batches)
                 .expect("TodoMVC completed cause path")
         })
         .collect::<BTreeSet<_>>();
@@ -2897,7 +2921,7 @@ fn inline_literal_row_holds_bind_to_sibling_sources() {
             .iter()
             .filter(|arm| arm.state == state.id)
             .map(|arm| {
-                event_cause_path_owned(arm.cause, &ir.sources, &ir.state_cells)
+                event_cause_path_owned(arm.cause, &ir.sources, &ir.state_cells, &ir.pulse_batches)
                     .expect("state update cause path")
             })
             .collect::<BTreeSet<_>>();

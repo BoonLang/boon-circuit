@@ -2525,6 +2525,11 @@ fn link_lowered_roles(
                     boon_ir::EventCause::State(state) => {
                         ValueRef::State(boon_plan::StateId(state.0))
                     }
+                    boon_ir::EventCause::Pulse(pulse) => {
+                        return Err(PlanError::new(format!(
+                            "distributed invocation arm references pulse batch {pulse}, but distributed pulse execution is not implemented"
+                        )));
+                    }
                 };
                 Ok(DistributedInvocationArmPlan {
                     gate: machine_plan_backend::lower_distributed_invocation_gate(

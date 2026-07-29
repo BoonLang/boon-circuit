@@ -849,6 +849,9 @@ fn plan_event_cause_owner(
                 })?;
             plan_state_owner(program, state)
         }
+        ir::EventCause::Pulse(pulse_id) => Err(PlanError::new(format!(
+            "event cause references pulse batch {pulse_id}, but MachinePlan pulse execution is not implemented"
+        ))),
     }
 }
 
@@ -9929,6 +9932,7 @@ fn event_cause_path(program: &ErasedProgram, cause: ir::EventCause) -> Option<&s
             .get(state_id.as_usize())
             .filter(|state| state.id == state_id)
             .map(|state| state.path.as_str()),
+        ir::EventCause::Pulse(_) => None,
     }
 }
 
@@ -9942,6 +9946,11 @@ fn event_cause_value_ref(
     let value = match cause {
         ir::EventCause::Source(source_id) => ValueRef::Source(plan_source_id(source_id)),
         ir::EventCause::State(state_id) => ValueRef::State(plan_state_id(state_id)),
+        ir::EventCause::Pulse(pulse_id) => {
+            return Err(PlanError::new(format!(
+                "event cause references pulse batch {pulse_id}, but MachinePlan pulse execution is not implemented"
+            )));
+        }
     };
     Ok((value, path))
 }

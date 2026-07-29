@@ -2479,6 +2479,14 @@ fn validate_reactive_dependency_closure(
             SemanticEventCauseV1::State(state) => {
                 semantic_state_resource(resource_graph, state)?.scoped
             }
+            SemanticEventCauseV1::Pulse(pulse) => graph
+                .pulse_batches
+                .get(pulse.as_usize())
+                .filter(|candidate| candidate.id == pulse)
+                .and_then(|batch| batch.state)
+                .map(|state| semantic_state_resource(resource_graph, state))
+                .transpose()?
+                .is_some_and(|state| state.scoped),
         };
         expected_edges.insert((trigger.cause, arm.state, target.scoped || cause_scoped));
         expected_causes
@@ -3307,6 +3315,9 @@ fn map_semantic_event_cause(
     match cause {
         SemanticEventCauseV1::Source(source) => Ok(EventCause::Source(ids.runtime_source(source)?)),
         SemanticEventCauseV1::State(state) => Ok(EventCause::State(ids.runtime_state(state)?)),
+        SemanticEventCauseV1::Pulse(pulse) => {
+            Ok(EventCause::Pulse(crate::PulseBatchId(pulse.as_usize())))
+        }
     }
 }
 
@@ -3328,6 +3339,7 @@ fn semantic_event_cause_path(
             .filter(|candidate| candidate.id == state)
             .map(|state| state.path.clone())
             .ok_or_else(|| format!("semantic cause maps to missing state {state}")),
+        EventCause::Pulse(pulse) => Ok(format!("$pulse.p{}", pulse.as_usize())),
     }
 }
 
@@ -3733,6 +3745,7 @@ fn map_dependency_timing(
                 .map(|boundary| match map_semantic_event_cause(boundary, ids)? {
                     EventCause::Source(source) => Ok(ErasedTemporalBoundary::Source(source)),
                     EventCause::State(state) => Ok(ErasedTemporalBoundary::State(state)),
+                    EventCause::Pulse(pulse) => Ok(ErasedTemporalBoundary::Pulse(pulse)),
                 })
                 .collect::<Result<Vec<_>, String>>()?,
         },
@@ -7572,6 +7585,16 @@ fn map_state_resource(
         semantic_path: state.semantic_path.clone(),
         executable_state_id: Some(ids.state(state.id)?),
         static_owner: state.owner,
+        lifetime: match state.lifetime {
+            boon_semantic::SemanticStateLifetimeV1::Persistent => {
+                crate::StateCellLifetimeV1::Persistent
+            }
+            boon_semantic::SemanticStateLifetimeV1::ActivationLocal { then_expression } => {
+                crate::StateCellLifetimeV1::ActivationLocal {
+                    then_expression: ids.expression(then_expression)?,
+                }
+            }
+        },
         statement_id: ids.statement(state.statement)?.as_usize(),
         scope_id: state
             .row_scope
@@ -8835,6 +8858,365 @@ const fn map_result_kind(kind: SemanticMaterializationResultKind) -> Materializa
     }
 }
 
+fn map_activation_sites(
+    graph: &SemanticReactiveGraphV1,
+    ids: &SemanticToExecutableMap,
+) -> Result<Vec<crate::ActivationSite>, String> {
+    require_dense(
+        graph
+            .activations
+            .iter()
+            .map(|activation| activation.id.as_usize()),
+        "semantic activation",
+    )?;
+    graph
+        .activations
+        .iter()
+        .enumerate()
+        .map(|(index, activation)| {
+            let then_expression = ids.expression(activation.then_expression)?;
+            let input_expression = ids.expression(activation.input_expression)?;
+            let output_expression = ids.expression(activation.output_expression)?;
+            if ids.value(activation.input_value)? != input_expression
+                || ids.value(activation.output_value)? != output_expression
+            {
+                return Err(format!(
+                    "semantic activation {} value identities do not map to their producing expressions",
+                    activation.id
+                ));
+            }
+            ids.lexical_scope(activation.route_scope)?;
+            let states = activation
+                .states
+                .iter()
+                .map(|state| ids.runtime_state(*state))
+                .collect::<Result<Vec<_>, String>>()?;
+            Ok(crate::ActivationSite {
+                id: crate::ActivationId(index),
+                then_expression,
+                input_expression,
+                output_expression,
+                static_owner: activation.owner,
+                states,
+            })
+        })
+        .collect()
+}
+
+fn map_pulse_batches(
+    graph: &SemanticReactiveGraphV1,
+    ids: &SemanticToExecutableMap,
+    storage: &MappedSemanticStorage,
+) -> Result<Vec<crate::PulseBatch>, String> {
+    require_dense(
+        graph.pulse_batches.iter().map(|batch| batch.id.as_usize()),
+        "semantic pulse batch",
+    )?;
+    graph
+        .pulse_batches
+        .iter()
+        .enumerate()
+        .map(|(index, batch)| {
+            let id = crate::PulseBatchId(index);
+            let enclosing_activation = batch
+                .enclosing_activation
+                .map(|activation| {
+                    graph
+                        .activations
+                        .get(activation.as_usize())
+                        .filter(|candidate| candidate.id == activation)
+                        .map(|_| crate::ActivationId(activation.as_usize()))
+                        .ok_or_else(|| {
+                            format!(
+                                "semantic pulse batch {} references missing activation {}",
+                                batch.id, activation
+                            )
+                        })
+                })
+                .transpose()?;
+            let state = batch
+                .state
+                .map(|state| ids.runtime_state(state))
+                .transpose()?;
+            let hold_expression = match (batch.hold_expression, batch.hold_value) {
+                (None, None) => None,
+                (Some(expression), Some(value)) => {
+                    let expression = ids.expression(expression)?;
+                    if ids.value(value)? != expression {
+                        return Err(format!(
+                            "semantic pulse batch {} HOLD value does not map to its producing expression",
+                            batch.id
+                        ));
+                    }
+                    Some(expression)
+                }
+                _ => {
+                    return Err(format!(
+                        "semantic pulse batch {} has incomplete HOLD expression/value provenance",
+                        batch.id
+                    ));
+                }
+            };
+            let call_expression = ids.call_expression(batch.call, batch.call_expression)?;
+            if ids.value(batch.call_value)? != call_expression {
+                return Err(format!(
+                    "semantic pulse batch {} call value does not map to its producing expression",
+                    batch.id
+                ));
+            }
+            let count_expression = ids.expression(batch.count_expression)?;
+            if ids.value(batch.count_value)? != count_expression {
+                return Err(format!(
+                    "semantic pulse batch {} count value does not map to its producing expression",
+                    batch.id
+                ));
+            }
+            let transition_expression = batch
+                .transition_expression
+                .map(|expression| ids.expression(expression))
+                .transpose()?;
+            let transition_output = batch
+                .transition_output
+                .map(|expression| ids.expression(expression))
+                .transpose()?;
+            let trigger_arms = batch
+                .trigger_arms
+                .iter()
+                .map(|trigger_id| {
+                    let semantic = graph
+                        .trigger_arms
+                        .get(trigger_id.as_usize())
+                        .filter(|candidate| candidate.id == *trigger_id)
+                        .ok_or_else(|| {
+                            format!(
+                                "semantic pulse batch {} references missing trigger arm {}",
+                                batch.id, trigger_id
+                            )
+                        })?;
+                    let mapped = storage
+                        .trigger_arms
+                        .get(trigger_id.as_usize())
+                        .cloned()
+                        .ok_or_else(|| {
+                            format!(
+                                "semantic pulse batch {} references missing finalized trigger arm {}",
+                                batch.id, trigger_id
+                            )
+                        })?;
+                    if mapped.cause != map_semantic_event_cause(semantic.cause, ids)? {
+                        return Err(format!(
+                            "semantic pulse batch {} trigger arm {} changed cause during lowering",
+                            batch.id, trigger_id
+                        ));
+                    }
+                    Ok(mapped)
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            let state_update_arms = batch
+                .state_update_arms
+                .iter()
+                .map(|arm_id| {
+                    let semantic = graph
+                        .state_update_arms
+                        .get(arm_id.as_usize())
+                        .filter(|candidate| candidate.id == *arm_id)
+                        .ok_or_else(|| {
+                            format!(
+                                "semantic pulse batch {} references missing state update arm {}",
+                                batch.id, arm_id
+                            )
+                        })?;
+                    let mapped = storage
+                        .state_update_arms
+                        .get(arm_id.as_usize())
+                        .cloned()
+                        .ok_or_else(|| {
+                            format!(
+                                "semantic pulse batch {} references missing finalized state update arm {}",
+                                batch.id, arm_id
+                            )
+                        })?;
+                    if mapped.state != ids.runtime_state(semantic.state)?
+                        || mapped.cause != crate::EventCause::Pulse(id)
+                    {
+                        return Err(format!(
+                            "semantic pulse batch {} state update arm {} changed target or cause during lowering",
+                            batch.id, arm_id
+                        ));
+                    }
+                    Ok(mapped)
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            let list_mutations = batch
+                .list_mutations
+                .iter()
+                .map(|mutation_id| {
+                    let semantic = graph
+                        .list_mutations
+                        .get(mutation_id.as_usize())
+                        .filter(|candidate| candidate.id == *mutation_id)
+                        .ok_or_else(|| {
+                            format!(
+                                "semantic pulse batch {} references missing list mutation {}",
+                                batch.id, mutation_id
+                            )
+                        })?;
+                    let mapped = storage
+                        .list_mutations
+                        .get(mutation_id.as_usize())
+                        .cloned()
+                        .ok_or_else(|| {
+                            format!(
+                                "semantic pulse batch {} references missing finalized list mutation {}",
+                                batch.id, mutation_id
+                            )
+                        })?;
+                    if semantic.cause != boon_semantic::SemanticEventCauseV1::Pulse(batch.id)
+                        || mapped.cause != crate::EventCause::Pulse(id)
+                    {
+                        return Err(format!(
+                            "semantic pulse batch {} list mutation {} changed cause during lowering",
+                            batch.id, mutation_id
+                        ));
+                    }
+                    Ok(mapped)
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            let derived_value_indices = batch
+                .derived_values
+                .iter()
+                .map(|derived_id| {
+                    graph
+                        .derived_values
+                        .get(derived_id.as_usize())
+                        .filter(|candidate| candidate.id == *derived_id)
+                        .ok_or_else(|| {
+                            format!(
+                                "semantic pulse batch {} references missing derived value {}",
+                                batch.id, derived_id
+                            )
+                        })?;
+                    storage
+                        .derived_values
+                        .get(derived_id.as_usize())
+                        .filter(|derived| derived.causes.contains(&crate::EventCause::Pulse(id)))
+                        .map(|_| derived_id.as_usize())
+                        .ok_or_else(|| {
+                            format!(
+                                "semantic pulse batch {} references missing finalized derived value {} with its pulse cause",
+                                batch.id, derived_id
+                            )
+                        })
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            let host_effects = batch
+                .host_effect_schedules
+                .iter()
+                .map(|schedule_id| {
+                    graph
+                        .host_effect_schedules
+                        .get(schedule_id.as_usize())
+                        .filter(|candidate| candidate.id == *schedule_id)
+                        .ok_or_else(|| {
+                            format!(
+                                "semantic pulse batch {} references missing host-effect schedule {}",
+                                batch.id, schedule_id
+                            )
+                        })?;
+                    let schedule = storage
+                        .host_effect_schedules
+                        .get(schedule_id.as_usize())
+                        .filter(|candidate| candidate.id == schedule_id.as_usize())
+                        .ok_or_else(|| {
+                            format!(
+                                "semantic pulse batch {} references missing finalized host-effect schedule {}",
+                                batch.id, schedule_id
+                            )
+                        })?;
+                    Ok(crate::PulseHostEffect {
+                        expression: schedule.expression,
+                        operation: schedule.operation.clone(),
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            let flush_roots = batch
+                .flush_roots
+                .iter()
+                .map(|expression| ids.expression(*expression))
+                .collect::<Result<Vec<_>, String>>()?;
+            let emission_routes = batch
+                .emission_routes
+                .iter()
+                .map(|route| {
+                    let consumer = route
+                        .consumer
+                        .map(|expression| ids.expression(expression))
+                        .transpose()?;
+                    let filter = match &route.filter {
+                        boon_semantic::SemanticPulseEmissionFilterV1::Passthrough => {
+                            crate::PulseEmissionFilter::Passthrough
+                        }
+                        boon_semantic::SemanticPulseEmissionFilterV1::Skip {
+                            call,
+                            expression,
+                            count_expression,
+                            count_value,
+                        } => {
+                            let expression = ids.call_expression(*call, *expression)?;
+                            if consumer != Some(expression) {
+                                return Err(format!(
+                                    "semantic pulse batch {} skip filter does not own its consumer",
+                                    batch.id
+                                ));
+                            }
+                            let count_expression = ids.expression(*count_expression)?;
+                            if ids.value(*count_value)? != count_expression {
+                                return Err(format!(
+                                    "semantic pulse batch {} skip count does not map to its producing expression",
+                                    batch.id
+                                ));
+                            }
+                            crate::PulseEmissionFilter::Skip {
+                                expression,
+                                count_expression,
+                            }
+                        }
+                    };
+                    Ok(crate::PulseEmissionRoute { consumer, filter })
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            Ok(crate::PulseBatch {
+                id,
+                enclosing_activation,
+                state,
+                hold_expression,
+                call_expression,
+                count_expression,
+                transition_expression,
+                transition_output,
+                trigger_arms,
+                state_update_arms,
+                list_mutations,
+                derived_value_indices,
+                host_effects,
+                flush_roots,
+                emission_routes,
+                schedule: match batch.schedule {
+                    boon_semantic::SemanticPulseScheduleV1::StageArbitrateCommitPublishBeforeNext => {
+                        crate::PulseSchedule::StageArbitrateCommitPublishBeforeNext
+                    }
+                },
+                flush_policy: match batch.flush_policy {
+                    boon_semantic::SemanticPulseFlushPolicyV1::DiscardCurrentStopRemainingKeepPriorCommits => {
+                        crate::PulseFlushPolicy::DiscardCurrentStopRemainingKeepPriorCommits
+                    }
+                },
+                semantic_slice_digest: batch.slice_digest.0,
+            })
+        })
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn finish_verified_semantic_lowering(
     execution_graph: &SemanticExecutionGraphV1,
@@ -8914,6 +9296,8 @@ pub(super) fn finish_verified_semantic_lowering(
         &output_values,
         &view_bindings,
     )?;
+    let activations = map_activation_sites(reactive_graph, &mapped.id_map)?;
+    let pulse_batches = map_pulse_batches(reactive_graph, &mapped.id_map, &storage)?;
 
     let MappedSemanticExecution {
         executable,
@@ -8969,6 +9353,8 @@ pub(super) fn finish_verified_semantic_lowering(
         sources,
         host_ports,
         state_cells,
+        activations,
+        pulse_batches,
         lists,
         semantic_memory,
         migration_edges,

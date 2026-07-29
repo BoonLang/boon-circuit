@@ -6,19 +6,21 @@
 //! expression IDs retained below are audit provenance for exact gates only.
 
 use crate::{
-    ProducerFunctionId, ProducerMaterializationMode, ResolvedOutGraph, SemanticBindingId,
-    SemanticCallId, SemanticCaptureId, SemanticContextualOperationKind, SemanticDependencyUseId,
-    SemanticDerivedValueId, SemanticExecutionGraphV1, SemanticExprId, SemanticExpression,
-    SemanticExpressionKind, SemanticExternalDependencyId, SemanticFieldId,
+    ProducerFunctionId, ProducerMaterializationMode, ResolvedOutGraph, SemanticActivationId,
+    SemanticBindingId, SemanticCallId, SemanticCaptureId, SemanticContextualOperationKind,
+    SemanticDependencyUseId, SemanticDerivedValueId, SemanticExecutionGraphV1, SemanticExprId,
+    SemanticExpression, SemanticExpressionKind, SemanticExternalDependencyId, SemanticFieldId,
     SemanticHostEffectScheduleId, SemanticListId, SemanticListMutationId,
     SemanticListResourceOriginV1, SemanticLocalBindingId, SemanticMaterializationId,
-    SemanticMaterializationLocalId, SemanticParameterId, SemanticReadId, SemanticResourceGraphV1,
-    SemanticRootKindV1, SemanticRowBinding, SemanticRowScopeId, SemanticScopeId, SemanticSourceId,
-    SemanticStateId, SemanticStateUpdateArmId, SemanticStatementId, SemanticStatementKind,
-    SemanticTriggerArmId, SemanticValueId, SemanticValueOrigin, StaticOwnerId,
+    SemanticMaterializationLocalId, SemanticParameterId, SemanticPulseBatchId, SemanticReadId,
+    SemanticResourceGraphV1, SemanticRootKindV1, SemanticRowBinding, SemanticRowScopeId,
+    SemanticScopeId, SemanticSourceId, SemanticStateId, SemanticStateUpdateArmId,
+    SemanticStatementId, SemanticStatementKind, SemanticTriggerArmId, SemanticValueId,
+    SemanticValueOrigin, StaticOwnerId,
 };
 use boon_typecheck::{
-    CheckedExprId, CheckedExternalDeclarationIdentityV1, DeclId, FlowMode, FlowType, Type,
+    CheckedExprId, CheckedExternalDeclarationIdentityV1, CheckedIntrinsicV1, DeclId, FlowMode,
+    FlowType, Type,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -47,6 +49,10 @@ pub struct SemanticReactiveGraphV1 {
     pub dependency_uses: Vec<SemanticDependencyUseV1>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub call_invocations: Vec<SemanticCallInvocationScheduleV1>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub activations: Vec<SemanticActivationSiteV1>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pulse_batches: Vec<SemanticPulseBatchV1>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub derived_values: Vec<SemanticDerivedValueV1>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -246,6 +252,95 @@ pub enum SemanticDependencyTimingV1 {
 pub enum SemanticEventCauseV1 {
     Source(SemanticSourceId),
     State(SemanticStateId),
+    Pulse(SemanticPulseBatchId),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SemanticActivationSiteV1 {
+    pub id: SemanticActivationId,
+    pub then_expression: SemanticExprId,
+    pub input_expression: SemanticExprId,
+    pub input_value: SemanticValueId,
+    pub output_expression: SemanticExprId,
+    pub output_value: SemanticValueId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<StaticOwnerId>,
+    pub route_scope: SemanticScopeId,
+    pub states: Vec<SemanticStateId>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SemanticPulseBatchDigestV1(pub [u8; 32]);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticPulseScheduleV1 {
+    StageArbitrateCommitPublishBeforeNext,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticPulseFlushPolicyV1 {
+    DiscardCurrentStopRemainingKeepPriorCommits,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SemanticPulseBatchV1 {
+    pub id: SemanticPulseBatchId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enclosing_activation: Option<SemanticActivationId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<SemanticStateId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold_expression: Option<SemanticExprId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold_value: Option<SemanticValueId>,
+    pub call: SemanticCallId,
+    pub call_expression: SemanticExprId,
+    pub call_value: SemanticValueId,
+    pub count_expression: SemanticExprId,
+    pub count_value: SemanticValueId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transition_expression: Option<SemanticExprId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transition_output: Option<SemanticExprId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trigger_arms: Vec<SemanticTriggerArmId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub state_update_arms: Vec<SemanticStateUpdateArmId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub list_mutations: Vec<SemanticListMutationId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub derived_values: Vec<SemanticDerivedValueId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub host_effect_schedules: Vec<SemanticHostEffectScheduleId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub flush_roots: Vec<SemanticExprId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub emission_routes: Vec<SemanticPulseEmissionRouteV1>,
+    pub schedule: SemanticPulseScheduleV1,
+    pub flush_policy: SemanticPulseFlushPolicyV1,
+    pub slice_digest: SemanticPulseBatchDigestV1,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SemanticPulseEmissionRouteV1 {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consumer: Option<SemanticExprId>,
+    pub filter: SemanticPulseEmissionFilterV1,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SemanticPulseEmissionFilterV1 {
+    Passthrough,
+    Skip {
+        call: SemanticCallId,
+        expression: SemanticExprId,
+        count_expression: SemanticExprId,
+        count_value: SemanticValueId,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -537,6 +632,39 @@ struct RawCallInvocationSchedule {
     invocation_arms: Vec<RawTriggerArm>,
 }
 
+#[derive(Clone, Debug)]
+struct RawPulseBatch {
+    id: SemanticPulseBatchId,
+    enclosing_then: Option<SemanticExprId>,
+    state: Option<SemanticStateId>,
+    hold_expression: Option<SemanticExprId>,
+    hold_value: Option<SemanticValueId>,
+    call: SemanticCallId,
+    call_expression: SemanticExprId,
+    call_value: SemanticValueId,
+    count_expression: SemanticExprId,
+    count_value: SemanticValueId,
+    transition_expression: Option<SemanticExprId>,
+    transition_output: Option<SemanticExprId>,
+    flush_roots: Vec<SemanticExprId>,
+    emission_routes: Vec<SemanticPulseEmissionRouteV1>,
+}
+
+fn semantic_pulse_batch_digest_v1(
+    batch: &SemanticPulseBatchV1,
+) -> Result<SemanticPulseBatchDigestV1, SemanticReactiveError> {
+    let mut payload = batch.clone();
+    payload.slice_digest = SemanticPulseBatchDigestV1([0; 32]);
+    boon_contract::canonical_serde_hash_v1(b"boon.semantic-pulse-batch.v1\0", &payload)
+        .map(SemanticPulseBatchDigestV1)
+        .map_err(|error| {
+            SemanticReactiveError::new(format!(
+                "semantic pulse batch {} canonical digest failed: {error}",
+                batch.id
+            ))
+        })
+}
+
 fn reachable_reactive_expressions(
     execution: &SemanticExecutionGraphV1,
 ) -> Result<BTreeSet<SemanticExprId>, SemanticReactiveError> {
@@ -673,11 +801,370 @@ impl<'a> ReactiveBuilder<'a> {
         })
     }
 
+    fn build_raw_pulse_batches(&self) -> Result<Vec<RawPulseBatch>, SemanticReactiveError> {
+        let mut batches = Vec::new();
+        for expression in &self.execution.expressions {
+            let SemanticExpressionKind::Call {
+                call,
+                intrinsic: Some(CheckedIntrinsicV1::StreamPulses),
+                arguments,
+                ..
+            } = &expression.kind
+            else {
+                continue;
+            };
+            let counts = arguments
+                .iter()
+                .filter(|argument| argument.name == "count")
+                .collect::<Vec<_>>();
+            let [count] = counts.as_slice() else {
+                return Err(SemanticReactiveError::new(format!(
+                    "semantic Stream/pulses expression {} resolves to {} count arguments",
+                    expression.id,
+                    counts.len()
+                )));
+            };
+            let count_expression = self.expressions.expression(count.value)?;
+            batches.push(RawPulseBatch {
+                id: SemanticPulseBatchId(0),
+                enclosing_then: None,
+                state: None,
+                hold_expression: None,
+                hold_value: None,
+                call: *call,
+                call_expression: expression.id,
+                call_value: expression.value_id,
+                count_expression: count.value,
+                count_value: count_expression.value_id,
+                transition_expression: None,
+                transition_output: None,
+                flush_roots: Vec::new(),
+                emission_routes: Vec::new(),
+            });
+        }
+        batches.sort_by_key(|batch| batch.call_expression);
+        for (index, batch) in batches.iter_mut().enumerate() {
+            batch.id = SemanticPulseBatchId(index);
+        }
+        let batch_by_expression = batches
+            .iter()
+            .enumerate()
+            .map(|(index, batch)| (batch.call_expression, index))
+            .collect::<BTreeMap<_, _>>();
+        if batch_by_expression.len() != batches.len() {
+            return Err(SemanticReactiveError::new(
+                "semantic Stream/pulses expressions are not unique",
+            ));
+        }
+
+        let mut parents = BTreeMap::<SemanticExprId, BTreeSet<SemanticExprId>>::new();
+        for expression in &self.execution.expressions {
+            for child in semantic_expression_children(&expression.kind, self.execution)? {
+                parents.entry(child).or_default().insert(expression.id);
+            }
+        }
+
+        for state in &self.resources.states {
+            let hold = self.expressions.expression(state.expression)?;
+            let SemanticExpressionKind::Hold { updates, .. } = &hold.kind else {
+                continue;
+            };
+            for update in updates {
+                let transition = self.expressions.expression(*update)?;
+                let SemanticExpressionKind::Then {
+                    input,
+                    output: Some(output),
+                } = &transition.kind
+                else {
+                    continue;
+                };
+                let Some(batch_index) = batch_by_expression.get(input).copied() else {
+                    continue;
+                };
+                let batch = &mut batches[batch_index];
+                if batch.state.is_some() {
+                    return Err(SemanticReactiveError::new(format!(
+                        "semantic pulse batch {} is owned by multiple HOLD transitions",
+                        batch.id
+                    )));
+                }
+                batch.state = Some(state.id);
+                batch.hold_expression = Some(state.expression);
+                batch.hold_value = Some(hold.value_id);
+                batch.enclosing_then = match state.lifetime {
+                    crate::SemanticStateLifetimeV1::Persistent => None,
+                    crate::SemanticStateLifetimeV1::ActivationLocal { then_expression } => {
+                        Some(then_expression)
+                    }
+                };
+                batch.transition_expression = Some(*update);
+                batch.transition_output = Some(*output);
+                batch.flush_roots = self.flush_roots(*output)?;
+                batch.emission_routes = self.pulse_emission_routes(state.expression, &parents)?;
+            }
+        }
+        Ok(batches)
+    }
+
+    fn pulse_emission_routes(
+        &self,
+        hold: SemanticExprId,
+        parents: &BTreeMap<SemanticExprId, BTreeSet<SemanticExprId>>,
+    ) -> Result<Vec<SemanticPulseEmissionRouteV1>, SemanticReactiveError> {
+        let consumers = parents.get(&hold).cloned().unwrap_or_default();
+        if consumers.is_empty() {
+            return Ok(vec![SemanticPulseEmissionRouteV1 {
+                consumer: None,
+                filter: SemanticPulseEmissionFilterV1::Passthrough,
+            }]);
+        }
+        consumers
+            .into_iter()
+            .map(|consumer| {
+                let expression = self.expressions.expression(consumer)?;
+                let filter = match &expression.kind {
+                    SemanticExpressionKind::Call {
+                        call,
+                        intrinsic: Some(CheckedIntrinsicV1::StreamSkip),
+                        arguments,
+                        ..
+                    } => {
+                        let stream_matches = arguments
+                            .iter()
+                            .filter(|argument| argument.name == "stream" && argument.value == hold)
+                            .count();
+                        let counts = arguments
+                            .iter()
+                            .filter(|argument| argument.name == "count")
+                            .collect::<Vec<_>>();
+                        let [count] = counts.as_slice() else {
+                            return Err(SemanticReactiveError::new(format!(
+                                "semantic Stream/skip expression {consumer} resolves to {} count arguments",
+                                counts.len()
+                            )));
+                        };
+                        if stream_matches != 1 {
+                            return Err(SemanticReactiveError::new(format!(
+                                "semantic Stream/skip expression {consumer} consumes HOLD {hold} through {stream_matches} exact stream arguments"
+                            )));
+                        }
+                        SemanticPulseEmissionFilterV1::Skip {
+                            call: *call,
+                            expression: consumer,
+                            count_expression: count.value,
+                            count_value: self.expressions.value(count.value)?,
+                        }
+                    }
+                    _ => SemanticPulseEmissionFilterV1::Passthrough,
+                };
+                Ok(SemanticPulseEmissionRouteV1 {
+                    consumer: Some(consumer),
+                    filter,
+                })
+            })
+            .collect()
+    }
+
+    fn flush_roots(
+        &self,
+        root: SemanticExprId,
+    ) -> Result<Vec<SemanticExprId>, SemanticReactiveError> {
+        let mut pending = vec![root];
+        let mut visited = BTreeSet::new();
+        let mut flushes = BTreeSet::new();
+        while let Some(expression) = pending.pop() {
+            if !visited.insert(expression) {
+                continue;
+            }
+            let expression = self.expressions.expression(expression)?;
+            if matches!(&expression.kind, SemanticExpressionKind::Flush { .. }) {
+                flushes.insert(expression.id);
+            }
+            pending.extend(semantic_expression_children(
+                &expression.kind,
+                self.execution,
+            )?);
+        }
+        Ok(flushes.into_iter().collect())
+    }
+
+    fn build_activation_sites(
+        &self,
+        batches: &[RawPulseBatch],
+    ) -> Result<
+        (
+            Vec<SemanticActivationSiteV1>,
+            BTreeMap<SemanticExprId, SemanticActivationId>,
+        ),
+        SemanticReactiveError,
+    > {
+        let mut states_by_then = BTreeMap::<SemanticExprId, BTreeSet<SemanticStateId>>::new();
+        for batch in batches {
+            if let (Some(then_expression), Some(state)) = (batch.enclosing_then, batch.state) {
+                states_by_then
+                    .entry(then_expression)
+                    .or_default()
+                    .insert(state);
+            }
+        }
+        let activation_ids = states_by_then
+            .keys()
+            .copied()
+            .enumerate()
+            .map(|(index, expression)| (expression, SemanticActivationId(index)))
+            .collect::<BTreeMap<_, _>>();
+        let activations = states_by_then
+            .into_iter()
+            .map(|(then_expression, states)| {
+                let expression = self.expressions.expression(then_expression)?;
+                let SemanticExpressionKind::Then {
+                    input,
+                    output: Some(output),
+                } = &expression.kind
+                else {
+                    return Err(SemanticReactiveError::new(format!(
+                        "activation site {then_expression} is not a THEN expression with an output"
+                    )));
+                };
+                Ok(SemanticActivationSiteV1 {
+                    id: activation_ids[&then_expression],
+                    then_expression,
+                    input_expression: *input,
+                    input_value: self.expressions.value(*input)?,
+                    output_expression: *output,
+                    output_value: self.expressions.value(*output)?,
+                    owner: expression.owner,
+                    route_scope: self.expressions.route_scope(then_expression)?,
+                    states: states.into_iter().collect(),
+                })
+            })
+            .collect::<Result<Vec<_>, SemanticReactiveError>>()?;
+        Ok((activations, activation_ids))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_pulse_batches(
+        &self,
+        batches: Vec<RawPulseBatch>,
+        activation_ids: &BTreeMap<SemanticExprId, SemanticActivationId>,
+        trigger_arms: &[SemanticTriggerOwnedArmV1],
+        all_state_update_arms: &[SemanticStateUpdateArmV1],
+        list_mutations: &[SemanticListMutationV1],
+        derived_values: &[SemanticDerivedValueV1],
+        host_effect_schedules: &[SemanticHostEffectScheduleV1],
+    ) -> Result<Vec<SemanticPulseBatchV1>, SemanticReactiveError> {
+        let trigger_causes = trigger_arms
+            .iter()
+            .map(|arm| (arm.id, arm.cause))
+            .collect::<BTreeMap<_, _>>();
+        let mut result = Vec::with_capacity(batches.len());
+        for raw in batches {
+            let cause = SemanticEventCauseV1::Pulse(raw.id);
+            let trigger_arms = trigger_arms
+                .iter()
+                .filter(|arm| arm.cause == cause)
+                .map(|arm| arm.id)
+                .collect::<Vec<_>>();
+            let state_update_arms = all_state_update_arms
+                .iter()
+                .filter(|arm| trigger_causes.get(&arm.trigger) == Some(&cause))
+                .map(|arm| arm.id)
+                .collect::<Vec<_>>();
+            if let Some(state) = raw.state
+                && !state_update_arms.iter().any(|arm| {
+                    all_state_update_arms
+                        .get(arm.as_usize())
+                        .is_some_and(|candidate| candidate.state == state)
+                })
+            {
+                return Err(SemanticReactiveError::new(format!(
+                    "semantic pulse batch {} does not schedule its owning state {state}",
+                    raw.id
+                )));
+            }
+            let state_update_arm_set = state_update_arms.iter().copied().collect::<BTreeSet<_>>();
+            let list_mutations = list_mutations
+                .iter()
+                .filter(|mutation| mutation.cause == cause)
+                .map(|mutation| mutation.id)
+                .collect::<Vec<_>>();
+            let derived_values = derived_values
+                .iter()
+                .filter(|derived| derived.causes.contains(&cause))
+                .map(|derived| derived.id)
+                .collect::<Vec<_>>();
+            let host_effect_schedules = host_effect_schedules
+                .iter()
+                .filter(|schedule| {
+                    schedule
+                        .state_update_arms
+                        .iter()
+                        .any(|arm| state_update_arm_set.contains(arm))
+                })
+                .map(|schedule| schedule.id)
+                .collect::<Vec<_>>();
+            let enclosing_activation =
+                raw.enclosing_then
+                    .map(|then_expression| {
+                        activation_ids.get(&then_expression).copied().ok_or_else(|| {
+                        SemanticReactiveError::new(format!(
+                            "semantic pulse batch {} lost activation site {then_expression}",
+                            raw.id
+                        ))
+                    })
+                    })
+                    .transpose()?;
+            let mut batch = SemanticPulseBatchV1 {
+                id: raw.id,
+                enclosing_activation,
+                state: raw.state,
+                hold_expression: raw.hold_expression,
+                hold_value: raw.hold_value,
+                call: raw.call,
+                call_expression: raw.call_expression,
+                call_value: raw.call_value,
+                count_expression: raw.count_expression,
+                count_value: raw.count_value,
+                transition_expression: raw.transition_expression,
+                transition_output: raw.transition_output,
+                trigger_arms,
+                state_update_arms,
+                list_mutations,
+                derived_values,
+                host_effect_schedules,
+                flush_roots: raw.flush_roots,
+                emission_routes: raw.emission_routes,
+                schedule: SemanticPulseScheduleV1::StageArbitrateCommitPublishBeforeNext,
+                flush_policy:
+                    SemanticPulseFlushPolicyV1::DiscardCurrentStopRemainingKeepPriorCommits,
+                slice_digest: SemanticPulseBatchDigestV1([0; 32]),
+            };
+            batch.slice_digest = semantic_pulse_batch_digest_v1(&batch)?;
+            result.push(batch);
+        }
+        Ok(result)
+    }
+
     fn build(self) -> Result<SemanticReactiveGraphV1, SemanticReactiveError> {
         let producer_instances = self.build_producer_instances()?;
         let fields = self.build_fields()?;
         let bindings = self.build_bindings(&fields)?;
         let reads = self.build_reads(&bindings)?;
+        let raw_pulse_batches = self.build_raw_pulse_batches()?;
+        let (activations, activation_ids) = self.build_activation_sites(&raw_pulse_batches)?;
+        let pulse_by_expression = raw_pulse_batches
+            .iter()
+            .map(|batch| (batch.call_expression, batch.id))
+            .collect::<BTreeMap<_, _>>();
+        if pulse_by_expression.len() != raw_pulse_batches.len() {
+            return Err(SemanticReactiveError::new(
+                "one semantic Stream/pulses expression belongs to multiple pulse batches",
+            ));
+        }
+        let pulse_states = raw_pulse_batches
+            .iter()
+            .filter_map(|batch| batch.state.map(|state| (batch.id, state)))
+            .collect::<BTreeMap<_, _>>();
         let mut triggers = TriggerResolver::new(
             self.execution,
             self.resources,
@@ -686,6 +1173,8 @@ impl<'a> ReactiveBuilder<'a> {
             &bindings,
             &self.local_values,
             &self.parameter_inputs,
+            &pulse_by_expression,
+            &pulse_states,
         )?;
 
         let raw_state_arms = self.build_state_update_arms(&mut triggers)?;
@@ -821,15 +1310,30 @@ impl<'a> ReactiveBuilder<'a> {
             })
             .collect::<Result<Vec<_>, SemanticReactiveError>>()?;
 
-        let dependencies = self.build_dependencies(&state_update_arms, &trigger_arms)?;
+        let dependencies =
+            self.build_dependencies(&state_update_arms, &trigger_arms, &pulse_states)?;
         let possible_causes = self.build_possible_causes(&state_update_arms, &trigger_arms)?;
         let host_effect_schedules =
             self.build_host_effect_schedules(&state_update_arms, &trigger_arms)?;
         let dependency_uses = self.build_dependency_uses(&bindings, &reads, &mut triggers)?;
         let output_values = self.build_output_values(&fields)?;
-        let view_captures =
-            self.build_view_captures(&output_values, &fields, &reads, &mut triggers)?;
+        let view_captures = self.build_view_captures(
+            &output_values,
+            &fields,
+            &reads,
+            &mut triggers,
+            &pulse_states,
+        )?;
         let migration_inputs = self.build_migration_inputs()?;
+        let pulse_batches = self.finish_pulse_batches(
+            raw_pulse_batches,
+            &activation_ids,
+            &trigger_arms,
+            &state_update_arms,
+            &list_mutations,
+            &derived_values,
+            &host_effect_schedules,
+        )?;
 
         Ok(SemanticReactiveGraphV1 {
             schema: SEMANTIC_REACTIVE_GRAPH_SCHEMA_V1.to_owned(),
@@ -839,6 +1343,8 @@ impl<'a> ReactiveBuilder<'a> {
             reads,
             dependency_uses,
             call_invocations,
+            activations,
+            pulse_batches,
             derived_values,
             trigger_arms,
             state_update_arms,
@@ -1519,7 +2025,7 @@ impl<'a> ReactiveBuilder<'a> {
                             candidate.declaration == state.declaration
                                 && candidate.owner == state.owner
                         }),
-                    SemanticEventCauseV1::Source(_) => false,
+                    SemanticEventCauseV1::Source(_) | SemanticEventCauseV1::Pulse(_) => false,
                 };
                 if !same_state_family {
                     result.insert(RawStateUpdateArm {
@@ -1941,6 +2447,7 @@ impl<'a> ReactiveBuilder<'a> {
         &self,
         state_arms: &[SemanticStateUpdateArmV1],
         triggers: &[SemanticTriggerOwnedArmV1],
+        pulse_states: &BTreeMap<SemanticPulseBatchId, SemanticStateId>,
     ) -> Result<Vec<SemanticDependencyEdgeV1>, SemanticReactiveError> {
         let mut edges = BTreeSet::new();
         for arm in state_arms {
@@ -1983,6 +2490,15 @@ impl<'a> ReactiveBuilder<'a> {
                         })?
                         .scoped
                 }
+                SemanticEventCauseV1::Pulse(pulse) => pulse_states
+                    .get(&pulse)
+                    .and_then(|state| {
+                        self.resources
+                            .states
+                            .get(state.as_usize())
+                            .filter(|candidate| candidate.id == *state)
+                    })
+                    .is_some_and(|state| state.scoped),
             };
             edges.insert((trigger.cause, arm.state, target.scoped || source_indexed));
         }
@@ -2329,6 +2845,7 @@ impl<'a> ReactiveBuilder<'a> {
         fields: &[SemanticFieldV1],
         reads: &[SemanticReadBindingV1],
         triggers: &mut TriggerResolver<'_>,
+        pulse_states: &BTreeMap<SemanticPulseBatchId, SemanticStateId>,
     ) -> Result<Vec<SemanticViewCaptureV1>, SemanticReactiveError> {
         let reads_by_expression = reads
             .iter()
@@ -2351,6 +2868,7 @@ impl<'a> ReactiveBuilder<'a> {
                     let trigger_scope = trigger_row_scope(
                         &triggers.event_causes_for_expression(expression)?,
                         self.resources,
+                        pulse_states,
                     )?;
                     let read_scope = materialization_local_read_scope(read, self.execution)?;
                     let row_scope = match (trigger_scope, read_scope) {
@@ -2545,6 +3063,8 @@ struct TriggerResolver<'a> {
     bindings: &'a [SemanticBindingV1],
     local_values: &'a BTreeMap<SemanticLocalBindingId, (DeclId, SemanticExprId)>,
     parameter_inputs: &'a BTreeMap<SemanticExprId, Vec<SemanticExprId>>,
+    pulse_by_expression: &'a BTreeMap<SemanticExprId, SemanticPulseBatchId>,
+    pulse_states: &'a BTreeMap<SemanticPulseBatchId, SemanticStateId>,
     causes_cache: BTreeMap<SemanticExprId, BTreeSet<SemanticEventCauseV1>>,
 }
 
@@ -2675,6 +3195,8 @@ impl<'a> TriggerResolver<'a> {
         bindings: &'a [SemanticBindingV1],
         local_values: &'a BTreeMap<SemanticLocalBindingId, (DeclId, SemanticExprId)>,
         parameter_inputs: &'a BTreeMap<SemanticExprId, Vec<SemanticExprId>>,
+        pulse_by_expression: &'a BTreeMap<SemanticExprId, SemanticPulseBatchId>,
+        pulse_states: &'a BTreeMap<SemanticPulseBatchId, SemanticStateId>,
     ) -> Result<Self, SemanticReactiveError> {
         for source in &resources.sources {
             if execution
@@ -2710,6 +3232,8 @@ impl<'a> TriggerResolver<'a> {
             bindings,
             local_values,
             parameter_inputs,
+            pulse_by_expression,
+            pulse_states,
             causes_cache: BTreeMap::new(),
         })
     }
@@ -2781,6 +3305,26 @@ impl<'a> TriggerResolver<'a> {
         expression: &SemanticExpression,
     ) -> Result<BTreeSet<SemanticEventCauseV1>, SemanticReactiveError> {
         let mut causes = BTreeSet::new();
+        if matches!(
+            &expression.kind,
+            SemanticExpressionKind::Call {
+                intrinsic: Some(CheckedIntrinsicV1::StreamPulses),
+                ..
+            }
+        ) {
+            let pulse = self
+                .pulse_by_expression
+                .get(&expression.id)
+                .copied()
+                .ok_or_else(|| {
+                    SemanticReactiveError::new(format!(
+                        "semantic Stream/pulses expression {} has no pulse batch identity",
+                        expression.id
+                    ))
+                })?;
+            causes.insert(SemanticEventCauseV1::Pulse(pulse));
+            return Ok(causes);
+        }
         if let SemanticExpressionKind::CanonicalRead {
             target,
             projection,
@@ -3053,6 +3597,14 @@ impl<'a> TriggerResolver<'a> {
                     }
                 }
             }
+            SemanticExpressionKind::Call {
+                intrinsic: Some(CheckedIntrinsicV1::StreamPulses),
+                ..
+            } => {
+                for cause in self.direct_causes(expression)? {
+                    arms.insert(self.arm(cause, id, id)?);
+                }
+            }
             SemanticExpressionKind::Call { arguments, .. } => {
                 for argument in arguments {
                     let mut argument_arms = BTreeSet::new();
@@ -3254,6 +3806,16 @@ impl<'a> TriggerResolver<'a> {
                     })?
                     .row_scope
             }
+            SemanticEventCauseV1::Pulse(pulse) => self
+                .pulse_states
+                .get(&pulse)
+                .and_then(|state| {
+                    self.resources
+                        .states
+                        .get(state.as_usize())
+                        .filter(|candidate| candidate.id == *state)
+                })
+                .and_then(|state| state.row_scope),
         };
         if cause_scope.is_some() {
             return Ok(cause_scope);
@@ -3537,6 +4099,7 @@ fn materialization_local_read_scope(
 fn trigger_row_scope(
     causes: &BTreeSet<SemanticEventCauseV1>,
     resources: &SemanticResourceGraphV1,
+    pulse_states: &BTreeMap<SemanticPulseBatchId, SemanticStateId>,
 ) -> Result<Option<SemanticRowScopeId>, SemanticReactiveError> {
     let scopes = causes
         .iter()
@@ -3550,6 +4113,15 @@ fn trigger_row_scope(
                 .states
                 .get(state.as_usize())
                 .filter(|candidate| candidate.id == *state)
+                .and_then(|state| state.row_scope),
+            SemanticEventCauseV1::Pulse(pulse) => pulse_states
+                .get(pulse)
+                .and_then(|state| {
+                    resources
+                        .states
+                        .get(state.as_usize())
+                        .filter(|candidate| candidate.id == *state)
+                })
                 .and_then(|state| state.row_scope),
         })
         .collect::<BTreeSet<_>>();

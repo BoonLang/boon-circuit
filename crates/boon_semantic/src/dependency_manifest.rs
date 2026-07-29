@@ -181,6 +181,8 @@ pub enum SemanticDependencyEntityDomainV1 {
     SemanticCall,
     SemanticSource,
     SemanticState,
+    SemanticActivation,
+    SemanticPulseBatch,
     SemanticFunction,
     SemanticMaterialization,
     SemanticRowScope,
@@ -340,6 +342,8 @@ pub enum SemanticDependencySubjectKindV1 {
     ReactiveRead,
     ReactiveDependencyUse,
     ReactiveCallSchedule,
+    ReactiveActivation,
+    ReactivePulseBatch,
     ReactiveDerivedValue,
     ReactiveTriggerArm,
     ReactiveStateUpdateArm,
@@ -1661,6 +1665,20 @@ fn state_entity(state: SemanticStateId) -> SemanticDependencyEntityV1 {
     indexed_entity(
         SemanticDependencyEntityDomainV1::SemanticState,
         state.as_usize(),
+    )
+}
+
+fn activation_entity(activation: SemanticActivationId) -> SemanticDependencyEntityV1 {
+    indexed_entity(
+        SemanticDependencyEntityDomainV1::SemanticActivation,
+        activation.as_usize(),
+    )
+}
+
+fn pulse_batch_entity(pulse: SemanticPulseBatchId) -> SemanticDependencyEntityV1 {
+    indexed_entity(
+        SemanticDependencyEntityDomainV1::SemanticPulseBatch,
+        pulse.as_usize(),
     )
 }
 
@@ -5163,6 +5181,153 @@ fn inventory_reactive(
         )?;
     }
 
+    for activation in &reactive.activations {
+        let owner = owners.expression(activation.then_expression)?;
+        let mut references = vec![
+            dependency_entity(expression_entity(activation.then_expression)),
+            dependency_entity(expression_entity(activation.input_expression)),
+            dependency_entity(expression_entity(activation.output_expression)),
+        ];
+        references.extend(
+            activation
+                .states
+                .iter()
+                .copied()
+                .map(state_entity)
+                .map(dependency_entity),
+        );
+        collect_dependency!(
+            collector,
+            owner,
+            SemanticDependencyChannelV1::CoverageRouting,
+            vec![
+                SemanticDependencyRoleV1::ResourceOrProviderBehavior,
+                SemanticDependencyRoleV1::AssuranceOrActivation,
+            ],
+            top_subject(
+                SemanticDependencySubjectKindV1::ReactiveActivation,
+                activation_entity(activation.id),
+            ),
+            SemanticDependencySemanticsV1 {
+                static_owner: activation.owner,
+                multiplicity: SemanticDependencyMultiplicityV1::PerEvent,
+                lifetime: SemanticDependencyLifetimeV1::Activation,
+                phase: SemanticDependencyPhaseV1::EventPayload,
+                ..SemanticDependencySemanticsV1::default()
+            },
+            activation,
+            references,
+        )?;
+    }
+
+    for pulse in &reactive.pulse_batches {
+        let owner = owners.expression(pulse.call_expression)?;
+        let mut references = vec![
+            dependency_entity(call_entity(pulse.call)),
+            dependency_entity(expression_entity(pulse.call_expression)),
+            dependency_entity(expression_entity(pulse.count_expression)),
+        ];
+        references.extend(
+            pulse
+                .enclosing_activation
+                .map(activation_entity)
+                .map(dependency_entity),
+        );
+        references.extend(pulse.state.map(state_entity).map(dependency_entity));
+        references.extend(
+            pulse
+                .hold_expression
+                .map(expression_entity)
+                .map(dependency_entity),
+        );
+        references.extend(
+            pulse
+                .transition_expression
+                .map(expression_entity)
+                .map(dependency_entity),
+        );
+        references.extend(
+            pulse
+                .transition_output
+                .map(expression_entity)
+                .map(dependency_entity),
+        );
+        references.extend(pulse.trigger_arms.iter().copied().map(|arm| {
+            dependency_entity(indexed_entity(
+                SemanticDependencyEntityDomainV1::SemanticTriggerArm,
+                arm.as_usize(),
+            ))
+        }));
+        references.extend(pulse.state_update_arms.iter().copied().map(|arm| {
+            dependency_entity(indexed_entity(
+                SemanticDependencyEntityDomainV1::SemanticStateUpdateArm,
+                arm.as_usize(),
+            ))
+        }));
+        references.extend(pulse.list_mutations.iter().copied().map(|mutation| {
+            dependency_entity(indexed_entity(
+                SemanticDependencyEntityDomainV1::SemanticListMutation,
+                mutation.as_usize(),
+            ))
+        }));
+        references.extend(pulse.derived_values.iter().copied().map(|derived| {
+            dependency_entity(indexed_entity(
+                SemanticDependencyEntityDomainV1::SemanticDerivedValue,
+                derived.as_usize(),
+            ))
+        }));
+        references.extend(pulse.host_effect_schedules.iter().copied().map(|effect| {
+            dependency_entity(indexed_entity(
+                SemanticDependencyEntityDomainV1::SemanticHostEffect,
+                effect.as_usize(),
+            ))
+        }));
+        references.extend(
+            pulse
+                .flush_roots
+                .iter()
+                .copied()
+                .map(expression_entity)
+                .map(dependency_entity),
+        );
+        for route in &pulse.emission_routes {
+            references.extend(route.consumer.map(expression_entity).map(dependency_entity));
+            if let SemanticPulseEmissionFilterV1::Skip {
+                call,
+                expression,
+                count_expression,
+                ..
+            } = &route.filter
+            {
+                references.push(dependency_entity(call_entity(*call)));
+                references.push(dependency_entity(expression_entity(*expression)));
+                references.push(dependency_entity(expression_entity(*count_expression)));
+            }
+        }
+        collect_dependency!(
+            collector,
+            owner,
+            SemanticDependencyChannelV1::RuntimeIntrinsicOrHostEffect,
+            vec![
+                SemanticDependencyRoleV1::ResourceOrProviderBehavior,
+                SemanticDependencyRoleV1::CoverageOrRouting,
+                SemanticDependencyRoleV1::AssuranceOrActivation,
+            ],
+            top_subject(
+                SemanticDependencySubjectKindV1::ReactivePulseBatch,
+                pulse_batch_entity(pulse.id),
+            ),
+            SemanticDependencySemanticsV1 {
+                multiplicity: SemanticDependencyMultiplicityV1::PerEvent,
+                lifetime: SemanticDependencyLifetimeV1::Activation,
+                phase: SemanticDependencyPhaseV1::Commit,
+                ..SemanticDependencySemanticsV1::default()
+            },
+            pulse,
+            references,
+        )?;
+    }
+
     for derived in &reactive.derived_values {
         let owner = exact_owner(
             vec![
@@ -5680,6 +5845,7 @@ fn event_cause_entity(cause: SemanticEventCauseV1) -> SemanticDependencyEntityV1
     match cause {
         SemanticEventCauseV1::Source(source) => source_entity(source),
         SemanticEventCauseV1::State(state) => state_entity(state),
+        SemanticEventCauseV1::Pulse(pulse) => pulse_batch_entity(pulse),
     }
 }
 

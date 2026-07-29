@@ -104,6 +104,10 @@ pub struct ErasedProgramFields {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub host_ports: Vec<HostPortDeclaration>,
     pub state_cells: Vec<StateCell>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub activations: Vec<ActivationSite>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pulse_batches: Vec<PulseBatch>,
     pub lists: Vec<ListMemory>,
     #[serde(default)]
     pub semantic_memory: Vec<SemanticMemory>,
@@ -189,6 +193,14 @@ impl ErasedProgram {
 
     pub fn state_cells(&self) -> &[StateCell] {
         &self.fields.state_cells
+    }
+
+    pub fn activations(&self) -> &[ActivationSite] {
+        &self.fields.activations
+    }
+
+    pub fn pulse_batches(&self) -> &[PulseBatch] {
+        &self.fields.pulse_batches
     }
 
     pub fn lists(&self) -> &[ListMemory] {
@@ -480,6 +492,8 @@ typed_usize_ids!(
     ScopeId,
     SourceId,
     StateId,
+    ActivationId,
+    PulseBatchId,
     ListId,
     FieldId,
     ViewBindingId,
@@ -837,6 +851,7 @@ pub struct StateCell {
     pub executable_state_id: Option<ExecutableStateId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub static_owner: Option<StaticOwnerId>,
+    pub lifetime: StateCellLifetimeV1,
     pub statement_id: usize,
     pub scope_id: Option<ScopeId>,
     pub hold_name: String,
@@ -844,6 +859,13 @@ pub struct StateCell {
     pub expression_ids: Vec<ExprId>,
     pub indexed: bool,
     pub source_line: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum StateCellLifetimeV1 {
+    Persistent,
+    ActivationLocal { then_expression: ExecutableExprId },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -947,6 +969,7 @@ pub struct DerivedValue {
 pub enum EventCause {
     Source(SourceId),
     State(StateId),
+    Pulse(PulseBatchId),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1090,6 +1113,86 @@ pub enum ExecutableValueOrigin {
         local: MaterializationLocalId,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         projection: Vec<String>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ActivationSite {
+    pub id: ActivationId,
+    pub then_expression: ExecutableExprId,
+    pub input_expression: ExecutableExprId,
+    pub output_expression: ExecutableExprId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub static_owner: Option<StaticOwnerId>,
+    pub states: Vec<StateId>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PulseSchedule {
+    StageArbitrateCommitPublishBeforeNext,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PulseFlushPolicy {
+    DiscardCurrentStopRemainingKeepPriorCommits,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PulseBatch {
+    pub id: PulseBatchId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enclosing_activation: Option<ActivationId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<StateId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold_expression: Option<ExecutableExprId>,
+    pub call_expression: ExecutableExprId,
+    pub count_expression: ExecutableExprId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transition_expression: Option<ExecutableExprId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transition_output: Option<ExecutableExprId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trigger_arms: Vec<TriggerOwnedArm>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub state_update_arms: Vec<StateUpdateArm>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub list_mutations: Vec<ListMutation>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub derived_value_indices: Vec<usize>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub host_effects: Vec<PulseHostEffect>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub flush_roots: Vec<ExecutableExprId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub emission_routes: Vec<PulseEmissionRoute>,
+    pub schedule: PulseSchedule,
+    pub flush_policy: PulseFlushPolicy,
+    pub semantic_slice_digest: [u8; 32],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PulseHostEffect {
+    pub expression: ExecutableExprId,
+    pub operation: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PulseEmissionRoute {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub consumer: Option<ExecutableExprId>,
+    pub filter: PulseEmissionFilter,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PulseEmissionFilter {
+    Passthrough,
+    Skip {
+        expression: ExecutableExprId,
+        count_expression: ExecutableExprId,
     },
 }
 
@@ -1591,6 +1694,7 @@ pub enum ErasedDependencyTiming {
 pub enum ErasedTemporalBoundary {
     Source(SourceId),
     State(StateId),
+    Pulse(PulseBatchId),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -3429,6 +3533,10 @@ fn verify_erased_scope_index(program: &ErasedProgram) -> Result<(), String> {
                         .state_cells
                         .get(state.as_usize())
                         .is_some_and(|candidate| candidate.id == *state),
+                    ErasedTemporalBoundary::Pulse(pulse) => program
+                        .pulse_batches
+                        .get(pulse.as_usize())
+                        .is_some_and(|candidate| candidate.id == *pulse),
                 };
                 if !exists {
                     return Err(format!(
@@ -3934,6 +4042,11 @@ pub fn verify_static_schedule(program: &ErasedProgram) -> Result<(), String> {
             _ => None,
         })
         .collect::<Vec<_>>();
+    let pulse_symbols = program
+        .pulse_batches
+        .iter()
+        .map(|pulse| format!("$pulse.p{}", pulse.id.as_usize()))
+        .collect::<Vec<_>>();
     let known_symbols = source_paths
         .iter()
         .chain(state_paths.iter())
@@ -3943,6 +4056,7 @@ pub fn verify_static_schedule(program: &ErasedProgram) -> Result<(), String> {
         .chain(store_list_names.iter().map(String::as_str))
         .chain(source_payload_paths.iter().map(String::as_str))
         .chain(materialization_local_symbols.iter().map(String::as_str))
+        .chain(pulse_symbols.iter().map(String::as_str))
         .chain(
             program
                 .semantic_index
@@ -3979,7 +4093,12 @@ pub fn verify_static_schedule(program: &ErasedProgram) -> Result<(), String> {
                     arm.state
                 )
             })?;
-        let cause = event_cause_path_owned(arm.cause, &program.sources, &program.state_cells)?;
+        let cause = event_cause_path_owned(
+            arm.cause,
+            &program.sources,
+            &program.state_cells,
+            &program.pulse_batches,
+        )?;
         let gate = program
             .executable
             .expressions
@@ -4020,7 +4139,12 @@ pub fn verify_static_schedule(program: &ErasedProgram) -> Result<(), String> {
                 mutation.list_id, list.name
             ));
         }
-        let cause = event_cause_path_owned(mutation.cause, &program.sources, &program.state_cells)?;
+        let cause = event_cause_path_owned(
+            mutation.cause,
+            &program.sources,
+            &program.state_cells,
+            &program.pulse_batches,
+        )?;
         let verify_expression = |id: ExecutableExprId, role: &str| {
             program
                 .executable
@@ -5072,6 +5196,7 @@ fn event_cause_path_owned(
     cause: EventCause,
     sources: &[SourcePort],
     states: &[StateCell],
+    pulse_batches: &[PulseBatch],
 ) -> Result<String, String> {
     match cause {
         EventCause::Source(source_id) => sources
@@ -5084,6 +5209,11 @@ fn event_cause_path_owned(
             .filter(|state| state.id == state_id)
             .map(|state| state.path.clone())
             .ok_or_else(|| format!("state update arm references missing StateId {state_id}")),
+        EventCause::Pulse(pulse_id) => pulse_batches
+            .get(pulse_id.as_usize())
+            .filter(|pulse| pulse.id == pulse_id)
+            .map(|_| format!("$pulse.p{}", pulse_id.as_usize()))
+            .ok_or_else(|| format!("state update arm references missing PulseBatchId {pulse_id}")),
     }
 }
 

@@ -19,7 +19,7 @@ use boon_typecheck::{
     ContextFormalId, DeclId, FlowType, LexicalScopeId, ProgramRole, Type,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 
 macro_rules! typed_semantic_id {
@@ -79,6 +79,8 @@ typed_semantic_id!(
     SemanticExternalDependencyId,
     SemanticDependencyUseId,
     SemanticHostEffectScheduleId,
+    SemanticActivationId,
+    SemanticPulseBatchId,
     SemanticRowValueId,
     SemanticValueListAuthorityId,
     SemanticScopeId,
@@ -678,6 +680,168 @@ pub struct SemanticStateDef {
     pub binding_path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<StaticOwnerId>,
+    pub lifetime: SemanticStateLifetimeV1,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SemanticStateLifetimeV1 {
+    Persistent,
+    ActivationLocal { then_expression: SemanticExprId },
+}
+
+pub(crate) fn derive_semantic_state_lifetime_v1(
+    expressions: &[SemanticExpression],
+    state_expression: SemanticExprId,
+) -> Result<SemanticStateLifetimeV1, String> {
+    if expressions
+        .get(state_expression.as_usize())
+        .filter(|expression| expression.id == state_expression)
+        .is_none()
+    {
+        return Err(format!(
+            "semantic state lifetime references missing expression {state_expression}"
+        ));
+    }
+    let mut parents = BTreeMap::<SemanticExprId, Vec<(SemanticExprId, bool)>>::new();
+    for expression in expressions {
+        for child in semantic_expression_children_for_lifetime_v1(&expression.kind) {
+            if expressions
+                .get(child.as_usize())
+                .filter(|candidate| candidate.id == child)
+                .is_none()
+            {
+                return Err(format!(
+                    "semantic expression {} lifetime edge references missing child {child}",
+                    expression.id
+                ));
+            }
+            let then_output = matches!(
+                &expression.kind,
+                SemanticExpressionKind::Then {
+                    output: Some(output),
+                    ..
+                } if *output == child
+            );
+            parents
+                .entry(child)
+                .or_default()
+                .push((expression.id, then_output));
+        }
+    }
+    for entries in parents.values_mut() {
+        entries.sort();
+        entries.dedup();
+    }
+
+    let mut pending = VecDeque::from([(state_expression, 0usize)]);
+    let mut visited = BTreeMap::<SemanticExprId, usize>::new();
+    let mut nearest_distance = None;
+    let mut nearest = BTreeSet::new();
+    while let Some((expression, distance)) = pending.pop_front() {
+        if nearest_distance.is_some_and(|nearest| distance >= nearest) {
+            continue;
+        }
+        if visited
+            .get(&expression)
+            .is_some_and(|previous| *previous <= distance)
+        {
+            continue;
+        }
+        visited.insert(expression, distance);
+        for (parent, then_output) in parents.get(&expression).into_iter().flatten() {
+            let parent_distance = distance + 1;
+            if *then_output {
+                match nearest_distance {
+                    None => {
+                        nearest_distance = Some(parent_distance);
+                        nearest.insert(*parent);
+                    }
+                    Some(nearest_distance) if parent_distance == nearest_distance => {
+                        nearest.insert(*parent);
+                    }
+                    Some(_) => {}
+                }
+            } else {
+                pending.push_back((*parent, parent_distance));
+            }
+        }
+    }
+    match nearest.into_iter().collect::<Vec<_>>().as_slice() {
+        [] => Ok(SemanticStateLifetimeV1::Persistent),
+        [then_expression] => Ok(SemanticStateLifetimeV1::ActivationLocal {
+            then_expression: *then_expression,
+        }),
+        candidates => Err(format!(
+            "semantic state expression {state_expression} belongs to {} equally-near THEN activation sites: {candidates:?}",
+            candidates.len()
+        )),
+    }
+}
+
+fn semantic_expression_children_for_lifetime_v1(
+    kind: &SemanticExpressionKind,
+) -> Vec<SemanticExprId> {
+    match kind {
+        SemanticExpressionKind::CanonicalRead { .. }
+        | SemanticExpressionKind::LocalRead { .. }
+        | SemanticExpressionKind::ExternalRead { .. }
+        | SemanticExpressionKind::ElementState { .. }
+        | SemanticExpressionKind::Drain { .. }
+        | SemanticExpressionKind::Text(_)
+        | SemanticExpressionKind::Number(_)
+        | SemanticExpressionKind::Bits(_)
+        | SemanticExpressionKind::BytesByte(_)
+        | SemanticExpressionKind::Absent
+        | SemanticExpressionKind::Tag(_)
+        | SemanticExpressionKind::Source { .. }
+        | SemanticExpressionKind::Materialize { .. }
+        | SemanticExpressionKind::Delimiter
+        | SemanticExpressionKind::MaterializationLocal { .. }
+        | SemanticExpressionKind::FunctionParameter { .. } => Vec::new(),
+        SemanticExpressionKind::TextTemplate { segments } => segments
+            .iter()
+            .filter_map(|segment| match segment {
+                SemanticTextSegment::Static { .. } => None,
+                SemanticTextSegment::Dynamic { value } => Some(*value),
+            })
+            .collect(),
+        SemanticExpressionKind::TaggedObject { fields, .. }
+        | SemanticExpressionKind::Object(fields) => {
+            fields.iter().map(|field| field.value).collect()
+        }
+        SemanticExpressionKind::Call { arguments, .. } => {
+            arguments.iter().map(|argument| argument.value).collect()
+        }
+        SemanticExpressionKind::Flush { payload: input }
+        | SemanticExpressionKind::FlushBoundary { input }
+        | SemanticExpressionKind::Draining { input }
+        | SemanticExpressionKind::Project { input, .. } => vec![*input],
+        SemanticExpressionKind::Hold {
+            initial, updates, ..
+        } => std::iter::once(*initial)
+            .chain(updates.iter().copied())
+            .collect(),
+        SemanticExpressionKind::Latest { branches } => branches.clone(),
+        SemanticExpressionKind::When { input, arms, .. } => std::iter::once(*input)
+            .chain(arms.iter().map(|arm| arm.output))
+            .collect(),
+        SemanticExpressionKind::Then { input, output } => {
+            std::iter::once(*input).chain(*output).collect()
+        }
+        SemanticExpressionKind::Infix { left, right, .. } => vec![*left, *right],
+        SemanticExpressionKind::MapEntry { key, value } => vec![*key, *value],
+        SemanticExpressionKind::MatchArm { output, .. } => output.iter().copied().collect(),
+        SemanticExpressionKind::Block { bindings, result } => bindings
+            .iter()
+            .map(|binding| binding.value)
+            .chain(std::iter::once(*result))
+            .collect(),
+        SemanticExpressionKind::List { items, .. }
+        | SemanticExpressionKind::Bytes { items, .. }
+        | SemanticExpressionKind::Map { entries: items }
+        | SemanticExpressionKind::Set { items } => items.clone(),
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1199,6 +1363,14 @@ impl SemanticExecutionGraphV1 {
             self.require_expression(state.initial, format!("state {} initial value", state.id))?;
             self.validate_owner(state.owner, format!("state {}", state.id))?;
             self.require_statement(state.statement, format!("state {} statement", state.id))?;
+            let expected_lifetime =
+                derive_semantic_state_lifetime_v1(&self.expressions, state.expression)?;
+            if state.lifetime != expected_lifetime {
+                return Err(format!(
+                    "semantic state {} lifetime {:?} differs from derived lifetime {:?}",
+                    state.id, state.lifetime, expected_lifetime
+                ));
+            }
             if let Some(call) = state.call_instance {
                 validate_call_instance(
                     out_net,

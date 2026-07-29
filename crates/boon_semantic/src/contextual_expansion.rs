@@ -12,7 +12,7 @@ use crate::execution::{
     SemanticSourceOrigin, SemanticSourceRead, SemanticStateDef, SemanticStateId, SemanticStatement,
     SemanticStatementId, SemanticStatementKind, SemanticStatementOrigin, SemanticStaticOwner,
     SemanticTextSegment, SemanticValueId, SemanticValueMember, SemanticValueOrigin,
-    SemanticValueProvenance, checked_semantic_root_specs_v1,
+    SemanticValueProvenance, checked_semantic_root_specs_v1, derive_semantic_state_lifetime_v1,
 };
 use crate::{
     OutCallInstanceId, OutInputValue, OutNetId, ResolvedOutGraph as OutNet, ScopedCheckedExpr,
@@ -2227,6 +2227,8 @@ pub(crate) fn derive_semantic_execution_graph(
             let initial = concrete_state_initial_expression(&arena.expressions, expression).ok_or(
                 ExpansionError::MissingStateInitializer(checked_state.expression),
             )?;
+            let lifetime = derive_semantic_state_lifetime_v1(&arena.expressions, expression)
+                .map_err(ExpansionError::InvalidLocalBindings)?;
             let id = SemanticStateId(states.len());
             if semantic_state_by_checked_instance.insert(key, id).is_some() {
                 return Err(ExpansionError::InvalidLocalBindings(format!(
@@ -2245,6 +2247,7 @@ pub(crate) fn derive_semantic_execution_graph(
                 call_instance: origin.call_instance,
                 binding_path: fallback_path.clone(),
                 owner: expression_definition.owner,
+                lifetime,
             });
         }
     }

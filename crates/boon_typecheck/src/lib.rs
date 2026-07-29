@@ -4850,7 +4850,30 @@ impl<'a> CheckedProgramBuilder<'a> {
             .len()
             .saturating_add(self.signatures.len())
             .saturating_add(4);
+        let mut final_boundary_unchanged = false;
         for _ in 0..iteration_limit {
+            let boundary_declarations = self
+                .declarations
+                .iter()
+                .map(|declaration| declaration.flow_type.clone())
+                .collect::<Vec<_>>();
+            let boundary_signatures = self
+                .signatures
+                .iter()
+                .map(|signature| signature.result.clone())
+                .collect::<Vec<_>>();
+            let boundary_calls = self
+                .calls
+                .iter()
+                .map(|call| {
+                    (
+                        call.result.clone(),
+                        call.type_substitutions.clone(),
+                        call.contextual_substitutions.clone(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let boundary_expressions = self.inferred_expr_types.clone();
             self.begin_checked_flow_inference_epoch();
             let callable_changed = self.refresh_checked_callable_result_types();
             if callable_changed {
@@ -4881,6 +4904,37 @@ impl<'a> CheckedProgramBuilder<'a> {
             if !changed {
                 return;
             }
+            final_boundary_unchanged = boundary_declarations
+                == self
+                    .declarations
+                    .iter()
+                    .map(|declaration| declaration.flow_type.clone())
+                    .collect::<Vec<_>>()
+                && boundary_signatures
+                    == self
+                        .signatures
+                        .iter()
+                        .map(|signature| signature.result.clone())
+                        .collect::<Vec<_>>()
+                && boundary_calls
+                    == self
+                        .calls
+                        .iter()
+                        .map(|call| {
+                            (
+                                call.result.clone(),
+                                call.type_substitutions.clone(),
+                                call.contextual_substitutions.clone(),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                && boundary_expressions == self.inferred_expr_types;
+        }
+        if final_boundary_unchanged {
+            // A deterministic epoch that reports internal rewrites while
+            // preserving the complete externally consumed inference state is
+            // a fixed point, not a user-visible non-convergence.
+            return;
         }
         self.diagnostics.push(TypeDiagnostic {
             severity: DiagnosticSeverity::Error,

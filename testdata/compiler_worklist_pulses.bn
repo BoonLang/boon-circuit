@@ -1,0 +1,47 @@
+store: [
+    run: SOURCE
+    worklist: LIST[9] {
+        [value: 1]
+    }
+    result:
+        run
+        |> process_worklist(worklist: worklist, work_budget: 8)
+]
+
+FUNCTION process_worklist(start, worklist, work_budget) {
+    start
+    |> THEN {
+        BLOCK {
+            [position: 1, processed: 0, checksum: 0, queued: 1]
+            |> HOLD state {
+                work_budget
+                |> Stream/pulses()
+                |> THEN {
+                    worklist
+                    |> List/get(position: state.position)
+                    |> WHEN {
+                        Found[value] => BLOCK {
+                            appended:
+                                worklist
+                                |> List/append(item: [value: state.position])
+                            [
+                                position: state.position + 1
+                                processed: state.processed + 1
+                                checksum: state.checksum + value.value
+                                queued: state.queued + 1
+                            ]
+                        }
+                        NotFound => [
+                            position: state.position
+                            processed: state.processed
+                            checksum: state.checksum
+                            queued: 0
+                        ]
+                    }
+                }
+            }
+            |> Stream/skip(count: work_budget)
+            |> .checksum
+        }
+    }
+}

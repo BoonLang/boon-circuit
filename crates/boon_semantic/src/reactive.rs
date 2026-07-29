@@ -1266,7 +1266,8 @@ impl<'a> ReactiveBuilder<'a> {
         }
 
         let raw_state_arms = self.build_state_update_arms(&mut triggers)?;
-        let raw_mutations = self.build_list_mutations(&mut triggers)?;
+        let mut raw_mutations = self.build_list_mutations(&bindings, &reads, &mut triggers)?;
+        self.bind_pulse_list_mutations(&raw_pulse_batches, &mut raw_mutations, &mut triggers)?;
         let mut raw_derived = self.build_raw_derived_values(&fields, &bindings, &mut triggers)?;
         self.bind_pulse_emission_derived_values(
             &mut raw_pulse_batches,
@@ -2162,19 +2163,224 @@ impl<'a> ReactiveBuilder<'a> {
 
     fn build_list_mutations(
         &self,
+        bindings: &[SemanticBindingV1],
+        reads: &[SemanticReadBindingV1],
         triggers: &mut TriggerResolver<'_>,
     ) -> Result<Vec<RawListMutation>, SemanticReactiveError> {
         let mut mutations = BTreeSet::new();
+        let mut visited_by_list = BTreeMap::<SemanticListId, BTreeSet<SemanticExprId>>::new();
         for list in &self.resources.lists {
             self.collect_list_mutations(
                 list.id,
                 list.producer,
-                &mut BTreeSet::new(),
+                visited_by_list.entry(list.id).or_default(),
                 triggers,
                 &mut mutations,
             )?;
         }
+        // Queue/worklist code mutates an authority through a read instead of
+        // returning a List/append pipeline as the declaration's producer.
+        // Discover those sites from their exact typed list input as well.
+        let mut classified_sites = mutations
+            .iter()
+            .map(|mutation| mutation.site)
+            .collect::<BTreeSet<_>>();
+        for expression in &self.execution.expressions {
+            let SemanticExpressionKind::Call {
+                callable,
+                callable_kind: crate::SemanticCallableKind::Builtin,
+                function,
+                arguments,
+                ..
+            } = &expression.kind
+            else {
+                continue;
+            };
+            if function != "List/append" {
+                continue;
+            }
+            if classified_sites.contains(&expression.id) {
+                continue;
+            }
+            let list_input = exact_call_argument_at_ordinal(
+                self.execution,
+                *callable,
+                arguments,
+                0,
+                expression.id,
+            )?;
+            let Some(list) = self.list_authority_for_expression(
+                list_input,
+                bindings,
+                reads,
+                &mut BTreeSet::new(),
+            )?
+            else {
+                continue;
+            };
+            self.collect_list_mutations(
+                list,
+                expression.id,
+                visited_by_list.entry(list).or_default(),
+                triggers,
+                &mut mutations,
+            )?;
+            classified_sites.insert(expression.id);
+        }
         Ok(mutations.into_iter().collect())
+    }
+
+    fn bind_pulse_list_mutations(
+        &self,
+        pulse_batches: &[RawPulseBatch],
+        mutations: &mut [RawListMutation],
+        triggers: &mut TriggerResolver<'_>,
+    ) -> Result<(), SemanticReactiveError> {
+        for mutation in mutations {
+            // A mutation structurally owned by a pulse transition executes in
+            // that microturn. Its item may read recurrence state, but that
+            // data dependency must not reschedule the mutation as a later
+            // state event.
+            let mut owners = Vec::new();
+            for batch in pulse_batches {
+                if let Some(output) = batch.transition_output
+                    && self.expression_reaches(output, mutation.site)?
+                {
+                    owners.push(batch.id);
+                }
+            }
+            match owners.as_slice() {
+                [] => {}
+                [pulse] => {
+                    let output = match &mutation.kind {
+                        SemanticListMutationKindV1::Append { .. } => {
+                            let expression = self.expressions.expression(mutation.site)?;
+                            let SemanticExpressionKind::Call {
+                                callable,
+                                arguments,
+                                ..
+                            } = &expression.kind
+                            else {
+                                return Err(SemanticReactiveError::new(format!(
+                                    "semantic list append site {} is not a call",
+                                    mutation.site
+                                )));
+                            };
+                            exact_call_argument_at_ordinal(
+                                self.execution,
+                                *callable,
+                                arguments,
+                                1,
+                                mutation.site,
+                            )?
+                        }
+                        SemanticListMutationKindV1::Remove { predicate, .. } => *predicate,
+                    };
+                    let trigger = triggers.arm(
+                        SemanticEventCauseV1::Pulse(*pulse),
+                        mutation.trigger.gate_expression,
+                        output,
+                    )?;
+                    match &mut mutation.kind {
+                        SemanticListMutationKindV1::Append {
+                            gate,
+                            gate_value,
+                            item,
+                            item_value,
+                        } => {
+                            *gate = trigger.gate_expression;
+                            *gate_value = trigger.gate_value;
+                            *item = output;
+                            *item_value = trigger.output_value;
+                        }
+                        SemanticListMutationKindV1::Remove {
+                            gate,
+                            gate_value,
+                            predicate,
+                            predicate_value,
+                            ..
+                        } => {
+                            *gate = trigger.gate_expression;
+                            *gate_value = trigger.gate_value;
+                            *predicate = output;
+                            *predicate_value = trigger.output_value;
+                        }
+                    }
+                    mutation.trigger = trigger;
+                }
+                _ => {
+                    return Err(SemanticReactiveError::new(format!(
+                        "semantic list mutation at {} belongs to {} pulse transition outputs",
+                        mutation.site,
+                        owners.len()
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn list_authority_for_expression(
+        &self,
+        root: SemanticExprId,
+        bindings: &[SemanticBindingV1],
+        reads: &[SemanticReadBindingV1],
+        visited: &mut BTreeSet<SemanticExprId>,
+    ) -> Result<Option<SemanticListId>, SemanticReactiveError> {
+        if !visited.insert(root) {
+            return Ok(None);
+        }
+        if let Some(read) = reads.iter().find(|read| read.expression == root)
+            && let SemanticReadTargetV1::Binding { binding, .. } = read.target
+        {
+            let binding = bindings
+                .get(binding.as_usize())
+                .filter(|candidate| candidate.id == binding)
+                .ok_or_else(|| {
+                    SemanticReactiveError::new(format!(
+                        "semantic list authority read {root} references missing binding {binding}"
+                    ))
+                })?;
+            if let SemanticBindingTargetV1::List { list } = binding.target {
+                return Ok(Some(list));
+            }
+        }
+        let expression = self.expressions.expression(root)?;
+        let input = match &expression.kind {
+            SemanticExpressionKind::Materialize { materialization } => self
+                .execution
+                .materializations
+                .get(materialization.as_usize())
+                .filter(|candidate| candidate.id == *materialization)
+                .map(|materialization| materialization.source),
+            SemanticExpressionKind::Draining { input }
+            | SemanticExpressionKind::Project { input, .. } => Some(*input),
+            SemanticExpressionKind::Then {
+                output: Some(output),
+                ..
+            }
+            | SemanticExpressionKind::MatchArm {
+                output: Some(output),
+                ..
+            } => Some(*output),
+            SemanticExpressionKind::Block { result, .. } => Some(*result),
+            SemanticExpressionKind::Call {
+                callable,
+                arguments,
+                ..
+            } if matches!(expression.flow_type.ty, Type::List(_)) => exact_unique_list_argument(
+                self.execution,
+                &self.expressions,
+                *callable,
+                arguments,
+                root,
+            )?,
+            _ => None,
+        };
+        match input {
+            Some(input) => self.list_authority_for_expression(input, bindings, reads, visited),
+            None => Ok(None),
+        }
     }
 
     fn collect_list_mutations(

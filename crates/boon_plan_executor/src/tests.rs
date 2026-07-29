@@ -15707,6 +15707,81 @@ fn compiler_pass_progress_uses_fused_scheduler_with_baseline_trace_equivalence()
 }
 
 #[test]
+fn compiler_worklist_executes_bounded_pulses_and_keeps_fusion_fail_closed() {
+    let compiled = compile_server_source(
+        "compiler-worklist-pulses.bn",
+        include_str!("../../../testdata/compiler_worklist_pulses.bn"),
+        TargetProfile::SoftwareBounded,
+    )
+    .expect("compiled compiler worklist pulse fixture");
+    let [batch] = compiled.plan.pulse_batches.as_slice() else {
+        panic!("compiler worklist must own one bounded pulse batch");
+    };
+    assert_eq!(batch.list_mutation_ops.len(), 1);
+    let PlanPulseFusionEligibility::Ineligible { diagnostics } = &batch.fusion else {
+        panic!("list mutation must keep pulse fusion fail-closed");
+    };
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.contains("mutates list authority"))
+    );
+    assert!(
+        matches!(&batch.start, PlanPulseStart::Triggered { .. }),
+        "compiler worklist pulse batch must be source-triggered: {batch:?}"
+    );
+    let source = source_id(&compiled.plan, "store.run");
+    let plan = compiled.plan;
+    let mut automatic =
+        MachineInstance::new(plan.clone(), SessionOptions::default()).expect("automatic pass");
+    let mut baseline = MachineInstance::new(
+        plan,
+        SessionOptions {
+            pulse_execution_mode: PulseExecutionMode::Baseline,
+            ..SessionOptions::default()
+        },
+    )
+    .expect("baseline pass");
+
+    let automatic_turn = automatic
+        .apply(SourceEvent {
+            sequence: 1,
+            source,
+            route: route_token(&automatic, source, None),
+            target: None,
+            payload: SourcePayload::default(),
+        })
+        .expect("automatic compiler worklist turn");
+    let baseline_turn = baseline
+        .apply(SourceEvent {
+            sequence: 1,
+            source,
+            route: route_token(&baseline, source, None),
+            target: None,
+            payload: SourcePayload::default(),
+        })
+        .expect("baseline compiler worklist turn");
+    assert_same_semantic_turn(&automatic_turn, &baseline_turn);
+    assert_eq!(automatic_turn.metrics.verified_pulse_fusion_batch_count, 0);
+    assert_eq!(baseline_turn.metrics.verified_pulse_fusion_batch_count, 0);
+    assert_eq!(
+        automatic
+            .root_value_current("store.result")
+            .expect("compiler worklist result"),
+        number(36)
+    );
+    assert_eq!(
+        automatic.root_value_current("store.result").unwrap(),
+        baseline.root_value_current("store.result").unwrap()
+    );
+    assert_eq!(automatic.snapshot().unwrap(), baseline.snapshot().unwrap());
+    assert_eq!(
+        automatic.authority_snapshot().unwrap(),
+        baseline.authority_snapshot().unwrap()
+    );
+}
+
+#[test]
 fn flushing_pulse_discards_its_candidate_and_keeps_prior_microturn_commits() {
     let compiled = compile_server_source(
         "flushing-pulses.bn",

@@ -911,7 +911,7 @@ mod tests {
         data_golden.extend_from_slice(&[ClientSessionDataOperation::Current as u8, 0xf6]);
         data_golden.extend_from_slice(&[0x11, 0xf6]);
         data_golden.extend_from_slice(&[
-            0x4b, b'B', b'W', b'V', 0x03, 0x05, 0x04, b'N', b'u', b'l', b'l', 0x00,
+            0x4b, b'B', b'W', b'V', 0x04, 0x05, 0x04, b'N', b'u', b'l', b'l', 0x00,
         ]);
         assert_eq!(
             encode_client_session_frame(&data, limits).unwrap(),

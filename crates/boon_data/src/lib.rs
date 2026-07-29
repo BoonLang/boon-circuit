@@ -11,7 +11,7 @@ pub use number::{
     MAX_NUMBER_PARSED_DIGITS,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Bounded formatting options for Boon's `Number/to_text()` builtin.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -226,6 +226,8 @@ pub enum Value {
         tag: String,
         fields: BTreeMap<String, Value>,
     },
+    Map(BTreeMap<Value, Value>),
+    Set(BTreeSet<Value>),
 }
 
 impl Value {
@@ -251,6 +253,17 @@ impl Value {
             Self::Tag { tag, fields } if fields.is_empty() && tag == "True" => Some(true),
             Self::Tag { tag, fields } if fields.is_empty() && tag == "False" => Some(false),
             _ => None,
+        }
+    }
+
+    /// Whether this value has the closed structural representation accepted
+    /// for canonical MAP keys and SET items.
+    pub fn is_key_safe(&self) -> bool {
+        match self {
+            Self::Number(_) | Self::Text(_) | Self::Bytes(_) => true,
+            Self::Object(fields) => fields.values().all(Self::is_key_safe),
+            Self::Tag { fields, .. } => fields.values().all(Self::is_key_safe),
+            Self::List(_) | Self::Map(_) | Self::Set(_) => false,
         }
     }
 }
@@ -390,5 +403,40 @@ mod tests {
         assert_eq!(Value::truth(true).as_truth(), Some(true));
         assert_eq!(Value::truth(false).as_truth(), Some(false));
         assert_eq!(Value::tag("Null").as_truth(), None);
+    }
+
+    #[test]
+    fn map_and_set_values_are_canonical_and_key_safe() {
+        let composite_key = Value::Tag {
+            tag: "Cell".to_owned(),
+            fields: BTreeMap::from([
+                ("column".to_owned(), Value::integer(2).unwrap()),
+                ("row".to_owned(), Value::integer(1).unwrap()),
+            ]),
+        };
+        assert!(composite_key.is_key_safe());
+
+        let map = Value::Map(BTreeMap::from([
+            (Value::Text("z".to_owned()), Value::integer(2).unwrap()),
+            (Value::Text("a".to_owned()), Value::integer(1).unwrap()),
+            (composite_key.clone(), Value::truth(true)),
+        ]));
+        let set = Value::Set(BTreeSet::from([
+            Value::Text("z".to_owned()),
+            Value::Text("a".to_owned()),
+            composite_key,
+        ]));
+
+        let Value::Map(map) = map else {
+            unreachable!();
+        };
+        assert_eq!(map.len(), 3);
+        let Value::Set(set) = set else {
+            unreachable!();
+        };
+        assert_eq!(set.len(), 3);
+        assert!(!Value::List(Vec::new()).is_key_safe());
+        assert!(!Value::Map(BTreeMap::new()).is_key_safe());
+        assert!(!Value::Set(BTreeSet::new()).is_key_safe());
     }
 }

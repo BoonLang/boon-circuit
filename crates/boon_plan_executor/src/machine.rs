@@ -134,6 +134,8 @@ pub enum Value {
         visible: Box<Value>,
         binding: HostValueBinding,
     },
+    Map(BTreeMap<Value, Value>),
+    Set(BTreeSet<Value>),
 }
 
 #[cfg(feature = "phase0-instrumentation")]
@@ -296,6 +298,19 @@ fn value_tree_stats(value: &Value) -> ValueTreeStats {
                 stats.add_value(68);
                 visit(visible, stats);
             }
+            Value::Map(entries) => {
+                stats.add_value(8);
+                for (key, value) in entries {
+                    visit(key, stats);
+                    visit(value, stats);
+                }
+            }
+            Value::Set(items) => {
+                stats.add_value(8);
+                for item in items {
+                    visit(item, stats);
+                }
+            }
         }
     }
 
@@ -309,6 +324,8 @@ fn value_is_recursive(value: &Value) -> bool {
     matches!(
         value,
         Value::List(_)
+            | Value::Map(_)
+            | Value::Set(_)
             | Value::Record(_)
             | Value::Tag { .. }
             | Value::MappedRow { .. }
@@ -370,6 +387,8 @@ impl Clone for Value {
                 visible: visible.clone(),
                 binding: binding.clone(),
             },
+            Value::Map(entries) => Value::Map(entries.clone()),
+            Value::Set(items) => Value::Set(items.clone()),
         };
         if guard.outermost {
             update_legacy_runtime_counters(|counters| {
@@ -518,6 +537,10 @@ impl Value {
                 fields.values().any(Self::contains_host_binding)
             }
             Self::Row { fields, .. } => fields.values().any(Self::contains_host_binding),
+            Self::Map(entries) => entries
+                .iter()
+                .any(|(key, value)| key.contains_host_binding() || value.contains_host_binding()),
+            Self::Set(items) => items.iter().any(Self::contains_host_binding),
             Self::Number(_) | Self::Text(_) | Self::Bytes(_) => false,
         }
     }
@@ -555,6 +578,15 @@ impl Value {
                     .map(|(field, value)| (field, value.into_visible_facade()))
                     .collect(),
             },
+            Self::Map(entries) => Self::Map(
+                entries
+                    .into_iter()
+                    .map(|(key, value)| (key.into_visible_facade(), value.into_visible_facade()))
+                    .collect(),
+            ),
+            Self::Set(items) => {
+                Self::Set(items.into_iter().map(Self::into_visible_facade).collect())
+            }
             value @ (Self::Number(_) | Self::Text(_) | Self::Bytes(_)) => value,
         }
     }
@@ -5148,6 +5180,15 @@ fn runtime_value_from_data(value: &boon_data::Value) -> Value {
                 .map(|(name, value)| (name.clone(), runtime_value_from_data(value)))
                 .collect(),
         },
+        boon_data::Value::Map(entries) => Value::Map(
+            entries
+                .iter()
+                .map(|(key, value)| (runtime_value_from_data(key), runtime_value_from_data(value)))
+                .collect(),
+        ),
+        boon_data::Value::Set(items) => {
+            Value::Set(items.iter().map(runtime_value_from_data).collect())
+        }
     }
 }
 
@@ -5175,6 +5216,34 @@ fn runtime_value_to_data(value: &Value) -> Result<boon_data::Value, Error> {
                 .map(|(name, value)| Ok((name.clone(), runtime_value_to_data(value)?)))
                 .collect::<Result<BTreeMap<_, _>, Error>>()?,
         },
+        Value::Map(entries) => boon_data::Value::Map(
+            entries
+                .iter()
+                .map(|(key, value)| {
+                    let key = runtime_value_to_data(key)?;
+                    if !key.is_key_safe() {
+                        return Err(Error::Evaluation(
+                            "runtime MAP contains a non-key-safe key".to_owned(),
+                        ));
+                    }
+                    Ok((key, runtime_value_to_data(value)?))
+                })
+                .collect::<Result<BTreeMap<_, _>, Error>>()?,
+        ),
+        Value::Set(items) => boon_data::Value::Set(
+            items
+                .iter()
+                .map(|item| {
+                    let item = runtime_value_to_data(item)?;
+                    if !item.is_key_safe() {
+                        return Err(Error::Evaluation(
+                            "runtime SET contains a non-key-safe item".to_owned(),
+                        ));
+                    }
+                    Ok(item)
+                })
+                .collect::<Result<BTreeSet<_>, Error>>()?,
+        ),
         Value::MappedRow { .. } | Value::Row { .. } => {
             return Err(Error::Evaluation(
                 "ordinary data boundaries cannot contain runtime row handles".to_owned(),
@@ -5336,6 +5405,32 @@ pub(crate) fn stored_value(value: &Value) -> Result<boon_persistence::StoredValu
                 .map(|(name, value)| Ok((name.clone(), stored_value(value)?)))
                 .collect::<Result<BTreeMap<_, _>, Error>>()?,
         }),
+        Value::Map(entries) => entries
+            .iter()
+            .map(|(key, value)| {
+                let key = stored_value(key)?;
+                if !key.is_key_safe() {
+                    return Err(Error::Evaluation(
+                        "durable MAP contains a non-key-safe key".to_owned(),
+                    ));
+                }
+                Ok((key, stored_value(value)?))
+            })
+            .collect::<Result<BTreeMap<_, _>, Error>>()
+            .map(boon_persistence::StoredValue::Map),
+        Value::Set(items) => items
+            .iter()
+            .map(|item| {
+                let item = stored_value(item)?;
+                if !item.is_key_safe() {
+                    return Err(Error::Evaluation(
+                        "durable SET contains a non-key-safe item".to_owned(),
+                    ));
+                }
+                Ok(item)
+            })
+            .collect::<Result<BTreeSet<_>, Error>>()
+            .map(boon_persistence::StoredValue::Set),
         Value::MappedRow { .. } | Value::Row { .. } => Err(Error::Evaluation(
             "row handles and derived mapped rows are not durable authority".to_owned(),
         )),
@@ -5416,6 +5511,31 @@ fn validate_value_for_data_type(
             }
             Ok(())
         }
+        (Value::Map(entries), DataTypePlan::Map { key, value }) => {
+            for (entry_key, entry_value) in entries {
+                validate_value_for_data_type(entry_key, key, &format!("{path}.key"))?;
+                let data_key = runtime_value_to_data(entry_key)?;
+                if !data_key.is_key_safe() {
+                    return Err(Error::Evaluation(format!(
+                        "{path} contains a non-key-safe MAP key"
+                    )));
+                }
+                validate_value_for_data_type(entry_value, value, &format!("{path}[key]"))?;
+            }
+            Ok(())
+        }
+        (Value::Set(items), DataTypePlan::Set { item }) => {
+            for value in items {
+                validate_value_for_data_type(value, item, &format!("{path}.item"))?;
+                let data_item = runtime_value_to_data(value)?;
+                if !data_item.is_key_safe() {
+                    return Err(Error::Evaluation(format!(
+                        "{path} contains a non-key-safe SET item"
+                    )));
+                }
+            }
+            Ok(())
+        }
         (Value::Record(values), DataTypePlan::Record { fields, open }) => {
             validate_record_for_data_type(values, fields, *open, path)
         }
@@ -5452,6 +5572,8 @@ fn runtime_value_kind(value: &Value) -> &'static str {
         Value::List(_) => "List",
         Value::Record(_) => "Record",
         Value::Tag { .. } => "Tag",
+        Value::Map(_) => "Map",
+        Value::Set(_) => "Set",
         Value::MappedRow { .. } => "MappedRow",
         Value::Row { .. } => "Row",
         Value::HostBound { visible, .. } => runtime_value_kind(visible),
@@ -5517,6 +5639,16 @@ pub(crate) fn runtime_value(value: boon_persistence::StoredValue) -> Result<Valu
                 .map(|(name, value)| Ok((name, runtime_value(value)?)))
                 .collect::<Result<BTreeMap<_, _>, Error>>()?,
         }),
+        boon_persistence::StoredValue::Map(entries) => entries
+            .into_iter()
+            .map(|(key, value)| Ok((runtime_value(key)?, runtime_value(value)?)))
+            .collect::<Result<BTreeMap<_, _>, Error>>()
+            .map(Value::Map),
+        boon_persistence::StoredValue::Set(items) => items
+            .into_iter()
+            .map(runtime_value)
+            .collect::<Result<BTreeSet<_>, Error>>()
+            .map(Value::Set),
     }
 }
 
@@ -6051,6 +6183,8 @@ fn validate_flush_payload_value(value: &Value) -> Result<(), Error> {
                 pending.extend(fields.values());
             }
             Value::List(_)
+            | Value::Map(_)
+            | Value::Set(_)
             | Value::MappedRow { .. }
             | Value::Row { .. }
             | Value::HostBound { .. } => {
@@ -7843,6 +7977,17 @@ fn schedule_apply_operands<'event, 'plan>(
         | PlanRowExpressionNode::ListLiteral { items: parts } => {
             for part in parts.iter().rev() {
                 push(*part)?;
+            }
+        }
+        PlanRowExpressionNode::MapLiteral { entries } => {
+            for entry in entries.iter().rev() {
+                push(entry.value)?;
+                push(entry.key)?;
+            }
+        }
+        PlanRowExpressionNode::SetLiteral { items } => {
+            for item in items.iter().rev() {
+                push(*item)?;
             }
         }
         PlanRowExpressionNode::ListRange { from, to } => {
@@ -26166,6 +26311,45 @@ impl MachineInstance {
                 }
                 EvalValue::List(values)
             }
+            PlanRowExpressionNode::MapLiteral { entries } => {
+                work.consume(entries.len().try_into().unwrap_or(u64::MAX))?;
+                let mut values = BTreeMap::new();
+                for _ in entries {
+                    let key = self.materialize_eval(next()?)?;
+                    let data_key = runtime_value_to_data(&key)?;
+                    if !data_key.is_key_safe() {
+                        return Err(Error::Evaluation(
+                            "MAP literal key is not key-safe".to_owned(),
+                        ));
+                    }
+                    let value = self.materialize_eval(next()?)?;
+                    if values.insert(key, value).is_some() {
+                        return Err(Error::Evaluation(
+                            "MAP literal contains a duplicate key".to_owned(),
+                        ));
+                    }
+                }
+                EvalValue::Value(Value::Map(values))
+            }
+            PlanRowExpressionNode::SetLiteral { items } => {
+                work.consume(items.len().try_into().unwrap_or(u64::MAX))?;
+                let mut values = BTreeSet::new();
+                for _ in items {
+                    let item = self.materialize_eval(next()?)?;
+                    let data_item = runtime_value_to_data(&item)?;
+                    if !data_item.is_key_safe() {
+                        return Err(Error::Evaluation(
+                            "SET literal item is not key-safe".to_owned(),
+                        ));
+                    }
+                    if !values.insert(item) {
+                        return Err(Error::Evaluation(
+                            "SET literal contains a duplicate item".to_owned(),
+                        ));
+                    }
+                }
+                EvalValue::Value(Value::Set(values))
+            }
             PlanRowExpressionNode::ListSum { .. } => {
                 let items = eval_to_list(next()?)?;
                 work.consume(items.len().try_into().unwrap_or(u64::MAX))?;
@@ -26710,6 +26894,121 @@ impl MachineInstance {
                 }
                 work.consume(count.try_into().unwrap_or(u64::MAX))?;
                 value
+            }
+            PlanRowBuiltin::MapUpsert => {
+                let Value::Map(mut entries) = self.materialize_eval(require_input(input)?)? else {
+                    return Err(Error::Evaluation(
+                        "Map/upsert input is not a MAP".to_owned(),
+                    ));
+                };
+                let entry = self
+                    .materialize_eval(take_required_builtin_arg(&mut args, "entry", function)?)?;
+                let Value::Record(mut fields) = entry else {
+                    return Err(Error::Evaluation(
+                        "Map/upsert entry must be an object with `key` and `value` fields"
+                            .to_owned(),
+                    ));
+                };
+                let key = fields.remove("key").ok_or_else(|| {
+                    Error::Evaluation("Map/upsert entry is missing `key`".to_owned())
+                })?;
+                let value = fields.remove("value").ok_or_else(|| {
+                    Error::Evaluation("Map/upsert entry is missing `value`".to_owned())
+                })?;
+                if !fields.is_empty() {
+                    return Err(Error::Evaluation(
+                        "Map/upsert entry accepts only `key` and `value` fields".to_owned(),
+                    ));
+                }
+                if !runtime_value_to_data(&key)?.is_key_safe() {
+                    return Err(Error::Evaluation(
+                        "Map/upsert key is not key-safe".to_owned(),
+                    ));
+                }
+                work.consume(1)?;
+                entries.insert(key, value);
+                EvalValue::Value(Value::Map(entries))
+            }
+            PlanRowBuiltin::MapRemove => {
+                let Value::Map(mut entries) = self.materialize_eval(require_input(input)?)? else {
+                    return Err(Error::Evaluation(
+                        "Map/remove input is not a MAP".to_owned(),
+                    ));
+                };
+                let key =
+                    self.materialize_eval(take_required_builtin_arg(&mut args, "key", function)?)?;
+                if !runtime_value_to_data(&key)?.is_key_safe() {
+                    return Err(Error::Evaluation(
+                        "Map/remove key is not key-safe".to_owned(),
+                    ));
+                }
+                work.consume(1)?;
+                entries.remove(&key);
+                EvalValue::Value(Value::Map(entries))
+            }
+            PlanRowBuiltin::MapGet => {
+                let Value::Map(entries) = self.materialize_eval(require_input(input)?)? else {
+                    return Err(Error::Evaluation("Map/get input is not a MAP".to_owned()));
+                };
+                let key =
+                    self.materialize_eval(take_required_builtin_arg(&mut args, "key", function)?)?;
+                if !runtime_value_to_data(&key)?.is_key_safe() {
+                    return Err(Error::Evaluation("Map/get key is not key-safe".to_owned()));
+                }
+                work.consume(1)?;
+                EvalValue::Value(
+                    entries
+                        .get(&key)
+                        .cloned()
+                        .map(found_value)
+                        .unwrap_or_else(|| Value::tag("NotFound")),
+                )
+            }
+            PlanRowBuiltin::SetAdd => {
+                let Value::Set(mut items) = self.materialize_eval(require_input(input)?)? else {
+                    return Err(Error::Evaluation("Set/add input is not a SET".to_owned()));
+                };
+                let item =
+                    self.materialize_eval(take_required_builtin_arg(&mut args, "item", function)?)?;
+                if !runtime_value_to_data(&item)?.is_key_safe() {
+                    return Err(Error::Evaluation("Set/add item is not key-safe".to_owned()));
+                }
+                work.consume(1)?;
+                items.insert(item);
+                EvalValue::Value(Value::Set(items))
+            }
+            PlanRowBuiltin::SetRemove => {
+                let Value::Set(mut items) = self.materialize_eval(require_input(input)?)? else {
+                    return Err(Error::Evaluation(
+                        "Set/remove input is not a SET".to_owned(),
+                    ));
+                };
+                let item =
+                    self.materialize_eval(take_required_builtin_arg(&mut args, "item", function)?)?;
+                if !runtime_value_to_data(&item)?.is_key_safe() {
+                    return Err(Error::Evaluation(
+                        "Set/remove item is not key-safe".to_owned(),
+                    ));
+                }
+                work.consume(1)?;
+                items.remove(&item);
+                EvalValue::Value(Value::Set(items))
+            }
+            PlanRowBuiltin::SetContains => {
+                let Value::Set(items) = self.materialize_eval(require_input(input)?)? else {
+                    return Err(Error::Evaluation(
+                        "Set/contains input is not a SET".to_owned(),
+                    ));
+                };
+                let item =
+                    self.materialize_eval(take_required_builtin_arg(&mut args, "item", function)?)?;
+                if !runtime_value_to_data(&item)?.is_key_safe() {
+                    return Err(Error::Evaluation(
+                        "Set/contains item is not key-safe".to_owned(),
+                    ));
+                }
+                work.consume(1)?;
+                EvalValue::Value(Value::truth(items.contains(&item)))
             }
             PlanRowBuiltin::TextJoin => {
                 let items = eval_to_list(require_input(input)?)?;
@@ -27742,6 +28041,21 @@ pub(crate) fn normalize_host_output_value(value: Value) -> Result<Value, Error> 
             .map(|(name, value)| Ok((name, normalize_host_output_value(value)?)))
             .collect::<Result<BTreeMap<_, _>, Error>>()
             .map(|fields| Value::Tag { tag, fields }),
+        Value::Map(entries) => entries
+            .into_iter()
+            .map(|(key, value)| {
+                Ok((
+                    normalize_host_output_value(key)?,
+                    normalize_host_output_value(value)?,
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>, Error>>()
+            .map(Value::Map),
+        Value::Set(items) => items
+            .into_iter()
+            .map(normalize_host_output_value)
+            .collect::<Result<BTreeSet<_>, Error>>()
+            .map(Value::Set),
         Value::MappedRow { fields, .. } => fields
             .into_iter()
             .map(|(name, value)| Ok((name, normalize_host_output_value(value)?)))
@@ -27775,6 +28089,21 @@ fn normalize_effect_intent_value(value: Value) -> Result<Value, Error> {
             .map(|(name, value)| Ok((name, normalize_effect_intent_value(value)?)))
             .collect::<Result<BTreeMap<_, _>, Error>>()
             .map(|fields| Value::Tag { tag, fields }),
+        Value::Map(entries) => entries
+            .into_iter()
+            .map(|(key, value)| {
+                Ok((
+                    normalize_effect_intent_value(key)?,
+                    normalize_effect_intent_value(value)?,
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>, Error>>()
+            .map(Value::Map),
+        Value::Set(items) => items
+            .into_iter()
+            .map(normalize_effect_intent_value)
+            .collect::<Result<BTreeSet<_>, Error>>()
+            .map(Value::Set),
         Value::MappedRow { fields, .. } => fields
             .into_iter()
             .map(|(name, value)| Ok((name, normalize_effect_intent_value(value)?)))
@@ -28308,6 +28637,8 @@ fn value_to_text(value: &Value) -> Result<String, Error> {
         Value::Tag { tag, fields } if fields.is_empty() => Ok(tag.clone()),
         Value::List(_)
         | Value::Record(_)
+        | Value::Map(_)
+        | Value::Set(_)
         | Value::Tag { .. }
         | Value::MappedRow { .. }
         | Value::Row { .. } => Err(Error::Evaluation(

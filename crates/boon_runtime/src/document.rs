@@ -1513,6 +1513,8 @@ enum EvalValue {
     },
     Tag(String, BTreeMap<String, EvalValue>),
     List(Vec<EvalValue>),
+    Map(Vec<(EvalValue, EvalValue)>),
+    Set(Vec<EvalValue>),
     RuntimeList {
         list: ListId,
         logical_len: u64,
@@ -3790,6 +3792,7 @@ impl EvalValue {
             Self::Tag(tag, fields) if fields.is_empty() => tag.clone(),
             Self::Tag(tag, fields) => format_record(Some(tag), fields),
             Self::List(values) => values.iter().map(Self::text).collect::<Vec<_>>().join(""),
+            Self::Map(_) | Self::Set(_) => String::new(),
             Self::RuntimeList { .. } => String::new(),
             Self::Row { .. } => String::new(),
             Self::Source(_) => String::new(),
@@ -3808,6 +3811,8 @@ impl EvalValue {
             Self::Record(value) | Self::Tag(_, value) => !value.is_empty(),
             Self::MappedRow { fields, .. } => !fields.is_empty(),
             Self::List(value) => !value.is_empty(),
+            Self::Map(value) => !value.is_empty(),
+            Self::Set(value) => !value.is_empty(),
             Self::RuntimeList { logical_len, .. } => *logical_len != 0,
             Self::Nodes(value) => !value.is_empty(),
             Self::Row { .. } => true,
@@ -3842,6 +3847,8 @@ fn inline_content_text(value: &EvalValue) -> Option<String> {
         | EvalValue::MappedRow { .. }
         | EvalValue::Tag(_, _)
         | EvalValue::List(_)
+        | EvalValue::Map(_)
+        | EvalValue::Set(_)
         | EvalValue::RuntimeList { .. }
         | EvalValue::Row { .. }
         | EvalValue::Source(_)
@@ -3894,6 +3901,16 @@ fn guard_value(value: &EvalValue) -> Option<Value> {
             .map(guard_value)
             .collect::<Option<Vec<_>>>()
             .map(Value::List),
+        EvalValue::Map(entries) => entries
+            .iter()
+            .map(|(key, value)| Some((guard_value(key)?, guard_value(value)?)))
+            .collect::<Option<BTreeMap<_, _>>>()
+            .map(Value::Map),
+        EvalValue::Set(items) => items
+            .iter()
+            .map(guard_value)
+            .collect::<Option<BTreeSet<_>>>()
+            .map(Value::Set),
         EvalValue::Row {
             id: Some(id),
             fields,
@@ -3953,6 +3970,13 @@ fn machine_value_to_eval(value: Value) -> EvalValue {
             provenance: BTreeMap::new(),
         },
         Value::HostBound { visible, .. } => machine_value_to_eval(*visible),
+        Value::Map(entries) => EvalValue::Map(
+            entries
+                .into_iter()
+                .map(|(key, value)| (machine_value_to_eval(key), machine_value_to_eval(value)))
+                .collect(),
+        ),
+        Value::Set(items) => EvalValue::Set(items.into_iter().map(machine_value_to_eval).collect()),
     }
 }
 

@@ -219,6 +219,14 @@ fn estimated_value_bytes(value: &Value) -> Option<usize> {
         Value::Tag { tag, fields } => {
             estimated_fields_bytes(fields, 32usize.checked_add(tag.len())?)
         }
+        Value::Map(entries) => entries.iter().try_fold(16usize, |total, (key, value)| {
+            total
+                .checked_add(estimated_value_bytes(key)?)?
+                .checked_add(estimated_value_bytes(value)?)
+        }),
+        Value::Set(items) => items.iter().try_fold(16usize, |total, item| {
+            total.checked_add(estimated_value_bytes(item)?)
+        }),
     }
 }
 

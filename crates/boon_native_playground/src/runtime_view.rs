@@ -3545,6 +3545,34 @@ fn format_inspection_value(value: &Value, depth: usize) -> String {
                 format!("{tag}[{}]", parts.join(", "))
             }
         }
+        Value::Map(entries) => {
+            let mut parts = entries
+                .iter()
+                .take(MAX_ITEMS)
+                .map(|(key, value)| {
+                    format!(
+                        "{} => {}",
+                        format_inspection_value(key, depth + 1),
+                        format_inspection_value(value, depth + 1)
+                    )
+                })
+                .collect::<Vec<_>>();
+            if entries.len() > MAX_ITEMS {
+                parts.push(format!("... {} more", entries.len() - MAX_ITEMS));
+            }
+            format!("MAP {{{}}}", parts.join(", "))
+        }
+        Value::Set(items) => {
+            let mut parts = items
+                .iter()
+                .take(MAX_ITEMS)
+                .map(|item| format_inspection_value(item, depth + 1))
+                .collect::<Vec<_>>();
+            if items.len() > MAX_ITEMS {
+                parts.push(format!("... {} more", items.len() - MAX_ITEMS));
+            }
+            format!("SET {{{}}}", parts.join(", "))
+        }
         Value::MappedRow { id, fields } => {
             let mut parts = fields
                 .iter()

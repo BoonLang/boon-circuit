@@ -304,10 +304,10 @@ pub const LANGUAGE_FEATURE_REGISTRY: &[LanguageFeatureSpec] = &[
     },
     LanguageFeatureSpec {
         id: "map_literals",
-        stage: LanguageFeatureStage::Planned,
-        parse_expectation: LanguageFeatureParseExpectation::Reject,
+        stage: LanguageFeatureStage::Current,
+        parse_expectation: LanguageFeatureParseExpectation::Accept,
         spellings: &["MAP"],
-        summary: "authoritative MAP literals are planned and rejected today",
+        summary: "typed authoritative MAP literals with delimiter-safe entry arrows",
     },
     LanguageFeatureSpec {
         id: "one_based_positions",
@@ -332,10 +332,10 @@ pub const LANGUAGE_FEATURE_REGISTRY: &[LanguageFeatureSpec] = &[
     },
     LanguageFeatureSpec {
         id: "set_literals",
-        stage: LanguageFeatureStage::Planned,
-        parse_expectation: LanguageFeatureParseExpectation::Reject,
+        stage: LanguageFeatureStage::Current,
+        parse_expectation: LanguageFeatureParseExpectation::Accept,
         spellings: &["SET"],
-        summary: "authoritative SET literals are planned and rejected today",
+        summary: "typed authoritative SET literals with canonical key-safe items",
     },
     LanguageFeatureSpec {
         id: "structured_out_and_pass",

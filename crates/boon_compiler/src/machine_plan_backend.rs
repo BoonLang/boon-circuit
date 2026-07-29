@@ -247,6 +247,17 @@ fn visit_row_node_children_mut(
                 visitor(&mut field.value);
             }
         }
+        PlanRowExpressionNode::MapLiteral { entries } => {
+            for entry in entries {
+                visitor(&mut entry.key);
+                visitor(&mut entry.value);
+            }
+        }
+        PlanRowExpressionNode::SetLiteral { items } => {
+            for item in items {
+                visitor(item);
+            }
+        }
         PlanRowExpressionNode::BuiltinCall { input, args, .. } => {
             if let Some(input) = input {
                 visitor(input);
@@ -10858,13 +10869,47 @@ impl<'a> ExecutableRowLowerer<'a> {
                     .collect::<Result<Vec<_>, _>>()?;
                 self.intern(PlanRowExpressionNode::ListLiteral { items })?
             }
-            ir::ExecutableExpressionKind::MapEntry { .. }
-            | ir::ExecutableExpressionKind::Map { .. }
-            | ir::ExecutableExpressionKind::Set { .. } => {
+            ir::ExecutableExpressionKind::MapEntry { .. } => {
                 return Err(PlanError::new(format!(
-                    "MAP/SET executable expression {} reached row lowering before collection authority lowering",
+                    "MAP entry executable expression {} escaped its MAP literal",
                     root.0
                 )));
+            }
+            ir::ExecutableExpressionKind::Map { entries } => {
+                let mut lowered = Vec::with_capacity(entries.len());
+                for entry in entries {
+                    let kind = self
+                        .program
+                        .executable
+                        .expressions
+                        .get(entry.as_usize())
+                        .filter(|expression| expression.id == entry)
+                        .map(|expression| expression.kind.clone())
+                        .ok_or_else(|| {
+                            PlanError::new(format!(
+                                "MAP executable expression {} references missing entry {}",
+                                root.0, entry.0
+                            ))
+                        })?;
+                    let ir::ExecutableExpressionKind::MapEntry { key, value } = kind else {
+                        return Err(PlanError::new(format!(
+                            "MAP executable expression {} contains non-entry expression {}",
+                            root.0, entry.0
+                        )));
+                    };
+                    lowered.push(PlanRowMapEntry {
+                        key: self.lower_scoped(key, owner)?,
+                        value: self.lower_scoped(value, owner)?,
+                    });
+                }
+                self.intern(PlanRowExpressionNode::MapLiteral { entries: lowered })?
+            }
+            ir::ExecutableExpressionKind::Set { items } => {
+                let items = items
+                    .into_iter()
+                    .map(|item| self.lower_scoped(item, owner))
+                    .collect::<Result<Vec<_>, _>>()?;
+                self.intern(PlanRowExpressionNode::SetLiteral { items })?
             }
             ir::ExecutableExpressionKind::Bytes { .. } => {
                 self.bytes_constant(executable_static_bytes(self.program, root).ok_or_else(
@@ -12263,6 +12308,8 @@ fn row_expression_value_type(
         | PlanRowExpressionNode::AuthorityListRef { .. }
         | PlanRowExpressionNode::ListRange { .. }
         | PlanRowExpressionNode::ListLiteral { .. }
+        | PlanRowExpressionNode::MapLiteral { .. }
+        | PlanRowExpressionNode::SetLiteral { .. }
         | PlanRowExpressionNode::ContextualCollection { .. }
         | PlanRowExpressionNode::ContextualOrder { .. }
         | PlanRowExpressionNode::ListAccess { .. }

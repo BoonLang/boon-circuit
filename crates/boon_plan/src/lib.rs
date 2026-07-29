@@ -1933,6 +1933,10 @@ fn distributed_call_expression_is_safe(
             PlanRowExpressionNode::ObjectField { object, field } => {
                 distributed_name_is_canonical(field) && child_is_valid(object)
             }
+            PlanRowExpressionNode::MapLiteral { entries } => entries
+                .iter()
+                .all(|entry| child_is_valid(&entry.key) && child_is_valid(&entry.value)),
+            PlanRowExpressionNode::SetLiteral { items } => items.iter().all(child_is_valid),
             PlanRowExpressionNode::Select { input, arms } => {
                 !arms.is_empty()
                     && child_is_valid(input)
@@ -6862,6 +6866,18 @@ static BUILTIN_PARAMS_LIST_TAKE: &[PlanRowBuiltinParameter] = &[
     PlanRowBuiltinParameter::required_receiver("list"),
     PlanRowBuiltinParameter::required("count"),
 ];
+static BUILTIN_PARAMS_MAP_ENTRY: &[PlanRowBuiltinParameter] = &[
+    PlanRowBuiltinParameter::required_receiver("map"),
+    PlanRowBuiltinParameter::required("entry"),
+];
+static BUILTIN_PARAMS_MAP_KEY: &[PlanRowBuiltinParameter] = &[
+    PlanRowBuiltinParameter::required_receiver("map"),
+    PlanRowBuiltinParameter::required("key"),
+];
+static BUILTIN_PARAMS_SET_ITEM: &[PlanRowBuiltinParameter] = &[
+    PlanRowBuiltinParameter::required_receiver("set"),
+    PlanRowBuiltinParameter::required("item"),
+];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PlanRowBuiltinSignature {
@@ -6985,6 +7001,12 @@ pub enum PlanRowBuiltin {
     ListLength,
     ListIsNotEmpty,
     ListTake,
+    MapUpsert,
+    MapRemove,
+    MapGet,
+    SetAdd,
+    SetRemove,
+    SetContains,
 }
 
 impl PlanRowBuiltin {
@@ -7022,6 +7044,12 @@ impl PlanRowBuiltin {
         Self::ListLength,
         Self::ListIsNotEmpty,
         Self::ListTake,
+        Self::MapUpsert,
+        Self::MapRemove,
+        Self::MapGet,
+        Self::SetAdd,
+        Self::SetRemove,
+        Self::SetContains,
     ];
 
     pub fn from_function_name(function: &str) -> Option<Self> {
@@ -7066,6 +7094,12 @@ impl PlanRowBuiltin {
             Self::ListLength => "List/length",
             Self::ListIsNotEmpty => "List/is_not_empty",
             Self::ListTake => "List/take",
+            Self::MapUpsert => "Map/upsert",
+            Self::MapRemove => "Map/remove",
+            Self::MapGet => "Map/get",
+            Self::SetAdd => "Set/add",
+            Self::SetRemove => "Set/remove",
+            Self::SetContains => "Set/contains",
         }
     }
 
@@ -7101,8 +7135,15 @@ impl PlanRowBuiltin {
             | Self::TextIsNotEmpty
             | Self::TextAllCharsIn
             | Self::ListIsNotEmpty
-            | Self::ListGet => Some(PlanValueType::Tag),
-            Self::ListLatest | Self::ListTake => None,
+            | Self::ListGet
+            | Self::MapGet
+            | Self::SetContains => Some(PlanValueType::Tag),
+            Self::ListLatest
+            | Self::ListTake
+            | Self::MapUpsert
+            | Self::MapRemove
+            | Self::SetAdd
+            | Self::SetRemove => None,
         }
     }
 
@@ -7138,6 +7179,9 @@ impl PlanRowBuiltin {
                 BUILTIN_PARAMS_LIST
             }
             Self::ListTake => BUILTIN_PARAMS_LIST_TAKE,
+            Self::MapUpsert => BUILTIN_PARAMS_MAP_ENTRY,
+            Self::MapRemove | Self::MapGet => BUILTIN_PARAMS_MAP_KEY,
+            Self::SetAdd | Self::SetRemove | Self::SetContains => BUILTIN_PARAMS_SET_ITEM,
         };
         PlanRowBuiltinSignature::new(parameters)
     }
@@ -7437,6 +7481,12 @@ pub enum PlanRowExpressionNode {
         input: PlanRowExpressionId,
         arms: Vec<PlanRowSelectArm>,
     },
+    MapLiteral {
+        entries: Vec<PlanRowMapEntry>,
+    },
+    SetLiteral {
+        items: Vec<PlanRowExpressionId>,
+    },
 }
 
 impl From<ValueRef> for PlanRowExpressionNode {
@@ -7633,6 +7683,13 @@ impl PlanRowExpressionNode {
             Self::Object { fields } | Self::TaggedObject { fields, .. } => {
                 fields.iter().map(|field| field.value).for_each(visitor);
             }
+            Self::MapLiteral { entries } => {
+                for entry in entries {
+                    visitor(entry.key);
+                    visitor(entry.value);
+                }
+            }
+            Self::SetLiteral { items } => items.iter().copied().for_each(visitor),
             Self::BuiltinCall { input, args, .. } => {
                 if let Some(input) = input {
                     visitor(*input);
@@ -7842,6 +7899,13 @@ impl PlanRowExpressionNode {
                     .map(|field| &mut field.value)
                     .for_each(visitor);
             }
+            Self::MapLiteral { entries } => {
+                for entry in entries {
+                    visitor(&mut entry.key);
+                    visitor(&mut entry.value);
+                }
+            }
+            Self::SetLiteral { items } => items.iter_mut().for_each(visitor),
             Self::BuiltinCall { input, args, .. } => {
                 if let Some(input) = input {
                     visitor(input);
@@ -8669,6 +8733,12 @@ pub struct PlanRowObjectField {
     pub value: PlanRowExpressionId,
     #[serde(default)]
     pub spread: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PlanRowMapEntry {
+    pub key: PlanRowExpressionId,
+    pub value: PlanRowExpressionId,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

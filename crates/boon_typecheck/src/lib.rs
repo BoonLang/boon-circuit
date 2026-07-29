@@ -1,5 +1,5 @@
 use boon_contract::SourceBundleDigestV1;
-use boon_data::{ExactNumber, ExactRoundingRule, MAX_NUMBER_TEXT_DIGITS};
+use boon_data::{ExactNumber, ExactRoundingRule, MAX_NUMBER_TEXT_DIGITS, Value as DataValue};
 pub use boon_document_model::ProgramRole;
 use boon_parser::{
     AstCallArg, AstCallArgKind, AstDrainPath, AstExpr, AstExprKind, AstMatchPattern, AstParameter,
@@ -11582,6 +11582,22 @@ fn unify_checked_type_pattern(
         (Type::List(pattern), Type::List(actual)) => {
             unify_checked_type_pattern(pattern, actual, substitutions);
         }
+        (
+            Type::Map {
+                key: pattern_key,
+                value: pattern_value,
+            },
+            Type::Map {
+                key: actual_key,
+                value: actual_value,
+            },
+        ) => {
+            unify_checked_type_pattern(pattern_key, actual_key, substitutions);
+            unify_checked_type_pattern(pattern_value, actual_value, substitutions);
+        }
+        (Type::Set(pattern), Type::Set(actual)) => {
+            unify_checked_type_pattern(pattern, actual, substitutions);
+        }
         (Type::Object(pattern), Type::Object(actual)) => {
             for (name, pattern) in &pattern.fields {
                 if let Some(actual) = actual.fields.get(name) {
@@ -12801,6 +12817,28 @@ pub fn type_is_map_key_safe(ty: &Type) -> bool {
         | Type::Union(_)
         | Type::Map { .. }
         | Type::Set(_) => false,
+    }
+}
+
+fn type_may_contain_collection_authority(ty: &Type) -> bool {
+    match ty {
+        Type::List(_) | Type::Map { .. } | Type::Set(_) => true,
+        Type::Object(shape) => shape
+            .fields
+            .values()
+            .any(type_may_contain_collection_authority),
+        Type::VariantSet(variants) => variants.iter().any(|variant| match variant {
+            Variant::Tag(_) => false,
+            Variant::Tagged { fields, .. } => fields
+                .fields
+                .values()
+                .any(type_may_contain_collection_authority),
+        }),
+        Type::Union(members) => members.iter().any(type_may_contain_collection_authority),
+        Type::Function { .. } | Type::UnresolvedShape { .. } | Type::Var(_) | Type::Unknown => {
+            false
+        }
+        Type::Text | Type::Number | Type::Bytes(_) | Type::Absent | Type::RenderContract => false,
     }
 }
 
@@ -14581,7 +14619,22 @@ impl<'a> Checker<'a> {
             AstExprKind::MapLiteral { entries } => {
                 let mut key_type: Option<Type> = None;
                 let mut value_type: Option<Type> = None;
+                let mut static_keys = BTreeMap::<DataValue, usize>::new();
                 for entry in entries {
+                    if let Some(AstExpr {
+                        kind: AstExprKind::MapEntry { key, .. },
+                        ..
+                    }) = self.program.expressions.get(*entry)
+                        && let Some(key_value) = static_key_value(self.program, *key)
+                        && let Some(first) = static_keys.insert(key_value, *key)
+                    {
+                        self.diagnostics.push(self.diagnostic_for_expr(
+                            *key,
+                            format!(
+                                "MAP literal contains a statically duplicate key; first equal key is expression {first}"
+                            ),
+                        ));
+                    }
                     let Type::Object(shape) = self.ensure_expr(*entry).ty else {
                         continue;
                     };
@@ -14659,6 +14712,8 @@ impl<'a> Checker<'a> {
                 } else if let Some(ty) = self.contextual_bytes_result_type(function, None, args) {
                     ty
                 } else if let Some(ty) = self.typed_list_result_type(function, None, args) {
+                    ty
+                } else if let Some(ty) = self.typed_map_set_result_type(function, None, args) {
                     ty
                 } else {
                     self.type_for_call_expr(expr.id, function, None, args)
@@ -14797,6 +14852,10 @@ impl<'a> Checker<'a> {
                 {
                     ty
                 } else if let Some(ty) = self.typed_list_result_type(op, Some(input_expr_id), args)
+                {
+                    ty
+                } else if let Some(ty) =
+                    self.typed_map_set_result_type(op, Some(input_expr_id), args)
                 {
                     ty
                 } else {
@@ -16240,6 +16299,40 @@ impl<'a> Checker<'a> {
                     .filter(|item| !matches!(item, Type::Absent))
                     .unwrap_or_else(open_object_type),
             )),
+            _ => None,
+        }
+    }
+
+    fn typed_map_set_result_type(
+        &mut self,
+        function: &str,
+        piped_input: Option<usize>,
+        args: &[AstCallArg],
+    ) -> Option<Type> {
+        match function {
+            "Map/upsert" | "Map/remove" | "Map/get" => {
+                let map = piped_input
+                    .or_else(|| named_arg_expr(args, "map"))
+                    .map(|expr_id| self.ensure_expr(expr_id).ty)?;
+                match function {
+                    "Map/upsert" | "Map/remove" => Some(map),
+                    "Map/get" => Some(found_or_not_found_type(match map {
+                        Type::Map { value, .. } => *value,
+                        _ => Type::Unknown,
+                    })),
+                    _ => unreachable!(),
+                }
+            }
+            "Set/add" | "Set/remove" | "Set/contains" => {
+                let set = piped_input
+                    .or_else(|| named_arg_expr(args, "set"))
+                    .map(|expr_id| self.ensure_expr(expr_id).ty)?;
+                if function == "Set/contains" {
+                    Some(true_false_type())
+                } else {
+                    Some(set)
+                }
+            }
             _ => None,
         }
     }
@@ -17876,10 +17969,28 @@ impl<'a> Checker<'a> {
             );
             return;
         }
+        if type_may_contain_collection_authority(&initial_type) {
+            self.diagnostics.push(self.diagnostic_for_expr(
+                initial,
+                format!(
+                    "`HOLD` state cannot contain LIST, SET, or MAP authority anywhere in its type\nfound: {}",
+                    boon_facing_type_label(&initial_type)
+                ),
+            ));
+        }
         for update in hold_update_exprs(statement, &self.program.expressions) {
             let update_type = self.ensure_expr(update).ty;
             if matches!(update_type, Type::Absent) {
                 continue;
+            }
+            if type_may_contain_collection_authority(&update_type) {
+                self.diagnostics.push(self.diagnostic_for_expr(
+                    update,
+                    format!(
+                        "`HOLD` state cannot contain LIST, SET, or MAP authority anywhere in its type\nfound: {}",
+                        boon_facing_type_label(&update_type)
+                    ),
+                ));
             }
             if concrete_type_conflict(&initial_type, &update_type) {
                 self.constraints.push(Constraint::FlowCompatible {
@@ -19281,6 +19392,69 @@ fn static_exact_number_expr(program: &ParsedProgram, expr_id: usize) -> Option<E
     evaluate(program, expr_id, &mut BTreeSet::new())
 }
 
+fn static_key_value(program: &ParsedProgram, expr_id: usize) -> Option<DataValue> {
+    fn evaluate(
+        program: &ParsedProgram,
+        expr_id: usize,
+        active: &mut BTreeSet<usize>,
+    ) -> Option<DataValue> {
+        if !active.insert(expr_id) {
+            return None;
+        }
+        let value = match &program.expressions.get(expr_id)?.kind {
+            AstExprKind::Number(_) | AstExprKind::Infix { .. } => {
+                static_exact_number_expr(program, expr_id).map(DataValue::Number)
+            }
+            AstExprKind::StringLiteral(value) | AstExprKind::TextLiteral(value) => {
+                Some(DataValue::Text(value.clone()))
+            }
+            AstExprKind::ByteLiteral { value, .. } => Some(DataValue::Bytes(vec![*value].into())),
+            AstExprKind::BytesLiteral { items, .. } => {
+                let mut bytes = Vec::new();
+                for item in items {
+                    let DataValue::Bytes(item) = evaluate(program, *item, active)? else {
+                        active.remove(&expr_id);
+                        return None;
+                    };
+                    bytes.extend_from_slice(&item);
+                }
+                Some(DataValue::Bytes(bytes.into()))
+            }
+            AstExprKind::Tag(tag) => Some(DataValue::tag(tag.clone())),
+            AstExprKind::TaggedObject { tag, fields } => {
+                let mut values = BTreeMap::new();
+                for field in fields {
+                    if field.spread {
+                        active.remove(&expr_id);
+                        return None;
+                    }
+                    values.insert(field.name.clone(), evaluate(program, field.value, active)?);
+                }
+                Some(DataValue::Tag {
+                    tag: tag.clone(),
+                    fields: values,
+                })
+            }
+            AstExprKind::Object(fields) => {
+                let mut values = BTreeMap::new();
+                for field in fields {
+                    if field.spread {
+                        active.remove(&expr_id);
+                        return None;
+                    }
+                    values.insert(field.name.clone(), evaluate(program, field.value, active)?);
+                }
+                Some(DataValue::Object(values))
+            }
+            _ => None,
+        };
+        active.remove(&expr_id);
+        value
+    }
+
+    evaluate(program, expr_id, &mut BTreeSet::new()).filter(DataValue::is_key_safe)
+}
+
 fn static_integer_expr_checked_cached(
     program: &ParsedProgram,
     expr_id: usize,
@@ -19445,6 +19619,8 @@ const RENDER_OPTIONAL_PARAMETER_PROFILE_V1: &str = "boon.render-optional-paramet
 const CONTEXTUAL_ITEM_VAR: TypeVar = TypeVar(0);
 const CONTEXTUAL_RESULT_VAR: TypeVar = TypeVar(1);
 const CONTEXTUAL_KEY_VAR: TypeVar = TypeVar(2);
+const MAP_KEY_VAR: TypeVar = TypeVar(3);
+const MAP_VALUE_VAR: TypeVar = TypeVar(4);
 
 fn contextual_item_type() -> Type {
     Type::Var(CONTEXTUAL_ITEM_VAR)
@@ -19456,6 +19632,25 @@ fn contextual_result_type() -> Type {
 
 fn contextual_key_type() -> Type {
     Type::Var(CONTEXTUAL_KEY_VAR)
+}
+
+fn map_key_type() -> Type {
+    Type::Var(MAP_KEY_VAR)
+}
+
+fn map_value_type() -> Type {
+    Type::Var(MAP_VALUE_VAR)
+}
+
+fn map_type() -> Type {
+    Type::Map {
+        key: Box::new(map_key_type()),
+        value: Box::new(map_value_type()),
+    }
+}
+
+fn set_type() -> Type {
+    Type::Set(Box::new(map_key_type()))
 }
 
 fn dependency_catch_type() -> Type {
@@ -20134,6 +20329,62 @@ impl Default for BuiltinSignatureRegistry {
                 "list",
                 Type::List(Box::new(contextual_item_type())),
             )],
+            None,
+        );
+        register(
+            "Map/upsert",
+            map_type(),
+            vec![
+                required_parameter("map", map_type()),
+                required_parameter(
+                    "entry",
+                    Type::Object(ObjectShape::from_ordered_fields(
+                        [
+                            ("key".to_owned(), map_key_type()),
+                            ("value".to_owned(), map_value_type()),
+                        ],
+                        false,
+                    )),
+                ),
+            ],
+            None,
+        );
+        register(
+            "Map/remove",
+            map_type(),
+            vec![
+                required_parameter("map", map_type()),
+                required_parameter("key", map_key_type()),
+            ],
+            None,
+        );
+        register(
+            "Map/get",
+            found_or_not_found_type(map_value_type()),
+            vec![
+                required_parameter("map", map_type()),
+                required_parameter("key", map_key_type()),
+            ],
+            None,
+        );
+        for name in ["Set/add", "Set/remove"] {
+            register(
+                name,
+                set_type(),
+                vec![
+                    required_parameter("set", set_type()),
+                    required_parameter("item", map_key_type()),
+                ],
+                None,
+            );
+        }
+        register(
+            "Set/contains",
+            true_false_type(),
+            vec![
+                required_parameter("set", set_type()),
+                required_parameter("item", map_key_type()),
+            ],
             None,
         );
         register(

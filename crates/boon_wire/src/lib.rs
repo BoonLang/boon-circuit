@@ -3,20 +3,22 @@
 //! This format is for process and network boundaries. In-process Boon graphs
 //! should continue to pass `Value` directly without serialization.
 //!
-//! # Version 3 format
+//! # Version 4 format
 //!
 //! Every message starts with `BWV` followed by the one-byte format version.
 //! Values use a one-byte tag. Lengths and collection counts use minimal
 //! unsigned LEB128. Numbers use a sign byte followed by minimal big-endian
 //! numerator-magnitude and positive-denominator byte strings. Text is UTF-8.
-//! Lists preserve item order, while object and Tag payload keys must be
-//! strictly increasing in Rust `String` order. Tag names use the same
-//! length-prefixed text representation as object keys.
+//! Lists preserve item order. Object and Tag payload keys must be strictly
+//! increasing in Rust `String` order. MAP entries and SET items must be
+//! strictly increasing in canonical [`Value`] order and must use key-safe
+//! values. Tag names use the same length-prefixed text representation as
+//! object keys.
 
 #![forbid(unsafe_code)]
 
 use boon_data::{ExactNumber, ExactNumberSign, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 use std::str;
@@ -39,7 +41,7 @@ pub use session_control::{
 };
 
 const MAGIC: [u8; 3] = *b"BWV";
-pub const FORMAT_VERSION: u8 = 3;
+pub const FORMAT_VERSION: u8 = 4;
 pub const HEADER: [u8; 4] = [MAGIC[0], MAGIC[1], MAGIC[2], FORMAT_VERSION];
 
 /// The protocol-owned same-origin WebSocket path for Client/Session traffic.
@@ -53,6 +55,8 @@ const VALUE_BYTES: u8 = 2;
 const VALUE_LIST: u8 = 3;
 const VALUE_OBJECT: u8 = 4;
 const VALUE_TAG: u8 = 5;
+const VALUE_MAP: u8 = 6;
+const VALUE_SET: u8 = 7;
 
 /// Resource limits applied to both encoding and decoding.
 ///
@@ -107,6 +111,9 @@ pub enum WireError {
     LengthOverflow,
     NonCanonicalNumber,
     NonCanonicalMapOrder,
+    NonCanonicalValueOrder,
+    InvalidMapKey,
+    InvalidSetItem,
     LimitExceeded {
         kind: LimitKind,
         actual: usize,
@@ -140,6 +147,11 @@ impl fmt::Display for WireError {
             Self::NonCanonicalMapOrder => {
                 formatter.write_str("Boon wire map keys are not strictly increasing")
             }
+            Self::NonCanonicalValueOrder => {
+                formatter.write_str("Boon wire MAP/SET values are not strictly increasing")
+            }
+            Self::InvalidMapKey => formatter.write_str("Boon wire MAP key is not key-safe"),
+            Self::InvalidSetItem => formatter.write_str("Boon wire SET item is not key-safe"),
             Self::LimitExceeded {
                 kind,
                 actual,
@@ -277,6 +289,29 @@ impl Encoder {
                 self.text(tag)?;
                 self.fields(fields, depth)
             }
+            Value::Map(entries) => {
+                self.byte(VALUE_MAP)?;
+                self.collection_len(entries.len())?;
+                for (key, value) in entries {
+                    if !key.is_key_safe() {
+                        return Err(WireError::InvalidMapKey);
+                    }
+                    self.value(key, depth + 1)?;
+                    self.value(value, depth + 1)?;
+                }
+                Ok(())
+            }
+            Value::Set(items) => {
+                self.byte(VALUE_SET)?;
+                self.collection_len(items.len())?;
+                for item in items {
+                    if !item.is_key_safe() {
+                        return Err(WireError::InvalidSetItem);
+                    }
+                    self.value(item, depth + 1)?;
+                }
+                Ok(())
+            }
         }
     }
 
@@ -378,6 +413,40 @@ impl Decoder<'_> {
                 let tag = self.text()?;
                 let fields = self.fields(depth)?;
                 Ok(Value::Tag { tag, fields })
+            }
+            VALUE_MAP => {
+                let count = self.collection_len(2)?;
+                let mut entries = BTreeMap::new();
+                for _ in 0..count {
+                    let key = self.value(depth + 1)?;
+                    if !key.is_key_safe() {
+                        return Err(WireError::InvalidMapKey);
+                    }
+                    if entries
+                        .last_key_value()
+                        .is_some_and(|(previous, _)| previous >= &key)
+                    {
+                        return Err(WireError::NonCanonicalValueOrder);
+                    }
+                    let value = self.value(depth + 1)?;
+                    entries.insert(key, value);
+                }
+                Ok(Value::Map(entries))
+            }
+            VALUE_SET => {
+                let count = self.collection_len(1)?;
+                let mut items = BTreeSet::new();
+                for _ in 0..count {
+                    let item = self.value(depth + 1)?;
+                    if !item.is_key_safe() {
+                        return Err(WireError::InvalidSetItem);
+                    }
+                    if items.last().is_some_and(|previous| previous >= &item) {
+                        return Err(WireError::NonCanonicalValueOrder);
+                    }
+                    items.insert(item);
+                }
+                Ok(Value::Set(items))
             }
             tag => Err(WireError::UnknownTag(tag)),
         }
@@ -523,6 +592,20 @@ mod tests {
                 ]),
             ),
             (
+                "map".into(),
+                Value::Map(BTreeMap::from([
+                    (Value::Text("first".into()), Value::integer(1).unwrap()),
+                    (Value::Text("second".into()), Value::integer(2).unwrap()),
+                ])),
+            ),
+            (
+                "set".into(),
+                Value::Set(BTreeSet::from([
+                    Value::Text("first".into()),
+                    Value::Text("second".into()),
+                ])),
+            ),
+            (
                 "variant".into(),
                 Value::Tag {
                     tag: "Ready".into(),
@@ -563,7 +646,7 @@ mod tests {
         let second = Value::Object(reordered);
 
         let golden = vec![
-            b'B', b'W', b'V', 3, 4, 2, 1, b'a', 5, 4, b'T', b'r', b'u', b'e', 0, 1, b'z', 5, 2,
+            b'B', b'W', b'V', 4, 4, 2, 1, b'a', 5, 4, b'T', b'r', b'u', b'e', 0, 1, b'z', 5, 2,
             b'O', b'k', 1, 1, b'n', 0, 2, 1, 3, 1, 2,
         ];
         assert_eq!(encode(&first).unwrap(), golden);
@@ -573,12 +656,12 @@ mod tests {
 
     #[test]
     fn rejects_malformed_headers_tags_and_trailing_bytes() {
-        assert_eq!(decode(b"bad\x03\x00"), Err(WireError::InvalidMagic));
+        assert_eq!(decode(b"bad\x04\x00"), Err(WireError::InvalidMagic));
         assert_eq!(
             decode(b"BWV\x01\x00"),
             Err(WireError::UnsupportedVersion(1))
         );
-        assert_eq!(decode(b"BWV\x03\xff"), Err(WireError::UnknownTag(0xff)));
+        assert_eq!(decode(b"BWV\x04\xff"), Err(WireError::UnknownTag(0xff)));
         let zero = Value::integer(0).unwrap();
         let mut trailing = encode(&zero).unwrap();
         assert_eq!(decode(&trailing), Ok(zero));
@@ -588,27 +671,27 @@ mod tests {
 
     #[test]
     fn rejects_invalid_text_varints_and_numbers() {
-        assert_eq!(decode(b"BWV\x03\x01\x01\xff"), Err(WireError::InvalidUtf8));
+        assert_eq!(decode(b"BWV\x04\x01\x01\xff"), Err(WireError::InvalidUtf8));
         assert_eq!(
-            decode(b"BWV\x03\x01\x80\x00"),
+            decode(b"BWV\x04\x01\x80\x00"),
             Err(WireError::NonCanonicalVarint)
         );
 
-        let mut overflowing = b"BWV\x03\x01".to_vec();
+        let mut overflowing = b"BWV\x04\x01".to_vec();
         overflowing.extend_from_slice(&[0xff; 9]);
         overflowing.push(0x02);
         assert_eq!(decode(&overflowing), Err(WireError::VarintOverflow));
 
         assert_eq!(
-            decode(b"BWV\x03\x00\x09\x00\x01\x01"),
+            decode(b"BWV\x04\x00\x09\x00\x01\x01"),
             Err(WireError::NonCanonicalNumber)
         );
         assert_eq!(
-            decode(b"BWV\x03\x00\x02\x01\x02\x01\x04"),
+            decode(b"BWV\x04\x00\x02\x01\x02\x01\x04"),
             Err(WireError::NonCanonicalNumber)
         );
         assert_eq!(
-            decode(b"BWV\x03\x00\x01\x00\x01\x02"),
+            decode(b"BWV\x04\x00\x01\x00\x01\x02"),
             Err(WireError::NonCanonicalNumber)
         );
         assert_eq!(
@@ -619,11 +702,35 @@ mod tests {
 
     #[test]
     fn rejects_noncanonical_map_key_order_and_duplicates() {
-        let out_of_order = b"BWV\x03\x04\x02\x01b\x05\x00\x00\x01a\x05\x00\x00";
+        let out_of_order = b"BWV\x04\x04\x02\x01b\x05\x00\x00\x01a\x05\x00\x00";
         assert_eq!(decode(out_of_order), Err(WireError::NonCanonicalMapOrder));
 
-        let duplicate = b"BWV\x03\x04\x02\x01a\x05\x00\x00\x01a\x05\x00\x00";
+        let duplicate = b"BWV\x04\x04\x02\x01a\x05\x00\x00\x01a\x05\x00\x00";
         assert_eq!(decode(duplicate), Err(WireError::NonCanonicalMapOrder));
+    }
+
+    #[test]
+    fn rejects_invalid_and_noncanonical_map_and_set_values() {
+        let invalid_map = Value::Map(BTreeMap::from([(
+            Value::List(Vec::new()),
+            Value::truth(true),
+        )]));
+        assert_eq!(encode(&invalid_map), Err(WireError::InvalidMapKey));
+        let invalid_set = Value::Set(BTreeSet::from([Value::List(Vec::new())]));
+        assert_eq!(encode(&invalid_set), Err(WireError::InvalidSetItem));
+
+        let duplicate_map_key = b"BWV\x04\x06\x02\x01\x01a\x01\x01v\x01\x01a\x01\x01w";
+        assert_eq!(
+            decode(duplicate_map_key),
+            Err(WireError::NonCanonicalValueOrder)
+        );
+        let descending_set = b"BWV\x04\x07\x02\x01\x01b\x01\x01a";
+        assert_eq!(
+            decode(descending_set),
+            Err(WireError::NonCanonicalValueOrder)
+        );
+        let unsafe_set_item = b"BWV\x04\x07\x01\x03\x00";
+        assert_eq!(decode(unsafe_set_item), Err(WireError::InvalidSetItem));
     }
 
     #[test]

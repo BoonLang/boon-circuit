@@ -423,6 +423,21 @@ fn hash_value(
             hasher.update([10]);
             hash_value(hasher, visible, identities)?;
         }
+        Value::Map(entries) => {
+            hasher.update([12]);
+            hasher.update((entries.len() as u64).to_be_bytes());
+            for (key, value) in entries {
+                hash_value(hasher, key, identities)?;
+                hash_value(hasher, value, identities)?;
+            }
+        }
+        Value::Set(items) => {
+            hasher.update([13]);
+            hasher.update((items.len() as u64).to_be_bytes());
+            for item in items {
+                hash_value(hasher, item, identities)?;
+            }
+        }
     }
     Ok(())
 }

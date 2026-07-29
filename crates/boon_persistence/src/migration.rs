@@ -954,6 +954,12 @@ fn migration_value_text(value: &StoredValue) -> Result<String, MigrationError> {
         StoredValue::List(_) => Err(MigrationError::Evaluation(
             "list cannot be interpolated into text".to_owned(),
         )),
+        StoredValue::Map(_) => Err(MigrationError::Evaluation(
+            "MAP cannot be interpolated into text".to_owned(),
+        )),
+        StoredValue::Set(_) => Err(MigrationError::Evaluation(
+            "SET cannot be interpolated into text".to_owned(),
+        )),
     }
 }
 
@@ -1260,6 +1266,8 @@ fn stored_tag(value: &StoredValue) -> &str {
         StoredValue::Bytes(_) => "Bytes",
         StoredValue::List(_) => "List",
         StoredValue::Object(_) => "Object",
+        StoredValue::Map(_) => "Map",
+        StoredValue::Set(_) => "Set",
     }
 }
 
@@ -1296,6 +1304,16 @@ fn ensure_value_type(value: &StoredValue, data_type: &DataTypePlan) -> Result<()
         (StoredValue::List(values), DataTypePlan::List { item }) => values
             .iter()
             .all(|value| ensure_value_type(value, item).is_ok()),
+        (StoredValue::Map(entries), DataTypePlan::Map { key, value }) => {
+            entries.iter().all(|(entry_key, entry_value)| {
+                entry_key.is_key_safe()
+                    && ensure_value_type(entry_key, key).is_ok()
+                    && ensure_value_type(entry_value, value).is_ok()
+            })
+        }
+        (StoredValue::Set(items), DataTypePlan::Set { item }) => items
+            .iter()
+            .all(|value| value.is_key_safe() && ensure_value_type(value, item).is_ok()),
         _ => false,
     };
     valid.then_some(()).ok_or_else(|| {

@@ -2156,6 +2156,8 @@ fn scenario_value_text(value: &Value) -> RuntimeResult<String> {
         Value::Tag { tag, fields } if fields.is_empty() => Ok(tag.clone()),
         Value::List(_)
         | Value::Record(_)
+        | Value::Map(_)
+        | Value::Set(_)
         | Value::Tag { .. }
         | Value::MappedRow { .. }
         | Value::Row { .. } => Err("scenario text expectation targeted a structured value".into()),

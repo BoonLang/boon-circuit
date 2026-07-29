@@ -2609,6 +2609,21 @@ fn hash_stored_value(hasher: &mut Sha256, value: &StoredValue) {
             hash_text(hasher, tag);
             hash_value_fields(hasher, fields);
         }
+        StoredValue::Map(entries) => {
+            hasher.update([27]);
+            hasher.update((entries.len() as u64).to_be_bytes());
+            for (key, value) in entries {
+                hash_stored_value(hasher, key);
+                hash_stored_value(hasher, value);
+            }
+        }
+        StoredValue::Set(items) => {
+            hasher.update([28]);
+            hasher.update((items.len() as u64).to_be_bytes());
+            for item in items {
+                hash_stored_value(hasher, item);
+            }
+        }
     }
 }
 

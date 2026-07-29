@@ -26,6 +26,8 @@ const STORED_LIST: u8 = 23;
 const STORED_OBJECT: u8 = 24;
 const STORED_TAG: u8 = 25;
 const STORED_BLOB_REFERENCE: u8 = 26;
+const STORED_MAP: u8 = 27;
+const STORED_SET: u8 = 28;
 pub const INLINE_BYTES_THRESHOLD: usize = 16 * 1024;
 const DEFAULT_MAX_TOTAL_BYTES: usize = 80 * 1024 * 1024;
 type CborEncoder<'a> = Encoder<&'a mut Vec<u8>>;
@@ -1519,6 +1521,33 @@ fn encode_component_value(
                 encode_component_value(encoder, value, depth + 1, blobs, references)?;
             }
         }
+        StoredValue::Map(entries) => {
+            encoder
+                .array(2)
+                .and_then(|encoder| encoder.u8(STORED_MAP))
+                .and_then(|encoder| encoder.array(entries.len() as u64))
+                .map_err(encode_error)?;
+            for (key, value) in entries {
+                if !key.is_key_safe() {
+                    return Err(CodecError::new("stored MAP contains a non-key-safe key"));
+                }
+                encode_component_value(encoder, key, depth + 1, blobs, references)?;
+                encode_component_value(encoder, value, depth + 1, blobs, references)?;
+            }
+        }
+        StoredValue::Set(items) => {
+            encoder
+                .array(2)
+                .and_then(|encoder| encoder.u8(STORED_SET))
+                .and_then(|encoder| encoder.array(items.len() as u64))
+                .map_err(encode_error)?;
+            for item in items {
+                if !item.is_key_safe() {
+                    return Err(CodecError::new("stored SET contains a non-key-safe item"));
+                }
+                encode_component_value(encoder, item, depth + 1, blobs, references)?;
+            }
+        }
     }
     Ok(())
 }
@@ -1570,6 +1599,45 @@ fn decode_component_value(
             tag: decode_text(decoder, limits)?,
             fields: decode_component_fields(decoder, limits, depth + 1, blobs, references)?,
         }),
+        (STORED_MAP, 2) => {
+            let count = collection_len(decoder, limits, "stored MAP", true)?;
+            let mut entries = BTreeMap::new();
+            for _ in 0..count {
+                let key = decode_component_value(decoder, limits, depth + 1, blobs, references)?;
+                if !key.is_key_safe() {
+                    return Err(CodecError::new("stored MAP key is not key-safe"));
+                }
+                if blobs.is_some()
+                    && entries
+                        .last_key_value()
+                        .is_some_and(|(previous, _)| previous >= &key)
+                {
+                    return Err(CodecError::new(
+                        "stored MAP keys are not in canonical order",
+                    ));
+                }
+                let value = decode_component_value(decoder, limits, depth + 1, blobs, references)?;
+                entries.insert(key, value);
+            }
+            Ok(StoredValue::Map(entries))
+        }
+        (STORED_SET, 2) => {
+            let count = collection_len(decoder, limits, "stored SET", true)?;
+            let mut items = BTreeSet::new();
+            for _ in 0..count {
+                let item = decode_component_value(decoder, limits, depth + 1, blobs, references)?;
+                if !item.is_key_safe() {
+                    return Err(CodecError::new("stored SET item is not key-safe"));
+                }
+                if blobs.is_some() && items.last().is_some_and(|previous| previous >= &item) {
+                    return Err(CodecError::new(
+                        "stored SET items are not in canonical order",
+                    ));
+                }
+                items.insert(item);
+            }
+            Ok(StoredValue::Set(items))
+        }
         (STORED_BLOB_REFERENCE, 3) => {
             let digest = BlobDigest(decode_digest(decoder)?);
             let length = decoder.u64().map_err(decode_error)?;
@@ -1668,6 +1736,33 @@ fn encode_value(
                 .map_err(encode_error)?;
             encode_value_fields(encoder, fields, depth + 1)?;
         }
+        StoredValue::Map(entries) => {
+            encoder
+                .array(2)
+                .and_then(|encoder| encoder.u8(STORED_MAP))
+                .and_then(|encoder| encoder.array(entries.len() as u64))
+                .map_err(encode_error)?;
+            for (key, value) in entries {
+                if !key.is_key_safe() {
+                    return Err(CodecError::new("stored MAP contains a non-key-safe key"));
+                }
+                encode_value(encoder, key, depth + 1)?;
+                encode_value(encoder, value, depth + 1)?;
+            }
+        }
+        StoredValue::Set(items) => {
+            encoder
+                .array(2)
+                .and_then(|encoder| encoder.u8(STORED_SET))
+                .and_then(|encoder| encoder.array(items.len() as u64))
+                .map_err(encode_error)?;
+            for item in items {
+                if !item.is_key_safe() {
+                    return Err(CodecError::new("stored SET contains a non-key-safe item"));
+                }
+                encode_value(encoder, item, depth + 1)?;
+            }
+        }
     }
     Ok(())
 }
@@ -1709,6 +1804,44 @@ fn decode_value(
             tag: decode_text(decoder, limits)?,
             fields: decode_value_fields(decoder, limits, depth + 1)?,
         }),
+        (STORED_MAP, 2) => {
+            let count = collection_len(decoder, limits, "stored MAP", true)?;
+            let mut entries = BTreeMap::new();
+            for _ in 0..count {
+                let key = decode_value(decoder, limits, depth + 1)?;
+                if !key.is_key_safe() {
+                    return Err(CodecError::new("stored MAP key is not key-safe"));
+                }
+                if entries
+                    .last_key_value()
+                    .is_some_and(|(previous, _)| previous >= &key)
+                {
+                    return Err(CodecError::new(
+                        "stored MAP keys are not in canonical order",
+                    ));
+                }
+                let value = decode_value(decoder, limits, depth + 1)?;
+                entries.insert(key, value);
+            }
+            Ok(StoredValue::Map(entries))
+        }
+        (STORED_SET, 2) => {
+            let count = collection_len(decoder, limits, "stored SET", true)?;
+            let mut items = BTreeSet::new();
+            for _ in 0..count {
+                let item = decode_value(decoder, limits, depth + 1)?;
+                if !item.is_key_safe() {
+                    return Err(CodecError::new("stored SET item is not key-safe"));
+                }
+                if items.last().is_some_and(|previous| previous >= &item) {
+                    return Err(CodecError::new(
+                        "stored SET items are not in canonical order",
+                    ));
+                }
+                items.insert(item);
+            }
+            Ok(StoredValue::Set(items))
+        }
         _ => Err(CodecError::new(format!(
             "unknown stored value tag {tag} with array length {len}"
         ))),
@@ -1881,6 +2014,40 @@ mod tests {
             None,
             turn_sequence,
         )
+    }
+
+    #[test]
+    fn stored_map_and_set_round_trip_canonically() {
+        let value = StoredValue::Object(BTreeMap::from([
+            (
+                "map".to_owned(),
+                StoredValue::Map(BTreeMap::from([
+                    (StoredValue::Text("a".to_owned()), number(1)),
+                    (StoredValue::Text("b".to_owned()), number(2)),
+                ])),
+            ),
+            (
+                "set".to_owned(),
+                StoredValue::Set(BTreeSet::from([
+                    StoredValue::Text("a".to_owned()),
+                    StoredValue::Text("b".to_owned()),
+                ])),
+            ),
+        ]));
+        let mut bytes = Vec::new();
+        encode_value(&mut Encoder::new(&mut bytes), &value, 0).unwrap();
+        let decoded = decode_value(&mut Decoder::new(&bytes), DecodeLimits::default(), 0).unwrap();
+        assert_eq!(decoded, value);
+
+        let invalid =
+            StoredValue::Map(BTreeMap::from([(StoredValue::List(Vec::new()), number(1))]));
+        let mut invalid_bytes = Vec::new();
+        assert!(
+            encode_value(&mut Encoder::new(&mut invalid_bytes), &invalid, 0)
+                .unwrap_err()
+                .to_string()
+                .contains("non-key-safe")
+        );
     }
 
     #[test]

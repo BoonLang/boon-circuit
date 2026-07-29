@@ -2035,6 +2035,7 @@ impl<'a> CheckedProgramBuilder<'a> {
         );
         checked_program_phase!("register_signatures", {
             builder.register_builtin_signatures(builtins);
+            builder.register_stream_signatures(builtins);
             builder.register_field_projection_signatures(expr_type_table);
             builder.register_session_info_intrinsics();
             builder.register_render_signatures(render_contracts);
@@ -2516,6 +2517,27 @@ impl<'a> CheckedProgramBuilder<'a> {
             if host_effect_signature(name).is_some() {
                 continue;
             }
+            self.register_authoritative_signature(name, CheckedCallableKind::Builtin, signature);
+        }
+    }
+
+    fn register_stream_signatures(&mut self, builtins: &BuiltinSignatureRegistry) {
+        for name in ["Stream/pulses", "Stream/skip"] {
+            let used = self
+                .program
+                .expressions
+                .iter()
+                .any(|expression| match &expression.kind {
+                    AstExprKind::Call { function, .. } => function == name,
+                    AstExprKind::Pipe { op, .. } => op == name,
+                    _ => false,
+                });
+            if !used {
+                continue;
+            }
+            let signature = builtins
+                .authoritative_signature(name)
+                .expect("registered stream builtin has an authoritative signature");
             self.register_authoritative_signature(name, CheckedCallableKind::Builtin, signature);
         }
     }
@@ -5609,8 +5631,8 @@ impl<'a> CheckedProgramBuilder<'a> {
         bindings: &BTreeMap<DeclId, FlowMode>,
         active: &mut BTreeSet<CheckedExprId>,
     ) -> FlowMode {
-        let (input, args) = match &expr.kind {
-            AstExprKind::Call { args, .. } => (None, args.as_slice()),
+        let (function, input, args) = match &expr.kind {
+            AstExprKind::Call { function, args, .. } => (function.as_str(), None, args.as_slice()),
             AstExprKind::Pipe {
                 input, op, args, ..
             } => {
@@ -5626,10 +5648,13 @@ impl<'a> CheckedProgramBuilder<'a> {
                         })
                         .unwrap_or(FlowMode::Continuous);
                 }
-                (input, args.as_slice())
+                (op.as_str(), input, args.as_slice())
             }
             _ => return FlowMode::Continuous,
         };
+        if matches!(function, "Stream/pulses" | "Stream/skip") {
+            return FlowMode::PresentOrAbsent;
+        }
         let mut mode = FlowMode::Continuous;
         for argument in args {
             if let Some(argument_mode) = self.infer_instantiated_expr_mode(
@@ -14815,6 +14840,7 @@ impl<'a> Checker<'a> {
                 self.check_number_to_text_arguments(expr.id, function, args, false);
                 self.check_number_round_arguments(function, args);
                 self.check_one_based_arguments(expr.id, function, args);
+                self.check_stream_builtin_arguments(function, None, args);
                 self.check_bits_builtin_arguments(expr.id, function, None, args);
                 self.check_builtin_call_compatibility(expr.id, function, None, args);
                 if self.render_contracts.is_render_constructor(function) {
@@ -14888,6 +14914,7 @@ impl<'a> Checker<'a> {
                 self.check_number_to_text_arguments(expr.id, op, args, true);
                 self.check_number_round_arguments(op, args);
                 self.check_one_based_arguments(expr.id, op, args);
+                self.check_stream_builtin_arguments(op, Some(input_expr_id), args);
                 self.check_bits_builtin_arguments(expr.id, op, Some(input_expr_id), args);
                 self.check_builtin_call_compatibility(expr.id, op, Some(input_expr_id), args);
                 if self.render_contracts.is_render_constructor(op) {
@@ -14951,6 +14978,10 @@ impl<'a> Checker<'a> {
                         }
                         (input_ty, _) => input_ty,
                     }
+                } else if op == "Stream/pulses" {
+                    tag_type("Pulse")
+                } else if op == "Stream/skip" {
+                    input_flow.ty
                 } else if op == "WHILE" {
                     if !matches!(input_flow.mode, FlowMode::Continuous) {
                         self.constraints.push(Constraint::FlowCompatible {
@@ -18126,6 +18157,11 @@ impl<'a> Checker<'a> {
                         merge_flow_modes,
                     )
             }
+            AstExprKind::Call { function, .. }
+                if matches!(function.as_str(), "Stream/pulses" | "Stream/skip") =>
+            {
+                FlowMode::PresentOrAbsent
+            }
             AstExprKind::Call { args, .. } => args
                 .iter()
                 .map(|arg| self.flow_mode_for_expr_id(arg.value))
@@ -18141,7 +18177,9 @@ impl<'a> Checker<'a> {
                 );
                 if op == "WHILE" {
                     FlowMode::Continuous
-                } else if op == "List/map" || op == "WHEN" {
+                } else if matches!(op.as_str(), "Stream/pulses" | "Stream/skip") {
+                    FlowMode::PresentOrAbsent
+                } else if matches!(op.as_str(), "List/map" | "WHEN") {
                     self.flow_mode_for_expr_id(input)
                 } else {
                     args.iter()
@@ -18524,6 +18562,40 @@ impl<'a> Checker<'a> {
             self.diagnostics.push(self.diagnostic_for_expr(
                 size,
                 "`List/page` size must be a whole Number between 1 and 10000".to_owned(),
+            ));
+        }
+    }
+
+    fn check_stream_builtin_arguments(
+        &mut self,
+        function: &str,
+        pipe_input: Option<usize>,
+        call_args: &[AstCallArg],
+    ) {
+        let count = match function {
+            "Stream/pulses" => pipe_input.or_else(|| named_arg_expr(call_args, "count")),
+            "Stream/skip" => named_arg_expr(call_args, "count"),
+            _ => None,
+        };
+        let Some(count) = count else {
+            return;
+        };
+        if let Some(value) = self.static_integer_literal(count) {
+            if value < 0 {
+                self.diagnostics.push(self.diagnostic_for_expr(
+                    count,
+                    format!("`{function}` count must be a non-negative whole Number"),
+                ));
+            }
+        } else if self
+            .program
+            .expressions
+            .get(count)
+            .is_some_and(|expr| matches!(expr.kind, AstExprKind::Number(_)))
+        {
+            self.diagnostics.push(self.diagnostic_for_expr(
+                count,
+                format!("`{function}` count must be a non-negative whole Number"),
             ));
         }
     }
@@ -21251,6 +21323,21 @@ impl Default for BuiltinSignatureRegistry {
             None,
         );
         register(
+            "Stream/pulses",
+            tag_type("Pulse"),
+            vec![required_parameter("count", Type::Number)],
+            None,
+        );
+        register(
+            "Stream/skip",
+            contextual_item_type(),
+            vec![
+                required_parameter("stream", contextual_item_type()),
+                required_parameter("count", Type::Number),
+            ],
+            None,
+        );
+        register(
             "Timer/interval",
             open_object_type(),
             vec![required_parameter("duration", Type::Unknown)],
@@ -21343,6 +21430,13 @@ impl Default for BuiltinSignatureRegistry {
             .and_then(|entry| entry.callable.as_mut())
             .expect("registered source-emitting builtin");
         callable.effect = source_effect;
+        for name in ["Stream/pulses", "Stream/skip"] {
+            let callable = entries
+                .get_mut(name)
+                .and_then(|entry| entry.callable.as_mut())
+                .expect("registered stream builtin");
+            callable.result.mode = FlowMode::PresentOrAbsent;
+        }
         for (name, result) in [
             ("List/move_field_first", list_type()),
             ("List/move_field_last", list_type()),
@@ -21369,7 +21463,12 @@ impl BuiltinSignatureRegistry {
     ) -> impl Iterator<Item = (&str, AuthoritativeCallableSignature)> + '_ {
         self.entries
             .iter()
+            .filter(|(name, _)| !matches!(**name, "Stream/pulses" | "Stream/skip"))
             .filter_map(|(name, entry)| entry.callable.clone().map(|signature| (*name, signature)))
+    }
+
+    fn authoritative_signature(&self, name: &str) -> Option<AuthoritativeCallableSignature> {
+        self.entries.get(name)?.callable.clone()
     }
 
     fn type_for_call(&self, function: &str, render_contracts: &RenderContractRegistry) -> Type {
@@ -24600,7 +24699,9 @@ fn object_type_for_path_requirement(parts: &[String], leaf_type: Option<Type>) -
 }
 
 fn pipe_input_expected_type(function: &str) -> Option<Type> {
-    if function == "Text/join" {
+    if function == "Stream/pulses" {
+        Some(Type::Number)
+    } else if function == "Text/join" {
         Some(Type::List(Box::new(Type::Text)))
     } else if function == "List/map"
         || matches!(
@@ -24696,6 +24797,15 @@ fn builtin_argument_expected_type(
         });
     }
     if function == "Bool/toggle" && arg_name == Some("when") {
+        return Some(Type::Unknown);
+    }
+    if matches!(
+        (function, arg_name),
+        ("Stream/pulses", Some("count") | None) | ("Stream/skip", Some("count"))
+    ) {
+        return Some(Type::Number);
+    }
+    if function == "Stream/skip" && matches!(arg_name, Some("stream") | None) {
         return Some(Type::Unknown);
     }
     if function == "File/read_text" {
@@ -25926,11 +26036,19 @@ fn simple_flow_mode_with_bindings(
             let path = external_value_path(parts).unwrap_or_else(|| parts.join("."));
             flow_binding_mode(bindings, &path).unwrap_or(FlowMode::Continuous)
         }
+        AstExprKind::Call { function, .. }
+            if matches!(function.as_str(), "Stream/pulses" | "Stream/skip") =>
+        {
+            FlowMode::PresentOrAbsent
+        }
         AstExprKind::Call { args, .. } => args
             .iter()
             .filter_map(|arg| expressions.get(arg.value))
             .map(|arg| simple_flow_mode_with_bindings(arg, expressions, bindings))
             .fold(FlowMode::Continuous, merge_flow_modes),
+        AstExprKind::Pipe { op, .. } if matches!(op.as_str(), "Stream/pulses" | "Stream/skip") => {
+            FlowMode::PresentOrAbsent
+        }
         AstExprKind::Pipe {
             input, op, args, ..
         } if op != "WHILE" => args
@@ -25950,6 +26068,11 @@ fn simple_flow_mode_with_bindings(
 fn simple_flow_mode(expr: &AstExpr, expressions: &[AstExpr]) -> FlowMode {
     match &expr.kind {
         AstExprKind::Source | AstExprKind::Then { .. } => FlowMode::PresentOrAbsent,
+        AstExprKind::Call { function, .. }
+            if matches!(function.as_str(), "Stream/pulses" | "Stream/skip") =>
+        {
+            FlowMode::PresentOrAbsent
+        }
         AstExprKind::When { input, .. } => expressions
             .get(*input)
             .map(|expr| simple_flow_mode(expr, expressions))
@@ -25957,6 +26080,9 @@ fn simple_flow_mode(expr: &AstExpr, expressions: &[AstExpr]) -> FlowMode {
         AstExprKind::Pipe { input, op, .. } if op == "WHILE" => {
             let _ = input;
             FlowMode::Continuous
+        }
+        AstExprKind::Pipe { op, .. } if matches!(op.as_str(), "Stream/pulses" | "Stream/skip") => {
+            FlowMode::PresentOrAbsent
         }
         AstExprKind::Pipe { input, .. } => expressions
             .get(*input)

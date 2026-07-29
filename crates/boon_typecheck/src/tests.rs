@@ -8,3 +8,4 @@ include!("tests/calls.rs");
 include!("tests/flush.rs");
 include!("tests/maps_sets.rs");
 include!("tests/bits.rs");
+include!("tests/pulses.rs");

@@ -5,8 +5,9 @@ use crate::cursor::{
 };
 use crate::effect_stream::TransientEffectSemanticValidator;
 use boon_data::{
-    Bytes, ExactNumberParseReason, ExactRoundingRule, NumberTextFormat, format_number_ascii_text,
-    format_number_text, number_bit_width,
+    Bits, BitsArithmeticFailure, BitsByteOrder, BitsDirection, BitsInterpretation, Bytes,
+    ExactNumberParseReason, ExactRoundingRule, MAX_BITS_WIDTH, NumberTextFormat,
+    format_number_ascii_text, format_number_text, number_bit_width,
 };
 use boon_list_access::{
     AccessError, AccessMetrics, AccessStream, ClosedTag as AccessClosedTag,
@@ -29917,6 +29918,311 @@ impl MachineInstance {
                 };
                 EvalValue::Value(Value::Number(value))
             }
+            PlanRowBuiltin::BitsWidth => {
+                let bits = eval_to_bits(&require_input(input)?)?;
+                consume_bits_work(work, bits.width())?;
+                EvalValue::Value(Value::Number(ExactNumber::from_u64(u64::from(
+                    bits.width(),
+                ))))
+            }
+            PlanRowBuiltin::BitsGet => {
+                let bits = eval_to_bits(&require_input(input)?)?;
+                let position = one_based_position(
+                    &take_required_builtin_arg(&mut args, "position", function)?,
+                    "Bits/get position",
+                )?;
+                let direction = take_optional_builtin_arg(&mut args, "from")
+                    .map(|value| eval_bits_direction(&value))
+                    .transpose()?
+                    .unwrap_or(BitsDirection::Left);
+                consume_bits_work(work, bits.width())?;
+                EvalValue::Value(Value::truth(
+                    bits.bit(position, direction)
+                        .map_err(|error| bits_evaluation_error(function, error))?,
+                ))
+            }
+            PlanRowBuiltin::BitsSet => {
+                let bits = eval_to_bits(&require_input(input)?)?;
+                let position = one_based_position(
+                    &take_required_builtin_arg(&mut args, "position", function)?,
+                    "Bits/set position",
+                )?;
+                let bit = eval_to_bool(&take_required_builtin_arg(&mut args, "to", function)?)?;
+                let direction = take_optional_builtin_arg(&mut args, "from")
+                    .map(|value| eval_bits_direction(&value))
+                    .transpose()?
+                    .unwrap_or(BitsDirection::Left);
+                consume_bits_work(work, bits.width())?;
+                EvalValue::Value(Value::Bits(
+                    bits.with_bit(position, direction, bit)
+                        .map_err(|error| bits_evaluation_error(function, error))?,
+                ))
+            }
+            PlanRowBuiltin::BitsSlice => {
+                let bits = eval_to_bits(&require_input(input)?)?;
+                let from = one_based_position(
+                    &take_required_builtin_arg(&mut args, "from", function)?,
+                    "Bits/slice from",
+                )?;
+                let count = bits_width_argument(
+                    &take_required_builtin_arg(&mut args, "count", function)?,
+                    function,
+                    "count",
+                )?;
+                consume_bits_work(work, bits.width())?;
+                EvalValue::Value(Value::Bits(
+                    bits.slice(from, count)
+                        .map_err(|error| bits_evaluation_error(function, error))?,
+                ))
+            }
+            PlanRowBuiltin::BitsSetSlice => {
+                let bits = eval_to_bits(&require_input(input)?)?;
+                let from = one_based_position(
+                    &take_required_builtin_arg(&mut args, "from", function)?,
+                    "Bits/set_slice from",
+                )?;
+                let replacement =
+                    eval_to_bits(&take_required_builtin_arg(&mut args, "value", function)?)?;
+                consume_bits_work(work, bits.width().saturating_add(replacement.width()))?;
+                EvalValue::Value(Value::Bits(
+                    bits.with_slice(from, &replacement)
+                        .map_err(|error| bits_evaluation_error(function, error))?,
+                ))
+            }
+            PlanRowBuiltin::BitsConcat => {
+                let bits = eval_to_bits(&require_input(input)?)?;
+                let right = eval_to_bits(&take_required_builtin_arg(&mut args, "with", function)?)?;
+                consume_bits_work(work, bits.width().saturating_add(right.width()))?;
+                EvalValue::Value(Value::Bits(
+                    bits.concat(&right)
+                        .map_err(|error| bits_evaluation_error(function, error))?,
+                ))
+            }
+            PlanRowBuiltin::BitsAnd | PlanRowBuiltin::BitsOr | PlanRowBuiltin::BitsXor => {
+                let bits = eval_to_bits(&require_input(input)?)?;
+                let right = eval_to_bits(&take_required_builtin_arg(&mut args, "with", function)?)?;
+                consume_bits_work(work, bits.width().saturating_add(right.width()))?;
+                let result = match function {
+                    PlanRowBuiltin::BitsAnd => bits.bit_and(&right),
+                    PlanRowBuiltin::BitsOr => bits.bit_or(&right),
+                    PlanRowBuiltin::BitsXor => bits.bit_xor(&right),
+                    _ => unreachable!(),
+                };
+                EvalValue::Value(Value::Bits(
+                    result.map_err(|error| bits_evaluation_error(function, error))?,
+                ))
+            }
+            PlanRowBuiltin::BitsNot => {
+                let bits = eval_to_bits(&require_input(input)?)?;
+                consume_bits_work(work, bits.width())?;
+                EvalValue::Value(Value::Bits(
+                    bits.bit_not()
+                        .map_err(|error| bits_evaluation_error(function, error))?,
+                ))
+            }
+            PlanRowBuiltin::BitsShiftLeft
+            | PlanRowBuiltin::BitsShiftRight
+            | PlanRowBuiltin::BitsShiftRightArithmetic
+            | PlanRowBuiltin::BitsRotateLeft
+            | PlanRowBuiltin::BitsRotateRight => {
+                let bits = eval_to_bits(&require_input(input)?)?;
+                let amount = exact_count(
+                    &take_required_builtin_arg(&mut args, "by", function)?,
+                    &format!("{} `by`", function.function_name()),
+                )?;
+                consume_bits_work(work, bits.width())?;
+                let result = match function {
+                    PlanRowBuiltin::BitsShiftLeft => bits.logical_shift_left(amount),
+                    PlanRowBuiltin::BitsShiftRight => bits.logical_shift_right(amount),
+                    PlanRowBuiltin::BitsShiftRightArithmetic => bits.arithmetic_shift_right(amount),
+                    PlanRowBuiltin::BitsRotateLeft => bits.rotate_left(amount),
+                    PlanRowBuiltin::BitsRotateRight => bits.rotate_right(amount),
+                    _ => unreachable!(),
+                };
+                EvalValue::Value(Value::Bits(
+                    result.map_err(|error| bits_evaluation_error(function, error))?,
+                ))
+            }
+            PlanRowBuiltin::BitsZeroExtend
+            | PlanRowBuiltin::BitsSignExtend
+            | PlanRowBuiltin::BitsTruncate => {
+                let bits = eval_to_bits(&require_input(input)?)?;
+                let width = bits_width_argument(
+                    &take_required_builtin_arg(&mut args, "width", function)?,
+                    function,
+                    "width",
+                )?;
+                consume_bits_work(work, bits.width().saturating_add(width))?;
+                let result = match function {
+                    PlanRowBuiltin::BitsZeroExtend => bits.zero_extend(width),
+                    PlanRowBuiltin::BitsSignExtend => bits.sign_extend(width),
+                    PlanRowBuiltin::BitsTruncate => bits.truncate(width),
+                    _ => unreachable!(),
+                };
+                EvalValue::Value(Value::Bits(
+                    result.map_err(|error| bits_evaluation_error(function, error))?,
+                ))
+            }
+            PlanRowBuiltin::BitsCompare => {
+                let bits = eval_to_bits(&require_input(input)?)?;
+                let right = eval_to_bits(&take_required_builtin_arg(&mut args, "with", function)?)?;
+                let interpretation = eval_bits_interpretation(&take_required_builtin_arg(
+                    &mut args,
+                    "interpretation",
+                    function,
+                )?)?;
+                consume_bits_work(work, bits.width().saturating_add(right.width()))?;
+                let ordering = bits
+                    .compare(&right, interpretation)
+                    .map_err(|error| bits_evaluation_error(function, error))?;
+                EvalValue::Value(Value::tag(match ordering {
+                    std::cmp::Ordering::Less => "Less",
+                    std::cmp::Ordering::Equal => "Equal",
+                    std::cmp::Ordering::Greater => "Greater",
+                }))
+            }
+            PlanRowBuiltin::BitsAddOrWrap | PlanRowBuiltin::BitsSubtractOrWrap => {
+                let bits = eval_to_bits(&require_input(input)?)?;
+                let right = eval_to_bits(&take_required_builtin_arg(&mut args, "with", function)?)?;
+                consume_bits_work(work, bits.width().saturating_add(right.width()))?;
+                let result = if function == PlanRowBuiltin::BitsAddOrWrap {
+                    bits.add_or_wrap(&right)
+                } else {
+                    bits.subtract_or_wrap(&right)
+                };
+                EvalValue::Value(Value::Bits(
+                    result.map_err(|error| bits_evaluation_error(function, error))?,
+                ))
+            }
+            PlanRowBuiltin::BitsAddWidening => {
+                let bits = eval_to_bits(&require_input(input)?)?;
+                let right = eval_to_bits(&take_required_builtin_arg(&mut args, "with", function)?)?;
+                let interpretation = eval_bits_interpretation(&take_required_builtin_arg(
+                    &mut args,
+                    "interpretation",
+                    function,
+                )?)?;
+                consume_bits_work(work, bits.width().saturating_add(right.width()))?;
+                EvalValue::Value(Value::Bits(
+                    bits.add_widening(&right, interpretation)
+                        .map_err(|error| bits_evaluation_error(function, error))?,
+                ))
+            }
+            PlanRowBuiltin::BitsTryAdd => {
+                let bits = eval_to_bits(&require_input(input)?)?;
+                let right = eval_to_bits(&take_required_builtin_arg(&mut args, "with", function)?)?;
+                let interpretation = eval_bits_interpretation(&take_required_builtin_arg(
+                    &mut args,
+                    "interpretation",
+                    function,
+                )?)?;
+                consume_bits_work(work, bits.width().saturating_add(right.width()))?;
+                let result = bits
+                    .try_add(&right, interpretation)
+                    .map_err(|error| bits_evaluation_error(function, error))?;
+                EvalValue::Value(match result {
+                    Ok(value) => Value::tagged(
+                        "Added",
+                        BTreeMap::from([("value".to_owned(), Value::Bits(value))]),
+                    ),
+                    Err(BitsArithmeticFailure::Overflow) => Value::tag("Overflow"),
+                    Err(BitsArithmeticFailure::Underflow) => {
+                        return Err(Error::InvalidPlan(
+                            "Bits/try_add produced an impossible Underflow result".to_owned(),
+                        ));
+                    }
+                })
+            }
+            PlanRowBuiltin::BitsTrySubtract => {
+                let bits = eval_to_bits(&require_input(input)?)?;
+                let right = eval_to_bits(&take_required_builtin_arg(&mut args, "with", function)?)?;
+                let interpretation = eval_bits_interpretation(&take_required_builtin_arg(
+                    &mut args,
+                    "interpretation",
+                    function,
+                )?)?;
+                consume_bits_work(work, bits.width().saturating_add(right.width()))?;
+                let result = bits
+                    .try_subtract(&right, interpretation)
+                    .map_err(|error| bits_evaluation_error(function, error))?;
+                EvalValue::Value(match result {
+                    Ok(value) => Value::tagged(
+                        "Subtracted",
+                        BTreeMap::from([("value".to_owned(), Value::Bits(value))]),
+                    ),
+                    Err(BitsArithmeticFailure::Underflow) => Value::tag("Underflow"),
+                    Err(BitsArithmeticFailure::Overflow) => Value::tag("Overflow"),
+                })
+            }
+            PlanRowBuiltin::NumberToBits => {
+                let number = eval_to_number(&require_input(input)?)?;
+                let width = bits_width_argument(
+                    &take_required_builtin_arg(&mut args, "width", function)?,
+                    function,
+                    "width",
+                )?;
+                let interpretation = eval_bits_interpretation(&take_required_builtin_arg(
+                    &mut args,
+                    "interpretation",
+                    function,
+                )?)?;
+                consume_bits_work(work, width)?;
+                EvalValue::Value(if !number.is_whole() {
+                    Value::tag("NotWhole")
+                } else {
+                    match Bits::from_number(width, &number, interpretation) {
+                        Ok(value) => Value::tagged(
+                            "Converted",
+                            BTreeMap::from([("value".to_owned(), Value::Bits(value))]),
+                        ),
+                        Err(_) => Value::tag("OutOfRange"),
+                    }
+                })
+            }
+            PlanRowBuiltin::BitsToNumber => {
+                let bits = eval_to_bits(&require_input(input)?)?;
+                let interpretation = eval_bits_interpretation(&take_required_builtin_arg(
+                    &mut args,
+                    "interpretation",
+                    function,
+                )?)?;
+                consume_bits_work(work, bits.width())?;
+                EvalValue::Value(Value::Number(
+                    bits.to_number(interpretation)
+                        .map_err(|error| bits_evaluation_error(function, error))?,
+                ))
+            }
+            PlanRowBuiltin::BitsToBytes => {
+                let bits = eval_to_bits(&require_input(input)?)?;
+                let byte_order = eval_bits_byte_order(&take_required_builtin_arg(
+                    &mut args,
+                    "byte_order",
+                    function,
+                )?)?;
+                consume_bits_work(work, bits.width())?;
+                EvalValue::Value(Value::Bytes(
+                    bits.to_bytes(byte_order)
+                        .map_err(|error| bits_evaluation_error(function, error))?,
+                ))
+            }
+            PlanRowBuiltin::BytesToBits => {
+                let bytes = eval_to_bytes(&require_input(input)?)?;
+                let width = bits_width_argument(
+                    &take_required_builtin_arg(&mut args, "width", function)?,
+                    function,
+                    "width",
+                )?;
+                let byte_order = eval_bits_byte_order(&take_required_builtin_arg(
+                    &mut args,
+                    "byte_order",
+                    function,
+                )?)?;
+                consume_bits_work(work, width)?;
+                EvalValue::Value(Value::Bits(
+                    Bits::from_bytes(width, bytes, byte_order)
+                        .map_err(|error| bits_evaluation_error(function, error))?,
+                ))
+            }
             PlanRowBuiltin::ListGet => {
                 let input = require_input(input)?;
                 let position = one_based_position(
@@ -31892,6 +32198,86 @@ fn eval_to_number(value: &EvalValue) -> Result<ExactNumber, Error> {
         EvalValue::Value(Value::Number(value)) => Ok(value.clone()),
         other => Err(Error::Evaluation(format!("value {other:?} is not numeric"))),
     }
+}
+
+fn eval_to_bits(value: &EvalValue) -> Result<Bits, Error> {
+    match value {
+        EvalValue::Value(Value::Bits(value)) => Ok(value.clone()),
+        other => Err(Error::Evaluation(format!("value {other:?} is not BITS"))),
+    }
+}
+
+fn eval_fieldless_tag(value: &EvalValue, context: &str) -> Result<String, Error> {
+    match value {
+        EvalValue::Value(Value::Tag { tag, fields }) if fields.is_empty() => Ok(tag.clone()),
+        other => Err(Error::Evaluation(format!(
+            "{context} must be a fieldless Tag, found {other:?}"
+        ))),
+    }
+}
+
+fn eval_bits_direction(value: &EvalValue) -> Result<BitsDirection, Error> {
+    match eval_fieldless_tag(value, "BITS direction")?.as_str() {
+        "Left" => Ok(BitsDirection::Left),
+        "Right" => Ok(BitsDirection::Right),
+        direction => Err(Error::Evaluation(format!(
+            "BITS direction must be Left or Right, found `{direction}`"
+        ))),
+    }
+}
+
+fn eval_bits_interpretation(value: &EvalValue) -> Result<BitsInterpretation, Error> {
+    match eval_fieldless_tag(value, "BITS interpretation")?.as_str() {
+        "Unsigned" => Ok(BitsInterpretation::Unsigned),
+        "TwosComplement" => Ok(BitsInterpretation::TwosComplement),
+        interpretation => Err(Error::Evaluation(format!(
+            "BITS interpretation must be Unsigned or TwosComplement, found `{interpretation}`"
+        ))),
+    }
+}
+
+fn eval_bits_byte_order(value: &EvalValue) -> Result<BitsByteOrder, Error> {
+    match eval_fieldless_tag(value, "BITS byte order")?.as_str() {
+        "BigEndian" => Ok(BitsByteOrder::BigEndian),
+        "LittleEndian" => Ok(BitsByteOrder::LittleEndian),
+        byte_order => Err(Error::Evaluation(format!(
+            "BITS byte order must be BigEndian or LittleEndian, found `{byte_order}`"
+        ))),
+    }
+}
+
+fn bits_width_argument(
+    value: &EvalValue,
+    function: PlanRowBuiltin,
+    name: &str,
+) -> Result<u32, Error> {
+    let value = eval_to_number(value)?.to_u64_exact().map_err(|error| {
+        Error::Evaluation(format!(
+            "{} `{name}` must be a positive whole Number: {error}",
+            function.function_name()
+        ))
+    })?;
+    let width = u32::try_from(value).map_err(|_| {
+        Error::Evaluation(format!(
+            "{} `{name}` exceeds deterministic BITS limit {MAX_BITS_WIDTH}",
+            function.function_name()
+        ))
+    })?;
+    if width == 0 || width > MAX_BITS_WIDTH {
+        return Err(Error::Evaluation(format!(
+            "{} `{name}` must be between 1 and {MAX_BITS_WIDTH}",
+            function.function_name()
+        )));
+    }
+    Ok(width)
+}
+
+fn consume_bits_work(work: &mut Work, width: u32) -> Result<(), Error> {
+    work.consume(u64::from(width.div_ceil(64)).max(1))
+}
+
+fn bits_evaluation_error(function: PlanRowBuiltin, error: boon_data::BitsError) -> Error {
+    Error::Evaluation(format!("{}: {error}", function.function_name()))
 }
 
 fn eval_to_rounding_rule(value: &EvalValue) -> Result<ExactRoundingRule, Error> {
@@ -34049,6 +34435,17 @@ store: [
         .unwrap()
         .plan;
         let list = plan.storage_layout.list_slots[0].list_id;
+        let append = plan
+            .regions
+            .iter()
+            .flat_map(|region| &region.ops)
+            .find_map(|op| match &op.kind {
+                PlanOpKind::ListMutation {
+                    mutation: PlanListMutation::Append(append),
+                } => Some(append.clone()),
+                _ => None,
+            })
+            .expect("compiled append mutation");
         let mut session = MachineInstance::new(plan, SessionOptions::default()).unwrap();
         let mut work = session.fresh_work();
         work.begin_turn(None, 1);
@@ -34058,7 +34455,11 @@ store: [
             sequence: 1,
             owner: OwnerInstanceId::ROOT,
             list,
-            fields: BTreeMap::new(),
+            append: append.clone(),
+            row: None,
+            event: None,
+            flush_state: None,
+            flush_target: None,
         };
         work.pending_list_mutations.push(mutation(0));
         work.pending_list_mutations.push(mutation(1));

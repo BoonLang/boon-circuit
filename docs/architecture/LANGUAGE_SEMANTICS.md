@@ -429,14 +429,84 @@ Raw object, LIST, MAP, SET, runtime-type, nested payload, renamed payload, and
 dynamic comparison patterns fail in the parser with targeted diagnostics.
 Pattern bindings and field projections are then carried structurally through
 the checked and executable artifacts; typechecking does not recover them by
-scanning source tokens. Fixed-width BITS literal patterns remain unavailable
-until the BITS value phase lands. `NaN` is neither a Number nor a match pattern.
-Strict `Text/to_number()` returns
+scanning source tokens. Fixed-width BITS patterns match only exact literals of
+the same width; masked, captured, or destructuring bit patterns are rejected.
+`NaN` is neither a Number nor a match pattern. Strict `Text/to_number()` returns
 `Parsed[value] | InvalidNumber[reason, position]`.
 
 On an absent event input, event-style `WHEN` returns `SKIP`. Value-style `WHEN`
 does not have absence unless the value being matched is itself an event/optional
 value.
+
+## BITS
+
+`BITS[N]` is an immutable raw bit sequence with a positive compile-time width.
+Width is part of the type, and BITS stores no signedness. A Number never
+implicitly becomes BITS.
+
+```boon
+opcode: BITS[7] { 2u0110011 }
+word: BITS[16] { 16ua305 }
+```
+
+The encoded literal is one nonnegative radix token and must fit exactly within
+the declared width. The runtime representation retains the width plus
+canonical big-endian bytes and supports widths beyond a machine word. The
+deterministic semantic ceiling is 1,048,576 bits.
+
+Positions are one-based. Position 1 means the leftmost displayed bit by
+default; `Bits/get` and `Bits/set` accept `from: Right` when right-origin
+addressing is intended. Slices use left-origin positions and a positive
+compile-time count.
+
+The initial operation set is:
+
+- `Bits/width`, `Bits/get`, `Bits/set`, `Bits/slice`, `Bits/set_slice`, and
+  `Bits/concat`;
+- `Bits/and`, `Bits/or`, `Bits/xor`, and `Bits/not`;
+- logical left/right shifts, arithmetic right shift, and left/right rotates;
+- zero extension, sign extension, and truncation;
+- comparison with explicit `Unsigned` or `TwosComplement` interpretation;
+- explicit wrapping, widening, and checked addition/subtraction.
+
+Width transformations are static: bitwise operations and shifts preserve
+`BITS[N]`, concat returns `BITS[N+M]`, slice returns `BITS[count]`, explicit
+extension/truncation returns the requested width, and widening addition returns
+`BITS[N+1]`. Equal-width operations reject mixed widths; callers extend or
+truncate explicitly.
+
+Arithmetic names expose their overflow behavior:
+
+```boon
+wrapped: left |> Bits/add_or_wrap(with: right)
+wide:
+    left
+    |> Bits/add_widening(with: right, interpretation: Unsigned)
+checked:
+    left
+    |> Bits/try_add(with: right, interpretation: TwosComplement)
+```
+
+Checked addition returns `Added[value] | Overflow`. Checked subtraction returns
+`Subtracted[value] | Underflow | Overflow`. `Number/to_bits` requires a static
+width and explicit interpretation and returns
+`Converted[value] | NotWhole | OutOfRange`; `Bits/to_number` also requires an
+interpretation.
+
+Byte conversion is exact and byte-aligned:
+
+```boon
+bytes: word |> Bits/to_bytes(byte_order: BigEndian)
+roundtrip:
+    bytes
+    |> Bytes/to_bits(width: 16, byte_order: BigEndian)
+```
+
+`BigEndian` and `LittleEndian` are explicit semantic orders, never host endian.
+Static width, fit, alignment, and range failures are typechecker diagnostics.
+Values that make a dynamic position or shift domain invalid fail
+deterministically at runtime; no accepted BITS path truncates implicitly or
+panics.
 
 ## WHILE
 

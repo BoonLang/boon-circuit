@@ -106,6 +106,25 @@ Non-literal `TEXT` values remain dynamic `BYTES` conversions. Malformed dynamic
 data is checked by the runtime/PlanExecutor boundary, not guessed by the
 compiler.
 
+## BITS Boundaries
+
+`BITS[N]` and `BYTES[N / 8]` convert only through explicit, exact,
+byte-aligned operations:
+
+```boon
+wire: BITS[16] { 16ua305 }
+network_bytes: wire |> Bits/to_bytes(byte_order: BigEndian)
+wire_again:
+    network_bytes
+    |> Bytes/to_bits(width: 16, byte_order: BigEndian)
+```
+
+The BITS width is compile-time and must be divisible by eight. A fixed BYTES
+input must have exactly `width / 8` bytes. `BigEndian` preserves canonical
+most-significant-byte-first order; `LittleEndian` reverses byte order without
+reversing bits inside each byte. Host endian is never consulted. Padding,
+extension, or truncation must be explicit BITS operations before conversion.
+
 ## Endian And Numeric Access
 
 Multi-byte numeric operations must specify endian explicitly:

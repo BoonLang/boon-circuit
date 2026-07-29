@@ -5,7 +5,8 @@
 pub use bytes::Bytes;
 mod bits;
 pub use bits::{
-    Bits, BitsArithmeticFailure, BitsDirection, BitsError, BitsInterpretation, MAX_BITS_WIDTH,
+    Bits, BitsArithmeticFailure, BitsByteOrder, BitsDirection, BitsError, BitsInterpretation,
+    MAX_BITS_WIDTH,
 };
 mod number;
 pub use number::{

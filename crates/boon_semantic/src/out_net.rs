@@ -941,12 +941,21 @@ where
             let result_scheme = signature
                 .map(|signature| &signature.result)
                 .unwrap_or(&checked_call.result);
+            let instantiated_result =
+                apply_checked_type_substitutions(&result_scheme.ty, &type_substitutions);
+            let result_type = if !crate::out_contract_type_is_resolved(&instantiated_result)
+                && crate::out_contract_type_is_resolved(&checked_call.result.ty)
+            {
+                checked_call.result.ty.clone()
+            } else {
+                instantiated_result
+            };
             let result = FlowType {
                 // The callable signature supplies the generic result type, but
                 // temporal gating is occurrence-specific and has already been
                 // resolved on the checked call.
                 mode: checked_call.result.mode,
-                ty: apply_checked_type_substitutions(&result_scheme.ty, &type_substitutions),
+                ty: result_type,
             };
             self.call_instances.push(OutCallInstance {
                 id: instance,
@@ -1819,6 +1828,45 @@ mod tests {
             output.report.diagnostics
         );
         output.program.expect("fixture typechecks")
+    }
+
+    #[test]
+    fn occurrence_specific_builtin_results_survive_out_elaboration() {
+        let program = checked_program(
+            "out-net-static-bits-results.bn",
+            r#"
+bits: BITS[8] { 2u10100011 }
+slice: bits |> Bits/slice(from: 2, count: 3)
+converted: 255 |> Number/to_bits(width: 8, interpretation: Unsigned)
+"#,
+        );
+        let built = OutNet::build(&program);
+        assert!(!built.has_errors(), "{:#?}", built.diagnostics);
+
+        for function in ["Bits/slice", "Number/to_bits"] {
+            let call = program
+                .calls
+                .iter()
+                .find(|call| call.function == function)
+                .unwrap_or_else(|| panic!("missing checked call `{function}`"));
+            let instance = built
+                .graph
+                .call_instances
+                .iter()
+                .find(|instance| instance.provenance.call_id == Some(call.id))
+                .unwrap_or_else(|| panic!("missing OUT instance for `{function}`"));
+            assert_eq!(instance.result, call.result);
+        }
+        assert_eq!(
+            program
+                .calls
+                .iter()
+                .find(|call| call.function == "Bits/slice")
+                .unwrap()
+                .result
+                .ty,
+            boon_typecheck::Type::Bits { width: 3 }
+        );
     }
 
     #[test]

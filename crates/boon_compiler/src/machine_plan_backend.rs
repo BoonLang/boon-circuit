@@ -6689,8 +6689,13 @@ fn inferred_builtin_call_value_type(function: &str) -> Option<PlanValueType> {
         | "Text/length"
         | "Bytes/length"
         | "Bytes/read_unsigned"
-        | "Bytes/read_signed" => Some(PlanValueType::Number),
-        "Text/find" | "Text/to_number" | "Bytes/find" | "Bytes/get" => Some(PlanValueType::Tag),
+        | "Bytes/read_signed"
+        | "Bits/width"
+        | "Bits/to_number" => Some(PlanValueType::Number),
+        "Text/find" | "Text/to_number" | "Bytes/find" | "Bytes/get" | "Bits/get"
+        | "Bits/compare" | "Bits/try_add" | "Bits/try_subtract" | "Number/to_bits" => {
+            Some(PlanValueType::Tag)
+        }
         "Bool/not" | "Bool/and" | "Bool/or" | "Bool/toggle" | "Text/is_empty"
         | "Text/is_not_empty" | "Text/starts_with" | "Text/contains" | "Text/all_chars_in"
         | "Bytes/is_empty" | "Bytes/equal" | "Bytes/starts_with" | "Bytes/ends_with" => {
@@ -6707,6 +6712,7 @@ fn inferred_builtin_call_value_type(function: &str) -> Option<PlanValueType> {
         | "Bytes/from_base64"
         | "Bytes/write_unsigned"
         | "Bytes/write_signed"
+        | "Bits/to_bytes"
         | "File/read_bytes" => Some(PlanValueType::Bytes { fixed_len: None }),
         _ => None,
     }
@@ -12405,7 +12411,14 @@ fn row_expression_value_type(
         | PlanRowExpressionNode::TextIsEmpty { .. }
         | PlanRowExpressionNode::TextStartsWith { .. }
         | PlanRowExpressionNode::TextToNumber { .. } => Some(PlanValueType::Tag),
-        PlanRowExpressionNode::BuiltinCall { function, .. } => function.fixed_result_type(),
+        PlanRowExpressionNode::BuiltinCall {
+            function,
+            input,
+            args,
+        } => {
+            bits_row_builtin_value_type(program, index, arena, constants, *function, *input, args)?
+                .or_else(|| function.fixed_result_type())
+        }
         PlanRowExpressionNode::Select { arms, .. } => {
             let mut arm_types = Vec::new();
             for arm in arms {
@@ -12444,6 +12457,93 @@ fn row_expression_value_type(
         | PlanRowExpressionNode::Object { .. }
         | PlanRowExpressionNode::TaggedObject { .. }
         | PlanRowExpressionNode::ObjectField { .. } => None,
+    })
+}
+
+fn bits_row_builtin_value_type(
+    program: &ErasedProgram,
+    index: &ValueIndex,
+    arena: &PlanRowExpressionArena,
+    constants: &[PlanConstant],
+    function: PlanRowBuiltin,
+    input: Option<PlanRowExpressionId>,
+    args: &[PlanRowCallArg],
+) -> Result<Option<PlanValueType>, PlanError> {
+    let input_type = match input {
+        Some(input) => row_expression_value_type(program, index, arena, constants, input)?,
+        None => None,
+    };
+    let input_width = match input_type {
+        Some(PlanValueType::Bits { width }) => Some(width),
+        _ => None,
+    };
+    let arg = |name: &str| {
+        args.iter()
+            .find(|argument| argument.name == name)
+            .map(|argument| argument.value)
+    };
+    let arg_bits_width = |name: &str| -> Result<Option<u32>, PlanError> {
+        let Some(expression) = arg(name) else {
+            return Ok(None);
+        };
+        Ok(
+            match row_expression_value_type(program, index, arena, constants, expression)? {
+                Some(PlanValueType::Bits { width }) => Some(width),
+                _ => None,
+            },
+        )
+    };
+    let static_width = |name: &str| {
+        let expression = arg(name)?;
+        let PlanRowExpressionNode::Constant { constant_id } = arena.node(expression).ok()? else {
+            return None;
+        };
+        constants
+            .iter()
+            .find(|constant| constant.id == *constant_id)
+            .and_then(|constant| match &constant.value {
+                PlanConstantValue::Number { value } => value
+                    .to_u64_exact()
+                    .ok()
+                    .and_then(|value| u32::try_from(value).ok()),
+                _ => None,
+            })
+    };
+
+    Ok(match function {
+        PlanRowBuiltin::BitsSet
+        | PlanRowBuiltin::BitsSetSlice
+        | PlanRowBuiltin::BitsAnd
+        | PlanRowBuiltin::BitsOr
+        | PlanRowBuiltin::BitsXor
+        | PlanRowBuiltin::BitsNot
+        | PlanRowBuiltin::BitsShiftLeft
+        | PlanRowBuiltin::BitsShiftRight
+        | PlanRowBuiltin::BitsShiftRightArithmetic
+        | PlanRowBuiltin::BitsRotateLeft
+        | PlanRowBuiltin::BitsRotateRight
+        | PlanRowBuiltin::BitsAddOrWrap
+        | PlanRowBuiltin::BitsSubtractOrWrap => input_type,
+        PlanRowBuiltin::BitsSlice => {
+            static_width("count").map(|width| PlanValueType::Bits { width })
+        }
+        PlanRowBuiltin::BitsConcat => input_width
+            .zip(arg_bits_width("with")?)
+            .and_then(|(left, right)| left.checked_add(right))
+            .map(|width| PlanValueType::Bits { width }),
+        PlanRowBuiltin::BitsZeroExtend
+        | PlanRowBuiltin::BitsSignExtend
+        | PlanRowBuiltin::BitsTruncate
+        | PlanRowBuiltin::BytesToBits => {
+            static_width("width").map(|width| PlanValueType::Bits { width })
+        }
+        PlanRowBuiltin::BitsAddWidening => input_width
+            .and_then(|width| width.checked_add(1))
+            .map(|width| PlanValueType::Bits { width }),
+        PlanRowBuiltin::BitsToBytes => input_width.map(|width| PlanValueType::Bytes {
+            fixed_len: Some(u64::from(width / 8)),
+        }),
+        _ => None,
     })
 }
 

@@ -278,6 +278,7 @@ fn test_data_type(value_type: PlanValueType) -> DataTypePlan {
         },
         PlanValueType::Data => DataTypePlan::Unknown,
         PlanValueType::Unknown => DataTypePlan::Unknown,
+        PlanValueType::Bits { width } => DataTypePlan::Bits { width },
     }
 }
 
@@ -15053,4 +15054,175 @@ fn detached_state_capture_field_identity_fails_closed() {
             panic!("{label} returned the wrong error: {error}");
         }
     }
+}
+
+#[test]
+fn fixed_width_bits_builtins_execute_end_to_end() {
+    let compiled = compile_server_source(
+        "bits-builtins-executor.bn",
+        r#"
+left: BITS[8] { 16ua3 }
+right: BITS[8] { 16u05 }
+word: BITS[16] { 16ua305 }
+half: 1 / 2
+negative_one: 0 - 1
+
+width: left |> Bits/width()
+get_left: left |> Bits/get(position: 1)
+get_right: left |> Bits/get(position: 1, from: Right)
+set_left: left |> Bits/set(position: 2, to: True)
+set_right: left |> Bits/set(position: 3, to: True, from: Right)
+slice: left |> Bits/slice(from: 2, count: 3)
+set_slice: left |> Bits/set_slice(from: 2, value: BITS[3] { 2u111 })
+concat: left |> Bits/concat(with: right)
+and_value: left |> Bits/and(with: right)
+or_value: left |> Bits/or(with: right)
+xor_value: left |> Bits/xor(with: right)
+not_value: left |> Bits/not()
+shift_left: left |> Bits/shift_left(by: 2)
+shift_right: left |> Bits/shift_right(by: 2)
+shift_right_arithmetic: left |> Bits/shift_right_arithmetic(by: 2)
+rotate_left: left |> Bits/rotate_left(by: 2)
+rotate_right: left |> Bits/rotate_right(by: 2)
+zero_extended: left |> Bits/zero_extend(width: 12)
+sign_extended: left |> Bits/sign_extend(width: 12)
+truncated: left |> Bits/truncate(width: 4)
+unsigned_compare: left |> Bits/compare(with: right, interpretation: Unsigned)
+signed_compare: left |> Bits/compare(with: right, interpretation: TwosComplement)
+add_wrap: left |> Bits/add_or_wrap(with: right)
+subtract_wrap: left |> Bits/subtract_or_wrap(with: right)
+add_widening_unsigned: left |> Bits/add_widening(with: right, interpretation: Unsigned)
+add_widening_signed: left |> Bits/add_widening(with: right, interpretation: TwosComplement)
+try_add: left |> Bits/try_add(with: right, interpretation: Unsigned)
+try_add_overflow:
+    BITS[8] { 16uff }
+    |> Bits/try_add(with: BITS[8] { 16u01 }, interpretation: Unsigned)
+try_subtract: left |> Bits/try_subtract(with: right, interpretation: Unsigned)
+try_subtract_underflow:
+    right
+    |> Bits/try_subtract(with: left, interpretation: Unsigned)
+try_signed_add_overflow:
+    BITS[8] { 16u7f }
+    |> Bits/try_add(with: BITS[8] { 16u01 }, interpretation: TwosComplement)
+try_signed_subtract_overflow:
+    BITS[8] { 16u80 }
+    |> Bits/try_subtract(with: BITS[8] { 16u01 }, interpretation: TwosComplement)
+number_to_bits: 255 |> Number/to_bits(width: 8, interpretation: Unsigned)
+number_to_bits_not_whole: half |> Number/to_bits(width: 8, interpretation: Unsigned)
+number_to_bits_out_of_range: 256 |> Number/to_bits(width: 8, interpretation: Unsigned)
+signed_number_to_bits:
+    negative_one
+    |> Number/to_bits(width: 8, interpretation: TwosComplement)
+to_unsigned_number: left |> Bits/to_number(interpretation: Unsigned)
+to_signed_number: left |> Bits/to_number(interpretation: TwosComplement)
+to_bytes_big: word |> Bits/to_bytes(byte_order: BigEndian)
+to_bytes_little: word |> Bits/to_bytes(byte_order: LittleEndian)
+from_bytes_big:
+    BYTES[2] { 16ua3, 16u05 }
+    |> Bytes/to_bits(width: 16, byte_order: BigEndian)
+from_bytes_little:
+    BYTES[2] { 16u05, 16ua3 }
+    |> Bytes/to_bits(width: 16, byte_order: LittleEndian)
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    let mut session = MachineInstance::new(compiled.plan, SessionOptions::default()).unwrap();
+    let bits =
+        |width, digits| Value::Bits(boon_data::Bits::parse_encoded(width, 16, digits).unwrap());
+    let tagged_bits = |tag: &str, width, digits| {
+        Value::tagged(
+            tag,
+            BTreeMap::from([(
+                "value".to_owned(),
+                Value::Bits(boon_data::Bits::parse_encoded(width, 16, digits).unwrap()),
+            )]),
+        )
+    };
+
+    for (path, expected) in [
+        ("width", number(8)),
+        ("get_left", Value::tag("True")),
+        ("get_right", Value::tag("True")),
+        ("set_left", bits(8, "e3")),
+        ("set_right", bits(8, "a7")),
+        ("slice", bits(3, "2")),
+        ("set_slice", bits(8, "f3")),
+        ("concat", bits(16, "a305")),
+        ("and_value", bits(8, "01")),
+        ("or_value", bits(8, "a7")),
+        ("xor_value", bits(8, "a6")),
+        ("not_value", bits(8, "5c")),
+        ("shift_left", bits(8, "8c")),
+        ("shift_right", bits(8, "28")),
+        ("shift_right_arithmetic", bits(8, "e8")),
+        ("rotate_left", bits(8, "8e")),
+        ("rotate_right", bits(8, "e8")),
+        ("zero_extended", bits(12, "0a3")),
+        ("sign_extended", bits(12, "fa3")),
+        ("truncated", bits(4, "3")),
+        ("unsigned_compare", Value::tag("Greater")),
+        ("signed_compare", Value::tag("Less")),
+        ("add_wrap", bits(8, "a8")),
+        ("subtract_wrap", bits(8, "9e")),
+        ("add_widening_unsigned", bits(9, "0a8")),
+        ("add_widening_signed", bits(9, "1a8")),
+        ("try_add", tagged_bits("Added", 8, "a8")),
+        ("try_add_overflow", Value::tag("Overflow")),
+        ("try_subtract", tagged_bits("Subtracted", 8, "9e")),
+        ("try_subtract_underflow", Value::tag("Underflow")),
+        ("try_signed_add_overflow", Value::tag("Overflow")),
+        ("try_signed_subtract_overflow", Value::tag("Overflow")),
+        ("number_to_bits", tagged_bits("Converted", 8, "ff")),
+        ("number_to_bits_not_whole", Value::tag("NotWhole")),
+        ("number_to_bits_out_of_range", Value::tag("OutOfRange")),
+        ("signed_number_to_bits", tagged_bits("Converted", 8, "ff")),
+        ("to_unsigned_number", number(163)),
+        ("to_signed_number", number(-93)),
+        ("to_bytes_big", Value::Bytes(vec![0xa3, 0x05].into())),
+        ("to_bytes_little", Value::Bytes(vec![0x05, 0xa3].into())),
+        ("from_bytes_big", bits(16, "a305")),
+        ("from_bytes_little", bits(16, "a305")),
+    ] {
+        assert_eq!(
+            session.root_value_current(path).unwrap(),
+            expected,
+            "wrong BITS result for `{path}`"
+        );
+    }
+}
+
+#[test]
+fn dynamic_bits_domain_errors_are_deterministic_runtime_errors() {
+    let compiled = compile_server_source(
+        "bits-runtime-domain-error.bn",
+        r#"
+store: [
+    refresh: SOURCE
+    position:
+        9 |> HOLD position {
+            refresh |> THEN { 9 }
+        }
+    result:
+        BITS[8] { 2u1 }
+        |> Bits/get(position: position)
+]
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+
+    let evaluate = || {
+        let mut session =
+            MachineInstance::new(compiled.plan.clone(), SessionOptions::default()).unwrap();
+        session
+            .root_value_current("store.result")
+            .expect_err("dynamic out-of-range BITS position")
+            .to_string()
+    };
+    let first = evaluate();
+    let second = evaluate();
+    assert_eq!(first, second);
+    assert!(first.contains("Bits/get"), "unexpected error: {first}");
+    assert!(first.contains("position 9"), "unexpected error: {first}");
 }

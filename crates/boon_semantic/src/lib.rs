@@ -2929,6 +2929,9 @@ fn concrete_checked_expression_type(
                             scoped.expression.0
                         ))
                     })?;
+                if out_contract_type_is_resolved(&instance.result.ty) {
+                    return Ok(instance.result.ty.clone());
+                }
                 let callable = program
                     .callables
                     .iter()

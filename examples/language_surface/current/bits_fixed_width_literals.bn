@@ -1,1 +1,50 @@
 opcode: BITS[7] { 2u0110011 }
+decoded:
+    opcode
+    |> WHEN {
+        BITS[7] { 2u0110011 } => RegisterInstruction
+        __ => UnknownInstruction
+    }
+
+alu_left: BITS[8] { 16ua3 }
+alu_right: BITS[8] { 16u05 }
+alu_xor: alu_left |> Bits/xor(with: alu_right)
+alu_wrapped_sum: alu_left |> Bits/add_or_wrap(with: alu_right)
+alu_wide_sum:
+    alu_left
+    |> Bits/add_widening(with: alu_right, interpretation: Unsigned)
+
+lfsr_state: BITS[8] { 2u1011_1000 }
+lfsr_tap_one: lfsr_state |> Bits/get(position: 1)
+lfsr_tap_three: lfsr_state |> Bits/get(position: 3)
+lfsr_feedback: lfsr_tap_one != lfsr_tap_three
+lfsr_shifted: lfsr_state |> Bits/shift_right(by: 1)
+lfsr_next:
+    lfsr_shifted
+    |> Bits/set(position: 1, to: lfsr_feedback)
+
+priority_input: BITS[8] { 2u0010_0000 }
+priority:
+    priority_input
+    |> WHEN {
+        BITS[8] { 2u1000_0000 } => Position1
+        BITS[8] { 2u0100_0000 } => Position2
+        BITS[8] { 2u0010_0000 } => Position3
+        BITS[8] { 2u0001_0000 } => Position4
+        __ => NoSingleHighNibbleBit
+    }
+
+packet: BITS[16] { 16ua305 }
+packet_kind: packet |> Bits/slice(from: 1, count: 4)
+packet_payload: packet |> Bits/slice(from: 5, count: 12)
+packet_bytes: packet |> Bits/to_bytes(byte_order: BigEndian)
+packet_roundtrip:
+    packet_bytes
+    |> Bytes/to_bits(width: 16, byte_order: BigEndian)
+
+document: Document/new(
+    root: Element/label(
+        element: []
+        label: TEXT { Fixed-width BITS hardware fixture }
+    )
+)

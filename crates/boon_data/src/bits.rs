@@ -29,6 +29,12 @@ pub enum BitsInterpretation {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum BitsByteOrder {
+    BigEndian,
+    LittleEndian,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum BitsArithmeticFailure {
     Underflow,
     Overflow,
@@ -491,6 +497,43 @@ impl Bits {
         Ok(ExactNumber::from_ratio(integer, BigUint::one())?)
     }
 
+    pub fn to_bytes(&self, byte_order: BitsByteOrder) -> Result<Bytes, BitsError> {
+        if !self.width.is_multiple_of(8) {
+            return Err(BitsError::new(format!(
+                "BITS[{}] is not byte-aligned; pad it explicitly before converting to BYTES",
+                self.width
+            )));
+        }
+        match byte_order {
+            BitsByteOrder::BigEndian => Ok(self.bytes.clone()),
+            BitsByteOrder::LittleEndian => {
+                let mut bytes = self.bytes.to_vec();
+                bytes.reverse();
+                Ok(bytes.into())
+            }
+        }
+    }
+
+    pub fn from_bytes(
+        width: u32,
+        bytes: impl Into<Bytes>,
+        byte_order: BitsByteOrder,
+    ) -> Result<Self, BitsError> {
+        validate_width(width)?;
+        if !width.is_multiple_of(8) {
+            return Err(BitsError::new(format!(
+                "BITS[{width}] is not byte-aligned; pad the BYTES explicitly before converting"
+            )));
+        }
+        let mut bytes = bytes.into();
+        if byte_order == BitsByteOrder::LittleEndian {
+            let mut reversed = bytes.to_vec();
+            reversed.reverse();
+            bytes = reversed.into();
+        }
+        Self::from_canonical_bytes(width, bytes)
+    }
+
     fn bit_index(
         &self,
         one_based_position: usize,
@@ -771,5 +814,231 @@ mod tests {
         let encoded = serde_json::to_string(&value).unwrap();
         assert_eq!(serde_json::from_str::<Bits>(&encoded).unwrap(), value);
         assert!(serde_json::from_str::<Bits>("[9,[255,1]]").is_err());
+    }
+
+    #[test]
+    fn byte_conversion_is_exact_aligned_and_ordered() {
+        let value = bits(16, 16, "1234");
+        assert_eq!(
+            value.to_bytes(BitsByteOrder::BigEndian).unwrap().as_ref(),
+            &[0x12, 0x34]
+        );
+        assert_eq!(
+            value
+                .to_bytes(BitsByteOrder::LittleEndian)
+                .unwrap()
+                .as_ref(),
+            &[0x34, 0x12]
+        );
+        assert_eq!(
+            Bits::from_bytes(16, [0x34, 0x12].as_slice(), BitsByteOrder::LittleEndian).unwrap(),
+            value
+        );
+        assert!(
+            bits(7, 2, "1010101")
+                .to_bytes(BitsByteOrder::BigEndian)
+                .is_err()
+        );
+        assert!(Bits::from_bytes(16, [0x12].as_slice(), BitsByteOrder::BigEndian).is_err());
+    }
+
+    #[test]
+    fn exhaustive_small_width_semantics_match_integer_references() {
+        fn raw_bits(width: u32, raw: u16) -> Bits {
+            Bits::from_biguint(width, BigUint::from(raw)).unwrap()
+        }
+
+        fn assert_raw(actual: Bits, expected: u16) {
+            assert_eq!(actual.to_biguint(), BigUint::from(expected));
+        }
+
+        fn signed_value(raw: u16, width: u32) -> i32 {
+            let sign = 1_u16 << (width - 1);
+            if raw & sign == 0 {
+                i32::from(raw)
+            } else {
+                i32::from(raw) - (1_i32 << width)
+            }
+        }
+
+        fn signed_encoding(value: i32, width: u32) -> u16 {
+            if value < 0 {
+                ((1_i32 << width) + value) as u16
+            } else {
+                value as u16
+            }
+        }
+
+        for width in 1..=8_u32 {
+            let modulus = 1_u16 << width;
+            let mask = modulus - 1;
+            let signed_min = -(1_i32 << (width - 1));
+            let signed_max = (1_i32 << (width - 1)) - 1;
+
+            for raw in 0..=mask {
+                let value = raw_bits(width, raw);
+                for position in 1..=width as usize {
+                    assert_eq!(
+                        value.bit(position, BitsDirection::Left).unwrap(),
+                        raw & (1_u16 << (width as usize - position)) != 0
+                    );
+                    assert_eq!(
+                        value.bit(position, BitsDirection::Right).unwrap(),
+                        raw & (1_u16 << (position - 1)) != 0
+                    );
+                }
+
+                assert_raw(value.bit_not().unwrap(), raw ^ mask);
+                for amount in 0..=(width as usize * 2 + 1) {
+                    let logical_left = if amount >= width as usize {
+                        0
+                    } else {
+                        (raw << amount) & mask
+                    };
+                    let logical_right = if amount >= width as usize {
+                        0
+                    } else {
+                        raw >> amount
+                    };
+                    let arithmetic_right = if amount >= width as usize {
+                        if signed_value(raw, width) < 0 {
+                            mask
+                        } else {
+                            0
+                        }
+                    } else {
+                        signed_encoding(signed_value(raw, width) >> amount, width)
+                    };
+                    let rotation = amount % width as usize;
+                    let rotate_left = if rotation == 0 {
+                        raw
+                    } else {
+                        ((raw << rotation) | (raw >> (width as usize - rotation))) & mask
+                    };
+                    let rotate_right = if rotation == 0 {
+                        raw
+                    } else {
+                        ((raw >> rotation) | (raw << (width as usize - rotation))) & mask
+                    };
+
+                    assert_raw(value.logical_shift_left(amount).unwrap(), logical_left);
+                    assert_raw(value.logical_shift_right(amount).unwrap(), logical_right);
+                    assert_raw(
+                        value.arithmetic_shift_right(amount).unwrap(),
+                        arithmetic_right,
+                    );
+                    assert_raw(value.rotate_left(amount).unwrap(), rotate_left);
+                    assert_raw(value.rotate_right(amount).unwrap(), rotate_right);
+                }
+
+                assert_raw(value.zero_extend(width + 2).unwrap(), raw);
+                assert_raw(
+                    value.sign_extend(width + 2).unwrap(),
+                    signed_encoding(signed_value(raw, width), width + 2),
+                );
+                for truncated_width in 1..=width {
+                    assert_raw(
+                        value.truncate(truncated_width).unwrap(),
+                        raw & ((1_u16 << truncated_width) - 1),
+                    );
+                }
+
+                for other_raw in 0..=mask {
+                    let other = raw_bits(width, other_raw);
+                    let signed_left = signed_value(raw, width);
+                    let signed_right = signed_value(other_raw, width);
+
+                    assert_raw(value.bit_and(&other).unwrap(), raw & other_raw);
+                    assert_raw(value.bit_or(&other).unwrap(), raw | other_raw);
+                    assert_raw(value.bit_xor(&other).unwrap(), raw ^ other_raw);
+                    assert_raw(
+                        value.add_or_wrap(&other).unwrap(),
+                        raw.wrapping_add(other_raw) & mask,
+                    );
+                    assert_raw(
+                        value.subtract_or_wrap(&other).unwrap(),
+                        raw.wrapping_sub(other_raw) & mask,
+                    );
+                    assert_eq!(
+                        value.compare(&other, BitsInterpretation::Unsigned).unwrap(),
+                        raw.cmp(&other_raw)
+                    );
+                    assert_eq!(
+                        value
+                            .compare(&other, BitsInterpretation::TwosComplement)
+                            .unwrap(),
+                        signed_left.cmp(&signed_right)
+                    );
+                    assert_raw(
+                        value
+                            .add_widening(&other, BitsInterpretation::Unsigned)
+                            .unwrap(),
+                        raw + other_raw,
+                    );
+                    assert_raw(
+                        value
+                            .add_widening(&other, BitsInterpretation::TwosComplement)
+                            .unwrap(),
+                        signed_encoding(signed_left + signed_right, width + 1),
+                    );
+
+                    let unsigned_sum = u32::from(raw) + u32::from(other_raw);
+                    match value.try_add(&other, BitsInterpretation::Unsigned).unwrap() {
+                        Ok(actual) => {
+                            assert!(unsigned_sum < u32::from(modulus));
+                            assert_raw(actual, unsigned_sum as u16);
+                        }
+                        Err(failure) => {
+                            assert_eq!(failure, BitsArithmeticFailure::Overflow);
+                            assert!(unsigned_sum >= u32::from(modulus));
+                        }
+                    }
+
+                    match value
+                        .try_subtract(&other, BitsInterpretation::Unsigned)
+                        .unwrap()
+                    {
+                        Ok(actual) => {
+                            assert!(raw >= other_raw);
+                            assert_raw(actual, raw - other_raw);
+                        }
+                        Err(failure) => {
+                            assert_eq!(failure, BitsArithmeticFailure::Underflow);
+                            assert!(raw < other_raw);
+                        }
+                    }
+
+                    let signed_sum = signed_left + signed_right;
+                    match value
+                        .try_add(&other, BitsInterpretation::TwosComplement)
+                        .unwrap()
+                    {
+                        Ok(actual) => {
+                            assert!((signed_min..=signed_max).contains(&signed_sum));
+                            assert_raw(actual, signed_encoding(signed_sum, width));
+                        }
+                        Err(failure) => {
+                            assert_eq!(failure, BitsArithmeticFailure::Overflow);
+                            assert!(!(signed_min..=signed_max).contains(&signed_sum));
+                        }
+                    }
+
+                    let signed_difference = signed_left - signed_right;
+                    match value
+                        .try_subtract(&other, BitsInterpretation::TwosComplement)
+                        .unwrap()
+                    {
+                        Ok(actual) => {
+                            assert!((signed_min..=signed_max).contains(&signed_difference));
+                            assert_raw(actual, signed_encoding(signed_difference, width));
+                        }
+                        Err(failure) => {
+                            assert_eq!(failure, BitsArithmeticFailure::Overflow);
+                            assert!(!(signed_min..=signed_max).contains(&signed_difference));
+                        }
+                    }
+                }
+            }
+        }
     }
 }

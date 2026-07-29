@@ -265,7 +265,7 @@ pub const LANGUAGE_FEATURE_REGISTRY: &[LanguageFeatureSpec] = &[
         stage: LanguageFeatureStage::Current,
         parse_expectation: LanguageFeatureParseExpectation::Accept,
         spellings: &["BITS"],
-        summary: "fixed-width BITS[N] literals with one encoded nonnegative integer token",
+        summary: "fixed-width BITS[N] literals, exact patterns, transforms, arithmetic, and byte boundaries",
     },
     LanguageFeatureSpec {
         id: "closed_truth_tags",
@@ -4690,6 +4690,7 @@ fn validate_bytes_syntax(
     ast: &AstProgram,
     text_literal_spans: &[(usize, usize)],
 ) -> Result<(), ParseError> {
+    let bits_encoded_spans = bits_literal_encoded_spans(ast);
     for window in ast.tokens.windows(2) {
         let [base_token, suffix_token] = window else {
             continue;
@@ -4717,11 +4718,10 @@ fn validate_bytes_syntax(
         {
             continue;
         }
-        if ast.expressions.iter().any(|expression| {
-            matches!(expression.kind, AstExprKind::BitsLiteral { .. })
-                && base_token.start >= expression.start
-                && suffix_token.end <= expression.end
-        }) {
+        if bits_encoded_spans
+            .iter()
+            .any(|(start, end)| base_token.start == *start && suffix_token.end == *end)
+        {
             continue;
         }
         parse_byte_literal_parts(&base_token.lexeme, &suffix_token.lexeme)
@@ -4731,6 +4731,41 @@ fn validate_bytes_syntax(
         validate_bytes_item_syntax(path, ast, item, text_literal_spans)?;
     }
     Ok(())
+}
+
+fn bits_literal_encoded_spans(ast: &AstProgram) -> Vec<(usize, usize)> {
+    ast.items
+        .iter()
+        .flat_map(|item| {
+            item.symbols
+                .iter()
+                .enumerate()
+                .filter_map(|(bits_index, symbol)| {
+                    (symbol == "BITS").then(|| {
+                        parse_bits_literal_tokens(bits_literal_tokens_at(&item.symbols, bits_index))
+                            .ok()
+                            .and_then(|(_, _, _, base_index, suffix_index)| {
+                                Some((
+                                    item.symbol_spans.get(bits_index + base_index)?.0,
+                                    item.symbol_spans.get(bits_index + suffix_index)?.1,
+                                ))
+                            })
+                    })?
+                })
+        })
+        .collect()
+}
+
+fn bits_literal_tokens_at(symbols: &[String], bits_index: usize) -> &[String] {
+    let candidate = &symbols[bits_index..];
+    let width_close = candidate
+        .get(1)
+        .filter(|token| token.as_str() == "[")
+        .and_then(|_| matching_close(candidate, 1));
+    let body_close = width_close
+        .and_then(|close| (candidate.get(close + 1)?.as_str() == "{").then_some(close + 1))
+        .and_then(|open| matching_close(candidate, open));
+    &candidate[..body_close.map_or(candidate.len(), |close| close + 1)]
 }
 
 fn validate_bits_syntax(
@@ -4756,39 +4791,13 @@ fn validate_bits_syntax(
             {
                 continue;
             }
-            let candidate = &item.symbols[bits_index..];
-            let width_close = candidate
-                .get(1)
-                .filter(|token| token.as_str() == "[")
-                .and_then(|_| matching_close(candidate, 1));
-            let body_close = width_close
-                .and_then(|close| (candidate.get(close + 1)?.as_str() == "{").then_some(close + 1))
-                .and_then(|open| matching_close(candidate, open));
-            let literal_end = body_close.map_or(candidate.len(), |close| close + 1);
-            let literal = &candidate[..literal_end];
+            let literal = bits_literal_tokens_at(&item.symbols, bits_index);
             let (_, radix, digits, base_index, suffix_index) =
                 parse_bits_literal_tokens(literal)
                     .map_err(|message| error(path, item.line, item.indent + 1, message.as_str()))?;
-            let semantic_tokens = ast
-                .tokens
-                .iter()
-                .filter(|token| {
-                    !matches!(token.kind, AstTokenKind::Comment | AstTokenKind::Newline)
-                })
-                .collect::<Vec<_>>();
-            let raw_bits_index = semantic_tokens
-                .iter()
-                .position(|token| token.start == token_start && token.lexeme == "BITS")
-                .ok_or_else(|| {
-                    error(
-                        path,
-                        item.line,
-                        item.indent + 1,
-                        "BITS literal token span is unavailable",
-                    )
-                })?;
-            let base_token = semantic_tokens
-                .get(raw_bits_index + base_index)
+            let base_span = item
+                .symbol_spans
+                .get(bits_index + base_index)
                 .ok_or_else(|| {
                     error(
                         path,
@@ -4797,8 +4806,9 @@ fn validate_bits_syntax(
                         "BITS literal base token is unavailable",
                     )
                 })?;
-            let suffix_token = semantic_tokens
-                .get(raw_bits_index + suffix_index)
+            let suffix_span = item
+                .symbol_spans
+                .get(bits_index + suffix_index)
                 .ok_or_else(|| {
                     error(
                         path,
@@ -4807,10 +4817,22 @@ fn validate_bits_syntax(
                         "BITS literal digit token is unavailable",
                     )
                 })?;
+            let base_token = ast
+                .tokens
+                .iter()
+                .find(|token| token.start == base_span.0)
+                .ok_or_else(|| {
+                    error(
+                        path,
+                        item.line,
+                        item.indent + 1,
+                        "BITS literal base source token is unavailable",
+                    )
+                })?;
             if base_token
                 .start
                 .checked_add(base_token.lexeme.len())
-                .is_none_or(|end| end != suffix_token.start)
+                .is_none_or(|end| end != suffix_span.0)
             {
                 return Err(error(
                     path,
@@ -6480,7 +6502,7 @@ result:
 opcode: BITS[7] { 2u011_0011 }
 kind:
     opcode |> WHEN {
-        BITS[7] { 16u33 } => Register
+        BITS[7] { 2u011_0011 } => Register
         __ => Unknown
     }
 "#,
@@ -6502,11 +6524,11 @@ kind:
                 AstExprKind::MatchArm {
                     pattern: AstMatchPattern::Bits {
                         width: 7,
-                        radix: 16,
+                        radix: 2,
                         digits,
                     },
                     ..
-                } if digits == "33"
+                } if digits == "011_0011"
             )
         }));
     }

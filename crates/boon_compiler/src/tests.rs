@@ -1796,6 +1796,141 @@ outputs: [
 }
 
 #[test]
+fn compiler_preserves_transformed_bits_widths_through_ir_plan_and_json() {
+    let compiled = compile_fixture_source_text_to_machine_plan(
+        "bits-operations-output.bn",
+        r#"
+store: [
+    left: BITS[8] { 16ua3 }
+    right: BITS[8] { 16u05 }
+    slice: left |> Bits/slice(from: 2, count: 3)
+    concatenated: left |> Bits/concat(with: right)
+    extended: left |> Bits/sign_extend(width: 12)
+    encoded:
+        concatenated
+        |> Bits/to_bytes(byte_order: BigEndian)
+]
+
+outputs: [
+    slice: store.slice
+    concatenated: store.concatenated
+    extended: store.extended
+    encoded: store.encoded
+]
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+
+    let call_type = |name: &str| {
+        compiled
+            .ir
+            .executable
+            .expressions
+            .iter()
+            .find_map(|expression| match &expression.kind {
+                boon_ir::ExecutableExpressionKind::Call {
+                    name: call_name, ..
+                } if call_name == name => Some(expression.flow_type.ty.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing executable BITS call `{name}`"))
+    };
+    assert_eq!(
+        call_type("Bits/slice"),
+        boon_typecheck::Type::Bits { width: 3 }
+    );
+    assert_eq!(
+        call_type("Bits/concat"),
+        boon_typecheck::Type::Bits { width: 16 }
+    );
+    assert_eq!(
+        call_type("Bits/sign_extend"),
+        boon_typecheck::Type::Bits { width: 12 }
+    );
+    assert_eq!(
+        call_type("Bits/to_bytes"),
+        boon_typecheck::Type::Bytes(boon_typecheck::BytesType::Fixed(2))
+    );
+
+    for (name, expected) in [
+        ("slice", boon_plan::DataTypePlan::Bits { width: 3 }),
+        ("concatenated", boon_plan::DataTypePlan::Bits { width: 16 }),
+        ("extended", boon_plan::DataTypePlan::Bits { width: 12 }),
+        (
+            "encoded",
+            boon_plan::DataTypePlan::Bytes { fixed_len: Some(2) },
+        ),
+    ] {
+        let output = compiled
+            .plan
+            .output_root(name)
+            .unwrap_or_else(|| panic!("missing output root `{name}`"));
+        assert_eq!(
+            output.contract,
+            boon_plan::OutputContractKind::HostValue {
+                data_type: expected
+            }
+        );
+    }
+
+    let plan_builtins = compiled
+        .plan
+        .row_expressions
+        .iter()
+        .filter_map(|(_, expression)| match expression {
+            boon_plan::PlanRowExpressionNode::BuiltinCall { function, .. } => Some(*function),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    assert!(plan_builtins.contains(&PlanRowBuiltin::BitsSlice));
+    assert!(plan_builtins.contains(&PlanRowBuiltin::BitsConcat));
+    assert!(plan_builtins.contains(&PlanRowBuiltin::BitsSignExtend));
+    assert!(plan_builtins.contains(&PlanRowBuiltin::BitsToBytes));
+
+    let encoded = serde_json::to_vec(&compiled.plan).unwrap();
+    let decoded: boon_plan::MachinePlan = serde_json::from_slice(&encoded).unwrap();
+    assert_eq!(decoded, compiled.plan);
+    assert_eq!(verify_plan(&decoded).unwrap().status, "pass");
+}
+
+#[test]
+fn public_fixed_width_bits_hardware_fixture_compiles_to_verified_operations() {
+    let compiled = compile_source_path_to_machine_plan(
+        &example_path("examples/language_surface/current/bits_fixed_width_literals.bn"),
+        TargetProfile::SoftwareDefault,
+    )
+    .expect("the public BITS hardware fixture must compile through the production pipeline");
+
+    let plan_builtins = compiled
+        .plan
+        .row_expressions
+        .iter()
+        .filter_map(|(_, expression)| match expression {
+            boon_plan::PlanRowExpressionNode::BuiltinCall { function, .. } => Some(*function),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    for expected in [
+        PlanRowBuiltin::BitsXor,
+        PlanRowBuiltin::BitsAddOrWrap,
+        PlanRowBuiltin::BitsAddWidening,
+        PlanRowBuiltin::BitsGet,
+        PlanRowBuiltin::BitsShiftRight,
+        PlanRowBuiltin::BitsSet,
+        PlanRowBuiltin::BitsSlice,
+        PlanRowBuiltin::BitsToBytes,
+        PlanRowBuiltin::BytesToBits,
+    ] {
+        assert!(
+            plan_builtins.contains(&expected),
+            "public BITS hardware fixture omitted {expected:?}: {plan_builtins:#?}"
+        );
+    }
+    assert_eq!(verify_plan(&compiled.plan).unwrap().status, "pass");
+}
+
+#[test]
 fn omitted_order_direction_erases_to_an_ascending_typed_index() {
     let compiled = compile_fixture_source_text_to_machine_plan(
         "default-order-direction.bn",

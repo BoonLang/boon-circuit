@@ -1,5 +1,8 @@
 use boon_contract::SourceBundleDigestV1;
-use boon_data::{Bits, ExactNumber, ExactRoundingRule, MAX_NUMBER_TEXT_DIGITS, Value as DataValue};
+use boon_data::{
+    Bits, ExactNumber, ExactRoundingRule, MAX_BITS_WIDTH, MAX_NUMBER_TEXT_DIGITS,
+    Value as DataValue,
+};
 pub use boon_document_model::ProgramRole;
 use boon_parser::{
     AstCallArg, AstCallArgKind, AstDrainPath, AstExpr, AstExprKind, AstMatchPattern, AstParameter,
@@ -195,6 +198,14 @@ pub struct TypeVarStore {
 }
 
 impl TypeVarStore {
+    fn with_reserved_vars(count: u32) -> Self {
+        let mut store = Self::default();
+        for index in 0..count {
+            debug_assert_eq!(store.new_var(), TypeVar(index));
+        }
+        store
+    }
+
     pub fn new_var(&mut self) -> TypeVar {
         self.table.new_key(None)
     }
@@ -5339,9 +5350,25 @@ impl<'a> CheckedProgramBuilder<'a> {
             );
         }
 
+        let instantiated_result = substitute_checked_type(&signature.result.ty, &substitutions);
+        let result_type = if !type_is_recursively_closed(&instantiated_result)
+            && type_is_recursively_closed(&call.result.ty)
+        {
+            call.result.ty.clone()
+        } else {
+            self.authoritative_expr_types
+                .contains(&(call.expression.0 as usize))
+                .then(|| {
+                    self.inferred_expr_types
+                        .get(&(call.expression.0 as usize))
+                        .map(|flow_type| flow_type.ty.clone())
+                })
+                .flatten()
+                .unwrap_or(instantiated_result)
+        };
         let result = FlowType {
             mode: self.instantiate_checked_call_result_mode(&signature, &call),
-            ty: substitute_checked_type(&signature.result.ty, &substitutions),
+            ty: result_type,
         };
         let type_substitutions = substitutions
             .iter()
@@ -10043,6 +10070,7 @@ fn order_key_call_is_error_capable(function: &str) -> bool {
             | "Bytes/read_signed"
             | "Bytes/write_unsigned"
             | "Bytes/write_signed"
+            | "Bytes/to_bits"
     )
 }
 
@@ -13355,7 +13383,7 @@ impl<'a> Checker<'a> {
         let mut checker = Self {
             program,
             external_types: external_types.clone(),
-            vars: TypeVarStore::default(),
+            vars: TypeVarStore::with_reserved_vars(BUILTIN_TYPE_VAR_COUNT),
             builtins: BuiltinSignatureRegistry::default(),
             render_contracts,
             source_payload_lookup,
@@ -14787,6 +14815,7 @@ impl<'a> Checker<'a> {
                 self.check_number_to_text_arguments(expr.id, function, args, false);
                 self.check_number_round_arguments(function, args);
                 self.check_one_based_arguments(expr.id, function, args);
+                self.check_bits_builtin_arguments(expr.id, function, None, args);
                 self.check_builtin_call_compatibility(expr.id, function, None, args);
                 if self.render_contracts.is_render_constructor(function) {
                     self.check_style_args(args);
@@ -14810,6 +14839,8 @@ impl<'a> Checker<'a> {
                     true_false_type()
                 } else if self.render_contracts.is_render_constructor(function) {
                     self.render_constructor_type_for_args(function, None, args)
+                } else if let Some(ty) = self.contextual_bits_result_type(function, None, args) {
+                    ty
                 } else if let Some(ty) = self.contextual_bytes_result_type(function, None, args) {
                     ty
                 } else if let Some(ty) = self.typed_list_result_type(function, None, args) {
@@ -14857,6 +14888,7 @@ impl<'a> Checker<'a> {
                 self.check_number_to_text_arguments(expr.id, op, args, true);
                 self.check_number_round_arguments(op, args);
                 self.check_one_based_arguments(expr.id, op, args);
+                self.check_bits_builtin_arguments(expr.id, op, Some(input_expr_id), args);
                 self.check_builtin_call_compatibility(expr.id, op, Some(input_expr_id), args);
                 if self.render_contracts.is_render_constructor(op) {
                     self.check_style_args(args);
@@ -14948,6 +14980,10 @@ impl<'a> Checker<'a> {
                         self.check_true_false_input(expr, op, &arg_flow);
                     }
                     true_false_type()
+                } else if let Some(ty) =
+                    self.contextual_bits_result_type(op, Some(input_expr_id), args)
+                {
+                    ty
                 } else if let Some(ty) =
                     self.contextual_bytes_result_type(op, Some(input_expr_id), args)
                 {
@@ -15240,6 +15276,287 @@ impl<'a> Checker<'a> {
         self.check_bytes_static_integer_argument_overflow(function, args);
         self.check_bytes_static_bounds(expr_id, function, piped_input, args);
         self.check_bytes_static_text_conversion(expr_id, function, piped_input, args);
+    }
+
+    fn check_bits_builtin_arguments(
+        &mut self,
+        expr_id: usize,
+        function: &str,
+        piped_input: Option<usize>,
+        args: &[AstCallArg],
+    ) {
+        if !is_bits_builtin(function) {
+            return;
+        }
+
+        let bits_expr = piped_input.or_else(|| named_arg_expr(args, "bits"));
+        let bits_width = bits_expr.and_then(|expr_id| match self.ensure_expr(expr_id).ty {
+            Type::Bits { width } => Some(width),
+            _ => None,
+        });
+        let other_width = |checker: &mut Self, name: &str| {
+            named_arg_expr(args, name).and_then(|expr_id| match checker.ensure_expr(expr_id).ty {
+                Type::Bits { width } => Some((expr_id, width)),
+                _ => None,
+            })
+        };
+
+        if matches!(
+            function,
+            "Bits/and"
+                | "Bits/or"
+                | "Bits/xor"
+                | "Bits/compare"
+                | "Bits/add_or_wrap"
+                | "Bits/add_widening"
+                | "Bits/try_add"
+                | "Bits/subtract_or_wrap"
+                | "Bits/try_subtract"
+        ) && let (Some(left), Some((right_expr, right))) =
+            (bits_width, other_width(self, "with"))
+            && left != right
+        {
+            self.diagnostics.push(self.diagnostic_for_expr(
+                right_expr,
+                format!(
+                    "`{function}` requires equal-width operands; found BITS[{left}] and BITS[{right}]. Extend or truncate explicitly."
+                ),
+            ));
+        }
+
+        match function {
+            "Bits/get" | "Bits/set" => {
+                if let Some(width) = bits_width {
+                    self.check_bits_static_position(function, args, "position", width);
+                }
+            }
+            "Bits/slice" => {
+                let count = self.check_bits_compile_time_width(function, args, "count");
+                if let (Some(width), Some(count)) = (bits_width, count)
+                    && let Some(from) =
+                        self.check_bits_static_position(function, args, "from", width)
+                    && from
+                        .checked_sub(1)
+                        .and_then(|start| start.checked_add(count))
+                        .is_none_or(|end| end > width)
+                {
+                    let argument = named_arg_expr(args, "from").unwrap_or(expr_id);
+                    self.diagnostics.push(self.diagnostic_for_expr(
+                        argument,
+                        format!(
+                            "`Bits/slice` range from {from} with count {count} exceeds BITS[{width}]"
+                        ),
+                    ));
+                }
+            }
+            "Bits/set_slice" => {
+                if let (Some(width), Some((_, replacement_width))) =
+                    (bits_width, other_width(self, "value"))
+                    && let Some(from) =
+                        self.check_bits_static_position(function, args, "from", width)
+                    && from
+                        .checked_sub(1)
+                        .and_then(|start| start.checked_add(replacement_width))
+                        .is_none_or(|end| end > width)
+                {
+                    let argument = named_arg_expr(args, "from").unwrap_or(expr_id);
+                    self.diagnostics.push(self.diagnostic_for_expr(
+                        argument,
+                        format!(
+                            "`Bits/set_slice` range from {from} with BITS[{replacement_width}] exceeds BITS[{width}]"
+                        ),
+                    ));
+                }
+            }
+            "Bits/concat" => {
+                if let (Some(left), Some((right_expr, right))) =
+                    (bits_width, other_width(self, "with"))
+                    && left
+                        .checked_add(right)
+                        .is_none_or(|width| width > MAX_BITS_WIDTH)
+                {
+                    self.diagnostics.push(self.diagnostic_for_expr(
+                        right_expr,
+                        format!(
+                            "`Bits/concat` result width exceeds deterministic BITS limit {MAX_BITS_WIDTH}"
+                        ),
+                    ));
+                }
+            }
+            "Bits/shift_left"
+            | "Bits/shift_right"
+            | "Bits/shift_right_arithmetic"
+            | "Bits/rotate_left"
+            | "Bits/rotate_right" => {
+                self.check_bits_nonnegative_quantity(function, args, "by");
+            }
+            "Bits/zero_extend" | "Bits/sign_extend" | "Bits/truncate" => {
+                let new_width = self.check_bits_compile_time_width(function, args, "width");
+                if let (Some(current), Some(new_width)) = (bits_width, new_width) {
+                    let invalid = match function {
+                        "Bits/zero_extend" | "Bits/sign_extend" => new_width < current,
+                        "Bits/truncate" => new_width > current,
+                        _ => unreachable!(),
+                    };
+                    if invalid {
+                        let argument = named_arg_expr(args, "width").unwrap_or(expr_id);
+                        self.diagnostics.push(self.diagnostic_for_expr(
+                            argument,
+                            format!(
+                                "`{function}` cannot transform BITS[{current}] to BITS[{new_width}]"
+                            ),
+                        ));
+                    }
+                }
+            }
+            "Bits/add_widening" => {
+                if bits_width.is_some_and(|width| width == MAX_BITS_WIDTH) {
+                    self.diagnostics.push(self.diagnostic_for_expr(
+                        bits_expr.unwrap_or(expr_id),
+                        format!(
+                            "`Bits/add_widening` result exceeds deterministic BITS limit {MAX_BITS_WIDTH}"
+                        ),
+                    ));
+                }
+            }
+            "Number/to_bits" | "Bytes/to_bits" => {
+                let width = self.check_bits_compile_time_width(function, args, "width");
+                if function == "Bytes/to_bits"
+                    && width.is_some_and(|width| !width.is_multiple_of(8))
+                {
+                    self.diagnostics.push(self.diagnostic_for_expr(
+                        named_arg_expr(args, "width").unwrap_or(expr_id),
+                        "`Bytes/to_bits` width must be byte-aligned; pad explicitly before conversion"
+                            .to_owned(),
+                    ));
+                }
+                if function == "Bytes/to_bits"
+                    && let Some(width) = width
+                    && let Some(bytes_expr) = piped_input.or_else(|| named_arg_expr(args, "bytes"))
+                    && let Type::Bytes(BytesType::Fixed(byte_len)) = self.ensure_expr(bytes_expr).ty
+                    && u64::try_from(byte_len)
+                        .ok()
+                        .and_then(|byte_len| byte_len.checked_mul(8))
+                        != Some(u64::from(width))
+                {
+                    self.diagnostics.push(self.diagnostic_for_expr(
+                        bytes_expr,
+                        format!(
+                            "`Bytes/to_bits` BITS[{width}] requires exactly {} byte(s), found {byte_len}",
+                            width / 8
+                        ),
+                    ));
+                }
+            }
+            "Bits/to_bytes" => {
+                if bits_width.is_some_and(|width| !width.is_multiple_of(8)) {
+                    self.diagnostics.push(self.diagnostic_for_expr(
+                        bits_expr.unwrap_or(expr_id),
+                        "`Bits/to_bytes` requires a byte-aligned BITS width; pad explicitly before conversion"
+                            .to_owned(),
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn check_bits_compile_time_width(
+        &mut self,
+        function: &str,
+        args: &[AstCallArg],
+        name: &str,
+    ) -> Option<u32> {
+        let expr_id = named_arg_expr(args, name)?;
+        let Some(value) = static_exact_number_expr(self.program, expr_id) else {
+            self.diagnostics.push(self.diagnostic_for_expr(
+                expr_id,
+                format!(
+                    "`{function}` argument `{name}` must be a positive compile-time whole Number"
+                ),
+            ));
+            return None;
+        };
+        let Ok(value) = value.to_u64_exact() else {
+            self.diagnostics.push(self.diagnostic_for_expr(
+                expr_id,
+                format!(
+                    "`{function}` argument `{name}` must be a positive compile-time whole Number"
+                ),
+            ));
+            return None;
+        };
+        let Ok(width) = u32::try_from(value) else {
+            self.diagnostics.push(self.diagnostic_for_expr(
+                expr_id,
+                format!(
+                    "`{function}` argument `{name}` exceeds deterministic BITS limit {MAX_BITS_WIDTH}"
+                ),
+            ));
+            return None;
+        };
+        if width == 0 || width > MAX_BITS_WIDTH {
+            self.diagnostics.push(self.diagnostic_for_expr(
+                expr_id,
+                format!("`{function}` argument `{name}` must be between 1 and {MAX_BITS_WIDTH}"),
+            ));
+            return None;
+        }
+        Some(width)
+    }
+
+    fn check_bits_static_position(
+        &mut self,
+        function: &str,
+        args: &[AstCallArg],
+        name: &str,
+        width: u32,
+    ) -> Option<u32> {
+        let expr_id = named_arg_expr(args, name)?;
+        let Some(value) = static_exact_number_expr(self.program, expr_id) else {
+            return None;
+        };
+        let Ok(value) = value.to_u64_exact() else {
+            self.diagnostics.push(self.diagnostic_for_expr(
+                expr_id,
+                format!(
+                    "`{function}` argument `{name}` is a one-based position and must be a positive whole Number"
+                ),
+            ));
+            return None;
+        };
+        let Ok(position) = u32::try_from(value) else {
+            self.diagnostics.push(self.diagnostic_for_expr(
+                expr_id,
+                format!("`{function}` position {value} exceeds BITS[{width}]"),
+            ));
+            return None;
+        };
+        if position == 0 || position > width {
+            self.diagnostics.push(self.diagnostic_for_expr(
+                expr_id,
+                format!("`{function}` position {position} exceeds BITS[{width}]"),
+            ));
+            return None;
+        }
+        Some(position)
+    }
+
+    fn check_bits_nonnegative_quantity(&mut self, function: &str, args: &[AstCallArg], name: &str) {
+        let Some(expr_id) = named_arg_expr(args, name) else {
+            return;
+        };
+        let Some(value) = static_exact_number_expr(self.program, expr_id) else {
+            return;
+        };
+        if !value.is_whole() || value.is_negative() {
+            self.diagnostics.push(self.diagnostic_for_expr(
+                expr_id,
+                format!(
+                    "`{function}` argument `{name}` must be a non-negative whole Number; shift and rotate amounts are never rounded"
+                ),
+            ));
+        }
     }
 
     fn check_number_to_text_arguments(
@@ -16378,6 +16695,82 @@ impl<'a> Checker<'a> {
         }
     }
 
+    fn contextual_bits_result_type(
+        &mut self,
+        function: &str,
+        piped_input: Option<usize>,
+        args: &[AstCallArg],
+    ) -> Option<Type> {
+        let exact_bits = |ty: Option<Type>| match ty {
+            Some(Type::Bits { width }) => Some(width),
+            _ => None,
+        };
+
+        match function {
+            "Bits/width" | "Bits/to_number" => Some(Type::Number),
+            "Bits/get" => Some(true_false_type()),
+            "Bits/compare" => Some(bits_comparison_type()),
+            "Bits/set"
+            | "Bits/set_slice"
+            | "Bits/and"
+            | "Bits/or"
+            | "Bits/xor"
+            | "Bits/not"
+            | "Bits/shift_left"
+            | "Bits/shift_right"
+            | "Bits/shift_right_arithmetic"
+            | "Bits/rotate_left"
+            | "Bits/rotate_right"
+            | "Bits/add_or_wrap"
+            | "Bits/subtract_or_wrap" => self.bits_input_type(piped_input, args),
+            "Bits/slice" => self
+                .static_bits_width_arg(args, "count")
+                .map(|width| Type::Bits { width }),
+            "Bits/concat" => exact_bits(self.bits_input_type(piped_input, args))
+                .zip(exact_bits(self.bits_named_arg_type(args, "with")))
+                .and_then(|(left, right)| left.checked_add(right))
+                .filter(|width| *width <= MAX_BITS_WIDTH)
+                .map(|width| Type::Bits { width }),
+            "Bits/zero_extend" | "Bits/sign_extend" | "Bits/truncate" | "Bytes/to_bits" => self
+                .static_bits_width_arg(args, "width")
+                .map(|width| Type::Bits { width }),
+            "Bits/add_widening" => exact_bits(self.bits_input_type(piped_input, args))
+                .and_then(|width| width.checked_add(1))
+                .filter(|width| *width <= MAX_BITS_WIDTH)
+                .map(|width| Type::Bits { width }),
+            "Bits/try_add" => self.bits_input_type(piped_input, args).map(bits_added_type),
+            "Bits/try_subtract" => self
+                .bits_input_type(piped_input, args)
+                .map(bits_subtracted_type),
+            "Number/to_bits" => self
+                .static_bits_width_arg(args, "width")
+                .map(|width| bits_converted_type(Type::Bits { width })),
+            "Bits/to_bytes" => exact_bits(self.bits_input_type(piped_input, args)).map(|width| {
+                Type::Bytes(BytesType::Fixed(
+                    usize::try_from(width / 8).unwrap_or(usize::MAX),
+                ))
+            }),
+            _ => None,
+        }
+    }
+
+    fn bits_input_type(&mut self, piped_input: Option<usize>, args: &[AstCallArg]) -> Option<Type> {
+        piped_input
+            .or_else(|| named_arg_expr(args, "bits"))
+            .map(|expr_id| self.ensure_expr(expr_id).ty)
+    }
+
+    fn bits_named_arg_type(&mut self, args: &[AstCallArg], name: &str) -> Option<Type> {
+        named_arg_expr(args, name).map(|expr_id| self.ensure_expr(expr_id).ty)
+    }
+
+    fn static_bits_width_arg(&self, args: &[AstCallArg], name: &str) -> Option<u32> {
+        named_arg_expr(args, name)
+            .and_then(|expr_id| self.static_integer_literal(expr_id))
+            .and_then(|width| u32::try_from(width).ok())
+            .filter(|width| (1..=MAX_BITS_WIDTH).contains(width))
+    }
+
     fn typed_list_result_type(
         &mut self,
         function: &str,
@@ -16741,6 +17134,11 @@ impl<'a> Checker<'a> {
                         active_functions,
                     ));
                 }
+                if let Some(ty) =
+                    self.static_bits_result_type(function, None, args, active_functions)
+                {
+                    return Some(ty);
+                }
                 self.user_function_return_type(function, active_functions)
                     .or_else(|| {
                         Some(
@@ -16763,7 +17161,11 @@ impl<'a> Checker<'a> {
             AstExprKind::Pipe {
                 input, op, args, ..
             } => {
-                if let Some(field) = op.strip_prefix("Field/") {
+                if let Some(ty) =
+                    self.static_bits_result_type(op, Some(*input), args, active_functions)
+                {
+                    Some(ty)
+                } else if let Some(field) = op.strip_prefix("Field/") {
                     self.program
                         .expressions
                         .get(*input)
@@ -16941,6 +17343,88 @@ impl<'a> Checker<'a> {
             AstExprKind::Latest { branches } => self
                 .static_latest_result_type(branches, active_functions)
                 .or_else(|| Some(exact_empty_object_type())),
+            _ => None,
+        }
+    }
+
+    fn static_bits_result_type(
+        &self,
+        function: &str,
+        piped_input: Option<usize>,
+        args: &[AstCallArg],
+        active_functions: &mut BTreeSet<String>,
+    ) -> Option<Type> {
+        if !is_bits_builtin(function) {
+            return None;
+        }
+        let expression_type = |expr_id: usize, active_functions: &mut BTreeSet<String>| {
+            self.program
+                .expressions
+                .get(expr_id)
+                .and_then(|expr| self.static_expr_type(expr, active_functions))
+        };
+        let bits_type = piped_input
+            .or_else(|| named_arg_expr(args, "bits"))
+            .and_then(|expr_id| expression_type(expr_id, active_functions));
+        let bits_width = match &bits_type {
+            Some(Type::Bits { width }) => Some(*width),
+            _ => None,
+        };
+        let other_width = |name: &str, active_functions: &mut BTreeSet<String>| {
+            named_arg_expr(args, name)
+                .and_then(|expr_id| expression_type(expr_id, active_functions))
+                .and_then(|ty| match ty {
+                    Type::Bits { width } => Some(width),
+                    _ => None,
+                })
+        };
+        let static_width = |name: &str| {
+            named_arg_expr(args, name)
+                .and_then(|expr_id| self.static_integer_literal(expr_id))
+                .and_then(|value| u32::try_from(value).ok())
+                .filter(|value| (1..=MAX_BITS_WIDTH).contains(value))
+        };
+
+        match function {
+            "Bits/width" | "Bits/to_number" => Some(Type::Number),
+            "Bits/get" => Some(true_false_type()),
+            "Bits/compare" => Some(bits_comparison_type()),
+            "Bits/set"
+            | "Bits/set_slice"
+            | "Bits/and"
+            | "Bits/or"
+            | "Bits/xor"
+            | "Bits/not"
+            | "Bits/shift_left"
+            | "Bits/shift_right"
+            | "Bits/shift_right_arithmetic"
+            | "Bits/rotate_left"
+            | "Bits/rotate_right"
+            | "Bits/add_or_wrap"
+            | "Bits/subtract_or_wrap" => bits_type,
+            "Bits/slice" => static_width("count").map(|width| Type::Bits { width }),
+            "Bits/concat" => bits_width
+                .zip(other_width("with", active_functions))
+                .and_then(|(left, right)| left.checked_add(right))
+                .filter(|width| *width <= MAX_BITS_WIDTH)
+                .map(|width| Type::Bits { width }),
+            "Bits/zero_extend" | "Bits/sign_extend" | "Bits/truncate" | "Bytes/to_bits" => {
+                static_width("width").map(|width| Type::Bits { width })
+            }
+            "Bits/add_widening" => bits_width
+                .and_then(|width| width.checked_add(1))
+                .filter(|width| *width <= MAX_BITS_WIDTH)
+                .map(|width| Type::Bits { width }),
+            "Bits/try_add" => bits_type.map(bits_added_type),
+            "Bits/try_subtract" => bits_type.map(bits_subtracted_type),
+            "Number/to_bits" => {
+                static_width("width").map(|width| bits_converted_type(Type::Bits { width }))
+            }
+            "Bits/to_bytes" => bits_width.map(|width| {
+                Type::Bytes(BytesType::Fixed(
+                    usize::try_from(width / 8).unwrap_or(usize::MAX),
+                ))
+            }),
             _ => None,
         }
     }
@@ -19738,6 +20222,10 @@ const CONTEXTUAL_RESULT_VAR: TypeVar = TypeVar(1);
 const CONTEXTUAL_KEY_VAR: TypeVar = TypeVar(2);
 const MAP_KEY_VAR: TypeVar = TypeVar(3);
 const MAP_VALUE_VAR: TypeVar = TypeVar(4);
+const BITS_VALUE_VAR: TypeVar = TypeVar(5);
+const BITS_OTHER_VAR: TypeVar = TypeVar(6);
+const BITS_RESULT_VAR: TypeVar = TypeVar(7);
+const BUILTIN_TYPE_VAR_COUNT: u32 = BITS_RESULT_VAR.0 + 1;
 
 fn contextual_item_type() -> Type {
     Type::Var(CONTEXTUAL_ITEM_VAR)
@@ -19768,6 +20256,79 @@ fn map_type() -> Type {
 
 fn set_type() -> Type {
     Type::Set(Box::new(map_key_type()))
+}
+
+fn bits_value_type() -> Type {
+    Type::Var(BITS_VALUE_VAR)
+}
+
+fn bits_other_type() -> Type {
+    Type::Var(BITS_OTHER_VAR)
+}
+
+fn bits_result_type() -> Type {
+    Type::Var(BITS_RESULT_VAR)
+}
+
+fn bits_direction_type() -> Type {
+    Type::VariantSet(vec![
+        Variant::Tag("Left".to_owned()),
+        Variant::Tag("Right".to_owned()),
+    ])
+}
+
+fn bits_interpretation_type() -> Type {
+    Type::VariantSet(vec![
+        Variant::Tag("Unsigned".to_owned()),
+        Variant::Tag("TwosComplement".to_owned()),
+    ])
+}
+
+fn bits_byte_order_type() -> Type {
+    Type::VariantSet(vec![
+        Variant::Tag("BigEndian".to_owned()),
+        Variant::Tag("LittleEndian".to_owned()),
+    ])
+}
+
+fn bits_comparison_type() -> Type {
+    Type::VariantSet(vec![
+        Variant::Tag("Less".to_owned()),
+        Variant::Tag("Equal".to_owned()),
+        Variant::Tag("Greater".to_owned()),
+    ])
+}
+
+fn bits_converted_type(value: Type) -> Type {
+    Type::VariantSet(vec![
+        Variant::Tagged {
+            tag: "Converted".to_owned(),
+            fields: ObjectShape::from_ordered_fields([("value".to_owned(), value)], false),
+        },
+        Variant::Tag("NotWhole".to_owned()),
+        Variant::Tag("OutOfRange".to_owned()),
+    ])
+}
+
+fn bits_added_type(value: Type) -> Type {
+    Type::VariantSet(vec![
+        Variant::Tagged {
+            tag: "Added".to_owned(),
+            fields: ObjectShape::from_ordered_fields([("value".to_owned(), value)], false),
+        },
+        Variant::Tag("Overflow".to_owned()),
+    ])
+}
+
+fn bits_subtracted_type(value: Type) -> Type {
+    Type::VariantSet(vec![
+        Variant::Tagged {
+            tag: "Subtracted".to_owned(),
+            fields: ObjectShape::from_ordered_fields([("value".to_owned(), value)], false),
+        },
+        Variant::Tag("Underflow".to_owned()),
+        Variant::Tag("Overflow".to_owned()),
+    ])
 }
 
 fn dependency_catch_type() -> Type {
@@ -20039,6 +20600,191 @@ impl Default for BuiltinSignatureRegistry {
             .map(|name| required_parameter(name, Type::Number))
             .chain([optional_parameter("zoom", Type::Unknown)])
             .collect(),
+            None,
+        );
+        register(
+            "Bits/width",
+            Type::Number,
+            vec![required_parameter("bits", bits_value_type())],
+            None,
+        );
+        register(
+            "Bits/get",
+            true_false_type(),
+            vec![
+                required_parameter("bits", bits_value_type()),
+                required_parameter("position", Type::Number),
+                optional_parameter("from", bits_direction_type()),
+            ],
+            None,
+        );
+        register(
+            "Bits/set",
+            bits_value_type(),
+            vec![
+                required_parameter("bits", bits_value_type()),
+                required_parameter("position", Type::Number),
+                required_parameter("to", true_false_type()),
+                optional_parameter("from", bits_direction_type()),
+            ],
+            None,
+        );
+        register(
+            "Bits/slice",
+            bits_result_type(),
+            vec![
+                required_parameter("bits", bits_value_type()),
+                required_parameter("from", Type::Number),
+                required_parameter("count", Type::Number),
+            ],
+            None,
+        );
+        register(
+            "Bits/set_slice",
+            bits_value_type(),
+            vec![
+                required_parameter("bits", bits_value_type()),
+                required_parameter("from", Type::Number),
+                required_parameter("value", bits_other_type()),
+            ],
+            None,
+        );
+        register(
+            "Bits/concat",
+            bits_result_type(),
+            vec![
+                required_parameter("bits", bits_value_type()),
+                required_parameter("with", bits_other_type()),
+            ],
+            None,
+        );
+        for name in [
+            "Bits/and",
+            "Bits/or",
+            "Bits/xor",
+            "Bits/add_or_wrap",
+            "Bits/subtract_or_wrap",
+        ] {
+            register(
+                name,
+                bits_value_type(),
+                vec![
+                    required_parameter("bits", bits_value_type()),
+                    required_parameter("with", bits_value_type()),
+                ],
+                None,
+            );
+        }
+        register(
+            "Bits/not",
+            bits_value_type(),
+            vec![required_parameter("bits", bits_value_type())],
+            None,
+        );
+        for name in [
+            "Bits/shift_left",
+            "Bits/shift_right",
+            "Bits/shift_right_arithmetic",
+            "Bits/rotate_left",
+            "Bits/rotate_right",
+        ] {
+            register(
+                name,
+                bits_value_type(),
+                vec![
+                    required_parameter("bits", bits_value_type()),
+                    required_parameter("by", Type::Number),
+                ],
+                None,
+            );
+        }
+        for name in ["Bits/zero_extend", "Bits/sign_extend", "Bits/truncate"] {
+            register(
+                name,
+                bits_result_type(),
+                vec![
+                    required_parameter("bits", bits_value_type()),
+                    required_parameter("width", Type::Number),
+                ],
+                None,
+            );
+        }
+        register(
+            "Bits/compare",
+            bits_comparison_type(),
+            vec![
+                required_parameter("bits", bits_value_type()),
+                required_parameter("with", bits_value_type()),
+                required_parameter("interpretation", bits_interpretation_type()),
+            ],
+            None,
+        );
+        register(
+            "Bits/add_widening",
+            bits_result_type(),
+            vec![
+                required_parameter("bits", bits_value_type()),
+                required_parameter("with", bits_value_type()),
+                required_parameter("interpretation", bits_interpretation_type()),
+            ],
+            None,
+        );
+        register(
+            "Bits/try_add",
+            bits_added_type(bits_value_type()),
+            vec![
+                required_parameter("bits", bits_value_type()),
+                required_parameter("with", bits_value_type()),
+                required_parameter("interpretation", bits_interpretation_type()),
+            ],
+            None,
+        );
+        register(
+            "Bits/try_subtract",
+            bits_subtracted_type(bits_value_type()),
+            vec![
+                required_parameter("bits", bits_value_type()),
+                required_parameter("with", bits_value_type()),
+                required_parameter("interpretation", bits_interpretation_type()),
+            ],
+            None,
+        );
+        register(
+            "Number/to_bits",
+            bits_converted_type(bits_result_type()),
+            vec![
+                required_parameter("number", Type::Number),
+                required_parameter("width", Type::Number),
+                required_parameter("interpretation", bits_interpretation_type()),
+            ],
+            None,
+        );
+        register(
+            "Bits/to_number",
+            Type::Number,
+            vec![
+                required_parameter("bits", bits_value_type()),
+                required_parameter("interpretation", bits_interpretation_type()),
+            ],
+            None,
+        );
+        register(
+            "Bits/to_bytes",
+            bits_result_type(),
+            vec![
+                required_parameter("bits", bits_value_type()),
+                required_parameter("byte_order", bits_byte_order_type()),
+            ],
+            None,
+        );
+        register(
+            "Bytes/to_bits",
+            bits_result_type(),
+            vec![
+                required_parameter("bytes", Type::Bytes(BytesType::Dynamic)),
+                required_parameter("width", Type::Number),
+                required_parameter("byte_order", bits_byte_order_type()),
+            ],
             None,
         );
         for name in ["List/count", "List/length", "List/sum"] {
@@ -23957,10 +24703,43 @@ fn builtin_argument_expected_type(
         .or_else(|| list_argument_expected_type(function, arg_name))
         .or_else(|| light_argument_expected_type(function, arg_name))
         .or_else(|| router_argument_expected_type(function, arg_name))
+        .or_else(|| bits_argument_expected_type(function, arg_name))
         .or_else(|| bytes_argument_expected_type(function, arg_name))
         .or_else(|| text_argument_expected_type(function, arg_name, piped))
         .or_else(|| number_argument_expected_type(function, arg_name, piped))
         .or_else(|| argument_expected_type(function))
+}
+
+fn bits_argument_expected_type(function: &str, arg_name: Option<&str>) -> Option<Type> {
+    match (function, arg_name) {
+        ("Number/to_bits", Some("number") | None) => Some(Type::Number),
+        ("Bytes/to_bits", Some("bytes") | None) => Some(Type::Bytes(BytesType::Dynamic)),
+        ("Bits/get" | "Bits/set", Some("position"))
+        | ("Bits/slice", Some("from" | "count"))
+        | ("Bits/set_slice", Some("from"))
+        | (
+            "Bits/shift_left"
+            | "Bits/shift_right"
+            | "Bits/shift_right_arithmetic"
+            | "Bits/rotate_left"
+            | "Bits/rotate_right",
+            Some("by"),
+        )
+        | (
+            "Bits/zero_extend" | "Bits/sign_extend" | "Bits/truncate" | "Number/to_bits"
+            | "Bytes/to_bits",
+            Some("width"),
+        ) => Some(Type::Number),
+        ("Bits/set", Some("to")) => Some(true_false_type()),
+        ("Bits/get" | "Bits/set", Some("from")) => Some(bits_direction_type()),
+        (
+            "Bits/compare" | "Bits/add_widening" | "Bits/try_add" | "Bits/try_subtract"
+            | "Number/to_bits" | "Bits/to_number",
+            Some("interpretation"),
+        ) => Some(bits_interpretation_type()),
+        ("Bits/to_bytes" | "Bytes/to_bits", Some("byte_order")) => Some(bits_byte_order_type()),
+        _ => None,
+    }
 }
 
 fn list_argument_expected_type(function: &str, arg_name: Option<&str>) -> Option<Type> {
@@ -24056,6 +24835,7 @@ fn number_argument_expected_type(
 fn builtin_pipe_input_custom_expected_label(function: &str) -> Option<&'static str> {
     match function {
         "Text/concat" | "Text/time_range_label" => Some("TEXT, NUMBER, BOOL, or tag"),
+        function if function.starts_with("Bits/") => Some("BITS[N]"),
         _ => None,
     }
 }
@@ -24063,6 +24843,10 @@ fn builtin_pipe_input_custom_expected_label(function: &str) -> Option<&'static s
 fn builtin_pipe_input_custom_accepts(function: &str, actual: &Type) -> bool {
     match function {
         "Text/concat" | "Text/time_range_label" => type_is_text_formattable_scalar(actual),
+        function if function.starts_with("Bits/") => matches!(
+            actual,
+            Type::Bits { .. } | Type::Unknown | Type::Var(_) | Type::UnresolvedShape { .. }
+        ),
         _ => false,
     }
 }
@@ -24082,6 +24866,21 @@ fn builtin_argument_custom_expected_label(
         ("Number/project_time", Some("pointer_x" | "pointer_width") | None) => {
             Some("NUMBER or numeric TEXT")
         }
+        (function, Some("bits")) if function.starts_with("Bits/") => Some("BITS[N]"),
+        (
+            "Bits/concat"
+            | "Bits/and"
+            | "Bits/or"
+            | "Bits/xor"
+            | "Bits/compare"
+            | "Bits/add_or_wrap"
+            | "Bits/add_widening"
+            | "Bits/try_add"
+            | "Bits/subtract_or_wrap"
+            | "Bits/try_subtract",
+            Some("with"),
+        )
+        | ("Bits/set_slice", Some("value")) => Some("BITS[N]"),
         _ => None,
     }
 }
@@ -24100,6 +24899,27 @@ fn builtin_argument_custom_accepts(
         ("Number/project_time", Some("pointer_x" | "pointer_width") | None) => {
             type_is_number_or_numeric_text(actual)
         }
+        (function, Some("bits")) if function.starts_with("Bits/") => matches!(
+            actual,
+            Type::Bits { .. } | Type::Unknown | Type::Var(_) | Type::UnresolvedShape { .. }
+        ),
+        (
+            "Bits/concat"
+            | "Bits/and"
+            | "Bits/or"
+            | "Bits/xor"
+            | "Bits/compare"
+            | "Bits/add_or_wrap"
+            | "Bits/add_widening"
+            | "Bits/try_add"
+            | "Bits/subtract_or_wrap"
+            | "Bits/try_subtract",
+            Some("with"),
+        )
+        | ("Bits/set_slice", Some("value")) => matches!(
+            actual,
+            Type::Bits { .. } | Type::Unknown | Type::Var(_) | Type::UnresolvedShape { .. }
+        ),
         _ => false,
     }
 }
@@ -24217,6 +25037,40 @@ fn is_bytes_boundary_builtin(function: &str) -> bool {
             | "Bytes/read_signed"
             | "Bytes/write_unsigned"
             | "Bytes/write_signed"
+    )
+}
+
+fn is_bits_builtin(function: &str) -> bool {
+    matches!(
+        function,
+        "Bits/width"
+            | "Bits/get"
+            | "Bits/set"
+            | "Bits/slice"
+            | "Bits/set_slice"
+            | "Bits/concat"
+            | "Bits/and"
+            | "Bits/or"
+            | "Bits/xor"
+            | "Bits/not"
+            | "Bits/shift_left"
+            | "Bits/shift_right"
+            | "Bits/shift_right_arithmetic"
+            | "Bits/rotate_left"
+            | "Bits/rotate_right"
+            | "Bits/zero_extend"
+            | "Bits/sign_extend"
+            | "Bits/truncate"
+            | "Bits/compare"
+            | "Bits/add_or_wrap"
+            | "Bits/add_widening"
+            | "Bits/try_add"
+            | "Bits/subtract_or_wrap"
+            | "Bits/try_subtract"
+            | "Number/to_bits"
+            | "Bits/to_number"
+            | "Bits/to_bytes"
+            | "Bytes/to_bits"
     )
 }
 
@@ -24412,6 +25266,9 @@ fn static_expr_type_from_bindings(
     expressions: &[AstExpr],
     bindings: &dyn StaticBindingLookup,
 ) -> Option<Type> {
+    if let Some(ty) = static_bits_result_type_from_bindings(expr, expressions, bindings) {
+        return Some(ty);
+    }
     if let AstExprKind::Call { function, .. } | AstExprKind::Pipe { op: function, .. } = &expr.kind
         && let Some(signature) = host_effect_signature(function)
     {
@@ -24471,6 +25328,125 @@ fn static_expr_type_from_bindings(
             let ty = simple_expr_type(expr, expressions);
             is_specific_type(&ty).then_some(ty)
         }
+        _ => None,
+    }
+}
+
+fn static_bits_result_type_from_bindings(
+    expr: &AstExpr,
+    expressions: &[AstExpr],
+    bindings: &dyn StaticBindingLookup,
+) -> Option<Type> {
+    let (function, piped_input, args) = match &expr.kind {
+        AstExprKind::Call { function, args, .. } => (function.as_str(), None, args.as_slice()),
+        AstExprKind::Pipe {
+            input, op, args, ..
+        } => (
+            op.as_str(),
+            Some(expr.linked_input.unwrap_or(*input)),
+            args.as_slice(),
+        ),
+        _ => return None,
+    };
+    if !is_bits_builtin(function) {
+        return None;
+    }
+
+    fn static_width(expressions: &[AstExpr], expr_id: usize) -> Option<u32> {
+        fn evaluate(
+            expressions: &[AstExpr],
+            expr_id: usize,
+            active: &mut BTreeSet<usize>,
+        ) -> Option<ExactNumber> {
+            if !active.insert(expr_id) {
+                return None;
+            }
+            let result = match &expressions.get(expr_id)?.kind {
+                AstExprKind::Number(value) => ExactNumber::parse_strict(value, None).ok(),
+                AstExprKind::Infix { left, op, right } => {
+                    let left = evaluate(expressions, *left, active)?;
+                    let right = evaluate(expressions, *right, active)?;
+                    match op.as_str() {
+                        "+" => left.checked_add(&right).ok(),
+                        "-" => left.checked_sub(&right).ok(),
+                        "*" => left.checked_mul(&right).ok(),
+                        "/" => left.checked_div(&right).ok(),
+                        "%" => left.checked_rem(&right).ok(),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            active.remove(&expr_id);
+            result
+        }
+
+        evaluate(expressions, expr_id, &mut BTreeSet::new())
+            .and_then(|value| value.to_u64_exact().ok())
+            .and_then(|value| u32::try_from(value).ok())
+            .filter(|width| (1..=MAX_BITS_WIDTH).contains(width))
+    }
+
+    let type_for_expr = |expr_id| {
+        expressions
+            .get(expr_id)
+            .and_then(|expr| static_expr_type_from_bindings(expr, expressions, bindings))
+    };
+    let bits_type = piped_input
+        .or_else(|| named_arg_expr(args, "bits"))
+        .and_then(type_for_expr);
+    let bits_width = match &bits_type {
+        Some(Type::Bits { width }) => Some(*width),
+        _ => None,
+    };
+    let named_bits_type = |name: &str| named_arg_expr(args, name).and_then(type_for_expr);
+    let named_bits_width = |name: &str| match named_bits_type(name) {
+        Some(Type::Bits { width }) => Some(width),
+        _ => None,
+    };
+    let width_arg =
+        |name: &str| named_arg_expr(args, name).and_then(|expr| static_width(expressions, expr));
+
+    match function {
+        "Bits/width" | "Bits/to_number" => Some(Type::Number),
+        "Bits/get" => Some(true_false_type()),
+        "Bits/compare" => Some(bits_comparison_type()),
+        "Bits/set"
+        | "Bits/set_slice"
+        | "Bits/and"
+        | "Bits/or"
+        | "Bits/xor"
+        | "Bits/not"
+        | "Bits/shift_left"
+        | "Bits/shift_right"
+        | "Bits/shift_right_arithmetic"
+        | "Bits/rotate_left"
+        | "Bits/rotate_right"
+        | "Bits/add_or_wrap"
+        | "Bits/subtract_or_wrap" => bits_type,
+        "Bits/slice" => width_arg("count").map(|width| Type::Bits { width }),
+        "Bits/concat" => bits_width
+            .zip(named_bits_width("with"))
+            .and_then(|(left, right)| left.checked_add(right))
+            .filter(|width| *width <= MAX_BITS_WIDTH)
+            .map(|width| Type::Bits { width }),
+        "Bits/zero_extend" | "Bits/sign_extend" | "Bits/truncate" | "Bytes/to_bits" => {
+            width_arg("width").map(|width| Type::Bits { width })
+        }
+        "Bits/add_widening" => bits_width
+            .and_then(|width| width.checked_add(1))
+            .filter(|width| *width <= MAX_BITS_WIDTH)
+            .map(|width| Type::Bits { width }),
+        "Bits/try_add" => bits_type.map(bits_added_type),
+        "Bits/try_subtract" => bits_type.map(bits_subtracted_type),
+        "Number/to_bits" => {
+            width_arg("width").map(|width| bits_converted_type(Type::Bits { width }))
+        }
+        "Bits/to_bytes" => bits_width.map(|width| {
+            Type::Bytes(BytesType::Fixed(
+                usize::try_from(width / 8).unwrap_or(usize::MAX),
+            ))
+        }),
         _ => None,
     }
 }

@@ -340,6 +340,27 @@ fn plan_row_builtin_signatures_are_complete_and_queryable() {
                         | PlanRowBuiltin::MapRemove
                         | PlanRowBuiltin::SetAdd
                         | PlanRowBuiltin::SetRemove
+                        | PlanRowBuiltin::BitsSet
+                        | PlanRowBuiltin::BitsSlice
+                        | PlanRowBuiltin::BitsSetSlice
+                        | PlanRowBuiltin::BitsConcat
+                        | PlanRowBuiltin::BitsAnd
+                        | PlanRowBuiltin::BitsOr
+                        | PlanRowBuiltin::BitsXor
+                        | PlanRowBuiltin::BitsNot
+                        | PlanRowBuiltin::BitsShiftLeft
+                        | PlanRowBuiltin::BitsShiftRight
+                        | PlanRowBuiltin::BitsShiftRightArithmetic
+                        | PlanRowBuiltin::BitsRotateLeft
+                        | PlanRowBuiltin::BitsRotateRight
+                        | PlanRowBuiltin::BitsZeroExtend
+                        | PlanRowBuiltin::BitsSignExtend
+                        | PlanRowBuiltin::BitsTruncate
+                        | PlanRowBuiltin::BitsAddOrWrap
+                        | PlanRowBuiltin::BitsAddWidening
+                        | PlanRowBuiltin::BitsSubtractOrWrap
+                        | PlanRowBuiltin::BitsToBytes
+                        | PlanRowBuiltin::BytesToBits
                 ),
             "{} lacks fixed result metadata",
             builtin

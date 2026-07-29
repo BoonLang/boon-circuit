@@ -7092,6 +7092,69 @@ static BUILTIN_PARAMS_SET_ITEM: &[PlanRowBuiltinParameter] = &[
     PlanRowBuiltinParameter::required_receiver("set"),
     PlanRowBuiltinParameter::required("item"),
 ];
+static BUILTIN_PARAMS_BITS: &[PlanRowBuiltinParameter] =
+    &[PlanRowBuiltinParameter::required_receiver("bits")];
+static BUILTIN_PARAMS_BITS_POSITION: &[PlanRowBuiltinParameter] = &[
+    PlanRowBuiltinParameter::required_receiver("bits"),
+    PlanRowBuiltinParameter::required("position"),
+    PlanRowBuiltinParameter::optional("from"),
+];
+static BUILTIN_PARAMS_BITS_SET: &[PlanRowBuiltinParameter] = &[
+    PlanRowBuiltinParameter::required_receiver("bits"),
+    PlanRowBuiltinParameter::required("position"),
+    PlanRowBuiltinParameter::required("to"),
+    PlanRowBuiltinParameter::optional("from"),
+];
+static BUILTIN_PARAMS_BITS_SLICE: &[PlanRowBuiltinParameter] = &[
+    PlanRowBuiltinParameter::required_receiver("bits"),
+    PlanRowBuiltinParameter::required("from"),
+    PlanRowBuiltinParameter::required("count"),
+];
+static BUILTIN_PARAMS_BITS_SET_SLICE: &[PlanRowBuiltinParameter] = &[
+    PlanRowBuiltinParameter::required_receiver("bits"),
+    PlanRowBuiltinParameter::required("from"),
+    PlanRowBuiltinParameter::required("value"),
+];
+static BUILTIN_PARAMS_BITS_WITH: &[PlanRowBuiltinParameter] = &[
+    PlanRowBuiltinParameter::required_receiver("bits"),
+    PlanRowBuiltinParameter::required("with"),
+];
+static BUILTIN_PARAMS_BITS_BY: &[PlanRowBuiltinParameter] = &[
+    PlanRowBuiltinParameter::required_receiver("bits"),
+    PlanRowBuiltinParameter::required("by"),
+];
+static BUILTIN_PARAMS_BITS_WIDTH: &[PlanRowBuiltinParameter] = &[
+    PlanRowBuiltinParameter::required_receiver("bits"),
+    PlanRowBuiltinParameter::required("width"),
+];
+static BUILTIN_PARAMS_BITS_COMPARE: &[PlanRowBuiltinParameter] = &[
+    PlanRowBuiltinParameter::required_receiver("bits"),
+    PlanRowBuiltinParameter::required("with"),
+    PlanRowBuiltinParameter::required("interpretation"),
+];
+static BUILTIN_PARAMS_BITS_WITH_INTERPRETATION: &[PlanRowBuiltinParameter] = &[
+    PlanRowBuiltinParameter::required_receiver("bits"),
+    PlanRowBuiltinParameter::required("with"),
+    PlanRowBuiltinParameter::required("interpretation"),
+];
+static BUILTIN_PARAMS_NUMBER_TO_BITS: &[PlanRowBuiltinParameter] = &[
+    PlanRowBuiltinParameter::required_receiver("number"),
+    PlanRowBuiltinParameter::required("width"),
+    PlanRowBuiltinParameter::required("interpretation"),
+];
+static BUILTIN_PARAMS_BITS_INTERPRETATION: &[PlanRowBuiltinParameter] = &[
+    PlanRowBuiltinParameter::required_receiver("bits"),
+    PlanRowBuiltinParameter::required("interpretation"),
+];
+static BUILTIN_PARAMS_BITS_BYTE_ORDER: &[PlanRowBuiltinParameter] = &[
+    PlanRowBuiltinParameter::required_receiver("bits"),
+    PlanRowBuiltinParameter::required("byte_order"),
+];
+static BUILTIN_PARAMS_BYTES_TO_BITS: &[PlanRowBuiltinParameter] = &[
+    PlanRowBuiltinParameter::required_receiver("bytes"),
+    PlanRowBuiltinParameter::required("width"),
+    PlanRowBuiltinParameter::required("byte_order"),
+];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PlanRowBuiltinSignature {
@@ -7221,6 +7284,34 @@ pub enum PlanRowBuiltin {
     SetAdd,
     SetRemove,
     SetContains,
+    BitsWidth,
+    BitsGet,
+    BitsSet,
+    BitsSlice,
+    BitsSetSlice,
+    BitsConcat,
+    BitsAnd,
+    BitsOr,
+    BitsXor,
+    BitsNot,
+    BitsShiftLeft,
+    BitsShiftRight,
+    BitsShiftRightArithmetic,
+    BitsRotateLeft,
+    BitsRotateRight,
+    BitsZeroExtend,
+    BitsSignExtend,
+    BitsTruncate,
+    BitsCompare,
+    BitsAddOrWrap,
+    BitsAddWidening,
+    BitsTryAdd,
+    BitsSubtractOrWrap,
+    BitsTrySubtract,
+    NumberToBits,
+    BitsToNumber,
+    BitsToBytes,
+    BytesToBits,
 }
 
 impl PlanRowBuiltin {
@@ -7264,6 +7355,34 @@ impl PlanRowBuiltin {
         Self::SetAdd,
         Self::SetRemove,
         Self::SetContains,
+        Self::BitsWidth,
+        Self::BitsGet,
+        Self::BitsSet,
+        Self::BitsSlice,
+        Self::BitsSetSlice,
+        Self::BitsConcat,
+        Self::BitsAnd,
+        Self::BitsOr,
+        Self::BitsXor,
+        Self::BitsNot,
+        Self::BitsShiftLeft,
+        Self::BitsShiftRight,
+        Self::BitsShiftRightArithmetic,
+        Self::BitsRotateLeft,
+        Self::BitsRotateRight,
+        Self::BitsZeroExtend,
+        Self::BitsSignExtend,
+        Self::BitsTruncate,
+        Self::BitsCompare,
+        Self::BitsAddOrWrap,
+        Self::BitsAddWidening,
+        Self::BitsTryAdd,
+        Self::BitsSubtractOrWrap,
+        Self::BitsTrySubtract,
+        Self::NumberToBits,
+        Self::BitsToNumber,
+        Self::BitsToBytes,
+        Self::BytesToBits,
     ];
 
     pub fn from_function_name(function: &str) -> Option<Self> {
@@ -7314,6 +7433,34 @@ impl PlanRowBuiltin {
             Self::SetAdd => "Set/add",
             Self::SetRemove => "Set/remove",
             Self::SetContains => "Set/contains",
+            Self::BitsWidth => "Bits/width",
+            Self::BitsGet => "Bits/get",
+            Self::BitsSet => "Bits/set",
+            Self::BitsSlice => "Bits/slice",
+            Self::BitsSetSlice => "Bits/set_slice",
+            Self::BitsConcat => "Bits/concat",
+            Self::BitsAnd => "Bits/and",
+            Self::BitsOr => "Bits/or",
+            Self::BitsXor => "Bits/xor",
+            Self::BitsNot => "Bits/not",
+            Self::BitsShiftLeft => "Bits/shift_left",
+            Self::BitsShiftRight => "Bits/shift_right",
+            Self::BitsShiftRightArithmetic => "Bits/shift_right_arithmetic",
+            Self::BitsRotateLeft => "Bits/rotate_left",
+            Self::BitsRotateRight => "Bits/rotate_right",
+            Self::BitsZeroExtend => "Bits/zero_extend",
+            Self::BitsSignExtend => "Bits/sign_extend",
+            Self::BitsTruncate => "Bits/truncate",
+            Self::BitsCompare => "Bits/compare",
+            Self::BitsAddOrWrap => "Bits/add_or_wrap",
+            Self::BitsAddWidening => "Bits/add_widening",
+            Self::BitsTryAdd => "Bits/try_add",
+            Self::BitsSubtractOrWrap => "Bits/subtract_or_wrap",
+            Self::BitsTrySubtract => "Bits/try_subtract",
+            Self::NumberToBits => "Number/to_bits",
+            Self::BitsToNumber => "Bits/to_number",
+            Self::BitsToBytes => "Bits/to_bytes",
+            Self::BytesToBits => "Bytes/to_bits",
         }
     }
 
@@ -7339,7 +7486,9 @@ impl PlanRowBuiltin {
             | Self::NumberProjectTime
             | Self::NumberProjectWidth
             | Self::ListCount
-            | Self::ListLength => Some(PlanValueType::Number),
+            | Self::ListLength
+            | Self::BitsWidth
+            | Self::BitsToNumber => Some(PlanValueType::Number),
             Self::BoolNot
             | Self::BoolAnd
             | Self::BoolOr
@@ -7351,13 +7500,39 @@ impl PlanRowBuiltin {
             | Self::ListIsNotEmpty
             | Self::ListGet
             | Self::MapGet
-            | Self::SetContains => Some(PlanValueType::Tag),
+            | Self::SetContains
+            | Self::BitsGet
+            | Self::BitsCompare
+            | Self::BitsTryAdd
+            | Self::BitsTrySubtract
+            | Self::NumberToBits => Some(PlanValueType::Tag),
             Self::ListLatest
             | Self::ListTake
             | Self::MapUpsert
             | Self::MapRemove
             | Self::SetAdd
-            | Self::SetRemove => None,
+            | Self::SetRemove
+            | Self::BitsSet
+            | Self::BitsSlice
+            | Self::BitsSetSlice
+            | Self::BitsConcat
+            | Self::BitsAnd
+            | Self::BitsOr
+            | Self::BitsXor
+            | Self::BitsNot
+            | Self::BitsShiftLeft
+            | Self::BitsShiftRight
+            | Self::BitsShiftRightArithmetic
+            | Self::BitsRotateLeft
+            | Self::BitsRotateRight
+            | Self::BitsZeroExtend
+            | Self::BitsSignExtend
+            | Self::BitsTruncate
+            | Self::BitsAddOrWrap
+            | Self::BitsAddWidening
+            | Self::BitsSubtractOrWrap
+            | Self::BitsToBytes
+            | Self::BytesToBits => None,
         }
     }
 
@@ -7396,6 +7571,33 @@ impl PlanRowBuiltin {
             Self::MapUpsert => BUILTIN_PARAMS_MAP_ENTRY,
             Self::MapRemove | Self::MapGet => BUILTIN_PARAMS_MAP_KEY,
             Self::SetAdd | Self::SetRemove | Self::SetContains => BUILTIN_PARAMS_SET_ITEM,
+            Self::BitsWidth | Self::BitsNot => BUILTIN_PARAMS_BITS,
+            Self::BitsGet => BUILTIN_PARAMS_BITS_POSITION,
+            Self::BitsSet => BUILTIN_PARAMS_BITS_SET,
+            Self::BitsSlice => BUILTIN_PARAMS_BITS_SLICE,
+            Self::BitsSetSlice => BUILTIN_PARAMS_BITS_SET_SLICE,
+            Self::BitsConcat
+            | Self::BitsAnd
+            | Self::BitsOr
+            | Self::BitsXor
+            | Self::BitsAddOrWrap
+            | Self::BitsSubtractOrWrap => BUILTIN_PARAMS_BITS_WITH,
+            Self::BitsShiftLeft
+            | Self::BitsShiftRight
+            | Self::BitsShiftRightArithmetic
+            | Self::BitsRotateLeft
+            | Self::BitsRotateRight => BUILTIN_PARAMS_BITS_BY,
+            Self::BitsZeroExtend | Self::BitsSignExtend | Self::BitsTruncate => {
+                BUILTIN_PARAMS_BITS_WIDTH
+            }
+            Self::BitsCompare => BUILTIN_PARAMS_BITS_COMPARE,
+            Self::BitsAddWidening | Self::BitsTryAdd | Self::BitsTrySubtract => {
+                BUILTIN_PARAMS_BITS_WITH_INTERPRETATION
+            }
+            Self::NumberToBits => BUILTIN_PARAMS_NUMBER_TO_BITS,
+            Self::BitsToNumber => BUILTIN_PARAMS_BITS_INTERPRETATION,
+            Self::BitsToBytes => BUILTIN_PARAMS_BITS_BYTE_ORDER,
+            Self::BytesToBits => BUILTIN_PARAMS_BYTES_TO_BITS,
         };
         PlanRowBuiltinSignature::new(parameters)
     }

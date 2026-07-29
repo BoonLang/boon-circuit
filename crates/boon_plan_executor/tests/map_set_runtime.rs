@@ -136,7 +136,7 @@ document: Document/new(
 }
 
 #[test]
-fn verified_local_map_and_set_regions_stay_private_and_snapshot_free() {
+fn verified_local_list_map_and_set_regions_stay_private_and_snapshot_free() {
     let compiled = boon_compiler::compile_source_text_to_machine_plan(
         "map-set-transient-runtime.bn",
         r#"
@@ -169,6 +169,38 @@ store: [
             without_admin
             |> Set/contains(item: Editor)
         }
+    third_item:
+        BLOCK {
+            items: LIST {
+                1
+                2
+            }
+            extended:
+                items
+                |> List/append(item: 3)
+            extended
+            |> List/get(position: 3)
+        }
+    item_count:
+        BLOCK {
+            items: LIST {
+                4
+            }
+            extended:
+                List/append(
+                    list: items
+                    item: 5
+                )
+            List/length(list: extended)
+        }
+    has_items:
+        BLOCK {
+            items: LIST {
+                6
+            }
+            items
+            |> List/is_not_empty()
+        }
 ]
 
 document: Document/new(
@@ -179,6 +211,7 @@ document: Document/new(
     )
     .unwrap();
     assert!(compiled.plan.persistence.collections.is_empty());
+    assert!(compiled.plan.persistence.lists.is_empty());
     let mut session = MachineInstance::new(compiled.plan, SessionOptions::default()).unwrap();
 
     let (selected_user, selected_metrics) = session
@@ -201,50 +234,133 @@ document: Document/new(
         .root_value_current_with_metrics("store.has_editor")
         .unwrap();
     assert_eq!(has_editor, Value::truth(true));
+    let (third_item, third_item_metrics) = session
+        .root_value_current_with_metrics("store.third_item")
+        .unwrap();
+    assert_eq!(
+        third_item,
+        Value::tagged(
+            "Found",
+            BTreeMap::from([("value".to_owned(), Value::integer(3).unwrap())]),
+        )
+    );
+    let (item_count, item_count_metrics) = session
+        .root_value_current_with_metrics("store.item_count")
+        .unwrap();
+    assert_eq!(item_count, Value::integer(2).unwrap());
+    let (has_items, has_items_metrics) = session
+        .root_value_current_with_metrics("store.has_items")
+        .unwrap();
+    assert_eq!(has_items, Value::truth(true));
 
     let authority = session.authority_snapshot().unwrap();
+    assert!(authority.lists.is_empty());
     assert!(authority.maps.is_empty());
     assert!(authority.sets.is_empty());
     let durable = session.semantic_value_image().unwrap();
+    assert!(durable.lists.is_empty());
     assert!(durable.maps.is_empty());
     assert!(durable.sets.is_empty());
 
+    let metrics = [
+        &selected_metrics,
+        &editor_metrics,
+        &third_item_metrics,
+        &item_count_metrics,
+        &has_items_metrics,
+    ];
     assert_eq!(
-        selected_metrics.transient_collection_region_count
-            + editor_metrics.transient_collection_region_count,
-        2
+        metrics
+            .iter()
+            .map(|metrics| metrics.transient_collection_region_count)
+            .sum::<u64>(),
+        5
     );
     assert_eq!(
-        selected_metrics.transient_collection_storage_allocation_count
-            + editor_metrics.transient_collection_storage_allocation_count,
-        2
+        metrics
+            .iter()
+            .map(|metrics| metrics.transient_collection_storage_allocation_count)
+            .sum::<u64>(),
+        5
     );
     assert_eq!(
-        selected_metrics.transient_collection_operation_count
-            + editor_metrics.transient_collection_operation_count,
-        8
+        metrics
+            .iter()
+            .map(|metrics| metrics.transient_collection_operation_count)
+            .sum::<u64>(),
+        17
     );
     assert_eq!(
-        selected_metrics.transient_collection_mutation_count
-            + editor_metrics.transient_collection_mutation_count,
-        4
+        metrics
+            .iter()
+            .map(|metrics| metrics.transient_collection_mutation_count)
+            .sum::<u64>(),
+        6
     );
     assert_eq!(
-        selected_metrics.transient_collection_storage_growth_count
-            + editor_metrics.transient_collection_storage_growth_count,
-        4
+        metrics
+            .iter()
+            .map(|metrics| metrics.transient_collection_storage_growth_count)
+            .sum::<u64>(),
+        10
     );
     assert_eq!(
-        selected_metrics
-            .transient_collection_storage_high_water
-            .max(editor_metrics.transient_collection_storage_high_water),
-        2
+        metrics
+            .iter()
+            .map(|metrics| metrics.transient_collection_storage_high_water)
+            .max()
+            .unwrap(),
+        3
     );
     assert_eq!(
-        selected_metrics.transient_collection_snapshot_copy_count
-            + editor_metrics.transient_collection_snapshot_copy_count,
+        metrics
+            .iter()
+            .map(|metrics| metrics.transient_collection_snapshot_copy_count)
+            .sum::<u64>(),
         0
     );
+}
+
+#[test]
+fn transient_list_capacity_exhaustion_preserves_the_terminal_error() {
+    let compiled = boon_compiler::compile_source_text_to_machine_plan(
+        "list-capacity-transient-runtime.bn",
+        r#"
+store: [
+    selected:
+        BLOCK {
+            items: LIST[1] {
+                1
+            }
+            extended:
+                items
+                |> List/append(item: 2)
+            extended
+            |> List/get(position: 2)
+        }
+]
+
+document: Document/new(
+    root: Element/label(element: [], style: [], label: TEXT { capacity })
+)
+"#,
+        TargetProfile::SoftwareBounded,
+    )
+    .unwrap();
+    assert!(compiled.plan.persistence.lists.is_empty());
+    let mut session = MachineInstance::new(compiled.plan, SessionOptions::default()).unwrap();
+
+    let error = session
+        .root_value_current("store.selected")
+        .expect_err("the second append must exceed LIST[1]");
+    assert!(
+        error
+            .to_string()
+            .contains("List/append would exceed declared LIST capacity 1"),
+        "{error}"
+    );
+    assert!(session.authority_snapshot().unwrap().lists.is_empty());
+    assert!(session.semantic_value_image().unwrap().lists.is_empty());
 }
 
 #[test]

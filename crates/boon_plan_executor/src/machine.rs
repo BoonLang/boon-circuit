@@ -7599,6 +7599,7 @@ struct MapUpsertEvaluationState<'event> {
 }
 
 enum TransientCollectionStorage {
+    List(Vec<Value>),
     Map(BTreeMap<Value, Value>),
     Set(BTreeSet<Value>),
 }
@@ -7617,6 +7618,15 @@ struct TransientCollectionEvaluationState<'event, 'plan> {
 
 #[derive(Clone, Copy)]
 enum TransientCollectionOperation {
+    ListAppend {
+        item: PlanRowExpressionId,
+        initial: bool,
+    },
+    ListGet {
+        position: PlanRowExpressionId,
+    },
+    ListLength,
+    ListIsNotEmpty,
     MapUpsert {
         key: PlanRowExpressionId,
         value: PlanRowExpressionId,
@@ -7641,11 +7651,16 @@ enum TransientCollectionOperation {
 }
 
 impl TransientCollectionOperation {
-    fn first_operand(self) -> PlanRowExpressionId {
+    fn first_operand(self) -> Option<PlanRowExpressionId> {
         match self {
-            Self::MapUpsert { key, .. } | Self::MapRemove { key } | Self::MapGet { key } => key,
+            Self::ListAppend { item, .. } => Some(item),
+            Self::ListGet { position } => Some(position),
+            Self::ListLength | Self::ListIsNotEmpty => None,
+            Self::MapUpsert { key, .. } | Self::MapRemove { key } | Self::MapGet { key } => {
+                Some(key)
+            }
             Self::SetAdd { item, .. } | Self::SetRemove { item } | Self::SetContains { item } => {
-                item
+                Some(item)
             }
         }
     }
@@ -7654,6 +7669,15 @@ impl TransientCollectionOperation {
 impl TransientCollectionEvaluationState<'_, '_> {
     fn next_operation(&mut self) -> Option<TransientCollectionOperation> {
         match self.region.kind {
+            PlanTransientCollectionKind::List => {
+                if let Some(item) = self.region.list_items.get(self.next_initial).copied() {
+                    self.next_initial += 1;
+                    return Some(TransientCollectionOperation::ListAppend {
+                        item,
+                        initial: true,
+                    });
+                }
+            }
             PlanTransientCollectionKind::Map => {
                 if let Some(entry) = self.region.map_entries.get(self.next_initial) {
                     self.next_initial += 1;
@@ -7677,6 +7701,12 @@ impl TransientCollectionEvaluationState<'_, '_> {
         if let Some(step) = self.region.steps.get(self.next_step) {
             self.next_step += 1;
             return Some(match step {
+                PlanTransientCollectionStep::ListAppend { item } => {
+                    TransientCollectionOperation::ListAppend {
+                        item: *item,
+                        initial: false,
+                    }
+                }
                 PlanTransientCollectionStep::MapUpsert { key, value } => {
                     TransientCollectionOperation::MapUpsert {
                         key: *key,
@@ -7703,6 +7733,13 @@ impl TransientCollectionEvaluationState<'_, '_> {
         }
         self.result_scheduled = true;
         Some(match self.region.result {
+            PlanTransientCollectionResult::ListGet { position } => {
+                TransientCollectionOperation::ListGet { position }
+            }
+            PlanTransientCollectionResult::ListLength => TransientCollectionOperation::ListLength,
+            PlanTransientCollectionResult::ListIsNotEmpty => {
+                TransientCollectionOperation::ListIsNotEmpty
+            }
             PlanTransientCollectionResult::MapGet { key } => {
                 TransientCollectionOperation::MapGet { key }
             }
@@ -7752,6 +7789,7 @@ fn record_transient_collection_storage(
     grew: bool,
 ) -> Result<(), Error> {
     let len = match &state.storage {
+        TransientCollectionStorage::List(values) => values.len(),
         TransientCollectionStorage::Map(values) => values.len(),
         TransientCollectionStorage::Set(values) => values.len(),
     };
@@ -23846,6 +23884,11 @@ impl MachineInstance {
                                         .validate_shape()
                                         .map_err(|error| Error::InvalidPlan(error.to_string()))?;
                                     let storage = match region.kind {
+                                        PlanTransientCollectionKind::List => {
+                                            TransientCollectionStorage::List(Vec::with_capacity(
+                                                region.storage_growth_budget,
+                                            ))
+                                        }
                                         PlanTransientCollectionKind::Map => {
                                             TransientCollectionStorage::Map(BTreeMap::new())
                                         }
@@ -24168,16 +24211,46 @@ impl MachineInstance {
                                         .to_owned(),
                                 )
                             })?;
-                            let expression = operation.first_operand();
-                            let context = state.context;
-                            stack.push_task(ExpressionTask::TransientCollectionAfterFirst {
-                                state,
-                                operation,
-                            })?;
-                            stack.push_task(ExpressionTask::Evaluate {
-                                expression,
-                                context,
-                            })?;
+                            if let Some(expression) = operation.first_operand() {
+                                let context = state.context;
+                                stack.push_task(ExpressionTask::TransientCollectionAfterFirst {
+                                    state,
+                                    operation,
+                                })?;
+                                stack.push_task(ExpressionTask::Evaluate {
+                                    expression,
+                                    context,
+                                })?;
+                            } else {
+                                record_transient_collection_operation(&mut state, work, false)?;
+                                let value = match (&state.storage, operation) {
+                                    (
+                                        TransientCollectionStorage::List(values),
+                                        TransientCollectionOperation::ListLength,
+                                    ) => Value::Number(ExactNumber::from_usize(values.len())),
+                                    (
+                                        TransientCollectionStorage::List(values),
+                                        TransientCollectionOperation::ListIsNotEmpty,
+                                    ) => Value::truth(!values.is_empty()),
+                                    (TransientCollectionStorage::List(_), _) => {
+                                        return Err(Error::InvalidPlan(
+                                            "transient LIST terminal lost its operand".to_owned(),
+                                        ));
+                                    }
+                                    _ => {
+                                        return Err(Error::InvalidPlan(
+                                            "operand-free transient terminal reached MAP/SET storage"
+                                                .to_owned(),
+                                        ));
+                                    }
+                                };
+                                finish_transient_collection(&state)?;
+                                work.metrics.transient_collection_snapshot_copy_count = work
+                                    .metrics
+                                    .transient_collection_snapshot_copy_count
+                                    .saturating_add(state.snapshot_copy_count);
+                                stack.push_value(EvalValue::Value(value))?;
+                            }
                         }
                         ExpressionTask::TransientCollectionAfterFirst {
                             mut state,
@@ -24191,6 +24264,70 @@ impl MachineInstance {
                                 value => self.materialize_eval(value)?,
                             };
                             match operation {
+                                TransientCollectionOperation::ListAppend { initial, .. } => {
+                                    record_transient_collection_operation(
+                                        &mut state, work, !initial,
+                                    )?;
+                                    let declared_capacity = state.region.declared_capacity;
+                                    let TransientCollectionStorage::List(values) =
+                                        &mut state.storage
+                                    else {
+                                        return Err(Error::InvalidPlan(
+                                            "transient List/append reached MAP/SET storage"
+                                                .to_owned(),
+                                        ));
+                                    };
+                                    if let Some(capacity) = declared_capacity
+                                        && values.len() >= capacity
+                                    {
+                                        return Err(Error::Evaluation(format!(
+                                            "{} would exceed declared LIST capacity {capacity}",
+                                            if initial {
+                                                "LIST literal"
+                                            } else {
+                                                "List/append"
+                                            }
+                                        )));
+                                    }
+                                    values.push(first);
+                                    record_transient_collection_storage(&mut state, work, true)?;
+                                    stack.push_task(ExpressionTask::TransientCollectionNext {
+                                        state,
+                                    })?;
+                                }
+                                TransientCollectionOperation::ListGet { .. } => {
+                                    let position = one_based_position(
+                                        &EvalValue::Value(first),
+                                        "List/get position",
+                                    )?;
+                                    record_transient_collection_operation(&mut state, work, false)?;
+                                    let value = match &state.storage {
+                                        TransientCollectionStorage::List(values) => values
+                                            .get(position - 1)
+                                            .cloned()
+                                            .map(found_value)
+                                            .unwrap_or_else(|| Value::tag("NotFound")),
+                                        _ => {
+                                            return Err(Error::InvalidPlan(
+                                                "transient List/get reached MAP/SET storage"
+                                                    .to_owned(),
+                                            ));
+                                        }
+                                    };
+                                    finish_transient_collection(&state)?;
+                                    work.metrics.transient_collection_snapshot_copy_count = work
+                                        .metrics
+                                        .transient_collection_snapshot_copy_count
+                                        .saturating_add(state.snapshot_copy_count);
+                                    stack.push_value(EvalValue::Value(value))?;
+                                }
+                                TransientCollectionOperation::ListLength
+                                | TransientCollectionOperation::ListIsNotEmpty => {
+                                    return Err(Error::InvalidPlan(
+                                        "operand-free transient LIST terminal requested an operand"
+                                            .to_owned(),
+                                    ));
+                                }
                                 TransientCollectionOperation::MapUpsert {
                                     value, initial, ..
                                 } => {
@@ -24281,9 +24418,11 @@ impl MachineInstance {
                                             .cloned()
                                             .map(found_value)
                                             .unwrap_or_else(|| Value::tag("NotFound")),
-                                        TransientCollectionStorage::Set(_) => {
+                                        TransientCollectionStorage::List(_)
+                                        | TransientCollectionStorage::Set(_) => {
                                             return Err(Error::InvalidPlan(
-                                                "transient Map/get reached SET storage".to_owned(),
+                                                "transient Map/get reached non-MAP storage"
+                                                    .to_owned(),
                                             ));
                                         }
                                     };
@@ -24301,9 +24440,10 @@ impl MachineInstance {
                                         TransientCollectionStorage::Set(values) => {
                                             Value::truth(values.contains(&first))
                                         }
-                                        TransientCollectionStorage::Map(_) => {
+                                        TransientCollectionStorage::List(_)
+                                        | TransientCollectionStorage::Map(_) => {
                                             return Err(Error::InvalidPlan(
-                                                "transient Set/contains reached MAP storage"
+                                                "transient Set/contains reached non-SET storage"
                                                     .to_owned(),
                                             ));
                                         }

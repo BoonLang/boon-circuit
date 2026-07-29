@@ -1,5 +1,8 @@
 use boon_compiler::compile_source_text_to_machine_plan;
-use boon_plan::{PlanRowBuiltin, PlanRowExpressionNode, TargetProfile};
+use boon_plan::{
+    PlanRowBuiltin, PlanRowExpressionNode, PlanTransientCollectionKind,
+    PlanTransientCollectionResult, TargetProfile,
+};
 
 #[test]
 fn map_and_set_literals_and_operations_cross_the_verified_compiler_spine() {
@@ -74,7 +77,7 @@ document: Document/new(
 }
 
 #[test]
-fn linear_block_local_map_and_set_lower_to_private_transient_regions() {
+fn linear_block_local_list_map_and_set_lower_to_private_transient_regions() {
     let compiled = compile_source_text_to_machine_plan(
         "map-set-transient.bn",
         r#"
@@ -107,6 +110,38 @@ store: [
             without_admin
             |> Set/contains(item: Editor)
         }
+    third_item:
+        BLOCK {
+            items: LIST {
+                1
+                2
+            }
+            extended:
+                items
+                |> List/append(item: 3)
+            extended
+            |> List/get(position: 3)
+        }
+    item_count:
+        BLOCK {
+            items: LIST {
+                4
+            }
+            extended:
+                List/append(
+                    list: items
+                    item: 5
+                )
+            List/length(list: extended)
+        }
+    has_items:
+        BLOCK {
+            items: LIST {
+                6
+            }
+            items
+            |> List/is_not_empty()
+        }
 ]
 
 document: Document/new(
@@ -126,7 +161,29 @@ document: Document/new(
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(transient.len(), 2);
+    assert_eq!(transient.len(), 5);
+    assert_eq!(
+        transient
+            .iter()
+            .filter(|region| region.kind == PlanTransientCollectionKind::List)
+            .count(),
+        3
+    );
+    assert!(
+        transient
+            .iter()
+            .any(|region| matches!(region.result, PlanTransientCollectionResult::ListGet { .. }))
+    );
+    assert!(
+        transient
+            .iter()
+            .any(|region| matches!(region.result, PlanTransientCollectionResult::ListLength))
+    );
+    assert!(
+        transient
+            .iter()
+            .any(|region| matches!(region.result, PlanTransientCollectionResult::ListIsNotEmpty))
+    );
     assert!(
         transient
             .iter()
@@ -139,10 +196,13 @@ document: Document/new(
             .iter()
             .any(|(_, node)| matches!(
                 node,
-                PlanRowExpressionNode::MapLiteral { .. } | PlanRowExpressionNode::SetLiteral { .. }
+                PlanRowExpressionNode::ListLiteral { .. }
+                    | PlanRowExpressionNode::MapLiteral { .. }
+                    | PlanRowExpressionNode::SetLiteral { .. }
             ))
     );
     assert!(compiled.plan.persistence.collections.is_empty());
+    assert!(compiled.plan.persistence.lists.is_empty());
 }
 
 #[test]
@@ -165,6 +225,23 @@ store: [
             [
                 first_result: first
                 second_result: second
+                list_results:
+                    BLOCK {
+                        items: LIST {
+                            1
+                            2
+                        }
+                        first_item:
+                            items
+                            |> List/get(position: 1)
+                        second_item:
+                            items
+                            |> List/get(position: 2)
+                        [
+                            first_item_result: first_item
+                            second_item_result: second_item
+                        ]
+                    }
             ]
         }
 ]
@@ -189,6 +266,54 @@ document: Document/new(
             .plan
             .row_expressions
             .iter()
-            .any(|(_, node)| matches!(node, PlanRowExpressionNode::MapLiteral { .. }))
+            .any(|(_, node)| matches!(
+                node,
+                PlanRowExpressionNode::MapLiteral { .. }
+                    | PlanRowExpressionNode::ListLiteral { .. }
+            ))
     );
+}
+
+#[test]
+fn capacity_exhausting_local_list_retains_its_terminal_error_contract() {
+    let compiled = compile_source_text_to_machine_plan(
+        "list-capacity-transient-negative.bn",
+        r#"
+store: [
+    selected:
+        BLOCK {
+            items: LIST[1] {
+                1
+            }
+            extended:
+                items
+                |> List/append(item: 2)
+            extended
+            |> List/get(position: 2)
+        }
+]
+
+document: Document/new(
+    root: Element/label(element: [], style: [], label: TEXT { capacity })
+)
+"#,
+        TargetProfile::SoftwareBounded,
+    )
+    .unwrap();
+
+    let regions = compiled
+        .plan
+        .row_expressions
+        .iter()
+        .filter_map(|(_, node)| match node {
+            PlanRowExpressionNode::TransientCollection { region } => Some(region.as_ref()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let [region] = regions.as_slice() else {
+        panic!("expected one capacity-bound transient LIST region");
+    };
+    assert_eq!(region.kind, PlanTransientCollectionKind::List);
+    assert_eq!(region.declared_capacity, Some(1));
+    assert_eq!(region.storage_growth_budget, 1);
 }

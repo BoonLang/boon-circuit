@@ -5956,6 +5956,7 @@ fn map_storage_named_value_target(
                 || !origin.sources.is_empty()
                 || !origin.states.is_empty()
                 || !origin.lists.is_empty()
+                || !origin.value_list_authorities.is_empty()
             {
                 return Err(
                     "diagnostic-only named value has executable semantic origin identity"
@@ -6398,6 +6399,18 @@ fn map_storage_named_values(
         }
         for state in &origin.states {
             semantic_state_resource(resources, *state)?;
+        }
+        for authority in &origin.value_list_authorities {
+            ids.value_list_authority(*authority)?;
+            resources
+                .value_list_authorities
+                .get(authority.as_usize())
+                .filter(|candidate| candidate.id == *authority)
+                .ok_or_else(|| {
+                    format!(
+                        "named-value origin references missing value-list authority {authority}"
+                    )
+                })?;
         }
         for binding in &origin.bindings {
             reactive
@@ -10388,6 +10401,9 @@ fn map_transient_collections(
                 ));
             }
             let kind = match region.kind {
+                boon_semantic::SemanticTransientCollectionKindV1::List => {
+                    crate::TransientCollectionKind::List
+                }
                 boon_semantic::SemanticTransientCollectionKindV1::Map => {
                     crate::TransientCollectionKind::Map
                 }
@@ -10395,6 +10411,12 @@ fn map_transient_collections(
                     crate::TransientCollectionKind::Set
                 }
             };
+            let list_items = region
+                .list_items
+                .iter()
+                .copied()
+                .map(|item| ids.expression(item))
+                .collect::<Result<Vec<_>, String>>()?;
             let map_entries = region
                 .map_entries
                 .iter()
@@ -10416,6 +10438,13 @@ fn map_transient_collections(
                 .iter()
                 .map(|step| {
                     Ok(match step {
+                        boon_semantic::SemanticTransientCollectionStepV1::ListAppend {
+                            expression,
+                            item,
+                        } => crate::TransientCollectionStep::ListAppend {
+                            expression: ids.expression(*expression)?,
+                            item: ids.expression(*item)?,
+                        },
                         boon_semantic::SemanticTransientCollectionStepV1::MapUpsert {
                             expression,
                             key,
@@ -10450,6 +10479,23 @@ fn map_transient_collections(
                 })
                 .collect::<Result<Vec<_>, String>>()?;
             let result = match &region.result {
+                boon_semantic::SemanticTransientCollectionResultV1::ListGet {
+                    expression,
+                    position,
+                } => crate::TransientCollectionResult::ListGet {
+                    expression: ids.expression(*expression)?,
+                    position: ids.expression(*position)?,
+                },
+                boon_semantic::SemanticTransientCollectionResultV1::ListLength {
+                    expression,
+                } => crate::TransientCollectionResult::ListLength {
+                    expression: ids.expression(*expression)?,
+                },
+                boon_semantic::SemanticTransientCollectionResultV1::ListIsNotEmpty {
+                    expression,
+                } => crate::TransientCollectionResult::ListIsNotEmpty {
+                    expression: ids.expression(*expression)?,
+                },
                 boon_semantic::SemanticTransientCollectionResultV1::MapGet {
                     expression,
                     key,
@@ -10468,6 +10514,8 @@ fn map_transient_collections(
             Ok(crate::TransientCollection {
                 kind,
                 constructor: ids.expression(region.constructor)?,
+                declared_capacity: region.declared_capacity,
+                list_items,
                 map_entries,
                 set_items,
                 steps,
@@ -12487,6 +12535,7 @@ store: [
                         || !origin.sources.is_empty()
                         || !origin.states.is_empty()
                         || !origin.lists.is_empty()
+                        || !origin.value_list_authorities.is_empty()
                 }
             })
             .expect("fixture has an executable named-value target")

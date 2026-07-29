@@ -11341,9 +11341,16 @@ impl<'a> ExecutableRowLowerer<'a> {
             )));
         }
         let kind = match region.kind {
+            ir::TransientCollectionKind::List => PlanTransientCollectionKind::List,
             ir::TransientCollectionKind::Map => PlanTransientCollectionKind::Map,
             ir::TransientCollectionKind::Set => PlanTransientCollectionKind::Set,
         };
+        let list_items = region
+            .list_items
+            .iter()
+            .copied()
+            .map(|item| self.lower_scoped(item, owner))
+            .collect::<Result<Vec<_>, PlanError>>()?;
         let map_entries = region
             .map_entries
             .iter()
@@ -11365,6 +11372,11 @@ impl<'a> ExecutableRowLowerer<'a> {
             .iter()
             .map(|step| {
                 Ok(match step {
+                    ir::TransientCollectionStep::ListAppend { item, .. } => {
+                        PlanTransientCollectionStep::ListAppend {
+                            item: self.lower_scoped(*item, owner)?,
+                        }
+                    }
                     ir::TransientCollectionStep::MapUpsert { key, value, .. } => {
                         PlanTransientCollectionStep::MapUpsert {
                             key: self.lower_scoped(*key, owner)?,
@@ -11390,6 +11402,17 @@ impl<'a> ExecutableRowLowerer<'a> {
             })
             .collect::<Result<Vec<_>, PlanError>>()?;
         let result = match region.result {
+            ir::TransientCollectionResult::ListGet { position, .. } => {
+                PlanTransientCollectionResult::ListGet {
+                    position: self.lower_scoped(position, owner)?,
+                }
+            }
+            ir::TransientCollectionResult::ListLength { .. } => {
+                PlanTransientCollectionResult::ListLength
+            }
+            ir::TransientCollectionResult::ListIsNotEmpty { .. } => {
+                PlanTransientCollectionResult::ListIsNotEmpty
+            }
             ir::TransientCollectionResult::MapGet { key, .. } => {
                 PlanTransientCollectionResult::MapGet {
                     key: self.lower_scoped(key, owner)?,
@@ -11404,6 +11427,8 @@ impl<'a> ExecutableRowLowerer<'a> {
         self.intern(PlanRowExpressionNode::TransientCollection {
             region: Box::new(PlanTransientCollection {
                 kind,
+                declared_capacity: region.declared_capacity,
+                list_items,
                 map_entries,
                 set_items,
                 steps,
@@ -12507,7 +12532,13 @@ fn row_expression_value_type(
         | PlanRowExpressionNode::TextIsEmpty { .. }
         | PlanRowExpressionNode::TextStartsWith { .. }
         | PlanRowExpressionNode::TextToNumber { .. } => Some(PlanValueType::Tag),
-        PlanRowExpressionNode::TransientCollection { .. } => Some(PlanValueType::Tag),
+        PlanRowExpressionNode::TransientCollection { region } => match &region.result {
+            PlanTransientCollectionResult::ListLength => Some(PlanValueType::Number),
+            PlanTransientCollectionResult::ListGet { .. }
+            | PlanTransientCollectionResult::ListIsNotEmpty
+            | PlanTransientCollectionResult::MapGet { .. }
+            | PlanTransientCollectionResult::SetContains { .. } => Some(PlanValueType::Tag),
+        },
         PlanRowExpressionNode::BuiltinCall {
             function,
             input,

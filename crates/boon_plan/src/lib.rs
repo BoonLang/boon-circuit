@@ -7651,6 +7651,7 @@ impl<'de> Deserialize<'de> for PlanRowBuiltin {
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanTransientCollectionKind {
+    List,
     Map,
     Set,
 }
@@ -7664,6 +7665,9 @@ pub struct PlanTransientMapEntry {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PlanTransientCollectionStep {
+    ListAppend {
+        item: PlanRowExpressionId,
+    },
     MapUpsert {
         key: PlanRowExpressionId,
         value: PlanRowExpressionId,
@@ -7682,6 +7686,9 @@ pub enum PlanTransientCollectionStep {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PlanTransientCollectionResult {
+    ListGet { position: PlanRowExpressionId },
+    ListLength,
+    ListIsNotEmpty,
     MapGet { key: PlanRowExpressionId },
     SetContains { item: PlanRowExpressionId },
 }
@@ -7689,6 +7696,10 @@ pub enum PlanTransientCollectionResult {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PlanTransientCollection {
     pub kind: PlanTransientCollectionKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declared_capacity: Option<usize>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub list_items: Vec<PlanRowExpressionId>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub map_entries: Vec<PlanTransientMapEntry>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -7704,8 +7715,31 @@ pub struct PlanTransientCollection {
 impl PlanTransientCollection {
     pub fn validate_shape(&self) -> Result<(), PlanError> {
         let initial_len = match self.kind {
+            PlanTransientCollectionKind::List => {
+                if self.declared_capacity == Some(0)
+                    || !self.map_entries.is_empty()
+                    || !self.set_items.is_empty()
+                    || !matches!(
+                        self.result,
+                        PlanTransientCollectionResult::ListGet { .. }
+                            | PlanTransientCollectionResult::ListLength
+                            | PlanTransientCollectionResult::ListIsNotEmpty
+                    )
+                    || self
+                        .steps
+                        .iter()
+                        .any(|step| !matches!(step, PlanTransientCollectionStep::ListAppend { .. }))
+                {
+                    return Err(PlanError::new(
+                        "transient LIST region contains MAP/SET operands or operations",
+                    ));
+                }
+                self.list_items.len()
+            }
             PlanTransientCollectionKind::Map => {
-                if !self.set_items.is_empty()
+                if self.declared_capacity.is_some()
+                    || !self.list_items.is_empty()
+                    || !self.set_items.is_empty()
                     || !matches!(self.result, PlanTransientCollectionResult::MapGet { .. })
                     || self.steps.iter().any(|step| {
                         !matches!(
@@ -7722,7 +7756,9 @@ impl PlanTransientCollection {
                 self.map_entries.len()
             }
             PlanTransientCollectionKind::Set => {
-                if !self.map_entries.is_empty()
+                if self.declared_capacity.is_some()
+                    || !self.list_items.is_empty()
+                    || !self.map_entries.is_empty()
                     || !matches!(
                         self.result,
                         PlanTransientCollectionResult::SetContains { .. }
@@ -7748,7 +7784,8 @@ impl PlanTransientCollection {
             .filter(|step| {
                 matches!(
                     step,
-                    PlanTransientCollectionStep::MapUpsert { .. }
+                    PlanTransientCollectionStep::ListAppend { .. }
+                        | PlanTransientCollectionStep::MapUpsert { .. }
                         | PlanTransientCollectionStep::SetAdd { .. }
                 )
             })
@@ -7756,8 +7793,13 @@ impl PlanTransientCollection {
         let operation_count = initial_len
             .saturating_add(self.steps.len())
             .saturating_add(1);
+        let attempted_storage_growth = initial_len.saturating_add(growth_steps);
+        let storage_growth_budget = self
+            .declared_capacity
+            .map(|capacity| attempted_storage_growth.min(capacity))
+            .unwrap_or(attempted_storage_growth);
         if self.operation_work_budget != u64::try_from(operation_count).unwrap_or(u64::MAX)
-            || self.storage_growth_budget != initial_len.saturating_add(growth_steps)
+            || self.storage_growth_budget != storage_growth_budget
             || self.snapshot_copy_budget != 0
         {
             return Err(PlanError::new(
@@ -7768,6 +7810,7 @@ impl PlanTransientCollection {
     }
 
     pub fn visit_children(&self, visitor: &mut impl FnMut(PlanRowExpressionId)) {
+        self.list_items.iter().copied().for_each(&mut *visitor);
         for entry in &self.map_entries {
             visitor(entry.key);
             visitor(entry.value);
@@ -7775,6 +7818,7 @@ impl PlanTransientCollection {
         self.set_items.iter().copied().for_each(&mut *visitor);
         for step in &self.steps {
             match step {
+                PlanTransientCollectionStep::ListAppend { item } => visitor(*item),
                 PlanTransientCollectionStep::MapUpsert { key, value } => {
                     visitor(*key);
                     visitor(*value);
@@ -7785,12 +7829,16 @@ impl PlanTransientCollection {
             }
         }
         match self.result {
+            PlanTransientCollectionResult::ListGet { position } => visitor(position),
+            PlanTransientCollectionResult::ListLength
+            | PlanTransientCollectionResult::ListIsNotEmpty => {}
             PlanTransientCollectionResult::MapGet { key } => visitor(key),
             PlanTransientCollectionResult::SetContains { item } => visitor(item),
         }
     }
 
     pub fn visit_children_mut(&mut self, visitor: &mut impl FnMut(&mut PlanRowExpressionId)) {
+        self.list_items.iter_mut().for_each(&mut *visitor);
         for entry in &mut self.map_entries {
             visitor(&mut entry.key);
             visitor(&mut entry.value);
@@ -7798,6 +7846,7 @@ impl PlanTransientCollection {
         self.set_items.iter_mut().for_each(&mut *visitor);
         for step in &mut self.steps {
             match step {
+                PlanTransientCollectionStep::ListAppend { item } => visitor(item),
                 PlanTransientCollectionStep::MapUpsert { key, value } => {
                     visitor(key);
                     visitor(value);
@@ -7808,6 +7857,9 @@ impl PlanTransientCollection {
             }
         }
         match &mut self.result {
+            PlanTransientCollectionResult::ListGet { position } => visitor(position),
+            PlanTransientCollectionResult::ListLength
+            | PlanTransientCollectionResult::ListIsNotEmpty => {}
             PlanTransientCollectionResult::MapGet { key } => visitor(key),
             PlanTransientCollectionResult::SetContains { item } => visitor(item),
         }

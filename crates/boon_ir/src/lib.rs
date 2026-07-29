@@ -275,6 +275,7 @@ impl ErasedProgram {
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TransientCollectionKind {
+    List,
     Map,
     Set,
 }
@@ -288,6 +289,10 @@ pub struct TransientMapEntry {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TransientCollectionStep {
+    ListAppend {
+        expression: ExecutableExprId,
+        item: ExecutableExprId,
+    },
     MapUpsert {
         expression: ExecutableExprId,
         key: ExecutableExprId,
@@ -310,7 +315,8 @@ pub enum TransientCollectionStep {
 impl TransientCollectionStep {
     pub const fn expression(&self) -> ExecutableExprId {
         match self {
-            Self::MapUpsert { expression, .. }
+            Self::ListAppend { expression, .. }
+            | Self::MapUpsert { expression, .. }
             | Self::MapRemove { expression, .. }
             | Self::SetAdd { expression, .. }
             | Self::SetRemove { expression, .. } => *expression,
@@ -321,6 +327,16 @@ impl TransientCollectionStep {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TransientCollectionResult {
+    ListGet {
+        expression: ExecutableExprId,
+        position: ExecutableExprId,
+    },
+    ListLength {
+        expression: ExecutableExprId,
+    },
+    ListIsNotEmpty {
+        expression: ExecutableExprId,
+    },
     MapGet {
         expression: ExecutableExprId,
         key: ExecutableExprId,
@@ -334,7 +350,11 @@ pub enum TransientCollectionResult {
 impl TransientCollectionResult {
     pub const fn expression(&self) -> ExecutableExprId {
         match self {
-            Self::MapGet { expression, .. } | Self::SetContains { expression, .. } => *expression,
+            Self::ListGet { expression, .. }
+            | Self::ListLength { expression }
+            | Self::ListIsNotEmpty { expression }
+            | Self::MapGet { expression, .. }
+            | Self::SetContains { expression, .. } => *expression,
         }
     }
 }
@@ -343,6 +363,10 @@ impl TransientCollectionResult {
 pub struct TransientCollection {
     pub kind: TransientCollectionKind,
     pub constructor: ExecutableExprId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declared_capacity: Option<usize>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub list_items: Vec<ExecutableExprId>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub map_entries: Vec<TransientMapEntry>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

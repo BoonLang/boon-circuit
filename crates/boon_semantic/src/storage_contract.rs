@@ -2741,7 +2741,7 @@ fn build_named_value_storage(
                 )
                 .map_err(|error| {
                     SemanticScopeStorageError::new(format!(
-                        "named value {} `{}` origin {origin_ordinal} {:?} semantic statements {:?} expressions {:?} bindings {:?} sources {:?} states {:?} lists {:?} target {target:?}: {error}",
+                        "named value {} `{}` origin {origin_ordinal} {:?} semantic statements {:?} expressions {:?} bindings {:?} sources {:?} states {:?} lists {:?} value-list authorities {:?} target {target:?}: {error}",
                         named_value.id,
                         named_value.diagnostic_path,
                         origin.checked,
@@ -2751,6 +2751,7 @@ fn build_named_value_storage(
                         origin.sources,
                         origin.states,
                         origin.lists,
+                        origin.value_list_authorities,
                     ))
                 })?;
                 let representation = derive_storage_representation(
@@ -2759,7 +2760,7 @@ fn build_named_value_storage(
                 )
                 .map_err(|error| {
                     SemanticScopeStorageError::new(format!(
-                        "named value {} `{}` origin {origin_ordinal} {:?} semantic statements {:?} expressions {:?} bindings {:?} sources {:?} states {:?} lists {:?} target {target:?}: {error}",
+                        "named value {} `{}` origin {origin_ordinal} {:?} semantic statements {:?} expressions {:?} bindings {:?} sources {:?} states {:?} lists {:?} value-list authorities {:?} target {target:?}: {error}",
                         named_value.id,
                         named_value.diagnostic_path,
                         origin.checked,
@@ -2769,6 +2770,7 @@ fn build_named_value_storage(
                         origin.sources,
                         origin.states,
                         origin.lists,
+                        origin.value_list_authorities,
                     ))
                 })?;
                 rows.push(SemanticNamedValueStorageV1 {
@@ -2931,6 +2933,7 @@ fn named_value_targets(
         && origin.sources.is_empty()
         && origin.states.is_empty()
         && origin.lists.is_empty()
+        && origin.value_list_authorities.is_empty()
     {
         targets.insert(SemanticNamedValueStorageTargetV1::DiagnosticOnly {
             reason: SemanticNamedValueDiagnosticOnlyReasonV1::NonExecutableStructuralContainer,
@@ -2954,6 +2957,17 @@ fn named_value_targets(
             .ok_or_else(|| {
                 SemanticScopeStorageError::new(format!(
                     "named-value origin references missing list {list}"
+                ))
+            })?;
+    }
+    for authority in &origin.value_list_authorities {
+        resources
+            .value_list_authorities
+            .get(authority.as_usize())
+            .filter(|candidate| candidate.id == *authority)
+            .ok_or_else(|| {
+                SemanticScopeStorageError::new(format!(
+                    "named-value origin references missing value-list authority {authority}"
                 ))
             })?;
     }
@@ -3677,6 +3691,7 @@ fn validate_named_value_storage_shape(
                         || !origin.sources.is_empty()
                         || !origin.states.is_empty()
                         || !origin.lists.is_empty()
+                        || !origin.value_list_authorities.is_empty()
                     {
                         return Err(SemanticScopeStorageError::new(format!(
                             "named value {} origin {origin_ordinal} is incorrectly classified diagnostic-only",

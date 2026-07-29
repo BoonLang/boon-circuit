@@ -35,12 +35,12 @@ pub const REQUIRED_FIXTURE_DATASET_IDS: &[(&str, &[&str])] = &[
         "tags-presence-fault",
         &["correctness.tags-presence-fault.v1"],
     ),
-    ("bits", &["correctness.future-bits-rejection.v1"]),
+    ("bits", &["correctness.foundations-bits-current.v1"]),
     (
         "map-set",
         &[
-            "correctness.future-map-rejection.v1",
-            "correctness.future-set-rejection.v1",
+            "correctness.foundations-map-current.v1",
+            "correctness.foundations-set-current.v1",
         ],
     ),
     ("typed-views", &["correctness.typed-views.v1"]),
@@ -63,7 +63,7 @@ pub const REQUIRED_FIXTURE_DATASET_IDS: &[(&str, &[&str])] = &[
         "bounded-hardware-eligibility",
         &[
             "hardware.bounded-profile-analogue.v1",
-            "hardware.future-bits-rejection.v1",
+            "hardware.semantic-bits-profile.v1",
         ],
     ),
 ];

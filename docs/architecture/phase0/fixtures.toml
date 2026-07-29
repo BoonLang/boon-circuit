@@ -67,34 +67,34 @@ replacement_seam = "Phase 2 replaces legacy internal absence/fault representatio
 
 [[fixtures]]
 id = "bits"
-classification = "future-language"
+classification = "current-regression"
 status = "existing"
-target_status = "not-yet-implemented"
-evidence_status = "compile-reject-future"
+target_status = "current-supported"
+evidence_status = "compile-execute-current"
 owner_phase = "goal-phase-2-foundations"
 owner_plan = "docs/plans/BOON_LANGUAGE_FOUNDATIONS_PLAN.md"
-path = "testdata/phase0/fixtures/future_bits.bn"
-dataset_fixture_ids = ["correctness.future-bits-rejection.v1"]
-command = "cargo test -p boon_phase0_baseline fixture_bits_map_set_future_syntax_fails_closed --lib"
-expected = "The real compiler rejects BITS syntax with a bounded BITS diagnostic and emits no MachinePlan."
-replacement_seam = "Phase 2 changes this exact source from rejection to native and Wasm execution before hardware consumes it."
+path = "testdata/phase0/fixtures/bits_current.bn"
+dataset_fixture_ids = ["correctness.foundations-bits-current.v1"]
+command = "cargo test -p boon_phase0_baseline fixture_bits_map_set_execute_from_source --lib"
+expected = "The real compiler and MachineInstance preserve the exact BITS[7] width and value through the verified artifact spine."
+replacement_seam = "Phase 2 cross-target gates extend this native executable seam with the same Wasm trace; later hardware consumes only bounded verified BITS."
 
 [[fixtures]]
 id = "map-set"
-classification = "future-language"
+classification = "current-regression"
 status = "existing"
-target_status = "not-yet-implemented"
-evidence_status = "compile-reject-future"
+target_status = "current-supported"
+evidence_status = "compile-execute-current"
 owner_phase = "goal-phase-2-foundations"
 owner_plan = "docs/plans/BOON_LANGUAGE_FOUNDATIONS_PLAN.md"
-path = "testdata/phase0/fixtures/future_map.bn"
+path = "testdata/phase0/fixtures/map_current.bn"
 dataset_fixture_ids = [
-  "correctness.future-map-rejection.v1",
-  "correctness.future-set-rejection.v1",
+  "correctness.foundations-map-current.v1",
+  "correctness.foundations-set-current.v1",
 ]
-command = "cargo test -p boon_phase0_baseline fixture_bits_map_set_future_syntax_fails_closed --lib"
-expected = "The real compiler rejects both MAP and SET source fixtures and emits no MachinePlan."
-replacement_seam = "Phase 2 replaces both rejection assertions with deterministic MAP/SET authority execution."
+command = "cargo test -p boon_phase0_baseline fixture_bits_map_set_execute_from_source --lib"
+expected = "The real compiler and MachineInstance execute canonical MAP and SET authorities with exact public contents."
+replacement_seam = "Phase 2 authority gates extend this executable seam with keyed deltas, persistence, ownership generations, and cross-target canonical ordering."
 
 [[fixtures]]
 id = "typed-views"
@@ -202,14 +202,14 @@ id = "bounded-hardware-eligibility"
 classification = "future-hardware"
 status = "existing"
 target_status = "not-yet-implemented"
-evidence_status = "current-execution-plus-future-rejection"
+evidence_status = "compile-execute-current"
 owner_phase = "goal-phase-8-riscv"
 owner_plan = "docs/plans/BOON_FIRST_RISCV_PROCESSOR_PLAN.md"
 path = "testdata/phase0/fixtures/bounded_hardware_current.bn"
 dataset_fixture_ids = [
   "hardware.bounded-profile-analogue.v1",
-  "hardware.future-bits-rejection.v1",
+  "hardware.semantic-bits-profile.v1",
 ]
-command = "cargo test -p boon_phase0_baseline fixture_bounded_hardware_records_current_profile_and_future_rejection --lib"
-expected = "The current SoftwareBounded analogue executes while generic BITS hardware source fails before CoreHardwareIR."
-replacement_seam = "Phase 8 replaces the future rejection with deterministic CoreHardwareIR eligibility plus explicit invalid/unbounded rejection."
+command = "cargo test -p boon_phase0_baseline fixture_bounded_profiles_execute_without_hardware_readiness_claim --lib"
+expected = "SoftwareBounded and fixed-width BITS semantics execute as MachinePlans; no CoreHardwareIR readiness is claimed."
+replacement_seam = "Phase 8 adds deterministic CoreHardwareIR eligibility plus explicit invalid/unbounded rejection without changing these semantic values."

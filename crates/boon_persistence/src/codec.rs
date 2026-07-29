@@ -2928,6 +2928,42 @@ mod tests {
     }
 
     #[test]
+    fn fixed_width_bits_value_and_shell_use_one_canonical_persistence_encoding() {
+        let bits = Bits::parse_encoded(9, 16, "101").unwrap();
+        let value = StoredValue::Bits(bits.clone());
+        let mut encoded = Vec::new();
+        encode_value(&mut Encoder::new(&mut encoded), &value, 0).unwrap();
+        assert_eq!(encoded, [0x83, 0x18, STORED_BITS, 9, 0x42, 0x01, 0x01]);
+        assert_eq!(
+            decode_value(&mut Decoder::new(&encoded), DecodeLimits::default(), 0).unwrap(),
+            value
+        );
+
+        let shell = StoredValueShell::Bits(bits);
+        let mut encoded_shell = Vec::new();
+        encode_stored_value_shell(&mut Encoder::new(&mut encoded_shell), &shell, 0).unwrap();
+        assert_eq!(encoded_shell, encoded);
+        assert_eq!(
+            decode_stored_value_shell(
+                &mut Decoder::new(&encoded_shell),
+                DecodeLimits::default(),
+                0,
+            )
+            .unwrap(),
+            shell
+        );
+
+        let mut noncanonical = encoded;
+        noncanonical[5] = 0x81;
+        assert!(
+            decode_value(&mut Decoder::new(&noncanonical), DecodeLimits::default(), 0,)
+                .unwrap_err()
+                .to_string()
+                .contains("nonzero unused high bits")
+        );
+    }
+
+    #[test]
     fn nested_collection_shell_and_owner_route_round_trip_canonically() {
         let parent_memory = map_memory("orders");
         let key = StoredValue::Text("order-a".to_owned());

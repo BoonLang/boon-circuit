@@ -50,35 +50,35 @@ owner_phase = "goal-phase-2-foundations"
 owner_plan = "docs/plans/BOON_LANGUAGE_FOUNDATIONS_PLAN.md"
 
 [[fixtures]]
-id = "correctness.future-bits-rejection.v1"
+id = "correctness.foundations-bits-current.v1"
 category = "correctness"
-behavior = "compile-reject-future"
-purpose = "Future BITS syntax rejection before the final bounded-bit value algebra exists."
-entrypoint = "testdata/phase0/fixtures/future_bits.bn"
-units = ["testdata/phase0/fixtures/future_bits.bn"]
-source_bundle_digest_v1 = "15535ead7609116a55cc3b2ec1e3a4c230eb07366c8b8211d1cf930bb09d14e6"
+behavior = "compile-execute-current"
+purpose = "Exact fixed-width BITS source compilation and native execution through the verified artifact spine."
+entrypoint = "testdata/phase0/fixtures/bits_current.bn"
+units = ["testdata/phase0/fixtures/bits_current.bn"]
+source_bundle_digest_v1 = "9c33ae36d83ad91ce4c07383d95447933d88fdf68a657609d7bc13f569124ade"
 owner_phase = "goal-phase-2-foundations"
 owner_plan = "docs/plans/BOON_LANGUAGE_FOUNDATIONS_PLAN.md"
 
 [[fixtures]]
-id = "correctness.future-map-rejection.v1"
+id = "correctness.foundations-map-current.v1"
 category = "correctness"
-behavior = "compile-reject-future"
-purpose = "Future MAP authority syntax rejection before the final collection algebra exists."
-entrypoint = "testdata/phase0/fixtures/future_map.bn"
-units = ["testdata/phase0/fixtures/future_map.bn"]
-source_bundle_digest_v1 = "bdc6103e719a78485283795514fe02c4bd1ff761e063687ea674d7e955a875ad"
+behavior = "compile-execute-current"
+purpose = "Canonical MAP authority source compilation and native execution with exact key/value contents."
+entrypoint = "testdata/phase0/fixtures/map_current.bn"
+units = ["testdata/phase0/fixtures/map_current.bn"]
+source_bundle_digest_v1 = "c2dc74b2e619a7f572612386f47497c4c443a2ca20fb7f293df1e2bdc06d0b8f"
 owner_phase = "goal-phase-2-foundations"
 owner_plan = "docs/plans/BOON_LANGUAGE_FOUNDATIONS_PLAN.md"
 
 [[fixtures]]
-id = "correctness.future-set-rejection.v1"
+id = "correctness.foundations-set-current.v1"
 category = "correctness"
-behavior = "compile-reject-future"
-purpose = "Future SET authority syntax rejection before the final collection algebra exists."
-entrypoint = "testdata/phase0/fixtures/future_set.bn"
-units = ["testdata/phase0/fixtures/future_set.bn"]
-source_bundle_digest_v1 = "0bf088ef2a864fb63d1372e49938a0d89bac276dfe4920f6443e5f38d73b3d8a"
+behavior = "compile-execute-current"
+purpose = "Canonical SET authority source compilation and native execution with exact item contents."
+entrypoint = "testdata/phase0/fixtures/set_current.bn"
+units = ["testdata/phase0/fixtures/set_current.bn"]
+source_bundle_digest_v1 = "7c0234b68374321a09898d5bcb4805d343e3229f37e38c3108e04baf728f5d79"
 owner_phase = "goal-phase-2-foundations"
 owner_plan = "docs/plans/BOON_LANGUAGE_FOUNDATIONS_PLAN.md"
 
@@ -171,13 +171,13 @@ owner_phase = "goal-phase-8-riscv"
 owner_plan = "docs/plans/BOON_FIRST_RISCV_PROCESSOR_PLAN.md"
 
 [[fixtures]]
-id = "hardware.future-bits-rejection.v1"
+id = "hardware.semantic-bits-profile.v1"
 category = "hardware"
-behavior = "compile-reject-future"
-purpose = "Future fixed-width register syntax must fail closed before CoreHardwareIR exists."
-entrypoint = "testdata/phase0/fixtures/future_hardware_bits.bn"
-units = ["testdata/phase0/fixtures/future_hardware_bits.bn"]
-source_bundle_digest_v1 = "b283045e63be8474b09675bf9cc0ee45ece948d5a3d1487d0846ca7048024d15"
+behavior = "compile-execute-current"
+purpose = "Current BITS semantics execute under the bounded FPGA-named MachinePlan profile without constituting CoreHardwareIR evidence."
+entrypoint = "testdata/phase0/fixtures/hardware_bits_semantic_current.bn"
+units = ["testdata/phase0/fixtures/hardware_bits_semantic_current.bn"]
+source_bundle_digest_v1 = "5bcb5da26afec221bbbd1ed5f0535bb4d1b8c7306450ac36e70e7ea7e5104089"
 owner_phase = "goal-phase-8-riscv"
 owner_plan = "docs/plans/BOON_FIRST_RISCV_PROCESSOR_PLAN.md"
 
@@ -197,7 +197,7 @@ units = [
   "examples/cells/store.bn",
   "examples/cells/view.bn",
 ]
-source_bundle_digest_v1 = "079c4ba86093e022830fbcfad6d02e5be528240caad11db7b4833fc7add65409"
+source_bundle_digest_v1 = "fb9996b2ed3155d7a21797a8ff3de45b6d33799ccc60df1e93cbe5d40d17a987"
 owner_phase = "goal-phase-5-packed"
 owner_plan = "docs/plans/BOON_PACKED_DATA_AND_DENSE_INTERNALS_PLAN.md"
 
@@ -272,7 +272,7 @@ units = [
   "examples/novywave/View/NovyView.bn",
   "examples/novywave/hold.bn",
 ]
-source_bundle_digest_v1 = "44c3afb53fd95ba487e6f1a89d8ee8154e3e156931f74fe03dbc050597ff834e"
+source_bundle_digest_v1 = "cbb2d4dd667abb9ed97a08e5d8639da7ad0787cc495a30f6d6ab0da5c5985bf8"
 owner_phase = "goal-phase-6-web-persistence"
 owner_plan = "docs/plans/NOVYWAVE_BOON_REWRITE_PLAN.md"
 
@@ -283,6 +283,6 @@ behavior = "product-regression-current"
 purpose = "Current self-contained TodoMVC product source dataset."
 entrypoint = "examples/todomvc.bn"
 units = ["examples/todomvc.bn"]
-source_bundle_digest_v1 = "4e156f0e296a8b7df793cca721a8484616b3c3dd3627084e805d9dfd9f8be77b"
+source_bundle_digest_v1 = "077bbd2aed99aba119c91c6483970990ffd7379b05aab20272dfebffa9ce8842"
 owner_phase = "goal-phase-6-web-persistence"
 owner_plan = "docs/plans/GOAL_PROMPT.md"

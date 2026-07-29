@@ -1,0 +1,5 @@
+-- Fixed-width BITS semantics are current under every MachinePlan profile.
+-- This remains a semantic MachinePlan fixture, not CoreHardwareIR evidence.
+left: BITS[32] { 16u00000001 }
+right: BITS[32] { 16u00000002 }
+result: left |> Bits/add_or_wrap(with: right)

@@ -2309,6 +2309,7 @@ fn stored_value_bytes(value: &super::StoredValue, depth: usize) -> usize {
         super::StoredValue::Number(_) => 16,
         super::StoredValue::Text(value) => 24usize.saturating_add(value.len()),
         super::StoredValue::Bytes(value) => 24usize.saturating_add(value.len()),
+        super::StoredValue::Bits(value) => 28usize.saturating_add(value.bytes().len()),
         super::StoredValue::List(values) => values.iter().fold(24, |bytes, value| {
             bytes.saturating_add(stored_value_bytes(value, depth + 1))
         }),
@@ -2346,6 +2347,7 @@ fn stored_value_shell_bytes(value: &StoredValueShell, depth: usize) -> usize {
         StoredValueShell::Number(_) => 16,
         StoredValueShell::Text(value) => 24usize.saturating_add(value.len()),
         StoredValueShell::Bytes(value) => 24usize.saturating_add(value.len()),
+        StoredValueShell::Bits(value) => 28usize.saturating_add(value.bytes().len()),
         StoredValueShell::List(values) => values.iter().fold(24, |bytes, value| {
             bytes.saturating_add(stored_value_shell_bytes(value, depth + 1))
         }),
@@ -6685,6 +6687,8 @@ mod tests {
     use boon_plan::MemoryLeafId;
     #[cfg(not(target_arch = "wasm32"))]
     use boon_plan::{EffectId, EffectInvocationId, MemoryKind, MemoryOwnerPath};
+    #[cfg(target_arch = "wasm32")]
+    use wasm_bindgen_test::wasm_bindgen_test;
 
     fn number(value: i64) -> StoredValue {
         StoredValue::integer(value).unwrap()
@@ -6695,6 +6699,17 @@ mod tests {
             unreachable!("integer helper always returns a number")
         };
         StoredValueShell::Number(value)
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen_test]
+    fn bits_admission_cost_includes_width_and_payload_bytes() {
+        let bits = boon_data::Bits::parse_encoded(9, 16, "101").unwrap();
+        assert_eq!(stored_value_bytes(&StoredValue::Bits(bits.clone()), 0), 30);
+        assert_eq!(
+            stored_value_shell_bytes(&StoredValueShell::Bits(bits), 0),
+            30
+        );
     }
 
     fn application() -> ApplicationIdentity {

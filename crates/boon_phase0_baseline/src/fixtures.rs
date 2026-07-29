@@ -1,9 +1,10 @@
 //! Executable Phase 0 replacement seams.
 //!
 //! These checks deliberately distinguish current behavior from target
-//! semantics. Supported analogues travel from source through the ordinary
-//! compiler and executor. Future syntax travels through the same compiler and
-//! must fail closed until its owning phase replaces the matching seam.
+//! semantics. Supported features travel from source through the ordinary
+//! compiler and executor. Unlanded future syntax travels through the same
+//! compiler and must fail closed until its owning phase replaces the matching
+//! seam.
 
 use boon_compiler::{
     CompiledMachinePlanFromSource, ProgramRole, TargetProfile,
@@ -11,6 +12,7 @@ use boon_compiler::{
 };
 use boon_plan::{ExactNumber, ListId, SourceId};
 use boon_plan_executor::{MachineInstance, SessionOptions, SourceEvent, SourcePayload, Value};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -190,10 +192,52 @@ pub fn tags_presence_and_fault_current_analogue_executes() -> Result<(), String>
     Ok(())
 }
 
-pub fn bits_map_and_set_future_syntax_fail_closed() -> Result<(), String> {
-    require_compile_rejection("future_bits.bn", TargetProfile::SoftwareDefault, "BITS")?;
-    require_compile_rejection("future_map.bn", TargetProfile::SoftwareDefault, "MAP")?;
-    require_compile_rejection("future_set.bn", TargetProfile::SoftwareDefault, "SET")
+pub fn bits_map_and_set_execute() -> Result<(), String> {
+    let mut bits_machine = machine(compile("bits_current.bn", TargetProfile::SoftwareDefault)?)?;
+    let opcode = bits_machine
+        .root_value_current("opcode")
+        .map_err(|error| error.to_string())?;
+    if !matches!(
+        &opcode,
+        Value::Bits(value)
+            if value.width() == 7 && value.to_string() == "BITS[7] { 2u0110011 }"
+    ) {
+        return Err(format!(
+            "current BITS fixture produced {opcode:?}; expected BITS[7] {{ 2u0110011 }}"
+        ));
+    }
+
+    let mut map_machine = machine(compile("map_current.bn", TargetProfile::SoftwareDefault)?)?;
+    let lookup = map_machine
+        .root_value_current("lookup")
+        .map_err(|error| error.to_string())?;
+    let expected_map = Value::Map(BTreeMap::from([
+        (
+            Value::Text("one".to_owned()),
+            Value::integer(1).map_err(|error| error.to_string())?,
+        ),
+        (
+            Value::Text("two".to_owned()),
+            Value::integer(2).map_err(|error| error.to_string())?,
+        ),
+    ]));
+    if lookup != expected_map {
+        return Err(format!(
+            "current MAP fixture produced {lookup:?}; expected {expected_map:?}"
+        ));
+    }
+
+    let mut set_machine = machine(compile("set_current.bn", TargetProfile::SoftwareDefault)?)?;
+    let roles = set_machine
+        .root_value_current("roles")
+        .map_err(|error| error.to_string())?;
+    let expected_set = Value::Set(BTreeSet::from([Value::tag("Admin"), Value::tag("Viewer")]));
+    if roles != expected_set {
+        return Err(format!(
+            "current SET fixture produced {roles:?}; expected {expected_set:?}"
+        ));
+    }
+    Ok(())
 }
 
 pub fn typed_views_execute() -> Result<(), String> {
@@ -415,7 +459,7 @@ pub fn scalar_and_row_storage_current_analogue_executes() -> Result<(), String> 
     Ok(())
 }
 
-pub fn bounded_software_profile_executes_and_future_hardware_fails_closed() -> Result<(), String> {
+pub fn bounded_profiles_execute_without_hardware_readiness_claim() -> Result<(), String> {
     let compiled = compile(
         "bounded_hardware_current.bn",
         TargetProfile::SoftwareBounded,
@@ -423,18 +467,35 @@ pub fn bounded_software_profile_executes_and_future_hardware_fails_closed() -> R
     if compiled.plan.target_profile != TargetProfile::SoftwareBounded {
         return Err("bounded analogue compiled for the wrong target profile".to_owned());
     }
-    let mut machine = machine(compiled)?;
-    let result = machine
+    let mut bounded_machine = machine(compiled)?;
+    let result = bounded_machine
         .root_value_current("result")
         .map_err(|error| error.to_string())?;
     if !number_is(&result, "3")? {
         return Err(format!("bounded software analogue produced {result:?}"));
     }
-    require_compile_rejection(
-        "future_hardware_bits.bn",
+
+    let compiled = compile(
+        "hardware_bits_semantic_current.bn",
         TargetProfile::FpgaTodomvc,
-        "BITS",
-    )
+    )?;
+    if compiled.plan.target_profile != TargetProfile::FpgaTodomvc {
+        return Err("BITS semantic fixture compiled for the wrong target profile".to_owned());
+    }
+    let mut bits_machine = machine(compiled)?;
+    let result = bits_machine
+        .root_value_current("result")
+        .map_err(|error| error.to_string())?;
+    if !matches!(
+        &result,
+        Value::Bits(value)
+            if value.width() == 32 && value.bytes().as_ref() == [0, 0, 0, 3]
+    ) {
+        return Err(format!(
+            "BITS semantic profile analogue produced {result:?}"
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -457,8 +518,8 @@ mod tests {
     }
 
     #[test]
-    fn fixture_bits_map_set_future_syntax_fails_closed() {
-        bits_map_and_set_future_syntax_fail_closed().unwrap();
+    fn fixture_bits_map_set_execute_from_source() {
+        bits_map_and_set_execute().unwrap();
     }
 
     #[test]
@@ -492,7 +553,7 @@ mod tests {
     }
 
     #[test]
-    fn fixture_bounded_hardware_records_current_profile_and_future_rejection() {
-        bounded_software_profile_executes_and_future_hardware_fails_closed().unwrap();
+    fn fixture_bounded_profiles_execute_without_hardware_readiness_claim() {
+        bounded_profiles_execute_without_hardware_readiness_claim().unwrap();
     }
 }

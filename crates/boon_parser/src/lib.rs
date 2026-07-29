@@ -2655,12 +2655,6 @@ fn ast_expr_kind(
     if tokens == ["SOURCE"] {
         return AstExprKind::Source;
     }
-    if tokens == ["True"] {
-        return AstExprKind::Tag("True".to_owned());
-    }
-    if tokens == ["False"] {
-        return AstExprKind::Tag("False".to_owned());
-    }
     if let Some(number) = ast_number_literal(tokens) {
         return AstExprKind::Number(number);
     }
@@ -2835,18 +2829,6 @@ fn ast_expr_kind(
 fn ast_match_pattern(tokens: &[String], item: &ParserItem, source: &str) -> AstMatchPattern {
     if tokens == ["__"] {
         return AstMatchPattern::Wildcard;
-    }
-    if tokens == ["True"] {
-        return AstMatchPattern::Tag {
-            name: "True".to_owned(),
-            fields: Vec::new(),
-        };
-    }
-    if tokens == ["False"] {
-        return AstMatchPattern::Tag {
-            name: "False".to_owned(),
-            fields: Vec::new(),
-        };
     }
     if tokens == ["NaN"] {
         return AstMatchPattern::Invalid {
@@ -5467,6 +5449,8 @@ selected:
         let cases = [
             ("[field: value]", "object patterns are unsupported"),
             ("LIST { value }", "LIST patterns are unsupported"),
+            ("MAP { key => value }", "MAP patterns are unsupported"),
+            ("SET { value }", "SET patterns are unsupported"),
             ("NUMBER", "runtime type patterns are unsupported"),
             ("SKIP", "private flow-control states cannot be matched"),
             ("NaN", "is not a Number or a valid match pattern"),
@@ -6534,6 +6518,48 @@ result:
                 .iter()
                 .any(|expression| matches!(expression.kind, AstExprKind::Arrow { .. }))
         );
+    }
+
+    #[test]
+    fn map_and_when_arrows_survive_canonical_formatting_idempotently() {
+        fn semantic_ast(value: &[AstExpr]) -> serde_json::Value {
+            fn remove_source_locations(value: &mut serde_json::Value) {
+                match value {
+                    serde_json::Value::Array(values) => {
+                        for value in values {
+                            remove_source_locations(value);
+                        }
+                    }
+                    serde_json::Value::Object(fields) => {
+                        fields.remove("line");
+                        fields.remove("start");
+                        fields.remove("end");
+                        for value in fields.values_mut() {
+                            remove_source_locations(value);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            let mut value = serde_json::to_value(value).unwrap();
+            remove_source_locations(&mut value);
+            value
+        }
+
+        let source = "settings: MAP {   \n    TEXT { theme } => [enabled: True]\n    selected.id => selected.value\n}\n\n\nresult:\n    status |> WHEN {\n        Ready => settings\n        __ => MAP {}\n    }   \n";
+        let parsed = parse_source("map-when-format.bn", source).unwrap();
+        let formatted = format_source("map-when-format.bn", source).unwrap();
+        let reparsed = parse_source("map-when-format.bn", &formatted).unwrap();
+        let reformatted = format_source("map-when-format.bn", &formatted).unwrap();
+
+        assert_eq!(formatted, reformatted);
+        assert_eq!(
+            semantic_ast(&parsed.expressions),
+            semantic_ast(&reparsed.expressions)
+        );
+        assert_eq!(formatted.matches("=>").count(), 4);
+        assert_eq!(formatted.matches("\n\n").count(), 1);
     }
 
     #[test]

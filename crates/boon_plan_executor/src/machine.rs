@@ -30,9 +30,11 @@ use boon_plan::{
     PlanMaterializedRowFieldCopy, PlanOp, PlanOpId, PlanOpKind, PlanOrderDirection,
     PlanOrderOperationKind, PlanOwner, PlanRowBuiltin, PlanRowCallArg, PlanRowExpressionArena,
     PlanRowExpressionId, PlanRowExpressionNode, PlanRowObjectField, PlanRowSelectPattern,
-    PlanStaticOwnerId, PlanValueListAuthority, ProducerFunctionInstancePlan, RemoteCallSiteId,
-    RemoteCallSitePlan, RootOutputDemand, ScalarInitializerPlan, ScalarStorageSlot, ScopeId,
-    SourceId, SourcePayloadField, SourceRoute, SourceRouteToken, StateId, ValueRef, verify_plan,
+    PlanStaticOwnerId, PlanTransientCollection, PlanTransientCollectionKind,
+    PlanTransientCollectionResult, PlanTransientCollectionStep, PlanValueListAuthority,
+    ProducerFunctionInstancePlan, RemoteCallSiteId, RemoteCallSitePlan, RootOutputDemand,
+    ScalarInitializerPlan, ScalarStorageSlot, ScopeId, SourceId, SourcePayloadField, SourceRoute,
+    SourceRouteToken, StateId, ValueRef, verify_plan,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1374,6 +1376,22 @@ pub struct TurnMetrics {
     pub whole_list_snapshot_comparison_count: u64,
     /// Old plus new top-level item population presented to those checks.
     pub whole_list_snapshot_comparison_input_item_count: u64,
+    /// Verified non-escaping collection regions executed in this interval.
+    pub transient_collection_region_count: u64,
+    /// Private mutable collection carriers allocated for those regions.
+    pub transient_collection_storage_allocation_count: u64,
+    /// Initializers, mutations, and terminal observations executed inside
+    /// verified transient collection regions.
+    pub transient_collection_operation_count: u64,
+    /// Mutation steps executed after transient collection initialization.
+    pub transient_collection_mutation_count: u64,
+    /// Inserts that increased private transient collection storage.
+    pub transient_collection_storage_growth_count: u64,
+    /// Largest private transient collection population observed.
+    pub transient_collection_storage_high_water: u64,
+    /// Whole-collection snapshots copied by transient lowering. This must
+    /// remain zero for the current verified region contract.
+    pub transient_collection_snapshot_copy_count: u64,
     /// Maximum number of pending expression continuation tasks.
     pub evaluator_task_queue_high_water: u64,
     pub evaluator_task_queue_push_count: u64,
@@ -7580,6 +7598,204 @@ struct MapUpsertEvaluationState<'event> {
     context: ExpressionContext<'event>,
 }
 
+enum TransientCollectionStorage {
+    Map(BTreeMap<Value, Value>),
+    Set(BTreeSet<Value>),
+}
+
+struct TransientCollectionEvaluationState<'event, 'plan> {
+    region: &'plan PlanTransientCollection,
+    next_initial: usize,
+    next_step: usize,
+    result_scheduled: bool,
+    operation_count: u64,
+    storage_high_water: usize,
+    snapshot_copy_count: u64,
+    storage: TransientCollectionStorage,
+    context: ExpressionContext<'event>,
+}
+
+#[derive(Clone, Copy)]
+enum TransientCollectionOperation {
+    MapUpsert {
+        key: PlanRowExpressionId,
+        value: PlanRowExpressionId,
+        initial: bool,
+    },
+    MapRemove {
+        key: PlanRowExpressionId,
+    },
+    SetAdd {
+        item: PlanRowExpressionId,
+        initial: bool,
+    },
+    SetRemove {
+        item: PlanRowExpressionId,
+    },
+    MapGet {
+        key: PlanRowExpressionId,
+    },
+    SetContains {
+        item: PlanRowExpressionId,
+    },
+}
+
+impl TransientCollectionOperation {
+    fn first_operand(self) -> PlanRowExpressionId {
+        match self {
+            Self::MapUpsert { key, .. } | Self::MapRemove { key } | Self::MapGet { key } => key,
+            Self::SetAdd { item, .. } | Self::SetRemove { item } | Self::SetContains { item } => {
+                item
+            }
+        }
+    }
+}
+
+impl TransientCollectionEvaluationState<'_, '_> {
+    fn next_operation(&mut self) -> Option<TransientCollectionOperation> {
+        match self.region.kind {
+            PlanTransientCollectionKind::Map => {
+                if let Some(entry) = self.region.map_entries.get(self.next_initial) {
+                    self.next_initial += 1;
+                    return Some(TransientCollectionOperation::MapUpsert {
+                        key: entry.key,
+                        value: entry.value,
+                        initial: true,
+                    });
+                }
+            }
+            PlanTransientCollectionKind::Set => {
+                if let Some(item) = self.region.set_items.get(self.next_initial).copied() {
+                    self.next_initial += 1;
+                    return Some(TransientCollectionOperation::SetAdd {
+                        item,
+                        initial: true,
+                    });
+                }
+            }
+        }
+        if let Some(step) = self.region.steps.get(self.next_step) {
+            self.next_step += 1;
+            return Some(match step {
+                PlanTransientCollectionStep::MapUpsert { key, value } => {
+                    TransientCollectionOperation::MapUpsert {
+                        key: *key,
+                        value: *value,
+                        initial: false,
+                    }
+                }
+                PlanTransientCollectionStep::MapRemove { key } => {
+                    TransientCollectionOperation::MapRemove { key: *key }
+                }
+                PlanTransientCollectionStep::SetAdd { item } => {
+                    TransientCollectionOperation::SetAdd {
+                        item: *item,
+                        initial: false,
+                    }
+                }
+                PlanTransientCollectionStep::SetRemove { item } => {
+                    TransientCollectionOperation::SetRemove { item: *item }
+                }
+            });
+        }
+        if self.result_scheduled {
+            return None;
+        }
+        self.result_scheduled = true;
+        Some(match self.region.result {
+            PlanTransientCollectionResult::MapGet { key } => {
+                TransientCollectionOperation::MapGet { key }
+            }
+            PlanTransientCollectionResult::SetContains { item } => {
+                TransientCollectionOperation::SetContains { item }
+            }
+        })
+    }
+}
+
+fn validate_transient_collection_key(value: &Value, diagnostic: &str) -> Result<(), Error> {
+    if runtime_value_to_data(value)?.is_key_safe() {
+        Ok(())
+    } else {
+        Err(Error::Evaluation(format!("{diagnostic} is not key-safe")))
+    }
+}
+
+fn record_transient_collection_operation(
+    state: &mut TransientCollectionEvaluationState<'_, '_>,
+    work: &mut Work,
+    mutation: bool,
+) -> Result<(), Error> {
+    work.consume(1)?;
+    state.operation_count = state.operation_count.saturating_add(1);
+    if state.operation_count > state.region.operation_work_budget {
+        return Err(Error::InvalidPlan(
+            "transient collection exceeded its exact operation work budget".to_owned(),
+        ));
+    }
+    work.metrics.transient_collection_operation_count = work
+        .metrics
+        .transient_collection_operation_count
+        .saturating_add(1);
+    if mutation {
+        work.metrics.transient_collection_mutation_count = work
+            .metrics
+            .transient_collection_mutation_count
+            .saturating_add(1);
+    }
+    Ok(())
+}
+
+fn record_transient_collection_storage(
+    state: &mut TransientCollectionEvaluationState<'_, '_>,
+    work: &mut Work,
+    grew: bool,
+) -> Result<(), Error> {
+    let len = match &state.storage {
+        TransientCollectionStorage::Map(values) => values.len(),
+        TransientCollectionStorage::Set(values) => values.len(),
+    };
+    if len > state.region.storage_growth_budget {
+        return Err(Error::InvalidPlan(
+            "transient collection exceeded its exact storage growth budget".to_owned(),
+        ));
+    }
+    state.storage_high_water = state.storage_high_water.max(len);
+    if grew {
+        work.metrics.transient_collection_storage_growth_count = work
+            .metrics
+            .transient_collection_storage_growth_count
+            .saturating_add(1);
+    }
+    work.metrics.transient_collection_storage_high_water = work
+        .metrics
+        .transient_collection_storage_high_water
+        .max(u64::try_from(state.storage_high_water).unwrap_or(u64::MAX));
+    Ok(())
+}
+
+fn finish_transient_collection(
+    state: &TransientCollectionEvaluationState<'_, '_>,
+) -> Result<(), Error> {
+    if state.operation_count != state.region.operation_work_budget {
+        return Err(Error::InvalidPlan(format!(
+            "transient collection executed {} operations but its exact budget is {}",
+            state.operation_count, state.region.operation_work_budget
+        )));
+    }
+    if state.storage_high_water > state.region.storage_growth_budget {
+        return Err(Error::InvalidPlan(
+            "transient collection storage high-water exceeds its exact budget".to_owned(),
+        ));
+    }
+    if state.snapshot_copy_count != state.region.snapshot_copy_budget {
+        return Err(Error::InvalidPlan(
+            "transient collection snapshot-copy count differs from its exact budget".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 enum ExpressionTask<'event, 'plan> {
     Evaluate {
         expression: PlanRowExpressionId,
@@ -7613,6 +7829,18 @@ enum ExpressionTask<'event, 'plan> {
         address: CollectionAuthorityAddress,
         key: Value,
         generation: u64,
+    },
+    TransientCollectionNext {
+        state: Box<TransientCollectionEvaluationState<'event, 'plan>>,
+    },
+    TransientCollectionAfterFirst {
+        state: Box<TransientCollectionEvaluationState<'event, 'plan>>,
+        operation: TransientCollectionOperation,
+    },
+    TransientCollectionAfterSecond {
+        state: Box<TransientCollectionEvaluationState<'event, 'plan>>,
+        operation: TransientCollectionOperation,
+        key: Value,
     },
     ObjectMaterializeNext {
         state: Box<ObjectMaterializationState<'event, 'plan>>,
@@ -8527,6 +8755,7 @@ fn schedule_apply_operands<'event, 'plan>(
         | PlanRowExpressionNode::EventRow { .. }
         | PlanRowExpressionNode::ListRowField { .. }
         | PlanRowExpressionNode::BuiltinCall { .. }
+        | PlanRowExpressionNode::TransientCollection { .. }
         | PlanRowExpressionNode::Select { .. } => {
             return Err(Error::InvalidPlan(
                 "non-apply row expression reached the apply operand scheduler".to_owned(),
@@ -23612,6 +23841,40 @@ impl MachineInstance {
                                         }),
                                     })?;
                                 }
+                                PlanRowExpressionNode::TransientCollection { region } => {
+                                    region
+                                        .validate_shape()
+                                        .map_err(|error| Error::InvalidPlan(error.to_string()))?;
+                                    let storage = match region.kind {
+                                        PlanTransientCollectionKind::Map => {
+                                            TransientCollectionStorage::Map(BTreeMap::new())
+                                        }
+                                        PlanTransientCollectionKind::Set => {
+                                            TransientCollectionStorage::Set(BTreeSet::new())
+                                        }
+                                    };
+                                    work.metrics.transient_collection_region_count = work
+                                        .metrics
+                                        .transient_collection_region_count
+                                        .saturating_add(1);
+                                    work.metrics.transient_collection_storage_allocation_count =
+                                        work.metrics
+                                            .transient_collection_storage_allocation_count
+                                            .saturating_add(1);
+                                    stack.push_task(ExpressionTask::TransientCollectionNext {
+                                        state: Box::new(TransientCollectionEvaluationState {
+                                            region,
+                                            next_initial: 0,
+                                            next_step: 0,
+                                            result_scheduled: false,
+                                            operation_count: 0,
+                                            storage_high_water: 0,
+                                            snapshot_copy_count: 0,
+                                            storage,
+                                            context,
+                                        }),
+                                    })?;
+                                }
                                 PlanRowExpressionNode::Select { input, .. } => {
                                     stack.push_task(ExpressionTask::SelectAfterInput {
                                         expression,
@@ -23897,6 +24160,191 @@ impl MachineInstance {
                             stack.push_value(EvalValue::Value(
                                 self.collection_authority_handle(&address)?,
                             ))?;
+                        }
+                        ExpressionTask::TransientCollectionNext { mut state } => {
+                            let operation = state.next_operation().ok_or_else(|| {
+                                Error::InvalidPlan(
+                                    "transient collection exhausted without producing its terminal observation"
+                                        .to_owned(),
+                                )
+                            })?;
+                            let expression = operation.first_operand();
+                            let context = state.context;
+                            stack.push_task(ExpressionTask::TransientCollectionAfterFirst {
+                                state,
+                                operation,
+                            })?;
+                            stack.push_task(ExpressionTask::Evaluate {
+                                expression,
+                                context,
+                            })?;
+                        }
+                        ExpressionTask::TransientCollectionAfterFirst {
+                            mut state,
+                            operation,
+                        } => {
+                            let first = match stack.pop_value()? {
+                                EvalValue::Absent => {
+                                    stack.push_value(EvalValue::Absent)?;
+                                    return Ok(());
+                                }
+                                value => self.materialize_eval(value)?,
+                            };
+                            match operation {
+                                TransientCollectionOperation::MapUpsert {
+                                    value, initial, ..
+                                } => {
+                                    validate_transient_collection_key(
+                                        &first,
+                                        if initial {
+                                            "MAP literal key"
+                                        } else {
+                                            "Map/upsert key"
+                                        },
+                                    )?;
+                                    let context = state.context;
+                                    stack.push_task(
+                                        ExpressionTask::TransientCollectionAfterSecond {
+                                            state,
+                                            operation,
+                                            key: first,
+                                        },
+                                    )?;
+                                    stack.push_task(ExpressionTask::Evaluate {
+                                        expression: value,
+                                        context,
+                                    })?;
+                                }
+                                TransientCollectionOperation::MapRemove { .. } => {
+                                    validate_transient_collection_key(&first, "Map/remove key")?;
+                                    record_transient_collection_operation(&mut state, work, true)?;
+                                    let TransientCollectionStorage::Map(values) =
+                                        &mut state.storage
+                                    else {
+                                        return Err(Error::InvalidPlan(
+                                            "transient Map/remove reached SET storage".to_owned(),
+                                        ));
+                                    };
+                                    values.remove(&first);
+                                    record_transient_collection_storage(&mut state, work, false)?;
+                                    stack.push_task(ExpressionTask::TransientCollectionNext {
+                                        state,
+                                    })?;
+                                }
+                                TransientCollectionOperation::SetAdd { initial, .. } => {
+                                    validate_transient_collection_key(
+                                        &first,
+                                        if initial {
+                                            "SET literal item"
+                                        } else {
+                                            "Set/add item"
+                                        },
+                                    )?;
+                                    record_transient_collection_operation(
+                                        &mut state, work, !initial,
+                                    )?;
+                                    let TransientCollectionStorage::Set(values) =
+                                        &mut state.storage
+                                    else {
+                                        return Err(Error::InvalidPlan(
+                                            "transient Set/add reached MAP storage".to_owned(),
+                                        ));
+                                    };
+                                    let grew = values.insert(first);
+                                    record_transient_collection_storage(&mut state, work, grew)?;
+                                    stack.push_task(ExpressionTask::TransientCollectionNext {
+                                        state,
+                                    })?;
+                                }
+                                TransientCollectionOperation::SetRemove { .. } => {
+                                    validate_transient_collection_key(&first, "Set/remove item")?;
+                                    record_transient_collection_operation(&mut state, work, true)?;
+                                    let TransientCollectionStorage::Set(values) =
+                                        &mut state.storage
+                                    else {
+                                        return Err(Error::InvalidPlan(
+                                            "transient Set/remove reached MAP storage".to_owned(),
+                                        ));
+                                    };
+                                    values.remove(&first);
+                                    record_transient_collection_storage(&mut state, work, false)?;
+                                    stack.push_task(ExpressionTask::TransientCollectionNext {
+                                        state,
+                                    })?;
+                                }
+                                TransientCollectionOperation::MapGet { .. } => {
+                                    validate_transient_collection_key(&first, "Map/get key")?;
+                                    record_transient_collection_operation(&mut state, work, false)?;
+                                    let value = match &state.storage {
+                                        TransientCollectionStorage::Map(values) => values
+                                            .get(&first)
+                                            .cloned()
+                                            .map(found_value)
+                                            .unwrap_or_else(|| Value::tag("NotFound")),
+                                        TransientCollectionStorage::Set(_) => {
+                                            return Err(Error::InvalidPlan(
+                                                "transient Map/get reached SET storage".to_owned(),
+                                            ));
+                                        }
+                                    };
+                                    finish_transient_collection(&state)?;
+                                    work.metrics.transient_collection_snapshot_copy_count = work
+                                        .metrics
+                                        .transient_collection_snapshot_copy_count
+                                        .saturating_add(state.snapshot_copy_count);
+                                    stack.push_value(EvalValue::Value(value))?;
+                                }
+                                TransientCollectionOperation::SetContains { .. } => {
+                                    validate_transient_collection_key(&first, "Set/contains item")?;
+                                    record_transient_collection_operation(&mut state, work, false)?;
+                                    let value = match &state.storage {
+                                        TransientCollectionStorage::Set(values) => {
+                                            Value::truth(values.contains(&first))
+                                        }
+                                        TransientCollectionStorage::Map(_) => {
+                                            return Err(Error::InvalidPlan(
+                                                "transient Set/contains reached MAP storage"
+                                                    .to_owned(),
+                                            ));
+                                        }
+                                    };
+                                    finish_transient_collection(&state)?;
+                                    work.metrics.transient_collection_snapshot_copy_count = work
+                                        .metrics
+                                        .transient_collection_snapshot_copy_count
+                                        .saturating_add(state.snapshot_copy_count);
+                                    stack.push_value(EvalValue::Value(value))?;
+                                }
+                            }
+                        }
+                        ExpressionTask::TransientCollectionAfterSecond {
+                            mut state,
+                            operation,
+                            key,
+                        } => {
+                            let value = match stack.pop_value()? {
+                                EvalValue::Absent => {
+                                    stack.push_value(EvalValue::Absent)?;
+                                    return Ok(());
+                                }
+                                value => self.materialize_eval(value)?,
+                            };
+                            let TransientCollectionOperation::MapUpsert { initial, .. } = operation
+                            else {
+                                return Err(Error::InvalidPlan(
+                                    "transient collection requested a second operand for a unary operation"
+                                        .to_owned(),
+                                ));
+                            };
+                            record_transient_collection_operation(&mut state, work, !initial)?;
+                            let TransientCollectionStorage::Map(values) = &mut state.storage else {
+                                return Err(Error::InvalidPlan(
+                                    "transient Map/upsert reached SET storage".to_owned(),
+                                ));
+                            };
+                            let grew = values.insert(key, value).is_none();
+                            record_transient_collection_storage(&mut state, work, grew)?;
+                            stack.push_task(ExpressionTask::TransientCollectionNext { state })?;
                         }
                         ExpressionTask::ObjectMaterializeNext { mut state } => {
                             let Some(field) = state.fields.get(state.next_field) else {
@@ -29454,6 +29902,7 @@ impl MachineInstance {
             | PlanRowExpressionNode::BuiltinCall { .. }
             | PlanRowExpressionNode::Object { .. }
             | PlanRowExpressionNode::TaggedObject { .. }
+            | PlanRowExpressionNode::TransientCollection { .. }
             | PlanRowExpressionNode::Select { .. } => {
                 return Err(Error::InvalidPlan(format!(
                     "row expression {} reached an invalid apply continuation",

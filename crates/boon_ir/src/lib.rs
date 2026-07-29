@@ -109,6 +109,8 @@ pub struct ErasedProgramFields {
     pub semantic_memory: Vec<SemanticMemory>,
     #[serde(default)]
     pub migration_edges: Vec<MigrationEdge>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub transient_collections: Vec<TransientCollection>,
     pub output_values: Vec<OutputRootValue>,
     pub derived_values: Vec<DerivedValue>,
     pub dependencies: Vec<DependencyEdge>,
@@ -201,6 +203,10 @@ impl ErasedProgram {
         &self.fields.migration_edges
     }
 
+    pub fn transient_collections(&self) -> &[TransientCollection] {
+        &self.fields.transient_collections
+    }
+
     pub fn output_values(&self) -> &[OutputRootValue] {
         &self.fields.output_values
     }
@@ -264,6 +270,90 @@ impl ErasedProgram {
     pub const fn verification_manifest_digest(&self) -> boon_verify::VerificationManifestDigestV1 {
         self.verification_manifest_digest
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransientCollectionKind {
+    Map,
+    Set,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TransientMapEntry {
+    pub key: ExecutableExprId,
+    pub value: ExecutableExprId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TransientCollectionStep {
+    MapUpsert {
+        expression: ExecutableExprId,
+        key: ExecutableExprId,
+        value: ExecutableExprId,
+    },
+    MapRemove {
+        expression: ExecutableExprId,
+        key: ExecutableExprId,
+    },
+    SetAdd {
+        expression: ExecutableExprId,
+        item: ExecutableExprId,
+    },
+    SetRemove {
+        expression: ExecutableExprId,
+        item: ExecutableExprId,
+    },
+}
+
+impl TransientCollectionStep {
+    pub const fn expression(&self) -> ExecutableExprId {
+        match self {
+            Self::MapUpsert { expression, .. }
+            | Self::MapRemove { expression, .. }
+            | Self::SetAdd { expression, .. }
+            | Self::SetRemove { expression, .. } => *expression,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TransientCollectionResult {
+    MapGet {
+        expression: ExecutableExprId,
+        key: ExecutableExprId,
+    },
+    SetContains {
+        expression: ExecutableExprId,
+        item: ExecutableExprId,
+    },
+}
+
+impl TransientCollectionResult {
+    pub const fn expression(&self) -> ExecutableExprId {
+        match self {
+            Self::MapGet { expression, .. } | Self::SetContains { expression, .. } => *expression,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TransientCollection {
+    pub kind: TransientCollectionKind,
+    pub constructor: ExecutableExprId,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub map_entries: Vec<TransientMapEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub set_items: Vec<ExecutableExprId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub steps: Vec<TransientCollectionStep>,
+    pub result: TransientCollectionResult,
+    pub authority_flow: Vec<ExecutableExprId>,
+    pub operation_work_budget: u64,
+    pub storage_growth_budget: usize,
+    pub snapshot_copy_budget: u64,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -804,6 +894,12 @@ pub struct ListRowInitialField {
 pub struct DerivedValue {
     pub id: FieldId,
     pub executable_statement_id: ExecutableStatementId,
+    /// Exact executable producer selected by semantic storage elaboration.
+    ///
+    /// A field statement can also retain a speculative, context-free checked
+    /// value for diagnostics. Nested structural values must execute this
+    /// producer instead of re-reading the statement's fallback value.
+    pub producer: ExecutableExprId,
     pub path: String,
     pub kind: DerivedValueKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]

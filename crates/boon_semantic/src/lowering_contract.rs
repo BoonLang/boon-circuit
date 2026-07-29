@@ -9,9 +9,10 @@
 use crate::{
     ResolvedOutGraph, SemanticBindingId, SemanticBindingTargetV1, SemanticCallableId,
     SemanticExecutionGraphV1, SemanticExprId, SemanticExpressionKind, SemanticFieldId,
-    SemanticListId, SemanticParameterId, SemanticReactiveGraphV1, SemanticResourceGraphV1,
-    SemanticRootKindV1, SemanticSourceId, SemanticSourceOrigin, SemanticStateId,
-    SemanticStatementId, SemanticStatementOrigin, SemanticValueId, checked_semantic_root_specs_v1,
+    SemanticListId, SemanticLocalBindingId, SemanticParameterId, SemanticReactiveGraphV1,
+    SemanticResourceGraphV1, SemanticRootKindV1, SemanticSourceId, SemanticSourceOrigin,
+    SemanticStateId, SemanticStatementId, SemanticStatementOrigin, SemanticValueId,
+    checked_semantic_root_specs_v1,
 };
 use boon_contract::SourceBundleDigestV1;
 use boon_typecheck::{
@@ -20,7 +21,7 @@ use boon_typecheck::{
     TypeDiagnostic, Variant,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 pub const SEMANTIC_LOWERING_CONTRACT_SCHEMA_V1: &str = "boon.semantic-lowering-contract.v1";
@@ -113,7 +114,102 @@ pub struct SemanticLoweringContractV1 {
     pub output_contracts: Vec<SemanticOutputContractV1>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub host_ports: Vec<SemanticHostPortBindingV1>,
+    /// Collection computations that are proven not to escape, persist, or
+    /// expose incremental authority identity. Backends may lower only these
+    /// exact regions to private mutable storage.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub transient_collections: Vec<SemanticTransientCollectionV1>,
     pub digest: SemanticLoweringContractDigestV1,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SemanticTransientCollectionKindV1 {
+    Map,
+    Set,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SemanticTransientMapEntryV1 {
+    pub key: SemanticExprId,
+    pub value: SemanticExprId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SemanticTransientCollectionStepV1 {
+    MapUpsert {
+        expression: SemanticExprId,
+        key: SemanticExprId,
+        value: SemanticExprId,
+    },
+    MapRemove {
+        expression: SemanticExprId,
+        key: SemanticExprId,
+    },
+    SetAdd {
+        expression: SemanticExprId,
+        item: SemanticExprId,
+    },
+    SetRemove {
+        expression: SemanticExprId,
+        item: SemanticExprId,
+    },
+}
+
+impl SemanticTransientCollectionStepV1 {
+    pub const fn expression(&self) -> SemanticExprId {
+        match self {
+            Self::MapUpsert { expression, .. }
+            | Self::MapRemove { expression, .. }
+            | Self::SetAdd { expression, .. }
+            | Self::SetRemove { expression, .. } => *expression,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SemanticTransientCollectionResultV1 {
+    MapGet {
+        expression: SemanticExprId,
+        key: SemanticExprId,
+    },
+    SetContains {
+        expression: SemanticExprId,
+        item: SemanticExprId,
+    },
+}
+
+impl SemanticTransientCollectionResultV1 {
+    pub const fn expression(&self) -> SemanticExprId {
+        match self {
+            Self::MapGet { expression, .. } | Self::SetContains { expression, .. } => *expression,
+        }
+    }
+}
+
+/// A deterministic proof product for one linear, non-escaping collection
+/// computation. `authority_flow` includes the constructor, every local alias
+/// read and mutation, and the terminal scalar observation in evaluation order.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SemanticTransientCollectionV1 {
+    pub kind: SemanticTransientCollectionKindV1,
+    pub constructor: SemanticExprId,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub map_entries: Vec<SemanticTransientMapEntryV1>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub set_items: Vec<SemanticExprId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub steps: Vec<SemanticTransientCollectionStepV1>,
+    pub result: SemanticTransientCollectionResultV1,
+    pub authority_flow: Vec<SemanticExprId>,
+    /// Exact upper bound charged by the private collection kernel.
+    pub operation_work_budget: u64,
+    /// Maximum number of elements the private storage may hold.
+    pub storage_growth_budget: usize,
+    /// Transient lowering never snapshots or clones the whole collection.
+    pub snapshot_copy_budget: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -391,11 +487,13 @@ pub(crate) fn build_semantic_lowering_contract(
     let output_contracts =
         build_output_contracts(checked, execution, reactive, &metadata.render_slots)?;
     let host_ports = build_host_ports(checked, resources, &output_contracts)?;
+    let transient_collections = build_transient_collections(execution)?;
     let mut contract = SemanticLoweringContractV1 {
         schema: SEMANTIC_LOWERING_CONTRACT_SCHEMA_V1.to_owned(),
         metadata,
         output_contracts,
         host_ports,
+        transient_collections,
         digest: SemanticLoweringContractDigestV1([0; 32]),
     };
     contract.digest = lowering_contract_digest(&contract)?;
@@ -1784,6 +1882,544 @@ fn resolved_visual_type(ty: &Type) -> bool {
     }
 }
 
+const MAX_TRANSIENT_COLLECTION_OPERATIONS: usize = 4_096;
+
+#[derive(Clone, Debug)]
+struct TransientAuthorityTrace {
+    constructor: SemanticExprId,
+    flow: Vec<SemanticExprId>,
+    steps: Vec<SemanticTransientCollectionStepV1>,
+}
+
+fn reachable_lowering_expressions(
+    execution: &SemanticExecutionGraphV1,
+) -> Result<BTreeSet<SemanticExprId>, SemanticLoweringContractError> {
+    let child_statements = execution
+        .statements
+        .iter()
+        .flat_map(|statement| statement.children.iter().copied())
+        .collect::<BTreeSet<_>>();
+    let mut pending = execution
+        .statements
+        .iter()
+        .filter(|statement| !child_statements.contains(&statement.id))
+        .filter_map(|statement| statement.value)
+        .chain(execution.roots.iter().map(|root| root.expression))
+        .chain(execution.functions.iter().map(|function| function.root))
+        .chain(execution.sources.iter().map(|source| source.expression))
+        .chain(execution.states.iter().map(|state| state.expression))
+        .collect::<Vec<_>>();
+    let mut reachable = BTreeSet::new();
+    loop {
+        while let Some(expression_id) = pending.pop() {
+            if !reachable.insert(expression_id) {
+                continue;
+            }
+            let expression = execution
+                .expressions
+                .get(expression_id.as_usize())
+                .filter(|candidate| candidate.id == expression_id)
+                .ok_or_else(|| {
+                    SemanticLoweringContractError::new(format!(
+                        "transient reachability references missing expression {expression_id}"
+                    ))
+                })?;
+            pending.extend(semantic_expression_children(&expression.kind));
+        }
+        let reverse_markers = execution
+            .expressions
+            .iter()
+            .filter_map(|expression| match expression.kind {
+                SemanticExpressionKind::Draining { input }
+                    if reachable.contains(&input) && !reachable.contains(&expression.id) =>
+                {
+                    Some(expression.id)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if reverse_markers.is_empty() {
+            break;
+        }
+        pending.extend(reverse_markers);
+    }
+    Ok(reachable)
+}
+
+fn build_transient_collections(
+    execution: &SemanticExecutionGraphV1,
+) -> Result<Vec<SemanticTransientCollectionV1>, SemanticLoweringContractError> {
+    let reachable = reachable_lowering_expressions(execution)?;
+    let mut local_values = BTreeMap::<SemanticLocalBindingId, SemanticExprId>::new();
+    for expression in execution
+        .expressions
+        .iter()
+        .filter(|expression| reachable.contains(&expression.id))
+    {
+        if let SemanticExpressionKind::Block { bindings, .. } = &expression.kind {
+            for binding in bindings {
+                if local_values.insert(binding.id, binding.value).is_some() {
+                    return Err(SemanticLoweringContractError::new(format!(
+                        "semantic transient analysis found duplicate local binding {}",
+                        binding.id
+                    )));
+                }
+            }
+        }
+    }
+
+    // Value-consumer edges deliberately omit a BLOCK's declaration edge for
+    // binding values. A binding owns a value lexically; its LocalRead nodes
+    // are the actual consumers and are added as explicit alias edges below.
+    let mut consumers = BTreeMap::<SemanticExprId, Vec<SemanticExprId>>::new();
+    for expression in execution
+        .expressions
+        .iter()
+        .filter(|expression| reachable.contains(&expression.id))
+    {
+        match &expression.kind {
+            SemanticExpressionKind::Block { result, .. } => {
+                consumers.entry(*result).or_default().push(expression.id);
+            }
+            kind => {
+                for child in semantic_expression_children(kind) {
+                    consumers.entry(child).or_default().push(expression.id);
+                }
+            }
+        }
+        if let SemanticExpressionKind::LocalRead {
+            binding,
+            projection,
+            ..
+        } = &expression.kind
+            && projection.is_empty()
+        {
+            let Some(value) = local_values.get(binding).copied() else {
+                return Err(SemanticLoweringContractError::new(format!(
+                    "semantic transient analysis cannot resolve local binding {binding}"
+                )));
+            };
+            consumers.entry(value).or_default().push(expression.id);
+        }
+    }
+
+    let mut claimed = BTreeSet::new();
+    let mut regions = Vec::new();
+    for terminal in execution
+        .expressions
+        .iter()
+        .filter(|expression| reachable.contains(&expression.id))
+    {
+        let SemanticExpressionKind::Call {
+            callable_kind,
+            function,
+            effect,
+            arguments,
+            contexts,
+            ..
+        } = &terminal.kind
+        else {
+            continue;
+        };
+        if *callable_kind != crate::SemanticCallableKind::Builtin
+            || *effect != CheckedEffectSummary::default()
+            || !contexts.is_empty()
+        {
+            continue;
+        }
+        let (kind, result_operand_name) = match function.as_str() {
+            "Map/get" => (SemanticTransientCollectionKindV1::Map, "key"),
+            "Set/contains" => (SemanticTransientCollectionKindV1::Set, "item"),
+            _ => continue,
+        };
+        let Some(receiver) = transient_pipe_input(arguments) else {
+            continue;
+        };
+        let Some(result_operand) = transient_named_input(arguments, result_operand_name) else {
+            continue;
+        };
+        if !transient_operand_is_safe(execution, &local_values, result_operand) {
+            continue;
+        }
+
+        let Some(mut trace) = trace_transient_authority(
+            execution,
+            &local_values,
+            receiver,
+            kind,
+            &mut BTreeSet::new(),
+        ) else {
+            continue;
+        };
+        trace.flow.push(terminal.id);
+        if trace.flow.len() < 2
+            || trace.flow.iter().copied().collect::<BTreeSet<_>>().len() != trace.flow.len()
+            || trace
+                .flow
+                .windows(2)
+                .any(|edge| consumers.get(&edge[0]).map(Vec::as_slice).unwrap_or(&[]) != [edge[1]])
+            || trace
+                .flow
+                .iter()
+                .any(|expression| claimed.contains(expression))
+        {
+            continue;
+        }
+
+        let Some(constructor) = execution
+            .expressions
+            .get(trace.constructor.as_usize())
+            .filter(|candidate| candidate.id == trace.constructor)
+        else {
+            return Err(SemanticLoweringContractError::new(format!(
+                "semantic transient constructor {} is missing",
+                trace.constructor
+            )));
+        };
+        if !type_is_closed_host_data(&constructor.flow_type.ty) {
+            continue;
+        }
+
+        let (map_entries, set_items) = match (&kind, &constructor.kind) {
+            (SemanticTransientCollectionKindV1::Map, SemanticExpressionKind::Map { entries }) => {
+                let mut lowered = Vec::with_capacity(entries.len());
+                let mut valid = true;
+                for entry in entries {
+                    let Some(entry) = execution
+                        .expressions
+                        .get(entry.as_usize())
+                        .filter(|candidate| candidate.id == *entry)
+                    else {
+                        return Err(SemanticLoweringContractError::new(
+                            "semantic transient MAP references a missing entry",
+                        ));
+                    };
+                    let SemanticExpressionKind::MapEntry { key, value } = entry.kind else {
+                        return Err(SemanticLoweringContractError::new(
+                            "semantic transient MAP contains a non-entry expression",
+                        ));
+                    };
+                    if !transient_operand_is_safe(execution, &local_values, key)
+                        || !transient_operand_is_safe(execution, &local_values, value)
+                    {
+                        valid = false;
+                        break;
+                    }
+                    lowered.push(SemanticTransientMapEntryV1 { key, value });
+                }
+                if !valid {
+                    continue;
+                }
+                (lowered, Vec::new())
+            }
+            (SemanticTransientCollectionKindV1::Set, SemanticExpressionKind::Set { items }) => {
+                if items
+                    .iter()
+                    .any(|item| !transient_operand_is_safe(execution, &local_values, *item))
+                {
+                    continue;
+                }
+                (Vec::new(), items.clone())
+            }
+            _ => continue,
+        };
+
+        let initial_len = map_entries.len().max(set_items.len());
+        let growth_steps = trace
+            .steps
+            .iter()
+            .filter(|step| {
+                matches!(
+                    step,
+                    SemanticTransientCollectionStepV1::MapUpsert { .. }
+                        | SemanticTransientCollectionStepV1::SetAdd { .. }
+                )
+            })
+            .count();
+        let operation_count = initial_len
+            .saturating_add(trace.steps.len())
+            .saturating_add(1);
+        if operation_count > MAX_TRANSIENT_COLLECTION_OPERATIONS {
+            continue;
+        }
+        let result = match kind {
+            SemanticTransientCollectionKindV1::Map => SemanticTransientCollectionResultV1::MapGet {
+                expression: terminal.id,
+                key: result_operand,
+            },
+            SemanticTransientCollectionKindV1::Set => {
+                SemanticTransientCollectionResultV1::SetContains {
+                    expression: terminal.id,
+                    item: result_operand,
+                }
+            }
+        };
+        claimed.extend(trace.flow.iter().copied());
+        regions.push(SemanticTransientCollectionV1 {
+            kind,
+            constructor: trace.constructor,
+            map_entries,
+            set_items,
+            steps: trace.steps,
+            result,
+            authority_flow: trace.flow,
+            operation_work_budget: u64::try_from(operation_count).unwrap_or(u64::MAX),
+            storage_growth_budget: initial_len.saturating_add(growth_steps),
+            snapshot_copy_budget: 0,
+        });
+    }
+    Ok(regions)
+}
+
+fn trace_transient_authority(
+    execution: &SemanticExecutionGraphV1,
+    local_values: &BTreeMap<SemanticLocalBindingId, SemanticExprId>,
+    expression_id: SemanticExprId,
+    kind: SemanticTransientCollectionKindV1,
+    active: &mut BTreeSet<SemanticExprId>,
+) -> Option<TransientAuthorityTrace> {
+    if !active.insert(expression_id) {
+        return None;
+    }
+    let expression = execution
+        .expressions
+        .get(expression_id.as_usize())
+        .filter(|candidate| candidate.id == expression_id)?;
+    let result = match &expression.kind {
+        SemanticExpressionKind::Map { .. } if kind == SemanticTransientCollectionKindV1::Map => {
+            Some(TransientAuthorityTrace {
+                constructor: expression_id,
+                flow: vec![expression_id],
+                steps: Vec::new(),
+            })
+        }
+        SemanticExpressionKind::Set { .. } if kind == SemanticTransientCollectionKindV1::Set => {
+            Some(TransientAuthorityTrace {
+                constructor: expression_id,
+                flow: vec![expression_id],
+                steps: Vec::new(),
+            })
+        }
+        SemanticExpressionKind::LocalRead {
+            binding,
+            projection,
+            ..
+        } if projection.is_empty() => {
+            let value = local_values.get(binding).copied()?;
+            let mut trace =
+                trace_transient_authority(execution, local_values, value, kind, active)?;
+            trace.flow.push(expression_id);
+            Some(trace)
+        }
+        SemanticExpressionKind::Call {
+            callable_kind,
+            function,
+            effect,
+            arguments,
+            contexts,
+            ..
+        } if *callable_kind == crate::SemanticCallableKind::Builtin
+            && *effect == CheckedEffectSummary::default()
+            && contexts.is_empty() =>
+        {
+            let receiver = transient_pipe_input(arguments)?;
+            let step = transient_collection_step(
+                execution,
+                local_values,
+                expression_id,
+                kind,
+                function,
+                arguments,
+            )?;
+            let mut trace =
+                trace_transient_authority(execution, local_values, receiver, kind, active)?;
+            trace.flow.push(expression_id);
+            trace.steps.push(step);
+            Some(trace)
+        }
+        _ => None,
+    };
+    active.remove(&expression_id);
+    result
+}
+
+fn transient_collection_step(
+    execution: &SemanticExecutionGraphV1,
+    local_values: &BTreeMap<SemanticLocalBindingId, SemanticExprId>,
+    expression: SemanticExprId,
+    kind: SemanticTransientCollectionKindV1,
+    function: &str,
+    arguments: &[crate::SemanticCallArgument],
+) -> Option<SemanticTransientCollectionStepV1> {
+    let step = match (kind, function) {
+        (SemanticTransientCollectionKindV1::Map, "Map/upsert") => {
+            let entry = transient_named_input(arguments, "entry")?;
+            let entry = execution
+                .expressions
+                .get(entry.as_usize())
+                .filter(|candidate| candidate.id == entry)?;
+            let SemanticExpressionKind::Object(fields) = &entry.kind else {
+                return None;
+            };
+            if fields.len() != 2 || fields.iter().any(|field| field.spread) {
+                return None;
+            }
+            let mut key = None;
+            let mut value = None;
+            for field in fields {
+                match field.name.as_str() {
+                    "key" if key.replace(field.value).is_none() => {}
+                    "value" if value.replace(field.value).is_none() => {}
+                    _ => return None,
+                }
+            }
+            let key = key?;
+            let value = value?;
+            if !transient_operand_is_safe(execution, local_values, key)
+                || !transient_operand_is_safe(execution, local_values, value)
+            {
+                return None;
+            }
+            SemanticTransientCollectionStepV1::MapUpsert {
+                expression,
+                key,
+                value,
+            }
+        }
+        (SemanticTransientCollectionKindV1::Map, "Map/remove") => {
+            let key = transient_named_input(arguments, "key")?;
+            if !transient_operand_is_safe(execution, local_values, key) {
+                return None;
+            }
+            SemanticTransientCollectionStepV1::MapRemove { expression, key }
+        }
+        (SemanticTransientCollectionKindV1::Set, "Set/add") => {
+            let item = transient_named_input(arguments, "item")?;
+            if !transient_operand_is_safe(execution, local_values, item) {
+                return None;
+            }
+            SemanticTransientCollectionStepV1::SetAdd { expression, item }
+        }
+        (SemanticTransientCollectionKindV1::Set, "Set/remove") => {
+            let item = transient_named_input(arguments, "item")?;
+            if !transient_operand_is_safe(execution, local_values, item) {
+                return None;
+            }
+            SemanticTransientCollectionStepV1::SetRemove { expression, item }
+        }
+        _ => return None,
+    };
+    Some(step)
+}
+
+fn transient_pipe_input(arguments: &[crate::SemanticCallArgument]) -> Option<SemanticExprId> {
+    let mut inputs = arguments
+        .iter()
+        .filter(|argument| argument.from_pipe)
+        .map(|argument| argument.value);
+    let input = inputs.next()?;
+    inputs.next().is_none().then_some(input)
+}
+
+fn transient_named_input(
+    arguments: &[crate::SemanticCallArgument],
+    name: &str,
+) -> Option<SemanticExprId> {
+    let mut inputs = arguments
+        .iter()
+        .filter(|argument| argument.name == name && !argument.from_pipe)
+        .map(|argument| argument.value);
+    let input = inputs.next()?;
+    inputs.next().is_none().then_some(input)
+}
+
+fn transient_operand_is_safe(
+    execution: &SemanticExecutionGraphV1,
+    local_values: &BTreeMap<SemanticLocalBindingId, SemanticExprId>,
+    root: SemanticExprId,
+) -> bool {
+    let mut pending = vec![root];
+    let mut visited = BTreeSet::new();
+    while let Some(expression_id) = pending.pop() {
+        if !visited.insert(expression_id) {
+            continue;
+        }
+        let Some(expression) = execution
+            .expressions
+            .get(expression_id.as_usize())
+            .filter(|candidate| candidate.id == expression_id)
+        else {
+            return false;
+        };
+        if expression.effect != CheckedEffectSummary::default()
+            || type_contains_collection(&expression.flow_type.ty)
+        {
+            return false;
+        }
+        match &expression.kind {
+            SemanticExpressionKind::CanonicalRead { .. }
+            | SemanticExpressionKind::ExternalRead { .. }
+            | SemanticExpressionKind::ElementState { .. }
+            | SemanticExpressionKind::Drain { .. }
+            | SemanticExpressionKind::Source { .. }
+            | SemanticExpressionKind::Materialize { .. }
+            | SemanticExpressionKind::Draining { .. }
+            | SemanticExpressionKind::Hold { .. }
+            | SemanticExpressionKind::Latest { .. }
+            | SemanticExpressionKind::When { .. }
+            | SemanticExpressionKind::Then { .. }
+            | SemanticExpressionKind::Flush { .. }
+            | SemanticExpressionKind::FlushBoundary { .. }
+            | SemanticExpressionKind::MaterializationLocal { .. }
+            | SemanticExpressionKind::Map { .. }
+            | SemanticExpressionKind::Set { .. }
+            | SemanticExpressionKind::List { .. } => return false,
+            SemanticExpressionKind::Call {
+                callable_kind,
+                contexts,
+                ..
+            } if *callable_kind != crate::SemanticCallableKind::Builtin || !contexts.is_empty() => {
+                return false;
+            }
+            SemanticExpressionKind::LocalRead {
+                binding,
+                projection,
+                ..
+            } if projection.is_empty() => {
+                let Some(value) = local_values.get(binding).copied() else {
+                    return false;
+                };
+                pending.push(value);
+            }
+            _ => {}
+        }
+        pending.extend(semantic_expression_children(&expression.kind));
+    }
+    true
+}
+
+fn type_contains_collection(data_type: &Type) -> bool {
+    match data_type {
+        Type::List(_) | Type::Set(_) | Type::Map { .. } => true,
+        Type::VariantSet(variants) => variants.iter().any(|variant| match variant {
+            Variant::Tag(_) => false,
+            Variant::Tagged { fields, .. } => fields.fields.values().any(type_contains_collection),
+        }),
+        Type::Object(shape) => shape.fields.values().any(type_contains_collection),
+        Type::Union(members) => members.iter().any(type_contains_collection),
+        Type::Text
+        | Type::Number
+        | Type::Bytes(_)
+        | Type::Bits { .. }
+        | Type::Absent
+        | Type::Function { .. }
+        | Type::RenderContract
+        | Type::UnresolvedShape { .. }
+        | Type::Var(_)
+        | Type::Unknown => false,
+    }
+}
+
 fn statement_descends_from(
     execution: &SemanticExecutionGraphV1,
     candidate: SemanticStatementId,
@@ -1942,6 +2578,7 @@ struct LoweringContractDigestPayload<'a> {
     metadata: &'a SemanticLoweringMetadataV1,
     output_contracts: &'a [SemanticOutputContractV1],
     host_ports: &'a [SemanticHostPortBindingV1],
+    transient_collections: &'a [SemanticTransientCollectionV1],
 }
 
 fn lowering_contract_digest(
@@ -1952,6 +2589,7 @@ fn lowering_contract_digest(
         metadata: &contract.metadata,
         output_contracts: &contract.output_contracts,
         host_ports: &contract.host_ports,
+        transient_collections: &contract.transient_collections,
     };
     boon_contract::canonical_serde_hash_v1(SEMANTIC_LOWERING_CONTRACT_DIGEST_DOMAIN, &payload)
         .map(SemanticLoweringContractDigestV1)

@@ -258,6 +258,9 @@ fn visit_row_node_children_mut(
                 visitor(item);
             }
         }
+        PlanRowExpressionNode::TransientCollection { region } => {
+            region.visit_children_mut(visitor);
+        }
         PlanRowExpressionNode::BuiltinCall { input, args, .. } => {
             if let Some(input) = input {
                 visitor(input);
@@ -898,15 +901,15 @@ fn demand_plan(
         if !demanded_outputs.contains(&field) {
             continue;
         }
-        let Some(producer) = program
+        let producer = derived.producer;
+        if program
             .executable
-            .statements
-            .get(derived.executable_statement_id.as_usize())
-            .filter(|statement| statement.id == derived.executable_statement_id)
-            .and_then(|statement| statement.value)
-        else {
+            .expressions
+            .get(producer.as_usize())
+            .is_none_or(|expression| expression.id != producer)
+        {
             continue;
-        };
+        }
         outputs_by_producer
             .entry(producer)
             .or_default()
@@ -6523,7 +6526,7 @@ fn derived_value_output_type(
     program: &ErasedProgram,
     derived: &boon_ir::DerivedValue,
 ) -> Option<PlanValueType> {
-    let root = executable_value_for_statement(program, derived.executable_statement_id.as_usize())?;
+    let root = derived.producer;
     program
         .executable
         .expressions
@@ -9774,7 +9777,12 @@ fn source_event_transform_expression(
         )));
     }
 
-    let root = executable_value_for_statement(program, derived.executable_statement_id.as_usize())
+    let root = program
+        .executable
+        .expressions
+        .get(derived.producer.as_usize())
+        .filter(|expression| expression.id == derived.producer)
+        .map(|_| derived.producer)
         .ok_or_else(|| {
             PlanError::new(format!(
                 "source-event derived value `{}` has no executable statement root",
@@ -10636,6 +10644,17 @@ impl<'a> ExecutableRowLowerer<'a> {
             .owner
             .map(|owner| PlanStaticOwnerId(owner.as_usize()))
             .or(inherited_owner);
+        if let Some(region) = self
+            .program
+            .transient_collections
+            .iter()
+            .find(|region| region.result.expression() == root)
+            .cloned()
+        {
+            let value = self.lower_transient_collection(&region, owner)?;
+            self.memo.insert(key, value);
+            return Ok(value);
+        }
         let value = match expression.kind {
             ir::ExecutableExpressionKind::CanonicalRead { .. }
             | ir::ExecutableExpressionKind::LocalRead { .. }
@@ -11305,6 +11324,95 @@ impl<'a> ExecutableRowLowerer<'a> {
         };
         self.memo.insert(key, value);
         Ok(value)
+    }
+
+    fn lower_transient_collection(
+        &mut self,
+        region: &ir::TransientCollection,
+        owner: Option<PlanStaticOwnerId>,
+    ) -> Result<PlanRowExpressionId, PlanError> {
+        if region.snapshot_copy_budget != 0
+            || region.authority_flow.first() != Some(&region.constructor)
+            || region.authority_flow.last() != Some(&region.result.expression())
+        {
+            return Err(PlanError::new(format!(
+                "verified transient collection {} has invalid proof flow or snapshot budget",
+                region.constructor.0
+            )));
+        }
+        let kind = match region.kind {
+            ir::TransientCollectionKind::Map => PlanTransientCollectionKind::Map,
+            ir::TransientCollectionKind::Set => PlanTransientCollectionKind::Set,
+        };
+        let map_entries = region
+            .map_entries
+            .iter()
+            .map(|entry| {
+                Ok(PlanTransientMapEntry {
+                    key: self.lower_scoped(entry.key, owner)?,
+                    value: self.lower_scoped(entry.value, owner)?,
+                })
+            })
+            .collect::<Result<Vec<_>, PlanError>>()?;
+        let set_items = region
+            .set_items
+            .iter()
+            .copied()
+            .map(|item| self.lower_scoped(item, owner))
+            .collect::<Result<Vec<_>, PlanError>>()?;
+        let steps = region
+            .steps
+            .iter()
+            .map(|step| {
+                Ok(match step {
+                    ir::TransientCollectionStep::MapUpsert { key, value, .. } => {
+                        PlanTransientCollectionStep::MapUpsert {
+                            key: self.lower_scoped(*key, owner)?,
+                            value: self.lower_scoped(*value, owner)?,
+                        }
+                    }
+                    ir::TransientCollectionStep::MapRemove { key, .. } => {
+                        PlanTransientCollectionStep::MapRemove {
+                            key: self.lower_scoped(*key, owner)?,
+                        }
+                    }
+                    ir::TransientCollectionStep::SetAdd { item, .. } => {
+                        PlanTransientCollectionStep::SetAdd {
+                            item: self.lower_scoped(*item, owner)?,
+                        }
+                    }
+                    ir::TransientCollectionStep::SetRemove { item, .. } => {
+                        PlanTransientCollectionStep::SetRemove {
+                            item: self.lower_scoped(*item, owner)?,
+                        }
+                    }
+                })
+            })
+            .collect::<Result<Vec<_>, PlanError>>()?;
+        let result = match region.result {
+            ir::TransientCollectionResult::MapGet { key, .. } => {
+                PlanTransientCollectionResult::MapGet {
+                    key: self.lower_scoped(key, owner)?,
+                }
+            }
+            ir::TransientCollectionResult::SetContains { item, .. } => {
+                PlanTransientCollectionResult::SetContains {
+                    item: self.lower_scoped(item, owner)?,
+                }
+            }
+        };
+        self.intern(PlanRowExpressionNode::TransientCollection {
+            region: Box::new(PlanTransientCollection {
+                kind,
+                map_entries,
+                set_items,
+                steps,
+                result,
+                operation_work_budget: region.operation_work_budget,
+                storage_growth_budget: region.storage_growth_budget,
+                snapshot_copy_budget: region.snapshot_copy_budget,
+            }),
+        })
     }
 
     fn lower_local_read(
@@ -12084,18 +12192,6 @@ fn executable_static_bytes(program: &ErasedProgram, root: ir::ExecutableExprId) 
     }
 }
 
-fn executable_value_for_statement(
-    program: &ErasedProgram,
-    statement_id: usize,
-) -> Option<ir::ExecutableExprId> {
-    program
-        .executable
-        .statements
-        .iter()
-        .find(|statement| statement.id == ir::ExecutableStatementId(statement_id))
-        .and_then(|statement| statement.value)
-}
-
 fn plan_builtin_expression(
     arena: &mut PlanRowExpressionArena,
     function: &str,
@@ -12411,6 +12507,7 @@ fn row_expression_value_type(
         | PlanRowExpressionNode::TextIsEmpty { .. }
         | PlanRowExpressionNode::TextStartsWith { .. }
         | PlanRowExpressionNode::TextToNumber { .. } => Some(PlanValueType::Tag),
+        PlanRowExpressionNode::TransientCollection { .. } => Some(PlanValueType::Tag),
         PlanRowExpressionNode::BuiltinCall {
             function,
             input,
@@ -12624,7 +12721,12 @@ fn row_expression_for_value(
     ) {
         return Ok(None);
     }
-    let root = executable_value_for_statement(program, derived.executable_statement_id.as_usize())
+    let root = program
+        .executable
+        .expressions
+        .get(derived.producer.as_usize())
+        .filter(|expression| expression.id == derived.producer)
+        .map(|_| derived.producer)
         .ok_or_else(|| {
             PlanError::new(format!(
                 "derived value `{}` has no executable root",

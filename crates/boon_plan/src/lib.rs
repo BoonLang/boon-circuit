@@ -1990,7 +1990,8 @@ fn distributed_call_expression_is_safe(
             | PlanRowExpressionNode::ListPage { .. }
             | PlanRowExpressionNode::BoundedListPage { .. }
             | PlanRowExpressionNode::EventRow { .. }
-            | PlanRowExpressionNode::ListSum { .. } => false,
+            | PlanRowExpressionNode::ListSum { .. }
+            | PlanRowExpressionNode::TransientCollection { .. } => false,
         };
         valid.insert(id, node_is_valid);
     }
@@ -7647,6 +7648,172 @@ impl<'de> Deserialize<'de> for PlanRowBuiltin {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanTransientCollectionKind {
+    Map,
+    Set,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PlanTransientMapEntry {
+    pub key: PlanRowExpressionId,
+    pub value: PlanRowExpressionId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PlanTransientCollectionStep {
+    MapUpsert {
+        key: PlanRowExpressionId,
+        value: PlanRowExpressionId,
+    },
+    MapRemove {
+        key: PlanRowExpressionId,
+    },
+    SetAdd {
+        item: PlanRowExpressionId,
+    },
+    SetRemove {
+        item: PlanRowExpressionId,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PlanTransientCollectionResult {
+    MapGet { key: PlanRowExpressionId },
+    SetContains { item: PlanRowExpressionId },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PlanTransientCollection {
+    pub kind: PlanTransientCollectionKind,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub map_entries: Vec<PlanTransientMapEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub set_items: Vec<PlanRowExpressionId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub steps: Vec<PlanTransientCollectionStep>,
+    pub result: PlanTransientCollectionResult,
+    pub operation_work_budget: u64,
+    pub storage_growth_budget: usize,
+    pub snapshot_copy_budget: u64,
+}
+
+impl PlanTransientCollection {
+    pub fn validate_shape(&self) -> Result<(), PlanError> {
+        let initial_len = match self.kind {
+            PlanTransientCollectionKind::Map => {
+                if !self.set_items.is_empty()
+                    || !matches!(self.result, PlanTransientCollectionResult::MapGet { .. })
+                    || self.steps.iter().any(|step| {
+                        !matches!(
+                            step,
+                            PlanTransientCollectionStep::MapUpsert { .. }
+                                | PlanTransientCollectionStep::MapRemove { .. }
+                        )
+                    })
+                {
+                    return Err(PlanError::new(
+                        "transient MAP region contains SET operands or operations",
+                    ));
+                }
+                self.map_entries.len()
+            }
+            PlanTransientCollectionKind::Set => {
+                if !self.map_entries.is_empty()
+                    || !matches!(
+                        self.result,
+                        PlanTransientCollectionResult::SetContains { .. }
+                    )
+                    || self.steps.iter().any(|step| {
+                        !matches!(
+                            step,
+                            PlanTransientCollectionStep::SetAdd { .. }
+                                | PlanTransientCollectionStep::SetRemove { .. }
+                        )
+                    })
+                {
+                    return Err(PlanError::new(
+                        "transient SET region contains MAP operands or operations",
+                    ));
+                }
+                self.set_items.len()
+            }
+        };
+        let growth_steps = self
+            .steps
+            .iter()
+            .filter(|step| {
+                matches!(
+                    step,
+                    PlanTransientCollectionStep::MapUpsert { .. }
+                        | PlanTransientCollectionStep::SetAdd { .. }
+                )
+            })
+            .count();
+        let operation_count = initial_len
+            .saturating_add(self.steps.len())
+            .saturating_add(1);
+        if self.operation_work_budget != u64::try_from(operation_count).unwrap_or(u64::MAX)
+            || self.storage_growth_budget != initial_len.saturating_add(growth_steps)
+            || self.snapshot_copy_budget != 0
+        {
+            return Err(PlanError::new(
+                "transient collection budgets differ from exact region shape",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn visit_children(&self, visitor: &mut impl FnMut(PlanRowExpressionId)) {
+        for entry in &self.map_entries {
+            visitor(entry.key);
+            visitor(entry.value);
+        }
+        self.set_items.iter().copied().for_each(&mut *visitor);
+        for step in &self.steps {
+            match step {
+                PlanTransientCollectionStep::MapUpsert { key, value } => {
+                    visitor(*key);
+                    visitor(*value);
+                }
+                PlanTransientCollectionStep::MapRemove { key } => visitor(*key),
+                PlanTransientCollectionStep::SetAdd { item }
+                | PlanTransientCollectionStep::SetRemove { item } => visitor(*item),
+            }
+        }
+        match self.result {
+            PlanTransientCollectionResult::MapGet { key } => visitor(key),
+            PlanTransientCollectionResult::SetContains { item } => visitor(item),
+        }
+    }
+
+    pub fn visit_children_mut(&mut self, visitor: &mut impl FnMut(&mut PlanRowExpressionId)) {
+        for entry in &mut self.map_entries {
+            visitor(&mut entry.key);
+            visitor(&mut entry.value);
+        }
+        self.set_items.iter_mut().for_each(&mut *visitor);
+        for step in &mut self.steps {
+            match step {
+                PlanTransientCollectionStep::MapUpsert { key, value } => {
+                    visitor(key);
+                    visitor(value);
+                }
+                PlanTransientCollectionStep::MapRemove { key } => visitor(key),
+                PlanTransientCollectionStep::SetAdd { item }
+                | PlanTransientCollectionStep::SetRemove { item } => visitor(item),
+            }
+        }
+        match &mut self.result {
+            PlanTransientCollectionResult::MapGet { key } => visitor(key),
+            PlanTransientCollectionResult::SetContains { item } => visitor(item),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PlanRowExpressionNode {
@@ -7905,6 +8072,12 @@ pub enum PlanRowExpressionNode {
         authority: PlanCollectionAuthorityId,
         items: Vec<PlanRowExpressionId>,
     },
+    /// A verified non-escaping collection computation. Its mutable identity
+    /// exists only while this node is evaluated and is never published into
+    /// authority, persistence, delta, or dependency tables.
+    TransientCollection {
+        region: Box<PlanTransientCollection>,
+    },
 }
 
 impl From<ValueRef> for PlanRowExpressionNode {
@@ -8108,6 +8281,7 @@ impl PlanRowExpressionNode {
                 }
             }
             Self::SetLiteral { items, .. } => items.iter().copied().for_each(visitor),
+            Self::TransientCollection { region } => region.visit_children(visitor),
             Self::BuiltinCall { input, args, .. } => {
                 if let Some(input) = input {
                     visitor(*input);
@@ -8324,6 +8498,7 @@ impl PlanRowExpressionNode {
                 }
             }
             Self::SetLiteral { items, .. } => items.iter_mut().for_each(visitor),
+            Self::TransientCollection { region } => region.visit_children_mut(visitor),
             Self::BuiltinCall { input, args, .. } => {
                 if let Some(input) = input {
                     visitor(input);
@@ -8463,6 +8638,9 @@ impl PlanRowExpressionArena {
 
     pub fn validate(&self) -> Result<(), PlanError> {
         for (parent_index, node) in self.nodes.iter().enumerate() {
+            if let PlanRowExpressionNode::TransientCollection { region } = node {
+                region.validate_shape()?;
+            }
             let mut invalid_child = None;
             node.visit_children(&mut |child| {
                 if invalid_child.is_none() && child.0 >= parent_index {
@@ -8977,6 +9155,9 @@ impl PlanRowExpressionArena {
     }
 
     fn validate_new_node(&self, node: &PlanRowExpressionNode) -> Result<(), PlanError> {
+        if let PlanRowExpressionNode::TransientCollection { region } = node {
+            region.validate_shape()?;
+        }
         let parent = PlanRowExpressionId(self.len());
         for child in node.child_ids() {
             if child == parent {

@@ -537,11 +537,67 @@ struct RawCallInvocationSchedule {
     invocation_arms: Vec<RawTriggerArm>,
 }
 
+fn reachable_reactive_expressions(
+    execution: &SemanticExecutionGraphV1,
+) -> Result<BTreeSet<SemanticExprId>, SemanticReactiveError> {
+    let child_statements = execution
+        .statements
+        .iter()
+        .flat_map(|statement| statement.children.iter().copied())
+        .collect::<BTreeSet<_>>();
+    let mut pending = execution
+        .statements
+        .iter()
+        .filter(|statement| !child_statements.contains(&statement.id))
+        .filter_map(|statement| statement.value)
+        .chain(execution.roots.iter().map(|root| root.expression))
+        .chain(execution.functions.iter().map(|function| function.root))
+        .chain(execution.sources.iter().map(|source| source.expression))
+        .chain(execution.states.iter().map(|state| state.expression))
+        .collect::<Vec<_>>();
+    let mut reachable = BTreeSet::new();
+    loop {
+        while let Some(expression_id) = pending.pop() {
+            if !reachable.insert(expression_id) {
+                continue;
+            }
+            let expression = execution
+                .expressions
+                .get(expression_id.as_usize())
+                .filter(|candidate| candidate.id == expression_id)
+                .ok_or_else(|| {
+                    SemanticReactiveError::new(format!(
+                        "reactive reachability references missing expression {expression_id}"
+                    ))
+                })?;
+            pending.extend(semantic_expression_children(&expression.kind, execution)?);
+        }
+        let reverse_markers = execution
+            .expressions
+            .iter()
+            .filter_map(|expression| match expression.kind {
+                SemanticExpressionKind::Draining { input }
+                    if reachable.contains(&input) && !reachable.contains(&expression.id) =>
+                {
+                    Some(expression.id)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if reverse_markers.is_empty() {
+            break;
+        }
+        pending.extend(reverse_markers);
+    }
+    Ok(reachable)
+}
+
 struct ReactiveBuilder<'a> {
     execution: &'a SemanticExecutionGraphV1,
     resources: &'a SemanticResourceGraphV1,
     out_net: &'a ResolvedOutGraph,
     expressions: ExpressionIndex<'a>,
+    reachable_expressions: BTreeSet<SemanticExprId>,
     local_values: BTreeMap<SemanticLocalBindingId, (DeclId, SemanticExprId)>,
     parameter_inputs: BTreeMap<SemanticExprId, Vec<SemanticExprId>>,
 }
@@ -553,6 +609,7 @@ impl<'a> ReactiveBuilder<'a> {
         out_net: &'a ResolvedOutGraph,
     ) -> Result<Self, SemanticReactiveError> {
         let expressions = ExpressionIndex::new(execution)?;
+        let reachable_expressions = reachable_reactive_expressions(execution)?;
         let mut local_values = BTreeMap::new();
         for expression in &execution.expressions {
             if let SemanticExpressionKind::Block { bindings, .. } = &expression.kind {
@@ -610,6 +667,7 @@ impl<'a> ReactiveBuilder<'a> {
             resources,
             out_net,
             expressions,
+            reachable_expressions,
             local_values,
             parameter_inputs,
         })
@@ -983,7 +1041,7 @@ impl<'a> ReactiveBuilder<'a> {
             let Some(declaration) = statement.declaration else {
                 continue;
             };
-            let Some(producer) = statement.value else {
+            let Some(statement_producer) = statement.value else {
                 continue;
             };
             if source_statements.contains(&statement.id)
@@ -994,6 +1052,65 @@ impl<'a> ReactiveBuilder<'a> {
             {
                 continue;
             }
+            let producer = if let Some(parent_id) = statement_parents.get(&statement.id) {
+                let parent = self
+                    .execution
+                    .statements
+                    .get(parent_id.as_usize())
+                    .filter(|candidate| candidate.id == *parent_id)
+                    .ok_or_else(|| {
+                        SemanticReactiveError::new(format!(
+                            "semantic field statement {} references missing parent {parent_id}",
+                            statement.id
+                        ))
+                    })?;
+                let mut parent_value = parent.value;
+                'producer: loop {
+                    let Some(value) = parent_value else {
+                        break statement_producer;
+                    };
+                    let expression = self.expressions.expression(value)?;
+                    match &expression.kind {
+                        SemanticExpressionKind::FlushBoundary { input } => {
+                            parent_value = Some(*input);
+                        }
+                        SemanticExpressionKind::Object(fields)
+                        | SemanticExpressionKind::TaggedObject { fields, .. } => {
+                            let structural = fields
+                                .iter()
+                                .filter(|field| field.declaration == Some(declaration))
+                                .map(|field| field.value)
+                                .collect::<Vec<_>>();
+                            match structural.as_slice() {
+                                [value] => {
+                                    let mut candidate = *value;
+                                    loop {
+                                        match &self.expressions.expression(candidate)?.kind {
+                                            SemanticExpressionKind::FlushBoundary { input } => {
+                                                candidate = *input;
+                                            }
+                                            SemanticExpressionKind::Block { .. } => {
+                                                break 'producer *value;
+                                            }
+                                            _ => break 'producer statement_producer,
+                                        }
+                                    }
+                                }
+                                [] => break statement_producer,
+                                _ => {
+                                    return Err(SemanticReactiveError::new(format!(
+                                        "semantic parent field {} contains multiple structural values for declaration {}",
+                                        parent.id, declaration.0
+                                    )));
+                                }
+                            }
+                        }
+                        _ => break statement_producer,
+                    }
+                }
+            } else {
+                statement_producer
+            };
             let exact = self.exact_field_metadata(statement.id);
             let Some((name, path, row)) = exact else {
                 continue;
@@ -1097,7 +1214,7 @@ impl<'a> ReactiveBuilder<'a> {
     ) -> Result<Vec<SemanticBindingV1>, SemanticReactiveError> {
         let fields_by_statement = fields
             .iter()
-            .map(|field| (field.statement, field.id))
+            .map(|field| (field.statement, field))
             .collect::<BTreeMap<_, _>>();
         let source_by_statement = self
             .resources
@@ -1168,8 +1285,8 @@ impl<'a> ReactiveBuilder<'a> {
                 )
             } else if let Some(field) = fields_by_statement.get(&statement.id) {
                 (
-                    statement_producer,
-                    SemanticBindingTargetV1::Field { field: *field },
+                    field.producer,
+                    SemanticBindingTargetV1::Field { field: field.id },
                 )
             } else if source_by_statement.contains_key(&statement.id) {
                 // The exact source-expression candidate was emitted above.
@@ -1258,7 +1375,27 @@ impl<'a> ReactiveBuilder<'a> {
                             projection: projection.clone(),
                         }
                     } else {
-                        let binding = self.resolve_decl_binding(*target, expression, bindings)?;
+                        let binding = match self.resolve_decl_binding(*target, expression, bindings)
+                        {
+                            Ok(binding) => binding,
+                            Err(_)
+                                if !self.reachable_expressions.contains(&expression.id)
+                                    && self.execution.expressions.iter().any(|candidate| {
+                                        candidate.checked_expr_id == expression.checked_expr_id
+                                            && self.reachable_expressions.contains(&candidate.id)
+                                            && matches!(
+                                                candidate.kind,
+                                                SemanticExpressionKind::LocalRead { .. }
+                                            )
+                                    }) =>
+                            {
+                                // Context-free checked statement copies are retained for
+                                // diagnostics, but only the structurally reachable BLOCK
+                                // occurrence owns a lexical value frame.
+                                continue;
+                            }
+                            Err(error) => return Err(error),
+                        };
                         match binding.target {
                             SemanticBindingTargetV1::State { state } => {
                                 SemanticReadTargetV1::StateProjection {
@@ -2075,7 +2212,13 @@ impl<'a> ReactiveBuilder<'a> {
         for binding in bindings {
             let reachable = self.reachable_expressions(binding.producer)?;
             let boundaries = triggers
-                .event_causes_for_expression(binding.producer)?
+                .event_causes_for_expression(binding.producer)
+                .map_err(|error| {
+                    SemanticReactiveError::new(format!(
+                        "semantic binding {} declaration {} producer {} failed dependency analysis: {error}",
+                        binding.id, binding.declaration.0, binding.producer
+                    ))
+                })?
                 .into_iter()
                 .collect::<Vec<_>>();
             for expression_id in reachable {

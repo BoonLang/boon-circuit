@@ -432,6 +432,7 @@ pub(super) struct MappedSemanticListMutation {
 pub(super) struct MappedSemanticDerivedValue {
     pub field: MappedReactiveFieldId,
     pub executable_statement_id: ExecutableStatementId,
+    pub producer: ExecutableExprId,
     pub path: String,
     pub kind: DerivedValueKind,
     pub materialized_list_id: Option<ListId>,
@@ -2795,7 +2796,12 @@ fn map_reactive_field(
 ) -> Result<MappedSemanticField, String> {
     let statement = semantic_execution_statement(execution, field.statement)?;
     if statement.declaration != Some(field.declaration)
-        || statement.value != Some(field.producer)
+        || !semantic_field_producer_matches_statement(
+            execution,
+            statement,
+            field.declaration,
+            field.producer,
+        )?
         || statement.flow_type.as_ref() != Some(&field.flow_type)
     {
         return Err(format!(
@@ -2840,6 +2846,41 @@ fn map_reactive_field(
         value,
         flow_type: field.flow_type.clone(),
     })
+}
+
+fn semantic_field_producer_matches_statement(
+    execution: &SemanticExecutionGraphV1,
+    statement: &SemanticStatement,
+    declaration: DeclId,
+    producer: SemanticExprId,
+) -> Result<bool, String> {
+    if statement.value == Some(producer) {
+        return Ok(true);
+    }
+    let Some(parent) = statement.parent else {
+        return Ok(false);
+    };
+    let parent = semantic_execution_statement(execution, parent)?;
+    let mut parent_value = parent.value;
+    loop {
+        let Some(value) = parent_value else {
+            return Ok(false);
+        };
+        let expression = semantic_execution_expression(execution, value)?;
+        match &expression.kind {
+            SemanticExpressionKind::FlushBoundary { input } => parent_value = Some(*input),
+            SemanticExpressionKind::Object(fields)
+            | SemanticExpressionKind::TaggedObject { fields, .. } => {
+                let matching = fields
+                    .iter()
+                    .filter(|candidate| candidate.declaration == Some(declaration))
+                    .map(|candidate| candidate.value)
+                    .collect::<Vec<_>>();
+                return Ok(matching.as_slice() == [producer]);
+            }
+            _ => return Ok(false),
+        }
+    }
 }
 
 fn mapped_field(
@@ -2887,9 +2928,13 @@ fn map_reactive_binding(
         SemanticBindingTargetV1::State { state } => {
             semantic_state_resource(resources, state)?.expression == binding.producer
         }
-        SemanticBindingTargetV1::Field { .. } | SemanticBindingTargetV1::List { .. } => {
-            statement.value == Some(binding.producer)
-        }
+        SemanticBindingTargetV1::Field { .. } => semantic_field_producer_matches_statement(
+            execution,
+            statement,
+            binding.declaration,
+            binding.producer,
+        )?,
+        SemanticBindingTargetV1::List { .. } => statement.value == Some(binding.producer),
     };
     if statement.declaration != Some(binding.declaration)
         || !producer_matches_statement
@@ -3660,6 +3705,7 @@ fn map_reactive_derived_value(
     Ok(MappedSemanticDerivedValue {
         field: field.id,
         executable_statement_id: statement,
+        producer,
         path: field.path.clone(),
         kind,
         materialized_list_id,
@@ -6798,6 +6844,7 @@ fn finalize_derived_values(
             Ok(DerivedValue {
                 id: storage_ids.reactive_field(mapped.field)?,
                 executable_statement_id: mapped.executable_statement_id,
+                producer: mapped.producer,
                 path: mapped.path.clone(),
                 kind: mapped.kind.clone(),
                 materialized_list_id: mapped.materialized_list_id,
@@ -8834,6 +8881,8 @@ pub(super) fn finish_verified_semantic_lowering(
         &mapped.id_map,
         &storage.id_map,
     )?;
+    let transient_collections =
+        map_transient_collections(lowering_contract, memory_graph, &mapped.id_map)?;
     let expression_types = map_expression_types(&lowering_contract.metadata);
     let function_types = map_function_types(&lowering_contract.metadata);
     let named_value_types = map_named_value_types(&lowering_contract.metadata);
@@ -8906,6 +8955,7 @@ pub(super) fn finish_verified_semantic_lowering(
         lists,
         semantic_memory,
         migration_edges,
+        transient_collections,
         output_values,
         derived_values,
         dependencies,
@@ -10297,6 +10347,143 @@ fn map_semantic_memory(
         })
         .collect::<Result<Vec<_>, String>>()?;
     Ok((memories, migration_edges))
+}
+
+fn map_transient_collections(
+    lowering: &SemanticLoweringContractV1,
+    memory: &boon_semantic::SemanticMemoryGraphV1,
+    ids: &SemanticToExecutableMap,
+) -> Result<Vec<crate::TransientCollection>, String> {
+    let durable_constructors = memory
+        .memories
+        .iter()
+        .filter_map(|memory| match memory.backing {
+            boon_semantic::SemanticMemoryBackingV1::Collection { expression, .. } => {
+                Some(expression)
+            }
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let mut seen_constructors = BTreeSet::new();
+    let mut seen_results = BTreeSet::new();
+    lowering
+        .transient_collections
+        .iter()
+        .map(|region| {
+            if durable_constructors.contains(&region.constructor) {
+                return Err(format!(
+                    "transient collection constructor {} also owns durable semantic memory",
+                    region.constructor
+                ));
+            }
+            if !seen_constructors.insert(region.constructor)
+                || !seen_results.insert(region.result.expression())
+                || region.snapshot_copy_budget != 0
+                || region.authority_flow.first() != Some(&region.constructor)
+                || region.authority_flow.last() != Some(&region.result.expression())
+            {
+                return Err(format!(
+                    "transient collection constructor {} has non-canonical proof identity or budgets",
+                    region.constructor
+                ));
+            }
+            let kind = match region.kind {
+                boon_semantic::SemanticTransientCollectionKindV1::Map => {
+                    crate::TransientCollectionKind::Map
+                }
+                boon_semantic::SemanticTransientCollectionKindV1::Set => {
+                    crate::TransientCollectionKind::Set
+                }
+            };
+            let map_entries = region
+                .map_entries
+                .iter()
+                .map(|entry| {
+                    Ok(crate::TransientMapEntry {
+                        key: ids.expression(entry.key)?,
+                        value: ids.expression(entry.value)?,
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            let set_items = region
+                .set_items
+                .iter()
+                .copied()
+                .map(|item| ids.expression(item))
+                .collect::<Result<Vec<_>, String>>()?;
+            let steps = region
+                .steps
+                .iter()
+                .map(|step| {
+                    Ok(match step {
+                        boon_semantic::SemanticTransientCollectionStepV1::MapUpsert {
+                            expression,
+                            key,
+                            value,
+                        } => crate::TransientCollectionStep::MapUpsert {
+                            expression: ids.expression(*expression)?,
+                            key: ids.expression(*key)?,
+                            value: ids.expression(*value)?,
+                        },
+                        boon_semantic::SemanticTransientCollectionStepV1::MapRemove {
+                            expression,
+                            key,
+                        } => crate::TransientCollectionStep::MapRemove {
+                            expression: ids.expression(*expression)?,
+                            key: ids.expression(*key)?,
+                        },
+                        boon_semantic::SemanticTransientCollectionStepV1::SetAdd {
+                            expression,
+                            item,
+                        } => crate::TransientCollectionStep::SetAdd {
+                            expression: ids.expression(*expression)?,
+                            item: ids.expression(*item)?,
+                        },
+                        boon_semantic::SemanticTransientCollectionStepV1::SetRemove {
+                            expression,
+                            item,
+                        } => crate::TransientCollectionStep::SetRemove {
+                            expression: ids.expression(*expression)?,
+                            item: ids.expression(*item)?,
+                        },
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            let result = match &region.result {
+                boon_semantic::SemanticTransientCollectionResultV1::MapGet {
+                    expression,
+                    key,
+                } => crate::TransientCollectionResult::MapGet {
+                    expression: ids.expression(*expression)?,
+                    key: ids.expression(*key)?,
+                },
+                boon_semantic::SemanticTransientCollectionResultV1::SetContains {
+                    expression,
+                    item,
+                } => crate::TransientCollectionResult::SetContains {
+                    expression: ids.expression(*expression)?,
+                    item: ids.expression(*item)?,
+                },
+            };
+            Ok(crate::TransientCollection {
+                kind,
+                constructor: ids.expression(region.constructor)?,
+                map_entries,
+                set_items,
+                steps,
+                result,
+                authority_flow: region
+                    .authority_flow
+                    .iter()
+                    .copied()
+                    .map(|expression| ids.expression(expression))
+                    .collect::<Result<Vec<_>, String>>()?,
+                operation_work_budget: region.operation_work_budget,
+                storage_growth_budget: region.storage_growth_budget,
+                snapshot_copy_budget: region.snapshot_copy_budget,
+            })
+        })
+        .collect()
 }
 
 const fn map_semantic_memory_kind(

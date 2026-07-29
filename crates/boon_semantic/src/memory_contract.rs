@@ -521,6 +521,13 @@ fn build_memories(
         .iter()
         .filter(|expression| reachable.contains(&expression.id))
     {
+        if lowering
+            .transient_collections
+            .iter()
+            .any(|region| region.constructor == expression.id)
+        {
+            continue;
+        }
         let kind = match expression.kind {
             SemanticExpressionKind::Map { .. } => SemanticMemoryKindV1::Map,
             SemanticExpressionKind::Set { .. } => SemanticMemoryKindV1::Set,

@@ -136,6 +136,118 @@ document: Document/new(
 }
 
 #[test]
+fn verified_local_map_and_set_regions_stay_private_and_snapshot_free() {
+    let compiled = boon_compiler::compile_source_text_to_machine_plan(
+        "map-set-transient-runtime.bn",
+        r#"
+store: [
+    selected_user:
+        BLOCK {
+            users: MAP {
+                TEXT { alice } => [score: 1]
+            }
+            with_bob:
+                users
+                |> Map/upsert(entry: [key: TEXT { bob }, value: [score: 2]])
+            without_alice:
+                with_bob
+                |> Map/remove(key: TEXT { alice })
+            without_alice
+            |> Map/get(key: TEXT { bob })
+        }
+    has_editor:
+        BLOCK {
+            roles: SET {
+                Admin
+            }
+            with_editor:
+                roles
+                |> Set/add(item: Editor)
+            without_admin:
+                with_editor
+                |> Set/remove(item: Admin)
+            without_admin
+            |> Set/contains(item: Editor)
+        }
+]
+
+document: Document/new(
+    root: Element/label(element: [], style: [], label: TEXT { transient })
+)
+"#,
+        TargetProfile::SoftwareBounded,
+    )
+    .unwrap();
+    assert!(compiled.plan.persistence.collections.is_empty());
+    let mut session = MachineInstance::new(compiled.plan, SessionOptions::default()).unwrap();
+
+    let (selected_user, selected_metrics) = session
+        .root_value_current_with_metrics("store.selected_user")
+        .unwrap();
+    assert_eq!(
+        selected_user,
+        Value::tagged(
+            "Found",
+            BTreeMap::from([(
+                "value".to_owned(),
+                Value::Record(BTreeMap::from([(
+                    "score".to_owned(),
+                    Value::integer(2).unwrap(),
+                )])),
+            )]),
+        )
+    );
+    let (has_editor, editor_metrics) = session
+        .root_value_current_with_metrics("store.has_editor")
+        .unwrap();
+    assert_eq!(has_editor, Value::truth(true));
+
+    let authority = session.authority_snapshot().unwrap();
+    assert!(authority.maps.is_empty());
+    assert!(authority.sets.is_empty());
+    let durable = session.semantic_value_image().unwrap();
+    assert!(durable.maps.is_empty());
+    assert!(durable.sets.is_empty());
+
+    assert_eq!(
+        selected_metrics.transient_collection_region_count
+            + editor_metrics.transient_collection_region_count,
+        2
+    );
+    assert_eq!(
+        selected_metrics.transient_collection_storage_allocation_count
+            + editor_metrics.transient_collection_storage_allocation_count,
+        2
+    );
+    assert_eq!(
+        selected_metrics.transient_collection_operation_count
+            + editor_metrics.transient_collection_operation_count,
+        8
+    );
+    assert_eq!(
+        selected_metrics.transient_collection_mutation_count
+            + editor_metrics.transient_collection_mutation_count,
+        4
+    );
+    assert_eq!(
+        selected_metrics.transient_collection_storage_growth_count
+            + editor_metrics.transient_collection_storage_growth_count,
+        4
+    );
+    assert_eq!(
+        selected_metrics
+            .transient_collection_storage_high_water
+            .max(editor_metrics.transient_collection_storage_high_water),
+        2
+    );
+    assert_eq!(
+        selected_metrics.transient_collection_snapshot_copy_count
+            + editor_metrics.transient_collection_snapshot_copy_count,
+        0
+    );
+}
+
+#[test]
 fn structurally_identical_map_constructions_keep_distinct_authorities() {
     let compiled = boon_compiler::compile_source_text_to_machine_plan(
         "map-authority-identity.bn",

@@ -5125,6 +5125,14 @@ impl<'a> SemanticExpressionBuilder<'a> {
                 callable: callable.decl_id,
                 formal: input.formal,
             })?;
+            // OUT topology is derived before semantic BLOCK frames exist, so
+            // a builtin argument may not yet carry the lexical value frame in
+            // which its call occurs. Inherit the call-site frame exactly as
+            // user-call parameter substitution does above.
+            let checked_value = ScopedCheckedExpr {
+                value_frame: checked_value.value_frame.or(scoped.value_frame),
+                ..checked_value
+            };
             arguments.push(SemanticCallArgument {
                 formal: input.formal,
                 ordinal: parameter.ordinal,

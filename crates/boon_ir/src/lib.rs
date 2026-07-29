@@ -898,6 +898,8 @@ pub enum InitialValue {
     /// The enclosing list field carries the exact executable expression that
     /// constructs a nested collection authority in the occurrence scope.
     ExpressionAuthority,
+    /// Private row-source routing metadata; never a scalar initializer.
+    ResourceOnly,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -5168,7 +5170,7 @@ fn reject_initial_value_identity(value: &InitialValue) -> Result<(), String> {
         InitialValue::Unknown { summary } => {
             reject_hidden_identity_identifier("unknown initializer", summary)
         }
-        InitialValue::ExpressionAuthority => Ok(()),
+        InitialValue::ExpressionAuthority | InitialValue::ResourceOnly => Ok(()),
         InitialValue::Text { .. }
         | InitialValue::Number { .. }
         | InitialValue::Bytes { .. }

@@ -7515,6 +7515,7 @@ fn map_initial_value(value: &SemanticInitialValueV1) -> InitialValue {
             summary: summary.clone(),
         },
         SemanticInitialValueV1::ExpressionAuthority => InitialValue::ExpressionAuthority,
+        SemanticInitialValueV1::ResourceOnly => InitialValue::ResourceOnly,
     }
 }
 

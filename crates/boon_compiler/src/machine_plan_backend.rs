@@ -6642,6 +6642,7 @@ fn initial_constant_value(value: &InitialValue) -> Option<PlanConstantValue> {
         InitialValue::RootInitialField { .. }
         | InitialValue::RowInitialField { .. }
         | InitialValue::ExpressionAuthority
+        | InitialValue::ResourceOnly
         | InitialValue::Unknown { .. } => None,
     }
 }
@@ -7313,6 +7314,12 @@ fn plan_initial_list_rows(
                                     list.name, field.name
                                 )));
                             }
+                            InitialValue::ResourceOnly => {
+                                return Err(PlanError::new(format!(
+                                    "list `{}` initial field `{}` exposed private row-source metadata as scalar data",
+                                    list.name, field.name
+                                )));
+                            }
                             InitialValue::Text { .. }
                             | InitialValue::Number { .. }
                             | InitialValue::Bytes { .. }
@@ -7661,11 +7668,34 @@ fn materialized_output_field<'a>(
                 && field.role.is_value()
         })
         .collect::<Vec<_>>();
-    let [field] = fields.as_slice() else {
+    let value_fields = fields
+        .iter()
+        .copied()
+        .filter(|field| field.role == ir::ErasedFieldRole::Value)
+        .collect::<Vec<_>>();
+    let candidates = if value_fields.is_empty() {
+        fields.as_slice()
+    } else {
+        value_fields.as_slice()
+    };
+    let [field] = candidates else {
         return Err(PlanError::new(format!(
-            "materialized list {} field `{name}` resolves to {} semantic value fields",
+            "materialized list {} field `{name}` resolves to {} preferred semantic value fields \
+             among {} candidates: {:?}",
             target_list.0,
-            fields.len()
+            candidates.len(),
+            fields.len(),
+            fields
+                .iter()
+                .map(|field| (
+                    field.id,
+                    field.role,
+                    field.declaration,
+                    field.statement,
+                    field.producer,
+                    field.diagnostic_path.as_str(),
+                ))
+                .collect::<Vec<_>>()
         )));
     };
     Ok(*field)
@@ -14184,9 +14214,39 @@ impl ValueIndex {
                 continue;
             }
             if field.role != ir::ErasedFieldRole::Capture {
-                by_path
-                    .entry(field.diagnostic_path.clone())
-                    .or_insert(ValueRef::Field(plan_field_id(field.id)));
+                let replace_existing_field = by_path
+                    .get(&field.diagnostic_path)
+                    .and_then(|value| match value {
+                        ValueRef::Field(existing) => program
+                            .scope_index
+                            .fields
+                            .get(existing.0)
+                            .filter(|candidate| plan_field_id(candidate.id) == *existing),
+                        _ => None,
+                    })
+                    .is_some_and(|existing| {
+                        let role_priority = |role| match role {
+                            ir::ErasedFieldRole::Value => 0,
+                            ir::ErasedFieldRole::ValueAuthority => 1,
+                            ir::ErasedFieldRole::ListAuthority => 2,
+                            ir::ErasedFieldRole::Capture => 3,
+                        };
+                        (
+                            role_priority(field.role),
+                            erased_row_field_depth(program, field),
+                            field.id,
+                        ) < (
+                            role_priority(existing.role),
+                            erased_row_field_depth(program, existing),
+                            existing.id,
+                        )
+                    });
+                if replace_existing_field || !by_path.contains_key(&field.diagnostic_path) {
+                    by_path.insert(
+                        field.diagnostic_path.clone(),
+                        ValueRef::Field(plan_field_id(field.id)),
+                    );
+                }
             }
             if let Some(value_type) = plan_value_type_from_typecheck_type(&field.flow_type.ty)
                 .filter(|value_type| plan_value_type_is_concrete(*value_type))
@@ -14412,9 +14472,9 @@ document: Document/new(
             .scope_index
             .fields
             .iter()
-            .find(|field| field.resource_only)
+            .find(|field| field.resource_only && field.static_owner.is_some())
             .map(|field| plan_field_id(field.id))
-            .expect("resource-only structural field")
+            .expect("producer-owned resource-only structural field")
     }
 
     fn assert_resource_ref_rejected(
@@ -14450,8 +14510,8 @@ document: Document/new(
             .scope_index
             .fields
             .iter()
-            .find(|field| field.resource_only)
-            .expect("resource-only structural field");
+            .find(|field| field.resource_only && field.static_owner.is_some())
+            .expect("producer-owned resource-only structural field");
         let scalar = compiled
             .ir
             .scope_index
@@ -14488,8 +14548,8 @@ document: Document/new(
             .scope_index
             .fields
             .iter()
-            .find(|field| field.resource_only)
-            .expect("resource-only structural field");
+            .find(|field| field.resource_only && field.static_owner.is_some())
+            .expect("producer-owned resource-only structural field");
         let owner = resource.static_owner.expect("row function owner");
         let ownership = producer_function_ownership_seed(&compiled.ir, owner).unwrap();
         assert!(

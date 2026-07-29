@@ -1631,12 +1631,6 @@ impl<'a> ReactiveBuilder<'a> {
     }
 
     fn build_fields(&self) -> Result<Vec<SemanticFieldV1>, SemanticReactiveError> {
-        let source_statements = self
-            .resources
-            .sources
-            .iter()
-            .map(|source| source.statement)
-            .collect::<BTreeSet<_>>();
         let statement_parents = self
             .execution
             .statements
@@ -1673,12 +1667,12 @@ impl<'a> ReactiveBuilder<'a> {
             let Some(statement_producer) = statement.value else {
                 continue;
             };
-            if source_statements.contains(&statement.id)
-                && !matches!(
-                    &statement.origin,
-                    crate::SemanticStatementOrigin::ProducerResult { .. }
-                )
-            {
+            if self.resources.sources.iter().any(|source| {
+                source.statement == statement.id && source.expression == statement_producer
+            }) && !matches!(
+                &statement.origin,
+                crate::SemanticStatementOrigin::ProducerResult { .. }
+            ) {
                 continue;
             }
             let producer = if let Some(parent_id) = statement_parents.get(&statement.id) {
@@ -3592,7 +3586,11 @@ fn lexical_binding_for_decl<'a>(
         else {
             continue;
         };
-        candidates.push(((frame_distance, owner_distance), binding));
+        let source_priority = u8::from(matches!(
+            binding.target,
+            SemanticBindingTargetV1::Source { .. }
+        ));
+        candidates.push(((frame_distance, owner_distance, source_priority), binding));
     }
     candidates.sort_by_key(|(distance, binding)| (*distance, binding.id));
     let Some((best_distance, _)) = candidates.first() else {
@@ -3608,10 +3606,20 @@ fn lexical_binding_for_decl<'a>(
         .collect::<Vec<_>>();
     let [binding] = best.as_slice() else {
         return Err(SemanticReactiveError::new(format!(
-            "{diagnostic} {} resolves declaration {} to {} equally-near lexical bindings",
+            "{diagnostic} {} resolves declaration {} to {} equally-near lexical bindings: {:?}",
             expression.id,
             declaration.0,
-            best.len()
+            best.len(),
+            best.iter()
+                .map(|binding| (
+                    binding.id,
+                    binding.statement,
+                    binding.call_instance,
+                    binding.owner,
+                    binding.producer,
+                    binding.target,
+                ))
+                .collect::<Vec<_>>()
         )));
     };
     Ok(*binding)

@@ -90,6 +90,8 @@ pub struct SemanticListResourceV1 {
     pub capacity: Option<usize>,
     pub key_policy: SemanticListKeyPolicyV1,
     pub initializer: SemanticListInitializerV1,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub row_predecessors: Vec<SemanticContextualRowPredecessor>,
     pub span: SemanticResourceSpanV1,
 }
 
@@ -218,6 +220,9 @@ pub enum SemanticInitialValueV1 {
     /// an unresolved initializer while keeping authority identity out of the
     /// public value payload.
     ExpressionAuthority,
+    /// A row-local source facade is runtime routing metadata, not an
+    /// application value or a serializable list initializer.
+    ResourceOnly,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -386,6 +391,7 @@ impl SemanticResourceGraphV1 {
         }
         validate_dense_resource_ids(self, execution)?;
         validate_materialization_bindings(self, execution)?;
+        validate_list_lineage(self, execution)?;
         validate_list_projections(self, execution)?;
         validate_resource_owners(self, execution)?;
         validate_resource_aliases(self)?;
@@ -405,11 +411,13 @@ pub(crate) fn build_semantic_resource_graph(
     out_net: &ResolvedOutGraph,
     execution: &mut SemanticExecutionGraphV1,
 ) -> Result<SemanticResourceGraphV1, String> {
-    let (row_scopes, lists, value_list_authorities) = discover_list_resources(checked, execution)?;
+    let (row_scopes, mut lists, value_list_authorities) =
+        discover_list_resources(checked, execution)?;
     let target_lists = materialization_target_lists(execution, &lists)?;
     bind_materialization_targets(execution, &lists, &target_lists)?;
     bind_materialization_sources(execution, &lists)?;
     bind_materialization_lineage(execution, &lists)?;
+    bind_list_lineage(execution, &mut lists)?;
 
     let mut aliases = Vec::new();
     let sources = build_source_resources(checked, execution, &lists, &target_lists, &mut aliases)?;
@@ -551,6 +559,7 @@ fn discover_list_resources(
             capacity: target.capacity,
             key_policy: target.key_policy,
             initializer,
+            row_predecessors: Vec::new(),
             span: target.span,
         });
     }
@@ -1357,6 +1366,9 @@ fn semantic_initial_value(
     if let Some(path) = semantic_root_initial_path(execution, expression_id) {
         return Ok(SemanticInitialValueV1::RootInitialField { path });
     }
+    if semantic_initializer_is_resource_only(execution, expression_id, &mut BTreeSet::new())? {
+        return Ok(SemanticInitialValueV1::ResourceOnly);
+    }
     match semantic_static_data(execution, expression_id) {
         Ok(value) => Ok(semantic_initial_value_from_data(value)),
         Err(_error)
@@ -1370,6 +1382,41 @@ fn semantic_initial_value(
             "semantic initial expression {expression_id}: {error}"
         )),
     }
+}
+
+fn semantic_initializer_is_resource_only(
+    execution: &SemanticExecutionGraphV1,
+    expression_id: SemanticExprId,
+    visiting: &mut BTreeSet<SemanticExprId>,
+) -> Result<bool, String> {
+    if !visiting.insert(expression_id) {
+        return Ok(false);
+    }
+    let expression = expression(execution, expression_id)?;
+    let result = match &expression.kind {
+        SemanticExpressionKind::Source { .. } => true,
+        SemanticExpressionKind::Object(fields)
+        | SemanticExpressionKind::TaggedObject { fields, .. } => {
+            let mut all_resource_only = !fields.is_empty();
+            for field in fields {
+                if !semantic_initializer_is_resource_only(execution, field.value, visiting)? {
+                    all_resource_only = false;
+                    break;
+                }
+            }
+            all_resource_only
+        }
+        SemanticExpressionKind::Block { result, .. } => {
+            semantic_initializer_is_resource_only(execution, *result, visiting)?
+        }
+        SemanticExpressionKind::FlushBoundary { input }
+        | SemanticExpressionKind::Draining { input } => {
+            semantic_initializer_is_resource_only(execution, *input, visiting)?
+        }
+        _ => false,
+    };
+    visiting.remove(&expression_id);
+    Ok(result)
 }
 
 fn semantic_type_contains_collection_authority(ty: &Type) -> bool {
@@ -2632,6 +2679,80 @@ fn bind_materialization_lineage(
         materialization.source_row_predecessors = predecessors;
     }
     verify_semantic_materialization_lineage(&execution.materializations)
+}
+
+fn bind_list_lineage(
+    execution: &SemanticExecutionGraphV1,
+    lists: &mut [SemanticListResourceV1],
+) -> Result<(), String> {
+    let statement_values = execution
+        .statements
+        .iter()
+        .filter_map(|statement| Some((statement.declaration?, statement.value?)))
+        .collect::<BTreeMap<_, _>>();
+    let statement_rows = lists
+        .iter()
+        .map(|list| {
+            (
+                list.declaration,
+                SemanticRowBinding {
+                    list: list.id,
+                    scope: list.row_scope,
+                },
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let locals = semantic_local_values(execution)?;
+    let mut resolved = Vec::with_capacity(lists.len());
+    for list in lists.iter() {
+        let predecessors = collect_lineage_leaves(
+            execution,
+            list.producer,
+            &statement_values,
+            &statement_rows,
+            &locals,
+        )?
+        .into_iter()
+        .map(|leaf| match leaf {
+            LineageLeaf::Value => SemanticContextualRowPredecessor::Value,
+            LineageLeaf::Stored(row) => SemanticContextualRowPredecessor::Stored { row },
+            LineageLeaf::Materialized(materialization) => {
+                SemanticContextualRowPredecessor::Materialized { materialization }
+            }
+            LineageLeaf::Provenance(materialization) => {
+                SemanticContextualRowPredecessor::Provenance { materialization }
+            }
+        })
+        .collect::<Vec<_>>();
+        if predecessors.is_empty() {
+            return Err(format!(
+                "list {} `{}` has no exact row predecessor",
+                list.id, list.semantic_path
+            ));
+        }
+        resolved.push(predecessors);
+    }
+    for (list, predecessors) in lists.iter_mut().zip(resolved) {
+        list.row_predecessors = predecessors;
+    }
+    Ok(())
+}
+
+fn validate_list_lineage(
+    graph: &SemanticResourceGraphV1,
+    execution: &SemanticExecutionGraphV1,
+) -> Result<(), String> {
+    let mut expected = graph.lists.clone();
+    bind_list_lineage(execution, &mut expected)?;
+    for (list, expected) in graph.lists.iter().zip(expected) {
+        if list.row_predecessors != expected.row_predecessors {
+            return Err(format!(
+                "list {} row lineage differs from its exact semantic producer",
+                list.id
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn collect_lineage_leaves(
@@ -4086,8 +4207,9 @@ pub(crate) fn validate_checked_list_classification(
     graph: &SemanticResourceGraphV1,
 ) -> Result<(), String> {
     let mut snapshot = execution.clone();
-    let (row_scopes, lists, value_list_authorities) =
+    let (row_scopes, mut lists, value_list_authorities) =
         discover_list_resources(checked, &mut snapshot)?;
+    bind_list_lineage(&snapshot, &mut lists)?;
     if graph.row_scopes != row_scopes
         || graph.lists != lists
         || graph.value_list_authorities != value_list_authorities
@@ -5344,6 +5466,7 @@ kept: mapped |> List/retain(item, if: True)
                     has_generation: true,
                 },
                 initializer: SemanticListInitializerV1::Empty,
+                row_predecessors: Vec::new(),
                 span: SemanticResourceSpanV1 {
                     line: 0,
                     start: 0,

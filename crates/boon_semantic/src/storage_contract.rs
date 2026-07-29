@@ -14,7 +14,7 @@ use crate::{
     SemanticReactiveGraphV1, SemanticReadId, SemanticReadTargetV1, SemanticResourceGraphV1,
     SemanticRowBinding, SemanticSourceId, SemanticSourceOrigin, SemanticStateId,
     SemanticStatementId, SemanticValueId, SemanticValueListAuthorityId, SemanticValueOrigin,
-    StaticOwnerId,
+    SemanticValueProvenance, StaticOwnerId,
 };
 use boon_contract::SourceBundleDigestV1;
 use boon_typecheck::{
@@ -1283,6 +1283,21 @@ fn append_materialized_value_fields(
                 .zip(materialization.target_scope_id)
                 .map(|(list, scope)| SemanticRowBinding { list, scope })
         })
+        .chain(resources.lists.iter().filter_map(|list| {
+            list.row_predecessors
+                .iter()
+                .any(|predecessor| {
+                    matches!(
+                        predecessor,
+                        SemanticContextualRowPredecessor::Value
+                            | SemanticContextualRowPredecessor::Stored { .. }
+                    )
+                })
+                .then_some(SemanticRowBinding {
+                    list: list.id,
+                    scope: list.row_scope,
+                })
+        }))
         .collect::<BTreeSet<_>>();
     let explicit_value_paths = fields
         .iter()
@@ -1300,8 +1315,14 @@ fn append_materialized_value_fields(
         .filter_map(|field| {
             let row = field.row?;
             let path = storage_field_item_path(field)?;
-            (materialized_rows.contains(&row) && !explicit_value_paths.contains(&(row, path)))
-                .then_some(field.id)
+            let resource_facade = resources
+                .lists
+                .get(row.list.as_usize())
+                .filter(|list| list.id == row.list && list.row_scope == row.scope)
+                .is_some_and(|list| list_initializer_path_is_resource_only(list, &path));
+            ((materialized_rows.contains(&row) || resource_facade)
+                && !explicit_value_paths.contains(&(row, path)))
+            .then_some(field.id)
         })
         .collect::<BTreeSet<_>>();
     for field in fields {
@@ -1697,6 +1718,23 @@ fn insert_local_member(
             ) =>
         {
             members.insert(incoming.path.clone(), incoming);
+            Ok(())
+        }
+        Some(existing)
+            if incoming.forwarded_from.is_some()
+                && matches!(
+                    existing.target,
+                    SemanticStorageLocalMemberTargetV1::Source(_)
+                )
+                && matches!(
+                    incoming.target,
+                    SemanticStorageLocalMemberTargetV1::Source(_)
+                ) =>
+        {
+            // A Map may replace a predecessor row resource with a freshly
+            // constructed source at the same structural path. The target
+            // local is authoritative; forwarding must not merge the replaced
+            // predecessor source back into that path.
             Ok(())
         }
         Some(existing) => Err(SemanticScopeStorageError::new(format!(
@@ -2104,6 +2142,8 @@ fn classify_resource_only_fields(
         fields: &snapshot,
         visiting: BTreeSet::new(),
         cache: BTreeMap::new(),
+        row_path_visiting: BTreeSet::new(),
+        row_path_cache: BTreeMap::new(),
     };
     for field in fields {
         field.resource_only = resolver.field_is_source_only(field.id)?;
@@ -2118,6 +2158,8 @@ struct StorageProvenanceResolver<'a> {
     fields: &'a [SemanticStorageFieldV1],
     visiting: BTreeSet<SemanticStorageFieldId>,
     cache: BTreeMap<SemanticStorageFieldId, bool>,
+    row_path_visiting: BTreeSet<(SemanticRowBinding, Vec<String>)>,
+    row_path_cache: BTreeMap<(SemanticRowBinding, Vec<String>), bool>,
 }
 
 impl StorageProvenanceResolver<'_> {
@@ -2139,12 +2181,37 @@ impl StorageProvenanceResolver<'_> {
                 SemanticScopeStorageError::new(format!(
                     "provenance references missing storage field {field}"
                 ))
-            })?;
-        let result = definition
+            })?
+            .clone();
+        let producer_is_source_only = definition
             .producer
             .map(|producer| self.expression_is_source_only(producer))
             .transpose()?
             .unwrap_or(false);
+        let item_path = storage_field_item_path(&definition);
+        let has_separate_value = definition.role == SemanticStorageFieldRoleV1::ListAuthority
+            && definition
+                .row
+                .zip(item_path.as_ref())
+                .is_some_and(|(row, path)| {
+                    self.fields.iter().any(|candidate| {
+                        candidate.id != definition.id
+                            && candidate.row == Some(row)
+                            && candidate.role == SemanticStorageFieldRoleV1::Value
+                            && storage_field_item_path(candidate).as_ref() == Some(path)
+                    })
+                });
+        let result = if has_separate_value {
+            false
+        } else {
+            match (definition.row, item_path, definition.producer) {
+                (Some(row), Some(path), Some(_)) => {
+                    producer_is_source_only && self.row_path_is_source_only(row, &path)?
+                }
+                (Some(row), Some(path), None) => self.row_path_is_source_only(row, &path)?,
+                _ => producer_is_source_only,
+            }
+        };
         self.visiting.remove(&field);
         self.cache.insert(field, result);
         Ok(result)
@@ -2155,11 +2222,18 @@ impl StorageProvenanceResolver<'_> {
         expression: SemanticExprId,
     ) -> Result<bool, SemanticScopeStorageError> {
         let expression = require_expression(self.execution, expression)?;
-        if expression.provenance.members.is_empty() {
+        self.provenance_is_source_only(&expression.provenance)
+    }
+
+    fn provenance_is_source_only(
+        &mut self,
+        provenance: &SemanticValueProvenance,
+    ) -> Result<bool, SemanticScopeStorageError> {
+        if provenance.members.is_empty() {
             return Ok(false);
         }
         let mut has_source = false;
-        for member in &expression.provenance.members {
+        for member in &provenance.members {
             match &member.origin {
                 SemanticValueOrigin::Source { source, .. } => {
                     require_source(self.resources, *source)?;
@@ -2217,6 +2291,7 @@ impl StorageProvenanceResolver<'_> {
                             member.path.starts_with(projection)
                                 || projection.starts_with(&member.path)
                         })
+                        .cloned()
                         .collect::<Vec<_>>();
                     if matches.is_empty() {
                         return Ok(false);
@@ -2228,7 +2303,9 @@ impl StorageProvenanceResolver<'_> {
                                 has_source = true;
                             }
                             SemanticStorageLocalMemberTargetV1::Field(field) => {
-                                if !self.field_is_source_only(field)? {
+                                if !self
+                                    .local_field_path_is_source_only(field, &member, projection)?
+                                {
                                     return Ok(false);
                                 }
                                 has_source = true;
@@ -2244,6 +2321,274 @@ impl StorageProvenanceResolver<'_> {
         }
         Ok(has_source)
     }
+
+    fn local_field_path_is_source_only(
+        &mut self,
+        field: SemanticStorageFieldId,
+        member: &SemanticStorageLocalMemberV1,
+        projection: &[String],
+    ) -> Result<bool, SemanticScopeStorageError> {
+        let definition = self
+            .fields
+            .get(field.as_usize())
+            .filter(|candidate| candidate.id == field)
+            .ok_or_else(|| {
+                SemanticScopeStorageError::new(format!(
+                    "local provenance references missing storage field {field}"
+                ))
+            })?
+            .clone();
+        let forwarded_row_path = match &member.forwarded_from {
+            Some(SemanticStorageLocalMemberForwardingV1::Row { row, path }) => {
+                Some((*row, path.clone()))
+            }
+            _ => None,
+        };
+        let Some((row, mut path)) =
+            forwarded_row_path.or_else(|| definition.row.zip(storage_field_item_path(&definition)))
+        else {
+            return self.field_is_source_only(field);
+        };
+        if let Some(suffix) = projection.strip_prefix(member.path.as_slice()) {
+            path.extend_from_slice(suffix);
+        }
+        self.row_path_is_source_only(row, &path)
+    }
+
+    fn row_path_is_source_only(
+        &mut self,
+        row: SemanticRowBinding,
+        path: &[String],
+    ) -> Result<bool, SemanticScopeStorageError> {
+        let key = (row, path.to_vec());
+        if let Some(cached) = self.row_path_cache.get(&key) {
+            return Ok(*cached);
+        }
+        if !self.row_path_visiting.insert(key.clone()) {
+            return Ok(false);
+        }
+        let list = self
+            .resources
+            .lists
+            .get(row.list.as_usize())
+            .filter(|list| list.id == row.list && list.row_scope == row.scope)
+            .ok_or_else(|| {
+                SemanticScopeStorageError::new(format!(
+                    "row {}/{} source-only classification references missing list",
+                    row.list, row.scope
+                ))
+            })?
+            .clone();
+        let result = !list.row_predecessors.is_empty()
+            && list
+                .row_predecessors
+                .iter()
+                .map(|predecessor| self.predecessor_path_is_source_only(&list, predecessor, path))
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .all(|source_only| source_only);
+        self.row_path_visiting.remove(&key);
+        self.row_path_cache.insert(key, result);
+        Ok(result)
+    }
+
+    fn predecessor_path_is_source_only(
+        &mut self,
+        list: &crate::SemanticListResourceV1,
+        predecessor: &SemanticContextualRowPredecessor,
+        path: &[String],
+    ) -> Result<bool, SemanticScopeStorageError> {
+        match predecessor {
+            SemanticContextualRowPredecessor::Value => {
+                Ok(list_initializer_path_is_resource_only(list, path))
+            }
+            SemanticContextualRowPredecessor::Stored { row } => {
+                self.stored_row_path_is_source_only(*row, path)
+            }
+            SemanticContextualRowPredecessor::Materialized { materialization }
+            | SemanticContextualRowPredecessor::Provenance { materialization } => {
+                self.materialization_path_is_source_only(*materialization, path)
+            }
+        }
+    }
+
+    fn stored_row_path_is_source_only(
+        &mut self,
+        row: SemanticRowBinding,
+        path: &[String],
+    ) -> Result<bool, SemanticScopeStorageError> {
+        let candidates = self
+            .fields
+            .iter()
+            .filter(|field| {
+                field.row == Some(row)
+                    && storage_field_item_path(field).as_deref() == Some(path)
+                    && field.role != SemanticStorageFieldRoleV1::Capture
+            })
+            .map(|field| field.id)
+            .collect::<Vec<_>>();
+        let values = candidates
+            .iter()
+            .copied()
+            .filter(|field| {
+                self.fields
+                    .get(field.as_usize())
+                    .is_some_and(|field| field.role == SemanticStorageFieldRoleV1::Value)
+            })
+            .collect::<Vec<_>>();
+        let selected = if values.is_empty() {
+            candidates
+        } else {
+            values
+        };
+        if selected.is_empty() {
+            return Ok(false);
+        }
+        for field in selected {
+            if !self.field_is_source_only(field)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn materialization_path_is_source_only(
+        &mut self,
+        materialization: crate::SemanticMaterializationId,
+        path: &[String],
+    ) -> Result<bool, SemanticScopeStorageError> {
+        let materialization = self
+            .execution
+            .materializations
+            .get(materialization.as_usize())
+            .filter(|candidate| candidate.id == materialization)
+            .ok_or_else(|| {
+                SemanticScopeStorageError::new(format!(
+                    "source-only classification references missing materialization {materialization}"
+                ))
+            })?
+            .clone();
+        match materialization.operation {
+            SemanticContextualOperationKind::Map => {
+                self.expression_path_is_source_only(materialization.body, path)
+            }
+            SemanticContextualOperationKind::Filter
+            | SemanticContextualOperationKind::Retain
+            | SemanticContextualOperationKind::Remove
+            | SemanticContextualOperationKind::SortBy
+            | SemanticContextualOperationKind::ThenBy => {
+                let Some(row) = materialization
+                    .source_list_id
+                    .zip(materialization.source_scope_id)
+                    .map(|(list, scope)| SemanticRowBinding { list, scope })
+                else {
+                    return Ok(false);
+                };
+                self.row_path_is_source_only(row, path)
+            }
+            SemanticContextualOperationKind::Every
+            | SemanticContextualOperationKind::Any
+            | SemanticContextualOperationKind::Find => Ok(false),
+        }
+    }
+
+    fn expression_path_is_source_only(
+        &mut self,
+        expression: SemanticExprId,
+        path: &[String],
+    ) -> Result<bool, SemanticScopeStorageError> {
+        if path.is_empty() {
+            return self.expression_is_source_only(expression);
+        }
+        let value = require_expression(self.execution, expression)?.clone();
+        match &value.kind {
+            SemanticExpressionKind::Object(fields)
+            | SemanticExpressionKind::TaggedObject { fields, .. } => {
+                let matches = fields
+                    .iter()
+                    .filter(|field| !field.spread && field.name == path[0])
+                    .collect::<Vec<_>>();
+                match matches.as_slice() {
+                    [field] => self.expression_path_is_source_only(field.value, &path[1..]),
+                    [] => Ok(false),
+                    _ => Err(SemanticScopeStorageError::new(format!(
+                        "expression {expression} has multiple fields named `{}`",
+                        path[0]
+                    ))),
+                }
+            }
+            SemanticExpressionKind::When { arms, .. } => {
+                if arms.is_empty() {
+                    return Ok(false);
+                }
+                for arm in arms {
+                    if !self.expression_path_is_source_only(arm.output, path)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            SemanticExpressionKind::Latest { branches } => {
+                if branches.is_empty() {
+                    return Ok(false);
+                }
+                for branch in branches {
+                    if !self.expression_path_is_source_only(*branch, path)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            SemanticExpressionKind::Block { result, .. } => {
+                self.expression_path_is_source_only(*result, path)
+            }
+            SemanticExpressionKind::Project { input, fields } => {
+                let mut projection = fields.clone();
+                projection.extend_from_slice(path);
+                self.expression_path_is_source_only(*input, &projection)
+            }
+            SemanticExpressionKind::FlushBoundary { input }
+            | SemanticExpressionKind::Draining { input } => {
+                self.expression_path_is_source_only(*input, path)
+            }
+            SemanticExpressionKind::Then {
+                output: Some(output),
+                ..
+            }
+            | SemanticExpressionKind::MatchArm {
+                output: Some(output),
+                ..
+            } => self.expression_path_is_source_only(*output, path),
+            _ => {
+                let projected = value.provenance.projected(path);
+                self.provenance_is_source_only(&projected)
+            }
+        }
+    }
+}
+
+fn list_initializer_path_is_resource_only(
+    list: &crate::SemanticListResourceV1,
+    path: &[String],
+) -> bool {
+    let Some(name) = path.first() else {
+        return false;
+    };
+    let crate::SemanticListInitializerV1::RecordLiteral { rows, .. } = &list.initializer else {
+        return false;
+    };
+    !rows.is_empty()
+        && rows.iter().all(|row| {
+            let matches = row
+                .fields
+                .iter()
+                .filter(|field| !field.spread && field.name == *name)
+                .collect::<Vec<_>>();
+            matches!(
+                matches.as_slice(),
+                [field] if field.value == crate::SemanticInitialValueV1::ResourceOnly
+            )
+        })
 }
 
 fn build_storage_bindings(
@@ -2453,7 +2798,8 @@ fn build_row_source_projections(
     resources: &SemanticResourceGraphV1,
     locals: &[SemanticStorageLocalV1],
 ) -> Result<Vec<SemanticStorageRowSourceProjectionV1>, SemanticScopeStorageError> {
-    let mut projections = BTreeMap::<(SemanticRowBinding, Vec<String>), SemanticSourceId>::new();
+    let mut projections =
+        BTreeMap::<(SemanticRowBinding, Vec<String>), (u8, SemanticSourceId)>::new();
     for local in locals {
         let Some(row) = local.row else {
             continue;
@@ -2467,6 +2813,7 @@ fn build_row_source_projections(
                 row,
                 &member.path,
                 source,
+                u8::from(member.forwarded_from.is_some()),
                 "storage local",
             )?;
         }
@@ -2493,6 +2840,7 @@ fn build_row_source_projections(
                             row,
                             &member.path,
                             source,
+                            0,
                             "map body",
                         )?;
                     }
@@ -2525,6 +2873,7 @@ fn build_row_source_projections(
                         row,
                         &member.path,
                         source,
+                        1,
                         "identity-preserving materialization",
                     )?;
                 }
@@ -2536,15 +2885,18 @@ fn build_row_source_projections(
     }
     Ok(projections
         .into_iter()
-        .map(|((row, path), source)| SemanticStorageRowSourceProjectionV1 { row, path, source })
+        .map(
+            |((row, path), (_, source))| SemanticStorageRowSourceProjectionV1 { row, path, source },
+        )
         .collect())
 }
 
 fn insert_row_source_projection(
-    projections: &mut BTreeMap<(SemanticRowBinding, Vec<String>), SemanticSourceId>,
+    projections: &mut BTreeMap<(SemanticRowBinding, Vec<String>), (u8, SemanticSourceId)>,
     row: SemanticRowBinding,
     path: &[String],
     source: SemanticSourceId,
+    priority: u8,
     context: &str,
 ) -> Result<(), SemanticScopeStorageError> {
     if path.is_empty() {
@@ -2552,15 +2904,30 @@ fn insert_row_source_projection(
             "{context} has an empty row source projection"
         )));
     }
-    if let Some(existing) = projections.insert((row, path.to_vec()), source)
-        && existing != source
-    {
-        return Err(SemanticScopeStorageError::new(format!(
-            "{context} row {}/{} projection `{}` resolves to both source {existing} and {source}",
-            row.list,
-            row.scope,
-            path.join(".")
-        )));
+    let key = (row, path.to_vec());
+    match projections.get(&key).copied() {
+        None => {
+            projections.insert(key, (priority, source));
+        }
+        Some((existing_priority, existing)) if existing == source => {
+            if priority < existing_priority {
+                projections.insert(key, (priority, source));
+            }
+        }
+        Some((existing_priority, _)) if priority < existing_priority => {
+            // A Map-created resource at the target path replaces a source
+            // merely forwarded by an identity-preserving predecessor.
+            projections.insert(key, (priority, source));
+        }
+        Some((existing_priority, _)) if priority > existing_priority => {}
+        Some((_, existing)) => {
+            return Err(SemanticScopeStorageError::new(format!(
+                "{context} row {}/{} projection `{}` resolves to both source {existing} and {source}",
+                row.list,
+                row.scope,
+                path.join(".")
+            )));
+        }
     }
     Ok(())
 }

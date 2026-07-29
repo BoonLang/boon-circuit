@@ -643,8 +643,9 @@ and `take` preserve compatible order provenance; reordering, expansion,
 incompatible branches, and unknown calls clear it. This provenance is erased
 after access planning and never becomes a runtime or Boon value.
 
-Initial ordering keys are finite `NUMBER`, ordinal `TEXT`, `BOOL`, and closed
-fieldless tags. Key expressions are total, deterministic, pure, and row-local.
+Initial ordering keys are finite `NUMBER`, ordinal `TEXT`, and closed fieldless
+Tags, including the closed `True | False` truth set. Key expressions are total,
+deterministic, pure, and row-local.
 Every compound component keeps its own direction. Text normalization is normal
 typed composition and participates in semantic identity; there are no string
 field paths or user-visible index/normalization declarations.

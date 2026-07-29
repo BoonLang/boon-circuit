@@ -197,7 +197,7 @@ units = [
   "examples/cells/store.bn",
   "examples/cells/view.bn",
 ]
-source_bundle_digest_v1 = "fb9996b2ed3155d7a21797a8ff3de45b6d33799ccc60df1e93cbe5d40d17a987"
+source_bundle_digest_v1 = "096a9b2d19c40d8d42ad44f86d1e328b18be6533ecb892aeb44f8e337e19859f"
 owner_phase = "goal-phase-5-packed"
 owner_plan = "docs/plans/BOON_PACKED_DATA_AND_DENSE_INTERNALS_PLAN.md"
 

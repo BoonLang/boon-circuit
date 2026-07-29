@@ -557,7 +557,7 @@ store: [
     let output = check_program(&parsed);
     assert!(
         !output.report.has_errors(),
-        "nested LATEST predicate must be BOOL: {:#?}",
+        "nested LATEST predicate must be the closed True | False Tag set: {:#?}",
         output.report.diagnostics
     );
     let checked = output.program.expect("checked program");
@@ -567,6 +567,43 @@ store: [
             CheckedExpressionKind::Latest { branches } if branches.len() == 2
         )
     }));
+}
+
+#[test]
+fn closed_truth_set_has_no_public_bool_type_alias() {
+    let truth = Type::VariantSet(vec![
+        Variant::Tag("False".to_owned()),
+        Variant::Tag("True".to_owned()),
+    ]);
+    assert_eq!(boon_facing_type_label(&truth), "True | False");
+    assert_eq!(
+        boon_facing_type_display_tree(&truth),
+        TypeDisplayNode::Union {
+            variants: vec![
+                TypeDisplayNode::Scalar {
+                    label: "True".to_owned(),
+                },
+                TypeDisplayNode::Scalar {
+                    label: "False".to_owned(),
+                },
+            ],
+        }
+    );
+
+    let parsed = boon_parser::parse_source(
+        "truth-diagnostic.bn",
+        "value: TEXT { no } |> Bool/not()\n",
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+    let diagnostic = output
+        .report
+        .diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.message.contains("Bool/not"))
+        .expect("Bool/not rejects non-Tag input");
+    assert!(diagnostic.message.contains("expected: True | False"));
+    assert!(!diagnostic.message.contains(concat!("BO", "OL")));
 }
 
 #[test]
@@ -972,9 +1009,9 @@ ordered: rows |> List/sort_by(item, key: item.name, direction: direction)
 }
 
 #[test]
-fn bool_is_a_canonical_order_key() {
+fn closed_truth_tags_are_canonical_order_keys() {
     let parsed = boon_parser::parse_source(
-        "bool-order-key.bn",
+        "truth-order-key.bn",
         r#"
 rows: LIST {
     [active: True]
@@ -990,7 +1027,7 @@ ordered: rows |> List/sort_by(item, key: item.active, direction: Ascending)
         "diagnostics: {:#?}",
         output.report.diagnostics
     );
-    let program = output.program.expect("Bool ordering is checked");
+    let program = output.program.expect("truth-Tag ordering is checked");
     let sort = program
         .calls
         .iter()

@@ -10936,7 +10936,7 @@ fn derive_checked_order_chains(
                             &mut seen,
                             span,
                             format!(
-                                "list order key has unsupported type\nexpected: finite NUMBER, TEXT, BOOL, or closed fieldless tags\nfound: {}",
+                                "list order key has unsupported type\nexpected: finite NUMBER, TEXT, or closed fieldless tags such as `True | False`\nfound: {}",
                                 boon_facing_type_label(&key.key_type)
                             ),
                         );
@@ -18212,7 +18212,7 @@ impl<'a> Checker<'a> {
         self.diagnostics.push(self.diagnostic_for_expr(
             expr.id,
             format!(
-                "`{operator}` expects `True` or `False`\nexpected: BOOL\nfound: {}",
+                "`{operator}` expects `True` or `False` Tags\nexpected: True | False\nfound: {}",
                 boon_facing_type_label(&input_flow.ty)
             ),
         ));
@@ -21890,7 +21890,7 @@ pub fn variants_use_boolean_runtime_representation(variants: &[Variant]) -> bool
             .all(|variant| matches!(variant, Variant::Tag(tag) if tag == "True" || tag == "False"))
 }
 
-fn variants_are_bool_alias(variants: &[Variant]) -> bool {
+fn variants_are_closed_truth_set(variants: &[Variant]) -> bool {
     let mut tags = Vec::new();
     for variant in variants {
         let Variant::Tag(tag) = variant else {
@@ -22035,8 +22035,13 @@ fn boon_facing_type_display_tree_with_depth(
             if variants.is_empty() {
                 return scalar_type_display_node("VALUE");
             }
-            if variants_are_bool_alias(&variants) {
-                return scalar_type_display_node("BOOL");
+            if variants_are_closed_truth_set(&variants) {
+                return TypeDisplayNode::Union {
+                    variants: ["True", "False"]
+                        .into_iter()
+                        .map(scalar_type_display_node)
+                        .collect(),
+                };
             }
             TypeDisplayNode::Union {
                 variants: variants
@@ -22146,8 +22151,8 @@ fn boon_facing_type_label_with_depth(
             if variants.is_empty() {
                 return "VALUE".to_owned();
             }
-            if variants_are_bool_alias(&variants) {
-                return "BOOL".to_owned();
+            if variants_are_closed_truth_set(&variants) {
+                return "True | False".to_owned();
             }
             if variants
                 .iter()
@@ -24834,7 +24839,9 @@ fn number_argument_expected_type(
 
 fn builtin_pipe_input_custom_expected_label(function: &str) -> Option<&'static str> {
     match function {
-        "Text/concat" | "Text/time_range_label" => Some("TEXT, NUMBER, BOOL, or tag"),
+        "Text/concat" | "Text/time_range_label" => {
+            Some("TEXT, NUMBER, True | False, or another tag")
+        }
         function if function.starts_with("Bits/") => Some("BITS[N]"),
         _ => None,
     }
@@ -24858,10 +24865,10 @@ fn builtin_argument_custom_expected_label(
 ) -> Option<&'static str> {
     match (function, arg_name) {
         ("Text/concat", Some("with" | "separator" | "input" | "text") | None) => {
-            Some("TEXT, NUMBER, BOOL, or tag")
+            Some("TEXT, NUMBER, True | False, or another tag")
         }
         ("Text/time_range_label", Some("end" | "unit" | "input" | "text") | None) => {
-            Some("TEXT, NUMBER, BOOL, or tag")
+            Some("TEXT, NUMBER, True | False, or another tag")
         }
         ("Number/project_time", Some("pointer_x" | "pointer_width") | None) => {
             Some("NUMBER or numeric TEXT")

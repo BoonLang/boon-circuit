@@ -297,7 +297,7 @@ A possible logical shape is:
 ConsoleInput
   button_levels      BITS[4]
   button_events      bounded ordered events
-  button_overflow    BOOL
+  button_overflow    True | False
   switch_levels      BITS[4]
   logical_tick       U32
   capability_bits    U32

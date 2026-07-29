@@ -1,24 +1,20 @@
 # Native Editor Type Hints
 
-> **Phase 0 status: rewrite required.**
+> **Phase 2 truth notation: current.**
 >
-> **Current executable behavior:** native editor behavior is defined by the
-> checked-in implementation and `docs/architecture/NATIVE_GPU_PIPELINE.md`.
+> Native editor truth labels use the ordinary closed Tag set `True | False`.
+> There is no public `BOOL` type or alias.
 >
-> **Historical/stale content:** the hint tokens and inspector examples below
-> inherit superseded type notation and are not native GPU handoff evidence.
+> Private absence and unresolved checker state are not public data types and
+> must not appear as `ABSENT` or `VALUE` aliases in accepted-program hints.
 >
 > **Target-only content:** sidebar, highlighting, and hint behavior described
 > below but absent from the current implementation remains proposed behavior.
->
-> **Flag-day owner:** unified goal Phase 2 rewrites this file with
-> `BOON_TYPE_NOTATION_AND_INSPECTOR.md` after the final value algebra and
-> one-based public APIs land.
 
-This document records the earlier native-editor type-hint design. Its
-Boon-facing notation and object-shape examples came from
+This document records the native-editor type-hint design. Its Boon-facing
+notation and object-shape examples come from
 `docs/architecture/BOON_TYPE_NOTATION_AND_INSPECTOR.md`; that file is also
-marked for the same flag-day rewrite.
+authoritative for inspector notation.
 
 ## Inline Hints
 
@@ -47,7 +43,7 @@ highlighting:
 | Inspector token | Source-editor style category |
 | --- | --- |
 | field names before `:` | `definition` |
-| `TEXT`, `NUMBER`, `BOOL`, `LIST`, `VALUE`, `ABSENT` | `type` |
+| `TEXT`, `NUMBER`, `BYTES`, `BITS`, `LIST`, `SET`, `MAP` | `type` |
 | tags and runtime kind names | `tag` |
 | strings | `string` |
 | numbers | `number` |
@@ -62,7 +58,7 @@ Examples:
 
 ```boon
 count: NUMBER
-completed: BOOL = False
+completed: True | False = False
 ```
 
 ```boon
@@ -71,7 +67,7 @@ completed: BOOL = False
     selected_filter: Active | All | Completed
     todos: LIST<[
         title: TEXT
-        completed: BOOL
+        completed: True | False
     ]>
 ]
 ```
@@ -88,7 +84,7 @@ Scalar and summary values are shown inline with the type:
 
 ```boon
 active_count: NUMBER = 3
-completed: BOOL = False
+completed: True | False = False
 todos: LIST = 4 items
 ```
 

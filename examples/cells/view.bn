@@ -63,10 +63,10 @@ FUNCTION selected_formula_bar(cell) {
                 element: [
                     address: store.selected_address
                     event: [
-                        change: cell.sources.editor.events.change
+                        change: cell.sources.editor.change
                         key_down: cell.sources.editor.commit
                         escape: cell.sources.editor.cancel
-                        blur: cell.sources.editor.events.blur
+                        blur: cell.sources.editor.blur
                     ]
                 ]
                 style: [

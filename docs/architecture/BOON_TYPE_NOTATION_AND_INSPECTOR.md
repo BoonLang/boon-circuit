@@ -1,25 +1,19 @@
 # Boon Type Notation And Inspector
 
-> **Phase 0 status: rewrite required.**
+> **Phase 2 truth notation: current.**
 >
-> **Current executable behavior:** the checked-in parser, typechecker, native
-> editor, and inspector code remain authoritative for what runs today.
+> `True` and `False` are ordinary Tags. Type labels, diagnostics, editor hints,
+> and inspector output spell their closed set as `True | False`; Boon has no
+> public `BOOL` type or alias.
 >
-> **Historical/stale content:** the notation and screenshots below mix that
-> behavior with the superseded public `BOOL`, `VALUE`, and `ABSENT` vocabulary;
-> they are not current verification evidence.
+> Private tick absence is not a displayed data type. Unresolved checker state is
+> a compiler diagnostic, not a public `VALUE` type.
 >
 > **Target-only content:** any UI or notation prescription below that is not
 > already implemented is a design proposal, not an available language feature.
->
-> **Flag-day owner:** unified goal Phase 2 rewrites this document together with
-> the Tags-only truth, private presence/fault channels, exact `NUMBER`, and
-> collection-position replacement. Until then, this is not an implementation
-> contract.
 
-This document records the earlier design for Boon-facing type notation, runtime
-object shapes, editor type hints, and inspector UI. It was also intended as the
-template for future runtime roots such as `scene:`.
+This document records the Boon-facing type notation, runtime object shapes,
+editor type hints, and inspector UI contract.
 
 ## Boon-Facing Type Notation
 
@@ -27,19 +21,20 @@ Use Boon syntax whenever a type is shown to a user.
 
 ```boon
 title: TEXT
-completed: BOOL
+completed: True | False
 todos: LIST<[
     [
         title: TEXT
-        completed: BOOL
+        completed: True | False
     ]
 ]>
 ```
 
-- Native types and built-in display aliases are uppercase: `TEXT`, `NUMBER`,
-  `BOOL`, `LIST<T>`, `VALUE`, `ABSENT`.
-- `BOOL` is the Boon-facing alias for the structural union `False | True`; it is
-  not a nominal runtime primitive.
+- Native data types are uppercase: `TEXT`, `NUMBER`, `BYTES`, `BITS[N]`,
+  `LIST<T>`, `SET<T>`, and `MAP<K, V>`.
+- Closed truth displays as the structural Tag union `True | False`.
+- There is no public type spelling for private absence, runtime faults,
+  unresolved type variables, or open dynamic fallback.
 - Other tags display directly, such as `Active | All | Completed`, never
   `tag Active | All | Completed`.
 - Untagged object shapes use bracket notation: `[title: TEXT]`.
@@ -53,7 +48,7 @@ todos: LIST<[
 ```boon
 [
     title: TEXT
-    completed: BOOL
+    completed: True | False
 ]
 ```
 
@@ -94,7 +89,7 @@ Initial document-runtime shape registry template:
 | `document:` | `Element/paragraph(...)` | `[kind: Text]` | display fields contribute `TEXT` constraints for function parameters |
 | `document:` | `Element/link(...)` | `[kind: Text]` | display fields contribute `TEXT` constraints for function parameters |
 | `document:` | `Element/button(...)` | `[kind: Button]` | event/source payloads are ordinary Boon values; there is no user-visible `Event` type |
-| `document:` | `Element/checkbox(...)` | `[kind: Button]` | checked/visible/focus state is `BOOL` when checked directly |
+| `document:` | `Element/checkbox(...)` | `[kind: Button]` | checked/visible/focus state is `True | False` when checked directly |
 | `document:` | `Element/text_input(...)` | `[kind: TextInput]` | text/value fields contribute `TEXT` constraints for function parameters; current wrapper objects such as `[text: TEXT]` remain valid |
 
 The typechecker may keep an internal render contract sentinel, but normal
@@ -107,8 +102,8 @@ unambiguous in existing Boon code:
 - `items:` and `children:` accept `LIST` of document-renderable objects.
 - `child:` accepts one document-renderable object or the existing scalar text
   shorthand.
-- `checked`, `visible`, `selected`, and `focus` accept `BOOL` when a
-  direct value is checked.
+- `checked`, `visible`, `selected`, and `focus` accept the closed
+  `True | False` Tag set when a direct value is checked.
 - Text-like display arguments are used to infer function parameter types, but
   direct render fields are not rejected merely because the runtime currently
   accepts display coercions or wrapper objects used by the bundled examples.
@@ -145,7 +140,7 @@ value displays feel like Boon code:
 | Inspector token | Source-editor style category |
 | --- | --- |
 | field names before `:` | `definition` |
-| native types and aliases such as `TEXT`, `NUMBER`, `BOOL`, `LIST`, `VALUE`, `ABSENT` | `type` |
+| native types such as `TEXT`, `NUMBER`, `BYTES`, `BITS`, `LIST`, `SET`, `MAP` | `type` |
 | tags such as `False`, `True`, `Active`, `Completed`, `Button` | `tag` |
 | string values such as `"Done"` | `string` |
 | numeric values such as `12` or `-3.5` | `number` |
@@ -171,7 +166,7 @@ Boon-style expression flow:
 
 ```boon
 active_count: NUMBER = 3
-completed: BOOL = False
+completed: True | False = False
 new_todo_text: TEXT = TEXT {}
 selected_filter: Active | All | Completed = All
 todos: LIST = 4 items
@@ -206,12 +201,11 @@ Avoid internal terms in normal diagnostics: `RenderContract`, `TypeVar`,
 
 ## Implementation Status
 
-Implemented v1:
+Implemented:
 
 - Boon-facing notation uses uppercase native types, direct tags, bracket object
   shapes, `[]` for exact empty objects, and `[...]` for collapsed known shapes.
-- `BOOL` displays the exact `False | True` tag union while preserving structural
-  typing internally.
+- Closed truth displays as `True | False` and has no public Boolean type alias.
 - The native editor renders sparse inline hints as virtual metadata, so source
   text, selection, copy/paste, and measurement stay tied to the original code.
 - The sidebar is the detailed type/value surface and uses the inspector

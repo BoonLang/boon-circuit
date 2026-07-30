@@ -238,7 +238,7 @@ path = "crates/boon_runtime/src/program.rs"
 needle = "if stored.format != PROGRAM_ARTIFACT_FORMAT"
 
 [[artifacts]]
-id = "native-playground-protocol-v13"
+id = "native-playground-protocol-v14"
 owner_phase = "goal-phase-7-pre-hardware-evidence"
 owner_plan = "docs/architecture/NATIVE_GPU_PIPELINE.md"
 status = "present"
@@ -251,7 +251,7 @@ needle = "const MAGIC: [u8; 4] = *b\"BNIP\";"
 [[artifacts.probes]]
 kind = "text-contains"
 path = "crates/boon_native_playground/src/protocol.rs"
-needle = "const VERSION: u16 = 13;"
+needle = "const VERSION: u16 = 14;"
 
 [[artifacts]]
 id = "physical-plan"
@@ -481,10 +481,10 @@ replacement = "Retain exact source and workspace identity; bump only with a sche
 
 [[version_axes]]
 id = "native-playground-protocol"
-current_version = "13"
+current_version = "14"
 owner_phase = "goal-phase-7-pre-hardware-evidence"
 owner_plan = "docs/architecture/NATIVE_GPU_PIPELINE.md"
-target = "BNIP native playground protocol v13"
+target = "BNIP native playground protocol v14"
 replacement = "Bump with any native desktop, preview, dev, source-bundle, catalog, migration, or verification frame contract change."
 
 [[version_axes]]

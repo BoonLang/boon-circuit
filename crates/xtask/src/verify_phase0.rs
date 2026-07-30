@@ -1104,7 +1104,7 @@ fn validate_versions(
         ("erased-program", ArtifactStatus::Present),
         ("machine-plan", ArtifactStatus::Present),
         ("program-artifact-v3", ArtifactStatus::Present),
-        ("native-playground-protocol-v13", ArtifactStatus::Present),
+        ("native-playground-protocol-v14", ArtifactStatus::Present),
         ("physical-plan", ArtifactStatus::Absent),
         ("kernel-ir", ArtifactStatus::Absent),
         ("hardware-process", ArtifactStatus::Absent),

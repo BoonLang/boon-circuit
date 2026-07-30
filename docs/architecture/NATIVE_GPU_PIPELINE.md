@@ -148,10 +148,21 @@ The protocol carries only:
 
 - role hello/ready and shutdown;
 - catalog labels for dev;
-- source-unit bundles and monotonic source revisions;
+- editor and preview source-unit bundles, application identity, monotonic source
+  revisions, and source-controlled migration-sequence metadata;
 - immutable content-addressed asset bundles declared by the selected manifest;
 - Run, Reset, and TEST requests;
-- bounded preview status and scalar performance snapshots.
+- bounded value-inspection requests and current-value replies;
+- forward-only migration Preview/Activate/Restart/confirmed-Start-Over requests
+  and bounded status replies;
+- explicit persistence Flush/Maintain/Clear/Export/Import requests, bounded
+  cached inspector snapshots, and bounded canonical state artifacts; and
+- bounded preview status, runtime-change, TEST-result, and scalar performance
+  snapshots.
+
+The persistence and migration frames expose the semantics owned by
+`docs/plans/BOON_PERSISTENCE_ARCHITECTURE_PLAN.md`; this native document owns
+only their bounded two-window transport and scheduling behavior.
 
 Source replacement is latest-wins with depth one. New work supersedes stale
 pending work before expensive compilation when possible. Stale compile results

@@ -2771,6 +2771,12 @@ fn lower_verified_semantic_execution(
     Ok(())
 }
 
+fn package_mapped_state_arms(mapped_state_update_arms: Vec<Arm>) -> PulseBatch {
+    PulseBatch {
+        state_update_arms: mapped_state_update_arms,
+    }
+}
+
 #[cfg(test)]
 mod arbitrary_test_support_name {
     use boon_typecheck::CheckedProgram as CP;
@@ -2811,6 +2817,11 @@ macro_rules! diagnostic_text {
                 "renamed old helper",
                 "use crate::contextual_expansion::derive_executable_program as convert;",
                 "derive_executable_program",
+            ),
+            (
+                "old reactive discovery helper",
+                "fn state_update_arms() {} fn bypass() { state_update_arms(); }",
+                "state_update_arms",
             ),
             (
                 "semantic DTO outside map",

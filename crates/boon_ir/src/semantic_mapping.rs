@@ -9268,7 +9268,7 @@ fn map_pulse_batches(
                 .iter()
                 .map(map_trigger_arm)
                 .collect::<Result<Vec<_>, String>>()?;
-            let state_update_arms = batch
+            let mapped_state_update_arms = batch
                 .state_update_arms
                 .iter()
                 .map(|arm_id| {
@@ -9501,7 +9501,7 @@ fn map_pulse_batches(
                             )
                         })?;
                     if update.state != fact.state
-                        || state_update_arms
+                        || mapped_state_update_arms
                             .get(state_update_arm_index)
                             .is_none_or(|arm| arm.state != state)
                     {
@@ -9537,7 +9537,7 @@ fn map_pulse_batches(
                 transition_expression,
                 transition_output,
                 trigger_arms,
-                state_update_arms,
+                state_update_arms: mapped_state_update_arms,
                 list_mutations,
                 derived_value_indices,
                 host_effects,

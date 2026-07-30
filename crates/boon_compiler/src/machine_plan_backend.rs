@@ -66,6 +66,7 @@ fn visit_row_node_children_mut(
     match node {
         PlanRowExpressionNode::Absent
         | PlanRowExpressionNode::Intrinsic { .. }
+        | PlanRowExpressionNode::EffectResult
         | PlanRowExpressionNode::Field { .. }
         | PlanRowExpressionNode::Constant { .. }
         | PlanRowExpressionNode::ListRef { .. }
@@ -2368,7 +2369,7 @@ fn semantic_list_memory_plan(
             row_fields.push(MemoryLeafPlan::new(
                 memory_id,
                 Some(runtime_field_id),
-                field.diagnostic_path.clone(),
+                list_authority_persistence_path(&memory.identity.semantic_path, field)?,
                 field_type,
             )?);
         }
@@ -2388,10 +2389,7 @@ fn semantic_list_memory_plan(
             row_fields.push(MemoryLeafPlan::new(
                 memory_id,
                 Some(runtime_field_id),
-                list_authority_persistence_path(
-                    &memory.identity.semantic_path,
-                    &field.diagnostic_path,
-                ),
+                list_authority_persistence_path(&memory.identity.semantic_path, field)?,
                 field_type,
             )?);
         }
@@ -2646,12 +2644,20 @@ fn append_item_field_names(ty: &boon_typecheck::Type) -> Vec<String> {
     names
 }
 
-fn list_authority_persistence_path(list_path: &str, field_path: &str) -> String {
-    let relative = field_path
-        .strip_prefix(list_path)
-        .and_then(|suffix| suffix.strip_prefix('.'))
-        .unwrap_or(field_path);
-    format!("{list_path}.@authority:{}", relative.replace('.', "/"))
+fn list_authority_persistence_path(
+    list_path: &str,
+    field: &ir::ErasedFieldDef,
+) -> Result<String, PlanError> {
+    if field.row_path.is_empty() {
+        return Err(PlanError::new(format!(
+            "authoritative field {} has no structural row-member path",
+            field.id
+        )));
+    }
+    Ok(format!(
+        "{list_path}.@authority:{}",
+        field.row_path.join("/")
+    ))
 }
 
 fn plan_value_type_for_value_ref(
@@ -4800,7 +4806,18 @@ pub(crate) fn compile_typed_program_with_distributed_context(
                         &format!("state update `{}` from `{cause_path}`", state.path),
                     )?,
                 )?;
-                (None, Some(effect))
+                let result_transform = exact_host_effect_result_transform(
+                    program,
+                    &index,
+                    &mut row_expressions,
+                    &mut constants,
+                    &mut inputs,
+                    &trigger,
+                    active_state,
+                    arm.output_expression_id,
+                    effect_expression,
+                )?;
+                (result_transform, Some(effect))
             } else {
                 let value = ExecutableRowLowerer::new(
                     program,
@@ -7354,7 +7371,6 @@ fn row_field_id_for_list_field(
         .iter()
         .find(|list| list.name == list_name)
         .map(|list| list.id)?;
-    let exact_path = format!("{list_name}.{field_name}");
     program
         .scope_index
         .fields
@@ -7363,18 +7379,14 @@ fn row_field_id_for_list_field(
             erased_field_is_runtime_row_storage(program, field)
                 && field.row.map(|row| row.list) == Some(list)
                 && field.name == field_name
-                && field.diagnostic_path == exact_path
+                && field.row_path.as_slice() == [field_name]
         })
         .min_by_key(|field| {
-            let value_priority = if field.role.is_value()
-                && !(field.role.is_authority()
-                    && erased_constructor_authority_has_separate_value(program, field))
-            {
-                0
-            } else if field.role.is_value() {
-                1
-            } else {
-                2
+            let value_priority = match field.role {
+                ir::ErasedFieldRole::Value => 0,
+                ir::ErasedFieldRole::ValueAuthority => 1,
+                ir::ErasedFieldRole::ListAuthority => 2,
+                ir::ErasedFieldRole::Capture => 3,
             };
             (
                 value_priority,
@@ -7505,8 +7517,8 @@ fn erased_constructor_authority_has_separate_value(
     program.scope_index.fields.iter().any(|candidate| {
         candidate.id != field.id
             && candidate.row == field.row
-            && candidate.diagnostic_path == field.diagnostic_path
-            && candidate.role.is_value()
+            && candidate.row_path == field.row_path
+            && candidate.role == ir::ErasedFieldRole::Value
             && erased_field_is_runtime_row_storage(program, candidate)
     })
 }
@@ -7650,11 +7662,10 @@ fn materialized_output_field<'a>(
     target_list: ListId,
     name: &str,
 ) -> Result<&'a ir::ErasedFieldDef, PlanError> {
-    let list_name = program
+    program
         .lists
         .iter()
         .find(|list| plan_list_id(list.id) == target_list)
-        .map(|list| list.name.as_str())
         .ok_or_else(|| PlanError::new(format!("materialized list {} is missing", target_list.0)))?;
     let fields = program
         .scope_index
@@ -7663,7 +7674,7 @@ fn materialized_output_field<'a>(
         .filter(|field| {
             erased_field_is_runtime_row_storage(program, field)
                 && field.row.map(|row| plan_list_id(row.list)) == Some(target_list)
-                && erased_field_is_direct_list_member(field, list_name)
+                && erased_field_is_direct_list_member(field)
                 && field.name == name
                 && field.role.is_value()
         })
@@ -7706,11 +7717,10 @@ fn materialized_output_fields(
     target_list: ListId,
     state_fields: &BTreeMap<String, StateId>,
 ) -> Result<BTreeMap<String, FieldId>, PlanError> {
-    let list_name = program
+    program
         .lists
         .iter()
         .find(|list| plan_list_id(list.id) == target_list)
-        .map(|list| list.name.as_str())
         .ok_or_else(|| PlanError::new(format!("materialized list {} is missing", target_list.0)))?;
     let names = program
         .scope_index
@@ -7719,7 +7729,7 @@ fn materialized_output_fields(
         .filter(|field| {
             erased_field_is_runtime_row_storage(program, field)
                 && field.row.map(|row| plan_list_id(row.list)) == Some(target_list)
-                && erased_field_is_direct_list_member(field, list_name)
+                && erased_field_is_direct_list_member(field)
                 && field.role.is_value()
                 && !field.resource_only
                 && !state_fields.contains_key(&field.name)
@@ -7818,11 +7828,10 @@ fn state_dependent_materialized_row_fields(
     if target_states.is_empty() && !include_state_independent {
         return Ok(Vec::new());
     }
-    let list_name = program
+    program
         .lists
         .iter()
         .find(|list| plan_list_id(list.id) == target_list)
-        .map(|list| list.name.as_str())
         .ok_or_else(|| PlanError::new(format!("materialized list {} is missing", target_list.0)))?;
     let candidates = program
         .scope_index
@@ -7831,7 +7840,7 @@ fn state_dependent_materialized_row_fields(
         .filter(|field| {
             erased_field_is_runtime_row_storage(program, field)
                 && field.row.map(|row| plan_list_id(row.list)) == Some(target_list)
-                && erased_field_is_direct_list_member(field, list_name)
+                && erased_field_is_direct_list_member(field)
                 && field.role == ir::ErasedFieldRole::Value
                 && !field.resource_only
                 && !state_fields.contains_key(&field.name)
@@ -9929,19 +9938,15 @@ fn top_level_materialized_data_field_names(
         .filter(|field| {
             erased_field_is_runtime_row_storage(program, field)
                 && field.row.map(|row| row.list) == Some(list.id)
-                && erased_field_is_direct_list_member(field, &list.name)
+                && erased_field_is_direct_list_member(field)
                 && !erased_field_contains_resource(program, field)
         })
         .map(|field| field.name.clone())
         .collect()
 }
 
-fn erased_field_is_direct_list_member(field: &ir::ErasedFieldDef, list_name: &str) -> bool {
-    field
-        .diagnostic_path
-        .strip_prefix(list_name)
-        .and_then(|suffix| suffix.strip_prefix('.'))
-        .is_some_and(|suffix| !suffix.is_empty() && !suffix.contains('.'))
+fn erased_field_is_direct_list_member(field: &ir::ErasedFieldDef) -> bool {
+    field.row_path.len() == 1
 }
 
 fn erased_field_contains_resource(program: &ErasedProgram, field: &ir::ErasedFieldDef) -> bool {
@@ -11153,6 +11158,9 @@ impl<'a> ExecutableRowLowerer<'a> {
             .map(|owner| PlanStaticOwnerId(owner.as_usize()))
             .or(inherited_owner);
         if let ir::ExecutableExpressionKind::When { input, arms } = expression.kind {
+            if executable_expression_reaches(self.program, input, target) {
+                return self.lower_reachability_gate_scoped(input, target, owner);
+            }
             let input = self.lower_scoped(input, owner)?;
             let mut reaches_effect = false;
             let mut has_wildcard = false;
@@ -13116,6 +13124,7 @@ fn row_expression_value_type(
             }
         }
         PlanRowExpressionNode::Intrinsic { .. } => Some(PlanValueType::Tag),
+        PlanRowExpressionNode::EffectResult => Some(PlanValueType::Data),
         PlanRowExpressionNode::Field { input } => {
             plan_value_type_for_value_ref(program, index, input)
         }
@@ -13559,6 +13568,35 @@ fn exact_host_effect_plan_parts(
         gate,
         intent_expressions,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn exact_host_effect_result_transform(
+    program: &ErasedProgram,
+    index: &ValueIndex,
+    arena: &mut PlanRowExpressionArena,
+    constants: &mut Vec<PlanConstant>,
+    inputs: &mut Vec<ValueRef>,
+    trigger: &ValueRef,
+    active_state: ir::ExecutableStateId,
+    output: ir::ExecutableExprId,
+    effect: ir::ExecutableExprId,
+) -> Result<Option<PlanRowExpressionId>, PlanError> {
+    if output == effect {
+        return Ok(None);
+    }
+    let result = arena.intern(PlanRowExpressionNode::EffectResult)?;
+    let transform = ExecutableRowLowerer::new(program, index, arena, constants, inputs)
+        .with_bindings(BTreeMap::from([(effect, result)]))
+        .with_event_trigger(trigger)
+        .with_state_update(active_state)
+        .lower(output)
+        .map_err(|error| {
+            PlanError::new(format!(
+                "host effect result continuation from expression {effect} to state output {output} failed exact lowering: {error}"
+            ))
+        })?;
+    Ok((transform != result).then_some(transform))
 }
 
 fn push_plan_constant(

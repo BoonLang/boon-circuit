@@ -1997,6 +1997,7 @@ fn distributed_call_expression_is_safe(
             PlanRowExpressionNode::Absent
             | PlanRowExpressionNode::Flush { .. }
             | PlanRowExpressionNode::Intrinsic { .. }
+            | PlanRowExpressionNode::EffectResult
             | PlanRowExpressionNode::ListGetField { .. }
             | PlanRowExpressionNode::ListRef { .. }
             | PlanRowExpressionNode::AuthorityListRef { .. }
@@ -8014,6 +8015,9 @@ pub enum PlanRowExpressionNode {
     Intrinsic {
         intrinsic: PlanIntrinsic,
     },
+    /// Private value supplied only while applying the result of the host
+    /// effect owned by the surrounding state-update operation.
+    EffectResult,
     Field {
         input: ValueRef,
     },
@@ -8268,6 +8272,7 @@ impl PlanRowExpressionNode {
         match self {
             Self::Absent
             | Self::Intrinsic { .. }
+            | Self::EffectResult
             | Self::Field { .. }
             | Self::Constant { .. }
             | Self::ListRef { .. }
@@ -8482,6 +8487,7 @@ impl PlanRowExpressionNode {
         match self {
             Self::Absent
             | Self::Intrinsic { .. }
+            | Self::EffectResult
             | Self::Field { .. }
             | Self::Constant { .. }
             | Self::ListRef { .. }
@@ -9114,6 +9120,14 @@ impl PlanRowExpressionArena {
                 visitor(*intrinsic);
             }
         })
+    }
+
+    pub fn contains_effect_result(&self, root: PlanRowExpressionId) -> Result<bool, PlanError> {
+        let mut found = false;
+        self.visit(root, &mut |_, node| {
+            found |= matches!(node, PlanRowExpressionNode::EffectResult);
+        })?;
+        Ok(found)
     }
 
     pub fn reads_authority_list(
@@ -12260,9 +12274,36 @@ fn effect_contracts_failure(plan: &MachinePlan) -> Option<String> {
         let PlanOpKind::StateUpdate { value, effect, .. } = &op.kind else {
             continue;
         };
-        if value.is_some() == effect.is_some() {
+        let effect_expressions_are_private = effect.as_ref().is_none_or(|effect| {
+            !plan
+                .row_expressions
+                .contains_effect_result(effect.gate)
+                .unwrap_or(true)
+                && effect.intent_fields.iter().all(|field| {
+                    !plan
+                        .row_expressions
+                        .contains_effect_result(field.expression)
+                        .unwrap_or(true)
+                })
+        });
+        let shape_is_valid = match (value, effect) {
+            (Some(value), None) => !plan
+                .row_expressions
+                .contains_effect_result(*value)
+                .unwrap_or(true),
+            (None, Some(_)) => effect_expressions_are_private,
+            (Some(value), Some(_)) => {
+                effect_expressions_are_private
+                    && plan
+                        .row_expressions
+                        .contains_effect_result(*value)
+                        .unwrap_or(false)
+            }
+            (None, None) => false,
+        };
+        if !shape_is_valid {
             return Some(format!(
-                "state update op {} must have exactly one value or effect",
+                "state update op {} has an invalid value/effect continuation shape",
                 op.id.0
             ));
         }
@@ -12348,6 +12389,13 @@ fn effect_contracts_failure(plan: &MachinePlan) -> Option<String> {
                     && plan
                         .row_expressions
                         .contextual_locals_resolve(field.expression)
+                        .unwrap_or(false)
+            })
+            || value.is_some_and(|transform| {
+                !row_expression_refs_resolve(&plan.row_expressions, op, transform)
+                    || !plan
+                        .row_expressions
+                        .contextual_locals_resolve(transform)
                         .unwrap_or(false)
             })
             || !effect_intent_fields_match_schema(
@@ -13968,6 +14016,24 @@ pub fn cpu_plan_executor_supports_whole_plan_op(
             value,
             effect,
         } => {
+            let effect_is_evaluable = |effect: &EffectInvocationPlan| {
+                row_expression_cpu_evaluable(arena, effect.gate)
+                    && row_expression_refs_resolve(arena, op, effect.gate)
+                    && arena
+                        .contextual_locals_resolve(effect.gate)
+                        .unwrap_or(false)
+                    && !arena.contains_effect_result(effect.gate).unwrap_or(true)
+                    && effect.intent_fields.iter().all(|field| {
+                        row_expression_cpu_evaluable(arena, field.expression)
+                            && row_expression_refs_resolve(arena, op, field.expression)
+                            && arena
+                                .contextual_locals_resolve(field.expression)
+                                .unwrap_or(false)
+                            && !arena
+                                .contains_effect_result(field.expression)
+                                .unwrap_or(true)
+                    })
+            };
             op.unresolved_executable_ref_count == 0
                 && state_update_trigger_is_supported(op)
                 && matches!(op.output, Some(ValueRef::State(_)))
@@ -13976,20 +14042,15 @@ pub fn cpu_plan_executor_supports_whole_plan_op(
                         row_expression_cpu_evaluable(arena, *value)
                             && row_expression_refs_resolve(arena, op, *value)
                             && arena.contextual_locals_resolve(*value).unwrap_or(false)
+                            && !arena.contains_effect_result(*value).unwrap_or(true)
                     }
-                    (None, Some(effect)) => {
-                        row_expression_cpu_evaluable(arena, effect.gate)
-                            && row_expression_refs_resolve(arena, op, effect.gate)
-                            && arena
-                                .contextual_locals_resolve(effect.gate)
-                                .unwrap_or(false)
-                            && effect.intent_fields.iter().all(|field| {
-                                row_expression_cpu_evaluable(arena, field.expression)
-                                    && row_expression_refs_resolve(arena, op, field.expression)
-                                    && arena
-                                        .contextual_locals_resolve(field.expression)
-                                        .unwrap_or(false)
-                            })
+                    (None, Some(effect)) => effect_is_evaluable(effect),
+                    (Some(value), Some(effect)) => {
+                        effect_is_evaluable(effect)
+                            && row_expression_cpu_evaluable(arena, *value)
+                            && row_expression_refs_resolve(arena, op, *value)
+                            && arena.contextual_locals_resolve(*value).unwrap_or(false)
+                            && arena.contains_effect_result(*value).unwrap_or(false)
                     }
                     _ => false,
                 }
@@ -14416,7 +14477,34 @@ fn constant_refs_resolve_and_match_storage_types_failure(plan: &MachinePlan) -> 
         let PlanOpKind::StateUpdate { value, effect, .. } = &op.kind else {
             continue;
         };
-        if !matches!(op.output, Some(ValueRef::State(_))) || value.is_some() == effect.is_some() {
+        let effect_expressions_are_private = effect.as_ref().is_none_or(|effect| {
+            !plan
+                .row_expressions
+                .contains_effect_result(effect.gate)
+                .unwrap_or(true)
+                && effect.intent_fields.iter().all(|field| {
+                    !plan
+                        .row_expressions
+                        .contains_effect_result(field.expression)
+                        .unwrap_or(true)
+                })
+        });
+        let shape_is_valid = match (value, effect) {
+            (Some(value), None) => !plan
+                .row_expressions
+                .contains_effect_result(*value)
+                .unwrap_or(true),
+            (None, Some(_)) => effect_expressions_are_private,
+            (Some(value), Some(_)) => {
+                effect_expressions_are_private
+                    && plan
+                        .row_expressions
+                        .contains_effect_result(*value)
+                        .unwrap_or(false)
+            }
+            (None, None) => false,
+        };
+        if !matches!(op.output, Some(ValueRef::State(_))) || !shape_is_valid {
             return Some(format!(
                 "state update op {} has an invalid output/value/effect shape",
                 op.id.0

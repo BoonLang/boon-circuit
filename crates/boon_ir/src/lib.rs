@@ -1659,6 +1659,10 @@ pub struct ErasedFieldDef {
     pub parent: Option<FieldId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub row: Option<ErasedRowBinding>,
+    /// Exact structural path within `row`. Empty for row roots and fields
+    /// without row storage. Diagnostic paths are never storage identity.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub row_path: Vec<String>,
     pub name: String,
     pub diagnostic_path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2620,6 +2624,38 @@ fn verify_erased_scope_index(program: &ErasedProgram) -> Result<(), String> {
         if let Some(row) = field.row {
             verify_erased_row(program, row, &format!("FieldId {}", field.id))?;
         }
+        let structural_row_path =
+            erased_field_structural_row_path(&program.scope_index.fields, field)?;
+        if field.row.is_none() && !field.row_path.is_empty() {
+            return Err(format!(
+                "erased FieldId {} without row storage has row-member path `{}`",
+                field.id,
+                field.row_path.join(".")
+            ));
+        }
+        if field.row_path.iter().any(String::is_empty)
+            || (!field.row_path.is_empty() && field.row_path.last() != Some(&field.name))
+        {
+            return Err(format!(
+                "erased FieldId {} has malformed row-member path `{}`",
+                field.id,
+                field.row_path.join(".")
+            ));
+        }
+        if !structural_row_path.is_empty() && field.row_path != structural_row_path {
+            return Err(format!(
+                "erased FieldId {} has row-member path `{}`, expected structural path `{}`",
+                field.id,
+                field.row_path.join("."),
+                structural_row_path.join(".")
+            ));
+        }
+        if field.role == ErasedFieldRole::Capture && !field.row_path.is_empty() {
+            return Err(format!(
+                "capture FieldId {} exposes a row-member path",
+                field.id
+            ));
+        }
         if field.role == ErasedFieldRole::ListAuthority
             && ((field.row.is_none() && field.parent.is_none())
                 || field.declaration.is_some()
@@ -2661,12 +2697,12 @@ fn verify_erased_scope_index(program: &ErasedProgram) -> Result<(), String> {
                 local.owner, local.local.0, local.source
             ));
         }
-        let target_row = program
+        let authority_row = program
             .scope_index
             .owners
             .get(local.owner.as_usize())
             .filter(|owner| owner.id == local.owner)
-            .and_then(|owner| owner.target_row);
+            .and_then(|owner| owner.authority_row);
         let mut capture_identities = BTreeSet::new();
         for capture in &local.captures {
             if !capture_identities.insert((
@@ -2707,9 +2743,9 @@ fn verify_erased_scope_index(program: &ErasedProgram) -> Result<(), String> {
                         local.owner, local.local.0, capture.field
                     )
                 })?;
-            if field.role != ErasedFieldRole::Capture || field.row != target_row {
+            if field.role != ErasedFieldRole::Capture || field.row != authority_row {
                 return Err(format!(
-                    "owner {} local {} capture FieldId {} is not hidden storage on its target row",
+                    "owner {} local {} capture FieldId {} is not hidden storage on its authority row",
                     local.owner, local.local.0, capture.field
                 ));
             }
@@ -2754,9 +2790,16 @@ fn verify_erased_scope_index(program: &ErasedProgram) -> Result<(), String> {
                             )
                         })?;
                     match member.forwarded_from.as_ref() {
-                        None => {}
                         Some(ErasedLocalMemberForwarding::Row { row, path })
                             if Some(*row) == local.row && *path == member.path => {}
+                        None => {
+                            return Err(format!(
+                                "owner {} local {} scalar member `{}` has no exact row forwarding",
+                                local.owner,
+                                local.local.0,
+                                member.path.join(".")
+                            ));
+                        }
                         Some(ErasedLocalMemberForwarding::Row { .. }) => {
                             return Err(format!(
                                 "owner {} local {} scalar member `{}` has inconsistent row forwarding",
@@ -2775,9 +2818,8 @@ fn verify_erased_scope_index(program: &ErasedProgram) -> Result<(), String> {
                         }
                     }
                     if field.row != local.row
+                        || member.path != field.row_path
                         || member.path.last() != Some(&field.name)
-                        || relative_path(&field.diagnostic_path)
-                            .is_none_or(|path| path != member.path)
                     {
                         return Err(format!(
                             "owner {} local {} member `{}` is inconsistent with FieldId {}",
@@ -3609,6 +3651,61 @@ fn verify_erased_scope_index(program: &ErasedProgram) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn erased_field_structural_row_path(
+    fields: &[ErasedFieldDef],
+    field: &ErasedFieldDef,
+) -> Result<Vec<String>, String> {
+    let Some(row) = field.row else {
+        return Ok(Vec::new());
+    };
+    let Some(parent) = field.parent else {
+        return Ok(Vec::new());
+    };
+    let mut parent = fields
+        .get(parent.as_usize())
+        .filter(|candidate| candidate.id == parent)
+        .ok_or_else(|| {
+            format!(
+                "erased FieldId {} references missing parent FieldId {parent}",
+                field.id
+            )
+        })?;
+    if parent.row != Some(row) {
+        return Ok(Vec::new());
+    }
+
+    let mut reversed = vec![field.name.clone()];
+    let mut remaining = fields.len().saturating_add(1);
+    loop {
+        if remaining == 0 {
+            return Err(format!(
+                "erased FieldId {} has cyclic structural row ancestry",
+                field.id
+            ));
+        }
+        remaining -= 1;
+        let Some(grandparent_id) = parent.parent else {
+            break;
+        };
+        let grandparent = fields
+            .get(grandparent_id.as_usize())
+            .filter(|candidate| candidate.id == grandparent_id)
+            .ok_or_else(|| {
+                format!(
+                    "erased FieldId {} ancestry references missing FieldId {grandparent_id}",
+                    field.id
+                )
+            })?;
+        if grandparent.row != Some(row) {
+            break;
+        }
+        reversed.push(parent.name.clone());
+        parent = grandparent;
+    }
+    reversed.reverse();
+    Ok(reversed)
 }
 
 fn verify_erased_row(

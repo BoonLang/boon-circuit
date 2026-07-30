@@ -41,10 +41,10 @@ use boon_semantic::{
     SemanticStatementId, SemanticStatementKind, SemanticStorageBindingTargetV1,
     SemanticStorageExternalReferenceId, SemanticStorageExternalReferenceKindV1,
     SemanticStorageFieldId, SemanticStorageFieldOriginV1, SemanticStorageFieldRoleV1,
-    SemanticStorageLocalMemberForwardingV1, SemanticStorageLocalMemberTargetV1,
-    SemanticStorageProjectionId, SemanticTextSegment, SemanticTriggerArmId, SemanticValueId,
-    SemanticValueListAuthorityId, SemanticValueMember, SemanticValueOrigin,
-    SemanticValueProvenance, StaticOwnerDef, StaticOwnerId,
+    SemanticStorageFieldV1, SemanticStorageLocalMemberForwardingV1,
+    SemanticStorageLocalMemberTargetV1, SemanticStorageProjectionId, SemanticTextSegment,
+    SemanticTriggerArmId, SemanticValueId, SemanticValueListAuthorityId, SemanticValueMember,
+    SemanticValueOrigin, SemanticValueProvenance, StaticOwnerDef, StaticOwnerId,
 };
 use boon_typecheck::{
     CheckedExternalDeclarationIdentityV1, CheckedExternalDeclarationKind, CheckedParameterKind,
@@ -4434,7 +4434,14 @@ pub(super) fn map_semantic_storage_join(
         &storage_ids,
     )?;
     let owners = map_storage_owners(execution, storage_graph, ids)?;
-    let fields = map_storage_fields(execution, storage_graph, ids, reactive, &storage_ids)?;
+    let fields = map_storage_fields(
+        execution,
+        resource_graph,
+        storage_graph,
+        ids,
+        reactive,
+        &storage_ids,
+    )?;
     let locals = map_storage_locals(execution, storage_graph, ids, &storage_ids, &fields)?;
     let bindings = map_storage_bindings(storage_graph, ids, reactive, &storage_ids, &fields)?;
     let sources = map_storage_sources(resource_graph, storage_graph, ids, reactive, &storage_ids)?;
@@ -4761,6 +4768,7 @@ const fn map_storage_field_role(role: SemanticStorageFieldRoleV1) -> ErasedField
 
 fn map_storage_fields(
     execution: &SemanticExecutionGraphV1,
+    resources: &SemanticResourceGraphV1,
     storage: &SemanticScopeStorageGraphV1,
     ids: &SemanticToExecutableMap,
     reactive: &MappedSemanticReactive,
@@ -4771,6 +4779,7 @@ fn map_storage_fields(
         .iter()
         .map(|field| {
             let id = storage_ids.storage_field(field.id)?;
+            let row_path = semantic_storage_row_path(resources, storage, field)?;
             if let Some(owner) = field.owner {
                 storage
                     .owners
@@ -4888,6 +4897,7 @@ fn map_storage_fields(
                 static_owner: field.owner,
                 parent,
                 row,
+                row_path,
                 name: field.name.clone(),
                 diagnostic_path: field.diagnostic_path.clone(),
                 statement,
@@ -4897,6 +4907,102 @@ fn map_storage_fields(
             })
         })
         .collect()
+}
+
+fn semantic_storage_row_path(
+    resources: &SemanticResourceGraphV1,
+    storage: &SemanticScopeStorageGraphV1,
+    field: &SemanticStorageFieldV1,
+) -> Result<Vec<String>, String> {
+    let Some(row) = field.row else {
+        return Ok(Vec::new());
+    };
+    match &field.origin {
+        SemanticStorageFieldOriginV1::ListAuthority { item_path, .. } => {
+            return Ok(item_path.clone());
+        }
+        SemanticStorageFieldOriginV1::RecordProjection { projection, .. } => {
+            return Ok(projection.clone());
+        }
+        SemanticStorageFieldOriginV1::DetachedCapture { .. }
+        | SemanticStorageFieldOriginV1::ValueListAuthority { .. } => {
+            return Ok(Vec::new());
+        }
+        SemanticStorageFieldOriginV1::Reactive { .. }
+        | SemanticStorageFieldOriginV1::StateAuthority { .. } => {}
+    }
+    if resources.lists.iter().any(|list| {
+        list.id == row.list
+            && list.row_scope == row.scope
+            && field.statement == Some(list.statement)
+            && matches!(field.origin, SemanticStorageFieldOriginV1::Reactive { .. })
+    }) {
+        return Ok(Vec::new());
+    }
+
+    let structural = semantic_storage_structural_row_path(storage, field)?;
+    if structural.is_empty() {
+        Ok(vec![field.name.clone()])
+    } else {
+        Ok(structural)
+    }
+}
+
+fn semantic_storage_structural_row_path(
+    storage: &SemanticScopeStorageGraphV1,
+    field: &SemanticStorageFieldV1,
+) -> Result<Vec<String>, String> {
+    let Some(row) = field.row else {
+        return Ok(Vec::new());
+    };
+    let Some(parent) = field.parent else {
+        return Ok(Vec::new());
+    };
+    let mut parent = storage
+        .fields
+        .get(parent.as_usize())
+        .filter(|candidate| candidate.id == parent)
+        .ok_or_else(|| {
+            format!(
+                "semantic storage field {} references missing parent {parent}",
+                field.id
+            )
+        })?;
+    if parent.row != Some(row) {
+        return Ok(Vec::new());
+    }
+
+    let mut reversed = vec![field.name.clone()];
+    let mut remaining = storage.fields.len().saturating_add(1);
+    loop {
+        if remaining == 0 {
+            return Err(format!(
+                "semantic storage field {} has cyclic structural row ancestry",
+                field.id
+            ));
+        }
+        remaining -= 1;
+        let Some(grandparent_id) = parent.parent else {
+            break;
+        };
+        let grandparent = storage
+            .fields
+            .get(grandparent_id.as_usize())
+            .filter(|candidate| candidate.id == grandparent_id)
+            .ok_or_else(|| {
+                format!(
+                    "semantic storage field {} ancestry references missing field {grandparent_id}",
+                    field.id
+                )
+            })?;
+        if grandparent.row != Some(row) {
+            break;
+        }
+        reversed.push(parent.name.clone());
+        parent = grandparent;
+    }
+    reversed.reverse();
+    Ok(reversed)
 }
 
 fn map_storage_local_member_target(
@@ -5011,6 +5117,7 @@ fn map_storage_locals(
                     ));
                 }
             };
+            let authority_row = target_row.or(row);
             let members = local
                 .members
                 .iter()
@@ -5061,7 +5168,7 @@ fn map_storage_locals(
                         .filter(|candidate| {
                             candidate.id == field
                                 && candidate.role == ErasedFieldRole::Capture
-                                && candidate.row == target_row
+                                && candidate.row == authority_row
                         })
                         .ok_or_else(|| {
                             format!(

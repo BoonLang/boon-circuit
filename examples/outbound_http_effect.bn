@@ -2,7 +2,7 @@ store: [
     request: SOURCE
 
     response:
-        NotRequested |> HOLD response {
+        0 |> HOLD response {
             request |> THEN {
                 Http/request(
                     endpoint: request.endpoint
@@ -14,14 +14,14 @@ store: [
                     connect_timeout_ms: request.connect_timeout_ms
                     overall_timeout_ms: request.overall_timeout_ms
                 )
+                |> WHEN {
+                    HttpSucceeded[status] => status
+                    __ => 0
+                }
             }
         }
 
-    last_status:
-        response |> WHEN {
-            HttpSucceeded => response.status
-            __ => 0
-        }
+    last_status: response
 ]
 
 outputs: [

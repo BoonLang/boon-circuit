@@ -2606,12 +2606,12 @@ FUNCTION entry_view(entry) {
         .iter()
         .find(|field| {
             field.row.map(|row| row.list) == Some(list.id)
-                && field.role == ErasedFieldRole::ValueAuthority
+                && field.role == ErasedFieldRole::ListAuthority
                 && field.name == "id"
         })
         .unwrap_or_else(|| {
             panic!(
-                "verified semantic storage must map the exact append item field; fields: {:#?}",
+                "verified semantic storage must retain the exact append constructor authority; fields: {:#?}",
                 ir.scope_index.fields
             )
         });

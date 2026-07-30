@@ -28475,6 +28475,19 @@ impl<'a> CheckedAuthorityAnalyzer<'a> {
                             true,
                         );
                     }
+                    function if is_registered_render_constructor(function) => {
+                        for entry in &call.entries {
+                            if let CheckedCallEntry::Input { value, .. } = entry {
+                                merge(recurse(
+                                    *value,
+                                    substitutions,
+                                    fresh_site,
+                                    callable_scope,
+                                    active,
+                                ));
+                            }
+                        }
+                    }
                     _ => {
                         let callable = self.callables.get(&call.callable).copied();
                         if let Some(callable) =

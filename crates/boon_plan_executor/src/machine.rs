@@ -7531,6 +7531,7 @@ struct ExpressionContext<'a> {
     row: Option<RowId>,
     collection_owner: CollectionOwnerRouteId,
     event: Option<&'a SourceEvent>,
+    effect_result: Option<&'a Value>,
     output: Option<FieldId>,
     consumer: Option<Consumer>,
 }
@@ -8908,6 +8909,7 @@ fn schedule_apply_operands<'event, 'plan>(
         | PlanRowExpressionNode::FlushBoundary { .. }
         | PlanRowExpressionNode::CatchCycle { .. }
         | PlanRowExpressionNode::Intrinsic { .. }
+        | PlanRowExpressionNode::EffectResult
         | PlanRowExpressionNode::Field { .. }
         | PlanRowExpressionNode::Constant { .. }
         | PlanRowExpressionNode::ListGetField { .. }
@@ -16527,7 +16529,20 @@ impl MachineInstance {
     ) -> Result<(), Error> {
         match route {
             boon_plan::EffectResultRoute::Target { target, .. } => {
-                let value = runtime_value(outcome)?;
+                let mut value = runtime_value(outcome)?;
+                if let PlanOpKind::StateUpdate {
+                    value: Some(transform),
+                    effect: Some(_),
+                    ..
+                } = &op.kind
+                {
+                    let evaluated =
+                        self.eval_effect_result_expression(*transform, context.row, &value, work)?;
+                    value = match evaluated {
+                        EvalValue::Absent | EvalValue::Flushed(_) => return Ok(()),
+                        evaluated => self.materialize_eval(evaluated)?,
+                    };
+                }
                 self.apply_effect_result(op, target, context, value, work)
             }
         }
@@ -21478,6 +21493,7 @@ impl MachineInstance {
                         row: Some(row),
                         collection_owner: CollectionOwnerRouteId::ROOT,
                         event: None,
+                        effect_result: None,
                         output: None,
                         consumer: None,
                     },
@@ -24410,11 +24426,36 @@ impl MachineInstance {
                     row,
                     collection_owner: CollectionOwnerRouteId::ROOT,
                     event,
+                    effect_result: None,
                     output,
                     consumer,
                 },
             },
             &mut BTreeMap::new(),
+            work,
+        )
+    }
+
+    fn eval_effect_result_expression(
+        &mut self,
+        expression: PlanRowExpressionId,
+        row: Option<RowId>,
+        effect_result: &Value,
+        work: &mut Work,
+    ) -> Result<EvalValue, Error> {
+        self.eval_expression_entry(
+            ExpressionEntry::Row {
+                expression,
+                context: ExpressionContext {
+                    row,
+                    collection_owner: CollectionOwnerRouteId::ROOT,
+                    event: None,
+                    effect_result: Some(effect_result),
+                    output: None,
+                    consumer: None,
+                },
+            },
+            &mut PlanLocalBindings::new(),
             work,
         )
     }
@@ -24530,6 +24571,7 @@ impl MachineInstance {
                     row,
                     collection_owner: CollectionOwnerRouteId::ROOT,
                     event,
+                    effect_result: None,
                     output,
                     consumer,
                 },
@@ -24663,6 +24705,15 @@ impl MachineInstance {
                                     .push_value(private_presence_eval(
                                         &self.eval_intrinsic_presence(*intrinsic),
                                     ))?,
+                                PlanRowExpressionNode::EffectResult => {
+                                    let value = context.effect_result.cloned().ok_or_else(|| {
+                                        Error::InvalidPlan(format!(
+                                            "effect-result expression {} was evaluated outside its owning effect continuation",
+                                            expression.0
+                                        ))
+                                    })?;
+                                    stack.push_value(EvalValue::Value(value))?;
+                                }
                                 PlanRowExpressionNode::Field {
                                     input: ValueRef::DistributedImport(import_id),
                                 } if self
@@ -26129,6 +26180,7 @@ impl MachineInstance {
                                             row: None,
                                             collection_owner: CollectionOwnerRouteId::ROOT,
                                             event: state.event,
+                                            effect_result: None,
                                             output: None,
                                             consumer: state.consumer,
                                         },
@@ -26952,6 +27004,7 @@ impl MachineInstance {
                                                 row: Some(row),
                                                 collection_owner: CollectionOwnerRouteId::ROOT,
                                                 event,
+                                                effect_result: None,
                                                 output: Some(field),
                                                 consumer: Some(consumer),
                                             },
@@ -27184,6 +27237,7 @@ impl MachineInstance {
                                         row,
                                         collection_owner: CollectionOwnerRouteId::ROOT,
                                         event,
+                                        effect_result: None,
                                         output,
                                         consumer,
                                     };
@@ -27247,6 +27301,7 @@ impl MachineInstance {
                                         row: None,
                                         collection_owner: CollectionOwnerRouteId::ROOT,
                                         event,
+                                        effect_result: None,
                                         output,
                                         consumer,
                                     };
@@ -29900,6 +29955,7 @@ impl MachineInstance {
                                 row: Some(state.row),
                                 collection_owner: CollectionOwnerRouteId::ROOT,
                                 event: None,
+                                effect_result: None,
                                 output: None,
                                 consumer: None,
                             };
@@ -31305,6 +31361,7 @@ impl MachineInstance {
             | PlanRowExpressionNode::FlushBoundary { .. }
             | PlanRowExpressionNode::CatchCycle { .. }
             | PlanRowExpressionNode::Intrinsic { .. }
+            | PlanRowExpressionNode::EffectResult
             | PlanRowExpressionNode::Field { .. }
             | PlanRowExpressionNode::Constant { .. }
             | PlanRowExpressionNode::ListGetField { .. }
@@ -32713,6 +32770,7 @@ impl MachineInstance {
                             row: Some(row),
                             collection_owner: CollectionOwnerRouteId::ROOT,
                             event,
+                            effect_result: None,
                             output: None,
                             consumer: None,
                         },
@@ -32736,6 +32794,7 @@ impl MachineInstance {
                             row: Some(row),
                             collection_owner: CollectionOwnerRouteId::ROOT,
                             event,
+                            effect_result: None,
                             output: None,
                             consumer: None,
                         },
@@ -36148,6 +36207,7 @@ store: [
             row: None,
             collection_owner: CollectionOwnerRouteId::ROOT,
             event: None,
+            effect_result: None,
             output: None,
             consumer: None,
         };

@@ -10,8 +10,7 @@ use crate::{
     SemanticLoweringContractV1, SemanticOutputContractId, SemanticOutputContractKindV1,
     SemanticReactiveGraphV1, SemanticReadBindingV1, SemanticReadId, SemanticReadTargetV1,
     SemanticResourceGraphV1, SemanticRowBinding, SemanticScopeId, SemanticScopeStorageGraphV1,
-    SemanticSourceId, SemanticStorageLocalMemberTargetV1, SemanticValueId,
-    SemanticViewCaptureTargetV1,
+    SemanticSourceId, SemanticValueId, SemanticValueOrigin, SemanticViewCaptureTargetV1,
 };
 use boon_contract::SourceBundleDigestV1;
 use boon_typecheck::{CheckedCallableKind, DeclId, Type};
@@ -253,117 +252,262 @@ impl SemanticViewBindingGraphV1 {
     }
 }
 
-fn exact_storage_event_source(
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ExactEventSourceLeaf {
+    source: SemanticSourceId,
+    relative_path: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ResolvedViewCaptureRoute {
+    target: SemanticViewBindingTargetV1,
+    leaf_capture_target: SemanticViewCaptureTargetV1,
+    diagnostic_path: String,
+    resource_row: Option<SemanticRowBinding>,
+    source_fallback_attribute: String,
+}
+
+fn exact_event_source_leaves(
+    execution: &SemanticExecutionGraphV1,
+    resources: &SemanticResourceGraphV1,
     storage: &SemanticScopeStorageGraphV1,
     read: &SemanticReadBindingV1,
-) -> Result<Option<SemanticSourceId>, SemanticViewBindingError> {
-    let SemanticReadTargetV1::MaterializationLocal {
-        owner,
-        local,
-        projection,
-    } = &read.target
-    else {
-        return Ok(None);
-    };
-    if projection.is_empty() {
-        return Ok(None);
-    }
-    let locals = storage
-        .locals
-        .iter()
-        .filter(|candidate| candidate.owner == *owner && candidate.local == *local)
-        .collect::<Vec<_>>();
-    let [local] = locals.as_slice() else {
+) -> Result<Vec<ExactEventSourceLeaf>, SemanticViewBindingError> {
+    let expression = require_expression(execution, read.expression)?;
+    if expression.value_id != read.value {
         return Err(SemanticViewBindingError::new(format!(
-            "view read {} materialization local {owner}:{local} resolves to {} exact storage locals",
-            read.id,
-            locals.len()
+            "view read {} expression/value identity differs",
+            read.id
         )));
-    };
+    }
 
-    let exact_sources = local
-        .members
-        .iter()
-        .filter(|member| member.path == *projection)
-        .filter_map(|member| match member.target {
-            SemanticStorageLocalMemberTargetV1::Source(source) => Some(source),
-            SemanticStorageLocalMemberTargetV1::Field(_)
-            | SemanticStorageLocalMemberTargetV1::State(_) => None,
-        })
-        .collect::<Vec<_>>();
-    match exact_sources.as_slice() {
-        [source] => return Ok(Some(*source)),
-        [] => {}
-        _ => {
-            return Err(SemanticViewBindingError::new(format!(
-                "view read {} projection `{}` resolves to {} exact storage sources",
-                read.id,
-                projection.join("."),
-                exact_sources.len()
-            )));
+    let mut leaves = BTreeSet::new();
+    for member in &expression.provenance.members {
+        match &member.origin {
+            SemanticValueOrigin::Source { source, .. } => {
+                resources
+                    .sources
+                    .get(source.as_usize())
+                    .filter(|candidate| candidate.id == *source)
+                    .ok_or_else(|| {
+                        SemanticViewBindingError::new(format!(
+                            "view read {} provenance references missing source {source}",
+                            read.id
+                        ))
+                    })?;
+                leaves.insert(ExactEventSourceLeaf {
+                    source: *source,
+                    relative_path: member.path.clone(),
+                });
+            }
+            SemanticValueOrigin::ProducerSource {
+                function,
+                producer,
+                identity,
+                owner,
+            } => {
+                let sources = resources
+                    .sources
+                    .iter()
+                    .filter(|source| {
+                        source.owner == Some(*owner)
+                            && matches!(
+                                source.origin,
+                                crate::SemanticSourceOrigin::ProducerInvocation {
+                                    function: candidate_function,
+                                    producer: candidate_producer,
+                                    identity: candidate_identity,
+                                } if candidate_function == *function
+                                    && candidate_producer == *producer
+                                    && candidate_identity == *identity
+                            )
+                    })
+                    .map(|source| source.id)
+                    .collect::<Vec<_>>();
+                let [source] = sources.as_slice() else {
+                    return Err(SemanticViewBindingError::new(format!(
+                        "view read {} producer provenance resolves to {} exact sources",
+                        read.id,
+                        sources.len()
+                    )));
+                };
+                resources
+                    .sources
+                    .get(source.as_usize())
+                    .filter(|candidate| candidate.id == *source)
+                    .ok_or_else(|| {
+                        SemanticViewBindingError::new(format!(
+                            "view read {} producer provenance references missing source {source}",
+                            read.id
+                        ))
+                    })?;
+                leaves.insert(ExactEventSourceLeaf {
+                    source: *source,
+                    relative_path: member.path.clone(),
+                });
+            }
+            SemanticValueOrigin::MaterializationLocal {
+                owner,
+                local,
+                projection,
+            } => {
+                let locals = storage
+                    .locals
+                    .iter()
+                    .filter(|candidate| candidate.owner == *owner && candidate.local == *local)
+                    .collect::<Vec<_>>();
+                let [local_definition] = locals.as_slice() else {
+                    return Err(SemanticViewBindingError::new(format!(
+                        "view read {} materialization provenance {owner}:{local} resolves to {} exact storage locals",
+                        read.id,
+                        locals.len()
+                    )));
+                };
+                let Some(row) = local_definition.row else {
+                    continue;
+                };
+                for source_projection in storage
+                    .row_source_projections
+                    .iter()
+                    .filter(|candidate| candidate.row == row)
+                {
+                    let Some(suffix) = source_projection.path.strip_prefix(projection.as_slice())
+                    else {
+                        continue;
+                    };
+                    resources
+                        .sources
+                        .get(source_projection.source.as_usize())
+                        .filter(|candidate| candidate.id == source_projection.source)
+                        .ok_or_else(|| {
+                            SemanticViewBindingError::new(format!(
+                                "view read {} row projection references missing source {}",
+                                read.id, source_projection.source
+                            ))
+                        })?;
+                    let mut relative_path = member.path.clone();
+                    relative_path.extend_from_slice(suffix);
+                    leaves.insert(ExactEventSourceLeaf {
+                        source: source_projection.source,
+                        relative_path,
+                    });
+                }
+            }
+            SemanticValueOrigin::Runtime | SemanticValueOrigin::State { .. } => {}
         }
     }
+    if leaves.is_empty()
+        && let SemanticReadTargetV1::Binding {
+            binding,
+            projection,
+        } = &read.target
+    {
+        let storage_bindings = storage
+            .bindings
+            .iter()
+            .filter(|candidate| candidate.binding == *binding)
+            .collect::<Vec<_>>();
+        let [storage_binding] = storage_bindings.as_slice() else {
+            return Err(SemanticViewBindingError::new(format!(
+                "view read {} binding {binding} resolves to {} exact storage bindings",
+                read.id,
+                storage_bindings.len()
+            )));
+        };
+        let producer = match storage_binding.target {
+            crate::SemanticStorageBindingTargetV1::Value { field, .. } => storage
+                .fields
+                .get(field.as_usize())
+                .filter(|candidate| candidate.id == field)
+                .ok_or_else(|| {
+                    SemanticViewBindingError::new(format!(
+                        "view read {} binding {binding} references missing storage field {field}",
+                        read.id
+                    ))
+                })?
+                .producer,
+            crate::SemanticStorageBindingTargetV1::List { .. }
+            | crate::SemanticStorageBindingTargetV1::Source { .. }
+            | crate::SemanticStorageBindingTargetV1::State { .. } => None,
+        };
+        if let Some(producer) = producer {
+            for row_value in storage
+                .row_values
+                .iter()
+                .filter(|row_value| row_value.expression == producer)
+            {
+                let Some(row_path) = projection.strip_prefix(row_value.projection.as_slice())
+                else {
+                    continue;
+                };
+                for source_projection in storage
+                    .row_source_projections
+                    .iter()
+                    .filter(|candidate| candidate.row == row_value.row)
+                {
+                    let Some(relative_path) = source_projection.path.strip_prefix(row_path) else {
+                        continue;
+                    };
+                    resources
+                        .sources
+                        .get(source_projection.source.as_usize())
+                        .filter(|candidate| candidate.id == source_projection.source)
+                        .ok_or_else(|| {
+                            SemanticViewBindingError::new(format!(
+                                "view read {} row value references missing source {}",
+                                read.id, source_projection.source
+                            ))
+                        })?;
+                    leaves.insert(ExactEventSourceLeaf {
+                        source: source_projection.source,
+                        relative_path: relative_path.to_vec(),
+                    });
+                }
+            }
+        }
+    }
+    Ok(leaves.into_iter().collect())
+}
 
-    let ancestor_fields = local
-        .members
-        .iter()
-        .filter(|member| projection.starts_with(member.path.as_slice()))
-        .filter_map(|member| match member.target {
-            SemanticStorageLocalMemberTargetV1::Field(field) => Some((member.path.len(), field)),
-            SemanticStorageLocalMemberTargetV1::Source(_)
-            | SemanticStorageLocalMemberTargetV1::State(_) => None,
-        })
-        .collect::<Vec<_>>();
-    let Some(longest) = ancestor_fields.iter().map(|(depth, _)| *depth).max() else {
-        return Ok(None);
-    };
-    let fields = ancestor_fields
-        .iter()
-        .filter(|(depth, _)| *depth == longest)
-        .map(|(_, field)| *field)
-        .collect::<Vec<_>>();
-    let [field] = fields.as_slice() else {
-        return Err(SemanticViewBindingError::new(format!(
-            "view read {} projection `{}` resolves to {} longest storage fields",
-            read.id,
-            projection.join("."),
-            fields.len()
-        )));
-    };
-    let field = storage
-        .fields
-        .get(field.as_usize())
-        .filter(|candidate| candidate.id == *field)
+fn exact_source_capture_route(
+    resources: &SemanticResourceGraphV1,
+    capture: SemanticCaptureId,
+    leaf: ExactEventSourceLeaf,
+) -> Result<ResolvedViewCaptureRoute, SemanticViewBindingError> {
+    let source = resources
+        .sources
+        .get(leaf.source.as_usize())
+        .filter(|candidate| candidate.id == leaf.source)
         .ok_or_else(|| {
             SemanticViewBindingError::new(format!(
-                "view read {} references missing storage field {field}",
-                read.id
+                "view capture {capture} route references missing semantic source {}",
+                leaf.source
             ))
         })?;
-    if !field.resource_only {
-        return Ok(None);
-    }
-
-    let descendants = local
-        .members
-        .iter()
-        .filter(|member| member.path.starts_with(projection.as_slice()))
-        .filter_map(|member| match member.target {
-            SemanticStorageLocalMemberTargetV1::Source(source) => Some(source),
-            SemanticStorageLocalMemberTargetV1::Field(_)
-            | SemanticStorageLocalMemberTargetV1::State(_) => None,
+    let resource_row = source
+        .target_list
+        .zip(source.row_scope)
+        .map(|(list, scope)| SemanticRowBinding { list, scope });
+    let source_fallback_attribute = leaf
+        .relative_path
+        .last()
+        .cloned()
+        .or_else(|| {
+            source
+                .semantic_path
+                .rsplit('.')
+                .next()
+                .filter(|attribute| !attribute.is_empty())
+                .map(str::to_owned)
         })
-        .collect::<Vec<_>>();
-    match descendants.as_slice() {
-        [source] => Ok(Some(*source)),
-        [] => Ok(None),
-        _ => Err(SemanticViewBindingError::new(format!(
-            "view read {} resource-only projection `{}` contains {} exact storage sources",
-            read.id,
-            projection.join("."),
-            descendants.len()
-        ))),
-    }
+        .unwrap_or_else(|| "event".to_owned());
+    Ok(ResolvedViewCaptureRoute {
+        target: SemanticViewBindingTargetV1::Event { source: source.id },
+        leaf_capture_target: SemanticViewCaptureTargetV1::Source { source: source.id },
+        diagnostic_path: source.semantic_path.clone(),
+        resource_row,
+        source_fallback_attribute,
+    })
 }
 
 fn semantic_read_diagnostic_path(
@@ -660,9 +804,7 @@ fn derive_semantic_view_binding_graph(
                     .collect::<Vec<_>>();
                 captures.sort_by_key(|capture| capture.id);
                 for capture in captures {
-                    let (target, leaf_capture_target, diagnostic_path, resource_row) = match capture
-                        .target
-                    {
+                    let routes = match capture.target {
                         SemanticViewCaptureTargetV1::Read { read } => {
                             let read_definition = reactive
                                 .reads
@@ -682,65 +824,50 @@ fn derive_semantic_view_binding_graph(
                                     capture.id
                                 )));
                             }
-                            if let Some(source) =
-                                exact_storage_event_source(storage, read_definition)?
-                            {
-                                let source_definition = resources
-                                    .sources
-                                    .get(source.as_usize())
-                                    .filter(|candidate| candidate.id == source)
-                                    .ok_or_else(|| {
-                                        SemanticViewBindingError::new(format!(
-                                            "view capture {} storage route references missing semantic source {source}",
-                                            capture.id
-                                        ))
-                                    })?;
-                                let resource_row = source_definition
-                                    .target_list
-                                    .zip(source_definition.row_scope)
-                                    .map(|(list, scope)| SemanticRowBinding { list, scope });
-                                (
-                                    SemanticViewBindingTargetV1::Event { source },
-                                    SemanticViewCaptureTargetV1::Source { source },
-                                    source_definition.semantic_path.clone(),
-                                    resource_row,
-                                )
-                            } else {
+                            let event_leaves = exact_event_source_leaves(
+                                execution,
+                                resources,
+                                storage,
+                                read_definition,
+                            )?;
+                            if event_leaves.is_empty() {
                                 let diagnostic_path = semantic_read_diagnostic_path(
                                     resources,
                                     storage,
                                     read_definition,
                                 )?
                                 .unwrap_or_else(|| format!("read:{read}"));
-                                (
-                                    SemanticViewBindingTargetV1::Data { read },
-                                    capture.target,
+                                let source_fallback_attribute = diagnostic_path
+                                    .rsplit('.')
+                                    .next()
+                                    .filter(|attribute| !attribute.is_empty())
+                                    .unwrap_or("event")
+                                    .to_owned();
+                                vec![ResolvedViewCaptureRoute {
+                                    target: SemanticViewBindingTargetV1::Data { read },
+                                    leaf_capture_target: capture.target,
                                     diagnostic_path,
-                                    None,
-                                )
+                                    resource_row: None,
+                                    source_fallback_attribute,
+                                }]
+                            } else {
+                                event_leaves
+                                    .into_iter()
+                                    .map(|leaf| {
+                                        exact_source_capture_route(resources, capture.id, leaf)
+                                    })
+                                    .collect::<Result<Vec<_>, _>>()?
                             }
                         }
                         SemanticViewCaptureTargetV1::Source { source } => {
-                            let source_definition = resources
-                                .sources
-                                .get(source.as_usize())
-                                .filter(|candidate| candidate.id == source)
-                                .ok_or_else(|| {
-                                    SemanticViewBindingError::new(format!(
-                                        "view capture {} references missing semantic source {source}",
-                                        capture.id
-                                    ))
-                                })?;
-                            let resource_row = source_definition
-                                .target_list
-                                .zip(source_definition.row_scope)
-                                .map(|(list, scope)| SemanticRowBinding { list, scope });
-                            (
-                                SemanticViewBindingTargetV1::Event { source },
-                                capture.target,
-                                source_definition.semantic_path.clone(),
-                                resource_row,
-                            )
+                            vec![exact_source_capture_route(
+                                resources,
+                                capture.id,
+                                ExactEventSourceLeaf {
+                                    source,
+                                    relative_path: Vec::new(),
+                                },
+                            )?]
                         }
                         SemanticViewCaptureTargetV1::Field { .. } => continue,
                     };
@@ -752,68 +879,71 @@ fn derive_semantic_view_binding_graph(
                         )));
                     }
                     let route_scope = expression_route_scope(execution, capture.expression)?;
-                    let row = resource_row
-                        .map(Ok)
-                        .or_else(|| {
-                            capture.row_scope.map(|scope| {
-                                resources
-                                    .row_scopes
-                                    .get(scope.as_usize())
-                                    .filter(|candidate| candidate.id == scope)
-                                    .map(|row| SemanticRowBinding {
-                                        list: row.list,
-                                        scope,
-                                    })
-                                    .ok_or_else(|| {
-                                        SemanticViewBindingError::new(format!(
-                                            "view capture {} references missing row scope {scope}",
-                                            capture.id
-                                        ))
-                                    })
+                    for route in routes {
+                        let row = route
+                            .resource_row
+                            .map(Ok)
+                            .or_else(|| {
+                                capture.row_scope.map(|scope| {
+                                    resources
+                                        .row_scopes
+                                        .get(scope.as_usize())
+                                        .filter(|candidate| candidate.id == scope)
+                                        .map(|row| SemanticRowBinding {
+                                            list: row.list,
+                                            scope,
+                                        })
+                                        .ok_or_else(|| {
+                                            SemanticViewBindingError::new(format!(
+                                                "view capture {} references missing row scope {scope}",
+                                                capture.id
+                                            ))
+                                        })
+                                })
                             })
-                        })
-                        .transpose()?;
-                    let leaf_bindings = binding_leaf_metadata(
-                        execution,
-                        call_argument.value,
-                        capture.expression,
-                        leaf_capture_target,
-                        function,
-                        &parameter.name,
-                        &diagnostic_path,
-                        output.contract,
-                    )?;
-                    if leaf_bindings.is_empty() {
-                        return Err(SemanticViewBindingError::new(format!(
-                            "view capture {} expression {} ({:?}) has no exact retained-view leaf under {} argument {} expression {} ({:?})",
-                            capture.id,
-                            capture.expression,
-                            capture_expression.kind,
-                            function,
-                            parameter.name,
+                            .transpose()?;
+                        let leaf_bindings = binding_leaf_metadata(
+                            execution,
                             call_argument.value,
-                            argument_expression.kind,
-                        )));
-                    }
-                    for leaf in leaf_bindings {
-                        bindings.push(SemanticViewBindingV1 {
-                            id: SemanticViewBindingId(bindings.len()),
-                            root: root_id,
-                            node: node_id,
-                            argument: argument_id,
-                            capture: capture.id,
-                            expression: capture.expression,
-                            value: capture.value,
-                            target,
-                            kind: leaf.kind,
-                            canonical_attribute: leaf.canonical_attribute,
-                            additional_projection: leaf.additional_projection,
-                            route_scope,
-                            row,
-                            diagnostic_node: diagnostic_kind.clone(),
-                            diagnostic_attribute: parameter.name.clone(),
-                            diagnostic_path: diagnostic_path.clone(),
-                        });
+                            capture.expression,
+                            route.leaf_capture_target,
+                            function,
+                            &parameter.name,
+                            &route.source_fallback_attribute,
+                            output.contract,
+                        )?;
+                        if leaf_bindings.is_empty() {
+                            return Err(SemanticViewBindingError::new(format!(
+                                "view capture {} expression {} ({:?}) has no exact retained-view leaf under {} argument {} expression {} ({:?})",
+                                capture.id,
+                                capture.expression,
+                                capture_expression.kind,
+                                function,
+                                parameter.name,
+                                call_argument.value,
+                                argument_expression.kind,
+                            )));
+                        }
+                        for leaf in leaf_bindings {
+                            bindings.push(SemanticViewBindingV1 {
+                                id: SemanticViewBindingId(bindings.len()),
+                                root: root_id,
+                                node: node_id,
+                                argument: argument_id,
+                                capture: capture.id,
+                                expression: capture.expression,
+                                value: capture.value,
+                                target: route.target,
+                                kind: leaf.kind,
+                                canonical_attribute: leaf.canonical_attribute,
+                                additional_projection: leaf.additional_projection,
+                                route_scope,
+                                row,
+                                diagnostic_node: diagnostic_kind.clone(),
+                                diagnostic_attribute: parameter.name.clone(),
+                                diagnostic_path: route.diagnostic_path.clone(),
+                            });
+                        }
                     }
                 }
             }
@@ -990,7 +1120,7 @@ fn binding_leaf_metadata(
     capture_target: SemanticViewCaptureTargetV1,
     constructor: &str,
     argument: &str,
-    diagnostic_path: &str,
+    source_fallback_attribute: &str,
     contract: SemanticOutputContractKindV1,
 ) -> Result<Vec<SemanticViewBindingLeaf>, SemanticViewBindingError> {
     let mode = match argument {
@@ -1007,11 +1137,6 @@ fn binding_leaf_metadata(
             kind: SemanticViewBindingKindV1::Data,
         },
     };
-    let source_fallback_attribute = diagnostic_path
-        .rsplit('.')
-        .next()
-        .filter(|attribute| !attribute.is_empty())
-        .unwrap_or("event");
     let mut traversal = BindingLeafTraversal {
         execution,
         capture,

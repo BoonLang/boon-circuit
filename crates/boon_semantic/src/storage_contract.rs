@@ -831,11 +831,7 @@ fn append_list_authority_fields(
             }
             fields.push(SemanticStorageFieldV1 {
                 id: SemanticStorageFieldId(fields.len()),
-                role: if mutation_value.is_some() {
-                    SemanticStorageFieldRoleV1::ValueAuthority
-                } else {
-                    SemanticStorageFieldRoleV1::ListAuthority
-                },
+                role: SemanticStorageFieldRoleV1::ListAuthority,
                 origin: SemanticStorageFieldOriginV1::ListAuthority {
                     list: list.id,
                     item_path: path.clone(),
@@ -847,7 +843,7 @@ fn append_list_authority_fields(
                 parent: Some(parent_field),
                 row: Some(row),
                 name,
-                diagnostic_path: format!("{}.{}", list.semantic_path, path.join(".")),
+                diagnostic_path: format!("@authority/{}/{}", list.id.as_usize(), path.join("/")),
                 statement: Some(list.statement),
                 producer: None,
                 resource_only: false,
@@ -1301,7 +1297,12 @@ fn append_materialized_value_fields(
         .collect::<BTreeSet<_>>();
     let explicit_value_paths = fields
         .iter()
-        .filter(|field| field.role == SemanticStorageFieldRoleV1::Value)
+        .filter(|field| {
+            matches!(
+                field.role,
+                SemanticStorageFieldRoleV1::Value | SemanticStorageFieldRoleV1::ValueAuthority
+            )
+        })
         .filter_map(|field| {
             field
                 .row
@@ -1611,21 +1612,22 @@ fn local_members_for_row(
                     && storage_field_item_path(field).as_deref() == Some(path.as_slice())
             })
             .collect::<Vec<_>>();
-        let preferred = candidates
+        let constructor_authorities = candidates
             .iter()
             .copied()
-            .filter(|field| {
-                matches!(
-                    field.role,
-                    SemanticStorageFieldRoleV1::ValueAuthority
-                        | SemanticStorageFieldRoleV1::ListAuthority
-                )
-            })
+            .filter(|field| field.role == SemanticStorageFieldRoleV1::ListAuthority)
             .collect::<Vec<_>>();
-        let selected = if preferred.is_empty() {
-            candidates
+        let value_authorities = candidates
+            .iter()
+            .copied()
+            .filter(|field| field.role == SemanticStorageFieldRoleV1::ValueAuthority)
+            .collect::<Vec<_>>();
+        let selected = if !constructor_authorities.is_empty() {
+            constructor_authorities
+        } else if !value_authorities.is_empty() {
+            value_authorities
         } else {
-            preferred
+            candidates
         };
         let [field] = selected.as_slice() else {
             let available = fields
@@ -1938,9 +1940,15 @@ fn nearest_target_materialization(
             .materializations
             .iter()
             .filter(|materialization| {
-                materialization.owner == owner
-                    && materialization.target_list_id == Some(row.list)
-                    && materialization.target_scope_id == Some(row.scope)
+                let authority_row = materialization
+                    .target_list_id
+                    .zip(materialization.target_scope_id)
+                    .or_else(|| {
+                        materialization
+                            .source_list_id
+                            .zip(materialization.source_scope_id)
+                    });
+                materialization.owner == owner && authority_row == Some((row.list, row.scope))
             })
             .collect::<Vec<_>>();
         match matches.as_slice() {
@@ -2838,6 +2846,37 @@ fn build_row_values(
         .collect::<BTreeMap<_, _>>();
     let mut values = BTreeSet::new();
     for expression in &execution.expressions {
+        if let SemanticExpressionKind::Materialize { materialization } = expression.kind {
+            let definition = execution
+                .materializations
+                .get(materialization.as_usize())
+                .filter(|candidate| candidate.id == materialization)
+                .ok_or_else(|| {
+                    SemanticScopeStorageError::new(format!(
+                        "row-value expression {} references missing materialization {materialization}",
+                        expression.id
+                    ))
+                })?;
+            if definition.operation == SemanticContextualOperationKind::Find {
+                let row = match (definition.source_list_id, definition.source_scope_id) {
+                    (Some(list), Some(scope)) => SemanticRowBinding { list, scope },
+                    (None, None) => continue,
+                    _ => {
+                        return Err(SemanticScopeStorageError::new(format!(
+                            "Find materialization {materialization} has an incomplete source row"
+                        )));
+                    }
+                };
+                // `List/find` returns `Found[value: row] | NotFound`. The
+                // typed operation, not a diagnostic field path, owns this
+                // exact row projection.
+                values.insert(SemanticStorageRowValueV1 {
+                    expression: expression.id,
+                    projection: vec!["value".to_owned()],
+                    row,
+                });
+            }
+        }
         for member in &expression.provenance.members {
             let SemanticValueOrigin::MaterializationLocal {
                 owner,

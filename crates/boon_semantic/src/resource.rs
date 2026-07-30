@@ -420,8 +420,8 @@ pub(crate) fn build_semantic_resource_graph(
     bind_list_lineage(execution, &mut lists)?;
 
     let mut aliases = Vec::new();
-    let sources = build_source_resources(checked, execution, &lists, &target_lists, &mut aliases)?;
-    let states = build_state_resources(checked, execution, &lists, &target_lists, &mut aliases)?;
+    let sources = build_source_resources(checked, execution, &lists, &mut aliases)?;
+    let states = build_state_resources(checked, execution, &lists, &mut aliases)?;
     aliases.sort();
     aliases.dedup();
     let materialization_bindings = execution
@@ -662,52 +662,116 @@ fn typed_list_targets(
                 matches.push(index);
             }
         }
-        if matches.is_empty()
-            && let Some(target) =
-                synthesize_inline_checked_list_target(checked, execution, checked_list, &path)?
-        {
-            matches.push(targets.len());
-            targets.push(target);
+        if matches.is_empty() {
+            for target in
+                synthesize_inline_checked_list_targets(checked, execution, checked_list, &path)?
+            {
+                matches.push(targets.len());
+                targets.push(target);
+            }
         }
-        let [index] = matches.as_slice() else {
+        let mut occurrence_targets = BTreeMap::new();
+        for index in &matches {
+            let target = &targets[*index];
+            let statement = execution
+                .statements
+                .get(target.statement.as_usize())
+                .filter(|statement| statement.id == target.statement)
+                .ok_or_else(|| {
+                    format!(
+                        "checked list {} target references missing statement {}",
+                        checked_list.id.0, target.statement
+                    )
+                })?;
+            let producer = expression(execution, target.producer)?;
+            let occurrence = (statement.call_instance, producer.owner);
+            if let Some(previous) = occurrence_targets.insert(occurrence, target.statement) {
+                return Err(format!(
+                    "checked list {} occurrence {occurrence:?} resolves to duplicate authority statements {previous} and {}",
+                    checked_list.id.0, target.statement
+                ));
+            }
+        }
+        if matches.is_empty() {
+            let occurrences = execution
+                .expressions
+                .iter()
+                .filter(|expression| expression.checked_expr_id == checked_list.producer)
+                .map(|expression| {
+                    let origin = execution
+                        .checked_expression_origins
+                        .get(expression.id.as_usize())
+                        .filter(|origin| origin.expression == expression.id);
+                    (
+                        expression.id,
+                        expression.owner,
+                        matches!(expression.kind, SemanticExpressionKind::List { .. }),
+                        origin.map(|origin| {
+                            (
+                                origin.checked_scope,
+                                origin.owning_statement,
+                                origin.call_instance,
+                            )
+                        }),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let binding = CheckedResourceBinding::ListAuthority {
+                list: checked_list.id,
+            };
+            let resource_statements = execution
+                .statements
+                .iter()
+                .filter(|statement| statement.checked_resources.contains(&binding))
+                .map(|statement| {
+                    (
+                        statement.id,
+                        statement.declaration,
+                        statement.parent,
+                        statement.call_instance,
+                    )
+                })
+                .collect::<Vec<_>>();
             return Err(format!(
-                "checked list {} declaration {} path `{path}` maps to {} exact semantic list producers",
+                "checked list {} declaration {} path `{path}` maps to {} exact semantic list producers; checked occurrences: {occurrences:?}; resource statements: {resource_statements:?}",
                 checked_list.id.0,
                 checked_list.declaration.0,
                 matches.len()
             ));
-        };
-        if !classified.insert(*index) {
-            return Err(format!(
-                "semantic list target {} is claimed by more than one checked list",
-                targets[*index].statement
-            ));
         }
-        let target = &mut targets[*index];
-        if target.item_type != checked_list.item_type
-            || target.capacity != checked_list.capacity
-            || target.alias.is_some()
-        {
-            return Err(format!(
-                "checked list {} differs from semantic list target {}: item type {:?} vs {:?}, capacity {:?} vs {:?}, alias {:?}",
-                checked_list.id.0,
-                target.statement,
-                checked_list.item_type,
-                target.item_type,
-                checked_list.capacity,
-                target.capacity,
-                target.alias,
-            ));
-        }
-        target.origin = SemanticListResourceOriginV1::CheckedLiteral {
-            checked_list: checked_list.id,
-        };
-        target.key_policy = match checked_list.key_policy {
-            CheckedListKeyPolicy::GeneratedOccurrenceU64 { has_generation } => {
-                SemanticListKeyPolicyV1::GeneratedOccurrenceU64 { has_generation }
+        for index in matches {
+            if !classified.insert(index) {
+                return Err(format!(
+                    "semantic list target {} is claimed by more than one checked list",
+                    targets[index].statement
+                ));
             }
-        };
-        target.span = checked_list.span.into();
+            let target = &mut targets[index];
+            if target.item_type != checked_list.item_type
+                || target.capacity != checked_list.capacity
+                || target.alias.is_some()
+            {
+                return Err(format!(
+                    "checked list {} differs from semantic list target {}: item type {:?} vs {:?}, capacity {:?} vs {:?}, alias {:?}",
+                    checked_list.id.0,
+                    target.statement,
+                    checked_list.item_type,
+                    target.item_type,
+                    checked_list.capacity,
+                    target.capacity,
+                    target.alias,
+                ));
+            }
+            target.origin = SemanticListResourceOriginV1::CheckedLiteral {
+                checked_list: checked_list.id,
+            };
+            target.key_policy = match checked_list.key_policy {
+                CheckedListKeyPolicy::GeneratedOccurrenceU64 { has_generation } => {
+                    SemanticListKeyPolicyV1::GeneratedOccurrenceU64 { has_generation }
+                }
+            };
+            target.span = checked_list.span.into();
+        }
     }
     Ok(targets)
 }
@@ -781,12 +845,53 @@ fn contextual_list_authority_statements(
     Ok(BTreeSet::new())
 }
 
-fn synthesize_inline_checked_list_target(
+fn checked_scope_is_function_local(
+    checked: &CheckedProgram,
+    mut scope: boon_typecheck::LexicalScopeId,
+) -> Result<bool, String> {
+    let mut visited = BTreeSet::new();
+    loop {
+        if !visited.insert(scope) {
+            return Err(format!(
+                "checked scope ancestry cycles while classifying list authority at {}",
+                scope.0
+            ));
+        }
+        let definition = checked
+            .scopes
+            .iter()
+            .find(|candidate| candidate.id == scope)
+            .ok_or_else(|| {
+                format!(
+                    "checked list authority references missing lexical scope {}",
+                    scope.0
+                )
+            })?;
+        if definition.kind == boon_typecheck::CheckedScopeKind::Function {
+            return Ok(true);
+        }
+        let Some(parent) = definition.parent else {
+            return Ok(false);
+        };
+        scope = parent;
+    }
+}
+
+fn synthesize_inline_checked_list_targets(
     checked: &CheckedProgram,
     execution: &mut SemanticExecutionGraphV1,
     checked_list: &boon_typecheck::CheckedList,
     path: &str,
-) -> Result<Option<ListTarget>, String> {
+) -> Result<Vec<ListTarget>, String> {
+    #[derive(Clone, Copy, Debug)]
+    struct Candidate {
+        expression: SemanticExprId,
+        authority_statement: SemanticStatementId,
+        existing_statement: Option<SemanticStatementId>,
+        call_instance: Option<OutCallInstanceId>,
+        owner: Option<StaticOwnerId>,
+    }
+
     let binding = CheckedResourceBinding::ListAuthority {
         list: checked_list.id,
     };
@@ -796,7 +901,7 @@ fn synthesize_inline_checked_list_target(
         .filter(|statement| statement.checked_resources.contains(&binding))
         .map(|statement| statement.id)
         .collect::<Vec<_>>();
-    let mut candidates = Vec::new();
+    let mut candidates = Vec::<Candidate>::new();
     for candidate in execution.expressions.iter().filter(|expression| {
         expression.checked_expr_id == checked_list.producer
             && matches!(expression.kind, SemanticExpressionKind::List { .. })
@@ -812,22 +917,15 @@ fn synthesize_inline_checked_list_target(
                 )
             })?;
         let mut owners = BTreeSet::new();
+        let function_local_occurrence = origin.call_instance.is_some()
+            && checked_scope_is_function_local(checked, origin.checked_scope)?;
         if let Some(statement) = origin.owning_statement
             && execution
                 .statements
                 .get(statement.as_usize())
                 .filter(|candidate| candidate.id == statement)
                 .is_some_and(|statement| {
-                    statement.checked_resources.contains(&binding)
-                        || origin.call_instance.is_some()
-                            && checked
-                                .declarations
-                                .iter()
-                                .find(|declaration| declaration.id == checked_list.path.anchor)
-                                .is_some_and(|declaration| {
-                                    declaration.kind
-                                        == boon_typecheck::CheckedDeclarationKind::Function
-                                })
+                    statement.checked_resources.contains(&binding) || function_local_occurrence
                 })
         {
             owners.insert(statement);
@@ -857,10 +955,37 @@ fn synthesize_inline_checked_list_target(
         }
         match owners.len() {
             0 => {}
-            1 => candidates.push((
-                candidate.id,
-                owners.iter().next().copied().expect("one exact list owner"),
-            )),
+            1 => {
+                let authority_statement = owners.iter().next().copied().ok_or_else(|| {
+                    format!(
+                        "checked inline list {} expression {} lost its exact authority statement",
+                        checked_list.id.0, candidate.id
+                    )
+                })?;
+                let existing_statement = execution
+                    .statements
+                    .get(authority_statement.as_usize())
+                    .filter(|statement| {
+                        statement.id == authority_statement
+                            && statement.declaration.is_none()
+                            && statement.value == Some(candidate.id)
+                            && matches!(
+                                &statement.kind,
+                                SemanticStatementKind::List {
+                                    path: Some(candidate_path),
+                                    ..
+                                } if candidate_path == path
+                            )
+                    })
+                    .map(|statement| statement.id);
+                candidates.push(Candidate {
+                    expression: candidate.id,
+                    authority_statement,
+                    existing_statement,
+                    call_instance: origin.call_instance,
+                    owner: candidate.owner,
+                });
+            }
             count => {
                 return Err(format!(
                     "checked inline list {} expression {} resolves to {count} semantic authority statements",
@@ -869,67 +994,44 @@ fn synthesize_inline_checked_list_target(
             }
         }
     }
-    let concrete_candidates = candidates
-        .iter()
-        .copied()
-        .filter(|(expression, statement)| {
-            execution
-                .statements
-                .get(statement.as_usize())
-                .filter(|candidate| candidate.id == *statement)
-                .is_some_and(|statement| {
-                    statement.declaration.is_none()
-                        && statement.value == Some(*expression)
-                        && matches!(
-                            &statement.kind,
-                            SemanticStatementKind::List {
-                                path: Some(candidate_path),
-                                ..
-                            } if candidate_path == path
-                        )
-                })
-        })
-        .collect::<Vec<_>>();
-    let (candidate, existing_statement, authority_statement) = match concrete_candidates.as_slice()
-    {
-        [(expression, statement)] => (*expression, Some(*statement), *statement),
-        [] => match candidates.as_slice() {
-            [(expression, statement)] => (*expression, None, *statement),
-            [] => return Ok(None),
+    let mut occurrences =
+        BTreeMap::<(Option<OutCallInstanceId>, Option<StaticOwnerId>), Vec<Candidate>>::new();
+    for candidate in candidates {
+        occurrences
+            .entry((candidate.call_instance, candidate.owner))
+            .or_default()
+            .push(candidate);
+    }
+    let mut selected = Vec::with_capacity(occurrences.len());
+    for (occurrence, candidates) in occurrences {
+        let concrete = candidates
+            .iter()
+            .copied()
+            .filter(|candidate| candidate.existing_statement.is_some())
+            .collect::<Vec<_>>();
+        let originals = candidates
+            .iter()
+            .copied()
+            .filter(|candidate| candidate.existing_statement.is_none())
+            .collect::<Vec<_>>();
+        let candidate = match (concrete.as_slice(), originals.as_slice()) {
+            ([concrete], [] | [_]) => *concrete,
+            ([], [original]) => *original,
             _ => {
                 return Err(format!(
-                    "checked inline list {} resolves to {} exact semantic authority expressions",
+                    "checked inline list {} occurrence {occurrence:?} resolves to {} original and {} concrete semantic authority expressions",
                     checked_list.id.0,
-                    candidates.len()
+                    originals.len(),
+                    concrete.len()
                 ));
             }
-        },
-        _ => {
-            return Err(format!(
-                "checked inline list {} resolves to {} concrete semantic authority statements",
-                checked_list.id.0,
-                concrete_candidates.len()
-            ));
-        }
-    };
-    let definition = expression(execution, candidate)?.clone();
-    let origin = execution
-        .checked_expression_origins
-        .get(candidate.as_usize())
-        .filter(|origin| origin.expression == candidate)
-        .cloned()
-        .ok_or_else(|| {
-            format!(
-                "checked inline list {} expression {candidate} has no exact origin",
-                checked_list.id.0
-            )
-        })?;
-    if origin.checked_scope != checked_list.owner_scope {
-        return Err(format!(
-            "checked inline list {} expression {candidate} has checked scope {}, expected {}",
-            checked_list.id.0, origin.checked_scope.0, checked_list.owner_scope.0
-        ));
+        };
+        selected.push(candidate);
     }
+    if selected.is_empty() {
+        return Ok(Vec::new());
+    }
+
     let local_name = checked
         .declarations
         .iter()
@@ -943,119 +1045,142 @@ fn synthesize_inline_checked_list_target(
                 checked_list.id.0
             )
         })?;
-    let (producer, statement) = if let Some(statement) = existing_statement {
-        (candidate, statement)
-    } else {
-        execution
-            .statements
-            .get(authority_statement.as_usize())
-            .filter(|statement| statement.id == authority_statement)
+    let mut targets = Vec::with_capacity(selected.len());
+    for candidate in selected {
+        let definition = expression(execution, candidate.expression)?.clone();
+        let origin = execution
+            .checked_expression_origins
+            .get(candidate.expression.as_usize())
+            .filter(|origin| origin.expression == candidate.expression)
+            .cloned()
             .ok_or_else(|| {
                 format!(
-                    "checked inline list {} references missing authority statement {authority_statement}",
-                    checked_list.id.0
+                    "checked inline list {} expression {} has no exact origin",
+                    checked_list.id.0, candidate.expression
                 )
             })?;
-        let parent = Some(authority_statement);
-        let statement = SemanticStatementId(execution.statements.len());
-        let producer = SemanticExprId(execution.expressions.len());
-        let mut concrete = definition.clone();
-        concrete.id = producer;
-        concrete.value_id = SemanticValueId(producer.as_usize());
-        concrete.flow_type.ty = Type::List(Box::new(checked_list.item_type.clone()));
-        let concrete_flow_type = concrete.flow_type.clone();
-        execution.expressions.push(concrete);
-        let mut concrete_origin = origin.clone();
-        concrete_origin.expression = producer;
-        concrete_origin.owning_statement = Some(statement);
-        execution.checked_expression_origins.push(concrete_origin);
-        let scope = execution
-            .scopes
-            .iter()
-            .find(|scope| scope.checked_scope == origin.checked_scope)
-            .map(|scope| scope.id)
-            .ok_or_else(|| {
-                format!(
-                    "checked inline list {} expression {candidate} references missing semantic scope {}",
-                    checked_list.id.0, origin.checked_scope.0
-                )
-            })?;
-        execution.statements.push(SemanticStatement {
-            id: statement,
-            origin: SemanticStatementOrigin::Checked {
-                statement: checked_list.statement,
-            },
-            scope,
-            parent,
-            call_instance: origin.call_instance,
-            span: checked_list.span,
-            checked_resources: vec![binding],
-            declaration: None,
-            flow_type: Some(concrete_flow_type),
-            kind: SemanticStatementKind::List {
-                name: Some(local_name.clone()),
-                path: Some(path.to_owned()),
-                capacity: checked_list.capacity,
-            },
-            value: Some(producer),
-            value_use: SemanticMaterializationResultKind::RuntimeValue,
-            children: Vec::new(),
-        });
-        if let Some(parent_id) = parent {
-            let parent = execution
+        if origin.checked_scope != checked_list.owner_scope {
+            return Err(format!(
+                "checked inline list {} expression {} has checked scope {}, expected {}",
+                checked_list.id.0,
+                candidate.expression,
+                origin.checked_scope.0,
+                checked_list.owner_scope.0
+            ));
+        }
+        let (producer, statement) = if let Some(statement) = candidate.existing_statement {
+            (candidate.expression, statement)
+        } else {
+            execution
                 .statements
-                .get_mut(parent_id.as_usize())
-                .filter(|candidate| candidate.id == parent_id)
+                .get(candidate.authority_statement.as_usize())
+                .filter(|statement| statement.id == candidate.authority_statement)
                 .ok_or_else(|| {
                     format!(
-                        "checked inline list {} references missing parent semantic statement {parent_id}",
-                        checked_list.id.0
+                        "checked inline list {} references missing authority statement {}",
+                        checked_list.id.0, candidate.authority_statement
+                    )
+                })?;
+            let parent = Some(candidate.authority_statement);
+            let statement = SemanticStatementId(execution.statements.len());
+            let producer = SemanticExprId(execution.expressions.len());
+            let mut concrete = definition.clone();
+            concrete.id = producer;
+            concrete.value_id = SemanticValueId(producer.as_usize());
+            concrete.flow_type.ty = Type::List(Box::new(checked_list.item_type.clone()));
+            let concrete_flow_type = concrete.flow_type.clone();
+            execution.expressions.push(concrete);
+            let mut concrete_origin = origin.clone();
+            concrete_origin.expression = producer;
+            concrete_origin.owning_statement = Some(statement);
+            execution.checked_expression_origins.push(concrete_origin);
+            let scope = execution
+                .scopes
+                .iter()
+                .find(|scope| scope.checked_scope == origin.checked_scope)
+                .map(|scope| scope.id)
+                .ok_or_else(|| {
+                    format!(
+                        "checked inline list {} expression {} references missing semantic scope {}",
+                        checked_list.id.0, candidate.expression, origin.checked_scope.0
+                    )
+                })?;
+            execution.statements.push(SemanticStatement {
+                id: statement,
+                origin: SemanticStatementOrigin::Checked {
+                    statement: checked_list.statement,
+                },
+                scope,
+                parent,
+                call_instance: origin.call_instance,
+                span: checked_list.span,
+                checked_resources: vec![binding],
+                declaration: None,
+                flow_type: Some(concrete_flow_type),
+                kind: SemanticStatementKind::List {
+                    name: Some(local_name.clone()),
+                    path: Some(path.to_owned()),
+                    capacity: checked_list.capacity,
+                },
+                value: Some(producer),
+                value_use: SemanticMaterializationResultKind::RuntimeValue,
+                children: Vec::new(),
+            });
+            let parent = execution
+                .statements
+                .get_mut(candidate.authority_statement.as_usize())
+                .filter(|statement| statement.id == candidate.authority_statement)
+                .ok_or_else(|| {
+                    format!(
+                        "checked inline list {} references missing parent semantic statement {}",
+                        checked_list.id.0, candidate.authority_statement
                     )
                 })?;
             if !parent.children.contains(&statement) {
                 parent.children.push(statement);
             }
-        }
-        (producer, statement)
-    };
-    let Type::List(_) = &definition.flow_type.ty else {
-        return Err(format!(
-            "checked inline list {} semantic authority is not list-typed",
-            checked_list.id.0
-        ));
-    };
-    // The literal's local type can intentionally be open (most notably for an
-    // empty fallback arm).  The checked list owns the contextual item type
-    // inferred from the complete declaration, so that is the exact authority
-    // type that must survive into semantic storage.
-    let mut item_fields = ordered_object_fields(&checked_list.item_type);
-    for field in expression_record_field_names(execution, producer)? {
-        if !item_fields.contains(&field) {
-            item_fields.push(field);
-        }
-    }
-    Ok(Some(ListTarget {
-        statement,
-        declaration: checked_list.declaration,
-        producer,
-        path: path.to_owned(),
-        local_name,
-        capacity: checked_list.capacity,
-        item_type: checked_list.item_type.clone(),
-        item_fields,
-        span: checked_list.span.into(),
-        alias: None,
-        absent: definition.flow_type.mode == boon_typecheck::FlowMode::Absent,
-        value_only: true,
-        origin: SemanticListResourceOriginV1::CheckedLiteral {
-            checked_list: checked_list.id,
-        },
-        key_policy: match checked_list.key_policy {
-            CheckedListKeyPolicy::GeneratedOccurrenceU64 { has_generation } => {
-                SemanticListKeyPolicyV1::GeneratedOccurrenceU64 { has_generation }
+            (producer, statement)
+        };
+        let Type::List(_) = &definition.flow_type.ty else {
+            return Err(format!(
+                "checked inline list {} semantic authority is not list-typed",
+                checked_list.id.0
+            ));
+        };
+        // The literal's local type can intentionally be open (most notably for
+        // an empty fallback arm). The checked list owns the contextual item
+        // type inferred from the complete declaration, so that is the exact
+        // authority type that must survive into semantic storage.
+        let mut item_fields = ordered_object_fields(&checked_list.item_type);
+        for field in expression_record_field_names(execution, producer)? {
+            if !item_fields.contains(&field) {
+                item_fields.push(field);
             }
-        },
-    }))
+        }
+        targets.push(ListTarget {
+            statement,
+            declaration: checked_list.declaration,
+            producer,
+            path: path.to_owned(),
+            local_name: local_name.clone(),
+            capacity: checked_list.capacity,
+            item_type: checked_list.item_type.clone(),
+            item_fields,
+            span: checked_list.span.into(),
+            alias: None,
+            absent: definition.flow_type.mode == boon_typecheck::FlowMode::Absent,
+            value_only: true,
+            origin: SemanticListResourceOriginV1::CheckedLiteral {
+                checked_list: checked_list.id,
+            },
+            key_policy: match checked_list.key_policy {
+                CheckedListKeyPolicy::GeneratedOccurrenceU64 { has_generation } => {
+                    SemanticListKeyPolicyV1::GeneratedOccurrenceU64 { has_generation }
+                }
+            },
+        });
+    }
+    Ok(targets)
 }
 
 fn direct_storage_statements(
@@ -2134,6 +2259,65 @@ fn bind_materialization_sources(
     Ok(())
 }
 
+/// Resolve the exact row authority visible to a contextual resource.
+///
+/// A materialization writes into its target row when it has one; otherwise its
+/// source row is the authority for row-local state and sources carried through
+/// a value-only contextual result. Transparent owners inherit the first
+/// enclosing materialization contract, while an explicit materialization with
+/// no stored source or target row is an authority boundary rather than a
+/// reason to guess at an ancestor row.
+fn contextual_resource_row(
+    execution: &SemanticExecutionGraphV1,
+    owner: Option<StaticOwnerId>,
+) -> Result<Option<SemanticRowBinding>, String> {
+    let mut current = owner;
+    let mut visited = BTreeSet::new();
+    while let Some(owner) = current {
+        if !visited.insert(owner) {
+            return Err(format!(
+                "contextual resource owner ancestry cycles at {owner}"
+            ));
+        }
+        let materializations = execution
+            .materializations
+            .iter()
+            .filter(|materialization| materialization.owner == owner)
+            .collect::<Vec<_>>();
+        match materializations.as_slice() {
+            [materialization] => {
+                let target = paired_row_binding(
+                    materialization.target_list_id,
+                    materialization.target_scope_id,
+                    "target",
+                    owner,
+                )?;
+                let source = paired_row_binding(
+                    materialization.source_list_id,
+                    materialization.source_scope_id,
+                    "source",
+                    owner,
+                )?;
+                return Ok(target.or(source));
+            }
+            [] => {}
+            _ => {
+                return Err(format!(
+                    "contextual resource owner {owner} has {} exact materializations",
+                    materializations.len()
+                ));
+            }
+        }
+        current = execution
+            .static_owners
+            .get(owner.as_usize())
+            .filter(|candidate| candidate.id == owner)
+            .ok_or_else(|| format!("missing semantic static owner {owner}"))?
+            .parent;
+    }
+    Ok(None)
+}
+
 /// Resolve the runtime row-storage scope of every semantic expression without
 /// recursion. This is the semantic equivalent of the legacy
 /// `ContextualStorageScopeResolver`: canonical reads and drains prefer exact
@@ -3182,19 +3366,26 @@ fn build_source_resources(
     checked: &CheckedProgram,
     execution: &SemanticExecutionGraphV1,
     lists: &[SemanticListResourceV1],
-    target_lists: &BTreeMap<StaticOwnerId, SemanticListId>,
     aliases: &mut Vec<SemanticResourceAliasV1>,
 ) -> Result<Vec<SemanticSourceResourceV1>, String> {
     let mut resources = Vec::with_capacity(execution.sources.len());
     for source in &execution.sources {
         let value = expression(execution, source.expression)?;
-        let target_list = source
-            .owner
-            .and_then(|owner| target_lists.get(&owner).copied());
-        let target_list_resource = target_list
-            .map(|list| list_resource(lists, list))
+        let authority_row = contextual_resource_row(execution, source.owner)?;
+        let target_list_resource = authority_row
+            .map(|row| {
+                let list = list_resource(lists, row.list)?;
+                if list.row_scope != row.scope {
+                    return Err(format!(
+                        "source {} authority row {}/{} differs from list scope {}",
+                        source.id, row.list, row.scope, list.row_scope
+                    ));
+                }
+                Ok(list)
+            })
             .transpose()?;
-        let row_scope = target_list_resource.map(|list| list.row_scope);
+        let target_list = authority_row.map(|row| row.list);
+        let row_scope = authority_row.map(|row| row.scope);
         let (declared_path, checked_statement, interval_ms, payload_type, span, alias_paths) =
             match source.origin {
                 SemanticSourceOrigin::Checked { source: checked_id } => {
@@ -3306,7 +3497,6 @@ fn build_state_resources(
     checked: &CheckedProgram,
     execution: &SemanticExecutionGraphV1,
     lists: &[SemanticListResourceV1],
-    target_lists: &BTreeMap<StaticOwnerId, SemanticListId>,
     aliases: &mut Vec<SemanticResourceAliasV1>,
 ) -> Result<Vec<SemanticStateResourceV1>, String> {
     let mut resources = Vec::with_capacity(execution.states.len());
@@ -3378,13 +3568,21 @@ fn build_state_resources(
                 state.declaration.0, state.owner
             ));
         }
-        let target_list = state
-            .owner
-            .and_then(|owner| target_lists.get(&owner).copied());
-        let target_list_resource = target_list
-            .map(|list| list_resource(lists, list))
+        let authority_row = contextual_resource_row(execution, state.owner)?;
+        let target_list_resource = authority_row
+            .map(|row| {
+                let list = list_resource(lists, row.list)?;
+                if list.row_scope != row.scope {
+                    return Err(format!(
+                        "state {} authority row {}/{} differs from list scope {}",
+                        state.id, row.list, row.scope, list.row_scope
+                    ));
+                }
+                Ok(list)
+            })
             .transpose()?;
-        let row_scope = target_list_resource.map(|list| list.row_scope);
+        let target_list = authority_row.map(|row| row.list);
+        let row_scope = authority_row.map(|row| row.scope);
         let semantic_path = is_published.then(|| {
             canonical_resource_path(
                 target_list_resource,
@@ -4231,22 +4429,11 @@ pub(crate) fn validate_checked_resource_provenance(
     execution: &SemanticExecutionGraphV1,
     graph: &SemanticResourceGraphV1,
 ) -> Result<(), String> {
-    let target_lists = materialization_target_lists(execution, &graph.lists)?;
     let mut expected_aliases = Vec::new();
-    let expected_sources = build_source_resources(
-        checked,
-        execution,
-        &graph.lists,
-        &target_lists,
-        &mut expected_aliases,
-    )?;
-    let expected_states = build_state_resources(
-        checked,
-        execution,
-        &graph.lists,
-        &target_lists,
-        &mut expected_aliases,
-    )?;
+    let expected_sources =
+        build_source_resources(checked, execution, &graph.lists, &mut expected_aliases)?;
+    let expected_states =
+        build_state_resources(checked, execution, &graph.lists, &mut expected_aliases)?;
     expected_aliases.sort();
     expected_aliases.dedup();
     if graph.sources != expected_sources {
@@ -5795,6 +5982,51 @@ numbers: List/range(from: -2, to: 3)
         ));
         assert_eq!(numbers.role, SemanticValueListRoleV1::ScalarAuthority);
         assert_eq!(semantic.resource_graph().lists.len(), 1);
+    }
+
+    #[test]
+    fn function_local_list_authorities_are_distinct_per_call_occurrence() {
+        let semantic = elaborate_source(
+            r#"
+left: component()
+right: component()
+
+FUNCTION component() {
+    [
+        rows: LIST {
+            [name: TEXT { one }]
+            [name: TEXT { two }]
+        }
+    ]
+}
+"#,
+        );
+        assert!(semantic.resource_graph().lists.is_empty());
+        let authorities = semantic
+            .resource_graph()
+            .value_list_authorities
+            .iter()
+            .filter(|authority| {
+                authority.local_name == "rows"
+                    && authority.role == SemanticValueListRoleV1::InlineValue
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(authorities.len(), 2, "{authorities:#?}");
+        assert_ne!(authorities[0].statement, authorities[1].statement);
+        assert_ne!(authorities[0].producer, authorities[1].producer);
+        let call_instances = authorities
+            .iter()
+            .map(|authority| {
+                semantic
+                    .execution_graph()
+                    .statements
+                    .get(authority.statement.as_usize())
+                    .filter(|statement| statement.id == authority.statement)
+                    .and_then(|statement| statement.call_instance)
+                    .expect("inline authority has an exact call occurrence")
+            })
+            .collect::<BTreeSet<_>>();
+        assert_eq!(call_instances.len(), 2);
     }
 
     #[test]

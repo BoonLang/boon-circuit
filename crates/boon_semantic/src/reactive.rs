@@ -1435,8 +1435,12 @@ impl<'a> ReactiveBuilder<'a> {
         let dependencies =
             self.build_dependencies(&state_update_arms, &trigger_arms, &pulse_states)?;
         let possible_causes = self.build_possible_causes(&state_update_arms, &trigger_arms)?;
-        let host_effect_schedules =
-            self.build_host_effect_schedules(&state_update_arms, &trigger_arms)?;
+        let host_effect_schedules = self.build_host_effect_schedules(
+            &fields,
+            &bindings,
+            &state_update_arms,
+            &trigger_arms,
+        )?;
         let dependency_uses = self.build_dependency_uses(&bindings, &reads, &mut triggers)?;
         let output_values = self.build_output_values(&fields)?;
         let view_captures = self.build_view_captures(
@@ -2582,16 +2586,12 @@ impl<'a> ReactiveBuilder<'a> {
                 }
             };
             if materialized.is_none()
-                && self
-                    .expressions
-                    .expression(binding.producer)?
-                    .provenance
-                    .direct_resource_origin()
-                    .is_some()
+                && self.expression_is_directly_source_only(binding.producer)?
             {
-                // A direct alias of a SOURCE is routing metadata. It retains
-                // its structural field/binding identity for semantic tools,
-                // but it must not become an executable scalar derivation.
+                // A SOURCE-only value is routing metadata even when a pure
+                // wrapper preserves several source leaves. It retains its
+                // structural field/binding identity for semantic tools, but
+                // it must not become an executable scalar derivation.
                 continue;
             }
             fields.push((binding, field, materialized));
@@ -2685,6 +2685,67 @@ impl<'a> ReactiveBuilder<'a> {
         }
         result.sort_by_key(|derived| derived.binding);
         Ok(result)
+    }
+
+    fn expression_is_directly_source_only(
+        &self,
+        expression: SemanticExprId,
+    ) -> Result<bool, SemanticReactiveError> {
+        let provenance = &self.expressions.expression(expression)?.provenance;
+        if provenance.members.is_empty() {
+            return Ok(false);
+        }
+        for member in &provenance.members {
+            match &member.origin {
+                SemanticValueOrigin::Source { source, .. } => {
+                    if self
+                        .resources
+                        .sources
+                        .get(source.as_usize())
+                        .filter(|candidate| candidate.id == *source)
+                        .is_none()
+                    {
+                        return Err(SemanticReactiveError::new(format!(
+                            "semantic expression {expression} provenance references missing source {source}"
+                        )));
+                    }
+                }
+                SemanticValueOrigin::ProducerSource {
+                    function,
+                    producer,
+                    identity,
+                    owner,
+                } => {
+                    let matches = self
+                        .resources
+                        .sources
+                        .iter()
+                        .filter(|source| {
+                            source.owner == Some(*owner)
+                                && matches!(
+                                    source.origin,
+                                    crate::SemanticSourceOrigin::ProducerInvocation {
+                                        function: candidate_function,
+                                        producer: candidate_producer,
+                                        identity: candidate_identity,
+                                    } if candidate_function == *function
+                                        && candidate_producer == *producer
+                                        && candidate_identity == *identity
+                                )
+                        })
+                        .count();
+                    if matches != 1 {
+                        return Err(SemanticReactiveError::new(format!(
+                            "semantic expression {expression} producer-source provenance resolves to {matches} exact sources"
+                        )));
+                    }
+                }
+                SemanticValueOrigin::Runtime
+                | SemanticValueOrigin::State { .. }
+                | SemanticValueOrigin::MaterializationLocal { .. } => return Ok(false),
+            }
+        }
+        Ok(true)
     }
 
     fn bind_pulse_emission_derived_values(
@@ -3020,10 +3081,33 @@ impl<'a> ReactiveBuilder<'a> {
 
     fn build_host_effect_schedules(
         &self,
+        fields: &[SemanticFieldV1],
+        bindings: &[SemanticBindingV1],
         state_arms: &[SemanticStateUpdateArmV1],
         triggers: &[SemanticTriggerOwnedArmV1],
     ) -> Result<Vec<SemanticHostEffectScheduleV1>, SemanticReactiveError> {
         let mut schedules = Vec::new();
+        let runtime_roots = self
+            .execution
+            .roots
+            .iter()
+            .map(|root| root.expression)
+            .chain(
+                self.execution
+                    .functions
+                    .iter()
+                    .map(|function| function.root),
+            )
+            .chain(
+                self.execution
+                    .sources
+                    .iter()
+                    .map(|source| source.expression),
+            )
+            .chain(self.resources.states.iter().map(|state| state.expression))
+            .chain(self.resources.lists.iter().map(|list| list.producer))
+            .chain(fields.iter().map(|field| field.producer))
+            .collect::<BTreeSet<_>>();
         for expression in &self.execution.expressions {
             let SemanticExpressionKind::Call { call, function, .. } = &expression.kind else {
                 continue;
@@ -3031,19 +3115,73 @@ impl<'a> ReactiveBuilder<'a> {
             if !boon_typecheck::is_typed_host_effect(function) {
                 continue;
             }
+            let mut runtime_reachable = false;
+            for root in &runtime_roots {
+                if self.expression_value_reaches(*root, expression.id, bindings)? {
+                    runtime_reachable = true;
+                    break;
+                }
+            }
+            if !runtime_reachable {
+                continue;
+            }
             let mut covering = Vec::new();
+            let mut candidates = Vec::new();
             for arm in state_arms {
                 let trigger = require_trigger(triggers, arm.trigger)?;
-                if trigger.owner == expression.owner
-                    && self.expression_reaches(trigger.output_expression, expression.id)?
-                {
+                let reaches = self.expression_value_reaches(
+                    trigger.output_expression,
+                    expression.id,
+                    bindings,
+                )?;
+                candidates.push((
+                    arm.id,
+                    arm.state,
+                    trigger.id,
+                    trigger.owner,
+                    trigger.output_expression,
+                    reaches,
+                ));
+                if trigger.owner == expression.owner && reaches {
                     covering.push(arm.id);
                 }
             }
             if covering.is_empty() {
+                let effect_occurrences = self
+                    .execution
+                    .expressions
+                    .iter()
+                    .filter_map(|candidate| {
+                        let SemanticExpressionKind::Call {
+                            call,
+                            function: candidate_function,
+                            ..
+                        } = &candidate.kind
+                        else {
+                            return None;
+                        };
+                        (boon_typecheck::is_typed_host_effect(candidate_function)
+                            && candidate.checked_expr_id == expression.checked_expr_id)
+                            .then(|| {
+                                let origin = self
+                                    .execution
+                                    .checked_expression_origins
+                                    .get(candidate.id.as_usize())
+                                    .filter(|origin| origin.expression == candidate.id);
+                                (
+                                    candidate.id,
+                                    *call,
+                                    candidate.owner,
+                                    origin.map(|origin| {
+                                        (origin.owning_statement, origin.call_instance)
+                                    }),
+                                )
+                            })
+                    })
+                    .collect::<Vec<_>>();
                 return Err(SemanticReactiveError::new(format!(
-                    "typed host effect `{function}` at semantic expression {} owner {:?} has no exact state update schedule",
-                    expression.id, expression.owner
+                    "typed host effect `{function}` at semantic expression {} checked {} owner {:?} has no exact state update schedule among {candidates:?}; exact checked occurrences: {effect_occurrences:?}",
+                    expression.id, expression.checked_expr_id.0, expression.owner,
                 )));
             }
             covering.sort();
@@ -3432,6 +3570,56 @@ impl<'a> ReactiveBuilder<'a> {
         target: SemanticExprId,
     ) -> Result<bool, SemanticReactiveError> {
         Ok(self.reachable_expressions(root)?.contains(&target))
+    }
+
+    fn expression_value_reaches(
+        &self,
+        root: SemanticExprId,
+        target: SemanticExprId,
+        bindings: &[SemanticBindingV1],
+    ) -> Result<bool, SemanticReactiveError> {
+        let mut pending = vec![root];
+        let mut visited = BTreeSet::new();
+        while let Some(id) = pending.pop() {
+            if !visited.insert(id) {
+                continue;
+            }
+            if id == target {
+                return Ok(true);
+            }
+            let expression = self.expressions.expression(id)?;
+            match &expression.kind {
+                SemanticExpressionKind::CanonicalRead {
+                    target: declaration,
+                    ..
+                } => {
+                    let binding = self.resolve_decl_binding(*declaration, expression, bindings)?;
+                    pending.push(binding.producer);
+                }
+                SemanticExpressionKind::LocalRead { binding, .. } => {
+                    let (_, producer) =
+                        self.local_values.get(binding).copied().ok_or_else(|| {
+                            SemanticReactiveError::new(format!(
+                                "semantic value reachability read {id} references missing local binding {binding}"
+                            ))
+                        })?;
+                    pending.push(producer);
+                }
+                SemanticExpressionKind::FunctionParameter { parameter, .. } => {
+                    let inputs = self.parameter_inputs.get(&id).ok_or_else(|| {
+                        SemanticReactiveError::new(format!(
+                            "semantic value reachability parameter expression {id} ({parameter:?}) has no exact producer inputs"
+                        ))
+                    })?;
+                    pending.extend(inputs.iter().copied());
+                }
+                _ => pending.extend(semantic_expression_children(
+                    &expression.kind,
+                    self.execution,
+                )?),
+            }
+        }
+        Ok(false)
     }
 }
 

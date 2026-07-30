@@ -13,9 +13,10 @@
 > **Target-only content:** hardware lowering without user-visible row identity
 > remains a target constraint, not an implemented FPGA capability.
 >
-> **Flag-day owner:** unified goal Phase 8 replaces this sketch with the
-> bounded RISC-V processor pipeline and then deletes this file rather than
-> retaining a second hardware contract.
+> **Flag-day owner:** the deletion ledger in
+> `docs/plans/BOON_CONSOLE_IMPLEMENTATION_PLAN.md` replaces this sketch with
+> generic target profiles, hardware IR, fixtures, and negative tests, then
+> deletes this file rather than retaining a second hardware contract.
 
 This document records the earlier design for lowering ordinary circuit-style
 TodoMVC to FPGA hardware without requiring a central reducer or a user-visible

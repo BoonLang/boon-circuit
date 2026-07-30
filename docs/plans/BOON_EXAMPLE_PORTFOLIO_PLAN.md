@@ -13,7 +13,7 @@ valid unless this plan explicitly changes only their catalog presentation.
 
 Full portfolio implementation follows completion of
 [`BOON_FIRST_RISCV_PROCESSOR_PLAN.md`](BOON_FIRST_RISCV_PROCESSOR_PLAN.md) and
-its Boon Orchard milestone. Before then, selected existing and planned
+the BoonConsole proof milestone. Before then, selected existing and planned
 portfolio-shaped fixtures may run only as generic language, runtime,
 packed-data, formal, and product regression probes. That earlier use does not
 claim the example, phase, or portfolio complete.
@@ -1570,7 +1570,7 @@ handoff target and the manifest/schema budgets are designed accordingly.
 
 Phases are dependency ordered. Each example still completes its native-first,
 browser-second vertical slice before being called complete. Phase 0 begins only
-after the complete Boon RV32I/Boon Orchard proof milestone. Earlier use of a
+after the complete Boon RV32I/BoonConsole proof milestone. Earlier use of a
 selected fixture by another plan is regression evidence for that owner, not
 early portfolio implementation.
 
@@ -1673,10 +1673,10 @@ early portfolio implementation.
   then live microphone.
 - Keep PC USB audio and board transport as platform adapters; DSP remains Boon.
 
-### Phase 10 — Proven Processor And Boon Orchard Integration
+### Phase 10 — Proven Processor And BoonConsole Evidence Integration
 
 - Consume the already-proved Boon RV32I source, artifact lineage, simulators,
-  generated RTL, formal results, FPGA signature, and Boon Orchard proof bundle.
+  generated RTL, formal results, FPGA signature, and BoonConsole proof bundle.
 - Add portfolio/Runtime Lab views that exercise and explain those existing
   generic artifacts without rebuilding the CPU, changing its evidence, or
   introducing a processor-specific runtime path.
@@ -1815,7 +1815,7 @@ This portfolio is complete only when:
   closure, and later separate physical-wiring observation;
 - Mandelbrot and Path Tracer execute the same source-derived kernel across CPU
   and generated GPU profiles;
-- Phase 10 consumes the already-proved Boon RV32I and Boon Orchard lineage
+- Phase 10 consumes the already-proved Boon RV32I and BoonConsole lineage
   without duplicating CPU semantics or weakening its proof manifest;
 - Boon Fingerprint implements hash, XOF/seek, keyed, and derive-key modes and
   passes their official vectors across streaming/worker modes;

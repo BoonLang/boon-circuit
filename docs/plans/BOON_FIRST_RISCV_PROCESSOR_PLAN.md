@@ -1,8 +1,10 @@
 # First Boon-Designed RISC-V Processor Plan
 
-Status: proposed implementation contract. Canonical implementation depends on
-complete language foundations, formal verification, universal packed-runtime
-completion, and the mature web-application gates described below.
+Status: proposed reusable processor implementation contract. Canonical
+implementation depends on complete language foundations, the mandatory
+verified-artifact/formal gates, packed hardware prerequisites, and generic
+hardware fixtures. It does not depend on universal software packed-runtime
+completion or mature web-product gates. It contains no game gate or game work.
 
 Working core name: **Boon RV32I**.
 
@@ -19,7 +21,7 @@ ParsedProgram
   -> ErasedProgram
   -> MachinePlan
   -> CoreHardwareIR
-  -> native and browser/Wasm cycle simulators
+  -> native and host-Wasm cycle simulators
   -> target elaboration
   -> TargetHardwareIR
   -> generated SystemVerilog
@@ -32,8 +34,11 @@ This project has three equal purposes:
 1. stabilize a general Boon-to-hardware/FPGA API;
 2. prove that Boon can describe, verify, simulate, and synthesize a substantial
    stateful digital system;
-3. provide the first major construction goal for
-   [`../game/BOON_ORCHARD.md`](../game/BOON_ORCHARD.md).
+3. provide the reusable processor proof bundle consumed by
+   [`BOON_CONSOLE_IMPLEMENTATION_PLAN.md`](BOON_CONSOLE_IMPLEMENTATION_PLAN.md).
+
+Game presentation is outside this processor plan and the current unified goal.
+It is not an implementation or acceptance stage.
 
 The core is not a decorative CPU-shaped demo. It must execute externally built
 RV32I programs and pass machine-readable architectural, differential, formal,
@@ -110,9 +115,10 @@ This plan does not require:
 - a CPU designed in Boon to compile itself;
 - any other circular bootstrap.
 
-In the Wasm milestone, the **Boon-authored processor model** runs in a
-browser/Wasm simulator. That does not mean the simulated RV32I executes the
-Boon compiler or runtime.
+In the host-Wasm milestone, the **Boon-authored processor model** runs in a
+Wasm cycle simulator. That does not mean the simulated RV32I executes the Boon
+compiler or runtime, and that host simulator is not the standalone
+BoonConsole `app.wasm`.
 
 Self-hosting is outside this roadmap. It is neither a prerequisite, a milestone,
 nor hidden acceptance work.
@@ -127,7 +133,8 @@ Useful foundations exist:
 - `MachinePlan` with typed IDs, storage, regions, commit, deltas, and profiles;
 - a dense row-expression arena;
 - deterministic native runtime semantics;
-- Wasm-capable compiler/runtime components;
+- Rust compiler/runtime components that can themselves run as browser-host
+  Wasm, but no standalone Boon guest-Wasm emitter;
 - VCD/FST/GHW support through `boon_wellen_host`;
 - a documented FPGA lowering model for TodoMVC;
 - `BITS[N]`, bounded target, and collection-lowering decisions in the
@@ -139,9 +146,11 @@ Important gaps remain:
 - there is no cycle simulator;
 - there is no RTL backend;
 - there is no hardware/formal report pipeline;
-- `BITS[N]` and the final public `MAP`/`SET` model are planned but not
-  implemented end to end;
-- the current `fpga_todomvc` profile has only a narrow concrete implementation;
+- `BITS[N]`, exact Number, MAP, and SET have substantial parser/data/typecheck/
+  runtime implementation, but target-bound proof, fixed hardware
+  representation, and hardware lowering are not complete;
+- the current `fpga_todomvc` MachinePlan profile supplies narrow resource
+  limits but no hardware backend;
 - the current CLI exposes `run`, `check`, `dump-plan`, and `dump-ir`, while
   `FPGA_TODOMVC_LOWERING.md` still describes an `explain-hardware` command that
   is not implemented.
@@ -149,7 +158,7 @@ Important gaps remain:
 Phase 0 must correct these gaps honestly. Existing planning language is not
 hardware-readiness evidence.
 
-## Dependency On The Completed Universal Stack
+## Dependency On The Verified Compiler And Hardware-Ready Artifacts
 
 Before the canonical processor project begins, all of these prerequisites must
 be complete:
@@ -162,35 +171,41 @@ be complete:
   spine;
 - every phase of
   [`BOON_FORMAL_VERIFICATION_AND_WHERE_PLAN.md`](BOON_FORMAL_VERIFICATION_AND_WHERE_PLAN.md);
-- every phase and acceptance criterion of
-  [`BOON_PACKED_DATA_AND_DENSE_INTERNALS_PLAN.md`](BOON_PACKED_DATA_AND_DENSE_INTERNALS_PLAN.md),
-  including formal Phase 6 integration, native/Wasm parity, product-scale
-  reports, and flag-day deletion;
-- the final Client/Session/Server, persistence, content/streaming, NovyWave,
-  Cells, FjordPulse, native, Wasm, browser, and deployment gates required by
-  the active combined [`GOAL_PROMPT.md`](GOAL_PROMPT.md).
+- the fixed-width, bounded-storage, dense-ID, shape/offset, target-eligibility,
+  and no-recursive-value requirements needed by hardware IR and cycle
+  execution. These facts are compatible with
+  [`BOON_PACKED_DATA_AND_DENSE_INTERNALS_PLAN.md`](BOON_PACKED_DATA_AND_DENSE_INTERNALS_PLAN.md)
+  but do not claim its universal software-runtime phases, product-scale
+  reports, flag-day deletion, or Clear End Condition;
+- the generic hardware pipeline and unrelated fixtures required by
+  [`BOON_CONSOLE_IMPLEMENTATION_PLAN.md`](BOON_CONSOLE_IMPLEMENTATION_PLAN.md).
 
-The following narrower technical gate remains useful as a diagnostic milestone
-inside the foundation and packed work:
+The final Client/Session/Server, NovyWave, FjordPulse, and public-deployment
+gates are not processor prerequisites. There are no Boon Orchard or other game
+gates in this processor plan or the current unified goal. Existing persistence,
+native, and host-Wasm implementation still supplies regression evidence where
+it shares compiler/runtime owners, but broad product completion cannot block the
+generic CPU path.
+
+The mandatory hardware-readiness gate is:
 
 - `BITS[N]` parses, typechecks, lowers, executes, serializes, and compares
   identically on native and Wasm;
 - bounded `MAP` exists as the public keyed authority;
 - dense bit keys can select a proved direct-address layout;
 - executable object fields are shape/offset based;
-- hardware-bound execution uses packed cells and typed columns;
-- cycle-hot work contains no recursive `Value`, string field lookup,
+- hardware-bound artifacts use fixed typed cells and dense tables;
+- hardware lowering and cycle-hot work contain no recursive `Value`, string field lookup,
   `BTreeMap`, `BTreeSet`, `HashMap`, or `HashSet`;
 - target profiles express concrete widths, capacities, ports, latency, and
   overflow/fault behavior;
 - the `CheckedProgram`/`SemanticProgram`/`ContractVerifiedProgram`/
   `ErasedProgram`/`MachinePlan` and physical/hardware artifact versions used by
   the processor are stable and separately hashed;
-- every compiler/runtime/layout path used by processor cycles has completed its
-  flag-day deletion, with no legacy/reference production switch or
-  compatibility materializer.
+- every hardware-lowering/cycle path has completed its own flag-day deletion,
+  with no legacy/reference production switch or compatibility materializer.
 
-Passing this milestone does not authorize canonical processor implementation.
+Passing this gate alone does not authorize canonical processor implementation.
 Before every prerequisite above passes, a pre-Stage-0 activity may perform only
 read-only specification, board, toolchain, test-suite, and repository
 inventory. Do not write canonical processor source, hardware IR implementation,
@@ -427,7 +442,7 @@ This port is verification infrastructure and the seed for:
 - RTL equivalence;
 - RVFI adaptation;
 - board UART signatures;
-- Boon Orchard trace visualization.
+- downstream trace visualization through the machine-readable proof API.
 
 Retirement/debug logic never feeds back into architectural state. Proof builds
 keep it enabled. A stripped build is a separately elaborated artifact that
@@ -668,7 +683,7 @@ The CPU's Boon source, semantic `MachinePlan`, core profile, and
 `CoreHardwareIR` digest are identical across:
 
 - native simulation;
-- browser/Wasm simulation;
+- host-Wasm cycle simulation;
 - each board profile.
 
 Each RTL/formal/board artifact records that parent core digest. Its
@@ -680,9 +695,9 @@ equivalence.
 
 ### Stage 0: Freeze Contracts And Inventory Gaps
 
-- Begin only after every prerequisite in the "Dependency On The Completed
-  Universal Stack" section passes; reconcile the earlier read-only inventory
-  against that unchanged revision.
+- Begin only after every prerequisite in the "Dependency On The Verified
+  Compiler And Hardware-Ready Artifacts" section passes; reconcile the earlier
+  read-only inventory against that unchanged revision.
 - Reconcile the stale FPGA CLI/documentation claims.
 - Inventory missing `BITS`, `MAP`, profile, IR, simulator, report, and toolchain
   pieces.
@@ -753,15 +768,15 @@ coverage against a pinned external oracle.
 Exit: the Boon-authored core executes mixed instruction programs, not only
 isolated operations.
 
-### Stage 4: Browser/Wasm Simulation
+### Stage 4: Host-Wasm Simulation
 
-- Build the same `CoreHardwareIR` cycle simulator for Wasm.
+- Build the same `CoreHardwareIR` cycle simulator for host Wasm.
 - Load the same firmware image and input schedule.
 - Produce the same retirement bytes and final state digest.
 - Expose a machine-readable step/run/reset/state/trace API. Presentation,
-  breakpoints, and waveform UI belong to Stage 8.
+  breakpoints, and waveform UI are downstream consumers.
 
-Exit: native and browser/Wasm proof artifacts are byte-identical where the
+Exit: native and host-Wasm proof artifacts are byte-identical where the
 manifest declares them canonical.
 
 ### Stage 5: Generated RTL
@@ -833,28 +848,25 @@ Only after this passes:
 - add richer peripherals;
 - compare another board.
 
-### Stage 8: Boon Orchard Projection
+### Stage 8: Publish The Reusable Processor Proof Bundle
 
-Expose existing proof data to the game:
+Publish one bounded, manifest-backed bundle containing:
 
-- instruction flow;
-- current FSM state;
-- register-bank activity;
-- bus waits;
-- retirement;
-- failed assertions/tests;
-- resource and timing budgets;
-- native/Wasm/RTL/board artifact lineage.
+- instruction and retirement traces;
+- current FSM, register-bank, and bus evidence;
+- failed assertion/test diagnostics;
+- resource and timing reports;
+- source, verified artifact, CoreHardwareIR, TargetHardwareIR, RTL, firmware,
+  bitstream, and board lineage;
+- the machine-readable Stage 4 step/run/reset/state/trace API.
 
-Build presentation here on top of the Stage 4 machine-readable API: pause,
-breakpoint-by-PC, register/memory inspection, waveform navigation, and
-source/proof selection.
+The bundle is consumed first by BoonConsole's SoC and hardware-in-the-loop
+plan. The API may support separately specified presentation consumers, but this
+processor plan and the current unified goal contain no game code, observation,
+or implementation task.
 
-The game does not define CPU correctness. It visualizes and motivates the same
-evidence produced by the compiler and verification pipeline.
-
-Exit: completing the in-game processor corresponds to passing the real
-processor proof manifest.
+Exit: an independent consumer can verify and integrate the exact CPU without a
+processor-specific compiler bypass or a game dependency.
 
 ## Verification Contract
 
@@ -1091,7 +1103,7 @@ the final design.
 
 The plan is complete only when:
 
-1. Every language, compiler, formal, packed-runtime, mature-web-stack, and
+1. Every language, compiler, formal, packed-hardware, generic-hardware, and
    fresh cross-target prerequisite named by this plan passed before Stage 0.
 2. The architectural CPU logic is Boon source.
 3. The implemented ISA contract is complete RV32I for the declared execution
@@ -1115,7 +1127,8 @@ The plan is complete only when:
 16. The core source, semantic plan, core profile, and `CoreHardwareIR` digest
     are unchanged across board profiles; target IR and shell digests are
     separately recorded.
-17. The Boon Orchard milestone consumes the real proof bundle.
+17. The BoonConsole SoC consumes the real proof bundle without changing the
+    core; no game presentation is scheduled or accepted by this plan.
 18. Self-hosting, Linux, networking, and a useful server workload were not
     smuggled into the critical path.
 19. The memory port proves one acceptance/one response, stable backpressure,
@@ -1191,7 +1204,7 @@ it all the way down:
 readable Boon processor source
   -> checked hardware meaning
   -> inspectable cycle simulation
-  -> browser/Wasm execution
+  -> host-Wasm cycle execution
   -> generated RTL
   -> formal and architectural proof
   -> a real FPGA running the same core

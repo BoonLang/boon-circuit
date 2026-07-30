@@ -2,8 +2,9 @@
 
 ```text
 /goal Complete the unified Boon language, verified compiler, universal packed
-runtime, mature web-application stack, first Boon-designed RV32I processor, and
-example portfolio objective from the current HEAD.
+runtime, BoonConsole with the first Boon-designed RV32I processor and exact
+interpreted app.wasm parity, mature web-application stack, and example portfolio
+objective from the current HEAD.
 
 Read AGENTS.md and these contracts completely before editing:
 
@@ -15,6 +16,7 @@ Read AGENTS.md and these contracts completely before editing:
 - docs/plans/BOON_FORMAL_VERIFICATION_AND_WHERE_PLAN.md
 - docs/plans/BOON_PERSISTENCE_ARCHITECTURE_PLAN.md
 - docs/plans/BOON_PACKED_DATA_AND_DENSE_INTERNALS_PLAN.md
+- docs/plans/BOON_CONSOLE_IMPLEMENTATION_PLAN.md
 - docs/plans/NOVYWAVE_BOON_REWRITE_PLAN.md
 - docs/plans/FJORDPULSE_FULL_STACK_BOON_REWRITE_PLAN.md
 - docs/plans/BOON_FIRST_RISCV_PROCESSOR_PLAN.md
@@ -24,6 +26,7 @@ Read AGENTS.md and these contracts completely before editing:
 - docs/architecture/RUNTIME_MODEL.md
 - docs/architecture/LIST_MODEL.md
 - docs/architecture/DELTA_PROTOCOL.md
+- docs/architecture/BOON_CONSOLE.md
 - docs/architecture/NATIVE_GPU_PIPELINE.md
 - docs/architecture/native_gpu_handoff_manifest.json
 
@@ -86,7 +89,10 @@ Authority and conflict rules:
   layouts, dense IDs/tables, packed runtime cells, arenas, currentness,
   dependency storage, collection kernels, KernelIR, boundary materialization,
   native/Wasm parity, and full flag-day deletion of the old execution world.
-  It is the universal runtime architecture, not a RISC-V-only prelude.
+  It is the universal runtime architecture, not a RISC-V-only prelude. Phase 5
+  may land compatible fixed-width/dense hardware prerequisites without claiming
+  the packed plan's software phases or Clear End Condition; Phase 7 completes
+  that universal owner.
 - The Client/Session/Server contract in this prompt supersedes conflicting
   older Client/Server pairing, ProgramRole::Document, internal HTTP/JSON,
   SessionInfo, and transport details.
@@ -100,9 +106,21 @@ Authority and conflict rules:
   product requirements.
 - `NATIVE_GPU_PIPELINE.md` and its manifest remain authoritative for native
   input, WGPU proof, performance evidence, and native handoff reports.
-- `BOON_FIRST_RISCV_PROCESSOR_PLAN.md` owns CoreHardwareIR/TargetHardwareIR,
-  RV32I, cycle simulation, generated RTL, ISA/formal verification, FPGA-board
-  evidence, and the Boon Orchard projection.
+- `BOON_CONSOLE.md` owns console scope, all-peripheral physical composition,
+  target-neutral ConsolePort meaning, interpreter-first exact-app-Wasm parity,
+  event/output ordering, bridge behavior, reset/persistence, safe state,
+  accessibility, board-profile boundaries, and readiness.
+- `BOON_CONSOLE_IMPLEMENTATION_PLAN.md` owns the executable console sequence,
+  board/interpreter experiments, planned implementation owners, reports,
+  budgets, deletion gates, and hardware-in-the-loop Clear End Condition.
+- `BOON_FIRST_RISCV_PROCESSOR_PLAN.md` owns reusable
+  CoreHardwareIR/TargetHardwareIR, RV32I, cycle simulation, generated RTL,
+  ISA/formal verification, and processor FPGA evidence. It does not own the
+  console, standalone app Wasm, bridge, or a game projection.
+- Boon Orchard owns fiction and game vision only. Game implementation is not
+  part of this goal or its completion conditions. A separately specified,
+  user-approved future goal may consume the real proof bundle after BoonConsole
+  readiness.
 - `BOON_EXAMPLE_PORTFOLIO_PLAN.md` owns the full post-processor portfolio. Its
   selected examples are also regression fixtures during earlier phases.
 - There is no public `MEMORY` keyword. Self-hosting and BoonInBoon are not goals,
@@ -302,7 +320,63 @@ Exit: every formal acceptance condition through Phase 5 passes and no unchecked
 semantic artifact reaches ErasedProgram; every deferred Clear End Condition
 from Phases 1–3 is closed.
 
-Phase 5: complete the universal packed runtime and formal optimization
+Phase 5: establish packed hardware prerequisites
+
+- Preserve semantic MachinePlan identity while adding only the target-relevant
+  fixed widths, bounds, dense IDs, shape/offset access, and typed storage facts
+  needed by hardware eligibility.
+- Require CoreHardwareIR, TargetHardwareIR, hardware lowering, and cycle
+  execution to contain no recursive Value, runtime string field lookup,
+  BTreeMap/BTreeSet/HashMap/HashSet, dynamic allocation, or compatibility
+  materializer.
+- Keep physical slots, columns, pointers, board pins, and primitive mappings out
+  of public values, persistence identity, and semantic hashes.
+- Obtain every proof fact through ContractVerifiedProgram and translation
+  validation; a target profile cannot bless an unchecked bound.
+- Do not claim the universal packed-runtime phases, PhysicalPlan/KernelIR
+  migration, product-scale reports, flag-day deletion, formal Phase 6, or
+  packed Clear End Condition from this narrower gate.
+
+Exit: verified MachinePlan can enter normalized generic hardware artifacts with
+fixed bounded representation and no software-runtime fallback. The universal
+packed software runtime remains open until Phase 7.
+
+Phase 6: build and prove BoonConsole and the first Boon-designed RV32I
+
+- No production console/compiler/hardware implementation begins until the
+  active simplification/native-recovery exit and Phases 1–5 pass. Read-only
+  spec, toolchain, interpreter, power, board, and owned-hardware inventory may
+  run earlier.
+- Implement every phase and acceptance criterion in
+  `BOON_CONSOLE_IMPLEMENTATION_PLAN.md` and the reusable processor work in
+  `BOON_FIRST_RISCV_PROCESSOR_PLAN.md`.
+- Build unrelated hardware API fixtures before the CPU. Use ordinary BITS,
+  bounded MAP, Tags, records, sources, verified semantics, and generic target
+  profiles; add no MEMORY keyword or RISC-V/console-aware language shortcut.
+- Implement CoreHardwareIR, cycle simulation, TargetHardwareIR, generated
+  SystemVerilog, target elaboration, architectural tests, Sail differential
+  execution, RVFI/riscv-formal properties, synthesis, and physical
+  signature/trace evidence.
+- Bring up Pmod BTN, SWT, 8LD, SSD, and CLS concurrently on the exact measured
+  iCESugar Pro assembly. The onboard RGB LED has no product or proof role.
+- Emit a deterministic bounded standalone `app.wasm` from the verified spine.
+  Execute the exact same bytes with an independent PC reference interpreter,
+  the simulated SoC, and the physical RV32I kernel/interpreter. Required AOT is
+  forbidden.
+- Finish volatile upload, persistent install/state, terminal-only USB CDC
+  bridge, reset/corruption recovery, safe state, accessibility, virtual/
+  physical parity, bounded reports, and the manifest-backed hardware-in-the-
+  loop aggregate.
+- Boon Orchard remains a vision document only. Do not begin game implementation
+  in this goal; it neither gates nor completes the processor/console proof.
+
+Exit: one Boon-authored RV32I and one exact replaceable Boon app are traceable
+from source through verified artifacts, hardware IR, generated RTL, physical
+board execution, app-Wasm interpretation, all-peripheral logical traces, and
+fresh HIL evidence. Documentation, simulator-only parity, host AOT, or visual
+observation does not pass.
+
+Phase 7: complete the universal packed runtime and formal optimization
 
 - Implement packed-plan phases 0 through 6: inventories/budgets, dense semantic
   artifacts, packed cells/typed arenas, dense scalar runtime, columnar rows,
@@ -313,20 +387,20 @@ Phase 5: complete the universal packed runtime and formal optimization
 - Integrate formal Phase 6 with packed Phase 7 KernelIR. Proof facts may select
   a generic optimization only through ContractVerifiedProgram; every accepted
   transformation has translation validation and measured evidence.
-- Complete packed phases 8 and 9: boundaries, native/Wasm parity, hardware
-  eligibility, product-scale reports, and deletion of the old value/row/
-  dependency/materialization execution world.
+- Complete packed phases 8 and 9: boundaries, native/Wasm parity, product-scale
+  reports, and deletion of the old value/row/dependency/materialization
+  execution world.
 - Remove cycle-hot recursive Value, string lookup, BTreeMap/BTreeSet/HashMap/
   HashSet, full snapshot, and compatibility materialization paths. Retain an
   ordered container only in a classified cold boundary/tooling use.
-- Complete every packed acceptance criterion, not only the smaller diagnostic
-  processor gate.
+- Reuse Phase 5 hardware facts where their identity and proof domains match,
+  but do not make hardware IR a software executor.
+- Complete every packed acceptance criterion and its Clear End Condition.
 
-Exit: one universal packed execution world serves native, Wasm, server, products,
-and later hardware lowering; the formal Phase 6 and packed Clear End Conditions
-pass.
+Exit: one universal packed execution world serves native, Wasm, server, and
+products; formal Phase 6 and the packed Clear End Condition pass.
 
-Phase 6: finish distributed/session, persistence, bytes, content, and streaming
+Phase 8: finish distributed/session, persistence, bytes, content, and streaming
 
 - Audit and preserve correct existing implementation after the final semantic
   and packed migrations.
@@ -351,9 +425,10 @@ Phase 6: finish distributed/session, persistence, bytes, content, and streaming
   writes, Busy, restart, and terminal cleanup.
 
 Exit: distributed/session/security, persistence, and streaming lifecycle gates
-pass on the final compiler and packed runtime.
+pass on the final compiler and packed runtime. Device flash persistence remains
+a separate bounded console adapter and does not replace this contract.
 
-Phase 7: complete formal external contracts and mature products
+Phase 9: complete formal external contracts and mature products
 
 - Complete formal Phase 7 over the stabilized distributed/provider boundaries.
   No contract disappears across a role or provider edge; assumptions are
@@ -385,65 +460,38 @@ Exit: formal Phase 7, every NovyWave acceptance scenario, all Cells functional/
 performance gates, all 108 FjordPulse stories, and the exact 340-scenario final
 classification pass.
 
-Phase 8: prove the pre-hardware web milestone from one unchanged revision
+Phase 10: prove the complete compiler, console, native, and web milestone
 
 - Run independent adversarial reviews for compiler genericity, proof
   completeness, typed-list semantics/access/currentness, packed storage,
-  native/Wasm parity, persistence/restore, nested ownership/event safety,
-  Session isolation/security, streaming cleanup, native proof integrity,
-  NovyWave real-data ownership, Cells performance, and FjordPulse parity.
-- Generate every applicable native GPU handoff report from one final unchanged
-  source revision using only the commands in
-  `docs/architecture/native_gpu_handoff_manifest.json`, then run:
-
-    cargo xtask verify-all --check-existing --report
-    target/reports/report-v2/verify-all.json
-
+  standalone app-Wasm identity, hardware lowering, interpreter bounds, RV32I
+  compliance, console HIL integrity, native/Wasm parity, persistence/restore,
+  nested ownership/event safety, Session isolation/security, streaming cleanup,
+  native proof integrity, NovyWave real-data ownership, Cells performance, and
+  FjordPulse parity.
+- Generate native GPU handoff reports using only
+  `docs/architecture/native_gpu_handoff_manifest.json` and console reports
+  using only the future
+  `docs/architecture/boon_console_handoff_manifest.json`. Run each
+  manifest-backed aggregate on the same unchanged revision.
 - Prove zero-scan bounded 58,500-station first/deep pages, browser 60 FPS,
   persistence/restart/migration, Live Entur operation, HTTPS/WSS, and production
   deployment at https://fjordpulse-boon.kavik.cz.
 - Bind source, semantic/verified/erased artifacts, schema/index, physical plan,
-  dataset, adapter, binary, deployment, surface, input, presented frame, and
-  proof identities as applicable.
+  app Wasm, hardware IR, RTL, bitstream, kernel/interpreter, board, dataset,
+  adapter, binary, deployment, surface, input, presented frame, and proof
+  identities as applicable.
 
-Exit: the complete pre-hardware web-application story is mature and freshly
-proved on the final universal compiler/runtime. Documentation, scaffolding,
-stale reports, partial parity, or deployment without persistence/restart proof
-does not pass.
+Exit: the complete compiler/runtime, BoonConsole, and web-application story is
+mature and freshly proved. Documentation, scaffolding, stale reports, partial
+parity, or deployment without persistence/restart proof does not pass.
 
-Phase 9: build and prove the first Boon-designed RV32I processor
-
-- No canonical processor/compiler/hardware implementation begins before Phase 8
-  passes. Read-only spec, toolchain, board, and owned-hardware inventory may be
-  prepared earlier, but it cannot create a processor-specific compiler path.
-- Implement every stage and acceptance criterion in
-  `BOON_FIRST_RISCV_PROCESSOR_PLAN.md`.
-- Build unrelated hardware API fixtures before the CPU. Use ordinary BITS,
-  bounded MAP, Tags, records, sources, and verified semantics; add no MEMORY
-  keyword or RISC-V-aware language/runtime shortcut.
-- Implement the architectural step model, multicycle core, native and browser/
-  Wasm cycle simulation, CoreHardwareIR, TargetHardwareIR, generated
-  SystemVerilog, synthesis, architectural tests, Sail differential execution,
-  RVFI/riscv-formal properties, bounded progress, and target reports.
-- Program the selected owned FPGA board with the exact reported bitstream and
-  firmware. Return machine-readable signature/trace evidence matching
-  simulation; an LED or hand-written smoke program is never sole proof.
-- Add the Boon Orchard projection only after the machine-readable processor API
-  and proof lineage exist. The game visualizes real artifacts; it does not
-  redefine correctness.
-- Self-hosting, Linux, networking, and a useful server workload are not hidden
-  processor acceptance criteria.
-
-Exit: one Boon-authored complete RV32I core is traceable from source through
-verified semantics, MachinePlan, CoreHardwareIR, native/Wasm simulation,
-generated RTL, formal evidence, FPGA bitstream/board result, and Boon Orchard.
-
-Phase 10: complete the example portfolio
+Phase 11: complete the example portfolio
 
 - Use selected examples throughout earlier phases as unrelated regression and
   budget fixtures: Counter/TodoMVC, Cells, NovyWave, a FjordPulse-shaped indexed
   dataset, an exact/rounded compute kernel, and BITS/byte/hardware fixtures.
-- After the RISC-V/Orchard milestone, implement every remaining phase and
+- After the RV32I/BoonConsole milestone, implement every remaining phase and
   completion condition in `BOON_EXAMPLE_PORTFOLIO_PLAN.md`.
 - Canonical native/Wasm examples use exact Number. GPU execution uses proved
   exact/fixed-point/BITS lowering or explicit exact source rounding with
@@ -477,7 +525,8 @@ Final verification and absolute stop condition:
   explicit deletion-audit documentation, never as accepted behavior.
 - Every compatible Clear End Condition in the OUT, foundations,
   structural-inference, typed-list, formal, persistence, packed, NovyWave,
-  Cells/native, FjordPulse, RISC-V, and example-portfolio contracts must pass.
+  Cells/native, FjordPulse, RISC-V, BoonConsole, and example-portfolio
+  contracts must pass.
 - Re-run every applicable final report after the final tracked edit. Evidence
   from a pre-foundations, pre-formal, pre-packed, pre-product, pre-processor, or
   otherwise different source/artifact revision is stale.

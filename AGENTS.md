@@ -5,6 +5,12 @@ and verification contract for native window work. The older plan files still
 document historical Ply/runtime verification, but they are not the source of
 truth for the native two-window GPU playground.
 
+Treat `docs/architecture/BOON_CONSOLE.md` and
+`docs/plans/BOON_CONSOLE_IMPLEMENTATION_PLAN.md` as the active console
+architecture and execution contract. `BOON_FIRST_RISCV_PROCESSOR_PLAN.md` owns
+the reusable CPU; game documents and `MISSION_WASM_AND_LANTERN_CONSOLES.md` do
+not own compiler, Wasm, console, bridge, or hardware-readiness decisions.
+
 Do not commit or push unless the user explicitly asks.
 
 When Boon source exposes a real compiler, typechecker, runtime, or engine

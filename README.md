@@ -18,19 +18,24 @@ two-window playground. Rust/Zig codegen, browser/WASM, and hardware-oriented
 lowering come after the runtime, document, render, and verifier contracts are
 kept generic and fast on TodoMVC and 7GUIs Cells.
 
+The first hardware product objective after those prerequisites is BoonConsole:
+a verified Boon-designed RV32I system plus an interpreter-first standalone
+`app.wasm` path with equivalent virtual and physical controls.
+
 ## Documents
 
 - [Runtime model](docs/architecture/RUNTIME_MODEL.md)
 - [Language semantics](docs/architecture/LANGUAGE_SEMANTICS.md)
 - [LIST and indexed memory model](docs/architecture/LIST_MODEL.md)
 - [Delta protocol for renderers and runtimes](docs/architecture/DELTA_PROTOCOL.md)
-- [FPGA TodoMVC lowering](docs/architecture/FPGA_TODOMVC_LOWERING.md)
+- [BoonConsole architecture](docs/architecture/BOON_CONSOLE.md)
+- [Historical FPGA TodoMVC lowering](docs/architecture/FPGA_TODOMVC_LOWERING.md)
 - [Relationship to previous Boon attempts](docs/architecture/PREVIOUS_ATTEMPTS.md)
 - [TodoMVC target shape](docs/examples/TODOMVC_CIRCUIT_STYLE.md)
 - [Cells target shape](docs/examples/CELLS_CIRCUIT_STYLE.md)
-- [Implementation plan](docs/plans/IMPLEMENTATION_PLAN.md)
+- [Active simplification and native recovery plan](docs/plans/BOON_CIRCUIT_SIMPLIFICATION_AND_NATIVE_RECOVERY_PLAN.md)
+- [BoonConsole implementation plan](docs/plans/BOON_CONSOLE_IMPLEMENTATION_PLAN.md)
 - [Native GPU pipeline contract](docs/architecture/NATIVE_GPU_PIPELINE.md)
-- [Native realtime frame-loop and proof plan](docs/plans/NATIVE_REALTIME_FRAME_LOOP_AND_PROOF_MODES_PLAN.md)
 - [Manual testing runbook](docs/plans/MANUAL_TESTING_RUNBOOK.md)
 - [`/goal` prompt](docs/plans/GOAL_PROMPT.md)
 

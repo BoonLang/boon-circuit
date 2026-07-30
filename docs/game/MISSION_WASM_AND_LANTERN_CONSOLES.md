@@ -1,11 +1,40 @@
 # Mission Wasm And Lantern Consoles
 
-Status: game and product-direction checkpoint, not an implementation contract.
+Status: **historical and superseded game-direction checkpoint**. It is not an
+implementation, architecture, sequencing, or verification contract.
 
 This document is a companion to
 [Boon Orchard](./BOON_ORCHARD.md). It records the portable-program,
 optional-hardware, console, island, and local-cluster direction that emerged
 after the original game vision.
+
+The active authorities are:
+
+- [`../architecture/BOON_CONSOLE.md`](../architecture/BOON_CONSOLE.md) for the
+  virtual/physical console, all required peripherals, exact interpreted
+  standalone `app.wasm`, bridge, reset/persistence, safe state, and readiness;
+- [`../plans/BOON_CONSOLE_IMPLEMENTATION_PLAN.md`](../plans/BOON_CONSOLE_IMPLEMENTATION_PLAN.md)
+  for implementation phases, experiments, reports, and the HIL gate;
+- [`../plans/BOON_FIRST_RISCV_PROCESSOR_PLAN.md`](../plans/BOON_FIRST_RISCV_PROCESSOR_PLAN.md)
+  for the reusable RV32I and generic hardware pipeline;
+- [`BOON_ORCHARD.md`](./BOON_ORCHARD.md) for game vision only.
+
+The following decisions in this historical file are expressly superseded:
+
+- host-AOT is not the first or required physical application path;
+- the exact standalone `app.wasm` must run through an onboard interpreter on
+  physical RV32I before readiness;
+- BTN, SWT, 8LD, SSD, and CLS are all required concurrently for BoonConsole V1,
+  not optional capabilities selected per mission;
+- the onboard RGB LED has no console status or proof role;
+- the terminal-only USB CDC bridge replaces the broader Orchard Agent/product
+  direction for this milestone;
+- detailed game work is outside the current goal and would require a separate
+  future specification after the BoonConsole HIL Clear End Condition passes.
+
+Everything below this notice is retained only to preserve the history of the
+brainstorm. Terms, diagrams, phases, AOT paths, optional-peripheral statements,
+and acceptance ideas below cannot override the active authorities.
 
 The central player promise is:
 
@@ -18,7 +47,7 @@ The central player promise is:
 The board makes the machine physical. It must not make the game purchasable
 only in pieces.
 
-## Decisions Captured Here
+## Historical Decisions Captured Here
 
 The following direction is now intentional:
 

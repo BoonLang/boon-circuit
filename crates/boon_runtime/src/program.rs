@@ -4412,6 +4412,39 @@ document: Document/new(
     }
 
     #[test]
+    fn document_startup_materializes_a_value_derived_from_initial_latest() {
+        const SOURCE: &str = r#"
+store: [
+    activate: SOURCE
+    workflow:
+        LATEST {
+            Idle
+            activate |> THEN { Active }
+        }
+    message:
+        workflow |> WHEN {
+            Idle => TEXT { Idle message }
+            Active => TEXT { Active message }
+        }
+]
+
+document: Document/new(
+    root: Element/label(
+        element: []
+        style: []
+        label: store.message
+    )
+)
+"#;
+        let runtime =
+            LiveRuntime::from_source("document-initial-latest-derived-value.bn", SOURCE).unwrap();
+        assert!(frame_has_text(
+            runtime.document_frame().expect("document frame"),
+            "Idle message"
+        ));
+    }
+
+    #[test]
     fn replaceable_artifact_owner_is_stable_per_parent_session() {
         let parent = ApplicationIdentity::new("dev.boon.parent", "owner-test", "local");
         let session = ProgramSessionId("public-page".to_owned());

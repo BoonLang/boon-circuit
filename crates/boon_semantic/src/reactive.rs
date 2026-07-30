@@ -1899,13 +1899,14 @@ impl<'a> ReactiveBuilder<'a> {
                 continue;
             };
             let (producer, target) = if let Some(state) = state_by_statement.get(&statement.id) {
-                let statement_expression = self.expressions.expression(statement_producer)?;
-                let producer = if statement_expression.flow_type == state.flow_type {
-                    statement_producer
-                } else {
-                    state.expression
-                };
-                (producer, SemanticBindingTargetV1::State { state: state.id })
+                // A lexical state binding names the exact HOLD authority.
+                // Statement-level FLUSH and DRAINING wrappers retain their own
+                // semantic identities, but must not replace the authority
+                // producer carried into executable storage/currentness.
+                (
+                    state.expression,
+                    SemanticBindingTargetV1::State { state: state.id },
+                )
             } else if let Some(list) = list_by_statement.get(&statement.id) {
                 (
                     statement_producer,

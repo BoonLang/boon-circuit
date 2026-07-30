@@ -10583,6 +10583,7 @@ struct ExecutableRowLowerer<'a> {
     active_materialization_owners: Vec<PlanStaticOwnerId>,
     lexical_bindings: Vec<BTreeMap<ir::ExecutableLocalBindingId, ir::ExecutableExprId>>,
     active_lexical_bindings: BTreeSet<ir::ExecutableLocalBindingId>,
+    active_storage_bindings: BTreeSet<ir::ErasedBindingId>,
     bindings: BTreeMap<ir::ExecutableExprId, PlanRowExpressionId>,
     memo: BTreeMap<
         (
@@ -10616,6 +10617,7 @@ impl<'a> ExecutableRowLowerer<'a> {
             active_materialization_owners: Vec::new(),
             lexical_bindings: Vec::new(),
             active_lexical_bindings: BTreeSet::new(),
+            active_storage_bindings: BTreeSet::new(),
             bindings: BTreeMap::new(),
             memo: BTreeMap::new(),
         }
@@ -12145,6 +12147,27 @@ impl<'a> ExecutableRowLowerer<'a> {
                         return self.value_ref(value);
                     }
                 }
+                if matches!(
+                    &binding.target,
+                    ir::ErasedBindingTarget::Value {
+                        field: None,
+                        row: None
+                    }
+                ) {
+                    if !self.active_storage_bindings.insert(*storage_binding) {
+                        return Err(PlanError::new(format!(
+                            "storage binding {storage_binding} `{}` forms an executable value cycle",
+                            binding.diagnostic_path
+                        )));
+                    }
+                    let lowered = self.lower_scoped(binding.producer, inherited_owner);
+                    self.active_storage_bindings.remove(storage_binding);
+                    let mut lowered = lowered?;
+                    for field in projection {
+                        lowered = self.project_field(lowered, field.clone())?;
+                    }
+                    return Ok(lowered);
+                }
                 let value = match binding.target {
                     ir::ErasedBindingTarget::Source { runtime, .. } => {
                         if !projection.is_empty() {
@@ -12167,7 +12190,10 @@ impl<'a> ExecutableRowLowerer<'a> {
                         .resolve_storage(*storage_binding)
                         .ok_or_else(|| {
                             PlanError::new(format!(
-                                "storage binding {storage_binding} has no exact machine value"
+                                "storage binding {storage_binding} `{}` has no exact machine value for producer {} and target {:?}",
+                                binding.diagnostic_path,
+                                binding.producer,
+                                binding.target,
                             ))
                         })?,
                 };

@@ -343,6 +343,7 @@ pub struct MigrationRowTarget {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum MigrationScenarioValue {
+    Tag { tag: String },
     Truth(bool),
     Integer(i64),
     Text(String),

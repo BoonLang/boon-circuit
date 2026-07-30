@@ -1763,6 +1763,7 @@ fn source_payload(
 
 fn scenario_value(value: &MigrationScenarioValue) -> Value {
     match value {
+        MigrationScenarioValue::Tag { tag } => Value::tag(tag.clone()),
         MigrationScenarioValue::Truth(value) => Value::truth(*value),
         MigrationScenarioValue::Integer(value) => Value::Number(ExactNumber::from_i64(*value)),
         MigrationScenarioValue::Text(value) => Value::Text(value.clone()),

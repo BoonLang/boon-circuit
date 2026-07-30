@@ -227,7 +227,7 @@ FUNCTION fibonacci_result(sequence) {
                                 if value.fields.get("value") == Some(&Type::Number)
                         )
             ))
-    ));
+    ), "root Fibonacci result lost its instantiated row shape: {:#?}", result_call.result.ty);
 }
 
 #[test]

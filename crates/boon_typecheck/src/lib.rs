@@ -513,6 +513,7 @@ pub struct SourcePayloadShapeEntry {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SourcePayloadSyntaxShapeEntry {
+    statement: usize,
     source_path: String,
     payload_type: Type,
     fields: Vec<SourcePayloadShapeField>,
@@ -5695,17 +5696,16 @@ impl<'a> CheckedProgramBuilder<'a> {
                 .unwrap_or(FlowMode::Continuous),
             AstExprKind::Hold { .. } => FlowMode::Continuous,
             AstExprKind::Pipe { op, .. } if op == "WHILE" => FlowMode::Continuous,
-            AstExprKind::Latest { branches } => branches
-                .iter()
-                .filter_map(|branch| {
+            AstExprKind::Latest { branches } => {
+                latest_flow_mode(branches.iter().filter_map(|branch| {
                     self.infer_instantiated_expr_mode(
                         CheckedExprId(*branch as u32),
                         bindings,
                         active,
                     )
-                })
-                .reduce(merge_flow_modes)
-                .unwrap_or(FlowMode::Continuous),
+                }))
+                .unwrap_or(FlowMode::Continuous)
+            }
             AstExprKind::When { input, .. } => self
                 .exact_pipeline_input(&expr, *input)
                 .and_then(|input| {
@@ -5887,6 +5887,16 @@ impl<'a> CheckedProgramBuilder<'a> {
                 bindings,
                 active,
             ),
+            AstExprKind::Latest { branches } => {
+                latest_flow_mode(branches.into_iter().filter_map(|branch| {
+                    self.infer_instantiated_projection_mode(
+                        CheckedExprId(branch as u32),
+                        projection,
+                        bindings,
+                        active,
+                    )
+                }))
+            }
             AstExprKind::Identifier(name) => {
                 let mut parts = vec![name];
                 parts.extend(projection.iter().cloned());
@@ -6272,12 +6282,13 @@ impl<'a> CheckedProgramBuilder<'a> {
                 .checked_read_flow_mode(expr_id, &drain_path_parts(path), active)
                 .unwrap_or(fallback),
             AstExprKind::Hold { .. } => FlowMode::Continuous,
-            AstExprKind::Latest { branches } => branches
-                .iter()
-                .copied()
-                .map(|branch| self.infer_checked_expr_flow(branch, active).mode)
-                .reduce(merge_flow_modes)
-                .unwrap_or(fallback),
+            AstExprKind::Latest { branches } => latest_flow_mode(
+                branches
+                    .iter()
+                    .copied()
+                    .map(|branch| self.infer_checked_expr_flow(branch, active).mode),
+            )
+            .unwrap_or(fallback),
             AstExprKind::When { input, .. } => self
                 .exact_pipeline_input(expr, *input)
                 .map(|selector| self.infer_checked_expr_flow(selector, active).mode)
@@ -6424,13 +6435,14 @@ impl<'a> CheckedProgramBuilder<'a> {
                     })
                     .reduce(merge_flow_modes)
             }
-            AstExprKind::Latest { branches } => branches
-                .into_iter()
-                .map(|branch| CheckedExprId(branch as u32))
-                .filter_map(|branch| {
-                    self.checked_projected_expression_flow_mode(branch, projection, active)
-                })
-                .reduce(merge_flow_modes),
+            AstExprKind::Latest { branches } => latest_flow_mode(
+                branches
+                    .into_iter()
+                    .map(|branch| CheckedExprId(branch as u32))
+                    .filter_map(|branch| {
+                        self.checked_projected_expression_flow_mode(branch, projection, active)
+                    }),
+            ),
             AstExprKind::Then { input, output } => self.checked_projected_expression_flow_mode(
                 CheckedExprId(output.unwrap_or(input) as u32),
                 projection,
@@ -6624,17 +6636,16 @@ impl<'a> CheckedProgramBuilder<'a> {
                 active,
                 visited,
             ),
-            AstExprKind::Latest { branches } => branches
-                .into_iter()
-                .filter_map(|branch| {
+            AstExprKind::Latest { branches } => {
+                latest_flow_mode(branches.into_iter().filter_map(|branch| {
                     self.checked_list_item_projection_flow_mode(
                         CheckedExprId(branch as u32),
                         projection,
                         active,
                         visited,
                     )
-                })
-                .reduce(merge_flow_modes),
+                }))
+            }
             AstExprKind::Then { input, output } => self.checked_list_item_projection_flow_mode(
                 CheckedExprId(output.unwrap_or(input) as u32),
                 projection,
@@ -13541,7 +13552,8 @@ impl<'a> Checker<'a> {
     ) -> (Self, CheckerInitProfile) {
         let checker_init_started = Instant::now();
         let source_paths_started = Instant::now();
-        let source_paths = syntax_source_sites(program)
+        let source_sites = syntax_source_sites(program);
+        let source_paths = source_sites
             .iter()
             .map(|source| source.path.clone())
             .collect();
@@ -13552,7 +13564,7 @@ impl<'a> Checker<'a> {
         let source_payload_shape_table_started = Instant::now();
         let source_payload_shape_table = source_payload_shape_table(
             program,
-            &source_paths,
+            &source_sites,
             &source_payload_lookup,
             &host_port_table,
         );
@@ -22992,6 +23004,27 @@ fn merge_flow_modes(left: FlowMode, right: FlowMode) -> FlowMode {
     }
 }
 
+fn latest_flow_mode(modes: impl IntoIterator<Item = FlowMode>) -> Option<FlowMode> {
+    let mut saw_mode = false;
+    let mut saw_continuous = false;
+    let mut saw_present = false;
+    for mode in modes {
+        saw_mode = true;
+        match mode {
+            FlowMode::Continuous => saw_continuous = true,
+            FlowMode::TickPresent | FlowMode::PresentOrAbsent => saw_present = true,
+            FlowMode::Absent => {}
+        }
+    }
+    saw_mode.then_some(if saw_continuous {
+        FlowMode::Continuous
+    } else if saw_present {
+        FlowMode::PresentOrAbsent
+    } else {
+        FlowMode::Absent
+    })
+}
+
 fn type_is_assignable_to(actual: &Type, expected: &Type) -> bool {
     match (actual, expected) {
         (_, Type::Unknown) | (Type::Unknown, _) | (Type::Var(_), _) | (_, Type::Var(_)) => true,
@@ -26338,19 +26371,23 @@ fn simple_statement_flow_mode(
     expressions: &[AstExpr],
     bindings: &BTreeMap<String, FlowMode>,
 ) -> FlowMode {
-    if !matches!(expr.kind, AstExprKind::Latest { .. }) {
+    let AstExprKind::Latest { branches } = &expr.kind else {
         return simple_flow_mode_with_bindings(expr, expressions, bindings);
-    }
-    statement
-        .children
-        .iter()
-        .filter_map(|child| {
+    };
+    let branch_mode = latest_flow_mode(
+        branches
+            .iter()
+            .filter_map(|branch| expressions.get(*branch))
+            .map(|branch| simple_flow_mode_with_bindings(branch, expressions, bindings)),
+    );
+    branch_mode.unwrap_or_else(|| {
+        latest_flow_mode(statement.children.iter().filter_map(|child| {
             direct_statement_value_expr_id(child, expressions)
                 .and_then(|expr_id| expressions.get(expr_id))
                 .map(|expr| simple_statement_flow_mode(child, expr, expressions, bindings))
-        })
-        .reduce(merge_flow_modes)
+        }))
         .unwrap_or(FlowMode::Continuous)
+    })
 }
 
 fn simple_flow_mode_with_bindings(
@@ -26714,7 +26751,6 @@ pub fn specialize_checked_call_result(instantiated: &Type, occurrence: &Type) ->
                 };
                 *instantiated_fields = specialized;
             }
-            variants.sort_by_key(variant_sort_key);
             Type::VariantSet(variants)
         }
         (Type::Union(instantiated), Type::Union(occurrence))
@@ -26730,7 +26766,10 @@ pub fn specialize_checked_call_result(instantiated: &Type, occurrence: &Type) ->
                     .collect(),
             )
         }
-        (_, occurrence) => occurrence.clone(),
+        // Occurrence inference supplements a generic instantiation; it is not
+        // allowed to replace an already concrete substituted type with a
+        // conflicting syntax-local approximation.
+        _ => instantiated.clone(),
     }
 }
 
@@ -28981,10 +29020,14 @@ fn source_payload_type_for_path(
 
 fn source_payload_shape_table(
     program: &ParsedProgram,
-    source_paths: &BTreeSet<String>,
+    source_sites: &[SyntaxSourceSite],
     source_lookup: &SourcePayloadPathLookup,
     host_ports: &HostPortSyntaxTable,
 ) -> Vec<SourcePayloadSyntaxShapeEntry> {
+    let source_paths = source_sites
+        .iter()
+        .map(|source| source.path.clone())
+        .collect::<BTreeSet<_>>();
     let mut fields_by_source = source_paths
         .iter()
         .map(|source_path| (source_path.clone(), BTreeMap::new()))
@@ -29059,11 +29102,11 @@ fn source_payload_shape_table(
             fields.insert(name, ty);
         }
     }
-    source_paths
+    source_sites
         .iter()
-        .map(|source_path| {
+        .map(|source| {
             let fields = fields_by_source
-                .get(source_path)
+                .get(&source.path)
                 .cloned()
                 .unwrap_or_default()
                 .into_iter()
@@ -29076,7 +29119,8 @@ fn source_payload_shape_table(
                 false,
             ));
             SourcePayloadSyntaxShapeEntry {
-                source_path: source_path.clone(),
+                statement: source.statement,
+                source_path: source.path.clone(),
                 payload_type,
                 fields,
             }
@@ -29997,15 +30041,9 @@ fn collect_statement_type_hints(
                 ));
             }
             AstStatementKind::Source { .. } => {
-                let source_path = source_payload_shape_table
-                    .iter()
-                    .find(|entry| {
-                        entry
-                            .source_path
-                            .ends_with(statement_source_suffix(statement).as_str())
-                    })
-                    .map(|entry| entry.payload_type.clone())
-                    .unwrap_or_else(exact_empty_object_type);
+                let source_path =
+                    source_payload_type_for_statement(statement, source_payload_shape_table)
+                        .unwrap_or_else(exact_empty_object_type);
                 entries.push(type_hint_entry_for_range(
                     program,
                     statement.expr,
@@ -30197,11 +30235,7 @@ fn source_payload_type_for_statement(
 ) -> Option<Type> {
     source_payload_shape_table
         .iter()
-        .find(|entry| {
-            entry
-                .source_path
-                .ends_with(statement_source_suffix(statement).as_str())
-        })
+        .find(|entry| entry.statement == statement.id)
         .map(|entry| entry.payload_type.clone())
 }
 
@@ -30463,20 +30497,6 @@ fn statement_by_id(statements: &[AstStatement], id: usize) -> Option<&AstStateme
     None
 }
 
-fn statement_source_suffix(statement: &AstStatement) -> String {
-    match &statement.kind {
-        AstStatementKind::Source {
-            field: Some(field),
-            event: Some(event),
-        } => format!("{field}.{event}"),
-        AstStatementKind::Source {
-            field: Some(field),
-            event: None,
-        } => field.clone(),
-        _ => statement_field(statement).unwrap_or_else(|| "source".to_owned()),
-    }
-}
-
 fn call_arg_name_range(program: &ParsedProgram, arg: &AstCallArg) -> Option<(usize, usize, usize)> {
     let name = arg.named_name()?;
     let line = line_for_byte(&program.source, arg.start);
@@ -30545,6 +30565,18 @@ fn collect_payload_pattern_fields(
         {
             for source_path in expr_source_paths(*input, expressions, source_lookup) {
                 if let Some(fields) = fields_by_source.get_mut(&source_path) {
+                    if let Some(field) =
+                        expr_source_payload_field(*input, expressions, source_lookup)
+                        && let Some(selector) =
+                            source_payload_tag_selector_type(&statement.children, expressions)
+                        && !source_payload_field_has_intrinsic_type(&field)
+                    {
+                        // A closed tag match is structural evidence for an
+                        // arbitrary payload field's exact variant set. It must
+                        // not replace renderer-defined event fields such as
+                        // `key` and `text`.
+                        fields.insert(field, selector);
+                    }
                     for child in &statement.children {
                         if let Some(AstExpr {
                             kind: AstExprKind::MatchArm { pattern, .. },
@@ -30566,6 +30598,91 @@ fn collect_payload_pattern_fields(
             fields_by_source,
         );
     }
+}
+
+fn source_payload_field_has_intrinsic_type(field: &str) -> bool {
+    matches!(
+        field,
+        "press"
+            | "click"
+            | "double_click"
+            | "blur"
+            | "change"
+            | "key_down"
+            | "bytes"
+            | "key"
+            | "text"
+    )
+}
+
+fn expr_source_payload_field(
+    expression: usize,
+    expressions: &[AstExpr],
+    source_lookup: &SourcePayloadPathLookup,
+) -> Option<String> {
+    match &expressions.get(expression)?.kind {
+        AstExprKind::Path(parts) => match source_lookup.access_for_parts(parts)? {
+            SourcePayloadAccess::Field(field) => Some(field),
+            SourcePayloadAccess::Direct(_) | SourcePayloadAccess::UnknownField(_) => None,
+        },
+        AstExprKind::Pipe { input, .. } | AstExprKind::When { input, .. } => {
+            expr_source_payload_field(*input, expressions, source_lookup)
+        }
+        _ => None,
+    }
+}
+
+fn source_payload_tag_selector_type(
+    arms: &[AstStatement],
+    expressions: &[AstExpr],
+) -> Option<Type> {
+    let mut variants = Vec::new();
+    for pattern in arms.iter().filter_map(|arm| {
+        arm.expr
+            .and_then(|expression| expressions.get(expression))
+            .and_then(|expression| match &expression.kind {
+                AstExprKind::MatchArm { pattern, .. } => Some(pattern),
+                _ => None,
+            })
+    }) {
+        match pattern {
+            AstMatchPattern::Tag { name, fields } => {
+                variants.push(if fields.is_empty() {
+                    Variant::Tag(name.clone())
+                } else {
+                    Variant::Tagged {
+                        tag: name.clone(),
+                        fields: ObjectShape {
+                            fields: fields
+                                .iter()
+                                .map(|field| (field.clone(), Type::Unknown))
+                                .collect(),
+                            field_order: fields.clone(),
+                            open: false,
+                        },
+                    }
+                });
+            }
+            AstMatchPattern::Wildcard | AstMatchPattern::Binding { .. } => {}
+            AstMatchPattern::Number { .. }
+            | AstMatchPattern::Text { .. }
+            | AstMatchPattern::Bits { .. } => return None,
+            AstMatchPattern::Invalid { .. } => {
+                unreachable!("invalid match patterns are rejected by boon_parser")
+            }
+        }
+    }
+    variants.sort_by(|left, right| {
+        let left = match left {
+            Variant::Tag(tag) | Variant::Tagged { tag, .. } => tag,
+        };
+        let right = match right {
+            Variant::Tag(tag) | Variant::Tagged { tag, .. } => tag,
+        };
+        left.cmp(right)
+    });
+    variants.dedup();
+    (!variants.is_empty()).then_some(Type::VariantSet(variants))
 }
 
 fn collect_payload_hold_update_types(

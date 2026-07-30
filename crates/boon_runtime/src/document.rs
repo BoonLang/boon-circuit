@@ -2304,7 +2304,19 @@ impl<'a> Evaluator<'a> {
             .project_current(&[target])
             .map_err(|error| DocumentError::Evaluation(error.to_string()))?;
         let value = projected.remove(&target).ok_or_else(|| {
-            DocumentError::Evaluation(format!("value target {target:?} is not current"))
+            let diagnostic_paths = match target {
+                ValueTarget::Field(field) => self
+                    .runtime
+                    .field_names
+                    .get(&field)
+                    .filter(|names| !names.is_empty())
+                    .map(|names| format!(" ({})", names.join(", ")))
+                    .unwrap_or_default(),
+                ValueTarget::State(_) | ValueTarget::RowField { .. } => String::new(),
+            };
+            DocumentError::Evaluation(format!(
+                "value target {target:?}{diagnostic_paths} is not current"
+            ))
         })?;
         self.record_dependency(dependency);
         self.projection_cache.insert(dependency, value.clone());

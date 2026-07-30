@@ -8447,6 +8447,39 @@ document: Document/new(
 }
 
 #[test]
+fn document_accepts_an_exact_nested_source_handle_without_treating_it_as_payload() {
+    let compiled = compile_fixture_source_text_to_machine_plan(
+        "document-nested-source-handle.bn",
+        r#"
+store: [
+    elements: [
+        button: SOURCE
+    ]
+]
+
+document: Document/new(
+    root: Element/label(
+        element: [events: store.elements.button]
+        style: []
+        label: TEXT { Ready }
+    )
+)
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+
+    let document = compiled.plan.document.as_ref().expect("document plan");
+    assert!(document.expressions.iter().any(|expression| matches!(
+        &expression.op,
+        DocumentExprOp::Read {
+            read: DocumentRead::Source { .. }
+        }
+    )));
+    assert!(boon_plan::verify_plan(&compiled.plan).is_ok());
+}
+
+#[test]
 fn retained_document_projects_passed_records_without_compiling_unused_event_fields() {
     let units = [
         CompilerSourceUnit {
@@ -9097,21 +9130,30 @@ store: [
 }
 
 #[test]
-fn compiler_resolves_append_record_fields_from_the_trigger_source_payload() {
+fn compiler_resolves_append_fields_from_the_exact_same_named_source_payload() {
     let compiled = compile_fixture_source_text_to_machine_plan(
         "append-source-payload-fields.bn",
         r#"
 store: [
-    completed: SOURCE
+    elements: [
+        draft: [completed: SOURCE]
+        publish: [completed: SOURCE]
+    ]
+    draft_bootstrap:
+        elements.draft.completed.bootstrap |> WHEN {
+            True => Ready
+            False => Pending
+        }
     append_token:
-        completed |> THEN { completed.digest }
+        elements.publish.completed
+        |> THEN { elements.publish.completed.digest }
     revisions:
         LIST {}
         |> List/append(item: append_token |> THEN {
             [
                 digest: append_token
-                compiler: completed.compiler
-                target: completed.target
+                compiler: elements.publish.completed.compiler
+                target: elements.publish.completed.target
             ]
         })
         |> List/map(item, new: revision_view(revision: item))

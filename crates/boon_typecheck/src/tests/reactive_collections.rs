@@ -289,6 +289,65 @@ FUNCTION selectable_row(row) {
 }
 
 #[test]
+fn same_named_nested_sources_keep_exact_statement_payload_types() {
+    let parsed = boon_parser::parse_source(
+        "same-named-source-payloads.bn",
+        r#"
+store: [
+    alpha: [shared: SOURCE]
+    beta: [shared: SOURCE]
+    alpha_ready:
+        alpha.shared.kind |> WHEN {
+            Ready => True
+            __ => False
+        }
+    beta_value:
+        beta.shared |> THEN { beta.shared.value }
+]
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+    assert!(
+        !output.report.has_errors(),
+        "same-named nested source diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+    let checked = output.program.expect("same-named nested sources are checked");
+    let source_by_path = |path: &str| {
+        checked
+            .sources
+            .iter()
+            .find(|source| checked.semantic_path(&source.path).as_deref() == Some(path))
+            .expect("checked source path")
+    };
+    let alpha = source_by_path("store.alpha.shared");
+    let beta = source_by_path("store.beta.shared");
+    let source_expression_type = |source: &CheckedSource| {
+        &checked
+            .expressions
+            .get(source.expression.0 as usize)
+            .filter(|expression| expression.id == source.expression)
+            .expect("source expression")
+            .flow_type
+            .ty
+    };
+    assert_eq!(source_expression_type(alpha), &alpha.payload_type);
+    assert_eq!(source_expression_type(beta), &beta.payload_type);
+    assert_ne!(alpha.payload_type, beta.payload_type);
+    assert_eq!(
+        output
+            .report
+            .named_value_type_table
+            .entries
+            .iter()
+            .find(|entry| entry.path == "store.beta_value")
+            .map(|entry| &entry.flow_type.ty),
+        Some(&Type::Text)
+    );
+}
+
+#[test]
 fn mapped_user_function_preserves_a_parameter_seeded_recursive_hold_field() {
     let parsed = boon_parser::parse_source(
         "mapped-recursive-hold-field.bn",
@@ -653,6 +712,61 @@ store: [
             .map(|branch| &checked.expressions[branch.0 as usize])
             .collect::<Vec<_>>()
     );
+}
+
+#[test]
+fn latest_with_a_continuous_fallback_remains_continuous_through_when() {
+    let parsed = boon_parser::parse_source(
+        "continuous-latest-fallback.bn",
+        r#"
+store: [
+    activate: SOURCE
+    workflow:
+        LATEST {
+            Idle
+            activate |> THEN { Active }
+        }
+    message:
+        workflow |> WHEN {
+            Idle => TEXT { Idle message }
+            Active => TEXT { Active message }
+        }
+]
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+    assert!(
+        !output.report.has_errors(),
+        "diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+    for path in ["store.workflow", "store.message"] {
+        assert_eq!(
+            output
+                .report
+                .named_value_type_table
+                .entries
+                .iter()
+                .find(|entry| entry.path == path)
+                .map(|entry| entry.flow_type.mode),
+            Some(FlowMode::Continuous),
+            "`{path}` lost its continuous fallback"
+        );
+    }
+    let checked = output.program.expect("continuous LATEST program");
+    for expression in checked.expressions.iter().filter(|expression| {
+        matches!(
+            expression.kind,
+            CheckedExpressionKind::Latest { .. } | CheckedExpressionKind::When { .. }
+        )
+    }) {
+        assert_eq!(
+            expression.flow_type.mode,
+            FlowMode::Continuous,
+            "continuous selector expression was typed as an event: {expression:#?}"
+        );
+    }
 }
 
 #[test]

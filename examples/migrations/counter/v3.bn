@@ -55,7 +55,7 @@ FUNCTION counter_migration_app(value, version) {
                 Element/label(
                     element: []
                     style: [width: Fill, height: 72, align: [row: Center], font: [size: 56]]
-                    label: value
+                    label: value |> Number/to_text()
                 )
                 counter_controls()
             }

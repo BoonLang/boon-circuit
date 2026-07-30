@@ -173,6 +173,7 @@ store: [
 
     draft_compile_state:
         LATEST {
+            Compiling
             elements.source_editor.event.change |> THEN { Compiling }
             elements.draft_program.compiled |> THEN { Ready }
             elements.draft_program.rejected |> THEN { Invalid }

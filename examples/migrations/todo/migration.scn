@@ -119,8 +119,8 @@ action = { kind = "activate", stage = "v3", mode = "incremental" }
   next_key = 3
   touched = false
   rows = [
-    { key = 1, generation = 1, values = { title = "Plan release (edited)", completed = true, priority = "Normal" }, touched_fields = ["title", "completed"] },
-    { key = 2, generation = 1, values = { title = "Test migration", completed = true, priority = "Normal" }, touched_fields = [] },
+    { key = 1, generation = 1, values = { title = "Plan release (edited)", completed = true, priority = { tag = "Normal" } }, touched_fields = ["title", "completed"] },
+    { key = 2, generation = 1, values = { title = "Test migration", completed = true, priority = { tag = "Normal" } }, touched_fields = [] },
   ]
 
 [[step]]
@@ -148,12 +148,12 @@ action = { kind = "activate", stage = "v4", mode = "incremental" }
   [[step.assert]]
   kind = "current_value"
   path = "store.theme"
-  value = "Light"
+  value = { tag = "Light" }
   touched = false
   [[step.assert]]
   kind = "current_value"
   path = "store.density"
-  value = "Comfortable"
+  value = { tag = "Comfortable" }
   touched = false
 
 [[step]]
@@ -185,8 +185,8 @@ action = { kind = "activate", stage = "v5", mode = "incremental" }
   next_key = 3
   touched = false
   rows = [
-    { key = 1, generation = 1, values = { text = "Plan release (edited)", completed = true, priority = "Normal" }, touched_fields = ["text", "completed"] },
-    { key = 2, generation = 1, values = { text = "Test migration", completed = true, priority = "Normal" }, touched_fields = [] },
+    { key = 1, generation = 1, values = { text = "Plan release (edited)", completed = true, priority = { tag = "Normal" } }, touched_fields = ["text", "completed"] },
+    { key = 2, generation = 1, values = { text = "Test migration", completed = true, priority = { tag = "Normal" } }, touched_fields = [] },
   ]
 
 [[step]]
@@ -218,8 +218,8 @@ action = { kind = "activate", stage = "v6", mode = "incremental" }
   next_key = 3
   touched = false
   rows = [
-    { key = 1, generation = 1, values = { text = "Plan release (edited)", status = "Done", priority = "Normal" }, touched_fields = ["text", "status"] },
-    { key = 2, generation = 1, values = { text = "Test migration", status = "Done", priority = "Normal" }, touched_fields = [] },
+    { key = 1, generation = 1, values = { text = "Plan release (edited)", status = { tag = "Done" }, priority = { tag = "Normal" } }, touched_fields = ["text", "status"] },
+    { key = 2, generation = 1, values = { text = "Test migration", status = { tag = "Done" }, priority = { tag = "Normal" } }, touched_fields = [] },
   ]
 
 [[step]]
@@ -257,8 +257,8 @@ action = { kind = "activate", stage = "v7", mode = "incremental" }
   next_key = 3
   touched = false
   rows = [
-    { key = 1, generation = 1, values = { text = "Plan release (edited)", status = "Done", priority = "Normal" }, touched_fields = ["text", "status"] },
-    { key = 2, generation = 1, values = { text = "Test migration", status = "Done", priority = "Normal" }, touched_fields = [] },
+    { key = 1, generation = 1, values = { text = "Plan release (edited)", status = { tag = "Done" }, priority = { tag = "Normal" } }, touched_fields = ["text", "status"] },
+    { key = 2, generation = 1, values = { text = "Test migration", status = { tag = "Done" }, priority = { tag = "Normal" } }, touched_fields = [] },
   ]
 
 [[step]]
@@ -267,12 +267,12 @@ action = { kind = "restart" }
   [[step.assert]]
   kind = "durable_value"
   path = "store.theme"
-  value = "Light"
+  value = { tag = "Light" }
   touched = false
   [[step.assert]]
   kind = "durable_value"
   path = "store.density"
-  value = "Comfortable"
+  value = { tag = "Comfortable" }
   touched = false
   [[step.assert]]
   kind = "list"
@@ -281,8 +281,8 @@ action = { kind = "restart" }
   next_key = 3
   touched = false
   rows = [
-    { key = 1, generation = 1, values = { text = "Plan release (edited)", status = "Done", priority = "Normal" }, touched_fields = ["text", "status"] },
-    { key = 2, generation = 1, values = { text = "Test migration", status = "Done", priority = "Normal" }, touched_fields = [] },
+    { key = 1, generation = 1, values = { text = "Plan release (edited)", status = { tag = "Done" }, priority = { tag = "Normal" } }, touched_fields = ["text", "status"] },
+    { key = 2, generation = 1, values = { text = "Test migration", status = { tag = "Done" }, priority = { tag = "Normal" } }, touched_fields = [] },
   ]
 
 [[step]]
@@ -358,8 +358,8 @@ action = { kind = "activate", stage = "v7", mode = "skipped" }
   next_key = 3
   touched = false
   rows = [
-    { key = 1, generation = 1, values = { text = "Plan release (edited)", status = "Done", priority = "Normal" }, touched_fields = ["text", "status"] },
-    { key = 2, generation = 1, values = { text = "Test migration", status = "Done", priority = "Normal" }, touched_fields = [] },
+    { key = 1, generation = 1, values = { text = "Plan release (edited)", status = { tag = "Done" }, priority = { tag = "Normal" } }, touched_fields = ["text", "status"] },
+    { key = 2, generation = 1, values = { text = "Test migration", status = { tag = "Done" }, priority = { tag = "Normal" } }, touched_fields = [] },
   ]
 
 [[step]]
@@ -375,8 +375,8 @@ action = { kind = "restart" }
   next_key = 3
   touched = false
   rows = [
-    { key = 1, generation = 1, values = { text = "Plan release (edited)", status = "Done", priority = "Normal" }, touched_fields = ["text", "status"] },
-    { key = 2, generation = 1, values = { text = "Test migration", status = "Done", priority = "Normal" }, touched_fields = [] },
+    { key = 1, generation = 1, values = { text = "Plan release (edited)", status = { tag = "Done" }, priority = { tag = "Normal" } }, touched_fields = ["text", "status"] },
+    { key = 2, generation = 1, values = { text = "Test migration", status = { tag = "Done" }, priority = { tag = "Normal" } }, touched_fields = [] },
   ]
   [[step.assert]]
   kind = "namespace_isolation"

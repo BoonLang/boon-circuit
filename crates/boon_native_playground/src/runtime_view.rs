@@ -4769,7 +4769,7 @@ document: Document/new(
         ] {
             assert_eq!(
                 view.root_value_current(path).unwrap(),
-                Value::Text(expected.to_owned()),
+                Value::tag(expected),
                 "passkey cancellation changed `{path}` incorrectly"
             );
         }
@@ -4804,7 +4804,7 @@ document: Document/new(
         ] {
             assert_eq!(
                 view.root_value_current(path).unwrap(),
-                Value::Text(expected.to_owned()),
+                Value::tag(expected),
                 "passkey registration did not update `{path}`"
             );
         }

@@ -1806,8 +1806,14 @@ impl<'a> DocumentCompiler<'a> {
                         read: DocumentRead::List { list },
                     },
                 )),
-                ValueRef::Source(source)
-                | ValueRef::SourcePayload {
+                ValueRef::Source(source) => Some(self.push_expr(
+                    compiler_id,
+                    final_class,
+                    DocumentExprOp::Read {
+                        read: DocumentRead::Source { source },
+                    },
+                )),
+                ValueRef::SourcePayload {
                     source_id: source, ..
                 } => {
                     return Err(PlanError::new(format!(

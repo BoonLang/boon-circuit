@@ -571,6 +571,7 @@ fn typed_list_targets(
     execution: &mut SemanticExecutionGraphV1,
 ) -> Result<Vec<ListTarget>, String> {
     let direct = direct_storage_statements(execution);
+    let executable_callables = executable_checked_callables(execution)?;
     let mut targets = Vec::new();
     for statement in &execution.statements {
         if !direct.contains(&statement.id) {
@@ -641,6 +642,16 @@ fn typed_list_targets(
     targets.sort_by_key(|target| target.statement);
     let mut classified = BTreeSet::new();
     for checked_list in &checked.lists {
+        if let Some(function) = checked_scope_function_owner(checked, checked_list.owner_scope)?
+            && !executable_callables.contains(&function)
+        {
+            // CheckedProgram covers the full source AST, including unused
+            // functions. The semantic resource graph covers executable
+            // occurrences only. Prove this function unreachable from both
+            // output roots and producer roots before omitting its syntax-only
+            // list literal.
+            continue;
+        }
         let path = checked.semantic_path(&checked_list.path).ok_or_else(|| {
             format!(
                 "checked list {} declaration {} has no canonical semantic path from anchor {} projection {:?}",
@@ -693,49 +704,12 @@ fn typed_list_targets(
             }
         }
         if matches.is_empty() {
-            let occurrences = execution
-                .expressions
-                .iter()
-                .filter(|expression| expression.checked_expr_id == checked_list.producer)
-                .map(|expression| {
-                    let origin = execution
-                        .checked_expression_origins
-                        .get(expression.id.as_usize())
-                        .filter(|origin| origin.expression == expression.id);
-                    (
-                        expression.id,
-                        expression.owner,
-                        matches!(expression.kind, SemanticExpressionKind::List { .. }),
-                        origin.map(|origin| {
-                            (
-                                origin.checked_scope,
-                                origin.owning_statement,
-                                origin.call_instance,
-                            )
-                        }),
-                    )
-                })
-                .collect::<Vec<_>>();
-            let binding = CheckedResourceBinding::ListAuthority {
-                list: checked_list.id,
-            };
-            let resource_statements = execution
-                .statements
-                .iter()
-                .filter(|statement| statement.checked_resources.contains(&binding))
-                .map(|statement| {
-                    (
-                        statement.id,
-                        statement.declaration,
-                        statement.parent,
-                        statement.call_instance,
-                    )
-                })
-                .collect::<Vec<_>>();
             return Err(format!(
-                "checked list {} declaration {} path `{path}` maps to {} exact semantic list producers; checked occurrences: {occurrences:?}; resource statements: {resource_statements:?}",
+                "reachable checked list {} producer {} declaration {} at line {} path `{path}` maps to {} exact semantic list producers",
                 checked_list.id.0,
+                checked_list.producer.0,
                 checked_list.declaration.0,
+                checked_list.span.line,
                 matches.len()
             ));
         }
@@ -774,6 +748,87 @@ fn typed_list_targets(
         }
     }
     Ok(targets)
+}
+
+fn executable_checked_callables(
+    execution: &SemanticExecutionGraphV1,
+) -> Result<BTreeSet<DeclId>, String> {
+    let mut reachable = execution
+        .functions
+        .iter()
+        .map(|function| function.callable)
+        .chain(
+            execution
+                .calls
+                .iter()
+                .filter(|call| call.owner_callable.is_none())
+                .map(|call| call.callable),
+        )
+        .collect::<BTreeSet<_>>();
+    loop {
+        let before = reachable.len();
+        for call in &execution.calls {
+            if call
+                .owner_callable
+                .is_some_and(|owner| reachable.contains(&owner))
+            {
+                reachable.insert(call.callable);
+            }
+        }
+        if reachable.len() == before {
+            break;
+        }
+    }
+    reachable
+        .into_iter()
+        .map(|callable| {
+            execution
+                .callables
+                .get(callable.as_usize())
+                .filter(|definition| definition.id == callable)
+                .map(|definition| definition.checked_callable)
+                .ok_or_else(|| {
+                    format!("executable call graph references missing semantic callable {callable}")
+                })
+        })
+        .collect()
+}
+
+fn checked_scope_function_owner(
+    checked: &CheckedProgram,
+    mut scope: boon_typecheck::LexicalScopeId,
+) -> Result<Option<DeclId>, String> {
+    let mut visited = BTreeSet::new();
+    loop {
+        if !visited.insert(scope) {
+            return Err(format!(
+                "checked scope ancestry cycles while classifying list authority at {}",
+                scope.0
+            ));
+        }
+        let definition = checked
+            .scopes
+            .iter()
+            .find(|candidate| candidate.id == scope)
+            .ok_or_else(|| {
+                format!(
+                    "checked list authority references missing lexical scope {}",
+                    scope.0
+                )
+            })?;
+        if definition.kind == boon_typecheck::CheckedScopeKind::Function {
+            return definition.owner.map(Some).ok_or_else(|| {
+                format!(
+                    "checked function scope {} has no owning declaration",
+                    definition.id.0
+                )
+            });
+        }
+        let Some(parent) = definition.parent else {
+            return Ok(None);
+        };
+        scope = parent;
+    }
 }
 
 fn contextual_list_authority_statements(
@@ -847,34 +902,9 @@ fn contextual_list_authority_statements(
 
 fn checked_scope_is_function_local(
     checked: &CheckedProgram,
-    mut scope: boon_typecheck::LexicalScopeId,
+    scope: boon_typecheck::LexicalScopeId,
 ) -> Result<bool, String> {
-    let mut visited = BTreeSet::new();
-    loop {
-        if !visited.insert(scope) {
-            return Err(format!(
-                "checked scope ancestry cycles while classifying list authority at {}",
-                scope.0
-            ));
-        }
-        let definition = checked
-            .scopes
-            .iter()
-            .find(|candidate| candidate.id == scope)
-            .ok_or_else(|| {
-                format!(
-                    "checked list authority references missing lexical scope {}",
-                    scope.0
-                )
-            })?;
-        if definition.kind == boon_typecheck::CheckedScopeKind::Function {
-            return Ok(true);
-        }
-        let Some(parent) = definition.parent else {
-            return Ok(false);
-        };
-        scope = parent;
-    }
+    checked_scope_function_owner(checked, scope).map(|owner| owner.is_some())
 }
 
 fn synthesize_inline_checked_list_targets(
@@ -6027,6 +6057,24 @@ FUNCTION component() {
             })
             .collect::<BTreeSet<_>>();
         assert_eq!(call_instances.len(), 2);
+    }
+
+    #[test]
+    fn unused_function_lists_remain_checked_without_becoming_executable_resources() {
+        let semantic = elaborate_source(
+            r#"
+answer: 42
+
+FUNCTION unused_component() {
+    LIST {
+        [name: TEXT { syntax is still checked }]
+    }
+}
+"#,
+        );
+        assert_eq!(semantic.checked_program.lists.len(), 1);
+        assert!(semantic.resource_graph().lists.is_empty());
+        assert!(semantic.resource_graph().value_list_authorities.is_empty());
     }
 
     #[test]

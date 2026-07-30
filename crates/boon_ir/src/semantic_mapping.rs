@@ -2964,8 +2964,10 @@ fn map_reactive_binding(
         || expression.flow_type != binding.flow_type
     {
         return Err(format!(
-            "semantic binding {} has stale statement/producer/value/owner/type provenance: statement={} declaration={:?}/{}, value={:?}/{}, expression_value={}/{}, owner={:?}/{:?}, flow={:?}/{:?}",
+            "semantic binding {} has stale statement/producer/value/owner/type provenance: target={:?}, producer_matches_statement={}, statement={} declaration={:?}/{}, value={:?}/{}, expression_value={}/{}, owner={:?}/{:?}, flow={:?}/{:?}",
             binding.id,
+            binding.target,
+            producer_matches_statement,
             binding.statement,
             statement.declaration,
             binding.declaration.0,

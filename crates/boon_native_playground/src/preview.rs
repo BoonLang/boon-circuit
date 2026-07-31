@@ -9,18 +9,18 @@ use boon_host::{
     HostEvent, HostEventEnvelope, HostEventOrigin, KeyEvent, LogicalKey, PointerButton,
     PointerEvent, PointerPhase, TextInputEvent, Viewport,
 };
-use boon_host_runtime::MigrationScenarioRunner;
+use boon_host_runtime::{MigrationScenarioRunner, PersistentRuntimeStartupDisposition};
 use boon_native_app_window::{NativeRoleResult, NativeSurfaceHost, SensitiveInputTarget};
 use boon_persistence::{DecodeLimits, encode_restore_image};
 use futures::channel::mpsc;
 use futures::{FutureExt, StreamExt, pin_mut, select};
 use sha2::{Digest, Sha256};
 
-use boon_runtime::{
-    PersistentRuntimeStartupDisposition, ProgramCompletion, ProgramHostCompletion,
-    ProgramHostRequest, ProgramRequestId, ProgramSessionId, RuntimePhaseTimings, ScenarioStep,
-    compile_program_artifact,
+use boon_program_runtime::{
+    ProgramCompletion, ProgramHostCompletion, ProgramHostRequest, ProgramRequestId,
+    ProgramSessionId, compile_program_artifact,
 };
+use boon_runtime::{RuntimePhaseTimings, ScenarioStep};
 
 use crate::compile::{
     CompileRequest, CompileWorker, ProgramCompileReceipt, ProgramCompileWorker,
@@ -6125,7 +6125,7 @@ mod readiness_tests {
             request_id: ProgramRequestId(request_id.to_owned()),
             session: ProgramSessionId("arrival-order".to_owned()),
             host: boon_document_model::DocumentNodeId("program-host".to_owned()),
-            compile: boon_runtime::ProgramCompileRequest {
+            compile: boon_program_runtime::ProgramCompileRequest {
                 revision,
                 entry_path: "RUN.bn".to_owned(),
                 units: vec![boon_runtime::RuntimeSourceUnit {

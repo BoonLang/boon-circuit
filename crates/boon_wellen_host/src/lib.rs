@@ -6,9 +6,9 @@ use boon_host_runtime::{
     ContentLease, ContentRef, ContentStore, ContentStoreError, ContentStoreErrorKind,
 };
 use boon_plan::{EffectDeliveryCardinality, EffectId, EffectInvocationId, ExactNumber};
+use boon_program_runtime::ProgramSession;
 use boon_runtime::{
-    ContentRefError, ProgramSession, RuntimeTurn, TransientEffectCallId, TransientEffectInvocation,
-    Value,
+    ContentRefError, RuntimeTurn, TransientEffectCallId, TransientEffectInvocation, Value,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;

@@ -6,6 +6,13 @@ use boon_editor::{Buffer, Command, Position};
 use boon_host::{
     DocumentNodeId as HostDocumentNodeId, HostEvent, PointerButton, PointerPhase, SourceBindingId,
 };
+pub(crate) use boon_host_runtime::ProgramCompletionObservation;
+use boon_host_runtime::{
+    HostEffectRouter, HostEffectWorker, ObservedProgramCompletion, PersistentActivationError,
+    PersistentPlanBuildRequest, PersistentRuntime, PersistentRuntimeStartup,
+    PersistentRuntimeStartupDisposition, PreparedPersistentPlanActivation, ProgramArtifactDrive,
+    ProgramArtifactLaneKind, ProgramArtifactLaneOutcome, ProgramArtifactTurnKind,
+};
 use boon_persistence::{
     InMemoryDriver, MigrationPreview, OutboxInspectorState, PersistenceInspectorSnapshot,
     PersistenceWorkerConfig, PersistenceWorkerStatus, RedbDriver,
@@ -14,16 +21,14 @@ use boon_plan::{
     ApplicationIdentity, ApplicationPlan, EffectReplay, ExactNumber, MachinePlan, MemoryKind,
     ProgramRole, SourceRouteToken,
 };
-pub(crate) use boon_runtime::ProgramCompletionObservation;
+use boon_program_runtime::{
+    DistributedProgramBundle, ProgramArtifact, ProgramDiagnostic, ProgramDocumentHost,
+    ProgramHostDiagnostic, ProgramHostRequest, ProgramRejection, ProgramRequestId,
+    ProgramSessionId,
+};
 use boon_runtime::{
-    DistributedProgramBundle, DocumentPatch, DocumentPatchStatus, HostEffectRouter,
-    HostEffectWorker, LiveRuntime, ObservedProgramCompletion, PersistentActivationError,
-    PersistentPlanBuildRequest, PersistentRuntime, PersistentRuntimeStartup,
-    PersistentRuntimeStartupDisposition, PreparedPersistentPlanActivation, ProgramArtifact,
-    ProgramArtifactDrive, ProgramArtifactLaneKind, ProgramArtifactLaneOutcome,
-    ProgramArtifactTurnKind, ProgramDiagnostic, ProgramDocumentHost, ProgramHostDiagnostic,
-    ProgramHostRequest, ProgramRejection, ProgramRequestId, ProgramSessionId, RuntimePhaseTimings,
-    RuntimeTurn, SessionOptions, SourcePayload, Value,
+    DocumentPatch, DocumentPatchStatus, LiveRuntime, RuntimePhaseTimings, RuntimeTurn,
+    SessionOptions, SourcePayload, Value,
 };
 use boon_server_runtime::{
     InProcessDistributedRuntime, InProcessPoll, InProcessTransientEffectOwner,
@@ -773,7 +778,7 @@ impl RuntimeView {
     pub fn preview_machine_plan(
         &self,
         plan: Arc<MachinePlan>,
-    ) -> ViewResult<boon_runtime::PersistentPlanPreview> {
+    ) -> ViewResult<boon_host_runtime::PersistentPlanPreview> {
         validate_preview_plan(&plan)?;
         if &plan.application.identity != self.application_identity() {
             return Err("preview plan belongs to a different application identity".to_owned());
@@ -1359,7 +1364,7 @@ impl RuntimeView {
     pub fn preview_state_artifact(
         &mut self,
         artifact: &[u8],
-    ) -> ViewResult<boon_runtime::PersistentStateArtifactPreview> {
+    ) -> ViewResult<boon_host_runtime::PersistentStateArtifactPreview> {
         let preview = self
             .runtime
             .single()?
@@ -1372,7 +1377,7 @@ impl RuntimeView {
     pub fn activate_state_artifact(
         &mut self,
         artifact: &[u8],
-    ) -> ViewResult<(boon_runtime::PersistentStateArtifactPreview, u64)> {
+    ) -> ViewResult<(boon_host_runtime::PersistentStateArtifactPreview, u64)> {
         let activation = self
             .runtime
             .single_mut()?

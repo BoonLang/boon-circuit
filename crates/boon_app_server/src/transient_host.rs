@@ -11,10 +11,9 @@ use boon_effect_schema::{
 use boon_host_runtime::{FileEffectAdapter, HostServiceEffectAdapter};
 use boon_http_runtime::OutboundHttpEffectAdapter;
 use boon_plan::{EffectId, ProgramRole};
+use boon_program_runtime::ProgramArtifact;
 use boon_runtime::ExactCallHostCore;
-use boon_runtime::{
-    ProgramArtifact, TransientEffectCallId, TransientEffectCreditGrant, TransientEffectInvocation,
-};
+use boon_runtime::{TransientEffectCallId, TransientEffectCreditGrant, TransientEffectInvocation};
 use boon_server_runtime::{
     TransientEffectHost, TransientEffectHostDelivery, TransientEffectHostError,
     TransientEffectHostEvent,
@@ -709,10 +708,10 @@ mod tests {
     use boon_host_services::{HostServiceConfig, HostServices};
     use boon_http_client::{ClientConfig, HttpClient};
     use boon_plan::{ApplicationIdentity, ProgramRole, TargetProfile};
-    use boon_runtime::{
-        ProgramArtifact, ProgramCapabilityProfile, ProgramCompileRequest, ProgramSession,
-        RuntimeSourceUnit, SourcePayload, Value, compile_program_artifact,
+    use boon_program_runtime::{
+        ProgramArtifact, ProgramCompileRequest, ProgramSession, compile_program_artifact,
     };
+    use boon_runtime::{ProgramCapabilityProfile, RuntimeSourceUnit, SourcePayload, Value};
     use boon_wellen_host::WaveformEffectLimits;
     use std::collections::BTreeMap;
     use std::io::Write;

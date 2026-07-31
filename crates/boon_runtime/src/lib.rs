@@ -48,23 +48,11 @@ mod content_ref;
 mod distributed;
 mod effect_host;
 mod host_capability;
-mod program;
-
-#[cfg(not(target_arch = "wasm32"))]
-mod persistent;
-
-#[cfg(not(target_arch = "wasm32"))]
-mod effects;
 
 pub use content_ref::*;
 pub use distributed::*;
 pub use effect_host::*;
-#[cfg(not(target_arch = "wasm32"))]
-pub use effects::*;
 pub use host_capability::*;
-#[cfg(not(target_arch = "wasm32"))]
-pub use persistent::*;
-pub use program::*;
 
 pub type RuntimeResult<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -206,7 +194,8 @@ fn cached_plan(
 }
 
 impl LiveRuntime {
-    pub(crate) fn fork_distributed_server_evaluation(
+    #[doc(hidden)]
+    pub fn fork_distributed_server_evaluation(
         &self,
         settle_prepared_turn: bool,
     ) -> RuntimeResult<Self> {
@@ -247,7 +236,8 @@ impl LiveRuntime {
         })
     }
 
-    pub(crate) fn has_unsettled_turn(&self) -> bool {
+    #[doc(hidden)]
+    pub fn has_unsettled_turn(&self) -> bool {
         self.pending_document_rollback.is_some()
     }
 
@@ -1142,6 +1132,23 @@ impl LiveRuntime {
         self.session.plan()
     }
 
+    #[doc(hidden)]
+    pub fn list_row_snapshots(&self, list: ListId) -> RuntimeResult<Vec<RowSnapshot>> {
+        self.session
+            .list_row_snapshots(list)
+            .map_err(|error| error.into())
+    }
+
+    #[doc(hidden)]
+    pub fn project_values_current(
+        &mut self,
+        targets: &[ValueTarget],
+    ) -> RuntimeResult<BTreeMap<ValueTarget, Value>> {
+        self.session
+            .project_current(targets)
+            .map_err(|error| error.into())
+    }
+
     pub fn shared_machine_plan(&self) -> Arc<MachinePlan> {
         self.session.shared_plan()
     }
@@ -1705,7 +1712,8 @@ impl LiveRuntime {
             .map(|entry| entry.label.as_str())
     }
 
-    fn scenario_target(&mut self, event: &ScenarioSourceEvent) -> RuntimeResult<Option<RowId>> {
+    #[doc(hidden)]
+    pub fn scenario_target(&mut self, event: &ScenarioSourceEvent) -> RuntimeResult<Option<RowId>> {
         if let Some(list) = event.target_list.as_deref() {
             let list = self
                 .session

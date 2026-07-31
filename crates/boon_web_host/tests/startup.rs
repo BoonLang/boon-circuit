@@ -3,10 +3,11 @@ use boon_app_package::{
     MAX_BROWSER_APP_CONFIG_BYTES, sha256_bytes,
 };
 use boon_plan::ProgramRole;
-use boon_runtime::{
-    ApplicationIdentity, ProgramArtifact, ProgramCapabilityProfile, ProgramCompileRequest,
-    RuntimeSourceUnit, compile_distributed_program_bundle, compile_program_artifact,
+use boon_program_runtime::{
+    ProgramArtifact, ProgramCompileRequest, compile_distributed_program_bundle,
+    compile_program_artifact,
 };
+use boon_runtime::{ApplicationIdentity, ProgramCapabilityProfile, RuntimeSourceUnit};
 use boon_web_host::{
     BrowserAppStartup, BrowserAppStartupPoll, WebHostError, decode_browser_app_config,
 };

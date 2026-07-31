@@ -3,14 +3,20 @@
 #![forbid(unsafe_code)]
 
 mod content_store;
+mod effects;
 mod migration_scenario;
+mod persistent;
+mod persistent_program_session;
 
 pub use boon_runtime::ContentRef;
 pub use content_store::{
     ContentLease, ContentStore, ContentStoreError, ContentStoreErrorKind, ContentStoreLimits,
     ContentWriter,
 };
+pub use effects::*;
 pub use migration_scenario::*;
+pub use persistent::*;
+pub use persistent_program_session::PersistentProgramSession;
 
 use atomic_write_file::AtomicWriteFile;
 use boon_host_services::{
@@ -18,11 +24,12 @@ use boon_host_services::{
     SecretMaterial, SecretRef, TimerReceiveError,
 };
 use boon_plan::{EffectDeliveryCardinality, EffectId, EffectInvocationId, ExactNumber};
+use boon_program_runtime::ProgramSession;
 use boon_runtime::{
     ByteStreamValidator, EffectCommitPermit, EffectStopDisposition, EffectStopReason,
     EffectTerminalReservation, HostCapabilityErrorKind, HostCapabilityRegistry, HostValueBinding,
-    ProgramSession, RuntimeTurn, TransientEffectCallId, TransientEffectCreditGrant,
-    TransientEffectInvocation, Value,
+    RuntimeTurn, TransientEffectCallId, TransientEffectCreditGrant, TransientEffectInvocation,
+    Value,
 };
 use bytes::Bytes;
 use sha2::{Digest, Sha256};

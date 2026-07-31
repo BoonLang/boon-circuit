@@ -642,6 +642,7 @@ dependencies = [
  "boon_contract",
  "boon_persistence",
  "boon_plan",
+ "boon_program_runtime",
  "boon_runtime",
  "ciborium",
  "serde",
@@ -666,6 +667,7 @@ dependencies = [
  "boon_http_runtime",
  "boon_persistence",
  "boon_plan",
+ "boon_program_runtime",
  "boon_runtime",
  "boon_server_host",
  "boon_server_runtime",
@@ -740,6 +742,7 @@ version = "0.1.0"
 dependencies = [
  "boon_data",
  "boon_plan",
+ "boon_program_runtime",
  "boon_runtime",
  "boon_wire",
  "ciborium",
@@ -813,14 +816,17 @@ version = "0.1.0"
 dependencies = [
  "atomic-write-file",
  "boon_compiler",
+ "boon_document_model",
  "boon_effect_schema",
  "boon_example_manifest",
  "boon_host_services",
  "boon_persistence",
  "boon_plan",
+ "boon_program_runtime",
  "boon_runtime",
  "bytes",
  "getrandom 0.3.4",
+ "redb",
  "sha2",
  "tempfile",
  "tokio",
@@ -854,6 +860,7 @@ dependencies = [
  "boon_effect_schema",
  "boon_http_client",
  "boon_plan",
+ "boon_program_runtime",
  "boon_runtime",
  "tokio",
 ]
@@ -928,6 +935,7 @@ dependencies = [
  "boon_parser",
  "boon_persistence",
  "boon_plan",
+ "boon_program_runtime",
  "boon_runtime",
  "boon_server_runtime",
  "boon_typecheck",
@@ -1027,6 +1035,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "boon_program_runtime"
+version = "0.1.0"
+dependencies = [
+ "boon_compiler",
+ "boon_contract",
+ "boon_document",
+ "boon_document_model",
+ "boon_persistence",
+ "boon_plan",
+ "boon_runtime",
+ "ciborium",
+ "serde",
+ "sha2",
+]
+
+[[package]]
 name = "boon_runtime"
 version = "0.1.0"
 dependencies = [
@@ -1039,9 +1063,6 @@ dependencies = [
  "boon_persistence",
  "boon_plan",
  "boon_plan_executor",
- "boon_wire",
- "ciborium",
- "redb",
  "serde",
  "sha2",
  "tempfile",
@@ -1087,6 +1108,7 @@ dependencies = [
  "boon_host_runtime",
  "boon_persistence",
  "boon_plan",
+ "boon_program_runtime",
  "boon_runtime",
  "boon_server_host",
  "boon_wire",
@@ -1156,6 +1178,7 @@ dependencies = [
  "boon_native_gpu",
  "boon_persistence",
  "boon_plan",
+ "boon_program_runtime",
  "boon_runtime",
  "boon_web_effect_host",
  "boon_wire",
@@ -1181,6 +1204,7 @@ dependencies = [
  "boon_effect_schema",
  "boon_host_runtime",
  "boon_plan",
+ "boon_program_runtime",
  "boon_runtime",
  "sha2",
  "tempfile",

@@ -13,6 +13,7 @@ boon_example_manifest.workspace = true
 boon_host_services.workspace = true
 boon_persistence.workspace = true
 boon_plan.workspace = true
+boon_program_runtime.workspace = true
 boon_runtime.workspace = true
 bytes.workspace = true
 getrandom.workspace = true
@@ -20,4 +21,6 @@ sha2.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+boon_document_model.workspace = true
+redb.workspace = true
 tempfile = "3.27.0"

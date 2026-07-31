@@ -16,7 +16,7 @@ const DEFAULT_REPORT: &str = "target/reports/phase0-v1/evidence.json";
 const VERSIONS_MANIFEST: &str = "docs/architecture/phase0/versions.toml";
 const DELETION_MANIFEST: &str = "docs/architecture/phase0/deletion_ledger.toml";
 const DELETION_MANIFEST_SHA256: &str =
-    "dd0d5c9aa1e649e848b6c5b8c7f3815c4d797cafcc4a547752c51a8846cd983f";
+    "9ceba678ada58236c9eec11901e5cf15354a90bced5979249327714ef162b83c";
 const CONTAINER_MANIFEST: &str = "docs/architecture/phase0/container_inventory.toml";
 #[cfg(test)]
 const CONTAINER_OCCURRENCE_LEDGER: &str = "docs/architecture/phase0/container_occurrences.tsv";
@@ -1104,7 +1104,7 @@ fn validate_versions(
         ("erased-program", ArtifactStatus::Present),
         ("machine-plan", ArtifactStatus::Present),
         ("program-artifact-v3", ArtifactStatus::Present),
-        ("native-playground-protocol-v14", ArtifactStatus::Present),
+        ("native-playground-protocol-v15", ArtifactStatus::Present),
         ("physical-plan", ArtifactStatus::Absent),
         ("kernel-ir", ArtifactStatus::Absent),
         ("hardware-process", ArtifactStatus::Absent),
@@ -2568,10 +2568,14 @@ fn classify_generated_container_occurrence(
         "crates/boon_compiler/",
         "crates/boon_distributed_runtime/",
         "crates/boon_document/src/runtime.rs",
+        "crates/boon_host_runtime/src/effects.rs",
         "crates/boon_host_runtime/src/migration_scenario.rs",
+        "crates/boon_host_runtime/src/persistent.rs",
+        "crates/boon_host_runtime/src/persistent_program_session.rs",
         "crates/boon_ir/",
         "crates/boon_plan/",
         "crates/boon_plan_executor/",
+        "crates/boon_program_runtime/",
         "crates/boon_runtime/",
         "crates/boon_server_runtime/src/router.rs",
         "crates/boon_typecheck/",

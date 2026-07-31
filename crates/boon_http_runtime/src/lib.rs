@@ -7,9 +7,8 @@ use boon_http_client::{
     HttpResponse, LimitKind, QueryParameter, RequestTimeouts, RequestViolation, TimeoutKind,
 };
 use boon_plan::{EffectId, EffectInvocationId, ExactNumber};
-use boon_runtime::{
-    ProgramSession, RuntimeTurn, TransientEffectCallId, TransientEffectInvocation, Value,
-};
+use boon_program_runtime::ProgramSession;
+use boon_runtime::{RuntimeTurn, TransientEffectCallId, TransientEffectInvocation, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::time::Duration;

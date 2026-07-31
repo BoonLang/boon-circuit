@@ -6,10 +6,10 @@ use crate::{
 };
 use boon_contract::{SourceBundleDigestV1, SourceBundleUnit};
 use boon_plan::{ApplicationIdentity, ProgramRole};
-use boon_runtime::{
-    ProgramArtifact, ProgramCompileRequest, RuntimeSourceUnit,
-    compile_trusted_package_distributed_program_bundle,
+use boon_program_runtime::{
+    ProgramArtifact, ProgramCompileRequest, compile_trusted_package_distributed_program_bundle,
 };
+use boon_runtime::RuntimeSourceUnit;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};

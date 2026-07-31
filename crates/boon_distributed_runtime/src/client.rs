@@ -9,8 +9,9 @@ use super::{DistributedRuntimeError, runtime_error};
 use boon_plan::{
     DistributedGraphIdentityPlan, DistributedWireSchemaPlan, ProgramRole, SourceRouteToken,
 };
+use boon_program_runtime::ProgramArtifact;
 use boon_runtime::{
-    DocumentFrame, DocumentPatch, MachineBuildProgress, ProgramArtifact, RowId, RuntimeTurn,
+    DocumentFrame, DocumentPatch, MachineBuildProgress, RowId, RuntimeTurn,
     SessionConnectionStatus, SessionContext, SessionOptions, SessionPrincipal, SourcePayload,
     TransientEffectCallId, Value,
 };

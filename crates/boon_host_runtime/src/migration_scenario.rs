@@ -1,3 +1,4 @@
+use crate::PersistentRuntime;
 use boon_compiler::{
     CompilerSourceUnit, compile_runtime_source_units_to_machine_plan_with_persistence_catalog,
     compiler_source_units_for_manifest_source,
@@ -16,9 +17,7 @@ use boon_plan::{
     ApplicationIdentity, ExactNumber, MachinePlan, MemoryId, MigrationPredecessorBinding,
     TargetProfile,
 };
-use boon_runtime::{
-    LiveRuntime, PersistentRuntime, RowId, SessionOptions, Snapshot, SourcePayload, Value,
-};
+use boon_runtime::{LiveRuntime, RowId, SessionOptions, Snapshot, SourcePayload, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};

@@ -1,5 +1,4 @@
 use super::DistributedRuntimeError;
-use crate::program::ProgramArtifact;
 use crate::{
     DistributedCurrentCallInstance, DistributedImportUpdate, RuntimeTurn, SessionContext,
     SourceEvent, SourcePayload, TransientEffectCallId, Value,
@@ -18,8 +17,6 @@ use std::fmt::{self, Debug, Formatter};
 /// second durable authority.
 pub trait DistributedServerMachine {
     type EvaluationMachine: DistributedServerMachine;
-
-    fn artifact(&self) -> &ProgramArtifact;
 
     fn fork_prepared_evaluation(
         &self,

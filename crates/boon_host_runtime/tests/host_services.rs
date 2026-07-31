@@ -3,9 +3,9 @@ use boon_host_runtime::{
 };
 use boon_host_services::{HostServiceConfig, HostServices, SecretMaterial};
 use boon_plan::{ApplicationIdentity, ExactNumber};
+use boon_program_runtime::{ProgramCompileRequest, ProgramSession, compile_program_artifact};
 use boon_runtime::{
-    ProgramCapabilityProfile, ProgramCompileRequest, ProgramSession, RuntimeSourceUnit,
-    SourcePayload, TransientEffectInvocation, Value, compile_program_artifact,
+    ProgramCapabilityProfile, RuntimeSourceUnit, SourcePayload, TransientEffectInvocation, Value,
 };
 use std::time::Duration;
 

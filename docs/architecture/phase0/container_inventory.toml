@@ -7,26 +7,26 @@ word_boundary = "rust-identifier"
 lexical_scope = "all-source-text"
 test_scope_policy = "test-oracle"
 non_code_policy = "unrelated-host-code"
-expected_file_count = 154
-expected_file_set_sha256 = "0d1a2e3626a809e0b3e8ce5de4916859ca9b63ed41d11bbf0c0cd247a67b756d"
+expected_file_count = 156
+expected_file_set_sha256 = "ca18a4c45b478056b635cac82a1d7fcf71febfd56ac1a664314a463fbddd06b5"
 occurrence_ledger_path = "docs/architecture/phase0/container_occurrences.tsv"
 occurrence_ledger_protocol = "boon-phase0-container-occurrences-v1"
 occurrence_ledger_generator = "cargo test -p xtask verify_phase0::tests::regenerate_container_occurrence_ledger -- --ignored --exact"
-expected_occurrence_ledger_sha256 = "bf0c635934cc16985a2c3423e997694b279ec7d6c52fb45a1b03df96d87a134d"
-expected_occurrence_rows = 5037
+expected_occurrence_ledger_sha256 = "01a7ad9c85262027b94d292bd36daaa8288de529045bb70c09059d4cd8149679"
+expected_occurrence_rows = 5039
 within_file_classification = "complete"
 within_file_owner_phase = "goal-phase-5-packed"
 within_file_owner_action = "Maintain one checked-in row per exact identifier occurrence; mixed files retain distinct per-use categories."
 
 [[constructs]]
 id = "BTreeMap"
-expected_occurrences = 3007
-expected_files = 128
+expected_occurrences = 3009
+expected_files = 130
 
 [[constructs]]
 id = "BTreeSet"
 expected_occurrences = 1944
-expected_files = 101
+expected_files = 102
 
 [[constructs]]
 id = "HashMap"
@@ -43,8 +43,8 @@ order = 0
 id = "dense-id-table"
 owner_phase = "goal-phase-5-packed"
 owner_plan = "docs/plans/BOON_PACKED_DATA_AND_DENSE_INTERNALS_PLAN.md"
-expected_files = 26
-expected_btree_map = 964
+expected_files = 28
+expected_btree_map = 967
 expected_btree_set = 0
 expected_hash_map = 0
 expected_hash_set = 0
@@ -54,7 +54,7 @@ order = 1
 id = "membership"
 owner_phase = "goal-phase-5-packed"
 owner_plan = "docs/plans/BOON_PACKED_DATA_AND_DENSE_INTERNALS_PLAN.md"
-expected_files = 87
+expected_files = 88
 expected_btree_map = 0
 expected_btree_set = 1721
 expected_hash_map = 0
@@ -87,8 +87,8 @@ order = 4
 id = "canonical-boundary"
 owner_phase = "goal-phase-6-web-persistence"
 owner_plan = "docs/plans/BOON_PERSISTENCE_ARCHITECTURE_PLAN.md"
-expected_files = 46
-expected_btree_map = 427
+expected_files = 45
+expected_btree_map = 426
 expected_btree_set = 34
 expected_hash_map = 2
 expected_hash_set = 0

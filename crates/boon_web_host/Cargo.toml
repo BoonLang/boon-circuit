@@ -95,6 +95,9 @@ web-sys = { version = "0.3.98", features = [
     "WritableStream",
 ] }
 
+[dev-dependencies]
+boon_program_runtime.workspace = true
+
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 boon_compiler.workspace = true
 futures.workspace = true

@@ -1,9 +1,9 @@
 use crate::protocol::ProgramSource;
 use boon_plan::ProgramRole;
-use boon_runtime::{
-    DistributedProgramBundle, ProgramCapabilityProfile, ProgramCompileRequest, RuntimeResult,
-    RuntimeSourceUnit, compile_distributed_program_bundle,
+use boon_program_runtime::{
+    DistributedProgramBundle, ProgramCompileRequest, compile_distributed_program_bundle,
 };
+use boon_runtime::{ProgramCapabilityProfile, RuntimeResult, RuntimeSourceUnit};
 
 pub(crate) fn compile_distributed_program(
     mut sources: Vec<ProgramSource>,
@@ -115,7 +115,7 @@ mod tests {
     use super::*;
     use crate::protocol::SourceUnit;
     use boon_contract::{SourceBundleDigestV1, SourceBundleUnit};
-    use boon_runtime::ProgramArtifact;
+    use boon_program_runtime::ProgramArtifact;
 
     const SHARED_PATH: &str = "distributed_fixture/Shared/DistributedContract.bn";
     const CLIENT_PATH: &str = "distributed_fixture/Client/RUN.bn";

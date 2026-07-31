@@ -1,8 +1,6 @@
 use boon_persistence::{PersistenceWorkerConfig, RedbDriver};
-use boon_runtime::{
-    ApplicationIdentity, ProgramCapabilityProfile, ProgramCompileRequest, RuntimeSourceUnit,
-    compile_program_artifact,
-};
+use boon_program_runtime::{ProgramCompileRequest, compile_program_artifact};
+use boon_runtime::{ApplicationIdentity, ProgramCapabilityProfile, RuntimeSourceUnit};
 use boon_server_host::{ServerConfig, bind};
 use boon_server_runtime::{BoonServerProgram, PersistentServerConfig, ServerLifecyclePhase};
 use futures::{SinkExt, StreamExt};
@@ -17,7 +15,11 @@ fn loopback() -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)
 }
 
-fn compile_artifact(path: &str, source: &str, namespace: &str) -> boon_runtime::ProgramArtifact {
+fn compile_artifact(
+    path: &str,
+    source: &str,
+    namespace: &str,
+) -> boon_program_runtime::ProgramArtifact {
     compile_program_artifact(&ProgramCompileRequest {
         revision: 1,
         entry_path: path.to_owned(),

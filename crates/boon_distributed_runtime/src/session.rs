@@ -4,9 +4,10 @@ use super::link::{ClientSessionLink, ReceiveOperation, SentControl};
 use super::message::{DistributedMessage, DistributedQueueLimits, TypedMessageQueue};
 use super::{DistributedRuntimeError, runtime_error};
 use boon_plan::{DistributedGraphIdentityPlan, DistributedWireSchemaPlan, ProgramRole};
+use boon_program_runtime::ProgramArtifact;
 use boon_runtime::{
-    MachineTemplate, ProgramArtifact, RuntimeTurn, SessionConnectionStatus, SessionContext,
-    SessionOptions, SessionPrincipal, TransientEffectCallId, Value,
+    MachineTemplate, RuntimeTurn, SessionConnectionStatus, SessionContext, SessionOptions,
+    SessionPrincipal, TransientEffectCallId, Value,
 };
 use boon_wire::{ClientSessionFrameLimits, SessionId};
 use std::collections::{BTreeSet, VecDeque};

@@ -2398,8 +2398,8 @@ roots = ["crates"]
 extensions = ["rs"]
 mode = "rust-token"
 needle = "BTreeMap"
-expected_occurrences = 3007
-expected_files = 128
+expected_occurrences = 3009
+expected_files = 130
 
 [entries.scans.expected_path_occurrences]
 "crates/boon_app_package/src/build.rs" = 2
@@ -2480,12 +2480,14 @@ expected_files = 128
 "crates/boon_runtime/src/distributed/server.rs" = 2
 "crates/boon_document/src/runtime.rs" = 140
 "crates/boon_runtime/src/effect_host.rs" = 5
-"crates/boon_runtime/src/effects.rs" = 2
+"crates/boon_host_runtime/src/effects.rs" = 2
 "crates/boon_runtime/src/host_capability.rs" = 3
-"crates/boon_runtime/src/lib.rs" = 16
+"crates/boon_runtime/src/lib.rs" = 17
 "crates/boon_host_runtime/src/migration_scenario.rs" = 14
-"crates/boon_runtime/src/persistent.rs" = 21
-"crates/boon_runtime/src/program.rs" = 20
+"crates/boon_host_runtime/src/persistent.rs" = 21
+"crates/boon_host_runtime/src/persistent_program_session.rs" = 3
+"crates/boon_program_runtime/src/program_core.rs" = 3
+"crates/boon_program_runtime/src/program_host.rs" = 15
 "crates/boon_web_host/src/web_persistent.rs" = 2
 "crates/boon_semantic/src/contextual_expansion.rs" = 88
 "crates/boon_semantic/src/dependency_manifest.rs" = 18
@@ -2537,7 +2539,7 @@ extensions = ["rs"]
 mode = "rust-token"
 needle = "BTreeSet"
 expected_occurrences = 1944
-expected_files = 101
+expected_files = 102
 
 [entries.scans.expected_path_occurrences]
 "crates/boon_app_package/src/browser.rs" = 2
@@ -2604,8 +2606,9 @@ expected_files = 101
 "crates/boon_runtime/src/effect_host.rs" = 2
 "crates/boon_runtime/src/lib.rs" = 2
 "crates/boon_host_runtime/src/migration_scenario.rs" = 4
-"crates/boon_runtime/src/persistent.rs" = 10
-"crates/boon_runtime/src/program.rs" = 17
+"crates/boon_host_runtime/src/persistent.rs" = 10
+"crates/boon_program_runtime/src/program_core.rs" = 1
+"crates/boon_program_runtime/src/program_host.rs" = 16
 "crates/boon_web_host/src/web_persistent.rs" = 5
 "crates/boon_semantic/src/contextual_expansion.rs" = 18
 "crates/boon_semantic/src/dependency_manifest.rs" = 17
@@ -2649,7 +2652,7 @@ expected_files = 101
 roots = ["docs/architecture/phase0/container_occurrences.tsv"]
 extensions = ["tsv"]
 needle = "\tdense-id-table\t"
-expected_occurrences = 964
+expected_occurrences = 967
 expected_files = 1
 
 [[entries.scans]]
@@ -2677,7 +2680,7 @@ expected_files = 1
 roots = ["docs/architecture/phase0/container_occurrences.tsv"]
 extensions = ["tsv"]
 needle = "\tcanonical-boundary\t"
-expected_occurrences = 463
+expected_occurrences = 462
 expected_files = 1
 
 [[entries.scans]]
@@ -2709,7 +2712,7 @@ measurement = "occurrence"
 roots = ["docs/architecture/phase0/container_occurrences.tsv"]
 extensions = ["tsv"]
 needle = "\tdense-id-table\t"
-expected_occurrences = 964
+expected_occurrences = 967
 expected_files = 1
 
 [[entries]]

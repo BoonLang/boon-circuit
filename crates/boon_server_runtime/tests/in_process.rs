@@ -1,8 +1,10 @@
 use boon_persistence::{PersistenceWorkerConfig, RedbDriver};
 use boon_plan::ProgramRole;
+use boon_program_runtime::{
+    DistributedProgramBundle, ProgramCompileRequest, compile_distributed_program_bundle,
+};
 use boon_runtime::{
-    ApplicationIdentity, DistributedProgramBundle, ProgramCapabilityProfile, ProgramCompileRequest,
-    RuntimeSourceUnit, SourcePayload, Value, compile_distributed_program_bundle,
+    ApplicationIdentity, ProgramCapabilityProfile, RuntimeSourceUnit, SourcePayload, Value,
 };
 use boon_server_runtime::{
     InProcessDistributedRuntime, InProcessPoll, InProcessTransientEffectOwner,
@@ -320,7 +322,7 @@ fn persistent_server_restart_restores_authority_with_a_fresh_process_local_sessi
     assert!(status.persistence.accepting_turns);
     assert_eq!(
         startup.disposition,
-        boon_runtime::PersistentRuntimeStartupDisposition::Fresh
+        boon_host_runtime::PersistentRuntimeStartupDisposition::Fresh
     );
     let mut now = Duration::ZERO;
     settle(&mut runtime, &mut now);
@@ -346,7 +348,7 @@ fn persistent_server_restart_restores_authority_with_a_fresh_process_local_sessi
     .unwrap();
     assert_eq!(
         startup.disposition,
-        boon_runtime::PersistentRuntimeStartupDisposition::Restored
+        boon_host_runtime::PersistentRuntimeStartupDisposition::Restored
     );
     let mut recovered_now = Duration::ZERO;
     settle(&mut recovered, &mut recovered_now);

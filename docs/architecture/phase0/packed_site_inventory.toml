@@ -7,12 +7,16 @@ scan_roots = [
   "crates/boon_distributed_runtime",
   "crates/boon_document/src/runtime.rs",
   "crates/boon_document_model",
+  "crates/boon_host_runtime/src/effects.rs",
   "crates/boon_host_runtime/src/migration_scenario.rs",
+  "crates/boon_host_runtime/src/persistent.rs",
+  "crates/boon_host_runtime/src/persistent_program_session.rs",
   "crates/boon_ir",
   "crates/boon_list_access",
   "crates/boon_persistence",
   "crates/boon_plan",
   "crates/boon_plan_executor",
+  "crates/boon_program_runtime",
   "crates/boon_runtime",
   "crates/boon_server_runtime",
   "crates/boon_typecheck",
@@ -22,9 +26,13 @@ scan_roots = [
 runtime_roots = [
   "crates/boon_distributed_runtime",
   "crates/boon_document/src/runtime.rs",
+  "crates/boon_host_runtime/src/effects.rs",
   "crates/boon_host_runtime/src/migration_scenario.rs",
+  "crates/boon_host_runtime/src/persistent.rs",
+  "crates/boon_host_runtime/src/persistent_program_session.rs",
   "crates/boon_list_access",
   "crates/boon_plan_executor",
+  "crates/boon_program_runtime",
   "crates/boon_runtime",
   "crates/boon_server_runtime",
   "crates/boon_web_host/src/web_persistent.rs",
@@ -32,9 +40,13 @@ runtime_roots = [
 hot_roots = [
   "crates/boon_distributed_runtime/src",
   "crates/boon_document/src/runtime.rs",
+  "crates/boon_host_runtime/src/effects.rs",
   "crates/boon_host_runtime/src/migration_scenario.rs",
+  "crates/boon_host_runtime/src/persistent.rs",
+  "crates/boon_host_runtime/src/persistent_program_session.rs",
   "crates/boon_list_access/src",
   "crates/boon_plan_executor/src",
+  "crates/boon_program_runtime/src",
   "crates/boon_runtime/src",
   "crates/boon_server_runtime/src",
   "crates/boon_web_host/src/web_persistent.rs",
@@ -82,20 +94,20 @@ occurrence_ledger_generator = "cargo run -p xtask --example packed_site_inventor
 occurrence_ledger_validator = "cargo run -p xtask --example packed_site_inventory -- --check"
 
 # Updated only after reviewing a deterministic generator run.
-expected_probe_set_sha256 = "eab041a923fa1c55ee6e8e83de802d347694b16304865e2e22675316e4a32da7"
-expected_file_set_sha256 = "bcdcec3a44fb6d4cde4051661052d403e71d928810bd4c67b940edd5e6b67c10"
-expected_scanned_files = 96
-expected_occurrence_files = 86
-expected_occurrence_ledger_sha256 = "2ddcf9a8b1513434b04e5b0c2c6b206bfa1b2960687f7e112d1c8c480e2c1614"
-expected_occurrence_rows = 19892
+expected_probe_set_sha256 = "74d30b30f6bcf09c10edaef60aefbae001c6bc9843751989617840593d5c7296"
+expected_file_set_sha256 = "496eb1a217a9c4c8fe4dfeb49e32a0ea8315ffbdaeab5df96eb369d88d455ff0"
+expected_scanned_files = 99
+expected_occurrence_files = 88
+expected_occurrence_ledger_sha256 = "dc0862afdcf3f59affe4cd4c8d5f9d7251ad719bc12da587264c504ce7b1620c"
+expected_occurrence_rows = 19896
 
 [[categories]]
 order = 0
 id = "recursive-value-carrier"
 owner_phase = "goal-phase-5-packed"
 owner_plan = "docs/plans/BOON_PACKED_DATA_AND_DENSE_INTERNALS_PLAN.md"
-expected_rows = 753
-expected_hot = 541
+expected_rows = 754
+expected_hot = 542
 expected_cold = 166
 expected_boundary = 46
 
@@ -124,8 +136,8 @@ order = 3
 id = "allocation-or-growth"
 owner_phase = "goal-phase-5-packed"
 owner_plan = "docs/plans/BOON_PACKED_DATA_AND_DENSE_INTERNALS_PLAN.md"
-expected_rows = 15642
-expected_hot = 4150
+expected_rows = 15643
+expected_hot = 4151
 expected_cold = 10059
 expected_boundary = 1433
 
@@ -134,8 +146,8 @@ order = 4
 id = "whole-snapshot-or-comparison"
 owner_phase = "goal-phase-5-packed"
 owner_plan = "docs/plans/BOON_PACKED_DATA_AND_DENSE_INTERNALS_PLAN.md"
-expected_rows = 481
-expected_hot = 126
+expected_rows = 483
+expected_hot = 128
 expected_cold = 282
 expected_boundary = 73
 

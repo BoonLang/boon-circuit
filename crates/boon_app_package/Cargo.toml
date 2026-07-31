@@ -13,6 +13,7 @@ build = ["dep:wasm-bindgen-cli-support"]
 boon_contract.workspace = true
 boon_persistence.workspace = true
 boon_plan.workspace = true
+boon_program_runtime.workspace = true
 boon_runtime.workspace = true
 ciborium.workspace = true
 serde.workspace = true

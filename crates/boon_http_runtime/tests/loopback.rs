@@ -7,10 +7,8 @@ use boon_http_client::{
 };
 use boon_http_runtime::{OutboundHttpEffectAdapter, apply_completion, apply_submission};
 use boon_plan::{ApplicationIdentity, ExactNumber};
-use boon_runtime::{
-    ProgramCapabilityProfile, ProgramCompileRequest, ProgramSession, RuntimeSourceUnit,
-    SourcePayload, Value, compile_program_artifact,
-};
+use boon_program_runtime::{ProgramCompileRequest, ProgramSession, compile_program_artifact};
+use boon_runtime::{ProgramCapabilityProfile, RuntimeSourceUnit, SourcePayload, Value};
 use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};

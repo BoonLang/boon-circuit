@@ -133,6 +133,41 @@ container inventories retain 19,892 candidate sites across 86 source files and
 5,037 exact container occurrences across 154 files under the new owners. All
 non-budget architecture checks pass.
 
+The following runtime-ownership cut creates target-neutral
+`boon_program_runtime` as the owner of program compilation, `ProgramArtifact`,
+`ProgramSession`, and embedded `ProgramDocumentHost` orchestration. Native
+effect execution, durable persistence, and `PersistentProgramSession` move to
+`boon_host_runtime`; `boon_server_runtime` consumes that host-owned persistent
+session instead of forcing native persistence back into core runtime.
+`boon_runtime` retains the single `LiveRuntime`/executor facade and the narrow
+target-neutral authority needed by those owners. No compiler, document,
+persistence, migration, fixture, or demo algorithm was deleted. The three
+checked-in Counter, Persons.pro, and TodoMVC migration scenarios pass in their
+new owner, as do the wrong-artifact rejection and exact equal-revision durable
+binding tests and the four-case in-process Server integration suite. A native
+affected all-target compile and a real `wasm32-unknown-unknown` all-target
+compile pass under serial execution.
+
+Runtime plus executor now measures 40,520 production lines and passes its
+42,000-line cap, an 8,350-line reduction from the preceding ownership cut.
+Tracked Rust is 456,444 lines and test Rust is 92,313 lines; those two global
+budgets remain open. Playground and xtask production remain within their caps
+at 31,305 and 17,773 lines. The packed and container inventories explicitly
+follow every moved implementation and pass with 19,896 candidate sites across
+88 source files and 5,039 exact container occurrences across 156 files. Phase
+0 versions, deletion, fixture, inventory, and stale-report checks pass; the
+Cells packed baseline and its dependent current-worktree budget report remain
+honestly stale.
+
+The executable migration demos currently prove the catalog/`MachinePlan`
+version-migration path, including incremental, skipped-version, restart,
+activation, namespace, and cross-path authority behavior. They do not claim
+that the planned Boon `DRAIN`/`DRAINING` source surface is already implemented.
+Its parser, typechecker, lowering, one-owner transfer, interruption/retry, and
+release-finalization tests remain explicit future work in
+`BOON_PERSISTENCE_ARCHITECTURE_PLAN.md`; this ownership cut removes none of
+those planned paths or their current migration fixtures.
+
 The nested-compositor diagnostic path has been deleted. The replacement uses
 ordinary COSMIC preview/dev windows, kernel uinput mouse and keyboard devices,
 the normal app_window callback route, and app-owned exact-frame WGPU readback.
@@ -146,9 +181,10 @@ proof, and aggregate gates pass.
 
 The remaining completion work is explicit and ordered:
 
-1. remove duplicated and superseded implementation/test ownership until all
-   three architecture line budgets pass, without deleting current generic
-   compiler, runtime, persistence, or product behavior;
+1. remove duplicated and superseded implementation/test ownership until the
+   remaining tracked-Rust and test-Rust line budgets pass, without deleting
+   current generic compiler, runtime, persistence, or product behavior; the
+   runtime-plus-executor budget now passes;
 2. restart the COSMIC session so the installed compositor exposes launch-scoped
    window reconciliation, then refresh all seven manifest reports and the
    aggregate from one unchanged revision;

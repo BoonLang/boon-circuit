@@ -11,7 +11,7 @@ use boon_host_services::{HostServiceConfig, HostServices};
 use boon_http_client::{ClientConfig, HttpClient};
 use boon_http_runtime::OutboundHttpEffectAdapter;
 use boon_persistence::{PersistenceWorkerConfig, RedbDriver};
-use boon_runtime::DistributedProgramBundle;
+use boon_program_runtime::DistributedProgramBundle;
 use boon_server_host::bind;
 use boon_server_runtime::{
     BoonServerProgram, DistributedSessionRegistryConfig, PersistentServerConfig,

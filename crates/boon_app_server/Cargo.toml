@@ -19,6 +19,7 @@ boon_http_client.workspace = true
 boon_http_runtime.workspace = true
 boon_persistence.workspace = true
 boon_plan.workspace = true
+boon_program_runtime.workspace = true
 boon_server_host.workspace = true
 boon_server_runtime.workspace = true
 boon_runtime.workspace = true

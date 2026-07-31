@@ -5,7 +5,8 @@ use crate::{
 };
 use boon_persistence::{ContentArtifact, ContentArtifactId};
 use boon_plan::{ProgramRole, TargetProfile};
-use boon_runtime::{ProgramArtifact, ProgramCapabilityProfile};
+use boon_program_runtime::ProgramArtifact;
+use boon_runtime::ProgramCapabilityProfile;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::io::Cursor;

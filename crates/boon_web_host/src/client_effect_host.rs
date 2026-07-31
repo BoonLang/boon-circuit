@@ -275,9 +275,9 @@ mod tests {
         EffectDeliveryCardinality, EffectId, EffectInvocationId, OwnerInstanceRoute,
         builtin_effect_contract,
     };
+    use boon_program_runtime::{ProgramCompileRequest, compile_distributed_program_bundle};
     use boon_runtime::{
-        ApplicationIdentity, ProgramCapabilityProfile, ProgramCompileRequest, RuntimeSourceUnit,
-        SourcePayload, Value, compile_distributed_program_bundle,
+        ApplicationIdentity, ProgramCapabilityProfile, RuntimeSourceUnit, SourcePayload, Value,
     };
     use boon_wire::SessionId;
     use std::collections::BTreeMap;

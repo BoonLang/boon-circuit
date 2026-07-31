@@ -10,10 +10,11 @@ use boon_contract::{CanonicalSourceBundleV1, SourceBundleDigestV1, SourceBundleU
 use boon_plan::{
     DEFAULT_PERSISTENCE_SCHEMA_VERSION, MachinePlan, MigrationPredecessorBinding, TargetProfile,
 };
-use boon_runtime::{
-    ApplicationIdentity, DistributedProgramBundle, ProgramArtifact, ProgramDiagnostic,
-    ProgramHostRequest, ProgramRequestId, ProgramSessionId, compile_program_artifact,
+use boon_program_runtime::{
+    DistributedProgramBundle, ProgramArtifact, ProgramDiagnostic, ProgramHostRequest,
+    ProgramRequestId, ProgramSessionId, compile_program_artifact,
 };
+use boon_runtime::ApplicationIdentity;
 use futures::channel::mpsc;
 use sha2::{Digest, Sha256};
 
@@ -670,7 +671,7 @@ mod tests {
                 request_id: ProgramRequestId(format!("request-{revision}")),
                 session: session.clone(),
                 host: host.clone(),
-                compile: boon_runtime::ProgramCompileRequest {
+                compile: boon_program_runtime::ProgramCompileRequest {
                     revision,
                     entry_path: "RUN.bn".to_owned(),
                     units: vec![boon_runtime::RuntimeSourceUnit {
@@ -696,7 +697,7 @@ mod tests {
                 request_id: ProgramRequestId(request_id.to_owned()),
                 session: session.clone(),
                 host: host.clone(),
-                compile: boon_runtime::ProgramCompileRequest {
+                compile: boon_program_runtime::ProgramCompileRequest {
                     revision: 2,
                     entry_path: "RUN.bn".to_owned(),
                     units: vec![boon_runtime::RuntimeSourceUnit {

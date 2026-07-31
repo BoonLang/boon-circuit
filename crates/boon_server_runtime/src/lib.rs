@@ -34,6 +34,10 @@ pub use router::{
 };
 
 use async_trait::async_trait;
+use boon_host_runtime::{
+    PersistentDispatchError, PersistentDistributedCommitOutcome, PersistentProgramSession,
+    PersistentRuntimeStartupDisposition,
+};
 use boon_persistence::{
     CommitAck, PersistenceDriver, PersistenceWorkerConfig, PersistenceWorkerStatus,
     TurnEnqueueError, TurnReservationError,
@@ -43,13 +47,14 @@ use boon_plan::{
     OutputContractKind, OutputRootId, OutputRootPlan, ProgramRole, SourceId, SourcePayloadField,
     SourceRoute,
 };
+use boon_program_runtime::{
+    DistributedProgramBundle, ProgramArtifact, ProgramSession, ProgramSessionDispatch,
+};
 use boon_runtime::{
-    DistributedImportUpdate, DistributedProgramBundle, DistributedRuntimeError,
-    DistributedServerMachine, EffectHostCoreError, PersistentDispatchError,
-    PersistentDistributedCommitOutcome, PersistentProgramSession,
-    PersistentRuntimeStartupDisposition, ProgramArtifact, ProgramCapabilityProfile, ProgramSession,
-    ProgramSessionDispatch, RuntimeTurn, SessionContext, SessionOrigin, SessionPrincipal,
-    SourceEvent, SourcePayload, TransientEffectCallId, TransientEffectInvocation, Value,
+    DistributedImportUpdate, DistributedRuntimeError, DistributedServerMachine,
+    EffectHostCoreError, ProgramCapabilityProfile, RuntimeTurn, SessionContext, SessionOrigin,
+    SessionPrincipal, SourceEvent, SourcePayload, TransientEffectCallId, TransientEffectInvocation,
+    Value,
 };
 use boon_server_host::{
     CallCancellation, CancellationReason, DistributedSessionAction,
@@ -637,10 +642,6 @@ impl ServerRuntimeSession {
 
 impl DistributedServerMachine for ServerRuntimeSession {
     type EvaluationMachine = ProgramSession;
-
-    fn artifact(&self) -> &ProgramArtifact {
-        ServerRuntimeSession::artifact(self)
-    }
 
     fn fork_prepared_evaluation(
         &self,
@@ -4741,10 +4742,8 @@ fn bounded_text(mut text: String, max_bytes: usize) -> String {
 mod transient_host_tests {
     use super::*;
     use async_trait::async_trait;
-    use boon_runtime::{
-        ApplicationIdentity, ProgramCapabilityProfile, ProgramCompileRequest, RuntimeSourceUnit,
-        compile_program_artifact,
-    };
+    use boon_program_runtime::{ProgramCompileRequest, compile_program_artifact};
+    use boon_runtime::{ApplicationIdentity, ProgramCapabilityProfile, RuntimeSourceUnit};
     use std::collections::VecDeque;
 
     const PROGRAM: &str = r#"
@@ -4971,10 +4970,8 @@ mod transaction_tests {
     use async_trait::async_trait;
     use boon_distributed_runtime::{DistributedClientRuntime, DistributedQueueLimits};
     use boon_persistence::InMemoryDriver;
-    use boon_runtime::{
-        ApplicationIdentity, ProgramCompileRequest, RuntimeSourceUnit,
-        compile_distributed_program_bundle,
-    };
+    use boon_program_runtime::{ProgramCompileRequest, compile_distributed_program_bundle};
+    use boon_runtime::{ApplicationIdentity, RuntimeSourceUnit};
     use boon_wire::{
         ClientCommit, ClientHello, ServerReady, SessionControlFrame, SessionId,
         decode_session_control_frame, encode_session_control_frame,

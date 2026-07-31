@@ -9,6 +9,7 @@ rust-version.workspace = true
 boon_effect_schema.workspace = true
 boon_host_runtime.workspace = true
 boon_plan.workspace = true
+boon_program_runtime.workspace = true
 boon_runtime.workspace = true
 tokio.workspace = true
 wellen.workspace = true

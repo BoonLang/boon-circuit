@@ -1,8 +1,8 @@
-use boon_persistence::StoredValue;
-use boon_plan::EffectId;
-use boon_runtime::{
+use boon_host_runtime::{
     HostEffectDriver, HostEffectError, HostEffectReconciliation, HostEffectRequest,
 };
+use boon_persistence::StoredValue;
+use boon_plan::EffectId;
 use std::collections::BTreeMap;
 
 pub const REGISTER_OPERATION: &str = "DevelopmentPasskey/register";

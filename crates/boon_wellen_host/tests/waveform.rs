@@ -3,9 +3,9 @@ use boon_host_runtime::{
     apply_event as apply_file_event,
 };
 use boon_plan::{ApplicationIdentity, ExactNumber, ProgramRole};
+use boon_program_runtime::{ProgramCompileRequest, ProgramSession, compile_program_artifact};
 use boon_runtime::{
-    ProgramCapabilityProfile, ProgramCompileRequest, ProgramSession, RuntimeSourceUnit,
-    SourcePayload, TransientEffectInvocation, Value, compile_program_artifact,
+    ProgramCapabilityProfile, RuntimeSourceUnit, SourcePayload, TransientEffectInvocation, Value,
 };
 use boon_wellen_host::{WaveformEffectAdapter, apply_waveform_completion};
 use sha2::{Digest, Sha256};

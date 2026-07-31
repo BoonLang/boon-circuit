@@ -3,9 +3,11 @@ use boon_host_runtime::{
     FileEffectEvent, FileEffectLimits, apply_event,
 };
 use boon_plan::{ApplicationIdentity, ProgramRole};
+use boon_program_runtime::{
+    ProgramArtifact, ProgramCompileRequest, ProgramSession, compile_program_artifact,
+};
 use boon_runtime::{
-    ProgramArtifact, ProgramCapabilityProfile, ProgramCompileRequest, ProgramSession,
-    RuntimeSourceUnit, SourcePayload, TransientEffectInvocation, Value, compile_program_artifact,
+    ProgramCapabilityProfile, RuntimeSourceUnit, SourcePayload, TransientEffectInvocation, Value,
 };
 use std::collections::BTreeMap;
 use std::fs;

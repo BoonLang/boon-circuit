@@ -10,7 +10,8 @@ use crate::{
 use boon_contract::SourceBundleDigestV1;
 use boon_persistence::{ContentArtifact, ContentArtifactId};
 use boon_plan::{ApplicationIdentity, ProgramRole, TargetProfile};
-use boon_runtime::{ProgramArtifact, ProgramCapabilityProfile};
+use boon_program_runtime::ProgramArtifact;
+use boon_runtime::ProgramCapabilityProfile;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;

@@ -1,7 +1,5 @@
-use boon_runtime::{
-    ApplicationIdentity, ProgramCapabilityProfile, ProgramCompileRequest, RuntimeSourceUnit,
-    compile_program_artifact,
-};
+use boon_program_runtime::{ProgramCompileRequest, compile_program_artifact};
+use boon_runtime::{ApplicationIdentity, ProgramCapabilityProfile, RuntimeSourceUnit};
 use boon_server_host::{ServerConfig, bind};
 use boon_server_runtime::BoonServerProgram;
 use reqwest::{Client, Method, Response, StatusCode};

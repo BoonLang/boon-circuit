@@ -11,9 +11,10 @@ use boon_distributed_runtime::{
     DistributedSessionTemplate, DistributedSessionUpdate,
 };
 use boon_plan::ProgramRole;
+use boon_program_runtime::DistributedProgramBundle;
 use boon_runtime::{
-    DistributedProgramBundle, DistributedRuntimeError, DistributedServerMachine, RuntimeTurn,
-    SessionConnectionStatus, SessionOrigin, SessionPrincipal, Value,
+    DistributedRuntimeError, DistributedServerMachine, RuntimeTurn, SessionConnectionStatus,
+    SessionOrigin, SessionPrincipal, Value,
 };
 use boon_wire::{
     ResumeToken, ResumeTokenGenerationError, ServerOffer, ServerReady, ServerReject, ServerRevoked,
@@ -2143,9 +2144,11 @@ mod tests {
     use super::*;
     use boon_distributed_runtime::DistributedClientRuntime;
     use boon_persistence::StoredValue as DataValue;
+    use boon_program_runtime::{
+        ProgramCompileRequest, ProgramSession, compile_distributed_program_bundle,
+    };
     use boon_runtime::{
-        ApplicationIdentity, ProgramCapabilityProfile, ProgramCompileRequest, ProgramSession,
-        RuntimeSourceUnit, SourcePayload, compile_distributed_program_bundle,
+        ApplicationIdentity, ProgramCapabilityProfile, RuntimeSourceUnit, SourcePayload,
     };
     use boon_wire::{ClientCommit, ClientHello, ClientRevoke, SessionId};
     use std::sync::{Arc, Mutex, OnceLock};

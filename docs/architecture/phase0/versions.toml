@@ -53,7 +53,7 @@ needle = "pub struct CanonicalSourceBundleV1"
 
 [[artifacts.probes]]
 kind = "text-contains"
-path = "crates/boon_runtime/src/program.rs"
+path = "crates/boon_program_runtime/src/program_core.rs"
 needle = "CanonicalSourceBundleV1::new"
 
 [[artifacts.probes]]
@@ -100,47 +100,47 @@ status = "present"
 
 [[artifacts.probes]]
 kind = "text-contains"
-path = "crates/boon_runtime/src/program.rs"
+path = "crates/boon_program_runtime/src/program_host.rs"
 needle = "boon.embedded-program-request.v3\\0"
 
 [[artifacts.probes]]
 kind = "text-contains"
-path = "crates/boon_runtime/src/program.rs"
+path = "crates/boon_program_runtime/src/program_host.rs"
 needle = "fn hash_prepared_program_revision_identity("
 
 [[artifacts.probes]]
 kind = "text-contains"
-path = "crates/boon_runtime/src/program.rs"
+path = "crates/boon_program_runtime/src/program_host.rs"
 needle = "PreparedProgramPayloadIdentity::SourceBundle(digest) => {"
 
 [[artifacts.probes]]
 kind = "text-contains"
-path = "crates/boon_runtime/src/program.rs"
+path = "crates/boon_program_runtime/src/program_host.rs"
 needle = "hash_owner_part(hasher, digest.as_bytes());"
 
 [[artifacts.probes]]
 kind = "text-contains"
-path = "crates/boon_runtime/src/program.rs"
+path = "crates/boon_program_runtime/src/program_host.rs"
 needle = "hash_owner_part(hasher, COMPILER_ID.as_bytes());"
 
 [[artifacts.probes]]
 kind = "text-contains"
-path = "crates/boon_runtime/src/program.rs"
+path = "crates/boon_program_runtime/src/program_host.rs"
 needle = "hash_owner_part(hasher, b\"software_bounded\");"
 
 [[artifacts.probes]]
 kind = "text-contains"
-path = "crates/boon_runtime/src/program.rs"
+path = "crates/boon_program_runtime/src/program_host.rs"
 needle = "&descriptor.bootstrap_support_sources"
 
 [[artifacts.probes]]
 kind = "text-contains"
-path = "crates/boon_runtime/src/program.rs"
+path = "crates/boon_program_runtime/src/program_host.rs"
 needle = "equal_revision_current_identity: Option<PreparedProgramRevisionIdentity>"
 
 [[artifacts.probes]]
 kind = "text-contains"
-path = "crates/boon_runtime/src/program.rs"
+path = "crates/boon_program_runtime/src/program_host.rs"
 needle = "let equal_revision_bootstrap_current_identity = (bootstrapping"
 
 [[artifacts]]
@@ -219,26 +219,26 @@ status = "present"
 
 [[artifacts.probes]]
 kind = "text-contains"
-path = "crates/boon_runtime/src/program.rs"
+path = "crates/boon_program_runtime/src/program_core.rs"
 needle = "const PROGRAM_ARTIFACT_FORMAT: u32 = 3;"
 
 [[artifacts.probes]]
 kind = "text-contains"
-path = "crates/boon_runtime/src/program.rs"
+path = "crates/boon_program_runtime/src/program_core.rs"
 needle = "const PROGRAM_ARTIFACT_MEDIA_TYPE: &str = \"application/vnd.boon.machine-plan+cbor;version=3\";"
 
 [[artifacts.probes]]
 kind = "text-contains"
-path = "crates/boon_runtime/src/program.rs"
+path = "crates/boon_program_runtime/src/program_core.rs"
 needle = "source_bundle_digest_v1: SourceBundleDigestV1"
 
 [[artifacts.probes]]
 kind = "text-contains"
-path = "crates/boon_runtime/src/program.rs"
+path = "crates/boon_program_runtime/src/program_core.rs"
 needle = "if stored.format != PROGRAM_ARTIFACT_FORMAT"
 
 [[artifacts]]
-id = "native-playground-protocol-v14"
+id = "native-playground-protocol-v15"
 owner_phase = "goal-phase-7-pre-hardware-evidence"
 owner_plan = "docs/architecture/NATIVE_GPU_PIPELINE.md"
 status = "present"
@@ -251,7 +251,7 @@ needle = "const MAGIC: [u8; 4] = *b\"BNIP\";"
 [[artifacts.probes]]
 kind = "text-contains"
 path = "crates/boon_native_playground/src/protocol.rs"
-needle = "const VERSION: u16 = 14;"
+needle = "const VERSION: u16 = 15;"
 
 [[artifacts]]
 id = "physical-plan"
@@ -481,10 +481,10 @@ replacement = "Retain exact source and workspace identity; bump only with a sche
 
 [[version_axes]]
 id = "native-playground-protocol"
-current_version = "14"
+current_version = "15"
 owner_phase = "goal-phase-7-pre-hardware-evidence"
 owner_plan = "docs/architecture/NATIVE_GPU_PIPELINE.md"
-target = "BNIP native playground protocol v14"
+target = "BNIP native playground protocol v15"
 replacement = "Bump with any native desktop, preview, dev, source-bundle, catalog, migration, or verification frame contract change."
 
 [[version_axes]]

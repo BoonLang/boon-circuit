@@ -12,8 +12,8 @@ expected_file_set_sha256 = "4adabe2b6003989645a14f971c78601d9a5cd139d7d3428d0c49
 occurrence_ledger_path = "docs/architecture/phase0/container_occurrences.tsv"
 occurrence_ledger_protocol = "boon-phase0-container-occurrences-v1"
 occurrence_ledger_generator = "cargo test -p xtask verify_phase0::tests::regenerate_container_occurrence_ledger -- --ignored --exact"
-expected_occurrence_ledger_sha256 = "225a6c34fb48a81b67e9aec21f05beeb7cfa35a46205daf50dd98883486e460d"
-expected_occurrence_rows = 4812
+expected_occurrence_ledger_sha256 = "3cadafba13d7cd57de9e6fe3c2636ca1779480d5dea3d232d54538c44abbd925"
+expected_occurrence_rows = 4808
 within_file_classification = "complete"
 within_file_owner_phase = "goal-phase-5-packed"
 within_file_owner_action = "Maintain one checked-in row per exact identifier occurrence; mixed files retain distinct per-use categories."
@@ -25,7 +25,7 @@ expected_files = 122
 
 [[constructs]]
 id = "BTreeSet"
-expected_occurrences = 1862
+expected_occurrences = 1858
 expected_files = 97
 
 [[constructs]]
@@ -56,7 +56,7 @@ owner_phase = "goal-phase-5-packed"
 owner_plan = "docs/plans/BOON_PACKED_DATA_AND_DENSE_INTERNALS_PLAN.md"
 expected_files = 88
 expected_btree_map = 0
-expected_btree_set = 1722
+expected_btree_set = 1718
 expected_hash_map = 0
 expected_hash_set = 28
 

@@ -32,19 +32,18 @@ use boon_semantic::{
     SemanticFunctionParameter, SemanticInitialValueV1, SemanticListId, SemanticListInitializerV1,
     SemanticListKeyPolicyV1, SemanticListMutationKindV1, SemanticListProjectionKindV1,
     SemanticLocalBindingId, SemanticLoweringContractV1, SemanticMaterializationId,
-    SemanticMaterializationLocalId, SemanticMaterializationResultKind, SemanticNamedValueId,
-    SemanticNamedValueStorageTargetV1, SemanticParameterId, SemanticPatternBinding,
-    SemanticReactiveGraphV1, SemanticReadId, SemanticReadTargetV1, SemanticRecordField,
-    SemanticResourceGraphV1, SemanticRoot, SemanticRowBinding, SemanticRowScopeId,
-    SemanticScopeStorageGraphV1, SemanticSelectArm, SemanticSourceDef, SemanticSourceId,
-    SemanticSourceOrigin, SemanticSourceRead, SemanticStateDef, SemanticStateId, SemanticStatement,
-    SemanticStatementId, SemanticStatementKind, SemanticStorageBindingTargetV1,
+    SemanticMaterializationLocalId, SemanticMaterializationResultKind, SemanticParameterId,
+    SemanticPatternBinding, SemanticReactiveGraphV1, SemanticReadId, SemanticReadTargetV1,
+    SemanticRecordField, SemanticResourceGraphV1, SemanticRoot, SemanticRowBinding,
+    SemanticRowScopeId, SemanticScopeStorageGraphV1, SemanticSelectArm, SemanticSourceDef,
+    SemanticSourceId, SemanticSourceOrigin, SemanticSourceRead, SemanticStateDef, SemanticStateId,
+    SemanticStatement, SemanticStatementId, SemanticStatementKind, SemanticStorageBindingTargetV1,
     SemanticStorageExternalReferenceId, SemanticStorageExternalReferenceKindV1,
     SemanticStorageFieldId, SemanticStorageFieldOriginV1, SemanticStorageFieldRoleV1,
     SemanticStorageFieldV1, SemanticStorageLocalMemberForwardingV1,
-    SemanticStorageLocalMemberTargetV1, SemanticStorageProjectionId, SemanticTextSegment,
-    SemanticTriggerArmId, SemanticValueId, SemanticValueListAuthorityId, SemanticValueMember,
-    SemanticValueOrigin, SemanticValueProvenance, StaticOwnerDef, StaticOwnerId,
+    SemanticStorageLocalMemberTargetV1, SemanticTextSegment, SemanticTriggerArmId, SemanticValueId,
+    SemanticValueListAuthorityId, SemanticValueMember, SemanticValueOrigin,
+    SemanticValueProvenance, StaticOwnerDef, StaticOwnerId,
 };
 use boon_typecheck::{
     CheckedExternalDeclarationIdentityV1, CheckedExternalDeclarationKind, CheckedParameterKind,
@@ -447,16 +446,12 @@ pub(super) struct MappedSemanticDerivedValue {
 
 #[derive(Clone, Debug)]
 struct SemanticReactiveToMappedMap {
-    fields: Vec<MappedReactiveFieldId>,
-    bindings: Vec<MappedReactiveBindingId>,
-    reads: Vec<MappedReactiveReadId>,
-    trigger_arms: Vec<MappedReactiveTriggerId>,
-    state_update_arms: Vec<usize>,
-    list_mutations: Vec<usize>,
-    derived_values: Vec<usize>,
-    dependency_uses: Vec<usize>,
-    dependencies: Vec<usize>,
-    host_effect_schedules: Vec<usize>,
+    field_count: usize,
+    binding_count: usize,
+    read_count: usize,
+    trigger_arm_count: usize,
+    state_update_arm_count: usize,
+    list_mutation_count: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -473,8 +468,6 @@ pub(super) struct MappedSemanticReactive {
     pub derived_values: Vec<MappedSemanticDerivedValue>,
     pub dependencies: Vec<DependencyEdge>,
     id_map: SemanticReactiveToMappedMap,
-    semantic_producer_instance_count: usize,
-    referenced_trigger_ids: BTreeSet<MappedReactiveTriggerId>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -598,93 +591,13 @@ pub(super) struct MappedSemanticExternalReference {
     pub bundle_ready: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) enum MappedSemanticNamedValueTarget {
-    Field {
-        binding: Option<ErasedBindingId>,
-        field: FieldId,
-    },
-    Source {
-        binding: ErasedBindingId,
-        source: SourceId,
-    },
-    State {
-        binding: ErasedBindingId,
-        state: StateId,
-        field: Option<FieldId>,
-    },
-    List {
-        binding: ErasedBindingId,
-        list: ListId,
-        field: FieldId,
-        row: ErasedRowBinding,
-    },
-    Value {
-        expression: ExecutableExprId,
-        value: ExecutableExprId,
-        field: Option<FieldId>,
-    },
-    DiagnosticOnly {
-        reason: boon_semantic::SemanticNamedValueDiagnosticOnlyReasonV1,
-    },
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct MappedSemanticNamedValueProjection {
-    pub id: SemanticStorageProjectionId,
-    pub ordinal: usize,
-    pub selector: String,
-    pub field_ordinal: usize,
-    pub input_type: boon_typecheck::Type,
-    pub output_type: boon_typecheck::Type,
-    pub storage_field: Option<FieldId>,
-    pub expression: Option<ExecutableExprId>,
-    pub value: Option<ExecutableExprId>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) enum MappedSemanticStorageTypePathSegment {
-    ObjectField {
-        selector: String,
-        field_ordinal: usize,
-    },
-    ListItem,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct MappedSemanticStorageFixedBytesRefinement {
-    pub path: Vec<MappedSemanticStorageTypePathSegment>,
-    pub fixed_len: usize,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) enum MappedSemanticStorageRepresentation {
-    Exact,
-    CheckedFixedBytes {
-        refinements: Vec<MappedSemanticStorageFixedBytesRefinement>,
-    },
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct MappedSemanticNamedValue {
-    pub named_value: SemanticNamedValueId,
-    pub checked_statement: boon_typecheck::CheckedStatementId,
-    pub diagnostic_path: String,
-    pub origin_ordinal: usize,
-    pub target_ordinal: usize,
-    pub target: MappedSemanticNamedValueTarget,
-    pub projection: Vec<MappedSemanticNamedValueProjection>,
-    pub representation: MappedSemanticStorageRepresentation,
-    pub flow_type: FlowType,
-}
-
 #[derive(Clone, Debug)]
 struct SemanticStorageToErasedMap {
-    storage_fields: Vec<FieldId>,
+    storage_field_count: usize,
     reactive_fields: Vec<FieldId>,
-    bindings: Vec<ErasedBindingId>,
-    reads: Vec<ErasedReadId>,
-    external_references: Vec<SemanticStorageExternalReferenceId>,
+    binding_count: usize,
+    read_count: usize,
+    external_reference_count: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -701,14 +614,12 @@ pub(super) struct MappedSemanticStorage {
     pub call_invocations: Vec<MappedSemanticCallInvocationSchedule>,
     pub host_effect_schedules: Vec<MappedSemanticHostEffectSchedule>,
     pub external_references: Vec<MappedSemanticExternalReference>,
-    pub named_values: Vec<MappedSemanticNamedValue>,
     pub producer_function_instances: Vec<ProducerFunctionInstance>,
     pub derived_values: Vec<DerivedValue>,
     pub trigger_arms: Vec<TriggerOwnedArm>,
     pub state_update_arms: Vec<StateUpdateArm>,
     pub list_mutations: Vec<ListMutation>,
     pub dependencies: Vec<DependencyEdge>,
-    named_value_checked_statements: Vec<boon_typecheck::CheckedStatementId>,
     id_map: SemanticStorageToErasedMap,
 }
 
@@ -2459,60 +2370,56 @@ impl SemanticReactiveToMappedMap {
         )?;
 
         Ok(Self {
-            fields: (0..graph.fields.len()).map(MappedReactiveFieldId).collect(),
-            bindings: (0..graph.bindings.len())
-                .map(MappedReactiveBindingId)
-                .collect(),
-            reads: (0..graph.reads.len()).map(MappedReactiveReadId).collect(),
-            trigger_arms: (0..graph.trigger_arms.len())
-                .map(MappedReactiveTriggerId)
-                .collect(),
-            state_update_arms: (0..graph.state_update_arms.len()).collect(),
-            list_mutations: (0..graph.list_mutations.len()).collect(),
-            derived_values: (0..graph.derived_values.len()).collect(),
-            dependency_uses: (0..graph.dependency_uses.len()).collect(),
-            dependencies: (0..graph.dependencies.len()).collect(),
-            host_effect_schedules: (0..graph.host_effect_schedules.len()).collect(),
+            field_count: graph.fields.len(),
+            binding_count: graph.bindings.len(),
+            read_count: graph.reads.len(),
+            trigger_arm_count: graph.trigger_arms.len(),
+            state_update_arm_count: graph.state_update_arms.len(),
+            list_mutation_count: graph.list_mutations.len(),
         })
     }
 
     fn field(&self, id: SemanticFieldId) -> Result<MappedReactiveFieldId, String> {
-        exact_map(&self.fields, id.as_usize(), "semantic field", id)
+        exact_dense_index(id.as_usize(), self.field_count, "semantic field", id)
+            .map(MappedReactiveFieldId)
     }
 
     fn binding(&self, id: SemanticBindingId) -> Result<MappedReactiveBindingId, String> {
-        exact_map(&self.bindings, id.as_usize(), "semantic binding", id)
+        exact_dense_index(id.as_usize(), self.binding_count, "semantic binding", id)
+            .map(MappedReactiveBindingId)
     }
 
     fn read(&self, id: SemanticReadId) -> Result<MappedReactiveReadId, String> {
-        exact_map(&self.reads, id.as_usize(), "semantic read", id)
+        exact_dense_index(id.as_usize(), self.read_count, "semantic read", id)
+            .map(MappedReactiveReadId)
     }
 
     fn trigger(&self, id: SemanticTriggerArmId) -> Result<MappedReactiveTriggerId, String> {
-        exact_map(
-            &self.trigger_arms,
+        exact_dense_index(
             id.as_usize(),
+            self.trigger_arm_count,
             "semantic trigger arm",
             id,
         )
+        .map(MappedReactiveTriggerId)
     }
 
     fn state_update_arm(
         &self,
         id: boon_semantic::SemanticStateUpdateArmId,
     ) -> Result<usize, String> {
-        exact_map(
-            &self.state_update_arms,
+        exact_dense_index(
             id.as_usize(),
+            self.state_update_arm_count,
             "semantic state update arm",
             id,
         )
     }
 
     fn list_mutation(&self, id: boon_semantic::SemanticListMutationId) -> Result<usize, String> {
-        exact_map(
-            &self.list_mutations,
+        exact_dense_index(
             id.as_usize(),
+            self.list_mutation_count,
             "semantic list mutation",
             id,
         )
@@ -2667,12 +2574,7 @@ pub(super) fn map_semantic_reactive(
                     arm.id, arm.trigger
                 )
             })?;
-            let id = *reactive_ids
-                .state_update_arms
-                .get(arm.id.as_usize())
-                .ok_or_else(|| {
-                    format!("semantic state update arm {} has no staged mapping", arm.id)
-                })?;
+            let id = reactive_ids.state_update_arm(arm.id)?;
             Ok(MappedSemanticStateUpdateArm {
                 id,
                 state: ids.runtime_state(arm.state)?,
@@ -2761,6 +2663,14 @@ pub(super) fn map_semantic_reactive(
             map_reactive_producer_instance(execution, resource_graph, ids, &fields, instance)
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let expected_trigger_ids = (0..graph.trigger_arms.len())
+        .map(MappedReactiveTriggerId)
+        .collect::<BTreeSet<_>>();
+    if referenced_trigger_ids != expected_trigger_ids {
+        return Err(format!(
+            "mapped reactive and pulse records reference trigger IDs {referenced_trigger_ids:?}, expected exact set {expected_trigger_ids:?}"
+        ));
+    }
 
     let mapped = MappedSemanticReactive {
         producer_function_instances,
@@ -2775,8 +2685,6 @@ pub(super) fn map_semantic_reactive(
         derived_values,
         dependencies,
         id_map: reactive_ids,
-        semantic_producer_instance_count: graph.producer_instances.len(),
-        referenced_trigger_ids,
     };
     mapped.validate_totality(graph, resource_graph, ids)?;
     Ok(mapped)
@@ -3807,23 +3715,6 @@ fn map_reactive_derived_value(
     // existing row execute once per row.
     let indexed = field.row.is_some() && materialized_list_id.is_none();
     let scope_id = indexed.then(|| field.row.expect("indexed field has a row").scope);
-    let derived_index = context
-        .reactive_ids
-        .derived_values
-        .get(derived.id.as_usize())
-        .copied()
-        .ok_or_else(|| {
-            format!(
-                "semantic derived value {} has no mapped identity",
-                derived.id
-            )
-        })?;
-    if derived_index != derived.id.as_usize() {
-        return Err(format!(
-            "semantic derived value {} maps to noncanonical index {derived_index}",
-            derived.id
-        ));
-    }
     Ok(MappedSemanticDerivedValue {
         field: field.id,
         executable_statement_id: statement,
@@ -3870,22 +3761,6 @@ fn map_reactive_dependency_use(
     reactive_ids: &SemanticReactiveToMappedMap,
     dependency: &boon_semantic::SemanticDependencyUseV1,
 ) -> Result<MappedSemanticDependencyUse, String> {
-    let dependency_index = reactive_ids
-        .dependency_uses
-        .get(dependency.id.as_usize())
-        .copied()
-        .ok_or_else(|| {
-            format!(
-                "semantic dependency use {} has no mapped identity",
-                dependency.id
-            )
-        })?;
-    if dependency_index != dependency.id.as_usize() {
-        return Err(format!(
-            "semantic dependency use {} maps to noncanonical index {dependency_index}",
-            dependency.id
-        ));
-    }
     let expression = ids.expression(dependency.expression)?;
     let target = match dependency.target {
         SemanticDependencyTargetV1::ExternalRead { read } => {
@@ -4001,22 +3876,6 @@ fn validate_reactive_call_and_host_schedules(
     }
 
     for schedule in &graph.host_effect_schedules {
-        let index = reactive_ids
-            .host_effect_schedules
-            .get(schedule.id.as_usize())
-            .copied()
-            .ok_or_else(|| {
-                format!(
-                    "semantic host-effect schedule {} has no mapped identity",
-                    schedule.id
-                )
-            })?;
-        if index != schedule.id.as_usize() {
-            return Err(format!(
-                "semantic host-effect schedule {} maps to noncanonical index {index}",
-                schedule.id
-            ));
-        }
         let expression = semantic_execution_expression(execution, schedule.expression)?;
         let mapped = validate_value_producer(
             ids,
@@ -4248,11 +4107,6 @@ impl MappedSemanticReactive {
                 graph.dependencies.len(),
                 self.dependencies.len(),
             ),
-            (
-                "host-effect schedule identity",
-                graph.host_effect_schedules.len(),
-                self.id_map.host_effect_schedules.len(),
-            ),
         ];
         for (label, semantic, mapped) in exact_lengths {
             if semantic != mapped {
@@ -4261,57 +4115,12 @@ impl MappedSemanticReactive {
                 ));
             }
         }
-        if self.semantic_producer_instance_count != graph.producer_instances.len()
-            || graph.producer_instances.len() != resources.producer_resources.len()
-        {
+        if graph.producer_instances.len() != resources.producer_resources.len() {
             return Err(format!(
-                "semantic producer-instance mapping covers {} identities for {} reactive instances and {} producer resources",
-                self.semantic_producer_instance_count,
+                "semantic producer-instance mapping covers {} reactive instances but {} producer resources",
                 graph.producer_instances.len(),
                 resources.producer_resources.len()
             ));
-        }
-        let identity_lengths = [
-            ("field", self.id_map.fields.len(), self.fields.len()),
-            ("binding", self.id_map.bindings.len(), self.bindings.len()),
-            ("read", self.id_map.reads.len(), self.reads.len()),
-            (
-                "trigger arm",
-                self.id_map.trigger_arms.len(),
-                self.trigger_arms.len(),
-            ),
-            (
-                "state update arm",
-                self.id_map.state_update_arms.len(),
-                self.state_update_arms.len(),
-            ),
-            (
-                "list mutation",
-                self.id_map.list_mutations.len(),
-                self.list_mutations.len(),
-            ),
-            (
-                "derived value",
-                self.id_map.derived_values.len(),
-                self.derived_values.len(),
-            ),
-            (
-                "dependency use",
-                self.id_map.dependency_uses.len(),
-                self.dependency_uses.len(),
-            ),
-            (
-                "dependency edge",
-                self.id_map.dependencies.len(),
-                self.dependencies.len(),
-            ),
-        ];
-        for (label, identities, mapped) in identity_lengths {
-            if identities != mapped {
-                return Err(format!(
-                    "semantic reactive {label} identity map covers {identities} IDs but emitted {mapped} records"
-                ));
-            }
         }
         for (index, field) in self.fields.iter().enumerate() {
             let expected = self.id_map.field(SemanticFieldId(index))?;
@@ -4455,9 +4264,12 @@ impl MappedSemanticReactive {
                 })?;
         }
         for (index, mutation) in self.list_mutations.iter().enumerate() {
-            let expected = *self.id_map.list_mutations.get(index).ok_or_else(|| {
-                format!("mapped list mutation at index {index} has no staged identity")
-            })?;
+            let expected = exact_dense_index(
+                index,
+                self.id_map.list_mutation_count,
+                "mapped list mutation",
+                index,
+            )?;
             if mutation.id != expected {
                 return Err(format!(
                     "mapped list mutation at index {index} emitted {}, expected {expected}",
@@ -4473,15 +4285,6 @@ impl MappedSemanticReactive {
                         mutation.trigger
                     )
                 })?;
-        }
-        let expected_triggers = (0..graph.trigger_arms.len())
-            .map(MappedReactiveTriggerId)
-            .collect::<BTreeSet<_>>();
-        if self.referenced_trigger_ids != expected_triggers {
-            return Err(format!(
-                "mapped reactive and pulse records reference trigger IDs {:?}, expected exact set {:?}",
-                self.referenced_trigger_ids, expected_triggers
-            ));
         }
         let producer_identities = self
             .producer_function_instances
@@ -4509,7 +4312,6 @@ pub(super) fn map_semantic_storage_join(
     resource_graph: &SemanticResourceGraphV1,
     reactive_graph: &SemanticReactiveGraphV1,
     storage_graph: &SemanticScopeStorageGraphV1,
-    lowering_contract: &SemanticLoweringContractV1,
     ids: &SemanticToExecutableMap,
     _resources: &MappedSemanticResources,
     reactive: &MappedSemanticReactive,
@@ -4567,32 +4369,6 @@ pub(super) fn map_semantic_storage_join(
         .collect::<Result<Vec<_>, String>>()?;
     let dependency_uses =
         map_storage_dependency_uses(reactive_graph, reactive, &storage_ids, &external_references)?;
-    let named_values = map_storage_named_values(
-        execution,
-        resource_graph,
-        reactive_graph,
-        storage_graph,
-        lowering_contract,
-        ids,
-        &storage_ids,
-    )?;
-    let named_value_checked_statements = lowering_contract
-        .metadata
-        .named_value_types
-        .iter()
-        .map(|value| value.checked_statement)
-        .collect::<Vec<_>>();
-    if named_value_checked_statements
-        .iter()
-        .copied()
-        .collect::<BTreeSet<_>>()
-        .len()
-        != named_value_checked_statements.len()
-    {
-        return Err(
-            "semantic named-value table repeats an exact checked statement site".to_owned(),
-        );
-    }
     let trigger_arms = reactive
         .trigger_arms
         .iter()
@@ -4631,14 +4407,12 @@ pub(super) fn map_semantic_storage_join(
         call_invocations,
         host_effect_schedules,
         external_references,
-        named_values,
         producer_function_instances,
         derived_values,
         trigger_arms,
         state_update_arms: finalized_state_transitions,
         list_mutations,
         dependencies: reactive.dependencies.clone(),
-        named_value_checked_statements,
         id_map: storage_ids,
     };
     mapped.validate_totality(storage_graph, reactive_graph, ids)?;
@@ -4909,7 +4683,6 @@ impl SemanticStorageToErasedMap {
             "semantic storage external reference",
         )?;
 
-        let storage_fields = (0..storage.fields.len()).map(FieldId).collect::<Vec<_>>();
         let mut reactive_fields = vec![None; reactive.fields.len()];
         for field in &storage.fields {
             match (&field.origin, field.reactive_field) {
@@ -4925,7 +4698,7 @@ impl SemanticStorageToErasedMap {
                                 field.id, reactive_field
                             )
                         })?;
-                    if slot.replace(storage_fields[field.id.as_usize()]).is_some() {
+                    if slot.replace(FieldId(field.id.as_usize())).is_some() {
                         return Err(format!(
                             "reactive field {reactive_field} maps to multiple semantic storage fields"
                         ));
@@ -4959,57 +4732,34 @@ impl SemanticStorageToErasedMap {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        let mut bindings = vec![None; reactive.bindings.len()];
-        for storage_binding in &storage.bindings {
-            let slot = bindings
-                .get_mut(storage_binding.binding.as_usize())
-                .ok_or_else(|| {
-                    format!(
-                        "semantic storage binding {} is outside the staged binding domain",
-                        storage_binding.binding
-                    )
-                })?;
-            let erased = ErasedBindingId(storage_binding.binding.as_usize());
-            if slot.replace(erased).is_some() {
-                return Err(format!(
-                    "reactive binding {} maps to multiple semantic storage bindings",
-                    storage_binding.binding
-                ));
-            }
+        if storage.bindings.len() != reactive.bindings.len() {
+            return Err(
+                "semantic storage binding map does not exactly cover reactive bindings".to_owned(),
+            );
         }
-        let bindings = bindings
-            .into_iter()
-            .enumerate()
-            .map(|(index, binding)| {
-                binding.ok_or_else(|| {
-                    format!(
-                        "reactive binding {} has no exact semantic storage binding",
-                        SemanticBindingId(index)
-                    )
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        require_exact_identity_set(
+            (0..reactive.bindings.len()).map(SemanticBindingId),
+            storage.bindings.iter().map(|binding| binding.binding),
+            "semantic storage binding",
+        )?;
 
         Ok(Self {
-            storage_fields,
+            storage_field_count: storage.fields.len(),
             reactive_fields,
-            bindings,
-            reads: (0..reactive.reads.len()).map(ErasedReadId).collect(),
-            external_references: storage
-                .external_references
-                .iter()
-                .map(|reference| reference.id)
-                .collect(),
+            binding_count: reactive.bindings.len(),
+            read_count: reactive.reads.len(),
+            external_reference_count: storage.external_references.len(),
         })
     }
 
     fn storage_field(&self, id: SemanticStorageFieldId) -> Result<FieldId, String> {
-        exact_map(
-            &self.storage_fields,
+        exact_dense_index(
             id.as_usize(),
+            self.storage_field_count,
             "semantic storage field",
             id,
         )
+        .map(FieldId)
     }
 
     fn reactive_field(&self, id: MappedReactiveFieldId) -> Result<FieldId, String> {
@@ -5017,23 +4767,25 @@ impl SemanticStorageToErasedMap {
     }
 
     fn binding(&self, id: MappedReactiveBindingId) -> Result<ErasedBindingId, String> {
-        exact_map(&self.bindings, id.0, "mapped reactive binding", id)
+        exact_dense_index(id.0, self.binding_count, "mapped reactive binding", id)
+            .map(ErasedBindingId)
     }
 
     fn read(&self, id: MappedReactiveReadId) -> Result<ErasedReadId, String> {
-        exact_map(&self.reads, id.0, "mapped reactive read", id)
+        exact_dense_index(id.0, self.read_count, "mapped reactive read", id).map(ErasedReadId)
     }
 
     fn external_reference(
         &self,
         id: SemanticStorageExternalReferenceId,
     ) -> Result<SemanticStorageExternalReferenceId, String> {
-        exact_map(
-            &self.external_references,
+        exact_dense_index(
             id.as_usize(),
+            self.external_reference_count,
             "semantic storage external reference",
             id,
         )
+        .map(SemanticStorageExternalReferenceId)
     }
 }
 
@@ -6311,787 +6063,6 @@ fn map_storage_dependency_uses(
         .collect()
 }
 
-fn semantic_storage_binding(
-    storage: &SemanticScopeStorageGraphV1,
-    id: SemanticBindingId,
-) -> Result<&boon_semantic::SemanticStorageBindingV1, String> {
-    let matches = storage
-        .bindings
-        .iter()
-        .filter(|binding| binding.binding == id)
-        .collect::<Vec<_>>();
-    let [binding] = matches.as_slice() else {
-        return Err(format!(
-            "semantic binding {id} resolves to {} exact storage bindings",
-            matches.len()
-        ));
-    };
-    Ok(*binding)
-}
-
-fn map_storage_named_value_target(
-    target: &SemanticNamedValueStorageTargetV1,
-    origin: &boon_semantic::SemanticNamedValueTypeOriginV1,
-    storage: &SemanticScopeStorageGraphV1,
-    ids: &SemanticToExecutableMap,
-    storage_ids: &SemanticStorageToErasedMap,
-) -> Result<MappedSemanticNamedValueTarget, String> {
-    Ok(match target {
-        SemanticNamedValueStorageTargetV1::Field { binding, field } => {
-            let storage_field = storage
-                .fields
-                .get(field.as_usize())
-                .filter(|candidate| candidate.id == *field)
-                .ok_or_else(|| format!("named value references missing storage field {field}"))?;
-            let binding = binding
-                .map(|binding| {
-                    if !origin.bindings.contains(&binding)
-                        || !matches!(
-                            semantic_storage_binding(storage, binding)?.target,
-                            SemanticStorageBindingTargetV1::Value {
-                                field: candidate,
-                                ..
-                            } if candidate == *field
-                        )
-                    {
-                        return Err(format!(
-                            "named-value field {field} binding {binding} is not an exact origin/storage join"
-                        ));
-                    }
-                    storage_ids.binding(MappedReactiveBindingId(binding.as_usize()))
-                })
-                .transpose()?;
-            if binding.is_none()
-                && !storage_field
-                    .statement
-                    .is_some_and(|statement| origin.statements.contains(&statement))
-                && !storage_field
-                    .producer
-                    .is_some_and(|producer| origin.expressions.contains(&producer))
-            {
-                return Err(format!(
-                    "unbound named-value field {field} is absent from the exact semantic origin"
-                ));
-            }
-            MappedSemanticNamedValueTarget::Field {
-                binding,
-                field: storage_ids.storage_field(*field)?,
-            }
-        }
-        SemanticNamedValueStorageTargetV1::Source { binding, source } => {
-            if !origin.bindings.contains(binding) && !origin.sources.contains(source) {
-                return Err(format!(
-                    "named-value source {source} binding {binding} is absent from the exact semantic origin"
-                ));
-            }
-            if !matches!(
-                semantic_storage_binding(storage, *binding)?.target,
-                SemanticStorageBindingTargetV1::Source {
-                    source: candidate,
-                } if candidate == *source
-            ) {
-                return Err(format!(
-                    "named-value source {source} binding {binding} differs from storage topology"
-                ));
-            }
-            MappedSemanticNamedValueTarget::Source {
-                binding: storage_ids.binding(MappedReactiveBindingId(binding.as_usize()))?,
-                source: ids.runtime_source(*source)?,
-            }
-        }
-        SemanticNamedValueStorageTargetV1::State {
-            binding,
-            state,
-            field,
-        } => {
-            if !origin.bindings.contains(binding) && !origin.states.contains(state) {
-                return Err(format!(
-                    "named-value state {state} binding {binding} is absent from the exact semantic origin"
-                ));
-            }
-            if !matches!(
-                semantic_storage_binding(storage, *binding)?.target,
-                SemanticStorageBindingTargetV1::State {
-                    state: candidate,
-                    field: candidate_field,
-                    ..
-                } if candidate == *state && candidate_field == *field
-            ) {
-                return Err(format!(
-                    "named-value state {state} binding {binding} differs from storage topology"
-                ));
-            }
-            MappedSemanticNamedValueTarget::State {
-                binding: storage_ids.binding(MappedReactiveBindingId(binding.as_usize()))?,
-                state: ids.runtime_state(*state)?,
-                field: field
-                    .map(|field| storage_ids.storage_field(field))
-                    .transpose()?,
-            }
-        }
-        SemanticNamedValueStorageTargetV1::List {
-            binding,
-            list,
-            field,
-            row,
-        } => {
-            if !origin.bindings.contains(binding) && !origin.lists.contains(list) {
-                return Err(format!(
-                    "named-value list {list} binding {binding} is absent from the exact semantic origin"
-                ));
-            }
-            if !matches!(
-                semantic_storage_binding(storage, *binding)?.target,
-                SemanticStorageBindingTargetV1::List {
-                    list: candidate,
-                    field: candidate_field,
-                    row: candidate_row,
-                } if candidate == *list
-                    && candidate_field == *field
-                    && candidate_row == *row
-            ) {
-                return Err(format!(
-                    "named-value list {list} binding {binding} differs from storage topology"
-                ));
-            }
-            MappedSemanticNamedValueTarget::List {
-                binding: storage_ids.binding(MappedReactiveBindingId(binding.as_usize()))?,
-                list: ids.list(*list)?,
-                field: storage_ids.storage_field(*field)?,
-                row: map_row_binding(ids, *row)?,
-            }
-        }
-        SemanticNamedValueStorageTargetV1::Value {
-            expression,
-            value,
-            field,
-        } => {
-            if !origin.expressions.contains(expression) || !origin.values.contains(value) {
-                return Err(format!(
-                    "named-value expression {expression}/value {value} is absent from the exact semantic origin"
-                ));
-            }
-            let expression = ids.expression(*expression)?;
-            let value = ids.value(*value)?;
-            if expression != value {
-                return Err(
-                    "named-value expression and value map to different executable identities"
-                        .to_owned(),
-                );
-            }
-            MappedSemanticNamedValueTarget::Value {
-                expression,
-                value,
-                field: field
-                    .map(|field| storage_ids.storage_field(field))
-                    .transpose()?,
-            }
-        }
-        SemanticNamedValueStorageTargetV1::DiagnosticOnly { reason } => {
-            if origin.statements.is_empty()
-                || !origin.expressions.is_empty()
-                || !origin.bindings.is_empty()
-                || !origin.sources.is_empty()
-                || !origin.states.is_empty()
-                || !origin.lists.is_empty()
-                || !origin.value_list_authorities.is_empty()
-            {
-                return Err(
-                    "diagnostic-only named value has executable semantic origin identity"
-                        .to_owned(),
-                );
-            }
-            MappedSemanticNamedValueTarget::DiagnosticOnly { reason: *reason }
-        }
-    })
-}
-
-fn named_value_storage_flow_type(
-    execution: &SemanticExecutionGraphV1,
-    resources: &SemanticResourceGraphV1,
-    reactive: &SemanticReactiveGraphV1,
-    storage: &SemanticScopeStorageGraphV1,
-    target: &SemanticNamedValueStorageTargetV1,
-) -> Result<FlowType, String> {
-    Ok(match target {
-        SemanticNamedValueStorageTargetV1::Field { field, .. } => storage
-            .fields
-            .get(field.as_usize())
-            .filter(|candidate| candidate.id == *field)
-            .map(|field| field.flow_type.clone())
-            .ok_or_else(|| format!("named value references missing storage field {field}"))?,
-        SemanticNamedValueStorageTargetV1::Source { binding, source } => {
-            reactive
-                .bindings
-                .get(binding.as_usize())
-                .filter(|candidate| candidate.id == *binding)
-                .ok_or_else(|| {
-                    format!("named value source references missing binding {binding}")
-                })?;
-            FlowType {
-                mode: boon_typecheck::FlowMode::TickPresent,
-                ty: semantic_source_resource(resources, *source)?
-                    .payload_type
-                    .clone(),
-            }
-        }
-        SemanticNamedValueStorageTargetV1::State { binding, state, .. } => {
-            reactive
-                .bindings
-                .get(binding.as_usize())
-                .filter(|candidate| candidate.id == *binding)
-                .ok_or_else(|| format!("named value state references missing binding {binding}"))?;
-            semantic_state_resource(resources, *state)?
-                .flow_type
-                .clone()
-        }
-        SemanticNamedValueStorageTargetV1::List { binding, .. } => reactive
-            .bindings
-            .get(binding.as_usize())
-            .filter(|candidate| candidate.id == *binding)
-            .map(|binding| binding.flow_type.clone())
-            .ok_or_else(|| format!("named value list references missing binding {binding}"))?,
-        SemanticNamedValueStorageTargetV1::Value {
-            expression, value, ..
-        } => {
-            let expression = semantic_execution_expression(execution, *expression)?;
-            if expression.value_id != *value {
-                return Err(format!(
-                    "named-value target expression {} does not own value {value}",
-                    expression.id
-                ));
-            }
-            expression.flow_type.clone()
-        }
-        SemanticNamedValueStorageTargetV1::DiagnosticOnly { .. } => FlowType {
-            mode: boon_typecheck::FlowMode::Continuous,
-            ty: boon_typecheck::Type::Unknown,
-        },
-    })
-}
-
-fn canonical_type_field_order(shape: &boon_typecheck::ObjectShape) -> Vec<String> {
-    let mut order = Vec::new();
-    let mut seen = BTreeSet::new();
-    for field in shape.field_order.iter().chain(shape.fields.keys()) {
-        if shape.fields.contains_key(field) && seen.insert(field.clone()) {
-            order.push(field.clone());
-        }
-    }
-    order
-}
-
-const fn named_value_target_storage_field(
-    target: &SemanticNamedValueStorageTargetV1,
-) -> Option<SemanticStorageFieldId> {
-    match target {
-        SemanticNamedValueStorageTargetV1::Field { field, .. }
-        | SemanticNamedValueStorageTargetV1::List { field, .. } => Some(*field),
-        SemanticNamedValueStorageTargetV1::State { field, .. }
-        | SemanticNamedValueStorageTargetV1::Value { field, .. } => *field,
-        SemanticNamedValueStorageTargetV1::Source { .. }
-        | SemanticNamedValueStorageTargetV1::DiagnosticOnly { .. } => None,
-    }
-}
-
-fn derive_mapped_storage_representation(
-    storage: &boon_typecheck::Type,
-    contract: &boon_typecheck::Type,
-) -> Result<MappedSemanticStorageRepresentation, String> {
-    fn visit(
-        storage: &boon_typecheck::Type,
-        contract: &boon_typecheck::Type,
-        path: &mut Vec<MappedSemanticStorageTypePathSegment>,
-        refinements: &mut Vec<MappedSemanticStorageFixedBytesRefinement>,
-    ) -> Result<(), String> {
-        if storage == contract {
-            return Ok(());
-        }
-        match (storage, contract) {
-            (
-                boon_typecheck::Type::Bytes(boon_typecheck::BytesType::Dynamic),
-                boon_typecheck::Type::Bytes(boon_typecheck::BytesType::Fixed(fixed_len)),
-            ) => {
-                refinements.push(MappedSemanticStorageFixedBytesRefinement {
-                    path: path.clone(),
-                    fixed_len: *fixed_len,
-                });
-                Ok(())
-            }
-            (boon_typecheck::Type::List(storage), boon_typecheck::Type::List(contract)) => {
-                path.push(MappedSemanticStorageTypePathSegment::ListItem);
-                let result = visit(storage, contract, path, refinements);
-                path.pop();
-                result
-            }
-            (boon_typecheck::Type::Object(storage), boon_typecheck::Type::Object(contract))
-                if storage.open == contract.open
-                    && storage.fields.len() == contract.fields.len()
-                    && storage.fields.keys().eq(contract.fields.keys()) =>
-            {
-                for (field_ordinal, selector) in
-                    canonical_type_field_order(storage).into_iter().enumerate()
-                {
-                    let storage_field = storage.fields.get(&selector).ok_or_else(|| {
-                        format!("mapped storage representation lost object field `{selector}`")
-                    })?;
-                    let contract_field = contract.fields.get(&selector).ok_or_else(|| {
-                        format!(
-                            "mapped storage representation contract lost object field `{selector}`"
-                        )
-                    })?;
-                    path.push(MappedSemanticStorageTypePathSegment::ObjectField {
-                        selector,
-                        field_ordinal,
-                    });
-                    visit(storage_field, contract_field, path, refinements)?;
-                    path.pop();
-                }
-                Ok(())
-            }
-            _ => Err(format!(
-                "named-value storage representation {storage:?} does not exactly preserve contract {contract:?}"
-            )),
-        }
-    }
-
-    let mut refinements = Vec::new();
-    visit(storage, contract, &mut Vec::new(), &mut refinements)?;
-    Ok(if refinements.is_empty() {
-        MappedSemanticStorageRepresentation::Exact
-    } else {
-        MappedSemanticStorageRepresentation::CheckedFixedBytes { refinements }
-    })
-}
-
-fn map_storage_representation_shape(
-    semantic: &boon_semantic::SemanticStorageRepresentationV1,
-) -> Result<MappedSemanticStorageRepresentation, String> {
-    Ok(match semantic {
-        boon_semantic::SemanticStorageRepresentationV1::Exact => {
-            MappedSemanticStorageRepresentation::Exact
-        }
-        boon_semantic::SemanticStorageRepresentationV1::CheckedFixedBytes { refinements } => {
-            if refinements.is_empty() {
-                return Err(
-                    "checked fixed-BYTES storage representation has no refinements".to_owned(),
-                );
-            }
-            MappedSemanticStorageRepresentation::CheckedFixedBytes {
-                refinements: refinements
-                    .iter()
-                    .map(|refinement| MappedSemanticStorageFixedBytesRefinement {
-                        path: refinement
-                            .path
-                            .iter()
-                            .map(|segment| match segment {
-                                boon_semantic::SemanticStorageTypePathSegmentV1::ObjectField {
-                                    selector,
-                                    field_ordinal,
-                                } => MappedSemanticStorageTypePathSegment::ObjectField {
-                                    selector: selector.clone(),
-                                    field_ordinal: *field_ordinal,
-                                },
-                                boon_semantic::SemanticStorageTypePathSegmentV1::ListItem => {
-                                    MappedSemanticStorageTypePathSegment::ListItem
-                                }
-                            })
-                            .collect(),
-                        fixed_len: refinement.fixed_len,
-                    })
-                    .collect(),
-            }
-        }
-    })
-}
-
-fn map_storage_representation(
-    semantic: &boon_semantic::SemanticStorageRepresentationV1,
-    storage_type: &boon_typecheck::Type,
-    contract_type: &boon_typecheck::Type,
-) -> Result<MappedSemanticStorageRepresentation, String> {
-    let mapped = map_storage_representation_shape(semantic)?;
-    let expected = derive_mapped_storage_representation(storage_type, contract_type)?;
-    if mapped != expected {
-        return Err(format!(
-            "semantic named-value storage representation {mapped:?} differs from exact structural refinement {expected:?}"
-        ));
-    }
-    Ok(mapped)
-}
-
-fn map_named_value_storage_representation(
-    target: &SemanticNamedValueStorageTargetV1,
-    semantic: &boon_semantic::SemanticStorageRepresentationV1,
-    storage_type: &boon_typecheck::Type,
-    contract_type: &boon_typecheck::Type,
-) -> Result<MappedSemanticStorageRepresentation, String> {
-    if matches!(
-        target,
-        SemanticNamedValueStorageTargetV1::DiagnosticOnly { .. }
-    ) {
-        let mapped = map_storage_representation_shape(semantic)?;
-        if mapped != MappedSemanticStorageRepresentation::Exact {
-            return Err(
-                "diagnostic-only named value has a non-exact storage representation".to_owned(),
-            );
-        }
-        return Ok(mapped);
-    }
-    map_storage_representation(semantic, storage_type, contract_type)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn map_storage_named_values(
-    execution: &SemanticExecutionGraphV1,
-    resources: &SemanticResourceGraphV1,
-    reactive: &SemanticReactiveGraphV1,
-    storage: &SemanticScopeStorageGraphV1,
-    lowering: &SemanticLoweringContractV1,
-    ids: &SemanticToExecutableMap,
-    storage_ids: &SemanticStorageToErasedMap,
-) -> Result<Vec<MappedSemanticNamedValue>, String> {
-    require_dense(
-        lowering
-            .metadata
-            .named_value_types
-            .iter()
-            .map(|value| value.id.as_usize()),
-        "semantic named value",
-    )?;
-    require_dense(
-        storage
-            .named_values
-            .iter()
-            .flat_map(|value| &value.projection)
-            .map(|projection| projection.id.as_usize()),
-        "semantic named-value projection",
-    )?;
-
-    let mut seen_targets = BTreeSet::new();
-    let mut mapped = Vec::with_capacity(storage.named_values.len());
-    for value in &storage.named_values {
-        let named = lowering
-            .metadata
-            .named_value_types
-            .get(value.named_value.as_usize())
-            .filter(|candidate| candidate.id == value.named_value)
-            .ok_or_else(|| {
-                format!(
-                    "storage named value references missing type metadata {}",
-                    value.named_value
-                )
-            })?;
-        let origin = named.origins.get(value.origin_ordinal).ok_or_else(|| {
-            format!(
-                "storage named value {} references missing origin {}",
-                value.named_value, value.origin_ordinal
-            )
-        })?;
-        if !seen_targets.insert((
-            value.named_value,
-            value.origin_ordinal,
-            value.target_ordinal,
-        )) {
-            return Err(format!(
-                "storage named value {} origin {} target {} has duplicate identity",
-                value.named_value, value.origin_ordinal, value.target_ordinal
-            ));
-        }
-        let selectors = value
-            .projection
-            .iter()
-            .map(|projection| projection.selector.as_str())
-            .collect::<Vec<_>>();
-        if selectors
-            != origin
-                .checked
-                .projection
-                .iter()
-                .map(String::as_str)
-                .collect::<Vec<_>>()
-        {
-            return Err(format!(
-                "storage named value {} origin {} projection differs from structural checked selectors",
-                value.named_value, value.origin_ordinal
-            ));
-        }
-        let public_storage_flow =
-            named_value_storage_flow_type(execution, resources, reactive, storage, &value.target)?;
-        let mut storage_type = mapped_named_value_storable_root_flow(
-            execution,
-            storage,
-            &value.target,
-            &public_storage_flow,
-        )?
-        .ty;
-        let mut parent_field = named_value_target_storage_field(&value.target);
-        for (ordinal, step) in value.projection.iter().enumerate() {
-            if step.ordinal != ordinal || step.input_type != storage_type {
-                return Err(format!(
-                    "named-value projection {} has stale ordinal/input type",
-                    step.id
-                ));
-            }
-            let boon_typecheck::Type::Object(shape) = &storage_type else {
-                return Err(format!(
-                    "named-value projection {} selector `{}` requires object input, got {:?}",
-                    step.id, step.selector, storage_type
-                ));
-            };
-            let field_order = canonical_type_field_order(shape);
-            if field_order.get(step.field_ordinal) != Some(&step.selector) {
-                return Err(format!(
-                    "named-value projection {} selector `{}` differs from structural field ordinal {}",
-                    step.id, step.selector, step.field_ordinal
-                ));
-            }
-            let output = shape.fields.get(&step.selector).ok_or_else(|| {
-                format!(
-                    "named-value projection {} references missing structural selector `{}`",
-                    step.id, step.selector
-                )
-            })?;
-            if output != &step.output_type {
-                return Err(format!(
-                    "named-value projection {} output type differs from structural selector `{}`",
-                    step.id, step.selector
-                ));
-            }
-            let expected_storage_field = parent_field
-                .map(|parent| {
-                    let candidates = storage
-                        .fields
-                        .iter()
-                        .filter(|field| {
-                            field.parent == Some(parent) && field.name == step.selector
-                        })
-                        .map(|field| field.id)
-                        .collect::<Vec<_>>();
-                    match candidates.as_slice() {
-                        [] => Ok(None),
-                        [field] => Ok(Some(*field)),
-                        _ => Err(format!(
-                            "named-value projection {} selector `{}` resolves to {} storage children",
-                            step.id,
-                            step.selector,
-                            candidates.len()
-                        )),
-                    }
-                })
-                .transpose()?
-                .flatten();
-            if step.storage_field != expected_storage_field {
-                return Err(format!(
-                    "named-value projection {} storage field differs from structural parent/selector",
-                    step.id
-                ));
-            }
-            let (expected_expression, expected_value) = expected_storage_field
-                .map(|field| -> Result<_, String> {
-                    let field = storage
-                        .fields
-                        .get(field.as_usize())
-                        .filter(|candidate| candidate.id == field)
-                        .ok_or_else(|| {
-                            format!(
-                                "named-value projection {} references missing storage field {field}",
-                                step.id
-                            )
-                    })?;
-                    let expression = field.producer;
-                    let value = match expression {
-                        Some(expression) => Some(
-                            semantic_execution_expression(execution, expression)?.value_id,
-                        ),
-                        None => None,
-                    };
-                    Ok((expression, value))
-                })
-                .transpose()?
-                .unwrap_or((None, None));
-            if step.expression != expected_expression || step.value != expected_value {
-                return Err(format!(
-                    "named-value projection {} expression/value differs from its exact storage field",
-                    step.id
-                ));
-            }
-            storage_type = step.output_type.clone();
-            parent_field = step.storage_field;
-        }
-        let representation = map_named_value_storage_representation(
-            &value.target,
-            &value.representation,
-            &storage_type,
-            &value.flow_type.ty,
-        )
-        .map_err(|error| {
-            format!(
-                "named value {} `{}` origin {} target {} {:?}: {error}",
-                value.named_value,
-                named.diagnostic_path,
-                value.origin_ordinal,
-                value.target_ordinal,
-                value.target
-            )
-        })?;
-        let projection = value
-            .projection
-            .iter()
-            .enumerate()
-            .map(|(ordinal, projection)| {
-                if projection.ordinal != ordinal {
-                    return Err(format!(
-                        "named-value projection {} has ordinal {}, expected {ordinal}",
-                        projection.id, projection.ordinal
-                    ));
-                }
-                let expression = projection
-                    .expression
-                    .map(|expression| ids.expression(expression))
-                    .transpose()?;
-                let mapped_value = projection.value.map(|value| ids.value(value)).transpose()?;
-                if expression.is_some() && mapped_value.is_some() && expression != mapped_value {
-                    return Err(format!(
-                        "named-value projection {} expression/value identities differ",
-                        projection.id
-                    ));
-                }
-                Ok(MappedSemanticNamedValueProjection {
-                    id: projection.id,
-                    ordinal: projection.ordinal,
-                    selector: projection.selector.clone(),
-                    field_ordinal: projection.field_ordinal,
-                    input_type: projection.input_type.clone(),
-                    output_type: projection.output_type.clone(),
-                    storage_field: projection
-                        .storage_field
-                        .map(|field| storage_ids.storage_field(field))
-                        .transpose()?,
-                    expression,
-                    value: mapped_value,
-                })
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        for source in &origin.sources {
-            semantic_source_resource(resources, *source)?;
-        }
-        for state in &origin.states {
-            semantic_state_resource(resources, *state)?;
-        }
-        for authority in &origin.value_list_authorities {
-            ids.value_list_authority(*authority)?;
-            resources
-                .value_list_authorities
-                .get(authority.as_usize())
-                .filter(|candidate| candidate.id == *authority)
-                .ok_or_else(|| {
-                    format!(
-                        "named-value origin references missing value-list authority {authority}"
-                    )
-                })?;
-        }
-        for binding in &origin.bindings {
-            reactive
-                .bindings
-                .get(binding.as_usize())
-                .filter(|candidate| candidate.id == *binding)
-                .ok_or_else(|| {
-                    format!("named-value origin references missing reactive binding {binding}")
-                })?;
-        }
-        mapped.push(MappedSemanticNamedValue {
-            named_value: value.named_value,
-            checked_statement: named.checked_statement,
-            diagnostic_path: named.diagnostic_path.clone(),
-            origin_ordinal: value.origin_ordinal,
-            target_ordinal: value.target_ordinal,
-            target: map_storage_named_value_target(
-                &value.target,
-                origin,
-                storage,
-                ids,
-                storage_ids,
-            )?,
-            projection,
-            representation,
-            flow_type: value.flow_type.clone(),
-        });
-    }
-
-    for named in &lowering.metadata.named_value_types {
-        for (origin_ordinal, _) in named.origins.iter().enumerate() {
-            let ordinals = storage
-                .named_values
-                .iter()
-                .filter(|value| {
-                    value.named_value == named.id && value.origin_ordinal == origin_ordinal
-                })
-                .map(|value| value.target_ordinal)
-                .collect::<Vec<_>>();
-            if ordinals.is_empty()
-                || ordinals
-                    .iter()
-                    .copied()
-                    .enumerate()
-                    .any(|(expected, actual)| expected != actual)
-            {
-                return Err(format!(
-                    "semantic named value {} origin {origin_ordinal} target ordinals are not total/dense: {ordinals:?}",
-                    named.id
-                ));
-            }
-        }
-    }
-    Ok(mapped)
-}
-
-fn mapped_named_value_storable_root_flow(
-    execution: &SemanticExecutionGraphV1,
-    storage: &SemanticScopeStorageGraphV1,
-    target: &SemanticNamedValueStorageTargetV1,
-    public_root_flow: &boon_typecheck::FlowType,
-) -> Result<boon_typecheck::FlowType, String> {
-    let storage_field = named_value_target_storage_field(target);
-    let mut expression = match storage_field {
-        Some(field) => {
-            storage
-                .fields
-                .get(field.as_usize())
-                .filter(|candidate| candidate.id == field)
-                .ok_or_else(|| {
-                    format!("named-value target references missing storage field {field}")
-                })?
-                .producer
-        }
-        None => match target {
-            SemanticNamedValueStorageTargetV1::Value { expression, .. } => Some(*expression),
-            SemanticNamedValueStorageTargetV1::Field { .. }
-            | SemanticNamedValueStorageTargetV1::List { .. }
-            | SemanticNamedValueStorageTargetV1::State { .. }
-            | SemanticNamedValueStorageTargetV1::Source { .. }
-            | SemanticNamedValueStorageTargetV1::DiagnosticOnly { .. } => None,
-        },
-    };
-    let mut consumed = false;
-    while let Some(current) = expression {
-        let value = semantic_execution_expression(execution, current)?;
-        let SemanticExpressionKind::FlushBoundary { input } = value.kind else {
-            break;
-        };
-        expression = Some(input);
-        consumed = true;
-    }
-    if !consumed {
-        return Ok(public_root_flow.clone());
-    }
-    let input =
-        expression.ok_or_else(|| "FLUSH boundary storage has no ordinary input".to_owned())?;
-    Ok(semantic_execution_expression(execution, input)?
-        .flow_type
-        .clone())
-}
-
 fn finalize_trigger_arm(trigger: &MappedSemanticTriggerArm) -> TriggerOwnedArm {
     TriggerOwnedArm {
         cause: trigger.cause,
@@ -7278,18 +6249,8 @@ fn finalize_host_effect_schedules(
         .iter()
         .enumerate()
         .map(|(index, schedule)| {
-            let allocated = reactive
-                .id_map
-                .host_effect_schedules
-                .get(schedule.id.as_usize())
-                .copied()
-                .ok_or_else(|| {
-                    format!(
-                        "semantic host-effect schedule {} has no staged identity",
-                        schedule.id
-                    )
-                })?;
-            if allocated != index || schedule.id.as_usize() != index {
+            let allocated = schedule.id.as_usize();
+            if allocated != index {
                 return Err(format!(
                     "semantic host-effect schedule {} is noncanonical at index {index}",
                     schedule.id
@@ -7322,17 +6283,12 @@ fn finalize_host_effect_schedules(
             let transient_result = schedule
                 .transient_result
                 .map(|derived| {
-                    reactive
-                        .id_map
-                        .derived_values
-                        .get(derived.as_usize())
-                        .copied()
-                        .ok_or_else(|| {
-                            format!(
-                                "semantic host-effect schedule {} references missing staged transient derived value {derived}",
-                                schedule.id
-                            )
-                        })
+                    exact_dense_index(
+                        derived.as_usize(),
+                        reactive.derived_values.len(),
+                        "semantic host-effect transient derived value",
+                        derived,
+                    )
                 })
                 .transpose()?;
             Ok(MappedSemanticHostEffectSchedule {
@@ -7558,11 +6514,6 @@ impl MappedSemanticStorage {
                 self.external_references.len(),
             ),
             (
-                "named value target",
-                storage.named_values.len(),
-                self.named_values.len(),
-            ),
-            (
                 "producer instance",
                 reactive.producer_instances.len(),
                 self.producer_function_instances.len(),
@@ -7600,35 +6551,12 @@ impl MappedSemanticStorage {
                 ));
             }
         }
-        let allocation_lengths = [
-            (
-                "storage field",
-                storage.fields.len(),
-                self.id_map.storage_fields.len(),
-            ),
-            (
-                "reactive field",
-                reactive.fields.len(),
+        if reactive.fields.len() != self.id_map.reactive_fields.len() {
+            return Err(format!(
+                "semantic storage reactive-field join has {} records for {} semantic fields",
                 self.id_map.reactive_fields.len(),
-            ),
-            (
-                "binding",
-                reactive.bindings.len(),
-                self.id_map.bindings.len(),
-            ),
-            ("read", reactive.reads.len(), self.id_map.reads.len()),
-            (
-                "external reference",
-                storage.external_references.len(),
-                self.id_map.external_references.len(),
-            ),
-        ];
-        for (label, semantic, allocated) in allocation_lengths {
-            if semantic != allocated {
-                return Err(format!(
-                    "semantic storage {label} domain has {semantic} records but allocation covers {allocated}"
-                ));
-            }
+                reactive.fields.len()
+            ));
         }
         for (index, field) in self.fields.iter().enumerate() {
             let expected = self.id_map.storage_field(SemanticStorageFieldId(index))?;
@@ -7743,70 +6671,6 @@ impl MappedSemanticStorage {
                 return Err(format!(
                     "mapped external reference at index {index} has inconsistent identity/readiness"
                 ));
-            }
-        }
-        let mut expected_projection_id = 0;
-        let covered_named_values = storage
-            .named_values
-            .iter()
-            .map(|value| value.named_value)
-            .collect::<BTreeSet<_>>();
-        let expected_named_values = (0..self.named_value_checked_statements.len())
-            .map(SemanticNamedValueId)
-            .collect::<BTreeSet<_>>();
-        if covered_named_values != expected_named_values {
-            return Err(format!(
-                "mapped named-value rows cover IDs {covered_named_values:?}, expected exact checked-site domain {expected_named_values:?}"
-            ));
-        }
-        for (semantic, mapped) in storage.named_values.iter().zip(&self.named_values) {
-            let expected_representation =
-                map_storage_representation_shape(&semantic.representation)?;
-            let expected_checked_statement = self
-                .named_value_checked_statements
-                .get(semantic.named_value.as_usize())
-                .copied()
-                .ok_or_else(|| {
-                    format!(
-                        "semantic named value {} has no exact checked statement site",
-                        semantic.named_value
-                    )
-                })?;
-            if mapped.named_value != semantic.named_value
-                || mapped.checked_statement != expected_checked_statement
-                || mapped.origin_ordinal != semantic.origin_ordinal
-                || mapped.target_ordinal != semantic.target_ordinal
-                || mapped.flow_type != semantic.flow_type
-                || mapped.projection.len() != semantic.projection.len()
-                || mapped.representation != expected_representation
-            {
-                return Err(format!(
-                    "mapped named-value target {}:{}/{} differs from semantic storage identity",
-                    semantic.named_value, semantic.origin_ordinal, semantic.target_ordinal
-                ));
-            }
-            for (semantic_projection, projection) in
-                semantic.projection.iter().zip(&mapped.projection)
-            {
-                if projection.id != SemanticStorageProjectionId(expected_projection_id) {
-                    return Err(format!(
-                        "mapped named-value projection {} is not dense at index {expected_projection_id}",
-                        projection.id
-                    ));
-                }
-                if projection.id != semantic_projection.id
-                    || projection.ordinal != semantic_projection.ordinal
-                    || projection.selector != semantic_projection.selector
-                    || projection.field_ordinal != semantic_projection.field_ordinal
-                    || projection.input_type != semantic_projection.input_type
-                    || projection.output_type != semantic_projection.output_type
-                {
-                    return Err(format!(
-                        "mapped named-value projection {} differs from semantic storage",
-                        projection.id
-                    ));
-                }
-                expected_projection_id += 1;
             }
         }
         for dependency in &self.dependency_uses {
@@ -10043,7 +8907,6 @@ pub(super) fn finish_verified_semantic_lowering(
         resource_graph,
         reactive_graph,
         scope_storage_graph,
-        lowering_contract,
         &mapped.id_map,
         &resources,
         &reactive,
@@ -11582,41 +10445,6 @@ mod tests {
     }
 
     #[test]
-    fn diagnostic_only_named_value_preserves_checked_contract_without_runtime_storage() {
-        let diagnostic = SemanticNamedValueStorageTargetV1::DiagnosticOnly {
-            reason:
-                boon_semantic::SemanticNamedValueDiagnosticOnlyReasonV1::NonExecutableCheckedLeaf,
-        };
-        assert_eq!(
-            map_named_value_storage_representation(
-                &diagnostic,
-                &boon_semantic::SemanticStorageRepresentationV1::Exact,
-                &boon_typecheck::Type::Unknown,
-                &boon_typecheck::Type::Text,
-            )
-            .expect("diagnostic-only checked contract has no fabricated runtime representation"),
-            MappedSemanticStorageRepresentation::Exact
-        );
-
-        let executable = SemanticNamedValueStorageTargetV1::Value {
-            expression: SemanticExprId(0),
-            value: SemanticValueId(0),
-            field: None,
-        };
-        let error = map_named_value_storage_representation(
-            &executable,
-            &boon_semantic::SemanticStorageRepresentationV1::Exact,
-            &boon_typecheck::Type::Unknown,
-            &boon_typecheck::Type::Text,
-        )
-        .expect_err("an executable value cannot pretend unknown storage exactly preserves Text");
-        assert!(
-            error.contains("does not exactly preserve contract"),
-            "{error}"
-        );
-    }
-
-    #[test]
     fn non_dense_semantic_resource_identity_has_no_executable_mapping() {
         let parsed = boon_parser::parse_source(
             "semantic-resource-mapping-invalid.bn",
@@ -12218,7 +11046,6 @@ result: identity(value: 1)
             semantic.resource_graph(),
             semantic.reactive_graph(),
             semantic.scope_storage_graph(),
-            semantic.lowering_contract(),
             &mapped.id_map,
             &mapped_resources,
             &mapped_reactive,
@@ -12238,7 +11065,6 @@ result: identity(value: 1)
                 semantic.resource_graph(),
                 semantic.reactive_graph(),
                 storage,
-                semantic.lowering_contract(),
                 &mapped.id_map,
                 &mapped_resources,
                 &mapped_reactive,
@@ -12343,7 +11169,6 @@ seed: 0
             semantic.resource_graph(),
             semantic.reactive_graph(),
             semantic.scope_storage_graph(),
-            semantic.lowering_contract(),
             &mapped.id_map,
             &resources,
             &reactive,
@@ -12352,9 +11177,12 @@ seed: 0
         assert_eq!(storage.producer_function_instances.len(), 1);
         assert_eq!(
             storage.producer_function_instances[0].result_field,
-            storage.id_map.storage_fields[semantic.scope_storage_graph().producer_result_fields[0]
-                .storage_field
-                .as_usize()]
+            storage
+                .id_map
+                .storage_field(
+                    semantic.scope_storage_graph().producer_result_fields[0].storage_field,
+                )
+                .unwrap()
         );
 
         let mut stale_result = semantic.scope_storage_graph().clone();
@@ -12364,7 +11192,6 @@ seed: 0
             semantic.resource_graph(),
             semantic.reactive_graph(),
             &stale_result,
-            semantic.lowering_contract(),
             &mapped.id_map,
             &resources,
             &reactive,
@@ -12577,7 +11404,6 @@ FUNCTION detail_row(row, suffix) {
             semantic.resource_graph(),
             semantic.reactive_graph(),
             semantic.scope_storage_graph(),
-            semantic.lowering_contract(),
             &execution.id_map,
             &resources,
             &reactive,
@@ -12591,7 +11417,6 @@ FUNCTION detail_row(row, suffix) {
             semantic.resource_graph(),
             semantic.reactive_graph(),
             &noncanonical_owner,
-            semantic.lowering_contract(),
             &execution.id_map,
             &resources,
             &reactive,
@@ -12645,7 +11470,6 @@ FUNCTION detail_row(row, suffix) {
             semantic.resource_graph(),
             semantic.reactive_graph(),
             &reversed,
-            semantic.lowering_contract(),
             &execution.id_map,
             &resources,
             &reactive,
@@ -12715,7 +11539,6 @@ FUNCTION projected_flavor(flavor) {
             semantic.resource_graph(),
             semantic.reactive_graph(),
             storage,
-            semantic.lowering_contract(),
             &execution.id_map,
             &resources,
             &reactive,
@@ -12735,7 +11558,6 @@ FUNCTION projected_flavor(flavor) {
             semantic.resource_graph(),
             semantic.reactive_graph(),
             &noncanonical,
-            semantic.lowering_contract(),
             &execution.id_map,
             &resources,
             &reactive,
@@ -12798,7 +11620,6 @@ FUNCTION selectable_row(seed) {
             semantic.resource_graph(),
             semantic.reactive_graph(),
             semantic.scope_storage_graph(),
-            semantic.lowering_contract(),
             &execution.id_map,
             &resources,
             &reactive,
@@ -12812,7 +11633,6 @@ FUNCTION selectable_row(seed) {
             semantic.resource_graph(),
             semantic.reactive_graph(),
             &mutated,
-            semantic.lowering_contract(),
             &execution.id_map,
             &resources,
             &reactive,
@@ -12828,7 +11648,6 @@ FUNCTION selectable_row(seed) {
             semantic.resource_graph(),
             semantic.reactive_graph(),
             &stale_row_value,
-            semantic.lowering_contract(),
             &execution.id_map,
             &resources,
             &reactive,
@@ -12879,7 +11698,6 @@ result:
             semantic.resource_graph(),
             semantic.reactive_graph(),
             semantic.scope_storage_graph(),
-            semantic.lowering_contract(),
             &execution.id_map,
             &resources,
             &reactive,
@@ -12951,7 +11769,6 @@ store: [
             semantic.resource_graph(),
             semantic.reactive_graph(),
             semantic.scope_storage_graph(),
-            semantic.lowering_contract(),
             &execution.id_map,
             &resources,
             &reactive,
@@ -12968,247 +11785,6 @@ store: [
             )
             .unwrap_err();
         assert!(error.contains("mapped list mutation"), "{error}");
-    }
-
-    #[test]
-    fn semantic_storage_join_preserves_fixed_bytes_representation_paths() {
-        let object = |fields: Vec<(&str, boon_typecheck::Type)>| {
-            let field_order = fields
-                .iter()
-                .map(|(name, _)| (*name).to_owned())
-                .collect::<Vec<_>>();
-            boon_typecheck::Type::Object(boon_typecheck::ObjectShape {
-                fields: fields
-                    .into_iter()
-                    .map(|(name, ty)| (name.to_owned(), ty))
-                    .collect(),
-                field_order,
-                open: false,
-            })
-        };
-        let dynamic = object(vec![(
-            "envelope",
-            boon_typecheck::Type::List(Box::new(object(vec![(
-                "body",
-                boon_typecheck::Type::Bytes(boon_typecheck::BytesType::Dynamic),
-            )]))),
-        )]);
-        let fixed = object(vec![(
-            "envelope",
-            boon_typecheck::Type::List(Box::new(object(vec![(
-                "body",
-                boon_typecheck::Type::Bytes(boon_typecheck::BytesType::Fixed(8)),
-            )]))),
-        )]);
-        let semantic = boon_semantic::SemanticStorageRepresentationV1::CheckedFixedBytes {
-            refinements: vec![boon_semantic::SemanticStorageFixedBytesRefinementV1 {
-                path: vec![
-                    boon_semantic::SemanticStorageTypePathSegmentV1::ObjectField {
-                        selector: "envelope".to_owned(),
-                        field_ordinal: 0,
-                    },
-                    boon_semantic::SemanticStorageTypePathSegmentV1::ListItem,
-                    boon_semantic::SemanticStorageTypePathSegmentV1::ObjectField {
-                        selector: "body".to_owned(),
-                        field_ordinal: 0,
-                    },
-                ],
-                fixed_len: 8,
-            }],
-        };
-        let mapped = map_storage_representation(&semantic, &dynamic, &fixed)
-            .expect("fixed-BYTES representation joins by structural type segments");
-        let MappedSemanticStorageRepresentation::CheckedFixedBytes { refinements } = mapped else {
-            panic!("mapped representation lost fixed-BYTES refinements")
-        };
-        assert_eq!(refinements[0].fixed_len, 8);
-        assert!(matches!(
-            refinements[0].path.as_slice(),
-            [
-                MappedSemanticStorageTypePathSegment::ObjectField {
-                    selector,
-                    field_ordinal: 0,
-                },
-                MappedSemanticStorageTypePathSegment::ListItem,
-                MappedSemanticStorageTypePathSegment::ObjectField {
-                    selector: body,
-                    field_ordinal: 0,
-                },
-            ] if selector == "envelope" && body == "body"
-        ));
-
-        let mut stale_length = semantic.clone();
-        let boon_semantic::SemanticStorageRepresentationV1::CheckedFixedBytes { refinements } =
-            &mut stale_length
-        else {
-            unreachable!()
-        };
-        refinements[0].fixed_len = 9;
-        let error = map_storage_representation(&stale_length, &dynamic, &fixed).unwrap_err();
-        assert!(error.contains("storage representation"), "{error}");
-
-        let mut stale_path = semantic;
-        let boon_semantic::SemanticStorageRepresentationV1::CheckedFixedBytes { refinements } =
-            &mut stale_path
-        else {
-            unreachable!()
-        };
-        let ordinal = refinements[0]
-            .path
-            .iter_mut()
-            .find_map(|segment| match segment {
-                boon_semantic::SemanticStorageTypePathSegmentV1::ObjectField {
-                    field_ordinal,
-                    ..
-                } => Some(field_ordinal),
-                boon_semantic::SemanticStorageTypePathSegmentV1::ListItem => None,
-            })
-            .expect("fixture refinement has an object-field segment");
-        *ordinal += 1;
-        let error = map_storage_representation(&stale_path, &dynamic, &fixed).unwrap_err();
-        assert!(error.contains("storage representation"), "{error}");
-    }
-
-    #[test]
-    fn semantic_storage_join_preserves_structural_named_value_projections() {
-        let parsed = boon_parser::parse_source(
-            "semantic-storage-named-projection.bn",
-            "group: [value: 1]\n",
-        )
-        .unwrap();
-        let checked = boon_typecheck::check_program(&parsed)
-            .program
-            .expect("named-projection fixture typechecks");
-        let semantic =
-            boon_semantic::elaborate(checked, &[]).expect("named-projection fixture elaborates");
-        assert!(
-            semantic
-                .scope_storage_graph()
-                .named_values
-                .iter()
-                .all(|row| row.projection.is_empty()),
-            "current exact-site table starts without synthetic projections"
-        );
-        let execution =
-            map_semantic_execution(semantic.execution_graph(), semantic.resource_graph())
-                .expect("named-projection execution maps");
-        let resources = map_semantic_resources(
-            semantic.execution_graph(),
-            semantic.resource_graph(),
-            &execution.id_map,
-        )
-        .expect("named-projection resources map");
-        let reactive = map_semantic_reactive(
-            semantic.execution_graph(),
-            semantic.resource_graph(),
-            semantic.reactive_graph(),
-            &execution.id_map,
-            &resources,
-        )
-        .expect("named-projection reactive graph maps");
-        let mut lowering = semantic.lowering_contract().clone();
-        let mut storage = semantic.scope_storage_graph().clone();
-        let (row_index, parent, child) = storage
-            .named_values
-            .iter()
-            .enumerate()
-            .filter_map(|(row_index, row)| {
-                let SemanticNamedValueStorageTargetV1::Field { field: parent, .. } = row.target
-                else {
-                    return None;
-                };
-                storage
-                    .fields
-                    .iter()
-                    .find(|field| field.parent == Some(parent) && field.name == "value")
-                    .map(|child| (row_index, parent, child.id))
-            })
-            .next()
-            .expect("fixture has an object field with a structural child");
-        let parent_type = storage.fields[parent.as_usize()].flow_type.ty.clone();
-        let boon_typecheck::Type::Object(shape) = &parent_type else {
-            panic!("projection parent is not an object")
-        };
-        let field_order = canonical_type_field_order(shape);
-        let field_ordinal = field_order
-            .iter()
-            .position(|field| field == "value")
-            .expect("value has a structural ordinal");
-        let output_type = shape.fields["value"].clone();
-        let child_field = &storage.fields[child.as_usize()];
-        let expression = child_field.producer;
-        let value = expression.map(|expression| {
-            semantic_execution_expression(semantic.execution_graph(), expression)
-                .expect("child producer exists")
-                .value_id
-        });
-        let named_value = storage.named_values[row_index].named_value;
-        let origin_ordinal = storage.named_values[row_index].origin_ordinal;
-        lowering.metadata.named_value_types[named_value.as_usize()].origins[origin_ordinal]
-            .checked
-            .projection = vec!["value".to_owned()];
-        storage.named_values[row_index].projection =
-            vec![boon_semantic::SemanticStorageProjectionStepV1 {
-                id: SemanticStorageProjectionId(0),
-                ordinal: 0,
-                selector: "value".to_owned(),
-                field_ordinal,
-                input_type: parent_type,
-                output_type: output_type.clone(),
-                storage_field: Some(child),
-                expression,
-                value,
-            }];
-        storage.named_values[row_index].flow_type.ty = output_type;
-        storage.named_values[row_index].representation =
-            boon_semantic::SemanticStorageRepresentationV1::Exact;
-        let mapped = map_semantic_storage_join(
-            semantic.execution_graph(),
-            semantic.resource_graph(),
-            semantic.reactive_graph(),
-            &storage,
-            &lowering,
-            &execution.id_map,
-            &resources,
-            &reactive,
-        )
-        .expect("structural named-value projection maps without a path lookup");
-        assert_eq!(
-            mapped.named_values[row_index].projection[0].storage_field,
-            Some(mapped.id_map.storage_field(child).unwrap())
-        );
-
-        let mut noncanonical = storage.clone();
-        noncanonical.named_values[row_index].projection[0].id =
-            SemanticStorageProjectionId(usize::MAX);
-        let error = map_semantic_storage_join(
-            semantic.execution_graph(),
-            semantic.resource_graph(),
-            semantic.reactive_graph(),
-            &noncanonical,
-            &lowering,
-            &execution.id_map,
-            &resources,
-            &reactive,
-        )
-        .unwrap_err();
-        assert!(error.contains("named-value projection"), "{error}");
-        assert!(error.contains("not dense"), "{error}");
-
-        let mut stale_ordinal = storage;
-        stale_ordinal.named_values[row_index].projection[0].field_ordinal = usize::MAX;
-        let error = map_semantic_storage_join(
-            semantic.execution_graph(),
-            semantic.resource_graph(),
-            semantic.reactive_graph(),
-            &stale_ordinal,
-            &lowering,
-            &execution.id_map,
-            &resources,
-            &reactive,
-        )
-        .unwrap_err();
-        assert!(error.contains("structural field ordinal"), "{error}");
     }
 
     #[test]
@@ -13268,6 +11844,15 @@ store: [
                 &execution.id_map,
             )
             .unwrap();
+        let remap_reactive = |graph: &SemanticReactiveGraphV1| {
+            map_semantic_reactive(
+                semantic.execution_graph(),
+                semantic.resource_graph(),
+                graph,
+                &execution.id_map,
+                &resources,
+            )
+        };
 
         assert_eq!(
             reactive.fields.len(),
@@ -13305,27 +11890,19 @@ store: [
         let mut trigger = extra_trigger.trigger_arms[0].clone();
         trigger.id = SemanticTriggerArmId(extra_trigger.trigger_arms.len());
         extra_trigger.trigger_arms.push(trigger);
-        let error = map_semantic_reactive(
-            semantic.execution_graph(),
-            semantic.resource_graph(),
-            &extra_trigger,
-            &execution.id_map,
-            &resources,
-        )
-        .unwrap_err();
+        let error = remap_reactive(&extra_trigger).unwrap_err();
         assert!(error.contains("expected exact set"), "{error}");
 
         let mut dangling_trigger = semantic.reactive_graph().clone();
         dangling_trigger.state_update_arms[0].trigger = SemanticTriggerArmId(usize::MAX);
-        let error = map_semantic_reactive(
-            semantic.execution_graph(),
-            semantic.resource_graph(),
-            &dangling_trigger,
-            &execution.id_map,
-            &resources,
-        )
-        .unwrap_err();
+        let error = remap_reactive(&dangling_trigger).unwrap_err();
         assert!(error.contains("references missing trigger"), "{error}");
+
+        let mut noncanonical_field = semantic.reactive_graph().clone();
+        noncanonical_field.fields[0].id = SemanticFieldId(usize::MAX);
+        let error = remap_reactive(&noncanonical_field).unwrap_err();
+        assert!(error.contains("semantic reactive field"), "{error}");
+        assert!(error.contains("not dense"), "{error}");
 
         assert!(
             !semantic.reactive_graph().dependencies.is_empty(),
@@ -13336,26 +11913,12 @@ store: [
         dependency.id =
             boon_semantic::SemanticExternalDependencyId(extra_dependency.dependencies.len());
         extra_dependency.dependencies.push(dependency);
-        let error = map_semantic_reactive(
-            semantic.execution_graph(),
-            semantic.resource_graph(),
-            &extra_dependency,
-            &execution.id_map,
-            &resources,
-        )
-        .unwrap_err();
+        let error = remap_reactive(&extra_dependency).unwrap_err();
         assert!(error.contains("dependency closure"), "{error}");
 
         let mut dangling_dependency = semantic.reactive_graph().clone();
         dangling_dependency.dependencies[0].to = SemanticStateId(usize::MAX);
-        let error = map_semantic_reactive(
-            semantic.execution_graph(),
-            semantic.resource_graph(),
-            &dangling_dependency,
-            &execution.id_map,
-            &resources,
-        )
-        .unwrap_err();
+        let error = remap_reactive(&dangling_dependency).unwrap_err();
         assert!(error.contains("dependency edge"), "{error}");
 
         let mapped_storage = map_semantic_storage_join(
@@ -13363,7 +11926,6 @@ store: [
             semantic.resource_graph(),
             semantic.reactive_graph(),
             semantic.scope_storage_graph(),
-            semantic.lowering_contract(),
             &execution.id_map,
             &resources,
             &reactive,
@@ -13389,10 +11951,6 @@ store: [
             semantic.reactive_graph().reads.len()
         );
         assert_eq!(
-            mapped_storage.named_values.len(),
-            semantic.scope_storage_graph().named_values.len()
-        );
-        assert_eq!(
             mapped_storage.call_invocations.len(),
             semantic.reactive_graph().call_invocations.len()
         );
@@ -13407,7 +11965,6 @@ store: [
                 semantic.resource_graph(),
                 semantic.reactive_graph(),
                 storage,
-                semantic.lowering_contract(),
                 &execution.id_map,
                 &resources,
                 &reactive,
@@ -13436,10 +11993,7 @@ store: [
         let mut missing_binding = semantic.scope_storage_graph().clone();
         missing_binding.bindings.pop();
         let error = map_storage(&missing_binding).unwrap_err();
-        assert!(
-            error.contains("no exact semantic storage binding"),
-            "{error}"
-        );
+        assert!(error.contains("semantic storage binding map"), "{error}");
 
         let mut bad_source = semantic.scope_storage_graph().clone();
         bad_source
@@ -13449,82 +12003,6 @@ store: [
             .binding = SemanticBindingId(usize::MAX);
         let error = map_storage(&bad_source).unwrap_err();
         assert!(error.contains("storage source"), "{error}");
-
-        let mut bad_named_target = semantic.scope_storage_graph().clone();
-        bad_named_target
-            .named_values
-            .first_mut()
-            .expect("fixture has named-value storage")
-            .target_ordinal = usize::MAX;
-        let error = map_storage(&bad_named_target).unwrap_err();
-        assert!(error.contains("target ordinals"), "{error}");
-
-        let mut stale_named_target = semantic.scope_storage_graph().clone();
-        let target = &mut stale_named_target
-            .named_values
-            .iter_mut()
-            .find(|value| {
-                !matches!(
-                    value.target,
-                    SemanticNamedValueStorageTargetV1::DiagnosticOnly { .. }
-                ) && {
-                    let origin = &semantic.lowering_contract().metadata.named_value_types
-                        [value.named_value.as_usize()]
-                    .origins[value.origin_ordinal];
-                    !origin.expressions.is_empty()
-                        || !origin.bindings.is_empty()
-                        || !origin.sources.is_empty()
-                        || !origin.states.is_empty()
-                        || !origin.lists.is_empty()
-                        || !origin.value_list_authorities.is_empty()
-                }
-            })
-            .expect("fixture has an executable named-value target")
-            .target;
-        match target {
-            SemanticNamedValueStorageTargetV1::Field { field, .. } => {
-                *field = SemanticStorageFieldId(usize::MAX);
-            }
-            SemanticNamedValueStorageTargetV1::Source { binding, .. }
-            | SemanticNamedValueStorageTargetV1::State { binding, .. }
-            | SemanticNamedValueStorageTargetV1::List { binding, .. } => {
-                *binding = SemanticBindingId(usize::MAX);
-            }
-            SemanticNamedValueStorageTargetV1::Value { expression, .. } => {
-                *expression = SemanticExprId(usize::MAX);
-            }
-            SemanticNamedValueStorageTargetV1::DiagnosticOnly { .. } => {
-                unreachable!("filtered executable target")
-            }
-        };
-        let error = map_storage(&stale_named_target).unwrap_err();
-        assert!(error.contains("named value"), "{error}");
-
-        let mut bad_representation = semantic.scope_storage_graph().clone();
-        bad_representation
-            .named_values
-            .first_mut()
-            .expect("fixture has named-value storage")
-            .representation = boon_semantic::SemanticStorageRepresentationV1::CheckedFixedBytes {
-            refinements: vec![boon_semantic::SemanticStorageFixedBytesRefinementV1 {
-                path: Vec::new(),
-                fixed_len: 1,
-            }],
-        };
-        let error = map_storage(&bad_representation).unwrap_err();
-        assert!(error.contains("storage representation"), "{error}");
-
-        let mut bad_checked_site = mapped_storage.clone();
-        bad_checked_site.named_values[0].checked_statement =
-            boon_typecheck::CheckedStatementId(u32::MAX);
-        let error = bad_checked_site
-            .validate_totality(
-                semantic.scope_storage_graph(),
-                semantic.reactive_graph(),
-                &execution.id_map,
-            )
-            .unwrap_err();
-        assert!(error.contains("mapped named-value target"), "{error}");
 
         let mut bad_mapped_field = mapped_storage.clone();
         bad_mapped_field.fields[0].id = FieldId(usize::MAX);

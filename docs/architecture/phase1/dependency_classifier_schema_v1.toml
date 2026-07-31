@@ -18,7 +18,7 @@ additional_types = []
 path = "crates/boon_ir/src/semantic_mapping.rs"
 selection = "explicit"
 prefixes = []
-explicit_types = ["ExecutableLexicalScopeId", "MappedReactiveBindingId", "MappedReactiveFieldId", "MappedReactiveReadId", "MappedReactiveTriggerId", "MappedSemanticBinding", "MappedSemanticBindingTarget", "MappedSemanticCallInvocationSchedule", "MappedSemanticDependencyTarget", "MappedSemanticDependencyUse", "MappedSemanticDerivedValue", "MappedSemanticExecution", "MappedSemanticExternalReference", "MappedSemanticExternalReferenceKind", "MappedSemanticField", "MappedSemanticHostEffectSchedule", "MappedSemanticListMutation", "MappedSemanticNamedValue", "MappedSemanticNamedValueProjection", "MappedSemanticNamedValueTarget", "MappedSemanticProducerInstance", "MappedSemanticReactive", "MappedSemanticRead", "MappedSemanticReadTarget", "MappedSemanticResources", "MappedSemanticSource", "MappedSemanticStateUpdateArm", "MappedSemanticStorage", "MappedSemanticStorageDependencyTarget", "MappedSemanticStorageDependencyUse", "MappedSemanticStorageFixedBytesRefinement", "MappedSemanticStorageRead", "MappedSemanticStorageReadTarget", "MappedSemanticStorageRepresentation", "MappedSemanticStorageTypePathSegment", "MappedSemanticTriggerArm", "SemanticToExecutableMap"]
+explicit_types = ["ExecutableLexicalScopeId", "MappedReactiveBindingId", "MappedReactiveFieldId", "MappedReactiveReadId", "MappedReactiveTriggerId", "MappedSemanticBinding", "MappedSemanticBindingTarget", "MappedSemanticCallInvocationSchedule", "MappedSemanticDependencyTarget", "MappedSemanticDependencyUse", "MappedSemanticDerivedValue", "MappedSemanticExecution", "MappedSemanticExternalReference", "MappedSemanticExternalReferenceKind", "MappedSemanticField", "MappedSemanticHostEffectSchedule", "MappedSemanticListMutation", "MappedSemanticProducerInstance", "MappedSemanticReactive", "MappedSemanticRead", "MappedSemanticReadTarget", "MappedSemanticResources", "MappedSemanticSource", "MappedSemanticStateUpdateArm", "MappedSemanticStorage", "MappedSemanticStorageDependencyTarget", "MappedSemanticStorageDependencyUse", "MappedSemanticStorageRead", "MappedSemanticStorageReadTarget", "MappedSemanticTriggerArm", "SemanticReactiveToMappedMap", "SemanticStorageToErasedMap", "SemanticToExecutableMap"]
 additional_types = []
 
 [[sources]]
@@ -3817,100 +3817,6 @@ fields = [
 [[records]]
 kind = "struct"
 source = "crates/boon_ir/src/semantic_mapping.rs"
-name = "MappedSemanticNamedValue"
-fields = [
-  { name = "named_value", disposition = "r-fc-priv-id-pc-n", reviewed = true },
-  { name = "checked_statement", disposition = "r-fc-priv-id-pc-n", reviewed = true },
-  { name = "diagnostic_path", disposition = "r-d-diag-so-n", reviewed = true },
-  { name = "origin_ordinal", disposition = "a-frc-priv-id-pc-n", reviewed = true },
-  { name = "target_ordinal", disposition = "a-fc-priv-id-pc-n", reviewed = true },
-  { name = "target", disposition = "r-fc-priv-id-pc-n", reviewed = true },
-  { name = "projection", disposition = "r-fc-priv-id-pc-n", reviewed = true },
-  { name = "representation", disposition = "r-fc-priv-id-pc-n", reviewed = true },
-  { name = "flow_type", disposition = "r-fc-priv-id-pc-n", reviewed = true },
-]
-
-[[records]]
-kind = "struct"
-source = "crates/boon_ir/src/semantic_mapping.rs"
-name = "MappedSemanticNamedValueProjection"
-fields = [
-  { name = "id", disposition = "a-fc-priv-id-pc-n", reviewed = true },
-  { name = "ordinal", disposition = "a-fc-priv-id-pc-n", reviewed = true },
-  { name = "selector", disposition = "r-fc-priv-id-pc-n", reviewed = true },
-  { name = "field_ordinal", disposition = "a-fc-priv-id-pc-n", reviewed = true },
-  { name = "input_type", disposition = "r-fc-priv-id-pc-n", reviewed = true },
-  { name = "output_type", disposition = "r-fc-priv-id-pc-n", reviewed = true },
-  { name = "storage_field", disposition = "r-fc-priv-id-pc-n", reviewed = true },
-  { name = "expression", disposition = "r-fc-priv-id-pc-n", reviewed = true },
-  { name = "value", disposition = "r-fc-priv-id-pc-n", reviewed = true },
-]
-
-[[records]]
-kind = "enum"
-source = "crates/boon_ir/src/semantic_mapping.rs"
-name = "MappedSemanticNamedValueTarget"
-
-[[records.variants]]
-name = "Field"
-disposition = "r-fc-priv-id-pc-n"
-reviewed = true
-fields = [
-  { name = "binding", disposition = "r-fc-priv-id-pc-n", reviewed = true },
-  { name = "field", disposition = "r-fc-priv-id-pc-n", reviewed = true },
-]
-
-[[records.variants]]
-name = "Source"
-disposition = "r-frc-priv-id-pc-n"
-reviewed = true
-fields = [
-  { name = "binding", disposition = "r-frc-priv-id-pc-n", reviewed = true },
-  { name = "source", disposition = "r-frc-priv-id-pc-n", reviewed = true },
-]
-
-[[records.variants]]
-name = "State"
-disposition = "r-frc-priv-id-pc-n"
-reviewed = true
-fields = [
-  { name = "binding", disposition = "r-frc-priv-id-pc-n", reviewed = true },
-  { name = "state", disposition = "r-frc-priv-id-pc-n", reviewed = true },
-  { name = "field", disposition = "r-frc-priv-id-pc-n", reviewed = true },
-]
-
-[[records.variants]]
-name = "List"
-disposition = "r-frc-priv-id-pc-n"
-reviewed = true
-fields = [
-  { name = "binding", disposition = "r-frc-priv-id-pc-n", reviewed = true },
-  { name = "list", disposition = "r-frc-priv-id-pc-n", reviewed = true },
-  { name = "field", disposition = "r-frc-priv-id-pc-n", reviewed = true },
-  { name = "row", disposition = "r-frc-priv-id-pc-n", reviewed = true },
-]
-
-[[records.variants]]
-name = "Value"
-disposition = "r-fc-priv-id-pc-n"
-reviewed = true
-fields = [
-  { name = "expression", disposition = "r-fc-priv-id-pc-n", reviewed = true },
-  { name = "value", disposition = "r-fc-priv-id-pc-n", reviewed = true },
-  { name = "field", disposition = "r-fc-priv-id-pc-n", reviewed = true },
-]
-
-[[records.variants]]
-name = "DiagnosticOnly"
-disposition = "r-d-diag-so-n"
-reviewed = true
-fields = [
-  { name = "reason", disposition = "a-d-diag-so-n", reviewed = true },
-]
-
-[[records]]
-kind = "struct"
-source = "crates/boon_ir/src/semantic_mapping.rs"
 name = "MappedSemanticProducerInstance"
 fields = [
   { name = "identity", disposition = "a-rc-priv-id-pc-n", reviewed = true },
@@ -3942,8 +3848,6 @@ fields = [
   { name = "derived_values", disposition = "r-fc-priv-id-pc-n", reviewed = true },
   { name = "dependencies", disposition = "r-c-priv-id-pc-n", reviewed = true },
   { name = "id_map", disposition = "a-c-priv-id-pc-n", reviewed = true },
-  { name = "semantic_producer_instance_count", disposition = "a-rc-priv-id-pc-n", reviewed = true },
-  { name = "referenced_trigger_ids", disposition = "a-c-priv-id-pc-n", reviewed = true },
 ]
 
 [[records]]
@@ -4090,14 +3994,12 @@ fields = [
   { name = "call_invocations", disposition = "r-fc-priv-id-pc-n", reviewed = true },
   { name = "host_effect_schedules", disposition = "r-rca-priv-id-pc-n", reviewed = true },
   { name = "external_references", disposition = "r-rc-priv-id-pc-n", reviewed = true },
-  { name = "named_values", disposition = "r-fc-priv-id-pc-n", reviewed = true },
   { name = "producer_function_instances", disposition = "r-frc-priv-id-pc-n", reviewed = true },
   { name = "derived_values", disposition = "r-fc-priv-id-pc-n", reviewed = true },
   { name = "trigger_arms", disposition = "r-c-priv-id-pc-n", reviewed = true },
   { name = "state_update_arms", disposition = "r-rc-priv-id-pc-n", reviewed = true },
   { name = "list_mutations", disposition = "r-rc-priv-id-pc-n", reviewed = true },
   { name = "dependencies", disposition = "r-c-priv-id-pc-n", reviewed = true },
-  { name = "named_value_checked_statements", disposition = "r-fc-priv-id-pc-n", reviewed = true },
   { name = "id_map", disposition = "a-c-priv-id-pc-n", reviewed = true },
 ]
 
@@ -4132,15 +4034,6 @@ fields = [
   { name = "expression", disposition = "r-fc-priv-id-pc-n", reviewed = true },
   { name = "target", disposition = "r-c-priv-id-pc-n", reviewed = true },
   { name = "timing", disposition = "r-c-priv-id-pc-n", reviewed = true },
-]
-
-[[records]]
-kind = "struct"
-source = "crates/boon_ir/src/semantic_mapping.rs"
-name = "MappedSemanticStorageFixedBytesRefinement"
-fields = [
-  { name = "path", disposition = "a-c-priv-id-pc-n", reviewed = true },
-  { name = "fixed_len", disposition = "r-c-priv-id-pc-n", reviewed = true },
 ]
 
 [[records]]
@@ -4236,47 +4129,6 @@ fields = [
 ]
 
 [[records]]
-kind = "enum"
-source = "crates/boon_ir/src/semantic_mapping.rs"
-name = "MappedSemanticStorageRepresentation"
-
-[[records.variants]]
-name = "Exact"
-disposition = "a-c-priv-id-pc-n"
-reviewed = true
-fields = [
-]
-
-[[records.variants]]
-name = "CheckedFixedBytes"
-disposition = "r-c-priv-id-pc-n"
-reviewed = true
-fields = [
-  { name = "refinements", disposition = "r-c-priv-id-pc-n", reviewed = true },
-]
-
-[[records]]
-kind = "enum"
-source = "crates/boon_ir/src/semantic_mapping.rs"
-name = "MappedSemanticStorageTypePathSegment"
-
-[[records.variants]]
-name = "ObjectField"
-disposition = "r-fc-priv-id-pc-n"
-reviewed = true
-fields = [
-  { name = "selector", disposition = "r-fc-priv-id-pc-n", reviewed = true },
-  { name = "field_ordinal", disposition = "a-fc-priv-id-pc-n", reviewed = true },
-]
-
-[[records.variants]]
-name = "ListItem"
-disposition = "a-frc-priv-id-pc-n"
-reviewed = true
-fields = [
-]
-
-[[records]]
 kind = "struct"
 source = "crates/boon_ir/src/semantic_mapping.rs"
 name = "MappedSemanticTriggerArm"
@@ -4289,6 +4141,31 @@ fields = [
   { name = "route_scope", disposition = "r-c-priv-id-pc-n", reviewed = true },
   { name = "row_scope", disposition = "r-frc-priv-id-pc-n", reviewed = true },
   { name = "output_expression", disposition = "r-fc-priv-id-pc-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_ir/src/semantic_mapping.rs"
+name = "SemanticReactiveToMappedMap"
+fields = [
+  { name = "field_count", disposition = "a-fc-priv-id-pc-n", reviewed = true },
+  { name = "binding_count", disposition = "a-fc-priv-id-pc-n", reviewed = true },
+  { name = "read_count", disposition = "a-fc-priv-id-pc-n", reviewed = true },
+  { name = "trigger_arm_count", disposition = "a-c-priv-id-pc-n", reviewed = true },
+  { name = "state_update_arm_count", disposition = "a-rc-priv-id-pc-n", reviewed = true },
+  { name = "list_mutation_count", disposition = "a-rc-priv-id-pc-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_ir/src/semantic_mapping.rs"
+name = "SemanticStorageToErasedMap"
+fields = [
+  { name = "storage_field_count", disposition = "a-fc-priv-id-pc-n", reviewed = true },
+  { name = "reactive_fields", disposition = "r-fc-priv-id-pc-n", reviewed = true },
+  { name = "binding_count", disposition = "a-fc-priv-id-pc-n", reviewed = true },
+  { name = "read_count", disposition = "a-fc-priv-id-pc-n", reviewed = true },
+  { name = "external_reference_count", disposition = "a-rc-priv-id-pc-n", reviewed = true },
 ]
 
 [[records]]

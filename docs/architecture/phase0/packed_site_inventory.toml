@@ -98,8 +98,8 @@ expected_probe_set_sha256 = "74d30b30f6bcf09c10edaef60aefbae001c6bc9843751989617
 expected_file_set_sha256 = "4bf148d82417a80c61fdd3bf9d7823c9409be05cf009d74371b3133e0d34d0f2"
 expected_scanned_files = 91
 expected_occurrence_files = 80
-expected_occurrence_ledger_sha256 = "045853b7d55ecdb2f548ea2ee4b98e76db6d3ebdb9be05d8ce9917bd95161cb9"
-expected_occurrence_rows = 18082
+expected_occurrence_ledger_sha256 = "18447180f92c9b243eca950424140d2d4d136f2d8b3d1b4eaff90b95db542928"
+expected_occurrence_rows = 17960
 
 [[categories]]
 order = 0
@@ -136,9 +136,9 @@ order = 3
 id = "allocation-or-growth"
 owner_phase = "goal-phase-5-packed"
 owner_plan = "docs/plans/BOON_PACKED_DATA_AND_DENSE_INTERNALS_PLAN.md"
-expected_rows = 14241
+expected_rows = 14119
 expected_hot = 4151
-expected_cold = 8657
+expected_cold = 8535
 expected_boundary = 1433
 
 [[categories]]

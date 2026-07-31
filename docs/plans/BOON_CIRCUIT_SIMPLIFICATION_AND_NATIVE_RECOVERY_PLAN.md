@@ -393,6 +393,32 @@ across 147 files. Phase 0 deletion and both regenerated inventories pass; only
 the already-declared stale Cells packed baseline and its dependent budget
 report remain open.
 
+The verified-erasure proof-shadow cut removes private mapped named-value,
+projection, and storage-representation copies after the semantic storage
+contract has already checked them. Final named-value type metadata continues
+to come from the verified lowering contract, while the reactive-to-mapped and
+storage-to-erased ID joins now retain dense-domain counts instead of allocated
+identity vectors. The one genuine non-identity reactive-field-to-storage-field
+map remains explicit and bijection-checked. An architecture contract fixes the
+exact two stage-map schemas and rejects restoration of the deleted proof-shadow
+record family. Executable state updates, list mutations, semantic memory,
+migration edges, persistence owners, draining behavior, and migration runners
+are unchanged.
+
+All 28 remaining IR tests, 6 compiler unit tests, 18 dependency-classifier
+tests, the focused architecture-contract test, and the three executable
+Counter, Persons.pro, and TodoMVC migration scenarios pass under serial
+execution. The affected all-target compile passes without warnings. This cut
+removes 1,377 tracked Rust lines, including 369 test Rust lines. The current
+architecture report measures 415,904 tracked Rust lines and 54,714 test Rust
+lines; only those two global caps fail. Runtime plus executor, playground, and
+xtask production remain within their caps at 40,503, 31,125, and 17,959 lines.
+The packed inventory now records 17,960 candidate sites across 80 files, and
+the exact container inventory records 4,808 occurrences across 147 files.
+Phase 0 deletion and both regenerated inventories pass; only the
+already-declared stale Cells packed baseline and its dependent budget report
+remain open.
+
 The nested-compositor diagnostic path has been deleted. The replacement uses
 ordinary COSMIC preview/dev windows, kernel uinput mouse and keyboard devices,
 the normal app_window callback route, and app-owned exact-frame WGPU readback.

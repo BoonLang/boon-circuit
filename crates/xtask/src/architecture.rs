@@ -1621,6 +1621,49 @@ fn flatten_use_tree(
 fn verify_semantic_mapping_contract(source: &str) -> Result<(), String> {
     let syntax = syn::parse_file(source)
         .map_err(|error| format!("cannot parse semantic mapping: {error}"))?;
+    verify_dense_stage_map_contract(
+        &syntax,
+        "SemanticReactiveToMappedMap",
+        &[
+            "field_count",
+            "binding_count",
+            "read_count",
+            "trigger_arm_count",
+            "state_update_arm_count",
+            "list_mutation_count",
+        ],
+        None,
+    )?;
+    verify_dense_stage_map_contract(
+        &syntax,
+        "SemanticStorageToErasedMap",
+        &[
+            "storage_field_count",
+            "reactive_fields",
+            "binding_count",
+            "read_count",
+            "external_reference_count",
+        ],
+        Some(("reactive_fields", "FieldId")),
+    )?;
+    for forbidden in [
+        "MappedSemanticNamedValue",
+        "MappedSemanticNamedValueProjection",
+        "MappedSemanticNamedValueTarget",
+        "MappedSemanticStorageFixedBytesRefinement",
+        "MappedSemanticStorageRepresentation",
+        "MappedSemanticStorageTypePathSegment",
+    ] {
+        if syntax.items.iter().any(|item| match item {
+            syn::Item::Struct(item) => item.ident == forbidden,
+            syn::Item::Enum(item) => item.ident == forbidden,
+            _ => false,
+        }) {
+            return Err(format!(
+                "`semantic_mapping` restores forbidden post-verification proof shadow `{forbidden}`"
+            ));
+        }
+    }
     let definitions = syntax
         .items
         .iter()
@@ -1772,6 +1815,96 @@ fn verify_semantic_mapping_contract(source: &str) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+fn verify_dense_stage_map_contract(
+    syntax: &syn::File,
+    name: &str,
+    expected_fields: &[&str],
+    non_identity_vec: Option<(&str, &str)>,
+) -> Result<(), String> {
+    let definitions = syntax
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            syn::Item::Struct(definition)
+                if definition.ident == name && !cfg_is_test_only(&definition.attrs) =>
+            {
+                Some(definition)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let [definition] = definitions.as_slice() else {
+        return Err(format!(
+            "`semantic_mapping` must define exactly one production `{name}`; observed {}",
+            definitions.len()
+        ));
+    };
+    let syn::Fields::Named(fields) = &definition.fields else {
+        return Err(format!("`{name}` must use named fields"));
+    };
+    let actual_fields = fields
+        .named
+        .iter()
+        .filter_map(|field| field.ident.as_ref().map(ToString::to_string))
+        .collect::<BTreeSet<_>>();
+    let expected_fields = expected_fields
+        .iter()
+        .map(|field| (*field).to_owned())
+        .collect::<BTreeSet<_>>();
+    if actual_fields != expected_fields {
+        return Err(format!(
+            "`{name}` fields differ from the canonical dense-domain ownership contract"
+        ));
+    }
+    for field in &fields.named {
+        let identifier = field.ident.as_ref().expect("named field");
+        if !matches!(field.vis, syn::Visibility::Inherited) {
+            return Err(format!("`{name}.{identifier}` must remain private"));
+        }
+        let valid = match non_identity_vec {
+            Some((field_name, element)) if identifier == field_name => {
+                direct_vec_element_is(&field.ty, element)
+            }
+            _ => direct_type_is(&field.ty, "usize"),
+        };
+        if !valid {
+            return Err(format!(
+                "`{name}.{identifier}` must be a dense-domain count or the declared non-identity allocation table"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn direct_type_is(ty: &syn::Type, expected: &str) -> bool {
+    matches!(
+        ty,
+        syn::Type::Path(path)
+            if path.qself.is_none()
+                && path.path.segments.len() == 1
+                && path.path.segments[0].ident == expected
+                && path.path.segments[0].arguments.is_empty()
+    )
+}
+
+fn direct_vec_element_is(ty: &syn::Type, expected: &str) -> bool {
+    let syn::Type::Path(path) = ty else {
+        return false;
+    };
+    let Some(segment) = path.path.segments.last() else {
+        return false;
+    };
+    let syn::PathArguments::AngleBracketed(arguments) = &segment.arguments else {
+        return false;
+    };
+    segment.ident == "Vec"
+        && arguments.args.len() == 1
+        && matches!(
+            arguments.args.first(),
+            Some(syn::GenericArgument::Type(element)) if direct_type_is(element, expected)
+        )
 }
 
 fn explicit_map_storage_type(ty: &syn::Type) -> bool {
@@ -3002,5 +3135,21 @@ macro_rules! diagnostic_text {
             mapping.replacen("    value_list_authority_count: usize,\n", "", 1);
         let error = verify_semantic_mapping_contract(&missing_explicit_erasure).unwrap_err();
         assert!(error.contains("value_list_authority_count"), "{error}");
+
+        let restored_identity_vector = mapping.replacen(
+            "    field_count: usize,",
+            "    fields: Vec<MappedReactiveFieldId>,",
+            1,
+        );
+        let error = verify_semantic_mapping_contract(&restored_identity_vector).unwrap_err();
+        assert!(error.contains("SemanticReactiveToMappedMap"), "{error}");
+
+        let restored_proof_shadow = mapping.replacen(
+            "struct MappedSemanticDerivedValue",
+            "struct MappedSemanticNamedValue",
+            1,
+        );
+        let error = verify_semantic_mapping_contract(&restored_proof_shadow).unwrap_err();
+        assert!(error.contains("proof shadow"), "{error}");
     }
 }

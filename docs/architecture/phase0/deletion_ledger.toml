@@ -2523,7 +2523,7 @@ roots = ["crates"]
 extensions = ["rs"]
 mode = "rust-token"
 needle = "BTreeSet"
-expected_occurrences = 1862
+expected_occurrences = 1858
 expected_files = 97
 
 [entries.scans.expected_path_occurrences]
@@ -2553,7 +2553,7 @@ expected_files = 97
 "crates/boon_http_client/src/client.rs" = 2
 "crates/boon_http_runtime/src/lib.rs" = 3
 "crates/boon_ir/src/lib.rs" = 35
-"crates/boon_ir/src/semantic_mapping.rs" = 52
+"crates/boon_ir/src/semantic_mapping.rs" = 46
 "crates/boon_list_access/src/index.rs" = 5
 "crates/boon_native_gpu/src/lib.rs" = 21
 "crates/boon_native_gpu/src/map.rs" = 7
@@ -2617,7 +2617,7 @@ expected_files = 97
 "crates/boon_web_host/tests/foundation.rs" = 2
 "crates/boon_wellen_host/src/lib.rs" = 6
 "crates/boon_wire/src/lib.rs" = 4
-"crates/xtask/src/architecture.rs" = 45
+"crates/xtask/src/architecture.rs" = 47
 "crates/xtask/src/dependency_classifier.rs" = 15
 "crates/xtask/src/fjordpulse_traceability.rs" = 7
 "crates/xtask/src/language_surface.rs" = 2
@@ -2639,7 +2639,7 @@ expected_files = 1
 roots = ["docs/architecture/phase0/container_occurrences.tsv"]
 extensions = ["tsv"]
 needle = "\tmembership\t"
-expected_occurrences = 1750
+expected_occurrences = 1746
 expected_files = 1
 
 [[entries.scans]]

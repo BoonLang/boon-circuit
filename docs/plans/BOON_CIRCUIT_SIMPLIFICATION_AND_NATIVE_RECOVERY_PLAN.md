@@ -265,6 +265,36 @@ Phase 0 deletion and both regenerated inventories pass; only the
 already-declared stale Cells packed baseline and its dependent budget report
 remain open.
 
+The host/session test-ownership cut removes the private
+`DistributedSessionRegistry`, Server transaction/transient-host, and host
+persistent-runtime behavior modules. Public server auth, hostile/resumable
+transport, HTTP contract, in-process restart/effect, and loopback integrations
+own Server behavior; public host content, file effect, stream, service, and
+migration integrations own host persistence and effect behavior. The cut also
+deletes the queue-pressure injection, mutable queue-limit hook, settled-slab
+inspection, direct-delivery helper, and transient-effect count accessor that
+existed only for those private modules. It removes no production migration
+runner, persistence backend, session registry path, state-draining path, or
+checked-in migration fixture.
+
+All 33 host-runtime tests pass, including the three executable migration
+scenarios. The affected Server all-target check passes without warnings. Its
+public test run passes 15 tests and keeps one explicit fixture refresh ignored;
+one websocket loopback remains red because `server_websocket_echo.bn` is
+rejected during compiler expansion with a checked-value cycle before the
+removed host/session test code can run. That broader failure is recorded rather
+than hidden or reported as green.
+
+This cut removes 5,743 tracked Rust lines, including 5,455 test Rust lines. The
+current architecture report measures 426,412 tracked Rust lines and 62,978 test
+Rust lines; only those two global caps fail. Runtime plus executor, playground,
+and xtask production remain within their caps at 40,508, 31,313, and 17,797
+lines. The packed inventory now records 18,642 candidate sites across 80 files,
+and the exact container inventory records 4,909 occurrences across 148 files.
+Phase 0 deletion and both regenerated inventories pass; only the
+already-declared stale Cells packed baseline and its dependent budget report
+remain open.
+
 The executable migration demos currently prove the catalog/`MachinePlan`
 version-migration path, including incremental, skipped-version, restart,
 activation, namespace, and cross-path authority behavior. They do not claim

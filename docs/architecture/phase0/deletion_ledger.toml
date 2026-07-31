@@ -2391,7 +2391,7 @@ roots = ["crates"]
 extensions = ["rs"]
 mode = "rust-token"
 needle = "BTreeMap"
-expected_occurrences = 2963
+expected_occurrences = 2952
 expected_files = 124
 
 [entries.scans.expected_path_occurrences]
@@ -2474,7 +2474,7 @@ expected_files = 124
 "crates/boon_runtime/src/host_capability.rs" = 3
 "crates/boon_runtime/src/lib.rs" = 17
 "crates/boon_host_runtime/src/migration_scenario.rs" = 14
-"crates/boon_host_runtime/src/persistent.rs" = 21
+"crates/boon_host_runtime/src/persistent.rs" = 16
 "crates/boon_host_runtime/src/persistent_program_session.rs" = 3
 "crates/boon_program_runtime/src/program_core.rs" = 3
 "crates/boon_program_runtime/src/program_host.rs" = 15
@@ -2491,9 +2491,9 @@ expected_files = 124
 "crates/boon_semantic/src/storage_contract.rs" = 31
 "crates/boon_server_host/src/host.rs" = 3
 "crates/boon_server_host/src/types.rs" = 3
-"crates/boon_server_runtime/src/distributed_sessions.rs" = 19
+"crates/boon_server_runtime/src/distributed_sessions.rs" = 18
 "crates/boon_server_runtime/src/in_process.rs" = 3
-"crates/boon_server_runtime/src/lib.rs" = 47
+"crates/boon_server_runtime/src/lib.rs" = 42
 "crates/boon_server_runtime/src/router.rs" = 49
 "crates/boon_server_runtime/tests/in_process.rs" = 2
 "crates/boon_typecheck/src/lib.rs" = 381
@@ -2525,7 +2525,7 @@ roots = ["crates"]
 extensions = ["rs"]
 mode = "rust-token"
 needle = "BTreeSet"
-expected_occurrences = 1873
+expected_occurrences = 1871
 expected_files = 97
 
 [entries.scans.expected_path_occurrences]
@@ -2589,7 +2589,7 @@ expected_files = 97
 "crates/boon_runtime/src/effect_host.rs" = 2
 "crates/boon_runtime/src/lib.rs" = 2
 "crates/boon_host_runtime/src/migration_scenario.rs" = 4
-"crates/boon_host_runtime/src/persistent.rs" = 10
+"crates/boon_host_runtime/src/persistent.rs" = 8
 "crates/boon_program_runtime/src/program_core.rs" = 1
 "crates/boon_program_runtime/src/program_host.rs" = 16
 "crates/boon_web_host/src/web_persistent.rs" = 5
@@ -2669,7 +2669,7 @@ expected_files = 1
 roots = ["docs/architecture/phase0/container_occurrences.tsv"]
 extensions = ["tsv"]
 needle = "\ttest-oracle\t"
-expected_occurrences = 511
+expected_occurrences = 498
 expected_files = 1
 
 [[entries.scans]]

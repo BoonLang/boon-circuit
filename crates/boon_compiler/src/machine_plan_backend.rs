@@ -1,10 +1,11 @@
 #![allow(clippy::too_many_arguments)]
 
-use boon_ir::{
-    self as ir, DerivedValueKind, ErasedProgram, InitialValue, ListInitializer, ListMutationKind,
+use boon_ir::ErasedProgram;
+use boon_plan::*;
+use boon_semantic::program_core::{
+    self as ir, DerivedValueKind, InitialValue, ListInitializer, ListMutationKind,
     ListProjectionKind,
 };
-use boon_plan::*;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -1540,10 +1541,7 @@ fn source_payload_field_from_ir(value: &ir::SourcePayloadField) -> SourcePayload
     }
 }
 
-fn state_executable_value_type(
-    program: &ErasedProgram,
-    state: &boon_ir::StateCell,
-) -> PlanValueType {
+fn state_executable_value_type(program: &ErasedProgram, state: &ir::StateCell) -> PlanValueType {
     executable_state_initializer(program, state)
         .and_then(|expression| inferred_executable_expression_value_type(program, expression))
         .filter(|value_type| plan_value_type_is_concrete(*value_type))
@@ -7189,7 +7187,7 @@ fn migration_indexed_default_expression(
 
 fn initial_state_expression(
     program: &ErasedProgram,
-    state: &boon_ir::StateCell,
+    state: &ir::StateCell,
     index: &ValueIndex,
     arena: &mut PlanRowExpressionArena,
     constants: &mut Vec<PlanConstant>,
@@ -7261,7 +7259,7 @@ fn plan_value_type_is_concrete(value_type: PlanValueType) -> bool {
 
 fn derived_value_output_type(
     program: &ErasedProgram,
-    derived: &boon_ir::DerivedValue,
+    derived: &ir::DerivedValue,
 ) -> Option<PlanValueType> {
     let root = derived.producer;
     program
@@ -7478,7 +7476,7 @@ fn plan_value_type_from_typecheck_type(ty: &boon_typecheck::Type) -> Option<Plan
 
 fn plan_initial_list_rows(
     program: &ErasedProgram,
-    list: &boon_ir::ListMemory,
+    list: &ir::ListMemory,
     initializer: &ListInitializer,
     index: &ValueIndex,
     arena: &mut PlanRowExpressionArena,
@@ -7809,7 +7807,7 @@ fn erased_constructor_authority_has_separate_value(
 
 fn public_list_value_field_ids(
     program: &ErasedProgram,
-    list: &boon_ir::ListMemory,
+    list: &ir::ListMemory,
 ) -> BTreeSet<FieldId> {
     let mut names = BTreeSet::new();
     for memory in program.semantic_memory.iter().filter(|memory| {
@@ -7845,7 +7843,7 @@ fn public_list_value_field_ids(
         .collect()
 }
 
-fn list_row_fields(program: &ErasedProgram, list: &boon_ir::ListMemory) -> Vec<PlanListRowField> {
+fn list_row_fields(program: &ErasedProgram, list: &ir::ListMemory) -> Vec<PlanListRowField> {
     let indexed_state_fields = indexed_state_field_ids(program);
     let public_value_fields = public_list_value_field_ids(program, list);
     program
@@ -7932,7 +7930,7 @@ fn bytes_plan_constant(bytes: &[u8]) -> Option<PlanConstantValue> {
 
 fn derived_expression_for_value(
     program: &ErasedProgram,
-    derived: &boon_ir::DerivedValue,
+    derived: &ir::DerivedValue,
     index: &ValueIndex,
     distributed: &DistributedMachineContext,
     arena: &mut PlanRowExpressionArena,
@@ -7967,7 +7965,7 @@ fn derived_expression_for_value(
 
 fn derived_materialized_list_id(
     _program: &ErasedProgram,
-    derived: &boon_ir::DerivedValue,
+    derived: &ir::DerivedValue,
 ) -> Option<ListId> {
     (derived.kind == DerivedValueKind::ListView)
         .then_some(derived.materialized_list_id)
@@ -10827,7 +10825,7 @@ fn collect_materialized_record_field_names(
 
 fn source_event_transform_expression(
     program: &ErasedProgram,
-    derived: &boon_ir::DerivedValue,
+    derived: &ir::DerivedValue,
     index: &ValueIndex,
     arena: &mut PlanRowExpressionArena,
     constants: &mut Vec<PlanConstant>,
@@ -14043,7 +14041,7 @@ fn row_bytes_constant_expression(
 
 fn row_expression_for_value(
     program: &ErasedProgram,
-    derived: &boon_ir::DerivedValue,
+    derived: &ir::DerivedValue,
     index: &ValueIndex,
     _distributed: &DistributedMachineContext,
     arena: &mut PlanRowExpressionArena,
@@ -14719,7 +14717,7 @@ fn delta_routes(
 }
 
 fn derived_output_ref(
-    derived: &boon_ir::DerivedValue,
+    derived: &ir::DerivedValue,
     scalar_fields: &ScalarFieldCatalog,
 ) -> Result<ValueRef, PlanError> {
     if let Some(list) = derived.materialized_list_id {

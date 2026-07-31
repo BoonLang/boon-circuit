@@ -419,6 +419,32 @@ Phase 0 deletion and both regenerated inventories pass; only the
 already-declared stale Cells packed baseline and its dependent budget report
 remain open.
 
+The canonical-core ownership prerequisite removes the erasure allocation map
+from bundle crossing and moves the complete target-neutral executable schema,
+including semantic-memory and migration records, from `boon_ir` into
+`boon_semantic::program_core::CanonicalProgramCoreV1`. `ErasedProgram` remains
+opaque and privately wraps that core plus the source, semantic, and
+verification digests; compiler backends still accept only `ErasedProgram`.
+Compiler consumers now import the semantic-owned schema directly, with no
+`boon_ir` compatibility aliases or duplicate DTO copy. The temporary
+`semantic_mapping` stage still constructs the core and is the next explicit
+deletion boundary. Migration recipes, predecessor handling, persistence,
+semantic memory, migration edges, state/list schedules, and draining paths are
+unchanged.
+
+All 28 IR tests, 18 dependency-classifier tests, 8 architecture-contract
+tests, the affected compiler all-target compile, and the three executable
+Counter, Persons.pro, and TodoMVC migration scenarios pass under serial
+execution. The architecture report fails only the two global line caps, at
+415,948 tracked Rust lines and 54,730 test Rust lines. Runtime plus executor,
+playground, and xtask production remain within their caps at 40,503, 31,125,
+and 17,986 lines. The packed inventory records 17,961 candidate sites across
+81 files, and the exact container inventory records 4,808 occurrences across
+147 files. Phase 0 again fails only the pre-existing stale Cells packed
+baseline and its dependent budget report. This preparatory ownership move adds
+a net 44 tracked Rust lines, including 16 test lines, to establish the final
+owner before deleting the roughly 10,400-line mapping island.
+
 The nested-compositor diagnostic path has been deleted. The replacement uses
 ordinary COSMIC preview/dev windows, kernel uinput mouse and keyboard devices,
 the normal app_window callback route, and app-owned exact-frame WGPU readback.

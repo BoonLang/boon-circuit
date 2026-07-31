@@ -2,7 +2,7 @@ use super::{
     CompileProfile, CompiledMachinePlanFromSource, CompilerResult, CompilerSourceUnit, elapsed_ms,
     machine_plan_backend, parse_source_units,
 };
-use boon_ir::{DistributedCall, ErasedProgram, verify_hidden_identity, verify_static_schedule};
+use boon_ir::{ErasedProgram, verify_hidden_identity, verify_static_schedule};
 use boon_plan::{
     ApplicationIdentity, DataTypeFieldPlan, DataTypePlan, DataVariantPlan, DistributedCallMode,
     DistributedCallResultPlan, DistributedCallRowBindingPlan, DistributedDeclarationId,
@@ -15,6 +15,7 @@ use boon_plan::{
     RemoteCallSitePlan, SourceId, SourcePayloadDescriptor, SourcePayloadField, SourcePayloadSchema,
     SourceRoute, TargetProfile, ValueRef, verify_plan,
 };
+use boon_semantic::program_core::{self as core, DistributedCall};
 use boon_typecheck::{
     CheckedCallEntry, CheckedCallableKind, CheckedContextBinding,
     CheckedExternalDeclarationIdentityV1, CheckedExternalDeclarationKind, CheckedParameterKind,
@@ -1815,7 +1816,7 @@ fn resolve_distributed_producer_value_ref(
                         _ => unreachable!("event authority is always a SOURCE value"),
                     };
                     let source_path =
-                        boon_ir::distributed_event_source_path(&reference.canonical_path);
+                        core::distributed_event_source_path(&reference.canonical_path);
                     let source_id = SourceId(
                         program
                             .sources
@@ -1992,7 +1993,7 @@ fn link_lowered_roles(
                 };
                 let event_source_id = if flow == DistributedReferenceFlow::Event {
                     let source_path =
-                        boon_ir::distributed_event_source_path(&reference.canonical_path);
+                        core::distributed_event_source_path(&reference.canonical_path);
                     Some(SourceId(
                         consumer
                             .ir
@@ -2074,7 +2075,7 @@ fn link_lowered_roles(
                     id: PlanSourceRouteId(usize::MAX),
                     source_id,
                     owner: PlanOwner::root(),
-                    path: boon_ir::distributed_event_source_path(&link.canonical_path),
+                    path: core::distributed_event_source_path(&link.canonical_path),
                     scoped: false,
                     scope_id: None,
                     row_projections: Vec::new(),
@@ -2681,11 +2682,11 @@ fn link_lowered_roles(
             .iter()
             .map(|arm| {
                 let trigger = match arm.cause {
-                    boon_ir::EventCause::Source(source) => ValueRef::Source(SourceId(source.0)),
-                    boon_ir::EventCause::State(state) => {
+                    core::EventCause::Source(source) => ValueRef::Source(SourceId(source.0)),
+                    core::EventCause::State(state) => {
                         ValueRef::State(boon_plan::StateId(state.0))
                     }
-                    boon_ir::EventCause::Pulse(pulse) => {
+                    core::EventCause::Pulse(pulse) => {
                         return Err(PlanError::new(format!(
                             "distributed invocation arm references pulse batch {pulse}, but distributed pulse execution is not implemented"
                         )));
@@ -2818,7 +2819,7 @@ fn link_lowered_roles(
 }
 
 fn bind_checked_expression_refs(
-    refs: &mut BTreeMap<boon_ir::ExecutableExprId, ValueRef>,
+    refs: &mut BTreeMap<core::ExecutableExprId, ValueRef>,
     program: &ErasedProgram,
     checked_expr_id: usize,
     value: ValueRef,
@@ -2851,8 +2852,8 @@ fn bind_checked_expression_refs(
 }
 
 fn bind_executable_expression_ref(
-    refs: &mut BTreeMap<boon_ir::ExecutableExprId, ValueRef>,
-    expression: boon_ir::ExecutableExprId,
+    refs: &mut BTreeMap<core::ExecutableExprId, ValueRef>,
+    expression: core::ExecutableExprId,
     value: ValueRef,
 ) -> Result<(), PlanError> {
     if let Some(previous) = refs.insert(expression, value.clone())
@@ -2982,7 +2983,7 @@ fn validate_distributed_immediate_cycles(
                 .filter(|read| {
                     matches!(
                         read.target,
-                        boon_ir::ErasedReadTarget::ExternalValue { reference }
+                        core::ErasedReadTarget::ExternalValue { reference }
                             if reference == reference_index
                     )
                 })
@@ -2996,12 +2997,12 @@ fn validate_distributed_immediate_cycles(
                 .filter(|use_site| {
                     matches!(
                         use_site.target,
-                        boon_ir::ErasedDependencyTarget::ExternalRead { read }
+                        core::ErasedDependencyTarget::ExternalRead { read }
                             if reads.contains(&read)
                     )
                 })
                 .filter(|use_site| {
-                    matches!(use_site.timing, boon_ir::ErasedDependencyTiming::Immediate)
+                    matches!(use_site.timing, core::ErasedDependencyTiming::Immediate)
                 })
             {
                 let dependent = program
@@ -3233,23 +3234,21 @@ fn distributed_cycle_from(
     None
 }
 
-fn distributed_cycle_binding_value(
-    binding: &boon_ir::ErasedBinding,
-) -> Result<ValueRef, PlanError> {
+fn distributed_cycle_binding_value(binding: &core::ErasedBinding) -> Result<ValueRef, PlanError> {
     match binding.target {
-        boon_ir::ErasedBindingTarget::Value { row: Some(row), .. } => {
+        core::ErasedBindingTarget::Value { row: Some(row), .. } => {
             Ok(ValueRef::List(boon_plan::ListId(row.list.as_usize())))
         }
-        boon_ir::ErasedBindingTarget::Value {
+        core::ErasedBindingTarget::Value {
             field: Some(field), ..
         } => Ok(ValueRef::Field(boon_plan::FieldId(field.as_usize()))),
-        boon_ir::ErasedBindingTarget::Source { runtime, .. } => {
+        core::ErasedBindingTarget::Source { runtime, .. } => {
             Ok(ValueRef::Source(SourceId(runtime.as_usize())))
         }
-        boon_ir::ErasedBindingTarget::State { runtime, .. } => {
+        core::ErasedBindingTarget::State { runtime, .. } => {
             Ok(ValueRef::State(boon_plan::StateId(runtime.as_usize())))
         }
-        boon_ir::ErasedBindingTarget::Value { .. } => Err(PlanError::new(format!(
+        core::ErasedBindingTarget::Value { .. } => Err(PlanError::new(format!(
             "distributed cycle dependency binding {} has no exact machine storage",
             binding.id
         ))),
@@ -3259,7 +3258,7 @@ fn distributed_cycle_binding_value(
 fn erased_external_call_owner_path(
     program: &ErasedProgram,
     reference: usize,
-    static_owner: Option<boon_ir::StaticOwnerId>,
+    static_owner: Option<core::StaticOwnerId>,
 ) -> Result<String, PlanError> {
     let owners = program
         .scope_index
@@ -3268,7 +3267,7 @@ fn erased_external_call_owner_path(
         .filter_map(|use_site| {
             matches!(
                 use_site.target,
-                boon_ir::ErasedDependencyTarget::ExternalCall {
+                core::ErasedDependencyTarget::ExternalCall {
                     reference: candidate,
                 } if candidate == reference
             )
@@ -3337,7 +3336,7 @@ fn erased_external_call_owner_path(
 
 fn distributed_call_row_bindings(
     program: &ErasedProgram,
-    owner: Option<boon_ir::StaticOwnerId>,
+    owner: Option<core::StaticOwnerId>,
     owner_plan: &PlanOwner,
 ) -> Result<Vec<DistributedCallRowBindingPlan>, PlanError> {
     let mut ancestry = Vec::new();

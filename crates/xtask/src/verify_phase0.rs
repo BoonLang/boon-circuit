@@ -16,7 +16,7 @@ const DEFAULT_REPORT: &str = "target/reports/phase0-v1/evidence.json";
 const VERSIONS_MANIFEST: &str = "docs/architecture/phase0/versions.toml";
 const DELETION_MANIFEST: &str = "docs/architecture/phase0/deletion_ledger.toml";
 const DELETION_MANIFEST_SHA256: &str =
-    "4bec3a973b804d30c423158a00a56d475cf587e1029c69d88022b0cc53338dc3";
+    "cd4a535935d0036d21696607ab2e51d97d16164930340e013f61b352d96e2f39";
 const CONTAINER_MANIFEST: &str = "docs/architecture/phase0/container_inventory.toml";
 #[cfg(test)]
 const CONTAINER_OCCURRENCE_LEDGER: &str = "docs/architecture/phase0/container_occurrences.tsv";

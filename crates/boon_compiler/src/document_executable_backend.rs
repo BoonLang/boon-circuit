@@ -1,6 +1,7 @@
 use crate::machine_plan_backend::{ValueIndex, lower_document_runtime_expression};
-use boon_ir::{self as ir, ErasedProgram};
+use boon_ir::ErasedProgram;
 use boon_plan::*;
+use boon_semantic::program_core as ir;
 use boon_typecheck::{Type, is_renderable_type};
 use std::collections::{BTreeMap, BTreeSet};
 

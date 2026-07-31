@@ -18,6 +18,7 @@ scan_roots = [
   "crates/boon_plan_executor",
   "crates/boon_program_runtime",
   "crates/boon_runtime",
+  "crates/boon_semantic/src/program_core.rs",
   "crates/boon_server_runtime",
   "crates/boon_typecheck",
   "crates/boon_web_host/src/web_persistent.rs",
@@ -94,12 +95,12 @@ occurrence_ledger_generator = "cargo run -p xtask --example packed_site_inventor
 occurrence_ledger_validator = "cargo run -p xtask --example packed_site_inventory -- --check"
 
 # Updated only after reviewing a deterministic generator run.
-expected_probe_set_sha256 = "74d30b30f6bcf09c10edaef60aefbae001c6bc9843751989617840593d5c7296"
-expected_file_set_sha256 = "4bf148d82417a80c61fdd3bf9d7823c9409be05cf009d74371b3133e0d34d0f2"
+expected_probe_set_sha256 = "1e073de6ea4ca3b1c2669e5199a01e841a08e370a9b394103cd0c9f7d0b4d83f"
+expected_file_set_sha256 = "05bc90b390a15c6aca4281eef51fb88084e94aaef99ba1acd761f5d40b559e63"
 expected_scanned_files = 91
-expected_occurrence_files = 80
-expected_occurrence_ledger_sha256 = "18447180f92c9b243eca950424140d2d4d136f2d8b3d1b4eaff90b95db542928"
-expected_occurrence_rows = 17960
+expected_occurrence_files = 81
+expected_occurrence_ledger_sha256 = "c0682b7c63fb5382efeb05b2336bfb00ca5fd6afee0afd25819738de68d80318"
+expected_occurrence_rows = 17961
 
 [[categories]]
 order = 0
@@ -136,9 +137,9 @@ order = 3
 id = "allocation-or-growth"
 owner_phase = "goal-phase-5-packed"
 owner_plan = "docs/plans/BOON_PACKED_DATA_AND_DENSE_INTERNALS_PLAN.md"
-expected_rows = 14119
+expected_rows = 14120
 expected_hot = 4151
-expected_cold = 8535
+expected_cold = 8536
 expected_boundary = 1433
 
 [[categories]]

@@ -665,6 +665,7 @@ fn verified_semantic_compiler_spine(workspace: &Path) -> Result<String, String> 
     verify_semantic_dependency_allowlist(workspace, &members)?;
 
     let semantic = read_text(&workspace.join("crates/boon_semantic/src/lib.rs"))?;
+    let program_core = read_text(&workspace.join("crates/boon_semantic/src/program_core.rs"))?;
     let verify = read_text(&workspace.join("crates/boon_verify/src/lib.rs"))?;
     let ir = read_text(&workspace.join("crates/boon_ir/src/lib.rs"))?;
     let parser = read_text(&workspace.join("crates/boon_parser/src/lib.rs"))?;
@@ -697,6 +698,7 @@ fn verified_semantic_compiler_spine(workspace: &Path) -> Result<String, String> 
         "source_bundle_digest_v1",
         "SourceBundleDigestV1",
     )?;
+    verify_required_direct_field(&ir, "ErasedProgram", "fields", "CanonicalProgramCoreV1")?;
     verify_required_direct_field(
         &ir,
         "ErasedProgram",
@@ -720,6 +722,20 @@ fn verified_semantic_compiler_spine(workspace: &Path) -> Result<String, String> 
         return Err(
             "semantic or verifier source reaches upward into executable boon_ir types".to_owned(),
         );
+    }
+    if exact_struct_definition_lines(&program_core, "CanonicalProgramCoreV1").count() != 1 {
+        return Err("boon_semantic must own exactly one public CanonicalProgramCoreV1".to_owned());
+    }
+    for forbidden in [
+        "pub struct ErasedProgramFields",
+        "pub type ErasedProgramFields",
+        "pub use boon_semantic::program_core",
+    ] {
+        if ir.contains(forbidden) {
+            return Err(format!(
+                "boon_ir retains compatibility ownership for the semantic core via `{forbidden}`"
+            ));
+        }
     }
     for required in [
         "pub struct SemanticProgram",
@@ -2457,9 +2473,12 @@ fn imported_boundary_functions(
             }
         }
         syn::UseTree::Glob(_) => {
-            if prefix.first().is_some_and(|root| {
-                matches!(root.as_str(), "boon_semantic" | "boon_verify" | "boon_ir")
-            }) {
+            let canonical_core_glob = prefix.as_slice() == ["boon_semantic", "program_core"];
+            if !canonical_core_glob
+                && prefix.first().is_some_and(|root| {
+                    matches!(root.as_str(), "boon_semantic" | "boon_verify" | "boon_ir")
+                })
+            {
                 output.push(format!("{}::*", prefix.join("::")));
             }
         }

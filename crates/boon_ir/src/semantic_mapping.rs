@@ -8893,7 +8893,7 @@ pub(super) fn finish_verified_semantic_lowering(
     pulse_fusion_decisions: &[boon_verify::VerifiedPulseFusionDecisionV1],
     mapped: MappedSemanticExecution,
     resources: MappedSemanticResources,
-) -> Result<crate::ErasedProgramFields, String> {
+) -> Result<crate::CanonicalProgramCoreV1, String> {
     let mut resources = resources;
     let reactive = map_semantic_reactive(
         execution_graph,
@@ -9017,7 +9017,7 @@ pub(super) fn finish_verified_semantic_lowering(
     }
     let graph_node_count = executable.expressions.len();
 
-    Ok(crate::ErasedProgramFields {
+    Ok(crate::CanonicalProgramCoreV1 {
         executable,
         scope_index: crate::ErasedScopeIndex {
             owners,

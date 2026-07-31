@@ -2913,8 +2913,8 @@ expected_files = 0
 roots = ["crates/boon_ir/src/lib.rs"]
 extensions = ["rs"]
 needle = "pub executable: ExecutableProgram,"
-expected_occurrences = 1
-expected_files = 1
+expected_occurrences = 0
+expected_files = 0
 
 [[entries.scans]]
 roots = ["crates/boon_ir/src/lib.rs"]

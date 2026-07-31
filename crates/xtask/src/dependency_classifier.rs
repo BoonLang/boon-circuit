@@ -213,6 +213,13 @@ fn required_source_specs() -> Vec<SourceSpecV1> {
             additional_types: Vec::new(),
         },
         SourceSpecV1 {
+            path: "crates/boon_semantic/src/program_core.rs".to_owned(),
+            selection: SourceSelectionV1::AllPublic,
+            prefixes: Vec::new(),
+            explicit_types: Vec::new(),
+            additional_types: Vec::new(),
+        },
+        SourceSpecV1 {
             path: "crates/boon_ir/src/semantic_mapping.rs".to_owned(),
             selection: SourceSelectionV1::Explicit,
             prefixes: Vec::new(),
@@ -1746,8 +1753,8 @@ fields = [
         let ir = downgraded
             .sources
             .iter_mut()
-            .find(|source| source.path == "crates/boon_ir/src/lib.rs")
-            .expect("required IR source exists");
+            .find(|source| source.path == "crates/boon_semantic/src/program_core.rs")
+            .expect("required canonical-core source exists");
         ir.selection = SourceSelectionV1::Prefixes;
         ir.prefixes = vec!["Erased".to_owned()];
         cases.push(downgraded);
@@ -1939,12 +1946,17 @@ fields = [
                 Some(false),
             ),
             (
-                "crates/boon_ir/src/lib.rs",
+                "crates/boon_semantic/src/program_core.rs",
                 "ExecutableProgram",
                 "functions",
                 None,
             ),
-            ("crates/boon_ir/src/lib.rs", "DerivedValue", "kind", None),
+            (
+                "crates/boon_semantic/src/program_core.rs",
+                "DerivedValue",
+                "kind",
+                None,
+            ),
             (
                 "crates/boon_semantic/src/execution.rs",
                 "SemanticStatement",
@@ -2010,8 +2022,8 @@ fields = [
         );
 
         let debug_fields = suggest_disposition(
-            "crates/boon_ir/src/lib.rs",
-            "ErasedProgramFields",
+            "crates/boon_semantic/src/program_core.rs",
+            "CanonicalProgramCoreV1",
             "debug_fields",
             None,
         );
@@ -2159,10 +2171,22 @@ fields = [
                     schema,
                     &mut suggested_dispositions,
                 );
-                records.push(merge_reviewed_record(
-                    previous_records.get(&(source.path.clone(), name)),
-                    suggested,
-                ));
+                let previous = previous_records
+                    .get(&(source.path.clone(), name.clone()))
+                    .or_else(|| {
+                        (source.path == "crates/boon_semantic/src/program_core.rs").then(|| {
+                            let previous_name = if name == "CanonicalProgramCoreV1" {
+                                "ErasedProgramFields"
+                            } else {
+                                name.as_str()
+                            };
+                            previous_records.get(&(
+                                "crates/boon_ir/src/lib.rs".to_owned(),
+                                previous_name.to_owned(),
+                            ))
+                        })?
+                    });
+                records.push(merge_reviewed_record(previous, suggested));
             }
         }
         let used_dispositions = records

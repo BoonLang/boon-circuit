@@ -1,3 +1,6 @@
+use boon_ir::erase_and_lower;
+use boon_semantic::program_core as core;
+
 fn compile_test_source(
     source_label: &str,
     source_text: &str,
@@ -171,12 +174,12 @@ fn bounded_pulse_stream_contracts_are_public_to_compiler_consumers() {
         boon_verify::VerifiedPulseFusionStatusV1::Ineligible { reasons }
             if reasons.contains(&boon_verify::PulseFusionIneligibilityV1::NoActivationLocalState)
     ));
-    let ir = boon_ir::erase_and_lower(verified).expect("erased pulse stream");
+    let ir = erase_and_lower(verified).expect("erased pulse stream");
     assert!(ir.activations().is_empty());
     let [batch] = ir.pulse_batches() else {
         panic!("one typed Stream/pulses call must lower to one baseline pulse batch");
     };
-    assert_eq!(batch.id, boon_ir::PulseBatchId(0));
+    assert_eq!(batch.id, core::PulseBatchId(0));
     assert_eq!(batch.state, None);
     assert_eq!(batch.hold_expression, None);
     assert_eq!(batch.enclosing_activation, None);
@@ -184,7 +187,7 @@ fn bounded_pulse_stream_contracts_are_public_to_compiler_consumers() {
     assert_ne!(batch.semantic_slice_digest, [0; 32]);
     assert!(matches!(
         ir.executable.expressions[batch.call_expression.as_usize()].kind,
-        boon_ir::ExecutableExpressionKind::Call {
+        core::ExecutableExpressionKind::Call {
             intrinsic: Some(boon_typecheck::CheckedIntrinsicV1::StreamPulses),
             ..
         }
@@ -235,21 +238,21 @@ fn canonical_fibonacci_pulses_cross_the_verified_ir_spine() {
         &decision.status,
         boon_verify::VerifiedPulseFusionStatusV1::Eligible { .. }
     ));
-    let ir = boon_ir::erase_and_lower(verified).expect("erased Fibonacci");
+    let ir = erase_and_lower(verified).expect("erased Fibonacci");
 
     let hold_updates = ir
         .executable
         .expressions
         .iter()
         .find_map(|expression| match &expression.kind {
-            boon_ir::ExecutableExpressionKind::Hold { updates, .. } => Some(updates),
+            core::ExecutableExpressionKind::Hold { updates, .. } => Some(updates),
             _ => None,
         })
         .expect("canonical HOLD");
     assert_eq!(hold_updates.len(), 1);
     assert!(matches!(
         ir.executable.expressions[hold_updates[0].as_usize()].kind,
-        boon_ir::ExecutableExpressionKind::Then { .. }
+        core::ExecutableExpressionKind::Then { .. }
     ));
     for (function, intrinsic) in [
         (
@@ -264,7 +267,7 @@ fn canonical_fibonacci_pulses_cross_the_verified_ir_spine() {
         assert!(ir.executable.expressions.iter().any(|expression| {
             matches!(
                 &expression.kind,
-                boon_ir::ExecutableExpressionKind::Call {
+                core::ExecutableExpressionKind::Call {
                     name,
                     intrinsic: Some(found),
                     ..
@@ -273,28 +276,27 @@ fn canonical_fibonacci_pulses_cross_the_verified_ir_spine() {
         }));
     }
     assert_eq!(ir.state_cells.len(), 1);
-    let boon_ir::StateCellLifetimeV1::ActivationLocal { then_expression } =
-        ir.state_cells[0].lifetime
+    let core::StateCellLifetimeV1::ActivationLocal { then_expression } = ir.state_cells[0].lifetime
     else {
         panic!("Fibonacci HOLD must be scoped to its enclosing THEN activation");
     };
     assert!(matches!(
         ir.executable.expressions[then_expression.as_usize()].kind,
-        boon_ir::ExecutableExpressionKind::Then { .. }
+        core::ExecutableExpressionKind::Then { .. }
     ));
     assert_ne!(then_expression, hold_updates[0]);
 
     let [activation] = ir.activations() else {
         panic!("activation-local Fibonacci HOLD must own one activation site");
     };
-    assert_eq!(activation.id, boon_ir::ActivationId(0));
+    assert_eq!(activation.id, core::ActivationId(0));
     assert_eq!(activation.then_expression, then_expression);
     assert_eq!(activation.states, vec![ir.state_cells[0].id]);
 
     let [batch] = ir.pulse_batches() else {
         panic!("canonical Fibonacci must own one baseline pulse batch");
     };
-    assert_eq!(batch.id, boon_ir::PulseBatchId(0));
+    assert_eq!(batch.id, core::PulseBatchId(0));
     assert_eq!(batch.enclosing_activation, Some(activation.id));
     assert_eq!(batch.state, Some(ir.state_cells[0].id));
     assert_eq!(
@@ -304,10 +306,7 @@ fn canonical_fibonacci_pulses_cross_the_verified_ir_spine() {
                 .expressions
                 .iter()
                 .find(|expression| {
-                    matches!(
-                        expression.kind,
-                        boon_ir::ExecutableExpressionKind::Hold { .. }
-                    )
+                    matches!(expression.kind, core::ExecutableExpressionKind::Hold { .. })
                 })
                 .expect("canonical HOLD expression")
                 .id
@@ -315,23 +314,23 @@ fn canonical_fibonacci_pulses_cross_the_verified_ir_spine() {
     );
     assert_eq!(
         batch.schedule,
-        boon_ir::PulseSchedule::StageArbitrateCommitPublishBeforeNext
+        core::PulseSchedule::StageArbitrateCommitPublishBeforeNext
     );
     assert_eq!(
         batch.flush_policy,
-        boon_ir::PulseFlushPolicy::DiscardCurrentStopRemainingKeepPriorCommits
+        core::PulseFlushPolicy::DiscardCurrentStopRemainingKeepPriorCommits
     );
     assert!(!batch.trigger_arms.is_empty());
     assert!(
         batch
             .trigger_arms
             .iter()
-            .all(|arm| arm.cause == boon_ir::EventCause::Pulse(batch.id))
+            .all(|arm| arm.cause == core::EventCause::Pulse(batch.id))
     );
     assert_eq!(batch.state_update_arms.len(), 1);
     assert_eq!(
         batch.state_update_arms[0].cause,
-        boon_ir::EventCause::Pulse(batch.id)
+        core::EventCause::Pulse(batch.id)
     );
     assert_eq!(batch.state_update_arms[0].state, ir.state_cells[0].id);
     assert!(ir.state_updates().contains(&batch.state_update_arms[0]));
@@ -339,15 +338,15 @@ fn canonical_fibonacci_pulses_cross_the_verified_ir_spine() {
         batch
             .emission_routes
             .iter()
-            .any(|route| matches!(route.filter, boon_ir::PulseEmissionFilter::Skip { .. }))
+            .any(|route| matches!(route.filter, core::PulseEmissionFilter::Skip { .. }))
     );
     assert!(matches!(
         &batch.fusion,
-        boon_ir::PulseFusionEligibility::VerifiedActivationLocalRecurrence {
+        core::PulseFusionEligibility::VerifiedActivationLocalRecurrence {
             activation,
             state,
             state_update_arm_index: 0,
-            proof: boon_ir::PulseFusionProof::FrozenRuntimeTargetGuardedFullTraceEmptySideLanes,
+            proof: core::PulseFusionProof::FrozenRuntimeTargetGuardedFullTraceEmptySideLanes,
         } if *activation == batch.enclosing_activation.unwrap()
             && *state == batch.state.unwrap()
     ));
@@ -451,12 +450,12 @@ fn list_materialized_fibonacci_owns_activation_local_state_per_row() {
     let semantic = boon_semantic::elaborate(checked.program.expect("checked"), &[])
         .expect("semantic Fibonacci list");
     let verified = boon_verify::verify_explicit_contracts(semantic).expect("verified");
-    let ir = boon_ir::erase_and_lower(verified).expect("erased");
+    let ir = erase_and_lower(verified).expect("erased");
     assert_eq!(ir.state_cells.len(), 1);
     assert!(ir.state_cells[0].indexed);
     assert!(matches!(
         ir.state_cells[0].lifetime,
-        boon_ir::StateCellLifetimeV1::ActivationLocal { .. }
+        core::StateCellLifetimeV1::ActivationLocal { .. }
     ));
 
     let compiled = compile_test_source(
@@ -627,16 +626,16 @@ fn compiler_worklist_carries_a_verified_preserved_list_mutation_lane() {
         boon_verify::VerifiedPulseFusionElisionPolicyV1::ElideOnlyUnobservedRecurrenceStateRouting
     );
 
-    let ir = boon_ir::erase_and_lower(verified).expect("erased compiler worklist");
+    let ir = erase_and_lower(verified).expect("erased compiler worklist");
     let [batch] = ir.pulse_batches() else {
         panic!("compiler worklist must lower one pulse batch");
     };
     assert_eq!(batch.list_mutations.len(), 1);
     assert!(matches!(
         batch.fusion,
-        boon_ir::PulseFusionEligibility::VerifiedActivationLocalRecurrence {
+        core::PulseFusionEligibility::VerifiedActivationLocalRecurrence {
             proof:
-                boon_ir::PulseFusionProof::FrozenRuntimeTargetGuardedFullTracePreservedListMutations,
+                core::PulseFusionProof::FrozenRuntimeTargetGuardedFullTracePreservedListMutations,
             ..
         }
     ));

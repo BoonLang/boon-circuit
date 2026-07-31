@@ -4969,10 +4969,11 @@ host_ports: [
 mod transaction_tests {
     use super::*;
     use async_trait::async_trait;
+    use boon_distributed_runtime::{DistributedClientRuntime, DistributedQueueLimits};
     use boon_persistence::InMemoryDriver;
     use boon_runtime::{
-        ApplicationIdentity, DistributedClientRuntime, DistributedQueueLimits,
-        ProgramCompileRequest, RuntimeSourceUnit, compile_distributed_program_bundle,
+        ApplicationIdentity, ProgramCompileRequest, RuntimeSourceUnit,
+        compile_distributed_program_bundle,
     };
     use boon_wire::{
         ClientCommit, ClientHello, ServerReady, SessionControlFrame, SessionId,
@@ -5054,7 +5055,7 @@ scene: Scene/Element/text(
             .distributed_sessions
             .as_mut()
             .unwrap()
-            .set_session_queue_limits_for_test(boon_runtime::DistributedQueueLimits {
+            .set_session_queue_limits_for_test(DistributedQueueLimits {
                 max_messages: 1,
                 max_bytes: 1024 * 1024,
             });

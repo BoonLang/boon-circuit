@@ -4,14 +4,16 @@ use crate::{
     DistributedServerAuthority, DistributedServerUpdate, PreparedDistributedServerTransaction,
     ServerDelivery, ServerDeliveryTarget,
 };
-use boon_plan::ProgramRole;
 #[cfg(test)]
-use boon_runtime::DistributedMessagePayload;
+use boon_distributed_runtime::DistributedMessagePayload;
+use boon_distributed_runtime::{
+    DistributedMessage, DistributedQueueLimits, DistributedSessionRuntime,
+    DistributedSessionTemplate, DistributedSessionUpdate,
+};
+use boon_plan::ProgramRole;
 use boon_runtime::{
-    DistributedMessage, DistributedProgramBundle, DistributedQueueLimits, DistributedRuntimeError,
-    DistributedServerMachine, DistributedSessionRuntime, DistributedSessionTemplate,
-    DistributedSessionUpdate, RuntimeTurn, SessionConnectionStatus, SessionOrigin,
-    SessionPrincipal, Value,
+    DistributedProgramBundle, DistributedRuntimeError, DistributedServerMachine, RuntimeTurn,
+    SessionConnectionStatus, SessionOrigin, SessionPrincipal, Value,
 };
 use boon_wire::{
     ResumeToken, ResumeTokenGenerationError, ServerOffer, ServerReady, ServerReject, ServerRevoked,
@@ -2139,11 +2141,11 @@ fn estimated_message_bytes(message: &DistributedMessage) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use boon_distributed_runtime::DistributedClientRuntime;
     use boon_persistence::StoredValue as DataValue;
     use boon_runtime::{
-        ApplicationIdentity, DistributedClientRuntime, ProgramCapabilityProfile,
-        ProgramCompileRequest, ProgramSession, RuntimeSourceUnit, SourcePayload,
-        compile_distributed_program_bundle,
+        ApplicationIdentity, ProgramCapabilityProfile, ProgramCompileRequest, ProgramSession,
+        RuntimeSourceUnit, SourcePayload, compile_distributed_program_bundle,
     };
     use boon_wire::{ClientCommit, ClientHello, ClientRevoke, SessionId};
     use std::sync::{Arc, Mutex, OnceLock};

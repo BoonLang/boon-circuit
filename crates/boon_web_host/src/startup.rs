@@ -1,10 +1,11 @@
 use crate::{DistributedSessionIdentity, WebHostError, WebHostResult};
 use boon_app_package::BrowserAppConfig;
-use boon_plan::EffectContract;
-use boon_runtime::{
+use boon_distributed_runtime::{
     ClientSessionQueueLimits, DistributedClientRuntime, DistributedClientStartupPoll,
-    DistributedClientStartupTask, MachineBuildProgress,
+    DistributedClientStartupTask,
 };
+use boon_plan::EffectContract;
+use boon_runtime::MachineBuildProgress;
 
 /// A verified public Client artifact mounted into the distributed Client
 /// endpoint. The browser adapter must move these parts into the resumable

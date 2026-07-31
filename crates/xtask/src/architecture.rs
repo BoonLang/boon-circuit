@@ -2412,6 +2412,7 @@ fn no_example_specific_engine_branches(workspace: &Path) -> Result<String, Strin
         "crates/boon_ir/",
         "crates/boon_plan/",
         "crates/boon_plan_executor/",
+        "crates/boon_distributed_runtime/",
         "crates/boon_runtime/",
         "crates/boon_persistence/",
         "crates/boon_document_model/",

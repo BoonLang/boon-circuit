@@ -735,6 +735,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "boon_distributed_runtime"
+version = "0.1.0"
+dependencies = [
+ "boon_data",
+ "boon_plan",
+ "boon_runtime",
+ "boon_wire",
+ "ciborium",
+ "serde",
+ "sha2",
+]
+
+[[package]]
 name = "boon_document"
 version = "0.1.0"
 dependencies = [
@@ -1066,6 +1079,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "boon_data",
+ "boon_distributed_runtime",
  "boon_effect_schema",
  "boon_host_runtime",
  "boon_persistence",
@@ -1131,6 +1145,7 @@ name = "boon_web_host"
 version = "0.1.0"
 dependencies = [
  "boon_app_package",
+ "boon_distributed_runtime",
  "boon_document",
  "boon_effect_schema",
  "boon_host",

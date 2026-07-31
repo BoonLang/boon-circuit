@@ -84,6 +84,23 @@ existing scheduling expectations failed. The moved router body is
 diff-identical to its prior `boon_runtime` body, so the failures are recorded
 rather than hidden or misreported as a passing broad suite.
 
+The next production ownership cut moves the existing target-neutral Client and
+Session transport orchestration into `boon_distributed_runtime`. The crate
+wraps, but does not duplicate, the one `boon_runtime` machine path; Server and
+browser hosts now consume it directly. `boon_runtime` retains the shared
+distributed error, narrow Server machine authority trait, opaque Session
+origin, and data-boundary helpers. No migration runner, migration fixture,
+draining state, persistence path, or transport behavior was removed. The
+runtime-plus-executor count is now 58,055, a 4,169-line reduction that leaves
+16,055 lines above its cap; tracked Rust is 456,321 and test Rust is 92,306.
+The packed-site and container inventories explicitly classify the new crate and
+pass with 19,892 packed candidates across 86 source files and 5,037 exact
+container occurrences across 154 files. The new crate's nine algorithm tests,
+the four-case in-process Client/Session/Server suite, the browser transport's
+17 reconnect/journal/backpressure tests, formatting, and an affected all-target
+compile pass under serial execution. The broader Server scheduling failures
+recorded above have not been reclassified or hidden.
+
 The nested-compositor diagnostic path has been deleted. The replacement uses
 ordinary COSMIC preview/dev windows, kernel uinput mouse and keyboard devices,
 the normal app_window callback route, and app-owned exact-frame WGPU readback.

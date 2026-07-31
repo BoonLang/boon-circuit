@@ -261,6 +261,11 @@ impl ProgramArtifact {
         &self.template
     }
 
+    #[doc(hidden)]
+    pub fn max_runtime_work_units_per_transaction(&self) -> u64 {
+        program_limits(self.capability_profile).max_runtime_work_units_per_transaction
+    }
+
     pub fn role(&self) -> ProgramRole {
         self.plan.program_role
     }

@@ -895,7 +895,7 @@ impl From<boon_runtime::DistributedRuntimeError> for DistributedSessionSocketErr
     }
 }
 
-/// Narrow transport-facing surface of [`boon_runtime::DistributedClientRuntime`].
+/// Narrow transport-facing surface of [`boon_distributed_runtime::DistributedClientRuntime`].
 ///
 /// The trait keeps browser-independent lifecycle tests deterministic without a
 /// WebAssembly runtime. Product hosts use the concrete implementation below.
@@ -905,20 +905,32 @@ pub trait DistributedSessionClientRuntime {
         session_id: SessionId,
         generation: u64,
         applied_client_through: u64,
-    ) -> Result<boon_runtime::DistributedClientUpdate, boon_runtime::DistributedRuntimeError>;
+    ) -> Result<
+        boon_distributed_runtime::DistributedClientUpdate,
+        boon_runtime::DistributedRuntimeError,
+    >;
 
     fn mark_current(
         &mut self,
-    ) -> Result<boon_runtime::DistributedClientUpdate, boon_runtime::DistributedRuntimeError>;
+    ) -> Result<
+        boon_distributed_runtime::DistributedClientUpdate,
+        boon_runtime::DistributedRuntimeError,
+    >;
 
     fn mark_stale(
         &mut self,
-    ) -> Result<boon_runtime::DistributedClientUpdate, boon_runtime::DistributedRuntimeError>;
+    ) -> Result<
+        boon_distributed_runtime::DistributedClientUpdate,
+        boon_runtime::DistributedRuntimeError,
+    >;
 
     fn accept_session_frame(
         &mut self,
         bytes: &[u8],
-    ) -> Result<boon_runtime::DistributedClientUpdate, boon_runtime::DistributedRuntimeError>;
+    ) -> Result<
+        boon_distributed_runtime::DistributedClientUpdate,
+        boon_runtime::DistributedRuntimeError,
+    >;
 
     fn next_session_frame(
         &mut self,
@@ -931,14 +943,17 @@ pub trait DistributedSessionClientRuntime {
     fn applied_server_through(&self) -> u64;
 }
 
-impl DistributedSessionClientRuntime for boon_runtime::DistributedClientRuntime {
+impl DistributedSessionClientRuntime for boon_distributed_runtime::DistributedClientRuntime {
     fn bind(
         &mut self,
         session_id: SessionId,
         generation: u64,
         applied_client_through: u64,
-    ) -> Result<boon_runtime::DistributedClientUpdate, boon_runtime::DistributedRuntimeError> {
-        boon_runtime::DistributedClientRuntime::bind(
+    ) -> Result<
+        boon_distributed_runtime::DistributedClientUpdate,
+        boon_runtime::DistributedRuntimeError,
+    > {
+        boon_distributed_runtime::DistributedClientRuntime::bind(
             self,
             session_id,
             generation,
@@ -948,39 +963,48 @@ impl DistributedSessionClientRuntime for boon_runtime::DistributedClientRuntime 
 
     fn mark_current(
         &mut self,
-    ) -> Result<boon_runtime::DistributedClientUpdate, boon_runtime::DistributedRuntimeError> {
-        boon_runtime::DistributedClientRuntime::mark_current(self)
+    ) -> Result<
+        boon_distributed_runtime::DistributedClientUpdate,
+        boon_runtime::DistributedRuntimeError,
+    > {
+        boon_distributed_runtime::DistributedClientRuntime::mark_current(self)
     }
 
     fn mark_stale(
         &mut self,
-    ) -> Result<boon_runtime::DistributedClientUpdate, boon_runtime::DistributedRuntimeError> {
-        boon_runtime::DistributedClientRuntime::mark_stale(self)
+    ) -> Result<
+        boon_distributed_runtime::DistributedClientUpdate,
+        boon_runtime::DistributedRuntimeError,
+    > {
+        boon_distributed_runtime::DistributedClientRuntime::mark_stale(self)
     }
 
     fn accept_session_frame(
         &mut self,
         bytes: &[u8],
-    ) -> Result<boon_runtime::DistributedClientUpdate, boon_runtime::DistributedRuntimeError> {
-        boon_runtime::DistributedClientRuntime::accept_session_frame(self, bytes)
+    ) -> Result<
+        boon_distributed_runtime::DistributedClientUpdate,
+        boon_runtime::DistributedRuntimeError,
+    > {
+        boon_distributed_runtime::DistributedClientRuntime::accept_session_frame(self, bytes)
     }
 
     fn next_session_frame(
         &mut self,
     ) -> Result<Option<Vec<u8>>, boon_runtime::DistributedRuntimeError> {
-        boon_runtime::DistributedClientRuntime::next_session_frame(self)
+        boon_distributed_runtime::DistributedClientRuntime::next_session_frame(self)
     }
 
     fn acknowledge_session_frame(&mut self) -> bool {
-        boon_runtime::DistributedClientRuntime::acknowledge_session_frame(self)
+        boon_distributed_runtime::DistributedClientRuntime::acknowledge_session_frame(self)
     }
 
     fn pending_session_frames(&self) -> usize {
-        boon_runtime::DistributedClientRuntime::pending_session_frames(self)
+        boon_distributed_runtime::DistributedClientRuntime::pending_session_frames(self)
     }
 
     fn applied_server_through(&self) -> u64 {
-        boon_runtime::DistributedClientRuntime::applied_server_through(self)
+        boon_distributed_runtime::DistributedClientRuntime::applied_server_through(self)
     }
 }
 
@@ -1212,13 +1236,13 @@ pub enum DistributedSessionSocketAdmission {
 
 #[derive(Debug, Default)]
 pub struct DistributedSessionSocketPoll {
-    pub runtime_updates: Vec<boon_runtime::DistributedClientUpdate>,
+    pub runtime_updates: Vec<boon_distributed_runtime::DistributedClientUpdate>,
 }
 
 #[derive(Debug)]
 pub struct DistributedSessionSocketDisconnect {
     pub admission: DistributedSessionSocketAdmission,
-    pub runtime_update: Option<boon_runtime::DistributedClientUpdate>,
+    pub runtime_update: Option<boon_distributed_runtime::DistributedClientUpdate>,
 }
 
 /// Borrowed front frame of the browser outbound queue.
@@ -1263,7 +1287,8 @@ enum DistributedSessionSocketLifecycle {
 /// [`Self::begin_connect`]. Events from replaced sockets are ignored before
 /// they can reach the handshake or runtime. Inbound frames and outbound frames
 /// awaiting browser admission are separately bounded.
-pub struct DistributedSessionSocketOwner<S, R = boon_runtime::DistributedClientRuntime> {
+pub struct DistributedSessionSocketOwner<S, R = boon_distributed_runtime::DistributedClientRuntime>
+{
     handshake: Option<DistributedSessionHandshake<S>>,
     pending_hello: Option<Vec<u8>>,
     restart_handshake: bool,
@@ -1800,7 +1825,7 @@ where
     }
 }
 
-impl<S> DistributedSessionSocketOwner<S, boon_runtime::DistributedClientRuntime>
+impl<S> DistributedSessionSocketOwner<S, boon_distributed_runtime::DistributedClientRuntime>
 where
     S: DistributedSessionJournalStore,
 {
@@ -1808,7 +1833,8 @@ where
         &mut self,
         path: &str,
         payload: boon_runtime::SourcePayload,
-    ) -> Result<boon_runtime::DistributedClientUpdate, DistributedSessionSocketError> {
+    ) -> Result<boon_distributed_runtime::DistributedClientUpdate, DistributedSessionSocketError>
+    {
         self.require_current()?;
         Ok(self.runtime.dispatch(path, payload)?)
     }
@@ -1817,7 +1843,8 @@ where
         &mut self,
         call_id: boon_runtime::TransientEffectCallId,
         outcome: boon_runtime::Value,
-    ) -> Result<boon_runtime::DistributedClientUpdate, DistributedSessionSocketError> {
+    ) -> Result<boon_distributed_runtime::DistributedClientUpdate, DistributedSessionSocketError>
+    {
         self.require_current()?;
         Ok(self.runtime.complete_transient_effect(call_id, outcome)?)
     }
@@ -1827,7 +1854,8 @@ where
         call_id: boon_runtime::TransientEffectCallId,
         result_sequence: u64,
         outcome: boon_runtime::Value,
-    ) -> Result<boon_runtime::DistributedClientUpdate, DistributedSessionSocketError> {
+    ) -> Result<boon_distributed_runtime::DistributedClientUpdate, DistributedSessionSocketError>
+    {
         self.require_current()?;
         Ok(self
             .runtime
@@ -1836,7 +1864,8 @@ where
 
     pub fn cancel_all_transient_effects(
         &mut self,
-    ) -> Result<boon_runtime::DistributedClientUpdate, DistributedSessionSocketError> {
+    ) -> Result<boon_distributed_runtime::DistributedClientUpdate, DistributedSessionSocketError>
+    {
         Ok(self.runtime.cancel_all_transient_effects()?)
     }
 

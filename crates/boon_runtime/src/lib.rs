@@ -1177,7 +1177,8 @@ impl LiveRuntime {
         Ok(self.session.recovery_image()?)
     }
 
-    pub(crate) fn fork_settled(&self) -> RuntimeResult<Self> {
+    #[doc(hidden)]
+    pub fn fork_settled(&self) -> RuntimeResult<Self> {
         if self.pending_document_rollback.is_some() {
             return Err("cannot fork a runtime with an unsettled document turn".into());
         }

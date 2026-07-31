@@ -5,10 +5,8 @@ use crate::{
     DistributedSessionSocketLimits, DistributedSessionSocketOwner, DistributedSessionSocketPhase,
     DistributedSessionStorageError, SocketFrame, WebHostError,
 };
-use boon_runtime::{
-    DistributedClientRuntime, DistributedClientUpdate, DocumentFrame, SourcePayload,
-    TransientEffectCallId, Value,
-};
+use boon_distributed_runtime::{DistributedClientRuntime, DistributedClientUpdate};
+use boon_runtime::{DocumentFrame, SourcePayload, TransientEffectCallId, Value};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 use std::rc::Rc;

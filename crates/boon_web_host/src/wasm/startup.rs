@@ -12,10 +12,10 @@ use crate::{
     FetchMethod, WebGpuFrameIdentity, WebHostError, WebHostResult, decode_browser_app_config,
 };
 use boon_app_package::{BrowserAppConfig, MAX_BROWSER_APP_CONFIG_BYTES};
+use boon_distributed_runtime::DistributedClientUpdate;
 use boon_document::SemanticWebInputEvent;
 use boon_host::{SemanticId, SensitiveInputHandle, SurfaceId, Viewport, WindowId};
 use boon_native_gpu::GlyphonRenderTextColumnMeasurer;
-use boon_runtime::DistributedClientUpdate;
 use boon_wire::DISTRIBUTED_SESSION_TRANSPORT_PATH;
 use js_sys::{Promise, Uint8Array};
 use std::cell::RefCell;

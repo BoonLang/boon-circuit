@@ -1,4 +1,5 @@
-use boon_runtime::{DistributedClientUpdate, DistributedRuntimeError};
+use boon_distributed_runtime::DistributedClientUpdate;
+use boon_runtime::DistributedRuntimeError;
 use boon_web_host::{
     DISTRIBUTED_SESSION_STORAGE_KEY_BYTES, DISTRIBUTED_SESSION_TOKEN_JOURNAL_MAX_BYTES,
     DistributedSessionClientRuntime, DistributedSessionHandshake, DistributedSessionHandshakeError,

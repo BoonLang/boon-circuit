@@ -270,14 +270,14 @@ fn invalid_policy(reason: impl ToString) -> WebHostError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use boon_distributed_runtime::{ClientSessionQueueLimits, DistributedClientRuntime};
     use boon_plan::{
         EffectDeliveryCardinality, EffectId, EffectInvocationId, OwnerInstanceRoute,
         builtin_effect_contract,
     };
     use boon_runtime::{
-        ApplicationIdentity, ClientSessionQueueLimits, DistributedClientRuntime,
-        ProgramCapabilityProfile, ProgramCompileRequest, RuntimeSourceUnit, SourcePayload, Value,
-        compile_distributed_program_bundle,
+        ApplicationIdentity, ProgramCapabilityProfile, ProgramCompileRequest, RuntimeSourceUnit,
+        SourcePayload, Value, compile_distributed_program_bundle,
     };
     use boon_wire::SessionId;
     use std::collections::BTreeMap;

@@ -29,6 +29,7 @@ pub(crate) const EXECUTION_CLASS_IDS: &[&str] = &["hot", "cold", "boundary"];
 const SCAN_ROOTS: &[&str] = &[
     "crates/boon_compiler",
     "crates/boon_data",
+    "crates/boon_distributed_runtime",
     "crates/boon_document_model",
     "crates/boon_ir",
     "crates/boon_list_access",
@@ -42,6 +43,7 @@ const SCAN_ROOTS: &[&str] = &[
 ];
 
 const RUNTIME_ROOTS: &[&str] = &[
+    "crates/boon_distributed_runtime",
     "crates/boon_list_access",
     "crates/boon_plan_executor",
     "crates/boon_runtime",
@@ -49,6 +51,7 @@ const RUNTIME_ROOTS: &[&str] = &[
 ];
 
 const HOT_ROOTS: &[&str] = &[
+    "crates/boon_distributed_runtime/src",
     "crates/boon_list_access/src",
     "crates/boon_plan_executor/src",
     "crates/boon_runtime/src",
@@ -65,7 +68,7 @@ const BOUNDARY_ROOTS: &[&str] = &[
 const BOUNDARY_FILE_SUFFIXES: &[&str] = &[
     "/persistent.rs",
     "/web_persistent.rs",
-    "/distributed/message.rs",
+    "/boon_distributed_runtime/src/message.rs",
     "/content_ref.rs",
 ];
 

@@ -4,6 +4,7 @@ baseline_scope = "current-worktree"
 scan_roots = [
   "crates/boon_compiler",
   "crates/boon_data",
+  "crates/boon_distributed_runtime",
   "crates/boon_document_model",
   "crates/boon_ir",
   "crates/boon_list_access",
@@ -16,12 +17,14 @@ scan_roots = [
   "crates/boon_wire",
 ]
 runtime_roots = [
+  "crates/boon_distributed_runtime",
   "crates/boon_list_access",
   "crates/boon_plan_executor",
   "crates/boon_runtime",
   "crates/boon_server_runtime",
 ]
 hot_roots = [
+  "crates/boon_distributed_runtime/src",
   "crates/boon_list_access/src",
   "crates/boon_plan_executor/src",
   "crates/boon_runtime/src",
@@ -36,7 +39,7 @@ boundary_roots = [
 boundary_file_suffixes = [
   "/persistent.rs",
   "/web_persistent.rs",
-  "/distributed/message.rs",
+  "/boon_distributed_runtime/src/message.rs",
   "/content_ref.rs",
 ]
 boundary_context_needles = [
@@ -70,11 +73,11 @@ occurrence_ledger_generator = "cargo run -p xtask --example packed_site_inventor
 occurrence_ledger_validator = "cargo run -p xtask --example packed_site_inventory -- --check"
 
 # Updated only after reviewing a deterministic generator run.
-expected_probe_set_sha256 = "be597fbe5ba6b3197fdcc7a343e5e3cfb95b09892cd53627ec6bd187ac3ea3cf"
-expected_file_set_sha256 = "0fc27431ec88f18aa28b97afac2be2be46aa6af1cda5da70df23052326731ad1"
-expected_scanned_files = 95
-expected_occurrence_files = 85
-expected_occurrence_ledger_sha256 = "db134a56e96a65b61ea6ee4636caf10cdbb129088988153a516c749aa714612e"
+expected_probe_set_sha256 = "5eb2f2429d8a2ec75aea02b6e94c7110bb949fdb89ddc2a60518dfa9e7752c4e"
+expected_file_set_sha256 = "f2048f273324c0f14698b4b224a23dc0c77132ddc227e6c21ee87d55f0b0045d"
+expected_scanned_files = 96
+expected_occurrence_files = 86
+expected_occurrence_ledger_sha256 = "69262286b9745b600e2e67da61f44799363c57bfe91e4a9a225475be895f2916"
 expected_occurrence_rows = 19892
 
 [[categories]]

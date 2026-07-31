@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 async-trait.workspace = true
 boon_data.workspace = true
+boon_distributed_runtime.workspace = true
 boon_effect_schema.workspace = true
 boon_plan.workspace = true
 boon_persistence.workspace = true

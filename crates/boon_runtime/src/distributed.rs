@@ -1,29 +1,11 @@
 use crate::{SourcePayload, Value};
-use boon_plan::{DistributedArgumentId, DistributedEventExportPlan, SourcePayloadField};
+use boon_plan::{DistributedArgumentId, SourcePayloadField};
 use std::collections::BTreeMap;
 use std::error::Error as StdError;
 use std::fmt;
 
-mod client;
-mod client_session;
-mod endpoint;
-mod link;
-mod message;
 mod server;
-mod session;
-
-pub use client::{
-    DistributedClientRuntime, DistributedClientStartupPoll, DistributedClientStartupTask,
-    DistributedClientUpdate,
-};
-pub use client_session::ClientSessionQueueLimits;
-pub use message::{DistributedMessage, DistributedMessagePayload, DistributedQueueLimits};
 pub use server::{DistributedServerMachine, SessionOrigin};
-pub use session::{
-    DistributedSessionRuntime, DistributedSessionTemplate, DistributedSessionUpdate,
-};
-
-pub const SESSION_RESUME_WINDOW_MS: u64 = 60_000;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DistributedRuntimeError {
@@ -98,20 +80,6 @@ pub fn runtime_error(error: impl fmt::Display) -> DistributedRuntimeError {
     DistributedRuntimeError::Runtime(error.to_string())
 }
 
-pub(super) fn exported_event_data(
-    export: &DistributedEventExportPlan,
-    source: &SourcePayload,
-) -> Result<Option<boon_data::Value>, DistributedRuntimeError> {
-    let Some(field) = export.payload_field.as_ref() else {
-        return Ok(None);
-    };
-    export_runtime_value(
-        source_payload_value(source, field)
-            .ok_or_else(|| runtime_error("distributed event export is missing its payload"))?,
-    )
-    .map(Some)
-}
-
 #[doc(hidden)]
 pub fn export_runtime_value(value: Value) -> Result<boon_data::Value, DistributedRuntimeError> {
     value.to_data().map_err(runtime_error)
@@ -135,20 +103,6 @@ pub fn import_data_arguments(
         .into_iter()
         .map(|(argument_id, value)| (argument_id, Value::from_data(&value)))
         .collect()
-}
-
-fn source_payload_value(payload: &SourcePayload, field: &SourcePayloadField) -> Option<Value> {
-    match field {
-        SourcePayloadField::Address => payload.address.clone().map(Value::Text),
-        SourcePayloadField::Key => payload.key.clone().map(Value::Text),
-        SourcePayloadField::Text => payload.text.clone().map(Value::Text),
-        SourcePayloadField::Named(name) => payload.fields.get(name).cloned(),
-        SourcePayloadField::Bytes => payload
-            .fields
-            .get("bytes")
-            .or_else(|| payload.fields.get("Bytes"))
-            .cloned(),
-    }
 }
 
 #[doc(hidden)]

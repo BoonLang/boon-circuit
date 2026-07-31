@@ -765,9 +765,33 @@ fn verified_semantic_compiler_spine(workspace: &Path) -> Result<String, String> 
             ));
         }
     }
+    for required in [
+        "pub struct CompileRequest<'a>",
+        "pub fn compile_machine_plan(",
+        "pub fn compile_erased_program(",
+    ] {
+        if !compiler.contains(required) {
+            return Err(format!("compiler omits canonical entrypoint `{required}`"));
+        }
+    }
+    for forbidden in [
+        "pub fn compile_typed_program",
+        "pub fn compile_source_path_to_machine_plan",
+        "pub fn compile_source_text_to_machine_plan",
+        "pub fn compile_source_units_to_machine_plan",
+        "pub fn compile_runtime_source_text_to_machine_plan",
+        "pub fn compile_runtime_source_units_to_machine_plan",
+        "pub fn compile_parsed_program_to_machine_plan",
+    ] {
+        if compiler.contains(forbidden) {
+            return Err(format!(
+                "compiler retains superseded public entrypoint `{forbidden}`"
+            ));
+        }
+    }
 
     Ok(
-        "CheckedProgram -> SemanticProgram -> ContractVerifiedProgram -> opaque ErasedProgram is the only production compiler spine"
+        "one explicit CompileRequest follows CheckedProgram -> SemanticProgram -> ContractVerifiedProgram -> opaque ErasedProgram"
             .to_owned(),
     )
 }

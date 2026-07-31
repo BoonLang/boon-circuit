@@ -4163,7 +4163,7 @@ fn list_mutation_owns_authority(program: &ErasedProgram, mutation: &ir::ListMuta
     }
 }
 
-pub fn compile_typed_program(
+pub fn compile_erased_program(
     program: &ErasedProgram,
     target_profile: TargetProfile,
     program_role: ProgramRole,
@@ -4171,7 +4171,7 @@ pub fn compile_typed_program(
     schema_version: u64,
     migration_predecessors: &[MigrationPredecessorBinding],
 ) -> Result<MachinePlan, PlanError> {
-    compile_typed_program_with_distributed_context(
+    compile_erased_program_with_distributed_context(
         program,
         target_profile,
         program_role,
@@ -4192,7 +4192,7 @@ pub(crate) struct DistributedMachineContext {
     pub endpoint: Option<DistributedEndpointPlan>,
 }
 
-pub(crate) fn compile_typed_program_with_distributed_context(
+pub(crate) fn compile_erased_program_with_distributed_context(
     program: &ErasedProgram,
     target_profile: TargetProfile,
     program_role: ProgramRole,
@@ -15222,11 +15222,13 @@ document: Document/new(
 "#;
 
     fn compiled_resource_rows() -> crate::CompiledMachinePlanFromSource {
-        crate::compile_source_text_to_machine_plan(
+        crate::compile_machine_plan(crate::CompileRequest::source_text(
             "scalar-field-catalog.bn",
             RESOURCE_ROWS,
             TargetProfile::SoftwareDefault,
-        )
+            ProgramRole::Client,
+            ApplicationIdentity::compiler_default(),
+        ))
         .expect("generic resource rows compile")
     }
 
@@ -15555,12 +15557,13 @@ outputs: [
 
     #[test]
     fn compiler_lowers_session_info_as_typed_plan_intrinsics() {
-        let compiled = crate::compile_source_text_to_machine_plan_for_role(
+        let compiled = crate::compile_machine_plan(crate::CompileRequest::source_text(
             "session-info.bn",
             SOURCE,
             TargetProfile::SoftwareDefault,
             ProgramRole::Session,
-        )
+            ApplicationIdentity::compiler_default(),
+        ))
         .unwrap();
 
         assert!(compiled.plan.constants.is_empty());

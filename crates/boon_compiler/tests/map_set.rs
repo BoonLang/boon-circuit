@@ -1,12 +1,28 @@
-use boon_compiler::compile_source_text_to_machine_plan;
-use boon_plan::{
-    PlanRowExpressionNode, PlanTransientCollectionKind, PlanTransientCollectionResult,
-    TargetProfile,
+use boon_compiler::{
+    CompileRequest, CompiledMachinePlanFromSource, CompilerResult, compile_machine_plan,
 };
+use boon_plan::{
+    ApplicationIdentity, PlanRowExpressionNode, PlanTransientCollectionKind,
+    PlanTransientCollectionResult, ProgramRole, TargetProfile,
+};
+
+fn compile_test_source(
+    source_label: &str,
+    source_text: &str,
+    target_profile: TargetProfile,
+) -> CompilerResult<CompiledMachinePlanFromSource> {
+    compile_machine_plan(CompileRequest::source_text(
+        source_label,
+        source_text,
+        target_profile,
+        ProgramRole::Client,
+        ApplicationIdentity::compiler_default(),
+    ))
+}
 
 #[test]
 fn linear_block_local_list_map_and_set_lower_to_private_transient_regions() {
-    let compiled = compile_source_text_to_machine_plan(
+    let compiled = compile_test_source(
         "map-set-transient.bn",
         r#"
 store: [
@@ -135,7 +151,7 @@ document: Document/new(
 
 #[test]
 fn multiply_observed_local_collection_stays_on_authority_path() {
-    let compiled = compile_source_text_to_machine_plan(
+    let compiled = compile_test_source(
         "map-set-observed.bn",
         r#"
 store: [
@@ -204,7 +220,7 @@ document: Document/new(
 
 #[test]
 fn capacity_exhausting_local_list_retains_its_terminal_error_contract() {
-    let compiled = compile_source_text_to_machine_plan(
+    let compiled = compile_test_source(
         "list-capacity-transient-negative.bn",
         r#"
 store: [

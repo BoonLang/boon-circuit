@@ -1,6 +1,6 @@
 use crate::PersistentRuntime;
 use boon_compiler::{
-    CompilerSourceUnit, compile_runtime_source_units_to_machine_plan_with_persistence_catalog,
+    CompileRequest, CompilerSourceUnit, compile_machine_plan,
     compiler_source_units_for_manifest_source,
 };
 use boon_example_manifest::{
@@ -15,7 +15,7 @@ use boon_persistence::{
 };
 use boon_plan::{
     ApplicationIdentity, ExactNumber, MachinePlan, MemoryId, MigrationPredecessorBinding,
-    TargetProfile,
+    ProgramRole, TargetProfile,
 };
 use boon_runtime::{LiveRuntime, RowId, SessionOptions, Snapshot, SourcePayload, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -576,13 +576,15 @@ impl MigrationScenarioRunner {
         let mut predecessor = None::<MigrationPredecessorBinding>;
         for stage in &self.stages {
             let predecessors = predecessor.as_slice();
-            let compiled = compile_runtime_source_units_to_machine_plan_with_persistence_catalog(
-                &stage.source_label,
-                &stage.units,
-                TargetProfile::SoftwareDefault,
-                identity.clone(),
-                stage.schema_version,
-                predecessors,
+            let compiled = compile_machine_plan(
+                CompileRequest::source_units(
+                    &stage.source_label,
+                    &stage.units,
+                    TargetProfile::SoftwareDefault,
+                    ProgramRole::Client,
+                    identity.clone(),
+                )
+                .with_persistence_catalog(stage.schema_version, predecessors),
             )
             .map_err(|error| {
                 ActionError::new(

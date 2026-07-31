@@ -1,11 +1,25 @@
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen_test::wasm_bindgen_test;
 
-use boon_plan::{FieldId, MachinePlan, SourceId, TargetProfile};
+use boon_plan::{ApplicationIdentity, FieldId, MachinePlan, ProgramRole, SourceId, TargetProfile};
 use boon_plan_executor::{
     AuthorityDelta, MachineInstance, SessionOptions, SourceEvent, SourcePayload, Value, ValueTarget,
 };
 use std::collections::{BTreeMap, BTreeSet};
+
+fn compile_test_source(
+    source_label: &str,
+    source_text: &str,
+    target_profile: TargetProfile,
+) -> boon_compiler::CompilerResult<boon_compiler::CompiledMachinePlanFromSource> {
+    boon_compiler::compile_machine_plan(boon_compiler::CompileRequest::source_text(
+        source_label,
+        source_text,
+        target_profile,
+        ProgramRole::Client,
+        ApplicationIdentity::compiler_default(),
+    ))
+}
 
 fn source_id(plan: &MachinePlan, path: &str) -> SourceId {
     plan.source_routes
@@ -47,7 +61,7 @@ fn source_event(
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), test)]
 fn map_set_values_and_sparse_deltas_have_one_native_and_wasm_trace() {
-    let compiled = boon_compiler::compile_source_text_to_machine_plan(
+    let compiled = compile_test_source(
         "map-set-cross-target.bn",
         r#"
 store: [
@@ -237,7 +251,7 @@ document: Document/new(
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), test)]
 fn conflicting_map_writes_fail_and_roll_back_identically_on_native_and_wasm() {
-    let compiled = boon_compiler::compile_source_text_to_machine_plan(
+    let compiled = compile_test_source(
         "map-conflict-cross-target.bn",
         r#"
 store: [

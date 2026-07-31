@@ -109,8 +109,15 @@ document: Document/new(
     let checked = boon_typecheck::check_program(&parsed);
     assert!(!checked.report.has_errors(), "{:#?}", checked.report);
     let ir = verify_and_lower_checked(checked.program.unwrap(), &[]).unwrap();
-    let plan = compile_typed_program(&ir, TargetProfile::SoftwareDefault)
-        .expect("nested structural fields are keyed by authority path, not leaf spelling");
+    let plan = compile_erased_program(
+        &ir,
+        TargetProfile::SoftwareDefault,
+        ProgramRole::Client,
+        &ApplicationIdentity::compiler_default(),
+        boon_plan::DEFAULT_PERSISTENCE_SCHEMA_VERSION,
+        &[],
+    )
+    .expect("nested structural fields are keyed by authority path, not leaf spelling");
     let list = plan
         .storage_layout
         .list_slots
@@ -345,12 +352,13 @@ fn compile_fixture_source_text_to_machine_plan(
     source: &str,
     target_profile: TargetProfile,
 ) -> CompilerResult<CompiledMachinePlanFromSource> {
-    compile_source_text_to_machine_plan_for_role(
+    compile_machine_plan(CompileRequest::source_text(
         source_label,
         source,
         target_profile,
         fixture_program_role(source),
-    )
+        ApplicationIdentity::compiler_default(),
+    ))
 }
 
 #[test]
@@ -446,13 +454,13 @@ fn compile_fixture_source_text_to_machine_plan_with_identity(
     target_profile: TargetProfile,
     application_identity: ApplicationIdentity,
 ) -> CompilerResult<CompiledMachinePlanFromSource> {
-    compile_source_text_to_machine_plan_for_role_with_identity(
+    compile_machine_plan(CompileRequest::source_text(
         source_label,
         source,
         target_profile,
         fixture_program_role(source),
         application_identity,
-    )
+    ))
 }
 
 fn compile_fixture_runtime_source_text_with_persistence_identity(
@@ -462,14 +470,15 @@ fn compile_fixture_runtime_source_text_with_persistence_identity(
     application_identity: ApplicationIdentity,
     schema_version: u64,
 ) -> CompilerResult<CompiledMachinePlanFromSource> {
-    compile_runtime_source_text_to_machine_plan_for_role_with_persistence_catalog(
-        source_label,
-        source,
-        target_profile,
-        fixture_program_role(source),
-        application_identity,
-        schema_version,
-        &[],
+    compile_machine_plan(
+        CompileRequest::source_text(
+            source_label,
+            source,
+            target_profile,
+            fixture_program_role(source),
+            application_identity,
+        )
+        .with_persistence_catalog(schema_version, &[]),
     )
 }
 
@@ -481,20 +490,48 @@ fn compile_fixture_runtime_source_text_with_persistence_catalog(
     schema_version: u64,
     migration_predecessors: &[MigrationPredecessorBinding],
 ) -> CompilerResult<CompiledMachinePlanFromSource> {
-    compile_runtime_source_text_to_machine_plan_for_role_with_persistence_catalog(
-        source_label,
-        source,
-        target_profile,
-        fixture_program_role(source),
-        application_identity,
-        schema_version,
-        migration_predecessors,
+    compile_machine_plan(
+        CompileRequest::source_text(
+            source_label,
+            source,
+            target_profile,
+            fixture_program_role(source),
+            application_identity,
+        )
+        .with_persistence_catalog(schema_version, migration_predecessors),
     )
+}
+
+fn compile_test_source_path(
+    source_path: &std::path::Path,
+    target_profile: TargetProfile,
+    program_role: ProgramRole,
+) -> CompilerResult<CompiledMachinePlanFromSource> {
+    compile_machine_plan(CompileRequest::source_path(
+        source_path,
+        target_profile,
+        program_role,
+        ApplicationIdentity::compiler_default(),
+    ))
+}
+
+fn compile_test_source_units(
+    source_label: &str,
+    units: &[CompilerSourceUnit],
+    target_profile: TargetProfile,
+) -> CompilerResult<CompiledMachinePlanFromSource> {
+    compile_machine_plan(CompileRequest::source_units(
+        source_label,
+        units,
+        target_profile,
+        ProgramRole::Client,
+        ApplicationIdentity::compiler_default(),
+    ))
 }
 
 #[test]
 fn compiler_owns_transient_outbound_http_effect_contract_and_stable_routes() {
-    let compiled = compile_source_path_to_machine_plan_for_role(
+    let compiled = compile_test_source_path(
         std::path::Path::new("examples/outbound_http_effect.bn"),
         TargetProfile::SoftwareDefault,
         ProgramRole::Server,
@@ -1039,7 +1076,8 @@ fn connected_fixture_repeated_nested_source_payloads_are_exact() {
 fn todo_v2_nested_mapped_rows_keep_typed_document_projections() {
     let path = example_path("examples/migrations/todo/v2.bn");
     let compiled =
-        compile_source_path_to_machine_plan(&path, TargetProfile::SoftwareDefault).unwrap();
+        compile_test_source_path(&path, TargetProfile::SoftwareDefault, ProgramRole::Client)
+            .unwrap();
     let tasks = compiled
         .ir
         .lists
@@ -1417,12 +1455,13 @@ fn compiler_lowers_typed_output_roots_into_the_generic_registry() {
 
 #[test]
 fn compiler_lowers_closed_nonvisual_outputs_without_a_document_plan() {
-    let compiled = compile_source_text_to_machine_plan_for_role(
+    let compiled = compile_machine_plan(CompileRequest::source_text(
         "server-outputs.bn",
         include_str!("../../../examples/server_outputs.bn"),
         TargetProfile::SoftwareDefault,
         ProgramRole::Server,
-    )
+        ApplicationIdentity::compiler_default(),
+    ))
     .unwrap();
 
     assert!(compiled.plan.document.is_none());
@@ -1677,7 +1716,7 @@ store: [
 
 #[test]
 fn fjordpulse_server_host_boundary_is_cpu_executable() {
-    let compiled = compile_source_path_to_machine_plan_for_role(
+    let compiled = compile_test_source_path(
         std::path::Path::new("examples/fjordpulse/Server/RUN.bn"),
         TargetProfile::SoftwareDefault,
         ProgramRole::Server,
@@ -4086,9 +4125,10 @@ document: Document/new(
 
 #[test]
 fn compiler_preserves_empty_selected_demand() {
-    let compiled = compile_source_path_to_machine_plan(
+    let compiled = compile_test_source_path(
         Path::new("../../examples/bytes_length_plan_ops.bn"),
         TargetProfile::SoftwareDefault,
+        ProgramRole::Client,
     )
     .unwrap();
 
@@ -5309,8 +5349,9 @@ document: Document/new(
 #[test]
 fn retained_document_can_consume_a_function_flush_boundary() {
     let path = example_path("examples/fibonacci.bn");
-    let compiled = compile_source_path_to_machine_plan(&path, TargetProfile::SoftwareDefault)
-        .expect("compiled retained FLUSH boundary");
+    let compiled =
+        compile_test_source_path(&path, TargetProfile::SoftwareDefault, ProgramRole::Client)
+            .expect("compiled retained FLUSH boundary");
 
     let document = compiled.plan.document.as_ref().expect("retained document");
     assert!(
@@ -5334,9 +5375,12 @@ fn retained_document_can_consume_a_function_flush_boundary() {
 #[test]
 fn document_ids_are_stable_across_identical_compilation() {
     let path = example_path("examples/counter.bn");
-    let first = compile_source_path_to_machine_plan(&path, TargetProfile::SoftwareDefault).unwrap();
+    let first =
+        compile_test_source_path(&path, TargetProfile::SoftwareDefault, ProgramRole::Client)
+            .unwrap();
     let second =
-        compile_source_path_to_machine_plan(&path, TargetProfile::SoftwareDefault).unwrap();
+        compile_test_source_path(&path, TargetProfile::SoftwareDefault, ProgramRole::Client)
+            .unwrap();
 
     assert_eq!(first.plan.document, second.plan.document);
     assert_eq!(
@@ -5429,7 +5473,7 @@ fn shared_source_bundle_digest_v1_golden_compiles_canonical_client_bundle() {
             source: unit.source().to_owned(),
         })
         .collect::<Vec<_>>();
-    let compiled = compile_source_units_to_machine_plan(
+    let compiled = compile_test_source_units(
         canonical.entrypoint(),
         &units,
         TargetProfile::SoftwareDefault,
@@ -5464,7 +5508,7 @@ fn source_unit_entrypoint_must_name_an_exact_canonical_unit() {
         path: "app/RUN.bn".to_owned(),
         source: "value: 1\n".to_owned(),
     }];
-    let error = compile_source_units_to_machine_plan(
+    let error = compile_test_source_units(
         "diagnostic-label-only",
         &units,
         TargetProfile::SoftwareDefault,
@@ -5533,8 +5577,7 @@ scene: ProfilePage/render(profile: profile)
     ];
 
     let compiled =
-        compile_source_units_to_machine_plan("RUN.bn", &units, TargetProfile::SoftwareDefault)
-            .unwrap();
+        compile_test_source_units("RUN.bn", &units, TargetProfile::SoftwareDefault).unwrap();
     let document = compiled.plan.document.as_ref().unwrap();
     assert!(matches!(
         document.expressions[document.root.expression.0].op,

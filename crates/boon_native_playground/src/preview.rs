@@ -6147,16 +6147,17 @@ mod readiness_tests {
 
     fn plan() -> Arc<boon_plan::MachinePlan> {
         Arc::new(
-            boon_compiler::compile_runtime_source_text_to_machine_plan_with_identity(
+            boon_compiler::compile_machine_plan(boon_compiler::CompileRequest::source_text(
                 "readiness-owner.bn",
                 "scene: Scene/Element/text(element: [], style: [], text: TEXT { Ready })",
                 TargetProfile::SoftwareDefault,
+                boon_plan::ProgramRole::Client,
                 boon_plan::ApplicationIdentity::new(
                     "dev.boon.readiness-test",
                     "owner-stamp",
                     "test",
                 ),
-            )
+            ))
             .unwrap()
             .plan,
         )

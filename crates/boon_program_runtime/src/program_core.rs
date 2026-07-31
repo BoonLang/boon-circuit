@@ -3,9 +3,8 @@ use boon_runtime::{
     ProgramCapabilityProfile, RowId, RuntimeSourceUnit, SessionOptions, SourcePayload,
 };
 use boon_compiler::{
-    COMPILER_ID, CompileProfile, CompilerSourceUnit, DistributedCompilerProgram,
-    compile_distributed_runtime_source_programs,
-    compile_runtime_source_units_to_machine_plan_for_role_with_identity,
+    COMPILER_ID, CompileProfile, CompileRequest, CompilerSourceUnit, DistributedCompilerProgram,
+    compile_distributed_runtime_source_programs, compile_machine_plan,
     diagnose_runtime_source_units,
 };
 use boon_contract::{CanonicalSourceBundleV1, SourceBundleDigestV1, SourceBundleUnit};
@@ -499,13 +498,13 @@ fn compile_validated_program_artifact(
             source: unit.source().to_owned(),
         })
         .collect::<Vec<_>>();
-    let compiled = compile_runtime_source_units_to_machine_plan_for_role_with_identity(
+    let compiled = compile_machine_plan(CompileRequest::source_units(
         source_bundle.entrypoint(),
         &units,
         TargetProfile::SoftwareBounded,
         request.role,
         request.application.clone(),
-    )
+    ))
     .map_err(|error| {
         let fallback = error.to_string();
         let location = diagnose_runtime_source_units(source_bundle.entrypoint(), &units)

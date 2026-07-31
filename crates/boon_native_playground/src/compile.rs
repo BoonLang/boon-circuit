@@ -4,11 +4,12 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use boon_compiler::{
-    CompilerSourceUnit, compile_runtime_source_units_to_machine_plan_with_persistence_catalog,
+    CompileRequest as MachinePlanCompileRequest, CompilerSourceUnit, compile_machine_plan,
 };
 use boon_contract::{CanonicalSourceBundleV1, SourceBundleDigestV1, SourceBundleUnit};
 use boon_plan::{
-    DEFAULT_PERSISTENCE_SCHEMA_VERSION, MachinePlan, MigrationPredecessorBinding, TargetProfile,
+    DEFAULT_PERSISTENCE_SCHEMA_VERSION, MachinePlan, MigrationPredecessorBinding, ProgramRole,
+    TargetProfile,
 };
 use boon_program_runtime::{
     DistributedProgramBundle, ProgramArtifact, ProgramDiagnostic, ProgramHostRequest,
@@ -339,13 +340,18 @@ fn compile(request: CompileRequest) -> Result<CompiledPreview, String> {
                         })
                         .collect::<Vec<_>>();
                     Arc::new(
-                        compile_runtime_source_units_to_machine_plan_with_persistence_catalog(
-                            &entry_path,
-                            &units,
-                            TargetProfile::SoftwareDefault,
-                            application.clone(),
-                            DEFAULT_PERSISTENCE_SCHEMA_VERSION,
-                            &[] as &[MigrationPredecessorBinding],
+                        compile_machine_plan(
+                            MachinePlanCompileRequest::source_units(
+                                &entry_path,
+                                &units,
+                                TargetProfile::SoftwareDefault,
+                                ProgramRole::Client,
+                                application.clone(),
+                            )
+                            .with_persistence_catalog(
+                                DEFAULT_PERSISTENCE_SCHEMA_VERSION,
+                                &[] as &[MigrationPredecessorBinding],
+                            ),
                         )
                         .map_err(|error| error.to_string())?
                         .plan,
@@ -437,13 +443,15 @@ fn compile_migration_stage_with_units(
             .collect::<Vec<_>>();
         let predecessors = predecessor.as_slice();
         let plan = Arc::new(
-            compile_runtime_source_units_to_machine_plan_with_persistence_catalog(
-                &entry_path,
-                &units,
-                TargetProfile::SoftwareDefault,
-                application.clone(),
-                stage.schema_version,
-                predecessors,
+            compile_machine_plan(
+                MachinePlanCompileRequest::source_units(
+                    &entry_path,
+                    &units,
+                    TargetProfile::SoftwareDefault,
+                    ProgramRole::Client,
+                    application.clone(),
+                )
+                .with_persistence_catalog(stage.schema_version, predecessors),
             )
             .map_err(|error| format!("migration stage `{}` failed to compile: {error}", stage.id))?
             .plan,

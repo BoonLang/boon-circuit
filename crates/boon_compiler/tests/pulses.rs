@@ -1,3 +1,18 @@
+fn compile_test_source(
+    source_label: &str,
+    source_text: &str,
+    target_profile: boon_plan::TargetProfile,
+    program_role: boon_plan::ProgramRole,
+) -> boon_compiler::CompilerResult<boon_compiler::CompiledMachinePlanFromSource> {
+    boon_compiler::compile_machine_plan(boon_compiler::CompileRequest::source_text(
+        source_label,
+        source_text,
+        target_profile,
+        program_role,
+        boon_plan::ApplicationIdentity::compiler_default(),
+    ))
+}
+
 const CANONICAL_FIBONACCI: &str = r#"
 value: fibonacci(position: 10)
 
@@ -341,7 +356,7 @@ fn canonical_fibonacci_pulses_cross_the_verified_ir_spine() {
 
 #[test]
 fn canonical_fibonacci_pulses_lower_into_a_verified_machine_plan() {
-    let compiled = boon_compiler::compile_source_text_to_machine_plan_for_role(
+    let compiled = compile_test_source(
         "fibonacci-pulses.bn",
         CANONICAL_FIBONACCI,
         boon_plan::TargetProfile::SoftwareDefault,
@@ -444,7 +459,7 @@ fn list_materialized_fibonacci_owns_activation_local_state_per_row() {
         boon_ir::StateCellLifetimeV1::ActivationLocal { .. }
     ));
 
-    let compiled = boon_compiler::compile_source_text_to_machine_plan_for_role(
+    let compiled = compile_test_source(
         "list-fibonacci-pulses.bn",
         LIST_FIBONACCI,
         boon_plan::TargetProfile::SoftwareDefault,
@@ -493,7 +508,7 @@ fn verified_pulse_fusion_is_explicit_on_every_bounded_target_profile() {
         boon_plan::TargetProfile::SoftwareBounded,
         boon_plan::TargetProfile::FpgaTodomvc,
     ] {
-        let compiled = boon_compiler::compile_source_text_to_machine_plan_for_role(
+        let compiled = compile_test_source(
             "fibonacci-pulses-target.bn",
             CANONICAL_FIBONACCI,
             target,
@@ -553,7 +568,7 @@ fn source_fibonacci_pulse_activation_has_distinct_start_and_emission_causes() {
             == boon_semantic::SemanticEventCauseV1::Pulse(batch.id)
     }));
 
-    let compiled = boon_compiler::compile_source_text_to_machine_plan_for_role(
+    let compiled = compile_test_source(
         "source-fibonacci-pulses.bn",
         SOURCE_FIBONACCI,
         boon_plan::TargetProfile::SoftwareDefault,
@@ -626,7 +641,7 @@ fn compiler_worklist_carries_a_verified_preserved_list_mutation_lane() {
         }
     ));
 
-    let mut plan = boon_compiler::compile_source_text_to_machine_plan_for_role(
+    let mut plan = compile_test_source(
         "compiler-worklist-pulses.bn",
         source,
         boon_plan::TargetProfile::SoftwareBounded,
@@ -671,7 +686,7 @@ fn compiler_worklist_carries_a_verified_preserved_list_mutation_lane() {
 
 #[test]
 fn flush_and_persistent_state_produce_explicit_fusion_rejection_diagnostics() {
-    let compiled = boon_compiler::compile_source_text_to_machine_plan_for_role(
+    let compiled = compile_test_source(
         "ineligible-flush-pulses.bn",
         r#"
 store: [

@@ -2432,7 +2432,7 @@ fn link_lowered_roles(
     ] {
         let program = lowered.get(&role).expect("lowered role");
         let compile_started = Instant::now();
-        let plan = machine_plan_backend::compile_typed_program_with_distributed_context(
+        let plan = machine_plan_backend::compile_erased_program_with_distributed_context(
             &program.ir,
             target_profile,
             role,

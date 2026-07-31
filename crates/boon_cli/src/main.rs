@@ -1,5 +1,5 @@
-use boon_compiler::compile_source_path_to_machine_plan;
-use boon_plan::{TargetProfile, verify_plan};
+use boon_compiler::{CompileRequest, compile_machine_plan};
+use boon_plan::{ApplicationIdentity, ProgramRole, TargetProfile, verify_plan};
 use boon_runtime::{LiveRuntime, parse_scenario, source_units_for_path};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -63,7 +63,12 @@ fn check_source(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let source = args.first().ok_or("check requires a source path")?;
     let target = target_profile(args)?;
     reject_unknown_options(args, &["--target"])?;
-    let compiled = compile_source_path_to_machine_plan(Path::new(source), target)?;
+    let compiled = compile_machine_plan(CompileRequest::source_path(
+        Path::new(source),
+        target,
+        ProgramRole::Client,
+        ApplicationIdentity::compiler_default(),
+    ))?;
     let verification = verify_plan(&compiled.plan)?;
     if verification.status != "pass" {
         let failed = verification
@@ -93,7 +98,12 @@ fn dump_plan(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let target = target_profile(args)?;
     let out = option_value(args, "--out")?.map(PathBuf::from);
     reject_unknown_options(args, &["--target", "--out"])?;
-    let compiled = compile_source_path_to_machine_plan(Path::new(source), target)?;
+    let compiled = compile_machine_plan(CompileRequest::source_path(
+        Path::new(source),
+        target,
+        ProgramRole::Client,
+        ApplicationIdentity::compiler_default(),
+    ))?;
     let bytes = serde_json::to_vec_pretty(&compiled.plan)?;
     write_or_print(out.as_deref(), &bytes)
 }
@@ -102,8 +112,12 @@ fn dump_ir(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let source = args.first().ok_or("dump-ir requires a source path")?;
     let out = option_value(args, "--out")?.map(PathBuf::from);
     reject_unknown_options(args, &["--out"])?;
-    let compiled =
-        compile_source_path_to_machine_plan(Path::new(source), TargetProfile::SoftwareDefault)?;
+    let compiled = compile_machine_plan(CompileRequest::source_path(
+        Path::new(source),
+        TargetProfile::SoftwareDefault,
+        ProgramRole::Client,
+        ApplicationIdentity::compiler_default(),
+    ))?;
     let bytes = serde_json::to_vec_pretty(&compiled.ir)?;
     write_or_print(out.as_deref(), &bytes)
 }

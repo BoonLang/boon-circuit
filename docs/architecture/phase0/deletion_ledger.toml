@@ -2952,8 +2952,10 @@ needle = "pub static_schedule_verified: bool,"
 expected_occurrences = 1
 expected_files = 1
 
-# The source compiler returns the forgeable artifact and five public typed-plan
-# entrypoints accept arbitrary ErasedProgram values.
+# The source compiler still returns the inspectable erased artifact, but the
+# compatibility wrapper matrix is gone. One explicit request entrypoint owns
+# source compilation and one explicit erased-program entrypoint owns backend
+# lowering.
 [[entries.scans]]
 roots = ["crates/boon_compiler/src/lib.rs"]
 extensions = ["rs"]
@@ -2965,8 +2967,50 @@ expected_files = 1
 roots = ["crates/boon_compiler/src/lib.rs"]
 extensions = ["rs"]
 needle = "pub fn compile_typed_program"
-expected_occurrences = 5
+expected_occurrences = 0
+expected_files = 0
+
+[[entries.scans]]
+roots = ["crates/boon_compiler/src/lib.rs"]
+extensions = ["rs"]
+needle = "pub struct CompileRequest<'a>"
+expected_occurrences = 1
 expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_compiler/src/lib.rs"]
+extensions = ["rs"]
+needle = "pub fn compile_machine_plan("
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_compiler/src/lib.rs"]
+extensions = ["rs"]
+needle = "pub fn compile_erased_program("
+expected_occurrences = 1
+expected_files = 1
+
+[[entries.scans]]
+roots = ["crates/boon_compiler/src/lib.rs"]
+extensions = ["rs"]
+needle = "pub fn compile_source_"
+expected_occurrences = 0
+expected_files = 0
+
+[[entries.scans]]
+roots = ["crates/boon_compiler/src/lib.rs"]
+extensions = ["rs"]
+needle = "pub fn compile_runtime_source_"
+expected_occurrences = 0
+expected_files = 0
+
+[[entries.scans]]
+roots = ["crates/boon_compiler/src/lib.rs"]
+extensions = ["rs"]
+needle = "pub fn compile_parsed_program_"
+expected_occurrences = 0
+expected_files = 0
 
 # Six public boon_ir lowerers construct ErasedProgram without the Phase 1
 # ContractVerifiedProgram gate. Both production compiler routes call the

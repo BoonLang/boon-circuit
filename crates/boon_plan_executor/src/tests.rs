@@ -2,12 +2,53 @@ use super::*;
 use boon_plan::*;
 use std::collections::{BTreeMap, BTreeSet};
 
+fn compile_test_source(
+    source_label: &str,
+    source_text: &str,
+    target_profile: TargetProfile,
+    program_role: ProgramRole,
+) -> boon_compiler::CompilerResult<boon_compiler::CompiledMachinePlanFromSource> {
+    boon_compiler::compile_machine_plan(boon_compiler::CompileRequest::source_text(
+        source_label,
+        source_text,
+        target_profile,
+        program_role,
+        ApplicationIdentity::compiler_default(),
+    ))
+}
+
+fn compile_client_source(
+    source_label: &str,
+    source_text: &str,
+    target_profile: TargetProfile,
+) -> boon_compiler::CompilerResult<boon_compiler::CompiledMachinePlanFromSource> {
+    compile_test_source(
+        source_label,
+        source_text,
+        target_profile,
+        ProgramRole::Client,
+    )
+}
+
+fn compile_test_path(
+    source_path: &std::path::Path,
+    target_profile: TargetProfile,
+    program_role: ProgramRole,
+) -> boon_compiler::CompilerResult<boon_compiler::CompiledMachinePlanFromSource> {
+    boon_compiler::compile_machine_plan(boon_compiler::CompileRequest::source_path(
+        source_path,
+        target_profile,
+        program_role,
+        ApplicationIdentity::compiler_default(),
+    ))
+}
+
 fn compile_server_source(
     source_label: &str,
     source_text: &str,
     target_profile: TargetProfile,
 ) -> boon_compiler::CompilerResult<boon_compiler::CompiledMachinePlanFromSource> {
-    boon_compiler::compile_source_text_to_machine_plan_for_role(
+    compile_test_source(
         source_label,
         source_text,
         target_profile,
@@ -19,11 +60,7 @@ fn compile_server_path(
     source_path: &std::path::Path,
     target_profile: TargetProfile,
 ) -> boon_compiler::CompilerResult<boon_compiler::CompiledMachinePlanFromSource> {
-    boon_compiler::compile_source_path_to_machine_plan_for_role(
-        source_path,
-        target_profile,
-        ProgramRole::Server,
-    )
+    compile_test_path(source_path, target_profile, ProgramRole::Server)
 }
 
 fn number(value: i64) -> Value {
@@ -1698,7 +1735,7 @@ fn unscoped_source_updates_every_row_owned_by_indexed_state() {
 
 #[test]
 fn dynamic_literal_row_defaults_remain_reactive_and_update_indexes_in_place() {
-    let compiled = boon_compiler::compile_source_text_to_machine_plan(
+    let compiled = compile_client_source(
         "dynamic-literal-row-default.bn",
         r#"
 store: [
@@ -1841,7 +1878,7 @@ document: Document/new(
 
 #[test]
 fn typed_list_page_preserves_scalar_items_across_direct_cursor_seeks() {
-    let compiled = boon_compiler::compile_source_text_to_machine_plan(
+    let compiled = compile_client_source(
         "typed-scalar-page.bn",
         r#"
 store: [
@@ -1888,7 +1925,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { static }))
 
 #[test]
 fn take_then_sort_pages_only_the_bounded_source_prefix() {
-    let compiled = boon_compiler::compile_source_text_to_machine_plan(
+    let compiled = compile_client_source(
         "typed-take-then-sort-page.bn",
         r#"
 store: [
@@ -1933,7 +1970,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { static }))
 
 #[test]
 fn typed_list_page_cursor_binds_trailing_map_captures() {
-    let compiled = boon_compiler::compile_source_text_to_machine_plan(
+    let compiled = compile_client_source(
         "typed-page-map-capture.bn",
         r#"
 store: [
@@ -1996,7 +2033,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { static }))
 
 #[test]
 fn identical_typed_views_share_one_physical_index() {
-    let compiled = boon_compiler::compile_source_text_to_machine_plan(
+    let compiled = compile_client_source(
         "typed-index-deduplication.bn",
         r#"
 store: [
@@ -2053,7 +2090,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { static }))
 
 #[test]
 fn typed_exact_range_and_boolean_access_use_bounded_structural_selections() {
-    let compiled = boon_compiler::compile_source_text_to_machine_plan(
+    let compiled = compile_client_source(
         "typed-structural-access-runtime.bn",
         r#"
 store: [
@@ -2210,7 +2247,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { static }))
 
 #[test]
 fn typed_list_page_seeks_directly_materializes_rows_and_expires_only_on_source_change() {
-    let compiled = boon_compiler::compile_source_text_to_machine_plan(
+    let compiled = compile_client_source(
         "typed-page-runtime.bn",
         r#"
 store: [
@@ -2401,7 +2438,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { static }))
 #[test]
 fn typed_list_page_cursor_survives_physical_list_renumbering() {
     let compile = |unrelated: &str| {
-        boon_compiler::compile_source_text_to_machine_plan(
+        compile_client_source(
             "typed-page-semantic-list-identity.bn",
             &format!(
                 r#"
@@ -2453,7 +2490,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT {{ static }}
 
 #[test]
 fn typed_list_page_returns_closed_dynamic_size_and_work_limit_variants() {
-    let dynamic = boon_compiler::compile_source_text_to_machine_plan(
+    let dynamic = compile_client_source(
         "typed-page-dynamic-size.bn",
         r#"
 store: [
@@ -2503,7 +2540,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { static }))
         );
     }
 
-    let bounded = boon_compiler::compile_source_text_to_machine_plan(
+    let bounded = compile_client_source(
         "typed-page-work-limit.bn",
         r#"
 store: [
@@ -2545,7 +2582,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { static }))
 #[test]
 fn typed_list_page_honors_upstream_take_and_binds_it_into_cursor_identity() {
     let compile = |take_count: usize| {
-        boon_compiler::compile_source_text_to_machine_plan(
+        compile_client_source(
             "typed-page-take-identity.bn",
             &format!(
                 r#"
@@ -2603,7 +2640,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT {{ static }}
 #[test]
 fn typed_list_page_binds_evaluated_literal_seek_values() {
     let compile = |prefix: &str| {
-        boon_compiler::compile_source_text_to_machine_plan(
+        compile_client_source(
             "typed-page-literal-capture.bn",
             &format!(
                 r#"
@@ -2650,7 +2687,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT {{ static }}
 
 #[test]
 fn typed_list_page_capture_identity_uses_normalized_seek_values() {
-    let compiled = boon_compiler::compile_source_text_to_machine_plan(
+    let compiled = compile_client_source(
         "typed-page-normalized-capture.bn",
         r#"
 store: [
@@ -2716,7 +2753,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { static }))
 #[test]
 fn typed_list_page_binds_captures_and_semantic_view_but_not_physical_index() {
     let compile = |direction: &str| {
-        boon_compiler::compile_source_text_to_machine_plan(
+        compile_client_source(
             "typed-page-view-identity.bn",
             &format!(
                 r#"
@@ -2808,7 +2845,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT {{ static }}
 
 #[test]
 fn dynamic_order_page_rejects_a_cursor_from_the_other_prebuilt_branch() {
-    let compiled = boon_compiler::compile_source_text_to_machine_plan(
+    let compiled = compile_client_source(
         "dynamic-order-page-cursor.bn",
         r#"
 store: [
@@ -2868,7 +2905,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { static }))
 
 #[test]
 fn typed_list_page_cursor_survives_touched_list_persistence_restore() {
-    let compiled = boon_compiler::compile_source_text_to_machine_plan(
+    let compiled = compile_client_source(
         "typed-page-touched-restore.bn",
         r#"
 store: [
@@ -3097,7 +3134,7 @@ fn visit_plan_pages_mut(
 #[test]
 fn typed_prefix_guard_skips_seek_and_key_changes_refresh_unseen_rows() {
     let compile = |query: &str| {
-        boon_compiler::compile_source_text_to_machine_plan(
+        compile_client_source(
             "typed-prefix-currentness.bn",
             &format!(
                 r#"
@@ -3197,7 +3234,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT {{ static }}
 
 #[test]
 fn source_order_only_relabel_refreshes_a_live_cached_take_view() {
-    let compiled = boon_compiler::compile_source_text_to_machine_plan(
+    let compiled = compile_client_source(
         "typed-source-order-currentness.bn",
         r#"
 store: [
@@ -3283,7 +3320,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { static }))
 
 #[test]
 fn typed_ordered_index_updates_after_append_remove_and_authority_restore() {
-    let compiled = boon_compiler::compile_source_text_to_machine_plan(
+    let compiled = compile_client_source(
         "typed-index-restore.bn",
         r#"
 store: [
@@ -3419,7 +3456,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { static }))
 #[test]
 fn typed_ordered_index_rejects_concrete_keys_beyond_target_budget_before_readiness() {
     let oversized = "x".repeat(5_000);
-    let compiled = boon_compiler::compile_source_text_to_machine_plan(
+    let compiled = compile_client_source(
         "typed-index-key-budget.bn",
         &format!(
             r#"
@@ -3446,7 +3483,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT {{ static }}
 
 #[test]
 fn machine_build_task_slices_large_storage_and_ordered_index_without_semantic_drift() {
-    let compiled = boon_compiler::compile_source_text_to_machine_plan(
+    let compiled = compile_client_source(
         "cooperative-machine-build.bn",
         r#"
 store: [
@@ -3493,7 +3530,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { static }))
 
 #[test]
 fn machine_build_task_keeps_one_work_budget_across_polls() {
-    let compiled = boon_compiler::compile_source_text_to_machine_plan(
+    let compiled = compile_client_source(
         "cooperative-machine-build-budget.bn",
         r#"
 store: [
@@ -3686,7 +3723,7 @@ fn machine_build_task_slices_full_authority_restore_and_runtime_rebuild() {
 
 #[test]
 fn failed_machine_build_task_cannot_publish_on_a_later_poll() {
-    let compiled = boon_compiler::compile_source_text_to_machine_plan(
+    let compiled = compile_client_source(
         "failed-cooperative-build.bn",
         "document: Document/new(root: Element/label(element: [], label: TEXT { static }))",
         TargetProfile::SoftwareDefault,
@@ -3733,7 +3770,7 @@ fn failed_machine_build_task_cannot_publish_on_a_later_poll() {
 
 #[test]
 fn typed_ordered_index_ignores_unrelated_row_field_changes() {
-    let compiled = boon_compiler::compile_source_text_to_machine_plan(
+    let compiled = compile_client_source(
         "typed-index-field-dependencies.bn",
         r#"
 store: [
@@ -3795,7 +3832,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT { static }))
 
 #[test]
 fn typed_ordered_index_uses_canonical_closed_tag_ordinals() {
-    let compiled = boon_compiler::compile_source_text_to_machine_plan(
+    let compiled = compile_client_source(
         "typed-tag-index.bn",
         r#"
 store: [
@@ -6540,7 +6577,7 @@ fn state_triggered_effect_chain_machine() -> MachinePlan {
 }
 
 fn file_stream_effect_machine() -> MachinePlan {
-    boon_compiler::compile_source_text_to_machine_plan_for_role(
+    compile_test_source(
         "file-stream-effect-executor.bn",
         r#"
 store: [
@@ -6565,7 +6602,7 @@ store: [
 }
 
 fn content_import_effect_machine() -> MachinePlan {
-    boon_compiler::compile_source_text_to_machine_plan_for_role(
+    compile_test_source(
         "content-import-effect-executor.bn",
         r#"
 store: [
@@ -6617,7 +6654,7 @@ store: [
 }
 
 fn indexed_file_stream_effect_machine() -> MachinePlan {
-    boon_compiler::compile_source_text_to_machine_plan_for_role(
+    compile_test_source(
         "indexed-file-stream-effect-executor.bn",
         r#"
 store: [
@@ -6659,7 +6696,7 @@ FUNCTION stream_row(row, asset) {
 }
 
 fn mapped_request_root_file_stream_effect_machine() -> MachinePlan {
-    boon_compiler::compile_source_text_to_machine_plan_for_role(
+    compile_test_source(
         "mapped-request-root-file-stream.bn",
         r#"
 store: [
@@ -9468,7 +9505,7 @@ outputs: [
 "#;
 
 fn session_info_plan() -> MachinePlan {
-    boon_compiler::compile_source_text_to_machine_plan_for_role(
+    compile_test_source(
         "session-info.bn",
         SESSION_INFO_SOURCE,
         TargetProfile::SoftwareDefault,

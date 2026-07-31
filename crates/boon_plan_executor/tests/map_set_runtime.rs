@@ -2,12 +2,28 @@ use boon_persistence::{
     CheckpointBatch, DurableChange, InMemoryDriver, PersistenceCommand, PersistenceDriver,
     PersistenceResult,
 };
-use boon_plan::{FieldId, ListId, MachinePlan, SourceId, TargetProfile};
+use boon_plan::{
+    ApplicationIdentity, FieldId, ListId, MachinePlan, ProgramRole, SourceId, TargetProfile,
+};
 use boon_plan_executor::{
     AuthorityDelta, MachineInstance, MachineInstanceBuilder, SessionOptions, SourceEvent,
     SourcePayload, Value, ValueTarget,
 };
 use std::collections::{BTreeMap, BTreeSet};
+
+fn compile_test_source(
+    source_label: &str,
+    source_text: &str,
+    target_profile: TargetProfile,
+) -> boon_compiler::CompilerResult<boon_compiler::CompiledMachinePlanFromSource> {
+    boon_compiler::compile_machine_plan(boon_compiler::CompileRequest::source_text(
+        source_label,
+        source_text,
+        target_profile,
+        ProgramRole::Client,
+        ApplicationIdentity::compiler_default(),
+    ))
+}
 
 fn source_id(plan: &MachinePlan, path: &str) -> SourceId {
     plan.source_routes
@@ -59,7 +75,7 @@ fn source_event(
 
 #[test]
 fn verified_local_list_map_and_set_regions_stay_private_and_snapshot_free() {
-    let compiled = boon_compiler::compile_source_text_to_machine_plan(
+    let compiled = compile_test_source(
         "map-set-transient-runtime.bn",
         r#"
 store: [
@@ -245,7 +261,7 @@ document: Document/new(
 
 #[test]
 fn transient_list_capacity_exhaustion_preserves_the_terminal_error() {
-    let compiled = boon_compiler::compile_source_text_to_machine_plan(
+    let compiled = compile_test_source(
         "list-capacity-transient-runtime.bn",
         r#"
 store: [
@@ -287,7 +303,7 @@ document: Document/new(
 
 #[test]
 fn structurally_identical_map_constructions_keep_distinct_authorities() {
-    let compiled = boon_compiler::compile_source_text_to_machine_plan(
+    let compiled = compile_test_source(
         "map-authority-identity.bn",
         r#"
 store: [
@@ -335,7 +351,7 @@ document: Document/new(
 
 #[test]
 fn nested_collection_authorities_are_scoped_to_map_key_generations() {
-    let compiled = boon_compiler::compile_source_text_to_machine_plan(
+    let compiled = compile_test_source(
         "nested-map-authority-identity.bn",
         r#"
 store: [
@@ -406,7 +422,7 @@ document: Document/new(
 
 #[test]
 fn removing_a_list_occurrence_retires_its_nested_collection_authorities() {
-    let compiled = boon_compiler::compile_source_text_to_machine_plan(
+    let compiled = compile_test_source(
         "nested-list-authority-lifecycle.bn",
         r#"
 store: [
@@ -565,7 +581,7 @@ document: Document/new(
 
 #[test]
 fn appended_list_occurrences_construct_fresh_nested_authorities() {
-    let compiled = boon_compiler::compile_source_text_to_machine_plan(
+    let compiled = compile_test_source(
         "appended-nested-list-authority-lifecycle.bn",
         r#"
 store: [
@@ -765,7 +781,7 @@ document: Document/new(
 
 #[test]
 fn removing_and_reinserting_a_map_key_retires_the_old_nested_generation() {
-    let compiled = boon_compiler::compile_source_text_to_machine_plan(
+    let compiled = compile_test_source(
         "nested-map-authority-lifecycle.bn",
         r#"
 store: [
@@ -944,7 +960,7 @@ document: Document/new(
 
 #[test]
 fn map_authority_emits_sparse_deltas_and_wakes_only_the_observed_key() {
-    let compiled = boon_compiler::compile_source_text_to_machine_plan(
+    let compiled = compile_test_source(
         "map-keyed-currentness.bn",
         r#"
 store: [
@@ -1112,7 +1128,7 @@ document: Document/new(
 
 #[test]
 fn conflicting_same_turn_map_writes_roll_back_the_complete_authority() {
-    let compiled = boon_compiler::compile_source_text_to_machine_plan(
+    let compiled = compile_test_source(
         "map-conflict-rollback.bn",
         r#"
 store: [

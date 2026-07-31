@@ -7,10 +7,9 @@
 //! seam.
 
 use boon_compiler::{
-    CompiledMachinePlanFromSource, ProgramRole, TargetProfile,
-    compile_source_path_to_machine_plan_for_role,
+    CompileRequest, CompiledMachinePlanFromSource, ProgramRole, TargetProfile, compile_machine_plan,
 };
-use boon_plan::{ExactNumber, ListId, SourceId};
+use boon_plan::{ApplicationIdentity, ExactNumber, ListId, SourceId};
 use boon_plan_executor::{MachineInstance, SessionOptions, SourceEvent, SourcePayload, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -31,8 +30,14 @@ pub fn fixture_path(name: &str) -> PathBuf {
 }
 
 fn compile(name: &str, target: TargetProfile) -> Result<CompiledMachinePlanFromSource, String> {
-    compile_source_path_to_machine_plan_for_role(&fixture_path(name), target, ProgramRole::Server)
-        .map_err(|error| error.to_string())
+    let path = fixture_path(name);
+    compile_machine_plan(CompileRequest::source_path(
+        &path,
+        target,
+        ProgramRole::Server,
+        ApplicationIdentity::compiler_default(),
+    ))
+    .map_err(|error| error.to_string())
 }
 
 fn compile_for_role(
@@ -40,8 +45,14 @@ fn compile_for_role(
     target: TargetProfile,
     role: ProgramRole,
 ) -> Result<CompiledMachinePlanFromSource, String> {
-    compile_source_path_to_machine_plan_for_role(&fixture_path(name), target, role)
-        .map_err(|error| error.to_string())
+    let path = fixture_path(name);
+    compile_machine_plan(CompileRequest::source_path(
+        &path,
+        target,
+        role,
+        ApplicationIdentity::compiler_default(),
+    ))
+    .map_err(|error| error.to_string())
 }
 
 fn machine(compiled: CompiledMachinePlanFromSource) -> Result<MachineInstance, String> {

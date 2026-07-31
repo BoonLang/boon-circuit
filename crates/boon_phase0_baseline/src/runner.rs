@@ -7,11 +7,10 @@ use crate::report::{
     WorkEvidence,
 };
 use boon_compiler::{
-    CompilerSourceUnit, compile_runtime_source_units_to_machine_plan,
-    compiler_source_units_for_path,
+    CompileRequest, CompilerSourceUnit, compile_machine_plan, compiler_source_units_for_path,
 };
 use boon_contract::{CanonicalSourceBundleV1, SourceBundleUnit};
-use boon_plan::{SourceId, TargetProfile};
+use boon_plan::{ApplicationIdentity, ProgramRole, SourceId, TargetProfile};
 use boon_plan_executor::{
     MachineInstance, RowId, SessionOptions, SourceEvent, SourcePayload, TurnMetrics, Value,
 };
@@ -87,11 +86,13 @@ fn measure_fixture(
 
     let compile_interval = AllocationInterval::begin().map_err(str::to_owned)?;
     let compile_started = Instant::now();
-    let compiled = compile_runtime_source_units_to_machine_plan(
+    let compiled = compile_machine_plan(CompileRequest::source_units(
         &canonical_input.entrypoint,
         &canonical_input.units,
         TargetProfile::SoftwareDefault,
-    )
+        ProgramRole::Client,
+        ApplicationIdentity::compiler_default(),
+    ))
     .map_err(|error| format!("fixture {} compilation: {error}", definition.id))?;
     let compilation_elapsed_ns = duration_ns(compile_started.elapsed());
     let compilation_allocator = compile_interval.finish();

@@ -1,11 +1,28 @@
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen_test::wasm_bindgen_test;
 
-use boon_compiler::compile_source_text_to_machine_plan_for_role;
-use boon_plan::{ProgramRole, TargetProfile};
+use boon_compiler::{
+    CompileRequest, CompiledMachinePlanFromSource, CompilerResult, compile_machine_plan,
+};
+use boon_plan::{ApplicationIdentity, ProgramRole, TargetProfile};
 use boon_plan_executor::{MachineInstance, SessionOptions, SourceEvent, SourcePayload, Value};
 use serde::Deserialize;
 use std::collections::BTreeMap;
+
+fn compile_test_source(
+    source_label: &str,
+    source_text: &str,
+    target_profile: TargetProfile,
+    program_role: ProgramRole,
+) -> CompilerResult<CompiledMachinePlanFromSource> {
+    compile_machine_plan(CompileRequest::source_text(
+        source_label,
+        source_text,
+        target_profile,
+        program_role,
+        ApplicationIdentity::compiler_default(),
+    ))
+}
 
 #[derive(Deserialize)]
 struct ExpectedRoot {
@@ -34,7 +51,7 @@ impl ExpectedRoot {
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), test)]
 fn universal_foundation_values_have_one_native_and_wasm_trace() {
-    let compiled = compile_source_text_to_machine_plan_for_role(
+    let compiled = compile_test_source(
         "foundations-vertical.bn",
         include_str!("../testdata/foundations_vertical.bn"),
         TargetProfile::SoftwareBounded,
@@ -71,7 +88,7 @@ fn row_ids(value: Value) -> Vec<boon_plan_executor::RowId> {
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), test)]
 fn typed_views_have_one_native_and_wasm_trace() {
-    let compiled = compile_source_text_to_machine_plan_for_role(
+    let compiled = compile_test_source(
         "typed-views-vertical.bn",
         include_str!("../../../testdata/phase0/fixtures/typed_views_current.bn"),
         TargetProfile::SoftwareBounded,
@@ -99,7 +116,7 @@ fn typed_views_have_one_native_and_wasm_trace() {
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen_test)]
 #[cfg_attr(not(target_arch = "wasm32"), test)]
 fn scoped_reactive_rows_have_one_native_and_wasm_trace() {
-    let compiled = compile_source_text_to_machine_plan_for_role(
+    let compiled = compile_test_source(
         "reactive-rows-vertical.bn",
         include_str!("../testdata/reactive_rows_vertical.bn"),
         TargetProfile::SoftwareBounded,

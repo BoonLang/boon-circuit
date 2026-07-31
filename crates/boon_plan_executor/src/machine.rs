@@ -36098,6 +36098,21 @@ mod ownership_tests {
     use super::*;
     use boon_plan::{DataTypePlan, DataVariantPlan, ProgramRole, TargetProfile};
 
+    fn compile_test_source(
+        source_label: &str,
+        source_text: &str,
+        target_profile: TargetProfile,
+        program_role: ProgramRole,
+    ) -> boon_compiler::CompilerResult<boon_compiler::CompiledMachinePlanFromSource> {
+        boon_compiler::compile_machine_plan(boon_compiler::CompileRequest::source_text(
+            source_label,
+            source_text,
+            target_profile,
+            program_role,
+            boon_plan::ApplicationIdentity::compiler_default(),
+        ))
+    }
+
     #[test]
     fn public_union_schema_accepts_exactly_one_matching_runtime_member() {
         let data_type = DataTypePlan::Union {
@@ -36716,7 +36731,7 @@ mod ownership_tests {
 
     #[test]
     fn changed_order_keys_stage_precise_bounded_index_dirty_fanout() {
-        let compiled = boon_compiler::compile_source_text_to_machine_plan_for_role(
+        let compiled = compile_test_source(
             "source-order-dirty-fanout-internal.bn",
             r#"
 store: [
@@ -36825,7 +36840,7 @@ outputs: [
 
     #[test]
     fn range_map_row_state_initializers_read_constructor_values_before_derived_values() {
-        let compiled = boon_compiler::compile_source_text_to_machine_plan_for_role(
+        let compiled = compile_test_source(
             "range-map-row-state-initializer-internal.bn",
             r#"
 FUNCTION stateful_row(seed) {
@@ -36899,7 +36914,7 @@ rows:
 
     #[test]
     fn removing_an_owner_row_retires_exact_generation_descendants_deepest_first() {
-        let plan = boon_compiler::compile_source_text_to_machine_plan_for_role(
+        let plan = compile_test_source(
             "owner-cascade-internal.bn",
             r#"
 store: [
@@ -36981,7 +36996,7 @@ store: [
 
     #[test]
     fn materialized_list_reconciliation_is_partitioned_by_exact_parent_owner() {
-        let plan = boon_compiler::compile_source_text_to_machine_plan_for_role(
+        let plan = compile_test_source(
             "owner-partitioned-materialization-internal.bn",
             r#"
 store: [
@@ -37176,7 +37191,7 @@ store: [
 
     #[test]
     fn equal_sequence_values_for_one_mutation_site_fail_before_authority_commit() {
-        let plan = boon_compiler::compile_source_text_to_machine_plan_for_role(
+        let plan = compile_test_source(
             "list-mutation-tie-internal.bn",
             r#"
 store: [

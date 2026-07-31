@@ -159,6 +159,29 @@ follow every moved implementation and pass with 19,896 candidate sites across
 Cells packed baseline and its dependent current-worktree budget report remain
 honestly stale.
 
+The compiler-entrypoint cut removes the public matrix of source-path,
+source-text, source-unit, parsed-program, runtime/full, default-identity, and
+persistence wrapper variants. One explicit `CompileRequest` now carries source,
+target profile, program role, and application identity; its optional
+persistence catalog carries schema version and exact predecessors. One
+`compile_machine_plan` route owns source compilation and one explicit
+`compile_erased_program` route owns verified backend lowering. Runtime
+compilation always uses the runtime checker; editor hint production remains a
+direct typechecker concern instead of a second executable compiler mode. The
+affected all-target check, all 143 compiler unit/integration tests, and the
+three generic Counter, Persons.pro, and TodoMVC migration scenarios pass under
+serial execution. No migration runner, fixture, persistence path, or draining
+state was removed.
+
+The fresh architecture report has only the two global budget failures: 456,396
+tracked Rust lines and 92,561 test Rust lines remain above their 240,000 and
+32,000 caps. Runtime plus executor, playground, and xtask production remain
+within their caps at 40,518, 31,313, and 17,797 lines. The canonical compiler
+entrypoint is now part of the verified-spine architecture check. The packed
+inventory follows the changed compiler ownership with 19,894 candidate sites
+across 88 files, and the exact container inventory retains 5,039 occurrences
+across 156 files.
+
 The executable migration demos currently prove the catalog/`MachinePlan`
 version-migration path, including incremental, skipped-version, restart,
 activation, namespace, and cross-path authority behavior. They do not claim

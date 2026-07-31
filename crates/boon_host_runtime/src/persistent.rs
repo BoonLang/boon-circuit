@@ -3960,6 +3960,44 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Condvar, Mutex};
 
+    fn compile_persistent_text(
+        source_label: &str,
+        source_text: &str,
+        target_profile: boon_plan::TargetProfile,
+        application_identity: ApplicationIdentity,
+        schema_version: u64,
+    ) -> boon_compiler::CompilerResult<boon_compiler::CompiledMachinePlanFromSource> {
+        boon_compiler::compile_machine_plan(
+            boon_compiler::CompileRequest::source_text(
+                source_label,
+                source_text,
+                target_profile,
+                boon_plan::ProgramRole::Client,
+                application_identity,
+            )
+            .with_persistence_catalog(schema_version, &[]),
+        )
+    }
+
+    fn compile_persistent_units(
+        source_label: &str,
+        units: &[boon_compiler::CompilerSourceUnit],
+        target_profile: boon_plan::TargetProfile,
+        application_identity: ApplicationIdentity,
+        schema_version: u64,
+    ) -> boon_compiler::CompilerResult<boon_compiler::CompiledMachinePlanFromSource> {
+        boon_compiler::compile_machine_plan(
+            boon_compiler::CompileRequest::source_units(
+                source_label,
+                units,
+                target_profile,
+                boon_plan::ProgramRole::Client,
+                application_identity,
+            )
+            .with_persistence_catalog(schema_version, &[]),
+        )
+    }
+
     fn number(value: i64) -> Value {
         Value::integer(value).unwrap()
     }
@@ -4342,7 +4380,7 @@ scene: Scene/Element/program(
 
     fn effect_plan(identity: boon_plan::ApplicationIdentity) -> Arc<MachinePlan> {
         Arc::new(
-            boon_compiler::compile_runtime_source_text_to_machine_plan_with_persistence_identity(
+            compile_persistent_text(
                 "persistent-idempotent-effect.bn",
                 include_str!("../../../testdata/persistent_idempotent_effect.bn"),
                 boon_plan::TargetProfile::SoftwareDefault,
@@ -4588,7 +4626,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT {{ static }}
 "#
         );
         let default_plan = Arc::new(
-            boon_compiler::compile_runtime_source_text_to_machine_plan_with_persistence_identity(
+            compile_persistent_text(
                 "restore-before-index.bn",
                 &source,
                 boon_plan::TargetProfile::SoftwareDefault,
@@ -4627,7 +4665,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT {{ static }}
         );
 
         let bounded_plan = Arc::new(
-            boon_compiler::compile_runtime_source_text_to_machine_plan_with_persistence_identity(
+            compile_persistent_text(
                 "restore-before-index.bn",
                 &source,
                 boon_plan::TargetProfile::SoftwareBounded,
@@ -4719,7 +4757,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT {{ static }}
         ))
         .unwrap();
         let plan = Arc::new(
-            boon_compiler::compile_runtime_source_units_to_machine_plan_with_persistence_identity(
+            compile_persistent_units(
                 &units[0].path,
                 &units,
                 boon_plan::TargetProfile::SoftwareDefault,
@@ -4911,7 +4949,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT {{ static }}
         ))
         .unwrap();
         let plan = Arc::new(
-            boon_compiler::compile_runtime_source_units_to_machine_plan_with_persistence_identity(
+            compile_persistent_units(
                 &units[0].path,
                 &units,
                 boon_plan::TargetProfile::SoftwareDefault,
@@ -5012,7 +5050,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT {{ static }}
         let identity =
             boon_plan::ApplicationIdentity::new("dev.boon.persistent-todomvc", "test", "local");
         let plan = Arc::new(
-            boon_compiler::compile_runtime_source_text_to_machine_plan_with_persistence_identity(
+            compile_persistent_text(
                 "persistent-todomvc.bn",
                 include_str!("../../../examples/todomvc.bn"),
                 boon_plan::TargetProfile::SoftwareDefault,
@@ -5096,7 +5134,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT {{ static }}
         let identity =
             boon_plan::ApplicationIdentity::new("dev.boon.persistent-fjordpulse", "test", "local");
         let plan = Arc::new(
-            boon_compiler::compile_runtime_source_text_to_machine_plan_with_persistence_identity(
+            compile_persistent_text(
                 "persistence-fjordpulse-fixture.bn",
                 include_str!("../../../examples/persistence_fjordpulse_fixture.bn"),
                 boon_plan::TargetProfile::SoftwareDefault,
@@ -5484,16 +5522,15 @@ document: Document/new(root: Element/label(element: [], label: TEXT {{ static }}
         let source = include_str!("../../../examples/counter.bn");
         let identity =
             boon_plan::ApplicationIdentity::new("dev.boon.persistent-activation", "test", "local");
-        let v1 =
-            boon_compiler::compile_runtime_source_text_to_machine_plan_with_persistence_identity(
-                "persistent-counter-v1.bn",
-                source,
-                boon_plan::TargetProfile::SoftwareDefault,
-                identity.clone(),
-                1,
-            )
-            .unwrap()
-            .plan;
+        let v1 = compile_persistent_text(
+            "persistent-counter-v1.bn",
+            source,
+            boon_plan::TargetProfile::SoftwareDefault,
+            identity.clone(),
+            1,
+        )
+        .unwrap()
+        .plan;
         let fail_activation = Arc::new(AtomicBool::new(false));
         let driver = FailingActivationDriver {
             inner: InMemoryDriver::default(),
@@ -5519,16 +5556,15 @@ document: Document/new(root: Element/label(element: [], label: TEXT {{ static }}
         runtime.barrier().unwrap();
         let current = runtime.load_durable_image().unwrap().unwrap();
 
-        let v2 =
-            boon_compiler::compile_runtime_source_text_to_machine_plan_with_persistence_identity(
-                "persistent-counter-v2.bn",
-                source,
-                boon_plan::TargetProfile::SoftwareDefault,
-                identity,
-                2,
-            )
-            .unwrap()
-            .plan;
+        let v2 = compile_persistent_text(
+            "persistent-counter-v2.bn",
+            source,
+            boon_plan::TargetProfile::SoftwareDefault,
+            identity,
+            2,
+        )
+        .unwrap()
+        .plan;
         let mut candidate_image = current.clone();
         candidate_image.schema_version = v2.persistence.schema_version;
         candidate_image.schema_hash = v2.persistence.schema_hash;

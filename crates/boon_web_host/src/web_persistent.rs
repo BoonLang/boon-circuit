@@ -1120,6 +1120,25 @@ mod tests {
     use std::task::Poll;
     use wasm_bindgen_test::*;
 
+    fn compile_persistent_text(
+        source_label: &str,
+        source_text: &str,
+        target_profile: TargetProfile,
+        application_identity: ApplicationIdentity,
+        schema_version: u64,
+    ) -> boon_compiler::CompilerResult<boon_compiler::CompiledMachinePlanFromSource> {
+        boon_compiler::compile_machine_plan(
+            boon_compiler::CompileRequest::source_text(
+                source_label,
+                source_text,
+                target_profile,
+                boon_plan::ProgramRole::Client,
+                application_identity,
+            )
+            .with_persistence_catalog(schema_version, &[]),
+        )
+    }
+
     wasm_bindgen_test_configure!(run_in_browser);
 
     static NEXT_DATABASE_ID: AtomicU32 = AtomicU32::new(0);
@@ -1516,7 +1535,7 @@ store: [
 document: Document/new(root: Element/label(element: [], label: TEXT { static }))
 "#;
         let plan = Arc::new(
-            boon_compiler::compile_runtime_source_text_to_machine_plan_with_persistence_identity(
+            compile_persistent_text(
                 "web-sixty-thousand-row-readiness.bn",
                 source,
                 TargetProfile::SoftwareDefault,
@@ -1648,7 +1667,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT {{ static }}
 "#
         );
         let default_plan = Arc::new(
-            boon_compiler::compile_runtime_source_text_to_machine_plan_with_persistence_identity(
+            compile_persistent_text(
                 "web-restore-before-index.bn",
                 &source,
                 TargetProfile::SoftwareDefault,
@@ -1689,7 +1708,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT {{ static }}
         );
 
         let bounded_plan = Arc::new(
-            boon_compiler::compile_runtime_source_text_to_machine_plan_with_persistence_identity(
+            compile_persistent_text(
                 "web-restore-before-index.bn",
                 &source,
                 TargetProfile::SoftwareBounded,

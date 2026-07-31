@@ -1,8 +1,6 @@
 use boon_compiler::{
-    CompileProfile, CompiledMachinePlanFromSource, CompilerSourceUnit,
-    compile_runtime_source_text_to_machine_plan_for_role_with_identity,
-    compile_runtime_source_units_to_machine_plan_for_role_with_identity,
-    compiler_source_text_for_path, compiler_source_units_for_manifest_source,
+    CompileProfile, CompileRequest, CompiledMachinePlanFromSource, CompilerSourceUnit,
+    compile_machine_plan, compiler_source_text_for_path, compiler_source_units_for_manifest_source,
     compiler_source_units_for_path,
 };
 use boon_contract::{CanonicalSourceBundleV1, SourceBundleDigestV1, SourceBundleUnit};
@@ -318,13 +316,13 @@ impl LiveRuntime {
         };
         let entrypoint = source_bundle.entrypoint().to_owned();
         let (cached, cache_hit) = cached_plan(key, || {
-            compile_runtime_source_text_to_machine_plan_for_role_with_identity(
+            compile_machine_plan(CompileRequest::source_text(
                 &entrypoint,
                 source,
                 TargetProfile::SoftwareDefault,
                 role,
                 application,
-            )
+            ))
         })?;
         let runtime = Self::from_cached_plan(cached.clone())?;
         Ok((
@@ -423,13 +421,13 @@ impl LiveRuntime {
             })
             .collect::<Vec<_>>();
         let (cached, cache_hit) = cached_plan(key, || {
-            compile_runtime_source_units_to_machine_plan_for_role_with_identity(
+            compile_machine_plan(CompileRequest::source_units(
                 &entrypoint,
                 &compiler_units,
                 TargetProfile::SoftwareDefault,
                 role,
                 application,
-            )
+            ))
         })?;
         let runtime = Self::from_cached_plan(cached.clone())?;
         Ok((

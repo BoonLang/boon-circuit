@@ -1,9 +1,27 @@
-use boon_compiler::compile_source_text_to_machine_plan;
-use boon_plan::{PlanOpKind, PlanRowExpressionNode, TargetProfile};
+use boon_compiler::{
+    CompileRequest, CompiledMachinePlanFromSource, CompilerResult, compile_machine_plan,
+};
+use boon_plan::{
+    ApplicationIdentity, PlanOpKind, PlanRowExpressionNode, ProgramRole, TargetProfile,
+};
+
+fn compile_test_source(
+    source_label: &str,
+    source_text: &str,
+    target_profile: TargetProfile,
+) -> CompilerResult<CompiledMachinePlanFromSource> {
+    compile_machine_plan(CompileRequest::source_text(
+        source_label,
+        source_text,
+        target_profile,
+        ProgramRole::Client,
+        ApplicationIdentity::compiler_default(),
+    ))
+}
 
 #[test]
 fn nested_boolean_match_updates_are_cpu_executable() {
-    let compiled = compile_source_text_to_machine_plan(
+    let compiled = compile_test_source(
         "nested-boolean-match.bn",
         r#"
 store: [

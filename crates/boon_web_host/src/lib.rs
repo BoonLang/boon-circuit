@@ -22,6 +22,8 @@ mod sensitive_input;
 mod startup;
 mod storage;
 mod support;
+#[cfg(target_arch = "wasm32")]
+mod web_persistent;
 
 #[cfg(target_arch = "wasm32")]
 pub mod wasm;
@@ -40,3 +42,5 @@ pub use semantic::*;
 pub use startup::*;
 pub use storage::*;
 pub use support::*;
+#[cfg(target_arch = "wasm32")]
+pub use web_persistent::*;

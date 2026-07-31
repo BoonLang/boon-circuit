@@ -115,6 +115,24 @@ serial execution. Packed and container inventories retain the same 19,892 and
 5,037 exact occurrences under the new owner, and all non-budget architecture
 checks pass.
 
+The next target-ownership cut moves the generic native migration scenario
+runner intact into `boon_host_runtime` and the IndexedDB persistence
+coordinator intact into `boon_web_host`. The native playground still invokes
+the same runner, and its three deterministic Counter, Persons.pro, and TodoMVC
+migration scenarios pass, including incremental and skipped version steps and
+cross-path authority preservation. The browser coordinator passes a real
+`wasm32-unknown-unknown` compile in its new owner. That target check also
+exposed and fixed a missing exhaustive queue-weight classification for the
+current `CollectionAuthority`, MAP, SET, and BITS runtime values in the generic
+web effect host. No migration fixture, draining state, persistence protocol,
+or migration demo path was removed. Runtime plus executor now measures 48,870
+lines, a further 2,942-line reduction that leaves 6,870 lines above its cap;
+tracked Rust is 456,350 and test Rust remains 92,306. Playground and xtask
+production remain within their caps at 31,299 and 17,753 lines. Packed and
+container inventories retain 19,892 candidate sites across 86 source files and
+5,037 exact container occurrences across 154 files under the new owners. All
+non-budget architecture checks pass.
+
 The nested-compositor diagnostic path has been deleted. The replacement uses
 ordinary COSMIC preview/dev windows, kernel uinput mouse and keyboard devices,
 the normal app_window callback route, and app-owned exact-frame WGPU readback.

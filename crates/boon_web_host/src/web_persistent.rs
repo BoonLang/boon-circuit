@@ -1,4 +1,3 @@
-use super::{DocumentPatch, LiveRuntime, LiveRuntimeBuildPoll, RuntimeTurn};
 use boon_persistence::{
     ActivationAck, BarrierAck, BarrierRequest, BrowserPersistenceEnqueueError,
     BrowserPersistenceOperation, BrowserStorageStatus, CheckpointBatch, CommitAck, CompactAck,
@@ -8,7 +7,10 @@ use boon_persistence::{
     stage_migration,
 };
 use boon_plan::{MachinePlan, SourceRouteToken};
-use boon_plan_executor::{MachineTemplate, SessionOptions, SourceEvent, SourcePayload, Value};
+use boon_runtime::{
+    DocumentPatch, LiveRuntime, LiveRuntimeBuildPoll, MachineTemplate, RuntimeTurn, SessionOptions,
+    SourceEvent, SourcePayload, TurnMetrics, Value,
+};
 use gloo_timers::future::TimeoutFuture;
 use std::collections::{BTreeSet, VecDeque};
 use std::fmt;
@@ -393,13 +395,13 @@ impl WebPersistentRuntime {
     pub fn root_value_current_with_metrics(
         &mut self,
         name: &str,
-    ) -> Result<(Value, boon_plan_executor::TurnMetrics), WebPersistenceError> {
+    ) -> Result<(Value, TurnMetrics), WebPersistenceError> {
         self.runtime
             .root_value_current_with_metrics(name)
             .map_err(runtime_error)
     }
 
-    pub fn startup_metrics(&self) -> &boon_plan_executor::TurnMetrics {
+    pub fn startup_metrics(&self) -> &TurnMetrics {
         self.runtime.startup_metrics()
     }
 
@@ -1112,7 +1114,7 @@ mod tests {
     use super::*;
     use boon_persistence::StoredValue;
     use boon_plan::{ApplicationIdentity, TargetProfile};
-    use boon_plan_executor::{CursorScopeFingerprint, CursorSealingKey};
+    use boon_runtime::{CursorScopeFingerprint, CursorSealingKey};
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::task::Poll;

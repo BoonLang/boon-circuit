@@ -812,8 +812,11 @@ name = "boon_host_runtime"
 version = "0.1.0"
 dependencies = [
  "atomic-write-file",
+ "boon_compiler",
  "boon_effect_schema",
+ "boon_example_manifest",
  "boon_host_services",
+ "boon_persistence",
  "boon_plan",
  "boon_runtime",
  "bytes",
@@ -1038,15 +1041,11 @@ dependencies = [
  "boon_plan_executor",
  "boon_wire",
  "ciborium",
- "futures",
- "gloo-timers",
- "js-sys",
  "redb",
  "serde",
  "sha2",
  "tempfile",
  "toml",
- "wasm-bindgen-test",
  "web-time",
 ]
 
@@ -1149,16 +1148,20 @@ name = "boon_web_host"
 version = "0.1.0"
 dependencies = [
  "boon_app_package",
+ "boon_compiler",
  "boon_distributed_runtime",
  "boon_document",
  "boon_effect_schema",
  "boon_host",
  "boon_native_gpu",
+ "boon_persistence",
  "boon_plan",
  "boon_runtime",
  "boon_web_effect_host",
  "boon_wire",
+ "futures",
  "getrandom 0.3.4",
+ "gloo-timers",
  "idb",
  "js-sys",
  "percent-encoding",

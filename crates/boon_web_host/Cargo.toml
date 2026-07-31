@@ -26,6 +26,8 @@ wgpu.workspace = true
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 boon_web_effect_host.workspace = true
+boon_persistence.workspace = true
+gloo-timers = { version = "0.3.0", features = ["futures"] }
 idb = { version = "0.6.5", default-features = false, features = ["builder"] }
 js-sys = "0.3.98"
 wasm-bindgen = "0.2.121"
@@ -94,4 +96,6 @@ web-sys = { version = "0.3.98", features = [
 ] }
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+boon_compiler.workspace = true
+futures.workspace = true
 wasm-bindgen-test = "0.3"

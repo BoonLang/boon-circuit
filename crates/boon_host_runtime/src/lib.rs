@@ -3,12 +3,14 @@
 #![forbid(unsafe_code)]
 
 mod content_store;
+mod migration_scenario;
 
 pub use boon_runtime::ContentRef;
 pub use content_store::{
     ContentLease, ContentStore, ContentStoreError, ContentStoreErrorKind, ContentStoreLimits,
     ContentWriter,
 };
+pub use migration_scenario::*;
 
 use atomic_write_file::AtomicWriteFile;
 use boon_host_services::{

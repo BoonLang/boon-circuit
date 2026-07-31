@@ -7,6 +7,7 @@ scan_roots = [
   "crates/boon_distributed_runtime",
   "crates/boon_document/src/runtime.rs",
   "crates/boon_document_model",
+  "crates/boon_host_runtime/src/migration_scenario.rs",
   "crates/boon_ir",
   "crates/boon_list_access",
   "crates/boon_persistence",
@@ -15,23 +16,28 @@ scan_roots = [
   "crates/boon_runtime",
   "crates/boon_server_runtime",
   "crates/boon_typecheck",
+  "crates/boon_web_host/src/web_persistent.rs",
   "crates/boon_wire",
 ]
 runtime_roots = [
   "crates/boon_distributed_runtime",
   "crates/boon_document/src/runtime.rs",
+  "crates/boon_host_runtime/src/migration_scenario.rs",
   "crates/boon_list_access",
   "crates/boon_plan_executor",
   "crates/boon_runtime",
   "crates/boon_server_runtime",
+  "crates/boon_web_host/src/web_persistent.rs",
 ]
 hot_roots = [
   "crates/boon_distributed_runtime/src",
   "crates/boon_document/src/runtime.rs",
+  "crates/boon_host_runtime/src/migration_scenario.rs",
   "crates/boon_list_access/src",
   "crates/boon_plan_executor/src",
   "crates/boon_runtime/src",
   "crates/boon_server_runtime/src",
+  "crates/boon_web_host/src/web_persistent.rs",
 ]
 boundary_roots = [
   "crates/boon_data",
@@ -76,11 +82,11 @@ occurrence_ledger_generator = "cargo run -p xtask --example packed_site_inventor
 occurrence_ledger_validator = "cargo run -p xtask --example packed_site_inventory -- --check"
 
 # Updated only after reviewing a deterministic generator run.
-expected_probe_set_sha256 = "4f5761004080f02defa52b7f882643b87cc6ed95a643698b71bb35b2a1f77d50"
-expected_file_set_sha256 = "2327848862626153ec965644df05349ceb6fe5571bb90d82f3cef2c4a024b24d"
+expected_probe_set_sha256 = "eab041a923fa1c55ee6e8e83de802d347694b16304865e2e22675316e4a32da7"
+expected_file_set_sha256 = "bcdcec3a44fb6d4cde4051661052d403e71d928810bd4c67b940edd5e6b67c10"
 expected_scanned_files = 96
 expected_occurrence_files = 86
-expected_occurrence_ledger_sha256 = "beafb0f9fce047e1c896b5d86bf3d8baf8c477bbeb6303fae21fbce59505e1e6"
+expected_occurrence_ledger_sha256 = "2ddcf9a8b1513434b04e5b0c2c6b206bfa1b2960687f7e112d1c8c480e2c1614"
 expected_occurrence_rows = 19892
 
 [[categories]]

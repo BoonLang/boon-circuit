@@ -32,6 +32,7 @@ const SCAN_ROOTS: &[&str] = &[
     "crates/boon_distributed_runtime",
     "crates/boon_document/src/runtime.rs",
     "crates/boon_document_model",
+    "crates/boon_host_runtime/src/migration_scenario.rs",
     "crates/boon_ir",
     "crates/boon_list_access",
     "crates/boon_persistence",
@@ -40,25 +41,30 @@ const SCAN_ROOTS: &[&str] = &[
     "crates/boon_runtime",
     "crates/boon_server_runtime",
     "crates/boon_typecheck",
+    "crates/boon_web_host/src/web_persistent.rs",
     "crates/boon_wire",
 ];
 
 const RUNTIME_ROOTS: &[&str] = &[
     "crates/boon_distributed_runtime",
     "crates/boon_document/src/runtime.rs",
+    "crates/boon_host_runtime/src/migration_scenario.rs",
     "crates/boon_list_access",
     "crates/boon_plan_executor",
     "crates/boon_runtime",
     "crates/boon_server_runtime",
+    "crates/boon_web_host/src/web_persistent.rs",
 ];
 
 const HOT_ROOTS: &[&str] = &[
     "crates/boon_distributed_runtime/src",
     "crates/boon_document/src/runtime.rs",
+    "crates/boon_host_runtime/src/migration_scenario.rs",
     "crates/boon_list_access/src",
     "crates/boon_plan_executor/src",
     "crates/boon_runtime/src",
     "crates/boon_server_runtime/src",
+    "crates/boon_web_host/src/web_persistent.rs",
 ];
 
 const BOUNDARY_ROOTS: &[&str] = &[

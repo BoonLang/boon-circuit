@@ -2422,6 +2422,8 @@ fn no_example_specific_engine_branches(workspace: &Path) -> Result<String, Strin
         "crates/boon_persistence/",
         "crates/boon_document_model/",
         "crates/boon_document/",
+        "crates/boon_host_runtime/src/migration_scenario.rs",
+        "crates/boon_web_host/src/web_persistent.rs",
         "crates/boon_native_gpu/",
         "crates/boon_native_app_window/",
         "crates/boon_host/",

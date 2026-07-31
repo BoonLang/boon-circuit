@@ -23,12 +23,12 @@ use boon_plan::{
     SourceRouteToken, TargetProfile,
 };
 pub use boon_plan_executor::{
-    AuthorityDelta, ByteStreamValidator, Delta, DistributedCurrentCallInstance,
-    DistributedImportUpdate, DistributedInvocation, EffectStreamValidationError, HostValueBinding,
-    MachineOrigin, MachineRecoveryImage, MachineTemplate, RowId, RowSnapshot,
-    SessionConnectionStatus, SessionContext, SessionOptions, SessionPrincipal, Snapshot,
-    SourceEvent, SourcePayload, TransientEffectCallId, TransientEffectCreditGrant,
-    TransientEffectInvocation, TurnMetrics, Value, ValueTarget,
+    AuthorityDelta, ByteStreamValidator, CursorScopeFingerprint, CursorSealingKey, Delta,
+    DistributedCurrentCallInstance, DistributedImportUpdate, DistributedInvocation,
+    EffectStreamValidationError, HostValueBinding, MachineOrigin, MachineRecoveryImage,
+    MachineTemplate, RowId, RowSnapshot, SessionConnectionStatus, SessionContext, SessionOptions,
+    SessionPrincipal, Snapshot, SourceEvent, SourcePayload, TransientEffectCallId,
+    TransientEffectCreditGrant, TransientEffectInvocation, TurnMetrics, Value, ValueTarget,
 };
 pub use boon_plan_executor::{MachineBuildPhase, MachineBuildProgress};
 use boon_plan_executor::{MachineBuildTask, MachineInstance, Turn};
@@ -53,14 +53,8 @@ mod program;
 #[cfg(not(target_arch = "wasm32"))]
 mod persistent;
 
-#[cfg(target_arch = "wasm32")]
-mod web_persistent;
-
 #[cfg(not(target_arch = "wasm32"))]
 mod effects;
-
-#[cfg(not(target_arch = "wasm32"))]
-mod migration_scenario;
 
 pub use content_ref::*;
 pub use distributed::*;
@@ -69,12 +63,8 @@ pub use effect_host::*;
 pub use effects::*;
 pub use host_capability::*;
 #[cfg(not(target_arch = "wasm32"))]
-pub use migration_scenario::*;
-#[cfg(not(target_arch = "wasm32"))]
 pub use persistent::*;
 pub use program::*;
-#[cfg(target_arch = "wasm32")]
-pub use web_persistent::*;
 
 pub type RuntimeResult<T> = Result<T, Box<dyn std::error::Error>>;
 

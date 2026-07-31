@@ -9,6 +9,7 @@ use boon_host::{
     HostEvent, HostEventEnvelope, HostEventOrigin, KeyEvent, LogicalKey, PointerButton,
     PointerEvent, PointerPhase, TextInputEvent, Viewport,
 };
+use boon_host_runtime::MigrationScenarioRunner;
 use boon_native_app_window::{NativeRoleResult, NativeSurfaceHost, SensitiveInputTarget};
 use boon_persistence::{DecodeLimits, encode_restore_image};
 use futures::channel::mpsc;
@@ -16,9 +17,9 @@ use futures::{FutureExt, StreamExt, pin_mut, select};
 use sha2::{Digest, Sha256};
 
 use boon_runtime::{
-    MigrationScenarioRunner, PersistentRuntimeStartupDisposition, ProgramCompletion,
-    ProgramHostCompletion, ProgramHostRequest, ProgramRequestId, ProgramSessionId,
-    RuntimePhaseTimings, ScenarioStep, compile_program_artifact,
+    PersistentRuntimeStartupDisposition, ProgramCompletion, ProgramHostCompletion,
+    ProgramHostRequest, ProgramRequestId, ProgramSessionId, RuntimePhaseTimings, ScenarioStep,
+    compile_program_artifact,
 };
 
 use crate::compile::{

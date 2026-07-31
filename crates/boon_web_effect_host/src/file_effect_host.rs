@@ -4185,6 +4185,13 @@ fn value_payload_bytes(value: &Value) -> usize {
         ),
         Value::Row { fields, .. } => fields.values().map(value_payload_bytes).sum(),
         Value::HostBound { visible, .. } => value_payload_bytes(visible),
+        Value::CollectionAuthority { .. } => 24,
+        Value::Map(entries) => entries
+            .iter()
+            .map(|(key, value)| value_payload_bytes(key).saturating_add(value_payload_bytes(value)))
+            .sum(),
+        Value::Set(values) => values.iter().map(value_payload_bytes).sum(),
+        Value::Bits(value) => value.bytes().len(),
         Value::Number(_) => 16,
     }
 }

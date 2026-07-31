@@ -7,8 +7,11 @@ rust-version.workspace = true
 
 [dependencies]
 atomic-write-file.workspace = true
+boon_compiler.workspace = true
 boon_effect_schema.workspace = true
+boon_example_manifest.workspace = true
 boon_host_services.workspace = true
+boon_persistence.workspace = true
 boon_plan.workspace = true
 boon_runtime.workspace = true
 bytes.workspace = true

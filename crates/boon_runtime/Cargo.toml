@@ -9,6 +9,7 @@ rust-version.workspace = true
 boon_compiler.workspace = true
 boon_contract.workspace = true
 boon_data.workspace = true
+boon_document.workspace = true
 boon_document_model.workspace = true
 boon_example_manifest.workspace = true
 boon_persistence.workspace = true

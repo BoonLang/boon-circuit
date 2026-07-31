@@ -6,6 +6,8 @@ use boon_compiler::{
     compiler_source_units_for_path,
 };
 use boon_contract::{CanonicalSourceBundleV1, SourceBundleDigestV1, SourceBundleUnit};
+use boon_document::runtime as document;
+pub use boon_document::{DocumentMaterializationStats, DocumentWindowDemand};
 pub use boon_document_model::{DocumentFrame, DocumentPatch, ProgramCapabilityProfile};
 use boon_example_manifest::ExampleManifest;
 pub use boon_example_manifest::{
@@ -44,7 +46,6 @@ use web_time::Instant;
 
 mod content_ref;
 mod distributed;
-mod document;
 mod effect_host;
 mod host_capability;
 mod program;
@@ -63,7 +64,6 @@ mod migration_scenario;
 
 pub use content_ref::*;
 pub use distributed::*;
-pub use document::{DocumentMaterializationStats, DocumentWindowDemand};
 pub use effect_host::*;
 #[cfg(not(target_arch = "wasm32"))]
 pub use effects::*;

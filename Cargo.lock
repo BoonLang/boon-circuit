@@ -751,8 +751,11 @@ dependencies = [
 name = "boon_document"
 version = "0.1.0"
 dependencies = [
+ "boon_data",
  "boon_document_model",
  "boon_host",
+ "boon_plan",
+ "boon_plan_executor",
  "serde",
  "sha2",
 ]
@@ -1027,6 +1030,7 @@ dependencies = [
  "boon_compiler",
  "boon_contract",
  "boon_data",
+ "boon_document",
  "boon_document_model",
  "boon_example_manifest",
  "boon_persistence",

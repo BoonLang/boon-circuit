@@ -202,7 +202,7 @@ expected_files = 10
 "crates/boon_native_playground/src/runtime_view.rs" = 3
 "crates/boon_native_playground/src/ui.rs" = 3
 "crates/boon_native_playground/src/view.rs" = 1
-"crates/boon_runtime/src/document.rs" = 6
+"crates/boon_document/src/runtime.rs" = 6
 "crates/boon_web_host/tests/document_runtime.rs" = 1
 
 [[entries.scans]]
@@ -743,7 +743,7 @@ expected_occurrences = 0
 expected_files = 0
 
 [[entries.scans]]
-roots = ["crates/boon_runtime/src/document.rs"]
+roots = ["crates/boon_document/src/runtime.rs"]
 extensions = ["rs"]
 needle = "    Enum(String),"
 expected_occurrences = 0
@@ -792,49 +792,49 @@ expected_occurrences = 0
 expected_files = 0
 
 [[entries.scans]]
-roots = ["crates/boon_runtime/src/document.rs"]
+roots = ["crates/boon_document/src/runtime.rs"]
 extensions = ["rs"]
 needle = "Number(f64),"
 expected_occurrences = 0
 expected_files = 0
 
 [[entries.scans]]
-roots = ["crates/boon_runtime/src/document.rs"]
+roots = ["crates/boon_document/src/runtime.rs"]
 extensions = ["rs"]
 needle = "10f64.powi"
 expected_occurrences = 0
 expected_files = 0
 
 [[entries.scans]]
-roots = ["crates/boon_runtime/src/document.rs"]
+roots = ["crates/boon_document/src/runtime.rs"]
 extensions = ["rs"]
 needle = "f64::NEG_INFINITY"
 expected_occurrences = 0
 expected_files = 0
 
 [[entries.scans]]
-roots = ["crates/boon_runtime/src/document.rs"]
+roots = ["crates/boon_document/src/runtime.rs"]
 extensions = ["rs"]
 needle = "f64::INFINITY"
 expected_occurrences = 0
 expected_files = 0
 
 [[entries.scans]]
-roots = ["crates/boon_runtime/src/document.rs"]
+roots = ["crates/boon_document/src/runtime.rs"]
 extensions = ["rs"]
 needle = "fn number(&self) -> Option<f64>"
 expected_occurrences = 0
 expected_files = 0
 
 [[entries.scans]]
-roots = ["crates/boon_runtime/src/document.rs"]
+roots = ["crates/boon_document/src/runtime.rs"]
 extensions = ["rs"]
 needle = "impl Fn(f64, f64) -> f64"
 expected_occurrences = 0
 expected_files = 0
 
 [[entries.scans]]
-roots = ["crates/boon_runtime/src/document.rs"]
+roots = ["crates/boon_document/src/runtime.rs"]
 extensions = ["rs"]
 needle = "fn named_number(arguments: &[(String, EvalValue)], name: &str) -> Option<f64>"
 expected_occurrences = 0
@@ -974,7 +974,7 @@ expected_files = 0
 # These casts are the document runtime's implicit Number boundary. Filtering
 # by semantic consumers avoids ratcheting unrelated pixel/layout DTOs.
 [[entries.scans]]
-roots = ["crates/boon_runtime/src/document.rs"]
+roots = ["crates/boon_document/src/runtime.rs"]
 extensions = ["rs"]
 needle = "as f64"
 line_contains_any = [
@@ -988,21 +988,21 @@ expected_occurrences = 0
 expected_files = 0
 
 [[entries.scans]]
-roots = ["crates/boon_runtime/src/document.rs"]
+roots = ["crates/boon_document/src/runtime.rs"]
 extensions = ["rs"]
 needle = "fn format_number(value: f64)"
 expected_occurrences = 0
 expected_files = 0
 
 [[entries.scans]]
-roots = ["crates/boon_runtime/src/document.rs"]
+roots = ["crates/boon_document/src/runtime.rs"]
 extensions = ["rs"]
 needle = "f64::EPSILON"
 expected_occurrences = 0
 expected_files = 0
 
 [[entries.scans]]
-roots = ["crates/boon_runtime/src/document.rs"]
+roots = ["crates/boon_document/src/runtime.rs"]
 extensions = ["rs"]
 needle = "EvalValue::Number(value) => Some(StyleValue::Number(*value))"
 expected_occurrences = 0
@@ -1041,21 +1041,21 @@ expected_files = 1
 # Map rendering is a host boundary, but these helpers currently expose Boon
 # Number as f64 without naming or enforcing an approximation policy.
 [[entries.scans]]
-roots = ["crates/boon_runtime/src/document.rs"]
+roots = ["crates/boon_document/src/runtime.rs"]
 extensions = ["rs"]
 needle = "map_required_number("
 expected_occurrences = 13
 expected_files = 1
 
 [[entries.scans]]
-roots = ["crates/boon_runtime/src/document.rs"]
+roots = ["crates/boon_document/src/runtime.rs"]
 extensions = ["rs"]
 needle = "map_number("
 expected_occurrences = 4
 expected_files = 1
 
 [[entries.scans]]
-roots = ["crates/boon_runtime/src/document.rs"]
+roots = ["crates/boon_document/src/runtime.rs"]
 extensions = ["rs"]
 needle = "EvalValue::Number(value) => Ok(*value),"
 expected_occurrences = 0
@@ -1072,7 +1072,7 @@ expected_files = 0
 
 # Document execution still silently converts invalid text to binary64 zero.
 [[entries.scans]]
-roots = ["crates/boon_runtime/src/document.rs"]
+roots = ["crates/boon_document/src/runtime.rs"]
 extensions = ["rs"]
 needle = "DocumentBuiltin::TextToNumber => {\n            EvalValue::Number(first.text().parse().unwrap_or_default())\n        }"
 expected_occurrences = 0
@@ -1577,49 +1577,49 @@ expected_occurrences = 0
 expected_files = 0
 
 [[entries.scans]]
-roots = ["crates/boon_runtime/src/document.rs"]
+roots = ["crates/boon_document/src/runtime.rs"]
 extensions = ["rs"]
 needle = "named_number(&arguments, \"index\").unwrap_or(0.0)"
 expected_occurrences = 0
 expected_files = 0
 
 [[entries.scans]]
-roots = ["crates/boon_runtime/src/document.rs"]
+roots = ["crates/boon_document/src/runtime.rs"]
 extensions = ["rs"]
 needle = "index < 0.0 || index.fract() != 0.0"
 expected_occurrences = 0
 expected_files = 0
 
 [[entries.scans]]
-roots = ["crates/boon_runtime/src/document.rs"]
+roots = ["crates/boon_document/src/runtime.rs"]
 extensions = ["rs"]
 needle = "runtime_list_row(list, logical_len, index as u64)"
 expected_occurrences = 0
 expected_files = 0
 
 [[entries.scans]]
-roots = ["crates/boon_runtime/src/document.rs"]
+roots = ["crates/boon_document/src/runtime.rs"]
 extensions = ["rs"]
 needle = "values.remove(index)"
 expected_occurrences = 0
 expected_files = 0
 
 [[entries.scans]]
-roots = ["crates/boon_runtime/src/document.rs"]
+roots = ["crates/boon_document/src/runtime.rs"]
 extensions = ["rs"]
 needle = "named_number(&arguments, \"start\")"
 expected_occurrences = 0
 expected_files = 0
 
 [[entries.scans]]
-roots = ["crates/boon_runtime/src/document.rs"]
+roots = ["crates/boon_document/src/runtime.rs"]
 extensions = ["rs"]
 needle = ".chars()\n                    .skip(start)"
 expected_occurrences = 0
 expected_files = 0
 
 [[entries.scans]]
-roots = ["crates/boon_runtime/src/document.rs"]
+roots = ["crates/boon_document/src/runtime.rs"]
 extensions = ["rs"]
 needle = ".find(&needle).unwrap_or(usize::MAX) as f64"
 expected_occurrences = 0
@@ -1766,21 +1766,21 @@ expected_occurrences = 0
 expected_files = 0
 
 [[entries.scans]]
-roots = ["crates/boon_runtime/src/document.rs"]
+roots = ["crates/boon_document/src/runtime.rs"]
 extensions = ["rs"]
 needle = "DocumentBuiltin::BytesSlice | DocumentBuiltin::TextSubstring =>"
 expected_occurrences = 0
 expected_files = 0
 
 [[entries.scans]]
-roots = ["crates/boon_runtime/src/document.rs"]
+roots = ["crates/boon_document/src/runtime.rs"]
 extensions = ["rs"]
 needle = "let end = named_number(&arguments, \"to\")"
 expected_occurrences = 0
 expected_files = 0
 
 [[entries.scans]]
-roots = ["crates/boon_runtime/src/document.rs"]
+roots = ["crates/boon_document/src/runtime.rs"]
 extensions = ["rs"]
 needle = ".or_else(|| named_number(&arguments, \"end\"))"
 expected_occurrences = 0
@@ -2211,28 +2211,28 @@ expected_occurrences = 1
 expected_files = 1
 
 [[entries.scans]]
-roots = ["crates/boon_runtime/src/document.rs"]
+roots = ["crates/boon_document/src/runtime.rs"]
 extensions = ["rs"]
 needle = "Record(BTreeMap<String, EvalValue>),"
 expected_occurrences = 1
 expected_files = 1
 
 [[entries.scans]]
-roots = ["crates/boon_runtime/src/document.rs"]
+roots = ["crates/boon_document/src/runtime.rs"]
 extensions = ["rs"]
 needle = "fields: BTreeMap<String, EvalValue>,"
 expected_occurrences = 1
 expected_files = 1
 
 [[entries.scans]]
-roots = ["crates/boon_runtime/src/document.rs"]
+roots = ["crates/boon_document/src/runtime.rs"]
 extensions = ["rs"]
 needle = "Tagged(String, BTreeMap<String, EvalValue>),"
 expected_occurrences = 0
 expected_files = 0
 
 [[entries.scans]]
-roots = ["crates/boon_runtime/src/document.rs"]
+roots = ["crates/boon_document/src/runtime.rs"]
 extensions = ["rs"]
 needle = "List(Vec<EvalValue>),"
 expected_occurrences = 1
@@ -2241,7 +2241,7 @@ expected_files = 1
 # Runtime execution still interprets document and machine plan AST enums
 # directly rather than dense packed op tables.
 [[entries.scans]]
-roots = ["crates/boon_runtime/src/document.rs"]
+roots = ["crates/boon_document/src/runtime.rs"]
 extensions = ["rs"]
 mode = "rust-code-token"
 needle = "DocumentExprOp"
@@ -2361,7 +2361,7 @@ expected_files = 1
 # typed carriers cover current get/remove helpers without conflating FieldId
 # maps, and must disappear with runtime field-name rediscovery.
 [[entries.scans]]
-roots = ["crates/boon_runtime/src/document.rs"]
+roots = ["crates/boon_document/src/runtime.rs"]
 extensions = ["rs"]
 needle = "BTreeMap<String, EvalValue>"
 expected_occurrences = 14
@@ -2478,7 +2478,7 @@ expected_files = 128
 "crates/boon_distributed_runtime/src/link.rs" = 3
 "crates/boon_distributed_runtime/src/message.rs" = 9
 "crates/boon_runtime/src/distributed/server.rs" = 2
-"crates/boon_runtime/src/document.rs" = 140
+"crates/boon_document/src/runtime.rs" = 140
 "crates/boon_runtime/src/effect_host.rs" = 5
 "crates/boon_runtime/src/effects.rs" = 2
 "crates/boon_runtime/src/host_capability.rs" = 3
@@ -2600,7 +2600,7 @@ expected_files = 101
 "crates/boon_distributed_runtime/src/client.rs" = 3
 "crates/boon_distributed_runtime/src/endpoint.rs" = 2
 "crates/boon_distributed_runtime/src/session.rs" = 3
-"crates/boon_runtime/src/document.rs" = 102
+"crates/boon_document/src/runtime.rs" = 102
 "crates/boon_runtime/src/effect_host.rs" = 2
 "crates/boon_runtime/src/lib.rs" = 2
 "crates/boon_runtime/src/migration_scenario.rs" = 4
@@ -3376,28 +3376,28 @@ expected_occurrences = 0
 expected_files = 0
 
 [[entries.scans]]
-roots = ["crates/boon_runtime/src/document.rs"]
+roots = ["crates/boon_document/src/runtime.rs"]
 extensions = ["rs"]
 needle = "EvalValue::Bool"
 expected_occurrences = 0
 expected_files = 0
 
 [[entries.scans]]
-roots = ["crates/boon_runtime/src/document.rs"]
+roots = ["crates/boon_document/src/runtime.rs"]
 extensions = ["rs"]
 needle = "EvalValue::Null"
 expected_occurrences = 0
 expected_files = 0
 
 [[entries.scans]]
-roots = ["crates/boon_runtime/src/document.rs"]
+roots = ["crates/boon_document/src/runtime.rs"]
 extensions = ["rs"]
 needle = "enum EvalValue {\n    Null,\n    Bool(bool),"
 expected_occurrences = 0
 expected_files = 0
 
 [[entries.scans]]
-roots = ["crates/boon_runtime/src/document.rs"]
+roots = ["crates/boon_document/src/runtime.rs"]
 extensions = ["rs"]
 needle = "EvalValue::Bool(value) => Some(StyleValue::Bool(*value))"
 expected_occurrences = 0

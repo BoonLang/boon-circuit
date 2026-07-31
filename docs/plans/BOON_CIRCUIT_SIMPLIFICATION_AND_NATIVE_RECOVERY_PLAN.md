@@ -101,6 +101,20 @@ the four-case in-process Client/Session/Server suite, the browser transport's
 compile pass under serial execution. The broader Server scheduling failures
 recorded above have not been reclassified or hidden.
 
+The following ownership cut moves the existing MachinePlan document evaluator
+intact into `boon_document`, which is now the sole document-evaluation owner;
+`boon_runtime` retains only the transaction facade that invokes it. The
+single-executor gate permits exactly the document evaluator and runtime as
+direct `boon_plan_executor` consumers and still rejects any additional
+dependent or executor definition. No document algorithm, migration path,
+draining state, or retained-window behavior was removed. Runtime plus executor
+now measures 51,812 lines, a further 6,243-line reduction that leaves 9,812
+lines above its cap; tracked Rust is 456,333 and test Rust remains 92,306. The
+18 moved document-evaluator tests and an affected all-target compile pass under
+serial execution. Packed and container inventories retain the same 19,892 and
+5,037 exact occurrences under the new owner, and all non-budget architecture
+checks pass.
+
 The nested-compositor diagnostic path has been deleted. The replacement uses
 ordinary COSMIC preview/dev windows, kernel uinput mouse and keyboard devices,
 the normal app_window callback route, and app-owned exact-frame WGPU readback.

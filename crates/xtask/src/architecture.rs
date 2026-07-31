@@ -526,6 +526,7 @@ fn single_execution_path(workspace: &Path) -> Result<String, String> {
     }
     let executor_source = read_text(&workspace.join("crates/boon_plan_executor/src/lib.rs"))?;
     let executor_machine = read_text(&workspace.join("crates/boon_plan_executor/src/machine.rs"))?;
+    let document_runtime = read_text(&workspace.join("crates/boon_document/src/runtime.rs"))?;
     let runtime_source = read_text(&workspace.join("crates/boon_runtime/src/lib.rs"))?;
     let expected_executor_machine = vec!["crates/boon_plan_executor/src/machine.rs".to_owned()];
     let machine_owned_by_executor = machine_instance_definitions == expected_executor_machine
@@ -537,6 +538,8 @@ fn single_execution_path(workspace: &Path) -> Result<String, String> {
     let runtime_uses_machine = runtime_source.contains("boon_plan_executor::MachineInstance")
         || (runtime_source.contains("use boon_plan_executor")
             && runtime_source.contains("MachineInstance"));
+    let document_uses_machine = document_runtime.contains("use boon_plan_executor")
+        && document_runtime.contains("MachineInstance");
 
     let mut direct_executor_dependents = Vec::new();
     let mut instrumentation_dependents = Vec::new();
@@ -580,13 +583,15 @@ fn single_execution_path(workspace: &Path) -> Result<String, String> {
         && forbidden_runtime_types.is_empty()
         && machine_owned_by_executor
         && runtime_uses_machine
-        && direct_executor_dependents == vec!["boon_runtime".to_owned()]
+        && document_uses_machine
+        && direct_executor_dependents
+            == vec!["boon_document".to_owned(), "boon_runtime".to_owned()]
         && instrumentation_dependents == vec!["boon_phase0_baseline".to_owned()];
     if valid {
-        Ok("one MachinePlan definition and one boon_plan_executor MachineTemplate/MachineInstance path; the only non-runtime dependent is the optional Phase 0 instrumentation producer".to_owned())
+        Ok("one MachinePlan definition and one boon_plan_executor MachineTemplate/MachineInstance path; only the document evaluator and runtime consume it directly, plus the optional Phase 0 instrumentation producer".to_owned())
     } else {
         Err(format!(
-            "MachinePlan defs={}; MachineInstance defs={}; MachineTemplate defs={}; forbidden runtime executors={}; executor machine={machine_owned_by_executor}; runtime uses machine={runtime_uses_machine}; direct dependents={}; optional instrumentation dependents={}",
+            "MachinePlan defs={}; MachineInstance defs={}; MachineTemplate defs={}; forbidden runtime executors={}; executor machine={machine_owned_by_executor}; runtime uses machine={runtime_uses_machine}; document uses machine={document_uses_machine}; direct dependents={}; optional instrumentation dependents={}",
             bounded_list(&machine_plan_definitions),
             bounded_list(&machine_instance_definitions),
             bounded_list(&machine_template_definitions),

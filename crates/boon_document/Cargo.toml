@@ -6,7 +6,10 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+boon_data.workspace = true
 boon_document_model.workspace = true
 boon_host.workspace = true
+boon_plan.workspace = true
+boon_plan_executor.workspace = true
 serde.workspace = true
 sha2.workspace = true

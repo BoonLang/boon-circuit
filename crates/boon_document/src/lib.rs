@@ -14,6 +14,8 @@ pub use boon_document_model::{
     UiSemanticChange, project_to_map_viewport, unproject_from_map_viewport,
 };
 pub mod render_scene;
+#[doc(hidden)]
+pub mod runtime;
 pub mod source_actions;
 use boon_host::Viewport;
 pub use boon_host::{
@@ -29,6 +31,7 @@ pub use render_scene::{
     RenderTextVerticalAlign, RenderTextureRef, RenderVisualPrimitive, RenderVisualPrimitiveKind,
     RetainedRenderChunkDescriptor,
 };
+pub use runtime::{DocumentMaterializationStats, DocumentWindowDemand};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;

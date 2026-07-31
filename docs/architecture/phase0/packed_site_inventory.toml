@@ -5,6 +5,7 @@ scan_roots = [
   "crates/boon_compiler",
   "crates/boon_data",
   "crates/boon_distributed_runtime",
+  "crates/boon_document/src/runtime.rs",
   "crates/boon_document_model",
   "crates/boon_ir",
   "crates/boon_list_access",
@@ -18,6 +19,7 @@ scan_roots = [
 ]
 runtime_roots = [
   "crates/boon_distributed_runtime",
+  "crates/boon_document/src/runtime.rs",
   "crates/boon_list_access",
   "crates/boon_plan_executor",
   "crates/boon_runtime",
@@ -25,6 +27,7 @@ runtime_roots = [
 ]
 hot_roots = [
   "crates/boon_distributed_runtime/src",
+  "crates/boon_document/src/runtime.rs",
   "crates/boon_list_access/src",
   "crates/boon_plan_executor/src",
   "crates/boon_runtime/src",
@@ -73,11 +76,11 @@ occurrence_ledger_generator = "cargo run -p xtask --example packed_site_inventor
 occurrence_ledger_validator = "cargo run -p xtask --example packed_site_inventory -- --check"
 
 # Updated only after reviewing a deterministic generator run.
-expected_probe_set_sha256 = "5eb2f2429d8a2ec75aea02b6e94c7110bb949fdb89ddc2a60518dfa9e7752c4e"
-expected_file_set_sha256 = "f2048f273324c0f14698b4b224a23dc0c77132ddc227e6c21ee87d55f0b0045d"
+expected_probe_set_sha256 = "4f5761004080f02defa52b7f882643b87cc6ed95a643698b71bb35b2a1f77d50"
+expected_file_set_sha256 = "2327848862626153ec965644df05349ceb6fe5571bb90d82f3cef2c4a024b24d"
 expected_scanned_files = 96
 expected_occurrence_files = 86
-expected_occurrence_ledger_sha256 = "69262286b9745b600e2e67da61f44799363c57bfe91e4a9a225475be895f2916"
+expected_occurrence_ledger_sha256 = "beafb0f9fce047e1c896b5d86bf3d8baf8c477bbeb6303fae21fbce59505e1e6"
 expected_occurrence_rows = 19892
 
 [[categories]]

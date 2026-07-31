@@ -145,7 +145,7 @@ pub struct DocumentMaterializationStats {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct DocumentRuntime {
+pub struct DocumentRuntime {
     machine_plan: Arc<MachinePlan>,
     expression_ops: Vec<Arc<DocumentExprOp>>,
     routes: BTreeMap<SourceId, String>,
@@ -182,7 +182,7 @@ pub(crate) struct DocumentRuntime {
 
 type RowSourceIndex = BTreeMap<ListId, BTreeMap<Vec<String>, SourceId>>;
 
-pub(crate) struct DocumentRollback(DocumentRollbackKind);
+pub struct DocumentRollback(DocumentRollbackKind);
 
 enum DocumentRollbackKind {
     Unchanged,
@@ -199,11 +199,11 @@ enum DocumentRollbackKind {
 }
 
 impl DocumentRollback {
-    pub(crate) fn unchanged() -> Self {
+    pub fn unchanged() -> Self {
         Self(DocumentRollbackKind::Unchanged)
     }
 
-    pub(crate) fn is_unchanged(&self) -> bool {
+    pub fn is_unchanged(&self) -> bool {
         matches!(self.0, DocumentRollbackKind::Unchanged)
     }
 }
@@ -219,7 +219,7 @@ enum ScalarPatchOutcome {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum DocumentError {
+pub enum DocumentError {
     InvalidPlan(String),
     Evaluation(String),
 }
@@ -236,7 +236,7 @@ impl fmt::Display for DocumentError {
 impl std::error::Error for DocumentError {}
 
 impl DocumentRuntime {
-    pub(crate) fn new(session: &mut MachineInstance) -> Result<Option<Self>, DocumentError> {
+    pub fn new(session: &mut MachineInstance) -> Result<Option<Self>, DocumentError> {
         let machine = session.shared_plan();
         let Some(plan) = machine.document_plan() else {
             return Ok(None);
@@ -330,7 +330,7 @@ impl DocumentRuntime {
         Ok(Some(runtime))
     }
 
-    pub(crate) fn frame(&self) -> &DocumentFrame {
+    pub fn frame(&self) -> &DocumentFrame {
         &self.frame
     }
 
@@ -418,7 +418,7 @@ impl DocumentRuntime {
         Ok(*source)
     }
 
-    pub(crate) fn stats(&self) -> DocumentMaterializationStats {
+    pub fn stats(&self) -> DocumentMaterializationStats {
         DocumentMaterializationStats {
             full_evaluation_count: self.full_evaluation_count,
             retained_scalar_evaluation_count: self.retained_scalar_evaluation_count,
@@ -427,7 +427,7 @@ impl DocumentRuntime {
         }
     }
 
-    pub(crate) fn demanded_targets(&self) -> Vec<ValueTarget> {
+    pub fn demanded_targets(&self) -> Vec<ValueTarget> {
         self.dependencies
             .iter()
             .filter_map(|dependency| match *dependency {
@@ -447,7 +447,7 @@ impl DocumentRuntime {
             .collect()
     }
 
-    pub(crate) fn mount_patches(&self) -> Vec<DocumentPatch> {
+    pub fn mount_patches(&self) -> Vec<DocumentPatch> {
         mount_patches(&self.frame)
     }
 
@@ -455,7 +455,7 @@ impl DocumentRuntime {
         resolve_row_source_index(&self.row_sources, list, path)
     }
 
-    pub(crate) fn apply_turn(
+    pub fn apply_turn(
         &mut self,
         session: &mut MachineInstance,
         deltas: &[Delta],
@@ -496,7 +496,7 @@ impl DocumentRuntime {
         ))
     }
 
-    pub(crate) fn rollback_turn(&mut self, rollback: DocumentRollback) {
+    pub fn rollback_turn(&mut self, rollback: DocumentRollback) {
         match rollback.0 {
             DocumentRollbackKind::Unchanged => {}
             DocumentRollbackKind::Scalar {
@@ -534,7 +534,7 @@ impl DocumentRuntime {
         }
     }
 
-    pub(crate) fn demand_window(
+    pub fn demand_window(
         &mut self,
         session: &mut MachineInstance,
         demand: DocumentWindowDemand,
@@ -6105,7 +6105,7 @@ fn collect_preorder(frame: &DocumentFrame, id: &FrameNodeId, order: &mut Vec<Fra
     }
 }
 
-pub(crate) fn diff_frames(previous: &DocumentFrame, next: &DocumentFrame) -> Vec<DocumentPatch> {
+pub fn diff_frames(previous: &DocumentFrame, next: &DocumentFrame) -> Vec<DocumentPatch> {
     let mut patches = Vec::new();
     let removed = previous
         .nodes

@@ -2918,7 +2918,7 @@ impl ProgramDocumentHost {
         let (requests, rejections) = self.schedule_requests();
         self.rebuild_composed_frame(parent);
         ProgramHostUpdate {
-            patches: crate::document::diff_frames(&previous, &self.frame),
+            patches: boon_document::runtime::diff_frames(&previous, &self.frame),
             requests,
             rejections,
             bootstrap: false,
@@ -3173,7 +3173,7 @@ impl ProgramDocumentHost {
                 .get(&host)
                 .map_or(0, |projection| projection.parent_children.len());
             patches.extend(
-                crate::document::diff_frames(&previous_frame, &next_frame)
+                boon_document::runtime::diff_frames(&previous_frame, &next_frame)
                     .into_iter()
                     .map(|patch| offset_projection_root_patch(patch, &host, parent_child_count)),
             );

@@ -2391,8 +2391,8 @@ roots = ["crates"]
 extensions = ["rs"]
 mode = "rust-token"
 needle = "BTreeMap"
-expected_occurrences = 3008
-expected_files = 129
+expected_occurrences = 3003
+expected_files = 127
 
 [entries.scans.expected_path_occurrences]
 "crates/boon_app_package/src/build.rs" = 2
@@ -2425,8 +2425,6 @@ expected_files = 129
 "crates/boon_http_runtime/tests/loopback.rs" = 5
 "crates/boon_ir/src/lib.rs" = 7
 "crates/boon_ir/src/semantic_mapping.rs" = 42
-"crates/boon_ir/src/tests/distributed.rs" = 3
-"crates/boon_ir/src/tests/sources_and_events.rs" = 2
 "crates/boon_list_access/src/index.rs" = 5
 "crates/boon_list_access/src/tests.rs" = 3
 "crates/boon_native_app_window/src/sensitive_input.rs" = 5
@@ -2530,8 +2528,8 @@ roots = ["crates"]
 extensions = ["rs"]
 mode = "rust-token"
 needle = "BTreeSet"
-expected_occurrences = 1914
-expected_files = 101
+expected_occurrences = 1879
+expected_files = 98
 
 [entries.scans.expected_path_occurrences]
 "crates/boon_app_package/src/browser.rs" = 2
@@ -2555,9 +2553,6 @@ expected_files = 101
 "crates/boon_http_runtime/src/lib.rs" = 3
 "crates/boon_ir/src/lib.rs" = 33
 "crates/boon_ir/src/semantic_mapping.rs" = 55
-"crates/boon_ir/src/tests.rs" = 1
-"crates/boon_ir/src/tests/bytes.rs" = 1
-"crates/boon_ir/src/tests/sources_and_events.rs" = 33
 "crates/boon_list_access/src/index.rs" = 5
 "crates/boon_native_gpu/src/lib.rs" = 21
 "crates/boon_native_gpu/src/map.rs" = 7
@@ -2678,7 +2673,7 @@ expected_files = 1
 roots = ["docs/architecture/phase0/container_occurrences.tsv"]
 extensions = ["tsv"]
 needle = "\ttest-oracle\t"
-expected_occurrences = 597
+expected_occurrences = 557
 expected_files = 1
 
 [[entries.scans]]

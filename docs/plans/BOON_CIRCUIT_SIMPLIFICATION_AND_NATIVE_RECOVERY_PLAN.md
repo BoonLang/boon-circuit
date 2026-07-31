@@ -203,6 +203,24 @@ across 155 files. Phase 0 deletion, fixture, and inventory checks pass; only
 the already-declared stale Cells packed baseline and its dependent budget
 report remain open.
 
+The erased-IR test-ownership cut removes 4,055 lines of private source-behavior
+verticals plus 50 lines of obsolete test-only runtime/full lowering helpers and
+unused producer aliases. The 31 retained private IR tests are genuine
+semantic-to-executable identity, allocation, storage-join, typed-list-storage,
+and fail-closed mapping algorithms. Public compiler integrations and the
+cross-layer foundations vertical remain the source-behavior owners. Those 31
+IR tests, all 18 retained compiler tests, all three foundations verticals, and
+the three executable migration scenarios pass under serial execution.
+
+The current architecture report now measures 444,347 tracked Rust lines and
+80,565 test Rust lines; only those two global caps fail. Runtime plus executor,
+playground, and xtask production remain within their caps at 40,518, 31,313,
+and 17,797 lines. The packed inventory now records 19,514 candidate sites
+across 83 files, and the exact container inventory records 4,968 occurrences
+across 151 files. Phase 0 deletion, fixture, and inventory checks pass; only
+the already-declared stale Cells packed baseline and its dependent budget
+report remain open.
+
 The executable migration demos currently prove the catalog/`MachinePlan`
 version-migration path, including incremental, skipped-version, restart,
 activation, namespace, and cross-path authority behavior. They do not claim

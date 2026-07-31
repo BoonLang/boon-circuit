@@ -1,10 +1,6 @@
 #[cfg(test)]
 use boon_parser::ParsedProgram;
-pub use boon_semantic::{
-    ProducerMaterializationMode as ProducerFunctionMode,
-    ProducerMaterializationRequest as ProducerFunctionLoweringRequest, StaticOwnerDef,
-    StaticOwnerId,
-};
+pub use boon_semantic::{StaticOwnerDef, StaticOwnerId};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -447,7 +443,7 @@ pub struct ProducerFunctionInstance {
     pub result_field: FieldId,
     pub result_path: String,
     pub root: ExecutableExprId,
-    pub mode: ProducerFunctionMode,
+    pub mode: boon_semantic::ProducerMaterializationMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub invocation_source: Option<SourceId>,
     pub arguments: Vec<ProducerFunctionArgument>,
@@ -2202,37 +2198,7 @@ fn erase_semantic_program(
 
 #[cfg(test)]
 fn lower(program: &ParsedProgram) -> Result<ErasedProgram, String> {
-    lower_with_external_types(program, &boon_typecheck::ExternalTypeEnvironment::default())
-}
-
-#[cfg(test)]
-fn lower_runtime(program: &ParsedProgram) -> Result<ErasedProgram, String> {
-    lower_runtime_with_external_types(program, &boon_typecheck::ExternalTypeEnvironment::default())
-}
-
-#[cfg(test)]
-fn lower_with_external_types(
-    program: &ParsedProgram,
-    external_types: &boon_typecheck::ExternalTypeEnvironment,
-) -> Result<ErasedProgram, String> {
-    lower_with_typecheck(program, external_types, true, &[])
-}
-
-#[cfg(test)]
-fn lower_runtime_with_external_types(
-    program: &ParsedProgram,
-    external_types: &boon_typecheck::ExternalTypeEnvironment,
-) -> Result<ErasedProgram, String> {
-    lower_with_typecheck(program, external_types, false, &[])
-}
-
-#[cfg(test)]
-fn lower_runtime_with_external_types_and_producer_functions(
-    program: &ParsedProgram,
-    external_types: &boon_typecheck::ExternalTypeEnvironment,
-    requests: &[ProducerFunctionLoweringRequest],
-) -> Result<ErasedProgram, String> {
-    lower_with_typecheck(program, external_types, false, requests)
+    lower_with_typecheck(program, &boon_typecheck::ExternalTypeEnvironment::default())
 }
 
 fn producer_identity_text(identity: [u8; 32]) -> String {
@@ -2243,8 +2209,6 @@ fn producer_identity_text(identity: [u8; 32]) -> String {
 fn lower_with_typecheck(
     program: &ParsedProgram,
     external_types: &boon_typecheck::ExternalTypeEnvironment,
-    include_type_hints: bool,
-    producer_requests: &[ProducerFunctionLoweringRequest],
 ) -> Result<ErasedProgram, String> {
     let trace_lower = std::env::var_os("BOON_IR_LOWER_TRACE").is_some();
     let trace_phase = |phase: &str, elapsed_ms: f64| {
@@ -2256,12 +2220,9 @@ fn lower_with_typecheck(
     if trace_lower {
         eprintln!("boon_ir lower typecheck:start");
     }
-    let check_output = if include_type_hints {
-        boon_typecheck::check_program_profiled_with_external_types(program, external_types)
-    } else {
+    let check_output =
         boon_typecheck::check_runtime_program_profiled_with_external_types(program, external_types)
-    }
-    .0;
+            .0;
     let typecheck_report = check_output.report;
     let typecheck_ms = lower_elapsed_ms(typecheck_started);
     trace_phase("typecheck", typecheck_ms);
@@ -2320,16 +2281,8 @@ fn lower_with_typecheck(
     let checked_program = check_output
         .program
         .ok_or_else(|| "typecheck produced no CheckedProgram for valid source".to_owned())?;
-    lower_checked(checked_program, producer_requests)
-}
-
-#[cfg(test)]
-fn lower_checked(
-    checked_program: boon_typecheck::CheckedProgram,
-    producer_requests: &[ProducerFunctionLoweringRequest],
-) -> Result<ErasedProgram, String> {
-    let semantic = boon_semantic::elaborate(checked_program, producer_requests)
-        .map_err(|error| error.to_string())?;
+    let semantic =
+        boon_semantic::elaborate(checked_program, &[]).map_err(|error| error.to_string())?;
     let verified =
         boon_verify::verify_explicit_contracts(semantic).map_err(|error| error.to_string())?;
     erase_and_lower(verified)
@@ -5667,9 +5620,6 @@ fn hidden_key_type(name: &str) -> String {
     output.push_str("Key");
     output
 }
-
-#[cfg(test)]
-mod tests;
 
 #[cfg(test)]
 mod typed_derived_list_storage_tests {

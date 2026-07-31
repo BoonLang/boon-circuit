@@ -1857,7 +1857,7 @@ pub fn erase_and_lower(
     verified: boon_verify::ContractVerifiedProgram,
 ) -> Result<ErasedProgram, String> {
     let (semantic, verification_manifest) = verified.into_lowering_parts();
-    erase_semantic_program(semantic, verification_manifest).map(|(program, _)| program)
+    erase_semantic_program(semantic, verification_manifest)
 }
 
 /// Atomically erases the exact three-role semantic bundle owned by one
@@ -1905,11 +1905,10 @@ pub fn erase_and_lower_bundle(
                 role.namespace()
             ));
         }
-        let (mut program, ids) = erase_semantic_program(semantic, manifest)?;
+        let mut program = erase_semantic_program(semantic, manifest)?;
         validate_erased_bundle_role_crossings(
             role,
             &mut program,
-            &ids,
             &call_crossings,
             &value_crossings,
         )?;
@@ -1947,7 +1946,7 @@ pub fn erase_and_lower_bundle(
 fn erase_semantic_program(
     semantic: boon_semantic::SemanticProgram,
     verification_manifest: boon_verify::VerificationManifestV1,
-) -> Result<(ErasedProgram, semantic_mapping::SemanticToExecutableMap), String> {
+) -> Result<ErasedProgram, String> {
     // The private ContractVerifiedProgram constructor has already validated
     // both artifacts. The digest join is retained as the erasure boundary's
     // exact ownership check; rescanning the same immutable semantic graph here
@@ -1971,7 +1970,7 @@ fn erase_semantic_program(
         semantic_program_digest,
         _dependency_manifest_digest,
     ) = semantic.into_lowering_parts();
-    let (fields, ids) = lower_verified_semantic_execution(
+    let fields = lower_verified_semantic_execution(
         execution_graph,
         resource_graph,
         reactive_graph,
@@ -1990,7 +1989,7 @@ fn erase_semantic_program(
     verify_erased_scope_index(&erased)?;
     verify_static_schedule(&erased)?;
     verify_hidden_identity(&erased)?;
-    Ok((erased, ids))
+    Ok(erased)
 }
 
 #[cfg(test)]
@@ -2094,20 +2093,13 @@ fn lower_verified_semantic_execution(
     scope_storage_graph: boon_semantic::SemanticScopeStorageGraphV1,
     memory_graph: boon_semantic::SemanticMemoryGraphV1,
     pulse_fusion_decisions: &[boon_verify::VerifiedPulseFusionDecisionV1],
-) -> Result<
-    (
-        ErasedProgramFields,
-        semantic_mapping::SemanticToExecutableMap,
-    ),
-    String,
-> {
+) -> Result<ErasedProgramFields, String> {
     let mapped = semantic_mapping::map_semantic_execution_with_reactive(
         &execution_graph,
         &resource_graph,
         &reactive_graph,
     )?;
     mapped.validate_totality()?;
-    let ids = mapped.id_map.clone();
     let resources = semantic_mapping::map_semantic_resources(
         &execution_graph,
         &resource_graph,
@@ -2125,13 +2117,12 @@ fn lower_verified_semantic_execution(
         mapped,
         resources,
     )?;
-    Ok((fields, ids))
+    Ok(fields)
 }
 
 fn validate_erased_bundle_role_crossings(
     role: boon_typecheck::ProgramRole,
     program: &mut ErasedProgram,
-    ids: &semantic_mapping::SemanticToExecutableMap,
     call_crossings: &[boon_semantic::BundleSemanticCallCrossingV1],
     value_crossings: &[boon_semantic::BundleSemanticValueCrossingV1],
 ) -> Result<(), String> {
@@ -2149,7 +2140,7 @@ fn validate_erased_bundle_role_crossings(
     }
     let mut matched_calls = BTreeSet::new();
     for crossing in expected_calls {
-        let expression = ids.expression(crossing.consumer_expression)?;
+        let expression = exact_erased_expression(program, crossing.consumer_expression)?;
         let matches = program
             .role_references()
             .calls
@@ -2187,7 +2178,7 @@ fn validate_erased_bundle_role_crossings(
                     flow_type,
                     ..
                 } => Some(
-                    ids.expression(*expression)
+                    exact_erased_expression(program, *expression)
                         .map(|value| (argument.name.as_str(), value, flow_type)),
                 ),
                 boon_semantic::BundleSemanticCallArgumentBindingV1::Omitted => None,
@@ -2239,7 +2230,7 @@ fn validate_erased_bundle_role_crossings(
     }
     let mut matched_values = BTreeSet::new();
     for crossing in expected_values {
-        let expression = ids.expression(crossing.consumer_expression)?;
+        let expression = exact_erased_expression(program, crossing.consumer_expression)?;
         let executable = program
             .executable
             .expressions
@@ -2310,6 +2301,24 @@ fn validate_erased_bundle_role_crossings(
     verify_static_schedule(program)?;
     verify_hidden_identity(program)?;
     Ok(())
+}
+
+fn exact_erased_expression(
+    program: &ErasedProgram,
+    semantic: boon_semantic::SemanticExprId,
+) -> Result<ExecutableExprId, String> {
+    let expression = ExecutableExprId(semantic.as_usize());
+    program
+        .executable
+        .expressions
+        .get(expression.as_usize())
+        .filter(|candidate| candidate.id == expression)
+        .map(|_| expression)
+        .ok_or_else(|| {
+            format!(
+                "semantic expression {semantic} has no exact expression in the erased dense arena"
+            )
+        })
 }
 
 fn ensure_erased_distributed_ingress_source(

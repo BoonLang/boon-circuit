@@ -930,13 +930,6 @@ expected_occurrences = 0
 expected_files = 0
 
 [[entries.scans]]
-roots = ["crates/boon_compiler/src/tests.rs"]
-extensions = ["rs"]
-needle = "f64::EPSILON"
-expected_occurrences = 0
-expected_files = 0
-
-[[entries.scans]]
 roots = ["crates/boon_persistence/src/codec.rs"]
 extensions = ["rs"]
 needle = ".f64("
@@ -2398,8 +2391,8 @@ roots = ["crates"]
 extensions = ["rs"]
 mode = "rust-token"
 needle = "BTreeMap"
-expected_occurrences = 3009
-expected_files = 130
+expected_occurrences = 3008
+expected_files = 129
 
 [entries.scans.expected_path_occurrences]
 "crates/boon_app_package/src/build.rs" = 2
@@ -2410,7 +2403,6 @@ expected_files = 130
 "crates/boon_compiler/src/distributed_compiler.rs" = 79
 "crates/boon_compiler/src/document_executable_backend.rs" = 27
 "crates/boon_compiler/src/machine_plan_backend.rs" = 97
-"crates/boon_compiler/src/tests.rs" = 1
 "crates/boon_contract/src/lib.rs" = 2
 "crates/boon_data/src/lib.rs" = 12
 "crates/boon_document/src/lib.rs" = 68
@@ -2538,8 +2530,8 @@ roots = ["crates"]
 extensions = ["rs"]
 mode = "rust-token"
 needle = "BTreeSet"
-expected_occurrences = 1944
-expected_files = 102
+expected_occurrences = 1914
+expected_files = 101
 
 [entries.scans.expected_path_occurrences]
 "crates/boon_app_package/src/browser.rs" = 2
@@ -2551,7 +2543,6 @@ expected_files = 102
 "crates/boon_compiler/src/distributed_compiler.rs" = 29
 "crates/boon_compiler/src/document_executable_backend.rs" = 18
 "crates/boon_compiler/src/machine_plan_backend.rs" = 143
-"crates/boon_compiler/src/tests.rs" = 30
 "crates/boon_contract/src/lib.rs" = 2
 "crates/boon_data/src/lib.rs" = 4
 "crates/boon_document/src/lib.rs" = 42
@@ -2687,7 +2678,7 @@ expected_files = 1
 roots = ["docs/architecture/phase0/container_occurrences.tsv"]
 extensions = ["tsv"]
 needle = "\ttest-oracle\t"
-expected_occurrences = 628
+expected_occurrences = 597
 expected_files = 1
 
 [[entries.scans]]

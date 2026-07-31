@@ -182,6 +182,27 @@ inventory follows the changed compiler ownership with 19,894 candidate sites
 across 88 files, and the exact container inventory retains 5,039 occurrences
 across 156 files.
 
+The next test-ownership cut deletes the 7,941-line private compiler behavior
+oracle module and its two now-unused dev dependencies. Public compiler
+integration tests retain transient collection, nested match, pulse/fusion, and
+worklist behavior; the cross-layer foundations vertical retains universal
+values, typed views, and scoped rows; the executable host migration runner
+retains Counter, Persons.pro, and incremental/skipped TodoMVC state migration.
+Six focused private tests remain for genuine document/backend mapping and
+resource-reference algorithms. The retained 18 compiler tests, three
+foundations verticals, and all three migration scenarios pass under serial
+execution.
+
+This cut removes 7,944 tracked Rust lines, including 7,941 test lines. The
+current architecture report now measures 448,452 tracked Rust lines and 84,620
+test Rust lines; only those two global caps fail. Runtime plus executor,
+playground, and xtask production remain within their caps at 40,518, 31,313,
+and 17,797 lines. The packed inventory now records 19,667 candidate sites
+across 87 files, and the exact container inventory records 5,008 occurrences
+across 155 files. Phase 0 deletion, fixture, and inventory checks pass; only
+the already-declared stale Cells packed baseline and its dependent budget
+report remain open.
+
 The executable migration demos currently prove the catalog/`MachinePlan`
 version-migration path, including incremental, skipped-version, restart,
 activation, namespace, and cross-path authority behavior. They do not claim

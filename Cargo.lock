@@ -696,7 +696,6 @@ dependencies = [
 name = "boon_compiler"
 version = "0.1.0"
 dependencies = [
- "boon_contract",
  "boon_data",
  "boon_example_manifest",
  "boon_ir",
@@ -706,7 +705,6 @@ dependencies = [
  "boon_typecheck",
  "boon_verify",
  "serde",
- "serde_json",
  "sha2",
  "toml",
  "unicode-segmentation",

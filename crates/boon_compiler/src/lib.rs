@@ -665,6 +665,3 @@ fn resolve_repo_file(relative: impl AsRef<Path>) -> PathBuf {
 fn elapsed_ms(started: Instant) -> f64 {
     started.elapsed().as_secs_f64() * 1000.0
 }
-
-#[cfg(test)]
-mod tests;

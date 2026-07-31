@@ -7,25 +7,25 @@ word_boundary = "rust-identifier"
 lexical_scope = "all-source-text"
 test_scope_policy = "test-oracle"
 non_code_policy = "unrelated-host-code"
-expected_file_count = 148
-expected_file_set_sha256 = "c9effc57c6b7372494a4a2753c27473d686e30dd2c3b6868cef6677920f87078"
+expected_file_count = 147
+expected_file_set_sha256 = "4adabe2b6003989645a14f971c78601d9a5cd139d7d3428d0c4931a4ad94d480"
 occurrence_ledger_path = "docs/architecture/phase0/container_occurrences.tsv"
 occurrence_ledger_protocol = "boon-phase0-container-occurrences-v1"
 occurrence_ledger_generator = "cargo test -p xtask verify_phase0::tests::regenerate_container_occurrence_ledger -- --ignored --exact"
-expected_occurrence_ledger_sha256 = "a30954c0e2d28af9262e3e749f08dfd886bf473c0f01f274c4e1378254baface"
-expected_occurrence_rows = 4849
+expected_occurrence_ledger_sha256 = "efe96db72893b4f6ca2a584beeb4617c4ec3d9274dc0157f7a24dd0e4d34d16d"
+expected_occurrence_rows = 4814
 within_file_classification = "complete"
 within_file_owner_phase = "goal-phase-5-packed"
 within_file_owner_action = "Maintain one checked-in row per exact identifier occurrence; mixed files retain distinct per-use categories."
 
 [[constructs]]
 id = "BTreeMap"
-expected_occurrences = 2895
-expected_files = 124
+expected_occurrences = 2865
+expected_files = 122
 
 [[constructs]]
 id = "BTreeSet"
-expected_occurrences = 1868
+expected_occurrences = 1863
 expected_files = 97
 
 [[constructs]]
@@ -98,9 +98,9 @@ order = 5
 id = "test-oracle"
 owner_phase = "goal-phase-0"
 owner_plan = "docs/plans/GOAL_PROMPT.md"
-expected_files = 57
-expected_btree_map = 327
-expected_btree_set = 102
+expected_files = 51
+expected_btree_map = 297
+expected_btree_set = 97
 expected_hash_map = 7
 expected_hash_set = 2
 

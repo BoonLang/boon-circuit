@@ -339,30 +339,6 @@ impl NativeTransientHost {
         self.calls.active_count() != 0
     }
 
-    #[cfg(test)]
-    pub fn active_call_count(&self) -> usize {
-        self.calls.active_count()
-    }
-
-    #[cfg(test)]
-    pub fn file_stream_outstanding_credits(&self) -> Vec<u32> {
-        self.calls
-            .active_call_ids()
-            .into_iter()
-            .filter_map(|call_id| self.file_streams.outstanding_credits(call_id))
-            .collect()
-    }
-
-    #[cfg(test)]
-    pub fn file_stream_owned_call_count(&self) -> usize {
-        self.file_streams.owned_call_count()
-    }
-
-    #[cfg(test)]
-    pub fn pending_content_writer_count(&self) -> usize {
-        self.file_streams.content_store().pending_writer_count()
-    }
-
     fn cancel(&mut self, call_id: TransientEffectCallId) {
         for (lane, call_id) in self.calls.cancel_calls(&[call_id]) {
             self.cancel_adapter(lane, call_id);

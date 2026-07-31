@@ -727,6 +727,3 @@ impl std::fmt::Display for ServerConfigError {
 }
 
 impl std::error::Error for ServerConfigError {}
-
-#[cfg(test)]
-mod tests;

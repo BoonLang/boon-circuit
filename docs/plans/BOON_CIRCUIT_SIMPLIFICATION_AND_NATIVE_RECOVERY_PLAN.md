@@ -318,6 +318,30 @@ Phase 0 deletion and both regenerated inventories pass; only the
 already-declared stale Cells packed baseline and its dependent budget report
 remain open.
 
+The product-host test-ownership cut removes private browser persistence and
+effect-host behavior modules, the app-server wrapper/transient-host behavior
+modules, and native runtime-view product scenarios. Public web-host
+integrations remain the browser document, storage, transport, capability, map,
+and startup behavior owners; public host/server integrations and manifest
+native gates remain the product-host owners. Test-only routing, queue-count,
+content-import, and native inspection hooks that had no remaining owner are
+also deleted. Production persistence coordinators, content/file effect
+algorithms, app-server configuration and routing, native document runtime,
+migration runners, fixtures, and state-draining paths remain intact.
+
+The affected web-host, web-effect-host, app-server, and native-playground
+all-target compile passes without warnings. All 47 retained native web-host
+unit/integration tests pass, as do the three executable Counter, Persons.pro,
+and TodoMVC migration scenarios. This cut removes 4,161 tracked Rust lines,
+including 3,751 test Rust lines. The current architecture report measures
+418,132 tracked Rust lines and 55,113 test Rust lines; only those two global
+caps fail. Runtime plus executor, playground, and xtask production remain
+within their caps at 40,503, 31,125, and 17,797 lines. The packed inventory now
+records 18,150 candidate sites across 80 files, and the exact container
+inventory records 4,814 occurrences across 147 files. Phase 0 deletion and
+both regenerated inventories pass; only the already-declared stale Cells
+packed baseline and its dependent budget report remain open.
+
 The executable migration demos currently prove the catalog/`MachinePlan`
 version-migration path, including incremental, skipped-version, restart,
 activation, namespace, and cross-path authority behavior. They do not claim

@@ -13342,16 +13342,6 @@ impl MachineInstance {
         self.set_row_authority_field(row, field, value, &mut work)
     }
 
-    #[cfg(test)]
-    pub(crate) fn test_ensure_ordered_index_current(
-        &mut self,
-        index: PlanListIndexId,
-    ) -> Result<TurnMetrics, Error> {
-        let mut work = self.fresh_work();
-        self.ensure_ordered_index_current(index, None, &mut work)?;
-        Ok(work.metrics)
-    }
-
     pub fn list_value_current(&mut self, list: ListId) -> Result<Value, Error> {
         self.list_value_current_with_metrics(list)
             .map(|(value, _)| value)

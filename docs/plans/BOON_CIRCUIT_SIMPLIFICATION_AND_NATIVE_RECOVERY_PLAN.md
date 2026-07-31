@@ -242,6 +242,29 @@ Phase 0 deletion and both regenerated inventories pass; only the
 already-declared stale Cells packed baseline and its dependent budget report
 remain open.
 
+The executor test-ownership cut removes a net 5,062 lines of private
+source-compiled success verticals for typed-list paging/index construction,
+FjordPulse and scalar conversions, public FLUSH behavior, source-level effect
+guards, stateful calls, BITS, and pulse fusion. Their public compiler,
+foundations, typed-list, map/set, FjordPulse, host/runtime, and pulse integration
+owners remain. The compact private executor suite retains the hand-built
+`MachinePlan` algorithms for rollback, currentness, dependency cycles, indexes,
+bounded work, transient and durable effects, distributed leases, and detached
+captures. Ten lines of test-only ordered-index access that became unused were
+also deleted. The 105 retained executor unit tests, 18 public executor
+integration tests, eight public pulse compiler tests, and all three executable
+migration scenarios pass under serial execution.
+
+This cut removes a net 5,010 tracked Rust lines and 5,000 test Rust lines. The
+current architecture report measures 432,155 tracked Rust lines and 68,433 test
+Rust lines; only those two global caps fail. Runtime plus executor, playground,
+and xtask production remain within their caps at 40,508, 31,313, and 17,797
+lines. The packed inventory now records 18,899 candidate sites across 80 files,
+and the exact container inventory records 4,922 occurrences across 148 files.
+Phase 0 deletion and both regenerated inventories pass; only the
+already-declared stale Cells packed baseline and its dependent budget report
+remain open.
+
 The executable migration demos currently prove the catalog/`MachinePlan`
 version-migration path, including incremental, skipped-version, restart,
 activation, namespace, and cross-path authority behavior. They do not claim

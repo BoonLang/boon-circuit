@@ -604,6 +604,76 @@ pub enum SemanticExpressionKind {
     Bits(boon_data::Bits),
 }
 
+impl SemanticExpressionKind {
+    /// Canonical direct expression edges.
+    ///
+    /// `Materialize` is deliberately a leaf here because its expression roots
+    /// belong to the referenced materialization rather than to the expression
+    /// node itself. Passes that traverse through materializations use
+    /// [`SemanticExecutionGraphV1::expression_children`] instead.
+    pub(crate) fn direct_children(&self) -> Vec<SemanticExprId> {
+        match self {
+            Self::CanonicalRead { .. }
+            | Self::LocalRead { .. }
+            | Self::ExternalRead { .. }
+            | Self::ElementState { .. }
+            | Self::Drain { .. }
+            | Self::Text(_)
+            | Self::Number(_)
+            | Self::Bits(_)
+            | Self::BytesByte(_)
+            | Self::Absent
+            | Self::Tag(_)
+            | Self::Source { .. }
+            | Self::Materialize { .. }
+            | Self::Delimiter
+            | Self::MaterializationLocal { .. }
+            | Self::FunctionParameter { .. } => Vec::new(),
+            Self::TextTemplate { segments } => segments
+                .iter()
+                .filter_map(|segment| match segment {
+                    SemanticTextSegment::Static { .. } => None,
+                    SemanticTextSegment::Dynamic { value } => Some(*value),
+                })
+                .collect(),
+            Self::TaggedObject { fields, .. } | Self::Object(fields) => {
+                fields.iter().map(|field| field.value).collect()
+            }
+            Self::Call { arguments, .. } => {
+                arguments.iter().map(|argument| argument.value).collect()
+            }
+            Self::Flush { payload: input }
+            | Self::FlushBoundary { input }
+            | Self::Draining { input }
+            | Self::Project { input, .. } => vec![*input],
+            Self::Hold {
+                initial, updates, ..
+            } => std::iter::once(*initial)
+                .chain(updates.iter().copied())
+                .collect(),
+            Self::Latest { branches } => branches.clone(),
+            Self::When { input, arms, .. } => std::iter::once(*input)
+                .chain(arms.iter().map(|arm| arm.output))
+                .collect(),
+            Self::Then { input, output } => std::iter::once(*input)
+                .chain(output.iter().copied())
+                .collect(),
+            Self::Infix { left, right, .. } => vec![*left, *right],
+            Self::MapEntry { key, value } => vec![*key, *value],
+            Self::MatchArm { output, .. } => output.iter().copied().collect(),
+            Self::Block { bindings, result } => bindings
+                .iter()
+                .map(|binding| binding.value)
+                .chain(std::iter::once(*result))
+                .collect(),
+            Self::List { items, .. }
+            | Self::Bytes { items, .. }
+            | Self::Map { entries: items }
+            | Self::Set { items } => items.clone(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SemanticMaterializationResultKind {
@@ -634,6 +704,100 @@ pub struct SemanticExecutionGraphV1 {
     /// audit provenance; checked IDs never become semantic execution IDs.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub checked_expression_origins: Vec<SemanticExpressionOrigin>,
+}
+
+impl SemanticExecutionGraphV1 {
+    pub(crate) fn expression(&self, id: SemanticExprId) -> Result<&SemanticExpression, String> {
+        self.expressions
+            .get(id.as_usize())
+            .filter(|expression| expression.id == id)
+            .ok_or_else(|| format!("semantic execution graph references missing expression {id}"))
+    }
+
+    pub(crate) fn statement(&self, id: SemanticStatementId) -> Result<&SemanticStatement, String> {
+        self.statements
+            .get(id.as_usize())
+            .filter(|statement| statement.id == id)
+            .ok_or_else(|| format!("semantic execution graph references missing statement {id}"))
+    }
+
+    pub(crate) fn callable(&self, id: SemanticCallableId) -> Result<&SemanticCallable, String> {
+        self.callables
+            .get(id.as_usize())
+            .filter(|callable| callable.id == id)
+            .ok_or_else(|| format!("semantic execution graph references missing callable {id}"))
+    }
+
+    pub(crate) fn call(&self, id: SemanticCallId) -> Result<&SemanticCall, String> {
+        self.calls
+            .get(id.as_usize())
+            .filter(|call| call.id == id)
+            .ok_or_else(|| format!("semantic execution graph references missing call {id}"))
+    }
+
+    pub(crate) fn source(&self, id: SemanticSourceId) -> Result<&SemanticSourceDef, String> {
+        self.sources
+            .get(id.as_usize())
+            .filter(|source| source.id == id)
+            .ok_or_else(|| format!("semantic execution graph references missing source {id}"))
+    }
+
+    pub(crate) fn state(&self, id: SemanticStateId) -> Result<&SemanticStateDef, String> {
+        self.states
+            .get(id.as_usize())
+            .filter(|state| state.id == id)
+            .ok_or_else(|| format!("semantic execution graph references missing state {id}"))
+    }
+
+    pub(crate) fn value(&self, id: SemanticExprId) -> Result<SemanticValueId, String> {
+        Ok(self.expression(id)?.value_id)
+    }
+
+    pub(crate) fn origin(&self, id: SemanticExprId) -> Result<&SemanticExpressionOrigin, String> {
+        self.checked_expression_origins
+            .get(id.as_usize())
+            .filter(|origin| origin.expression == id)
+            .ok_or_else(|| {
+                format!("semantic expression {id} has no exact checked-expression origin")
+            })
+    }
+
+    pub(crate) fn route_scope(&self, id: SemanticExprId) -> Result<SemanticScopeId, String> {
+        let origin = self.origin(id)?;
+        let matches = self
+            .scopes
+            .iter()
+            .filter(|scope| scope.checked_scope == origin.checked_scope)
+            .map(|scope| scope.id)
+            .collect::<Vec<_>>();
+        let [scope] = matches.as_slice() else {
+            return Err(format!(
+                "semantic expression {id} checked scope {} resolves to {} semantic scopes",
+                origin.checked_scope.0,
+                matches.len()
+            ));
+        };
+        Ok(*scope)
+    }
+
+    /// Canonical expression edges with materialization roots expanded.
+    ///
+    /// `None` means a `Materialize` expression references a missing or
+    /// non-canonical dense materialization ID. Callers retain ownership of
+    /// their phase-specific diagnostic.
+    pub(crate) fn expression_children(
+        &self,
+        kind: &SemanticExpressionKind,
+    ) -> Option<Vec<SemanticExprId>> {
+        match kind {
+            SemanticExpressionKind::Materialize { materialization } => self
+                .materializations
+                .get(materialization.as_usize())
+                .filter(|candidate| candidate.id == *materialization)
+                .map(SemanticContextualMaterialization::expression_roots),
+            _ => Some(kind.direct_children()),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -717,7 +881,7 @@ impl SemanticStateLifetimeDeriverV1 {
     pub(crate) fn new(expressions: &[SemanticExpression]) -> Result<Self, String> {
         let mut parents = vec![Vec::new(); expressions.len()];
         for expression in expressions {
-            for child in semantic_expression_children_for_lifetime_v1(&expression.kind) {
+            for child in expression.kind.direct_children() {
                 let Some(child_index) = expressions
                     .get(child.as_usize())
                     .filter(|candidate| candidate.id == child)
@@ -831,71 +995,6 @@ fn semantic_expression_is_producer_invocation_source(
                         && matches!(member.origin, SemanticValueOrigin::ProducerSource { .. })
                 })
         })
-}
-
-fn semantic_expression_children_for_lifetime_v1(
-    kind: &SemanticExpressionKind,
-) -> Vec<SemanticExprId> {
-    match kind {
-        SemanticExpressionKind::CanonicalRead { .. }
-        | SemanticExpressionKind::LocalRead { .. }
-        | SemanticExpressionKind::ExternalRead { .. }
-        | SemanticExpressionKind::ElementState { .. }
-        | SemanticExpressionKind::Drain { .. }
-        | SemanticExpressionKind::Text(_)
-        | SemanticExpressionKind::Number(_)
-        | SemanticExpressionKind::Bits(_)
-        | SemanticExpressionKind::BytesByte(_)
-        | SemanticExpressionKind::Absent
-        | SemanticExpressionKind::Tag(_)
-        | SemanticExpressionKind::Source { .. }
-        | SemanticExpressionKind::Materialize { .. }
-        | SemanticExpressionKind::Delimiter
-        | SemanticExpressionKind::MaterializationLocal { .. }
-        | SemanticExpressionKind::FunctionParameter { .. } => Vec::new(),
-        SemanticExpressionKind::TextTemplate { segments } => segments
-            .iter()
-            .filter_map(|segment| match segment {
-                SemanticTextSegment::Static { .. } => None,
-                SemanticTextSegment::Dynamic { value } => Some(*value),
-            })
-            .collect(),
-        SemanticExpressionKind::TaggedObject { fields, .. }
-        | SemanticExpressionKind::Object(fields) => {
-            fields.iter().map(|field| field.value).collect()
-        }
-        SemanticExpressionKind::Call { arguments, .. } => {
-            arguments.iter().map(|argument| argument.value).collect()
-        }
-        SemanticExpressionKind::Flush { payload: input }
-        | SemanticExpressionKind::FlushBoundary { input }
-        | SemanticExpressionKind::Draining { input }
-        | SemanticExpressionKind::Project { input, .. } => vec![*input],
-        SemanticExpressionKind::Hold {
-            initial, updates, ..
-        } => std::iter::once(*initial)
-            .chain(updates.iter().copied())
-            .collect(),
-        SemanticExpressionKind::Latest { branches } => branches.clone(),
-        SemanticExpressionKind::When { input, arms, .. } => std::iter::once(*input)
-            .chain(arms.iter().map(|arm| arm.output))
-            .collect(),
-        SemanticExpressionKind::Then { input, output } => {
-            std::iter::once(*input).chain(*output).collect()
-        }
-        SemanticExpressionKind::Infix { left, right, .. } => vec![*left, *right],
-        SemanticExpressionKind::MapEntry { key, value } => vec![*key, *value],
-        SemanticExpressionKind::MatchArm { output, .. } => output.iter().copied().collect(),
-        SemanticExpressionKind::Block { bindings, result } => bindings
-            .iter()
-            .map(|binding| binding.value)
-            .chain(std::iter::once(*result))
-            .collect(),
-        SemanticExpressionKind::List { items, .. }
-        | SemanticExpressionKind::Bytes { items, .. }
-        | SemanticExpressionKind::Map { entries: items }
-        | SemanticExpressionKind::Set { items } => items.clone(),
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -2677,12 +2776,17 @@ mod tests {
     }
 
     #[test]
-    fn non_dense_expression_id_is_rejected() {
+    fn non_dense_expression_and_value_ids_are_rejected() {
         let semantic = empty_semantic_program();
         let mut graph = one_expression_graph();
         graph.expressions[0].id = SemanticExprId(1);
         let error = graph.validate(semantic.resolved_out_graph()).unwrap_err();
         assert!(error.contains("non-dense ID 1"), "{error}");
+
+        let mut graph = one_expression_graph();
+        graph.expressions[0].value_id = SemanticValueId(1);
+        let error = graph.validate(semantic.resolved_out_graph()).unwrap_err();
+        assert!(error.contains("non-dense value ID 1"), "{error}");
     }
 
     #[test]

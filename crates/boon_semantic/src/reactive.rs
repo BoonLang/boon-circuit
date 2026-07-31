@@ -554,6 +554,12 @@ impl fmt::Display for SemanticReactiveError {
 
 impl std::error::Error for SemanticReactiveError {}
 
+impl From<String> for SemanticReactiveError {
+    fn from(message: String) -> Self {
+        Self::new(message)
+    }
+}
+
 /// Derive the semantic-owned reactive graph.
 ///
 /// This function validates its three input graphs before deriving anything.
@@ -814,7 +820,6 @@ struct ReactiveBuilder<'a> {
     execution: &'a SemanticExecutionGraphV1,
     resources: &'a SemanticResourceGraphV1,
     out_net: &'a ResolvedOutGraph,
-    expressions: ExpressionIndex<'a>,
     reachable_expressions: BTreeSet<SemanticExprId>,
     local_values: BTreeMap<SemanticLocalBindingId, (DeclId, SemanticExprId)>,
     parameter_inputs: BTreeMap<SemanticExprId, Vec<SemanticExprId>>,
@@ -828,7 +833,6 @@ impl<'a> ReactiveBuilder<'a> {
         out_net: &'a ResolvedOutGraph,
         external_event_identities: BTreeSet<CheckedExternalDeclarationIdentityV1>,
     ) -> Result<Self, SemanticReactiveError> {
-        let expressions = ExpressionIndex::new(execution)?;
         let reachable_expressions = reachable_reactive_expressions(execution)?;
         let mut local_values = BTreeMap::new();
         for expression in &execution.expressions {
@@ -859,7 +863,7 @@ impl<'a> ReactiveBuilder<'a> {
                 if !visited.insert(expression_id) {
                     continue;
                 }
-                let expression = expressions.expression(expression_id)?;
+                let expression = execution.expression(expression_id)?;
                 if let SemanticExpressionKind::FunctionParameter { parameter, .. } =
                     &expression.kind
                 {
@@ -886,7 +890,6 @@ impl<'a> ReactiveBuilder<'a> {
             execution,
             resources,
             out_net,
-            expressions,
             reachable_expressions,
             local_values,
             parameter_inputs,
@@ -917,7 +920,7 @@ impl<'a> ReactiveBuilder<'a> {
                     counts.len()
                 )));
             };
-            let count_expression = self.expressions.expression(count.value)?;
+            let count_expression = self.execution.expression(count.value)?;
             batches.push(RawPulseBatch {
                 id: SemanticPulseBatchId(0),
                 enclosing_then: None,
@@ -960,7 +963,7 @@ impl<'a> ReactiveBuilder<'a> {
         }
 
         for state in &self.resources.states {
-            let hold = self.expressions.expression(state.expression)?;
+            let hold = self.execution.expression(state.expression)?;
             let SemanticExpressionKind::Hold { updates, .. } = &hold.kind else {
                 continue;
             };
@@ -1007,7 +1010,7 @@ impl<'a> ReactiveBuilder<'a> {
             if !visited.insert((expression_id, start)) {
                 continue;
             }
-            let expression = self.expressions.expression(expression_id)?;
+            let expression = self.execution.expression(expression_id)?;
             if let SemanticExpressionKind::Then { input, output } = &expression.kind {
                 if let (Some(batch_index), Some(output)) =
                     (batch_by_expression.get(input).copied(), *output)
@@ -1048,7 +1051,7 @@ impl<'a> ReactiveBuilder<'a> {
         consumers
             .into_iter()
             .map(|consumer| {
-                let expression = self.expressions.expression(consumer)?;
+                let expression = self.execution.expression(consumer)?;
                 let filter = match &expression.kind {
                     SemanticExpressionKind::Call {
                         call,
@@ -1079,7 +1082,7 @@ impl<'a> ReactiveBuilder<'a> {
                             call: *call,
                             expression: consumer,
                             count_expression: count.value,
-                            count_value: self.expressions.value(count.value)?,
+                            count_value: self.execution.value(count.value)?,
                         }
                     }
                     _ => SemanticPulseEmissionFilterV1::Passthrough,
@@ -1103,7 +1106,7 @@ impl<'a> ReactiveBuilder<'a> {
             if !visited.insert(expression) {
                 continue;
             }
-            let expression = self.expressions.expression(expression)?;
+            let expression = self.execution.expression(expression)?;
             if matches!(&expression.kind, SemanticExpressionKind::Flush { .. }) {
                 flushes.insert(expression.id);
             }
@@ -1144,7 +1147,7 @@ impl<'a> ReactiveBuilder<'a> {
         let activations = states_by_then
             .into_iter()
             .map(|(then_expression, states)| {
-                let expression = self.expressions.expression(then_expression)?;
+                let expression = self.execution.expression(then_expression)?;
                 let SemanticExpressionKind::Then {
                     input,
                     output: Some(output),
@@ -1158,11 +1161,11 @@ impl<'a> ReactiveBuilder<'a> {
                     id: activation_ids[&then_expression],
                     then_expression,
                     input_expression: *input,
-                    input_value: self.expressions.value(*input)?,
+                    input_value: self.execution.value(*input)?,
                     output_expression: *output,
-                    output_value: self.expressions.value(*output)?,
+                    output_value: self.execution.value(*output)?,
                     owner: expression.owner,
-                    route_scope: self.expressions.route_scope(then_expression)?,
+                    route_scope: self.execution.route_scope(then_expression)?,
                     states: states.into_iter().collect(),
                 })
             })
@@ -1309,7 +1312,6 @@ impl<'a> ReactiveBuilder<'a> {
             self.execution,
             self.resources,
             self.out_net,
-            &self.expressions,
             &bindings,
             &self.local_values,
             &self.parameter_inputs,
@@ -1682,7 +1684,7 @@ impl<'a> ReactiveBuilder<'a> {
                     let input_values = parameter
                         .input_expressions
                         .iter()
-                        .map(|expression| self.expressions.value(*expression))
+                        .map(|expression| self.execution.value(*expression))
                         .collect::<Result<Vec<_>, _>>()?;
                     Ok(SemanticProducerParameterV1 {
                         parameter: parameter.id,
@@ -1704,7 +1706,7 @@ impl<'a> ReactiveBuilder<'a> {
                 result_declaration: resource.result_declaration,
                 result_path: resource.result_path.clone(),
                 root_expression,
-                root_value: self.expressions.value(root_expression)?,
+                root_value: self.execution.value(root_expression)?,
                 mode: resource.mode,
                 invocation_source,
                 parameters,
@@ -1776,7 +1778,7 @@ impl<'a> ReactiveBuilder<'a> {
                     let Some(value) = parent_value else {
                         break statement_producer;
                     };
-                    let expression = self.expressions.expression(value)?;
+                    let expression = self.execution.expression(value)?;
                     match &expression.kind {
                         SemanticExpressionKind::FlushBoundary { input } => {
                             parent_value = Some(*input);
@@ -1791,7 +1793,7 @@ impl<'a> ReactiveBuilder<'a> {
                             match structural.as_slice() {
                                 [value] => {
                                     if matches!(
-                                        &self.expressions.expression(statement_producer)?.kind,
+                                        &self.execution.expression(statement_producer)?.kind,
                                         SemanticExpressionKind::Project { input, fields }
                                             if *input == *value && fields.is_empty()
                                     ) {
@@ -1799,7 +1801,7 @@ impl<'a> ReactiveBuilder<'a> {
                                     }
                                     let mut candidate = *value;
                                     loop {
-                                        match &self.expressions.expression(candidate)?.kind {
+                                        match &self.execution.expression(candidate)?.kind {
                                             SemanticExpressionKind::FlushBoundary { input } => {
                                                 candidate = *input;
                                             }
@@ -1829,7 +1831,7 @@ impl<'a> ReactiveBuilder<'a> {
             let Some((name, path, row)) = exact else {
                 continue;
             };
-            let expression = self.expressions.expression(producer)?;
+            let expression = self.execution.expression(producer)?;
             candidates.push((
                 statement.id,
                 declaration,
@@ -1966,7 +1968,7 @@ impl<'a> ReactiveBuilder<'a> {
                         source.id, source.statement
                     ))
                 })?;
-            let expression = self.expressions.expression(source.expression)?;
+            let expression = self.execution.expression(source.expression)?;
             candidates.push((
                 source.statement,
                 source.declaration,
@@ -1991,7 +1993,7 @@ impl<'a> ReactiveBuilder<'a> {
                 // expressions). Preserve every exact state binding instead of
                 // collapsing the statement to its final state.
                 for state in states {
-                    let expression = self.expressions.expression(state.expression)?;
+                    let expression = self.execution.expression(state.expression)?;
                     candidates.push((
                         statement.id,
                         declaration,
@@ -2021,7 +2023,7 @@ impl<'a> ReactiveBuilder<'a> {
             } else {
                 continue;
             };
-            let expression = self.expressions.expression(producer)?;
+            let expression = self.execution.expression(producer)?;
             candidates.push((
                 statement.id,
                 declaration,
@@ -2184,7 +2186,7 @@ impl<'a> ReactiveBuilder<'a> {
                         binding: *binding,
                         declaration: *declaration,
                         producer,
-                        producer_value: self.expressions.value(producer)?,
+                        producer_value: self.execution.value(producer)?,
                         projection: projection.clone(),
                     }
                 }
@@ -2237,7 +2239,7 @@ impl<'a> ReactiveBuilder<'a> {
         expression: &SemanticExpression,
         bindings: &'b [SemanticBindingV1],
     ) -> Result<&'b SemanticBindingV1, SemanticReactiveError> {
-        let origin = self.expressions.origin(expression.id)?;
+        let origin = self.execution.origin(expression.id)?;
         lexical_binding_for_decl(
             self.execution,
             self.resources,
@@ -2376,7 +2378,7 @@ impl<'a> ReactiveBuilder<'a> {
                 [pulse] => {
                     let output = match &mutation.kind {
                         SemanticListMutationKindV1::Append { .. } => {
-                            let expression = self.expressions.expression(mutation.site)?;
+                            let expression = self.execution.expression(mutation.site)?;
                             let SemanticExpressionKind::Call {
                                 callable,
                                 arguments,
@@ -2467,7 +2469,7 @@ impl<'a> ReactiveBuilder<'a> {
                 return Ok(Some(list));
             }
         }
-        let expression = self.expressions.expression(root)?;
+        let expression = self.execution.expression(root)?;
         let input = match &expression.kind {
             SemanticExpressionKind::Materialize { materialization } => self
                 .execution
@@ -2490,13 +2492,9 @@ impl<'a> ReactiveBuilder<'a> {
                 callable,
                 arguments,
                 ..
-            } if matches!(expression.flow_type.ty, Type::List(_)) => exact_unique_list_argument(
-                self.execution,
-                &self.expressions,
-                *callable,
-                arguments,
-                root,
-            )?,
+            } if matches!(expression.flow_type.ty, Type::List(_)) => {
+                exact_unique_list_argument(self.execution, *callable, arguments, root)?
+            }
             _ => None,
         };
         match input {
@@ -2516,7 +2514,7 @@ impl<'a> ReactiveBuilder<'a> {
         if !visited.insert(root) {
             return Ok(());
         }
-        let expression = self.expressions.expression(root)?;
+        let expression = self.execution.expression(root)?;
         match &expression.kind {
             SemanticExpressionKind::Materialize { materialization } => {
                 let materialization = self
@@ -2601,13 +2599,9 @@ impl<'a> ReactiveBuilder<'a> {
                 arguments,
                 ..
             } => {
-                if let Some(input) = exact_unique_list_argument(
-                    self.execution,
-                    &self.expressions,
-                    *callable,
-                    arguments,
-                    root,
-                )? {
+                if let Some(input) =
+                    exact_unique_list_argument(self.execution, *callable, arguments, root)?
+                {
                     self.collect_list_mutations(list, input, visited, triggers, mutations)?;
                 }
             }
@@ -2665,7 +2659,7 @@ impl<'a> ReactiveBuilder<'a> {
                                 binding.id
                             ))
                         })?;
-                    let producer = self.expressions.expression(binding.producer)?;
+                    let producer = self.execution.expression(binding.producer)?;
                     if matches!(
                         resource.origin,
                         SemanticListResourceOriginV1::CheckedLiteral { .. }
@@ -2758,7 +2752,7 @@ impl<'a> ReactiveBuilder<'a> {
             } else {
                 SemanticDerivedValueKindV1::Pure
             };
-            let default_values = match &self.expressions.expression(binding.producer)?.kind {
+            let default_values = match &self.execution.expression(binding.producer)?.kind {
                 SemanticExpressionKind::Latest { branches } => branches
                     .iter()
                     .filter(|branch| {
@@ -2766,10 +2760,10 @@ impl<'a> ReactiveBuilder<'a> {
                             .event_causes_for_expression(**branch)
                             .is_ok_and(|causes| causes.is_empty())
                     })
-                    .map(|branch| self.expressions.value(*branch))
+                    .map(|branch| self.execution.value(*branch))
                     .collect::<Result<Vec<_>, _>>()?,
                 SemanticExpressionKind::Hold { initial, .. } => {
-                    vec![self.expressions.value(*initial)?]
+                    vec![self.execution.value(*initial)?]
                 }
                 _ => Vec::new(),
             };
@@ -2820,7 +2814,7 @@ impl<'a> ReactiveBuilder<'a> {
         ) {
             return Ok(None);
         }
-        let expression = self.expressions.expression(expression)?;
+        let expression = self.execution.expression(expression)?;
         let [member] = expression.provenance.members.as_slice() else {
             return Ok(None);
         };
@@ -2856,7 +2850,7 @@ impl<'a> ReactiveBuilder<'a> {
         &self,
         expression: SemanticExprId,
     ) -> Result<bool, SemanticReactiveError> {
-        let provenance = &self.expressions.expression(expression)?.provenance;
+        let provenance = &self.execution.expression(expression)?.provenance;
         if provenance.members.is_empty() {
             return Ok(false);
         }
@@ -2941,7 +2935,7 @@ impl<'a> ReactiveBuilder<'a> {
                             intrinsic: Some(CheckedIntrinsicV1::StreamSkip),
                             arguments,
                             ..
-                        } = &self.expressions.expression(*expression)?.kind
+                        } = &self.execution.expression(*expression)?.kind
                         else {
                             continue;
                         };
@@ -2979,7 +2973,7 @@ impl<'a> ReactiveBuilder<'a> {
                                     call: *call,
                                     expression: *expression,
                                     count_expression: count.value,
-                                    count_value: self.expressions.value(count.value)?,
+                                    count_value: self.execution.value(count.value)?,
                                 },
                             },
                         );
@@ -3042,7 +3036,7 @@ impl<'a> ReactiveBuilder<'a> {
     }
 
     fn expression_owns_event(&self, id: SemanticExprId) -> Result<bool, SemanticReactiveError> {
-        let expression = self.expressions.expression(id)?;
+        let expression = self.execution.expression(id)?;
         Ok(matches!(
             expression.flow_type.mode,
             FlowMode::TickPresent | FlowMode::PresentOrAbsent
@@ -3075,7 +3069,7 @@ impl<'a> ReactiveBuilder<'a> {
         let Some(value) = statement.value else {
             return Ok(false);
         };
-        let expression = self.expressions.expression(value)?;
+        let expression = self.execution.expression(value)?;
         if !matches!(
             expression.kind,
             SemanticExpressionKind::Object(_) | SemanticExpressionKind::TaggedObject { .. }
@@ -3105,7 +3099,7 @@ impl<'a> ReactiveBuilder<'a> {
         &self,
         expression: SemanticExprId,
     ) -> Result<bool, SemanticReactiveError> {
-        let expression = self.expressions.expression(expression)?;
+        let expression = self.execution.expression(expression)?;
         let SemanticExpressionKind::Materialize { materialization } = expression.kind else {
             return Ok(false);
         };
@@ -3434,31 +3428,11 @@ impl<'a> ReactiveBuilder<'a> {
             else {
                 continue;
             };
-            let call_definition = self
-                .execution
-                .calls
-                .get(call.as_usize())
-                .filter(|candidate| candidate.id == *call)
-                .ok_or_else(|| {
-                    SemanticReactiveError::new(format!(
-                        "call expression {} references missing semantic call {}",
-                        expression.id, call
-                    ))
-                })?;
+            let call_definition = self.execution.call(*call)?;
             if *callable_kind != crate::SemanticCallableKind::External {
                 continue;
             }
-            let callable = self
-                .execution
-                .callables
-                .get(call_definition.callable.as_usize())
-                .filter(|candidate| candidate.id == call_definition.callable)
-                .ok_or_else(|| {
-                    SemanticReactiveError::new(format!(
-                        "external call expression {} references missing callable {}",
-                        expression.id, call_definition.callable
-                    ))
-                })?;
+            let callable = self.execution.callable(call_definition.callable)?;
             if callable.kind != boon_typecheck::CheckedCallableKind::External {
                 return Err(SemanticReactiveError::new(format!(
                     "external call expression {} maps to non-external callable {}",
@@ -3473,7 +3447,7 @@ impl<'a> ReactiveBuilder<'a> {
             }
             let current_capable = result.mode == FlowMode::Continuous
                 && arguments.iter().all(|argument| {
-                    self.expressions
+                    self.execution
                         .expression(argument.value)
                         .is_ok_and(|value| value.flow_type.mode == FlowMode::Continuous)
                 })
@@ -3551,7 +3525,7 @@ impl<'a> ReactiveBuilder<'a> {
                 .into_iter()
                 .collect::<Vec<_>>();
             for expression_id in reachable {
-                let expression = self.expressions.expression(expression_id)?;
+                let expression = self.execution.expression(expression_id)?;
                 if let Some(read) = reads_by_expression.get(&expression_id)
                     && matches!(read.target, SemanticReadTargetV1::External { .. })
                 {
@@ -3563,17 +3537,7 @@ impl<'a> ReactiveBuilder<'a> {
                     ));
                 }
                 if let SemanticExpressionKind::Call { call, .. } = expression.kind {
-                    let semantic_call = self
-                        .execution
-                        .calls
-                        .get(call.as_usize())
-                        .filter(|candidate| candidate.id == call)
-                        .ok_or_else(|| {
-                            SemanticReactiveError::new(format!(
-                                "expression {} references missing semantic call {}",
-                                expression_id, call
-                            ))
-                        })?;
+                    let semantic_call = self.execution.call(call)?;
                     if semantic_call.external_identity.is_some() {
                         raw.insert((
                             binding.id,
@@ -3627,8 +3591,8 @@ impl<'a> ReactiveBuilder<'a> {
             })
             .enumerate()
             .map(|(ordinal, root)| {
-                let expression = self.expressions.expression(root.expression)?;
-                let origin = self.expressions.origin(root.expression)?;
+                let expression = self.execution.expression(root.expression)?;
+                let origin = self.execution.origin(root.expression)?;
                 if expression.checked_expr_id != root.checked_expr_id
                     || expression.value_id != root.value
                     || origin.checked_expression != root.checked_expr_id
@@ -3646,7 +3610,7 @@ impl<'a> ReactiveBuilder<'a> {
                     value: root.value,
                     statement: root.statement,
                     field: fields_by_statement.get(&root.statement).copied(),
-                    route_scope: self.expressions.route_scope(root.expression)?,
+                    route_scope: self.execution.route_scope(root.expression)?,
                 })
             })
             .collect()
@@ -3753,9 +3717,9 @@ impl<'a> ReactiveBuilder<'a> {
                 marker: expression.id,
                 marker_value: expression.value_id,
                 input,
-                input_value: self.expressions.value(input)?,
+                input_value: self.execution.value(input)?,
                 owner: expression.owner,
-                route_scope: self.expressions.route_scope(expression.id)?,
+                route_scope: self.execution.route_scope(expression.id)?,
             });
         }
         Ok(result)
@@ -3771,7 +3735,7 @@ impl<'a> ReactiveBuilder<'a> {
             if !result.insert(expression) {
                 continue;
             }
-            let expression = self.expressions.expression(expression)?;
+            let expression = self.execution.expression(expression)?;
             pending.extend(semantic_expression_children(
                 &expression.kind,
                 self.execution,
@@ -3803,7 +3767,7 @@ impl<'a> ReactiveBuilder<'a> {
             if id == target {
                 return Ok(true);
             }
-            let expression = self.expressions.expression(id)?;
+            let expression = self.execution.expression(id)?;
             match &expression.kind {
                 SemanticExpressionKind::CanonicalRead {
                     target: declaration,
@@ -3856,91 +3820,10 @@ struct RawDerivedValue {
     startup_recompute: bool,
 }
 
-#[derive(Debug)]
-struct ExpressionIndex<'a> {
-    execution: &'a SemanticExecutionGraphV1,
-}
-
-impl<'a> ExpressionIndex<'a> {
-    fn new(execution: &'a SemanticExecutionGraphV1) -> Result<Self, SemanticReactiveError> {
-        for (index, expression) in execution.expressions.iter().enumerate() {
-            if expression.id != SemanticExprId(index)
-                || expression.value_id != SemanticValueId(index)
-            {
-                return Err(SemanticReactiveError::new(format!(
-                    "semantic expression at index {index} does not have exact dense expression/value identity"
-                )));
-            }
-        }
-        if execution.checked_expression_origins.len() != execution.expressions.len() {
-            return Err(SemanticReactiveError::new(format!(
-                "semantic checked-expression origins cover {}, expected {} expressions",
-                execution.checked_expression_origins.len(),
-                execution.expressions.len()
-            )));
-        }
-        Ok(Self { execution })
-    }
-
-    fn expression(
-        &self,
-        id: SemanticExprId,
-    ) -> Result<&'a SemanticExpression, SemanticReactiveError> {
-        self.execution
-            .expressions
-            .get(id.as_usize())
-            .filter(|expression| expression.id == id)
-            .ok_or_else(|| {
-                SemanticReactiveError::new(format!(
-                    "reactive derivation references missing semantic expression {id}"
-                ))
-            })
-    }
-
-    fn value(&self, id: SemanticExprId) -> Result<SemanticValueId, SemanticReactiveError> {
-        Ok(self.expression(id)?.value_id)
-    }
-
-    fn origin(
-        &self,
-        id: SemanticExprId,
-    ) -> Result<&'a crate::SemanticExpressionOrigin, SemanticReactiveError> {
-        self.execution
-            .checked_expression_origins
-            .get(id.as_usize())
-            .filter(|origin| origin.expression == id)
-            .ok_or_else(|| {
-                SemanticReactiveError::new(format!(
-                    "semantic expression {id} has no exact checked-origin entry"
-                ))
-            })
-    }
-
-    fn route_scope(&self, id: SemanticExprId) -> Result<SemanticScopeId, SemanticReactiveError> {
-        let origin = self.origin(id)?;
-        let matches = self
-            .execution
-            .scopes
-            .iter()
-            .filter(|scope| scope.checked_scope == origin.checked_scope)
-            .map(|scope| scope.id)
-            .collect::<Vec<_>>();
-        let [scope] = matches.as_slice() else {
-            return Err(SemanticReactiveError::new(format!(
-                "semantic expression {id} checked scope {} resolves to {} semantic scopes",
-                origin.checked_scope.0,
-                matches.len()
-            )));
-        };
-        Ok(*scope)
-    }
-}
-
 struct TriggerResolver<'a> {
     execution: &'a SemanticExecutionGraphV1,
     resources: &'a SemanticResourceGraphV1,
     out_net: &'a ResolvedOutGraph,
-    expressions: &'a ExpressionIndex<'a>,
     bindings: &'a [SemanticBindingV1],
     local_values: &'a BTreeMap<SemanticLocalBindingId, (DeclId, SemanticExprId)>,
     parameter_inputs: &'a BTreeMap<SemanticExprId, Vec<SemanticExprId>>,
@@ -4106,7 +3989,6 @@ impl<'a> TriggerResolver<'a> {
         execution: &'a SemanticExecutionGraphV1,
         resources: &'a SemanticResourceGraphV1,
         out_net: &'a ResolvedOutGraph,
-        expressions: &'a ExpressionIndex<'a>,
         bindings: &'a [SemanticBindingV1],
         local_values: &'a BTreeMap<SemanticLocalBindingId, (DeclId, SemanticExprId)>,
         parameter_inputs: &'a BTreeMap<SemanticExprId, Vec<SemanticExprId>>,
@@ -4116,36 +3998,15 @@ impl<'a> TriggerResolver<'a> {
         external_event_identities: &'a BTreeSet<CheckedExternalDeclarationIdentityV1>,
     ) -> Result<Self, SemanticReactiveError> {
         for source in &resources.sources {
-            if execution
-                .sources
-                .get(source.id.as_usize())
-                .filter(|candidate| candidate.id == source.id)
-                .is_none()
-            {
-                return Err(SemanticReactiveError::new(format!(
-                    "reactive source resource references missing semantic source {}",
-                    source.id
-                )));
-            }
+            execution.source(source.id)?;
         }
         for state in &resources.states {
-            if execution
-                .states
-                .get(state.id.as_usize())
-                .filter(|candidate| candidate.id == state.id)
-                .is_none()
-            {
-                return Err(SemanticReactiveError::new(format!(
-                    "reactive state resource references missing semantic state {}",
-                    state.id
-                )));
-            }
+            execution.state(state.id)?;
         }
         Ok(Self {
             execution,
             resources,
             out_net,
-            expressions,
             bindings,
             local_values,
             parameter_inputs,
@@ -4180,7 +4041,7 @@ impl<'a> TriggerResolver<'a> {
         if terminal == Some(id) || !visited.insert(id) {
             return Ok(());
         }
-        let expression = self.expressions.expression(id)?;
+        let expression = self.execution.expression(id)?;
         let direct = self.direct_causes(expression)?;
         if !direct.is_empty() {
             causes.extend(direct);
@@ -4355,7 +4216,7 @@ impl<'a> TriggerResolver<'a> {
                 .map(|source| source.id)
                 .collect::<Vec<_>>();
             if matches.is_empty() {
-                let origin = self.expressions.origin(expression.id)?;
+                let origin = self.execution.origin(expression.id)?;
                 matches = self
                     .resources
                     .sources
@@ -4489,7 +4350,7 @@ impl<'a> TriggerResolver<'a> {
         if terminal == Some(id) || !visited.insert(id) {
             return Ok(());
         }
-        let expression = self.expressions.expression(id)?;
+        let expression = self.execution.expression(id)?;
         match &expression.kind {
             SemanticExpressionKind::When {
                 input,
@@ -4566,7 +4427,7 @@ impl<'a> TriggerResolver<'a> {
                     )?;
                     if argument_arms.is_empty()
                         && matches!(
-                            self.expressions.expression(argument.value)?.flow_type.mode,
+                            self.execution.expression(argument.value)?.flow_type.mode,
                             FlowMode::TickPresent | FlowMode::PresentOrAbsent
                         )
                     {
@@ -4710,17 +4571,17 @@ impl<'a> TriggerResolver<'a> {
         gate: SemanticExprId,
         output: SemanticExprId,
     ) -> Result<RawTriggerArm, SemanticReactiveError> {
-        let gate_expression = self.expressions.expression(gate)?;
+        let gate_expression = self.execution.expression(gate)?;
         Ok(RawTriggerArm {
             cause,
             gate_checked_expression: gate_expression.checked_expr_id,
             gate_expression: gate,
             gate_value: gate_expression.value_id,
             owner: gate_expression.owner,
-            route_scope: self.expressions.route_scope(gate)?,
+            route_scope: self.execution.route_scope(gate)?,
             row_scope: self.row_scope(cause, gate_expression)?,
             output_expression: output,
-            output_value: self.expressions.value(output)?,
+            output_value: self.execution.value(output)?,
         })
     }
 
@@ -4810,7 +4671,7 @@ impl<'a> TriggerResolver<'a> {
         declaration: DeclId,
         expression: &SemanticExpression,
     ) -> Result<&SemanticBindingV1, SemanticReactiveError> {
-        let origin = self.expressions.origin(expression.id)?;
+        let origin = self.execution.origin(expression.id)?;
         lexical_binding_for_decl(
             self.execution,
             self.resources,
@@ -4828,77 +4689,13 @@ fn semantic_expression_children(
     kind: &SemanticExpressionKind,
     execution: &SemanticExecutionGraphV1,
 ) -> Result<Vec<SemanticExprId>, SemanticReactiveError> {
-    Ok(match kind {
-        SemanticExpressionKind::CanonicalRead { .. }
-        | SemanticExpressionKind::LocalRead { .. }
-        | SemanticExpressionKind::ExternalRead { .. }
-        | SemanticExpressionKind::ElementState { .. }
-        | SemanticExpressionKind::Drain { .. }
-        | SemanticExpressionKind::Text(_)
-        | SemanticExpressionKind::Number(_)
-        | SemanticExpressionKind::Bits(_)
-        | SemanticExpressionKind::BytesByte(_)
-        | SemanticExpressionKind::Absent
-        | SemanticExpressionKind::Tag(_)
-        | SemanticExpressionKind::Source { .. }
-        | SemanticExpressionKind::Delimiter
-        | SemanticExpressionKind::MaterializationLocal { .. }
-        | SemanticExpressionKind::FunctionParameter { .. } => Vec::new(),
-        SemanticExpressionKind::Materialize { materialization } => {
-            let materialization = execution
-                .materializations
-                .get(materialization.as_usize())
-                .filter(|candidate| candidate.id == *materialization)
-                .ok_or_else(|| {
-                    SemanticReactiveError::new(format!(
-                        "expression references missing semantic materialization {}",
-                        materialization
-                    ))
-                })?;
-            materialization.expression_roots()
-        }
-        SemanticExpressionKind::TextTemplate { segments } => segments
-            .iter()
-            .filter_map(|segment| match segment {
-                crate::SemanticTextSegment::Static { .. } => None,
-                crate::SemanticTextSegment::Dynamic { value } => Some(*value),
-            })
-            .collect(),
-        SemanticExpressionKind::TaggedObject { fields, .. }
-        | SemanticExpressionKind::Object(fields) => {
-            fields.iter().map(|field| field.value).collect()
-        }
-        SemanticExpressionKind::Block { bindings, result } => bindings
-            .iter()
-            .map(|binding| binding.value)
-            .chain(std::iter::once(*result))
-            .collect(),
-        SemanticExpressionKind::Call { arguments, .. } => {
-            arguments.iter().map(|argument| argument.value).collect()
-        }
-        SemanticExpressionKind::Flush { payload: input }
-        | SemanticExpressionKind::FlushBoundary { input }
-        | SemanticExpressionKind::Draining { input }
-        | SemanticExpressionKind::Project { input, .. } => vec![*input],
-        SemanticExpressionKind::Hold {
-            initial, updates, ..
-        } => std::iter::once(*initial)
-            .chain(updates.iter().copied())
-            .collect(),
-        SemanticExpressionKind::Latest { branches } => branches.clone(),
-        SemanticExpressionKind::When { input, arms, .. } => std::iter::once(*input)
-            .chain(arms.iter().map(|arm| arm.output))
-            .collect(),
-        SemanticExpressionKind::Then { input, output } => std::iter::once(*input)
-            .chain(output.iter().copied())
-            .collect(),
-        SemanticExpressionKind::Infix { left, right, .. } => vec![*left, *right],
-        SemanticExpressionKind::MapEntry { key, value } => vec![*key, *value],
-        SemanticExpressionKind::MatchArm { output, .. } => output.iter().copied().collect(),
-        SemanticExpressionKind::List { items, .. }
-        | SemanticExpressionKind::Bytes { items, .. }
-        | SemanticExpressionKind::Map { entries: items }
-        | SemanticExpressionKind::Set { items } => items.clone(),
+    execution.expression_children(kind).ok_or_else(|| {
+        let SemanticExpressionKind::Materialize { materialization } = kind else {
+            unreachable!("only invalid materialization references lack expression children");
+        };
+        SemanticReactiveError::new(format!(
+            "expression references missing semantic materialization {materialization}"
+        ))
     })
 }
 
@@ -4909,15 +4706,7 @@ fn exact_call_argument_at_ordinal(
     ordinal: usize,
     expression: SemanticExprId,
 ) -> Result<SemanticExprId, SemanticReactiveError> {
-    let callable = execution
-        .callables
-        .get(callable.as_usize())
-        .filter(|candidate| candidate.id == callable)
-        .ok_or_else(|| {
-            SemanticReactiveError::new(format!(
-                "semantic call expression {expression} references missing callable {callable}"
-            ))
-        })?;
+    let callable = execution.callable(callable)?;
     let parameter = callable
         .parameters
         .get(ordinal)
@@ -4947,7 +4736,6 @@ fn exact_call_argument_at_ordinal(
 
 fn exact_unique_list_argument(
     execution: &SemanticExecutionGraphV1,
-    expressions: &ExpressionIndex<'_>,
     callable: crate::SemanticCallableId,
     arguments: &[crate::SemanticCallArgument],
     expression: SemanticExprId,
@@ -4961,7 +4749,7 @@ fn exact_unique_list_argument(
             argument.ordinal,
             expression,
         )?;
-        if matches!(expressions.expression(exact)?.flow_type.ty, Type::List(_)) {
+        if matches!(execution.expression(exact)?.flow_type.ty, Type::List(_)) {
             list_arguments.push((argument.ordinal, exact));
         }
     }
@@ -4982,16 +4770,7 @@ fn unique_binding_for_target<'a>(
     expression: &SemanticExpression,
     execution: &SemanticExecutionGraphV1,
 ) -> Result<&'a SemanticBindingV1, SemanticReactiveError> {
-    let origin = execution
-        .checked_expression_origins
-        .get(expression.id.as_usize())
-        .filter(|origin| origin.expression == expression.id)
-        .ok_or_else(|| {
-            SemanticReactiveError::new(format!(
-                "semantic expression {} has no exact origin",
-                expression.id
-            ))
-        })?;
+    let origin = execution.origin(expression.id)?;
     let matches = bindings
         .iter()
         .filter(|binding| binding.target == target)
@@ -5446,18 +5225,6 @@ mod tests {
     }
 
     #[test]
-    fn expression_value_identity_is_total_and_dense() {
-        let mut execution = graph(vec![source_expression(0, 0, None)]);
-        execution.expressions[0].value_id = SemanticValueId(1);
-        let error = ExpressionIndex::new(&execution).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("exact dense expression/value identity")
-        );
-    }
-
-    #[test]
     fn route_scope_rejects_ambiguous_semantic_scope() {
         let mut execution = graph(vec![source_expression(0, 0, None)]);
         execution.scopes.push(SemanticScope {
@@ -5472,30 +5239,8 @@ mod tests {
                 end: 1,
             },
         });
-        let index = ExpressionIndex::new(&execution).unwrap();
-        let error = index.route_scope(SemanticExprId(0)).unwrap_err();
+        let error = execution.route_scope(SemanticExprId(0)).unwrap_err();
         assert!(error.to_string().contains("resolves to 2 semantic scopes"));
-    }
-
-    #[test]
-    fn missing_child_expression_is_rejected_without_a_fallback() {
-        let execution = graph(vec![SemanticExpression {
-            id: SemanticExprId(0),
-            value_id: SemanticValueId(0),
-            checked_expr_id: CheckedExprId(0),
-            flow_type: flow(FlowMode::Continuous),
-            effect: CheckedEffectSummary::default(),
-            owner: None,
-            provenance: SemanticValueProvenance::default(),
-            resource_binding_path: None,
-            kind: SemanticExpressionKind::Project {
-                input: SemanticExprId(1),
-                fields: vec!["missing".to_owned()],
-            },
-        }]);
-        let index = ExpressionIndex::new(&execution).unwrap();
-        let error = index.expression(SemanticExprId(1)).unwrap_err();
-        assert!(error.to_string().contains("missing semantic expression 1"));
     }
 
     #[test]

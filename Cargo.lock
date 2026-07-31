@@ -742,7 +742,6 @@ dependencies = [
  "boon_host",
  "serde",
  "sha2",
- "toml",
 ]
 
 [[package]]
@@ -880,7 +879,6 @@ dependencies = [
  "boon_document",
  "boon_host",
  "bytemuck",
- "encase",
  "futures",
  "glyphon",
  "image",
@@ -906,7 +904,6 @@ dependencies = [
  "boon_host_services",
  "boon_http_client",
  "boon_http_runtime",
- "boon_ir",
  "boon_native_app_window",
  "boon_native_gpu",
  "boon_parser",
@@ -920,7 +917,6 @@ dependencies = [
  "cosmic-protocols",
  "evdev",
  "futures",
- "image",
  "libc",
  "open",
  "reqwest",
@@ -999,7 +995,6 @@ dependencies = [
  "boon_compiler",
  "boon_data",
  "boon_effect_schema",
- "boon_ir",
  "boon_list_access",
  "boon_persistence",
  "boon_plan",
@@ -1079,10 +1074,8 @@ dependencies = [
  "boon_runtime",
  "boon_server_host",
  "boon_wire",
- "ciborium",
  "futures",
  "reqwest",
- "serde",
  "sha2",
  "tempfile",
  "tokio",
@@ -1152,7 +1145,6 @@ dependencies = [
  "js-sys",
  "percent-encoding",
  "serde",
- "serde_json",
  "sha2",
  "wasm-bindgen",
  "wasm-bindgen-futures",
@@ -1430,15 +1422,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4ca0197aee26d1ae37445ee532fefce43251d24cc7c166799f4d46817f1d3973"
 dependencies = [
  "crossbeam-utils",
-]
-
-[[package]]
-name = "const_panic"
-version = "0.2.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e262cdaac42494e3ae34c43969f9cdeb7da178bdb4b66fa6a1ea2edb4c8ae652"
-dependencies = [
- "typewit",
 ]
 
 [[package]]
@@ -1796,37 +1779,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eabffdaee24bd1bf95c5ef7cec31260444317e72ea56c4c91750e8b7ee58d5f1"
 dependencies = [
  "log",
-]
-
-[[package]]
-name = "encase"
-version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6e3e0ff2ee0b7aa97428308dd9e1e42369cb22f5fb8dc1c55546637443a60f1e"
-dependencies = [
- "const_panic",
- "encase_derive",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "encase_derive"
-version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a4d90c5d7d527c6cb8a3b114efd26a6304d9ab772656e73d8f4e32b1f3d601a2"
-dependencies = [
- "encase_derive_impl",
-]
-
-[[package]]
-name = "encase_derive_impl"
-version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c8bad72d8308f7a382de2391ec978ddd736e0103846b965d7e2a63a75768af30"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
 ]
 
 [[package]]
@@ -5040,12 +4992,6 @@ name = "typenum"
 version = "1.20.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40ce102ab67701b8526c123c1bab5cbe42d7040ccfd0f64af1a385808d2f43de"
-
-[[package]]
-name = "typewit"
-version = "1.15.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "214ca0b2191785cbc06209b9ca1861e048e39b5ba33574b3cedd58363d5bb5f6"
 
 [[package]]
 name = "uds_windows"

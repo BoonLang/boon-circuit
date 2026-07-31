@@ -1353,74 +1353,13 @@ fn expression_children(
     execution: &SemanticExecutionGraphV1,
     kind: &SemanticExpressionKind,
 ) -> Result<Vec<SemanticExprId>, SemanticViewBindingError> {
-    Ok(match kind {
-        SemanticExpressionKind::CanonicalRead { .. }
-        | SemanticExpressionKind::LocalRead { .. }
-        | SemanticExpressionKind::ExternalRead { .. }
-        | SemanticExpressionKind::ElementState { .. }
-        | SemanticExpressionKind::Drain { .. }
-        | SemanticExpressionKind::Text(_)
-        | SemanticExpressionKind::Number(_)
-        | SemanticExpressionKind::Bits(_)
-        | SemanticExpressionKind::BytesByte(_)
-        | SemanticExpressionKind::Absent
-        | SemanticExpressionKind::Tag(_)
-        | SemanticExpressionKind::Source { .. }
-        | SemanticExpressionKind::Delimiter
-        | SemanticExpressionKind::MaterializationLocal { .. }
-        | SemanticExpressionKind::FunctionParameter { .. } => Vec::new(),
-        SemanticExpressionKind::Materialize { materialization } => execution
-            .materializations
-            .get(materialization.as_usize())
-            .filter(|candidate| candidate.id == *materialization)
-            .ok_or_else(|| {
-                SemanticViewBindingError::new(format!(
-                    "view traversal references missing semantic materialization {materialization}"
-                ))
-            })?
-            .expression_roots(),
-        SemanticExpressionKind::TextTemplate { segments } => segments
-            .iter()
-            .filter_map(|segment| match segment {
-                crate::SemanticTextSegment::Static { .. } => None,
-                crate::SemanticTextSegment::Dynamic { value } => Some(*value),
-            })
-            .collect(),
-        SemanticExpressionKind::TaggedObject { fields, .. }
-        | SemanticExpressionKind::Object(fields) => {
-            fields.iter().map(|field| field.value).collect()
-        }
-        SemanticExpressionKind::Call { arguments, .. } => {
-            arguments.iter().map(|argument| argument.value).collect()
-        }
-        SemanticExpressionKind::Flush { payload: input }
-        | SemanticExpressionKind::FlushBoundary { input }
-        | SemanticExpressionKind::Draining { input }
-        | SemanticExpressionKind::Project { input, .. } => vec![*input],
-        SemanticExpressionKind::Hold {
-            initial, updates, ..
-        } => std::iter::once(*initial)
-            .chain(updates.iter().copied())
-            .collect(),
-        SemanticExpressionKind::Latest { branches } => branches.clone(),
-        SemanticExpressionKind::When { input, arms, .. } => std::iter::once(*input)
-            .chain(arms.iter().map(|arm| arm.output))
-            .collect(),
-        SemanticExpressionKind::Then { input, output } => std::iter::once(*input)
-            .chain(output.iter().copied())
-            .collect(),
-        SemanticExpressionKind::Infix { left, right, .. } => vec![*left, *right],
-        SemanticExpressionKind::MapEntry { key, value } => vec![*key, *value],
-        SemanticExpressionKind::MatchArm { output, .. } => output.iter().copied().collect(),
-        SemanticExpressionKind::Block { bindings, result } => bindings
-            .iter()
-            .map(|binding| binding.value)
-            .chain(std::iter::once(*result))
-            .collect(),
-        SemanticExpressionKind::List { items, .. }
-        | SemanticExpressionKind::Bytes { items, .. }
-        | SemanticExpressionKind::Map { entries: items }
-        | SemanticExpressionKind::Set { items } => items.clone(),
+    execution.expression_children(kind).ok_or_else(|| {
+        let SemanticExpressionKind::Materialize { materialization } = kind else {
+            unreachable!("only invalid materialization references lack expression children");
+        };
+        SemanticViewBindingError::new(format!(
+            "view traversal references missing semantic materialization {materialization}"
+        ))
     })
 }
 
@@ -1525,29 +1464,9 @@ fn expression_route_scope(
     execution: &SemanticExecutionGraphV1,
     expression: SemanticExprId,
 ) -> Result<SemanticScopeId, SemanticViewBindingError> {
-    let origin = execution
-        .checked_expression_origins
-        .get(expression.as_usize())
-        .filter(|candidate| candidate.expression == expression)
-        .ok_or_else(|| {
-            SemanticViewBindingError::new(format!(
-                "view expression {expression} has no exact checked-origin identity"
-            ))
-        })?;
-    let matches = execution
-        .scopes
-        .iter()
-        .filter(|scope| scope.checked_scope == origin.checked_scope)
-        .map(|scope| scope.id)
-        .collect::<Vec<_>>();
-    let [scope] = matches.as_slice() else {
-        return Err(SemanticViewBindingError::new(format!(
-            "view expression {expression} checked scope {} resolves to {} semantic scopes",
-            origin.checked_scope.0,
-            matches.len()
-        )));
-    };
-    Ok(*scope)
+    execution
+        .route_scope(expression)
+        .map_err(SemanticViewBindingError::new)
 }
 
 fn require_expression(
@@ -1555,14 +1474,8 @@ fn require_expression(
     id: SemanticExprId,
 ) -> Result<&SemanticExpression, SemanticViewBindingError> {
     execution
-        .expressions
-        .get(id.as_usize())
-        .filter(|candidate| candidate.id == id)
-        .ok_or_else(|| {
-            SemanticViewBindingError::new(format!(
-                "semantic view-binding graph references missing expression {id}"
-            ))
-        })
+        .expression(id)
+        .map_err(SemanticViewBindingError::new)
 }
 
 fn require_callable(
@@ -1570,14 +1483,8 @@ fn require_callable(
     id: SemanticCallableId,
 ) -> Result<&crate::SemanticCallable, SemanticViewBindingError> {
     execution
-        .callables
-        .get(id.as_usize())
-        .filter(|candidate| candidate.id == id)
-        .ok_or_else(|| {
-            SemanticViewBindingError::new(format!(
-                "semantic view-binding graph references missing callable {id}"
-            ))
-        })
+        .callable(id)
+        .map_err(SemanticViewBindingError::new)
 }
 
 #[derive(Serialize)]

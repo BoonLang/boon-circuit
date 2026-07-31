@@ -14,7 +14,6 @@ boon_plan.workspace = true
 boon_persistence.workspace = true
 sha2.workspace = true
 boon_parser.workspace = true
-boon_ir.workspace = true
 boon_typecheck.workspace = true
 boon_document.workspace = true
 boon_document_model.workspace = true
@@ -46,6 +45,3 @@ evdev.workspace = true
 wayland-client.workspace = true
 wayland-protocols.workspace = true
 cosmic-protocols.workspace = true
-
-[dev-dependencies]
-image.workspace = true

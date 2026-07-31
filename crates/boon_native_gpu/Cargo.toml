@@ -9,7 +9,6 @@ rust-version.workspace = true
 boon_document.workspace = true
 boon_host.workspace = true
 bytemuck.workspace = true
-encase.workspace = true
 serde.workspace = true
 wgpu.workspace = true
 glyphon.workspace = true

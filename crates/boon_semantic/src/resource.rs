@@ -2173,7 +2173,7 @@ fn materialization_target_lists(
                 }
                 pending.push(materialization.source);
             } else {
-                pending.extend(semantic_expression_children(&value.kind));
+                pending.extend(value.kind.direct_children());
             }
         }
     }
@@ -5456,78 +5456,11 @@ fn semantic_local_values(
     Ok(locals)
 }
 
-fn semantic_expression_children(kind: &SemanticExpressionKind) -> Vec<SemanticExprId> {
-    match kind {
-        SemanticExpressionKind::CanonicalRead { .. }
-        | SemanticExpressionKind::LocalRead { .. }
-        | SemanticExpressionKind::ExternalRead { .. }
-        | SemanticExpressionKind::ElementState { .. }
-        | SemanticExpressionKind::Drain { .. }
-        | SemanticExpressionKind::Text(_)
-        | SemanticExpressionKind::Number(_)
-        | SemanticExpressionKind::Bits(_)
-        | SemanticExpressionKind::BytesByte(_)
-        | SemanticExpressionKind::Absent
-        | SemanticExpressionKind::Tag(_)
-        | SemanticExpressionKind::Source { .. }
-        | SemanticExpressionKind::Materialize { .. }
-        | SemanticExpressionKind::Delimiter
-        | SemanticExpressionKind::MaterializationLocal { .. }
-        | SemanticExpressionKind::FunctionParameter { .. } => Vec::new(),
-        SemanticExpressionKind::TextTemplate { segments } => segments
-            .iter()
-            .filter_map(|segment| match segment {
-                crate::SemanticTextSegment::Static { .. } => None,
-                crate::SemanticTextSegment::Dynamic { value } => Some(*value),
-            })
-            .collect(),
-        SemanticExpressionKind::TaggedObject { fields, .. }
-        | SemanticExpressionKind::Object(fields) => {
-            fields.iter().map(|field| field.value).collect()
-        }
-        SemanticExpressionKind::Call { arguments, .. } => {
-            arguments.iter().map(|argument| argument.value).collect()
-        }
-        SemanticExpressionKind::Flush { payload: input }
-        | SemanticExpressionKind::FlushBoundary { input }
-        | SemanticExpressionKind::Draining { input }
-        | SemanticExpressionKind::Project { input, .. } => vec![*input],
-        SemanticExpressionKind::Hold {
-            initial, updates, ..
-        } => std::iter::once(*initial)
-            .chain(updates.iter().copied())
-            .collect(),
-        SemanticExpressionKind::Latest { branches } => branches.clone(),
-        SemanticExpressionKind::When { input, arms, .. } => std::iter::once(*input)
-            .chain(arms.iter().map(|arm| arm.output))
-            .collect(),
-        SemanticExpressionKind::Then { input, output } => {
-            std::iter::once(*input).chain(*output).collect()
-        }
-        SemanticExpressionKind::Infix { left, right, .. } => vec![*left, *right],
-        SemanticExpressionKind::MapEntry { key, value } => vec![*key, *value],
-        SemanticExpressionKind::MatchArm { output, .. } => output.iter().copied().collect(),
-        SemanticExpressionKind::Block { bindings, result } => bindings
-            .iter()
-            .map(|binding| binding.value)
-            .chain(std::iter::once(*result))
-            .collect(),
-        SemanticExpressionKind::List { items, .. }
-        | SemanticExpressionKind::Bytes { items, .. }
-        | SemanticExpressionKind::Map { entries: items }
-        | SemanticExpressionKind::Set { items } => items.clone(),
-    }
-}
-
 fn expression(
     execution: &SemanticExecutionGraphV1,
     id: SemanticExprId,
 ) -> Result<&crate::SemanticExpression, String> {
-    execution
-        .expressions
-        .get(id.as_usize())
-        .filter(|expression| expression.id == id)
-        .ok_or_else(|| format!("semantic resource graph reaches missing expression {id}"))
+    execution.expression(id)
 }
 
 fn list_resource(
@@ -5688,7 +5621,7 @@ fn reachable_expression_members(
                 })?;
             pending.extend(materialization.expression_roots());
         }
-        pending.extend(semantic_expression_children(&value.kind));
+        pending.extend(value.kind.direct_children());
     }
     Ok(visited.into_iter().collect())
 }
@@ -5718,7 +5651,7 @@ fn expression_reaches(
                 })?;
             pending.extend(materialization.expression_roots());
         }
-        pending.extend(semantic_expression_children(&value.kind));
+        pending.extend(value.kind.direct_children());
     }
     Ok(false)
 }

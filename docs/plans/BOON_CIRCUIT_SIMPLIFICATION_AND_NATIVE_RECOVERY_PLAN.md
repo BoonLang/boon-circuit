@@ -42,7 +42,7 @@ patches. The Phase 2 foundations checkpoint passes formatting, the full runtime
 suite, and `cargo check --workspace --all-targets`. A fresh architecture report
 passes the verified compiler spine, dependency-classifier schema, and every
 non-budget structural check, but the post-foundations tree is over three
-mandatory limits: 471,706 tracked Rust lines against 240,000, 107,072 test Rust
+mandatory limits: 471,180 tracked Rust lines against 240,000, 107,043 test Rust
 lines against 32,000, and 64,824 runtime-plus-executor lines against 42,000.
 Native product reports remain stale until those budgets close and the
 compositor restart described below occurs.

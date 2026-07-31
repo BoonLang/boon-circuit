@@ -68,20 +68,20 @@ occurrence_ledger_validator = "cargo run -p xtask --example packed_site_inventor
 
 # Updated only after reviewing a deterministic generator run.
 expected_probe_set_sha256 = "54f1c6ca0c9e9c0994bdb66f1a7829d6df3142afa3297b93d48290f8a856479c"
-expected_file_set_sha256 = "66e5bd22edf30280d6352cbcba94e71c78f1c3c5ccc6f75c5d3df25a86bb2ca1"
+expected_file_set_sha256 = "60286568405414573dc17747a519c034d3bc63baab9d55ca490f6c6c3d694d0d"
 expected_scanned_files = 87
-expected_occurrence_files = 78
-expected_occurrence_ledger_sha256 = "03134994a97fbe19ae41378be719f38fa5057d011e256de1024cdd7d527660f7"
-expected_occurrence_rows = 20279
+expected_occurrence_files = 77
+expected_occurrence_ledger_sha256 = "9df1819f732a712ffcd087d9181b4db441f2d8cade5f16c48fe993d1150b08be"
+expected_occurrence_rows = 20244
 
 [[categories]]
 order = 0
 id = "recursive-value-carrier"
 owner_phase = "goal-phase-5-packed"
 owner_plan = "docs/plans/BOON_PACKED_DATA_AND_DENSE_INTERNALS_PLAN.md"
-expected_rows = 786
+expected_rows = 782
 expected_hot = 520
-expected_cold = 220
+expected_cold = 216
 expected_boundary = 46
 
 [[categories]]
@@ -99,9 +99,9 @@ order = 2
 id = "recursive-clone"
 owner_phase = "goal-phase-5-packed"
 owner_plan = "docs/plans/BOON_PACKED_DATA_AND_DENSE_INTERNALS_PLAN.md"
-expected_rows = 1638
+expected_rows = 1639
 expected_hot = 1115
-expected_cold = 415
+expected_cold = 416
 expected_boundary = 108
 
 [[categories]]
@@ -109,9 +109,9 @@ order = 3
 id = "allocation-or-growth"
 owner_phase = "goal-phase-5-packed"
 owner_plan = "docs/plans/BOON_PACKED_DATA_AND_DENSE_INTERNALS_PLAN.md"
-expected_rows = 15799
+expected_rows = 15767
 expected_hot = 3844
-expected_cold = 10522
+expected_cold = 10490
 expected_boundary = 1433
 
 [[categories]]

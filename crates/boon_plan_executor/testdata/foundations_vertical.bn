@@ -1,0 +1,102 @@
+left: BITS[8] { 16ua3 }
+right: BITS[8] { 16u05 }
+word: BITS[16] { 16ua305 }
+half: 1 / 2
+negative_one: 0 - 1
+
+width: left |> Bits/width()
+get_left: left |> Bits/get(position: 1)
+get_right: left |> Bits/get(position: 1, from: Right)
+set_left: left |> Bits/set(position: 2, to: True)
+set_right: left |> Bits/set(position: 3, to: True, from: Right)
+slice: left |> Bits/slice(from: 2, count: 3)
+set_slice: left |> Bits/set_slice(from: 2, value: BITS[3] { 2u111 })
+concat: left |> Bits/concat(with: right)
+and_value: left |> Bits/and(with: right)
+or_value: left |> Bits/or(with: right)
+xor_value: left |> Bits/xor(with: right)
+not_value: left |> Bits/not()
+shift_left: left |> Bits/shift_left(by: 2)
+shift_right: left |> Bits/shift_right(by: 2)
+shift_right_arithmetic: left |> Bits/shift_right_arithmetic(by: 2)
+rotate_left: left |> Bits/rotate_left(by: 2)
+rotate_right: left |> Bits/rotate_right(by: 2)
+zero_extended: left |> Bits/zero_extend(width: 12)
+sign_extended: left |> Bits/sign_extend(width: 12)
+truncated: left |> Bits/truncate(width: 4)
+unsigned_compare: left |> Bits/compare(with: right, interpretation: Unsigned)
+signed_compare: left |> Bits/compare(with: right, interpretation: TwosComplement)
+add_wrap: left |> Bits/add_or_wrap(with: right)
+subtract_wrap: left |> Bits/subtract_or_wrap(with: right)
+add_widening_unsigned: left |> Bits/add_widening(with: right, interpretation: Unsigned)
+add_widening_signed: left |> Bits/add_widening(with: right, interpretation: TwosComplement)
+try_add: left |> Bits/try_add(with: right, interpretation: Unsigned)
+try_add_overflow:
+    BITS[8] { 16uff }
+    |> Bits/try_add(with: BITS[8] { 16u01 }, interpretation: Unsigned)
+try_subtract: left |> Bits/try_subtract(with: right, interpretation: Unsigned)
+try_subtract_underflow:
+    right
+    |> Bits/try_subtract(with: left, interpretation: Unsigned)
+try_signed_add_overflow:
+    BITS[8] { 16u7f }
+    |> Bits/try_add(with: BITS[8] { 16u01 }, interpretation: TwosComplement)
+try_signed_subtract_overflow:
+    BITS[8] { 16u80 }
+    |> Bits/try_subtract(with: BITS[8] { 16u01 }, interpretation: TwosComplement)
+number_to_bits: 255 |> Number/to_bits(width: 8, interpretation: Unsigned)
+number_to_bits_not_whole: half |> Number/to_bits(width: 8, interpretation: Unsigned)
+number_to_bits_out_of_range: 256 |> Number/to_bits(width: 8, interpretation: Unsigned)
+signed_number_to_bits:
+    negative_one
+    |> Number/to_bits(width: 8, interpretation: TwosComplement)
+to_unsigned_number: left |> Bits/to_number(interpretation: Unsigned)
+to_signed_number: left |> Bits/to_number(interpretation: TwosComplement)
+to_bytes_big: word |> Bits/to_bytes(byte_order: BigEndian)
+to_bytes_little: word |> Bits/to_bytes(byte_order: LittleEndian)
+from_bytes_big:
+    BYTES[2] { 16ua3, 16u05 }
+    |> Bytes/to_bits(width: 16, byte_order: BigEndian)
+from_bytes_little:
+    BYTES[2] { 16u05, 16ua3 }
+    |> Bytes/to_bits(width: 16, byte_order: LittleEndian)
+
+nearest_even: 5 / 2 |> Number/round(to: 1, using: NearestEven)
+nearest_away: -5 / 2 |> Number/round(to: 1, using: NearestAwayFromZero)
+toward_zero: -7 / 3 |> Number/round(to: 1, using: TowardZero)
+toward_positive: -7 / 3 |> Number/round(to: 1, using: TowardPositive)
+toward_negative: 7 / 3 |> Number/round(to: 1, using: TowardNegative)
+away: 7 / 3 |> Number/round(to: 1, using: AwayFromZero)
+cents: 10 / 3 |> Number/round(to: 0.01, using: NearestEven)
+
+selected: TEXT { alpha }
+selected_ids: LIST { selected }
+optional_selected_ids:
+    False |> WHEN {
+        True => LIST {}
+        False => LIST { selected }
+    }
+
+grouped_number: 42 |> Number/to_text(radix: 2, min_width: 8, group_size: 4)
+signed_number: 255 |> Number/to_text(radix: 10, signed_width: 8)
+hexadecimal_number: 42 |> Number/to_text(radix: 16, prefix: True)
+
+users: MAP {
+    TEXT { alice } => [score: 1]
+}
+updated_users:
+    users
+    |> Map/upsert(entry: [key: TEXT { bob }, value: [score: 2]])
+selected_user:
+    updated_users
+    |> Map/get(key: TEXT { bob })
+roles: SET {
+    Admin
+    Editor
+}
+updated_roles:
+    roles
+    |> Set/remove(item: Admin)
+has_editor:
+    updated_roles
+    |> Set/contains(item: Editor)

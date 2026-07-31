@@ -23,4 +23,5 @@ web-time = { workspace = true, optional = true }
 
 [dev-dependencies]
 boon_compiler.workspace = true
+serde_json.workspace = true
 wasm-bindgen-test = "0.3"

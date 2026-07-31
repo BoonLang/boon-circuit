@@ -2398,7 +2398,7 @@ roots = ["crates"]
 extensions = ["rs"]
 mode = "rust-token"
 needle = "BTreeMap"
-expected_occurrences = 3056
+expected_occurrences = 3050
 expected_files = 130
 
 [entries.scans.expected_path_occurrences]
@@ -2467,11 +2467,11 @@ expected_files = 130
 "crates/boon_plan_executor/src/cursor.rs" = 12
 "crates/boon_plan_executor/src/effect_stream.rs" = 7
 "crates/boon_plan_executor/src/machine.rs" = 487
-"crates/boon_plan_executor/src/tests.rs" = 132
-"crates/boon_plan_executor/tests/bits_cross_target.rs" = 2
+"crates/boon_plan_executor/src/tests.rs" = 131
 "crates/boon_plan_executor/tests/fjordpulse_server_search.rs" = 4
+"crates/boon_plan_executor/tests/foundations_vertical.rs" = 2
 "crates/boon_plan_executor/tests/map_set_cross_target.rs" = 8
-"crates/boon_plan_executor/tests/map_set_runtime.rs" = 32
+"crates/boon_plan_executor/tests/map_set_runtime.rs" = 27
 "crates/boon_plan_executor/tests/typed_list_cross_target.rs" = 3
 "crates/boon_runtime/src/content_ref.rs" = 2
 "crates/boon_runtime/src/distributed.rs" = 5
@@ -2538,7 +2538,7 @@ roots = ["crates"]
 extensions = ["rs"]
 mode = "rust-token"
 needle = "BTreeSet"
-expected_occurrences = 1970
+expected_occurrences = 1968
 expected_files = 103
 
 [entries.scans.expected_path_occurrences]
@@ -2551,7 +2551,7 @@ expected_files = 103
 "crates/boon_compiler/src/distributed_compiler.rs" = 29
 "crates/boon_compiler/src/document_executable_backend.rs" = 18
 "crates/boon_compiler/src/machine_plan_backend.rs" = 143
-"crates/boon_compiler/src/tests.rs" = 49
+"crates/boon_compiler/src/tests.rs" = 48
 "crates/boon_contract/src/lib.rs" = 2
 "crates/boon_data/src/lib.rs" = 4
 "crates/boon_document/src/lib.rs" = 42
@@ -2599,7 +2599,7 @@ expected_files = 103
 "crates/boon_plan_executor/src/tests.rs" = 11
 "crates/boon_plan_executor/tests/fjordpulse_server_search.rs" = 2
 "crates/boon_plan_executor/tests/map_set_cross_target.rs" = 3
-"crates/boon_plan_executor/tests/map_set_runtime.rs" = 7
+"crates/boon_plan_executor/tests/map_set_runtime.rs" = 6
 "crates/boon_runtime/src/distributed/client.rs" = 3
 "crates/boon_runtime/src/distributed/endpoint.rs" = 2
 "crates/boon_runtime/src/distributed/session.rs" = 3
@@ -2688,7 +2688,7 @@ expected_files = 1
 roots = ["docs/architecture/phase0/container_occurrences.tsv"]
 extensions = ["tsv"]
 needle = "\ttest-oracle\t"
-expected_occurrences = 708
+expected_occurrences = 700
 expected_files = 1
 
 [[entries.scans]]

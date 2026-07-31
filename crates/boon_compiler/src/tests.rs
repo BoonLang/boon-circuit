@@ -1826,70 +1826,6 @@ fn fjordpulse_server_host_boundary_is_cpu_executable() {
 }
 
 #[test]
-fn compiler_lowers_decimal_numbers_as_canonical_executable_number_constants() {
-    let compiled = compile_fixture_source_text_to_machine_plan(
-        "real-output.bn",
-        r#"
-store: [
-    latitude: 59.91
-]
-
-outputs: [
-    latitude: store.latitude
-]
-"#,
-        TargetProfile::SoftwareDefault,
-    )
-    .unwrap();
-
-    assert!(compiled.plan.capability_summary.cpu_plan_executor_complete);
-    assert!(compiled.plan.constants.iter().any(|constant| {
-        matches!(
-            &constant.value,
-            boon_plan::PlanConstantValue::Number { value }
-                if value == &"59.91".parse::<boon_plan::ExactNumber>().unwrap()
-        )
-    }));
-    assert_eq!(verify_plan(&compiled.plan).unwrap().status, "pass");
-}
-
-#[test]
-fn compiler_lowers_fixed_width_bits_through_the_verified_artifact_spine() {
-    let compiled = compile_fixture_source_text_to_machine_plan(
-        "bits-output.bn",
-        r#"
-store: [
-    opcode: BITS[7] { 2u0110011 }
-]
-
-outputs: [
-    opcode: store.opcode
-]
-"#,
-        TargetProfile::SoftwareDefault,
-    )
-    .unwrap();
-
-    assert!(compiled.ir.executable.expressions.iter().any(|expression| {
-        matches!(
-            &expression.kind,
-            boon_ir::ExecutableExpressionKind::Bits(value)
-                if value.width() == 7
-                    && value.to_string() == "BITS[7] { 2u0110011 }"
-        )
-    }));
-    assert!(compiled.plan.constants.iter().any(|constant| {
-        matches!(
-            &constant.value,
-            boon_plan::PlanConstantValue::Bits { value }
-                if value.width() == 7
-                    && value.to_string() == "BITS[7] { 2u0110011 }"
-        )
-    }));
-    assert_eq!(verify_plan(&compiled.plan).unwrap().status, "pass");
-}
-
-#[test]
 fn compiler_preserves_transformed_bits_widths_through_ir_plan_and_json() {
     let compiled = compile_fixture_source_text_to_machine_plan(
         "bits-operations-output.bn",
@@ -1986,42 +1922,6 @@ outputs: [
     let decoded: boon_plan::MachinePlan = serde_json::from_slice(&encoded).unwrap();
     assert_eq!(decoded, compiled.plan);
     assert_eq!(verify_plan(&decoded).unwrap().status, "pass");
-}
-
-#[test]
-fn public_fixed_width_bits_hardware_fixture_compiles_to_verified_operations() {
-    let compiled = compile_source_path_to_machine_plan(
-        &example_path("examples/language_surface/current/bits_fixed_width_literals.bn"),
-        TargetProfile::SoftwareDefault,
-    )
-    .expect("the public BITS hardware fixture must compile through the production pipeline");
-
-    let plan_builtins = compiled
-        .plan
-        .row_expressions
-        .iter()
-        .filter_map(|(_, expression)| match expression {
-            boon_plan::PlanRowExpressionNode::BuiltinCall { function, .. } => Some(*function),
-            _ => None,
-        })
-        .collect::<BTreeSet<_>>();
-    for expected in [
-        PlanRowBuiltin::BitsXor,
-        PlanRowBuiltin::BitsAddOrWrap,
-        PlanRowBuiltin::BitsAddWidening,
-        PlanRowBuiltin::BitsGet,
-        PlanRowBuiltin::BitsShiftRight,
-        PlanRowBuiltin::BitsSet,
-        PlanRowBuiltin::BitsSlice,
-        PlanRowBuiltin::BitsToBytes,
-        PlanRowBuiltin::BytesToBits,
-    ] {
-        assert!(
-            plan_builtins.contains(&expected),
-            "public BITS hardware fixture omitted {expected:?}: {plan_builtins:#?}"
-        );
-    }
-    assert_eq!(verify_plan(&compiled.plan).unwrap().status, "pass");
 }
 
 #[test]

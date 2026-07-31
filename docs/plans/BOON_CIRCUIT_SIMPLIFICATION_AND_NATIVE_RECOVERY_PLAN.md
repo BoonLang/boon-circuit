@@ -49,13 +49,25 @@ ordinary HOLD state storage stays on the existing singular path.
 The focused matrix and the typechecker, semantic, IR, compiler, plan, and
 executor suites pass under serial execution. A fresh architecture report passes
 the verified compiler spine, dependency-classifier schema, and every non-budget
-structural check. Relative to the previous fresh measurement, this slice removes
-8,461 tracked Rust lines and 8,800 test Rust lines. The worktree is still over
-three mandatory limits: 461,960 tracked Rust lines against 240,000, 97,484 test
-Rust lines against 32,000, and 64,948 runtime-plus-executor lines against 42,000.
-The playground and xtask production caps pass at 31,298 and 17,723 lines.
-Native product reports remain stale until those budgets close and the
-compositor restart described below occurs.
+structural check. The first consolidation removed 8,461 tracked Rust lines and
+8,800 test Rust lines relative to its preceding measurement.
+
+The next ownership cut deletes 5,613 lines of private `boon_runtime` wrapper and
+distributed behavior oracles now owned by public executor, server-runtime,
+persistence, web-host, and native integration paths. Genuine transport,
+document, persistence, Wasm, and migration algorithms retain focused tests. It
+also deletes the stale in-process `resume_persistent` compatibility API: a cold
+Server restart restores durable Server authority while creating a fresh
+process-local Session, whereas reconnect inside the live resume window remains
+the Session registry's one resumability path. The public four-case in-process
+Client/Session/Server integration suite passes with that ownership.
+
+A fresh architecture report now measures 456,248 tracked Rust lines, 92,304
+test Rust lines, and 64,505 runtime-plus-executor production lines. Those remain
+over the respective 240,000, 32,000, and 42,000 limits. The playground and
+xtask production caps pass at 31,298 and 17,725 lines. Every non-budget
+architecture check passes. Native product reports remain stale until those
+budgets close and the compositor restart described below occurs.
 
 The nested-compositor diagnostic path has been deleted. The replacement uses
 ordinary COSMIC preview/dev windows, kernel uinput mouse and keyboard devices,

@@ -13,8 +13,8 @@ use boon_runtime::{
     Value,
 };
 use boon_wire::{
-    ClientCommit, ClientHello, ResumeToken, ServerReady, SessionControlFrame,
-    SessionControlFrameError, decode_session_control_frame, encode_session_control_frame,
+    ClientCommit, ClientHello, ServerReady, SessionControlFrame, SessionControlFrameError,
+    decode_session_control_frame, encode_session_control_frame,
 };
 use std::collections::{BTreeMap, VecDeque};
 use std::error::Error;
@@ -51,23 +51,6 @@ impl InProcessDistributedRuntimeConfig {
             ));
         }
         Ok(self)
-    }
-}
-
-/// Move-only, process-local Client authority needed to resume the same
-/// persistent Session after restarting its Server authority.
-///
-/// The bearer token and transport cursor remain private and are never formatted
-/// or serialized by this adapter.
-pub struct InProcessResumeState {
-    client: DistributedClientRuntime,
-    token: ResumeToken,
-    applied_server_through: u64,
-}
-
-impl InProcessResumeState {
-    fn into_parts(self) -> (DistributedClientRuntime, ResumeToken, u64) {
-        (self.client, self.token, self.applied_server_through)
     }
 }
 
@@ -274,7 +257,6 @@ struct PendingTurn {
 struct InitializedClient {
     client: DistributedClientRuntime,
     connection: DistributedSessionConnectionId,
-    resume_token: ResumeToken,
     pending_turns: VecDeque<PendingTurn>,
 }
 
@@ -287,7 +269,6 @@ pub struct InProcessDistributedRuntime {
     client: Option<DistributedClientRuntime>,
     server: BoonServerProgram,
     connection: DistributedSessionConnectionId,
-    resume_token: Option<ResumeToken>,
     clock_origin: Duration,
     last_now: Duration,
     config: InProcessDistributedRuntimeConfig,
@@ -310,7 +291,7 @@ impl InProcessDistributedRuntime {
         let config = config.validate()?;
         let mut server = BoonServerProgram::new_distributed(bundle, config.sessions)?;
         let clock_origin = unix_now()?;
-        let initialized = initialize_client(bundle, &mut server, config, clock_origin, None)?;
+        let initialized = initialize_client(bundle, &mut server, config, clock_origin)?;
         Ok(Self::from_initialized(
             server,
             initialized,
@@ -344,50 +325,6 @@ impl InProcessDistributedRuntime {
     where
         D: PersistenceDriver + Send + 'static,
     {
-        Self::start_or_resume_persistent(bundle, driver, persistence, config, None)
-    }
-
-    pub fn resume_persistent<D>(
-        bundle: &DistributedProgramBundle,
-        driver: D,
-        persistence: PersistentServerConfig,
-        resume: InProcessResumeState,
-    ) -> Result<(Self, PersistentServerStartup), InProcessDistributedRuntimeError>
-    where
-        D: PersistenceDriver + Send + 'static,
-    {
-        Self::resume_persistent_with_config(
-            bundle,
-            driver,
-            persistence,
-            InProcessDistributedRuntimeConfig::default(),
-            resume,
-        )
-    }
-
-    pub fn resume_persistent_with_config<D>(
-        bundle: &DistributedProgramBundle,
-        driver: D,
-        persistence: PersistentServerConfig,
-        config: InProcessDistributedRuntimeConfig,
-        resume: InProcessResumeState,
-    ) -> Result<(Self, PersistentServerStartup), InProcessDistributedRuntimeError>
-    where
-        D: PersistenceDriver + Send + 'static,
-    {
-        Self::start_or_resume_persistent(bundle, driver, persistence, config, Some(resume))
-    }
-
-    fn start_or_resume_persistent<D>(
-        bundle: &DistributedProgramBundle,
-        driver: D,
-        persistence: PersistentServerConfig,
-        config: InProcessDistributedRuntimeConfig,
-        resume: Option<InProcessResumeState>,
-    ) -> Result<(Self, PersistentServerStartup), InProcessDistributedRuntimeError>
-    where
-        D: PersistenceDriver + Send + 'static,
-    {
         let config = config.validate()?;
         let (mut server, startup) = BoonServerProgram::with_distributed_persistence(
             bundle,
@@ -396,8 +333,7 @@ impl InProcessDistributedRuntime {
             config.sessions,
         )?;
         let clock_origin = unix_now()?;
-        let initialized = match initialize_client(bundle, &mut server, config, clock_origin, resume)
-        {
+        let initialized = match initialize_client(bundle, &mut server, config, clock_origin) {
             Ok(initialized) => initialized,
             Err(error) => {
                 let _ = server.shutdown_persistent();
@@ -420,7 +356,6 @@ impl InProcessDistributedRuntime {
             client: Some(initialized.client),
             server,
             connection: initialized.connection,
-            resume_token: Some(initialized.resume_token),
             clock_origin,
             last_now: Duration::ZERO,
             config,
@@ -750,20 +685,16 @@ impl InProcessDistributedRuntime {
             .map(|lifecycle| lifecycle.status())
     }
 
-    /// Disconnects the real Session, drains persistent authority, and returns
-    /// opaque resume authority for a later `resume_persistent` call.
-    pub fn shutdown(
-        &mut self,
-    ) -> Result<Option<InProcessResumeState>, InProcessDistributedRuntimeError> {
+    /// Disconnects the process-local Session and drains persistent Server authority.
+    pub fn shutdown(&mut self) -> Result<(), InProcessDistributedRuntimeError> {
         if self.shutdown {
-            return Ok(None);
+            return Ok(());
         }
-        let client = self
+        let _ = self
             .client
             .as_mut()
-            .expect("running in-process runtime owns its Client");
-        let applied_server_through = client.applied_server_through();
-        let _ = client.cancel_all_transient_effects()?;
+            .expect("running in-process runtime owns its Client")
+            .cancel_all_transient_effects()?;
 
         let active = self
             .active_transient_effects
@@ -794,15 +725,8 @@ impl InProcessDistributedRuntime {
         self.server.shutdown_persistent()?;
         self.pending_turns.clear();
         self.shutdown = true;
-        let client = self
-            .client
-            .take()
-            .expect("shutting down in-process runtime still owns its Client");
-        Ok(self.resume_token.take().map(|token| InProcessResumeState {
-            client,
-            token,
-            applied_server_through,
-        }))
+        self.client.take();
+        Ok(())
     }
 
     fn registry_now(&self, now: Duration) -> Result<Duration, InProcessDistributedRuntimeError> {
@@ -996,35 +920,22 @@ fn initialize_client(
     server: &mut BoonServerProgram,
     config: InProcessDistributedRuntimeConfig,
     registry_now: Duration,
-    resume: Option<InProcessResumeState>,
 ) -> Result<InitializedClient, InProcessDistributedRuntimeError> {
     let identity = server
         .distributed_identity()
         .ok_or(DistributedSessionRegistryError::IdentityUnavailable)?;
-    let (mut client, resume_token, applied_server_through) = match resume {
-        Some(resume) => {
-            let (client, token, applied) = resume.into_parts();
-            (client, Some(token), applied)
-        }
-        None => {
-            let artifact = bundle.artifact(ProgramRole::Client).ok_or_else(|| {
-                InProcessDistributedRuntimeError::Client(DistributedRuntimeError::Runtime(
-                    "distributed bundle has no Client artifact".to_owned(),
-                ))
-            })?;
-            (
-                DistributedClientRuntime::start(artifact, config.client_queue_limits)?,
-                None,
-                0,
-            )
-        }
-    };
+    let artifact = bundle.artifact(ProgramRole::Client).ok_or_else(|| {
+        InProcessDistributedRuntimeError::Client(DistributedRuntimeError::Runtime(
+            "distributed bundle has no Client artifact".to_owned(),
+        ))
+    })?;
+    let mut client = DistributedClientRuntime::start(artifact, config.client_queue_limits)?;
     let hello = encode_session_control_frame(&SessionControlFrame::ClientHello(ClientHello::new(
         identity.graph_id,
         identity.graph_revision,
         identity.schema_hash,
-        resume_token,
-        applied_server_through,
+        None,
+        0,
     )))?;
     let offer = match server.begin_distributed_handshake(
         registry_now,
@@ -1045,9 +956,9 @@ fn initialize_client(
             "awaiting ServerOffer",
         ));
     };
-    let (next_resume_token, session_id, generation, applied_client_through) = offer.into_parts();
+    let (_resume_token, session_id, generation, applied_client_through) = offer.into_parts();
     let commit = encode_session_control_frame(&SessionControlFrame::ClientCommit(
-        ClientCommit::new(session_id, generation, applied_server_through),
+        ClientCommit::new(session_id, generation, 0),
     ))?;
     let ready_frame = server.commit_distributed_handshake(registry_now, connection, &commit)?;
     let SessionControlFrame::ServerReady(ready) = decode_session_control_frame(&ready_frame)?
@@ -1083,7 +994,6 @@ fn initialize_client(
     Ok(InitializedClient {
         client,
         connection,
-        resume_token: next_resume_token,
         pending_turns,
     })
 }

@@ -24,9 +24,8 @@ pub use distributed_sessions::{
 pub use in_process::{
     DEFAULT_IN_PROCESS_POLL_STEPS, InProcessDistributedRuntime, InProcessDistributedRuntimeConfig,
     InProcessDistributedRuntimeError, InProcessFrameProgress, InProcessFrameTransferProgress,
-    InProcessPoll, InProcessResumeState, InProcessTransientEffectCancellation,
-    InProcessTransientEffectCreditGrant, InProcessTransientEffectInvocation,
-    InProcessTransientEffectOwner,
+    InProcessPoll, InProcessTransientEffectCancellation, InProcessTransientEffectCreditGrant,
+    InProcessTransientEffectInvocation, InProcessTransientEffectOwner,
 };
 
 use async_trait::async_trait;

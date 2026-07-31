@@ -1198,7 +1198,8 @@ fn load_source_files(workspace: &Path) -> Result<(Vec<SourceFile>, String), Stri
         })
         .collect::<Result<Vec<_>, _>>()?;
     paths.retain(|path| {
-        path.ends_with(".rs")
+        workspace.join(path).is_file()
+            && path.ends_with(".rs")
             && SCAN_ROOTS
                 .iter()
                 .any(|root| path == root || path.starts_with(&format!("{root}/")))

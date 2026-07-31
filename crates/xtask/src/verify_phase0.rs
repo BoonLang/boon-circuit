@@ -16,7 +16,7 @@ const DEFAULT_REPORT: &str = "target/reports/phase0-v1/evidence.json";
 const VERSIONS_MANIFEST: &str = "docs/architecture/phase0/versions.toml";
 const DELETION_MANIFEST: &str = "docs/architecture/phase0/deletion_ledger.toml";
 const DELETION_MANIFEST_SHA256: &str =
-    "36014867dc35cb966e8a11a5b2cb8200a5e12049defa820c801658124ea19528";
+    "038728ac454edd2afe91c9d00ac92ef6487e4710dcaff9a1b72b8927fd1b8f57";
 const CONTAINER_MANIFEST: &str = "docs/architecture/phase0/container_inventory.toml";
 #[cfg(test)]
 const CONTAINER_OCCURRENCE_LEDGER: &str = "docs/architecture/phase0/container_occurrences.tsv";
@@ -4428,6 +4428,7 @@ fn workspace_files(workspace: &Path) -> Result<Vec<String>, String> {
         .filter(|path| !path.is_empty())
         .map(|path| String::from_utf8(path.to_vec()).map_err(|error| error.to_string()))
         .collect::<Result<Vec<_>, _>>()?;
+    files.retain(|relative| workspace.join(relative).is_file());
     files.sort();
     files.dedup();
     Ok(files)

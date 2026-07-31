@@ -297,7 +297,7 @@ fn transient_effect_completions_return_to_the_exact_role_owner() {
 }
 
 #[test]
-fn persistent_authority_and_session_resume_without_exposing_session_ids() {
+fn persistent_server_restart_restores_authority_with_a_fresh_process_local_session() {
     let directory = tempfile::tempdir().unwrap();
     let database = directory.path().join("in-process.redb");
     let bundle = bundle();
@@ -332,20 +332,16 @@ fn persistent_authority_and_session_resume_without_exposing_session_ids() {
         runtime.client_root_value_current("store.result").unwrap(),
         Value::integer(101).unwrap()
     );
-    let resume = runtime
-        .shutdown()
-        .unwrap()
-        .expect("first shutdown should return opaque resume authority");
+    runtime.shutdown().unwrap();
     assert_eq!(
         runtime.persistent_server_status().unwrap().phase,
         boon_server_runtime::ServerLifecyclePhase::Stopped
     );
 
-    let (mut recovered, startup) = InProcessDistributedRuntime::resume_persistent(
+    let (mut recovered, startup) = InProcessDistributedRuntime::start_persistent(
         &bundle,
         RedbDriver::open(&database).unwrap(),
         persistence(),
-        resume,
     )
     .unwrap();
     assert_eq!(
@@ -356,7 +352,8 @@ fn persistent_authority_and_session_resume_without_exposing_session_ids() {
     settle(&mut recovered, &mut recovered_now);
     assert_eq!(
         recovered.client_root_value_current("store.result").unwrap(),
-        Value::integer(101).unwrap()
+        Value::integer(100).unwrap(),
+        "a cold Server restart restores durable authority but creates a fresh process-local Session"
     );
     recovered.shutdown().unwrap();
     assert_eq!(

@@ -68,20 +68,20 @@ occurrence_ledger_validator = "cargo run -p xtask --example packed_site_inventor
 
 # Updated only after reviewing a deterministic generator run.
 expected_probe_set_sha256 = "54f1c6ca0c9e9c0994bdb66f1a7829d6df3142afa3297b93d48290f8a856479c"
-expected_file_set_sha256 = "60286568405414573dc17747a519c034d3bc63baab9d55ca490f6c6c3d694d0d"
-expected_scanned_files = 87
-expected_occurrence_files = 77
-expected_occurrence_ledger_sha256 = "3b1089f9e46469a3c5ee42482895be43dae0ca04bedab6e5cf23d99cbc83954e"
-expected_occurrence_rows = 19736
+expected_file_set_sha256 = "dd94486758dbae128dd0187bacc861c2b98f1a41ea0888f19ee1739fa53252fb"
+expected_scanned_files = 86
+expected_occurrence_files = 76
+expected_occurrence_ledger_sha256 = "c135a1d38df939022b74daa2399425ae23e355592562f9f05add6dd76e68fdb4"
+expected_occurrence_rows = 19292
 
 [[categories]]
 order = 0
 id = "recursive-value-carrier"
 owner_phase = "goal-phase-5-packed"
 owner_plan = "docs/plans/BOON_PACKED_DATA_AND_DENSE_INTERNALS_PLAN.md"
-expected_rows = 744
+expected_rows = 731
 expected_hot = 520
-expected_cold = 178
+expected_cold = 165
 expected_boundary = 46
 
 [[categories]]
@@ -89,9 +89,9 @@ order = 1
 id = "runtime-string-lookup"
 owner_phase = "goal-phase-5-packed"
 owner_plan = "docs/plans/BOON_PACKED_DATA_AND_DENSE_INTERNALS_PLAN.md"
-expected_rows = 112
+expected_rows = 110
 expected_hot = 83
-expected_cold = 21
+expected_cold = 19
 expected_boundary = 8
 
 [[categories]]
@@ -99,9 +99,9 @@ order = 2
 id = "recursive-clone"
 owner_phase = "goal-phase-5-packed"
 owner_plan = "docs/plans/BOON_PACKED_DATA_AND_DENSE_INTERNALS_PLAN.md"
-expected_rows = 1615
+expected_rows = 1510
 expected_hot = 1117
-expected_cold = 390
+expected_cold = 285
 expected_boundary = 108
 
 [[categories]]
@@ -109,9 +109,9 @@ order = 3
 id = "allocation-or-growth"
 owner_phase = "goal-phase-5-packed"
 owner_plan = "docs/plans/BOON_PACKED_DATA_AND_DENSE_INTERNALS_PLAN.md"
-expected_rows = 15463
+expected_rows = 15164
 expected_hot = 3854
-expected_cold = 10176
+expected_cold = 9877
 expected_boundary = 1433
 
 [[categories]]
@@ -119,9 +119,9 @@ order = 4
 id = "whole-snapshot-or-comparison"
 owner_phase = "goal-phase-5-packed"
 owner_plan = "docs/plans/BOON_PACKED_DATA_AND_DENSE_INTERNALS_PLAN.md"
-expected_rows = 477
+expected_rows = 475
 expected_hot = 124
-expected_cold = 280
+expected_cold = 278
 expected_boundary = 73
 
 [[categories]]
@@ -129,7 +129,7 @@ order = 5
 id = "boundary-or-runtime-materialization"
 owner_phase = "goal-phase-5-packed"
 owner_plan = "docs/plans/BOON_PACKED_DATA_AND_DENSE_INTERNALS_PLAN.md"
-expected_rows = 1325
+expected_rows = 1302
 expected_hot = 440
-expected_cold = 774
+expected_cold = 751
 expected_boundary = 111

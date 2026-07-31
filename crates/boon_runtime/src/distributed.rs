@@ -176,6 +176,3 @@ pub(super) fn set_source_payload_value(
     }
     Ok(())
 }
-
-#[cfg(test)]
-mod tests;

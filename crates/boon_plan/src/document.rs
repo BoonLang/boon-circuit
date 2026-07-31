@@ -218,6 +218,9 @@ pub enum DocumentRead {
     Source {
         source: SourceId,
     },
+    Sources {
+        sources: Vec<SourceId>,
+    },
     Parameter {
         parameter: DocumentParameterId,
         projection: Vec<DocumentNameId>,
@@ -550,6 +553,7 @@ pub enum DocumentBindingKind {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum DocumentBindingTarget {
     Source { source: SourceId },
+    Sources { sources: Vec<SourceId> },
     State { state: StateId },
     Field { field: FieldId },
     List { list: ListId },

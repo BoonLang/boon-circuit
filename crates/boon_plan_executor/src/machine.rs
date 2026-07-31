@@ -9006,6 +9006,8 @@ fn schedule_apply_operands<'event, 'plan>(
         | PlanRowExpressionNode::Local { .. }
         | PlanRowExpressionNode::LocalRow { .. }
         | PlanRowExpressionNode::EventRow { .. }
+        | PlanRowExpressionNode::EventSources { .. }
+        | PlanRowExpressionNode::EventSourcePayloads { .. }
         | PlanRowExpressionNode::ListRowField { .. }
         | PlanRowExpressionNode::BuiltinCall { .. }
         | PlanRowExpressionNode::TransientCollection { .. }
@@ -13779,18 +13781,18 @@ impl MachineInstance {
             .ok_or_else(|| {
                 Error::InvalidPlan(format!("document binding {} does not exist", binding.0))
             })?;
-        match binding.target {
+        match &binding.target {
             boon_plan::DocumentBindingTarget::State { state } => {
-                Ok(Some(ValueTarget::State(state)))
+                Ok(Some(ValueTarget::State(*state)))
             }
             boon_plan::DocumentBindingTarget::Field { field } => {
-                Ok(Some(ValueTarget::Field(field)))
+                Ok(Some(ValueTarget::Field(*field)))
             }
             boon_plan::DocumentBindingTarget::ScopedField { scope, field } => {
                 let row = row.ok_or_else(|| {
                     Error::InvalidEvent(format!("document binding {} requires a row", binding.id.0))
                 })?;
-                let owner = self.metadata.list_by_scope.get(&scope).ok_or_else(|| {
+                let owner = self.metadata.list_by_scope.get(scope).ok_or_else(|| {
                     Error::InvalidPlan(format!("document scope {} has no owning list", scope.0))
                 })?;
                 if row.list != *owner {
@@ -13799,9 +13801,10 @@ impl MachineInstance {
                         binding.id.0, row.list.0, owner.0
                     )));
                 }
-                Ok(Some(ValueTarget::RowField { row, field }))
+                Ok(Some(ValueTarget::RowField { row, field: *field }))
             }
             boon_plan::DocumentBindingTarget::Source { .. }
+            | boon_plan::DocumentBindingTarget::Sources { .. }
             | boon_plan::DocumentBindingTarget::List { .. }
             | boon_plan::DocumentBindingTarget::Expression { .. } => Ok(None),
         }
@@ -15186,6 +15189,24 @@ impl MachineInstance {
         source: SourceId,
         ancestors: &[RowId],
     ) -> Result<SourceRouteToken, Error> {
+        self.source_route_token_if_bound(source, ancestors)?
+            .ok_or_else(|| {
+                if let Some(row) = ancestors.last() {
+                    Error::InvalidEvent(format!(
+                        "source {} is not bound to owner row {}:{}:{}",
+                        source.0, row.list.0, row.key, row.generation
+                    ))
+                } else {
+                    Error::InvalidEvent(format!("source {} has no root binding", source.0))
+                }
+            })
+    }
+
+    pub fn source_route_token_if_bound(
+        &self,
+        source: SourceId,
+        ancestors: &[RowId],
+    ) -> Result<Option<SourceRouteToken>, Error> {
         let route = self.metadata.routes.get(&source).ok_or_else(|| {
             Error::InvalidEvent(format!("source {} is not in the plan", source.0))
         })?;
@@ -15227,23 +15248,16 @@ impl MachineInstance {
                 .and_then(|list| list.rows.get(&row))
                 .and_then(|row| row.bindings.get(&source))
                 .copied()
-                .ok_or_else(|| {
-                    Error::InvalidEvent(format!(
-                        "source {} is not bound to owner row {}:{}:{}",
-                        source.0, row.list.0, row.key, row.generation
-                    ))
-                })?
         } else {
-            self.root_source_bindings
-                .get(&source)
-                .copied()
-                .ok_or_else(|| {
-                    Error::InvalidEvent(format!("source {} has no root binding", source.0))
-                })?
+            self.root_source_bindings.get(&source).copied()
+        };
+        let Some(binding_epoch) = binding_epoch else {
+            return Ok(None);
         };
         let owner = OwnerInstanceRoute::new(route.owner.static_owner, owner_rows)
             .map_err(|detail| Error::InvalidPlan(detail.to_owned()))?;
         SourceRouteToken::new(self.options.program_revision, owner, source, binding_epoch)
+            .map(Some)
             .map_err(|detail| Error::InvalidEvent(detail.to_owned()))
     }
 
@@ -15252,16 +15266,31 @@ impl MachineInstance {
         path: &str,
         ancestors: &[RowId],
     ) -> Result<SourceRouteToken, Error> {
-        let source = self
+        let sources = self
             .metadata
             .routes
             .values()
-            .find(|route| route.path == path)
+            .filter(|route| route.path == path)
             .map(|route| route.source_id)
-            .ok_or_else(|| {
-                Error::InvalidEvent(format!("source path `{path}` is not in the plan"))
-            })?;
-        self.source_route_token(source, ancestors)
+            .collect::<Vec<_>>();
+        if sources.is_empty() {
+            return Err(Error::InvalidEvent(format!(
+                "source path `{path}` is not in the plan"
+            )));
+        }
+        let mut bound = Vec::new();
+        for source in sources {
+            if let Some(route) = self.source_route_token_if_bound(source, ancestors)? {
+                bound.push(route);
+            }
+        }
+        bound.sort_by_key(|route| route.source);
+        let Some(route) = bound.first() else {
+            return Err(Error::InvalidEvent(format!(
+                "source path `{path}` has no live route alternative"
+            )));
+        };
+        Ok(route.clone())
     }
 
     pub fn row_target_for_source_path(
@@ -15270,16 +15299,31 @@ impl MachineInstance {
         key: u64,
         generation: u64,
     ) -> Result<RowId, Error> {
-        let source = self
+        let sources = self
             .metadata
             .routes
             .values()
-            .find(|route| route.path == path)
+            .filter(|route| route.path == path)
             .map(|route| route.source_id)
-            .ok_or_else(|| {
-                Error::InvalidEvent(format!("source path `{path}` is not in the plan"))
-            })?;
-        self.row_target_for_source(source, key, generation)
+            .collect::<Vec<_>>();
+        if sources.is_empty() {
+            return Err(Error::InvalidEvent(format!(
+                "source path `{path}` is not in the plan"
+            )));
+        }
+        let mut rows = sources
+            .into_iter()
+            .map(|source| self.row_target_for_source(source, key, generation))
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.sort_unstable();
+        rows.dedup();
+        let [row] = rows.as_slice() else {
+            return Err(Error::InvalidEvent(format!(
+                "source path `{path}` resolves to {} row targets",
+                rows.len()
+            )));
+        };
+        Ok(*row)
     }
 
     fn initialize_storage_prelude(&mut self) -> Result<(), Error> {
@@ -25558,6 +25602,25 @@ impl MachineInstance {
                                         })?;
                                     stack.push_value(value)?;
                                 }
+                                PlanRowExpressionNode::EventSources { sources } => {
+                                    let active = context.event.is_some_and(|event| {
+                                        sources.binary_search(&event.source).is_ok()
+                                    });
+                                    stack.push_value(EvalValue::Value(Value::truth(active)))?;
+                                }
+                                PlanRowExpressionNode::EventSourcePayloads { sources, field } => {
+                                    let value = context
+                                        .event
+                                        .filter(|event| {
+                                            sources.binary_search(&event.source).is_ok()
+                                        })
+                                        .and_then(|event| {
+                                            source_payload_value(&event.payload, field)
+                                        })
+                                        .map(EvalValue::Value)
+                                        .unwrap_or(EvalValue::Absent);
+                                    stack.push_value(value)?;
+                                }
                                 PlanRowExpressionNode::EventRow { source, list_id } => {
                                     let event = context.event.ok_or_else(|| {
                                     Error::InvalidPlan(format!(
@@ -32109,6 +32172,8 @@ impl MachineInstance {
             | PlanRowExpressionNode::Local { .. }
             | PlanRowExpressionNode::LocalRow { .. }
             | PlanRowExpressionNode::EventRow { .. }
+            | PlanRowExpressionNode::EventSources { .. }
+            | PlanRowExpressionNode::EventSourcePayloads { .. }
             | PlanRowExpressionNode::ListRowField { .. }
             | PlanRowExpressionNode::BuiltinCall { .. }
             | PlanRowExpressionNode::Object { .. }
@@ -34652,6 +34717,19 @@ fn collect_uncaptured_page_dependencies(
             }
             PlanRowExpressionNode::EventRow { source, .. } => {
                 insert_input(ValueRef::Source(*source));
+            }
+            PlanRowExpressionNode::EventSources { sources } => {
+                for source in sources {
+                    insert_input(ValueRef::Source(*source));
+                }
+            }
+            PlanRowExpressionNode::EventSourcePayloads { sources, field } => {
+                for source in sources {
+                    insert_input(ValueRef::SourcePayload {
+                        source_id: *source,
+                        field: field.clone(),
+                    });
+                }
             }
             _ => {}
         }

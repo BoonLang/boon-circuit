@@ -1132,8 +1132,10 @@ FUNCTION selectable_row(seed) {
         .locals
         .iter()
         .flat_map(|local| local.members.iter())
-        .filter_map(|member| match member.target {
-            ErasedLocalMemberTarget::Source(source) if member.path == ["select"] => Some(source),
+        .filter_map(|member| match &member.target {
+            ErasedLocalMemberTarget::Sources(sources) if member.path == ["select"] => {
+                sources.as_slice().first().copied()
+            }
             _ => None,
         })
         .collect::<BTreeSet<_>>();
@@ -1276,7 +1278,7 @@ document: Document/new(
     assert!(ir.scope_index.locals.iter().any(|local| {
         local.members.iter().any(|member| {
             member.path == ["controls", "select"]
-                && member.target == ErasedLocalMemberTarget::Source(source.id)
+                && member.target == ErasedLocalMemberTarget::Sources(vec![source.id])
                 && member.forwarded_from.is_some()
         })
     }));
@@ -1341,7 +1343,7 @@ document: Document/new(
         .collect::<Vec<_>>();
     assert!(local_members.iter().any(|member| {
         member.path == ["controls", "press"]
-            && matches!(member.target, ErasedLocalMemberTarget::Source(_))
+            && matches!(&member.target, ErasedLocalMemberTarget::Sources(_))
             && member.forwarded_from.is_some()
     }));
     let current = local_members
@@ -1426,7 +1428,7 @@ document: Document/new(
     assert!(ir.scope_index.locals.iter().any(|local| {
         local.members.iter().any(|member| {
             member.path == ["controls", "remove"]
-                && member.target == ErasedLocalMemberTarget::Source(remove.id)
+                && member.target == ErasedLocalMemberTarget::Sources(vec![remove.id])
         }) && local.members.iter().any(|member| {
             member.path == ["controls"]
                 && matches!(member.target, ErasedLocalMemberTarget::Field(_))
@@ -2533,7 +2535,7 @@ fn erased_scope_index_rejects_cyclic_resource_forwarding() {
             local
                 .members
                 .iter()
-                .any(|member| matches!(member.target, ErasedLocalMemberTarget::Source(_)))
+                .any(|member| matches!(&member.target, ErasedLocalMemberTarget::Sources(_)))
         })
         .expect("materialized source member");
     let owner = local.owner;
@@ -2541,7 +2543,7 @@ fn erased_scope_index_rejects_cyclic_resource_forwarding() {
     let member = local
         .members
         .iter_mut()
-        .find(|member| matches!(member.target, ErasedLocalMemberTarget::Source(_)))
+        .find(|member| matches!(&member.target, ErasedLocalMemberTarget::Sources(_)))
         .expect("materialized source member");
     member.forwarded_from = Some(ErasedLocalMemberForwarding::Local {
         owner,

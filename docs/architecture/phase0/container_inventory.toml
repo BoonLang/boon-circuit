@@ -7,26 +7,26 @@ word_boundary = "rust-identifier"
 lexical_scope = "all-source-text"
 test_scope_policy = "test-oracle"
 non_code_policy = "unrelated-host-code"
-expected_file_count = 157
-expected_file_set_sha256 = "d3f53f9499eab89e0677c2336ad8577b071e1a84a6c4b45ef78010429e52229f"
+expected_file_count = 154
+expected_file_set_sha256 = "d24ac8322727500d2d1a5b1a6b25f427eec498ae16615facdd1a5469a6a270a2"
 occurrence_ledger_path = "docs/architecture/phase0/container_occurrences.tsv"
 occurrence_ledger_protocol = "boon-phase0-container-occurrences-v1"
 occurrence_ledger_generator = "cargo test -p xtask verify_phase0::tests::regenerate_container_occurrence_ledger -- --ignored --exact"
-expected_occurrence_ledger_sha256 = "0906b57470eff9f5000a5634fe76e360fb90077399fae2689d0832951c6a5d17"
-expected_occurrence_rows = 5104
+expected_occurrence_ledger_sha256 = "d9eedd7f742f55b284adda6bc3bd7e293ee880a5eed23ba16270efdb358812fb"
+expected_occurrence_rows = 5060
 within_file_classification = "complete"
 within_file_owner_phase = "goal-phase-5-packed"
 within_file_owner_action = "Maintain one checked-in row per exact identifier occurrence; mixed files retain distinct per-use categories."
 
 [[constructs]]
 id = "BTreeMap"
-expected_occurrences = 3050
-expected_files = 130
+expected_occurrences = 3024
+expected_files = 128
 
 [[constructs]]
 id = "BTreeSet"
-expected_occurrences = 1968
-expected_files = 103
+expected_occurrences = 1950
+expected_files = 101
 
 [[constructs]]
 id = "HashMap"
@@ -56,7 +56,7 @@ owner_phase = "goal-phase-5-packed"
 owner_plan = "docs/plans/BOON_PACKED_DATA_AND_DENSE_INTERNALS_PLAN.md"
 expected_files = 87
 expected_btree_map = 0
-expected_btree_set = 1718
+expected_btree_set = 1721
 expected_hash_map = 0
 expected_hash_set = 28
 
@@ -76,8 +76,8 @@ order = 3
 id = "name-lookup"
 owner_phase = "goal-phase-1-verified-spine"
 owner_plan = "docs/plans/TYPE_INFERENCE_AND_TYPECHECKING_PLAN.md"
-expected_files = 56
-expected_btree_map = 556
+expected_files = 57
+expected_btree_map = 557
 expected_btree_set = 0
 expected_hash_map = 10
 expected_hash_set = 0
@@ -98,9 +98,9 @@ order = 5
 id = "test-oracle"
 owner_phase = "goal-phase-0"
 owner_plan = "docs/plans/GOAL_PROMPT.md"
-expected_files = 74
-expected_btree_map = 486
-expected_btree_set = 205
+expected_files = 71
+expected_btree_map = 459
+expected_btree_set = 184
 expected_hash_map = 7
 expected_hash_set = 2
 

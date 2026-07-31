@@ -7122,9 +7122,10 @@ fn inventory_storage(
             references,
         )?;
         for (ordinal, member) in local.members.iter().enumerate() {
-            let mut references = vec![dependency_entity(storage_local_member_target_entity(
-                member.target,
-            ))];
+            let mut references = storage_local_member_target_entities(&member.target)
+                .into_iter()
+                .map(dependency_entity)
+                .collect::<Vec<_>>();
             if let Some(forwarding) = &member.forwarded_from {
                 match forwarding {
                     SemanticStorageLocalMemberForwardingV1::Local { owner, local, .. } => {
@@ -7520,16 +7521,18 @@ fn inventory_storage(
     Ok(())
 }
 
-fn storage_local_member_target_entity(
-    target: SemanticStorageLocalMemberTargetV1,
-) -> SemanticDependencyEntityV1 {
+fn storage_local_member_target_entities(
+    target: &SemanticStorageLocalMemberTargetV1,
+) -> Vec<SemanticDependencyEntityV1> {
     match target {
-        SemanticStorageLocalMemberTargetV1::Field(field) => indexed_entity(
+        SemanticStorageLocalMemberTargetV1::Field(field) => vec![indexed_entity(
             SemanticDependencyEntityDomainV1::SemanticStorageField,
             field.as_usize(),
-        ),
-        SemanticStorageLocalMemberTargetV1::Source(source) => source_entity(source),
-        SemanticStorageLocalMemberTargetV1::State(state) => state_entity(state),
+        )],
+        SemanticStorageLocalMemberTargetV1::Sources(sources) => {
+            sources.iter().copied().map(source_entity).collect()
+        }
+        SemanticStorageLocalMemberTargetV1::State(state) => vec![state_entity(*state)],
     }
 }
 

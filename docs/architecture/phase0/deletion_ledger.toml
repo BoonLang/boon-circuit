@@ -2253,7 +2253,7 @@ roots = ["crates/boon_plan_executor/src/machine.rs"]
 extensions = ["rs"]
 mode = "rust-code-token"
 needle = "PlanRowExpressionNode"
-expected_occurrences = 187
+expected_occurrences = 195
 expected_files = 1
 
 # Every ordinary-turn full-list comparison routes through one instrumented
@@ -2398,8 +2398,8 @@ roots = ["crates"]
 extensions = ["rs"]
 mode = "rust-token"
 needle = "BTreeMap"
-expected_occurrences = 3050
-expected_files = 130
+expected_occurrences = 3024
+expected_files = 128
 
 [entries.scans.expected_path_occurrences]
 "crates/boon_app_package/src/build.rs" = 2
@@ -2431,7 +2431,7 @@ expected_files = 130
 "crates/boon_http_client/src/dns.rs" = 2
 "crates/boon_http_runtime/src/lib.rs" = 18
 "crates/boon_http_runtime/tests/loopback.rs" = 5
-"crates/boon_ir/src/lib.rs" = 6
+"crates/boon_ir/src/lib.rs" = 7
 "crates/boon_ir/src/semantic_mapping.rs" = 42
 "crates/boon_ir/src/tests/distributed.rs" = 3
 "crates/boon_ir/src/tests/sources_and_events.rs" = 2
@@ -2467,12 +2467,10 @@ expected_files = 130
 "crates/boon_plan_executor/src/cursor.rs" = 12
 "crates/boon_plan_executor/src/effect_stream.rs" = 7
 "crates/boon_plan_executor/src/machine.rs" = 487
-"crates/boon_plan_executor/src/tests.rs" = 131
-"crates/boon_plan_executor/tests/fjordpulse_server_search.rs" = 4
+"crates/boon_plan_executor/src/tests.rs" = 111
 "crates/boon_plan_executor/tests/foundations_vertical.rs" = 2
 "crates/boon_plan_executor/tests/map_set_cross_target.rs" = 8
 "crates/boon_plan_executor/tests/map_set_runtime.rs" = 27
-"crates/boon_plan_executor/tests/typed_list_cross_target.rs" = 3
 "crates/boon_runtime/src/content_ref.rs" = 2
 "crates/boon_runtime/src/distributed.rs" = 5
 "crates/boon_runtime/src/distributed/client_session.rs" = 3
@@ -2538,8 +2536,8 @@ roots = ["crates"]
 extensions = ["rs"]
 mode = "rust-token"
 needle = "BTreeSet"
-expected_occurrences = 1968
-expected_files = 103
+expected_occurrences = 1950
+expected_files = 101
 
 [entries.scans.expected_path_occurrences]
 "crates/boon_app_package/src/browser.rs" = 2
@@ -2551,7 +2549,7 @@ expected_files = 103
 "crates/boon_compiler/src/distributed_compiler.rs" = 29
 "crates/boon_compiler/src/document_executable_backend.rs" = 18
 "crates/boon_compiler/src/machine_plan_backend.rs" = 143
-"crates/boon_compiler/src/tests.rs" = 48
+"crates/boon_compiler/src/tests.rs" = 30
 "crates/boon_contract/src/lib.rs" = 2
 "crates/boon_data/src/lib.rs" = 4
 "crates/boon_document/src/lib.rs" = 42
@@ -2562,7 +2560,7 @@ expected_files = 103
 "crates/boon_host_runtime/src/lib.rs" = 6
 "crates/boon_http_client/src/client.rs" = 2
 "crates/boon_http_runtime/src/lib.rs" = 3
-"crates/boon_ir/src/lib.rs" = 31
+"crates/boon_ir/src/lib.rs" = 33
 "crates/boon_ir/src/semantic_mapping.rs" = 55
 "crates/boon_ir/src/tests.rs" = 1
 "crates/boon_ir/src/tests/bytes.rs" = 1
@@ -2593,11 +2591,10 @@ expected_files = 103
 "crates/boon_phase0_baseline/src/report.rs" = 4
 "crates/boon_plan/src/document.rs" = 10
 "crates/boon_plan/src/host.rs" = 3
-"crates/boon_plan/src/lib.rs" = 116
+"crates/boon_plan/src/lib.rs" = 117
 "crates/boon_plan/src/tests.rs" = 2
 "crates/boon_plan_executor/src/machine.rs" = 191
 "crates/boon_plan_executor/src/tests.rs" = 11
-"crates/boon_plan_executor/tests/fjordpulse_server_search.rs" = 2
 "crates/boon_plan_executor/tests/map_set_cross_target.rs" = 3
 "crates/boon_plan_executor/tests/map_set_runtime.rs" = 6
 "crates/boon_runtime/src/distributed/client.rs" = 3
@@ -2626,7 +2623,6 @@ expected_files = 103
 "crates/boon_server_runtime/src/lib.rs" = 13
 "crates/boon_typecheck/src/lib.rs" = 270
 "crates/boon_typecheck/src/tests/host_ports.rs" = 1
-"crates/boon_typecheck/src/tests/reactive_collections.rs" = 1
 "crates/boon_verify/src/lib.rs" = 20
 "crates/boon_web_effect_host/src/content_store.rs" = 5
 "crates/boon_web_effect_host/src/file_effect_host.rs" = 4
@@ -2660,7 +2656,7 @@ expected_files = 1
 roots = ["docs/architecture/phase0/container_occurrences.tsv"]
 extensions = ["tsv"]
 needle = "\tmembership\t"
-expected_occurrences = 1746
+expected_occurrences = 1749
 expected_files = 1
 
 [[entries.scans]]
@@ -2674,7 +2670,7 @@ expected_files = 1
 roots = ["docs/architecture/phase0/container_occurrences.tsv"]
 extensions = ["tsv"]
 needle = "\tname-lookup\t"
-expected_occurrences = 566
+expected_occurrences = 567
 expected_files = 1
 
 [[entries.scans]]
@@ -2688,7 +2684,7 @@ expected_files = 1
 roots = ["docs/architecture/phase0/container_occurrences.tsv"]
 extensions = ["tsv"]
 needle = "\ttest-oracle\t"
-expected_occurrences = 700
+expected_occurrences = 652
 expected_files = 1
 
 [[entries.scans]]

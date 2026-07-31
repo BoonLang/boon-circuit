@@ -74,7 +74,9 @@ fn visit_row_node_children_mut(
         | PlanRowExpressionNode::AuthorityListRef { .. }
         | PlanRowExpressionNode::Local { .. }
         | PlanRowExpressionNode::LocalRow { .. }
-        | PlanRowExpressionNode::EventRow { .. } => {}
+        | PlanRowExpressionNode::EventRow { .. }
+        | PlanRowExpressionNode::EventSources { .. }
+        | PlanRowExpressionNode::EventSourcePayloads { .. } => {}
         PlanRowExpressionNode::Flush { payload: input }
         | PlanRowExpressionNode::FlushBoundary { input }
         | PlanRowExpressionNode::TextTrim { input }
@@ -12414,37 +12416,77 @@ impl<'a> ExecutableRowLowerer<'a> {
                                 field,
                             })?
                         }
-                        ir::ErasedLocalMemberTarget::Source(source) => {
+                        ir::ErasedLocalMemberTarget::Sources(sources) => {
+                            if sources.is_empty()
+                                || sources.windows(2).any(|pair| pair[0] >= pair[1])
+                            {
+                                return Err(PlanError::new(
+                                    "materialization local has an empty or noncanonical source set",
+                                ));
+                            }
                             if let Some(payload_name) = projection.get(consumed) {
-                                let source_port = self
-                                    .program
-                                    .sources
-                                    .iter()
-                                    .find(|candidate| candidate.id == source)
-                                    .ok_or_else(|| {
-                                        PlanError::new(format!(
-                                            "materialization local references missing source {}",
-                                            source.0
-                                        ))
-                                    })?;
-                                let payload_field = source_port
-                                    .payload_schema
-                                    .fields
-                                    .iter()
-                                    .find(|field| field.name() == payload_name)
-                                    .ok_or_else(|| {
-                                        PlanError::new(format!(
-                                            "source `{}` has no payload field `{payload_name}`",
-                                            source_port.path
-                                        ))
-                                    })?;
+                                let mut payload_field = None;
+                                for source in &sources {
+                                    let source_port = self
+                                        .program
+                                        .sources
+                                        .iter()
+                                        .find(|candidate| candidate.id == *source)
+                                        .ok_or_else(|| {
+                                            PlanError::new(format!(
+                                                "materialization local references missing source {}",
+                                                source.0
+                                            ))
+                                        })?;
+                                    let candidate = source_port
+                                        .payload_schema
+                                        .fields
+                                        .iter()
+                                        .find(|field| field.name() == payload_name)
+                                        .map(source_payload_field_from_ir)
+                                        .ok_or_else(|| {
+                                            PlanError::new(format!(
+                                                "source `{}` has no payload field `{payload_name}`",
+                                                source_port.path
+                                            ))
+                                        })?;
+                                    if payload_field
+                                        .as_ref()
+                                        .is_some_and(|field| field != &candidate)
+                                    {
+                                        return Err(PlanError::new(format!(
+                                            "source alternatives disagree on payload field `{payload_name}`"
+                                        )));
+                                    }
+                                    payload_field = Some(candidate);
+                                }
+                                let payload_field = payload_field.expect("nonempty source set");
                                 projection_offset += 1;
-                                self.value_ref(ValueRef::SourcePayload {
-                                    source_id: plan_source_id(source),
-                                    field: source_payload_field_from_ir(payload_field),
+                                let sources =
+                                    sources.into_iter().map(plan_source_id).collect::<Vec<_>>();
+                                for source in &sources {
+                                    let input = ValueRef::SourcePayload {
+                                        source_id: *source,
+                                        field: payload_field.clone(),
+                                    };
+                                    if !self.inputs.contains(&input) {
+                                        self.inputs.push(input);
+                                    }
+                                }
+                                self.intern(PlanRowExpressionNode::EventSourcePayloads {
+                                    sources,
+                                    field: payload_field,
                                 })?
                             } else {
-                                self.value_ref(ValueRef::Source(plan_source_id(source)))?
+                                let sources =
+                                    sources.into_iter().map(plan_source_id).collect::<Vec<_>>();
+                                for source in &sources {
+                                    let input = ValueRef::Source(*source);
+                                    if !self.inputs.contains(&input) {
+                                        self.inputs.push(input);
+                                    }
+                                }
+                                self.intern(PlanRowExpressionNode::EventSources { sources })?
                             }
                         }
                         ir::ErasedLocalMemberTarget::State(state) => {
@@ -12887,7 +12929,7 @@ impl<'a> ExecutableRowLowerer<'a> {
             .iter()
             .filter(|member| projection.starts_with(&member.path))
             .max_by_key(|member| member.path.len())
-            .map(|member| (member.target, member.path.len()))
+            .map(|member| (member.target.clone(), member.path.len()))
     }
 
     fn event_list_field(&self, list: ListId, name: &str) -> Result<FieldId, PlanError> {
@@ -13062,6 +13104,8 @@ impl<'a> ExecutableRowLowerer<'a> {
                 }
             }
             PlanRowExpressionNode::EventRow { list_id, .. } => Ok(Some(*list_id)),
+            PlanRowExpressionNode::EventSources { .. }
+            | PlanRowExpressionNode::EventSourcePayloads { .. } => Ok(None),
             PlanRowExpressionNode::ObjectField { object, field }
                 if field == "value"
                     && matches!(
@@ -13806,6 +13850,30 @@ fn row_expression_value_type(
         PlanRowExpressionNode::ListGetField { field, .. }
         | PlanRowExpressionNode::ListRowField { field, .. } => {
             index.field_value_type(*field).copied()
+        }
+        PlanRowExpressionNode::EventSources { .. } => Some(PlanValueType::Tag),
+        PlanRowExpressionNode::EventSourcePayloads { sources, field } => {
+            let mut types = sources
+                .iter()
+                .filter_map(|source| {
+                    plan_value_type_for_value_ref(
+                        program,
+                        index,
+                        &ValueRef::SourcePayload {
+                            source_id: *source,
+                            field: field.clone(),
+                        },
+                    )
+                })
+                .collect::<Vec<_>>();
+            let Some(first) = types.pop() else {
+                return Ok(None);
+            };
+            types
+                .into_iter()
+                .all(|value_type| value_type == first)
+                .then_some(first)
+                .or(Some(PlanValueType::Data))
         }
         PlanRowExpressionNode::ListRef { .. }
         | PlanRowExpressionNode::AuthorityListRef { .. }

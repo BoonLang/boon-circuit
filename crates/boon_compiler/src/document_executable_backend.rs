@@ -152,10 +152,10 @@ impl<'a> DocumentCompiler<'a> {
             return Ok(None);
         };
         let rest = &projection[consumed..];
-        match member.target {
-            ir::ErasedLocalMemberTarget::Source(source) if rest.is_empty() => {
-                Ok(Some(DocumentRead::Source {
-                    source: SourceId(source.0),
+        match &member.target {
+            ir::ErasedLocalMemberTarget::Sources(sources) if rest.is_empty() => {
+                Ok(Some(DocumentRead::Sources {
+                    sources: sources.iter().map(|source| SourceId(source.0)).collect(),
                 }))
             }
             ir::ErasedLocalMemberTarget::State(state) if rest.is_empty() => {
@@ -163,7 +163,7 @@ impl<'a> DocumentCompiler<'a> {
                     .program
                     .state_cells
                     .get(state.as_usize())
-                    .is_some_and(|candidate| candidate.id == state && candidate.scope_id.is_some())
+                    .is_some_and(|candidate| candidate.id == *state && candidate.scope_id.is_some())
                 {
                     return Ok(None);
                 }
@@ -171,7 +171,7 @@ impl<'a> DocumentCompiler<'a> {
                     state: StateId(state.0),
                 }))
             }
-            ir::ErasedLocalMemberTarget::Source(_) | ir::ErasedLocalMemberTarget::State(_) => {
+            ir::ErasedLocalMemberTarget::Sources(_) | ir::ErasedLocalMemberTarget::State(_) => {
                 Err(PlanError::new(format!(
                     "document materialization resource `{}` cannot project `{}` directly",
                     member.path.join("."),
@@ -2262,7 +2262,7 @@ impl<'a> DocumentCompiler<'a> {
                 definition.item_type
             )));
         };
-        let target = member.target;
+        let target = member.target.clone();
         let rest = &projection[consumed..];
         let ir::ErasedLocalMemberTarget::Field(mut field) = target else {
             if !rest.is_empty() {
@@ -2273,8 +2273,8 @@ impl<'a> DocumentCompiler<'a> {
                 )));
             }
             return Ok(match &target {
-                ir::ErasedLocalMemberTarget::Source(source) => DocumentBindingTarget::Source {
-                    source: SourceId(source.0),
+                ir::ErasedLocalMemberTarget::Sources(sources) => DocumentBindingTarget::Sources {
+                    sources: sources.iter().map(|source| SourceId(source.0)).collect(),
                 },
                 ir::ErasedLocalMemberTarget::State(state) => DocumentBindingTarget::State {
                     state: StateId(state.0),

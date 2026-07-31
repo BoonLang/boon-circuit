@@ -1495,7 +1495,7 @@ fields = [
 ]
 
 [[records.variants]]
-name = "Source"
+name = "Sources"
 disposition = "r-r-priv-id-pc-n"
 reviewed = true
 fields = [
@@ -11146,7 +11146,7 @@ fields = [
 ]
 
 [[records.variants]]
-name = "Source"
+name = "Sources"
 disposition = "r-frc-priv-sp-id-pc-n"
 reviewed = true
 fields = [

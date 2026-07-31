@@ -38,12 +38,22 @@ every test dispatch. NovyWave now uses canonical row-owned scope and signal
 events instead of parallel scenario-only controls.
 
 Fresh semantic runs pass through `MachinePlan`, `Session`, and typed document
-patches. The Phase 2 foundations checkpoint passes formatting, the full runtime
-suite, and `cargo check --workspace --all-targets`. A fresh architecture report
-passes the verified compiler spine, dependency-classifier schema, and every
-non-budget structural check, but the post-foundations tree is over three
-mandatory limits: 470,421 tracked Rust lines against 240,000, 106,284 test Rust
-lines against 32,000, and 64,824 runtime-plus-executor lines against 42,000.
+patches. The current vertical-matrix consolidation keeps one native/Wasm
+foundation trace for universal values, typed list views, and scoped reactive
+rows while deleting duplicated happy-path assertions from the typechecker,
+compiler, and executor suites. Mutually exclusive scoped `SOURCE` occurrences
+at one structural row path now remain explicit alternatives through semantic
+storage, erased IR, `MachinePlan`, `Session`, and retained document bindings;
+ordinary HOLD state storage stays on the existing singular path.
+
+The focused matrix and the typechecker, semantic, IR, compiler, plan, and
+executor suites pass under serial execution. A fresh architecture report passes
+the verified compiler spine, dependency-classifier schema, and every non-budget
+structural check. Relative to the previous fresh measurement, this slice removes
+8,461 tracked Rust lines and 8,800 test Rust lines. The worktree is still over
+three mandatory limits: 461,960 tracked Rust lines against 240,000, 97,484 test
+Rust lines against 32,000, and 64,948 runtime-plus-executor lines against 42,000.
+The playground and xtask production caps pass at 31,298 and 17,723 lines.
 Native product reports remain stale until those budgets close and the
 compositor restart described below occurs.
 

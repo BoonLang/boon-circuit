@@ -150,11 +150,11 @@ pub struct SemanticStorageLocalMemberV1 {
     pub forwarded_from: Option<SemanticStorageLocalMemberForwardingV1>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "id", rename_all = "snake_case")]
 pub enum SemanticStorageLocalMemberTargetV1 {
     Field(SemanticStorageFieldId),
-    Source(SemanticSourceId),
+    Sources(Vec<SemanticSourceId>),
     State(SemanticStateId),
 }
 
@@ -1588,7 +1588,7 @@ fn local_members_for_row(
             &mut members,
             SemanticStorageLocalMemberV1 {
                 path,
-                target: SemanticStorageLocalMemberTargetV1::Source(source.id),
+                target: SemanticStorageLocalMemberTargetV1::Sources(vec![source.id]),
                 forwarded_from: None,
             },
             "row source",
@@ -1772,39 +1772,45 @@ fn insert_local_member(
     incoming: SemanticStorageLocalMemberV1,
     context: &str,
 ) -> Result<(), SemanticScopeStorageError> {
+    if let Some(existing) = members.get_mut(&incoming.path) {
+        if existing.target == incoming.target {
+            return Ok(());
+        }
+        match (&mut existing.target, &incoming.target) {
+            (
+                SemanticStorageLocalMemberTargetV1::Field(_),
+                SemanticStorageLocalMemberTargetV1::Sources(_),
+            ) => {
+                members.insert(incoming.path.clone(), incoming);
+                return Ok(());
+            }
+            (
+                SemanticStorageLocalMemberTargetV1::Sources(_),
+                SemanticStorageLocalMemberTargetV1::Sources(_),
+            ) if incoming.forwarded_from.is_some()
+                && existing.forwarded_from != incoming.forwarded_from =>
+            {
+                // A Map may replace a predecessor row resource with a freshly
+                // constructed source at the same structural path. The target
+                // local is authoritative; forwarding must not merge the
+                // replaced predecessor source back into that path.
+                return Ok(());
+            }
+            (
+                SemanticStorageLocalMemberTargetV1::Sources(existing_sources),
+                SemanticStorageLocalMemberTargetV1::Sources(incoming_sources),
+            ) if existing.forwarded_from == incoming.forwarded_from => {
+                existing_sources.extend(incoming_sources.iter().copied());
+                existing_sources.sort_unstable();
+                existing_sources.dedup();
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
     match members.get(&incoming.path) {
         None => {
             members.insert(incoming.path.clone(), incoming);
-            Ok(())
-        }
-        Some(existing) if existing.target == incoming.target => Ok(()),
-        Some(existing)
-            if matches!(
-                existing.target,
-                SemanticStorageLocalMemberTargetV1::Field(_)
-            ) && matches!(
-                incoming.target,
-                SemanticStorageLocalMemberTargetV1::Source(_)
-            ) =>
-        {
-            members.insert(incoming.path.clone(), incoming);
-            Ok(())
-        }
-        Some(existing)
-            if incoming.forwarded_from.is_some()
-                && matches!(
-                    existing.target,
-                    SemanticStorageLocalMemberTargetV1::Source(_)
-                )
-                && matches!(
-                    incoming.target,
-                    SemanticStorageLocalMemberTargetV1::Source(_)
-                ) =>
-        {
-            // A Map may replace a predecessor row resource with a freshly
-            // constructed source at the same structural path. The target
-            // local is authoritative; forwarding must not merge the replaced
-            // predecessor source back into that path.
             Ok(())
         }
         Some(existing) => Err(SemanticScopeStorageError::new(format!(
@@ -1874,7 +1880,10 @@ fn resolve_local_forwarding(
                 })?;
             let source_members = locals[source_index].members.clone();
             for source_member in source_members.into_iter().filter(|member| {
-                matches!(member.target, SemanticStorageLocalMemberTargetV1::Source(_))
+                matches!(
+                    &member.target,
+                    SemanticStorageLocalMemberTargetV1::Sources(_)
+                )
             }) {
                 let mut forwarded = source_member;
                 forwarded.forwarded_from = Some(SemanticStorageLocalMemberForwardingV1::Local {
@@ -2500,14 +2509,16 @@ impl StorageProvenanceResolver<'_> {
                         return Ok(false);
                     }
                     for member in matches {
-                        match member.target {
-                            SemanticStorageLocalMemberTargetV1::Source(source) => {
-                                require_source(self.resources, source)?;
+                        match &member.target {
+                            SemanticStorageLocalMemberTargetV1::Sources(sources) => {
+                                for source in sources {
+                                    require_source(self.resources, *source)?;
+                                }
                                 has_source = true;
                             }
                             SemanticStorageLocalMemberTargetV1::Field(field) => {
                                 if !self
-                                    .local_field_path_is_source_only(field, &member, projection)?
+                                    .local_field_path_is_source_only(*field, &member, projection)?
                                 {
                                     return Ok(false);
                                 }
@@ -3291,23 +3302,25 @@ fn build_row_source_projections(
     locals: &[SemanticStorageLocalV1],
 ) -> Result<Vec<SemanticStorageRowSourceProjectionV1>, SemanticScopeStorageError> {
     let mut projections =
-        BTreeMap::<(SemanticRowBinding, Vec<String>), (u8, SemanticSourceId)>::new();
+        BTreeMap::<(SemanticRowBinding, Vec<String>, SemanticSourceId), u8>::new();
     for local in locals {
         let Some(row) = local.row else {
             continue;
         };
         for member in &local.members {
-            let SemanticStorageLocalMemberTargetV1::Source(source) = member.target else {
+            let SemanticStorageLocalMemberTargetV1::Sources(sources) = &member.target else {
                 continue;
             };
-            insert_row_source_projection(
-                &mut projections,
-                row,
-                &member.path,
-                source,
-                u8::from(member.forwarded_from.is_some()),
-                "storage local",
-            )?;
+            for source in sources {
+                insert_row_source_projection(
+                    &mut projections,
+                    row,
+                    &member.path,
+                    *source,
+                    u8::from(member.forwarded_from.is_some()),
+                    "storage local",
+                )?;
+            }
         }
     }
     for materialization in &execution.materializations {
@@ -3356,18 +3369,21 @@ fn build_row_source_projections(
                         ))
                     })?;
                 for member in &local.members {
-                    let SemanticStorageLocalMemberTargetV1::Source(source) = member.target else {
+                    let SemanticStorageLocalMemberTargetV1::Sources(sources) = &member.target
+                    else {
                         continue;
                     };
-                    require_source(resources, source)?;
-                    insert_row_source_projection(
-                        &mut projections,
-                        row,
-                        &member.path,
-                        source,
-                        1,
-                        "identity-preserving materialization",
-                    )?;
+                    for source in sources {
+                        require_source(resources, *source)?;
+                        insert_row_source_projection(
+                            &mut projections,
+                            row,
+                            &member.path,
+                            *source,
+                            1,
+                            "identity-preserving materialization",
+                        )?;
+                    }
                 }
             }
             SemanticContextualOperationKind::Every
@@ -3377,14 +3393,12 @@ fn build_row_source_projections(
     }
     Ok(projections
         .into_iter()
-        .map(
-            |((row, path), (_, source))| SemanticStorageRowSourceProjectionV1 { row, path, source },
-        )
+        .map(|((row, path, source), _)| SemanticStorageRowSourceProjectionV1 { row, path, source })
         .collect())
 }
 
 fn insert_row_source_projection(
-    projections: &mut BTreeMap<(SemanticRowBinding, Vec<String>), (u8, SemanticSourceId)>,
+    projections: &mut BTreeMap<(SemanticRowBinding, Vec<String>, SemanticSourceId), u8>,
     row: SemanticRowBinding,
     path: &[String],
     source: SemanticSourceId,
@@ -3396,31 +3410,26 @@ fn insert_row_source_projection(
             "{context} has an empty row source projection"
         )));
     }
-    let key = (row, path.to_vec());
-    match projections.get(&key).copied() {
-        None => {
-            projections.insert(key, (priority, source));
-        }
-        Some((existing_priority, existing)) if existing == source => {
-            if priority < existing_priority {
-                projections.insert(key, (priority, source));
-            }
-        }
-        Some((existing_priority, _)) if priority < existing_priority => {
-            // A Map-created resource at the target path replaces a source
+    let path = path.to_vec();
+    let existing_priority = projections
+        .iter()
+        .filter(|((candidate_row, candidate_path, _), _)| {
+            *candidate_row == row && *candidate_path == path
+        })
+        .map(|(_, priority)| *priority)
+        .min();
+    match existing_priority {
+        Some(existing) if priority > existing => return Ok(()),
+        Some(existing) if priority < existing => {
+            // A Map-created resource at the target path replaces every source
             // merely forwarded by an identity-preserving predecessor.
-            projections.insert(key, (priority, source));
+            projections.retain(|(candidate_row, candidate_path, _), _| {
+                *candidate_row != row || *candidate_path != path
+            });
         }
-        Some((existing_priority, _)) if priority > existing_priority => {}
-        Some((_, existing)) => {
-            return Err(SemanticScopeStorageError::new(format!(
-                "{context} row {}/{} projection `{}` resolves to both source {existing} and {source}",
-                row.list,
-                row.scope,
-                path.join(".")
-            )));
-        }
+        Some(_) | None => {}
     }
+    projections.insert((row, path, source), priority);
     Ok(())
 }
 

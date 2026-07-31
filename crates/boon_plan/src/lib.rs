@@ -2010,6 +2010,8 @@ fn distributed_call_expression_is_safe(
             | PlanRowExpressionNode::ListPage { .. }
             | PlanRowExpressionNode::BoundedListPage { .. }
             | PlanRowExpressionNode::EventRow { .. }
+            | PlanRowExpressionNode::EventSources { .. }
+            | PlanRowExpressionNode::EventSourcePayloads { .. }
             | PlanRowExpressionNode::ListSum { .. }
             | PlanRowExpressionNode::TransientCollection { .. } => false,
         };
@@ -6798,6 +6800,14 @@ impl<'a, 'plan> TypedListViewNormalizer<'a, 'plan> {
                 *source = self.normalize_source(*source)?;
                 *list_id = self.normalize_list(*list_id)?;
             }
+            PlanRowExpressionNode::EventSources { sources }
+            | PlanRowExpressionNode::EventSourcePayloads { sources, .. } => {
+                for source in sources.iter_mut() {
+                    *source = self.normalize_source(*source)?;
+                }
+                sources.sort_unstable();
+                sources.dedup();
+            }
             _ => {}
         }
         Ok(())
@@ -8243,6 +8253,16 @@ pub enum PlanRowExpressionNode {
         source: SourceId,
         list_id: ListId,
     },
+    /// One of several mutually exclusive SOURCE occurrences published at the
+    /// same structural row path. The active event selects the live source.
+    EventSources {
+        sources: Vec<SourceId>,
+    },
+    /// Payload read paired with `EventSources`.
+    EventSourcePayloads {
+        sources: Vec<SourceId>,
+        field: SourcePayloadField,
+    },
     ListSum {
         input: PlanRowExpressionId,
     },
@@ -8307,7 +8327,9 @@ impl PlanRowExpressionNode {
             | Self::AuthorityListRef { .. }
             | Self::Local { .. }
             | Self::LocalRow { .. }
-            | Self::EventRow { .. } => {}
+            | Self::EventRow { .. }
+            | Self::EventSources { .. }
+            | Self::EventSourcePayloads { .. } => {}
             Self::Flush { payload: input }
             | Self::FlushBoundary { input }
             | Self::TextTrim { input }
@@ -8523,7 +8545,9 @@ impl PlanRowExpressionNode {
             | Self::AuthorityListRef { .. }
             | Self::Local { .. }
             | Self::LocalRow { .. }
-            | Self::EventRow { .. } => {}
+            | Self::EventRow { .. }
+            | Self::EventSources { .. }
+            | Self::EventSourcePayloads { .. } => {}
             Self::Flush { payload: input }
             | Self::FlushBoundary { input }
             | Self::TextTrim { input }
@@ -9060,6 +9084,19 @@ impl PlanRowExpressionArena {
                 visitor(ValueRef::List(*list_id));
             }
             PlanRowExpressionNode::EventRow { source, .. } => visitor(ValueRef::Source(*source)),
+            PlanRowExpressionNode::EventSources { sources } => {
+                for source in sources {
+                    visitor(ValueRef::Source(*source));
+                }
+            }
+            PlanRowExpressionNode::EventSourcePayloads { sources, field } => {
+                for source in sources {
+                    visitor(ValueRef::SourcePayload {
+                        source_id: *source,
+                        field: field.clone(),
+                    });
+                }
+            }
             _ => {}
         })
     }
@@ -9094,6 +9131,21 @@ impl PlanRowExpressionArena {
                 }
                 PlanRowExpressionNode::EventRow { source, .. } if !keyed_receiver => {
                     visitor(ValueRef::Source(*source));
+                }
+                PlanRowExpressionNode::EventSources { sources } if !keyed_receiver => {
+                    for source in sources {
+                        visitor(ValueRef::Source(*source));
+                    }
+                }
+                PlanRowExpressionNode::EventSourcePayloads { sources, field }
+                    if !keyed_receiver =>
+                {
+                    for source in sources {
+                        visitor(ValueRef::SourcePayload {
+                            source_id: *source,
+                            field: field.clone(),
+                        });
+                    }
                 }
                 PlanRowExpressionNode::BuiltinCall {
                     function,
@@ -12662,7 +12714,7 @@ fn effect_result_route_matches(
 }
 
 fn source_route_owners_resolve(plan: &MachinePlan) -> bool {
-    let mut row_projections = BTreeMap::<(ListId, Vec<String>), SourceId>::new();
+    let mut row_projections = BTreeMap::<(ListId, Vec<String>), Vec<&SourceRoute>>::new();
     for route in &plan.source_routes {
         for projection in &route.row_projections {
             if projection.path.is_empty()
@@ -12674,20 +12726,32 @@ fn source_route_owners_resolve(plan: &MachinePlan) -> bool {
             {
                 return false;
             }
-            if row_projections.iter().any(|((list, path), source)| {
+            if row_projections.iter().any(|((list, path), _)| {
                 *list == projection.list
-                    && *source != route.source_id
+                    && *path != projection.path
                     && (path.starts_with(&projection.path) || projection.path.starts_with(path))
             }) {
                 return false;
             }
-            if row_projections
-                .insert((projection.list, projection.path.clone()), route.source_id)
-                .is_some_and(|source| source != route.source_id)
-            {
-                return false;
-            }
+            row_projections
+                .entry((projection.list, projection.path.clone()))
+                .or_default()
+                .push(route);
         }
+    }
+    if row_projections.values().any(|routes| {
+        let Some(first) = routes.first() else {
+            return true;
+        };
+        let mut sources = BTreeSet::new();
+        routes.iter().any(|route| {
+            !sources.insert(route.source_id)
+                || route.path != first.path
+                || route.scope_id != first.scope_id
+                || route.payload_schema != first.payload_schema
+        })
+    }) {
+        return false;
     }
     plan.source_routes.iter().all(|route| {
         if route.scoped != route.scope_id.is_some() {
@@ -15329,6 +15393,17 @@ fn row_expression_refs_resolve(
                 PlanRowExpressionNode::EventRow { source, .. } => {
                     op.inputs.contains(&ValueRef::Source(*source))
                 }
+                PlanRowExpressionNode::EventSources { sources } => sources
+                    .iter()
+                    .all(|source| op.inputs.contains(&ValueRef::Source(*source))),
+                PlanRowExpressionNode::EventSourcePayloads { sources, field } => {
+                    sources.iter().all(|source| {
+                        op.inputs.contains(&ValueRef::SourcePayload {
+                            source_id: *source,
+                            field: field.clone(),
+                        })
+                    })
+                }
                 _ => true,
             };
         valid.insert(id, node_resolves);
@@ -15578,6 +15653,16 @@ fn row_expression_list_fields_resolve_with_order(
                                 slot.list_id == *list_id && slot.scope_id == route.scope_id
                             })
                     }),
+                PlanRowExpressionNode::EventSources { sources }
+                | PlanRowExpressionNode::EventSourcePayloads { sources, .. } => {
+                    !sources.is_empty()
+                        && sources.windows(2).all(|pair| pair[0] < pair[1])
+                        && sources.iter().all(|source| {
+                            plan.source_routes
+                                .iter()
+                                .any(|route| route.source_id == *source)
+                        })
+                }
                 PlanRowExpressionNode::ListGetField { list_id, field, .. }
                 | PlanRowExpressionNode::ListRowField { list_id, field, .. } => {
                     list_has_row_field(plan, *list_id, *field)

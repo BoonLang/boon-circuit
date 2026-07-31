@@ -1660,11 +1660,11 @@ pub struct ErasedLocalCapture {
     pub field: FieldId,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "id", rename_all = "snake_case")]
 pub enum ErasedLocalMemberTarget {
     Field(FieldId),
-    Source(SourceId),
+    Sources(Vec<SourceId>),
     State(StateId),
 }
 
@@ -2823,13 +2823,13 @@ fn verify_erased_scope_index(program: &ErasedProgram) -> Result<(), String> {
                     member.path.join(".")
                 ));
             }
-            match member.target {
+            match &member.target {
                 ErasedLocalMemberTarget::Field(field) => {
                     let field = program
                         .scope_index
                         .fields
                         .get(field.as_usize())
-                        .filter(|candidate| candidate.id == field)
+                        .filter(|candidate| candidate.id == *field)
                         .ok_or_else(|| {
                             format!(
                                 "owner {} local {} member `{}` references missing FieldId {field}",
@@ -2883,63 +2883,70 @@ fn verify_erased_scope_index(program: &ErasedProgram) -> Result<(), String> {
                         ));
                     }
                 }
-                ErasedLocalMemberTarget::Source(source) => {
-                    let source = program
-                        .sources
-                        .get(source.as_usize())
-                        .filter(|candidate| candidate.id == source)
-                        .ok_or_else(|| {
-                            format!(
-                                "owner {} local {} member `{}` references missing SourceId {source}",
-                                local.owner, local.local.0, member.path.join(".")
-                            )
-                        })?;
-                    if let Some(forwarding) = member.forwarded_from.as_ref() {
-                        match forwarding {
-                            ErasedLocalMemberForwarding::Local {
-                                owner,
-                                local: upstream_local,
-                                path,
-                            } => {
-                                let upstream = program
-                                    .scope_index
-                                    .locals
-                                    .iter()
-                                    .find(|candidate| {
-                                        candidate.owner == *owner
-                                            && candidate.local == *upstream_local
-                                    })
-                                    .ok_or_else(|| {
-                                        format!(
-                                            "owner {} local {} member `{}` forwards from missing local {}:{}",
-                                            local.owner,
-                                            local.local.0,
-                                            member.path.join("."),
-                                            owner,
-                                            upstream_local.0
-                                        )
-                                    })?;
-                                let upstream_members = upstream
-                                    .members
-                                    .iter()
-                                    .filter(|candidate| {
-                                        candidate.path == *path
-                                            && candidate.target
-                                                == ErasedLocalMemberTarget::Source(source.id)
-                                    })
-                                    .collect::<Vec<_>>();
-                                if upstream_members.len() != 1 {
-                                    return Err(format!(
-                                        "owner {} local {} member `{}` forwards source {} from {} exact upstream members",
-                                        local.owner,
-                                        local.local.0,
-                                        member.path.join("."),
-                                        source.id,
-                                        upstream_members.len()
-                                    ));
-                                }
-                            }
-                            ErasedLocalMemberForwarding::Row { row, path } => {
+                ErasedLocalMemberTarget::Sources(sources) => {
+                    if sources.is_empty() || sources.windows(2).any(|pair| pair[0] >= pair[1]) {
+                        return Err(format!(
+                            "owner {} local {} member `{}` has an empty or noncanonical source set",
+                            local.owner,
+                            local.local.0,
+                            member.path.join(".")
+                        ));
+                    }
+                    if let Some(ErasedLocalMemberForwarding::Local {
+                        owner,
+                        local: upstream_local,
+                        path,
+                    }) = member.forwarded_from.as_ref()
+                    {
+                        let upstream = program
+                            .scope_index
+                            .locals
+                            .iter()
+                            .find(|candidate| {
+                                candidate.owner == *owner
+                                    && candidate.local == *upstream_local
+                            })
+                            .ok_or_else(|| {
+                                format!(
+                                    "owner {} local {} member `{}` forwards from missing local {}:{}",
+                                    local.owner,
+                                    local.local.0,
+                                    member.path.join("."),
+                                    owner,
+                                    upstream_local.0
+                                )
+                            })?;
+                        let upstream_members = upstream
+                            .members
+                            .iter()
+                            .filter(|candidate| {
+                                candidate.path == *path && candidate.target == member.target
+                            })
+                            .count();
+                        if upstream_members != 1 {
+                            return Err(format!(
+                                "owner {} local {} member `{}` forwards its source set from {} exact upstream members",
+                                local.owner,
+                                local.local.0,
+                                member.path.join("."),
+                                upstream_members
+                            ));
+                        }
+                    }
+                    for source_id in sources {
+                        let source = program
+                            .sources
+                            .get(source_id.as_usize())
+                            .filter(|candidate| candidate.id == *source_id)
+                            .ok_or_else(|| {
+                                format!(
+                                    "owner {} local {} member `{}` references missing SourceId {source_id}",
+                                    local.owner, local.local.0, member.path.join(".")
+                                )
+                            })?;
+                        match member.forwarded_from.as_ref() {
+                            Some(ErasedLocalMemberForwarding::Local { .. }) => {}
+                            Some(ErasedLocalMemberForwarding::Row { row, path }) => {
                                 let list = program
                                     .lists
                                     .get(row.list.as_usize())
@@ -2986,17 +2993,20 @@ fn verify_erased_scope_index(program: &ErasedProgram) -> Result<(), String> {
                                     ));
                                 }
                             }
+                            None if source.scope_id != local.row.map(|row| row.scope)
+                                || relative_path(&source.path)
+                                    .is_none_or(|path| path != member.path) =>
+                            {
+                                return Err(format!(
+                                    "owner {} local {} member `{}` is inconsistent with source `{}`",
+                                    local.owner,
+                                    local.local.0,
+                                    member.path.join("."),
+                                    source.path
+                                ));
+                            }
+                            None => {}
                         }
-                    } else if source.scope_id != local.row.map(|row| row.scope)
-                        || relative_path(&source.path).is_none_or(|path| path != member.path)
-                    {
-                        return Err(format!(
-                            "owner {} local {} member `{}` is inconsistent with source `{}`",
-                            local.owner,
-                            local.local.0,
-                            member.path.join("."),
-                            source.path
-                        ));
                     }
                 }
                 ErasedLocalMemberTarget::State(state) => {
@@ -3011,7 +3021,7 @@ fn verify_erased_scope_index(program: &ErasedProgram) -> Result<(), String> {
                     let state = program
                         .state_cells
                         .get(state.as_usize())
-                        .filter(|candidate| candidate.id == state)
+                        .filter(|candidate| candidate.id == *state)
                         .ok_or_else(|| {
                             format!(
                                 "owner {} local {} member `{}` references missing StateId {state}",
@@ -3041,7 +3051,7 @@ fn verify_erased_scope_index(program: &ErasedProgram) -> Result<(), String> {
     >::new();
     for local in &program.scope_index.locals {
         for member in &local.members {
-            let ErasedLocalMemberTarget::Source(source) = member.target else {
+            let ErasedLocalMemberTarget::Sources(sources) = &member.target else {
                 continue;
             };
             let Some(ErasedLocalMemberForwarding::Local {
@@ -3052,10 +3062,12 @@ fn verify_erased_scope_index(program: &ErasedProgram) -> Result<(), String> {
             else {
                 continue;
             };
-            local_forwarding.insert(
-                (local.owner, local.local, member.path.clone(), source),
-                (*owner, *upstream_local, path.clone(), source),
-            );
+            for source in sources {
+                local_forwarding.insert(
+                    (local.owner, local.local, member.path.clone(), *source),
+                    (*owner, *upstream_local, path.clone(), *source),
+                );
+            }
         }
     }
     for start in local_forwarding.keys() {
@@ -3971,10 +3983,49 @@ pub fn verify_static_schedule(program: &ErasedProgram) -> Result<(), String> {
     verify_distributed_reference_schedule(program)?;
     verify_executable_schedule(program)?;
 
-    let source_paths = unique_strings(
-        "source port",
-        program.sources.iter().map(|source| source.path.as_str()),
-    )?;
+    let mut source_paths = BTreeSet::new();
+    let mut sources_by_path = BTreeMap::<&str, Vec<&SourcePort>>::new();
+    for source in &program.sources {
+        if source.path.trim().is_empty() {
+            return Err("source port has empty path".to_owned());
+        }
+        source_paths.insert(source.path.as_str());
+        sources_by_path
+            .entry(source.path.as_str())
+            .or_default()
+            .push(source);
+    }
+    for (path, sources) in sources_by_path {
+        let Some(first) = sources.first() else {
+            continue;
+        };
+        if sources.len() > 1 {
+            let projection_set = |source: SourceId| {
+                program
+                    .scope_index
+                    .row_source_projections
+                    .iter()
+                    .filter(|projection| projection.source == source)
+                    .map(|projection| (projection.row, projection.path.clone()))
+                    .collect::<BTreeSet<_>>()
+            };
+            let expected = projection_set(first.id);
+            if !first.scoped
+                || first.scope_id.is_none()
+                || expected.is_empty()
+                || sources.iter().any(|source| {
+                    !source.scoped
+                        || source.scope_id != first.scope_id
+                        || source.payload_schema != first.payload_schema
+                        || projection_set(source.id) != expected
+                })
+            {
+                return Err(format!(
+                    "duplicate source port `{path}` is not one canonical scoped alternative set"
+                ));
+            }
+        }
+    }
     for (index, source) in program.sources.iter().enumerate() {
         if source.id.as_usize() != index {
             return Err(format!(
@@ -5924,8 +5975,8 @@ FUNCTION entry_view(entry) {
                 .members
                 .iter()
                 .find(|member| member.path == ["id"])
-                .map(|member| member.target),
-            Some(ErasedLocalMemberTarget::Field(authority.id))
+                .map(|member| &member.target),
+            Some(&ErasedLocalMemberTarget::Field(authority.id))
         );
     }
 

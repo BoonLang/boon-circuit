@@ -4198,9 +4198,7 @@ impl<'a> TriggerResolver<'a> {
                     local,
                     ref projection,
                 } => {
-                    if let Some(source) =
-                        self.materialization_local_source(owner, local, projection)?
-                    {
+                    for source in self.materialization_local_sources(owner, local, projection)? {
                         causes.insert(SemanticEventCauseV1::Source(source));
                     }
                 }
@@ -4271,14 +4269,14 @@ impl<'a> TriggerResolver<'a> {
         Ok(causes)
     }
 
-    fn materialization_local_source(
+    fn materialization_local_sources(
         &self,
         owner: StaticOwnerId,
         local: SemanticMaterializationLocalId,
         projection: &[String],
-    ) -> Result<Option<SemanticSourceId>, SemanticReactiveError> {
+    ) -> Result<Vec<SemanticSourceId>, SemanticReactiveError> {
         if projection.is_empty() {
-            return Ok(None);
+            return Ok(Vec::new());
         }
         let source_lists = self
             .execution
@@ -4313,17 +4311,11 @@ impl<'a> TriggerResolver<'a> {
                     .map(|source| source.id),
             );
         }
-        let matches = matches.into_iter().collect::<Vec<_>>();
-        match matches.as_slice() {
-            [] => Ok(None),
-            [source] => Ok(Some(*source)),
-            _ => Err(SemanticReactiveError::new(format!(
-                "materialization owner {owner} local {} projection `{}` resolves to {} sources",
-                local.0,
-                projection.join("."),
-                matches.len()
-            ))),
-        }
+        // Conditional row constructors may contribute distinct, mutually
+        // exclusive SOURCE occurrences at the same materialized projection.
+        // Every occurrence is a valid static trigger; the row binding selects
+        // the one live occurrence at runtime.
+        Ok(matches.into_iter().collect())
     }
 
     fn trigger_arms_for_expression(

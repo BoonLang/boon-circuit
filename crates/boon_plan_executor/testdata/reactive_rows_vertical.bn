@@ -1,0 +1,50 @@
+store: [
+    reset: SOURCE
+    seed_rows: LIST {
+        [kind: Primary, name: TEXT { one }, formatter: Hexadecimal]
+        [kind: Secondary, name: TEXT { two }, formatter: Binary]
+    }
+    rows:
+        seed_rows
+        |> List/map(item, new: selectable_row(row: item))
+    state_rows:
+        seed_rows
+        |> List/map(item, new: stateful_row(row: item))
+    selected:
+        rows
+        |> List/map(item, new:
+            item.controls.select |> THEN { item.name }
+        )
+        |> List/latest()
+    primary_names:
+        rows
+        |> List/filter(item, if: item.kind == Primary)
+        |> List/map(item, new: item.name)
+]
+
+FUNCTION selectable_row(row) {
+    row.kind |> WHEN {
+        Primary => source_row(row: row)
+        __ => source_row(row: row)
+    }
+}
+
+FUNCTION source_row(row) {
+    [
+        kind: row.kind
+        controls: [select: SOURCE]
+        name: row.name
+        formatter: row.formatter
+    ]
+}
+
+FUNCTION stateful_row(row) {
+    [
+        kind: row.kind
+        name: row.name
+        formatter:
+            row.formatter |> HOLD formatter {
+                store.reset |> THEN { formatter }
+            }
+    ]
+}

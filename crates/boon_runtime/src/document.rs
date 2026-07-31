@@ -346,6 +346,21 @@ impl DocumentRuntime {
         source: SourceId,
         env: &EvalEnv,
     ) -> Result<boon_plan::SourceRouteToken, DocumentError> {
+        self.source_route_token_if_bound(session, source, env)?
+            .ok_or_else(|| {
+                DocumentError::Evaluation(format!(
+                    "source {} is not bound to the active document row",
+                    source.0
+                ))
+            })
+    }
+
+    fn source_route_token_if_bound(
+        &self,
+        session: &MachineInstance,
+        source: SourceId,
+        env: &EvalEnv,
+    ) -> Result<Option<boon_plan::SourceRouteToken>, DocumentError> {
         let route = self
             .machine_plan
             .source_routes
@@ -375,8 +390,32 @@ impl DocumentRuntime {
             })
             .collect::<Result<Vec<_>, DocumentError>>()?;
         session
-            .source_route_token(source, &ancestors)
+            .source_route_token_if_bound(source, &ancestors)
             .map_err(|error| DocumentError::Evaluation(error.to_string()))
+    }
+
+    fn bound_source(
+        &self,
+        session: &MachineInstance,
+        sources: &[SourceId],
+        env: &EvalEnv,
+    ) -> Result<SourceId, DocumentError> {
+        let mut bound = Vec::new();
+        for source in sources {
+            if self
+                .source_route_token_if_bound(session, *source, env)?
+                .is_some()
+            {
+                bound.push(*source);
+            }
+        }
+        bound.sort_unstable();
+        let Some(source) = bound.first() else {
+            return Err(DocumentError::Evaluation(format!(
+                "document source set has no live row binding"
+            )));
+        };
+        Ok(*source)
     }
 
     pub(crate) fn stats(&self) -> DocumentMaterializationStats {
@@ -2222,6 +2261,11 @@ impl<'a> Evaluator<'a> {
                 Ok(EvalValue::RuntimeList { list, logical_len })
             }
             DocumentRead::Source { source } => Ok(EvalValue::Source(source)),
+            DocumentRead::Sources { sources } => Ok(EvalValue::Source(self.runtime.bound_source(
+                self.session,
+                &sources,
+                env,
+            )?)),
             DocumentRead::Parameter {
                 parameter,
                 projection,
@@ -2608,6 +2652,7 @@ impl<'a> Evaluator<'a> {
             DocumentRead::List { .. }
             | DocumentRead::DistributedImport { .. }
             | DocumentRead::Source { .. }
+            | DocumentRead::Sources { .. }
             | DocumentRead::Parameter { .. }
             | DocumentRead::Local { .. }
             | DocumentRead::Matched { .. }
@@ -2642,6 +2687,7 @@ impl<'a> Evaluator<'a> {
                 | DocumentRead::DistributedImport { .. }
                 | DocumentRead::List { .. }
                 | DocumentRead::Source { .. }
+                | DocumentRead::Sources { .. }
                 | DocumentRead::Row { .. } => false,
             },
             DocumentExprOp::Project { input, .. } => self.guard_key_expression(*input, next),

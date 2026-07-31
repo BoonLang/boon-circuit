@@ -5537,19 +5537,22 @@ fn semantic_storage_structural_row_path(
 }
 
 fn map_storage_local_member_target(
-    target: SemanticStorageLocalMemberTargetV1,
+    target: &SemanticStorageLocalMemberTargetV1,
     ids: &SemanticToExecutableMap,
     storage_ids: &SemanticStorageToErasedMap,
 ) -> Result<ErasedLocalMemberTarget, String> {
     Ok(match target {
         SemanticStorageLocalMemberTargetV1::Field(field) => {
-            ErasedLocalMemberTarget::Field(storage_ids.storage_field(field)?)
+            ErasedLocalMemberTarget::Field(storage_ids.storage_field(*field)?)
         }
-        SemanticStorageLocalMemberTargetV1::Source(source) => {
-            ErasedLocalMemberTarget::Source(ids.runtime_source(source)?)
-        }
+        SemanticStorageLocalMemberTargetV1::Sources(sources) => ErasedLocalMemberTarget::Sources(
+            sources
+                .iter()
+                .map(|source| ids.runtime_source(*source))
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
         SemanticStorageLocalMemberTargetV1::State(state) => {
-            ErasedLocalMemberTarget::State(ids.runtime_state(state)?)
+            ErasedLocalMemberTarget::State(ids.runtime_state(*state)?)
         }
     })
 }
@@ -5655,7 +5658,7 @@ fn map_storage_locals(
                 .map(|member| {
                     Ok(ErasedLocalMember {
                         path: member.path.clone(),
-                        target: map_storage_local_member_target(member.target, ids, storage_ids)?,
+                        target: map_storage_local_member_target(&member.target, ids, storage_ids)?,
                         forwarded_from: member
                             .forwarded_from
                             .as_ref()

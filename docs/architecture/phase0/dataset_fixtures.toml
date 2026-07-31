@@ -272,7 +272,7 @@ units = [
   "examples/novywave/View/NovyView.bn",
   "examples/novywave/hold.bn",
 ]
-source_bundle_digest_v1 = "cbb2d4dd667abb9ed97a08e5d8639da7ad0787cc495a30f6d6ab0da5c5985bf8"
+source_bundle_digest_v1 = "8c00af9e86da91ce37b893e88274bdcdc50a854ba2d53b5ed9f7a45c9dc3c56d"
 owner_phase = "goal-phase-6-web-persistence"
 owner_plan = "docs/plans/NOVYWAVE_BOON_REWRITE_PLAN.md"
 

@@ -3016,6 +3016,8 @@ fn validate_documents(
         "persistence",
         "packed-data",
         "first-riscv",
+        "boon-console-implementation",
+        "boon-console-architecture",
         "portfolio",
         "novywave",
         "fjordpulse",
@@ -3038,16 +3040,6 @@ fn validate_documents(
         "persons-pro-local-first",
     ];
     const REPLACEMENT_DOCUMENTS: &[(&str, DocumentClassification, &str)] = &[
-        (
-            "boon-type-notation-and-inspector",
-            DocumentClassification::RewriteRequired,
-            "goal-phase-2-foundations",
-        ),
-        (
-            "native-editor-type-hints",
-            DocumentClassification::RewriteRequired,
-            "goal-phase-2-foundations",
-        ),
         (
             "pass-passed-and-todomvc-ui-model",
             DocumentClassification::RewriteRequired,
@@ -5192,7 +5184,7 @@ label: Text/concat(input: TEXT { x }, with: TEXT { "|index:" })
         let (manifest, _) = load_toml::<DocumentManifest>(&workspace, DOCUMENT_MANIFEST).unwrap();
         let workspace_files = workspace_files(&workspace).unwrap();
         let summary = validate_documents(&workspace, &workspace_files, &manifest).unwrap();
-        assert_eq!(summary.rewrite_required.len(), 4);
+        assert_eq!(summary.rewrite_required.len(), 2);
         assert_eq!(summary.delete_after_replacement.len(), 2);
     }
 

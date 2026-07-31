@@ -768,6 +768,18 @@ impl MappedSemanticExecution {
             .iter()
             .map(|materialization| (materialization.owner, materialization.row_local))
             .collect::<Vec<_>>();
+        let emitted_external_event_expressions = self
+            .id_map
+            .external_event_sources
+            .keys()
+            .map(|expression| self.id_map.expression(*expression))
+            .collect::<Result<Vec<_>, _>>()?;
+        let emitted_external_event_sources = self
+            .id_map
+            .external_event_sources
+            .values()
+            .copied()
+            .collect::<BTreeSet<_>>();
         let emitted_call_instance_count = emitted_call_instances
             .iter()
             .copied()
@@ -858,6 +870,16 @@ impl MappedSemanticExecution {
                 "materialization local",
                 self.id_map.materialization_locals.len(),
                 emitted_materialization_locals.len(),
+            ),
+            (
+                "external event expression",
+                self.id_map.external_event_sources.len(),
+                emitted_external_event_expressions.len(),
+            ),
+            (
+                "external event source path",
+                self.id_map.external_event_source_paths.len(),
+                emitted_external_event_sources.len(),
             ),
             (
                 "runtime source identity",
@@ -989,6 +1011,11 @@ impl MappedSemanticExecution {
                 .map(|((owner, _), local)| (*owner, *local)),
             emitted_materialization_locals,
             "materialization local",
+        )?;
+        require_exact_identity_set(
+            self.id_map.external_event_source_paths.keys().copied(),
+            emitted_external_event_sources,
+            "external event source",
         )?;
         Ok(())
     }

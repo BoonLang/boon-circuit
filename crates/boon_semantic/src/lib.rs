@@ -37,8 +37,8 @@ use std::fmt;
 pub const SEMANTIC_PROGRAM_SCHEMA_V1: &str = "boon.semantic-program.v1";
 pub const BUNDLE_SEMANTIC_PROGRAM_SCHEMA_V1: &str = "boon.bundle-semantic-program.v1";
 pub const DEPENDENCY_CLASSIFIER_SCHEMA_DIGEST_V1: [u8; 32] = [
-    0x03, 0x90, 0xef, 0x16, 0x54, 0x2f, 0x13, 0xbe, 0xdd, 0x67, 0x80, 0x31, 0x7e, 0xa1, 0x90, 0xd1,
-    0x34, 0xf0, 0x52, 0xe5, 0x34, 0xde, 0xbf, 0x55, 0x9f, 0x59, 0xc6, 0xf8, 0x8b, 0x5a, 0x2a, 0x5d,
+    0x8e, 0xe3, 0x32, 0x24, 0x98, 0xc3, 0x72, 0x3b, 0x72, 0xe5, 0xf4, 0xa4, 0x1c, 0x5d, 0xc5, 0x43,
+    0xf3, 0x7f, 0x38, 0xb8, 0xd9, 0x81, 0xe9, 0xd1, 0xec, 0x50, 0x00, 0xbe, 0x38, 0x7b, 0x8f, 0x30,
 ];
 pub const MAX_BUNDLE_SEMANTIC_PRODUCER_REQUESTS_V1: usize = 4_096;
 pub const MAX_BUNDLE_SEMANTIC_PRODUCER_REQUEST_BYTES_V1: usize = 4 * 1024 * 1024;
@@ -2459,11 +2459,11 @@ pub fn elaborate_with_external_event_identities(
     macro_rules! elaboration_phase {
         ($name:literal, $expression:expr) => {{
             if trace_elaboration {
-                eprintln!(concat!("boon_semantic elaborate ", $name, ":start"));
+                eprintln!(concat!("boon_semantic phase ", $name, ":start"));
             }
             let result = $expression;
             if trace_elaboration {
-                eprintln!(concat!("boon_semantic elaborate ", $name, ":done"));
+                eprintln!(concat!("boon_semantic phase ", $name, ":done"));
             }
             result
         }};

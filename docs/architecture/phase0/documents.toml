@@ -61,6 +61,18 @@ classification = "target-contract"
 owner_phase = "goal-phase-8-riscv"
 
 [[documents]]
+id = "boon-console-implementation"
+path = "docs/plans/BOON_CONSOLE_IMPLEMENTATION_PLAN.md"
+classification = "target-contract"
+owner_phase = "goal-phase-6-console"
+
+[[documents]]
+id = "boon-console-architecture"
+path = "docs/architecture/BOON_CONSOLE.md"
+classification = "target-contract"
+owner_phase = "goal-phase-6-console"
+
+[[documents]]
 id = "portfolio"
 path = "docs/plans/BOON_EXAMPLE_PORTFOLIO_PLAN.md"
 classification = "target-contract"
@@ -129,16 +141,14 @@ owner_phase = "all"
 [[documents]]
 id = "boon-type-notation-and-inspector"
 path = "docs/architecture/BOON_TYPE_NOTATION_AND_INSPECTOR.md"
-classification = "rewrite-required"
+classification = "current-behavior"
 owner_phase = "goal-phase-2-foundations"
-status_notice = "Phase 0 status: rewrite required."
 
 [[documents]]
 id = "native-editor-type-hints"
 path = "docs/architecture/NATIVE_EDITOR_TYPE_HINTS.md"
-classification = "rewrite-required"
+classification = "current-behavior"
 owner_phase = "goal-phase-2-foundations"
-status_notice = "Phase 0 status: rewrite required."
 
 [[documents]]
 id = "pass-passed-and-todomvc-ui-model"

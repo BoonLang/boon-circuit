@@ -35,7 +35,7 @@ boon_host                portable host events and semantic input
 boon_native_gpu          retained WGPU renderer and product render graph
 boon_native_app_window   app_window event and WGPU surface lifecycle
 boon_native_playground   role composition and verifier producer
-xtask                    report-v2 validation and six-gate aggregate
+xtask                    report-v2 validation and seven-gate aggregate
 ```
 
 Hard rules:
@@ -387,6 +387,7 @@ verify-counter-dev
 verify-todomvc-physical
 verify-cells
 verify-novywave
+verify-persons-pro
 verify-negative
 verify-all
 ```

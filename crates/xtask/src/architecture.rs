@@ -1412,7 +1412,7 @@ impl<'a> IrPhase1BoundaryCollector<'a> {
         if !self.in_semantic_mapping
             && segments
                 .last()
-                .is_some_and(|segment| segment == "map_semantic_execution")
+                .is_some_and(|segment| segment == "map_semantic_execution_with_reactive")
             && segments.iter().any(|segment| segment == "semantic_mapping")
         {
             self.mapping_delegation_functions.insert(self.function());
@@ -1431,7 +1431,12 @@ impl<'a> IrPhase1BoundaryCollector<'a> {
     fn inspect_macro_tokens(&mut self, tokens: &str) {
         for identifier in rust_token_identifiers(tokens) {
             self.inspect_identifier(&identifier, "macro tokens", true);
-            if !self.in_semantic_mapping && identifier == "map_semantic_execution" {
+            if !self.in_semantic_mapping
+                && matches!(
+                    identifier.as_str(),
+                    "map_semantic_execution" | "map_semantic_execution_with_reactive"
+                )
+            {
                 self.violations.push(
                     "macro tokens hide semantic-to-executable conversion outside `semantic_mapping`"
                         .to_owned(),
@@ -1662,7 +1667,7 @@ fn verify_semantic_mapping_contract(source: &str) -> Result<(), String> {
         .collect::<Vec<_>>();
     if !missing_initializers.is_empty() {
         return Err(format!(
-            "`SemanticToExecutableMap::allocate` does not initialize every explicit map: {}",
+            "`SemanticToExecutableMap::allocate_with_external_events` does not initialize every explicit map: {}",
             bounded_list(&missing_initializers)
         ));
     }
@@ -1683,7 +1688,7 @@ fn verify_semantic_mapping_contract(source: &str) -> Result<(), String> {
         .collect::<Vec<_>>();
     if !missing_dense_domains.is_empty() {
         return Err(format!(
-            "`SemanticToExecutableMap::allocate` does not validate dense source identities for: {}",
+            "`SemanticToExecutableMap::allocate_with_external_events` does not validate dense source identities for: {}",
             bounded_list(&missing_dense_domains)
         ));
     }
@@ -1703,12 +1708,13 @@ fn verify_semantic_mapping_contract(source: &str) -> Result<(), String> {
     }
     if !collector.entrypoint_allocates_map {
         return Err(
-            "`map_semantic_execution` does not allocate `SemanticToExecutableMap`".to_owned(),
+            "`map_semantic_execution_with_external_events` does not allocate `SemanticToExecutableMap`"
+                .to_owned(),
         );
     }
     if !(collector.allocate_uses_unique_set && collector.allocate_compares_unique_lengths) {
         return Err(
-            "`SemanticToExecutableMap::allocate` lacks explicit one-to-one/bijection validation"
+            "`SemanticToExecutableMap::allocate_with_external_events` lacks explicit one-to-one/bijection validation"
                 .to_owned(),
         );
     }
@@ -1748,7 +1754,7 @@ struct SemanticMappingContractCollector {
 impl SemanticMappingContractCollector {
     fn in_map_allocate(&self) -> bool {
         self.current_impl.as_deref() == Some("SemanticToExecutableMap")
-            && self.current_function.as_deref() == Some("allocate")
+            && self.current_function.as_deref() == Some("allocate_with_external_events")
     }
 
     fn in_totality_validator(&self) -> bool {
@@ -1834,11 +1840,12 @@ impl<'ast> Visit<'ast> for SemanticMappingContractCollector {
             self.require_dense_depth += 1;
         }
         if self.current_impl.is_none()
-            && self.current_function.as_deref() == Some("map_semantic_execution")
+            && self.current_function.as_deref()
+                == Some("map_semantic_execution_with_external_events")
             && matches!(
                 expression.func.as_ref(),
                 syn::Expr::Path(path)
-                    if path.path.segments.last().is_some_and(|segment| segment.ident == "allocate")
+                    if path.path.segments.last().is_some_and(|segment| segment.ident == "allocate_with_external_events")
                         && path.path.segments.iter().any(|segment| segment.ident == "SemanticToExecutableMap")
             )
         {
@@ -2009,8 +2016,9 @@ fn skip_quoted_token(bytes: &[u8], mut index: usize, quote: u8) -> usize {
     bytes.len()
 }
 
-const VERIFIED_BOUNDARY_FUNCTIONS: [&str; 6] = [
+const VERIFIED_BOUNDARY_FUNCTIONS: [&str; 7] = [
     "elaborate",
+    "elaborate_with_external_event_identities",
     "verify_explicit_contracts",
     "erase_and_lower",
     "verify_bundle",
@@ -2138,7 +2146,12 @@ fn verify_exhaustive_boundary_callers(workspace: &Path) -> Result<(), String> {
     let expected = [
         BoundaryReference {
             file: "crates/boon_compiler/src/lib.rs".to_owned(),
-            path: "boon_semantic::elaborate".to_owned(),
+            path: "boon_semantic::elaborate_with_external_event_identities".to_owned(),
+            kind: "expression",
+        },
+        BoundaryReference {
+            file: "crates/boon_semantic/src/lib.rs".to_owned(),
+            path: "elaborate_with_external_event_identities".to_owned(),
             kind: "expression",
         },
         BoundaryReference {
@@ -2763,8 +2776,10 @@ impl Artifact {
 fn lower_verified_semantic_execution(
     graph: boon_semantic::SemanticExecutionGraphV1,
     resources: Resources,
+    reactive: Reactive,
 ) -> Result<(), String> {
-    let mapped = semantic_mapping::map_semantic_execution(&graph, &resources)?;
+    let mapped =
+        semantic_mapping::map_semantic_execution_with_reactive(&graph, &resources, &reactive)?;
     mapped.validate_totality()?;
     let _resources =
         semantic_mapping::map_semantic_resources(&graph, &resources, &mapped.id_map)?;

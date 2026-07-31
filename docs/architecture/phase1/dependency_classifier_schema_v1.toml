@@ -1141,6 +1141,7 @@ fields = [
   { name = "producer", disposition = "r-fr-priv-id-pc-n", reviewed = true },
   { name = "path", disposition = "a-fc-priv-id-pc-n", reviewed = true },
   { name = "kind", disposition = "r-fc-priv-id-pc-n", reviewed = true },
+  { name = "state_backing", disposition = "a-frc-priv-id-pc-n", reviewed = true },
   { name = "materialized_list_id", disposition = "a-frc-priv-id-pc-n", reviewed = true },
   { name = "materialized_row_scope_id", disposition = "a-frc-priv-id-pc-n", reviewed = true },
   { name = "causes", disposition = "r-fc-priv-id-pc-n", reviewed = true },
@@ -1561,6 +1562,7 @@ fields = [
   { name = "dependencies", disposition = "r-fd-diag-id-pc-n", reviewed = true },
   { name = "possible_causes", disposition = "r-f-priv-id-pc-n", reviewed = true },
   { name = "state_update_arms", disposition = "r-fr-priv-id-pc-n", reviewed = true },
+  { name = "host_effect_schedules", disposition = "r-rca-priv-id-pc-n", reviewed = true },
   { name = "list_mutations", disposition = "r-fr-priv-id-pc-n", reviewed = true },
   { name = "list_projections", disposition = "r-fr-priv-id-pc-n", reviewed = true },
   { name = "materializations", disposition = "r-fr-priv-id-pc-n", reviewed = true },
@@ -2165,6 +2167,7 @@ fields = [
   { name = "owner", disposition = "r-frc-priv-id-pc-n", reviewed = true },
   { name = "local", disposition = "r-frc-priv-id-pc-n", reviewed = true },
   { name = "projection", disposition = "r-frc-priv-id-pc-n", reviewed = true },
+  { name = "constructor_projection", disposition = "r-frc-priv-id-pc-n", reviewed = true },
 ]
 
 [[records.variants]]
@@ -2764,6 +2767,16 @@ fields = [
   { name = "graph_clones_per_item", disposition = "r-frc-priv-id-pc-n", reviewed = true },
   { name = "capacity", disposition = "a-rc-priv-id-pc-n", reviewed = true },
   { name = "initializer", disposition = "r-rc-priv-id-pc-n", reviewed = true },
+  { name = "initializer_inputs", disposition = "r-frc-priv-id-pc-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_ir/src/lib.rs"
+name = "ListInitializerInput"
+fields = [
+  { name = "name", disposition = "a-fc-priv-id-pc-n", reviewed = true },
+  { name = "field", disposition = "r-frc-priv-id-pc-n", reviewed = true },
 ]
 
 [[records]]
@@ -3678,9 +3691,25 @@ fields = [
 [[records]]
 kind = "struct"
 source = "crates/boon_ir/src/lib.rs"
+name = "HostEffectSchedule"
+fields = [
+  { name = "id", disposition = "a-rca-priv-id-pc-n", reviewed = true },
+  { name = "expression", disposition = "r-frca-priv-id-pc-n", reviewed = true },
+  { name = "checked_expression", disposition = "r-frca-priv-id-pc-n", reviewed = true },
+  { name = "owner", disposition = "r-rca-priv-id-pc-n", reviewed = true },
+  { name = "operation", disposition = "r-frca-priv-id-pc-n", reviewed = true },
+  { name = "state_update_arms", disposition = "r-rca-priv-id-pc-n", reviewed = true },
+  { name = "transient_result", disposition = "a-frca-priv-id-pc-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_ir/src/lib.rs"
 name = "ViewBinding"
 fields = [
   { name = "id", disposition = "r-c-priv-id-pc-n", reviewed = true },
+  { name = "node_expression", disposition = "r-fc-priv-id-pc-n", reviewed = true },
+  { name = "argument_expression", disposition = "r-fc-priv-id-pc-n", reviewed = true },
   { name = "node_kind", disposition = "r-c-priv-id-pc-n", reviewed = true },
   { name = "attr", disposition = "r-c-priv-id-pc-n", reviewed = true },
   { name = "path", disposition = "r-rc-priv-id-pc-n", reviewed = true },
@@ -3903,6 +3932,7 @@ fields = [
   { name = "producer", disposition = "r-frc-priv-id-pc-n", reviewed = true },
   { name = "path", disposition = "a-fc-priv-id-pc-n", reviewed = true },
   { name = "kind", disposition = "r-fc-priv-id-pc-n", reviewed = true },
+  { name = "state_backing", disposition = "a-frc-priv-id-pc-n", reviewed = true },
   { name = "materialized_list_id", disposition = "a-frc-priv-id-pc-n", reviewed = true },
   { name = "materialized_row_scope_id", disposition = "a-frc-priv-id-pc-n", reviewed = true },
   { name = "causes", disposition = "r-fc-priv-id-pc-n", reviewed = true },
@@ -3999,6 +4029,7 @@ fields = [
   { name = "owner", disposition = "r-rca-priv-id-pc-n", reviewed = true },
   { name = "operation", disposition = "r-frca-priv-id-pc-n", reviewed = true },
   { name = "state_update_arms", disposition = "r-rca-priv-id-pc-n", reviewed = true },
+  { name = "transient_result", disposition = "a-frca-priv-id-pc-n", reviewed = true },
 ]
 
 [[records]]
@@ -4521,6 +4552,8 @@ fields = [
   { name = "row_scopes", disposition = "r-c-priv-id-pc-n", reviewed = true },
   { name = "value_list_authorities", disposition = "r-fr-priv-id-pc-n", reviewed = true },
   { name = "runtime_sources", disposition = "r-r-priv-id-pc-n", reviewed = true },
+  { name = "external_event_sources", disposition = "r-r-priv-id-pc-n", reviewed = true },
+  { name = "external_event_source_paths", disposition = "r-r-priv-id-pc-n", reviewed = true },
   { name = "runtime_states", disposition = "r-r-priv-id-pc-n", reviewed = true },
 ]
 
@@ -7243,6 +7276,7 @@ fields = [
   { name = "owner", disposition = "r-frc-priv-sp-id-n", reviewed = true },
   { name = "local", disposition = "r-frc-priv-sp-id-n", reviewed = true },
   { name = "projection", disposition = "r-frc-priv-sp-id-n", reviewed = true },
+  { name = "constructor_projection", disposition = "r-frc-priv-sp-id-n", reviewed = true },
 ]
 
 [[records.variants]]
@@ -8114,6 +8148,16 @@ disposition = "r-fc-priv-sp-id-pc-n"
 reviewed = true
 fields = [
   { name = "source", disposition = "r-frc-priv-sp-id-pc-n", reviewed = true },
+  { name = "payload_projection", disposition = "r-fc-priv-sp-id-pc-n", reviewed = true },
+]
+
+[[records.variants]]
+name = "RelayedEvent"
+disposition = "r-fc-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+  { name = "read", disposition = "r-frc-priv-sp-id-pc-n", reviewed = true },
+  { name = "external_identity", disposition = "a-frc-priv-sp-id-pc-n", reviewed = true },
   { name = "payload_projection", disposition = "r-fc-priv-sp-id-pc-n", reviewed = true },
 ]
 
@@ -9702,6 +9746,7 @@ fields = [
   { name = "producer", disposition = "r-frc-priv-sp-id-pc-n", reviewed = true },
   { name = "value", disposition = "r-fc-priv-sp-id-pc-n", reviewed = true },
   { name = "kind", disposition = "r-fc-priv-sp-id-pc-n", reviewed = true },
+  { name = "state_backing", disposition = "r-frc-priv-sp-id-pc-n", reviewed = true },
   { name = "materialized_list", disposition = "r-frc-priv-sp-id-pc-n", reviewed = true },
   { name = "materialized_row_scope", disposition = "r-frc-priv-sp-id-pc-n", reviewed = true },
   { name = "causes", disposition = "r-fc-priv-sp-id-pc-n", reviewed = true },
@@ -9739,6 +9784,14 @@ fields = [
   { name = "0", disposition = "r-rca-priv-sp-id-pc-n", reviewed = true },
 ]
 
+[[records.variants]]
+name = "ExternalRead"
+disposition = "r-rca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+  { name = "0", disposition = "r-rca-priv-sp-id-pc-n", reviewed = true },
+]
+
 [[records]]
 kind = "struct"
 source = "crates/boon_semantic/src/reactive.rs"
@@ -9769,6 +9822,7 @@ fields = [
   { name = "owner", disposition = "r-rca-priv-sp-id-pc-n", reviewed = true },
   { name = "operation", disposition = "r-frca-priv-sp-id-pc-n", reviewed = true },
   { name = "state_update_arms", disposition = "r-rca-priv-sp-id-pc-n", reviewed = true },
+  { name = "transient_result", disposition = "r-frca-priv-sp-id-pc-n", reviewed = true },
 ]
 
 [[records]]
@@ -10016,6 +10070,7 @@ source = "crates/boon_semantic/src/reactive.rs"
 name = "SemanticReactiveGraphV1"
 fields = [
   { name = "schema", disposition = "a-ca-priv-sp-id-pc-n", reviewed = true },
+  { name = "external_event_identities", disposition = "r-rca-priv-sp-id-pc-n", reviewed = true },
   { name = "producer_instances", disposition = "r-rc-priv-sp-id-pc-n", reviewed = true },
   { name = "fields", disposition = "r-fc-priv-sp-id-pc-n", reviewed = true },
   { name = "bindings", disposition = "r-fc-priv-sp-id-pc-n", reviewed = true },
@@ -10670,6 +10725,13 @@ name = "SemanticNamedValueDiagnosticOnlyReasonV1"
 
 [[records.variants]]
 name = "NonExecutableStructuralContainer"
+disposition = "a-d-diag-so-n"
+reviewed = true
+fields = [
+]
+
+[[records.variants]]
+name = "NonExecutableCheckedLeaf"
 disposition = "a-d-diag-so-n"
 reviewed = true
 fields = [

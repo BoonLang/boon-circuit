@@ -844,15 +844,15 @@ expected_files = 0
 roots = ["crates/boon_typecheck/src/lib.rs"]
 extensions = ["rs"]
 needle = "value.parse::<f64>()"
-expected_occurrences = 2
-expected_files = 1
+expected_occurrences = 0
+expected_files = 0
 
 [[entries.scans]]
 roots = ["crates/boon_typecheck/src/lib.rs"]
 extensions = ["rs"]
 needle = "milliseconds.round() as u64"
-expected_occurrences = 2
-expected_files = 1
+expected_occurrences = 0
+expected_files = 0
 
 [[entries.scans]]
 roots = ["crates/boon_plan_executor/src/cursor.rs"]
@@ -1933,15 +1933,15 @@ expected_files = 0
 roots = ["crates/boon_parser/src/lib.rs"]
 extensions = ["rs"]
 needle = "tokens == [\"True\"]"
-expected_occurrences = 2
-expected_files = 1
+expected_occurrences = 0
+expected_files = 0
 
 [[entries.scans]]
 roots = ["crates/boon_parser/src/lib.rs"]
 extensions = ["rs"]
 needle = "tokens == [\"False\"]"
-expected_occurrences = 2
-expected_files = 1
+expected_occurrences = 0
+expected_files = 0
 
 [[entries.scans]]
 roots = ["crates/boon_parser/src/lib.rs"]
@@ -2121,7 +2121,7 @@ expected_files = 1
 roots = ["crates/boon_plan_executor/src/machine.rs"]
 extensions = ["rs"]
 needle = "List(Vec<Value>),"
-expected_occurrences = 1
+expected_occurrences = 2
 expected_files = 1
 
 [[entries.scans]]
@@ -2253,7 +2253,7 @@ roots = ["crates/boon_plan_executor/src/machine.rs"]
 extensions = ["rs"]
 mode = "rust-code-token"
 needle = "PlanRowExpressionNode"
-expected_occurrences = 178
+expected_occurrences = 187
 expected_files = 1
 
 # Every ordinary-turn full-list comparison routes through one instrumented
@@ -2398,8 +2398,8 @@ roots = ["crates"]
 extensions = ["rs"]
 mode = "rust-token"
 needle = "BTreeMap"
-expected_occurrences = 2907
-expected_files = 128
+expected_occurrences = 3056
+expected_files = 130
 
 [entries.scans.expected_path_occurrences]
 "crates/boon_app_package/src/build.rs" = 2
@@ -2407,9 +2407,9 @@ expected_files = 128
 "crates/boon_app_server/src/lib.rs" = 8
 "crates/boon_app_server/src/tests.rs" = 3
 "crates/boon_app_server/src/transient_host.rs" = 8
-"crates/boon_compiler/src/distributed_compiler.rs" = 74
-"crates/boon_compiler/src/document_executable_backend.rs" = 23
-"crates/boon_compiler/src/machine_plan_backend.rs" = 94
+"crates/boon_compiler/src/distributed_compiler.rs" = 79
+"crates/boon_compiler/src/document_executable_backend.rs" = 27
+"crates/boon_compiler/src/machine_plan_backend.rs" = 97
 "crates/boon_compiler/src/tests.rs" = 1
 "crates/boon_contract/src/lib.rs" = 2
 "crates/boon_data/src/lib.rs" = 12
@@ -2419,6 +2419,7 @@ expected_files = 128
 "crates/boon_document_model/src/lib.rs" = 7
 "crates/boon_document_model/src/map.rs" = 4
 "crates/boon_document_model/src/tests.rs" = 4
+"crates/boon_editor/src/language.rs" = 4
 "crates/boon_example_manifest/src/lib.rs" = 12
 "crates/boon_host/src/lib.rs" = 2
 "crates/boon_host_runtime/src/content_store.rs" = 5
@@ -2430,8 +2431,8 @@ expected_files = 128
 "crates/boon_http_client/src/dns.rs" = 2
 "crates/boon_http_runtime/src/lib.rs" = 18
 "crates/boon_http_runtime/tests/loopback.rs" = 5
-"crates/boon_ir/src/lib.rs" = 5
-"crates/boon_ir/src/semantic_mapping.rs" = 35
+"crates/boon_ir/src/lib.rs" = 6
+"crates/boon_ir/src/semantic_mapping.rs" = 42
 "crates/boon_ir/src/tests/distributed.rs" = 3
 "crates/boon_ir/src/tests/sources_and_events.rs" = 2
 "crates/boon_list_access/src/index.rs" = 5
@@ -2444,11 +2445,10 @@ expected_files = 128
 "crates/boon_native_playground/src/budget.rs" = 3
 "crates/boon_native_playground/src/compile.rs" = 2
 "crates/boon_native_playground/src/dev.rs" = 6
-"crates/boon_native_playground/src/language.rs" = 4
 "crates/boon_native_playground/src/map_host.rs" = 8
 "crates/boon_native_playground/src/passkey_simulator.rs" = 6
 "crates/boon_native_playground/src/preview.rs" = 5
-"crates/boon_native_playground/src/protocol.rs" = 2
+"crates/boon_native_playground/src/protocol.rs" = 1
 "crates/boon_native_playground/src/runtime_view.rs" = 25
 "crates/boon_native_playground/src/transient_host.rs" = 2
 "crates/boon_native_playground/src/verify.rs" = 7
@@ -2463,19 +2463,20 @@ expected_files = 128
 "crates/boon_phase0_baseline/src/fixtures.rs" = 3
 "crates/boon_phase0_baseline/src/report.rs" = 5
 "crates/boon_phase0_baseline/src/runner.rs" = 8
-"crates/boon_plan/src/lib.rs" = 51
+"crates/boon_plan/src/lib.rs" = 55
 "crates/boon_plan_executor/src/cursor.rs" = 12
 "crates/boon_plan_executor/src/effect_stream.rs" = 7
-"crates/boon_plan_executor/src/machine.rs" = 460
-"crates/boon_plan_executor/src/tests.rs" = 124
+"crates/boon_plan_executor/src/machine.rs" = 487
+"crates/boon_plan_executor/src/tests.rs" = 132
 "crates/boon_plan_executor/tests/bits_cross_target.rs" = 2
 "crates/boon_plan_executor/tests/fjordpulse_server_search.rs" = 4
-"crates/boon_plan_executor/tests/map_set_runtime.rs" = 29
+"crates/boon_plan_executor/tests/map_set_cross_target.rs" = 8
+"crates/boon_plan_executor/tests/map_set_runtime.rs" = 32
 "crates/boon_plan_executor/tests/typed_list_cross_target.rs" = 3
 "crates/boon_runtime/src/content_ref.rs" = 2
 "crates/boon_runtime/src/distributed.rs" = 5
 "crates/boon_runtime/src/distributed/client_session.rs" = 3
-"crates/boon_runtime/src/distributed/endpoint.rs" = 20
+"crates/boon_runtime/src/distributed/endpoint.rs" = 21
 "crates/boon_runtime/src/distributed/link.rs" = 3
 "crates/boon_runtime/src/distributed/message.rs" = 9
 "crates/boon_runtime/src/distributed/server.rs" = 50
@@ -2484,27 +2485,28 @@ expected_files = 128
 "crates/boon_runtime/src/effect_host.rs" = 5
 "crates/boon_runtime/src/effects.rs" = 2
 "crates/boon_runtime/src/host_capability.rs" = 3
-"crates/boon_runtime/src/lib.rs" = 15
+"crates/boon_runtime/src/lib.rs" = 22
 "crates/boon_runtime/src/migration_scenario.rs" = 14
 "crates/boon_runtime/src/persistent.rs" = 21
 "crates/boon_runtime/src/program.rs" = 23
 "crates/boon_runtime/src/web_persistent.rs" = 2
-"crates/boon_semantic/src/contextual_expansion.rs" = 86
-"crates/boon_semantic/src/dependency_manifest.rs" = 17
+"crates/boon_semantic/src/contextual_expansion.rs" = 88
+"crates/boon_semantic/src/dependency_manifest.rs" = 18
 "crates/boon_semantic/src/execution.rs" = 7
 "crates/boon_semantic/src/lib.rs" = 26
+"crates/boon_semantic/src/lowering_contract.rs" = 6
 "crates/boon_semantic/src/memory_contract.rs" = 16
 "crates/boon_semantic/src/out_net.rs" = 31
-"crates/boon_semantic/src/reactive.rs" = 26
-"crates/boon_semantic/src/resource.rs" = 47
-"crates/boon_semantic/src/storage_contract.rs" = 25
+"crates/boon_semantic/src/reactive.rs" = 49
+"crates/boon_semantic/src/resource.rs" = 61
+"crates/boon_semantic/src/storage_contract.rs" = 31
 "crates/boon_server_host/src/host.rs" = 3
 "crates/boon_server_host/src/types.rs" = 3
 "crates/boon_server_runtime/src/distributed_sessions.rs" = 19
 "crates/boon_server_runtime/src/in_process.rs" = 3
 "crates/boon_server_runtime/src/lib.rs" = 47
 "crates/boon_server_runtime/tests/in_process.rs" = 2
-"crates/boon_typecheck/src/lib.rs" = 361
+"crates/boon_typecheck/src/lib.rs" = 381
 "crates/boon_typecheck/src/tests/calls.rs" = 1
 "crates/boon_typecheck/src/tests/distributed.rs" = 2
 "crates/boon_typecheck/src/tests/flush.rs" = 1
@@ -2536,8 +2538,8 @@ roots = ["crates"]
 extensions = ["rs"]
 mode = "rust-token"
 needle = "BTreeSet"
-expected_occurrences = 1817
-expected_files = 102
+expected_occurrences = 1970
+expected_files = 103
 
 [entries.scans.expected_path_occurrences]
 "crates/boon_app_package/src/browser.rs" = 2
@@ -2546,10 +2548,10 @@ expected_files = 102
 "crates/boon_app_package/src/manifest.rs" = 11
 "crates/boon_app_server/src/lib.rs" = 3
 "crates/boon_app_server/src/transient_host.rs" = 3
-"crates/boon_compiler/src/distributed_compiler.rs" = 22
-"crates/boon_compiler/src/document_executable_backend.rs" = 15
-"crates/boon_compiler/src/machine_plan_backend.rs" = 130
-"crates/boon_compiler/src/tests.rs" = 41
+"crates/boon_compiler/src/distributed_compiler.rs" = 29
+"crates/boon_compiler/src/document_executable_backend.rs" = 18
+"crates/boon_compiler/src/machine_plan_backend.rs" = 143
+"crates/boon_compiler/src/tests.rs" = 49
 "crates/boon_contract/src/lib.rs" = 2
 "crates/boon_data/src/lib.rs" = 4
 "crates/boon_document/src/lib.rs" = 42
@@ -2561,7 +2563,7 @@ expected_files = 102
 "crates/boon_http_client/src/client.rs" = 2
 "crates/boon_http_runtime/src/lib.rs" = 3
 "crates/boon_ir/src/lib.rs" = 31
-"crates/boon_ir/src/semantic_mapping.rs" = 44
+"crates/boon_ir/src/semantic_mapping.rs" = 55
 "crates/boon_ir/src/tests.rs" = 1
 "crates/boon_ir/src/tests/bytes.rs" = 1
 "crates/boon_ir/src/tests/sources_and_events.rs" = 33
@@ -2591,40 +2593,41 @@ expected_files = 102
 "crates/boon_phase0_baseline/src/report.rs" = 4
 "crates/boon_plan/src/document.rs" = 10
 "crates/boon_plan/src/host.rs" = 3
-"crates/boon_plan/src/lib.rs" = 106
+"crates/boon_plan/src/lib.rs" = 116
 "crates/boon_plan/src/tests.rs" = 2
-"crates/boon_plan_executor/src/machine.rs" = 185
+"crates/boon_plan_executor/src/machine.rs" = 191
 "crates/boon_plan_executor/src/tests.rs" = 11
 "crates/boon_plan_executor/tests/fjordpulse_server_search.rs" = 2
+"crates/boon_plan_executor/tests/map_set_cross_target.rs" = 3
 "crates/boon_plan_executor/tests/map_set_runtime.rs" = 7
 "crates/boon_runtime/src/distributed/client.rs" = 3
 "crates/boon_runtime/src/distributed/endpoint.rs" = 2
 "crates/boon_runtime/src/distributed/session.rs" = 3
-"crates/boon_runtime/src/document.rs" = 98
+"crates/boon_runtime/src/document.rs" = 102
 "crates/boon_runtime/src/effect_host.rs" = 2
 "crates/boon_runtime/src/lib.rs" = 7
 "crates/boon_runtime/src/migration_scenario.rs" = 4
 "crates/boon_runtime/src/persistent.rs" = 10
 "crates/boon_runtime/src/program.rs" = 18
 "crates/boon_runtime/src/web_persistent.rs" = 5
-"crates/boon_semantic/src/contextual_expansion.rs" = 14
-"crates/boon_semantic/src/dependency_manifest.rs" = 15
+"crates/boon_semantic/src/contextual_expansion.rs" = 18
+"crates/boon_semantic/src/dependency_manifest.rs" = 17
 "crates/boon_semantic/src/execution.rs" = 19
-"crates/boon_semantic/src/lib.rs" = 15
-"crates/boon_semantic/src/lowering_contract.rs" = 14
+"crates/boon_semantic/src/lib.rs" = 16
+"crates/boon_semantic/src/lowering_contract.rs" = 24
 "crates/boon_semantic/src/memory_contract.rs" = 37
 "crates/boon_semantic/src/out_net.rs" = 13
-"crates/boon_semantic/src/reactive.rs" = 47
-"crates/boon_semantic/src/resource.rs" = 60
-"crates/boon_semantic/src/storage_contract.rs" = 23
-"crates/boon_semantic/src/view_contract.rs" = 9
+"crates/boon_semantic/src/reactive.rs" = 73
+"crates/boon_semantic/src/resource.rs" = 82
+"crates/boon_semantic/src/storage_contract.rs" = 30
+"crates/boon_semantic/src/view_contract.rs" = 10
 "crates/boon_server_host/src/config.rs" = 3
 "crates/boon_server_host/src/host.rs" = 5
 "crates/boon_server_runtime/src/lib.rs" = 13
-"crates/boon_typecheck/src/lib.rs" = 258
+"crates/boon_typecheck/src/lib.rs" = 270
 "crates/boon_typecheck/src/tests/host_ports.rs" = 1
 "crates/boon_typecheck/src/tests/reactive_collections.rs" = 1
-"crates/boon_verify/src/lib.rs" = 17
+"crates/boon_verify/src/lib.rs" = 20
 "crates/boon_web_effect_host/src/content_store.rs" = 5
 "crates/boon_web_effect_host/src/file_effect_host.rs" = 4
 "crates/boon_web_host/src/capability.rs" = 7
@@ -2650,14 +2653,14 @@ expected_files = 102
 roots = ["docs/architecture/phase0/container_occurrences.tsv"]
 extensions = ["tsv"]
 needle = "\tdense-id-table\t"
-expected_occurrences = 837
+expected_occurrences = 963
 expected_files = 1
 
 [[entries.scans]]
 roots = ["docs/architecture/phase0/container_occurrences.tsv"]
 extensions = ["tsv"]
 needle = "\tmembership\t"
-expected_occurrences = 1532
+expected_occurrences = 1746
 expected_files = 1
 
 [[entries.scans]]
@@ -2671,28 +2674,28 @@ expected_files = 1
 roots = ["docs/architecture/phase0/container_occurrences.tsv"]
 extensions = ["tsv"]
 needle = "\tname-lookup\t"
-expected_occurrences = 539
+expected_occurrences = 566
 expected_files = 1
 
 [[entries.scans]]
 roots = ["docs/architecture/phase0/container_occurrences.tsv"]
 extensions = ["tsv"]
 needle = "\tcanonical-boundary\t"
-expected_occurrences = 360
+expected_occurrences = 463
 expected_files = 1
 
 [[entries.scans]]
 roots = ["docs/architecture/phase0/container_occurrences.tsv"]
 extensions = ["tsv"]
 needle = "\ttest-oracle\t"
-expected_occurrences = 582
+expected_occurrences = 708
 expected_files = 1
 
 [[entries.scans]]
 roots = ["docs/architecture/phase0/container_occurrences.tsv"]
 extensions = ["tsv"]
 needle = "\tunrelated-host-code\t"
-expected_occurrences = 599
+expected_occurrences = 639
 expected_files = 1
 
 [[entries]]
@@ -2710,7 +2713,7 @@ measurement = "occurrence"
 roots = ["docs/architecture/phase0/container_occurrences.tsv"]
 extensions = ["tsv"]
 needle = "\tdense-id-table\t"
-expected_occurrences = 837
+expected_occurrences = 963
 expected_files = 1
 
 [[entries]]

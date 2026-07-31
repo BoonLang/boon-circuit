@@ -7,26 +7,26 @@ word_boundary = "rust-identifier"
 lexical_scope = "all-source-text"
 test_scope_policy = "test-oracle"
 non_code_policy = "unrelated-host-code"
-expected_file_count = 153
-expected_file_set_sha256 = "47858624d98498edfd70e73a6f5bfede1161bdfe869828f7003fb1fd94177b21"
+expected_file_count = 157
+expected_file_set_sha256 = "0eb76d8cad9e910d140c077644962e28e8056af840ceae7c36a79b55bc344e76"
 occurrence_ledger_path = "docs/architecture/phase0/container_occurrences.tsv"
 occurrence_ledger_protocol = "boon-phase0-container-occurrences-v1"
 occurrence_ledger_generator = "cargo test -p xtask verify_phase0::tests::regenerate_container_occurrence_ledger -- --ignored --exact"
-expected_occurrence_ledger_sha256 = "691ff91c8678e4535b70bf3868bb49bdf2712dac6c1d649363fbc3fb462462eb"
-expected_occurrence_rows = 4476
+expected_occurrence_ledger_sha256 = "35ee7f815a9a03185c22e265264723ef8af03d5a99acd349f8572d354c06385c"
+expected_occurrence_rows = 5112
 within_file_classification = "complete"
 within_file_owner_phase = "goal-phase-5-packed"
 within_file_owner_action = "Maintain one checked-in row per exact identifier occurrence; mixed files retain distinct per-use categories."
 
 [[constructs]]
 id = "BTreeMap"
-expected_occurrences = 2682
-expected_files = 125
+expected_occurrences = 3056
+expected_files = 130
 
 [[constructs]]
 id = "BTreeSet"
-expected_occurrences = 1709
-expected_files = 98
+expected_occurrences = 1970
+expected_files = 103
 
 [[constructs]]
 id = "HashMap"
@@ -35,7 +35,7 @@ expected_files = 8
 
 [[constructs]]
 id = "HashSet"
-expected_occurrences = 33
+expected_occurrences = 34
 expected_files = 5
 
 [[categories]]
@@ -44,7 +44,7 @@ id = "dense-id-table"
 owner_phase = "goal-phase-5-packed"
 owner_plan = "docs/plans/BOON_PACKED_DATA_AND_DENSE_INTERNALS_PLAN.md"
 expected_files = 25
-expected_btree_map = 837
+expected_btree_map = 963
 expected_btree_set = 0
 expected_hash_map = 0
 expected_hash_set = 0
@@ -54,11 +54,11 @@ order = 1
 id = "membership"
 owner_phase = "goal-phase-5-packed"
 owner_plan = "docs/plans/BOON_PACKED_DATA_AND_DENSE_INTERNALS_PLAN.md"
-expected_files = 85
+expected_files = 87
 expected_btree_map = 0
-expected_btree_set = 1505
+expected_btree_set = 1718
 expected_hash_map = 0
-expected_hash_set = 27
+expected_hash_set = 28
 
 [[categories]]
 order = 2
@@ -76,8 +76,8 @@ order = 3
 id = "name-lookup"
 owner_phase = "goal-phase-1-verified-spine"
 owner_plan = "docs/plans/TYPE_INFERENCE_AND_TYPECHECKING_PLAN.md"
-expected_files = 55
-expected_btree_map = 529
+expected_files = 56
+expected_btree_map = 556
 expected_btree_set = 0
 expected_hash_map = 10
 expected_hash_set = 0
@@ -87,9 +87,9 @@ order = 4
 id = "canonical-boundary"
 owner_phase = "goal-phase-6-web-persistence"
 owner_plan = "docs/plans/BOON_PERSISTENCE_ARCHITECTURE_PLAN.md"
-expected_files = 45
-expected_btree_map = 332
-expected_btree_set = 26
+expected_files = 46
+expected_btree_map = 427
+expected_btree_set = 34
 expected_hash_map = 2
 expected_hash_set = 0
 
@@ -98,9 +98,9 @@ order = 5
 id = "test-oracle"
 owner_phase = "goal-phase-0"
 owner_plan = "docs/plans/GOAL_PROMPT.md"
-expected_files = 69
-expected_btree_map = 405
-expected_btree_set = 168
+expected_files = 74
+expected_btree_map = 492
+expected_btree_set = 207
 expected_hash_map = 7
 expected_hash_set = 2
 
@@ -110,7 +110,7 @@ id = "unrelated-host-code"
 owner_phase = "goal-phase-0"
 owner_plan = "docs/plans/GOAL_PROMPT.md"
 expected_files = 70
-expected_btree_map = 557
-expected_btree_set = 5
+expected_btree_map = 596
+expected_btree_set = 6
 expected_hash_map = 33
 expected_hash_set = 4

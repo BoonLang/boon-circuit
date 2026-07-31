@@ -4,7 +4,7 @@ Status: active implementation contract for the destructive cleanup.
 
 ## Objective
 
-Reduce the current roughly 384,000 tracked Rust lines to at most 240,000 while
+Reduce the current roughly 472,000 tracked Rust lines to at most 240,000 while
 restoring a responsive native playground. The final repository has one
 execution engine, one typed document/render update path, one native input path,
 compact verification tooling, and no executable 3D/manufacturing island.
@@ -38,10 +38,14 @@ every test dispatch. NovyWave now uses canonical row-owned scope and signal
 events instead of parallel scenario-only controls.
 
 Fresh semantic runs pass through `MachinePlan`, `Session`, and typed document
-patches. `cargo fmt --all -- --check`, `cargo check --workspace --all-targets`,
-and `cargo test --workspace --all-targets --quiet` pass. The architecture and
-negative manifest reports pass from current HEAD; product-native reports await
-the compositor restart described below.
+patches. The Phase 2 foundations checkpoint passes formatting, the full runtime
+suite, and `cargo check --workspace --all-targets`. A fresh architecture report
+passes the verified compiler spine, dependency-classifier schema, and every
+non-budget structural check, but the post-foundations tree is over three
+mandatory limits: 471,706 tracked Rust lines against 240,000, 107,072 test Rust
+lines against 32,000, and 64,824 runtime-plus-executor lines against 42,000.
+Native product reports remain stale until those budgets close and the
+compositor restart described below occurs.
 
 The nested-compositor diagnostic path has been deleted. The replacement uses
 ordinary COSMIC preview/dev windows, kernel uinput mouse and keyboard devices,
@@ -54,12 +58,15 @@ that operation. No refreshed native report is accepted until the COSMIC session
 loads the installed binary and the real Counter, Cells, wheel, keyboard, TEST,
 proof, and aggregate gates pass.
 
-The remaining completion work is explicit:
+The remaining completion work is explicit and ordered:
 
-1. restart the COSMIC session so the installed compositor exposes launch-scoped
-   window reconciliation, then refresh all six manifest reports and the
-   aggregate;
-2. launch the release playground with demand pacing and obtain the required
+1. remove duplicated and superseded implementation/test ownership until all
+   three architecture line budgets pass, without deleting current generic
+   compiler, runtime, persistence, or product behavior;
+2. restart the COSMIC session so the installed compositor exposes launch-scoped
+   window reconciliation, then refresh all seven manifest reports and the
+   aggregate from one unchanged revision;
+3. launch the release playground with demand pacing and obtain the required
    physical human confirmation.
 
 ## Non-Negotiable Rules
@@ -118,8 +125,9 @@ The remaining completion work is explicit:
 ### Verification
 
 - Delete `boon_report_schema`; report-v2 types and validation are tooling-only.
-- Reduce xtask to at most eight public commands and a six-gate native manifest:
-  architecture, Counter/dev, TodoMVC/physical, Cells, NovyWave, and negative.
+- Reduce xtask to at most nine public commands and a seven-gate native manifest:
+  architecture, Counter/dev, TodoMVC/physical, Cells, NovyWave, Persons.pro,
+  and negative.
 - Every proof names its frame, input, content, layout, render, surface epoch, and
   present revisions. PNG proof is an asynchronous sidecar.
 - A private Wayland server drives the actual app-window callback path. TEST is

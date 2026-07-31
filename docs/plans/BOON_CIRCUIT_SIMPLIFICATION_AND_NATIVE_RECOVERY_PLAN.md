@@ -351,6 +351,28 @@ release-finalization tests remain explicit future work in
 `BOON_PERSISTENCE_ARCHITECTURE_PLAN.md`; this ownership cut removes none of
 those planned paths or their current migration fixtures.
 
+The verified-erasure ownership cut removes post-verification mirrors from the
+opaque `ErasedProgram`: the full semantic index is reduced to the source-unit
+and field records consumed by compiler debug maps, row-scope validity is
+derived from canonical list ownership, and duplicated expression-coverage,
+possible-cause, and verification-flag records are gone. The authoritative
+semantic possible-cause closure and its validation remain in `boon_semantic`;
+executable state updates, list mutations, semantic memory, migration edges,
+persistence owners, and migration runners are unchanged. All 31 IR tests, 6
+compiler unit tests, 18 dependency-classifier tests, and the three executable
+Counter, Persons.pro, and TodoMVC migration scenarios pass under serial
+execution. The affected all-target compile passes without warnings.
+
+This cut removes 764 tracked Rust lines, including 26 test Rust lines. The
+current architecture report measures 417,368 tracked Rust lines and 55,087
+test Rust lines; only those two global caps fail. Runtime plus executor,
+playground, and xtask production remain within their caps at 40,503, 31,125,
+and 17,797 lines. The packed inventory now records 18,103 candidate sites
+across 80 files, while the exact container inventory remains at 4,814
+occurrences across 147 files. Phase 0 deletion and both regenerated inventories
+pass; only the already-declared stale Cells packed baseline and its dependent
+budget report remain open.
+
 The nested-compositor diagnostic path has been deleted. The replacement uses
 ordinary COSMIC preview/dev windows, kernel uinput mouse and keyboard devices,
 the normal app_window callback route, and app-owned exact-frame WGPU readback.

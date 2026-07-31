@@ -546,14 +546,6 @@ hash_targets = ["semantic_program", "implementation_dependency", "proof_context"
 erasure = "normalize_then_erase"
 
 [[dispositions]]
-id = "r-fa-priv-id-pc-n"
-traversal = "recurse"
-roles = ["formula_binder", "assurance_or_activation"]
-visibility = "private"
-hash_targets = ["implementation_dependency", "proof_context"]
-erasure = "normalize_then_erase"
-
-[[dispositions]]
 id = "r-fa-priv-sp-id-n"
 traversal = "recurse"
 roles = ["formula_binder", "assurance_or_activation"]
@@ -1196,14 +1188,6 @@ fields = [
 [[records]]
 kind = "struct"
 source = "crates/boon_ir/src/lib.rs"
-name = "DiagnosticSpanId"
-fields = [
-  { name = "0", disposition = "a-d-diag-so-n", reviewed = true },
-]
-
-[[records]]
-kind = "struct"
-source = "crates/boon_ir/src/lib.rs"
 name = "DistributedCall"
 fields = [
   { name = "expression", disposition = "r-fc-priv-id-pc-n", reviewed = true },
@@ -1542,12 +1526,11 @@ fields = [
   { name = "executable", disposition = "r-f-priv-id-pc-n", reviewed = true },
   { name = "scope_index", disposition = "r-fc-priv-id-pc-n", reviewed = true },
   { name = "expression_count", disposition = "r-f-priv-id-pc-n", reviewed = true },
-  { name = "expression_coverage", disposition = "r-fa-priv-id-pc-n", reviewed = true },
   { name = "distributed_references", disposition = "r-f-priv-id-pc-n", reviewed = true },
   { name = "producer_function_instances", disposition = "r-fr-priv-id-pc-n", reviewed = true },
-  { name = "semantic_index", disposition = "r-f-priv-id-pc-n", reviewed = true },
+  { name = "debug_source_units", disposition = "r-frc-priv-id-pc-n", reviewed = true },
+  { name = "debug_fields", disposition = "r-fc-priv-id-pc-n", reviewed = true },
   { name = "graph_node_count", disposition = "r-f-priv-id-pc-n", reviewed = true },
-  { name = "row_scopes", disposition = "r-fc-priv-id-pc-n", reviewed = true },
   { name = "sources", disposition = "r-fr-priv-id-pc-n", reviewed = true },
   { name = "host_ports", disposition = "r-fr-priv-id-pc-n", reviewed = true },
   { name = "state_cells", disposition = "r-fr-priv-id-pc-n", reviewed = true },
@@ -1560,7 +1543,6 @@ fields = [
   { name = "output_values", disposition = "r-fr-priv-id-pc-n", reviewed = true },
   { name = "derived_values", disposition = "r-f-priv-id-pc-n", reviewed = true },
   { name = "dependencies", disposition = "r-fd-diag-id-pc-n", reviewed = true },
-  { name = "possible_causes", disposition = "r-f-priv-id-pc-n", reviewed = true },
   { name = "state_update_arms", disposition = "r-fr-priv-id-pc-n", reviewed = true },
   { name = "host_effect_schedules", disposition = "r-rca-priv-id-pc-n", reviewed = true },
   { name = "list_mutations", disposition = "r-fr-priv-id-pc-n", reviewed = true },
@@ -1570,8 +1552,6 @@ fields = [
   { name = "expression_types", disposition = "r-f-priv-id-pc-n", reviewed = true },
   { name = "function_types", disposition = "r-f-priv-id-pc-n", reviewed = true },
   { name = "named_value_types", disposition = "r-f-priv-id-pc-n", reviewed = true },
-  { name = "hidden_identity_verified", disposition = "r-fca-priv-id-pc-n", reviewed = true },
-  { name = "static_schedule_verified", disposition = "r-fa-priv-id-pc-n", reviewed = true },
 ]
 
 [[records]]
@@ -2556,24 +2536,6 @@ fields = [
 [[records]]
 kind = "struct"
 source = "crates/boon_ir/src/lib.rs"
-name = "ExpressionCoverage"
-fields = [
-  { name = "computed_from", disposition = "r-fca-priv-id-pc-n", reviewed = true },
-  { name = "ast_expression_count", disposition = "a-fca-priv-id-pc-n", reviewed = true },
-  { name = "distributed_reference_expression_count", disposition = "a-fca-priv-id-pc-n", reviewed = true },
-  { name = "unknown_ast_expression_count", disposition = "a-fca-priv-id-pc-n", reviewed = true },
-  { name = "ignored_unknown_ast_expression_count", disposition = "a-fca-priv-id-pc-n", reviewed = true },
-  { name = "unknown_list_initializer_count", disposition = "a-frca-priv-id-pc-n", reviewed = true },
-  { name = "unknown_list_initial_value_count", disposition = "a-frca-priv-id-pc-n", reviewed = true },
-  { name = "unknown_list_predicate_count", disposition = "a-frca-priv-id-pc-n", reviewed = true },
-  { name = "unknown_derived_value_count", disposition = "a-fca-priv-id-pc-n", reviewed = true },
-  { name = "unknown_labels", disposition = "r-fca-priv-id-pc-n", reviewed = true },
-  { name = "ignored_unknown_labels", disposition = "r-fca-priv-id-pc-n", reviewed = true },
-]
-
-[[records]]
-kind = "struct"
-source = "crates/boon_ir/src/lib.rs"
 name = "FieldId"
 fields = [
   { name = "0", disposition = "a-fc-priv-id-pc-n", reviewed = true },
@@ -2585,6 +2547,20 @@ source = "crates/boon_ir/src/lib.rs"
 name = "FunctionId"
 fields = [
   { name = "0", disposition = "a-fc-priv-id-pc-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_ir/src/lib.rs"
+name = "HostEffectSchedule"
+fields = [
+  { name = "id", disposition = "a-rca-priv-id-pc-n", reviewed = true },
+  { name = "expression", disposition = "r-frca-priv-id-pc-n", reviewed = true },
+  { name = "checked_expression", disposition = "r-frca-priv-id-pc-n", reviewed = true },
+  { name = "owner", disposition = "r-rca-priv-id-pc-n", reviewed = true },
+  { name = "operation", disposition = "r-frca-priv-id-pc-n", reviewed = true },
+  { name = "state_update_arms", disposition = "r-rca-priv-id-pc-n", reviewed = true },
+  { name = "transient_result", disposition = "a-frca-priv-id-pc-n", reviewed = true },
 ]
 
 [[records]]
@@ -2756,6 +2732,15 @@ fields = [
 [[records]]
 kind = "struct"
 source = "crates/boon_ir/src/lib.rs"
+name = "ListInitializerInput"
+fields = [
+  { name = "name", disposition = "a-fc-priv-id-pc-n", reviewed = true },
+  { name = "field", disposition = "r-frc-priv-id-pc-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_ir/src/lib.rs"
 name = "ListMemory"
 fields = [
   { name = "id", disposition = "a-rc-priv-id-pc-n", reviewed = true },
@@ -2768,15 +2753,6 @@ fields = [
   { name = "capacity", disposition = "a-rc-priv-id-pc-n", reviewed = true },
   { name = "initializer", disposition = "r-rc-priv-id-pc-n", reviewed = true },
   { name = "initializer_inputs", disposition = "r-frc-priv-id-pc-n", reviewed = true },
-]
-
-[[records]]
-kind = "struct"
-source = "crates/boon_ir/src/lib.rs"
-name = "ListInitializerInput"
-fields = [
-  { name = "name", disposition = "a-fc-priv-id-pc-n", reviewed = true },
-  { name = "field", disposition = "r-frc-priv-id-pc-n", reviewed = true },
 ]
 
 [[records]]
@@ -2894,15 +2870,6 @@ fields = [
   { name = "binding_id", disposition = "a-frc-priv-id-pc-n", reviewed = true },
   { name = "line", disposition = "a-rcd-diag-id-pc-n", reviewed = true },
   { name = "typed_contract_known", disposition = "r-frca-priv-id-pc-n", reviewed = true },
-]
-
-[[records]]
-kind = "struct"
-source = "crates/boon_ir/src/lib.rs"
-name = "PossibleCause"
-fields = [
-  { name = "target", disposition = "r-c-priv-id-pc-n", reviewed = true },
-  { name = "sources", disposition = "r-r-priv-id-pc-n", reviewed = true },
 ]
 
 [[records]]
@@ -3097,33 +3064,9 @@ fields = [
 [[records]]
 kind = "struct"
 source = "crates/boon_ir/src/lib.rs"
-name = "RowScope"
-fields = [
-  { name = "id", disposition = "a-rc-priv-id-pc-n", reviewed = true },
-  { name = "list", disposition = "r-rc-priv-id-pc-n", reviewed = true },
-  { name = "function", disposition = "r-frc-priv-id-pc-n", reviewed = true },
-  { name = "row_scope", disposition = "r-frc-priv-id-pc-n", reviewed = true },
-]
-
-[[records]]
-kind = "struct"
-source = "crates/boon_ir/src/lib.rs"
 name = "ScopeId"
 fields = [
   { name = "0", disposition = "a-c-priv-id-pc-n", reviewed = true },
-]
-
-[[records]]
-kind = "struct"
-source = "crates/boon_ir/src/lib.rs"
-name = "SemanticDiagnosticSpan"
-fields = [
-  { name = "id", disposition = "a-d-diag-so-n", reviewed = true },
-  { name = "line", disposition = "a-d-diag-so-n", reviewed = true },
-  { name = "start", disposition = "a-d-diag-so-n", reviewed = true },
-  { name = "end", disposition = "a-d-diag-so-n", reviewed = true },
-  { name = "severity", disposition = "a-d-diag-so-n", reviewed = true },
-  { name = "message", disposition = "a-d-diag-so-n", reviewed = true },
 ]
 
 [[records]]
@@ -3139,92 +3082,6 @@ fields = [
   { name = "statement_id", disposition = "a-fc-priv-id-pc-n", reviewed = true },
   { name = "line", disposition = "a-cd-diag-id-pc-n", reviewed = true },
   { name = "kind", disposition = "r-fc-priv-id-pc-n", reviewed = true },
-]
-
-[[records]]
-kind = "struct"
-source = "crates/boon_ir/src/lib.rs"
-name = "SemanticFunctionEntry"
-fields = [
-  { name = "id", disposition = "a-fc-priv-id-pc-n", reviewed = true },
-  { name = "name", disposition = "a-fc-priv-id-pc-n", reviewed = true },
-  { name = "args", disposition = "r-fc-priv-id-pc-n", reviewed = true },
-  { name = "statement_id", disposition = "a-fc-priv-id-pc-n", reviewed = true },
-  { name = "line", disposition = "a-cd-diag-id-pc-n", reviewed = true },
-  { name = "type_known", disposition = "r-fc-priv-id-pc-n", reviewed = true },
-]
-
-[[records]]
-kind = "struct"
-source = "crates/boon_ir/src/lib.rs"
-name = "SemanticIndex"
-fields = [
-  { name = "version", disposition = "r-ca-priv-id-pc-n", reviewed = true },
-  { name = "computed_from", disposition = "r-c-priv-id-pc-n", reviewed = true },
-  { name = "parser_policy_phase", disposition = "r-ca-priv-id-pc-n", reviewed = true },
-  { name = "reuse_key", disposition = "r-ca-priv-id-pc-n", reviewed = true },
-  { name = "output_roots", disposition = "r-fc-priv-id-pc-n", reviewed = true },
-  { name = "source_units", disposition = "r-rc-priv-id-pc-n", reviewed = true },
-  { name = "sources", disposition = "r-rc-priv-id-pc-n", reviewed = true },
-  { name = "lists", disposition = "r-rc-priv-id-pc-n", reviewed = true },
-  { name = "row_scopes", disposition = "r-frc-priv-id-pc-n", reviewed = true },
-  { name = "functions", disposition = "r-fc-priv-id-pc-n", reviewed = true },
-  { name = "fields", disposition = "r-fc-priv-id-pc-n", reviewed = true },
-  { name = "view_bindings", disposition = "r-fc-priv-id-pc-n", reviewed = true },
-  { name = "diagnostic_spans", disposition = "r-d-diag-so-n", reviewed = true },
-  { name = "symbols", disposition = "r-c-priv-id-pc-n", reviewed = true },
-  { name = "readiness", disposition = "r-ca-priv-id-pc-n", reviewed = true },
-  { name = "reuse", disposition = "r-ca-priv-id-pc-n", reviewed = true },
-]
-
-[[records]]
-kind = "struct"
-source = "crates/boon_ir/src/lib.rs"
-name = "SemanticIndexReadiness"
-fields = [
-  { name = "source_payload_schemas", disposition = "a-rca-priv-id-pc-n", reviewed = true },
-  { name = "source_completions", disposition = "r-rca-priv-id-pc-n", reviewed = true },
-  { name = "route_critical_unknowns", disposition = "r-ca-priv-id-pc-n", reviewed = true },
-  { name = "row_scopes", disposition = "r-frca-priv-id-pc-n", reviewed = true },
-  { name = "row_scope_ambiguity", disposition = "r-frca-priv-id-pc-n", reviewed = true },
-  { name = "selectors", disposition = "r-fca-priv-id-pc-n", reviewed = true },
-  { name = "selector_index_ambiguity", disposition = "r-fca-priv-id-pc-n", reviewed = true },
-  { name = "render_contracts", disposition = "r-fca-priv-id-pc-n", reviewed = true },
-  { name = "bridge_page_descriptors", disposition = "r-ca-priv-id-pc-n", reviewed = true },
-  { name = "dynamic_fallback_count", disposition = "a-ca-priv-id-pc-n", reviewed = true },
-]
-
-[[records]]
-kind = "struct"
-source = "crates/boon_ir/src/lib.rs"
-name = "SemanticIndexReuse"
-fields = [
-  { name = "parser_reused_by_ir", disposition = "r-ca-priv-id-pc-n", reviewed = true },
-  { name = "typecheck_reused_by_ir", disposition = "r-ca-priv-id-pc-n", reviewed = true },
-  { name = "runtime_reports_reuse_index", disposition = "r-ca-priv-id-pc-n", reviewed = true },
-  { name = "shared_tables", disposition = "r-ca-priv-id-pc-n", reviewed = true },
-]
-
-[[records]]
-kind = "struct"
-source = "crates/boon_ir/src/lib.rs"
-name = "SemanticKnowledgeStatus"
-fields = [
-  { name = "known_count", disposition = "a-ca-priv-id-pc-n", reviewed = true },
-  { name = "fallback_count", disposition = "a-ca-priv-id-pc-n", reviewed = true },
-  { name = "fallback_reasons", disposition = "r-ca-priv-id-pc-n", reviewed = true },
-]
-
-[[records]]
-kind = "struct"
-source = "crates/boon_ir/src/lib.rs"
-name = "SemanticListEntry"
-fields = [
-  { name = "id", disposition = "a-rc-priv-id-pc-n", reviewed = true },
-  { name = "name", disposition = "a-rc-priv-id-pc-n", reviewed = true },
-  { name = "row_scope_id", disposition = "a-frc-priv-id-pc-n", reviewed = true },
-  { name = "capacity", disposition = "a-rc-priv-id-pc-n", reviewed = true },
-  { name = "initializer_known", disposition = "r-rc-priv-id-pc-n", reviewed = true },
 ]
 
 [[records]]
@@ -3268,20 +3125,6 @@ fields = [
 ]
 
 [[records]]
-kind = "struct"
-source = "crates/boon_ir/src/lib.rs"
-name = "SemanticOutputRootEntry"
-fields = [
-  { name = "root", disposition = "r-frc-priv-id-pc-n", reviewed = true },
-  { name = "contract", disposition = "r-frca-priv-id-pc-n", reviewed = true },
-  { name = "demand", disposition = "r-rc-priv-id-pc-n", reviewed = true },
-  { name = "data_type", disposition = "r-frc-priv-id-pc-n", reviewed = true },
-  { name = "statement_id", disposition = "a-frc-priv-id-pc-n", reviewed = true },
-  { name = "line", disposition = "a-rcd-diag-id-pc-n", reviewed = true },
-  { name = "typed_contract_known", disposition = "r-frca-priv-id-pc-n", reviewed = true },
-]
-
-[[records]]
 kind = "enum"
 source = "crates/boon_ir/src/lib.rs"
 name = "SemanticRetainedVisualKind"
@@ -3303,30 +3146,6 @@ fields = [
 [[records]]
 kind = "struct"
 source = "crates/boon_ir/src/lib.rs"
-name = "SemanticRowScopeEntry"
-fields = [
-  { name = "id", disposition = "a-rc-priv-id-pc-n", reviewed = true },
-  { name = "list", disposition = "r-rc-priv-id-pc-n", reviewed = true },
-  { name = "function", disposition = "r-frc-priv-id-pc-n", reviewed = true },
-  { name = "row_scope", disposition = "r-frc-priv-id-pc-n", reviewed = true },
-]
-
-[[records]]
-kind = "struct"
-source = "crates/boon_ir/src/lib.rs"
-name = "SemanticSourceEntry"
-fields = [
-  { name = "id", disposition = "a-rc-priv-id-pc-n", reviewed = true },
-  { name = "path", disposition = "a-rc-priv-id-pc-n", reviewed = true },
-  { name = "scoped", disposition = "a-rc-priv-id-pc-n", reviewed = true },
-  { name = "scope_id", disposition = "a-rc-priv-id-pc-n", reviewed = true },
-  { name = "payload_schema_known", disposition = "a-rca-priv-id-pc-n", reviewed = true },
-  { name = "payload_field_count", disposition = "a-frc-priv-id-pc-n", reviewed = true },
-]
-
-[[records]]
-kind = "struct"
-source = "crates/boon_ir/src/lib.rs"
 name = "SemanticSourceUnit"
 fields = [
   { name = "id", disposition = "a-rc-priv-id-pc-n", reviewed = true },
@@ -3334,39 +3153,6 @@ fields = [
   { name = "module", disposition = "a-rc-priv-id-pc-n", reviewed = true },
   { name = "start_line", disposition = "a-rcd-diag-id-pc-n", reviewed = true },
   { name = "line_count", disposition = "a-rcd-diag-id-pc-n", reviewed = true },
-]
-
-[[records]]
-kind = "struct"
-source = "crates/boon_ir/src/lib.rs"
-name = "SemanticSymbolEntry"
-fields = [
-  { name = "id", disposition = "a-c-priv-id-pc-n", reviewed = true },
-  { name = "category", disposition = "r-c-priv-id-pc-n", reviewed = true },
-  { name = "text", disposition = "r-c-priv-id-pc-n", reviewed = true },
-]
-
-[[records]]
-kind = "struct"
-source = "crates/boon_ir/src/lib.rs"
-name = "SemanticSymbolId"
-fields = [
-  { name = "0", disposition = "a-c-priv-id-pc-n", reviewed = true },
-]
-
-[[records]]
-kind = "struct"
-source = "crates/boon_ir/src/lib.rs"
-name = "SemanticViewBindingEntry"
-fields = [
-  { name = "id", disposition = "a-fc-priv-id-pc-n", reviewed = true },
-  { name = "node_kind", disposition = "r-fc-priv-id-pc-n", reviewed = true },
-  { name = "attr", disposition = "r-fc-priv-id-pc-n", reviewed = true },
-  { name = "path", disposition = "a-fc-priv-id-pc-n", reviewed = true },
-  { name = "kind", disposition = "r-fc-priv-id-pc-n", reviewed = true },
-  { name = "scope_id", disposition = "a-fc-priv-id-pc-n", reviewed = true },
-  { name = "source_id", disposition = "a-frc-priv-id-pc-n", reviewed = true },
-  { name = "render_contract_known", disposition = "r-fca-priv-id-pc-n", reviewed = true },
 ]
 
 [[records]]
@@ -3686,20 +3472,6 @@ fields = [
   { name = "gate_expression_id", disposition = "a-fc-priv-id-pc-n", reviewed = true },
   { name = "owner", disposition = "r-rc-priv-id-pc-n", reviewed = true },
   { name = "output_expression_id", disposition = "a-fc-priv-id-pc-n", reviewed = true },
-]
-
-[[records]]
-kind = "struct"
-source = "crates/boon_ir/src/lib.rs"
-name = "HostEffectSchedule"
-fields = [
-  { name = "id", disposition = "a-rca-priv-id-pc-n", reviewed = true },
-  { name = "expression", disposition = "r-frca-priv-id-pc-n", reviewed = true },
-  { name = "checked_expression", disposition = "r-frca-priv-id-pc-n", reviewed = true },
-  { name = "owner", disposition = "r-rca-priv-id-pc-n", reviewed = true },
-  { name = "operation", disposition = "r-frca-priv-id-pc-n", reviewed = true },
-  { name = "state_update_arms", disposition = "r-rca-priv-id-pc-n", reviewed = true },
-  { name = "transient_result", disposition = "a-frca-priv-id-pc-n", reviewed = true },
 ]
 
 [[records]]
@@ -4175,7 +3947,6 @@ fields = [
   { name = "list_mutations", disposition = "r-rc-priv-id-pc-n", reviewed = true },
   { name = "derived_values", disposition = "r-fc-priv-id-pc-n", reviewed = true },
   { name = "dependencies", disposition = "r-c-priv-id-pc-n", reviewed = true },
-  { name = "possible_causes", disposition = "r-c-priv-id-pc-n", reviewed = true },
   { name = "id_map", disposition = "a-c-priv-id-pc-n", reviewed = true },
   { name = "semantic_producer_instance_count", disposition = "a-rc-priv-id-pc-n", reviewed = true },
   { name = "referenced_trigger_ids", disposition = "a-c-priv-id-pc-n", reviewed = true },
@@ -4280,7 +4051,6 @@ kind = "struct"
 source = "crates/boon_ir/src/semantic_mapping.rs"
 name = "MappedSemanticResources"
 fields = [
-  { name = "row_scopes", disposition = "r-rc-priv-id-pc-n", reviewed = true },
   { name = "lists", disposition = "r-r-priv-id-pc-n", reviewed = true },
   { name = "sources", disposition = "r-r-priv-id-pc-n", reviewed = true },
   { name = "state_cells", disposition = "r-r-priv-id-pc-n", reviewed = true },
@@ -4334,7 +4104,6 @@ fields = [
   { name = "state_update_arms", disposition = "r-rc-priv-id-pc-n", reviewed = true },
   { name = "list_mutations", disposition = "r-rc-priv-id-pc-n", reviewed = true },
   { name = "dependencies", disposition = "r-c-priv-id-pc-n", reviewed = true },
-  { name = "possible_causes", disposition = "r-c-priv-id-pc-n", reviewed = true },
   { name = "named_value_checked_statements", disposition = "r-fc-priv-id-pc-n", reviewed = true },
   { name = "id_map", disposition = "a-c-priv-id-pc-n", reviewed = true },
 ]

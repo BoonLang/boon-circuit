@@ -15,10 +15,10 @@ use crate::{
     ExecutableValueMember, ExecutableValueOrigin, ExecutableValueProvenance, ExprId, FieldId,
     FunctionId, InitialValue, ListId, ListInitialRecord, ListInitializer, ListInitializerInput,
     ListMemory, ListMutation, ListMutationKind, ListProjection, ListProjectionKind,
-    ListRowInitialField, MaterializationLocalId, MaterializationResultKind, PossibleCause,
-    ProducerFunctionArgument, ProducerFunctionInstance, RowScope, ScopeId, SourceId,
-    SourcePayloadDescriptor, SourcePayloadField, SourcePayloadSchema, SourcePort, StateCell,
-    StateId, StateUpdateArm, TriggerOwnedArm, producer_identity_text,
+    ListRowInitialField, MaterializationLocalId, MaterializationResultKind,
+    ProducerFunctionArgument, ProducerFunctionInstance, ScopeId, SourceId, SourcePayloadDescriptor,
+    SourcePayloadField, SourcePayloadSchema, SourcePort, StateCell, StateId, StateUpdateArm,
+    TriggerOwnedArm, producer_identity_text,
 };
 use boon_semantic::{
     OutCallInstanceId, ProducerFunctionId, SemanticBindingId, SemanticBindingTargetV1,
@@ -240,7 +240,6 @@ pub(super) struct MappedSemanticExecution {
 
 #[derive(Clone, Debug)]
 pub(super) struct MappedSemanticResources {
-    pub row_scopes: Vec<RowScope>,
     pub lists: Vec<ListMemory>,
     pub sources: Vec<SourcePort>,
     pub state_cells: Vec<StateCell>,
@@ -479,7 +478,6 @@ pub(super) struct MappedSemanticReactive {
     pub list_mutations: Vec<MappedSemanticListMutation>,
     pub derived_values: Vec<MappedSemanticDerivedValue>,
     pub dependencies: Vec<DependencyEdge>,
-    pub possible_causes: Vec<PossibleCause>,
     id_map: SemanticReactiveToMappedMap,
     semantic_producer_instance_count: usize,
     referenced_trigger_ids: BTreeSet<MappedReactiveTriggerId>,
@@ -716,7 +714,6 @@ pub(super) struct MappedSemanticStorage {
     pub state_update_arms: Vec<StateUpdateArm>,
     pub list_mutations: Vec<ListMutation>,
     pub dependencies: Vec<DependencyEdge>,
-    pub possible_causes: Vec<PossibleCause>,
     named_value_checked_statements: Vec<boon_typecheck::CheckedStatementId>,
     id_map: SemanticStorageToErasedMap,
 }
@@ -2256,25 +2253,6 @@ pub(super) fn map_semantic_resources(
         }
         validate_initializer_references(ids, &authority.initializer)?;
     }
-    let row_scopes = graph
-        .row_scopes
-        .iter()
-        .map(|scope| {
-            let list = semantic_list_resource(graph, scope.list)?;
-            if scope.semantic_path != list.semantic_path {
-                return Err(format!(
-                    "semantic row scope {} path `{}` differs from list {} path `{}`",
-                    scope.id, scope.semantic_path, list.id, list.semantic_path
-                ));
-            }
-            Ok(RowScope {
-                id: ids.row_scope(scope.id)?,
-                list: scope.semantic_path.clone(),
-                function: "checked_list".to_owned(),
-                row_scope: scope.stable_name.clone(),
-            })
-        })
-        .collect::<Result<Vec<_>, String>>()?;
     let lists = graph
         .lists
         .iter()
@@ -2366,7 +2344,6 @@ pub(super) fn map_semantic_resources(
         .collect::<Result<Vec<_>, String>>()?;
 
     let mapped = MappedSemanticResources {
-        row_scopes,
         lists,
         sources,
         state_cells,
@@ -2421,7 +2398,6 @@ impl MappedSemanticResources {
         ids: &SemanticToExecutableMap,
     ) -> Result<(), String> {
         let exact_lengths = [
-            ("row scope", graph.row_scopes.len(), self.row_scopes.len()),
             ("list", graph.lists.len(), self.lists.len()),
             (
                 "source resource plus distributed ingress",
@@ -2454,15 +2430,6 @@ impl MappedSemanticResources {
             if semantic != executable {
                 return Err(format!(
                     "semantic {label} graph has {semantic} records but executable mapping emitted {executable}"
-                ));
-            }
-        }
-        for (index, scope) in self.row_scopes.iter().enumerate() {
-            let expected = ids.row_scope(SemanticRowScopeId(index))?;
-            if scope.id != expected {
-                return Err(format!(
-                    "mapped row scope at index {index} emitted ID {}, expected {expected}",
-                    scope.id
                 ));
             }
         }
@@ -2912,33 +2879,6 @@ pub(super) fn map_semantic_reactive(
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
-    let possible_causes = graph
-        .possible_causes
-        .iter()
-        .enumerate()
-        .map(|(index, causes)| {
-            let expected = SemanticStateId(index);
-            if causes.state != expected {
-                return Err(format!(
-                    "semantic possible-causes entry at index {index} covers {}, expected {expected}",
-                    causes.state
-                ));
-            }
-            let state = semantic_state_resource(resource_graph, causes.state)?;
-            let mut sources = causes
-                .causes
-                .iter()
-                .copied()
-                .map(|cause| semantic_event_cause_path(cause, ids, resources))
-                .collect::<Result<Vec<_>, _>>()?;
-            sources.sort();
-            sources.dedup();
-            Ok(PossibleCause {
-                target: state.path.clone(),
-                sources,
-            })
-        })
-        .collect::<Result<Vec<_>, String>>()?;
     let producer_function_instances = graph
         .producer_instances
         .iter()
@@ -2959,7 +2899,6 @@ pub(super) fn map_semantic_reactive(
         list_mutations,
         derived_values,
         dependencies,
-        possible_causes,
         id_map: reactive_ids,
         semantic_producer_instance_count: graph.producer_instances.len(),
         referenced_trigger_ids,
@@ -4435,11 +4374,6 @@ impl MappedSemanticReactive {
                 self.dependencies.len(),
             ),
             (
-                "possible-causes state",
-                resources.states.len(),
-                self.possible_causes.len(),
-            ),
-            (
                 "host-effect schedule identity",
                 graph.host_effect_schedules.len(),
                 self.id_map.host_effect_schedules.len(),
@@ -4704,7 +4638,7 @@ pub(super) fn map_semantic_storage_join(
     storage_graph: &SemanticScopeStorageGraphV1,
     lowering_contract: &SemanticLoweringContractV1,
     ids: &SemanticToExecutableMap,
-    resources: &MappedSemanticResources,
+    _resources: &MappedSemanticResources,
     reactive: &MappedSemanticReactive,
 ) -> Result<MappedSemanticStorage, String> {
     reactive.validate_totality(reactive_graph, resource_graph, ids)?;
@@ -4831,11 +4765,10 @@ pub(super) fn map_semantic_storage_join(
         state_update_arms: finalized_state_transitions,
         list_mutations,
         dependencies: reactive.dependencies.clone(),
-        possible_causes: reactive.possible_causes.clone(),
         named_value_checked_statements,
         id_map: storage_ids,
     };
-    mapped.validate_totality(storage_graph, reactive_graph, resources, ids)?;
+    mapped.validate_totality(storage_graph, reactive_graph, ids)?;
     Ok(mapped)
 }
 
@@ -7716,7 +7649,6 @@ impl MappedSemanticStorage {
         &self,
         storage: &SemanticScopeStorageGraphV1,
         reactive: &SemanticReactiveGraphV1,
-        resources: &MappedSemanticResources,
         ids: &SemanticToExecutableMap,
     ) -> Result<(), String> {
         let lengths = [
@@ -7786,11 +7718,6 @@ impl MappedSemanticStorage {
                 "dependency edge",
                 reactive.dependencies.len(),
                 self.dependencies.len(),
-            ),
-            (
-                "possible cause",
-                resources.state_cells.len(),
-                self.possible_causes.len(),
             ),
         ];
         for (label, semantic, mapped) in lengths {
@@ -10288,17 +10215,12 @@ pub(super) fn finish_verified_semantic_lowering(
     let expression_types = map_expression_types(&lowering_contract.metadata);
     let function_types = map_function_types(&lowering_contract.metadata);
     let named_value_types = map_named_value_types(&lowering_contract.metadata);
-    let expression_coverage =
-        map_expression_coverage(&lowering_contract.metadata, &mapped_role_references);
-    let semantic_index = map_semantic_index(
-        execution_graph,
-        lowering_contract,
-        &mapped.id_map,
-        &resources,
-        &storage,
-        &output_values,
-        &view_bindings,
-    )?;
+    let debug_source_units = map_debug_source_units(&lowering_contract.metadata)?;
+    let debug_fields = map_semantic_field_entries(
+        &storage.fields,
+        &storage.derived_values,
+        &resources.state_cells,
+    );
     let activations = map_activation_sites(reactive_graph, &mapped.id_map)?;
     let pulse_batches = map_pulse_batches(
         reactive_graph,
@@ -10325,7 +10247,6 @@ pub(super) fn finish_verified_semantic_lowering(
         ..
     } = mapped;
     let MappedSemanticResources {
-        row_scopes,
         lists,
         sources,
         state_cells,
@@ -10346,7 +10267,6 @@ pub(super) fn finish_verified_semantic_lowering(
         host_effect_schedules,
         list_mutations,
         dependencies,
-        possible_causes,
         ..
     } = storage;
     for source in external_storage_sources {
@@ -10375,12 +10295,11 @@ pub(super) fn finish_verified_semantic_lowering(
             dependencies: dependency_uses,
         },
         expression_count: lowering_contract.metadata.original_source_expression_count,
-        expression_coverage,
         distributed_references: mapped_role_references,
         producer_function_instances,
-        semantic_index,
+        debug_source_units,
+        debug_fields,
         graph_node_count,
-        row_scopes,
         sources,
         host_ports,
         state_cells,
@@ -10393,7 +10312,6 @@ pub(super) fn finish_verified_semantic_lowering(
         output_values,
         derived_values,
         dependencies,
-        possible_causes,
         state_update_arms: finalized_state_transitions,
         host_effect_schedules: host_effect_schedules
             .into_iter()
@@ -10414,8 +10332,6 @@ pub(super) fn finish_verified_semantic_lowering(
         expression_types,
         function_types,
         named_value_types,
-        hidden_identity_verified: true,
-        static_schedule_verified: true,
     })
 }
 
@@ -11141,38 +11057,10 @@ fn map_named_value_types(
     }
 }
 
-fn map_expression_coverage(
+fn map_debug_source_units(
     metadata: &boon_semantic::SemanticLoweringMetadataV1,
-    distributed: &crate::DistributedReferences,
-) -> crate::ExpressionCoverage {
-    crate::ExpressionCoverage {
-        computed_from: "verified_semantic_program".to_owned(),
-        ast_expression_count: metadata.original_source_expression_count,
-        distributed_reference_expression_count: distributed.value_references.len()
-            + distributed.calls.len(),
-        unknown_ast_expression_count: 0,
-        ignored_unknown_ast_expression_count: 0,
-        unknown_list_initializer_count: 0,
-        unknown_list_initial_value_count: 0,
-        unknown_list_predicate_count: 0,
-        unknown_derived_value_count: 0,
-        unknown_labels: Vec::new(),
-        ignored_unknown_labels: Vec::new(),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn map_semantic_index(
-    execution: &SemanticExecutionGraphV1,
-    lowering: &SemanticLoweringContractV1,
-    ids: &SemanticToExecutableMap,
-    resources: &MappedSemanticResources,
-    storage: &MappedSemanticStorage,
-    output_values: &[crate::OutputRootValue],
-    view_bindings: &[crate::ViewBinding],
-) -> Result<crate::SemanticIndex, String> {
-    let metadata = &lowering.metadata;
-    let source_units = metadata
+) -> Result<Vec<crate::SemanticSourceUnit>, String> {
+    metadata
         .source_units
         .iter()
         .enumerate()
@@ -11191,172 +11079,7 @@ fn map_semantic_index(
                 line_count: unit.line_count,
             })
         })
-        .collect::<Result<Vec<_>, String>>()?;
-    let output_roots = output_values
-        .iter()
-        .map(|output| crate::SemanticOutputRootEntry {
-            root: output.root.clone(),
-            contract: output.contract,
-            demand: output.demand,
-            data_type: output.data_type.clone(),
-            statement_id: output.statement_id,
-            line: output.line,
-            typed_contract_known: output.typed_contract_known,
-        })
-        .collect::<Vec<_>>();
-    let payload_sources = metadata
-        .source_payload_shapes
-        .iter()
-        .flat_map(|shape| shape.sources.iter().copied())
-        .collect::<BTreeSet<_>>();
-    let sources = resources
-        .sources
-        .iter()
-        .enumerate()
-        .map(|(index, source)| crate::SemanticSourceEntry {
-            id: source.id,
-            path: source.path.clone(),
-            scoped: source.scoped,
-            scope_id: source.scope_id,
-            payload_schema_known: payload_sources.contains(&SemanticSourceId(index)),
-            payload_field_count: source.payload_schema.fields.len(),
-        })
-        .collect::<Vec<_>>();
-    let lists = resources
-        .lists
-        .iter()
-        .map(|list| crate::SemanticListEntry {
-            id: list.id,
-            name: list.name.clone(),
-            row_scope_id: list.row_scope_id,
-            capacity: list.capacity,
-            initializer_known: !matches!(list.initializer, ListInitializer::Unknown { .. }),
-        })
-        .collect::<Vec<_>>();
-    let row_scopes = resources
-        .row_scopes
-        .iter()
-        .map(|scope| crate::SemanticRowScopeEntry {
-            id: scope.id,
-            list: scope.list.clone(),
-            function: scope.function.clone(),
-            row_scope: scope.row_scope.clone(),
-        })
-        .collect::<Vec<_>>();
-    let functions = metadata
-        .function_types
-        .iter()
-        .map(|function| {
-            let callable = execution
-                .callables
-                .get(function.callable.as_usize())
-                .filter(|candidate| candidate.id == function.callable)
-                .ok_or_else(|| {
-                    format!(
-                        "semantic function type for `{}` references missing callable {}",
-                        function.name, function.callable
-                    )
-                })?;
-            let statement = callable.body.and_then(|body| {
-                execution.statements.iter().find(|statement| {
-                    matches!(
-                        statement.origin,
-                        boon_semantic::SemanticStatementOrigin::Checked { statement }
-                            if statement == body
-                    )
-                })
-            });
-            Ok(crate::SemanticFunctionEntry {
-                id: ids.callable(function.callable)?,
-                name: function.name.clone(),
-                args: function
-                    .parameters
-                    .iter()
-                    .map(|parameter| parameter.name.clone())
-                    .collect(),
-                statement_id: callable
-                    .body
-                    .map_or(usize::MAX, |statement| statement.0 as usize),
-                line: statement.map_or(0, |statement| statement.span.line),
-                type_known: true,
-            })
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    let fields = map_semantic_field_entries(
-        &storage.fields,
-        &storage.derived_values,
-        &resources.state_cells,
-    );
-    let semantic_view_bindings = view_bindings
-        .iter()
-        .map(|binding| crate::SemanticViewBindingEntry {
-            id: binding.id,
-            node_kind: binding.node_kind.clone(),
-            attr: binding.attr.clone(),
-            path: binding.path.clone(),
-            kind: binding.kind,
-            scope_id: binding.scope_id,
-            source_id: match binding.target {
-                crate::ViewBindingTarget::Source { source } => Some(source),
-                crate::ViewBindingTarget::Read { .. } => None,
-            },
-            render_contract_known: true,
-        })
-        .collect::<Vec<_>>();
-    let diagnostic_spans = metadata
-        .diagnostics
-        .iter()
-        .enumerate()
-        .map(|(index, diagnostic)| crate::SemanticDiagnosticSpan {
-            id: crate::DiagnosticSpanId(index),
-            line: diagnostic.line,
-            start: diagnostic.start,
-            end: diagnostic.end,
-            severity: format!("{:?}", diagnostic.severity).to_ascii_lowercase(),
-            message: diagnostic.message.clone(),
-        })
-        .collect::<Vec<_>>();
-    let symbols = map_semantic_symbols(
-        execution,
-        &source_units,
-        &output_roots,
-        &sources,
-        &lists,
-        &row_scopes,
-        &functions,
-        &fields,
-        &semantic_view_bindings,
-    );
-    let readiness = map_semantic_index_readiness(metadata, &sources, &lists, &row_scopes);
-
-    Ok(crate::SemanticIndex {
-        version: 1,
-        computed_from: "verified_semantic_program".to_owned(),
-        parser_policy_phase: "verified_semantics_only".to_owned(),
-        reuse_key: metadata.digest.to_string(),
-        output_roots,
-        source_units,
-        sources,
-        lists,
-        row_scopes,
-        functions,
-        fields,
-        view_bindings: semantic_view_bindings,
-        diagnostic_spans,
-        symbols,
-        readiness,
-        reuse: crate::SemanticIndexReuse {
-            parser_reused_by_ir: false,
-            typecheck_reused_by_ir: false,
-            runtime_reports_reuse_index: true,
-            shared_tables: vec![
-                "SemanticLoweringMetadataV1".to_owned(),
-                "SemanticResourceGraphV1".to_owned(),
-                "SemanticScopeStorageGraphV1".to_owned(),
-                "SemanticViewBindingGraphV1".to_owned(),
-            ],
-        },
-    })
+        .collect()
 }
 
 fn map_semantic_field_entries(
@@ -11409,176 +11132,6 @@ fn map_semantic_field_entries(
             },
         })
         .collect()
-}
-
-#[allow(clippy::too_many_arguments)]
-fn map_semantic_symbols(
-    execution: &SemanticExecutionGraphV1,
-    source_units: &[crate::SemanticSourceUnit],
-    output_roots: &[crate::SemanticOutputRootEntry],
-    sources: &[crate::SemanticSourceEntry],
-    lists: &[crate::SemanticListEntry],
-    row_scopes: &[crate::SemanticRowScopeEntry],
-    functions: &[crate::SemanticFunctionEntry],
-    fields: &[crate::SemanticFieldEntry],
-    view_bindings: &[crate::SemanticViewBindingEntry],
-) -> Vec<crate::SemanticSymbolEntry> {
-    let mut symbols = BTreeSet::<(String, String)>::new();
-    let mut insert = |category: &str, text: &str| {
-        if !text.is_empty() {
-            symbols.insert((category.to_owned(), text.to_owned()));
-        }
-    };
-    for unit in source_units {
-        insert("source_unit_path", &unit.path);
-        if let Some(module) = &unit.module {
-            insert("module_path", module);
-        }
-    }
-    for output in output_roots {
-        insert("output_root", &output.root);
-        insert("output_kind", output.contract.as_str());
-    }
-    for source in sources {
-        insert("source_label", &source.path);
-        for segment in source.path.split('.') {
-            insert("source_label_segment", segment);
-        }
-    }
-    for list in lists {
-        insert("list_name", &list.name);
-    }
-    for scope in row_scopes {
-        insert("row_scope", &scope.row_scope);
-        insert("row_scope_function", &scope.function);
-    }
-    for function in functions {
-        insert("function_name", &function.name);
-        for argument in &function.args {
-            insert("function_arg", argument);
-        }
-    }
-    for field in fields {
-        insert("field_path", &field.path);
-        insert("field_name", &field.local_name);
-    }
-    for expression in &execution.expressions {
-        match &expression.kind {
-            SemanticExpressionKind::Tag(name) => insert("tag", name),
-            SemanticExpressionKind::TaggedObject { tag, fields } => {
-                insert("tag", tag);
-                for field in fields {
-                    insert("document_attr", &field.name);
-                }
-            }
-            SemanticExpressionKind::Object(fields) => {
-                for field in fields {
-                    insert("document_attr", &field.name);
-                    insert("style_attr", &field.name);
-                }
-            }
-            _ => {}
-        }
-    }
-    for call in &execution.calls {
-        insert("operator_name", &call.function);
-        for entry in &call.entries {
-            let name = match entry {
-                SemanticCallEntry::Input { name, .. }
-                | SemanticCallEntry::FreshOut { name, .. }
-                | SemanticCallEntry::ForwardOut { name, .. } => name,
-            };
-            insert("document_attr", name);
-        }
-    }
-    for binding in view_bindings {
-        insert("document_attr", &binding.attr);
-        insert("view_node_kind", &binding.node_kind);
-    }
-    symbols
-        .into_iter()
-        .enumerate()
-        .map(|(index, (category, text))| crate::SemanticSymbolEntry {
-            id: crate::SemanticSymbolId(index),
-            category,
-            text,
-        })
-        .collect()
-}
-
-fn map_semantic_index_readiness(
-    metadata: &boon_semantic::SemanticLoweringMetadataV1,
-    sources: &[crate::SemanticSourceEntry],
-    lists: &[crate::SemanticListEntry],
-    row_scopes: &[crate::SemanticRowScopeEntry],
-) -> crate::SemanticIndexReadiness {
-    let source_fallbacks = sources
-        .iter()
-        .filter(|source| !source.payload_schema_known)
-        .map(|source| format!("{} has no semantic payload shape", source.path))
-        .collect::<Vec<_>>();
-    let row_fallbacks = if !lists.is_empty() && row_scopes.is_empty() {
-        vec!["semantic lists exist without row scopes".to_owned()]
-    } else {
-        Vec::new()
-    };
-    let render_fallbacks = metadata
-        .render_slots
-        .iter()
-        .filter(|slot| !slot.diagnostics.is_empty())
-        .map(|slot| {
-            format!(
-                "render slot `{}` has {} diagnostics",
-                slot.slot_name,
-                slot.diagnostics.len()
-            )
-        })
-        .collect::<Vec<_>>();
-    let route_fallbacks = (metadata.dynamic_fallback_count > 0)
-        .then(|| {
-            format!(
-                "{} semantic expressions retain dynamic fallback",
-                metadata.dynamic_fallback_count
-            )
-        })
-        .into_iter()
-        .collect::<Vec<_>>();
-    let known = |known_count| crate::SemanticKnowledgeStatus {
-        known_count,
-        fallback_count: 0,
-        fallback_reasons: Vec::new(),
-    };
-    crate::SemanticIndexReadiness {
-        source_payload_schemas: crate::SemanticKnowledgeStatus {
-            known_count: sources.len().saturating_sub(source_fallbacks.len()),
-            fallback_count: source_fallbacks.len(),
-            fallback_reasons: source_fallbacks,
-        },
-        source_completions: known(sources.len()),
-        route_critical_unknowns: crate::SemanticKnowledgeStatus {
-            known_count: metadata.checked_expression_count,
-            fallback_count: route_fallbacks.len(),
-            fallback_reasons: route_fallbacks,
-        },
-        row_scopes: crate::SemanticKnowledgeStatus {
-            known_count: row_scopes.len(),
-            fallback_count: row_fallbacks.len(),
-            fallback_reasons: row_fallbacks,
-        },
-        row_scope_ambiguity: known(row_scopes.len()),
-        selectors: known(lists.len()),
-        selector_index_ambiguity: known(lists.len()),
-        render_contracts: crate::SemanticKnowledgeStatus {
-            known_count: metadata
-                .render_slots
-                .len()
-                .saturating_sub(render_fallbacks.len()),
-            fallback_count: render_fallbacks.len(),
-            fallback_reasons: render_fallbacks,
-        },
-        bridge_page_descriptors: known(0),
-        dynamic_fallback_count: metadata.dynamic_fallback_count,
-    }
 }
 
 fn map_semantic_memory(
@@ -12829,7 +12382,6 @@ result: identity(value: 1)
             .validate_totality(
                 semantic.scope_storage_graph(),
                 semantic.reactive_graph(),
-                &mapped_resources,
                 &mapped.id_map,
             )
             .unwrap_err();
@@ -12841,7 +12393,6 @@ result: identity(value: 1)
             .validate_totality(
                 semantic.scope_storage_graph(),
                 semantic.reactive_graph(),
-                &mapped_resources,
                 &mapped.id_map,
             )
             .unwrap_err();
@@ -13464,7 +13015,6 @@ result:
             .validate_totality(
                 semantic.scope_storage_graph(),
                 semantic.reactive_graph(),
-                &resources,
                 &execution.id_map,
             )
             .unwrap_err();
@@ -13531,7 +13081,6 @@ store: [
             .validate_totality(
                 semantic.scope_storage_graph(),
                 semantic.reactive_graph(),
-                &resources,
                 &execution.id_map,
             )
             .unwrap_err();
@@ -13941,7 +13490,6 @@ store: [
             .validate_totality(
                 semantic.scope_storage_graph(),
                 semantic.reactive_graph(),
-                &resources,
                 &execution.id_map,
             )
             .unwrap();
@@ -14090,7 +13638,6 @@ store: [
             .validate_totality(
                 semantic.scope_storage_graph(),
                 semantic.reactive_graph(),
-                &resources,
                 &execution.id_map,
             )
             .unwrap_err();
@@ -14102,7 +13649,6 @@ store: [
             .validate_totality(
                 semantic.scope_storage_graph(),
                 semantic.reactive_graph(),
-                &resources,
                 &execution.id_map,
             )
             .unwrap_err();
@@ -14118,7 +13664,6 @@ store: [
             .validate_totality(
                 semantic.scope_storage_graph(),
                 semantic.reactive_graph(),
-                &resources,
                 &execution.id_map,
             )
             .unwrap_err();
@@ -14134,7 +13679,6 @@ store: [
             .validate_totality(
                 semantic.scope_storage_graph(),
                 semantic.reactive_graph(),
-                &resources,
                 &execution.id_map,
             )
             .unwrap_err();

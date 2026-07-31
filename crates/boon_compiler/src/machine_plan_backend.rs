@@ -5863,8 +5863,7 @@ pub(crate) fn compile_erased_program_with_distributed_context(
         },
         debug_map: DebugMap {
             source_units: program
-                .semantic_index
-                .source_units
+                .debug_source_units
                 .iter()
                 .map(|unit| DebugEntry {
                     id: format!("source_unit:{}", unit.id),
@@ -5904,8 +5903,7 @@ pub(crate) fn compile_erased_program_with_distributed_context(
                 })
                 .collect(),
             fields: program
-                .semantic_index
-                .fields
+                .debug_fields
                 .iter()
                 .map(|field| DebugEntry {
                     id: format!("field:{}", field.id),

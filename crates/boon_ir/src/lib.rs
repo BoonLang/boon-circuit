@@ -88,14 +88,15 @@ pub struct ErasedProgramFields {
     pub executable: ExecutableProgram,
     pub scope_index: ErasedScopeIndex,
     pub expression_count: usize,
-    pub expression_coverage: ExpressionCoverage,
     #[serde(default)]
     pub distributed_references: DistributedReferences,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub producer_function_instances: Vec<ProducerFunctionInstance>,
-    pub semantic_index: SemanticIndex,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub debug_source_units: Vec<SemanticSourceUnit>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub debug_fields: Vec<SemanticFieldEntry>,
     pub graph_node_count: usize,
-    pub row_scopes: Vec<RowScope>,
     pub sources: Vec<SourcePort>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub host_ports: Vec<HostPortDeclaration>,
@@ -114,7 +115,6 @@ pub struct ErasedProgramFields {
     pub output_values: Vec<OutputRootValue>,
     pub derived_values: Vec<DerivedValue>,
     pub dependencies: Vec<DependencyEdge>,
-    pub possible_causes: Vec<PossibleCause>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub state_update_arms: Vec<StateUpdateArm>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -128,8 +128,6 @@ pub struct ErasedProgramFields {
     pub expression_types: boon_typecheck::ExprTypeTable,
     pub function_types: boon_typecheck::FunctionTypeTable,
     pub named_value_types: boon_typecheck::NamedValueTypeTable,
-    pub hidden_identity_verified: bool,
-    pub static_schedule_verified: bool,
 }
 
 impl std::ops::Deref for ErasedProgram {
@@ -157,10 +155,6 @@ impl ErasedProgram {
         self.fields.expression_count
     }
 
-    pub const fn expression_coverage(&self) -> &ExpressionCoverage {
-        &self.fields.expression_coverage
-    }
-
     pub const fn role_references(&self) -> &DistributedReferences {
         &self.fields.distributed_references
     }
@@ -169,16 +163,16 @@ impl ErasedProgram {
         &self.fields.producer_function_instances
     }
 
-    pub const fn semantic_index(&self) -> &SemanticIndex {
-        &self.fields.semantic_index
+    pub fn debug_source_units(&self) -> &[SemanticSourceUnit] {
+        &self.fields.debug_source_units
+    }
+
+    pub fn debug_fields(&self) -> &[SemanticFieldEntry] {
+        &self.fields.debug_fields
     }
 
     pub const fn graph_node_count(&self) -> usize {
         self.fields.graph_node_count
-    }
-
-    pub fn row_scopes(&self) -> &[RowScope] {
-        &self.fields.row_scopes
     }
 
     pub fn sources(&self) -> &[SourcePort] {
@@ -229,10 +223,6 @@ impl ErasedProgram {
         &self.fields.dependencies
     }
 
-    pub fn possible_causes(&self) -> &[PossibleCause] {
-        &self.fields.possible_causes
-    }
-
     pub fn state_updates(&self) -> &[StateUpdateArm] {
         &self.fields.state_update_arms
     }
@@ -263,14 +253,6 @@ impl ErasedProgram {
 
     pub const fn named_value_types(&self) -> &boon_typecheck::NamedValueTypeTable {
         &self.fields.named_value_types
-    }
-
-    pub const fn hidden_identity_verified(&self) -> bool {
-        self.fields.hidden_identity_verified
-    }
-
-    pub const fn static_schedule_verified(&self) -> bool {
-        self.fields.static_schedule_verified
     }
 
     pub const fn semantic_program_digest(&self) -> boon_semantic::SemanticProgramDigestV1 {
@@ -499,8 +481,6 @@ typed_usize_ids!(
     FunctionId,
     ErasedBindingId,
     ErasedReadId,
-    DiagnosticSpanId,
-    SemanticSymbolId,
     SemanticMemoryId,
 );
 
@@ -508,38 +488,6 @@ typed_usize_ids!(
 pub struct ExecutableParameterId {
     pub function: FunctionId,
     pub ordinal: usize,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct SemanticIndex {
-    pub version: u32,
-    pub computed_from: String,
-    pub parser_policy_phase: String,
-    pub reuse_key: String,
-    pub output_roots: Vec<SemanticOutputRootEntry>,
-    pub source_units: Vec<SemanticSourceUnit>,
-    pub sources: Vec<SemanticSourceEntry>,
-    pub lists: Vec<SemanticListEntry>,
-    pub row_scopes: Vec<SemanticRowScopeEntry>,
-    pub functions: Vec<SemanticFunctionEntry>,
-    pub fields: Vec<SemanticFieldEntry>,
-    pub view_bindings: Vec<SemanticViewBindingEntry>,
-    pub diagnostic_spans: Vec<SemanticDiagnosticSpan>,
-    pub symbols: Vec<SemanticSymbolEntry>,
-    pub readiness: SemanticIndexReadiness,
-    pub reuse: SemanticIndexReuse,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct SemanticOutputRootEntry {
-    pub root: String,
-    pub contract: SemanticOutputContractKind,
-    pub demand: SemanticOutputDemandPolicy,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub data_type: Option<SemanticDataType>,
-    pub statement_id: usize,
-    pub line: usize,
-    pub typed_contract_known: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -586,43 +534,6 @@ pub struct SemanticSourceUnit {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct SemanticSourceEntry {
-    pub id: SourceId,
-    pub path: String,
-    pub scoped: bool,
-    pub scope_id: Option<ScopeId>,
-    pub payload_schema_known: bool,
-    pub payload_field_count: usize,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct SemanticListEntry {
-    pub id: ListId,
-    pub name: String,
-    pub row_scope_id: Option<ScopeId>,
-    pub capacity: Option<usize>,
-    pub initializer_known: bool,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct SemanticRowScopeEntry {
-    pub id: ScopeId,
-    pub list: String,
-    pub function: String,
-    pub row_scope: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct SemanticFunctionEntry {
-    pub id: FunctionId,
-    pub name: String,
-    pub args: Vec<String>,
-    pub statement_id: usize,
-    pub line: usize,
-    pub type_known: bool,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SemanticFieldEntry {
     pub id: FieldId,
     pub path: String,
@@ -632,106 +543,6 @@ pub struct SemanticFieldEntry {
     pub statement_id: usize,
     pub line: usize,
     pub kind: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct SemanticViewBindingEntry {
-    pub id: ViewBindingId,
-    pub node_kind: String,
-    pub attr: String,
-    pub path: String,
-    pub kind: ViewBindingKind,
-    pub scope_id: Option<ScopeId>,
-    pub source_id: Option<SourceId>,
-    pub render_contract_known: bool,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct SemanticDiagnosticSpan {
-    pub id: DiagnosticSpanId,
-    pub line: usize,
-    pub start: usize,
-    pub end: usize,
-    pub severity: String,
-    pub message: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct SemanticSymbolEntry {
-    pub id: SemanticSymbolId,
-    pub category: String,
-    pub text: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct SemanticIndexReadiness {
-    pub source_payload_schemas: SemanticKnowledgeStatus,
-    pub source_completions: SemanticKnowledgeStatus,
-    pub route_critical_unknowns: SemanticKnowledgeStatus,
-    pub row_scopes: SemanticKnowledgeStatus,
-    pub row_scope_ambiguity: SemanticKnowledgeStatus,
-    pub selectors: SemanticKnowledgeStatus,
-    pub selector_index_ambiguity: SemanticKnowledgeStatus,
-    pub render_contracts: SemanticKnowledgeStatus,
-    pub bridge_page_descriptors: SemanticKnowledgeStatus,
-    pub dynamic_fallback_count: usize,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct SemanticKnowledgeStatus {
-    pub known_count: usize,
-    pub fallback_count: usize,
-    pub fallback_reasons: Vec<String>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct SemanticIndexReuse {
-    pub parser_reused_by_ir: bool,
-    pub typecheck_reused_by_ir: bool,
-    pub runtime_reports_reuse_index: bool,
-    pub shared_tables: Vec<String>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ExpressionCoverage {
-    pub computed_from: String,
-    pub ast_expression_count: usize,
-    #[serde(default)]
-    pub distributed_reference_expression_count: usize,
-    pub unknown_ast_expression_count: usize,
-    pub ignored_unknown_ast_expression_count: usize,
-    pub unknown_list_initializer_count: usize,
-    pub unknown_list_initial_value_count: usize,
-    pub unknown_list_predicate_count: usize,
-    pub unknown_derived_value_count: usize,
-    pub unknown_labels: Vec<String>,
-    pub ignored_unknown_labels: Vec<String>,
-}
-
-impl ExpressionCoverage {
-    pub fn empty() -> Self {
-        Self {
-            computed_from: "parser_ast_and_typed_ir".to_owned(),
-            ast_expression_count: 0,
-            distributed_reference_expression_count: 0,
-            unknown_ast_expression_count: 0,
-            ignored_unknown_ast_expression_count: 0,
-            unknown_list_initializer_count: 0,
-            unknown_list_initial_value_count: 0,
-            unknown_list_predicate_count: 0,
-            unknown_derived_value_count: 0,
-            unknown_labels: Vec::new(),
-            ignored_unknown_labels: Vec::new(),
-        }
-    }
-
-    pub fn unknown_total(&self) -> usize {
-        self.unknown_ast_expression_count
-            + self.unknown_list_initializer_count
-            + self.unknown_list_initial_value_count
-            + self.unknown_list_predicate_count
-            + self.unknown_derived_value_count
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -770,14 +581,6 @@ pub enum HostPortDeclaration {
         error_source: String,
         actions_output: String,
     },
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct RowScope {
-    pub id: ScopeId,
-    pub list: String,
-    pub function: String,
-    pub row_scope: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1979,12 +1782,6 @@ pub struct DependencyEdge {
     pub from: String,
     pub to: String,
     pub indexed: bool,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct PossibleCause {
-    pub target: String,
-    pub sources: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -3844,9 +3641,6 @@ fn lower_elapsed_ms(start: Instant) -> f64 {
 }
 
 pub fn verify_hidden_identity(program: &ErasedProgram) -> Result<(), String> {
-    if !program.hidden_identity_verified {
-        return Err("hidden identity verification did not run".to_owned());
-    }
     if program.lists.iter().any(|list| !list.has_generation) {
         return Err("all list memories must carry generation guards".to_owned());
     }
@@ -3923,9 +3717,6 @@ fn verify_list_initializer_inputs(
 }
 
 pub fn verify_static_schedule(program: &ErasedProgram) -> Result<(), String> {
-    if !program.static_schedule_verified {
-        return Err("static schedule verification did not run".to_owned());
-    }
     if program.graph_node_count != program.executable.expressions.len() {
         return Err(format!(
             "graph_node_count {} does not match {} canonical executable expressions",
@@ -4006,33 +3797,7 @@ pub fn verify_static_schedule(program: &ErasedProgram) -> Result<(), String> {
         }
     }
     let list_names = unique_strings("list", program.lists.iter().map(|list| list.name.as_str()))?;
-    let row_scope_names = unique_strings(
-        "row scope",
-        program
-            .row_scopes
-            .iter()
-            .map(|scope| scope.row_scope.as_str()),
-    )?;
-    for (index, scope) in program.row_scopes.iter().enumerate() {
-        if scope.id.as_usize() != index {
-            return Err(format!(
-                "row scope `{}` has ScopeId {}, expected {index}",
-                scope.row_scope, scope.id
-            ));
-        }
-        if !list_names.contains(scope.list.as_str()) {
-            return Err(format!(
-                "row scope `{}` references unknown list `{}`",
-                scope.row_scope, scope.list
-            ));
-        }
-        if scope.function.trim().is_empty() {
-            return Err(format!(
-                "row scope `{}` has empty function",
-                scope.row_scope
-            ));
-        }
-    }
+    let mut row_scope_ids = BTreeSet::new();
     for (index, list) in program.lists.iter().enumerate() {
         if list.id.as_usize() != index {
             return Err(format!(
@@ -4040,16 +3805,23 @@ pub fn verify_static_schedule(program: &ErasedProgram) -> Result<(), String> {
                 list.name, list.id
             ));
         }
-        if list.row_scope_id.is_some_and(|scope_id| {
-            scope_id.as_usize() >= program.row_scopes.len()
-                || program.row_scopes[scope_id.as_usize()].list != list.name
-        }) {
+        if let Some(scope_id) = list.row_scope_id
+            && !row_scope_ids.insert(scope_id)
+        {
             return Err(format!(
-                "list memory `{}` has invalid row ScopeId {:?}",
-                list.name, list.row_scope_id
+                "list memory `{}` reuses row ScopeId {}",
+                list.name, scope_id
             ));
         }
         verify_list_initializer_inputs(program, list)?;
+    }
+    for (index, scope_id) in row_scope_ids.iter().copied().enumerate() {
+        if scope_id.as_usize() != index {
+            return Err(format!(
+                "row ScopeId {} is not canonical at index {index}",
+                scope_id
+            ));
+        }
     }
     let derived_paths = unique_strings(
         "derived value",
@@ -4109,21 +3881,6 @@ pub fn verify_static_schedule(program: &ErasedProgram) -> Result<(), String> {
                 return Err(format!(
                     "typed list view `{}` storage metadata does not match ListId {} and ScopeId {}",
                     value.path, list_id, row_scope_id
-                ));
-            }
-            let row_scope = program
-                .row_scopes
-                .get(row_scope_id.as_usize())
-                .ok_or_else(|| {
-                    format!(
-                        "typed list view `{}` references missing materialized row ScopeId {}",
-                        value.path, row_scope_id
-                    )
-                })?;
-            if row_scope.id != row_scope_id || row_scope.list != list.name {
-                return Err(format!(
-                    "typed list view `{}` row ScopeId {} does not own ListId {}",
-                    value.path, row_scope_id, list_id
                 ));
             }
         }
@@ -4247,7 +4004,7 @@ pub fn verify_static_schedule(program: &ErasedProgram) -> Result<(), String> {
             ));
         }
         if let Some(scope_id) = binding.scope_id
-            && scope_id.as_usize() >= program.row_scopes.len()
+            && !row_scope_ids.contains(&scope_id)
         {
             return Err(format!(
                 "view binding `{}.{}` references missing ScopeId {}",
@@ -4313,12 +4070,12 @@ pub fn verify_static_schedule(program: &ErasedProgram) -> Result<(), String> {
     verify_scope_refs(
         "source",
         program.sources.iter().filter_map(|source| source.scope_id),
-        program,
+        &row_scope_ids,
     )?;
     verify_scope_refs(
         "state cell",
         program.state_cells.iter().filter_map(|cell| cell.scope_id),
-        program,
+        &row_scope_ids,
     )?;
     verify_scope_refs(
         "derived value",
@@ -4326,21 +4083,8 @@ pub fn verify_static_schedule(program: &ErasedProgram) -> Result<(), String> {
             .derived_values
             .iter()
             .filter_map(|value| value.scope_id),
-        program,
+        &row_scope_ids,
     )?;
-    for cell in &program.state_cells {
-        if cell.indexed
-            && cell.scope_id.is_none()
-            && row_scope_names
-                .iter()
-                .any(|scope| cell.path.split('.').any(|segment| segment == *scope))
-        {
-            return Err(format!(
-                "indexed state cell `{}` did not resolve to a typed ScopeId",
-                cell.path
-            ));
-        }
-    }
     let store_list_names = program
         .lists
         .iter()
@@ -4391,13 +4135,7 @@ pub fn verify_static_schedule(program: &ErasedProgram) -> Result<(), String> {
         .chain(source_payload_paths.iter().map(String::as_str))
         .chain(materialization_local_symbols.iter().map(String::as_str))
         .chain(pulse_symbols.iter().map(String::as_str))
-        .chain(
-            program
-                .semantic_index
-                .fields
-                .iter()
-                .map(|field| field.path.as_str()),
-        )
+        .chain(program.debug_fields.iter().map(|field| field.path.as_str()))
         .chain(
             program
                 .role_references()
@@ -4409,12 +4147,6 @@ pub fn verify_static_schedule(program: &ErasedProgram) -> Result<(), String> {
     for edge in &program.dependencies {
         require_known_symbol("dependency source", &edge.from, &known_symbols)?;
         require_known_symbol("dependency target", &edge.to, &known_symbols)?;
-    }
-    for cause in &program.possible_causes {
-        require_known_symbol("cause target", &cause.target, &known_symbols)?;
-        for source in &cause.sources {
-            require_known_symbol("cause source", source, &known_symbols)?;
-        }
     }
     for arm in program.state_updates() {
         let state = program
@@ -4996,21 +4728,6 @@ pub fn executable_expression_children(kind: &ExecutableExpressionKind) -> Vec<Ex
 }
 
 fn verify_distributed_reference_schedule(program: &ErasedProgram) -> Result<(), String> {
-    let expected_count =
-        program.role_references().value_references.len() + program.role_references().calls.len();
-    if program
-        .expression_coverage
-        .distributed_reference_expression_count
-        != expected_count
-    {
-        return Err(format!(
-            "distributed expression coverage reports {}, expected {expected_count}",
-            program
-                .expression_coverage
-                .distributed_reference_expression_count
-        ));
-    }
-
     let scheduled_expr_ids = program
         .executable
         .expressions
@@ -5179,10 +4896,10 @@ fn unique_strings<'a>(
 fn verify_scope_refs(
     label: &str,
     refs: impl IntoIterator<Item = ScopeId>,
-    program: &ErasedProgram,
+    row_scope_ids: &BTreeSet<ScopeId>,
 ) -> Result<(), String> {
     for scope_id in refs {
-        if scope_id.as_usize() >= program.row_scopes.len() {
+        if !row_scope_ids.contains(&scope_id) {
             return Err(format!(
                 "{label} references missing ScopeId {}",
                 scope_id.as_usize()
@@ -5479,12 +5196,6 @@ fn verify_identity_clean_identifiers(program: &ErasedProgram) -> Result<(), Stri
         reject_hidden_identity_identifier("dependency source", &edge.from)?;
         reject_hidden_identity_identifier("dependency target", &edge.to)?;
     }
-    for cause in &program.possible_causes {
-        reject_hidden_identity_identifier("cause target", &cause.target)?;
-        for source in &cause.sources {
-            reject_hidden_identity_identifier("cause source", source)?;
-        }
-    }
     for projection in &program.list_projections {
         reject_hidden_identity_identifier("list projection target", &projection.target)?;
         reject_hidden_identity_identifier("list projection list", &projection.list)?;
@@ -5642,7 +5353,6 @@ mod typed_derived_list_storage_tests {
         assert_eq!(list.name, path);
         assert_eq!(list.row_scope_id, Some(row_scope_id));
         assert!(list.has_generation);
-        assert_eq!(ir.row_scopes[row_scope_id.as_usize()].list, path);
         (list_id, row_scope_id)
     }
 
@@ -5902,10 +5612,7 @@ FUNCTION entry_view(entry) {
         assert!(authority.producer.is_none());
         assert!(authority.diagnostic_path.starts_with("@authority/"));
         assert!(
-            ir.semantic_index
-                .fields
-                .iter()
-                .all(|field| field.id != authority.id),
+            ir.debug_fields.iter().all(|field| field.id != authority.id),
             "authority storage is not a user-visible semantic field"
         );
 

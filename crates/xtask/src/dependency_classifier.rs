@@ -2001,19 +2001,6 @@ fields = [
                 .contains(&DependencyRoleV1::AssuranceOrActivation)
         );
 
-        let fallback = suggest_disposition(
-            "crates/boon_ir/src/lib.rs",
-            "SemanticKnowledgeStatus",
-            "fallback_reasons",
-            None,
-        );
-        assert!(
-            fallback
-                .roles
-                .contains(&DependencyRoleV1::AssuranceOrActivation)
-        );
-        assert_ne!(fallback.hash_targets, vec![HashTargetV1::SourceOnly]);
-
         let order_purity = suggest_disposition(
             "crates/boon_typecheck/src/lib.rs",
             "CheckedOrderKey",
@@ -2026,13 +2013,13 @@ fields = [
                 .contains(&DependencyRoleV1::AssuranceOrActivation)
         );
 
-        let semantic_index = suggest_disposition(
+        let debug_fields = suggest_disposition(
             "crates/boon_ir/src/lib.rs",
             "ErasedProgramFields",
-            "semantic_index",
+            "debug_fields",
             None,
         );
-        assert_eq!(semantic_index.traversal, TraversalV1::Recurse);
+        assert_eq!(debug_fields.traversal, TraversalV1::Recurse);
 
         let compiler_output = suggest_disposition(
             "crates/boon_typecheck/src/lib.rs",

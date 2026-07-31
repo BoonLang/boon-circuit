@@ -295,6 +295,29 @@ Phase 0 deletion and both regenerated inventories pass; only the
 already-declared stale Cells packed baseline and its dependent budget report
 remain open.
 
+The second executor test-ownership cut removes the remaining private
+compiler-fixture behavior block for host-bound values, transient and durable
+effects, SessionInfo, distributed context replacement, remote function leases,
+and row-owned distributed calls. Public host/server integrations own those
+behaviors. The retained private executor module now contains only direct
+`MachinePlan` algorithms for rollback, currentness, dependency cycles, indexes,
+bounded work, FLUSH, and detached captures; cursor, effect-stream, and ownership
+algorithm modules remain separate. The deleted block's compiler helpers and
+template-metadata inspection are also gone, while the Phase 0-only delta helper
+is compiled only when its instrumentation feature is active.
+
+All 66 retained executor unit tests, all 18 public executor integrations, and
+the three executable migration scenarios pass under serial execution. This cut
+removes 4,119 tracked Rust lines, including 4,114 test Rust lines. The current
+architecture report measures 422,293 tracked Rust lines and 58,864 test Rust
+lines; only those two global caps fail. Runtime plus executor, playground, and
+xtask production remain within their caps at 40,503, 31,313, and 17,797 lines.
+The packed inventory now records 18,193 candidate sites across 80 files, and
+the exact container inventory records 4,849 occurrences across 148 files.
+Phase 0 deletion and both regenerated inventories pass; only the
+already-declared stale Cells packed baseline and its dependent budget report
+remain open.
+
 The executable migration demos currently prove the catalog/`MachinePlan`
 version-migration path, including incremental, skipped-version, restart,
 activation, namespace, and cross-path authority behavior. They do not claim

@@ -12,20 +12,20 @@ expected_file_set_sha256 = "c9effc57c6b7372494a4a2753c27473d686e30dd2c3b6868cef6
 occurrence_ledger_path = "docs/architecture/phase0/container_occurrences.tsv"
 occurrence_ledger_protocol = "boon-phase0-container-occurrences-v1"
 occurrence_ledger_generator = "cargo test -p xtask verify_phase0::tests::regenerate_container_occurrence_ledger -- --ignored --exact"
-expected_occurrence_ledger_sha256 = "b2939e7d874a2dd85b6d4643e22b20e19084be317b4eedabd21d0bf013edc29c"
-expected_occurrence_rows = 4909
+expected_occurrence_ledger_sha256 = "a30954c0e2d28af9262e3e749f08dfd886bf473c0f01f274c4e1378254baface"
+expected_occurrence_rows = 4849
 within_file_classification = "complete"
 within_file_owner_phase = "goal-phase-5-packed"
 within_file_owner_action = "Maintain one checked-in row per exact identifier occurrence; mixed files retain distinct per-use categories."
 
 [[constructs]]
 id = "BTreeMap"
-expected_occurrences = 2952
+expected_occurrences = 2895
 expected_files = 124
 
 [[constructs]]
 id = "BTreeSet"
-expected_occurrences = 1871
+expected_occurrences = 1868
 expected_files = 97
 
 [[constructs]]
@@ -99,8 +99,8 @@ id = "test-oracle"
 owner_phase = "goal-phase-0"
 owner_plan = "docs/plans/GOAL_PROMPT.md"
 expected_files = 57
-expected_btree_map = 384
-expected_btree_set = 105
+expected_btree_map = 327
+expected_btree_set = 102
 expected_hash_map = 7
 expected_hash_set = 2
 

@@ -11369,11 +11369,6 @@ impl MachineInstance {
         &self.startup_metrics
     }
 
-    #[cfg(test)]
-    pub(crate) fn shares_template_metadata(&self, template: &MachineTemplate) -> bool {
-        Arc::ptr_eq(&self.metadata, &template.metadata) && Arc::ptr_eq(&self.plan, &template.plan)
-    }
-
     fn fresh_work(&self) -> Work {
         Work::with_limit(self.options.max_work_units_per_transaction)
     }
@@ -35698,7 +35693,7 @@ fn base64_digit(digit: u8) -> Result<u8, Error> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "phase0-instrumentation"))]
 pub(crate) fn report_deltas(deltas: Vec<Delta>) -> Vec<Delta> {
     report_deltas_preserving(deltas, |_| false)
 }

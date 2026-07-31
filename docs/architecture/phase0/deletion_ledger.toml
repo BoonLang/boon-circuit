@@ -2391,7 +2391,7 @@ roots = ["crates"]
 extensions = ["rs"]
 mode = "rust-token"
 needle = "BTreeMap"
-expected_occurrences = 2952
+expected_occurrences = 2895
 expected_files = 124
 
 [entries.scans.expected_path_occurrences]
@@ -2457,7 +2457,7 @@ expected_files = 124
 "crates/boon_plan_executor/src/cursor.rs" = 12
 "crates/boon_plan_executor/src/effect_stream.rs" = 7
 "crates/boon_plan_executor/src/machine.rs" = 487
-"crates/boon_plan_executor/src/tests.rs" = 75
+"crates/boon_plan_executor/src/tests.rs" = 18
 "crates/boon_plan_executor/tests/foundations_vertical.rs" = 2
 "crates/boon_plan_executor/tests/map_set_cross_target.rs" = 8
 "crates/boon_plan_executor/tests/map_set_runtime.rs" = 27
@@ -2525,7 +2525,7 @@ roots = ["crates"]
 extensions = ["rs"]
 mode = "rust-token"
 needle = "BTreeSet"
-expected_occurrences = 1871
+expected_occurrences = 1868
 expected_files = 97
 
 [entries.scans.expected_path_occurrences]
@@ -2579,7 +2579,7 @@ expected_files = 97
 "crates/boon_plan/src/lib.rs" = 117
 "crates/boon_plan/src/tests.rs" = 2
 "crates/boon_plan_executor/src/machine.rs" = 191
-"crates/boon_plan_executor/src/tests.rs" = 6
+"crates/boon_plan_executor/src/tests.rs" = 3
 "crates/boon_plan_executor/tests/map_set_cross_target.rs" = 3
 "crates/boon_plan_executor/tests/map_set_runtime.rs" = 6
 "crates/boon_distributed_runtime/src/client.rs" = 3
@@ -2669,7 +2669,7 @@ expected_files = 1
 roots = ["docs/architecture/phase0/container_occurrences.tsv"]
 extensions = ["tsv"]
 needle = "\ttest-oracle\t"
-expected_occurrences = 498
+expected_occurrences = 438
 expected_files = 1
 
 [[entries.scans]]

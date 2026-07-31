@@ -996,6 +996,17 @@ fn build_named_value_origin(
             })
         })
         .collect::<Vec<_>>();
+    // A computed named list can reuse a checked literal's keyed authority, so
+    // the checked named-value row does not itself carry CheckedListId. Join
+    // that occurrence through the exact declaration/statement/producer
+    // identity instead of losing the list and later mistaking one nested row
+    // field for the whole named value.
+    lists.extend(resources.lists.iter().filter_map(|list| {
+        (origin.declaration == Some(list.declaration)
+            && statements.contains(&list.statement)
+            && expressions.contains(&list.producer))
+        .then_some(list.id)
+    }));
     lists.sort();
     lists.dedup();
     let mut value_list_authorities = origin
@@ -1016,6 +1027,14 @@ fn build_named_value_origin(
                 })
         })
         .collect::<Vec<_>>();
+    value_list_authorities.extend(resources.value_list_authorities.iter().filter_map(
+        |authority| {
+            (origin.declaration == Some(authority.declaration)
+                && statements.contains(&authority.statement)
+                && expressions.contains(&authority.producer))
+            .then_some(authority.id)
+        },
+    ));
     value_list_authorities.sort();
     value_list_authorities.dedup();
 
@@ -1523,16 +1542,38 @@ fn bind_output_contract(
             binding.declaration == declaration.declaration
                 && binding.statement == statement
                 && binding.call_instance.is_none()
-                && binding.owner.is_none()
+                // A top-level output statement can execute the exact expanded
+                // result of a user-call occurrence. Its lexical statement is
+                // still global while the value correctly retains that
+                // occurrence's static owner.
+                && binding.owner == expression_definition.owner
                 && binding.producer == expression
                 && binding.value == value
         })
         .collect::<Vec<_>>();
     let [binding] = binding_matches.as_slice() else {
+        let candidates = reactive
+            .bindings
+            .iter()
+            .filter(|binding| binding.declaration == declaration.declaration)
+            .map(|binding| {
+                format!(
+                    "{}[statement={},call_instance={:?},owner={:?},producer={},value={}]",
+                    binding.id,
+                    binding.statement,
+                    binding.call_instance,
+                    binding.owner,
+                    binding.producer,
+                    binding.value,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
         return Err(SemanticLoweringContractError::new(format!(
-            "output `{}` resolves to {} exact semantic storage bindings",
+            "output `{}` resolves to {} exact semantic storage bindings for statement={statement}, expression={expression}, value={value}; declaration candidates: [{}]",
             declaration.value_path,
-            binding_matches.len()
+            binding_matches.len(),
+            candidates,
         )));
     };
     let typed_contract_known = match declaration.contract {

@@ -9,10 +9,11 @@ use crate::execution::{
     SemanticMaterializationId, SemanticMaterializationLocalId, SemanticMaterializationResultKind,
     SemanticParameterId, SemanticPatternBinding, SemanticRecordField, SemanticRoot, SemanticScope,
     SemanticScopeId, SemanticSelectArm, SemanticSelectKind, SemanticSourceDef, SemanticSourceId,
-    SemanticSourceOrigin, SemanticSourceRead, SemanticStateDef, SemanticStateId, SemanticStatement,
-    SemanticStatementId, SemanticStatementKind, SemanticStatementOrigin, SemanticStaticOwner,
-    SemanticTextSegment, SemanticValueId, SemanticValueMember, SemanticValueOrigin,
-    SemanticValueProvenance, checked_semantic_root_specs_v1, derive_semantic_state_lifetime_v1,
+    SemanticSourceOrigin, SemanticSourceRead, SemanticStateDef, SemanticStateId,
+    SemanticStateLifetimeDeriverV1, SemanticStatement, SemanticStatementId, SemanticStatementKind,
+    SemanticStatementOrigin, SemanticStaticOwner, SemanticTextSegment, SemanticValueId,
+    SemanticValueMember, SemanticValueOrigin, SemanticValueProvenance,
+    checked_semantic_root_specs_v1,
 };
 use crate::{
     OutCallInstanceId, OutInputValue, OutNetId, ResolvedOutGraph as OutNet, ScopedCheckedExpr,
@@ -766,6 +767,7 @@ pub(crate) fn derive_contextual_materializations(
     let mut result = Vec::with_capacity(candidates.len());
     let mut arena = SemanticExpressionArena::default();
     let mut item_types_by_owner = BTreeMap::new();
+    let builder_indexes = SemanticExpressionBuilderIndexes::new(program, out_net);
     for (id, candidate) in candidates.iter().cloned().enumerate() {
         let materialization_id = SemanticMaterializationId(id);
         let inherited_candidates = inherited_order_candidates[id]
@@ -793,8 +795,9 @@ pub(crate) fn derive_contextual_materializations(
             program,
             &lookup,
             out_net,
+            &builder_indexes,
             locals,
-            item_types_by_owner.clone(),
+            &item_types_by_owner,
             &materializations_by_owner,
             &materialization_result_types,
         );
@@ -1019,6 +1022,30 @@ pub(crate) fn erase_runtime_type_vars(ty: &Type) -> Type {
         | Type::UnresolvedShape { .. }
         | Type::Unknown => ty.clone(),
     }
+}
+
+fn refine_runtime_occurrence_type(existing: &Type, expected: &Type) -> Result<Type, String> {
+    let existing = erase_runtime_type_vars(existing);
+    let expected = erase_runtime_type_vars(expected);
+    let existing_closed = boon_typecheck::type_is_recursively_closed(&existing);
+    let expected_closed = boon_typecheck::type_is_recursively_closed(&expected);
+    if expected_closed {
+        if existing_closed && !boon_typecheck::resolved_type_is_assignable_to(&existing, &expected)
+        {
+            return Err(format!(
+                "closed runtime type {existing:?} is not assignable to required type {expected:?}"
+            ));
+        }
+        // A closed instantiated occurrence is already the exact callable
+        // contract. `specialize_checked_call_result` would return it unchanged,
+        // so avoid recursively re-walking the same structural type at every
+        // transparent wrapper layer.
+        return Ok(expected);
+    }
+    let refined = erase_runtime_type_vars(&boon_typecheck::specialize_checked_call_result(
+        &expected, &existing,
+    ));
+    Ok(refined)
 }
 
 fn project_concrete_type(mut ty: Type, fields: &[String]) -> Option<Type> {
@@ -1458,12 +1485,15 @@ pub(crate) fn derive_semantic_execution_graph(
         .iter()
         .map(|materialization| (materialization.id, materialization.result_type.clone()))
         .collect::<BTreeMap<_, _>>();
+    let builder_indexes = SemanticExpressionBuilderIndexes::new(program, out_net);
+    let inherited_local_types = BTreeMap::new();
     let mut builder = SemanticExpressionBuilder::new(
         program,
         &lookup,
         out_net,
+        &builder_indexes,
         BTreeMap::new(),
-        BTreeMap::new(),
+        &inherited_local_types,
         &materializations_by_owner,
         &materialization_result_types,
     );
@@ -2232,8 +2262,6 @@ pub(crate) fn derive_semantic_execution_graph(
             let initial = concrete_state_initial_expression(&arena.expressions, expression).ok_or(
                 ExpansionError::MissingStateInitializer(checked_state.expression),
             )?;
-            let lifetime = derive_semantic_state_lifetime_v1(&arena.expressions, expression)
-                .map_err(ExpansionError::InvalidLocalBindings)?;
             let id = SemanticStateId(states.len());
             if semantic_state_by_checked_instance.insert(key, id).is_some() {
                 return Err(ExpansionError::InvalidLocalBindings(format!(
@@ -2252,9 +2280,16 @@ pub(crate) fn derive_semantic_execution_graph(
                 call_instance: origin.call_instance,
                 binding_path: fallback_path.clone(),
                 owner: expression_definition.owner,
-                lifetime,
+                lifetime: crate::SemanticStateLifetimeV1::Persistent,
             });
         }
+    }
+    let mut state_lifetime_deriver = SemanticStateLifetimeDeriverV1::new(&arena.expressions)
+        .map_err(ExpansionError::InvalidLocalBindings)?;
+    for state in &mut states {
+        state.lifetime = state_lifetime_deriver
+            .derive(state.expression)
+            .map_err(ExpansionError::InvalidLocalBindings)?;
     }
     remap_checked_resource_ids(
         program,
@@ -2369,7 +2404,11 @@ fn exact_resource_instance_expression(
     if !exact_resource_candidates.is_empty() {
         candidates = exact_resource_candidates;
     }
-    let declaration_statements = statements
+    let owned_statement_ids = candidates
+        .iter()
+        .filter_map(|(_, statement)| statement.map(|statement| statement.id))
+        .collect::<BTreeSet<_>>();
+    let mut declaration_statements = statements
         .iter()
         .filter(|statement| {
             matches!(
@@ -2378,9 +2417,33 @@ fn exact_resource_instance_expression(
                     if statement == checked_statement
             ) && statement.declaration == Some(declaration)
                 && statement.checked_resources.contains(&checked_binding)
+                && owned_statement_ids.contains(&statement.id)
         })
         .map(|statement| statement.id)
         .collect::<Vec<_>>();
+    if declaration_statements.is_empty() {
+        // A statement root can be established before its expression-origin
+        // ownership is attached. Recover that exact checked declaration by
+        // reachability instead of synthesizing a second statement for the
+        // same SOURCE/state authority.
+        for statement in statements.iter().filter(|statement| {
+            matches!(
+                statement.origin,
+                SemanticStatementOrigin::Checked { statement }
+                    if statement == checked_statement
+            ) && statement.declaration == Some(declaration)
+                && statement.checked_resources.contains(&checked_binding)
+        }) {
+            let Some(root) = statement.value else {
+                continue;
+            };
+            if candidates.iter().any(|(candidate, _)| {
+                arena_expression_reaches_in_slice(expressions, root, *candidate)
+            }) {
+                declaration_statements.push(statement.id);
+            }
+        }
+    }
     if declaration_statements.len() > 1 {
         return Err(ExpansionError::InvalidLocalBindings(format!(
             "checked {resource_kind} {checked_id} has {} exact semantic declaration statements",
@@ -2453,10 +2516,6 @@ fn exact_resource_instance_expression(
             occurrence_statements = declarations;
         }
     }
-    let owned_statement_ids = candidates
-        .iter()
-        .filter_map(|(_, statement)| statement.map(|statement| statement.id))
-        .collect::<BTreeSet<_>>();
     let anchor = match occurrence_statements.as_slice() {
         [statement] => Some(*statement),
         [] if owned_statement_ids.len() == 1 => owned_statement_ids.iter().next().copied(),
@@ -2556,6 +2615,31 @@ fn exact_resource_instance_expression(
         )));
     };
     Ok((*definition_site, Some(anchor)))
+}
+
+fn arena_expression_reaches_in_slice(
+    expressions: &[SemanticExpression],
+    root: SemanticExprId,
+    target: SemanticExprId,
+) -> bool {
+    let mut pending = vec![root];
+    let mut visited = BTreeSet::new();
+    while let Some(id) = pending.pop() {
+        if !visited.insert(id) {
+            continue;
+        }
+        if id == target {
+            return true;
+        }
+        let Some(expression) = expressions
+            .get(id.as_usize())
+            .filter(|candidate| candidate.id == id)
+        else {
+            return false;
+        };
+        pending.extend(arena_expression_children(&expression.kind));
+    }
+    false
 }
 
 fn ensure_statement_owned_expression(
@@ -3214,7 +3298,11 @@ fn executable_latest_has_initial(
     branches
         .first()
         .and_then(|branch| expressions.get(branch.as_usize()))
-        .is_some_and(|branch| branch.flow_type.mode == FlowMode::Continuous)
+        .is_some_and(|branch| {
+            branch.flow_type.mode == FlowMode::Continuous
+                && !branch.effect.invokes_host
+                && !branch.effect.emits_source
+        })
 }
 
 fn synthesize_statement_owned_states(
@@ -4072,39 +4160,14 @@ fn resolve_executable_local_provenance(
     Ok(())
 }
 
-pub(crate) struct SemanticExpressionBuilder<'a> {
-    program: &'a CheckedProgram,
-    lookup: &'a CheckedProgramLookup,
-    out_net: &'a OutNet,
-    locals: BTreeMap<OutNetId, (StaticOwnerId, SemanticMaterializationLocalId)>,
-    local_types: BTreeMap<(StaticOwnerId, SemanticMaterializationLocalId), Type>,
-    materializations_by_owner: &'a BTreeMap<StaticOwnerId, SemanticMaterializationId>,
-    materialization_result_types: &'a BTreeMap<SemanticMaterializationId, Type>,
+struct SemanticExpressionBuilderIndexes {
     callable_ids: BTreeMap<DeclId, SemanticCallableId>,
     call_ids: BTreeMap<CheckedCallId, SemanticCallId>,
     producer_callable_ids: BTreeMap<crate::ProducerFunctionId, SemanticCallableId>,
-    expressions: Vec<SemanticExpression>,
-    checked_expression_origins: Vec<SemanticExpressionOrigin>,
-    memo: BTreeMap<ExpansionKey, SemanticExprId>,
-    owner_stack: Vec<Option<StaticOwnerId>>,
-    frame_stack: Vec<Option<OutCallInstanceId>>,
-    current_statement: Option<SemanticStatementId>,
-    value_frames: Vec<SemanticValueFrame>,
-    value_frame_by_key: BTreeMap<SemanticValueFrameKey, usize>,
-    next_local_binding: usize,
-    defer_nested_expansion: bool,
 }
 
-impl<'a> SemanticExpressionBuilder<'a> {
-    fn new(
-        program: &'a CheckedProgram,
-        lookup: &'a CheckedProgramLookup,
-        out_net: &'a OutNet,
-        locals: BTreeMap<OutNetId, (StaticOwnerId, SemanticMaterializationLocalId)>,
-        local_types: BTreeMap<StaticOwnerId, Type>,
-        materializations_by_owner: &'a BTreeMap<StaticOwnerId, SemanticMaterializationId>,
-        materialization_result_types: &'a BTreeMap<SemanticMaterializationId, Type>,
-    ) -> Self {
+impl SemanticExpressionBuilderIndexes {
+    fn new(program: &CheckedProgram, out_net: &OutNet) -> Self {
         let callable_ids = program
             .callables
             .iter()
@@ -4128,19 +4191,56 @@ impl<'a> SemanticExpressionBuilder<'a> {
             })
             .collect::<BTreeMap<_, _>>();
         Self {
-            program,
-            lookup,
-            out_net,
-            locals,
-            local_types: local_types
-                .into_iter()
-                .map(|(owner, ty)| ((owner, SemanticMaterializationLocalId(0)), ty))
-                .collect(),
-            materializations_by_owner,
-            materialization_result_types,
             callable_ids,
             call_ids,
             producer_callable_ids,
+        }
+    }
+}
+
+pub(crate) struct SemanticExpressionBuilder<'a> {
+    program: &'a CheckedProgram,
+    lookup: &'a CheckedProgramLookup,
+    out_net: &'a OutNet,
+    indexes: &'a SemanticExpressionBuilderIndexes,
+    locals: BTreeMap<OutNetId, (StaticOwnerId, SemanticMaterializationLocalId)>,
+    inherited_local_types: &'a BTreeMap<StaticOwnerId, Type>,
+    local_types: BTreeMap<(StaticOwnerId, SemanticMaterializationLocalId), Type>,
+    materializations_by_owner: &'a BTreeMap<StaticOwnerId, SemanticMaterializationId>,
+    materialization_result_types: &'a BTreeMap<SemanticMaterializationId, Type>,
+    expressions: Vec<SemanticExpression>,
+    checked_expression_origins: Vec<SemanticExpressionOrigin>,
+    memo: BTreeMap<ExpansionKey, SemanticExprId>,
+    owner_stack: Vec<Option<StaticOwnerId>>,
+    frame_stack: Vec<Option<OutCallInstanceId>>,
+    current_statement: Option<SemanticStatementId>,
+    value_frames: Vec<SemanticValueFrame>,
+    value_frame_by_key: BTreeMap<SemanticValueFrameKey, usize>,
+    next_local_binding: usize,
+    defer_nested_expansion: bool,
+}
+
+impl<'a> SemanticExpressionBuilder<'a> {
+    fn new(
+        program: &'a CheckedProgram,
+        lookup: &'a CheckedProgramLookup,
+        out_net: &'a OutNet,
+        indexes: &'a SemanticExpressionBuilderIndexes,
+        locals: BTreeMap<OutNetId, (StaticOwnerId, SemanticMaterializationLocalId)>,
+        inherited_local_types: &'a BTreeMap<StaticOwnerId, Type>,
+        materializations_by_owner: &'a BTreeMap<StaticOwnerId, SemanticMaterializationId>,
+        materialization_result_types: &'a BTreeMap<SemanticMaterializationId, Type>,
+    ) -> Self {
+        Self {
+            program,
+            lookup,
+            out_net,
+            indexes,
+            locals,
+            inherited_local_types,
+            local_types: BTreeMap::new(),
+            materializations_by_owner,
+            materialization_result_types,
             expressions: Vec::new(),
             checked_expression_origins: Vec::new(),
             memo: BTreeMap::new(),
@@ -4317,6 +4417,7 @@ impl<'a> SemanticExpressionBuilder<'a> {
                 owner,
                 local,
                 projection,
+                ..
             } => SemanticValueProvenance {
                 members: vec![SemanticValueMember {
                     path: Vec::new(),
@@ -4706,8 +4807,14 @@ impl<'a> SemanticExpressionBuilder<'a> {
                     let local_type = self
                         .local_types
                         .get(&(local_owner, local))
+                        .or_else(|| {
+                            (local == SemanticMaterializationLocalId(0))
+                                .then(|| self.inherited_local_types.get(&local_owner))
+                                .flatten()
+                        })
                         .cloned()
                         .and_then(|ty| project_concrete_type(ty, &projection));
+                    let constructor_projection = projection.clone();
                     let local_expression = self.push(
                         &expression,
                         owner,
@@ -4715,6 +4822,7 @@ impl<'a> SemanticExpressionBuilder<'a> {
                             owner: local_owner,
                             local,
                             projection,
+                            constructor_projection,
                         },
                     );
                     if let Some(ty) = local_type {
@@ -4723,13 +4831,14 @@ impl<'a> SemanticExpressionBuilder<'a> {
                     }
                     return Ok(local_expression);
                 }
-                if let Some((actual, argument_owner)) = scoped.frame.and_then(|frame| {
+                if let Some((frame, actual, argument_owner)) = scoped.frame.and_then(|frame| {
                     self.out_net.call_instances[frame.as_usize()]
                         .inputs
                         .iter()
                         .find(|binding| binding.formal == target)
                         .map(|binding| {
                             (
+                                frame,
                                 binding.value.clone(),
                                 self.out_net.owner_for_call_evaluation(frame),
                             )
@@ -4743,6 +4852,54 @@ impl<'a> SemanticExpressionBuilder<'a> {
                             };
                             let expanded =
                                 self.expand_with_inherited_owner(actual, argument_owner)?;
+                            let instance = &self.out_net.call_instances[frame.as_usize()];
+                            if let Some(parameter) = self
+                                .lookup
+                                .callable(self.program, instance.provenance.callable)
+                                .and_then(|callable| {
+                                    callable
+                                        .parameters
+                                        .iter()
+                                        .find(|parameter| parameter.decl_id == target)
+                                })
+                            {
+                                let required = concrete_type_in_frame(
+                                    self.out_net,
+                                    &parameter.flow_type.ty,
+                                    Some(frame),
+                                );
+                                let existing =
+                                    self.expressions[expanded.as_usize()].flow_type.ty.clone();
+                                let refined = refine_runtime_occurrence_type(&existing, &required)
+                                    .map_err(|error| {
+                                        let expanded = &self.expressions[expanded.as_usize()];
+                                        let checked_call = instance
+                                            .provenance
+                                            .call_id
+                                            .and_then(|call| self.lookup.call(self.program, call));
+                                        let checked_expression = self
+                                            .lookup
+                                            .expression(self.program, expanded.checked_expr_id);
+                                        ExpansionError::InvalidLocalBindings(format!(
+                                            "call frame {frame} {:?} function {:?} formal {} \
+                                                 `{}` scheme \
+                                                 {:?} cannot refine expression {} checked {:?} \
+                                                 checked definition {:?} kind {:?} flow {:?}: \
+                                                 {error}",
+                                            instance.provenance,
+                                            checked_call.map(|call| call.function.as_str()),
+                                            target.0,
+                                            parameter.name,
+                                            parameter.flow_type,
+                                            expanded.id,
+                                            expanded.checked_expr_id,
+                                            checked_expression,
+                                            expanded.kind,
+                                            expanded.flow_type
+                                        ))
+                                    })?;
+                                self.expressions[expanded.as_usize()].flow_type.ty = refined;
+                            }
                             return self.project(&expression, owner, expanded, projection);
                         }
                         OutInputValue::ProducerParameter {
@@ -4757,6 +4914,7 @@ impl<'a> SemanticExpressionBuilder<'a> {
                                     ))
                                 })?;
                             let callable = self
+                                .indexes
                                 .producer_callable_ids
                                 .get(&parameter.function)
                                 .copied()
@@ -5167,7 +5325,18 @@ impl<'a> SemanticExpressionBuilder<'a> {
             // is the call occurrence. Give that occurrence the checked,
             // call-local result instead of leaving the callable's open
             // structural scheme on the shared body syntax.
-            self.expressions[result.as_usize()].flow_type = concrete_result.clone();
+            let existing_result = self.expressions[result.as_usize()].flow_type.clone();
+            self.expressions[result.as_usize()].flow_type = FlowType {
+                mode: concrete_result.mode,
+                ty: refine_runtime_occurrence_type(&existing_result.ty, &concrete_result.ty)
+                    .map_err(|error| {
+                        ExpansionError::InvalidLocalBindings(format!(
+                            "user call {instance} result expression {result} cannot refine its \
+                         occurrence type: {error}"
+                        ))
+                    })?,
+            };
+            let concrete_result = self.expressions[result.as_usize()].flow_type.clone();
             let result_expression = callable
                 .result_expression
                 .ok_or(ExpansionError::MissingFunctionResult(callable.decl_id))?;
@@ -5274,13 +5443,19 @@ impl<'a> SemanticExpressionBuilder<'a> {
                 ordinal: context.signature,
             })
             .collect();
-        let semantic_call = self.call_ids.get(&call_id).copied().ok_or_else(|| {
-            ExpansionError::InvalidLocalBindings(format!(
-                "checked call {} has no semantic call identity",
-                call_id.0
-            ))
-        })?;
+        let semantic_call = self
+            .indexes
+            .call_ids
+            .get(&call_id)
+            .copied()
+            .ok_or_else(|| {
+                ExpansionError::InvalidLocalBindings(format!(
+                    "checked call {} has no semantic call identity",
+                    call_id.0
+                ))
+            })?;
         let semantic_callable = self
+            .indexes
             .callable_ids
             .get(&checked_call.callable)
             .copied()
@@ -5392,13 +5567,23 @@ impl<'a> SemanticExpressionBuilder<'a> {
         {
             return checked_expression;
         }
-        let Some(SemanticExpressionKind::CanonicalRead { target, .. }) = self
+        let Some(SemanticExpressionKind::CanonicalRead {
+            target, projection, ..
+        }) = self
             .expressions
             .get(semantic_expression.as_usize())
             .map(|expression| &expression.kind)
         else {
             return checked_expression;
         };
+        if !projection.is_empty() {
+            // The target's FLUSH payload belongs to the whole named value.
+            // A projected read carries only the successful member type; it
+            // must not widen that member with a sibling whole-record control
+            // payload. Runtime FLUSH already prevents the target authority
+            // from committing on the failing path.
+            return checked_expression;
+        }
         self.lookup
             .declaration(self.program, *target)
             .and_then(|declaration| declaration.value)
@@ -5702,9 +5887,33 @@ impl<'a> SemanticExpressionBuilder<'a> {
         mut input: SemanticExprId,
         mut fields: Vec<String>,
     ) -> Result<SemanticExprId, ExpansionError> {
+        let mut direct_constructor_projection = Vec::new();
         loop {
             let Some(first) = fields.first() else {
-                return Ok(input);
+                if direct_constructor_projection.is_empty() {
+                    return Ok(input);
+                }
+                let kind = match &self.expressions[input.as_usize()].kind {
+                    SemanticExpressionKind::MaterializationLocal {
+                        owner: local_owner,
+                        local,
+                        projection,
+                        ..
+                    } => Some(SemanticExpressionKind::MaterializationLocal {
+                        owner: *local_owner,
+                        local: *local,
+                        projection: projection.clone(),
+                        constructor_projection: direct_constructor_projection,
+                    }),
+                    _ => None,
+                };
+                let Some(kind) = kind else {
+                    return Ok(input);
+                };
+                let projected = self.push(expression, owner, kind);
+                self.expressions[projected.as_usize()].flow_type.ty =
+                    self.expressions[input.as_usize()].flow_type.ty.clone();
+                return Ok(projected);
             };
             let direct_field = match &self.expressions[input.as_usize()].kind {
                 SemanticExpressionKind::Object(record_fields)
@@ -5741,6 +5950,7 @@ impl<'a> SemanticExpressionBuilder<'a> {
             let Some(direct_field) = direct_field else {
                 break;
             };
+            direct_constructor_projection.push(first.clone());
             input = direct_field;
             fields.remove(0);
         }
@@ -5772,13 +5982,21 @@ impl<'a> SemanticExpressionBuilder<'a> {
                 owner: local_owner,
                 local,
                 projection,
+                constructor_projection,
             } => {
                 let mut projection = projection.clone();
-                projection.extend(fields);
+                projection.extend(fields.iter().cloned());
+                let mut constructor_projection = if direct_constructor_projection.is_empty() {
+                    constructor_projection.clone()
+                } else {
+                    direct_constructor_projection
+                };
+                constructor_projection.extend(fields);
                 SemanticExpressionKind::MaterializationLocal {
                     owner: *local_owner,
                     local: *local,
                     projection,
+                    constructor_projection,
                 }
             }
             _ => SemanticExpressionKind::Project { input, fields },
@@ -6032,6 +6250,60 @@ mod tests {
             );
         };
         materialization
+    }
+
+    #[test]
+    fn function_local_source_has_one_declaration_per_contextual_materialization() {
+        let graph = semantic_graph(
+            r#"
+store: [
+    first:
+        LIST { [name: TEXT { first }] }
+        |> List/map(item, new: selectable_row(row: item))
+    second:
+        LIST { [name: TEXT { second }] }
+        |> List/map(item, new: selectable_row(row: item))
+]
+
+FUNCTION selectable_row(row) {
+    [controls: [select: SOURCE], name: row.name]
+}
+"#,
+        );
+        assert_eq!(graph.sources.len(), 2, "{:#?}", graph.sources);
+        assert_eq!(
+            graph
+                .sources
+                .iter()
+                .filter_map(|source| match source.origin {
+                    SemanticSourceOrigin::Checked { source } => Some(source),
+                    SemanticSourceOrigin::ProducerInvocation { .. } => None,
+                })
+                .collect::<BTreeSet<_>>()
+                .len(),
+            1,
+            "both concrete resources must retain one checked SOURCE identity"
+        );
+        assert_eq!(
+            graph
+                .sources
+                .iter()
+                .filter_map(|source| source.owner)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            2,
+            "each contextual materialization must own its own SOURCE resource"
+        );
+        assert_eq!(
+            graph
+                .sources
+                .iter()
+                .map(|source| source.statement)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            2,
+            "each concrete SOURCE must bind its exact semantic declaration statement"
+        );
     }
 
     #[test]

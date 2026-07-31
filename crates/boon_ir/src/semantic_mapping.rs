@@ -13,12 +13,12 @@ use crate::{
     ExecutableSourceId, ExecutableSourceOrigin, ExecutableStateDef, ExecutableStateId,
     ExecutableStatement, ExecutableStatementId, ExecutableStatementKind, ExecutableTextSegment,
     ExecutableValueMember, ExecutableValueOrigin, ExecutableValueProvenance, ExprId, FieldId,
-    FunctionId, InitialValue, ListId, ListInitialRecord, ListInitializer, ListMemory, ListMutation,
-    ListMutationKind, ListProjection, ListProjectionKind, ListRowInitialField,
-    MaterializationLocalId, MaterializationResultKind, PossibleCause, ProducerFunctionArgument,
-    ProducerFunctionInstance, RowScope, ScopeId, SourceId, SourcePayloadDescriptor,
-    SourcePayloadField, SourcePayloadSchema, SourcePort, StateCell, StateId, StateUpdateArm,
-    TriggerOwnedArm, producer_identity_text,
+    FunctionId, InitialValue, ListId, ListInitialRecord, ListInitializer, ListInitializerInput,
+    ListMemory, ListMutation, ListMutationKind, ListProjection, ListProjectionKind,
+    ListRowInitialField, MaterializationLocalId, MaterializationResultKind, PossibleCause,
+    ProducerFunctionArgument, ProducerFunctionInstance, RowScope, ScopeId, SourceId,
+    SourcePayloadDescriptor, SourcePayloadField, SourcePayloadSchema, SourcePort, StateCell,
+    StateId, StateUpdateArm, TriggerOwnedArm, producer_identity_text,
 };
 use boon_semantic::{
     OutCallInstanceId, ProducerFunctionId, SemanticBindingId, SemanticBindingTargetV1,
@@ -48,7 +48,7 @@ use boon_semantic::{
 };
 use boon_typecheck::{
     CheckedExternalDeclarationIdentityV1, CheckedExternalDeclarationKind, CheckedParameterKind,
-    CheckedParameterRequirement, DeclId, FlowType,
+    CheckedParameterRequirement, DeclId, FlowMode, FlowType,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -215,6 +215,11 @@ pub(super) struct SemanticToExecutableMap {
     row_scopes: Vec<ScopeId>,
     value_list_authorities: Vec<()>,
     runtime_sources: BTreeMap<SemanticSourceId, SourceId>,
+    /// Exact event-valued external-read occurrences mapped to the distributed
+    /// ingress SOURCE allocated after the local semantic source domain.
+    external_event_sources: BTreeMap<SemanticExprId, SourceId>,
+    /// One canonical runtime path per distinct distributed ingress SOURCE.
+    external_event_source_paths: BTreeMap<SourceId, String>,
     runtime_states: BTreeMap<SemanticStateId, StateId>,
 }
 
@@ -435,6 +440,7 @@ pub(super) struct MappedSemanticDerivedValue {
     pub producer: ExecutableExprId,
     pub path: String,
     pub kind: DerivedValueKind,
+    pub state_backing: Option<StateId>,
     pub materialized_list_id: Option<ListId>,
     pub materialized_row_scope_id: Option<ScopeId>,
     pub causes: Vec<EventCause>,
@@ -575,6 +581,7 @@ pub(super) struct MappedSemanticHostEffectSchedule {
     pub owner: Option<StaticOwnerId>,
     pub operation: String,
     pub state_update_arms: Vec<StateUpdateArm>,
+    pub transient_result: Option<usize>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -988,9 +995,10 @@ impl MappedSemanticExecution {
 }
 
 impl SemanticToExecutableMap {
-    fn allocate(
+    fn allocate_with_external_events(
         graph: &SemanticExecutionGraphV1,
         resources: &SemanticResourceGraphV1,
+        external_event_identities: &[CheckedExternalDeclarationIdentityV1],
     ) -> Result<Self, String> {
         require_dense(
             graph.expressions.iter().map(|expression| expression.id.0),
@@ -1103,6 +1111,12 @@ impl SemanticToExecutableMap {
         let (call_instances, call_contexts) = allocate_call_identities(graph)?;
         let materialization_locals = allocate_materialization_locals(graph)?;
         let (runtime_sources, runtime_states) = allocate_runtime_resource_ids(graph, resources)?;
+        let (external_event_sources, external_event_source_paths) =
+            allocate_external_event_source_ids(
+                graph,
+                runtime_sources.len(),
+                external_event_identities,
+            )?;
 
         let allocated = Self {
             expressions,
@@ -1127,6 +1141,8 @@ impl SemanticToExecutableMap {
             row_scopes: (0..resources.row_scopes.len()).map(ScopeId).collect(),
             value_list_authorities: vec![(); resources.value_list_authorities.len()],
             runtime_sources,
+            external_event_sources,
+            external_event_source_paths,
             runtime_states,
         };
         allocated.validate_allocation_bijections()?;
@@ -1202,8 +1218,11 @@ impl SemanticToExecutableMap {
             "row scope",
         )?;
         require_unique_allocation(
-            self.runtime_sources.values().copied(),
-            self.runtime_sources.len(),
+            self.runtime_sources
+                .values()
+                .copied()
+                .chain(self.external_event_source_paths.keys().copied()),
+            self.runtime_sources.len() + self.external_event_source_paths.len(),
             "runtime source",
         )?;
         require_unique_allocation(
@@ -1379,6 +1398,17 @@ impl SemanticToExecutableMap {
             .get(&id)
             .copied()
             .ok_or_else(|| format!("semantic runtime source {id} has no executable mapping"))
+    }
+
+    fn external_event_source(&self, expression: SemanticExprId) -> Result<SourceId, String> {
+        self.external_event_sources
+            .get(&expression)
+            .copied()
+            .ok_or_else(|| {
+                format!(
+                    "semantic external event expression {expression} has no executable ingress SOURCE mapping"
+                )
+            })
     }
 
     fn runtime_state(&self, id: SemanticStateId) -> Result<StateId, String> {
@@ -1984,11 +2014,128 @@ fn allocate_runtime_resource_ids(
     Ok((runtime_sources, runtime_states))
 }
 
+fn allocate_external_event_source_ids(
+    graph: &SemanticExecutionGraphV1,
+    local_source_count: usize,
+    external_event_identities: &[CheckedExternalDeclarationIdentityV1],
+) -> Result<
+    (
+        BTreeMap<SemanticExprId, SourceId>,
+        BTreeMap<SourceId, String>,
+    ),
+    String,
+> {
+    let external_event_identities = external_event_identities
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let mut events_by_path =
+        BTreeMap::<String, (CheckedExternalDeclarationIdentityV1, Vec<SemanticExprId>)>::new();
+    for expression in &graph.expressions {
+        let SemanticExpressionKind::ExternalRead {
+            canonical_path,
+            external_identity,
+        } = &expression.kind
+        else {
+            continue;
+        };
+        if !matches!(
+            expression.flow_type.mode,
+            FlowMode::TickPresent | FlowMode::PresentOrAbsent
+        ) {
+            continue;
+        }
+        let Some(identity) = *external_identity else {
+            continue;
+        };
+        if !external_event_identities.contains(&identity) {
+            continue;
+        }
+        if identity.kind != CheckedExternalDeclarationKind::Value {
+            return Err(format!(
+                "event-valued semantic external read `{canonical_path}` expression {} carries a non-value declaration identity",
+                expression.id
+            ));
+        }
+        match events_by_path.entry(canonical_path.clone()) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert((identity, vec![expression.id]));
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                if entry.get().0 != identity {
+                    return Err(format!(
+                        "event-valued semantic external path `{canonical_path}` resolves to multiple sealed declaration identities"
+                    ));
+                }
+                entry.get_mut().1.push(expression.id);
+            }
+        }
+    }
+    let matched_identities = events_by_path
+        .values()
+        .map(|(identity, _)| *identity)
+        .collect::<BTreeSet<_>>();
+    if matched_identities != external_event_identities {
+        return Err(format!(
+            "semantic external-event SOURCE allocation matched identities {matched_identities:?}, expected {external_event_identities:?}"
+        ));
+    }
+
+    let mut by_expression = BTreeMap::new();
+    let mut paths = BTreeMap::new();
+    for (ordinal, (canonical_path, (_, expressions))) in events_by_path.into_iter().enumerate() {
+        let source = SourceId(
+            local_source_count
+                .checked_add(ordinal)
+                .ok_or_else(|| "distributed ingress SOURCE IDs exhausted".to_owned())?,
+        );
+        let runtime_path = crate::distributed_event_source_path(&canonical_path);
+        if paths.insert(source, runtime_path).is_some() {
+            return Err(format!(
+                "distributed ingress SOURCE {source} was allocated more than once"
+            ));
+        }
+        for expression in expressions {
+            if by_expression.insert(expression, source).is_some() {
+                return Err(format!(
+                    "event-valued semantic external expression {expression} was allocated more than once"
+                ));
+            }
+        }
+    }
+    Ok((by_expression, paths))
+}
+
+#[cfg(test)]
 pub(super) fn map_semantic_execution(
     graph: &SemanticExecutionGraphV1,
     resources: &SemanticResourceGraphV1,
 ) -> Result<MappedSemanticExecution, String> {
-    let id_map = SemanticToExecutableMap::allocate(graph, resources)?;
+    map_semantic_execution_with_external_events(graph, resources, &[])
+}
+
+pub(super) fn map_semantic_execution_with_reactive(
+    graph: &SemanticExecutionGraphV1,
+    resources: &SemanticResourceGraphV1,
+    reactive: &SemanticReactiveGraphV1,
+) -> Result<MappedSemanticExecution, String> {
+    map_semantic_execution_with_external_events(
+        graph,
+        resources,
+        &reactive.external_event_identities,
+    )
+}
+
+fn map_semantic_execution_with_external_events(
+    graph: &SemanticExecutionGraphV1,
+    resources: &SemanticResourceGraphV1,
+    external_event_identities: &[CheckedExternalDeclarationIdentityV1],
+) -> Result<MappedSemanticExecution, String> {
+    let id_map = SemanticToExecutableMap::allocate_with_external_events(
+        graph,
+        resources,
+        external_event_identities,
+    )?;
     let expressions = graph
         .expressions
         .iter()
@@ -2133,14 +2280,39 @@ pub(super) fn map_semantic_resources(
                 graph_clones_per_item: 0,
                 capacity: list.capacity,
                 initializer: map_list_initializer(ids, &list.initializer)?,
+                initializer_inputs: Vec::new(),
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
-    let sources = graph
+    let mut sources = graph
         .sources
         .iter()
         .map(|source| map_source_resource(execution, ids, source))
         .collect::<Result<Vec<_>, String>>()?;
+    for (source, path) in &ids.external_event_source_paths {
+        if source.as_usize() != sources.len() {
+            return Err(format!(
+                "distributed ingress SOURCE {source} is not dense after {} local/previous sources",
+                sources.len()
+            ));
+        }
+        sources.push(SourcePort {
+            id: *source,
+            path: path.clone(),
+            binding_path: path.clone(),
+            executable_source_id: None,
+            static_owner: None,
+            source_expr_id: None,
+            source_line: 0,
+            scoped: false,
+            scope_id: None,
+            interval_ms: None,
+            payload_schema: SourcePayloadSchema {
+                fields: Vec::new(),
+                typed_fields: Vec::new(),
+            },
+        });
+    }
     let state_cells = graph
         .states
         .iter()
@@ -2224,11 +2396,15 @@ impl MappedSemanticResources {
         let exact_lengths = [
             ("row scope", graph.row_scopes.len(), self.row_scopes.len()),
             ("list", graph.lists.len(), self.lists.len()),
-            ("source resource", graph.sources.len(), self.sources.len()),
+            (
+                "source resource plus distributed ingress",
+                graph.sources.len() + ids.external_event_source_paths.len(),
+                self.sources.len(),
+            ),
             ("state resource", graph.states.len(), self.state_cells.len()),
             (
                 "runtime source identity",
-                ids.runtime_sources.len(),
+                ids.runtime_sources.len() + ids.external_event_source_paths.len(),
                 self.sources.len(),
             ),
             (
@@ -2273,6 +2449,9 @@ impl MappedSemanticResources {
             }
         }
         for (index, source) in self.sources.iter().enumerate() {
+            if index >= graph.sources.len() {
+                break;
+            }
             let semantic = graph.sources.get(index).ok_or_else(|| {
                 format!("mapped source resource at index {index} has no semantic record")
             })?;
@@ -2284,6 +2463,26 @@ impl MappedSemanticResources {
                 return Err(format!(
                     "mapped source resource at index {index} emitted runtime ID {} and executable ID {:?}, expected {expected_runtime} and {expected_executable}",
                     source.id, source.executable_source_id
+                ));
+            }
+        }
+        for (source, path) in &ids.external_event_source_paths {
+            let mapped = self
+                .sources
+                .get(source.as_usize())
+                .filter(|candidate| candidate.id == *source)
+                .ok_or_else(|| {
+                    format!("distributed ingress SOURCE {source} has no mapped source resource")
+                })?;
+            if mapped.path != *path
+                || mapped.binding_path != *path
+                || mapped.executable_source_id.is_some()
+                || mapped.static_owner.is_some()
+                || mapped.scoped
+                || mapped.scope_id.is_some()
+            {
+                return Err(format!(
+                    "distributed ingress SOURCE {source} differs from its exact root-scoped runtime contract"
                 ));
             }
         }
@@ -2303,7 +2502,10 @@ impl MappedSemanticResources {
             }
         }
         require_exact_identity_set(
-            ids.runtime_sources.values().copied(),
+            ids.runtime_sources
+                .values()
+                .copied()
+                .chain(ids.external_event_source_paths.keys().copied()),
             self.sources.iter().map(|source| source.id),
             "runtime source",
         )?;
@@ -2486,6 +2688,7 @@ fn validate_reactive_dependency_closure(
                 .map(|state| semantic_state_resource(resource_graph, state))
                 .transpose()?
                 .is_some_and(|state| state.scoped),
+            SemanticEventCauseV1::ExternalRead(_) => false,
         };
         expected_edges.insert((trigger.cause, arm.state, target.scoped || cause_scoped));
         expected_causes
@@ -3333,6 +3536,9 @@ fn map_semantic_event_cause(
         SemanticEventCauseV1::Pulse(pulse) => {
             Ok(EventCause::Pulse(crate::PulseBatchId(pulse.as_usize())))
         }
+        SemanticEventCauseV1::ExternalRead(expression) => {
+            Ok(EventCause::Source(ids.external_event_source(expression)?))
+        }
     }
 }
 
@@ -3705,6 +3911,54 @@ fn map_reactive_derived_value(
         SemanticDerivedValueKindV1::Aggregate => DerivedValueKind::Aggregate,
         SemanticDerivedValueKindV1::Pure => DerivedValueKind::Pure,
     };
+    let state_backing = derived
+        .state_backing
+        .map(|state| context.ids.runtime_state(state))
+        .transpose()?;
+    if let Some(state) = state_backing {
+        if kind != DerivedValueKind::Pure || !causes.is_empty() || !mapped_triggers.is_empty() {
+            return Err(format!(
+                "semantic derived value {} has eventful scheduling for exact state backing {}",
+                derived.id, state.0
+            ));
+        }
+        let mapped_state = context
+            .resources
+            .state_cells
+            .get(state.as_usize())
+            .filter(|candidate| candidate.id == state)
+            .ok_or_else(|| {
+                format!(
+                    "semantic derived value {} maps to missing runtime state {}",
+                    derived.id, state.0
+                )
+            })?;
+        let [member] = expression.provenance.members.as_slice() else {
+            return Err(format!(
+                "semantic derived value {} state backing has non-exact value provenance",
+                derived.id
+            ));
+        };
+        let boon_semantic::SemanticValueOrigin::State {
+            state: semantic_state,
+            owner,
+        } = &member.origin
+        else {
+            return Err(format!(
+                "semantic derived value {} state backing is not state provenance",
+                derived.id
+            ));
+        };
+        if !member.path.is_empty()
+            || context.ids.runtime_state(*semantic_state)? != state
+            || *owner != mapped_state.static_owner
+        {
+            return Err(format!(
+                "semantic derived value {} has stale exact state backing provenance",
+                derived.id
+            ));
+        }
+    }
     // A materialized list field carries its target row identity so storage can
     // own the list's row fields.  That does not make the list-producing
     // operation row-indexed: the operation computes the whole list and writes
@@ -3735,6 +3989,7 @@ fn map_reactive_derived_value(
         producer,
         path: field.path.clone(),
         kind,
+        state_backing,
         materialized_list_id,
         materialized_row_scope_id,
         causes,
@@ -4555,6 +4810,253 @@ pub(super) fn map_semantic_storage_join(
     };
     mapped.validate_totality(storage_graph, reactive_graph, resources, ids)?;
     Ok(mapped)
+}
+
+fn storage_field_is_runtime_row_value(
+    storage: &MappedSemanticStorage,
+    field: &ErasedFieldDef,
+) -> bool {
+    !field.resource_only
+        && !storage.bindings.iter().any(|binding| {
+            (matches!(binding.target, ErasedBindingTarget::Source { .. })
+                && field.producer == Some(binding.producer))
+                || (matches!(
+                    binding.target,
+                    ErasedBindingTarget::Value {
+                        field: None,
+                        row: Some(row),
+                    } if Some(row) == field.row
+                ) && field.producer == Some(binding.producer)
+                    && field.declaration == Some(binding.declaration))
+                || (matches!(
+                    binding.target,
+                    ErasedBindingTarget::State {
+                        field: Some(authority),
+                        row: Some(row),
+                        ..
+                    } if Some(row) == field.row && authority != field.id
+                ) && field.producer == Some(binding.producer)
+                    && field.declaration == Some(binding.declaration))
+        })
+}
+
+fn mapped_row_field_depth(storage: &MappedSemanticStorage, field: &ErasedFieldDef) -> usize {
+    let Some(row) = field.row else {
+        return usize::MAX;
+    };
+    let mut depth = 0usize;
+    let mut parent = field.parent;
+    let mut remaining = storage.fields.len().saturating_add(1);
+    while let Some(parent_id) = parent {
+        if remaining == 0 {
+            return usize::MAX;
+        }
+        remaining -= 1;
+        let Some(parent_field) = storage
+            .fields
+            .get(parent_id.as_usize())
+            .filter(|candidate| candidate.id == parent_id)
+        else {
+            return usize::MAX;
+        };
+        if parent_field.row != Some(row) {
+            break;
+        }
+        depth = depth.saturating_add(1);
+        parent = parent_field.parent;
+    }
+    depth
+}
+
+fn initializer_required_input_names(initializer: &ListInitializer) -> BTreeSet<String> {
+    let ListInitializer::RecordLiteral { rows } = initializer else {
+        return BTreeSet::new();
+    };
+    let mut names = BTreeSet::new();
+    for row in rows {
+        for field in &row.fields {
+            if field.value == InitialValue::ResourceOnly {
+                continue;
+            }
+            names.insert(field.name.clone());
+            if let InitialValue::RowInitialField { path } = &field.value
+                && let Some(root) = path.split('.').next().filter(|root| !root.is_empty())
+            {
+                names.insert(root.to_owned());
+            }
+        }
+    }
+    names
+}
+
+fn bind_list_initializer_inputs(
+    lists: &mut [ListMemory],
+    storage: &MappedSemanticStorage,
+) -> Result<(), String> {
+    for list in lists {
+        let Some(scope) = list.row_scope_id else {
+            if matches!(
+                list.initializer,
+                ListInitializer::RecordLiteral { ref rows } if !rows.is_empty()
+            ) {
+                return Err(format!(
+                    "list `{}` has record initial rows without an exact row scope",
+                    list.name
+                ));
+            }
+            continue;
+        };
+        let row = ErasedRowBinding {
+            list: list.id,
+            scope,
+        };
+        let required = initializer_required_input_names(&list.initializer);
+        let mut names = required.clone();
+        names.extend(
+            storage
+                .fields
+                .iter()
+                .filter(|field| field.row == Some(row) && field.row_path.len() == 1)
+                .map(|field| field.row_path[0].clone()),
+        );
+        for local in storage.locals.iter().filter(|local| local.row == Some(row)) {
+            names.extend(
+                local
+                    .members
+                    .iter()
+                    .filter(|member| {
+                        member.path.len() == 1
+                            && matches!(member.target, ErasedLocalMemberTarget::Field(_))
+                    })
+                    .map(|member| member.path[0].clone()),
+            );
+            names.extend(
+                local
+                    .captures
+                    .iter()
+                    .filter(|capture| capture.projection.len() == 1)
+                    .map(|capture| capture.projection[0].clone()),
+            );
+        }
+
+        let mut inputs = Vec::new();
+        for name in names {
+            let source_path = [name.clone()];
+            let constructor_candidates = storage
+                .fields
+                .iter()
+                .filter(|field| {
+                    field.row == Some(row)
+                        && field.role == ErasedFieldRole::ListAuthority
+                        && field.row_path == source_path
+                })
+                .map(|field| field.id)
+                .collect::<BTreeSet<_>>();
+            let direct = match constructor_candidates.len() {
+                0 => storage
+                    .fields
+                    .iter()
+                    .filter(|field| {
+                        field.row == Some(row)
+                            && field.name == name
+                            && field.row_path == source_path
+                            && storage_field_is_runtime_row_value(storage, field)
+                    })
+                    .min_by_key(|field| {
+                        let role_priority = match field.role {
+                            ErasedFieldRole::Value => 0,
+                            ErasedFieldRole::ValueAuthority => 1,
+                            ErasedFieldRole::ListAuthority => 2,
+                            ErasedFieldRole::Capture => 3,
+                        };
+                        (
+                            role_priority,
+                            mapped_row_field_depth(storage, field),
+                            field.id,
+                        )
+                    })
+                    .map(|field| field.id),
+                1 => constructor_candidates.iter().next().copied(),
+                count => {
+                    return Err(format!(
+                        "list `{}` initializer input `{name}` resolves to {count} constructor authority fields: {constructor_candidates:?}",
+                        list.name
+                    ));
+                }
+            };
+            let field = if let Some(field) = direct {
+                Some(field)
+            } else {
+                let mut forwarded = BTreeSet::new();
+                for local in storage.locals.iter().filter(|local| local.row == Some(row)) {
+                    for member in local
+                        .members
+                        .iter()
+                        .filter(|member| member.path == source_path)
+                    {
+                        let ErasedLocalMemberTarget::Field(field) = member.target else {
+                            continue;
+                        };
+                        let Some(ErasedLocalMemberForwarding::Row {
+                            row: forwarded_row,
+                            path: forwarded_path,
+                        }) = member.forwarded_from.as_ref()
+                        else {
+                            continue;
+                        };
+                        let target = storage.fields.get(field.as_usize()).filter(|candidate| {
+                            candidate.id == field
+                                && candidate.row == Some(row)
+                                && candidate.row_path == *forwarded_path
+                                && *forwarded_row == row
+                                && storage_field_is_runtime_row_value(storage, candidate)
+                        });
+                        if target.is_some() {
+                            forwarded.insert(field);
+                        }
+                    }
+                    for capture in local
+                        .captures
+                        .iter()
+                        .filter(|capture| capture.projection == source_path)
+                    {
+                        let field = capture.field;
+                        let target = storage.fields.get(field.as_usize()).filter(|candidate| {
+                            candidate.id == field
+                                && candidate.row == Some(row)
+                                && candidate.role == ErasedFieldRole::Capture
+                                && storage_field_is_runtime_row_value(storage, candidate)
+                        });
+                        if target.is_some() {
+                            forwarded.insert(field);
+                        }
+                    }
+                }
+                match forwarded.len() {
+                    0 => None,
+                    1 => forwarded.iter().next().copied(),
+                    count => {
+                        return Err(format!(
+                            "list `{}` initializer input `{name}` resolves to {count} exact forwarded fields: {forwarded:?}",
+                            list.name
+                        ));
+                    }
+                }
+            };
+            match field {
+                Some(field) => inputs.push(ListInitializerInput { name, field }),
+                None if required.contains(&name) => {
+                    return Err(format!(
+                        "list `{}` initializer input `{name}` has no exact semantic storage field",
+                        list.name
+                    ));
+                }
+                None => {}
+            }
+        }
+        list.initializer_inputs = inputs;
+    }
+    Ok(())
 }
 
 impl SemanticStorageToErasedMap {
@@ -6382,6 +6884,27 @@ fn map_storage_representation(
     Ok(mapped)
 }
 
+fn map_named_value_storage_representation(
+    target: &SemanticNamedValueStorageTargetV1,
+    semantic: &boon_semantic::SemanticStorageRepresentationV1,
+    storage_type: &boon_typecheck::Type,
+    contract_type: &boon_typecheck::Type,
+) -> Result<MappedSemanticStorageRepresentation, String> {
+    if matches!(
+        target,
+        SemanticNamedValueStorageTargetV1::DiagnosticOnly { .. }
+    ) {
+        let mapped = map_storage_representation_shape(semantic)?;
+        if mapped != MappedSemanticStorageRepresentation::Exact {
+            return Err(
+                "diagnostic-only named value has a non-exact storage representation".to_owned(),
+            );
+        }
+        return Ok(mapped);
+    }
+    map_storage_representation(semantic, storage_type, contract_type)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn map_storage_named_values(
     execution: &SemanticExecutionGraphV1,
@@ -6457,9 +6980,15 @@ fn map_storage_named_values(
                 value.named_value, value.origin_ordinal
             ));
         }
-        let mut storage_type =
-            named_value_storage_flow_type(execution, resources, reactive, storage, &value.target)?
-                .ty;
+        let public_storage_flow =
+            named_value_storage_flow_type(execution, resources, reactive, storage, &value.target)?;
+        let mut storage_type = mapped_named_value_storable_root_flow(
+            execution,
+            storage,
+            &value.target,
+            &public_storage_flow,
+        )?
+        .ty;
         let mut parent_field = named_value_target_storage_field(&value.target);
         for (ordinal, step) in value.projection.iter().enumerate() {
             if step.ordinal != ordinal || step.input_type != storage_type {
@@ -6554,8 +7083,22 @@ fn map_storage_named_values(
             storage_type = step.output_type.clone();
             parent_field = step.storage_field;
         }
-        let representation =
-            map_storage_representation(&value.representation, &storage_type, &value.flow_type.ty)?;
+        let representation = map_named_value_storage_representation(
+            &value.target,
+            &value.representation,
+            &storage_type,
+            &value.flow_type.ty,
+        )
+        .map_err(|error| {
+            format!(
+                "named value {} `{}` origin {} target {} {:?}: {error}",
+                value.named_value,
+                named.diagnostic_path,
+                value.origin_ordinal,
+                value.target_ordinal,
+                value.target
+            )
+        })?;
         let projection = value
             .projection
             .iter()
@@ -6665,6 +7208,52 @@ fn map_storage_named_values(
         }
     }
     Ok(mapped)
+}
+
+fn mapped_named_value_storable_root_flow(
+    execution: &SemanticExecutionGraphV1,
+    storage: &SemanticScopeStorageGraphV1,
+    target: &SemanticNamedValueStorageTargetV1,
+    public_root_flow: &boon_typecheck::FlowType,
+) -> Result<boon_typecheck::FlowType, String> {
+    let storage_field = named_value_target_storage_field(target);
+    let mut expression = match storage_field {
+        Some(field) => {
+            storage
+                .fields
+                .get(field.as_usize())
+                .filter(|candidate| candidate.id == field)
+                .ok_or_else(|| {
+                    format!("named-value target references missing storage field {field}")
+                })?
+                .producer
+        }
+        None => match target {
+            SemanticNamedValueStorageTargetV1::Value { expression, .. } => Some(*expression),
+            SemanticNamedValueStorageTargetV1::Field { .. }
+            | SemanticNamedValueStorageTargetV1::List { .. }
+            | SemanticNamedValueStorageTargetV1::State { .. }
+            | SemanticNamedValueStorageTargetV1::Source { .. }
+            | SemanticNamedValueStorageTargetV1::DiagnosticOnly { .. } => None,
+        },
+    };
+    let mut consumed = false;
+    while let Some(current) = expression {
+        let value = semantic_execution_expression(execution, current)?;
+        let SemanticExpressionKind::FlushBoundary { input } = value.kind else {
+            break;
+        };
+        expression = Some(input);
+        consumed = true;
+    }
+    if !consumed {
+        return Ok(public_root_flow.clone());
+    }
+    let input =
+        expression.ok_or_else(|| "FLUSH boundary storage has no ordinary input".to_owned())?;
+    Ok(semantic_execution_expression(execution, input)?
+        .flow_type
+        .clone())
 }
 
 fn finalize_trigger_arm(trigger: &MappedSemanticTriggerArm) -> TriggerOwnedArm {
@@ -6894,6 +7483,22 @@ fn finalize_host_effect_schedules(
                     })
                 })
                 .collect::<Result<Vec<_>, String>>()?;
+            let transient_result = schedule
+                .transient_result
+                .map(|derived| {
+                    reactive
+                        .id_map
+                        .derived_values
+                        .get(derived.as_usize())
+                        .copied()
+                        .ok_or_else(|| {
+                            format!(
+                                "semantic host-effect schedule {} references missing staged transient derived value {derived}",
+                                schedule.id
+                            )
+                        })
+                })
+                .transpose()?;
             Ok(MappedSemanticHostEffectSchedule {
                 id: allocated,
                 expression,
@@ -6903,6 +7508,7 @@ fn finalize_host_effect_schedules(
                 owner: schedule.owner,
                 operation: schedule.operation.clone(),
                 state_update_arms: mapped_arms,
+                transient_result,
             })
         })
         .collect()
@@ -7060,6 +7666,7 @@ fn finalize_derived_values(
                 producer: mapped.producer,
                 path: mapped.path.clone(),
                 kind: mapped.kind.clone(),
+                state_backing: mapped.state_backing,
                 materialized_list_id: mapped.materialized_list_id,
                 materialized_row_scope_id: mapped.materialized_row_scope_id,
                 causes: mapped.causes.clone(),
@@ -7483,6 +8090,21 @@ impl MappedSemanticStorage {
                         })
                 })
                 .collect::<Result<Vec<_>, String>>()?;
+            let expected_transient = semantic
+                .transient_result
+                .map(|derived| {
+                    self
+                        .derived_values
+                        .get(derived.as_usize())
+                        .map(|_| derived.as_usize())
+                        .ok_or_else(|| {
+                            format!(
+                                "semantic host-effect schedule {} references missing transient derived value {derived}",
+                                semantic.id
+                            )
+                        })
+                })
+                .transpose()?;
             if semantic.id.as_usize() != index
                 || mapped.id != index
                 || mapped.expression != expected_expression
@@ -7492,6 +8114,7 @@ impl MappedSemanticStorage {
                 || mapped.owner != semantic.owner
                 || mapped.operation != semantic.operation
                 || mapped.state_update_arms != expected_arms
+                || mapped.transient_result != expected_transient
             {
                 return Err(format!(
                     "mapped host-effect schedule {} differs from its exact final-ID join",
@@ -8068,10 +8691,12 @@ fn map_expression_kind(
             owner,
             local,
             projection,
+            constructor_projection,
         } => ExecutableExpressionKind::MaterializationLocal {
             owner: *owner,
             local: ids.materialization_local(*owner, *local)?,
             projection: projection.clone(),
+            constructor_projection: constructor_projection.clone(),
         },
         SemanticExpressionKind::FunctionParameter {
             parameter,
@@ -9575,6 +10200,7 @@ pub(super) fn finish_verified_semantic_lowering(
     mapped: MappedSemanticExecution,
     resources: MappedSemanticResources,
 ) -> Result<crate::ErasedProgramFields, String> {
+    let mut resources = resources;
     let reactive = map_semantic_reactive(
         execution_graph,
         resource_graph,
@@ -9592,6 +10218,7 @@ pub(super) fn finish_verified_semantic_lowering(
         &resources,
         &reactive,
     )?;
+    bind_list_initializer_inputs(&mut resources.lists, &storage)?;
     if mapped.static_owners.len() != storage.owners.len()
         || mapped
             .static_owners
@@ -9649,6 +10276,18 @@ pub(super) fn finish_verified_semantic_lowering(
         &storage,
         pulse_fusion_decisions,
     )?;
+    let external_storage_sources = mapped
+        .id_map
+        .external_event_source_paths
+        .keys()
+        .copied()
+        .map(|source| ErasedSourceDef {
+            source,
+            static_owner: None,
+            owner_ancestry: Vec::new(),
+            origin: ErasedSourceOrigin::DistributedImport,
+        })
+        .collect::<Vec<_>>();
 
     let MappedSemanticExecution {
         executable,
@@ -9668,17 +10307,28 @@ pub(super) fn finish_verified_semantic_lowering(
         locals,
         fields,
         bindings,
-        sources: storage_sources,
+        sources: mut storage_sources,
         row_values,
         row_source_projections,
         producer_function_instances,
         derived_values,
         state_update_arms: finalized_state_transitions,
+        host_effect_schedules,
         list_mutations,
         dependencies,
         possible_causes,
         ..
     } = storage;
+    for source in external_storage_sources {
+        if source.source.as_usize() != storage_sources.len() {
+            return Err(format!(
+                "distributed ingress source {} is not dense after {} local/previous source definitions",
+                source.source,
+                storage_sources.len()
+            ));
+        }
+        storage_sources.push(source);
+    }
     let graph_node_count = executable.expressions.len();
 
     Ok(crate::ErasedProgramFields {
@@ -9715,6 +10365,18 @@ pub(super) fn finish_verified_semantic_lowering(
         dependencies,
         possible_causes,
         state_update_arms: finalized_state_transitions,
+        host_effect_schedules: host_effect_schedules
+            .into_iter()
+            .map(|schedule| crate::HostEffectSchedule {
+                id: schedule.id,
+                expression: schedule.expression,
+                checked_expression: schedule.checked_expression,
+                owner: schedule.owner,
+                operation: schedule.operation,
+                state_update_arms: schedule.state_update_arms,
+                transient_result: schedule.transient_result,
+            })
+            .collect(),
         list_mutations,
         list_projections,
         materializations,
@@ -9800,10 +10462,28 @@ fn map_distributed_references(
                         reference.id
                     ));
                 }
+                let mut local_alias_paths = storage
+                    .bindings
+                    .iter()
+                    .filter(|binding| {
+                        binding.producer == expression
+                            && binding.flow_type == executable.flow_type
+                            && matches!(
+                                binding.target,
+                                crate::ErasedBindingTarget::Value {
+                                    field: Some(_),
+                                    row: None,
+                                }
+                            )
+                    })
+                    .map(|binding| binding.diagnostic_path.clone())
+                    .collect::<Vec<_>>();
+                local_alias_paths.sort();
+                local_alias_paths.dedup();
                 value_references.push(crate::DistributedValueReference {
                     expr_id: ExprId(executable.checked_expr_id.0 as usize),
                     canonical_path: reference.canonical_path.clone(),
-                    local_alias_paths: Vec::new(),
+                    local_alias_paths,
                     producer_role,
                     flow_mode: executable.flow_type.mode,
                     value_type: executable.flow_type.ty.clone(),
@@ -10226,7 +10906,7 @@ fn map_view_bindings(
                         binding.id, binding.node
                     )
                 })?;
-            graph
+            let argument = graph
                 .arguments
                 .get(binding.argument.as_usize())
                 .filter(|candidate| candidate.id == binding.argument)
@@ -10266,6 +10946,8 @@ fn map_view_bindings(
             };
             Ok(crate::ViewBinding {
                 id: crate::ViewBindingId(index),
+                node_expression: ids.expression(node.expression)?,
+                argument_expression: ids.expression(argument.expression)?,
                 node_kind: node.diagnostic_kind.clone(),
                 attr: binding.canonical_attribute.clone(),
                 path,
@@ -11433,6 +12115,41 @@ mod tests {
     }
 
     #[test]
+    fn diagnostic_only_named_value_preserves_checked_contract_without_runtime_storage() {
+        let diagnostic = SemanticNamedValueStorageTargetV1::DiagnosticOnly {
+            reason:
+                boon_semantic::SemanticNamedValueDiagnosticOnlyReasonV1::NonExecutableCheckedLeaf,
+        };
+        assert_eq!(
+            map_named_value_storage_representation(
+                &diagnostic,
+                &boon_semantic::SemanticStorageRepresentationV1::Exact,
+                &boon_typecheck::Type::Unknown,
+                &boon_typecheck::Type::Text,
+            )
+            .expect("diagnostic-only checked contract has no fabricated runtime representation"),
+            MappedSemanticStorageRepresentation::Exact
+        );
+
+        let executable = SemanticNamedValueStorageTargetV1::Value {
+            expression: SemanticExprId(0),
+            value: SemanticValueId(0),
+            field: None,
+        };
+        let error = map_named_value_storage_representation(
+            &executable,
+            &boon_semantic::SemanticStorageRepresentationV1::Exact,
+            &boon_typecheck::Type::Unknown,
+            &boon_typecheck::Type::Text,
+        )
+        .expect_err("an executable value cannot pretend unknown storage exactly preserves Text");
+        assert!(
+            error.contains("does not exactly preserve contract"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn non_dense_semantic_resource_identity_has_no_executable_mapping() {
         let parsed = boon_parser::parse_source(
             "semantic-resource-mapping-invalid.bn",
@@ -12238,6 +12955,7 @@ result: rows |> List/map(item, new: item.value + 1)
             owner,
             local: SemanticMaterializationLocalId(1),
             projection: Vec::new(),
+            constructor_projection: Vec::new(),
         };
         let error = map_semantic_execution(&dangling, semantic.resource_graph()).unwrap_err();
         assert!(error.contains("referenced without a definition"), "{error}");

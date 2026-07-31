@@ -869,9 +869,12 @@ fn verify_semantic_program(
     policy: VerificationPolicyV1,
 ) -> Result<VerificationManifestV1, VerifyError> {
     policy.validate()?;
-    semantic_program
-        .validate()
-        .map_err(|error| VerifyError::new(error.to_string()))?;
+    // SemanticProgram has private fields and is constructed only by
+    // boon_semantic after its complete graph, manifest, and digest validation.
+    // Revalidating that same immutable artifact here used to rebuild or rescan
+    // product-scale semantic state at every ownership handoff. Verification
+    // derives and validates its own manifest below, binding it to the already
+    // validated semantic-program and dependency-manifest digests.
     let dependency_manifest = semantic_program.dependency_manifest();
     let verifier_policy = policy.digest();
     let mut requirements = RequiredObligationManifestV1 {

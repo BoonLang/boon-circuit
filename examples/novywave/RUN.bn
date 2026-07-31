@@ -78,7 +78,8 @@ store: [
         }
 
     real_hierarchy_page_result:
-        NotStarted |> HOLD real_hierarchy_page_result {
+        LATEST {
+            NotStarted
             real_waveform_open_result |> WHEN {
                 WaveformOpened => Wellen/hierarchy_page(
                     artifact: real_waveform_open_result.artifact
@@ -162,9 +163,11 @@ store: [
 
     real_signal_page_request:
         LATEST {
-            real_hierarchy_page_result |> WHEN {
-                HierarchyPage => real_signal_page_request_fingerprint
-                __ => SKIP
+            real_hierarchy_page_result |> THEN {
+                real_hierarchy_page_result |> WHEN {
+                    HierarchyPage => real_signal_page_request_fingerprint
+                    __ => SKIP
+                }
             }
             row_selected_signal_key |> THEN { real_signal_page_request_fingerprint }
             elements.zoom_in |> THEN { real_signal_page_request_fingerprint }
@@ -192,7 +195,8 @@ store: [
         }
 
     real_signal_page_result:
-        NotStarted |> HOLD real_signal_page_result {
+        LATEST {
+            NotStarted
             real_signal_page_request |> THEN {
                 real_hierarchy_page_result |> WHEN {
                     HierarchyPage =>
@@ -240,15 +244,18 @@ store: [
 
     real_cursor_values_request:
         LATEST {
-            real_signal_page_result |> WHEN {
-                SignalPage => real_cursor_request_fingerprint
-                __ => SKIP
+            real_signal_page_result |> THEN {
+                real_signal_page_result |> WHEN {
+                    SignalPage => real_cursor_request_fingerprint
+                    __ => SKIP
+                }
             }
             selected_timeline_cursor_update |> THEN { real_cursor_request_fingerprint }
         }
 
     real_cursor_values_result:
-        NotStarted |> HOLD real_cursor_values_result {
+        LATEST {
+            NotStarted
             real_cursor_values_request |> THEN {
                 real_signal_page_result |> WHEN {
                     SignalPage => real_signal_page_result.request_fingerprint == real_signal_page_request_fingerprint |> WHEN {
@@ -304,7 +311,8 @@ store: [
         }
 
     comparison_hierarchy_page_result:
-        NotStarted |> HOLD comparison_hierarchy_page_result {
+        LATEST {
+            NotStarted
             comparison_waveform_open_result |> WHEN {
                 WaveformOpened => Wellen/hierarchy_page(
                     artifact: comparison_waveform_open_result.artifact
@@ -342,9 +350,11 @@ store: [
 
     comparison_signal_page_request:
         LATEST {
-            comparison_hierarchy_page_result |> WHEN {
-                HierarchyPage => comparison_signal_page_request_fingerprint
-                __ => SKIP
+            comparison_hierarchy_page_result |> THEN {
+                comparison_hierarchy_page_result |> WHEN {
+                    HierarchyPage => comparison_signal_page_request_fingerprint
+                    __ => SKIP
+                }
             }
             elements.zoom_in |> THEN { comparison_signal_page_request_fingerprint }
             elements.zoom_out |> THEN { comparison_signal_page_request_fingerprint }
@@ -362,7 +372,8 @@ store: [
         }
 
     comparison_signal_page_result:
-        NotStarted |> HOLD comparison_signal_page_result {
+        LATEST {
+            NotStarted
             comparison_signal_page_request |> THEN {
                 comparison_waveform_mode |> WHILE {
                     Active => comparison_hierarchy_page_result |> WHEN {
@@ -390,7 +401,8 @@ store: [
         |> Text/concat(with: real_cursor_time_tick, separator: "|cursor:")
 
     comparison_cursor_values_result:
-        NotStarted |> HOLD comparison_cursor_values_result {
+        LATEST {
+            NotStarted
             LATEST {
                 comparison_signal_page_result |> WHEN {
                     SignalPage => Wellen/cursor_values(
@@ -1613,7 +1625,7 @@ store: [
             source: TEXT { Wellen/signal_page }
             primary_fingerprint: real_signal_page_request_fingerprint
             comparison_fingerprint: comparison_signal_page_request_fingerprint
-            comparison_transition_count: comparison_transition_count
+            comparison_transition_count: store.comparison_transition_count
         ]
 
     bridge_file_format:
@@ -3252,8 +3264,8 @@ store: [
             LATEST {
                 elements.select_data |> THEN {
                     data_signal_toggle_state |> WHEN {
-                        On => TEXT { Off }
-                        Off => TEXT { On }
+                        TEXT { On } => TEXT { Off }
+                        TEXT { Off } => TEXT { On }
                         __ => TEXT { On }
                     }
                 }
@@ -3781,8 +3793,8 @@ store: [
                 elements.select_reset |> THEN { TEXT { B_FIT } }
                 elements.select_data |> THEN {
                     data_signal_toggle_state |> WHEN {
-                        On => TEXT { DATA_FIT }
-                        Off => TEXT { NONE }
+                        TEXT { On } => TEXT { DATA_FIT }
+                        TEXT { Off } => TEXT { NONE }
                     }
                 }
                 elements.select_temperature |> THEN { TEXT { TEMP_FIT } }

@@ -11,8 +11,13 @@ use boon_typecheck::{
     TypeDisplayNode,
 };
 use futures::channel::mpsc;
+use serde::{Deserialize, Serialize};
 
-use crate::protocol::SourceUnit;
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SourceUnit {
+    pub path: String,
+    pub source: String,
+}
 
 const ANALYSIS_QUIET: Duration = Duration::from_millis(90);
 
@@ -1068,7 +1073,7 @@ shown: render(value: mapped, PASS: [store: [count: 1]])
             .find(|item| item.kind == SemanticKind::FreshOut && item.name == "entry")
             .expect("outer call creates entry");
         assert!(
-            fresh.label.contains("supplied by RUN/doubled"),
+            fresh.label.contains("supplied by doubled"),
             "{}",
             fresh.label
         );
@@ -1131,11 +1136,11 @@ shown: render(value: mapped, PASS: [store: [count: 1]])
             snapshot
                 .definition_at(pass.location.start)
                 .map(|item| item.name.as_str()),
-            Some("RUN/render")
+            Some("render")
         );
         assert!(snapshot.semantics.iter().any(|item| {
             item.kind == SemanticKind::Call
-                && item.name == "RUN/render"
+                && item.name == "render"
                 && item.detail.contains("with explicit PASS")
         }));
     }
@@ -1164,7 +1169,7 @@ result: wrapper(PASS: [store: [count: 1]])
             .iter()
             .find(|item| {
                 item.kind == SemanticKind::Call
-                    && item.name.ends_with("/leaf")
+                    && item.name == "leaf"
                     && item.detail.contains("with inherited PASS")
             })
             .expect("nested requiring call exposes inherited PASS in hover");

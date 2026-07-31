@@ -148,6 +148,58 @@ store: [
 }
 
 #[test]
+fn transformed_tag_match_does_not_retype_its_source_payload_input() {
+    let parsed = boon_parser::parse_source(
+        "transformed-source-payload-match.bn",
+        r#"
+store: [
+    pointer: SOURCE
+    width:
+        1 |> HOLD width {
+            pointer.pointer_width |> THEN {
+                pointer.pointer_width |> Text/to_number() |> WHEN {
+                    Parsed[value] => value
+                    InvalidNumber[reason, position] => width
+                }
+            }
+        }
+    projected:
+        pointer.pointer_x |> THEN {
+            Number/project_time(
+                pointer_x: pointer.pointer_x
+                pointer_width: pointer.pointer_width
+                viewport_start: 0
+                viewport_end: 100
+                fallback: 0
+            )
+        }
+]
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+    assert!(
+        !output.report.has_errors(),
+        "diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+    let payload = output
+        .report
+        .source_payload_shape_table
+        .iter()
+        .find(|entry| entry.diagnostic_path == "store.pointer")
+        .expect("pointer payload");
+    assert_eq!(
+        payload
+            .fields
+            .iter()
+            .find(|field| field.name == "pointer_width")
+            .map(|field| &field.ty),
+        Some(&Type::Text)
+    );
+}
+
+#[test]
 fn latest_preserves_merged_source_event_flow_for_one_host_effect() {
     let parsed = boon_parser::parse_source(
         "merged-file-effect.bn",

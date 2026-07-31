@@ -28,7 +28,7 @@ pub use storage_contract::*;
 pub use view_contract::*;
 
 use boon_contract::SourceBundleDigestV1;
-use boon_typecheck::{CheckedProgram, DeclId};
+use boon_typecheck::{CheckedExternalDeclarationIdentityV1, CheckedProgram, DeclId};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -715,6 +715,12 @@ pub enum BundleSemanticValueDeliveryV1 {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         payload_projection: Vec<String>,
     },
+    RelayedEvent {
+        read: SemanticExprId,
+        external_identity: boon_typecheck::CheckedExternalDeclarationIdentityV1,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        payload_projection: Vec<String>,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -914,18 +920,10 @@ impl SemanticProgram {
         )
         .map_err(SemanticError::new)?;
         self.dependency_manifest
-            .validate_against(
+            .validate_integrity(
                 DEPENDENCY_CLASSIFIER_SCHEMA_DIGEST_V1,
                 &self.checked_program,
-                &self.producer_materializations,
-                &self.resolved_out_graph,
                 &self.execution_graph,
-                &self.resource_graph,
-                &self.reactive_graph,
-                &self.lowering_contract,
-                &self.view_binding_graph,
-                &self.scope_storage_graph,
-                &self.memory_graph,
             )
             .map_err(|error| SemanticError::new(error.to_string()))?;
         let expected = semantic_program_digest(self)?;
@@ -1172,7 +1170,8 @@ fn bundle_value_route_scope(
         }
         (boon_typecheck::ProgramRole::Session, boon_typecheck::ProgramRole::Server) => {
             Ok(match delivery {
-                BundleSemanticValueDeliveryV1::Event { .. } => {
+                BundleSemanticValueDeliveryV1::Event { .. }
+                | BundleSemanticValueDeliveryV1::RelayedEvent { .. } => {
                     BundleSemanticRouteScopeV1::OriginScoped
                 }
                 BundleSemanticValueDeliveryV1::Current if producer_origin_scoped => {
@@ -1517,6 +1516,18 @@ fn append_bundle_event_projection(
                 payload_projection,
             }
         }
+        BundleSemanticValueDeliveryV1::RelayedEvent {
+            read,
+            external_identity,
+            mut payload_projection,
+        } => {
+            payload_projection.extend_from_slice(projection);
+            BundleSemanticValueDeliveryV1::RelayedEvent {
+                read,
+                external_identity,
+                payload_projection,
+            }
+        }
     }
 }
 
@@ -1660,12 +1671,20 @@ fn exact_bundle_value_delivery(
                 output: Some(output),
                 ..
             } => resolve(program, *output, visited)?,
-            SemanticExpressionKind::ExternalRead { canonical_path, .. }
-                if expression.flow_type.mode != boon_typecheck::FlowMode::Continuous =>
-            {
-                return Err(SemanticError::new(format!(
-                    "event-valued semantic alias `{canonical_path}` has no exact local source identity"
-                )));
+            SemanticExpressionKind::ExternalRead {
+                canonical_path,
+                external_identity,
+            } if expression.flow_type.mode != boon_typecheck::FlowMode::Continuous => {
+                let external_identity = external_identity.ok_or_else(|| {
+                    SemanticError::new(format!(
+                        "event-valued semantic alias `{canonical_path}` has no sealed declaration identity"
+                    ))
+                })?;
+                BundleSemanticValueDeliveryV1::RelayedEvent {
+                    read: expression_id,
+                    external_identity,
+                    payload_projection: Vec::new(),
+                }
             }
             _ => {
                 let direct_source_members = expression
@@ -1864,6 +1883,56 @@ type BundleSemanticClosureV1 = (
     Vec<BundleSemanticCallCrossingV1>,
     Vec<BundleSemanticValueCrossingV1>,
 );
+
+fn exact_bundle_producer_expression(
+    producer: &SemanticProgram,
+    declaration: DeclId,
+    canonical_path: &str,
+) -> Result<SemanticExprId, SemanticError> {
+    let candidates = producer
+        .reactive_graph()
+        .bindings
+        .iter()
+        .filter(|binding| binding.declaration == declaration && binding.call_instance.is_none())
+        .map(|binding| {
+            let priority = match binding.target {
+                SemanticBindingTargetV1::State { .. } | SemanticBindingTargetV1::List { .. } => {
+                    0_u8
+                }
+                SemanticBindingTargetV1::Field { .. } => 1,
+                SemanticBindingTargetV1::Source { .. } => 2,
+            };
+            (priority, binding.producer)
+        })
+        .collect::<Vec<_>>();
+    let Some(priority) = candidates.iter().map(|(priority, _)| *priority).min() else {
+        return Err(SemanticError::new(format!(
+            "external value read `{canonical_path}` target declaration {} has no root semantic binding",
+            declaration.0
+        )));
+    };
+    let producers = candidates
+        .into_iter()
+        .filter(|(candidate, _)| *candidate == priority)
+        .map(|(_, producer)| producer)
+        .collect::<BTreeSet<_>>();
+    let mut exact = producers.iter().copied();
+    let Some(producer) = exact.next() else {
+        return Err(SemanticError::new(format!(
+            "external value read `{canonical_path}` target declaration {} maps to {} equally authoritative producer semantic values",
+            declaration.0,
+            producers.len()
+        )));
+    };
+    if exact.next().is_some() {
+        return Err(SemanticError::new(format!(
+            "external value read `{canonical_path}` target declaration {} maps to {} equally authoritative producer semantic values",
+            declaration.0,
+            producers.len()
+        )));
+    }
+    Ok(producer)
+}
 
 fn derive_bundle_call_closure(
     programs: &[SemanticProgram; 3],
@@ -2187,36 +2256,29 @@ fn derive_bundle_call_closure(
                     "external value read `{canonical_path}` producer source digest is stale"
                 )));
             }
-            let producer_values = producer
-                .execution_graph()
-                .statements
-                .iter()
-                .filter(|statement| {
-                    statement.declaration == Some(external_identity.producer_declaration)
-                        && statement.call_instance.is_none()
-                })
-                .filter_map(|statement| statement.value)
-                .collect::<Vec<_>>();
-            let [producer_expression] = producer_values.as_slice() else {
-                return Err(SemanticError::new(format!(
-                    "external value read `{canonical_path}` target declaration {} maps to {} producer semantic values",
-                    external_identity.producer_declaration.0,
-                    producer_values.len()
-                )));
-            };
+            let producer_expression = exact_bundle_producer_expression(
+                producer,
+                external_identity.producer_declaration,
+                &canonical_path,
+            )?;
             let producer_expression_definition = producer
                 .execution_graph()
                 .expressions
                 .get(producer_expression.as_usize())
-                .filter(|candidate| candidate.id == *producer_expression)
+                .filter(|candidate| candidate.id == producer_expression)
                 .ok_or_else(|| {
                     SemanticError::new(format!(
                         "external value read `{canonical_path}` target expression {producer_expression} is missing"
                     ))
                 })?;
-            if producer_expression_definition.flow_type != expression.flow_type {
+            // A producer-owned current is Continuous inside its authority, but
+            // its consumer-side import is PresentOrAbsent until the first
+            // transport snapshot arrives (and again across reconnect). The
+            // sealed delivery contract below owns that presence distinction;
+            // the public data type itself must still match exactly.
+            if producer_expression_definition.flow_type.ty != expression.flow_type.ty {
                 return Err(SemanticError::new(format!(
-                    "external value read `{canonical_path}` flow type differs from sealed producer value"
+                    "external value read `{canonical_path}` data type differs from sealed producer value"
                 )));
             }
             let consumer_origin = consumer
@@ -2237,12 +2299,12 @@ fn derive_bundle_call_closure(
                 consumer_origin.checked_scope,
                 &format!("external value read `{canonical_path}`"),
             )?;
-            let delivery = exact_bundle_value_delivery(producer, *producer_expression)?;
+            let delivery = exact_bundle_value_delivery(producer, producer_expression)?;
             let producer_origin_scoped = producer.role() == boon_typecheck::ProgramRole::Server
                 && matches!(delivery, BundleSemanticValueDeliveryV1::Current)
                 && semantic_expression_depends_on_role(
                     producer,
-                    *producer_expression,
+                    producer_expression,
                     boon_typecheck::ProgramRole::Session,
                 )?;
             let route_scope = bundle_value_route_scope(
@@ -2268,7 +2330,7 @@ fn derive_bundle_call_closure(
                 consumer_scope,
                 producer_role: external_identity.producer_role,
                 producer_declaration: external_identity.producer_declaration,
-                producer_expression: *producer_expression,
+                producer_expression,
                 producer_value: producer_expression_definition.value_id,
                 external_identity,
                 canonical_path,
@@ -2378,15 +2440,56 @@ pub fn elaborate(
     checked_program: CheckedProgram,
     producer_materializations: &[ProducerMaterializationRequest],
 ) -> Result<SemanticProgram, SemanticError> {
+    elaborate_with_external_event_identities(checked_program, producer_materializations, &[])
+}
+
+/// Elaborate one role with the exact sealed external declarations whose
+/// producer deliveries were proven event-backed by the atomic bundle.
+///
+/// The ordinary single-program boundary passes an empty set. Distributed
+/// compilation first freezes producer delivery, then re-elaborates all roles
+/// through this boundary so current crossings cannot masquerade as SOURCE
+/// triggers.
+pub fn elaborate_with_external_event_identities(
+    checked_program: CheckedProgram,
+    producer_materializations: &[ProducerMaterializationRequest],
+    external_event_identities: &[CheckedExternalDeclarationIdentityV1],
+) -> Result<SemanticProgram, SemanticError> {
+    let trace_elaboration = std::env::var_os("BOON_SEMANTIC_TRACE").is_some();
+    macro_rules! elaboration_phase {
+        ($name:literal, $expression:expr) => {{
+            if trace_elaboration {
+                eprintln!(concat!("boon_semantic elaborate ", $name, ":start"));
+            }
+            let result = $expression;
+            if trace_elaboration {
+                eprintln!(concat!("boon_semantic elaborate ", $name, ":done"));
+            }
+            result
+        }};
+    }
+
     let source_bundle_digest_v1 = checked_program.source_bundle_digest_v1;
-    let producer_materializations = canonical_producer_requests(producer_materializations)?;
-    validate_contextual_bindings(&checked_program)?;
-    let producer_roots = resolve_producer_roots(&checked_program, &producer_materializations)?;
-    let out_net = out_net::OutNet::<OutPortContractV1>::try_build_with(
-        &checked_program,
-        producer_roots,
-        |call, _, entry| provisional_out_port_contract(&checked_program, call, entry),
-        |kind, _, _, _, _| kind == boon_typecheck::CheckedCallableKind::Builtin,
+    let producer_materializations = elaboration_phase!(
+        "canonical_producer_requests",
+        canonical_producer_requests(producer_materializations)
+    )?;
+    elaboration_phase!(
+        "validate_contextual_bindings",
+        validate_contextual_bindings(&checked_program)
+    )?;
+    let producer_roots = elaboration_phase!(
+        "resolve_producer_roots",
+        resolve_producer_roots(&checked_program, &producer_materializations)
+    )?;
+    let out_net = elaboration_phase!(
+        "out_net",
+        out_net::OutNet::<OutPortContractV1>::try_build_with(
+            &checked_program,
+            producer_roots,
+            |call, _, entry| provisional_out_port_contract(&checked_program, call, entry),
+            |kind, _, _, _, _| kind == boon_typecheck::CheckedCallableKind::Builtin,
+        )
     )?;
     if out_net.has_errors() {
         return Err(SemanticError::new(
@@ -2399,85 +2502,127 @@ pub fn elaborate(
         ));
     }
     let mut resolved_out_graph = out_net.graph;
-    resolve_out_contracts(&checked_program, &mut resolved_out_graph)?;
-    validate_out_contracts(&checked_program, &resolved_out_graph)?;
-    let (materializations, materialization_expressions) =
+    elaboration_phase!(
+        "resolve_out_contracts",
+        resolve_out_contracts(&checked_program, &mut resolved_out_graph)
+    )?;
+    elaboration_phase!(
+        "validate_out_contracts",
+        validate_out_contracts(&checked_program, &resolved_out_graph)
+    )?;
+    let (materializations, materialization_expressions) = elaboration_phase!(
+        "derive_contextual_materializations",
         contextual_expansion::derive_contextual_materializations(
             &checked_program,
             &resolved_out_graph,
         )
-        .map_err(|error| SemanticError::new(error.to_string()))?;
-    let mut execution_graph = contextual_expansion::derive_semantic_execution_graph(
-        &checked_program,
-        &resolved_out_graph,
-        &materializations,
-        materialization_expressions,
     )
     .map_err(|error| SemanticError::new(error.to_string()))?;
-    execution_graph
-        .validate_checked_roots(&checked_program)
-        .map_err(SemanticError::new)?;
-    execution_graph
-        .validate(&resolved_out_graph)
-        .map_err(SemanticError::new)?;
-    let resource_graph = resource::build_semantic_resource_graph(
-        &checked_program,
-        &resolved_out_graph,
-        &mut execution_graph,
+    let mut execution_graph = elaboration_phase!(
+        "derive_semantic_execution_graph",
+        contextual_expansion::derive_semantic_execution_graph(
+            &checked_program,
+            &resolved_out_graph,
+            &materializations,
+            materialization_expressions,
+        )
+    )
+    .map_err(|error| SemanticError::new(error.to_string()))?;
+    elaboration_phase!(
+        "validate_checked_roots",
+        execution_graph.validate_checked_roots(&checked_program)
     )
     .map_err(SemanticError::new)?;
-    execution_graph
-        .validate(&resolved_out_graph)
-        .map_err(SemanticError::new)?;
-    let reactive_graph =
-        build_semantic_reactive_graph(&execution_graph, &resource_graph, &resolved_out_graph)
-            .map_err(|error| SemanticError::new(error.to_string()))?;
-    let lowering_contract = build_semantic_lowering_contract(
-        &checked_program,
-        &execution_graph,
-        &resource_graph,
-        &reactive_graph,
-        &resolved_out_graph,
+    elaboration_phase!(
+        "validate_execution_graph_before_resources",
+        execution_graph.validate(&resolved_out_graph)
+    )
+    .map_err(SemanticError::new)?;
+    let resource_graph = elaboration_phase!(
+        "build_semantic_resource_graph",
+        resource::build_semantic_resource_graph(
+            &checked_program,
+            &resolved_out_graph,
+            &mut execution_graph,
+        )
+    )
+    .map_err(SemanticError::new)?;
+    elaboration_phase!(
+        "validate_execution_graph_after_resources",
+        execution_graph.validate(&resolved_out_graph)
+    )
+    .map_err(SemanticError::new)?;
+    let reactive_graph = elaboration_phase!(
+        "build_semantic_reactive_graph",
+        build_semantic_reactive_graph_with_external_events(
+            &execution_graph,
+            &resource_graph,
+            &resolved_out_graph,
+            external_event_identities,
+        )
     )
     .map_err(|error| SemanticError::new(error.to_string()))?;
-    let scope_storage_graph = build_semantic_scope_storage_graph(
-        &checked_program,
-        &execution_graph,
-        &resource_graph,
-        &reactive_graph,
-        &lowering_contract,
-        &resolved_out_graph,
+    let lowering_contract = elaboration_phase!(
+        "build_semantic_lowering_contract",
+        build_semantic_lowering_contract(
+            &checked_program,
+            &execution_graph,
+            &resource_graph,
+            &reactive_graph,
+            &resolved_out_graph,
+        )
     )
     .map_err(|error| SemanticError::new(error.to_string()))?;
-    let view_binding_graph = build_semantic_view_binding_graph(
-        &execution_graph,
-        &resource_graph,
-        &reactive_graph,
-        &scope_storage_graph,
-        &lowering_contract,
+    let scope_storage_graph = elaboration_phase!(
+        "build_semantic_scope_storage_graph",
+        build_semantic_scope_storage_graph(
+            &checked_program,
+            &execution_graph,
+            &resource_graph,
+            &reactive_graph,
+            &lowering_contract,
+            &resolved_out_graph,
+        )
     )
     .map_err(|error| SemanticError::new(error.to_string()))?;
-    let memory_graph = build_semantic_memory_graph(
-        &checked_program,
-        &execution_graph,
-        &resource_graph,
-        &reactive_graph,
-        &scope_storage_graph,
-        &lowering_contract,
+    let view_binding_graph = elaboration_phase!(
+        "build_semantic_view_binding_graph",
+        build_semantic_view_binding_graph(
+            &execution_graph,
+            &resource_graph,
+            &reactive_graph,
+            &scope_storage_graph,
+            &lowering_contract,
+        )
     )
     .map_err(|error| SemanticError::new(error.to_string()))?;
-    let dependency_manifest = build_callable_dependency_manifest(
-        DEPENDENCY_CLASSIFIER_SCHEMA_DIGEST_V1,
-        &checked_program,
-        &producer_materializations,
-        &resolved_out_graph,
-        &execution_graph,
-        &resource_graph,
-        &reactive_graph,
-        &lowering_contract,
-        &view_binding_graph,
-        &scope_storage_graph,
-        &memory_graph,
+    let memory_graph = elaboration_phase!(
+        "build_semantic_memory_graph",
+        build_semantic_memory_graph(
+            &checked_program,
+            &execution_graph,
+            &resource_graph,
+            &reactive_graph,
+            &scope_storage_graph,
+            &lowering_contract,
+        )
+    )
+    .map_err(|error| SemanticError::new(error.to_string()))?;
+    let dependency_manifest = elaboration_phase!(
+        "build_callable_dependency_manifest",
+        build_callable_dependency_manifest(
+            DEPENDENCY_CLASSIFIER_SCHEMA_DIGEST_V1,
+            &checked_program,
+            &producer_materializations,
+            &resolved_out_graph,
+            &execution_graph,
+            &resource_graph,
+            &reactive_graph,
+            &lowering_contract,
+            &view_binding_graph,
+            &scope_storage_graph,
+            &memory_graph,
+        )
     )
     .map_err(|error| SemanticError::new(error.to_string()))?;
     let mut semantic = SemanticProgram {
@@ -2495,8 +2640,11 @@ pub fn elaborate(
         dependency_manifest,
         digest: SemanticProgramDigestV1([0; 32]),
     };
-    semantic.digest = semantic_program_digest(&semantic)?;
-    semantic.validate()?;
+    semantic.digest = elaboration_phase!(
+        "semantic_program_digest",
+        semantic_program_digest(&semantic)
+    )?;
+    elaboration_phase!("semantic_validate", semantic.validate())?;
     Ok(semantic)
 }
 
@@ -5006,6 +5154,74 @@ store: [
             .expect("event value bundle freezes")
     }
 
+    fn frozen_relayed_event_value_bundle() -> BundleSemanticProgramV1 {
+        let client_checked = checked_role(
+            "client-relayed-event-value-bundle.bn",
+            "store: [\n    submit: SOURCE\n]\n",
+            &ExternalTypeEnvironment::empty(ProgramRole::Client),
+        );
+        let client_submit = client_checked
+            .declarations
+            .iter()
+            .find(|declaration| {
+                client_checked.declaration_path(declaration.id).as_deref() == Some("store.submit")
+            })
+            .expect("client submit declaration");
+        let client_submit_identity = CheckedExternalDeclarationIdentityV1 {
+            producer_role: ProgramRole::Client,
+            producer_source_bundle_digest_v1: client_checked.source_bundle_digest_v1,
+            producer_declaration: client_submit.id,
+            kind: CheckedExternalDeclarationKind::Value,
+        };
+        let mut session_environment = ExternalTypeEnvironment::sealed(ProgramRole::Session);
+        session_environment.values.insert(
+            "Client/store.submit".to_owned(),
+            client_submit.flow_type.clone(),
+        );
+        session_environment
+            .external_identities
+            .insert("Client/store.submit".to_owned(), client_submit_identity);
+        let session_checked = checked_role(
+            "session-relayed-event-value-bundle.bn",
+            "store: [\n    session_submit: Client/store.submit\n]\n",
+            &session_environment,
+        );
+        let session_submit = session_checked
+            .declarations
+            .iter()
+            .find(|declaration| {
+                session_checked.declaration_path(declaration.id).as_deref()
+                    == Some("store.session_submit")
+            })
+            .expect("session submit declaration");
+        let session_submit_identity = CheckedExternalDeclarationIdentityV1 {
+            producer_role: ProgramRole::Session,
+            producer_source_bundle_digest_v1: session_checked.source_bundle_digest_v1,
+            producer_declaration: session_submit.id,
+            kind: CheckedExternalDeclarationKind::Value,
+        };
+        let mut server_environment = ExternalTypeEnvironment::sealed(ProgramRole::Server);
+        server_environment.values.insert(
+            "Session/store.session_submit".to_owned(),
+            session_submit.flow_type.clone(),
+        );
+        server_environment.external_identities.insert(
+            "Session/store.session_submit".to_owned(),
+            session_submit_identity,
+        );
+        let server_checked = checked_role(
+            "server-relayed-event-value-bundle.bn",
+            "request: Session/store.session_submit\n",
+            &server_environment,
+        );
+
+        let client = elaborate(client_checked, &[]).expect("client semantic program");
+        let session = elaborate(session_checked, &[]).expect("session semantic program");
+        let server = elaborate(server_checked, &[]).expect("server semantic program");
+        BundleSemanticProgramV1::freeze([server, client, session])
+            .expect("relayed event value bundle freezes")
+    }
+
     #[test]
     fn semantic_callable_and_call_inventories_are_exact_and_fail_closed() {
         let bundle = frozen_call_bundle();
@@ -5432,6 +5648,142 @@ FUNCTION add_session_twice(value) {
         mutated
             .validate()
             .expect_err("event source/projection mutation must fail");
+    }
+
+    #[test]
+    fn imported_event_drives_the_exact_local_hold_update() {
+        let client_checked = checked_role(
+            "client-imported-hold-event.bn",
+            "store: [\n    increment: SOURCE\n]\n",
+            &ExternalTypeEnvironment::empty(ProgramRole::Client),
+        );
+        let client_increment = client_checked
+            .declarations
+            .iter()
+            .find(|declaration| {
+                client_checked.declaration_path(declaration.id).as_deref()
+                    == Some("store.increment")
+            })
+            .expect("client increment declaration");
+        let mut session_environment = ExternalTypeEnvironment::sealed(ProgramRole::Session);
+        session_environment.values.insert(
+            "Client/store.increment".to_owned(),
+            client_increment.flow_type.clone(),
+        );
+        let increment_identity = CheckedExternalDeclarationIdentityV1 {
+            producer_role: ProgramRole::Client,
+            producer_source_bundle_digest_v1: client_checked.source_bundle_digest_v1,
+            producer_declaration: client_increment.id,
+            kind: CheckedExternalDeclarationKind::Value,
+        };
+        session_environment
+            .external_identities
+            .insert("Client/store.increment".to_owned(), increment_identity);
+        let session_checked = checked_role(
+            "session-imported-hold-event.bn",
+            r#"
+store: [
+    increment: Client/store.increment
+    count:
+        0 |> HOLD count {
+            increment |> THEN { count + 1 }
+        }
+]
+"#,
+            &session_environment,
+        );
+        let session =
+            elaborate_with_external_event_identities(session_checked, &[], &[increment_identity])
+                .expect("session semantic program");
+        let graph = session.reactive_graph();
+        let [arm] = graph.state_update_arms.as_slice() else {
+            panic!(
+                "imported event must own one state update arm: {:#?}",
+                graph.state_update_arms
+            );
+        };
+        let trigger = graph
+            .trigger_arms
+            .get(arm.trigger.as_usize())
+            .filter(|trigger| trigger.id == arm.trigger)
+            .expect("state update trigger");
+        assert!(
+            matches!(
+                trigger.cause,
+                SemanticEventCauseV1::ExternalRead(SemanticExprId(0))
+            ),
+            "imported event update must retain its exact pre-bundle read cause: {trigger:#?}"
+        );
+    }
+
+    #[test]
+    fn bundle_relayed_event_value_crossing_binds_exact_upstream_read() {
+        let bundle = frozen_relayed_event_value_bundle();
+        bundle.validate().unwrap();
+        assert!(bundle.call_crossings().is_empty());
+        assert_eq!(bundle.value_crossings().len(), 2);
+
+        let direct = bundle
+            .value_crossings()
+            .iter()
+            .find(|crossing| crossing.consumer_role == ProgramRole::Session)
+            .expect("Client event crosses into Session");
+        assert!(matches!(
+            direct.delivery,
+            BundleSemanticValueDeliveryV1::Event { .. }
+        ));
+
+        let relayed = bundle
+            .value_crossings()
+            .iter()
+            .find(|crossing| crossing.consumer_role == ProgramRole::Server)
+            .expect("Session event crosses into Server");
+        let BundleSemanticValueDeliveryV1::RelayedEvent {
+            read,
+            external_identity,
+            payload_projection,
+        } = &relayed.delivery
+        else {
+            panic!("Session alias must preserve imported event authority");
+        };
+        assert!(payload_projection.is_empty());
+        assert_eq!(
+            relayed.route_scope,
+            BundleSemanticRouteScopeV1::OriginScoped
+        );
+        let session = bundle
+            .role_program(ProgramRole::Session)
+            .expect("session role");
+        let upstream = session
+            .execution_graph()
+            .expressions
+            .get(read.as_usize())
+            .filter(|expression| expression.id == *read)
+            .expect("exact upstream read");
+        let SemanticExpressionKind::ExternalRead {
+            external_identity: Some(upstream_identity),
+            ..
+        } = upstream.kind
+        else {
+            panic!("relayed event authority must be an external read");
+        };
+        assert_eq!(upstream_identity, *external_identity);
+        assert_eq!(external_identity.producer_role, ProgramRole::Client);
+
+        let mut mutated = bundle.clone();
+        let delivery = &mut mutated
+            .value_crossings
+            .iter_mut()
+            .find(|crossing| crossing.consumer_role == ProgramRole::Server)
+            .expect("mutated Server crossing")
+            .delivery;
+        let BundleSemanticValueDeliveryV1::RelayedEvent { read, .. } = delivery else {
+            panic!("Server crossing must be relayed");
+        };
+        *read = SemanticExprId(usize::MAX);
+        mutated
+            .validate()
+            .expect_err("relayed event read mutation must fail");
     }
 
     #[test]
@@ -6337,5 +6689,45 @@ seed: 0
         let crossing = values.value_crossings[0].clone();
         values.value_crossings = vec![crossing; MAX_BUNDLE_SEMANTIC_VALUE_CROSSINGS_V1 + 1];
         assert!(values.validate().is_err());
+    }
+
+    #[test]
+    fn direct_host_result_owns_its_schedule_before_downstream_hold_consumers() {
+        let parsed = boon_parser::parse_source(
+            "direct-host-result-schedule.bn",
+            r#"
+store: [
+    start: SOURCE
+    result:
+        start |> THEN { Clock/wall() }
+    observed:
+        0 |> HOLD observed {
+            result |> WHEN {
+                WallClockRead => 1
+                __ => SKIP
+            }
+        }
+]
+"#,
+        )
+        .expect("direct host-result fixture parses");
+        let checked = boon_typecheck::check_program(&parsed)
+            .program
+            .expect("direct host-result fixture typechecks");
+        let semantic = elaborate(checked, &[]).expect("direct host-result fixture elaborates");
+        let [schedule] = semantic.reactive_graph().host_effect_schedules.as_slice() else {
+            panic!("expected one direct host-effect schedule");
+        };
+        assert!(schedule.state_update_arms.is_empty());
+        let derived = schedule
+            .transient_result
+            .expect("direct host effect owns a transient result");
+        let result = semantic
+            .reactive_graph()
+            .derived_values
+            .get(derived.as_usize())
+            .expect("transient derived result exists");
+        assert!(!result.trigger_arms.is_empty());
+        assert!(result.state_backing.is_none());
     }
 }

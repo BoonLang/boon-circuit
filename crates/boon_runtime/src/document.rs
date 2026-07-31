@@ -154,6 +154,7 @@ pub(crate) struct DocumentRuntime {
     field_state_aliases: BTreeMap<FieldId, boon_plan::StateId>,
     field_owners: BTreeMap<FieldId, ListId>,
     list_scopes: BTreeMap<ListId, ScopeId>,
+    pending_distributed_targets: BTreeSet<ValueTarget>,
     row_sources: RowSourceIndex,
     windows: BTreeMap<DocumentMaterializationId, DocumentWindowDemand>,
     last_nonempty_windows: BTreeMap<DocumentMaterializationId, DocumentWindowDemand>,
@@ -269,6 +270,7 @@ impl DocumentRuntime {
             .iter()
             .filter_map(|slot| slot.scope_id.map(|scope| (slot.list_id, scope)))
             .collect();
+        let pending_distributed_targets = pending_distributed_targets(&machine);
         let row_sources = compiled_row_source_index(&machine)?;
         let windows: BTreeMap<DocumentMaterializationId, DocumentWindowDemand> = plan
             .materializations
@@ -297,6 +299,7 @@ impl DocumentRuntime {
             field_state_aliases,
             field_owners,
             list_scopes,
+            pending_distributed_targets,
             row_sources,
             windows,
             last_nonempty_windows,
@@ -2303,7 +2306,11 @@ impl<'a> Evaluator<'a> {
             .session
             .project_current(&[target])
             .map_err(|error| DocumentError::Evaluation(error.to_string()))?;
-        let value = projected.remove(&target).ok_or_else(|| {
+        let Some(value) = projected.remove(&target) else {
+            if self.runtime.pending_distributed_targets.contains(&target) {
+                self.record_dependency(dependency);
+                return Ok(EvalValue::Absent);
+            }
             let diagnostic_paths = match target {
                 ValueTarget::Field(field) => self
                     .runtime
@@ -2314,10 +2321,10 @@ impl<'a> Evaluator<'a> {
                     .unwrap_or_default(),
                 ValueTarget::State(_) | ValueTarget::RowField { .. } => String::new(),
             };
-            DocumentError::Evaluation(format!(
+            return Err(DocumentError::Evaluation(format!(
                 "value target {target:?}{diagnostic_paths} is not current"
-            ))
-        })?;
+            )));
+        };
         self.record_dependency(dependency);
         self.projection_cache.insert(dependency, value.clone());
         Ok(self.value(value))
@@ -2328,6 +2335,10 @@ impl<'a> Evaluator<'a> {
         if let Some(value) = self.projection_cache.get(&dependency).cloned() {
             self.record_dependency(dependency);
             return Ok(self.value(value));
+        }
+        if self.session.distributed_import_revision(import).is_none() {
+            self.record_dependency(dependency);
+            return Ok(EvalValue::Absent);
         }
         let value = self
             .session
@@ -2845,6 +2856,10 @@ impl<'a> Evaluator<'a> {
             DocumentPattern::Tag { tag } => {
                 let tag = self.name(tag)?;
                 matches!(input, EvalValue::Tag(value, _) if value == tag)
+                    || matches!(
+                        (input, tag),
+                        (EvalValue::Truth(true), "True") | (EvalValue::Truth(false), "False")
+                    )
             }
             DocumentPattern::Wildcard => true,
         })
@@ -5568,7 +5583,7 @@ fn collect_sources(
                 collect_sources(
                     value,
                     intent,
-                    explicit_intent.is_some() || inherited_intent.is_some(),
+                    allow_unqualified || explicit_intent.is_some() || inherited_intent.is_some(),
                     sources,
                 );
             }
@@ -5801,6 +5816,84 @@ fn field_state_alias_index(plan: &MachinePlan) -> BTreeMap<FieldId, boon_plan::S
                 .map(|state| (field, state))
         })
         .collect()
+}
+
+fn pending_distributed_targets(plan: &MachinePlan) -> BTreeSet<ValueTarget> {
+    let mut pending = plan
+        .distributed_endpoint
+        .as_ref()
+        .into_iter()
+        .flat_map(|endpoint| {
+            endpoint
+                .endpoint
+                .value_imports
+                .iter()
+                .map(|import| ValueRef::DistributedImport(import.import_id))
+                .chain(
+                    endpoint
+                        .endpoint
+                        .remote_call_sites
+                        .iter()
+                        .filter_map(|call| call.result.current_import_id())
+                        .map(ValueRef::DistributedImport),
+                )
+        })
+        .collect::<BTreeSet<_>>();
+
+    loop {
+        let mut changed = false;
+        for operation in plan.regions.iter().flat_map(|region| &region.ops) {
+            let Some(output) = &operation.output else {
+                continue;
+            };
+            if operation
+                .inputs
+                .iter()
+                .any(|input| value_ref_is_pending(input, &pending))
+            {
+                changed |= pending.insert(output.clone());
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    pending
+        .into_iter()
+        .filter_map(|value| match value {
+            ValueRef::State(state)
+            | ValueRef::StateProjection {
+                state_id: state, ..
+            } => Some(ValueTarget::State(state)),
+            ValueRef::Field(field) => Some(ValueTarget::Field(field)),
+            ValueRef::Source(_)
+            | ValueRef::SourcePayload { .. }
+            | ValueRef::Pulse(_)
+            | ValueRef::List(_)
+            | ValueRef::Constant(_)
+            | ValueRef::DistributedImport(_) => None,
+        })
+        .collect()
+}
+
+fn value_ref_is_pending(value: &ValueRef, pending: &BTreeSet<ValueRef>) -> bool {
+    pending.contains(value)
+        || match value {
+            ValueRef::StateProjection { state_id, .. } => {
+                pending.contains(&ValueRef::State(*state_id))
+            }
+            ValueRef::State(state) => pending.iter().any(
+                |candidate| matches!(candidate, ValueRef::StateProjection { state_id, .. } if state_id == state),
+            ),
+            ValueRef::Source(_)
+            | ValueRef::SourcePayload { .. }
+            | ValueRef::Pulse(_)
+            | ValueRef::Field(_)
+            | ValueRef::List(_)
+            | ValueRef::Constant(_)
+            | ValueRef::DistributedImport(_) => false,
+        }
 }
 
 fn frame_node_id(plan_id: u64, instance: Option<&str>) -> FrameNodeId {
@@ -6515,7 +6608,7 @@ mod tests {
                     EvalValue::Text("profile-source".to_owned()),
                 ),
                 ("line".to_owned(), eval_number(7)),
-                ("column".to_owned(), EvalValue::Text("3".to_owned())),
+                ("column".to_owned(), eval_number(3)),
             ])),
         );
         assert_eq!(

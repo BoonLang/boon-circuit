@@ -1998,6 +1998,7 @@ fn distributed_call_expression_is_safe(
             | PlanRowExpressionNode::Flush { .. }
             | PlanRowExpressionNode::Intrinsic { .. }
             | PlanRowExpressionNode::EffectResult
+            | PlanRowExpressionNode::TransientEffectResult { .. }
             | PlanRowExpressionNode::ListGetField { .. }
             | PlanRowExpressionNode::ListRef { .. }
             | PlanRowExpressionNode::AuthorityListRef { .. }
@@ -5859,6 +5860,14 @@ pub enum PlanOpKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         effect: Option<EffectInvocationPlan>,
     },
+    /// Event-owned host effect whose result is current runtime data but not
+    /// HOLD authority or persistence state.
+    EffectUpdate {
+        trigger: ValueRef,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        result_transform: Option<PlanRowExpressionId>,
+        effect: EffectInvocationPlan,
+    },
     ListMutation {
         mutation: PlanListMutation,
     },
@@ -6117,6 +6126,20 @@ impl PlanOp {
                     for field in &effect.intent_fields {
                         arena.visit_inputs(field.expression, &mut insert)?;
                     }
+                }
+            }
+            PlanOpKind::EffectUpdate {
+                trigger,
+                result_transform,
+                effect,
+            } => {
+                insert(trigger.clone());
+                if let Some(transform) = result_transform {
+                    arena.visit_inputs(*transform, &mut insert)?;
+                }
+                arena.visit_inputs(effect.gate, &mut insert)?;
+                for field in &effect.intent_fields {
+                    arena.visit_inputs(field.expression, &mut insert)?;
                 }
             }
             PlanOpKind::ListMutation { mutation } => match mutation {
@@ -8018,6 +8041,10 @@ pub enum PlanRowExpressionNode {
     /// Private value supplied only while applying the result of the host
     /// effect owned by the surrounding state-update operation.
     EffectResult,
+    /// Current value in a compiler-owned, nonpersistent host-result lane.
+    TransientEffectResult {
+        invocation_id: EffectInvocationId,
+    },
     Field {
         input: ValueRef,
     },
@@ -8273,6 +8300,7 @@ impl PlanRowExpressionNode {
             Self::Absent
             | Self::Intrinsic { .. }
             | Self::EffectResult
+            | Self::TransientEffectResult { .. }
             | Self::Field { .. }
             | Self::Constant { .. }
             | Self::ListRef { .. }
@@ -8488,6 +8516,7 @@ impl PlanRowExpressionNode {
             Self::Absent
             | Self::Intrinsic { .. }
             | Self::EffectResult
+            | Self::TransientEffectResult { .. }
             | Self::Field { .. }
             | Self::Constant { .. }
             | Self::ListRef { .. }
@@ -10134,6 +10163,9 @@ fn producer_function_ownership_ids_failure(
                     PlanOpKind::StateUpdate {
                         effect: Some(invocation),
                         ..
+                    } | PlanOpKind::EffectUpdate {
+                        effect: invocation,
+                        ..
                     } if invocation.invocation_id == **invocation_id
                 )
             })
@@ -10187,7 +10219,10 @@ fn producer_function_plan_static_owners(plan: &MachinePlan) -> BTreeSet<PlanStat
             PlanOpKind::StateUpdate {
                 effect: Some(effect),
                 ..
-            } => collect_plan_owner_static_owners(&effect.owner, &mut owners),
+            }
+            | PlanOpKind::EffectUpdate { effect, .. } => {
+                collect_plan_owner_static_owners(&effect.owner, &mut owners)
+            }
             PlanOpKind::ListMutation { mutation } => match mutation {
                 PlanListMutation::Append(append) => {
                     collect_plan_owner_static_owners(&append.owner, &mut owners);
@@ -11919,6 +11954,19 @@ fn visit_plan_row_expressions(
                     }
                 }
             }
+            PlanOpKind::EffectUpdate {
+                result_transform,
+                effect,
+                ..
+            } => {
+                if let Some(transform) = result_transform {
+                    roots.push(*transform);
+                }
+                roots.push(effect.gate);
+                for field in &effect.intent_fields {
+                    roots.push(field.expression);
+                }
+            }
             PlanOpKind::ListMutation { mutation } => match mutation {
                 PlanListMutation::Append(append) => {
                     roots.push(append.gate);
@@ -12270,11 +12318,79 @@ fn effect_contracts_failure(plan: &MachinePlan) -> Option<String> {
         }
     }
     let mut invocations_by_id = BTreeMap::<EffectInvocationId, &EffectInvocationPlan>::new();
+    let mut transient_invocation_targets = BTreeMap::<EffectInvocationId, ValueRef>::new();
     for op in plan.regions.iter().flat_map(|region| &region.ops) {
-        let PlanOpKind::StateUpdate { value, effect, .. } = &op.kind else {
-            continue;
+        let (result_transform, effect, transient_lane) = match &op.kind {
+            PlanOpKind::StateUpdate { value, effect, .. } => {
+                let effect_expressions_are_private = effect.as_ref().is_none_or(|effect| {
+                    !plan
+                        .row_expressions
+                        .contains_effect_result(effect.gate)
+                        .unwrap_or(true)
+                        && effect.intent_fields.iter().all(|field| {
+                            !plan
+                                .row_expressions
+                                .contains_effect_result(field.expression)
+                                .unwrap_or(true)
+                        })
+                });
+                let shape_is_valid = match (value, effect) {
+                    (Some(value), None) => !plan
+                        .row_expressions
+                        .contains_effect_result(*value)
+                        .unwrap_or(true),
+                    (None, Some(_)) => effect_expressions_are_private,
+                    (Some(value), Some(_)) => {
+                        effect_expressions_are_private
+                            && plan
+                                .row_expressions
+                                .contains_effect_result(*value)
+                                .unwrap_or(false)
+                    }
+                    (None, None) => false,
+                };
+                if !shape_is_valid {
+                    return Some(format!(
+                        "state update op {} has an invalid value/effect continuation shape",
+                        op.id.0
+                    ));
+                }
+                (value.as_ref(), effect.as_ref(), false)
+            }
+            PlanOpKind::EffectUpdate {
+                result_transform,
+                effect,
+                ..
+            } => {
+                let effect_expressions_are_private = !plan
+                    .row_expressions
+                    .contains_effect_result(effect.gate)
+                    .unwrap_or(true)
+                    && effect.intent_fields.iter().all(|field| {
+                        !plan
+                            .row_expressions
+                            .contains_effect_result(field.expression)
+                            .unwrap_or(true)
+                    });
+                let transform_is_private = result_transform.is_none_or(|transform| {
+                    plan.row_expressions
+                        .contains_effect_result(transform)
+                        .unwrap_or(false)
+                });
+                if !effect_expressions_are_private
+                    || !transform_is_private
+                    || !matches!(op.output, Some(ValueRef::Field(_) | ValueRef::List(_)))
+                {
+                    return Some(format!(
+                        "transient effect update op {} has an invalid output or continuation shape",
+                        op.id.0
+                    ));
+                }
+                (result_transform.as_ref(), Some(effect), true)
+            }
+            _ => continue,
         };
-        let effect_expressions_are_private = effect.as_ref().is_none_or(|effect| {
+        let effect_expressions_are_private = effect.is_none_or(|effect| {
             !plan
                 .row_expressions
                 .contains_effect_result(effect.gate)
@@ -12286,30 +12402,27 @@ fn effect_contracts_failure(plan: &MachinePlan) -> Option<String> {
                         .unwrap_or(true)
                 })
         });
-        let shape_is_valid = match (value, effect) {
-            (Some(value), None) => !plan
-                .row_expressions
-                .contains_effect_result(*value)
-                .unwrap_or(true),
-            (None, Some(_)) => effect_expressions_are_private,
-            (Some(value), Some(_)) => {
-                effect_expressions_are_private
-                    && plan
-                        .row_expressions
-                        .contains_effect_result(*value)
-                        .unwrap_or(false)
-            }
-            (None, None) => false,
-        };
-        if !shape_is_valid {
-            return Some(format!(
-                "state update op {} has an invalid value/effect continuation shape",
-                op.id.0
-            ));
-        }
+        debug_assert!(effect_expressions_are_private);
         let Some(invocation) = effect else {
             continue;
         };
+        if transient_lane {
+            let Some(output) = op.output.clone() else {
+                return Some(format!(
+                    "transient effect invocation {} has no result output",
+                    invocation.invocation_id
+                ));
+            };
+            if let Some(previous) =
+                transient_invocation_targets.insert(invocation.invocation_id, output.clone())
+                && previous != output
+            {
+                return Some(format!(
+                    "transient effect invocation {} targets multiple result lanes",
+                    invocation.invocation_id
+                ));
+            }
+        }
         if !plan_owner_resolves(plan, &invocation.owner) {
             return Some(format!(
                 "effect invocation {} has an invalid structural owner",
@@ -12349,30 +12462,36 @@ fn effect_contracts_failure(plan: &MachinePlan) -> Option<String> {
             .effect_outbox
             .iter()
             .find(|schema| schema.effect_id == invocation.effect_id);
-        match (&contract.replay, outbox) {
-            (EffectReplay::Idempotent { .. }, Some(outbox))
+        match (&contract.replay, outbox, transient_lane) {
+            (EffectReplay::Idempotent { .. }, _, true) => {
+                return Some(format!(
+                    "transient effect invocation {} cannot use a durable replay contract",
+                    invocation.invocation_id
+                ));
+            }
+            (EffectReplay::Idempotent { .. }, Some(outbox), false)
                 if outbox.invocation_ids.contains(&invocation.invocation_id) => {}
-            (EffectReplay::Idempotent { .. }, _) => {
+            (EffectReplay::Idempotent { .. }, _, false) => {
                 return Some(format!(
                     "effect invocation {} is absent from its durable outbox schema",
                     invocation.invocation_id
                 ));
             }
-            (EffectReplay::ReadOnly, None) => {}
-            (EffectReplay::ReadOnly, Some(_)) => {
+            (EffectReplay::ReadOnly, None, _) => {}
+            (EffectReplay::ReadOnly, Some(_), _) => {
                 return Some(format!(
                     "read-only effect invocation {} must not use a durable outbox",
                     invocation.invocation_id
                 ));
             }
-            (EffectReplay::ProcessScoped, None) => {}
-            (EffectReplay::ProcessScoped, Some(_)) => {
+            (EffectReplay::ProcessScoped, None, _) => {}
+            (EffectReplay::ProcessScoped, Some(_), _) => {
                 return Some(format!(
                     "process-scoped effect invocation {} must not use a durable outbox",
                     invocation.invocation_id
                 ));
             }
-            (EffectReplay::NonReplayable, _) => {
+            (EffectReplay::NonReplayable, _, _) => {
                 return Some(format!(
                     "non-replayable effect invocation {} cannot be executed safely",
                     invocation.invocation_id
@@ -12391,11 +12510,11 @@ fn effect_contracts_failure(plan: &MachinePlan) -> Option<String> {
                         .contextual_locals_resolve(field.expression)
                         .unwrap_or(false)
             })
-            || value.is_some_and(|transform| {
-                !row_expression_refs_resolve(&plan.row_expressions, op, transform)
+            || result_transform.is_some_and(|transform| {
+                !row_expression_refs_resolve(&plan.row_expressions, op, *transform)
                     || !plan
                         .row_expressions
-                        .contextual_locals_resolve(transform)
+                        .contextual_locals_resolve(*transform)
                         .unwrap_or(false)
             })
             || !effect_intent_fields_match_schema(
@@ -12417,6 +12536,65 @@ fn effect_contracts_failure(plan: &MachinePlan) -> Option<String> {
                 invocation.invocation_id
             ));
         }
+    }
+    let mut transient_lane_targets = BTreeMap::<EffectInvocationId, ValueRef>::new();
+    let mut transient_lane_roots = BTreeSet::new();
+    for op in plan.regions.iter().flat_map(|region| &region.ops) {
+        let PlanOpKind::DerivedValue {
+            expression: Some(PlanDerivedExpression::RowExpression { expression }),
+            materialization: None,
+            ..
+        } = &op.kind
+        else {
+            continue;
+        };
+        let Some(PlanRowExpressionNode::TransientEffectResult { invocation_id }) =
+            plan.row_expressions.get(*expression)
+        else {
+            continue;
+        };
+        let Some(output) = op.output.clone() else {
+            return Some(format!(
+                "transient result lane for invocation {} has no derived output",
+                invocation_id
+            ));
+        };
+        if let Some(previous) = transient_lane_targets.insert(*invocation_id, output.clone())
+            && previous != output
+        {
+            return Some(format!(
+                "transient result invocation {} has multiple derived outputs",
+                invocation_id
+            ));
+        }
+        transient_lane_roots.insert(*expression);
+    }
+    if transient_lane_targets != transient_invocation_targets {
+        return Some(
+            "transient effect invocations differ from compiler-owned result lanes".to_owned(),
+        );
+    }
+    let mut invalid_transient_lane_node = None;
+    if visit_plan_row_expressions(plan, &mut |id, expression| {
+        if matches!(
+            expression,
+            PlanRowExpressionNode::TransientEffectResult { .. }
+        ) && !transient_lane_roots.contains(&id)
+        {
+            invalid_transient_lane_node = Some(id);
+        }
+    })
+    .is_err()
+    {
+        return Some(
+            "transient effect result lane contains an invalid expression graph".to_owned(),
+        );
+    }
+    if let Some(expression) = invalid_transient_lane_node {
+        return Some(format!(
+            "transient effect result expression {} is not a derived lane root",
+            expression.0
+        ));
     }
     let bound_invocation_ids = plan
         .persistence
@@ -13099,6 +13277,7 @@ fn pulse_execution_contract_failure(plan: &MachinePlan) -> Option<String> {
                     .flat_map(|region| &region.ops)
                     .any(|op| match &op.kind {
                         PlanOpKind::StateUpdate { trigger, .. } => trigger == &state_trigger,
+                        PlanOpKind::EffectUpdate { trigger, .. } => trigger == &state_trigger,
                         PlanOpKind::ListMutation {
                             mutation: PlanListMutation::Append(append),
                         } => append.trigger == state_trigger,
@@ -14055,6 +14234,32 @@ pub fn cpu_plan_executor_supports_whole_plan_op(
                     _ => false,
                 }
         }
+        PlanOpKind::EffectUpdate {
+            trigger: _,
+            result_transform,
+            effect,
+        } => {
+            let expression_is_evaluable = |expression| {
+                row_expression_cpu_evaluable(arena, expression)
+                    && row_expression_refs_resolve(arena, op, expression)
+                    && arena.contextual_locals_resolve(expression).unwrap_or(false)
+            };
+            op.unresolved_executable_ref_count == 0
+                && effect_update_trigger_is_supported(op)
+                && matches!(op.output, Some(ValueRef::Field(_) | ValueRef::List(_)))
+                && expression_is_evaluable(effect.gate)
+                && !arena.contains_effect_result(effect.gate).unwrap_or(true)
+                && effect.intent_fields.iter().all(|field| {
+                    expression_is_evaluable(field.expression)
+                        && !arena
+                            .contains_effect_result(field.expression)
+                            .unwrap_or(true)
+                })
+                && result_transform.is_none_or(|transform| {
+                    expression_is_evaluable(transform)
+                        && arena.contains_effect_result(transform).unwrap_or(false)
+                })
+        }
         PlanOpKind::DerivedValue { .. } => cpu_plan_executor_supports_derived_value_op(
             arena,
             scalar_slots,
@@ -14074,6 +14279,10 @@ fn state_update_trigger_is_supported(op: &PlanOp) -> bool {
     let PlanOpKind::StateUpdate { trigger, .. } = &op.kind else {
         return false;
     };
+    event_update_trigger_is_supported(op, trigger)
+}
+
+fn event_update_trigger_is_supported(op: &PlanOp, trigger: &ValueRef) -> bool {
     let source_inputs = op
         .inputs
         .iter()
@@ -14095,6 +14304,13 @@ fn state_update_trigger_is_supported(op: &PlanOp) -> bool {
         | ValueRef::Constant(_)
         | ValueRef::DistributedImport(_) => false,
     }
+}
+
+fn effect_update_trigger_is_supported(op: &PlanOp) -> bool {
+    let PlanOpKind::EffectUpdate { trigger, .. } = &op.kind else {
+        return false;
+    };
+    event_update_trigger_is_supported(op, trigger)
 }
 
 pub fn cpu_plan_executor_supports_list_mutation_op(
@@ -14474,6 +14690,69 @@ fn constant_refs_resolve_and_match_storage_types_failure(plan: &MachinePlan) -> 
     }
 
     for op in plan.regions.iter().flat_map(|region| &region.ops) {
+        if let PlanOpKind::EffectUpdate {
+            result_transform,
+            effect,
+            ..
+        } = &op.kind
+        {
+            let shape_is_valid = matches!(op.output, Some(ValueRef::Field(_) | ValueRef::List(_)))
+                && !plan
+                    .row_expressions
+                    .contains_effect_result(effect.gate)
+                    .unwrap_or(true)
+                && effect.intent_fields.iter().all(|field| {
+                    !plan
+                        .row_expressions
+                        .contains_effect_result(field.expression)
+                        .unwrap_or(true)
+                })
+                && result_transform.is_none_or(|transform| {
+                    plan.row_expressions
+                        .contains_effect_result(transform)
+                        .unwrap_or(false)
+                });
+            if !shape_is_valid {
+                return Some(format!(
+                    "transient effect update op {} has an invalid output/value/effect shape",
+                    op.id.0
+                ));
+            }
+            let expressions = result_transform
+                .iter()
+                .chain(std::iter::once(&effect.gate))
+                .chain(effect.intent_fields.iter().map(|field| &field.expression));
+            for expression in expressions {
+                let mut missing_inputs = BTreeSet::new();
+                if plan
+                    .row_expressions
+                    .visit_inputs(*expression, &mut |input| {
+                        if !op.inputs.contains(&input) {
+                            missing_inputs.insert(input);
+                        }
+                    })
+                    .is_err()
+                {
+                    return Some(format!(
+                        "transient effect update op {} references an invalid row expression {}",
+                        op.id.0, expression.0
+                    ));
+                }
+                let refs_resolve =
+                    row_expression_refs_resolve(&plan.row_expressions, op, *expression);
+                let contextual_locals_resolve = plan
+                    .row_expressions
+                    .contextual_locals_resolve(*expression)
+                    .unwrap_or(false);
+                if !refs_resolve || !contextual_locals_resolve {
+                    return Some(format!(
+                        "transient effect update op {} has unresolved executable references: refs_resolve={refs_resolve}, contextual_locals_resolve={contextual_locals_resolve}, missing_inputs={missing_inputs:?}, expression={expression:?}",
+                        op.id.0,
+                    ));
+                }
+            }
+            continue;
+        }
         let PlanOpKind::StateUpdate { value, effect, .. } = &op.kind else {
             continue;
         };
@@ -15249,6 +15528,15 @@ fn row_expression_list_fields_resolve(plan: &MachinePlan) -> bool {
                     }))
                     .all(|expression| row_expression_list_fields_resolve_inner(plan, *expression))
             }
+            PlanOpKind::EffectUpdate {
+                result_transform,
+                effect,
+                ..
+            } => result_transform
+                .iter()
+                .chain(std::iter::once(&effect.gate))
+                .chain(effect.intent_fields.iter().map(|field| &field.expression))
+                .all(|expression| row_expression_list_fields_resolve_inner(plan, *expression)),
             _ => true,
         })
 }

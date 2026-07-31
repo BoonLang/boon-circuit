@@ -903,6 +903,15 @@ impl LiveRuntime {
         Ok(self.session.distributed_export_value_current(export_id)?)
     }
 
+    pub fn distributed_export_value_if_current(
+        &mut self,
+        export_id: ExportId,
+    ) -> RuntimeResult<Option<Value>> {
+        Ok(self
+            .session
+            .distributed_export_value_if_current(export_id)?)
+    }
+
     pub fn evaluate_distributed_function_instance_unsettled(
         &mut self,
         call_site_id: RemoteCallSiteId,
@@ -918,6 +927,33 @@ impl LiveRuntime {
         let (value, turn) = self
             .session
             .evaluate_distributed_function_instance_unsettled(
+                call_site_id,
+                call_instance_id,
+                export_id,
+                content_revision,
+                arguments,
+            )?;
+        let turn = turn
+            .map(|turn| self.runtime_turn(turn, duration_us(started.elapsed())))
+            .transpose()?;
+        Ok((value, turn))
+    }
+
+    pub fn activate_distributed_current_function_instance_unsettled(
+        &mut self,
+        call_site_id: RemoteCallSiteId,
+        call_instance_id: DistributedCallInstanceId,
+        export_id: ExportId,
+        content_revision: u64,
+        arguments: BTreeMap<DistributedArgumentId, Value>,
+    ) -> RuntimeResult<(Option<Value>, Option<RuntimeTurn>)> {
+        if self.pending_document_rollback.is_some() {
+            return Err("previous runtime turn has not been settled".into());
+        }
+        let started = Instant::now();
+        let (value, turn) = self
+            .session
+            .activate_distributed_current_function_instance_unsettled(
                 call_site_id,
                 call_instance_id,
                 export_id,
@@ -968,6 +1004,16 @@ impl LiveRuntime {
         Ok(self
             .session
             .distributed_producer_call_result_current(call_site_id, call_instance_id)?)
+    }
+
+    pub fn distributed_producer_call_result_if_current(
+        &mut self,
+        call_site_id: RemoteCallSiteId,
+        call_instance_id: DistributedCallInstanceId,
+    ) -> RuntimeResult<Option<Value>> {
+        Ok(self
+            .session
+            .distributed_producer_call_result_if_current(call_site_id, call_instance_id)?)
     }
 
     pub fn update_distributed_call_result_instance_unsettled(
@@ -1798,7 +1844,7 @@ pub struct ScenarioStep {
     pub expectations: Vec<ScenarioExpectation>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ScenarioExpectation {
     RootText {
         name: String,
@@ -1839,7 +1885,7 @@ pub enum ScenarioExpectation {
     DocumentChanged,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ScenarioFieldMatch {
     pub field: String,
     pub value: String,
@@ -2416,6 +2462,290 @@ document: Document/new(
                         .any(|key| node.style.get(*key) == Some(&StyleValue::Text("A".to_owned())))
                 })
         );
+    }
+}
+
+#[cfg(test)]
+mod derived_list_document_currentness_tests {
+    use super::*;
+
+    fn artifact(seed: u8) -> Value {
+        Value::Record(BTreeMap::from([
+            (
+                "content".to_owned(),
+                Value::Record(BTreeMap::from([
+                    ("digest".to_owned(), Value::Bytes(vec![seed; 32].into())),
+                    (
+                        "media".to_owned(),
+                        Value::Text("application/vnd.boon.waveform/vcd".to_owned()),
+                    ),
+                    ("size".to_owned(), Value::integer(1).unwrap()),
+                ])),
+            ),
+            ("format".to_owned(), Value::Text("VCD".to_owned())),
+            ("parser_version".to_owned(), Value::Text("test".to_owned())),
+            (
+                "schema_version".to_owned(),
+                Value::Text("wellen.v1".to_owned()),
+            ),
+        ]))
+    }
+
+    fn hierarchy_outcome(artifact: Value, signal_id: &str, name: &str) -> Value {
+        let signal_row = Value::Record(BTreeMap::from([
+            ("kind".to_owned(), Value::Text("Signal".to_owned())),
+            ("id".to_owned(), Value::Text(format!("signal:{signal_id}"))),
+            ("parent_id".to_owned(), Value::Text("scope:top".to_owned())),
+            ("name".to_owned(), Value::Text(name.to_owned())),
+            ("full_name".to_owned(), Value::Text(format!("top.{name}"))),
+            ("signal_id".to_owned(), Value::Text(signal_id.to_owned())),
+            ("width".to_owned(), Value::integer(1).unwrap()),
+            ("encoding".to_owned(), Value::Text("Bits".to_owned())),
+        ]));
+        Value::tagged(
+            "HierarchyPage",
+            BTreeMap::from([
+                ("artifact".to_owned(), artifact),
+                (
+                    "request_fingerprint".to_owned(),
+                    Value::Text("hierarchy".to_owned()),
+                ),
+                ("start_time".to_owned(), Value::integer(0).unwrap()),
+                ("end_time".to_owned(), Value::integer(10).unwrap()),
+                ("offset".to_owned(), Value::integer(0).unwrap()),
+                ("has_more".to_owned(), Value::truth(false)),
+                ("next_offset".to_owned(), Value::integer(1).unwrap()),
+                ("total_rows".to_owned(), Value::integer(1).unwrap()),
+                (
+                    "signal_ids".to_owned(),
+                    Value::List(vec![Value::Text(signal_id.to_owned())]),
+                ),
+                ("rows".to_owned(), Value::List(vec![signal_row])),
+            ]),
+        )
+    }
+
+    fn frame_has_text(runtime: &LiveRuntime, expected: &str) -> bool {
+        runtime
+            .document_frame()
+            .unwrap()
+            .nodes
+            .values()
+            .any(|node| node.text.as_ref().is_some_and(|text| text.text == expected))
+    }
+
+    #[test]
+    fn inherited_pass_context_populates_nested_scene_list_items() {
+        let units = [
+            RuntimeSourceUnit {
+                path: "RUN.bn".to_owned(),
+                source: r#"
+store: [
+    workspace_dialog: Closed
+    load_files_dialog: Closed
+]
+
+scene: View/main_scene(PASS: [store: store])
+"#
+                .to_owned(),
+            },
+            RuntimeSourceUnit {
+                path: "View.bn".to_owned(),
+                source: r#"
+FUNCTION main_scene() {
+    Scene/new(root: root())
+}
+
+FUNCTION root() {
+    Scene/Element/stripe(
+        element: []
+        direction: Column
+        gap: 0
+        style: []
+        items: LIST {
+            shell_for_dialog_state()
+            workspace_dialog()
+            load_files_dialog()
+        }
+    )
+}
+
+FUNCTION shell_for_dialog_state() {
+    PASSED.store.workspace_dialog == Open |> WHEN {
+        True => label(text: TEXT { modal })
+        False => app_shell()
+    }
+}
+
+FUNCTION app_shell() {
+    label(text: TEXT { NovyWave })
+}
+
+FUNCTION workspace_dialog() {
+    PASSED.store.workspace_dialog == Open |> WHEN {
+        True => label(text: TEXT { workspace })
+        __ => NoElement
+    }
+}
+
+FUNCTION load_files_dialog() {
+    PASSED.store.load_files_dialog == Open |> WHEN {
+        True => label(text: TEXT { files })
+        __ => NoElement
+    }
+}
+
+FUNCTION label(text) {
+    Scene/Element/text(element: [], style: [], text: text)
+}
+"#
+                .to_owned(),
+            },
+        ];
+
+        let runtime = LiveRuntime::from_project("RUN.bn", &units).unwrap();
+        assert!(frame_has_text(&runtime, "NovyWave"));
+        assert_eq!(
+            runtime
+                .document_frame()
+                .unwrap()
+                .nodes
+                .values()
+                .filter(|node| node.text.is_some())
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn effect_result_list_updates_the_retained_document_after_index_publication() {
+        let units = [
+            RuntimeSourceUnit {
+                path: "RUN.bn".to_owned(),
+                source: r#"
+store: [
+    load: SOURCE
+    hierarchy_result:
+        LATEST {
+            NotStarted
+            load |> THEN {
+                Wellen/hierarchy_page(
+                    artifact: load.artifact
+                    request_fingerprint: TEXT { hierarchy }
+                    offset: 0
+                    limit: 8
+                )
+            }
+        }
+    rows:
+        hierarchy_result |> WHEN {
+            HierarchyPage =>
+                hierarchy_result.rows
+                |> List/filter(item, if: item.kind == TEXT { Signal })
+            __ => LIST {}
+        }
+    selected_name:
+        rows
+        |> List/find(item, if: item.id == TEXT { signal:first })
+        |> WHEN {
+            Found[value] => value.name
+            NotFound => TEXT { missing }
+        }
+    catalog_label:
+        TEXT { empty } |> HOLD catalog_label {
+            hierarchy_result |> WHEN {
+                HierarchyPage =>
+                    rows
+                    |> List/map(item, new: item.name)
+                    |> Text/join(separator: TEXT { , }, empty: TEXT { empty })
+                __ => SKIP
+            }
+        }
+]
+document: View/main(PASS: [store: store])
+"#
+                .to_owned(),
+            },
+            RuntimeSourceUnit {
+                path: "View.bn".to_owned(),
+                source: r#"
+FUNCTION main() {
+    Document/new(
+        root: Element/label(
+            element: []
+            label: PASSED.store.catalog_label
+        )
+    )
+}
+"#
+                .to_owned(),
+            },
+        ];
+        let mut runtime = LiveRuntime::from_project("RUN.bn", &units).unwrap();
+        assert!(frame_has_text(&runtime, "empty"));
+
+        let first_artifact = artifact(1);
+        let first_event = runtime
+            .source_event_for_path(
+                1,
+                "store.load",
+                &[],
+                SourcePayload {
+                    fields: BTreeMap::from([("artifact".to_owned(), first_artifact.clone())]),
+                    ..SourcePayload::default()
+                },
+            )
+            .unwrap();
+        let first_call = runtime
+            .dispatch(first_event)
+            .unwrap()
+            .transient_effects
+            .remove(0);
+        runtime
+            .complete_transient_effect(
+                first_call.call_id,
+                hierarchy_outcome(first_artifact, "first", "Alpha"),
+            )
+            .unwrap();
+        assert!(frame_has_text(&runtime, "Alpha"));
+        assert!(matches!(
+            runtime
+                .inspect_value_current("store.selected_name", 1)
+                .unwrap(),
+            Value::Text(value) if value == "Alpha"
+        ));
+
+        let second_artifact = artifact(2);
+        let second_event = runtime
+            .source_event_for_path(
+                2,
+                "store.load",
+                &[],
+                SourcePayload {
+                    fields: BTreeMap::from([("artifact".to_owned(), second_artifact.clone())]),
+                    ..SourcePayload::default()
+                },
+            )
+            .unwrap();
+        let second_call = runtime
+            .dispatch(second_event)
+            .unwrap()
+            .transient_effects
+            .remove(0);
+        runtime
+            .complete_transient_effect(
+                second_call.call_id,
+                hierarchy_outcome(second_artifact, "second", "Beta"),
+            )
+            .unwrap();
+
+        assert!(frame_has_text(&runtime, "Beta"));
+        assert!(matches!(
+            runtime
+                .inspect_value_current("store.selected_name", 1)
+                .unwrap(),
+            Value::Text(value) if value == "missing"
+        ));
     }
 }
 

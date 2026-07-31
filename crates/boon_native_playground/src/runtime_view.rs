@@ -3829,7 +3829,7 @@ mod tests {
                 "{context} did not settle"
             );
             view.poll_host_effects(Instant::now() + Duration::from_millis(2))
-                .unwrap();
+                .unwrap_or_else(|error| panic!("{context} failed: {error}"));
             thread::sleep(Duration::from_millis(1));
         }
         assert_eq!(
@@ -4012,22 +4012,59 @@ mod tests {
         });
         let active_signal_name = active_signal_name
             .unwrap_or_else(|| panic!("{expected_format} active signal is absent from hierarchy"));
+        let active_signal_label = view
+            .root_value_current("store.active_signal_label")
+            .unwrap();
+        let Value::Text(active_signal_label) = active_signal_label else {
+            panic!("{expected_format} active signal label is not text: {active_signal_label:?}");
+        };
+        assert!(
+            !active_signal_label.is_empty() && active_signal_label != "none",
+            "{expected_format} active signal has no renderable UI label"
+        );
 
+        let bridge_summary = view
+            .root_value_current("store.bridge_open_summary")
+            .unwrap();
+        let hierarchy_label = view
+            .root_value_current("store.bridge_hierarchy_page_label")
+            .unwrap();
+        let file_status = view
+            .root_value_current("store.file_compare_status")
+            .unwrap();
+        let retained_node_count = view.retained_frame().nodes.len();
         let visible_text = view
             .retained_frame()
             .nodes
             .values()
-            .filter_map(|node| node.text.as_ref().map(|text| text.text.as_str()))
+            .filter_map(|node| node.text.as_ref().map(|text| text.text.clone()))
             .collect::<BTreeSet<_>>();
+        let relevant_text = visible_text
+            .iter()
+            .filter(|text| {
+                ["VCD", "FST", "GHW", "waveform", "opened"]
+                    .into_iter()
+                    .any(|needle| text.contains(needle))
+            })
+            .take(64)
+            .collect::<Vec<_>>();
         assert!(
             visible_text
                 .iter()
                 .any(|text| text.contains(expected_format)),
-            "{expected_format} container format did not reach retained UI text"
+            "{expected_format} container format did not reach retained UI text; \
+             bridge_summary={bridge_summary:?}; hierarchy_label={hierarchy_label:?}; \
+             file_status={file_status:?}; retained_nodes={retained_node_count}; \
+             relevant_text={relevant_text:#?}"
         );
         assert!(
-            visible_text.contains(active_signal_name),
-            "{expected_format} real active signal did not reach retained UI text"
+            visible_text.contains(&active_signal_label),
+            "{expected_format} real active signal did not reach retained UI text; \
+             active_signal={active_signal:?}; active_signal_name={active_signal_name:?}; \
+             active_signal_label={active_signal_label:?}; selected_signal_rows={:?}; \
+             retained_nodes={retained_node_count}; visible_text={:#?}",
+            view.root_value_current("store.selected_signal_rows"),
+            visible_text.iter().take(128).collect::<Vec<_>>()
         );
     }
 
@@ -4352,16 +4389,21 @@ document: Document/new(
             )
             .unwrap();
             if expected_format == "FST" {
-                assert_eq!(
-                    view.root_value_current("store.comparison_waveform_mode")
-                        .unwrap(),
-                    Value::Text("Active".to_owned()),
-                    "the FST row must enter comparison mode"
+                let comparison_mode = view
+                    .root_value_current("store.comparison_waveform_mode")
+                    .unwrap();
+                assert!(
+                    matches!(
+                        comparison_mode,
+                        Value::Tag { ref tag, ref fields }
+                            if tag == "Active" && fields.is_empty()
+                    ),
+                    "the FST row must enter typed comparison mode: {comparison_mode:?}"
                 );
                 assert_eq!(
-                    view.transient_host.active_call_count(),
+                    view.transient_host.file_stream_owned_call_count(),
                     2,
-                    "the FST row must start one primary and one comparison stream"
+                    "the FST row must own one primary and one comparison stream"
                 );
             }
             settle_host_effects(
@@ -4443,9 +4485,14 @@ document: Document/new(
         let hierarchy = view
             .root_value_current("store.real_hierarchy_page_result")
             .unwrap();
-        let Value::Record(hierarchy) = hierarchy else {
-            panic!("real VCD hierarchy is not a record: {hierarchy:?}");
+        let Value::Tag {
+            tag,
+            fields: hierarchy,
+        } = hierarchy
+        else {
+            panic!("real VCD hierarchy is not a tagged result: {hierarchy:?}");
         };
+        assert_eq!(tag, "HierarchyPage");
         let Some(Value::List(hierarchy_rows)) = hierarchy.get("rows") else {
             panic!("real VCD hierarchy has no rows: {hierarchy:?}");
         };
@@ -4566,9 +4613,14 @@ document: Document/new(
         let next_analog_page = view
             .root_value_current("store.real_signal_page_result")
             .unwrap();
-        let Value::Record(next_analog_page) = next_analog_page else {
-            panic!("continued analog page is not a record: {next_analog_page:?}");
+        let Value::Tag {
+            tag,
+            fields: next_analog_page,
+        } = next_analog_page
+        else {
+            panic!("continued analog page is not a tagged result: {next_analog_page:?}");
         };
+        assert_eq!(tag, "SignalPage");
         assert_eq!(
             next_analog_page.get("offset"),
             Some(&Value::integer(2).unwrap())
@@ -4618,8 +4670,13 @@ document: Document/new(
         assert_eq!(view.transient_host.active_call_count(), 0);
 
         dispatch_press(&mut view, "store.elements.show_empty");
-        view.root_value_current("store.external_file_tree_selected_file")
-            .expect("empty-state list membership change must remain a current non-event value");
+        let inactive = view
+            .root_value_current("store.external_file_tree_selected_file")
+            .expect_err("empty-state list membership must not synthesize a row event");
+        assert!(
+            inactive.contains("privately absent"),
+            "empty-state list membership changed private event absence: {inactive}"
+        );
     }
 
     #[test]

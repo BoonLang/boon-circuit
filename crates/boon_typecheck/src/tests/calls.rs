@@ -13,6 +13,66 @@ fn checked_program_preserves_the_exact_parser_source_bundle_digest() {
 }
 
 #[test]
+fn dependency_cycle_fallback_survives_nested_user_result_propagation() {
+    let parsed = boon_parser::parse_source(
+        "checked-nested-dependency-cycle-result.bn",
+        r#"
+FUNCTION leaf() {
+    Dependency/catch_cycle(
+        value: Numeric[value: 1]
+        on_cycle: CycleError
+    )
+}
+
+FUNCTION wrapper() {
+    leaf()
+}
+
+FUNCTION display(result) {
+    result |> WHEN {
+        Numeric[value] => TEXT { numeric }
+        CycleError => TEXT { cycle }
+    }
+}
+
+result: wrapper()
+label: display(result: result)
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+    assert!(
+        !output.report.has_errors(),
+        "cycle fallback propagation diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+    let program = output.program.expect("valid source has a checked program");
+    let wrapper = program
+        .callables
+        .iter()
+        .find(|callable| callable.name == "wrapper")
+        .expect("wrapper signature");
+    let Type::VariantSet(variants) = &wrapper.result.ty else {
+        panic!(
+            "wrapper must return the closed cycle-result variant set: {:?}",
+            wrapper.result.ty
+        );
+    };
+    assert!(
+        variants
+            .iter()
+            .any(|variant| matches!(variant, Variant::Tag(tag) if tag == "CycleError")),
+        "nested wrapper lost the cycle fallback: {variants:?}"
+    );
+    assert!(
+        variants
+            .iter()
+            .any(|variant| matches!(variant, Variant::Tagged { tag, .. } if tag == "Numeric")),
+        "nested wrapper lost the normal value: {variants:?}"
+    );
+}
+
+#[test]
 fn checked_when_consumes_the_comparison_result() {
     let parsed = boon_parser::parse_source(
         "checked-comparison-when.bn",
@@ -2766,6 +2826,127 @@ result:
 }
 
 #[test]
+fn tagged_payload_shadow_does_not_retype_the_outer_function_parameter() {
+    let parsed = boon_parser::parse_project(
+        "RUN.bn",
+        [
+            (
+                "RUN.bn".to_owned(),
+                r#"
+rows: LIST {
+    [raw_label: TEXT { 1010 }, bit_width: TEXT { auto }]
+}
+result: WidthView/widths(PASS: [rows: rows])
+"#
+                .to_owned(),
+            ),
+            (
+                "View/WidthView.bn".to_owned(),
+                r#"
+FUNCTION widths() {
+    PASSED.rows
+    |> List/map(item, new:
+        WidthModel/bit_width(value: item.raw_label, raw_width: item.bit_width)
+    )
+}
+"#
+                .to_owned(),
+            ),
+            (
+                "Model/WidthModel.bn".to_owned(),
+                r#"
+FUNCTION value_trimmed(value) {
+    value |> Text/trim()
+}
+
+FUNCTION value_radix(value) {
+    value_trimmed(value: value) |> Text/starts_with(prefix: TEXT { 0x }) |> WHEN {
+        True => 16
+        False => value_trimmed(value: value) |> Text/starts_with(prefix: TEXT { 0b }) |> WHEN {
+            True => 2
+            False => 10
+        }
+    }
+}
+
+FUNCTION value_number(value) {
+    value_trimmed(value: value) |> Text/to_number(radix: value_radix(value: value))
+}
+
+FUNCTION trimmed_length(value) {
+    value_trimmed(value: value) |> Text/length()
+}
+
+FUNCTION binary_width(value) {
+    value_trimmed(value: value) |> Text/starts_with(prefix: TEXT { 0b }) |> WHEN {
+        True => prefixed_digit_count(value: value)
+        False => trimmed_length(value: value)
+    }
+}
+
+FUNCTION prefixed_digit_count(value) {
+    trimmed_length(value: value) - 2
+}
+
+FUNCTION hex_width(value) {
+    prefixed_digit_count(value: value) * 4
+}
+
+FUNCTION inferred_width(value) {
+    value_radix(value: value) |> WHEN {
+        16 => hex_width(value: value)
+        2 => binary_width(value: value)
+        __ => value_number(value: value) |> WHEN {
+            Parsed[value] => value |> Number/bit_width()
+            InvalidNumber[reason, position] => trimmed_length(value: value)
+        }
+    }
+}
+
+FUNCTION bit_width(value, raw_width) {
+    raw_width |> Text/to_number() |> WHEN {
+        Parsed[value] => value
+        InvalidNumber[reason, position] => inferred_width(value: value)
+    }
+}
+"#
+                .to_owned(),
+            ),
+        ],
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+    assert!(
+        !output.report.has_errors(),
+        "diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+    let program = output.program.expect("shadowed payload source is checked");
+    let callable = checked_callable(&program, "WidthModel/inferred_width");
+    let parameter = callable
+        .parameters
+        .iter()
+        .find(|parameter| parameter.name == "value")
+        .expect("outer value parameter");
+    assert_eq!(
+        parameter.flow_type.ty,
+        Type::Text,
+        "inferred-width callable: {callable:#?}"
+    );
+    assert_eq!(callable.result.ty, Type::Number);
+    let payload = program
+        .declarations
+        .iter()
+        .find(|declaration| {
+            declaration.kind == CheckedDeclarationKind::PatternBinding
+                && declaration.name == "value"
+        })
+        .expect("Parsed value payload");
+    assert_eq!(payload.flow_type.ty, Type::Number);
+    assert_ne!(parameter.decl_id, payload.id);
+}
+
+#[test]
 fn typed_find_rejects_an_unknown_found_payload_field() {
     let parsed = boon_parser::parse_source(
         "checked-direct-find-unknown-payload.bn",
@@ -3663,6 +3844,41 @@ result: wrapped(value: TEXT { ok })
 }
 
 #[test]
+fn checked_root_record_field_initializer_rejects_a_same_name_outer_capture() {
+    let parsed = boon_parser::parse_source(
+        "checked-root-record-shadow.bn",
+        r#"
+value: TEXT { outer }
+record:
+    [
+        value: value
+    ]
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+    assert!(output.program.is_none());
+    let diagnostic = output
+        .report
+        .diagnostics
+        .iter()
+        .find(|diagnostic| {
+            diagnostic
+                .message
+                .contains("canonical checked value contains an expansion cycle")
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "missing root record self-cycle diagnostic: {:#?}",
+                output.report.diagnostics
+            )
+        });
+    assert_eq!(diagnostic.line, 5);
+    assert!(diagnostic.start < diagnostic.end);
+    assert_eq!(&parsed.source[diagnostic.start..diagnostic.end], "value");
+}
+
+#[test]
 fn checked_record_field_can_read_a_differently_named_outer_parameter() {
     let parsed = boon_parser::parse_source(
         "checked-record-distinct-parameter.bn",
@@ -3822,6 +4038,191 @@ number: display(value: NumberValue[number: 3])
 }
 
 #[test]
+fn tagged_arm_helper_requirements_preserve_the_selector_variant_set() {
+    let parsed = boon_parser::parse_source(
+        "tagged-arm-helper-parameter-requirements.bn",
+        r#"
+FUNCTION value_state(value) {
+    value |> WHEN {
+        BinaryValue => text_state(text: value.bits)
+        RealValue => Analog
+        __ => Unknown
+    }
+}
+
+FUNCTION text_state(text) {
+    text |> Text/is_not_empty() |> WHEN {
+        True => Known
+        False => Unknown
+    }
+}
+
+binary: value_state(value: BinaryValue[bits: TEXT { 01 }])
+real: value_state(value: RealValue[value: 1])
+unavailable: value_state(value: UnavailableValue)
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+    assert!(
+        !output.report.has_errors(),
+        "diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+    let program = output.program.expect("tagged helper source is checked");
+    let parameter = checked_callable(&program, "value_state")
+        .parameters
+        .iter()
+        .find(|parameter| parameter.name == "value")
+        .expect("value_state value parameter");
+    let Type::VariantSet(variants) = &parameter.flow_type.ty else {
+        panic!(
+            "tagged selector parameter collapsed to a non-variant shape: {:?}",
+            parameter.flow_type.ty
+        );
+    };
+    assert!(variants.iter().any(
+        |variant| matches!(variant, Variant::Tagged { tag, .. } if tag == "BinaryValue")
+    ));
+    assert!(variants.iter().any(
+        |variant| matches!(variant, Variant::Tagged { tag, .. } if tag == "RealValue")
+    ));
+    assert!(
+        variants
+            .iter()
+            .any(|variant| matches!(variant, Variant::Tag(tag) if tag == "UnavailableValue"))
+    );
+}
+
+#[test]
+fn forwarded_variant_selector_preserves_the_complete_pattern_domain() {
+    let parsed = boon_parser::parse_source(
+        "forwarded-variant-selector-domain.bn",
+        r#"
+FUNCTION label_for(selected) {
+    selected |> WHEN {
+        True => TEXT { selected }
+        False => TEXT { idle }
+    }
+}
+
+FUNCTION button(selected) {
+    label_for(selected: selected)
+}
+
+literal: button(selected: False)
+comparison: button(selected: 1 == 1)
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+    assert!(
+        !output.report.has_errors(),
+        "diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+    let program = output.program.expect("forwarded selector source is checked");
+    for callable in ["label_for", "button"] {
+        let selected = checked_callable(&program, callable)
+            .parameters
+            .iter()
+            .find(|parameter| parameter.name == "selected")
+            .expect("selected parameter");
+        assert!(
+            matches!(
+                &selected.flow_type.ty,
+                Type::VariantSet(variants)
+                    if variants.contains(&Variant::Tag("False".to_owned()))
+                        && variants.contains(&Variant::Tag("True".to_owned()))
+            ),
+            "{callable} selected domain: {:?}",
+            selected.flow_type.ty
+        );
+    }
+}
+
+#[test]
+fn tagged_selector_domain_includes_a_typed_find_branch_and_its_fallback() {
+    let parsed = boon_parser::parse_source(
+        "tagged-selector-find-domain.bn",
+        r#"
+rows: LIST {
+    [id: 1, value: BinaryValue[bits: TEXT { 01 }]]
+    [id: 2, value: StringValue[text: TEXT { ready }]]
+}
+
+selected:
+    rows
+    |> List/find(item, if: item.id == 1)
+    |> WHEN {
+        Found[value] => value.value
+        NotFound => StringValue[text: Text/empty()]
+    }
+
+label: value_text(value: selected)
+segments:
+    rows
+    |> List/map(item, new: segment(transition: item))
+
+FUNCTION segment(transition) {
+    [label: value_text(value: transition.value)]
+}
+
+FUNCTION value_text(value) {
+    value |> WHEN {
+        BinaryValue => value.bits
+        StringValue => value.text
+        __ => TEXT { ? }
+    }
+}
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+    assert!(
+        !output.report.has_errors(),
+        "diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+    let program = output
+        .program
+        .expect("typed find selector source is checked");
+    let parameter = checked_callable(&program, "value_text")
+        .parameters
+        .iter()
+        .find(|parameter| parameter.name == "value")
+        .expect("value_text value parameter");
+    let Type::VariantSet(variants) = &parameter.flow_type.ty else {
+        panic!(
+            "typed find selector parameter is not a variant set: {:?}",
+            parameter.flow_type.ty
+        );
+    };
+    assert!(variants.iter().any(
+        |variant| matches!(variant, Variant::Tagged { tag, .. } if tag == "BinaryValue")
+    ));
+    assert!(variants.iter().any(
+        |variant| matches!(variant, Variant::Tagged { tag, .. } if tag == "StringValue")
+    ));
+    let transition = checked_callable(&program, "segment")
+        .parameters
+        .iter()
+        .find(|parameter| parameter.name == "transition")
+        .expect("segment transition parameter");
+    let Type::Object(transition) = &transition.flow_type.ty else {
+        panic!(
+            "segment transition parameter is not an object: {:?}",
+            transition.flow_type.ty
+        );
+    };
+    assert_eq!(
+        transition.fields.get("value"),
+        Some(&parameter.flow_type.ty),
+        "the upstream wrapper must retain the complete selector domain"
+    );
+}
+
+#[test]
 fn checked_program_rejects_a_root_sibling_as_a_function_result() {
     let parsed = boon_parser::parse_source(
         "checked-unindented-record-result.bn",
@@ -3964,6 +4365,65 @@ rows:
         "named HOLD alias escaped as an ambient read: {:#?}",
         program.expressions
     );
+}
+
+#[test]
+fn same_name_hold_accumulator_shadows_a_package_field_during_inference() {
+    let parsed = boon_parser::parse_source(
+        "same-name-hold-shadow.bn",
+        r#"
+store: [
+    selected:
+        LIST { [id: TEXT { package }] }
+        |> List/find(item, if: True)
+    rows:
+        LIST {
+            [id: TEXT { first }, selected: False]
+            [id: TEXT { second }, selected: True]
+        }
+        |> List/map(item, new: stateful_row(row: item))
+]
+
+FUNCTION stateful_row(row) {
+    [
+        change: SOURCE
+        selected:
+            row.selected |> HOLD selected {
+                change |> THEN { selected }
+            }
+    ]
+}
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+    assert!(
+        !output.report.has_errors(),
+        "diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+    let program = output.program.expect("checked program");
+    let state = program
+        .states
+        .iter()
+        .find(|state| {
+            program
+                .declarations
+                .iter()
+                .find(|declaration| declaration.id == state.declaration)
+                .is_some_and(|declaration| declaration.name == "selected")
+        })
+        .expect("function-local selected state");
+    assert_eq!(state.flow_type.ty, true_false_type());
+    assert!(program.expressions.iter().any(|expression| matches!(
+        &expression.kind,
+        CheckedExpressionKind::Read {
+            target,
+            projection,
+            ..
+        } if *target == state.declaration
+            && projection.is_empty()
+    )));
 }
 
 #[test]
@@ -4744,6 +5204,63 @@ FUNCTION stateful_row(row) {
         !output.report.has_errors(),
         "diagnostics: {:#?}",
         output.report.diagnostics
+    );
+}
+
+#[test]
+fn closed_call_result_does_not_absorb_stale_occurrence_fields() {
+    let instantiated = Type::Object(ObjectShape::from_ordered_fields(
+        [
+            ("key".to_owned(), Type::Text),
+            (
+                "selected".to_owned(),
+                Type::VariantSet(vec![Variant::Tagged {
+                    tag: "Found".to_owned(),
+                    fields: ObjectShape::from_ordered_fields(
+                        [(
+                            "value".to_owned(),
+                            Type::Object(ObjectShape::from_ordered_fields(
+                                [("signal_id".to_owned(), Type::Text)],
+                                false,
+                            )),
+                        )],
+                        false,
+                    ),
+                }]),
+            ),
+        ],
+        false,
+    ));
+    let occurrence = Type::Object(ObjectShape::from_ordered_fields(
+        [
+            ("key".to_owned(), Type::Text),
+            (
+                "selected".to_owned(),
+                Type::VariantSet(vec![Variant::Tagged {
+                    tag: "Found".to_owned(),
+                    fields: ObjectShape::from_ordered_fields(
+                        [(
+                            "value".to_owned(),
+                            Type::Object(ObjectShape::from_ordered_fields(
+                                [
+                                    ("signal_id".to_owned(), Type::Text),
+                                    ("syntax_only".to_owned(), Type::Number),
+                                ],
+                                false,
+                            )),
+                        )],
+                        false,
+                    ),
+                }]),
+            ),
+        ],
+        false,
+    ));
+
+    assert!(type_is_recursively_closed(&instantiated));
+    assert_eq!(
+        specialize_checked_call_result(&instantiated, &occurrence),
+        instantiated
     );
 }
 

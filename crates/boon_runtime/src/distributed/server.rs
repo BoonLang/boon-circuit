@@ -83,7 +83,10 @@ pub trait DistributedServerMachine {
         self.prepare_dispatch(event)
     }
 
-    fn export_current(&mut self, export_id: ExportId) -> Result<Value, DistributedRuntimeError>;
+    fn export_if_current(
+        &mut self,
+        export_id: ExportId,
+    ) -> Result<Option<Value>, DistributedRuntimeError>;
 
     /// Returns the complete live demand set for this call site in the current
     /// machine origin. This includes root demands and demands retained inside
@@ -2094,7 +2097,10 @@ where
             .cloned()
             .collect::<Vec<_>>();
         for edge in edges {
-            let value = export_runtime_value(self.machine.export_current(edge.export_id)?)?;
+            let Some(value) = self.machine.export_if_current(edge.export_id)? else {
+                continue;
+            };
+            let value = export_runtime_value(value)?;
             let state = self.state.origins.get_mut(&origin).expect("active origin");
             if state
                 .sent_values
@@ -2326,7 +2332,10 @@ where
             .cloned()
             .collect::<Vec<_>>();
         for edge in edges {
-            let value = export_runtime_value(self.machine.export_current(edge.export_id)?)?;
+            let Some(value) = self.machine.export_if_current(edge.export_id)? else {
+                continue;
+            };
+            let value = export_runtime_value(value)?;
             let changed = self
                 .state
                 .shared_sent_values

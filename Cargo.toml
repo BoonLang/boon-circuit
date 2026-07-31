@@ -84,6 +84,7 @@ boon_native_app_window = { path = "crates/boon_native_app_window" }
 app_window = { git = "https://github.com/BoonLang/app_window.git", rev = "6aec9831f281df355736df28a4c3aacdef7cf8a1" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+bincode = "1.3.3"
 base64 = "0.22.1"
 bytes = { version = "1.11.1", features = ["serde"] }
 num-bigint = { version = "0.4.6", features = ["serde"] }

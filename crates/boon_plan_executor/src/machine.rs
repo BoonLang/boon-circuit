@@ -4092,17 +4092,25 @@ struct EffectConsumer {
     row: Option<RowId>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct TransientEffectResultKey {
+    invocation_id: EffectInvocationId,
+    row: Option<RowId>,
+}
+
+#[derive(Clone)]
 struct EffectApplicationContext {
     owner: OwnerInstanceId,
     row: Option<RowId>,
     sequence: u64,
+    activation: Option<EffectActivation>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct EffectActivation {
     invocation_id: EffectInvocationId,
     owner: OwnerInstanceId,
+    trigger: ActiveTrigger,
     source_event: Option<SourceEvent>,
 }
 
@@ -4948,7 +4956,8 @@ impl Metadata {
                         )));
                     }
                 },
-                PlanOpKind::StateUpdate { trigger, .. } => {
+                PlanOpKind::StateUpdate { trigger, .. }
+                | PlanOpKind::EffectUpdate { trigger, .. } => {
                     let op = Arc::new(op.clone());
                     if update_branch_has_effect(&op)
                         && effect_updates_by_id
@@ -5546,6 +5555,77 @@ fn output_list_field(
                 list.0
             ))
         })
+}
+
+fn page_row_schema(
+    plan: &MachinePlan,
+    slot: &ListStorageSlot,
+) -> Result<(Vec<(String, FieldId)>, Option<DataTypePlan>), Error> {
+    let item_type = plan
+        .persistence
+        .lists
+        .iter()
+        .find(|memory| memory.runtime_slot == slot.id)
+        .and_then(|memory| match &memory.data_type {
+            DataTypePlan::List { item } => Some(item.as_ref()),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            Error::InvalidPlan(format!(
+                "typed list page source list {} has no declared item type",
+                slot.list_id.0
+            ))
+        })?;
+    let scalar_type = match item_type {
+        DataTypePlan::Record { fields, .. } => {
+            let public_fields = fields
+                .iter()
+                .filter(|field| !field.name.starts_with("@authority:"))
+                .count();
+            if public_fields == 0 {
+                fields
+                    .iter()
+                    .find(|field| field.name == "@authority:value")
+                    .map(|field| field.data_type.clone())
+            } else {
+                None
+            }
+        }
+        item_type => Some(item_type.clone()),
+    };
+    if let Some(scalar_type) = scalar_type {
+        let field = slot
+            .row_fields
+            .iter()
+            .find(|field| field.name == "value" && field.role.is_value())
+            .ok_or_else(|| {
+                Error::InvalidPlan(format!(
+                    "typed scalar list page source {} has no public `value` field",
+                    slot.list_id.0
+                ))
+            })?;
+        return Ok((
+            vec![("value".to_owned(), field.field_id)],
+            Some(scalar_type),
+        ));
+    }
+
+    let mut fields = BTreeMap::new();
+    for field in slot.row_fields.iter().filter(|field| field.role.is_value()) {
+        if fields.insert(field.name.clone(), field.field_id).is_some() {
+            return Err(Error::InvalidPlan(format!(
+                "typed list page source {} has duplicate public row field `{}`",
+                slot.list_id.0, field.name
+            )));
+        }
+    }
+    if fields.is_empty() {
+        return Err(Error::InvalidPlan(format!(
+            "typed list page source {} has no public row fields",
+            slot.list_id.0
+        )));
+    }
+    Ok((fields.into_iter().collect(), None))
 }
 
 fn debug_name_variants(label: &str) -> Vec<String> {
@@ -6307,6 +6387,7 @@ struct Work {
     list_revision_undo: BTreeMap<ListId, u64>,
     distributed_context_undo: Option<DistributedContextUndo>,
     effect_activation_undo: BTreeMap<EffectConsumer, Option<EffectActivation>>,
+    transient_effect_result_undo: BTreeMap<TransientEffectResultKey, Option<Value>>,
     detached_producer_leases: BTreeMap<ProducerLeaseKey, ProducerLeaseState>,
     active_value_list_authorities: Vec<PlanValueListAuthority>,
     pending_settle: bool,
@@ -6383,6 +6464,7 @@ impl Work {
         self.list_revision_undo.clear();
         self.distributed_context_undo = None;
         self.effect_activation_undo.clear();
+        self.transient_effect_result_undo.clear();
         self.detached_producer_leases.clear();
         self.active_value_list_authorities.clear();
         self.pending_settle = false;
@@ -8910,6 +8992,7 @@ fn schedule_apply_operands<'event, 'plan>(
         | PlanRowExpressionNode::CatchCycle { .. }
         | PlanRowExpressionNode::Intrinsic { .. }
         | PlanRowExpressionNode::EffectResult
+        | PlanRowExpressionNode::TransientEffectResult { .. }
         | PlanRowExpressionNode::Field { .. }
         | PlanRowExpressionNode::Constant { .. }
         | PlanRowExpressionNode::ListGetField { .. }
@@ -9097,6 +9180,7 @@ pub struct MachineInstance {
     distributed_import_revisions: BTreeMap<ImportId, u64>,
     row_owned_call_results:
         BTreeMap<(ImportId, DistributedCallInstanceId), DistributedCurrentCallResult>,
+    transient_effect_results: BTreeMap<TransientEffectResultKey, Value>,
     distributed_current_call_demands: DistributedCurrentCallDemands,
     root_states: BTreeMap<StateId, PrivatePresence<Value>>,
     activation_root_states: BTreeMap<StateId, PrivatePresence<Value>>,
@@ -9238,6 +9322,7 @@ struct ProducerLeaseState {
     distributed_current_call_demands: DistributedCurrentCallDemands,
     row_owned_call_results:
         BTreeMap<(ImportId, DistributedCallInstanceId), DistributedCurrentCallResult>,
+    transient_effect_results: BTreeMap<TransientEffectResultKey, Value>,
     producer_result: Option<Value>,
     root_source_bindings: BTreeMap<SourceId, u64>,
     touched_root_states: BTreeSet<StateId>,
@@ -9261,6 +9346,7 @@ struct ActiveProducerLease {
     saved_effect_activations: BTreeMap<EffectConsumer, EffectActivation>,
     saved_row_owned_call_results:
         BTreeMap<(ImportId, DistributedCallInstanceId), DistributedCurrentCallResult>,
+    saved_transient_effect_results: BTreeMap<TransientEffectResultKey, Value>,
     producer_result: Option<Value>,
 }
 
@@ -9735,6 +9821,7 @@ impl MachineInstanceBuilder {
                 distributed_imports,
                 distributed_import_revisions: BTreeMap::new(),
                 row_owned_call_results: BTreeMap::new(),
+                transient_effect_results: BTreeMap::new(),
                 distributed_current_call_demands: BTreeMap::new(),
                 root_states: BTreeMap::new(),
                 activation_root_states: BTreeMap::new(),
@@ -11467,6 +11554,10 @@ impl MachineInstance {
             &mut self.row_owned_call_results,
             lease.row_owned_call_results,
         );
+        let saved_transient_effect_results = std::mem::replace(
+            &mut self.transient_effect_results,
+            lease.transient_effect_results,
+        );
         self.active_producer_lease = Some(ActiveProducerLease {
             key,
             call_site_id: instance.call_site_id,
@@ -11479,6 +11570,7 @@ impl MachineInstance {
             saved_distributed_current_call_demands,
             saved_effect_activations,
             saved_row_owned_call_results,
+            saved_transient_effect_results,
             producer_result: lease.producer_result,
         });
         Ok(())
@@ -11548,6 +11640,10 @@ impl MachineInstance {
             row_owned_call_results: std::mem::replace(
                 &mut self.row_owned_call_results,
                 active.saved_row_owned_call_results,
+            ),
+            transient_effect_results: std::mem::replace(
+                &mut self.transient_effect_results,
+                active.saved_transient_effect_results,
             ),
             producer_result: active.producer_result,
             root_source_bindings: take_map_where(&mut self.root_source_bindings, |source, _| {
@@ -11937,8 +12033,8 @@ impl MachineInstance {
         import_updates: Vec<DistributedImportUpdate>,
         install: DistributedContextInstall,
         turn: DistributedContextTurn,
-        result: Option<(&ValueRef, &DataTypePlan)>,
-    ) -> Result<(Option<Turn>, Option<Value>), Error> {
+        result: Option<(&ValueRef, &DataTypePlan, bool)>,
+    ) -> Result<(Option<Turn>, Option<PrivatePresence<Value>>), Error> {
         validate_session_context(&session_context)?;
 
         let mut seen_imports = BTreeSet::new();
@@ -12023,9 +12119,12 @@ impl MachineInstance {
             let mut work = self.fresh_work();
             self.initialize_active_producer_lease(&mut work)?;
             let value = match result {
-                Some((result, result_type)) => {
-                    Some(self.read_distributed_graph_result(result, result_type, &mut work)?)
-                }
+                Some((result, result_type, true)) => Some(
+                    self.read_distributed_graph_result_presence(result, result_type, &mut work)?,
+                ),
+                Some((result, result_type, false)) => Some(PrivatePresence::Present(
+                    self.read_distributed_graph_result(result, result_type, &mut work)?,
+                )),
                 None => None,
             };
             if self.active_producer_lease.is_some() {
@@ -12121,9 +12220,12 @@ impl MachineInstance {
             }
             self.ensure_published_current(None, &mut work)?;
             let result = match result {
-                Some((result, result_type)) => {
-                    Some(self.read_distributed_graph_result(result, result_type, &mut work)?)
-                }
+                Some((result, result_type, true)) => Some(
+                    self.read_distributed_graph_result_presence(result, result_type, &mut work)?,
+                ),
+                Some((result, result_type, false)) => Some(PrivatePresence::Present(
+                    self.read_distributed_graph_result(result, result_type, &mut work)?,
+                )),
                 None => None,
             };
             self.turn_sequence = sequence;
@@ -12155,6 +12257,20 @@ impl MachineInstance {
         result_type: &DataTypePlan,
         work: &mut Work,
     ) -> Result<Value, Error> {
+        match self.read_distributed_graph_result_presence(result, result_type, work)? {
+            PrivatePresence::Present(value) => Ok(value),
+            PrivatePresence::Absent => Err(Error::Evaluation(
+                "distributed function result is not current".to_owned(),
+            )),
+        }
+    }
+
+    fn read_distributed_graph_result_presence(
+        &mut self,
+        result: &ValueRef,
+        result_type: &DataTypePlan,
+        work: &mut Work,
+    ) -> Result<PrivatePresence<Value>, Error> {
         let call_site_id = self
             .active_producer_lease
             .as_ref()
@@ -12168,13 +12284,18 @@ impl MachineInstance {
         let consumer = Consumer::ProducerResult(call_site_id);
         self.clear_consumer_dependencies(consumer);
         let evaluated = self.eval_value_ref(result, None, None, None, Some(consumer), work)?;
-        let value = self.materialize_eval(evaluated)?;
-        validate_distributed_boundary_value(&value, result_type, "distributed function result")?;
+        let presence = self.materialize_private_presence(evaluated)?;
+        if let PrivatePresence::Present(value) = &presence {
+            validate_distributed_boundary_value(value, result_type, "distributed function result")?;
+        }
         self.active_producer_lease
             .as_mut()
             .expect("producer lease remained active while reading its result")
-            .producer_result = Some(value.clone());
-        Ok(value)
+            .producer_result = match &presence {
+            PrivatePresence::Present(value) => Some(value.clone()),
+            PrivatePresence::Absent => None,
+        };
+        Ok(presence)
     }
 
     fn invalidate_session_info_fields(&mut self, work: &mut Work) {
@@ -12292,6 +12413,14 @@ impl MachineInstance {
         &mut self,
         export_id: ExportId,
     ) -> Result<Value, Error> {
+        self.distributed_export_value_if_current(export_id)?
+            .ok_or_else(|| Error::Evaluation("distributed value export is not current".to_owned()))
+    }
+
+    pub fn distributed_export_value_if_current(
+        &mut self,
+        export_id: ExportId,
+    ) -> Result<Option<Value>, Error> {
         let export = self
             .plan
             .distributed_endpoint
@@ -12311,9 +12440,17 @@ impl MachineInstance {
             })?;
         let mut work = self.fresh_work();
         let evaluated = self.eval_value_ref(&export.value, None, None, None, None, &mut work)?;
-        let value = self.materialize_eval(evaluated)?;
-        validate_distributed_boundary_value(&value, &export.data_type, "distributed value export")?;
-        Ok(value)
+        match self.materialize_private_presence(evaluated)? {
+            PrivatePresence::Present(value) => {
+                validate_distributed_boundary_value(
+                    &value,
+                    &export.data_type,
+                    "distributed value export",
+                )?;
+                Ok(Some(value))
+            }
+            PrivatePresence::Absent => Ok(None),
+        }
     }
 
     pub fn evaluate_distributed_function_instance_unsettled(
@@ -12324,6 +12461,72 @@ impl MachineInstance {
         content_revision: u64,
         arguments: BTreeMap<DistributedArgumentId, Value>,
     ) -> Result<(Value, Option<Turn>), Error> {
+        let (instance, updates) = self.prepare_distributed_function_instance(
+            call_site_id,
+            export_id,
+            content_revision,
+            arguments,
+        )?;
+        if instance.mode == DistributedCallMode::Invocation {
+            return self.evaluate_distributed_invocation_unsettled(
+                &instance,
+                call_instance_id,
+                updates,
+            );
+        }
+        let (presence, turn) = self.evaluate_distributed_current_instance_unsettled(
+            &instance,
+            call_instance_id,
+            updates,
+            false,
+        )?;
+        let PrivatePresence::Present(value) = presence else {
+            unreachable!("strict distributed Current evaluation rejects private absence")
+        };
+        Ok((value, turn))
+    }
+
+    pub fn activate_distributed_current_function_instance_unsettled(
+        &mut self,
+        call_site_id: RemoteCallSiteId,
+        call_instance_id: DistributedCallInstanceId,
+        export_id: ExportId,
+        content_revision: u64,
+        arguments: BTreeMap<DistributedArgumentId, Value>,
+    ) -> Result<(Option<Value>, Option<Turn>), Error> {
+        let (instance, updates) = self.prepare_distributed_function_instance(
+            call_site_id,
+            export_id,
+            content_revision,
+            arguments,
+        )?;
+        if instance.mode != DistributedCallMode::Current {
+            return Err(Error::InvalidEvent(
+                "distributed producer call site is not a Current call".to_owned(),
+            ));
+        }
+        let (presence, turn) = self.evaluate_distributed_current_instance_unsettled(
+            &instance,
+            call_instance_id,
+            updates,
+            true,
+        )?;
+        Ok((
+            match presence {
+                PrivatePresence::Present(value) => Some(value),
+                PrivatePresence::Absent => None,
+            },
+            turn,
+        ))
+    }
+
+    fn prepare_distributed_function_instance(
+        &self,
+        call_site_id: RemoteCallSiteId,
+        export_id: ExportId,
+        content_revision: u64,
+        arguments: BTreeMap<DistributedArgumentId, Value>,
+    ) -> Result<(ProducerFunctionInstancePlan, Vec<DistributedImportUpdate>), Error> {
         let instance = self
             .metadata
             .producer_function_instances
@@ -12373,20 +12576,23 @@ impl MachineInstance {
                 value,
             ));
         }
-        if instance.mode == DistributedCallMode::Invocation {
-            return self.evaluate_distributed_invocation_unsettled(
-                &instance,
-                call_instance_id,
-                updates,
-            );
-        }
+        Ok((instance, updates))
+    }
+
+    fn evaluate_distributed_current_instance_unsettled(
+        &mut self,
+        instance: &ProducerFunctionInstancePlan,
+        call_instance_id: DistributedCallInstanceId,
+        updates: Vec<DistributedImportUpdate>,
+        allow_pending: bool,
+    ) -> Result<(PrivatePresence<Value>, Option<Turn>), Error> {
         self.activate_producer_lease(&instance, call_instance_id)?;
         let evaluated = self.install_distributed_context_with_result(
             self.options.session_context.clone(),
             updates,
             DistributedContextInstall::Patch,
             DistributedContextTurn::Execution,
-            Some((&instance.result, &instance.result_type)),
+            Some((&instance.result, &instance.result_type, allow_pending)),
         );
         match evaluated {
             Ok((turn, value)) => {
@@ -12678,15 +12884,24 @@ impl MachineInstance {
         call_site_id: RemoteCallSiteId,
         call_instance_id: DistributedCallInstanceId,
     ) -> Result<Value, Error> {
+        self.distributed_producer_call_result_if_current(call_site_id, call_instance_id)?
+            .ok_or_else(|| {
+                Error::Evaluation(
+                    "distributed producer call instance has no current result".to_owned(),
+                )
+            })
+    }
+
+    pub fn distributed_producer_call_result_if_current(
+        &mut self,
+        call_site_id: RemoteCallSiteId,
+        call_instance_id: DistributedCallInstanceId,
+    ) -> Result<Option<Value>, Error> {
         if let Some(active) = &self.active_producer_lease
             && active.call_site_id == call_site_id
             && active.key.call_instance_id == call_instance_id
         {
-            return active.producer_result.clone().ok_or_else(|| {
-                Error::Evaluation(
-                    "distributed producer call instance has no current result".to_owned(),
-                )
-            });
+            return Ok(active.producer_result.clone());
         }
         let instance = self
             .metadata
@@ -12715,22 +12930,25 @@ impl MachineInstance {
             ));
         };
         if self.active_producer_lease.is_some() || self.turn_work.pending_settle {
-            return lease.producer_result.clone().ok_or_else(|| {
-                Error::Evaluation(
-                    "distributed producer call instance has no current result".to_owned(),
-                )
-            });
+            return Ok(lease.producer_result.clone());
         }
         self.activate_producer_lease(&instance, call_instance_id)?;
         let mut work = self.fresh_work();
         let result = (|| {
             self.initialize_active_producer_lease(&mut work)?;
-            self.read_distributed_graph_result(&instance.result, &instance.result_type, &mut work)
+            self.read_distributed_graph_result_presence(
+                &instance.result,
+                &instance.result_type,
+                &mut work,
+            )
         })();
         match result {
-            Ok(value) => {
+            Ok(presence) => {
                 self.finish_active_producer_lease(true);
-                Ok(value)
+                Ok(match presence {
+                    PrivatePresence::Present(value) => Some(value),
+                    PrivatePresence::Absent => None,
+                })
             }
             Err(error) => {
                 self.restore_active_producer_lease();
@@ -13494,6 +13712,37 @@ impl MachineInstance {
             active: ActiveTrigger {
                 cause: origin.active.cause,
                 owner_plan,
+                owner,
+                target: Some(row),
+                sequence: origin.active.sequence,
+            },
+            source_event: origin.source_event,
+        })
+    }
+
+    fn trigger_for_plan_owner_target<'a>(
+        &mut self,
+        plan: &PlanOwner,
+        origin: &TriggerFrame<'a>,
+        row: RowId,
+    ) -> Result<TriggerFrame<'a>, Error> {
+        let owner = if plan.ancestors.is_empty() {
+            self.owner_instances.intern_rows(plan.static_owner, [])?
+        } else if origin
+            .active
+            .owner_plan
+            .ancestors
+            .starts_with(&plan.ancestors)
+            && self.owner_instances.depth(origin.active.owner)? >= plan.ancestors.len()
+        {
+            instantiate_plan_owner(plan, &origin.active, &mut self.owner_instances)?
+        } else {
+            self.owner_instance_for_row(plan, row)?
+        };
+        Ok(TriggerFrame {
+            active: ActiveTrigger {
+                cause: origin.active.cause,
+                owner_plan: plan.clone(),
                 owner,
                 target: Some(row),
                 sequence: origin.active.sequence,
@@ -15587,6 +15836,7 @@ impl MachineInstance {
                     owner,
                     row,
                     sequence,
+                    activation: None,
                 },
                 outcome.clone(),
                 &mut work,
@@ -15705,6 +15955,13 @@ impl MachineInstance {
         let mut work = self.take_internal_turn_work();
         work.effect_reconciliation_sequence = Some(sequence);
         let result = (|| {
+            let activation = self
+                .effect_activations
+                .get(&EffectConsumer {
+                    op: op.id,
+                    row: pending.target,
+                })
+                .cloned();
             self.apply_effect_outcome(
                 &op,
                 &effect.result,
@@ -15712,6 +15969,7 @@ impl MachineInstance {
                     owner: pending.owner,
                     row: pending.target,
                     sequence,
+                    activation,
                 },
                 stored_outcome,
                 &mut work,
@@ -15865,6 +16123,13 @@ impl MachineInstance {
         let mut work = self.take_internal_turn_work();
         work.effect_reconciliation_sequence = Some(sequence);
         let result = (|| {
+            let activation = self
+                .effect_activations
+                .get(&EffectConsumer {
+                    op: op.id,
+                    row: pending.target,
+                })
+                .cloned();
             self.apply_effect_outcome(
                 &op,
                 &effect.result,
@@ -15872,6 +16137,7 @@ impl MachineInstance {
                     owner: pending.owner,
                     row: pending.target,
                     sequence,
+                    activation,
                 },
                 stored_outcome,
                 &mut work,
@@ -16102,12 +16368,13 @@ impl MachineInstance {
             .iter()
             .flat_map(|region| &region.ops)
             .find_map(|op| {
-                let PlanOpKind::StateUpdate {
-                    effect: Some(effect),
-                    ..
-                } = &op.kind
-                else {
-                    return None;
+                let effect = match &op.kind {
+                    PlanOpKind::StateUpdate {
+                        effect: Some(effect),
+                        ..
+                    }
+                    | PlanOpKind::EffectUpdate { effect, .. } => effect,
+                    _ => return None,
                 };
                 (effect.invocation_id == invocation_id).then(|| (op.clone(), effect.clone()))
             })
@@ -16530,14 +16797,21 @@ impl MachineInstance {
         match route {
             boon_plan::EffectResultRoute::Target { target, .. } => {
                 let mut value = runtime_value(outcome)?;
-                if let PlanOpKind::StateUpdate {
-                    value: Some(transform),
-                    effect: Some(_),
-                    ..
-                } = &op.kind
-                {
+                let transform = match &op.kind {
+                    PlanOpKind::StateUpdate {
+                        value: Some(transform),
+                        effect: Some(_),
+                        ..
+                    }
+                    | PlanOpKind::EffectUpdate {
+                        result_transform: Some(transform),
+                        ..
+                    } => Some(*transform),
+                    _ => None,
+                };
+                if let Some(transform) = transform {
                     let evaluated =
-                        self.eval_effect_result_expression(*transform, context.row, &value, work)?;
+                        self.eval_effect_result_expression(transform, context.row, &value, work)?;
                     value = match evaluated {
                         EvalValue::Absent | EvalValue::Flushed(_) => return Ok(()),
                         evaluated => self.materialize_eval(evaluated)?,
@@ -16556,6 +16830,14 @@ impl MachineInstance {
         value: Value,
         work: &mut Work,
     ) -> Result<(), Error> {
+        if matches!(op.kind, PlanOpKind::EffectUpdate { .. }) {
+            let source_event = context
+                .activation
+                .as_ref()
+                .and_then(|activation| activation.source_event.as_ref());
+            self.set_transient_effect_result(op, context.row, value, source_event, work)?;
+            return self.resume_transient_effect_result_activation(op, target, &context, work);
+        }
         let ValueRef::State(state) = target else {
             return Err(Error::InvalidPlan(format!(
                 "effect invocation {} has a non-state result target",
@@ -16620,6 +16902,312 @@ impl MachineInstance {
         Ok(())
     }
 
+    fn record_transient_effect_result_undo(&self, key: TransientEffectResultKey, work: &mut Work) {
+        work.transient_effect_result_undo
+            .entry(key)
+            .or_insert_with(|| self.transient_effect_results.get(&key).cloned());
+    }
+
+    fn refresh_transient_effect_result_target(
+        &mut self,
+        op: &PlanOp,
+        row: Option<RowId>,
+        event: Option<&SourceEvent>,
+        work: &mut Work,
+    ) -> Result<(), Error> {
+        match &op.output {
+            Some(ValueRef::Field(field)) if op.indexed => {
+                let row = row.ok_or_else(|| {
+                    Error::InvalidPlan(format!(
+                        "indexed transient effect result op {} has no row",
+                        op.id.0
+                    ))
+                })?;
+                self.mark_row_dirty(row, *field, work);
+                let _ = self.ensure_row_field_presence(row, *field, event, work)?;
+            }
+            Some(ValueRef::Field(field)) => {
+                if row.is_some() {
+                    return Err(Error::InvalidPlan(format!(
+                        "root transient effect result op {} unexpectedly carries a row",
+                        op.id.0
+                    )));
+                }
+                self.mark_root_dirty(*field, work);
+                let _ = self.ensure_root_field_presence(*field, event, work)?;
+            }
+            Some(ValueRef::List(list)) if !op.indexed => {
+                if row.is_some() {
+                    return Err(Error::InvalidPlan(format!(
+                        "root transient effect list op {} unexpectedly carries a row",
+                        op.id.0
+                    )));
+                }
+                self.mark_list_dirty(*list, work);
+                let _ = self.ensure_list_presence(*list, event, work)?;
+            }
+            output => {
+                return Err(Error::InvalidPlan(format!(
+                    "transient effect result op {} has unsupported target {output:?}",
+                    op.id.0
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn set_transient_effect_result(
+        &mut self,
+        op: &PlanOp,
+        row: Option<RowId>,
+        value: Value,
+        event: Option<&SourceEvent>,
+        work: &mut Work,
+    ) -> Result<(), Error> {
+        let key = TransientEffectResultKey {
+            invocation_id: effect_invocation_id(op)?,
+            row,
+        };
+        if self.transient_effect_results.get(&key) == Some(&value) {
+            return Ok(());
+        }
+        self.record_transient_effect_result_undo(key, work);
+        self.transient_effect_results.insert(key, value);
+        self.refresh_transient_effect_result_target(op, row, event, work)
+    }
+
+    fn clear_transient_effect_result(
+        &mut self,
+        op: &PlanOp,
+        row: Option<RowId>,
+        event: Option<&SourceEvent>,
+        work: &mut Work,
+    ) -> Result<(), Error> {
+        if !matches!(op.kind, PlanOpKind::EffectUpdate { .. }) {
+            return Ok(());
+        }
+        let key = TransientEffectResultKey {
+            invocation_id: effect_invocation_id(op)?,
+            row,
+        };
+        if !self.transient_effect_results.contains_key(&key) {
+            return Ok(());
+        }
+        self.record_transient_effect_result_undo(key, work);
+        self.transient_effect_results.remove(&key);
+        self.refresh_transient_effect_result_target(op, row, event, work)
+    }
+
+    fn resume_transient_effect_result_activation(
+        &mut self,
+        op: &PlanOp,
+        target: &ValueRef,
+        context: &EffectApplicationContext,
+        work: &mut Work,
+    ) -> Result<(), Error> {
+        let PlanOpKind::EffectUpdate { trigger, .. } = &op.kind else {
+            return Ok(());
+        };
+        let Some(activation) = context.activation.as_ref() else {
+            return Err(Error::InvalidPlan(format!(
+                "transient effect result op {} has no live activation",
+                op.id.0
+            )));
+        };
+        if activation.invocation_id != effect_invocation_id(op)?
+            || activation.owner != context.owner
+            || activation.trigger.target != context.row
+        {
+            return Err(Error::InvalidPlan(format!(
+                "transient effect result op {} completion does not match its activation",
+                op.id.0
+            )));
+        }
+
+        let mut active = activation.trigger.clone();
+        active.sequence = context.sequence;
+        let frame = TriggerFrame {
+            active,
+            source_event: activation.source_event.as_ref(),
+        };
+
+        let (updates, mutations, fields, lists) = match trigger {
+            ValueRef::Source(source) => (
+                self.metadata
+                    .updates_by_source
+                    .get(source)
+                    .cloned()
+                    .unwrap_or_default(),
+                self.metadata
+                    .mutations_by_source
+                    .get(source)
+                    .cloned()
+                    .unwrap_or_default(),
+                self.metadata
+                    .source_derived_by_source
+                    .get(source)
+                    .cloned()
+                    .unwrap_or_default(),
+                self.metadata
+                    .source_derived_lists_by_source
+                    .get(source)
+                    .cloned()
+                    .unwrap_or_default(),
+            ),
+            ValueRef::State(state) => (
+                self.metadata
+                    .updates_by_state
+                    .get(state)
+                    .cloned()
+                    .unwrap_or_default(),
+                self.metadata
+                    .mutations_by_state
+                    .get(state)
+                    .cloned()
+                    .unwrap_or_default(),
+                self.metadata
+                    .state_derived_by_state
+                    .get(state)
+                    .cloned()
+                    .unwrap_or_default(),
+                self.metadata
+                    .state_derived_lists_by_state
+                    .get(state)
+                    .cloned()
+                    .unwrap_or_default(),
+            ),
+            ValueRef::Pulse(pulse) => (
+                self.metadata
+                    .updates_by_pulse
+                    .get(pulse)
+                    .cloned()
+                    .unwrap_or_default(),
+                self.metadata
+                    .mutations_by_pulse
+                    .get(pulse)
+                    .cloned()
+                    .unwrap_or_default(),
+                BTreeSet::new(),
+                BTreeSet::new(),
+            ),
+            _ => {
+                return Err(Error::InvalidPlan(format!(
+                    "transient effect result op {} has non-event trigger {trigger:?}",
+                    op.id.0
+                )));
+            }
+        };
+
+        let fields = fields
+            .into_iter()
+            .filter(|field| {
+                self.metadata
+                    .root_computations
+                    .get(field)
+                    .or_else(|| self.metadata.row_computations.get(field))
+                    .is_some_and(|computation| computation.inputs.contains(target))
+            })
+            .collect::<Vec<_>>();
+        let lists = lists
+            .into_iter()
+            .filter(|list| {
+                self.metadata
+                    .list_computations
+                    .get(list)
+                    .is_some_and(|computation| computation.inputs.contains(target))
+            })
+            .collect::<Vec<_>>();
+
+        for field in &fields {
+            if self.metadata.row_field_owner.contains_key(field) {
+                let row = context.row.ok_or_else(|| {
+                    Error::InvalidPlan(format!(
+                        "transient effect continuation field {} has no row",
+                        field.0
+                    ))
+                })?;
+                self.mark_row_dirty(row, *field, work);
+            } else {
+                self.mark_root_dirty(*field, work);
+            }
+        }
+        for list in &lists {
+            self.mark_list_dirty(*list, work);
+        }
+
+        for update in updates
+            .iter()
+            .filter(|update| !update_branch_has_effect(update))
+            .filter(|update| update.inputs.contains(target))
+        {
+            if update.indexed {
+                if let (ValueRef::Source(_), Some(event)) =
+                    (trigger, activation.source_event.as_ref())
+                {
+                    let rows = self.indexed_update_targets(update, event, &[])?;
+                    let source_trigger = self.source_trigger_frame(event)?;
+                    self.execute_indexed_update_batch(update, &rows, &source_trigger, work)?;
+                } else {
+                    self.execute_update(update, context.row, &frame, work)?;
+                }
+            } else {
+                self.execute_update(update, context.row, &frame, work)?;
+            }
+        }
+
+        let mutations = mutations
+            .into_iter()
+            .filter(|mutation| mutation.inputs.contains(target))
+            .collect::<Vec<_>>();
+        self.stage_mutation_batch(&mutations, activation.source_event.as_ref(), &frame, work)?;
+
+        for field in fields {
+            if self.metadata.row_field_owner.contains_key(&field) {
+                let row = context.row.ok_or_else(|| {
+                    Error::InvalidPlan(format!(
+                        "transient effect continuation field {} has no row",
+                        field.0
+                    ))
+                })?;
+                let _ = self.ensure_row_field_presence(
+                    row,
+                    field,
+                    activation.source_event.as_ref(),
+                    work,
+                )?;
+            } else {
+                let _ =
+                    self.ensure_root_field_presence(field, activation.source_event.as_ref(), work)?;
+            }
+        }
+        for list in lists {
+            let _ = self.ensure_list_presence(list, activation.source_event.as_ref(), work)?;
+        }
+
+        self.commit_pending_list_mutations(work)?;
+        for update in updates
+            .iter()
+            .filter(|update| update_branch_has_effect(update))
+            .filter(|update| update.inputs.contains(target))
+        {
+            if update.indexed {
+                if let (ValueRef::Source(_), Some(event)) =
+                    (trigger, activation.source_event.as_ref())
+                {
+                    let rows = self.indexed_update_targets(update, event, &[])?;
+                    let source_trigger = self.source_trigger_frame(event)?;
+                    self.execute_indexed_update_batch(update, &rows, &source_trigger, work)?;
+                } else {
+                    self.execute_update(update, context.row, &frame, work)?;
+                }
+            } else {
+                self.execute_update(update, context.row, &frame, work)?;
+            }
+        }
+        self.collect_distributed_invocations_for_trigger(&frame, work)?;
+        self.route_triggered_pulse_batches(&frame, work)
+    }
+
     fn route_state_transition(
         &mut self,
         state: StateId,
@@ -16680,7 +17268,12 @@ impl MachineInstance {
                 .cloned()
                 .unwrap_or_default();
             for op in updates.iter().filter(|op| !update_branch_has_effect(op)) {
-                self.execute_update(op, row, &trigger, work)?;
+                if op.indexed {
+                    let rows = self.indexed_state_transition_targets(op, state, row)?;
+                    self.execute_indexed_update_batch(op, &rows, &trigger, work)?;
+                } else {
+                    self.execute_update(op, row, &trigger, work)?;
+                }
             }
             for field in &derived {
                 self.mark_state_derived_field_dirty(*field, row, work)?;
@@ -16702,7 +17295,12 @@ impl MachineInstance {
                 .unwrap_or_default();
             self.stage_mutation_batch(&mutations, None, &trigger, work)?;
             for op in updates.iter().filter(|op| update_branch_has_effect(op)) {
-                self.execute_update(op, row, &trigger, work)?;
+                if op.indexed {
+                    let rows = self.indexed_state_transition_targets(op, state, row)?;
+                    self.execute_indexed_update_batch(op, &rows, &trigger, work)?;
+                } else {
+                    self.execute_update(op, row, &trigger, work)?;
+                }
             }
             self.commit_pending_list_mutations(work)?;
             self.collect_distributed_invocations_for_trigger(&trigger, work)?;
@@ -17922,6 +18520,16 @@ impl MachineInstance {
                 }
             }
         }
+        for (key, previous) in std::mem::take(&mut work.transient_effect_result_undo) {
+            match previous {
+                Some(previous) => {
+                    self.transient_effect_results.insert(key, previous);
+                }
+                None => {
+                    self.transient_effect_results.remove(&key);
+                }
+            }
+        }
         work.undo_root_states.clear();
         work.undo_row_fields.clear();
         work.undo_collection_authorities.clear();
@@ -18154,20 +18762,56 @@ impl MachineInstance {
         let targets = self.event_targets(event, work)?;
         let metadata = Arc::clone(&self.metadata);
         let trigger = self.source_trigger_frame(event)?;
+        let deferred_effect_targets = metadata
+            .updates_by_source
+            .get(&event.source)
+            .into_iter()
+            .flatten()
+            .filter_map(|op| {
+                matches!(op.kind, PlanOpKind::EffectUpdate { .. })
+                    .then(|| op.output.clone())
+                    .flatten()
+            })
+            .collect::<BTreeSet<_>>();
+        let depends_on_deferred_effect = |op: &PlanOp| {
+            op.inputs
+                .iter()
+                .any(|input| deferred_effect_targets.contains(input))
+        };
 
         if let Some(source_fields) = metadata.source_derived_by_source.get(&event.source) {
-            for field in source_fields {
+            let source_fields = source_fields
+                .iter()
+                .copied()
+                .filter(|field| {
+                    metadata
+                        .root_computations
+                        .get(field)
+                        .is_none_or(|op| !depends_on_deferred_effect(op))
+                })
+                .collect::<Vec<_>>();
+            for field in &source_fields {
                 self.mark_root_dirty(*field, work);
             }
-            for field in source_fields {
+            for field in &source_fields {
                 self.ensure_root_field_presence(*field, Some(event), work)?;
             }
         }
         if let Some(source_lists) = metadata.source_derived_lists_by_source.get(&event.source) {
-            for list in source_lists {
+            let source_lists = source_lists
+                .iter()
+                .copied()
+                .filter(|list| {
+                    metadata
+                        .list_computations
+                        .get(list)
+                        .is_none_or(|op| !depends_on_deferred_effect(op))
+                })
+                .collect::<Vec<_>>();
+            for list in &source_lists {
                 self.mark_list_dirty(*list, work);
             }
-            for list in source_lists {
+            for list in &source_lists {
                 self.ensure_list_presence(*list, Some(event), work)?;
             }
         }
@@ -18178,10 +18822,14 @@ impl MachineInstance {
             .and_then(|route| route.scope_id)
             .and(event.target);
         if let Some(updates) = metadata.updates_by_source.get(&event.source) {
-            for op in updates.iter().filter(|op| !update_branch_has_effect(op)) {
+            for op in updates
+                .iter()
+                .filter(|op| !update_branch_has_effect(op))
+                .filter(|op| !depends_on_deferred_effect(op))
+            {
                 if op.indexed {
                     let rows = self.indexed_update_targets(op, event, &targets)?;
-                    self.execute_indexed_update_batch(op, &rows, event, work)?;
+                    self.execute_indexed_update_batch(op, &rows, &trigger, work)?;
                 } else {
                     self.execute_update(
                         op,
@@ -18198,15 +18846,20 @@ impl MachineInstance {
             .get(&event.source)
             .into_iter()
             .flatten()
+            .filter(|op| !depends_on_deferred_effect(op))
             .cloned()
             .collect::<Vec<_>>();
         self.stage_mutation_batch(&mutations, Some(event), &trigger, work)?;
 
         if let Some(updates) = metadata.updates_by_source.get(&event.source) {
-            for op in updates.iter().filter(|op| update_branch_has_effect(op)) {
+            for op in updates
+                .iter()
+                .filter(|op| update_branch_has_effect(op))
+                .filter(|op| !depends_on_deferred_effect(op))
+            {
                 if op.indexed {
                     let rows = self.indexed_update_targets(op, event, &targets)?;
-                    self.execute_indexed_update_batch(op, &rows, event, work)?;
+                    self.execute_indexed_update_batch(op, &rows, &trigger, work)?;
                 } else {
                     self.execute_update(
                         op,
@@ -18371,17 +19024,7 @@ impl MachineInstance {
         event: &SourceEvent,
         scoped_targets: &[RowId],
     ) -> Result<Vec<RowId>, Error> {
-        let Some(ValueRef::State(state)) = op.output else {
-            return Err(Error::InvalidPlan(format!(
-                "indexed update op {} has no state output",
-                op.id.0
-            )));
-        };
-        let owner = *self
-            .metadata
-            .indexed_state_owner
-            .get(&state)
-            .ok_or_else(|| Error::InvalidPlan(format!("indexed state {} has no owner", state.0)))?;
+        let owner = self.indexed_update_owner(op)?;
         if let Some(target) = event.target {
             return Ok((target.list == owner)
                 .then_some(target)
@@ -18403,6 +19046,80 @@ impl MachineInstance {
         Ok(self.list_row_ids(owner))
     }
 
+    fn indexed_update_owner(&self, op: &PlanOp) -> Result<ListId, Error> {
+        match op.output.as_ref() {
+            Some(ValueRef::State(state)) => self
+                .metadata
+                .indexed_state_owner
+                .get(state)
+                .copied()
+                .ok_or_else(|| {
+                    Error::InvalidPlan(format!("indexed state {} has no owner", state.0))
+                }),
+            Some(ValueRef::Field(field)) => self
+                .metadata
+                .row_field_owner
+                .get(field)
+                .copied()
+                .ok_or_else(|| {
+                    Error::InvalidPlan(format!("indexed field {} has no owner", field.0))
+                }),
+            _ => Err(Error::InvalidPlan(format!(
+                "indexed update op {} has no state or row-field output",
+                op.id.0
+            ))),
+        }
+    }
+
+    fn indexed_state_transition_targets(
+        &self,
+        op: &PlanOp,
+        origin_state: StateId,
+        origin_row: Option<RowId>,
+    ) -> Result<Vec<RowId>, Error> {
+        let target_owner = self.indexed_update_owner(op)?;
+        if !self
+            .metadata
+            .indexed_state_owner
+            .contains_key(&origin_state)
+        {
+            return Ok(self.list_row_ids(target_owner));
+        }
+
+        let origin_row = origin_row.ok_or_else(|| {
+            Error::InvalidPlan(format!(
+                "indexed state {} transition has no row target",
+                origin_state.0
+            ))
+        })?;
+        if origin_row.list == target_owner {
+            return Ok(vec![origin_row]);
+        }
+
+        let origin_rows = self.row_owner_rows(origin_row)?;
+        if let Some(ancestor) = origin_rows
+            .iter()
+            .find(|ancestor| ancestor.list == target_owner)
+        {
+            return Ok(vec![RowId {
+                list: ancestor.list,
+                key: ancestor.key,
+                generation: ancestor.generation,
+            }]);
+        }
+
+        let origin_ancestry = self.row_owner_ancestry(origin_row)?;
+        let descendants = self.list_row_ids_for_owner(target_owner, origin_ancestry);
+        if !descendants.is_empty() {
+            return Ok(descendants);
+        }
+
+        Err(Error::InvalidPlan(format!(
+            "indexed state {} transition row belongs to list {}, but indexed update op {} belongs to unrelated list {}",
+            origin_state.0, origin_row.list.0, op.id.0, target_owner.0
+        )))
+    }
+
     fn execute_update(
         &mut self,
         op: &PlanOp,
@@ -18410,6 +19127,9 @@ impl MachineInstance {
         trigger: &TriggerFrame<'_>,
         work: &mut Work,
     ) -> Result<(), Error> {
+        if matches!(op.kind, PlanOpKind::EffectUpdate { .. }) {
+            return self.stage_effect_invocation(op, row, trigger, work);
+        }
         let PlanOpKind::StateUpdate { effect, .. } = &op.kind else {
             return Err(Error::InvalidPlan(format!(
                 "update region op {} is not a state update",
@@ -18512,9 +19232,16 @@ impl MachineInstance {
         &mut self,
         op: &PlanOp,
         rows: &[RowId],
-        event: &SourceEvent,
+        origin: &TriggerFrame<'_>,
         work: &mut Work,
     ) -> Result<(), Error> {
+        if let PlanOpKind::EffectUpdate { effect, .. } = &op.kind {
+            for row in rows {
+                let trigger = self.trigger_for_plan_owner_target(&effect.owner, origin, *row)?;
+                self.stage_effect_invocation(op, Some(*row), &trigger, work)?;
+            }
+            return Ok(());
+        }
         let PlanOpKind::StateUpdate { effect, .. } = &op.kind else {
             return Err(Error::InvalidPlan(format!(
                 "update region op {} is not a state update",
@@ -18529,8 +19256,7 @@ impl MachineInstance {
         };
         if effect.is_some() {
             for row in rows {
-                let source_trigger = self.source_trigger_frame(event)?;
-                let trigger = self.trigger_for_state_target(state, &source_trigger, *row)?;
+                let trigger = self.trigger_for_state_target(state, origin, *row)?;
                 self.stage_effect_invocation(op, Some(*row), &trigger, work)?;
             }
             return Ok(());
@@ -18544,15 +19270,14 @@ impl MachineInstance {
             })?;
         let mut pending = Vec::with_capacity(rows.len());
         for row in rows {
-            match self.evaluate_update(op, Some(*row), Some(event), work)? {
+            match self.evaluate_update(op, Some(*row), origin.source_event, work)? {
                 ControlOutcome::Normal(Some(value)) => {
                     work.flushed_state_candidates.remove(&(state, Some(*row)));
                     pending.push((*row, value));
                 }
                 ControlOutcome::Normal(None) => {}
                 ControlOutcome::Flushed(payload) => {
-                    let source_trigger = self.source_trigger_frame(event)?;
-                    let trigger = self.trigger_for_state_target(state, &source_trigger, *row)?;
+                    let trigger = self.trigger_for_state_target(state, origin, *row)?;
                     self.propagate_flushed_state_candidate(
                         state,
                         Some(*row),
@@ -18588,8 +19313,7 @@ impl MachineInstance {
                     .contains_key(&state)
                 || self.metadata.mutations_by_state.contains_key(&state);
             if has_state_consumers {
-                let source_trigger = self.source_trigger_frame(event)?;
-                let trigger = self.trigger_for_state_target(state, &source_trigger, row)?;
+                let trigger = self.trigger_for_state_target(state, origin, row)?;
                 self.route_state_transition(state, &trigger, Some(row), work)?;
             }
         }
@@ -18648,6 +19372,12 @@ impl MachineInstance {
             work.pending_effect_reconciliations.insert(effect_consumer);
         } else {
             work.pending_effect_reconciliations.remove(&effect_consumer);
+        }
+        if matches!(op.kind, PlanOpKind::EffectUpdate { .. }) {
+            validate_flush_payload_value(&payload)?;
+            self.clear_transient_effect_result(op, row, trigger.source_event, work)?;
+            work.pending_effect_reconciliations.remove(&effect_consumer);
+            return Ok(());
         }
         let Some(ValueRef::State(state)) = op.output else {
             return Err(Error::InvalidPlan(format!(
@@ -18768,7 +19498,11 @@ impl MachineInstance {
                 &mut PlanLocalBindings::new(),
                 work,
             )?;
-            if !value_to_bool(&self.materialize_eval(gate)?)? {
+            let gate_open = match gate {
+                EvalValue::Absent => false,
+                gate => value_to_bool(&self.materialize_eval(gate)?)?,
+            };
+            if !gate_open {
                 continue;
             }
             for field in &effect.intent_fields {
@@ -18801,16 +19535,7 @@ impl MachineInstance {
         trigger: &TriggerFrame<'_>,
         work: &mut Work,
     ) -> Result<(), Error> {
-        let PlanOpKind::StateUpdate {
-            effect: Some(effect),
-            ..
-        } = &op.kind
-        else {
-            return Err(Error::InvalidPlan(format!(
-                "update op {} has no effect invocation plan",
-                op.id.0
-            )));
-        };
+        let effect = effect_invocation_plan(op)?.clone();
         let contract = self
             .plan
             .effects
@@ -18901,6 +19626,7 @@ impl MachineInstance {
                     work,
                 );
             }
+            EvalValue::Absent => false,
             gate => value_to_bool(&self.materialize_eval(gate)?)?,
         };
         let mut intent_values = BTreeMap::new();
@@ -18949,6 +19675,7 @@ impl MachineInstance {
             EffectActivation {
                 invocation_id: effect.invocation_id,
                 owner,
+                trigger: trigger.active.clone(),
                 source_event: trigger.source_event.cloned(),
             },
         );
@@ -20265,7 +20992,7 @@ fn update_branch_has_effect(op: &PlanOp) -> bool {
         PlanOpKind::StateUpdate {
             effect: Some(_),
             ..
-        }
+        } | PlanOpKind::EffectUpdate { .. }
     )
 }
 
@@ -20278,7 +21005,8 @@ fn effect_invocation_plan(op: &PlanOp) -> Result<&EffectInvocationPlan, Error> {
         PlanOpKind::StateUpdate {
             effect: Some(effect),
             ..
-        } => Ok(effect),
+        }
+        | PlanOpKind::EffectUpdate { effect, .. } => Ok(effect),
         _ => Err(Error::InvalidPlan(format!(
             "update op {} has no effect invocation identity",
             op.id.0
@@ -21023,11 +21751,12 @@ impl MachineInstance {
                 let dirty_indexes = subscribed_indexes
                     .into_iter()
                     .filter(|index| {
-                        self.dirty_ordered_indexes.contains(index)
+                        (self.dirty_ordered_indexes.contains(index)
                             || self
                                 .dirty_ordered_index_rows
                                 .get(index)
-                                .is_some_and(|rows| !rows.is_empty())
+                                .is_some_and(|rows| !rows.is_empty()))
+                            && self.ordered_index_source_is_publishable(*index)
                     })
                     .collect::<Vec<_>>();
                 if dirty_indexes.is_empty() {
@@ -21568,6 +22297,19 @@ impl MachineInstance {
         })();
         self.evaluating_ordered_indexes.remove(&plan.id);
         result
+    }
+
+    fn ordered_index_source_is_publishable(&self, index: PlanListIndexId) -> bool {
+        // A derived list publishes its physical row image only at FinishList. Rebuilding an
+        // index over those rows sooner would either recurse into the evaluating list or expose a
+        // partial authority reconciliation. The next currentness barrier retries the dirty index
+        // after its source list becomes current.
+        self.metadata
+            .list_indexes
+            .get(&index)
+            .map(|plan| plan.source_list)
+            .and_then(|source| self.derived_lists.get(&source))
+            .is_none_or(|cell| cell.currentness != Currentness::Evaluating)
     }
 
     fn list_row_ids(&self, list: ListId) -> Vec<RowId> {
@@ -24331,6 +25073,7 @@ impl MachineInstance {
         };
         let mut fields = fields
             .into_iter()
+            .filter(|(_, value)| !matches!(value, EvalValue::Absent))
             .map(|(name, value)| {
                 let field = runtime_string_map_get(field_ids, &name)
                     .copied()
@@ -24713,6 +25456,19 @@ impl MachineInstance {
                                         ))
                                     })?;
                                     stack.push_value(EvalValue::Value(value))?;
+                                }
+                                PlanRowExpressionNode::TransientEffectResult { invocation_id } => {
+                                    let key = TransientEffectResultKey {
+                                        invocation_id: *invocation_id,
+                                        row: context.row,
+                                    };
+                                    stack.push_value(
+                                        self.transient_effect_results
+                                            .get(&key)
+                                            .cloned()
+                                            .map(EvalValue::Value)
+                                            .unwrap_or(EvalValue::Absent),
+                                    )?;
                                 }
                                 PlanRowExpressionNode::Field {
                                     input: ValueRef::DistributedImport(import_id),
@@ -25212,14 +25968,6 @@ impl MachineInstance {
                                     expression.0
                                 )));
                             }
-                            if stack.values[value_base..]
-                                .iter()
-                                .any(|value| matches!(value, EvalValue::Absent))
-                            {
-                                stack.values.truncate(value_base);
-                                stack.push_value(EvalValue::Absent)?;
-                                return Ok(());
-                            }
                             if let PlanRowExpressionNode::Object { fields }
                             | PlanRowExpressionNode::TaggedObject { fields, .. } = node
                             {
@@ -25231,6 +25979,15 @@ impl MachineInstance {
                                         values.len(),
                                         fields.len()
                                     )));
+                                }
+                                let private_row_fields =
+                                    matches!(context.consumer, Some(Consumer::List(_)));
+                                if fields.iter().zip(&values).any(|(field, value)| {
+                                    matches!(value, EvalValue::Absent)
+                                        && (!private_row_fields || field.spread)
+                                }) {
+                                    stack.push_value(EvalValue::Absent)?;
+                                    return Ok(());
                                 }
                                 let tag = match node {
                                     PlanRowExpressionNode::TaggedObject { tag, .. } => {
@@ -25249,6 +26006,14 @@ impl MachineInstance {
                                         context,
                                     }),
                                 })?;
+                                return Ok(());
+                            }
+                            if stack.values[value_base..]
+                                .iter()
+                                .any(|value| matches!(value, EvalValue::Absent))
+                            {
+                                stack.values.truncate(value_base);
+                                stack.push_value(EvalValue::Absent)?;
                                 return Ok(());
                             }
                             let value = self.apply_row_expression_node(
@@ -27510,7 +28275,12 @@ impl MachineInstance {
                             }
                         }
                         ExpressionTask::ListAccessAfterGuard { access, context } => {
-                            if !eval_to_bool(&stack.pop_value()?)? {
+                            let guard = stack.pop_value()?;
+                            if matches!(guard, EvalValue::Absent) {
+                                stack.push_value(EvalValue::Absent)?;
+                                return Ok(());
+                            }
+                            if !eval_to_bool(&guard)? {
                                 stack.push_value(EvalValue::List(Vec::new()))?;
                                 return Ok(());
                             }
@@ -27699,7 +28469,12 @@ impl MachineInstance {
                             view_limit_capture,
                             context,
                         } => {
-                            let guard_matches = eval_to_bool(&stack.pop_value()?)?;
+                            let guard = stack.pop_value()?;
+                            if matches!(guard, EvalValue::Absent) {
+                                stack.push_value(EvalValue::Absent)?;
+                                return Ok(());
+                            }
+                            let guard_matches = eval_to_bool(&guard)?;
                             let mut expressions = Vec::new();
                             page.access
                                 .selection
@@ -27868,9 +28643,12 @@ impl MachineInstance {
                             })?;
                         }
                         ExpressionTask::ListSelectionAfterValue { mut state } => {
-                            state
-                                .values
-                                .push(self.materialize_eval(stack.pop_value()?)?);
+                            let value = stack.pop_value()?;
+                            if matches!(value, EvalValue::Absent) {
+                                stack.push_value(EvalValue::Absent)?;
+                                return Ok(());
+                            }
+                            state.values.push(self.materialize_eval(value)?);
                             stack.push_task(ExpressionTask::ListSelectionNext { state })?;
                         }
                         ExpressionTask::IndexedContextualAfterSelection {
@@ -29035,68 +29813,8 @@ impl MachineInstance {
                                                         id.list.0
                                                     ))
                                                 })?;
-                                            let item_type = plan
-                                                .persistence
-                                                .lists
-                                                .iter()
-                                                .find(|memory| {
-                                                    memory.runtime_slot == slot.id
-                                                })
-                                                .and_then(|memory| {
-                                                    match &memory.data_type {
-                                                        DataTypePlan::List { item } => {
-                                                            Some(item.as_ref().clone())
-                                                        }
-                                                        _ => None,
-                                                    }
-                                                })
-                                                .ok_or_else(|| {
-                                                    Error::InvalidPlan(format!(
-                                                        "typed list page source list {} has no declared item type",
-                                                        id.list.0
-                                                    ))
-                                                })?;
-                                            let output_fields = slot
-                                                .row_fields
-                                                .iter()
-                                                .map(|field| OutputListFieldRef {
-                                                    list_id: id.list,
-                                                    name: field.name.clone(),
-                                                    field_id: field.field_id,
-                                                })
-                                                .collect::<Vec<_>>();
-                                            let (fields, scalar_type) = match &item_type {
-                                                DataTypePlan::Record {
-                                                    fields,
-                                                    open: false,
-                                                } => (
-                                                    fields
-                                                        .iter()
-                                                        .map(|field| {
-                                                            Ok((
-                                                                field.name.clone(),
-                                                                output_list_field(
-                                                                    &output_fields,
-                                                                    id.list,
-                                                                    &field.name,
-                                                                )?,
-                                                            ))
-                                                        })
-                                                        .collect::<Result<Vec<_>, Error>>()?,
-                                                    None,
-                                                ),
-                                                _ => (
-                                                    vec![(
-                                                        "value".to_owned(),
-                                                        output_list_field(
-                                                            &output_fields,
-                                                            id.list,
-                                                            "value",
-                                                        )?,
-                                                    )],
-                                                    Some(item_type),
-                                                ),
-                                            };
+                                            let (fields, scalar_type) =
+                                                page_row_schema(&plan, &slot)?;
                                             let event = match &state.continuation {
                                                 PageNormalizationContinuation::ListPage(page) => {
                                                     page.context.event
@@ -30076,11 +30794,12 @@ impl MachineInstance {
                                 .collect::<BTreeSet<_>>()
                                 .into_iter()
                                 .filter(|index| {
-                                    self.dirty_ordered_indexes.contains(index)
+                                    (self.dirty_ordered_indexes.contains(index)
                                         || self
                                             .dirty_ordered_index_rows
                                             .get(index)
-                                            .is_some_and(|rows| !rows.is_empty())
+                                            .is_some_and(|rows| !rows.is_empty()))
+                                        && self.ordered_index_source_is_publishable(*index)
                                 })
                                 .collect::<Vec<_>>();
                             if dirty_indexes.is_empty() {
@@ -30178,7 +30897,11 @@ impl MachineInstance {
                                 })
                                 .ok_or_else(|| {
                                     Error::Evaluation(format!(
-                                        "select has no matching arm for {input:?}"
+                                        "row expression {} select has no matching arm for {input:?}; patterns: {:?}",
+                                        expression.0,
+                                        arms.iter()
+                                            .map(|arm| &arm.pattern)
+                                            .collect::<Vec<_>>()
                                     ))
                                 })?;
                             stack.push_task(ExpressionTask::Evaluate {
@@ -30451,7 +31174,12 @@ impl MachineInstance {
                             item,
                             context,
                         } => {
-                            let matches = eval_to_bool(&stack.pop_value()?)?;
+                            let predicate = stack.pop_value()?;
+                            if matches!(predicate, EvalValue::Absent) {
+                                stack.push_value(EvalValue::Absent)?;
+                                return Ok(());
+                            }
+                            let matches = eval_to_bool(&predicate)?;
                             match state.operation {
                                 PlanContextualOperationKind::Filter
                                 | PlanContextualOperationKind::Retain => {
@@ -30757,7 +31485,12 @@ impl MachineInstance {
                             candidate,
                             context,
                         } => {
-                            let include = eval_to_bool(&stack.pop_value()?)?;
+                            let predicate = stack.pop_value()?;
+                            if matches!(predicate, EvalValue::Absent) {
+                                stack.push_value(EvalValue::Absent)?;
+                                return Ok(());
+                            }
+                            let include = eval_to_bool(&predicate)?;
                             if include {
                                 match state.operation {
                                     PlanContextualOperationKind::Filter
@@ -31362,6 +32095,7 @@ impl MachineInstance {
             | PlanRowExpressionNode::CatchCycle { .. }
             | PlanRowExpressionNode::Intrinsic { .. }
             | PlanRowExpressionNode::EffectResult
+            | PlanRowExpressionNode::TransientEffectResult { .. }
             | PlanRowExpressionNode::Field { .. }
             | PlanRowExpressionNode::Constant { .. }
             | PlanRowExpressionNode::ListGetField { .. }

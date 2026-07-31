@@ -1,19 +1,21 @@
 use std::fmt;
-use std::io::{self, Read, Write};
+use std::io::{self, Cursor, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::Duration;
 
+use bincode::Options;
 use boon_plan::ProgramRole;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
+pub use boon_editor::language::SourceUnit;
 pub use boon_runtime::{
     ApplicationIdentity, MigrationScenario, MigrationSequence, MigrationTestDriver,
     ScenarioExpectation, ScenarioFieldMatch,
 };
 
 const MAGIC: [u8; 4] = *b"BNIP";
-const VERSION: u16 = 14;
+const VERSION: u16 = 15;
 const HEADER_BYTES: usize = MAGIC.len() + 2 + 1;
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const MAX_STRING_BYTES: usize = 8 * 1024 * 1024;
@@ -34,32 +36,17 @@ pub const MAX_PERSISTENCE_OUTBOX_SAMPLES: usize = 16;
 pub const MAX_PERSISTENCE_STATUS_BYTES: usize = 4 * 1024;
 pub const MAX_PERSISTENCE_ARTIFACT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_AUTHORITY_PATH_BYTES: usize = 1024;
+const LAST_MESSAGE_TAG: u8 = 26;
 pub const VERIFY_BOUNDED_WINDOWS_ENV: &str = "BOON_VERIFY_BOUNDED_WINDOWS";
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[repr(u8)]
 pub enum Role {
     Preview = 1,
     Dev = 2,
 }
 
-impl Role {
-    fn decode(value: u8) -> Result<Self, ProtocolError> {
-        match value {
-            1 => Ok(Self::Preview),
-            2 => Ok(Self::Dev),
-            _ => Err(ProtocolError::InvalidEnum("role", value)),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SourceUnit {
-    pub path: String,
-    pub source: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ProgramSource {
     pub role: ProgramRole,
     pub entry_path: String,
@@ -67,7 +54,7 @@ pub struct ProgramSource {
     pub application: ApplicationIdentity,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum PreviewSource {
     BuiltInSingleRole {
         application: ApplicationIdentity,
@@ -79,7 +66,7 @@ pub enum PreviewSource {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AssetBlob {
     pub url: String,
     pub media_type: String,
@@ -87,14 +74,14 @@ pub struct AssetBlob {
     pub bytes: Vec<u8>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CatalogItem {
     pub id: String,
     pub label: String,
     pub custom: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct TestStep {
     pub id: String,
     pub source_path: String,
@@ -113,7 +100,7 @@ pub struct TestStep {
     pub expectations: Vec<ScenarioExpectation>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct MigrationStage {
     pub id: String,
     pub label: String,
@@ -123,14 +110,43 @@ pub struct MigrationStage {
     pub units: Vec<SourceUnit>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct MigrationBundle {
     pub initial_stage: String,
     pub launch_stage: String,
     pub test_driver: MigrationTestDriver,
     pub scenario_path: String,
     pub stages: Vec<MigrationStage>,
+    #[serde(with = "migration_scenario_wire")]
     pub scenario: MigrationScenario,
+}
+
+mod migration_scenario_wire {
+    use serde::{Deserialize, Deserializer, Serializer, de, ser};
+
+    use super::{MAX_MIGRATION_SCENARIO_BYTES, MigrationScenario};
+
+    pub fn serialize<S>(scenario: &MigrationScenario, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let encoded = toml::to_string(scenario).map_err(ser::Error::custom)?;
+        if encoded.len() > MAX_MIGRATION_SCENARIO_BYTES {
+            return Err(ser::Error::custom("migration scenario exceeds byte limit"));
+        }
+        serializer.serialize_str(&encoded)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<MigrationScenario, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let encoded = String::deserialize(deserializer)?;
+        if encoded.len() > MAX_MIGRATION_SCENARIO_BYTES {
+            return Err(de::Error::custom("migration scenario exceeds byte limit"));
+        }
+        toml::from_str(&encoded).map_err(de::Error::custom)
+    }
 }
 
 impl MigrationBundle {
@@ -201,6 +217,15 @@ impl MigrationBundle {
                 "migration scenario path is empty".to_owned(),
             ));
         }
+        validate_string(&self.scenario_path)?;
+        let scenario = toml::to_string(&self.scenario)
+            .map_err(|error| ProtocolError::InvalidMigration(error.to_string()))?;
+        check_limit(
+            "migration scenario bytes",
+            scenario.len(),
+            MAX_MIGRATION_SCENARIO_BYTES,
+        )?;
+
         let mut ids = std::collections::BTreeSet::new();
         let mut previous_schema_version = None;
         for stage in &self.stages {
@@ -223,18 +248,17 @@ impl MigrationBundle {
                 ));
             }
             previous_schema_version = Some(stage.schema_version);
-            if stage.source_files.len() > MAX_MIGRATION_SOURCE_FILES {
-                return Err(ProtocolError::LimitExceeded(
-                    "migration source file count",
-                    stage.source_files.len(),
-                ));
-            }
-            if stage.units.len() > MAX_SOURCE_UNITS {
-                return Err(ProtocolError::LimitExceeded(
-                    "migration source unit count",
-                    stage.units.len(),
-                ));
-            }
+            check_limit(
+                "migration source file count",
+                stage.source_files.len(),
+                MAX_MIGRATION_SOURCE_FILES,
+            )?;
+            validate_strings(
+                std::iter::once(stage.label.as_str())
+                    .chain(std::iter::once(stage.source.as_str()))
+                    .chain(stage.source_files.iter().map(String::as_str)),
+            )?;
+            validate_source_units(&stage.units, "migration source unit count")?;
         }
         if !ids.contains(self.initial_stage.as_str()) {
             return Err(ProtocolError::InvalidMigration(format!(
@@ -267,7 +291,7 @@ fn validate_migration_id(name: &'static str, value: &str) -> Result<(), Protocol
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum MigrationCommand {
     Preview { stage_id: String },
     Activate { stage_id: String },
@@ -275,7 +299,7 @@ pub enum MigrationCommand {
     StartOver { confirmed: bool },
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[repr(u8)]
 pub enum MigrationOperation {
     Opened = 1,
@@ -286,21 +310,7 @@ pub enum MigrationOperation {
     Failed = 6,
 }
 
-impl MigrationOperation {
-    fn decode(value: u8) -> Result<Self, ProtocolError> {
-        match value {
-            1 => Ok(Self::Opened),
-            2 => Ok(Self::Previewed),
-            3 => Ok(Self::Activated),
-            4 => Ok(Self::Restarted),
-            5 => Ok(Self::StartedOver),
-            6 => Ok(Self::Failed),
-            _ => Err(ProtocolError::InvalidEnum("migration operation", value)),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct MigrationStatus {
     pub request_id: Option<u64>,
     pub revision: u64,
@@ -315,7 +325,7 @@ pub struct MigrationStatus {
     pub message: String,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[repr(u8)]
 pub enum AuthoritySelectionKind {
     Scalar = 1,
@@ -325,23 +335,7 @@ pub enum AuthoritySelectionKind {
     Set = 5,
 }
 
-impl AuthoritySelectionKind {
-    fn decode(value: u8) -> Result<Self, ProtocolError> {
-        match value {
-            1 => Ok(Self::Scalar),
-            2 => Ok(Self::IndexedField),
-            3 => Ok(Self::List),
-            4 => Ok(Self::Map),
-            5 => Ok(Self::Set),
-            _ => Err(ProtocolError::InvalidEnum(
-                "authority selection kind",
-                value,
-            )),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AuthoritySelection {
     pub semantic_path: String,
     pub memory_id: [u8; 32],
@@ -362,22 +356,13 @@ impl AuthoritySelection {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[repr(u8)]
 pub enum StateArtifactFormat {
     CanonicalCbor = 1,
 }
 
-impl StateArtifactFormat {
-    fn decode(value: u8) -> Result<Self, ProtocolError> {
-        match value {
-            1 => Ok(Self::CanonicalCbor),
-            _ => Err(ProtocolError::InvalidEnum("state artifact format", value)),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CanonicalStateArtifact {
     pub format: StateArtifactFormat,
     pub schema_version: u64,
@@ -385,7 +370,7 @@ pub struct CanonicalStateArtifact {
     pub bytes: Vec<u8>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct StateArtifactPreviewSummary {
     pub preview_id: u64,
     pub source_schema_version: u64,
@@ -403,17 +388,15 @@ pub struct StateArtifactPreviewSummary {
 
 impl CanonicalStateArtifact {
     fn validate(&self) -> Result<(), ProtocolError> {
-        if self.bytes.len() > MAX_PERSISTENCE_ARTIFACT_BYTES {
-            return Err(ProtocolError::LimitExceeded(
-                "persistence artifact bytes",
-                self.bytes.len(),
-            ));
-        }
-        Ok(())
+        check_limit(
+            "persistence artifact bytes",
+            self.bytes.len(),
+            MAX_PERSISTENCE_ARTIFACT_BYTES,
+        )
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum PersistenceCommand {
     Flush,
     Compact,
@@ -434,30 +417,16 @@ pub enum PersistenceCommand {
 }
 
 impl PersistenceCommand {
-    fn decode(input: &mut Decoder<'_>) -> Result<Self, ProtocolError> {
-        match input.u8()? {
-            1 => Ok(Self::Flush),
-            2 => Ok(Self::Compact),
-            3 => Ok(Self::ClearAll {
-                confirmed: input.bool()?,
-            }),
-            4 => Ok(Self::ExportState),
-            5 => Ok(Self::ImportPreview {
-                artifact: input.state_artifact()?,
-            }),
-            6 => Ok(Self::ActivateImport {
-                preview_id: input.u64()?,
-            }),
-            7 => Ok(Self::ClearSelected {
-                selection: input.authority_selection()?,
-                confirmed: input.bool()?,
-            }),
-            value => Err(ProtocolError::InvalidEnum("persistence command", value)),
+    fn validate(&self) -> Result<(), ProtocolError> {
+        match self {
+            Self::ImportPreview { artifact } => artifact.validate(),
+            Self::ClearSelected { selection, .. } => selection.validate(),
+            _ => Ok(()),
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[repr(u8)]
 pub enum PersistenceOperation {
     Flush = 1,
@@ -469,22 +438,7 @@ pub enum PersistenceOperation {
     ClearSelected = 7,
 }
 
-impl PersistenceOperation {
-    fn decode(value: u8) -> Result<Self, ProtocolError> {
-        match value {
-            1 => Ok(Self::Flush),
-            2 => Ok(Self::Compact),
-            3 => Ok(Self::ClearAll),
-            4 => Ok(Self::ExportState),
-            5 => Ok(Self::ImportPreview),
-            6 => Ok(Self::ActivateImport),
-            7 => Ok(Self::ClearSelected),
-            _ => Err(ProtocolError::InvalidEnum("persistence operation", value)),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PersistenceOperationStatus {
     pub request_id: u64,
     pub operation: PersistenceOperation,
@@ -492,13 +446,13 @@ pub struct PersistenceOperationStatus {
     pub message: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PersistenceCapability {
     pub available: bool,
     pub reason: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PersistenceCapabilities {
     pub clear_selected: PersistenceCapability,
     pub export_state: PersistenceCapability,
@@ -506,7 +460,7 @@ pub struct PersistenceCapabilities {
     pub activate_import: PersistenceCapability,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct AuthoritySummary {
     pub runtime_turn_sequence: u64,
     pub source_event_sequence: u64,
@@ -518,7 +472,7 @@ pub struct AuthoritySummary {
     pub effect_contract_count: u32,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct StoredSummary {
     pub epoch: u64,
     pub through_turn_sequence: u64,
@@ -531,7 +485,7 @@ pub struct StoredSummary {
     pub completed_migration_count: u32,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PersistenceTimingSummary {
     pub authority_enqueue_us: u64,
     pub encode_us: u64,
@@ -542,7 +496,7 @@ pub struct PersistenceTimingSummary {
     pub rebuild_derived_us: u64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PendingSummary {
     pub first_turn_sequence: Option<u64>,
     pub last_turn_sequence: Option<u64>,
@@ -553,13 +507,13 @@ pub struct PendingSummary {
     pub accepting_turns: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DurableSummary {
     pub epoch: u64,
     pub through_turn_sequence: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[repr(u8)]
 pub enum OutboxSampleState {
     Pending = 1,
@@ -568,19 +522,7 @@ pub enum OutboxSampleState {
     Completed = 4,
 }
 
-impl OutboxSampleState {
-    fn decode(value: u8) -> Result<Self, ProtocolError> {
-        match value {
-            1 => Ok(Self::Pending),
-            2 => Ok(Self::Dispatching),
-            3 => Ok(Self::ReconciliationRequired),
-            4 => Ok(Self::Completed),
-            _ => Err(ProtocolError::InvalidEnum("outbox sample state", value)),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct OutboxSample {
     pub item_id: [u8; 32],
     pub invocation_id: [u8; 32],
@@ -591,7 +533,7 @@ pub struct OutboxSample {
     pub updated_turn_sequence: u64,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct OutboxSummary {
     pub pending_count: u32,
     pub dispatching_count: u32,
@@ -600,7 +542,7 @@ pub struct OutboxSummary {
     pub samples: Vec<OutboxSample>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PersistenceSnapshot {
     pub snapshot_sequence: u64,
     pub revision: u64,
@@ -622,12 +564,12 @@ pub struct PersistenceSnapshot {
 
 impl PersistenceSnapshot {
     fn validate(&self) -> Result<(), ProtocolError> {
-        if self.outbox.samples.len() > MAX_PERSISTENCE_OUTBOX_SAMPLES {
-            return Err(ProtocolError::LimitExceeded(
-                "persistence outbox sample count",
-                self.outbox.samples.len(),
-            ));
-        }
+        validate_application(&self.application)?;
+        check_limit(
+            "persistence outbox sample count",
+            self.outbox.samples.len(),
+            MAX_PERSISTENCE_OUTBOX_SAMPLES,
+        )?;
         if let Some(preview) = self.import_preview.as_ref()
             && preview.preview_id == 0
         {
@@ -644,12 +586,11 @@ impl PersistenceSnapshot {
         .into_iter()
         .flatten()
         {
-            if value.len() > MAX_PERSISTENCE_STATUS_BYTES {
-                return Err(ProtocolError::LimitExceeded(
-                    "persistence status bytes",
-                    value.len(),
-                ));
-            }
+            check_limit(
+                "persistence status bytes",
+                value.len(),
+                MAX_PERSISTENCE_STATUS_BYTES,
+            )?;
         }
         for capability in [
             &self.capabilities.clear_selected,
@@ -657,12 +598,11 @@ impl PersistenceSnapshot {
             &self.capabilities.import_preview,
             &self.capabilities.activate_import,
         ] {
-            if capability.reason.len() > MAX_PERSISTENCE_STATUS_BYTES {
-                return Err(ProtocolError::LimitExceeded(
-                    "persistence status bytes",
-                    capability.reason.len(),
-                ));
-            }
+            check_limit(
+                "persistence status bytes",
+                capability.reason.len(),
+                MAX_PERSISTENCE_STATUS_BYTES,
+            )?;
             if capability.available && !capability.reason.is_empty() {
                 return Err(ProtocolError::InvalidPersistence(
                     "available persistence capability carries a failure reason".to_owned(),
@@ -694,7 +634,7 @@ impl PersistenceSnapshot {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[repr(u8)]
 pub enum PreviewIntent {
     Replace = 1,
@@ -703,19 +643,7 @@ pub enum PreviewIntent {
     Test = 4,
 }
 
-impl PreviewIntent {
-    fn decode(value: u8) -> Result<Self, ProtocolError> {
-        match value {
-            1 => Ok(Self::Replace),
-            2 => Ok(Self::Run),
-            3 => Ok(Self::Reset),
-            4 => Ok(Self::Test),
-            _ => Err(ProtocolError::InvalidEnum("preview intent", value)),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[repr(u8)]
 pub enum FrameMode {
     Idle = 1,
@@ -723,18 +651,7 @@ pub enum FrameMode {
     Probe = 3,
 }
 
-impl FrameMode {
-    fn decode(value: u8) -> Result<Self, ProtocolError> {
-        match value {
-            1 => Ok(Self::Idle),
-            2 => Ok(Self::Burst),
-            3 => Ok(Self::Probe),
-            _ => Err(ProtocolError::InvalidEnum("frame mode", value)),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[repr(u8)]
 pub enum ProofMode {
     Off = 1,
@@ -742,18 +659,7 @@ pub enum ProofMode {
     Readback = 3,
 }
 
-impl ProofMode {
-    fn decode(value: u8) -> Result<Self, ProtocolError> {
-        match value {
-            1 => Ok(Self::Off),
-            2 => Ok(Self::Trace),
-            3 => Ok(Self::Readback),
-            _ => Err(ProtocolError::InvalidEnum("proof mode", value)),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PreviewStats {
     pub frame_seq: u64,
     pub source_revision: u64,
@@ -776,7 +682,7 @@ pub struct PreviewStats {
     pub persistence_error: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum Message {
     Hello {
         role: Role,
@@ -926,353 +832,297 @@ impl Message {
         }
     }
 
-    fn encode_payload(&self, out: &mut Encoder) -> Result<(), ProtocolError> {
+    fn validate(&self) -> Result<(), ProtocolError> {
         match self {
-            Self::Hello { role, pid } => {
-                out.u8(*role as u8);
-                out.u32(*pid);
-            }
-            Self::Ready { role } => out.u8(*role as u8),
+            Self::Hello { .. }
+            | Self::Ready { .. }
+            | Self::DevReset
+            | Self::PreviewRuntimeChanged { .. }
+            | Self::Shutdown => Ok(()),
             Self::Catalog { entries, active_id } => {
-                out.catalog(entries)?;
-                out.string(active_id)?;
+                check_limit("catalog entry count", entries.len(), MAX_CATALOG_ENTRIES)?;
+                validate_string(active_id)?;
+                for entry in entries {
+                    validate_strings([entry.id.as_str(), entry.label.as_str()])?;
+                }
+                Ok(())
             }
             Self::OpenEditor {
                 example_id,
                 label,
                 application,
-                revision,
                 units,
                 migration,
                 migration_stage,
+                ..
             } => {
-                out.string(example_id)?;
-                out.string(label)?;
-                out.application_identity(application)?;
-                out.u64(*revision);
-                out.source_units(units)?;
-                out.optional_migration_bundle(migration.as_ref())?;
-                out.optional_string(migration_stage.as_deref())?;
+                validate_strings([example_id.as_str(), label.as_str()])?;
+                validate_application(application)?;
+                validate_source_units(units, "source unit count")?;
+                if let Some(migration) = migration {
+                    migration.validate()?;
+                }
+                validate_optional_strings([migration_stage.as_deref()])
             }
-            Self::DevSelectExample { example_id } => out.string(example_id)?,
+            Self::DevSelectExample { example_id } => validate_string(example_id),
             Self::DevSourceChanged {
-                application,
-                revision,
-                units,
+                application, units, ..
             }
             | Self::DevRun {
-                application,
-                revision,
-                units,
-            } => {
-                out.application_identity(application)?;
-                out.u64(*revision);
-                out.source_units(units)?;
+                application, units, ..
             }
-            Self::DevReset => {}
-            Self::DevTest {
-                request_id,
-                application,
-                revision,
-                units,
+            | Self::DevTest {
+                application, units, ..
             } => {
-                out.u64(*request_id);
-                out.application_identity(application)?;
-                out.u64(*revision);
-                out.source_units(units)?;
+                validate_application(application)?;
+                validate_source_units(units, "source unit count")
             }
             Self::PreviewApply {
-                intent,
-                request_id,
-                revision,
                 source,
                 test_steps,
                 migration,
                 migration_stage,
+                ..
             } => {
-                out.u8(*intent as u8);
-                out.optional_u64(*request_id);
-                out.u64(*revision);
-                out.preview_source(source)?;
-                out.test_steps(test_steps)?;
-                out.optional_migration_bundle(migration.as_ref())?;
-                out.optional_string(migration_stage.as_deref())?;
+                validate_preview_source(source)?;
+                validate_test_steps(test_steps)?;
+                if let Some(migration) = migration {
+                    migration.validate()?;
+                }
+                validate_optional_strings([migration_stage.as_deref()])
             }
-            Self::PreviewAssets { assets } => out.asset_blobs(assets)?,
-            Self::PreviewStats(stats) => {
-                out.u64(stats.frame_seq);
-                out.u64(stats.source_revision);
-                out.u8(stats.frame_mode as u8);
-                out.u8(stats.proof_mode as u8);
-                out.u32(stats.frames_per_second_milli);
-                out.u32(stats.input_to_present_micros);
-                out.u32(stats.render_micros);
-                out.u32(stats.present_micros);
-                out.u64(stats.missed_frames);
-                out.u64(stats.dropped_snapshots);
-                out.u32(stats.sample_age_millis);
-                out.u64(stats.persistence_schema_version);
-                out.u64(stats.persistence_durable_epoch);
-                out.u64(stats.persistence_durable_turn);
-                out.u32(stats.persistence_pending_turns);
-                out.u32(stats.persistence_queue_depth);
-                out.bool(stats.persistence_accepting);
-                out.bool(stats.persistence_worker_alive);
-                out.string(&stats.persistence_error)?;
+            Self::PreviewAssets { assets } => validate_assets(assets),
+            Self::PreviewStats(stats) => validate_string(&stats.persistence_error),
+            Self::PreviewStatus { message, .. } | Self::PreviewTestResult { message, .. } => {
+                validate_string(message)
             }
-            Self::PreviewStatus {
-                revision,
-                ok,
-                message,
-            } => {
-                out.u64(*revision);
-                out.bool(*ok);
-                out.string(message)?;
-            }
-            Self::PreviewRuntimeChanged {
-                revision,
-                runtime_sequence,
-            } => {
-                out.u64(*revision);
-                out.u64(*runtime_sequence);
-            }
-            Self::PreviewTestResult {
-                request_id,
-                passed,
-                message,
-            } => {
-                out.u64(*request_id);
-                out.bool(*passed);
-                out.string(message)?;
-            }
-            Self::DevInspect {
-                request_id,
-                revision,
-                path,
-            }
-            | Self::PreviewInspect {
-                request_id,
-                revision,
-                path,
-            } => {
-                out.u64(*request_id);
-                out.u64(*revision);
-                out.string(path)?;
+            Self::DevInspect { path, .. } | Self::PreviewInspect { path, .. } => {
+                validate_string(path)
             }
             Self::PreviewInspectResult {
-                request_id,
-                revision,
-                runtime_sequence,
                 path,
-                ok,
                 value,
                 authority,
+                ..
             } => {
-                out.u64(*request_id);
-                out.u64(*revision);
-                out.u64(*runtime_sequence);
-                out.string(path)?;
-                out.bool(*ok);
-                out.string(value)?;
-                match authority.as_ref() {
-                    Some(selection) => {
-                        out.u8(1);
-                        out.authority_selection(selection)?;
-                    }
-                    None => out.u8(0),
+                validate_strings([path.as_str(), value.as_str()])?;
+                if let Some(authority) = authority {
+                    authority.validate()?;
                 }
+                Ok(())
             }
-            Self::DevMigrationCommand {
-                request_id,
-                revision,
-                command,
+            Self::DevMigrationCommand { command, .. }
+            | Self::PreviewMigrationCommand { command, .. } => match command {
+                MigrationCommand::Preview { stage_id }
+                | MigrationCommand::Activate { stage_id } => validate_string(stage_id),
+                MigrationCommand::Restart | MigrationCommand::StartOver { .. } => Ok(()),
+            },
+            Self::PreviewMigrationStatus(status) => {
+                validate_string(&status.active_stage)?;
+                validate_optional_strings([
+                    status.previewed_stage.as_deref(),
+                    status.target_stage.as_deref(),
+                ])?;
+                validate_string(&status.message)
             }
-            | Self::PreviewMigrationCommand {
-                request_id,
-                revision,
-                command,
-            } => {
-                out.u64(*request_id);
-                out.u64(*revision);
-                out.migration_command(command)?;
-            }
-            Self::PreviewMigrationStatus(status) => out.migration_status(status)?,
-            Self::DevPersistenceCommand {
-                request_id,
-                revision,
-                command,
-            }
-            | Self::PreviewPersistenceCommand {
-                request_id,
-                revision,
-                command,
-            } => {
-                out.u64(*request_id);
-                out.u64(*revision);
-                out.persistence_command(command)?;
-            }
-            Self::PreviewPersistenceSnapshot(snapshot) => {
-                out.persistence_snapshot(snapshot)?;
-            }
-            Self::PreviewPersistenceArtifact {
-                request_id,
-                revision,
-                artifact,
-            } => {
-                out.u64(*request_id);
-                out.u64(*revision);
-                out.state_artifact(artifact)?;
-            }
-            Self::Shutdown => {}
+            Self::DevPersistenceCommand { command, .. }
+            | Self::PreviewPersistenceCommand { command, .. } => command.validate(),
+            Self::PreviewPersistenceSnapshot(snapshot) => snapshot.validate(),
+            Self::PreviewPersistenceArtifact { artifact, .. } => artifact.validate(),
         }
+    }
+}
+
+fn validate_application(application: &ApplicationIdentity) -> Result<(), ProtocolError> {
+    validate_strings([
+        application.package_id.as_str(),
+        application.state_namespace.as_str(),
+        application.deployment_domain.as_str(),
+    ])
+}
+
+fn validate_source_units(
+    units: &[SourceUnit],
+    limit_name: &'static str,
+) -> Result<(), ProtocolError> {
+    check_limit(limit_name, units.len(), MAX_SOURCE_UNITS)?;
+    for unit in units {
+        validate_strings([unit.path.as_str(), unit.source.as_str()])?;
+    }
+    Ok(())
+}
+
+fn validate_preview_source(source: &PreviewSource) -> Result<(), ProtocolError> {
+    match source {
+        PreviewSource::BuiltInSingleRole {
+            application,
+            entry_path,
+            units,
+        } => {
+            validate_application(application)?;
+            validate_string(entry_path)?;
+            validate_source_units(units, "source unit count")
+        }
+        PreviewSource::DistributedPackage { programs } => {
+            check_limit(
+                "distributed program count",
+                programs.len(),
+                MAX_DISTRIBUTED_PROGRAMS,
+            )?;
+            for program in programs {
+                validate_application(&program.application)?;
+                validate_string(&program.entry_path)?;
+                validate_source_units(&program.units, "source unit count")?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn validate_assets(assets: &[AssetBlob]) -> Result<(), ProtocolError> {
+    check_limit("asset count", assets.len(), MAX_ASSET_BLOBS)?;
+    for asset in assets {
+        validate_strings([
+            asset.url.as_str(),
+            asset.media_type.as_str(),
+            asset.sha256.as_str(),
+        ])?;
+        check_limit("asset blob bytes", asset.bytes.len(), MAX_ASSET_BLOB_BYTES)?;
+    }
+    Ok(())
+}
+
+fn validate_test_steps(steps: &[TestStep]) -> Result<(), ProtocolError> {
+    check_limit("test step count", steps.len(), MAX_TEST_STEPS)?;
+    for step in steps {
+        validate_strings([step.id.as_str(), step.source_path.as_str()])?;
+        validate_optional_strings([
+            step.action_kind.as_deref(),
+            step.target_text.as_deref(),
+            step.text.as_deref(),
+            step.key.as_deref(),
+            step.address.as_deref(),
+            step.pointer_x.as_deref(),
+            step.pointer_y.as_deref(),
+            step.pointer_width.as_deref(),
+            step.pointer_height.as_deref(),
+        ])?;
+        check_limit(
+            "test expectation count",
+            step.expectations.len(),
+            MAX_TEST_EXPECTATIONS_PER_STEP,
+        )?;
+        for expectation in &step.expectations {
+            validate_test_expectation(expectation)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_field_match(value: &ScenarioFieldMatch) -> Result<(), ProtocolError> {
+    validate_strings([value.field.as_str(), value.value.as_str()])
+}
+
+fn validate_expectation_values(values: &[String]) -> Result<(), ProtocolError> {
+    check_limit(
+        "test expectation value count",
+        values.len(),
+        MAX_TEST_EXPECTATION_VALUES,
+    )?;
+    validate_strings(values.iter().map(String::as_str))
+}
+
+fn validate_test_expectation(expectation: &ScenarioExpectation) -> Result<(), ProtocolError> {
+    match expectation {
+        ScenarioExpectation::RootText { name, value } => {
+            validate_strings([name.as_str(), value.as_str()])
+        }
+        ScenarioExpectation::RootNonEmpty { name } => validate_string(name),
+        ScenarioExpectation::ListTexts {
+            list,
+            field,
+            filter,
+            values,
+        } => {
+            validate_strings([list.as_str(), field.as_str()])?;
+            if let Some(filter) = filter {
+                validate_field_match(filter)?;
+            }
+            validate_expectation_values(values)
+        }
+        ScenarioExpectation::RootRowTexts {
+            root,
+            field,
+            values,
+        } => {
+            validate_strings([root.as_str(), field.as_str()])?;
+            validate_expectation_values(values)
+        }
+        ScenarioExpectation::ListCount { list, filter, .. } => {
+            validate_string(list)?;
+            validate_field_match(filter)
+        }
+        ScenarioExpectation::RowFields {
+            list,
+            key_field,
+            key,
+            fields,
+        } => {
+            validate_strings([list.as_str(), key_field.as_str(), key.as_str()])?;
+            check_limit(
+                "test expectation field count",
+                fields.len(),
+                MAX_TEST_EXPECTATION_FIELDS,
+            )?;
+            for (field, value) in fields {
+                validate_strings([field.as_str(), value.as_str()])?;
+            }
+            Ok(())
+        }
+        ScenarioExpectation::RecomputedRows {
+            list,
+            key_field,
+            field,
+            keys,
+        } => {
+            validate_strings([list.as_str(), key_field.as_str(), field.as_str()])?;
+            validate_expectation_values(keys)
+        }
+        ScenarioExpectation::SemanticDeltaContains(value) => validate_string(value),
+        ScenarioExpectation::DocumentChanged => Ok(()),
+    }
+}
+
+fn validate_string(value: &str) -> Result<(), ProtocolError> {
+    check_limit("string bytes", value.len(), MAX_STRING_BYTES)
+}
+
+fn validate_strings<'a>(values: impl IntoIterator<Item = &'a str>) -> Result<(), ProtocolError> {
+    for value in values {
+        validate_string(value)?;
+    }
+    Ok(())
+}
+
+fn validate_optional_strings<'a>(
+    values: impl IntoIterator<Item = Option<&'a str>>,
+) -> Result<(), ProtocolError> {
+    validate_strings(values.into_iter().flatten())
+}
+
+fn check_limit(name: &'static str, actual: usize, maximum: usize) -> Result<(), ProtocolError> {
+    if actual > maximum {
+        Err(ProtocolError::LimitExceeded(name, actual))
+    } else {
         Ok(())
     }
+}
 
-    fn decode(tag: u8, input: &mut Decoder<'_>) -> Result<Self, ProtocolError> {
-        let message = match tag {
-            1 => Self::Hello {
-                role: Role::decode(input.u8()?)?,
-                pid: input.u32()?,
-            },
-            2 => Self::Ready {
-                role: Role::decode(input.u8()?)?,
-            },
-            3 => Self::Catalog {
-                entries: input.catalog()?,
-                active_id: input.string()?,
-            },
-            4 => Self::OpenEditor {
-                example_id: input.string()?,
-                label: input.string()?,
-                application: input.application_identity()?,
-                revision: input.u64()?,
-                units: input.source_units()?,
-                migration: input.optional_migration_bundle()?,
-                migration_stage: input.optional_string()?,
-            },
-            5 => Self::DevSelectExample {
-                example_id: input.string()?,
-            },
-            6 => Self::DevSourceChanged {
-                application: input.application_identity()?,
-                revision: input.u64()?,
-                units: input.source_units()?,
-            },
-            7 => Self::DevRun {
-                application: input.application_identity()?,
-                revision: input.u64()?,
-                units: input.source_units()?,
-            },
-            8 => Self::DevReset,
-            9 => Self::DevTest {
-                request_id: input.u64()?,
-                application: input.application_identity()?,
-                revision: input.u64()?,
-                units: input.source_units()?,
-            },
-            10 => Self::PreviewApply {
-                intent: PreviewIntent::decode(input.u8()?)?,
-                request_id: input.optional_u64()?,
-                revision: input.u64()?,
-                source: input.preview_source()?,
-                test_steps: input.test_steps()?,
-                migration: input.optional_migration_bundle()?,
-                migration_stage: input.optional_string()?,
-            },
-            11 => Self::PreviewStats(PreviewStats {
-                frame_seq: input.u64()?,
-                source_revision: input.u64()?,
-                frame_mode: FrameMode::decode(input.u8()?)?,
-                proof_mode: ProofMode::decode(input.u8()?)?,
-                frames_per_second_milli: input.u32()?,
-                input_to_present_micros: input.u32()?,
-                render_micros: input.u32()?,
-                present_micros: input.u32()?,
-                missed_frames: input.u64()?,
-                dropped_snapshots: input.u64()?,
-                sample_age_millis: input.u32()?,
-                persistence_schema_version: input.u64()?,
-                persistence_durable_epoch: input.u64()?,
-                persistence_durable_turn: input.u64()?,
-                persistence_pending_turns: input.u32()?,
-                persistence_queue_depth: input.u32()?,
-                persistence_accepting: input.bool()?,
-                persistence_worker_alive: input.bool()?,
-                persistence_error: input.string()?,
-            }),
-            12 => Self::PreviewStatus {
-                revision: input.u64()?,
-                ok: input.bool()?,
-                message: input.string()?,
-            },
-            13 => Self::PreviewTestResult {
-                request_id: input.u64()?,
-                passed: input.bool()?,
-                message: input.string()?,
-            },
-            14 => Self::Shutdown,
-            15 => Self::DevInspect {
-                request_id: input.u64()?,
-                revision: input.u64()?,
-                path: input.string()?,
-            },
-            16 => Self::PreviewInspect {
-                request_id: input.u64()?,
-                revision: input.u64()?,
-                path: input.string()?,
-            },
-            17 => Self::PreviewInspectResult {
-                request_id: input.u64()?,
-                revision: input.u64()?,
-                runtime_sequence: input.u64()?,
-                path: input.string()?,
-                ok: input.bool()?,
-                value: input.string()?,
-                authority: match input.u8()? {
-                    0 => None,
-                    1 => Some(input.authority_selection()?),
-                    value => return Err(ProtocolError::InvalidOption(value)),
-                },
-            },
-            18 => Self::PreviewRuntimeChanged {
-                revision: input.u64()?,
-                runtime_sequence: input.u64()?,
-            },
-            19 => Self::PreviewAssets {
-                assets: input.asset_blobs()?,
-            },
-            20 => Self::DevMigrationCommand {
-                request_id: input.u64()?,
-                revision: input.u64()?,
-                command: input.migration_command()?,
-            },
-            21 => Self::PreviewMigrationCommand {
-                request_id: input.u64()?,
-                revision: input.u64()?,
-                command: input.migration_command()?,
-            },
-            22 => Self::PreviewMigrationStatus(input.migration_status()?),
-            23 => Self::DevPersistenceCommand {
-                request_id: input.u64()?,
-                revision: input.u64()?,
-                command: PersistenceCommand::decode(input)?,
-            },
-            24 => Self::PreviewPersistenceCommand {
-                request_id: input.u64()?,
-                revision: input.u64()?,
-                command: PersistenceCommand::decode(input)?,
-            },
-            25 => Self::PreviewPersistenceSnapshot(Box::new(input.persistence_snapshot()?)),
-            26 => Self::PreviewPersistenceArtifact {
-                request_id: input.u64()?,
-                revision: input.u64()?,
-                artifact: input.state_artifact()?,
-            },
-            _ => return Err(ProtocolError::UnknownMessage(tag)),
-        };
-        input.finish()?;
-        Ok(message)
-    }
+fn codec() -> impl Options {
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .with_little_endian()
+        .reject_trailing_bytes()
 }
 
 #[derive(Debug)]
@@ -1282,15 +1132,11 @@ pub enum ProtocolError {
     InvalidMagic,
     UnsupportedVersion(u16),
     UnknownMessage(u8),
-    InvalidEnum(&'static str, u8),
-    InvalidBool(u8),
-    InvalidOption(u8),
-    InvalidUtf8(std::str::Utf8Error),
+    MismatchedMessageTag { outer: u8, payload: u8 },
+    InvalidPayload(bincode::Error),
     InvalidMigration(String),
     InvalidPersistence(String),
-    InvalidTest(String),
     LimitExceeded(&'static str, usize),
-    Truncated,
     TrailingBytes(usize),
 }
 
@@ -1304,21 +1150,20 @@ impl fmt::Display for ProtocolError {
                 write!(f, "IPC protocol version {version} is unsupported")
             }
             Self::UnknownMessage(tag) => write!(f, "IPC message tag {tag} is unknown"),
-            Self::InvalidEnum(name, value) => write!(f, "IPC {name} value {value} is invalid"),
-            Self::InvalidBool(value) => write!(f, "IPC bool value {value} is invalid"),
-            Self::InvalidOption(value) => write!(f, "IPC option value {value} is invalid"),
-            Self::InvalidUtf8(error) => write!(f, "IPC string is not UTF-8: {error}"),
+            Self::MismatchedMessageTag { outer, payload } => write!(
+                f,
+                "IPC outer message tag {outer} does not match payload tag {payload}"
+            ),
+            Self::InvalidPayload(error) => write!(f, "IPC payload is invalid: {error}"),
             Self::InvalidMigration(message) => {
                 write!(f, "IPC migration data is invalid: {message}")
             }
             Self::InvalidPersistence(message) => {
                 write!(f, "IPC persistence data is invalid: {message}")
             }
-            Self::InvalidTest(message) => write!(f, "IPC TEST data is invalid: {message}"),
             Self::LimitExceeded(name, value) => {
                 write!(f, "IPC {name} exceeds its limit: {value}")
             }
-            Self::Truncated => f.write_str("IPC frame is truncated"),
             Self::TrailingBytes(bytes) => write!(f, "IPC frame has {bytes} trailing bytes"),
         }
     }
@@ -1328,7 +1173,7 @@ impl std::error::Error for ProtocolError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io(error) => Some(error),
-            Self::InvalidUtf8(error) => Some(error),
+            Self::InvalidPayload(error) => Some(error.as_ref()),
             _ => None,
         }
     }
@@ -1377,16 +1222,22 @@ impl Connection {
 }
 
 pub fn write_message(writer: &mut impl Write, message: &Message) -> Result<(), ProtocolError> {
-    let mut body = Encoder::default();
-    body.bytes.extend_from_slice(&MAGIC);
-    body.u16(VERSION);
-    body.u8(message.tag());
-    message.encode_payload(&mut body)?;
-    if body.bytes.len() > MAX_FRAME_BYTES {
-        return Err(ProtocolError::FrameTooLarge(body.bytes.len()));
+    message.validate()?;
+    let payload = codec()
+        .serialize(message)
+        .map_err(ProtocolError::InvalidPayload)?;
+    let frame_bytes = HEADER_BYTES
+        .checked_add(payload.len())
+        .ok_or(ProtocolError::FrameTooLarge(usize::MAX))?;
+    if frame_bytes > MAX_FRAME_BYTES {
+        return Err(ProtocolError::FrameTooLarge(frame_bytes));
     }
-    writer.write_all(&(body.bytes.len() as u32).to_le_bytes())?;
-    writer.write_all(&body.bytes)?;
+
+    writer.write_all(&(frame_bytes as u32).to_le_bytes())?;
+    writer.write_all(&MAGIC)?;
+    writer.write_all(&VERSION.to_le_bytes())?;
+    writer.write_all(&[message.tag()])?;
+    writer.write_all(&payload)?;
     writer.flush()?;
     Ok(())
 }
@@ -1403,6 +1254,7 @@ pub fn read_message(reader: &mut impl Read) -> Result<Option<Message>, ProtocolE
     if !(HEADER_BYTES..=MAX_FRAME_BYTES).contains(&length) {
         return Err(ProtocolError::FrameTooLarge(length));
     }
+
     let mut body = vec![0; length];
     reader.read_exact(&mut body)?;
     if body[..MAGIC.len()] != MAGIC {
@@ -1412,1281 +1264,30 @@ pub fn read_message(reader: &mut impl Read) -> Result<Option<Message>, ProtocolE
     if version != VERSION {
         return Err(ProtocolError::UnsupportedVersion(version));
     }
-    let tag = body[6];
-    let mut input = Decoder::new(&body[HEADER_BYTES..]);
-    Message::decode(tag, &mut input).map(Some)
-}
-
-#[derive(Default)]
-struct Encoder {
-    bytes: Vec<u8>,
-}
-
-impl Encoder {
-    fn u8(&mut self, value: u8) {
-        self.bytes.push(value);
+    let outer_tag = body[6];
+    if !(1..=LAST_MESSAGE_TAG).contains(&outer_tag) {
+        return Err(ProtocolError::UnknownMessage(outer_tag));
     }
 
-    fn bool(&mut self, value: bool) {
-        self.u8(u8::from(value));
+    let payload = &body[HEADER_BYTES..];
+    let mut cursor = Cursor::new(payload);
+    let message: Message = codec()
+        .with_limit(payload.len() as u64)
+        .allow_trailing_bytes()
+        .deserialize_from(&mut cursor)
+        .map_err(ProtocolError::InvalidPayload)?;
+    let consumed = cursor.position() as usize;
+    if consumed != payload.len() {
+        return Err(ProtocolError::TrailingBytes(payload.len() - consumed));
     }
-
-    fn u16(&mut self, value: u16) {
-        self.bytes.extend_from_slice(&value.to_le_bytes());
-    }
-
-    fn u32(&mut self, value: u32) {
-        self.bytes.extend_from_slice(&value.to_le_bytes());
-    }
-
-    fn u64(&mut self, value: u64) {
-        self.bytes.extend_from_slice(&value.to_le_bytes());
-    }
-
-    fn optional_u64(&mut self, value: Option<u64>) {
-        match value {
-            Some(value) => {
-                self.u8(1);
-                self.u64(value);
-            }
-            None => self.u8(0),
-        }
-    }
-
-    fn string(&mut self, value: &str) -> Result<(), ProtocolError> {
-        if value.len() > MAX_STRING_BYTES {
-            return Err(ProtocolError::LimitExceeded("string bytes", value.len()));
-        }
-        let projected = self
-            .bytes
-            .len()
-            .checked_add(4)
-            .and_then(|length| length.checked_add(value.len()))
-            .ok_or(ProtocolError::FrameTooLarge(usize::MAX))?;
-        if projected > MAX_FRAME_BYTES {
-            return Err(ProtocolError::FrameTooLarge(projected));
-        }
-        self.u32(value.len() as u32);
-        self.bytes.extend_from_slice(value.as_bytes());
-        Ok(())
-    }
-
-    fn source_units(&mut self, units: &[SourceUnit]) -> Result<(), ProtocolError> {
-        if units.len() > MAX_SOURCE_UNITS {
-            return Err(ProtocolError::LimitExceeded(
-                "source unit count",
-                units.len(),
-            ));
-        }
-        self.u32(units.len() as u32);
-        for unit in units {
-            self.string(&unit.path)?;
-            self.string(&unit.source)?;
-        }
-        Ok(())
-    }
-
-    fn program_sources(&mut self, programs: &[ProgramSource]) -> Result<(), ProtocolError> {
-        if programs.len() > MAX_DISTRIBUTED_PROGRAMS {
-            return Err(ProtocolError::LimitExceeded(
-                "distributed program count",
-                programs.len(),
-            ));
-        }
-        self.u32(programs.len() as u32);
-        for program in programs {
-            self.u8(match program.role {
-                ProgramRole::Client => 1,
-                ProgramRole::Session => 2,
-                ProgramRole::Server => 3,
-            });
-            self.string(&program.entry_path)?;
-            self.source_units(&program.units)?;
-            self.application_identity(&program.application)?;
-        }
-        Ok(())
-    }
-
-    fn preview_source(&mut self, source: &PreviewSource) -> Result<(), ProtocolError> {
-        match source {
-            PreviewSource::BuiltInSingleRole {
-                application,
-                entry_path,
-                units,
-            } => {
-                self.u8(1);
-                self.application_identity(application)?;
-                self.string(entry_path)?;
-                self.source_units(units)
-            }
-            PreviewSource::DistributedPackage { programs } => {
-                self.u8(2);
-                self.program_sources(programs)
-            }
-        }
-    }
-
-    fn application_identity(
-        &mut self,
-        application: &ApplicationIdentity,
-    ) -> Result<(), ProtocolError> {
-        self.string(&application.package_id)?;
-        self.string(&application.state_namespace)?;
-        self.string(&application.deployment_domain)
-    }
-
-    fn optional_migration_bundle(
-        &mut self,
-        migration: Option<&MigrationBundle>,
-    ) -> Result<(), ProtocolError> {
-        match migration {
-            Some(migration) => {
-                self.u8(1);
-                self.migration_bundle(migration)
-            }
-            None => {
-                self.u8(0);
-                Ok(())
-            }
-        }
-    }
-
-    fn migration_bundle(&mut self, migration: &MigrationBundle) -> Result<(), ProtocolError> {
-        migration.validate()?;
-        self.string(&migration.initial_stage)?;
-        self.string(&migration.launch_stage)?;
-        self.u8(match migration.test_driver {
-            MigrationTestDriver::Migration => 1,
-            MigrationTestDriver::Example => 2,
+    if message.tag() != outer_tag {
+        return Err(ProtocolError::MismatchedMessageTag {
+            outer: outer_tag,
+            payload: message.tag(),
         });
-        self.string(&migration.scenario_path)?;
-        self.u32(migration.stages.len() as u32);
-        for stage in &migration.stages {
-            self.string(&stage.id)?;
-            self.string(&stage.label)?;
-            self.u64(stage.schema_version);
-            self.string(&stage.source)?;
-            self.string_slice(&stage.source_files, "migration source file count")?;
-            self.source_units(&stage.units)?;
-        }
-        let scenario = toml::to_string(&migration.scenario)
-            .map_err(|error| ProtocolError::InvalidMigration(error.to_string()))?;
-        if scenario.len() > MAX_MIGRATION_SCENARIO_BYTES {
-            return Err(ProtocolError::LimitExceeded(
-                "migration scenario bytes",
-                scenario.len(),
-            ));
-        }
-        self.string(&scenario)
     }
-
-    fn migration_command(&mut self, command: &MigrationCommand) -> Result<(), ProtocolError> {
-        match command {
-            MigrationCommand::Preview { stage_id } => {
-                validate_migration_id("migration preview stage", stage_id)?;
-                self.u8(1);
-                self.string(stage_id)
-            }
-            MigrationCommand::Activate { stage_id } => {
-                validate_migration_id("migration activation stage", stage_id)?;
-                self.u8(2);
-                self.string(stage_id)
-            }
-            MigrationCommand::Restart => {
-                self.u8(3);
-                Ok(())
-            }
-            MigrationCommand::StartOver { confirmed } => {
-                self.u8(4);
-                self.bool(*confirmed);
-                Ok(())
-            }
-        }
-    }
-
-    fn migration_status(&mut self, status: &MigrationStatus) -> Result<(), ProtocolError> {
-        validate_migration_id("active migration stage", &status.active_stage)?;
-        if let Some(stage) = status.previewed_stage.as_deref() {
-            validate_migration_id("previewed migration stage", stage)?;
-        }
-        if let Some(stage) = status.target_stage.as_deref() {
-            validate_migration_id("target migration stage", stage)?;
-        }
-        self.optional_u64(status.request_id);
-        self.u64(status.revision);
-        self.u8(status.operation as u8);
-        self.bool(status.ok);
-        self.string(&status.active_stage)?;
-        self.optional_string(status.previewed_stage.as_deref())?;
-        self.optional_string(status.target_stage.as_deref())?;
-        self.u64(status.target_schema_version);
-        self.u32(status.migration_step_count);
-        self.u32(status.deleted_memory_count);
-        self.string(&status.message)
-    }
-
-    fn persistence_command(&mut self, command: &PersistenceCommand) -> Result<(), ProtocolError> {
-        match command {
-            PersistenceCommand::Flush => self.u8(1),
-            PersistenceCommand::Compact => self.u8(2),
-            PersistenceCommand::ClearAll { confirmed } => {
-                self.u8(3);
-                self.bool(*confirmed);
-            }
-            PersistenceCommand::ExportState => self.u8(4),
-            PersistenceCommand::ImportPreview { artifact } => {
-                self.u8(5);
-                self.state_artifact(artifact)?;
-            }
-            PersistenceCommand::ActivateImport { preview_id } => {
-                self.u8(6);
-                self.u64(*preview_id);
-            }
-            PersistenceCommand::ClearSelected {
-                selection,
-                confirmed,
-            } => {
-                self.u8(7);
-                self.authority_selection(selection)?;
-                self.bool(*confirmed);
-            }
-        }
-        Ok(())
-    }
-
-    fn persistence_snapshot(
-        &mut self,
-        snapshot: &PersistenceSnapshot,
-    ) -> Result<(), ProtocolError> {
-        snapshot.validate()?;
-        self.u64(snapshot.snapshot_sequence);
-        self.u64(snapshot.revision);
-        self.application_identity(&snapshot.application)?;
-        self.u64(snapshot.schema_version);
-        self.digest(snapshot.schema_hash);
-
-        self.u64(snapshot.authority.runtime_turn_sequence);
-        self.u64(snapshot.authority.source_event_sequence);
-        self.u32(snapshot.authority.scalar_count);
-        self.u32(snapshot.authority.indexed_field_count);
-        self.u32(snapshot.authority.list_count);
-        self.u32(snapshot.authority.map_count);
-        self.u32(snapshot.authority.set_count);
-        self.u32(snapshot.authority.effect_contract_count);
-
-        match snapshot.stored.as_ref() {
-            Some(stored) => {
-                self.u8(1);
-                self.u64(stored.epoch);
-                self.u64(stored.through_turn_sequence);
-                self.u32(stored.scalar_count);
-                self.u32(stored.list_count);
-                self.u64(stored.row_count);
-                self.u32(stored.content_artifact_count);
-                self.u64(stored.content_artifact_bytes);
-                self.optional_u64(stored.encoded_value_bytes);
-                self.u32(stored.completed_migration_count);
-            }
-            None => self.u8(0),
-        }
-
-        self.optional_u64(snapshot.pending.first_turn_sequence);
-        self.optional_u64(snapshot.pending.last_turn_sequence);
-        self.u64(snapshot.pending.oldest_age_millis);
-        self.u64(snapshot.pending.turn_count);
-        self.u32(snapshot.pending.queue_depth);
-        self.u32(snapshot.pending.reserved_slots);
-        self.bool(snapshot.pending.accepting_turns);
-
-        self.u64(snapshot.durable.epoch);
-        self.u64(snapshot.durable.through_turn_sequence);
-
-        self.u64(snapshot.timings.authority_enqueue_us);
-        self.u64(snapshot.timings.encode_us);
-        self.u64(snapshot.timings.checkpoint_us);
-        self.u64(snapshot.timings.barrier_us);
-        self.u64(snapshot.timings.restore_us);
-        self.u64(snapshot.timings.migration_us);
-        self.u64(snapshot.timings.rebuild_derived_us);
-
-        self.u32(snapshot.outbox.pending_count);
-        self.u32(snapshot.outbox.dispatching_count);
-        self.u32(snapshot.outbox.reconciliation_count);
-        self.u32(snapshot.outbox.completed_count);
-        self.u32(snapshot.outbox.samples.len() as u32);
-        for sample in &snapshot.outbox.samples {
-            self.digest(sample.item_id);
-            self.digest(sample.invocation_id);
-            self.digest(sample.effect_id);
-            self.u8(sample.state as u8);
-            self.u32(sample.attempt);
-            self.u64(sample.created_turn_sequence);
-            self.u64(sample.updated_turn_sequence);
-        }
-
-        self.bool(snapshot.worker_alive);
-        for capability in [
-            &snapshot.capabilities.clear_selected,
-            &snapshot.capabilities.export_state,
-            &snapshot.capabilities.import_preview,
-            &snapshot.capabilities.activate_import,
-        ] {
-            self.bool(capability.available);
-            self.bounded_persistence_string(&capability.reason)?;
-        }
-        match snapshot.import_preview.as_ref() {
-            Some(preview) => {
-                self.u8(1);
-                self.u64(preview.preview_id);
-                self.u64(preview.source_schema_version);
-                self.u64(preview.target_schema_version);
-                self.u32(preview.scalar_count);
-                self.u32(preview.list_count);
-                self.u64(preview.row_count);
-                self.u32(preview.migration_step_count);
-                self.u32(preview.deleted_memory_count);
-                self.u32(preview.document_node_count);
-                self.u64(preview.baseline_runtime_turn_sequence);
-                self.u64(preview.baseline_durable_epoch);
-                self.u64(preview.baseline_durable_turn_sequence);
-            }
-            None => self.u8(0),
-        }
-        self.optional_bounded_string(snapshot.last_actionable_error.as_deref())?;
-        match snapshot.last_operation.as_ref() {
-            Some(operation) => {
-                self.u8(1);
-                self.u64(operation.request_id);
-                self.u8(operation.operation as u8);
-                self.bool(operation.ok);
-                self.bounded_persistence_string(&operation.message)?;
-            }
-            None => self.u8(0),
-        }
-        Ok(())
-    }
-
-    fn authority_selection(&mut self, selection: &AuthoritySelection) -> Result<(), ProtocolError> {
-        selection.validate()?;
-        self.string(&selection.semantic_path)?;
-        self.digest(selection.memory_id);
-        self.u8(selection.kind as u8);
-        match selection.row {
-            Some((key, generation)) => {
-                self.u8(1);
-                self.u64(key);
-                self.u64(generation);
-            }
-            None => self.u8(0),
-        }
-        match selection.leaf_id {
-            Some(leaf_id) => {
-                self.u8(1);
-                self.digest(leaf_id);
-            }
-            None => self.u8(0),
-        }
-        Ok(())
-    }
-
-    fn state_artifact(&mut self, artifact: &CanonicalStateArtifact) -> Result<(), ProtocolError> {
-        artifact.validate()?;
-        self.u8(artifact.format as u8);
-        self.u64(artifact.schema_version);
-        self.digest(artifact.sha256);
-        self.u32(artifact.bytes.len() as u32);
-        self.bytes.extend_from_slice(&artifact.bytes);
-        Ok(())
-    }
-
-    fn digest(&mut self, value: [u8; 32]) {
-        self.bytes.extend_from_slice(&value);
-    }
-
-    fn optional_bounded_string(&mut self, value: Option<&str>) -> Result<(), ProtocolError> {
-        match value {
-            Some(value) => {
-                self.u8(1);
-                self.bounded_persistence_string(value)
-            }
-            None => {
-                self.u8(0);
-                Ok(())
-            }
-        }
-    }
-
-    fn bounded_persistence_string(&mut self, value: &str) -> Result<(), ProtocolError> {
-        if value.len() > MAX_PERSISTENCE_STATUS_BYTES {
-            return Err(ProtocolError::LimitExceeded(
-                "persistence status bytes",
-                value.len(),
-            ));
-        }
-        self.string(value)
-    }
-
-    fn string_slice(
-        &mut self,
-        values: &[String],
-        limit_name: &'static str,
-    ) -> Result<(), ProtocolError> {
-        if values.len() > MAX_MIGRATION_SOURCE_FILES {
-            return Err(ProtocolError::LimitExceeded(limit_name, values.len()));
-        }
-        self.u32(values.len() as u32);
-        for value in values {
-            self.string(value)?;
-        }
-        Ok(())
-    }
-
-    fn asset_blobs(&mut self, assets: &[AssetBlob]) -> Result<(), ProtocolError> {
-        if assets.len() > MAX_ASSET_BLOBS {
-            return Err(ProtocolError::LimitExceeded("asset count", assets.len()));
-        }
-        self.u32(assets.len() as u32);
-        for asset in assets {
-            self.string(&asset.url)?;
-            self.string(&asset.media_type)?;
-            self.string(&asset.sha256)?;
-            if asset.bytes.len() > MAX_ASSET_BLOB_BYTES {
-                return Err(ProtocolError::LimitExceeded(
-                    "asset blob bytes",
-                    asset.bytes.len(),
-                ));
-            }
-            self.u32(asset.bytes.len() as u32);
-            self.bytes.extend_from_slice(&asset.bytes);
-        }
-        Ok(())
-    }
-
-    fn catalog(&mut self, entries: &[CatalogItem]) -> Result<(), ProtocolError> {
-        if entries.len() > MAX_CATALOG_ENTRIES {
-            return Err(ProtocolError::LimitExceeded(
-                "catalog entry count",
-                entries.len(),
-            ));
-        }
-        self.u32(entries.len() as u32);
-        for entry in entries {
-            self.string(&entry.id)?;
-            self.string(&entry.label)?;
-            self.bool(entry.custom);
-        }
-        Ok(())
-    }
-
-    fn test_steps(&mut self, steps: &[TestStep]) -> Result<(), ProtocolError> {
-        if steps.len() > MAX_TEST_STEPS {
-            return Err(ProtocolError::LimitExceeded("test step count", steps.len()));
-        }
-        self.u32(steps.len() as u32);
-        for step in steps {
-            self.string(&step.id)?;
-            self.string(&step.source_path)?;
-            self.optional_string(step.action_kind.as_deref())?;
-            self.optional_string(step.target_text.as_deref())?;
-            self.optional_string(step.text.as_deref())?;
-            self.optional_string(step.key.as_deref())?;
-            self.optional_string(step.address.as_deref())?;
-            self.optional_u64(step.target_key);
-            self.optional_u64(step.target_generation);
-            self.optional_u64(step.target_occurrence);
-            self.optional_string(step.pointer_x.as_deref())?;
-            self.optional_string(step.pointer_y.as_deref())?;
-            self.optional_string(step.pointer_width.as_deref())?;
-            self.optional_string(step.pointer_height.as_deref())?;
-            self.test_expectations(&step.expectations)?;
-        }
-        Ok(())
-    }
-
-    fn test_expectations(
-        &mut self,
-        expectations: &[ScenarioExpectation],
-    ) -> Result<(), ProtocolError> {
-        if expectations.len() > MAX_TEST_EXPECTATIONS_PER_STEP {
-            return Err(ProtocolError::LimitExceeded(
-                "test expectations per step",
-                expectations.len(),
-            ));
-        }
-        self.u32(expectations.len() as u32);
-        for expectation in expectations {
-            match expectation {
-                ScenarioExpectation::RootText { name, value } => {
-                    self.u8(1);
-                    self.string(name)?;
-                    self.string(value)?;
-                }
-                ScenarioExpectation::RootNonEmpty { name } => {
-                    self.u8(9);
-                    self.string(name)?;
-                }
-                ScenarioExpectation::ListTexts {
-                    list,
-                    field,
-                    filter,
-                    values,
-                } => {
-                    self.u8(2);
-                    self.string(list)?;
-                    self.string(field)?;
-                    self.optional_test_field_match(filter.as_ref())?;
-                    self.test_expectation_strings(values)?;
-                }
-                ScenarioExpectation::RootRowTexts {
-                    root,
-                    field,
-                    values,
-                } => {
-                    self.u8(3);
-                    self.string(root)?;
-                    self.string(field)?;
-                    self.test_expectation_strings(values)?;
-                }
-                ScenarioExpectation::ListCount {
-                    list,
-                    filter,
-                    count,
-                } => {
-                    self.u8(4);
-                    self.string(list)?;
-                    self.test_field_match(filter)?;
-                    self.u64(
-                        (*count)
-                            .try_into()
-                            .map_err(|_| ProtocolError::LimitExceeded("test list count", *count))?,
-                    );
-                }
-                ScenarioExpectation::RowFields {
-                    list,
-                    key_field,
-                    key,
-                    fields,
-                } => {
-                    self.u8(5);
-                    self.string(list)?;
-                    self.string(key_field)?;
-                    self.string(key)?;
-                    if fields.len() > MAX_TEST_EXPECTATION_FIELDS {
-                        return Err(ProtocolError::LimitExceeded(
-                            "test expectation field count",
-                            fields.len(),
-                        ));
-                    }
-                    self.u32(fields.len() as u32);
-                    for (name, value) in fields {
-                        self.string(name)?;
-                        self.string(value)?;
-                    }
-                }
-                ScenarioExpectation::RecomputedRows {
-                    list,
-                    key_field,
-                    field,
-                    keys,
-                } => {
-                    self.u8(6);
-                    self.string(list)?;
-                    self.string(key_field)?;
-                    self.string(field)?;
-                    self.test_expectation_strings(keys)?;
-                }
-                ScenarioExpectation::SemanticDeltaContains(value) => {
-                    self.u8(7);
-                    self.string(value)?;
-                }
-                ScenarioExpectation::DocumentChanged => self.u8(8),
-            }
-        }
-        Ok(())
-    }
-
-    fn optional_test_field_match(
-        &mut self,
-        value: Option<&ScenarioFieldMatch>,
-    ) -> Result<(), ProtocolError> {
-        match value {
-            Some(value) => {
-                self.u8(1);
-                self.test_field_match(value)
-            }
-            None => {
-                self.u8(0);
-                Ok(())
-            }
-        }
-    }
-
-    fn test_field_match(&mut self, value: &ScenarioFieldMatch) -> Result<(), ProtocolError> {
-        self.string(&value.field)?;
-        self.string(&value.value)
-    }
-
-    fn test_expectation_strings(&mut self, values: &[String]) -> Result<(), ProtocolError> {
-        if values.len() > MAX_TEST_EXPECTATION_VALUES {
-            return Err(ProtocolError::LimitExceeded(
-                "test expectation value count",
-                values.len(),
-            ));
-        }
-        self.u32(values.len() as u32);
-        for value in values {
-            self.string(value)?;
-        }
-        Ok(())
-    }
-
-    fn optional_string(&mut self, value: Option<&str>) -> Result<(), ProtocolError> {
-        match value {
-            Some(value) => {
-                self.u8(1);
-                self.string(value)?;
-            }
-            None => self.u8(0),
-        }
-        Ok(())
-    }
-}
-
-struct Decoder<'a> {
-    bytes: &'a [u8],
-    offset: usize,
-}
-
-impl<'a> Decoder<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, offset: 0 }
-    }
-
-    fn take(&mut self, count: usize) -> Result<&'a [u8], ProtocolError> {
-        let end = self
-            .offset
-            .checked_add(count)
-            .ok_or(ProtocolError::Truncated)?;
-        let value = self
-            .bytes
-            .get(self.offset..end)
-            .ok_or(ProtocolError::Truncated)?;
-        self.offset = end;
-        Ok(value)
-    }
-
-    fn u8(&mut self) -> Result<u8, ProtocolError> {
-        Ok(self.take(1)?[0])
-    }
-
-    fn bool(&mut self) -> Result<bool, ProtocolError> {
-        match self.u8()? {
-            0 => Ok(false),
-            1 => Ok(true),
-            value => Err(ProtocolError::InvalidBool(value)),
-        }
-    }
-
-    fn u32(&mut self) -> Result<u32, ProtocolError> {
-        Ok(u32::from_le_bytes(
-            self.take(4)?.try_into().expect("four-byte slice"),
-        ))
-    }
-
-    fn u64(&mut self) -> Result<u64, ProtocolError> {
-        Ok(u64::from_le_bytes(
-            self.take(8)?.try_into().expect("eight-byte slice"),
-        ))
-    }
-
-    fn optional_u64(&mut self) -> Result<Option<u64>, ProtocolError> {
-        match self.u8()? {
-            0 => Ok(None),
-            1 => self.u64().map(Some),
-            value => Err(ProtocolError::InvalidOption(value)),
-        }
-    }
-
-    fn string(&mut self) -> Result<String, ProtocolError> {
-        let length = self.u32()? as usize;
-        if length > MAX_STRING_BYTES {
-            return Err(ProtocolError::LimitExceeded("string bytes", length));
-        }
-        let value = std::str::from_utf8(self.take(length)?).map_err(ProtocolError::InvalidUtf8)?;
-        Ok(value.to_owned())
-    }
-
-    fn source_units(&mut self) -> Result<Vec<SourceUnit>, ProtocolError> {
-        let count = self.u32()? as usize;
-        if count > MAX_SOURCE_UNITS {
-            return Err(ProtocolError::LimitExceeded("source unit count", count));
-        }
-        (0..count)
-            .map(|_| {
-                Ok(SourceUnit {
-                    path: self.string()?,
-                    source: self.string()?,
-                })
-            })
-            .collect()
-    }
-
-    fn program_sources(&mut self) -> Result<Vec<ProgramSource>, ProtocolError> {
-        let count = self.u32()? as usize;
-        if count > MAX_DISTRIBUTED_PROGRAMS {
-            return Err(ProtocolError::LimitExceeded(
-                "distributed program count",
-                count,
-            ));
-        }
-        (0..count)
-            .map(|_| {
-                let role = match self.u8()? {
-                    1 => ProgramRole::Client,
-                    2 => ProgramRole::Session,
-                    3 => ProgramRole::Server,
-                    value => return Err(ProtocolError::InvalidEnum("program role", value)),
-                };
-                Ok(ProgramSource {
-                    role,
-                    entry_path: self.string()?,
-                    units: self.source_units()?,
-                    application: self.application_identity()?,
-                })
-            })
-            .collect()
-    }
-
-    fn preview_source(&mut self) -> Result<PreviewSource, ProtocolError> {
-        match self.u8()? {
-            1 => Ok(PreviewSource::BuiltInSingleRole {
-                application: self.application_identity()?,
-                entry_path: self.string()?,
-                units: self.source_units()?,
-            }),
-            2 => Ok(PreviewSource::DistributedPackage {
-                programs: self.program_sources()?,
-            }),
-            value => Err(ProtocolError::InvalidEnum("preview source", value)),
-        }
-    }
-
-    fn application_identity(&mut self) -> Result<ApplicationIdentity, ProtocolError> {
-        Ok(ApplicationIdentity::new(
-            self.string()?,
-            self.string()?,
-            self.string()?,
-        ))
-    }
-
-    fn optional_migration_bundle(&mut self) -> Result<Option<MigrationBundle>, ProtocolError> {
-        match self.u8()? {
-            0 => Ok(None),
-            1 => self.migration_bundle().map(Some),
-            value => Err(ProtocolError::InvalidOption(value)),
-        }
-    }
-
-    fn migration_bundle(&mut self) -> Result<MigrationBundle, ProtocolError> {
-        let initial_stage = self.string()?;
-        let launch_stage = self.string()?;
-        let test_driver = match self.u8()? {
-            1 => MigrationTestDriver::Migration,
-            2 => MigrationTestDriver::Example,
-            value => return Err(ProtocolError::InvalidEnum("migration test driver", value)),
-        };
-        let scenario_path = self.string()?;
-        let count = self.u32()? as usize;
-        if count > MAX_MIGRATION_STAGES {
-            return Err(ProtocolError::LimitExceeded("migration stage count", count));
-        }
-        let mut stages = Vec::with_capacity(count);
-        for _ in 0..count {
-            stages.push(MigrationStage {
-                id: self.string()?,
-                label: self.string()?,
-                schema_version: self.u64()?,
-                source: self.string()?,
-                source_files: self
-                    .string_vec(MAX_MIGRATION_SOURCE_FILES, "migration source file count")?,
-                units: self.source_units()?,
-            });
-        }
-        let encoded_scenario = self.string()?;
-        if encoded_scenario.len() > MAX_MIGRATION_SCENARIO_BYTES {
-            return Err(ProtocolError::LimitExceeded(
-                "migration scenario bytes",
-                encoded_scenario.len(),
-            ));
-        }
-        let scenario = toml::from_str(&encoded_scenario)
-            .map_err(|error| ProtocolError::InvalidMigration(error.to_string()))?;
-        let migration = MigrationBundle {
-            initial_stage,
-            launch_stage,
-            test_driver,
-            scenario_path,
-            stages,
-            scenario,
-        };
-        migration.validate()?;
-        Ok(migration)
-    }
-
-    fn migration_command(&mut self) -> Result<MigrationCommand, ProtocolError> {
-        match self.u8()? {
-            1 => {
-                let stage_id = self.string()?;
-                validate_migration_id("migration preview stage", &stage_id)?;
-                Ok(MigrationCommand::Preview { stage_id })
-            }
-            2 => {
-                let stage_id = self.string()?;
-                validate_migration_id("migration activation stage", &stage_id)?;
-                Ok(MigrationCommand::Activate { stage_id })
-            }
-            3 => Ok(MigrationCommand::Restart),
-            4 => Ok(MigrationCommand::StartOver {
-                confirmed: self.bool()?,
-            }),
-            value => Err(ProtocolError::InvalidEnum("migration command", value)),
-        }
-    }
-
-    fn migration_status(&mut self) -> Result<MigrationStatus, ProtocolError> {
-        let status = MigrationStatus {
-            request_id: self.optional_u64()?,
-            revision: self.u64()?,
-            operation: MigrationOperation::decode(self.u8()?)?,
-            ok: self.bool()?,
-            active_stage: self.string()?,
-            previewed_stage: self.optional_string()?,
-            target_stage: self.optional_string()?,
-            target_schema_version: self.u64()?,
-            migration_step_count: self.u32()?,
-            deleted_memory_count: self.u32()?,
-            message: self.string()?,
-        };
-        validate_migration_id("active migration stage", &status.active_stage)?;
-        if let Some(stage) = status.previewed_stage.as_deref() {
-            validate_migration_id("previewed migration stage", stage)?;
-        }
-        if let Some(stage) = status.target_stage.as_deref() {
-            validate_migration_id("target migration stage", stage)?;
-        }
-        Ok(status)
-    }
-
-    fn persistence_snapshot(&mut self) -> Result<PersistenceSnapshot, ProtocolError> {
-        let snapshot_sequence = self.u64()?;
-        let revision = self.u64()?;
-        let application = self.application_identity()?;
-        let schema_version = self.u64()?;
-        let schema_hash = self.digest()?;
-        let authority = AuthoritySummary {
-            runtime_turn_sequence: self.u64()?,
-            source_event_sequence: self.u64()?,
-            scalar_count: self.u32()?,
-            indexed_field_count: self.u32()?,
-            list_count: self.u32()?,
-            map_count: self.u32()?,
-            set_count: self.u32()?,
-            effect_contract_count: self.u32()?,
-        };
-        let stored = match self.u8()? {
-            0 => None,
-            1 => Some(StoredSummary {
-                epoch: self.u64()?,
-                through_turn_sequence: self.u64()?,
-                scalar_count: self.u32()?,
-                list_count: self.u32()?,
-                row_count: self.u64()?,
-                content_artifact_count: self.u32()?,
-                content_artifact_bytes: self.u64()?,
-                encoded_value_bytes: self.optional_u64()?,
-                completed_migration_count: self.u32()?,
-            }),
-            value => return Err(ProtocolError::InvalidOption(value)),
-        };
-        let pending = PendingSummary {
-            first_turn_sequence: self.optional_u64()?,
-            last_turn_sequence: self.optional_u64()?,
-            oldest_age_millis: self.u64()?,
-            turn_count: self.u64()?,
-            queue_depth: self.u32()?,
-            reserved_slots: self.u32()?,
-            accepting_turns: self.bool()?,
-        };
-        let durable = DurableSummary {
-            epoch: self.u64()?,
-            through_turn_sequence: self.u64()?,
-        };
-        let timings = PersistenceTimingSummary {
-            authority_enqueue_us: self.u64()?,
-            encode_us: self.u64()?,
-            checkpoint_us: self.u64()?,
-            barrier_us: self.u64()?,
-            restore_us: self.u64()?,
-            migration_us: self.u64()?,
-            rebuild_derived_us: self.u64()?,
-        };
-        let pending_count = self.u32()?;
-        let dispatching_count = self.u32()?;
-        let reconciliation_count = self.u32()?;
-        let completed_count = self.u32()?;
-        let sample_count = self.u32()? as usize;
-        if sample_count > MAX_PERSISTENCE_OUTBOX_SAMPLES {
-            return Err(ProtocolError::LimitExceeded(
-                "persistence outbox sample count",
-                sample_count,
-            ));
-        }
-        let mut samples = Vec::with_capacity(sample_count);
-        for _ in 0..sample_count {
-            samples.push(OutboxSample {
-                item_id: self.digest()?,
-                invocation_id: self.digest()?,
-                effect_id: self.digest()?,
-                state: OutboxSampleState::decode(self.u8()?)?,
-                attempt: self.u32()?,
-                created_turn_sequence: self.u64()?,
-                updated_turn_sequence: self.u64()?,
-            });
-        }
-        let worker_alive = self.bool()?;
-        let mut capability = || -> Result<PersistenceCapability, ProtocolError> {
-            Ok(PersistenceCapability {
-                available: self.bool()?,
-                reason: self.bounded_persistence_string()?,
-            })
-        };
-        let capabilities = PersistenceCapabilities {
-            clear_selected: capability()?,
-            export_state: capability()?,
-            import_preview: capability()?,
-            activate_import: capability()?,
-        };
-        let import_preview = match self.u8()? {
-            0 => None,
-            1 => Some(StateArtifactPreviewSummary {
-                preview_id: self.u64()?,
-                source_schema_version: self.u64()?,
-                target_schema_version: self.u64()?,
-                scalar_count: self.u32()?,
-                list_count: self.u32()?,
-                row_count: self.u64()?,
-                migration_step_count: self.u32()?,
-                deleted_memory_count: self.u32()?,
-                document_node_count: self.u32()?,
-                baseline_runtime_turn_sequence: self.u64()?,
-                baseline_durable_epoch: self.u64()?,
-                baseline_durable_turn_sequence: self.u64()?,
-            }),
-            value => return Err(ProtocolError::InvalidOption(value)),
-        };
-        let last_actionable_error = self.optional_bounded_persistence_string()?;
-        let last_operation = match self.u8()? {
-            0 => None,
-            1 => Some(PersistenceOperationStatus {
-                request_id: self.u64()?,
-                operation: PersistenceOperation::decode(self.u8()?)?,
-                ok: self.bool()?,
-                message: self.bounded_persistence_string()?,
-            }),
-            value => return Err(ProtocolError::InvalidOption(value)),
-        };
-        let snapshot = PersistenceSnapshot {
-            snapshot_sequence,
-            revision,
-            application,
-            schema_version,
-            schema_hash,
-            authority,
-            stored,
-            pending,
-            durable,
-            timings,
-            outbox: OutboxSummary {
-                pending_count,
-                dispatching_count,
-                reconciliation_count,
-                completed_count,
-                samples,
-            },
-            worker_alive,
-            capabilities,
-            import_preview,
-            last_actionable_error,
-            last_operation,
-        };
-        snapshot.validate()?;
-        Ok(snapshot)
-    }
-
-    fn authority_selection(&mut self) -> Result<AuthoritySelection, ProtocolError> {
-        let semantic_path = self.string()?;
-        let memory_id = self.digest()?;
-        let kind = AuthoritySelectionKind::decode(self.u8()?)?;
-        let row = match self.u8()? {
-            0 => None,
-            1 => Some((self.u64()?, self.u64()?)),
-            value => return Err(ProtocolError::InvalidOption(value)),
-        };
-        let leaf_id = match self.u8()? {
-            0 => None,
-            1 => Some(self.digest()?),
-            value => return Err(ProtocolError::InvalidOption(value)),
-        };
-        let selection = AuthoritySelection {
-            semantic_path,
-            memory_id,
-            kind,
-            row,
-            leaf_id,
-        };
-        selection.validate()?;
-        Ok(selection)
-    }
-
-    fn state_artifact(&mut self) -> Result<CanonicalStateArtifact, ProtocolError> {
-        let format = StateArtifactFormat::decode(self.u8()?)?;
-        let schema_version = self.u64()?;
-        let sha256 = self.digest()?;
-        let length = self.u32()? as usize;
-        if length > MAX_PERSISTENCE_ARTIFACT_BYTES {
-            return Err(ProtocolError::LimitExceeded(
-                "persistence artifact bytes",
-                length,
-            ));
-        }
-        let artifact = CanonicalStateArtifact {
-            format,
-            schema_version,
-            sha256,
-            bytes: self.take(length)?.to_vec(),
-        };
-        artifact.validate()?;
-        Ok(artifact)
-    }
-
-    fn digest(&mut self) -> Result<[u8; 32], ProtocolError> {
-        Ok(self.take(32)?.try_into().expect("32-byte digest"))
-    }
-
-    fn optional_bounded_persistence_string(&mut self) -> Result<Option<String>, ProtocolError> {
-        match self.u8()? {
-            0 => Ok(None),
-            1 => self.bounded_persistence_string().map(Some),
-            value => Err(ProtocolError::InvalidOption(value)),
-        }
-    }
-
-    fn bounded_persistence_string(&mut self) -> Result<String, ProtocolError> {
-        let value = self.string()?;
-        if value.len() > MAX_PERSISTENCE_STATUS_BYTES {
-            return Err(ProtocolError::LimitExceeded(
-                "persistence status bytes",
-                value.len(),
-            ));
-        }
-        Ok(value)
-    }
-
-    fn string_vec(
-        &mut self,
-        max: usize,
-        limit_name: &'static str,
-    ) -> Result<Vec<String>, ProtocolError> {
-        let count = self.u32()? as usize;
-        if count > max {
-            return Err(ProtocolError::LimitExceeded(limit_name, count));
-        }
-        (0..count).map(|_| self.string()).collect()
-    }
-
-    fn asset_blobs(&mut self) -> Result<Vec<AssetBlob>, ProtocolError> {
-        let count = self.u32()? as usize;
-        if count > MAX_ASSET_BLOBS {
-            return Err(ProtocolError::LimitExceeded("asset count", count));
-        }
-        (0..count)
-            .map(|_| {
-                let url = self.string()?;
-                let media_type = self.string()?;
-                let sha256 = self.string()?;
-                let length = self.u32()? as usize;
-                if length > MAX_ASSET_BLOB_BYTES {
-                    return Err(ProtocolError::LimitExceeded("asset blob bytes", length));
-                }
-                Ok(AssetBlob {
-                    url,
-                    media_type,
-                    sha256,
-                    bytes: self.take(length)?.to_vec(),
-                })
-            })
-            .collect()
-    }
-
-    fn catalog(&mut self) -> Result<Vec<CatalogItem>, ProtocolError> {
-        let count = self.u32()? as usize;
-        if count > MAX_CATALOG_ENTRIES {
-            return Err(ProtocolError::LimitExceeded("catalog entry count", count));
-        }
-        (0..count)
-            .map(|_| {
-                Ok(CatalogItem {
-                    id: self.string()?,
-                    label: self.string()?,
-                    custom: self.bool()?,
-                })
-            })
-            .collect()
-    }
-
-    fn test_steps(&mut self) -> Result<Vec<TestStep>, ProtocolError> {
-        let count = self.u32()? as usize;
-        if count > MAX_TEST_STEPS {
-            return Err(ProtocolError::LimitExceeded("test step count", count));
-        }
-        (0..count)
-            .map(|_| {
-                Ok(TestStep {
-                    id: self.string()?,
-                    source_path: self.string()?,
-                    action_kind: self.optional_string()?,
-                    target_text: self.optional_string()?,
-                    text: self.optional_string()?,
-                    key: self.optional_string()?,
-                    address: self.optional_string()?,
-                    target_key: self.optional_u64()?,
-                    target_generation: self.optional_u64()?,
-                    target_occurrence: self.optional_u64()?,
-                    pointer_x: self.optional_string()?,
-                    pointer_y: self.optional_string()?,
-                    pointer_width: self.optional_string()?,
-                    pointer_height: self.optional_string()?,
-                    expectations: self.test_expectations()?,
-                })
-            })
-            .collect()
-    }
-
-    fn test_expectations(&mut self) -> Result<Vec<ScenarioExpectation>, ProtocolError> {
-        let count = self.u32()? as usize;
-        if count > MAX_TEST_EXPECTATIONS_PER_STEP {
-            return Err(ProtocolError::LimitExceeded(
-                "test expectations per step",
-                count,
-            ));
-        }
-        (0..count)
-            .map(|_| match self.u8()? {
-                1 => Ok(ScenarioExpectation::RootText {
-                    name: self.string()?,
-                    value: self.string()?,
-                }),
-                2 => Ok(ScenarioExpectation::ListTexts {
-                    list: self.string()?,
-                    field: self.string()?,
-                    filter: self.optional_test_field_match()?,
-                    values: self.test_expectation_strings()?,
-                }),
-                3 => Ok(ScenarioExpectation::RootRowTexts {
-                    root: self.string()?,
-                    field: self.string()?,
-                    values: self.test_expectation_strings()?,
-                }),
-                4 => {
-                    let list = self.string()?;
-                    let filter = self.test_field_match()?;
-                    let count = usize::try_from(self.u64()?)
-                        .map_err(|_| ProtocolError::LimitExceeded("test list count", usize::MAX))?;
-                    Ok(ScenarioExpectation::ListCount {
-                        list,
-                        filter,
-                        count,
-                    })
-                }
-                5 => {
-                    let list = self.string()?;
-                    let key_field = self.string()?;
-                    let key = self.string()?;
-                    let field_count = self.u32()? as usize;
-                    if field_count > MAX_TEST_EXPECTATION_FIELDS {
-                        return Err(ProtocolError::LimitExceeded(
-                            "test expectation field count",
-                            field_count,
-                        ));
-                    }
-                    let mut fields = std::collections::BTreeMap::new();
-                    for _ in 0..field_count {
-                        let name = self.string()?;
-                        let value = self.string()?;
-                        if fields.insert(name, value).is_some() {
-                            return Err(ProtocolError::InvalidTest(
-                                "duplicate test expectation field".to_owned(),
-                            ));
-                        }
-                    }
-                    Ok(ScenarioExpectation::RowFields {
-                        list,
-                        key_field,
-                        key,
-                        fields,
-                    })
-                }
-                6 => Ok(ScenarioExpectation::RecomputedRows {
-                    list: self.string()?,
-                    key_field: self.string()?,
-                    field: self.string()?,
-                    keys: self.test_expectation_strings()?,
-                }),
-                7 => Ok(ScenarioExpectation::SemanticDeltaContains(self.string()?)),
-                8 => Ok(ScenarioExpectation::DocumentChanged),
-                9 => Ok(ScenarioExpectation::RootNonEmpty {
-                    name: self.string()?,
-                }),
-                value => Err(ProtocolError::InvalidEnum("test expectation", value)),
-            })
-            .collect()
-    }
-
-    fn optional_test_field_match(&mut self) -> Result<Option<ScenarioFieldMatch>, ProtocolError> {
-        match self.u8()? {
-            0 => Ok(None),
-            1 => self.test_field_match().map(Some),
-            value => Err(ProtocolError::InvalidOption(value)),
-        }
-    }
-
-    fn test_field_match(&mut self) -> Result<ScenarioFieldMatch, ProtocolError> {
-        Ok(ScenarioFieldMatch {
-            field: self.string()?,
-            value: self.string()?,
-        })
-    }
-
-    fn test_expectation_strings(&mut self) -> Result<Vec<String>, ProtocolError> {
-        self.string_vec(MAX_TEST_EXPECTATION_VALUES, "test expectation value count")
-    }
-
-    fn optional_string(&mut self) -> Result<Option<String>, ProtocolError> {
-        match self.u8()? {
-            0 => Ok(None),
-            1 => self.string().map(Some),
-            value => Err(ProtocolError::InvalidOption(value)),
-        }
-    }
-
-    fn finish(&self) -> Result<(), ProtocolError> {
-        let remaining = self.bytes.len() - self.offset;
-        if remaining == 0 {
-            Ok(())
-        } else {
-            Err(ProtocolError::TrailingBytes(remaining))
-        }
-    }
+    message.validate()?;
+    Ok(Some(message))
 }
 
 #[cfg(test)]
@@ -3039,14 +1640,22 @@ mod tests {
     }
 
     #[test]
-    fn rejects_trailing_payload_bytes() {
-        let mut bytes = Vec::new();
-        write_message(&mut bytes, &Message::DevReset).expect("encode message");
-        let length = u32::from_le_bytes(bytes[..4].try_into().expect("length"));
-        bytes[..4].copy_from_slice(&(length + 1).to_le_bytes());
-        bytes.push(0xff);
+    fn rejects_tag_mismatch_and_trailing_payload_bytes() {
+        let mut mismatched = Vec::new();
+        write_message(&mut mismatched, &Message::DevReset).expect("encode message");
+        mismatched[10] = Message::Ready { role: Role::Dev }.tag();
         assert!(matches!(
-            read_message(&mut bytes.as_slice()),
+            read_message(&mut mismatched.as_slice()),
+            Err(ProtocolError::MismatchedMessageTag { .. })
+        ));
+
+        let mut trailing = Vec::new();
+        write_message(&mut trailing, &Message::DevReset).expect("encode message");
+        let length = u32::from_le_bytes(trailing[..4].try_into().expect("length"));
+        trailing[..4].copy_from_slice(&(length + 1).to_le_bytes());
+        trailing.push(0xff);
+        assert!(matches!(
+            read_message(&mut trailing.as_slice()),
             Err(ProtocolError::TrailingBytes(1))
         ));
     }

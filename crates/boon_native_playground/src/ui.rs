@@ -5,11 +5,11 @@ use boon_document::{
 use boon_document_model::{ScrollState, SourceBinding, SourceBindingId};
 use boon_editor::{Buffer, Selection};
 
-use crate::language::LanguageSnapshot;
 use crate::protocol::{
     AuthoritySelection, CatalogItem, MigrationStage, OutboxSampleState, PersistenceSnapshot,
 };
 use crate::workspace::ProjectOrigin;
+use boon_editor::language::LanguageSnapshot;
 
 pub const DEV_PREVIOUS: &str = "dev.previous";
 pub const DEV_NEXT: &str = "dev.next";

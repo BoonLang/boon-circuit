@@ -1,6 +1,6 @@
 use crate::{
     ExactNumber, FieldId, ImportId, ListId, MachinePlan, PlanLocalId, PlanRowExpressionId,
-    PlanStaticOwnerId, ScopeId, SourceId, StateId,
+    PlanStaticOwnerId, RootOutputDemand, ScopeId, SourceId, StateId,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -531,7 +531,8 @@ pub enum DocumentMaterializationPolicy {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DocumentViewBinding {
     pub id: DocumentBindingId,
-    pub template: Option<DocumentTemplateId>,
+    /// Exact retained constructor instance that owns the bound attribute.
+    pub template: DocumentTemplateId,
     pub attribute: DocumentNameId,
     pub kind: DocumentBindingKind,
     pub target: DocumentBindingTarget,
@@ -618,6 +619,42 @@ impl DocumentPlan {
         if self.root.expression.0 >= self.expressions.len() {
             return Err("document root expression is out of bounds".to_owned());
         }
+        let root_field_is_demanded = |field: FieldId| match &machine.demand.root_derived_outputs {
+            RootOutputDemand::All => true,
+            RootOutputDemand::Selected(fields) => fields.binary_search(&field).is_ok(),
+        };
+        for expression in &self.expressions {
+            if let DocumentExprOp::Read {
+                read: DocumentRead::Field { field },
+            } = &expression.op
+                && !root_field_is_demanded(*field)
+            {
+                return Err(format!(
+                    "document expression {} reads root field {} outside the demand plan",
+                    expression.id.0, field.0
+                ));
+            }
+        }
+        for materialization in &self.materializations {
+            if let DocumentMaterializationSource::Field { field } = &materialization.source
+                && !root_field_is_demanded(*field)
+            {
+                return Err(format!(
+                    "document materialization {} reads root field {} outside the demand plan",
+                    materialization.id.0, field.0
+                ));
+            }
+        }
+        for binding in &self.view_bindings {
+            if let DocumentBindingTarget::Field { field } = &binding.target
+                && !root_field_is_demanded(*field)
+            {
+                return Err(format!(
+                    "document binding {} reads root field {} outside the demand plan",
+                    binding.id.0, field.0
+                ));
+            }
+        }
         if self.initial_patch_batch.root != self.root.node
             || self.initial_patch_batch
                 != Self::build_initial_patch_batch(
@@ -663,6 +700,36 @@ impl DocumentPlan {
         }
         let expression_count = self.expressions.len();
         let constant_count = self.constants.len();
+        for (index, binding) in self.view_bindings.iter().enumerate() {
+            if binding.id.as_usize() != index {
+                return Err(format!(
+                    "document view binding {} is not dense at index {index}",
+                    binding.id.0
+                ));
+            }
+            if !template_ids.contains(&binding.template) {
+                return Err(format!(
+                    "document view binding {} references missing template {}",
+                    binding.id.0, binding.template.0
+                ));
+            }
+            if binding.attribute.as_usize() >= self.names.len() {
+                return Err(format!(
+                    "document view binding {} references missing attribute name {}",
+                    binding.id.0, binding.attribute.0
+                ));
+            }
+            if matches!(
+                &binding.target,
+                DocumentBindingTarget::Expression { expression }
+                    if expression.as_usize() >= expression_count
+            ) {
+                return Err(format!(
+                    "document view binding {} references a missing expression",
+                    binding.id.0
+                ));
+            }
+        }
         let distributed_imports = machine
             .distributed_endpoint
             .as_ref()

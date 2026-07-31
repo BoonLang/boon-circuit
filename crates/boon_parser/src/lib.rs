@@ -1573,13 +1573,11 @@ fn pipeline_placeholder_target(expr_id: usize, expressions: &[AstExpr]) -> Optio
         | AstExprKind::Hold { initial: input, .. } => *input,
         AstExprKind::Infix { left, .. } => *left,
         AstExprKind::MatchArm {
-            output: Some(output),
-            ..
+            output: Some(_), ..
         }
         | AstExprKind::Arrow {
-            output: Some(output),
-            ..
-        } => return pipeline_placeholder_target(*output, expressions),
+            output: Some(_), ..
+        } => return None,
         _ => return None,
     };
     if expressions
@@ -5671,6 +5669,56 @@ while_value:
                 _ => None,
             });
         assert_eq!(while_arms.expect("WHILE arms").len(), 2);
+    }
+
+    #[test]
+    fn multiline_selector_structural_arms_replace_partial_inline_parse() {
+        let parsed = parse_ast(
+            "partial-inline-selector.bn",
+            r#"
+value:
+    selector |> WHEN {
+        True => TEXT { immediate }
+        False =>
+            TEXT { prefix }
+            |> Text/concat(with: TEXT { suffix }, separator: " ")
+    }
+"#,
+        )
+        .unwrap();
+
+        let when = parsed
+            .expressions
+            .iter()
+            .find(|expression| matches!(expression.kind, AstExprKind::When { .. }))
+            .expect("WHEN expression");
+        let AstExprKind::When { arms, .. } = &when.kind else {
+            unreachable!();
+        };
+        assert_eq!(arms.len(), 2, "{arms:#?}");
+        assert_eq!(
+            arms.iter()
+                .map(|arm| match &parsed.expressions[*arm].kind {
+                    AstExprKind::MatchArm {
+                        pattern: AstMatchPattern::Tag { name, .. },
+                        ..
+                    } => name.as_str(),
+                    other => panic!("expected tag match arm, found {other:#?}"),
+                })
+                .collect::<Vec<_>>(),
+            ["True", "False"]
+        );
+        let false_output = match &parsed.expressions[arms[1]].kind {
+            AstExprKind::MatchArm {
+                output: Some(output),
+                ..
+            } => *output,
+            other => panic!("False arm lost its output: {other:#?}"),
+        };
+        assert!(matches!(
+            &parsed.expressions[false_output].kind,
+            AstExprKind::Pipe { op, .. } if op == "Text/concat"
+        ));
     }
 
     #[test]

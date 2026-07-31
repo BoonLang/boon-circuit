@@ -584,6 +584,8 @@ pub enum SemanticExpressionKind {
         owner: StaticOwnerId,
         local: SemanticMaterializationLocalId,
         projection: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        constructor_projection: Vec<String>,
     },
     FunctionParameter {
         parameter: SemanticParameterId,
@@ -705,93 +707,130 @@ pub enum SemanticStateLifetimeV1 {
     ActivationLocal { then_expression: SemanticExprId },
 }
 
-pub(crate) fn derive_semantic_state_lifetime_v1(
-    expressions: &[SemanticExpression],
-    state_expression: SemanticExprId,
-) -> Result<SemanticStateLifetimeV1, String> {
-    if expressions
-        .get(state_expression.as_usize())
-        .filter(|expression| expression.id == state_expression)
-        .is_none()
-    {
-        return Err(format!(
-            "semantic state lifetime references missing expression {state_expression}"
-        ));
-    }
-    let mut parents = BTreeMap::<SemanticExprId, Vec<(SemanticExprId, bool)>>::new();
-    for expression in expressions {
-        for child in semantic_expression_children_for_lifetime_v1(&expression.kind) {
-            if expressions
-                .get(child.as_usize())
-                .filter(|candidate| candidate.id == child)
-                .is_none()
-            {
-                return Err(format!(
-                    "semantic expression {} lifetime edge references missing child {child}",
-                    expression.id
-                ));
+pub(crate) struct SemanticStateLifetimeDeriverV1 {
+    parents: Vec<Vec<(SemanticExprId, bool)>>,
+    visit_generation: Vec<usize>,
+    generation: usize,
+}
+
+impl SemanticStateLifetimeDeriverV1 {
+    pub(crate) fn new(expressions: &[SemanticExpression]) -> Result<Self, String> {
+        let mut parents = vec![Vec::new(); expressions.len()];
+        for expression in expressions {
+            for child in semantic_expression_children_for_lifetime_v1(&expression.kind) {
+                let Some(child_index) = expressions
+                    .get(child.as_usize())
+                    .filter(|candidate| candidate.id == child)
+                    .map(|_| child.as_usize())
+                else {
+                    return Err(format!(
+                        "semantic expression {} lifetime edge references missing child {child}",
+                        expression.id
+                    ));
+                };
+                let then_output = matches!(
+                    &expression.kind,
+                    SemanticExpressionKind::Then {
+                        input,
+                        output: Some(output),
+                    } if *output == child
+                        && !semantic_expression_is_producer_invocation_source(expressions, *input)
+                );
+                parents[child_index].push((expression.id, then_output));
             }
-            let then_output = matches!(
-                &expression.kind,
-                SemanticExpressionKind::Then {
-                    output: Some(output),
-                    ..
-                } if *output == child
-            );
-            parents
-                .entry(child)
-                .or_default()
-                .push((expression.id, then_output));
         }
-    }
-    for entries in parents.values_mut() {
-        entries.sort();
-        entries.dedup();
+        for entries in &mut parents {
+            entries.sort();
+            entries.dedup();
+        }
+        Ok(Self {
+            visit_generation: vec![usize::MAX; expressions.len()],
+            parents,
+            generation: 0,
+        })
     }
 
-    let mut pending = VecDeque::from([(state_expression, 0usize)]);
-    let mut visited = BTreeMap::<SemanticExprId, usize>::new();
-    let mut nearest_distance = None;
-    let mut nearest = BTreeSet::new();
-    while let Some((expression, distance)) = pending.pop_front() {
-        if nearest_distance.is_some_and(|nearest| distance >= nearest) {
-            continue;
+    pub(crate) fn derive(
+        &mut self,
+        state_expression: SemanticExprId,
+    ) -> Result<SemanticStateLifetimeV1, String> {
+        if self.parents.get(state_expression.as_usize()).is_none() {
+            return Err(format!(
+                "semantic state lifetime references missing expression {state_expression}"
+            ));
         }
-        if visited
-            .get(&expression)
-            .is_some_and(|previous| *previous <= distance)
-        {
-            continue;
+        if self.generation == usize::MAX {
+            self.visit_generation.fill(usize::MAX);
+            self.generation = 0;
         }
-        visited.insert(expression, distance);
-        for (parent, then_output) in parents.get(&expression).into_iter().flatten() {
-            let parent_distance = distance + 1;
-            if *then_output {
-                match nearest_distance {
-                    None => {
-                        nearest_distance = Some(parent_distance);
-                        nearest.insert(*parent);
+        let generation = self.generation;
+        self.generation += 1;
+
+        let mut pending = VecDeque::from([(state_expression, 0usize)]);
+        let mut nearest_distance = None;
+        let mut nearest = Vec::new();
+        while let Some((expression, distance)) = pending.pop_front() {
+            if nearest_distance.is_some_and(|nearest| distance >= nearest) {
+                continue;
+            }
+            let expression_index = expression.as_usize();
+            if self.visit_generation[expression_index] == generation {
+                continue;
+            }
+            self.visit_generation[expression_index] = generation;
+            for (parent, then_output) in &self.parents[expression_index] {
+                let parent_distance = distance + 1;
+                if *then_output {
+                    match nearest_distance {
+                        None => {
+                            nearest_distance = Some(parent_distance);
+                            nearest.push(*parent);
+                        }
+                        Some(nearest_distance) if parent_distance == nearest_distance => {
+                            nearest.push(*parent);
+                        }
+                        Some(_) => {}
                     }
-                    Some(nearest_distance) if parent_distance == nearest_distance => {
-                        nearest.insert(*parent);
-                    }
-                    Some(_) => {}
+                } else {
+                    pending.push_back((*parent, parent_distance));
                 }
-            } else {
-                pending.push_back((*parent, parent_distance));
             }
         }
+        nearest.sort();
+        nearest.dedup();
+        match nearest.as_slice() {
+            [] => Ok(SemanticStateLifetimeV1::Persistent),
+            [then_expression] => Ok(SemanticStateLifetimeV1::ActivationLocal {
+                then_expression: *then_expression,
+            }),
+            candidates => Err(format!(
+                "semantic state expression {state_expression} belongs to {} equally-near THEN activation sites: {candidates:?}",
+                candidates.len()
+            )),
+        }
     }
-    match nearest.into_iter().collect::<Vec<_>>().as_slice() {
-        [] => Ok(SemanticStateLifetimeV1::Persistent),
-        [then_expression] => Ok(SemanticStateLifetimeV1::ActivationLocal {
-            then_expression: *then_expression,
-        }),
-        candidates => Err(format!(
-            "semantic state expression {state_expression} belongs to {} equally-near THEN activation sites: {candidates:?}",
-            candidates.len()
-        )),
-    }
+}
+
+fn semantic_expression_is_producer_invocation_source(
+    expressions: &[SemanticExpression],
+    expression: SemanticExprId,
+) -> bool {
+    // Invocation-mode producer expansion wraps the function body in a
+    // synthetic THEN so the remote call has an exact private source route.
+    // That wrapper is transport, not a source-language state-cell lifetime:
+    // producer HOLD authority remains live for its process-local call-site
+    // lease and is excluded from global persistence separately.
+    expressions
+        .get(expression.as_usize())
+        .filter(|candidate| candidate.id == expression)
+        .is_some_and(|expression| {
+            matches!(expression.kind, SemanticExpressionKind::Source { .. })
+                && !expression.provenance.members.is_empty()
+                && expression.provenance.members.iter().all(|member| {
+                    member.path.is_empty()
+                        && matches!(member.origin, SemanticValueOrigin::ProducerSource { .. })
+                })
+        })
 }
 
 fn semantic_expression_children_for_lifetime_v1(
@@ -1373,13 +1412,13 @@ impl SemanticExecutionGraphV1 {
                 }
             }
         }
+        let mut state_lifetime_deriver = SemanticStateLifetimeDeriverV1::new(&self.expressions)?;
         for state in &self.states {
             self.require_expression(state.expression, format!("state {} expression", state.id))?;
             self.require_expression(state.initial, format!("state {} initial value", state.id))?;
             self.validate_owner(state.owner, format!("state {}", state.id))?;
             self.require_statement(state.statement, format!("state {} statement", state.id))?;
-            let expected_lifetime =
-                derive_semantic_state_lifetime_v1(&self.expressions, state.expression)?;
+            let expected_lifetime = state_lifetime_deriver.derive(state.expression)?;
             if state.lifetime != expected_lifetime {
                 return Err(format!(
                     "semantic state {} lifetime {:?} differs from derived lifetime {:?}",
@@ -1982,8 +2021,24 @@ impl SemanticExecutionGraphV1 {
                     || expression_definition.flow_type != expected_flow_type
                 {
                     return Err(format!(
-                        "expression {expression} call contract differs from semantic call {call}: expression result {result:?}, call result {:?}, expression flow {:?}, resolved instance flow {expected_flow_type:?}",
-                        call_definition.result, expression_definition.flow_type,
+                        "expression {expression} call contract differs from semantic call {call}: \
+                         callable={callable:?}/{:?}, kind={callable_kind:?}/{expected_kind:?}, \
+                         name={name:?}/{:?}, function={function:?}/{:?}, \
+                         intrinsic={intrinsic:?}/{:?}, role={role:?}/{:?}, \
+                         callable effect={effect:?}/{:?}, result={result:?}/{:?}, \
+                         checked={:?}/{:?}, expression effect={:?}, \
+                         expression flow={:?}, resolved instance flow={expected_flow_type:?}",
+                        call_definition.callable,
+                        callable_definition.name,
+                        call_definition.function,
+                        call_definition.intrinsic,
+                        call_definition.role,
+                        callable_definition.effect,
+                        call_definition.result,
+                        expression_definition.checked_expr_id,
+                        call_definition.checked_expression,
+                        expression_definition.effect,
+                        expression_definition.flow_type,
                     ));
                 }
                 if resolved_instance.provenance.call_id != Some(call_definition.checked_call)
@@ -2527,6 +2582,90 @@ mod tests {
             }],
             ..SemanticExecutionGraphV1::default()
         }
+    }
+
+    fn lifetime_expression(id: usize, kind: SemanticExpressionKind) -> SemanticExpression {
+        SemanticExpression {
+            id: SemanticExprId(id),
+            value_id: SemanticValueId(id),
+            checked_expr_id: CheckedExprId(u32::try_from(id).unwrap()),
+            flow_type: FlowType {
+                mode: boon_typecheck::FlowMode::Continuous,
+                ty: Type::Text,
+            },
+            effect: CheckedEffectSummary::default(),
+            owner: None,
+            provenance: SemanticValueProvenance::default(),
+            resource_binding_path: None,
+            kind,
+        }
+    }
+
+    #[test]
+    fn state_lifetime_deriver_reuses_one_parent_index() {
+        let expressions = vec![
+            lifetime_expression(0, SemanticExpressionKind::Text("state".to_owned())),
+            lifetime_expression(
+                1,
+                SemanticExpressionKind::Project {
+                    input: SemanticExprId(0),
+                    fields: Vec::new(),
+                },
+            ),
+            lifetime_expression(2, SemanticExpressionKind::Text("trigger".to_owned())),
+            lifetime_expression(
+                3,
+                SemanticExpressionKind::Then {
+                    input: SemanticExprId(2),
+                    output: Some(SemanticExprId(1)),
+                },
+            ),
+            lifetime_expression(4, SemanticExpressionKind::Text("persistent".to_owned())),
+        ];
+        let mut deriver = SemanticStateLifetimeDeriverV1::new(&expressions).unwrap();
+
+        assert_eq!(
+            deriver.derive(SemanticExprId(0)).unwrap(),
+            SemanticStateLifetimeV1::ActivationLocal {
+                then_expression: SemanticExprId(3),
+            }
+        );
+        assert_eq!(
+            deriver.derive(SemanticExprId(4)).unwrap(),
+            SemanticStateLifetimeV1::Persistent
+        );
+    }
+
+    #[test]
+    fn state_lifetime_deriver_rejects_equal_nearest_then_sites() {
+        let expressions = vec![
+            lifetime_expression(0, SemanticExpressionKind::Text("state".to_owned())),
+            lifetime_expression(1, SemanticExpressionKind::Text("left".to_owned())),
+            lifetime_expression(2, SemanticExpressionKind::Text("right".to_owned())),
+            lifetime_expression(
+                3,
+                SemanticExpressionKind::Then {
+                    input: SemanticExprId(1),
+                    output: Some(SemanticExprId(0)),
+                },
+            ),
+            lifetime_expression(
+                4,
+                SemanticExpressionKind::Then {
+                    input: SemanticExprId(2),
+                    output: Some(SemanticExprId(0)),
+                },
+            ),
+        ];
+        let mut deriver = SemanticStateLifetimeDeriverV1::new(&expressions).unwrap();
+
+        let error = deriver.derive(SemanticExprId(0)).unwrap_err();
+        assert!(
+            error.contains("2 equally-near THEN activation sites"),
+            "{error}"
+        );
+        assert!(error.contains("SemanticExprId(3)"), "{error}");
+        assert!(error.contains("SemanticExprId(4)"), "{error}");
     }
 
     #[test]

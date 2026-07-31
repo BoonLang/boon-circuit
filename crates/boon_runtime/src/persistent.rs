@@ -1027,6 +1027,15 @@ impl PersistentRuntime {
             .map_err(|error| PersistentDispatchError::Runtime(error.to_string()))
     }
 
+    pub fn distributed_export_value_if_current(
+        &mut self,
+        export_id: ExportId,
+    ) -> Result<Option<Value>, PersistentDispatchError> {
+        self.runtime
+            .distributed_export_value_if_current(export_id)
+            .map_err(|error| PersistentDispatchError::Runtime(error.to_string()))
+    }
+
     pub fn distributed_call_instances_current(
         &mut self,
         call_site_id: RemoteCallSiteId,
@@ -4725,10 +4734,11 @@ document: Document/new(root: Element/label(element: [], label: TEXT {{ static }}
             PersistenceWorkerConfig::default(),
         )
         .unwrap();
+        const A3_ROW_KEY: u64 = 53;
         let event = |runtime: &mut PersistentRuntime, sequence, path: &str, text: Option<&str>| {
             let target = runtime
                 .runtime_mut()
-                .row_target_for_source_path(path, 79, 1)
+                .row_target_for_source_path(path, A3_ROW_KEY, 1)
                 .expect("Cells source row A3");
             runtime
                 .runtime()
@@ -4822,7 +4832,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT {{ static }}
         );
         let a3 = restored
             .runtime
-            .row_target_for_source_path("cells.sources.editor.select", 79, 1)
+            .row_target_for_source_path("cells.sources.editor.select", A3_ROW_KEY, 1)
             .unwrap();
         let formula_field = restored
             .runtime
@@ -4960,7 +4970,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT {{ static }}
                 .runtime
                 .root_value_current("store.panel_arrangement")
                 .unwrap(),
-            Value::Text("Docked".to_owned())
+            Value::tag("Docked")
         );
         let durable = runtime.load_durable_image().unwrap().unwrap();
         assert_eq!(durable.scalars.len(), 1, "{durable:#?}");
@@ -4983,7 +4993,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT {{ static }}
                 .runtime
                 .root_value_current("store.panel_arrangement")
                 .unwrap(),
-            Value::Text("Docked".to_owned())
+            Value::tag("Docked")
         );
         let Value::List(formatters) = restored
             .runtime_mut()
@@ -5155,7 +5165,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT {{ static }}
         );
         for (path, expected) in [
             ("store.locale", Value::Text("nb-NO".to_owned())),
-            ("store.basemap", Value::Text("Satellite".to_owned())),
+            ("store.basemap", Value::tag("Satellite")),
             (
                 "store.selected_station",
                 Value::Text("station-42".to_owned()),
@@ -5168,7 +5178,7 @@ document: Document/new(root: Element/label(element: [], label: TEXT {{ static }}
                 "store.last_known_snapshot",
                 Value::Text("temperature=12.4".to_owned()),
             ),
-            ("store.connection_status", Value::Text("Online".to_owned())),
+            ("store.connection_status", Value::tag("Online")),
             ("store.snapshot_stale", Value::truth(false)),
         ] {
             assert_eq!(restored.runtime.root_value_current(path).unwrap(), expected);

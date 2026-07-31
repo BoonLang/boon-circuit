@@ -14,7 +14,6 @@ use crate::frame::{
     NativeFrameTransaction, PresentedFrame, ProductFrame, drain_native_events, host_event_digest,
     input_kind, pointer_button_pressed,
 };
-use crate::language::{LanguageSnapshot, LanguageWorker, SemanticItem};
 use crate::observer::{InputAccepted, ObserverClient, ObserverEvent, ObserverRole};
 use crate::protocol::{
     ApplicationIdentity, AuthoritySelection, CanonicalStateArtifact, CatalogItem, Connection,
@@ -32,6 +31,7 @@ use crate::view::RetainedView;
 use crate::workspace::{
     PersistRequest, PersistenceWorker, ProjectOrigin, ProjectStore, StoredProject,
 };
+use boon_editor::language::{LanguageSnapshot, LanguageWorker, SemanticItem};
 
 pub fn connect(path: &Path) -> Result<Connection, Box<dyn std::error::Error + Send + Sync>> {
     Ok(Connection::connect(path, Role::Dev)?)
@@ -1794,7 +1794,7 @@ fn perf_line(stats: &PreviewStats) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::language::{LanguageSnapshot, LineDecorations, SemanticKind, SourceLocation};
+    use boon_editor::language::{LanguageSnapshot, LineDecorations, SemanticKind, SourceLocation};
 
     use super::*;
 

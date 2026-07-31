@@ -39,15 +39,51 @@ fn elaborate_checked(
     checked: boon_typecheck::CheckedProgram,
     producer_requests: &[boon_semantic::ProducerMaterializationRequest],
 ) -> Result<boon_semantic::SemanticProgram, String> {
-    boon_semantic::elaborate(checked, producer_requests).map_err(|error| error.to_string())
+    elaborate_checked_with_external_event_identities(checked, producer_requests, &[])
+}
+
+fn elaborate_checked_with_external_event_identities(
+    checked: boon_typecheck::CheckedProgram,
+    producer_requests: &[boon_semantic::ProducerMaterializationRequest],
+    external_event_identities: &[boon_typecheck::CheckedExternalDeclarationIdentityV1],
+) -> Result<boon_semantic::SemanticProgram, String> {
+    let started = Instant::now();
+    let semantic = boon_semantic::elaborate_with_external_event_identities(
+        checked,
+        producer_requests,
+        external_event_identities,
+    )
+    .map_err(|error| error.to_string())?;
+    if std::env::var_os("BOON_COMPILER_LOWER_TRACE").is_some() {
+        eprintln!(
+            "boon_compiler lower semantic_elaboration: {:.3}ms",
+            elapsed_ms(started)
+        );
+    }
+    Ok(semantic)
 }
 
 fn verify_and_lower_semantic(
     semantic: boon_semantic::SemanticProgram,
 ) -> Result<ErasedProgram, String> {
+    let verify_started = Instant::now();
     let verified =
         boon_verify::verify_explicit_contracts(semantic).map_err(|error| error.to_string())?;
-    boon_ir::erase_and_lower(verified)
+    if std::env::var_os("BOON_COMPILER_LOWER_TRACE").is_some() {
+        eprintln!(
+            "boon_compiler lower semantic_verification: {:.3}ms",
+            elapsed_ms(verify_started)
+        );
+    }
+    let erase_started = Instant::now();
+    let lowered = boon_ir::erase_and_lower(verified)?;
+    if std::env::var_os("BOON_COMPILER_LOWER_TRACE").is_some() {
+        eprintln!(
+            "boon_compiler lower ir_erasure: {:.3}ms",
+            elapsed_ms(erase_started)
+        );
+    }
+    Ok(lowered)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

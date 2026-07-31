@@ -1,11 +1,14 @@
 use std::fmt;
-use std::io::{self, Read, Write};
+use std::io::{self, Cursor, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
+
+use bincode::Options;
+use serde::{Deserialize, Serialize};
 
 pub const OBSERVER_SOCKET_ENV: &str = "BOON_VERIFY_OBSERVER_SOCKET";
 pub const NATIVE_SESSION_ID_ENV: &str = "BOON_VERIFY_NATIVE_SESSION_ID";
@@ -27,20 +30,21 @@ pub const NATIVE_WORKFLOW_STEPS_ENV: &str = "BOON_VERIFY_NATIVE_WORKFLOW_STEPS";
 pub const NATIVE_WORKFLOW_PROOF_STEPS_ENV: &str = "BOON_VERIFY_NATIVE_WORKFLOW_PROOF_STEPS";
 
 const MAGIC: [u8; 4] = *b"BNVO";
-const VERSION: u16 = 9;
+const VERSION: u16 = 10;
 const HEADER_BYTES: usize = 7;
 const MAX_EVENT_BYTES: usize = 64 * 1024;
 const MAX_STRING_BYTES: usize = 8 * 1024;
 const CLIENT_QUEUE_DEPTH: usize = 512;
+const LAST_EVENT_TAG: u8 = 29;
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[repr(u8)]
 pub enum ObserverRole {
     Preview = 1,
     Dev = 2,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[repr(u8)]
 pub enum TestPointerPhase {
     Move = 1,
@@ -50,7 +54,7 @@ pub enum TestPointerPhase {
     State = 5,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[repr(u8)]
 pub enum PersistenceEvidenceKind {
     Exported = 1,
@@ -62,7 +66,7 @@ pub enum PersistenceEvidenceKind {
     MigrationProductRestored = 7,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[repr(u8)]
 pub enum StartupDisposition {
     Fresh = 1,
@@ -70,18 +74,7 @@ pub enum StartupDisposition {
     Migrated = 3,
 }
 
-impl StartupDisposition {
-    fn decode(value: u8) -> Result<Self, ObserverError> {
-        match value {
-            1 => Ok(Self::Fresh),
-            2 => Ok(Self::Restored),
-            3 => Ok(Self::Migrated),
-            _ => Err(ObserverError::InvalidEnum("startup disposition", value)),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct StartupMigrationEvidence {
     pub source_schema_version: u64,
     pub source_schema_hash: String,
@@ -90,48 +83,7 @@ pub struct StartupMigrationEvidence {
     pub step_count: u32,
 }
 
-impl PersistenceEvidenceKind {
-    fn decode(value: u8) -> Result<Self, ObserverError> {
-        match value {
-            1 => Ok(Self::Exported),
-            2 => Ok(Self::CorruptionRejected),
-            3 => Ok(Self::ClearedAndStartedOver),
-            4 => Ok(Self::ImportPreviewed),
-            5 => Ok(Self::ImportActivated),
-            6 => Ok(Self::MigrationActivated),
-            7 => Ok(Self::MigrationProductRestored),
-            _ => Err(ObserverError::InvalidEnum(
-                "persistence evidence kind",
-                value,
-            )),
-        }
-    }
-}
-
-impl TestPointerPhase {
-    fn decode(value: u8) -> Result<Self, ObserverError> {
-        match value {
-            1 => Ok(Self::Move),
-            2 => Ok(Self::Hover),
-            3 => Ok(Self::Down),
-            4 => Ok(Self::Up),
-            5 => Ok(Self::State),
-            _ => Err(ObserverError::InvalidEnum("test pointer phase", value)),
-        }
-    }
-}
-
-impl ObserverRole {
-    fn decode(value: u8) -> Result<Self, ObserverError> {
-        match value {
-            1 => Ok(Self::Preview),
-            2 => Ok(Self::Dev),
-            _ => Err(ObserverError::InvalidEnum("role", value)),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[repr(u8)]
 pub enum InputKind {
     PointerMove = 1,
@@ -147,26 +99,7 @@ pub enum InputKind {
     Sensitive = 11,
 }
 
-impl InputKind {
-    fn decode(value: u8) -> Result<Self, ObserverError> {
-        match value {
-            1 => Ok(Self::PointerMove),
-            2 => Ok(Self::PointerButton),
-            3 => Ok(Self::Wheel),
-            4 => Ok(Self::Keyboard),
-            5 => Ok(Self::Text),
-            6 => Ok(Self::Ime),
-            7 => Ok(Self::Focus),
-            8 => Ok(Self::Resize),
-            9 => Ok(Self::Accessibility),
-            10 => Ok(Self::Close),
-            11 => Ok(Self::Sensitive),
-            _ => Err(ObserverError::InvalidEnum("input kind", value)),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[repr(u8)]
 pub enum AsyncLaneKind {
     ChildProgramCompile = 1,
@@ -176,20 +109,7 @@ pub enum AsyncLaneKind {
     ProofReadback = 5,
 }
 
-impl AsyncLaneKind {
-    fn decode(value: u8) -> Result<Self, ObserverError> {
-        match value {
-            1 => Ok(Self::ChildProgramCompile),
-            2 => Ok(Self::PersistenceTurn),
-            3 => Ok(Self::ProgramArtifactStore),
-            4 => Ok(Self::ProgramArtifactLoad),
-            5 => Ok(Self::ProofReadback),
-            _ => Err(ObserverError::InvalidEnum("async lane kind", value)),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[repr(u8)]
 pub enum AsyncLaneOutcome {
     Applied = 1,
@@ -197,18 +117,7 @@ pub enum AsyncLaneOutcome {
     Failed = 3,
 }
 
-impl AsyncLaneOutcome {
-    fn decode(value: u8) -> Result<Self, ObserverError> {
-        match value {
-            1 => Ok(Self::Applied),
-            2 => Ok(Self::StaleRejected),
-            3 => Ok(Self::Failed),
-            _ => Err(ObserverError::InvalidEnum("async lane outcome", value)),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct FrameEvidenceKey {
     pub surface_id: String,
     pub process_id: u32,
@@ -246,39 +155,12 @@ impl FrameEvidenceKey {
             && self.session_id == other.session_id
     }
 
-    fn encode(&self, out: &mut Encoder) -> Result<(), ObserverError> {
-        out.string(&self.surface_id)?;
-        out.u32(self.process_id);
-        out.string(&self.session_id)?;
-        out.u64(self.frame_id);
-        out.u64(self.input_id);
-        out.u64(self.content_id);
-        out.u64(self.layout_id);
-        out.u64(self.render_id);
-        out.u64(self.surface_epoch);
-        out.u64(self.present_id);
-        out.u64(self.proof_id);
-        Ok(())
-    }
-
-    fn decode(input: &mut Decoder<'_>) -> Result<Self, ObserverError> {
-        Ok(Self {
-            surface_id: input.string()?,
-            process_id: input.u32()?,
-            session_id: input.string()?,
-            frame_id: input.u64()?,
-            input_id: input.u64()?,
-            content_id: input.u64()?,
-            layout_id: input.u64()?,
-            render_id: input.u64()?,
-            surface_epoch: input.u64()?,
-            present_id: input.u64()?,
-            proof_id: input.u64()?,
-        })
+    fn validate(&self) -> Result<(), ObserverError> {
+        validate_strings([self.surface_id.as_str(), self.session_id.as_str()])
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct RoleMetadata {
     pub role: ObserverRole,
     pub pid: u32,
@@ -299,7 +181,7 @@ pub struct RoleMetadata {
     pub window_backend: String,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct InputAccepted {
     pub role: ObserverRole,
     pub event_sequence: u64,
@@ -316,7 +198,7 @@ pub struct InputAccepted {
     pub visible_change: bool,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct FramePresented {
     pub role: ObserverRole,
     pub key: FrameEvidenceKey,
@@ -344,7 +226,7 @@ pub struct FramePresented {
     pub observer_drop_count: u64,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ProofArtifact {
     pub path: String,
     pub sha256: String,
@@ -355,7 +237,18 @@ pub struct ProofArtifact {
     pub unique_rgba_values: u64,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+impl ProofArtifact {
+    fn validate(&self) -> Result<(), ObserverError> {
+        validate_strings([
+            self.path.as_str(),
+            self.sha256.as_str(),
+            self.capture_method.as_str(),
+            self.capture_token_digest.as_str(),
+        ])
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub enum ObserverEvent {
     RoleMetadata(RoleMetadata),
     InputAccepted(InputAccepted),
@@ -661,949 +554,232 @@ impl ObserverEvent {
         }
     }
 
-    fn encode(&self, out: &mut Encoder) -> Result<(), ObserverError> {
+    fn validate(&self) -> Result<(), ObserverError> {
         match self {
-            Self::RoleMetadata(value) => {
-                out.u8(value.role as u8);
-                out.u32(value.pid);
-                out.string(&value.surface_id)?;
-                out.string(&value.session_id)?;
-                out.u64(value.surface_epoch);
-                out.f32(value.logical_width);
-                out.f32(value.logical_height);
-                out.u32(value.physical_width);
-                out.u32(value.physical_height);
-                out.f64(value.scale);
-                out.string(&value.adapter_name)?;
-                out.string(&value.adapter_backend)?;
-                out.string(&value.adapter_device_type)?;
-                out.bool(value.software_adapter);
-                out.string(&value.surface_format)?;
-                out.string(&value.present_mode)?;
-                out.string(&value.window_backend)?;
-            }
+            Self::RoleMetadata(value) => validate_strings([
+                value.surface_id.as_str(),
+                value.session_id.as_str(),
+                value.adapter_name.as_str(),
+                value.adapter_backend.as_str(),
+                value.adapter_device_type.as_str(),
+                value.surface_format.as_str(),
+                value.present_mode.as_str(),
+                value.window_backend.as_str(),
+            ]),
             Self::InputAccepted(value) => {
-                out.u8(value.role as u8);
-                out.u64(value.event_sequence);
-                out.bool(value.real_os);
-                out.u64(value.callback_to_host_ns);
-                out.u64(value.surface_epoch);
-                out.u8(value.kind as u8);
-                out.u8(match value.pointer_button_pressed {
-                    None => 0,
-                    Some(true) => 1,
-                    Some(false) => 2,
-                });
-                out.optional_f32(value.pointer_x);
-                out.optional_f32(value.pointer_y);
-                out.optional_string(value.target.as_deref())?;
-                out.optional_string(value.target_source_path.as_deref())?;
-                out.string(&value.event_digest)?;
-                out.bool(value.visible_change);
+                validate_strings([value.event_digest.as_str()])?;
+                validate_optional_strings([
+                    value.target.as_deref(),
+                    value.target_source_path.as_deref(),
+                ])
             }
-            Self::FramePresented(value) => {
-                out.u8(value.role as u8);
-                value.key.encode(out)?;
-                out.optional_u64(value.event_sequence);
-                out.optional_u8(value.input_kind.map(|kind| kind as u8));
-                out.u64(value.callback_to_host_ns);
-                out.u64(value.input_to_present_us);
-                out.u64(value.event_dispatch_us);
-                out.u64(value.executor_us);
-                out.u64(value.runtime_document_us);
-                out.u64(value.document_update_us);
-                out.u64(value.render_us);
-                out.u64(value.document_scene_convert_us);
-                out.u64(value.scene_key_us);
-                out.u64(value.rect_vertices_us);
-                out.u64(value.asset_prepare_us);
-                out.u64(value.quad_batch_key_us);
-                out.u64(value.quad_upload_us);
-                out.u64(value.draw_pass_us);
-                out.u64(value.retained_metrics_us);
-                out.u64(value.text_render_us);
-                out.u64(value.submit_us);
-                out.u64(value.present_us);
-                out.u64(value.frame_us);
-                out.u64(value.observer_drop_count);
-            }
-            Self::SourceSwitchAcknowledged {
-                revision,
-                elapsed_us,
-            } => {
-                out.u64(*revision);
-                out.u64(*elapsed_us);
-            }
-            Self::SourceSwitchFinal {
-                revision,
-                elapsed_us,
-                compile_us,
-                post_compile_us,
-                key,
-            } => {
-                out.u64(*revision);
-                out.u64(*elapsed_us);
-                out.u64(*compile_us);
-                out.u64(*post_compile_us);
-                key.encode(out)?;
-            }
+            Self::FramePresented(value) => value.key.validate(),
+            Self::SourceSwitchAcknowledged { .. } => Ok(()),
+            Self::SourceSwitchFinal { key, .. }
+            | Self::ProofRequested { key, .. }
+            | Self::ScrollProofFrame { key, .. }
+            | Self::ResponsiveResizeObserved { key, .. } => key.validate(),
             Self::TestTarget {
-                request_id,
-                node,
-                source_path,
-                x,
-                y,
-            } => {
-                out.u64(*request_id);
-                out.string(node)?;
-                out.string(source_path)?;
-                out.f32(*x);
-                out.f32(*y);
-            }
-            Self::TestCompleted {
-                request_id,
-                passed,
-                semantic_assertions_proven,
-                completed_steps,
-                message,
-            } => {
-                out.u64(*request_id);
-                out.bool(*passed);
-                out.bool(*semantic_assertions_proven);
-                out.u32(*completed_steps);
-                out.string(message)?;
-            }
-            Self::TestPointerFrame {
-                request_id,
-                step_index,
-                phase,
-                x,
-                y,
-                target,
-                runtime_sequence,
-                key,
-            } => {
-                out.u64(*request_id);
-                out.u32(*step_index);
-                out.u8(*phase as u8);
-                out.f32(*x);
-                out.f32(*y);
-                out.optional_string(target.as_deref())?;
-                out.u64(*runtime_sequence);
-                key.encode(out)?;
-            }
-            Self::ProofRequested {
-                key,
-                snapshot_prepare_us,
-            } => {
-                key.encode(out)?;
-                out.u64(*snapshot_prepare_us);
+                node, source_path, ..
+            } => validate_strings([node.as_str(), source_path.as_str()]),
+            Self::TestCompleted { message, .. } => validate_strings([message.as_str()]),
+            Self::TestPointerFrame { target, key, .. } => {
+                validate_optional_strings([target.as_deref()])?;
+                key.validate()
             }
             Self::ProofCompleted {
                 key,
                 completed_after_key,
-                elapsed_us,
-                replaced_count,
-                result_drop_count,
                 artifact,
                 error,
+                ..
             } => {
-                key.encode(out)?;
-                completed_after_key.encode(out)?;
-                out.u64(*elapsed_us);
-                out.u64(*replaced_count);
-                out.u64(*result_drop_count);
-                out.bool(artifact.is_some());
+                key.validate()?;
+                completed_after_key.validate()?;
                 if let Some(artifact) = artifact {
-                    out.string(&artifact.path)?;
-                    out.string(&artifact.sha256)?;
-                    out.u64(artifact.byte_len);
-                    out.string(&artifact.capture_method)?;
-                    out.string(&artifact.capture_token_digest)?;
-                    out.u64(artifact.nonblank_samples);
-                    out.u64(artifact.unique_rgba_values);
+                    artifact.validate()?;
                 }
-                out.optional_string(error.as_deref())?;
+                validate_optional_strings([error.as_deref()])
             }
-            Self::RoleTarget { role, node, x, y } => {
-                out.u8(*role as u8);
-                out.string(node)?;
-                out.f32(*x);
-                out.f32(*y);
-            }
-            Self::SourceFailed {
-                revision,
-                stage,
-                message,
-            } => {
-                out.u64(*revision);
-                out.string(stage)?;
-                out.string(message)?;
+            Self::RoleTarget { node, .. } => validate_strings([node.as_str()]),
+            Self::SourceFailed { stage, message, .. } => {
+                validate_strings([stage.as_str(), message.as_str()])
             }
             Self::StateMounted {
-                disposition,
-                schema_version,
                 schema_hash,
                 migration,
-                source_revision,
-                runtime_sequence,
-                durable_epoch,
-                durable_turn_sequence,
                 state_digest,
                 key,
+                ..
             } => {
-                out.u8(*disposition as u8);
-                out.u64(*schema_version);
-                out.string(schema_hash)?;
-                out.bool(migration.is_some());
+                validate_strings([schema_hash.as_str(), state_digest.as_str()])?;
                 if let Some(migration) = migration {
-                    out.u64(migration.source_schema_version);
-                    out.string(&migration.source_schema_hash)?;
-                    out.u64(migration.target_schema_version);
-                    out.string(&migration.target_schema_hash)?;
-                    out.u32(migration.step_count);
+                    validate_strings([
+                        migration.source_schema_hash.as_str(),
+                        migration.target_schema_hash.as_str(),
+                    ])?;
                 }
-                out.u64(*source_revision);
-                out.u64(*runtime_sequence);
-                out.u64(*durable_epoch);
-                out.u64(*durable_turn_sequence);
-                out.string(state_digest)?;
-                key.encode(out)?;
+                key.validate()
             }
             Self::ScenarioCheckpoint {
-                request_id,
                 step_id,
-                assertion_count,
-                source_revision,
-                runtime_sequence,
-                durable_epoch,
-                durable_turn_sequence,
                 state_digest,
                 key,
+                ..
             } => {
-                out.u64(*request_id);
-                out.string(step_id)?;
-                out.u32(*assertion_count);
-                out.u64(*source_revision);
-                out.u64(*runtime_sequence);
-                out.u64(*durable_epoch);
-                out.u64(*durable_turn_sequence);
-                out.string(state_digest)?;
-                key.encode(out)?;
+                validate_strings([step_id.as_str(), state_digest.as_str()])?;
+                key.validate()
             }
             Self::PersistenceEvidence {
-                kind,
-                source_revision,
-                runtime_sequence,
-                durable_epoch,
-                durable_turn_sequence,
                 before_state_digest,
                 after_state_digest,
                 key,
+                ..
             } => {
-                out.u8(*kind as u8);
-                out.u64(*source_revision);
-                out.u64(*runtime_sequence);
-                out.u64(*durable_epoch);
-                out.u64(*durable_turn_sequence);
-                out.string(before_state_digest)?;
-                out.string(after_state_digest)?;
-                key.encode(out)?;
+                validate_strings([before_state_digest.as_str(), after_state_digest.as_str()])?;
+                key.validate()
             }
             Self::ResponsiveLayoutEvidence {
-                resize_sequence,
-                logical_width,
-                logical_height,
                 baseline_key,
-                baseline_action_count,
                 baseline_action_digest,
-                action_count,
                 action_digest,
                 state_digest,
-                source_revision,
-                runtime_sequence,
-                durable_epoch,
-                durable_turn_sequence,
                 key,
+                ..
             } => {
-                out.u64(*resize_sequence);
-                out.u32(*logical_width);
-                out.u32(*logical_height);
-                baseline_key.encode(out)?;
-                out.u32(*baseline_action_count);
-                out.string(baseline_action_digest)?;
-                out.u32(*action_count);
-                out.string(action_digest)?;
-                out.string(state_digest)?;
-                out.u64(*source_revision);
-                out.u64(*runtime_sequence);
-                out.u64(*durable_epoch);
-                out.u64(*durable_turn_sequence);
-                key.encode(out)?;
+                baseline_key.validate()?;
+                validate_strings([
+                    baseline_action_digest.as_str(),
+                    action_digest.as_str(),
+                    state_digest.as_str(),
+                ])?;
+                key.validate()
             }
             Self::ProfileSample {
-                ordinal,
-                input_sequence,
-                callback_to_host_ns,
-                editor_visible_us,
-                preview_visible_us,
-                compile_us,
-                parent_dispatch_us,
-                parent_executor_us,
-                parent_runtime_document_us,
-                parent_persistence_us,
-                completion_us,
-                completion_executor_us,
-                completion_runtime_document_us,
-                completion_persistence_us,
-                document_us,
-                interaction_us,
-                demand_us,
-                present_us,
-                patch_count,
-                full_lowered,
-                interaction_frame_block_us,
-                pending_child_artifacts,
-                pending_program_artifact_stores,
-                pending_program_artifact_loads,
-                pending_persistence_artifact_stores,
-                pending_persistence_artifact_loads,
-                pending_durable_batches,
-                trusted_parent_rebuilds,
-                source_revision,
-                runtime_sequence,
-                editor_key,
-                key,
+                editor_key, key, ..
+            }
+            | Self::ProfileInputSeeded {
+                editor_key, key, ..
             } => {
-                out.u32(*ordinal);
-                out.u64(*input_sequence);
-                out.u64(*callback_to_host_ns);
-                out.u64(*editor_visible_us);
-                out.u64(*preview_visible_us);
-                out.u64(*compile_us);
-                out.u64(*parent_dispatch_us);
-                out.u64(*parent_executor_us);
-                out.u64(*parent_runtime_document_us);
-                out.u64(*parent_persistence_us);
-                out.u64(*completion_us);
-                out.u64(*completion_executor_us);
-                out.u64(*completion_runtime_document_us);
-                out.u64(*completion_persistence_us);
-                out.u64(*document_us);
-                out.u64(*interaction_us);
-                out.u64(*demand_us);
-                out.u64(*present_us);
-                out.u32(*patch_count);
-                out.bool(*full_lowered);
-                out.u64(*interaction_frame_block_us);
-                out.u32(*pending_child_artifacts);
-                out.u32(*pending_program_artifact_stores);
-                out.u32(*pending_program_artifact_loads);
-                out.u32(*pending_persistence_artifact_stores);
-                out.u32(*pending_persistence_artifact_loads);
-                out.u32(*pending_durable_batches);
-                out.u32(*trusted_parent_rebuilds);
-                out.u64(*source_revision);
-                out.u64(*runtime_sequence);
-                editor_key.encode(out)?;
-                key.encode(out)?;
+                editor_key.validate()?;
+                key.validate()
             }
             Self::StaleProgramRejected {
                 session,
-                stale_revision,
-                latest_revision,
-                source_revision,
-                runtime_sequence,
-                durable_epoch,
-                durable_turn_sequence,
                 state_digest,
                 key,
+                ..
             } => {
-                out.string(session)?;
-                out.u64(*stale_revision);
-                out.u64(*latest_revision);
-                out.u64(*source_revision);
-                out.u64(*runtime_sequence);
-                out.u64(*durable_epoch);
-                out.u64(*durable_turn_sequence);
-                out.string(state_digest)?;
-                key.encode(out)?;
+                validate_strings([session.as_str(), state_digest.as_str()])?;
+                key.validate()
             }
             Self::ProfileInputTarget {
                 node,
                 source_path,
-                x,
-                y,
-                sample_count,
                 key,
+                ..
             } => {
-                out.string(node)?;
-                out.string(source_path)?;
-                out.f32(*x);
-                out.f32(*y);
-                out.u32(*sample_count);
-                key.encode(out)?;
-            }
-            Self::ProfileInputSeeded {
-                input_sequence,
-                callback_to_host_ns,
-                compile_us,
-                pending_child_artifacts,
-                editor_key,
-                key,
-            } => {
-                out.u64(*input_sequence);
-                out.u64(*callback_to_host_ns);
-                out.u64(*compile_us);
-                out.u32(*pending_child_artifacts);
-                editor_key.encode(out)?;
-                key.encode(out)?;
+                validate_strings([node.as_str(), source_path.as_str()])?;
+                key.validate()
             }
             Self::ResponsiveResizeReady {
-                desired_width,
-                desired_height,
-                current_width,
-                current_height,
-                baseline_action_count,
                 baseline_action_digest,
                 key,
+                ..
             } => {
-                out.u32(*desired_width);
-                out.u32(*desired_height);
-                out.u32(*current_width);
-                out.u32(*current_height);
-                out.u32(*baseline_action_count);
-                out.string(baseline_action_digest)?;
-                key.encode(out)?;
-            }
-            Self::ResponsiveResizeObserved {
-                event_sequence,
-                logical_width,
-                logical_height,
-                previous_surface_epoch,
-                key,
-            } => {
-                out.u64(*event_sequence);
-                out.u32(*logical_width);
-                out.u32(*logical_height);
-                out.u64(*previous_surface_epoch);
-                key.encode(out)?;
-            }
-            Self::ScrollProofFrame { ordinal, key } => {
-                out.u32(*ordinal);
-                key.encode(out)?;
+                validate_strings([baseline_action_digest.as_str()])?;
+                key.validate()
             }
             Self::NativeWorkflowReady {
-                test_request_id,
-                step_count,
-                source_revision,
-                runtime_sequence,
-                durable_epoch,
-                state_digest,
-                key,
+                state_digest, key, ..
             } => {
-                out.u64(*test_request_id);
-                out.u32(*step_count);
-                out.u64(*source_revision);
-                out.u64(*runtime_sequence);
-                out.u64(*durable_epoch);
-                out.string(state_digest)?;
-                key.encode(out)?;
+                validate_strings([state_digest.as_str()])?;
+                key.validate()
             }
             Self::NativeWorkflowTarget {
-                request_id,
-                ordinal,
                 step_id,
                 source_path,
                 action_kind,
                 action_digest,
                 node,
-                x,
-                y,
                 key,
+                ..
             } => {
-                out.u64(*request_id);
-                out.u32(*ordinal);
-                out.string(step_id)?;
-                out.string(source_path)?;
-                out.string(action_kind)?;
-                out.string(action_digest)?;
-                out.string(node)?;
-                out.f32(*x);
-                out.f32(*y);
-                key.encode(out)?;
+                validate_strings([
+                    step_id.as_str(),
+                    source_path.as_str(),
+                    action_kind.as_str(),
+                    action_digest.as_str(),
+                    node.as_str(),
+                ])?;
+                key.validate()
             }
             Self::NativeWorkflowStep {
-                request_id,
-                ordinal,
                 step_id,
                 source_path,
                 action_kind,
                 action_digest,
-                input_first_sequence,
-                input_last_sequence,
-                input_event_count,
                 input_event_digest,
-                assertion_count,
-                source_revision,
-                runtime_sequence,
-                durable_epoch,
-                durable_turn_sequence,
-                durable_acked,
                 before_state_digest,
                 state_digest,
                 key,
+                ..
             } => {
-                out.u64(*request_id);
-                out.u32(*ordinal);
-                out.string(step_id)?;
-                out.string(source_path)?;
-                out.string(action_kind)?;
-                out.string(action_digest)?;
-                out.u64(*input_first_sequence);
-                out.u64(*input_last_sequence);
-                out.u32(*input_event_count);
-                out.string(input_event_digest)?;
-                out.u32(*assertion_count);
-                out.u64(*source_revision);
-                out.u64(*runtime_sequence);
-                out.u64(*durable_epoch);
-                out.u64(*durable_turn_sequence);
-                out.bool(*durable_acked);
-                out.string(before_state_digest)?;
-                out.string(state_digest)?;
-                key.encode(out)?;
+                validate_strings([
+                    step_id.as_str(),
+                    source_path.as_str(),
+                    action_kind.as_str(),
+                    action_digest.as_str(),
+                    input_event_digest.as_str(),
+                    before_state_digest.as_str(),
+                    state_digest.as_str(),
+                ])?;
+                key.validate()
             }
             Self::NativeWorkflowCompleted {
-                test_request_id,
-                step_count,
                 initial_state_digest,
                 final_state_digest,
                 key,
+                ..
             } => {
-                out.u64(*test_request_id);
-                out.u32(*step_count);
-                out.string(initial_state_digest)?;
-                out.string(final_state_digest)?;
-                key.encode(out)?;
+                validate_strings([initial_state_digest.as_str(), final_state_digest.as_str()])?;
+                key.validate()
             }
             Self::AsyncLaneCompleted {
-                lane,
-                request_id,
-                revision,
-                queue_depth,
-                queue_wait_us,
-                worker_us,
-                apply_us,
-                end_to_end_us,
-                outcome,
-                key,
+                request_id, key, ..
             } => {
-                out.u8(*lane as u8);
-                out.string(request_id)?;
-                out.u64(*revision);
-                out.u32(*queue_depth);
-                out.u64(*queue_wait_us);
-                out.u64(*worker_us);
-                out.u64(*apply_us);
-                out.u64(*end_to_end_us);
-                out.u8(*outcome as u8);
-                key.encode(out)?;
+                validate_strings([request_id.as_str()])?;
+                key.validate()
             }
             Self::AsyncLaneCompletedBeforePresent {
                 surface_id,
-                process_id,
-                lane,
                 request_id,
-                revision,
-                queue_depth,
-                queue_wait_us,
-                worker_us,
-                apply_us,
-                end_to_end_us,
-                outcome,
-            } => {
-                out.string(surface_id)?;
-                out.u32(*process_id);
-                out.u8(*lane as u8);
-                out.string(request_id)?;
-                out.u64(*revision);
-                out.u32(*queue_depth);
-                out.u64(*queue_wait_us);
-                out.u64(*worker_us);
-                out.u64(*apply_us);
-                out.u64(*end_to_end_us);
-                out.u8(*outcome as u8);
-            }
+                ..
+            } => validate_strings([surface_id.as_str(), request_id.as_str()]),
         }
-        Ok(())
     }
+}
 
-    fn decode(tag: u8, input: &mut Decoder<'_>) -> Result<Self, ObserverError> {
-        let event = match tag {
-            1 => Self::RoleMetadata(RoleMetadata {
-                role: ObserverRole::decode(input.u8()?)?,
-                pid: input.u32()?,
-                surface_id: input.string()?,
-                session_id: input.string()?,
-                surface_epoch: input.u64()?,
-                logical_width: input.f32()?,
-                logical_height: input.f32()?,
-                physical_width: input.u32()?,
-                physical_height: input.u32()?,
-                scale: input.f64()?,
-                adapter_name: input.string()?,
-                adapter_backend: input.string()?,
-                adapter_device_type: input.string()?,
-                software_adapter: input.bool()?,
-                surface_format: input.string()?,
-                present_mode: input.string()?,
-                window_backend: input.string()?,
-            }),
-            2 => Self::InputAccepted(InputAccepted {
-                role: ObserverRole::decode(input.u8()?)?,
-                event_sequence: input.u64()?,
-                real_os: input.bool()?,
-                callback_to_host_ns: input.u64()?,
-                surface_epoch: input.u64()?,
-                kind: InputKind::decode(input.u8()?)?,
-                pointer_button_pressed: match input.u8()? {
-                    0 => None,
-                    1 => Some(true),
-                    2 => Some(false),
-                    value => return Err(ObserverError::InvalidEnum("pointer button state", value)),
-                },
-                pointer_x: input.optional_f32()?,
-                pointer_y: input.optional_f32()?,
-                target: input.optional_string()?,
-                target_source_path: input.optional_string()?,
-                event_digest: input.string()?,
-                visible_change: input.bool()?,
-            }),
-            3 => Self::FramePresented(FramePresented {
-                role: ObserverRole::decode(input.u8()?)?,
-                key: FrameEvidenceKey::decode(input)?,
-                event_sequence: input.optional_u64()?,
-                input_kind: input.optional_u8()?.map(InputKind::decode).transpose()?,
-                callback_to_host_ns: input.u64()?,
-                input_to_present_us: input.u64()?,
-                event_dispatch_us: input.u64()?,
-                executor_us: input.u64()?,
-                runtime_document_us: input.u64()?,
-                document_update_us: input.u64()?,
-                render_us: input.u64()?,
-                document_scene_convert_us: input.u64()?,
-                scene_key_us: input.u64()?,
-                rect_vertices_us: input.u64()?,
-                asset_prepare_us: input.u64()?,
-                quad_batch_key_us: input.u64()?,
-                quad_upload_us: input.u64()?,
-                draw_pass_us: input.u64()?,
-                retained_metrics_us: input.u64()?,
-                text_render_us: input.u64()?,
-                submit_us: input.u64()?,
-                present_us: input.u64()?,
-                frame_us: input.u64()?,
-                observer_drop_count: input.u64()?,
-            }),
-            4 => Self::SourceSwitchAcknowledged {
-                revision: input.u64()?,
-                elapsed_us: input.u64()?,
-            },
-            5 => Self::SourceSwitchFinal {
-                revision: input.u64()?,
-                elapsed_us: input.u64()?,
-                compile_us: input.u64()?,
-                post_compile_us: input.u64()?,
-                key: FrameEvidenceKey::decode(input)?,
-            },
-            6 => Self::TestTarget {
-                request_id: input.u64()?,
-                node: input.string()?,
-                source_path: input.string()?,
-                x: input.f32()?,
-                y: input.f32()?,
-            },
-            7 => Self::TestCompleted {
-                request_id: input.u64()?,
-                passed: input.bool()?,
-                semantic_assertions_proven: input.bool()?,
-                completed_steps: input.u32()?,
-                message: input.string()?,
-            },
-            8 => Self::ProofRequested {
-                key: FrameEvidenceKey::decode(input)?,
-                snapshot_prepare_us: input.u64()?,
-            },
-            9 => {
-                let key = FrameEvidenceKey::decode(input)?;
-                let completed_after_key = FrameEvidenceKey::decode(input)?;
-                let elapsed_us = input.u64()?;
-                let replaced_count = input.u64()?;
-                let result_drop_count = input.u64()?;
-                let artifact = if input.bool()? {
-                    Some(ProofArtifact {
-                        path: input.string()?,
-                        sha256: input.string()?,
-                        byte_len: input.u64()?,
-                        capture_method: input.string()?,
-                        capture_token_digest: input.string()?,
-                        nonblank_samples: input.u64()?,
-                        unique_rgba_values: input.u64()?,
-                    })
-                } else {
-                    None
-                };
-                Self::ProofCompleted {
-                    key,
-                    completed_after_key,
-                    elapsed_us,
-                    replaced_count,
-                    result_drop_count,
-                    artifact,
-                    error: input.optional_string()?,
-                }
-            }
-            10 => Self::RoleTarget {
-                role: ObserverRole::decode(input.u8()?)?,
-                node: input.string()?,
-                x: input.f32()?,
-                y: input.f32()?,
-            },
-            11 => Self::SourceFailed {
-                revision: input.u64()?,
-                stage: input.string()?,
-                message: input.string()?,
-            },
-            12 => Self::TestPointerFrame {
-                request_id: input.u64()?,
-                step_index: input.u32()?,
-                phase: TestPointerPhase::decode(input.u8()?)?,
-                x: input.f32()?,
-                y: input.f32()?,
-                target: input.optional_string()?,
-                runtime_sequence: input.u64()?,
-                key: FrameEvidenceKey::decode(input)?,
-            },
-            13 => Self::StateMounted {
-                disposition: StartupDisposition::decode(input.u8()?)?,
-                schema_version: input.u64()?,
-                schema_hash: input.string()?,
-                migration: if input.bool()? {
-                    Some(StartupMigrationEvidence {
-                        source_schema_version: input.u64()?,
-                        source_schema_hash: input.string()?,
-                        target_schema_version: input.u64()?,
-                        target_schema_hash: input.string()?,
-                        step_count: input.u32()?,
-                    })
-                } else {
-                    None
-                },
-                source_revision: input.u64()?,
-                runtime_sequence: input.u64()?,
-                durable_epoch: input.u64()?,
-                durable_turn_sequence: input.u64()?,
-                state_digest: input.string()?,
-                key: FrameEvidenceKey::decode(input)?,
-            },
-            14 => Self::ScenarioCheckpoint {
-                request_id: input.u64()?,
-                step_id: input.string()?,
-                assertion_count: input.u32()?,
-                source_revision: input.u64()?,
-                runtime_sequence: input.u64()?,
-                durable_epoch: input.u64()?,
-                durable_turn_sequence: input.u64()?,
-                state_digest: input.string()?,
-                key: FrameEvidenceKey::decode(input)?,
-            },
-            15 => Self::PersistenceEvidence {
-                kind: PersistenceEvidenceKind::decode(input.u8()?)?,
-                source_revision: input.u64()?,
-                runtime_sequence: input.u64()?,
-                durable_epoch: input.u64()?,
-                durable_turn_sequence: input.u64()?,
-                before_state_digest: input.string()?,
-                after_state_digest: input.string()?,
-                key: FrameEvidenceKey::decode(input)?,
-            },
-            16 => Self::ResponsiveLayoutEvidence {
-                resize_sequence: input.u64()?,
-                logical_width: input.u32()?,
-                logical_height: input.u32()?,
-                baseline_key: FrameEvidenceKey::decode(input)?,
-                baseline_action_count: input.u32()?,
-                baseline_action_digest: input.string()?,
-                action_count: input.u32()?,
-                action_digest: input.string()?,
-                state_digest: input.string()?,
-                source_revision: input.u64()?,
-                runtime_sequence: input.u64()?,
-                durable_epoch: input.u64()?,
-                durable_turn_sequence: input.u64()?,
-                key: FrameEvidenceKey::decode(input)?,
-            },
-            17 => Self::ProfileSample {
-                ordinal: input.u32()?,
-                input_sequence: input.u64()?,
-                callback_to_host_ns: input.u64()?,
-                editor_visible_us: input.u64()?,
-                preview_visible_us: input.u64()?,
-                compile_us: input.u64()?,
-                parent_dispatch_us: input.u64()?,
-                parent_executor_us: input.u64()?,
-                parent_runtime_document_us: input.u64()?,
-                parent_persistence_us: input.u64()?,
-                completion_us: input.u64()?,
-                completion_executor_us: input.u64()?,
-                completion_runtime_document_us: input.u64()?,
-                completion_persistence_us: input.u64()?,
-                document_us: input.u64()?,
-                interaction_us: input.u64()?,
-                demand_us: input.u64()?,
-                present_us: input.u64()?,
-                patch_count: input.u32()?,
-                full_lowered: input.bool()?,
-                interaction_frame_block_us: input.u64()?,
-                pending_child_artifacts: input.u32()?,
-                pending_program_artifact_stores: input.u32()?,
-                pending_program_artifact_loads: input.u32()?,
-                pending_persistence_artifact_stores: input.u32()?,
-                pending_persistence_artifact_loads: input.u32()?,
-                pending_durable_batches: input.u32()?,
-                trusted_parent_rebuilds: input.u32()?,
-                source_revision: input.u64()?,
-                runtime_sequence: input.u64()?,
-                editor_key: FrameEvidenceKey::decode(input)?,
-                key: FrameEvidenceKey::decode(input)?,
-            },
-            18 => Self::StaleProgramRejected {
-                session: input.string()?,
-                stale_revision: input.u64()?,
-                latest_revision: input.u64()?,
-                source_revision: input.u64()?,
-                runtime_sequence: input.u64()?,
-                durable_epoch: input.u64()?,
-                durable_turn_sequence: input.u64()?,
-                state_digest: input.string()?,
-                key: FrameEvidenceKey::decode(input)?,
-            },
-            19 => Self::ProfileInputTarget {
-                node: input.string()?,
-                source_path: input.string()?,
-                x: input.f32()?,
-                y: input.f32()?,
-                sample_count: input.u32()?,
-                key: FrameEvidenceKey::decode(input)?,
-            },
-            20 => Self::ProfileInputSeeded {
-                input_sequence: input.u64()?,
-                callback_to_host_ns: input.u64()?,
-                compile_us: input.u64()?,
-                pending_child_artifacts: input.u32()?,
-                editor_key: FrameEvidenceKey::decode(input)?,
-                key: FrameEvidenceKey::decode(input)?,
-            },
-            21 => Self::ResponsiveResizeReady {
-                desired_width: input.u32()?,
-                desired_height: input.u32()?,
-                current_width: input.u32()?,
-                current_height: input.u32()?,
-                baseline_action_count: input.u32()?,
-                baseline_action_digest: input.string()?,
-                key: FrameEvidenceKey::decode(input)?,
-            },
-            22 => Self::ResponsiveResizeObserved {
-                event_sequence: input.u64()?,
-                logical_width: input.u32()?,
-                logical_height: input.u32()?,
-                previous_surface_epoch: input.u64()?,
-                key: FrameEvidenceKey::decode(input)?,
-            },
-            23 => Self::ScrollProofFrame {
-                ordinal: input.u32()?,
-                key: FrameEvidenceKey::decode(input)?,
-            },
-            24 => Self::NativeWorkflowReady {
-                test_request_id: input.u64()?,
-                step_count: input.u32()?,
-                source_revision: input.u64()?,
-                runtime_sequence: input.u64()?,
-                durable_epoch: input.u64()?,
-                state_digest: input.string()?,
-                key: FrameEvidenceKey::decode(input)?,
-            },
-            25 => Self::NativeWorkflowTarget {
-                request_id: input.u64()?,
-                ordinal: input.u32()?,
-                step_id: input.string()?,
-                source_path: input.string()?,
-                action_kind: input.string()?,
-                action_digest: input.string()?,
-                node: input.string()?,
-                x: input.f32()?,
-                y: input.f32()?,
-                key: FrameEvidenceKey::decode(input)?,
-            },
-            26 => Self::NativeWorkflowStep {
-                request_id: input.u64()?,
-                ordinal: input.u32()?,
-                step_id: input.string()?,
-                source_path: input.string()?,
-                action_kind: input.string()?,
-                action_digest: input.string()?,
-                input_first_sequence: input.u64()?,
-                input_last_sequence: input.u64()?,
-                input_event_count: input.u32()?,
-                input_event_digest: input.string()?,
-                assertion_count: input.u32()?,
-                source_revision: input.u64()?,
-                runtime_sequence: input.u64()?,
-                durable_epoch: input.u64()?,
-                durable_turn_sequence: input.u64()?,
-                durable_acked: input.bool()?,
-                before_state_digest: input.string()?,
-                state_digest: input.string()?,
-                key: FrameEvidenceKey::decode(input)?,
-            },
-            27 => Self::NativeWorkflowCompleted {
-                test_request_id: input.u64()?,
-                step_count: input.u32()?,
-                initial_state_digest: input.string()?,
-                final_state_digest: input.string()?,
-                key: FrameEvidenceKey::decode(input)?,
-            },
-            28 => Self::AsyncLaneCompleted {
-                lane: AsyncLaneKind::decode(input.u8()?)?,
-                request_id: input.string()?,
-                revision: input.u64()?,
-                queue_depth: input.u32()?,
-                queue_wait_us: input.u64()?,
-                worker_us: input.u64()?,
-                apply_us: input.u64()?,
-                end_to_end_us: input.u64()?,
-                outcome: AsyncLaneOutcome::decode(input.u8()?)?,
-                key: FrameEvidenceKey::decode(input)?,
-            },
-            29 => Self::AsyncLaneCompletedBeforePresent {
-                surface_id: input.string()?,
-                process_id: input.u32()?,
-                lane: AsyncLaneKind::decode(input.u8()?)?,
-                request_id: input.string()?,
-                revision: input.u64()?,
-                queue_depth: input.u32()?,
-                queue_wait_us: input.u64()?,
-                worker_us: input.u64()?,
-                apply_us: input.u64()?,
-                end_to_end_us: input.u64()?,
-                outcome: AsyncLaneOutcome::decode(input.u8()?)?,
-            },
-            _ => return Err(ObserverError::UnknownEvent(tag)),
-        };
-        input.finish()?;
-        Ok(event)
+fn validate_strings<'a>(values: impl IntoIterator<Item = &'a str>) -> Result<(), ObserverError> {
+    for value in values {
+        if value.len() > MAX_STRING_BYTES {
+            return Err(ObserverError::StringTooLarge(value.len()));
+        }
     }
+    Ok(())
+}
+
+fn validate_optional_strings<'a>(
+    values: impl IntoIterator<Item = Option<&'a str>>,
+) -> Result<(), ObserverError> {
+    validate_strings(values.into_iter().flatten())
+}
+
+fn codec() -> impl Options {
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .with_little_endian()
+        .reject_trailing_bytes()
 }
 
 pub struct ObserverClient {
@@ -1673,16 +849,22 @@ fn observer_writer(
 }
 
 pub fn write_event(writer: &mut impl Write, event: &ObserverEvent) -> Result<(), ObserverError> {
-    let mut encoded = Encoder::default();
-    encoded.bytes.extend_from_slice(&MAGIC);
-    encoded.u16(VERSION);
-    encoded.u8(event.tag());
-    event.encode(&mut encoded)?;
-    if encoded.bytes.len() > MAX_EVENT_BYTES {
-        return Err(ObserverError::FrameTooLarge(encoded.bytes.len()));
+    event.validate()?;
+    let payload = codec()
+        .serialize(event)
+        .map_err(ObserverError::InvalidPayload)?;
+    let frame_bytes = HEADER_BYTES
+        .checked_add(payload.len())
+        .ok_or(ObserverError::FrameTooLarge(usize::MAX))?;
+    if frame_bytes > MAX_EVENT_BYTES {
+        return Err(ObserverError::FrameTooLarge(frame_bytes));
     }
-    writer.write_all(&(encoded.bytes.len() as u32).to_le_bytes())?;
-    writer.write_all(&encoded.bytes)?;
+
+    writer.write_all(&(frame_bytes as u32).to_le_bytes())?;
+    writer.write_all(&MAGIC)?;
+    writer.write_all(&VERSION.to_le_bytes())?;
+    writer.write_all(&[event.tag()])?;
+    writer.write_all(&payload)?;
     writer.flush()?;
     Ok(())
 }
@@ -1699,17 +881,40 @@ pub fn read_event(reader: &mut impl Read) -> Result<Option<ObserverEvent>, Obser
     if !(HEADER_BYTES..=MAX_EVENT_BYTES).contains(&length) {
         return Err(ObserverError::FrameTooLarge(length));
     }
+
     let mut bytes = vec![0; length];
     reader.read_exact(&mut bytes)?;
-    if bytes[..4] != MAGIC {
+    if bytes[..MAGIC.len()] != MAGIC {
         return Err(ObserverError::InvalidMagic);
     }
     let version = u16::from_le_bytes([bytes[4], bytes[5]]);
     if version != VERSION {
         return Err(ObserverError::UnsupportedVersion(version));
     }
-    let mut input = Decoder::new(&bytes[HEADER_BYTES..]);
-    ObserverEvent::decode(bytes[6], &mut input).map(Some)
+    let outer_tag = bytes[6];
+    if !(1..=LAST_EVENT_TAG).contains(&outer_tag) {
+        return Err(ObserverError::UnknownEvent(outer_tag));
+    }
+
+    let payload = &bytes[HEADER_BYTES..];
+    let mut cursor = Cursor::new(payload);
+    let event: ObserverEvent = codec()
+        .with_limit(payload.len() as u64)
+        .allow_trailing_bytes()
+        .deserialize_from(&mut cursor)
+        .map_err(ObserverError::InvalidPayload)?;
+    let consumed = cursor.position() as usize;
+    if consumed != payload.len() {
+        return Err(ObserverError::TrailingBytes(payload.len() - consumed));
+    }
+    if event.tag() != outer_tag {
+        return Err(ObserverError::MismatchedEventTag {
+            outer: outer_tag,
+            payload: event.tag(),
+        });
+    }
+    event.validate()?;
+    Ok(Some(event))
 }
 
 #[derive(Debug)]
@@ -1720,11 +925,8 @@ pub enum ObserverError {
     InvalidMagic,
     UnsupportedVersion(u16),
     UnknownEvent(u8),
-    InvalidEnum(&'static str, u8),
-    InvalidBool(u8),
-    InvalidOption(u8),
-    InvalidUtf8(std::str::Utf8Error),
-    Truncated,
+    MismatchedEventTag { outer: u8, payload: u8 },
+    InvalidPayload(bincode::Error),
     TrailingBytes(usize),
 }
 
@@ -1742,13 +944,13 @@ impl fmt::Display for ObserverError {
                 )
             }
             Self::UnknownEvent(tag) => write!(formatter, "observer event tag {tag} is unknown"),
-            Self::InvalidEnum(name, value) => {
-                write!(formatter, "observer {name} value {value} is invalid")
+            Self::MismatchedEventTag { outer, payload } => write!(
+                formatter,
+                "observer outer event tag {outer} does not match payload tag {payload}"
+            ),
+            Self::InvalidPayload(error) => {
+                write!(formatter, "observer event payload is invalid: {error}")
             }
-            Self::InvalidBool(value) => write!(formatter, "observer bool {value} is invalid"),
-            Self::InvalidOption(value) => write!(formatter, "observer option {value} is invalid"),
-            Self::InvalidUtf8(error) => write!(formatter, "observer UTF-8 is invalid: {error}"),
-            Self::Truncated => formatter.write_str("observer frame is truncated"),
             Self::TrailingBytes(bytes) => {
                 write!(formatter, "observer frame has {bytes} trailing bytes")
             }
@@ -1756,7 +958,15 @@ impl fmt::Display for ObserverError {
     }
 }
 
-impl std::error::Error for ObserverError {}
+impl std::error::Error for ObserverError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            Self::InvalidPayload(error) => Some(error.as_ref()),
+            _ => None,
+        }
+    }
+}
 
 impl From<io::Error> for ObserverError {
     fn from(error: io::Error) -> Self {
@@ -1764,195 +974,94 @@ impl From<io::Error> for ObserverError {
     }
 }
 
-#[derive(Default)]
-struct Encoder {
-    bytes: Vec<u8>,
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-impl Encoder {
-    fn u8(&mut self, value: u8) {
-        self.bytes.push(value);
-    }
-
-    fn bool(&mut self, value: bool) {
-        self.u8(u8::from(value));
-    }
-
-    fn u16(&mut self, value: u16) {
-        self.bytes.extend_from_slice(&value.to_le_bytes());
-    }
-
-    fn u32(&mut self, value: u32) {
-        self.bytes.extend_from_slice(&value.to_le_bytes());
-    }
-
-    fn u64(&mut self, value: u64) {
-        self.bytes.extend_from_slice(&value.to_le_bytes());
-    }
-
-    fn f32(&mut self, value: f32) {
-        self.u32(value.to_bits());
-    }
-
-    fn f64(&mut self, value: f64) {
-        self.u64(value.to_bits());
-    }
-
-    fn optional_u8(&mut self, value: Option<u8>) {
-        match value {
-            Some(value) => {
-                self.u8(1);
-                self.u8(value);
-            }
-            None => self.u8(0),
+    fn key() -> FrameEvidenceKey {
+        FrameEvidenceKey {
+            surface_id: "preview".to_owned(),
+            process_id: 42,
+            session_id: "session".to_owned(),
+            frame_id: 1,
+            input_id: 2,
+            content_id: 3,
+            layout_id: 4,
+            render_id: 5,
+            surface_epoch: 6,
+            present_id: 7,
+            proof_id: 8,
         }
     }
 
-    fn optional_u64(&mut self, value: Option<u64>) {
-        match value {
-            Some(value) => {
-                self.u8(1);
-                self.u64(value);
-            }
-            None => self.u8(0),
-        }
+    #[test]
+    fn nested_event_roundtrips_through_bounded_little_endian_frame() {
+        let event = ObserverEvent::NativeWorkflowStep {
+            request_id: 11,
+            ordinal: 2,
+            step_id: "increment".to_owned(),
+            source_path: "counter.increment.press".to_owned(),
+            action_kind: "click".to_owned(),
+            action_digest: "action".to_owned(),
+            input_first_sequence: 17,
+            input_last_sequence: 18,
+            input_event_count: 2,
+            input_event_digest: "input".to_owned(),
+            assertion_count: 3,
+            source_revision: 19,
+            runtime_sequence: 20,
+            durable_epoch: 21,
+            durable_turn_sequence: 22,
+            durable_acked: true,
+            before_state_digest: "before".to_owned(),
+            state_digest: "after".to_owned(),
+            key: key(),
+        };
+        let mut bytes = Vec::new();
+        write_event(&mut bytes, &event).expect("encode event");
+        assert_eq!(
+            read_event(&mut bytes.as_slice()).expect("decode event"),
+            Some(event)
+        );
     }
 
-    fn optional_f32(&mut self, value: Option<f32>) {
-        match value {
-            Some(value) => {
-                self.u8(1);
-                self.f32(value);
-            }
-            None => self.u8(0),
-        }
+    #[test]
+    fn decoder_rejects_outer_tag_mismatch_and_trailing_bytes() {
+        let event = ObserverEvent::ScrollProofFrame {
+            ordinal: 3,
+            key: key(),
+        };
+        let mut mismatched = Vec::new();
+        write_event(&mut mismatched, &event).expect("encode event");
+        mismatched[10] = 1;
+        assert!(matches!(
+            read_event(&mut mismatched.as_slice()),
+            Err(ObserverError::MismatchedEventTag { .. })
+        ));
+
+        let mut trailing = Vec::new();
+        write_event(&mut trailing, &event).expect("encode event");
+        let length = u32::from_le_bytes(trailing[..4].try_into().expect("length"));
+        trailing[..4].copy_from_slice(&(length + 1).to_le_bytes());
+        trailing.push(0xff);
+        assert!(matches!(
+            read_event(&mut trailing.as_slice()),
+            Err(ObserverError::TrailingBytes(1))
+        ));
     }
 
-    fn optional_string(&mut self, value: Option<&str>) -> Result<(), ObserverError> {
-        match value {
-            Some(value) => {
-                self.u8(1);
-                self.string(value)?;
-            }
-            None => self.u8(0),
-        }
-        Ok(())
-    }
-
-    fn string(&mut self, value: &str) -> Result<(), ObserverError> {
-        if value.len() > MAX_STRING_BYTES {
-            return Err(ObserverError::StringTooLarge(value.len()));
-        }
-        self.u32(value.len() as u32);
-        self.bytes.extend_from_slice(value.as_bytes());
-        Ok(())
-    }
-}
-
-struct Decoder<'a> {
-    bytes: &'a [u8],
-    offset: usize,
-}
-
-impl<'a> Decoder<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, offset: 0 }
-    }
-
-    fn take(&mut self, count: usize) -> Result<&'a [u8], ObserverError> {
-        let end = self
-            .offset
-            .checked_add(count)
-            .ok_or(ObserverError::Truncated)?;
-        let value = self
-            .bytes
-            .get(self.offset..end)
-            .ok_or(ObserverError::Truncated)?;
-        self.offset = end;
-        Ok(value)
-    }
-
-    fn u8(&mut self) -> Result<u8, ObserverError> {
-        Ok(self.take(1)?[0])
-    }
-
-    fn bool(&mut self) -> Result<bool, ObserverError> {
-        match self.u8()? {
-            0 => Ok(false),
-            1 => Ok(true),
-            value => Err(ObserverError::InvalidBool(value)),
-        }
-    }
-
-    fn u32(&mut self) -> Result<u32, ObserverError> {
-        Ok(u32::from_le_bytes(
-            self.take(4)?.try_into().expect("four-byte slice"),
-        ))
-    }
-
-    fn u64(&mut self) -> Result<u64, ObserverError> {
-        Ok(u64::from_le_bytes(
-            self.take(8)?.try_into().expect("eight-byte slice"),
-        ))
-    }
-
-    fn f32(&mut self) -> Result<f32, ObserverError> {
-        self.u32().map(f32::from_bits)
-    }
-
-    fn f64(&mut self) -> Result<f64, ObserverError> {
-        self.u64().map(f64::from_bits)
-    }
-
-    fn optional_u8(&mut self) -> Result<Option<u8>, ObserverError> {
-        match self.u8()? {
-            0 => Ok(None),
-            1 => self.u8().map(Some),
-            value => Err(ObserverError::InvalidOption(value)),
-        }
-    }
-
-    fn optional_u64(&mut self) -> Result<Option<u64>, ObserverError> {
-        match self.u8()? {
-            0 => Ok(None),
-            1 => self.u64().map(Some),
-            value => Err(ObserverError::InvalidOption(value)),
-        }
-    }
-
-    fn optional_f32(&mut self) -> Result<Option<f32>, ObserverError> {
-        match self.u8()? {
-            0 => Ok(None),
-            1 => self.f32().map(Some),
-            value => Err(ObserverError::InvalidOption(value)),
-        }
-    }
-
-    fn optional_string(&mut self) -> Result<Option<String>, ObserverError> {
-        match self.u8()? {
-            0 => Ok(None),
-            1 => self.string().map(Some),
-            value => Err(ObserverError::InvalidOption(value)),
-        }
-    }
-
-    fn string(&mut self) -> Result<String, ObserverError> {
-        let length = self.u32()? as usize;
-        if length > MAX_STRING_BYTES {
-            return Err(ObserverError::StringTooLarge(length));
-        }
-        let bytes = self.take(length)?;
-        std::str::from_utf8(bytes)
-            .map(str::to_owned)
-            .map_err(ObserverError::InvalidUtf8)
-    }
-
-    fn finish(&self) -> Result<(), ObserverError> {
-        let trailing = self.bytes.len().saturating_sub(self.offset);
-        if trailing == 0 {
-            Ok(())
-        } else {
-            Err(ObserverError::TrailingBytes(trailing))
-        }
+    #[test]
+    fn encoder_and_decoder_enforce_string_ceiling() {
+        let oversized = ObserverEvent::TestCompleted {
+            request_id: 1,
+            passed: false,
+            semantic_assertions_proven: false,
+            completed_steps: 0,
+            message: "x".repeat(MAX_STRING_BYTES + 1),
+        };
+        assert!(matches!(
+            write_event(&mut Vec::new(), &oversized),
+            Err(ObserverError::StringTooLarge(_))
+        ));
     }
 }

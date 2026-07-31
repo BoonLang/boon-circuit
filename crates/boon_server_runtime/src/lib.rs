@@ -754,13 +754,17 @@ impl DistributedServerMachine for ServerRuntimeSession {
         }
     }
 
-    fn export_current(
+    fn export_if_current(
         &mut self,
         export_id: boon_plan::ExportId,
-    ) -> Result<Value, DistributedRuntimeError> {
+    ) -> Result<Option<Value>, DistributedRuntimeError> {
         match self {
-            Self::Ephemeral(session) => session.export_current(export_id),
-            Self::Persistent { session, .. } => session.export_current(export_id),
+            Self::Ephemeral(session) => {
+                DistributedServerMachine::export_if_current(&mut **session, export_id)
+            }
+            Self::Persistent { session, .. } => {
+                DistributedServerMachine::export_if_current(&mut **session, export_id)
+            }
         }
     }
 

@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 pub(crate) fn compile_document_plan(
     program: &ErasedProgram,
     value_index: &ValueIndex,
+    root_computation_fields: &BTreeSet<FieldId>,
     row_expressions: &mut PlanRowExpressionArena,
     machine_constants: &mut Vec<PlanConstant>,
     distributed_expression_refs: &BTreeMap<ir::ExecutableExprId, ValueRef>,
@@ -29,6 +30,7 @@ pub(crate) fn compile_document_plan(
     DocumentCompiler::new(
         program,
         value_index,
+        root_computation_fields,
         row_expressions,
         machine_constants,
         distributed_expression_refs,
@@ -58,7 +60,7 @@ struct ContextualMaterializationInfo {
     owner: ir::StaticOwnerId,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct CompileContext {
     cache_scope: usize,
     stable_owner: Option<ir::StaticOwnerId>,
@@ -69,7 +71,7 @@ struct CompileContext {
     pattern_bindings: BTreeMap<String, PatternBindingContext>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct PatternBindingContext {
     selector: usize,
     projection: Vec<String>,
@@ -86,6 +88,7 @@ struct ExecutableCall<'a> {
 struct DocumentCompiler<'a> {
     program: &'a ErasedProgram,
     value_index: &'a ValueIndex,
+    root_computation_fields: &'a BTreeSet<FieldId>,
     row_expressions: &'a mut PlanRowExpressionArena,
     machine_constants: &'a mut Vec<PlanConstant>,
     globals_by_storage: BTreeMap<ir::ErasedBindingId, GlobalValue>,
@@ -102,6 +105,8 @@ struct DocumentCompiler<'a> {
     function_ids: BTreeSet<DocumentFunctionId>,
     templates: Vec<DocumentTemplate>,
     template_ids: BTreeSet<DocumentTemplateId>,
+    templates_by_node_expression: BTreeMap<ir::ExecutableExprId, DocumentTemplateId>,
+    template_contexts: BTreeMap<DocumentTemplateId, CompileContext>,
     materializations: Vec<DocumentMaterialization>,
     materialization_ids: BTreeSet<DocumentMaterializationId>,
     materializations_in_progress: BTreeSet<usize>,
@@ -180,6 +185,7 @@ impl<'a> DocumentCompiler<'a> {
     fn new(
         program: &'a ErasedProgram,
         value_index: &'a ValueIndex,
+        root_computation_fields: &'a BTreeSet<FieldId>,
         row_expressions: &'a mut PlanRowExpressionArena,
         machine_constants: &'a mut Vec<PlanConstant>,
         distributed_expression_refs: &'a BTreeMap<ir::ExecutableExprId, ValueRef>,
@@ -236,6 +242,7 @@ impl<'a> DocumentCompiler<'a> {
         Ok(Self {
             program,
             value_index,
+            root_computation_fields,
             row_expressions,
             machine_constants,
             globals_by_storage,
@@ -252,6 +259,8 @@ impl<'a> DocumentCompiler<'a> {
             function_ids: BTreeSet::new(),
             templates: Vec::new(),
             template_ids: BTreeSet::new(),
+            templates_by_node_expression: BTreeMap::new(),
+            template_contexts: BTreeMap::new(),
             materializations: Vec::new(),
             materialization_ids: BTreeSet::new(),
             materializations_in_progress: BTreeSet::new(),
@@ -524,6 +533,7 @@ impl<'a> DocumentCompiler<'a> {
                         owner,
                         local,
                         projection: existing,
+                        ..
                     } => {
                         let projection = existing
                             .iter()
@@ -542,13 +552,24 @@ impl<'a> DocumentCompiler<'a> {
                         let parameter = context
                             .materialization_locals
                             .get(&(*owner, *local))
-                            .copied()
-                            .ok_or_else(|| {
-                                PlanError::new(format!(
-                                    "executable expression {} reads unbound materialization owner {} local {}",
-                                    expression_id.0, owner.0, local.0
-                                ))
-                            })?;
+                        .copied()
+                        .ok_or_else(|| {
+                            PlanError::new(format!(
+                                "executable expression {} reads unbound materialization owner {} local {}; retained path: {}",
+                                expression_id.0,
+                                owner.0,
+                                local.0,
+                                self.compile_stack
+                                    .iter()
+                                    .copied()
+                                    .map(|expression| executable_debug_label(
+                                        self.program,
+                                        expression
+                                    ))
+                                    .collect::<Vec<_>>()
+                                    .join(" -> ")
+                            ))
+                        })?;
                         let projection = projection
                             .iter()
                             .map(|field| self.intern_name(field))
@@ -1018,6 +1039,7 @@ impl<'a> DocumentCompiler<'a> {
                 owner,
                 local,
                 projection,
+                ..
             } => {
                 if let Some(read) =
                     self.materialization_resource_read(*owner, *local, projection)?
@@ -1034,8 +1056,15 @@ impl<'a> DocumentCompiler<'a> {
                     .copied()
                     .ok_or_else(|| {
                         PlanError::new(format!(
-                            "executable expression {compiler_id} reads unbound materialization owner {} local {}",
-                            owner.0, local.0
+                            "executable expression {compiler_id} reads unbound materialization owner {} local {}; retained path: {}",
+                            owner.0,
+                            local.0,
+                            self.compile_stack
+                                .iter()
+                                .copied()
+                                .map(|expression| executable_debug_label(self.program, expression))
+                                .collect::<Vec<_>>()
+                                .join(" -> ")
                         ))
                     })?;
                 let projection = projection
@@ -1240,6 +1269,24 @@ impl<'a> DocumentCompiler<'a> {
         let stable_owner = expression.owner.or(context.stable_owner);
         let template = DocumentTemplateId(stable_compiler_identity(3, stable_owner, compiler_id)?);
         let node = DocumentNodeId(stable_compiler_identity(4, stable_owner, compiler_id)?);
+        if let Some(previous) = self
+            .templates_by_node_expression
+            .insert(expression.id, template)
+            && previous != template
+        {
+            return Err(PlanError::new(format!(
+                "retained constructor expression {compiler_id} maps to both template {} and {}",
+                previous.0, template.0
+            )));
+        }
+        if let Some(previous) = self.template_contexts.insert(template, context.clone())
+            && previous != *context
+        {
+            return Err(PlanError::new(format!(
+                "retained constructor expression {compiler_id} reuses template {} across different exact compile contexts",
+                template.0
+            )));
+        }
         let result = self.push_expr(
             compiler_id,
             DocumentValueClass::Render,
@@ -1792,13 +1839,16 @@ impl<'a> DocumentCompiler<'a> {
                     );
                     Some(self.project_fields(compiler_id, base, &field_path, final_class))
                 }
-                ValueRef::Field(field) => Some(self.push_expr(
-                    compiler_id,
-                    final_class,
-                    DocumentExprOp::Read {
-                        read: DocumentRead::Field { field },
-                    },
-                )),
+                ValueRef::Field(field) if self.root_computation_fields.contains(&field) => {
+                    Some(self.push_expr(
+                        compiler_id,
+                        final_class,
+                        DocumentExprOp::Read {
+                            read: DocumentRead::Field { field },
+                        },
+                    ))
+                }
+                ValueRef::Field(_) => None,
                 ValueRef::List(list) => Some(self.push_expr(
                     compiler_id,
                     final_class,
@@ -1983,6 +2033,29 @@ impl<'a> DocumentCompiler<'a> {
     fn compile_view_bindings(&mut self) -> Result<Vec<DocumentViewBinding>, PlanError> {
         let mut result = Vec::new();
         for binding in self.program.view_bindings.clone() {
+            let template = self
+                .templates_by_node_expression
+                .get(&binding.node_expression)
+                .copied()
+                .ok_or_else(|| {
+                    PlanError::new(format!(
+                        "view binding {} `{}`.{} references retained node expression {} with no exact document template",
+                        binding.id.0,
+                        binding.node_kind,
+                        binding.attr,
+                        binding.node_expression.0
+                    ))
+                })?;
+            let context = self
+                .template_contexts
+                .get(&template)
+                .cloned()
+                .ok_or_else(|| {
+                    PlanError::new(format!(
+                        "view binding {} template {} has no exact compile context",
+                        binding.id.0, template.0
+                    ))
+                })?;
             let scope = binding.scope_id.map(|scope| ScopeId(scope.0));
             let target = match &binding.target {
                 ir::ViewBindingTarget::Read {
@@ -2047,37 +2120,54 @@ impl<'a> DocumentCompiler<'a> {
                             local,
                             projection,
                         } if additional_projection.is_empty() && !projection.is_empty() => {
-                            let scope = scope.ok_or_else(|| {
-                                PlanError::new(format!(
-                                    "view binding {} materialization local has no exact row scope",
-                                    binding.id.0
-                                ))
-                            })?;
-                            let target = self.resolve_view_materialization_target(
-                                binding.id.0,
-                                *owner,
-                                *local,
-                                scope,
-                                projection,
-                            )?;
-                            Some(target)
+                            let definition = self
+                                .program
+                                .scope_index
+                                .locals
+                                .iter()
+                                .find(|definition| {
+                                    definition.owner == *owner
+                                        && definition.local == *local
+                                })
+                                .ok_or_else(|| {
+                                    PlanError::new(format!(
+                                        "view binding {} references missing materialization local {}:{}",
+                                        binding.id.0, owner.0, local.0
+                                    ))
+                                })?;
+                            match (scope, definition.row) {
+                                (Some(scope), _) => {
+                                    let target = self.resolve_view_materialization_target(
+                                        binding.id.0,
+                                        *owner,
+                                        *local,
+                                        scope,
+                                        projection,
+                                    )?;
+                                    Some(target)
+                                }
+                                (None, None) => None,
+                                (None, Some(row)) => {
+                                    return Err(PlanError::new(format!(
+                                        "view binding {} `{}`.{} materialization local {}:{} owns stored row {}/{} but has no exact row scope",
+                                        binding.id.0,
+                                        binding.node_kind,
+                                        binding.attr,
+                                        owner.0,
+                                        local.0,
+                                        row.list.0,
+                                        row.scope.0,
+                                    )));
+                                }
+                            }
                         }
                         _ => None,
                     };
                     if let Some(direct) = direct {
                         direct
                     } else {
-                        let expression = self.compile_expression(
-                            read.expression,
-                            &CompileContext::default(),
-                            None,
-                        )?;
-                        let expression = self.project_fields(
-                            binding.id.0,
-                            expression,
-                            additional_projection,
-                            DocumentValueClass::DynamicScalar,
-                        );
+                        let expression =
+                            self.compile_expression(binding.argument_expression, &context, None)?;
                         DocumentBindingTarget::Expression { expression }
                     }
                 }
@@ -2087,7 +2177,7 @@ impl<'a> DocumentCompiler<'a> {
             };
             result.push(DocumentViewBinding {
                 id: DocumentBindingId(binding.id.0),
-                template: None,
+                template,
                 attribute: self.intern_name(&binding.attr),
                 kind: match binding.kind {
                     ir::ViewBindingKind::Data => DocumentBindingKind::Data,

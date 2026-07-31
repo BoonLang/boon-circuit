@@ -5,8 +5,8 @@ store: [
         [name: TEXT { accept }, value: BYTES {}]
     }
 
-    response_result:
-        NotRequested |> HOLD response_result {
+    response_status:
+        NotRequested |> HOLD response_status {
             request |> THEN {
                 Http/request(
                     endpoint: TEXT { catalog }
@@ -18,14 +18,18 @@ store: [
                     connect_timeout_ms: 500
                     overall_timeout_ms: 2000
                 )
+                |> WHEN {
+                    HttpSucceeded => Succeeded
+                    HttpFailed => Failed
+                }
             }
         }
 
     random_result:
         RandomNotRequested |> HOLD random_result {
-            response_result |> THEN {
-                response_result |> WHEN {
-                    HttpSucceeded => Random/bytes(byte_count: 16)
+            response_status |> THEN {
+                response_status |> WHEN {
+                    Succeeded => Random/bytes(byte_count: 16)
                     __ => SKIP
                 }
             }
@@ -35,8 +39,8 @@ store: [
         random_result |> WHEN {
             RandomBytesReady => random_result.bytes |> Bytes/length()
             HostServiceFailed => -2
-            __ => response_result |> WHEN {
-                HttpFailed => -1
+            __ => response_status |> WHEN {
+                Failed => -1
                 __ => 0
             }
         }

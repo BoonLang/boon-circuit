@@ -1043,12 +1043,12 @@ impl crate::DistributedServerMachine for ProgramSession {
             .map_err(distributed_machine_error)
     }
 
-    fn export_current(
+    fn export_if_current(
         &mut self,
         export_id: boon_plan::ExportId,
-    ) -> Result<crate::Value, crate::DistributedRuntimeError> {
+    ) -> Result<Option<crate::Value>, crate::DistributedRuntimeError> {
         self.runtime
-            .distributed_export_value_current(export_id)
+            .distributed_export_value_if_current(export_id)
             .map_err(distributed_machine_error)
     }
 
@@ -1774,12 +1774,12 @@ impl crate::DistributedServerMachine for PersistentProgramSession {
             .map_err(distributed_machine_error)
     }
 
-    fn export_current(
+    fn export_if_current(
         &mut self,
         export_id: boon_plan::ExportId,
-    ) -> Result<crate::Value, crate::DistributedRuntimeError> {
+    ) -> Result<Option<crate::Value>, crate::DistributedRuntimeError> {
         self.runtime
-            .distributed_export_value_current(export_id)
+            .distributed_export_value_if_current(export_id)
             .map_err(distributed_machine_error)
     }
 
@@ -4290,7 +4290,7 @@ outputs: [
 store: [
     request: SOURCE
     response:
-        NotRequested |> HOLD response {
+        0 |> HOLD response {
             store.request |> THEN {
                 Http/request(
                     endpoint: store.request.endpoint
@@ -4302,6 +4302,10 @@ store: [
                     connect_timeout_ms: store.request.connect_timeout_ms
                     overall_timeout_ms: store.request.overall_timeout_ms
                 )
+                |> WHEN {
+                    HttpSucceeded[status] => status
+                    __ => 0
+                }
             }
         }
 ]
@@ -4805,7 +4809,7 @@ document: Document/new(
                             "endpoint".to_owned(),
                             crate::Value::Text("catalog".to_owned()),
                         ),
-                        ("method".to_owned(), crate::Value::Text("Get".to_owned())),
+                        ("method".to_owned(), crate::Value::tag("Get")),
                         ("path_segments".to_owned(), crate::Value::List(Vec::new())),
                         ("query".to_owned(), crate::Value::List(Vec::new())),
                         ("headers".to_owned(), crate::Value::List(Vec::new())),
@@ -4851,7 +4855,7 @@ document: Document/new(
                     "endpoint".to_owned(),
                     crate::Value::Text("catalog".to_owned()),
                 ),
-                ("method".to_owned(), crate::Value::Text("Get".to_owned())),
+                ("method".to_owned(), crate::Value::tag("Get")),
                 ("path_segments".to_owned(), crate::Value::List(Vec::new())),
                 ("query".to_owned(), crate::Value::List(Vec::new())),
                 ("headers".to_owned(), crate::Value::List(Vec::new())),

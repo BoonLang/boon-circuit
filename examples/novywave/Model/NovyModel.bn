@@ -132,7 +132,7 @@ FUNCTION format_signal_value(value, bit_width, format) {
         True => Text/empty()
         False => signal_value_is_special(value: value) |> WHEN {
             True => signal_special_value_label(value: value, format: format)
-            False => signal_numeric_value_label(value: value, bit_width: bit_width, format: format)
+            False => signal_numeric_value_label(signal_text: value, bit_width: bit_width, format: format)
         }
     }
 }
@@ -245,10 +245,10 @@ FUNCTION signal_octal_digits(width) {
     signal_octal_numerator(width: width) / 3
 }
 
-FUNCTION signal_numeric_value_label(value, bit_width, format) {
-    signal_value_number(value: value) |> WHEN {
-        Parsed[value] => signal_numeric_number_label(number: value, width: signal_bit_width(value: value, bit_width: bit_width), format: format)
-        InvalidNumber[reason, position] => signal_value_trimmed(value: value)
+FUNCTION signal_numeric_value_label(signal_text, bit_width, format) {
+    signal_value_number(value: signal_text) |> WHEN {
+        Parsed[value] => signal_numeric_number_label(number: value, width: signal_bit_width(value: signal_text, bit_width: bit_width), format: format)
+        InvalidNumber[reason, position] => signal_value_trimmed(value: signal_text)
     }
 }
 

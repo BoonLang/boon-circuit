@@ -10,7 +10,7 @@ use boon_plan::{
     DistributedEventExportPlan, DistributedEventImportPlan, DistributedFunctionExportPlan,
     DistributedGraphIdentityPlan, DistributedGraphPlan, DistributedInvocationArmPlan,
     DistributedValueExportPlan, DistributedValueImportPlan, ExportId, FieldId, ImportId, ListId,
-    MigrationPredecessorBinding, PlanError, PlanLocalId, PlanOwner, PlanSourceRouteId,
+    MachinePlan, MigrationPredecessorBinding, PlanError, PlanLocalId, PlanOwner, PlanSourceRouteId,
     PlanStaticOwnerId, ProducerFunctionInstancePlan, ProgramRole, RemoteCallSiteId,
     RemoteCallSitePlan, SourceId, SourcePayloadDescriptor, SourcePayloadField, SourcePayloadSchema,
     SourceRoute, TargetProfile, ValueRef, verify_plan,
@@ -353,15 +353,74 @@ fn resolve_distributed_semantic_fixed_point(
         BTreeMap::<[u8; 32], Vec<(ProgramRole, boon_semantic::SemanticCallableId)>>::new();
     let mut call_crossings = DistributedSemanticCallSnapshot::new();
     let mut value_crossings = DistributedSemanticValueSnapshot::new();
+    // The first bundle pass must be able to elaborate effects behind imported
+    // event-shaped values before producer delivery is sealed. Start from every
+    // typed event candidate, then replace that provisional set with the exact
+    // event deliveries proven by the frozen bundle.
+    let mut external_event_identities = roles
+        .into_iter()
+        .map(|role| {
+            let identities = checked
+                .get(&role)
+                .expect("checked program exists for every role")
+                .expressions
+                .iter()
+                .filter_map(|expression| {
+                    let boon_typecheck::CheckedExpressionKind::ExternalRead {
+                        external_identity: Some(identity),
+                        ..
+                    } = &expression.kind
+                    else {
+                        return None;
+                    };
+                    (identity.kind == CheckedExternalDeclarationKind::Value
+                        && matches!(
+                            expression.flow_type.mode,
+                            FlowMode::TickPresent | FlowMode::PresentOrAbsent
+                        ))
+                    .then_some(*identity)
+                })
+                .collect::<BTreeSet<_>>();
+            (role, identities)
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut external_event_identities_are_exact = false;
     let producer_callable_count = checked
         .values()
         .flat_map(|program| &program.callables)
         .filter(|callable| callable.kind == CheckedCallableKind::User)
         .count();
-    let max_rounds = producer_callable_count.saturating_add(1);
+    let external_value_count = checked
+        .values()
+        .flat_map(|program| &program.expressions)
+        .filter_map(|expression| {
+            let boon_typecheck::CheckedExpressionKind::ExternalRead {
+                external_identity: Some(identity),
+                ..
+            } = &expression.kind
+            else {
+                return None;
+            };
+            (identity.kind == CheckedExternalDeclarationKind::Value).then_some(*identity)
+        })
+        .collect::<BTreeSet<_>>()
+        .len();
+    // Producer expansion and event delivery are one semantic closure. A newly
+    // proven event ingress can make another distributed call reachable, while
+    // materializing that call can reveal another event-valued crossing. Each
+    // non-terminal round must therefore add either one producer lineage level
+    // or one sealed external event identity.
+    let max_rounds = producer_callable_count
+        .saturating_add(1)
+        .saturating_mul(external_value_count.saturating_add(1))
+        .saturating_add(1);
 
     for round in 0..max_rounds {
-        let programs = elaborate_distributed_roles(checked, &requests)?;
+        let programs = elaborate_distributed_roles_with_external_events(
+            checked,
+            &requests,
+            &external_event_identities,
+        )?;
         let (next_requests, next_lineages, next_call_crossings, next_value_crossings) =
             derive_distributed_producer_requests(&programs, &producer_lineages)?;
         if next_requests.values().map(BTreeSet::len).sum::<usize>()
@@ -406,7 +465,47 @@ fn resolve_distributed_semantic_fixed_point(
         if next_requests == requests {
             let stable_bundle =
                 boon_semantic::BundleSemanticProgramV1::freeze(semantic_program_array(programs)?)?;
-            let confirmed_programs = elaborate_distributed_roles(checked, &requests)?;
+            let next_external_event_identities =
+                external_event_identities_from_bundle(&stable_bundle)?;
+            if external_event_identities_are_exact {
+                for role in roles {
+                    let current = external_event_identities
+                        .get(&role)
+                        .expect("canonical current external-event set");
+                    let next = next_external_event_identities
+                        .get(&role)
+                        .expect("canonical next external-event set");
+                    if !current.is_subset(next) {
+                        return Err(PlanError::new(format!(
+                            "{} distributed external-event set changed non-monotonically in round {round}",
+                            role.namespace()
+                        ))
+                        .into());
+                    }
+                }
+            }
+            if next_external_event_identities != external_event_identities {
+                external_event_identities = next_external_event_identities;
+                external_event_identities_are_exact = true;
+                // Event-aware reachability can legitimately remove a
+                // provisional call occurrence (for example a distributed call
+                // under a statically false branch). Restart producer closure
+                // from the program roots under the stronger delivery facts;
+                // monotonicity remains mandatory within each event regime.
+                requests = roles
+                    .into_iter()
+                    .map(|role| (role, BTreeSet::new()))
+                    .collect();
+                producer_lineages.clear();
+                call_crossings.clear();
+                value_crossings.clear();
+                continue;
+            }
+            let confirmed_programs = elaborate_distributed_roles_with_external_events(
+                checked,
+                &requests,
+                &external_event_identities,
+            )?;
             let (
                 confirmed_requests,
                 confirmed_lineages,
@@ -444,14 +543,18 @@ fn resolve_distributed_semantic_fixed_point(
         value_crossings = next_value_crossings;
     }
     Err(PlanError::new(format!(
-        "distributed semantic producer closure exceeded its {max_rounds}-round callable bound"
+        "distributed semantic closure exceeded its {max_rounds}-round producer/event bound"
     ))
     .into())
 }
 
-fn elaborate_distributed_roles(
+fn elaborate_distributed_roles_with_external_events(
     checked: &BTreeMap<ProgramRole, CheckedProgram>,
     requests: &BTreeMap<ProgramRole, BTreeSet<boon_semantic::ProducerMaterializationRequest>>,
+    external_event_identities: &BTreeMap<
+        ProgramRole,
+        BTreeSet<CheckedExternalDeclarationIdentityV1>,
+    >,
 ) -> CompilerResult<BTreeMap<ProgramRole, boon_semantic::SemanticProgram>> {
     [
         ProgramRole::Client,
@@ -466,13 +569,58 @@ fn elaborate_distributed_roles(
             .iter()
             .cloned()
             .collect::<Vec<_>>();
-        let semantic = super::elaborate_checked(
+        let role_external_events = external_event_identities
+            .get(&role)
+            .map(BTreeSet::iter)
+            .into_iter()
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>();
+        let semantic = super::elaborate_checked_with_external_event_identities(
             checked.get(&role).expect("checked role authority").clone(),
             &role_requests,
+            &role_external_events,
         )?;
         Ok((role, semantic))
     })
     .collect()
+}
+
+fn external_event_identities_from_bundle(
+    bundle: &boon_semantic::BundleSemanticProgramV1,
+) -> Result<BTreeMap<ProgramRole, BTreeSet<CheckedExternalDeclarationIdentityV1>>, PlanError> {
+    let mut classifications = BTreeMap::<CheckedExternalDeclarationIdentityV1, bool>::new();
+    let mut by_consumer = [
+        ProgramRole::Client,
+        ProgramRole::Session,
+        ProgramRole::Server,
+    ]
+    .into_iter()
+    .map(|role| (role, BTreeSet::new()))
+    .collect::<BTreeMap<_, _>>();
+    for crossing in bundle.value_crossings() {
+        let event_backed = matches!(
+            crossing.delivery,
+            boon_semantic::BundleSemanticValueDeliveryV1::Event { .. }
+                | boon_semantic::BundleSemanticValueDeliveryV1::RelayedEvent { .. }
+        );
+        if let Some(previous) = classifications.insert(crossing.external_identity, event_backed)
+            && previous != event_backed
+        {
+            return Err(PlanError::new(format!(
+                "sealed external declaration {} for {} has conflicting current/event producer deliveries",
+                crossing.external_identity.producer_declaration.0,
+                crossing.external_identity.producer_role.namespace()
+            )));
+        }
+        if event_backed {
+            by_consumer
+                .get_mut(&crossing.consumer_role)
+                .expect("canonical bundle consumer role")
+                .insert(crossing.external_identity);
+        }
+    }
+    Ok(by_consumer)
 }
 
 type DistributedProducerRequestSets =
@@ -1249,9 +1397,19 @@ fn resolve_bundle_external_identities(
             PlanError::new(format!("missing {} interface check", role.namespace()))
         })?;
         if output.report.has_errors() {
+            let diagnostics = output
+                .report
+                .diagnostics
+                .iter()
+                .filter(|diagnostic| {
+                    diagnostic.severity == boon_typecheck::DiagnosticSeverity::Error
+                })
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>()
+                .join("; ");
             return Err(PlanError::new(format!(
-                "{} provisional interface check still contains errors",
-                role.namespace()
+                "{} provisional interface check still contains errors: {diagnostics}",
+                role.namespace(),
             )));
         }
         output.program.as_ref().ok_or_else(|| {
@@ -2796,6 +2954,11 @@ fn validate_distributed_immediate_cycles(
                 continue;
             };
             for input in &op.inputs {
+                if output == input
+                    && distributed_cycle_op_is_canonical_identity(&program.plan, op, output)?
+                {
+                    continue;
+                }
                 edges
                     .entry((*role, output.clone()))
                     .or_default()
@@ -3016,6 +3179,26 @@ fn validate_distributed_immediate_cycles(
         }
     }
     Ok(())
+}
+
+fn distributed_cycle_op_is_canonical_identity(
+    plan: &MachinePlan,
+    op: &boon_plan::PlanOp,
+    output: &ValueRef,
+) -> Result<bool, PlanError> {
+    let boon_plan::PlanOpKind::DerivedValue {
+        derived_kind: boon_plan::PlanDerivedKind::Pure,
+        startup_recompute: false,
+        materialization: None,
+        expression: Some(boon_plan::PlanDerivedExpression::RowExpression { expression }),
+    } = &op.kind
+    else {
+        return Ok(false);
+    };
+    Ok(matches!(
+        plan.row_expressions.node(*expression)?,
+        boon_plan::PlanRowExpressionNode::Field { input } if input == output
+    ))
 }
 
 fn distributed_cycle_from(

@@ -122,6 +122,8 @@ pub struct ErasedProgramFields {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub state_update_arms: Vec<StateUpdateArm>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub host_effect_schedules: Vec<HostEffectSchedule>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub list_mutations: Vec<ListMutation>,
     pub list_projections: Vec<ListProjection>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -838,6 +840,17 @@ pub struct ListMemory {
     pub graph_clones_per_item: usize,
     pub capacity: Option<usize>,
     pub initializer: ListInitializer,
+    /// Exact scalar storage destinations for named fields entering this list's
+    /// row constructor. This includes semantic forwarding such as an
+    /// initializer field `id` that constructs the stored field `key`.
+    /// Resource-only row facades never enter this table.
+    pub initializer_inputs: Vec<ListInitializerInput>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ListInitializerInput {
+    pub name: String,
+    pub field: FieldId,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -950,6 +963,12 @@ pub struct DerivedValue {
     pub producer: ExecutableExprId,
     pub path: String,
     pub kind: DerivedValueKind,
+    /// Exact runtime state whose whole current value backs this derived field.
+    ///
+    /// This identity is emitted by semantic provenance. Backends must not
+    /// recover it from paths or from a context-free fallback HOLD expression.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_backing: Option<StateId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub materialized_list_id: Option<ListId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -993,6 +1012,25 @@ pub struct StateUpdateArm {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<StaticOwnerId>,
     pub output_expression_id: ExecutableExprId,
+}
+
+/// Exact verified owner for one typed host-effect occurrence.
+///
+/// Retained effects target ordinary state-update arms. Direct asynchronous
+/// expressions target one compiler-owned transient derived-value lane instead;
+/// that lane is runtime-only and never becomes HOLD or persistence authority.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct HostEffectSchedule {
+    pub id: usize,
+    pub expression: ExecutableExprId,
+    pub checked_expression: boon_typecheck::CheckedExprId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<StaticOwnerId>,
+    pub operation: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub state_update_arms: Vec<StateUpdateArm>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transient_result: Option<usize>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1399,6 +1437,8 @@ pub enum ExecutableExpressionKind {
         owner: StaticOwnerId,
         local: MaterializationLocalId,
         projection: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        constructor_projection: Vec<String>,
     },
     FunctionParameter {
         parameter: ExecutableParameterId,
@@ -1980,6 +2020,13 @@ pub enum ListMutationKind {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ViewBinding {
     pub id: ViewBindingId,
+    /// Exact executable retained-view constructor that owns this binding.
+    /// Backends must not rediscover the node from diagnostic kind/path text.
+    pub node_expression: ExecutableExprId,
+    /// Exact executable constructor argument whose dependency produced this
+    /// binding. Backends use it when the dependency is not itself the complete
+    /// bound value (for example, a read inside BLOCK, WHEN, or List/find).
+    pub argument_expression: ExecutableExprId,
     pub node_kind: String,
     pub attr: String,
     pub path: String,
@@ -2030,12 +2077,10 @@ pub fn erase_and_lower_bundle(
     verified: boon_verify::ContractVerifiedBundle,
 ) -> Result<ErasedBundle, String> {
     let (semantic_bundle, role_verifications, bundle_manifest) = verified.into_lowering_parts();
-    semantic_bundle
-        .validate()
-        .map_err(|error| error.to_string())?;
-    bundle_manifest
-        .validate()
-        .map_err(|error| error.to_string())?;
+    // ContractVerifiedBundle is a non-forgeable ownership token constructed
+    // only after the semantic bundle and every verification manifest validate.
+    // Keep the exact digest joins below without repeating those full graph
+    // traversals after ownership has transferred.
     if semantic_bundle.digest() != bundle_manifest.bundle_semantic_program_digest {
         return Err("verified bundle semantic digest differs from its bundle manifest".to_owned());
     }
@@ -2061,7 +2106,6 @@ pub fn erase_and_lower_bundle(
                 role.namespace()
             )
         })?;
-        manifest.validate().map_err(|error| error.to_string())?;
         if manifest.requirements.semantic_program_digest != semantic.digest() {
             return Err(format!(
                 "verified {} role manifest does not match its semantic program",
@@ -2111,10 +2155,10 @@ fn erase_semantic_program(
     semantic: boon_semantic::SemanticProgram,
     verification_manifest: boon_verify::VerificationManifestV1,
 ) -> Result<(ErasedProgram, semantic_mapping::SemanticToExecutableMap), String> {
-    semantic.validate().map_err(|error| error.to_string())?;
-    verification_manifest
-        .validate()
-        .map_err(|error| error.to_string())?;
+    // The private ContractVerifiedProgram constructor has already validated
+    // both artifacts. The digest join is retained as the erasure boundary's
+    // exact ownership check; rescanning the same immutable semantic graph here
+    // would not add a new trust boundary.
     if verification_manifest.requirements.semantic_program_digest != semantic.digest() {
         return Err(
             "verification manifest semantic digest differs from its semantic program".to_owned(),
@@ -2307,7 +2351,11 @@ fn lower_verified_semantic_execution(
     ),
     String,
 > {
-    let mapped = semantic_mapping::map_semantic_execution(&execution_graph, &resource_graph)?;
+    let mapped = semantic_mapping::map_semantic_execution_with_reactive(
+        &execution_graph,
+        &resource_graph,
+        &reactive_graph,
+    )?;
     mapped.validate_totality()?;
     let ids = mapped.id_map.clone();
     let resources = semantic_mapping::map_semantic_resources(
@@ -2500,6 +2548,7 @@ fn validate_erased_bundle_role_crossings(
         if matches!(
             crossing.delivery,
             boon_semantic::BundleSemanticValueDeliveryV1::Event { .. }
+                | boon_semantic::BundleSemanticValueDeliveryV1::RelayedEvent { .. }
         ) {
             ensure_erased_distributed_ingress_source(
                 program,
@@ -2789,9 +2838,12 @@ fn verify_erased_scope_index(program: &ErasedProgram) -> Result<(), String> {
                                 member.path.join(".")
                             )
                         })?;
-                    match member.forwarded_from.as_ref() {
+                    let forwarded_path = match member.forwarded_from.as_ref() {
                         Some(ErasedLocalMemberForwarding::Row { row, path })
-                            if Some(*row) == local.row && *path == member.path => {}
+                            if Some(*row) == local.row =>
+                        {
+                            path
+                        }
                         None => {
                             return Err(format!(
                                 "owner {} local {} scalar member `{}` has no exact row forwarding",
@@ -2816,16 +2868,17 @@ fn verify_erased_scope_index(program: &ErasedProgram) -> Result<(), String> {
                                 member.path.join(".")
                             ));
                         }
-                    }
+                    };
                     if field.row != local.row
-                        || member.path != field.row_path
-                        || member.path.last() != Some(&field.name)
+                        || *forwarded_path != field.row_path
+                        || forwarded_path.last() != Some(&field.name)
                     {
                         return Err(format!(
-                            "owner {} local {} member `{}` is inconsistent with FieldId {}",
+                            "owner {} local {} member `{}` forwarded as `{}` is inconsistent with FieldId {}",
                             local.owner,
                             local.local.0,
                             member.path.join("."),
+                            forwarded_path.join("."),
                             field.id
                         ));
                     }
@@ -3250,6 +3303,9 @@ fn verify_erased_scope_index(program: &ErasedProgram) -> Result<(), String> {
         let Some(declaration) = statement.declaration else {
             continue;
         };
+        if direct_list_alias_target(&program.executable, statement).is_some() {
+            continue;
+        }
         let Some(flow_type) = &statement.flow_type else {
             return Err(format!(
                 "executable declaration {} statement {} has no final checked type",
@@ -3278,9 +3334,23 @@ fn verify_erased_scope_index(program: &ErasedProgram) -> Result<(), String> {
             })
             .count();
         if matches != 1 {
+            let candidate_bindings = program
+                .scope_index
+                .bindings
+                .iter()
+                .filter(|binding| binding.declaration == declaration)
+                .map(|binding| {
+                    format!(
+                        "{} producer {} path `{}` target {:?}",
+                        binding.id, binding.producer, binding.diagnostic_path, binding.target
+                    )
+                })
+                .collect::<Vec<_>>();
             return Err(format!(
-                "typed list declaration {} must have one ListId storage binding, found {matches}",
-                declaration.0
+                "typed list declaration {} at statement {} ({:?}, value {:?}) must have one \
+                 ListId storage binding, found {matches}; declaration bindings: \
+                 {candidate_bindings:?}",
+                declaration.0, statement.id, statement.kind, statement.value
             ));
         }
     }
@@ -3525,12 +3595,17 @@ fn verify_erased_scope_index(program: &ErasedProgram) -> Result<(), String> {
             ));
         }
         if row_value.projection.iter().any(String::is_empty)
-            || !row_value_keys.insert((row_value.expression, row_value.projection.clone()))
+            || !row_value_keys.insert((
+                row_value.expression,
+                row_value.projection.clone(),
+                row_value.row,
+            ))
         {
             return Err(format!(
-                "erased row value expression {} has an empty or duplicate projection `{}`",
+                "erased row value expression {} has an empty projection or duplicate row identity `{}` at {:?}",
                 row_value.expression,
-                row_value.projection.join(".")
+                row_value.projection.join("."),
+                row_value.row,
             ));
         }
         verify_erased_row(
@@ -3814,6 +3889,74 @@ pub fn verify_hidden_identity(program: &ErasedProgram) -> Result<(), String> {
     Ok(())
 }
 
+fn verify_list_initializer_inputs(
+    program: &ErasedProgram,
+    list: &ListMemory,
+) -> Result<(), String> {
+    let row = list.row_scope_id.map(|scope| ErasedRowBinding {
+        list: list.id,
+        scope,
+    });
+    let mut previous_name: Option<&str> = None;
+    let mut inputs = BTreeMap::new();
+    for input in &list.initializer_inputs {
+        if input.name.is_empty()
+            || previous_name.is_some_and(|previous| previous >= input.name.as_str())
+        {
+            return Err(format!(
+                "list `{}` initializer inputs are empty, duplicated, or not canonically ordered at `{}`",
+                list.name, input.name
+            ));
+        }
+        previous_name = Some(&input.name);
+        let field = program
+            .scope_index
+            .fields
+            .get(input.field.as_usize())
+            .filter(|field| field.id == input.field)
+            .ok_or_else(|| {
+                format!(
+                    "list `{}` initializer input `{}` references missing FieldId {}",
+                    list.name, input.name, input.field
+                )
+            })?;
+        if field.row != row || row.is_none() {
+            return Err(format!(
+                "list `{}` initializer input `{}` FieldId {} does not belong to its exact row",
+                list.name, input.name, input.field
+            ));
+        }
+        inputs.insert(input.name.as_str(), input.field);
+    }
+
+    let ListInitializer::RecordLiteral { rows } = &list.initializer else {
+        return Ok(());
+    };
+    for initial_row in rows {
+        for field in &initial_row.fields {
+            if field.value == InitialValue::ResourceOnly {
+                continue;
+            }
+            if !inputs.contains_key(field.name.as_str()) {
+                return Err(format!(
+                    "list `{}` initial field `{}` has no verified initializer FieldId",
+                    list.name, field.name
+                ));
+            }
+            if let InitialValue::RowInitialField { path } = &field.value {
+                let source = path.split('.').next().filter(|name| !name.is_empty());
+                if source.is_none_or(|source| !inputs.contains_key(source)) {
+                    return Err(format!(
+                        "list `{}` initial field `{}` references row initializer `{path}` without an exact FieldId",
+                        list.name, field.name
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn verify_static_schedule(program: &ErasedProgram) -> Result<(), String> {
     if !program.static_schedule_verified {
         return Err("static schedule verification did not run".to_owned());
@@ -3902,6 +4045,7 @@ pub fn verify_static_schedule(program: &ErasedProgram) -> Result<(), String> {
                 list.name, list.row_scope_id
             ));
         }
+        verify_list_initializer_inputs(program, list)?;
     }
     let derived_paths = unique_strings(
         "derived value",
@@ -4068,6 +4212,34 @@ pub fn verify_static_schedule(program: &ErasedProgram) -> Result<(), String> {
             return Err(format!(
                 "view binding `{}.{}` has ViewBindingId {}, expected {index}",
                 binding.node_kind, binding.attr, binding.id
+            ));
+        }
+        let node_expression = program
+            .executable
+            .expressions
+            .get(binding.node_expression.as_usize())
+            .filter(|candidate| candidate.id == binding.node_expression)
+            .ok_or_else(|| {
+                format!(
+                    "view binding `{}.{}` references missing retained-view node expression {}",
+                    binding.node_kind, binding.attr, binding.node_expression
+                )
+            })?;
+        if !matches!(&node_expression.kind, ExecutableExpressionKind::Call { .. }) {
+            return Err(format!(
+                "view binding `{}.{}` node expression {} is not an exact constructor call",
+                binding.node_kind, binding.attr, binding.node_expression
+            ));
+        }
+        if program
+            .executable
+            .expressions
+            .get(binding.argument_expression.as_usize())
+            .is_none_or(|candidate| candidate.id != binding.argument_expression)
+        {
+            return Err(format!(
+                "view binding `{}.{}` references missing constructor argument expression {}",
+                binding.node_kind, binding.attr, binding.argument_expression
             ));
         }
         if let Some(scope_id) = binding.scope_id
@@ -4600,6 +4772,12 @@ fn verify_runtime_executable_types(program: &ErasedProgram) -> Result<(), String
             .iter()
             .map(|output| output.value_expression_id),
     );
+    pending.extend(
+        program
+            .view_bindings
+            .iter()
+            .map(|binding| binding.node_expression),
+    );
     pending.extend(program.view_bindings.iter().filter_map(|binding| {
         match &binding.target {
             ViewBindingTarget::Read { read, .. } => program
@@ -4639,11 +4817,48 @@ fn verify_runtime_executable_types(program: &ErasedProgram) -> Result<(), String
                 format!(
                     "runtime type verification reaches missing executable expression {expression_id}"
                 )
-            })?;
+        })?;
         if runtime_type_contains_var(&expression.flow_type.ty) {
+            let statements = program
+                .executable
+                .statements
+                .iter()
+                .filter(|statement| statement.value == Some(expression_id))
+                .map(|statement| {
+                    (
+                        statement.id,
+                        statement.declaration,
+                        statement.kind.clone(),
+                        statement.flow_type.clone(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let parents = program
+                .executable
+                .expressions
+                .iter()
+                .filter(|candidate| {
+                    executable_expression_children(&candidate.kind).contains(&expression_id)
+                })
+                .map(|candidate| {
+                    (
+                        candidate.id,
+                        candidate.checked_expr_id,
+                        candidate.flow_type.clone(),
+                        candidate.kind.clone(),
+                    )
+                })
+                .collect::<Vec<_>>();
             return Err(format!(
-                "runtime executable expression {expression_id} has unresolved type {:?}",
-                expression.flow_type.ty
+                "runtime executable expression {expression_id} checked {:?} has unresolved type \
+                 {:?}; kind {:?}; owner {:?}; resource path {:?}; provenance {:?}; direct \
+                 statements {statements:?}; parent expressions {parents:?}",
+                expression.checked_expr_id,
+                expression.flow_type.ty,
+                expression.kind,
+                expression.owner,
+                expression.resource_binding_path,
+                expression.provenance
             ));
         }
         pending.extend(executable_expression_children(&expression.kind));
@@ -5246,6 +5461,9 @@ fn verify_identity_clean_identifiers(program: &ErasedProgram) -> Result<(), Stri
     for list in &program.lists {
         reject_hidden_identity_identifier("list", &list.name)?;
         reject_list_initializer_identity(&list.initializer)?;
+        for input in &list.initializer_inputs {
+            reject_hidden_identity_identifier("list initializer input", &input.name)?;
+        }
     }
     for value in &program.derived_values {
         reject_hidden_identity_identifier("derived value", &value.path)?;
@@ -5548,6 +5766,47 @@ selected_ids: LIST { selected }
                 && value.materialized_list_id.is_none()
                 && value.kind == DerivedValueKind::Pure
         }));
+    }
+
+    #[test]
+    fn direct_record_list_alias_reuses_the_target_authority_without_new_keyed_storage() {
+        let parsed = boon_parser::parse_source(
+            "typed-record-list-alias.bn",
+            r#"
+store: [
+    rows: LIST {
+        [id: TEXT { a }]
+        [id: TEXT { b }]
+    }
+    selected_rows:
+        rows
+        |> List/filter(item, if: item.id == TEXT { a })
+    selected_signals: selected_rows
+]
+"#,
+        )
+        .unwrap();
+        let ir = lower(&parsed).expect("a direct record-list alias must reuse target authority");
+
+        storage_for(&ir, "store.selected_rows");
+        let alias = ir
+            .scope_index
+            .bindings
+            .iter()
+            .find(|binding| binding.diagnostic_path == "store.selected_signals")
+            .expect("direct alias binding");
+        assert!(matches!(
+            alias.target,
+            ErasedBindingTarget::Value {
+                field: Some(_),
+                row: None,
+            }
+        ));
+        assert!(
+            ir.lists
+                .iter()
+                .all(|list| list.name != "store.selected_signals")
+        );
     }
 
     #[test]

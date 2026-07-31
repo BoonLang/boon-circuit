@@ -1582,8 +1582,8 @@ fn unscoped_source_updates_every_row_owned_by_indexed_state() {
             input: current,
             arms: vec![
                 PlanRowSelectArm {
-                    pattern: PlanRowSelectPattern::Text {
-                        value: "Hexadecimal".to_owned(),
+                    pattern: PlanRowSelectPattern::Tag {
+                        name: "Hexadecimal".to_owned(),
                     },
                     value: binary,
                 },
@@ -2192,9 +2192,9 @@ document: Document/new(
         .iter()
         .find(|slot| slot.list_id == selected)
         .and_then(|slot| {
-            slot.row_fields.iter().find(|field| {
-                field.name == "format_label" && field.role == PlanListRowFieldRole::Value
-            })
+            slot.row_fields
+                .iter()
+                .find(|field| field.name == "format_label" && field.role.is_value())
         })
         .map(|field| field.field_id)
         .expect("selected format_label field");
@@ -2215,9 +2215,9 @@ document: Document/new(
         .iter()
         .find(|slot| slot.list_id == visible)
         .and_then(|slot| {
-            slot.row_fields.iter().find(|field| {
-                field.name == "format_label" && field.role == PlanListRowFieldRole::Value
-            })
+            slot.row_fields
+                .iter()
+                .find(|field| field.name == "format_label" && field.role.is_value())
         })
         .map(|field| field.field_id)
         .expect("visible format_label field");
@@ -2470,13 +2470,16 @@ document: Document/new(
     let sheet_rows = list_id(&compiled.plan, "store.sheet_rows");
     let items_field = compiled
         .plan
-        .debug_map
-        .fields
+        .storage_layout
+        .list_slots
         .iter()
-        .find(|entry| entry.label == "store.sheet_rows.items")
-        .and_then(|entry| entry.id.strip_prefix("field:"))
-        .and_then(|id| id.parse::<usize>().ok())
-        .map(FieldId)
+        .find(|slot| slot.list_id == sheet_rows)
+        .and_then(|slot| {
+            slot.row_fields
+                .iter()
+                .find(|field| field.name == "items" && field.role.is_value())
+        })
+        .map(|field| field.field_id)
         .expect("chunk items field");
     let mut session = MachineInstance::new(compiled.plan, SessionOptions::default()).unwrap();
 
@@ -8739,19 +8742,17 @@ store: [
             }
         }
     response:
-        NotRequested |> HOLD response {
-            request |> THEN {
-                Http/request(
-                    endpoint: request.endpoint
-                    method: request.method
-                    path_segments: request.path_segments
-                    query: request.query
-                    headers: request.headers
-                    body: request.body
-                    connect_timeout_ms: request.connect_timeout_ms
-                    overall_timeout_ms: request.overall_timeout_ms
-                )
-            }
+        request |> THEN {
+            Http/request(
+                endpoint: request.endpoint
+                method: request.method
+                path_segments: request.path_segments
+                query: request.query
+                headers: request.headers
+                body: request.body
+                connect_timeout_ms: request.connect_timeout_ms
+                overall_timeout_ms: request.overall_timeout_ms
+            )
         }
     visible_headers:
         response |> WHEN {
@@ -9349,6 +9350,432 @@ store: [
 }
 
 #[test]
+fn multiline_select_arm_pipeline_does_not_replace_its_sibling() {
+    let compiled = compile_server_source(
+        "multiline-select-arm-pipeline.bn",
+        r#"
+store: [
+    request_window: TEXT { no request window }
+    page_window:
+        request_window == TEXT { no request window } |> WHEN {
+            True => TEXT { no page window scheduled }
+            False =>
+                TEXT { window }
+                |> Text/concat(with: request_window, separator: " ")
+        }
+]
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    let mut session = MachineInstance::new(compiled.plan, SessionOptions::default()).unwrap();
+
+    assert_eq!(
+        session.root_value_current("store.page_window").unwrap(),
+        Value::Text("no page window scheduled".to_owned())
+    );
+}
+
+#[test]
+fn find_with_inactive_latest_key_remains_privately_absent() {
+    let compiled = compile_server_source(
+        "inactive-find-key.bn",
+        r#"
+FUNCTION new_row(input) {
+    [
+        controls: [select: SOURCE]
+        key: input.key
+    ]
+}
+
+store: [
+    seed: LIST {
+        [key: TEXT { first }]
+    }
+    rows:
+        seed
+        |> List/map(item, new:
+            new_row(input: item)
+        )
+    selected_key:
+        rows
+        |> List/map(item, new:
+            item.controls.select |> THEN { item.key }
+        )
+        |> List/latest()
+    selected_record:
+        rows
+        |> List/find(item, if: item.key == selected_key)
+    selected_record_scanned:
+        rows
+        |> List/find(item, if:
+            item.key |> Text/contains(needle: selected_key)
+        )
+]
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    let scanned_field = field_id(&compiled.plan, "store.selected_record_scanned");
+    let scanned_expression = compiled
+        .plan
+        .regions
+        .iter()
+        .flat_map(|region| &region.ops)
+        .find_map(|op| {
+            (op.output.as_ref() == Some(&ValueRef::Field(scanned_field)))
+                .then(|| match &op.kind {
+                    PlanOpKind::DerivedValue {
+                        expression: Some(PlanDerivedExpression::RowExpression { expression }),
+                        ..
+                    } => Some(*expression),
+                    _ => None,
+                })
+                .flatten()
+        })
+        .expect("scanned find has a derived row expression");
+    assert!(matches!(
+        compiled.plan.row_expression(scanned_expression).unwrap(),
+        PlanRowExpressionNode::ContextualCollection {
+            indexed_access: None,
+            ..
+        }
+    ));
+    let route = compiled
+        .plan
+        .source_routes
+        .iter()
+        .find(|route| route.path == "store.rows.controls.select")
+        .expect("mapped row exposes select");
+    let source = route.source_id;
+    let scope = route.scope_id.expect("mapped row source has a list scope");
+    let list = compiled
+        .plan
+        .storage_layout
+        .list_slots
+        .iter()
+        .find(|slot| slot.scope_id == Some(scope))
+        .expect("mapped row source scope has list storage")
+        .list_id;
+    let mut session = MachineInstance::new(compiled.plan, SessionOptions::default()).unwrap();
+
+    for path in ["store.selected_record", "store.selected_record_scanned"] {
+        let inactive = session
+            .root_value_current(path)
+            .expect_err("an inactive find key must keep the result privately absent");
+        assert!(
+            inactive.to_string().contains("privately absent"),
+            "{path}: {inactive}"
+        );
+    }
+
+    let row = session.list_rows_current(list).unwrap()[0];
+    session
+        .apply(SourceEvent {
+            sequence: 1,
+            source,
+            route: route_token(&session, source, Some(row)),
+            target: Some(row),
+            payload: SourcePayload::default(),
+        })
+        .unwrap();
+    let found = Value::tagged(
+        "Found",
+        BTreeMap::from([(
+            "value".to_owned(),
+            Value::Row {
+                id: row,
+                fields: BTreeMap::new(),
+            },
+        )]),
+    );
+    for path in ["store.selected_record", "store.selected_record_scanned"] {
+        assert_eq!(session.root_value_current(path).unwrap(), found, "{path}");
+    }
+}
+
+#[test]
+fn list_membership_change_keeps_inactive_row_event_projection_privately_absent() {
+    let compiled = compile_server_source(
+        "inactive-row-event-after-membership-change.bn",
+        r#"
+FUNCTION new_row(item) {
+    [
+        controls: [select: SOURCE]
+        label: item.label
+    ]
+}
+
+store: [
+    clear: SOURCE
+    active_label:
+        TEXT { First } |> HOLD active_label {
+            clear |> THEN { TEXT { none } }
+        }
+    rows:
+        LIST {
+            [label: TEXT { First }]
+        }
+        |> List/map(item, new: new_row(item: item))
+    visible_rows:
+        rows
+        |> List/filter(item, if: item.label == active_label)
+    row_selected:
+        visible_rows
+        |> List/map(item, new:
+            item.controls.select.event.press |> THEN { item.label }
+        )
+        |> List/latest()
+]
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    let clear = source_id(&compiled.plan, "store.clear");
+    let mut session = MachineInstance::new(compiled.plan, SessionOptions::default()).unwrap();
+
+    for context in ["before", "after"] {
+        let inactive = session
+            .root_value_current("store.row_selected")
+            .expect_err("inactive row event projection must remain private");
+        assert!(
+            inactive.to_string().contains("privately absent"),
+            "{context} membership change: {inactive}"
+        );
+        if context == "before" {
+            session
+                .apply(SourceEvent {
+                    sequence: 1,
+                    source: clear,
+                    route: route_token(&session, clear, None),
+                    target: None,
+                    payload: SourcePayload::default(),
+                })
+                .unwrap();
+        }
+    }
+}
+
+#[test]
+fn root_state_transition_fans_out_indexed_row_updates() {
+    let compiled = compile_server_source(
+        "root-state-indexed-row-update.bn",
+        r#"
+FUNCTION new_row(input) {
+    [
+        key: input.key
+        selected:
+            False |> HOLD selected {
+                store.reset |> WHEN {
+                    True => input.initial
+                    False => SKIP
+                }
+            }
+    ]
+}
+
+store: [
+    reset_event: SOURCE
+    reset:
+        False |> HOLD reset {
+            reset_event |> THEN { True }
+        }
+    seed: LIST {
+        [key: TEXT { first }, initial: True]
+        [key: TEXT { second }, initial: True]
+    }
+    rows:
+        seed
+        |> List/map(item, new:
+            new_row(input: item)
+        )
+    selected_values:
+        rows
+        |> List/map(item, new: item.selected)
+]
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    let reset = source_id(&compiled.plan, "store.reset_event");
+    let mut session = MachineInstance::new(compiled.plan, SessionOptions::default()).unwrap();
+    assert_eq!(
+        session.root_value_current("store.selected_values").unwrap(),
+        Value::List(vec![Value::truth(false), Value::truth(false)])
+    );
+
+    session
+        .apply(SourceEvent {
+            sequence: 1,
+            source: reset,
+            route: route_token(&session, reset, None),
+            target: None,
+            payload: SourcePayload::default(),
+        })
+        .unwrap();
+    assert_eq!(
+        session.root_value_current("store.selected_values").unwrap(),
+        Value::List(vec![Value::truth(true), Value::truth(true)])
+    );
+}
+
+#[test]
+fn indexed_access_flush_waits_for_its_derived_source_list_to_publish() {
+    let compiled = compile_server_source(
+        "derived-list-index-publication-order.bn",
+        r#"
+store: [
+    load: SOURCE
+    hierarchy_result:
+        LATEST {
+            NotStarted
+            load |> THEN {
+                Wellen/hierarchy_page(
+                    artifact: load.artifact
+                    request_fingerprint: TEXT { hierarchy }
+                    offset: 0
+                    limit: 8
+                )
+            }
+        }
+    rows:
+        hierarchy_result |> WHEN {
+            HierarchyPage =>
+                hierarchy_result.rows
+                |> List/filter(item, if: item.kind == TEXT { Signal })
+            __ => LIST {}
+        }
+    selected_name:
+        rows
+        |> List/find(item, if: item.id == TEXT { signal:first })
+        |> WHEN {
+            Found[value] => value.name
+            NotFound => TEXT { missing }
+        }
+    catalog_label:
+        TEXT { empty } |> HOLD catalog_label {
+            hierarchy_result |> WHEN {
+                HierarchyPage =>
+                    rows
+                    |> List/map(item, new: item.name)
+                    |> Text/join(separator: TEXT { , }, empty: TEXT { empty })
+                __ => SKIP
+            }
+        }
+]
+"#,
+        TargetProfile::SoftwareDefault,
+    )
+    .unwrap();
+    let load = source_id(&compiled.plan, "store.load");
+    let mut session = MachineInstance::new(compiled.plan, SessionOptions::default()).unwrap();
+    let artifact = |seed: u8| {
+        Value::Record(BTreeMap::from([
+            (
+                "content".to_owned(),
+                Value::Record(BTreeMap::from([
+                    ("digest".to_owned(), Value::Bytes(vec![seed; 32].into())),
+                    (
+                        "media".to_owned(),
+                        Value::Text("application/vnd.boon.waveform/vcd".to_owned()),
+                    ),
+                    ("size".to_owned(), number(1)),
+                ])),
+            ),
+            ("format".to_owned(), Value::Text("VCD".to_owned())),
+            ("parser_version".to_owned(), Value::Text("test".to_owned())),
+            (
+                "schema_version".to_owned(),
+                Value::Text("wellen.v1".to_owned()),
+            ),
+        ]))
+    };
+    let hierarchy_outcome = |artifact: Value, signal_id: &str, name: &str| {
+        let signal_row = Value::Record(BTreeMap::from([
+            ("kind".to_owned(), Value::Text("Signal".to_owned())),
+            ("id".to_owned(), Value::Text(format!("signal:{signal_id}"))),
+            ("parent_id".to_owned(), Value::Text("scope:top".to_owned())),
+            ("name".to_owned(), Value::Text(name.to_owned())),
+            ("full_name".to_owned(), Value::Text(format!("top.{name}"))),
+            ("signal_id".to_owned(), Value::Text(signal_id.to_owned())),
+            ("width".to_owned(), number(1)),
+            ("encoding".to_owned(), Value::Text("Bits".to_owned())),
+        ]));
+        file_stream_outcome(
+            "HierarchyPage",
+            [
+                ("artifact", artifact),
+                ("request_fingerprint", Value::Text("hierarchy".to_owned())),
+                ("start_time", number(0)),
+                ("end_time", number(10)),
+                ("offset", number(0)),
+                ("has_more", Value::truth(false)),
+                ("next_offset", number(1)),
+                ("total_rows", number(1)),
+                (
+                    "signal_ids",
+                    Value::List(vec![Value::Text(signal_id.to_owned())]),
+                ),
+                ("rows", Value::List(vec![signal_row])),
+            ],
+        )
+    };
+    let start_load = |session: &mut MachineInstance, sequence, artifact: Value| {
+        session
+            .apply(SourceEvent {
+                sequence,
+                source: load,
+                route: route_token(session, load, None),
+                target: None,
+                payload: SourcePayload {
+                    fields: BTreeMap::from([("artifact".to_owned(), artifact)]),
+                    ..SourcePayload::default()
+                },
+            })
+            .unwrap()
+            .transient_effects
+            .remove(0)
+    };
+
+    let first_artifact = artifact(1);
+    let first_call = start_load(&mut session, 1, first_artifact.clone());
+    session
+        .complete_transient_effect(
+            first_call.call_id,
+            hierarchy_outcome(first_artifact, "first", "Alpha"),
+        )
+        .unwrap();
+    assert_eq!(
+        session.root_value_current("store.catalog_label").unwrap(),
+        Value::Text("Alpha".to_owned())
+    );
+    assert_eq!(
+        session.root_value_current("store.selected_name").unwrap(),
+        Value::Text("Alpha".to_owned()),
+        "the first access must establish an indexed dynamic dependency"
+    );
+
+    let second_artifact = artifact(2);
+    let second_call = start_load(&mut session, 2, second_artifact.clone());
+    session
+        .complete_transient_effect(
+            second_call.call_id,
+            hierarchy_outcome(second_artifact, "second", "Beta"),
+        )
+        .expect("the derived list must publish before its dirty index is flushed");
+
+    assert_eq!(
+        session.root_value_current("store.catalog_label").unwrap(),
+        Value::Text("Beta".to_owned())
+    );
+    assert_eq!(
+        session.root_value_current("store.selected_name").unwrap(),
+        Value::Text("missing".to_owned()),
+        "the deferred index publication must still invalidate its subscriber"
+    );
+}
+
+#[test]
 fn value_when_over_a_held_effect_result_tracks_continuous_branch_dependencies() {
     let compiled = compile_server_source(
         "held-effect-result-value-when.bn",
@@ -9611,15 +10038,13 @@ store: [
     load: SOURCE
     repeat: SOURCE
     hierarchy_result:
-        NotStarted |> HOLD hierarchy_result {
-            load |> THEN {
-                Wellen/hierarchy_page(
-                    artifact: load.artifact
-                    request_fingerprint: TEXT { hierarchy }
-                    offset: 0
-                    limit: 8
-                )
-            }
+        load |> THEN {
+            Wellen/hierarchy_page(
+                artifact: load.artifact
+                request_fingerprint: TEXT { hierarchy }
+                offset: 0
+                limit: 8
+            )
         }
     first_signal:
         hierarchy_result |> WHEN {
@@ -9673,23 +10098,21 @@ store: [
             repeat |> THEN { signal_request_fingerprint }
         }
     signal_result:
-        NotStarted |> HOLD signal_result {
-            signal_request |> THEN {
-                hierarchy_result |> WHEN {
-                    HierarchyPage => signal_ids |> List/is_not_empty() |> WHEN {
-                        True => Wellen/signal_page(
-                            artifact: hierarchy_result.artifact
-                            request_fingerprint: signal_request_fingerprint
-                            signal_ids: signal_ids
-                            start_time: 0
-                            end_time: 10
-                            offset: 0
-                            max_transitions: 8
-                        )
-                        False => SKIP
-                    }
-                    __ => SKIP
+        signal_request |> THEN {
+            hierarchy_result |> WHEN {
+                HierarchyPage => signal_ids |> List/is_not_empty() |> WHEN {
+                    True => Wellen/signal_page(
+                        artifact: hierarchy_result.artifact
+                        request_fingerprint: signal_request_fingerprint
+                        signal_ids: signal_ids
+                        start_time: 0
+                        end_time: 10
+                        offset: 0
+                        max_transitions: 8
+                    )
+                    False => SKIP
                 }
+                __ => SKIP
             }
         }
     active_signal:
@@ -11114,7 +11537,7 @@ FUNCTION new_row(row) {
         .unwrap();
     assert_eq!(
         session.root_value_current("store.mode").unwrap(),
-        Value::Text("Active".to_owned())
+        Value::tag("Active")
     );
     assert_eq!(
         selected.transient_effects.len(),
@@ -11826,7 +12249,7 @@ fn correlated_effect_completion_routes_each_registration_variant_with_typed_fiel
         let snapshot = session.snapshot().unwrap();
         assert_eq!(
             snapshot.states[&state_id(&machine, "store.last_result")],
-            Value::Text(expected_tag.to_owned())
+            Value::tag(expected_tag)
         );
         if let Some((label, expected)) = typed_field {
             assert_eq!(snapshot.states[&state_id(&machine, label)], expected);
@@ -14412,14 +14835,21 @@ FUNCTION double(value) {
     .unwrap();
 
     for (instance, value) in [(first_outer, 3), (second_outer, 4)] {
-        let initial = session.evaluate_distributed_function_instance(
-            outer_call.call_site_id,
-            instance,
-            outer_call.function_export_id,
-            1,
-            BTreeMap::from([(outer_argument, number(value))]),
+        let (initial, turn) = session
+            .activate_distributed_current_function_instance_unsettled(
+                outer_call.call_site_id,
+                instance,
+                outer_call.function_export_id,
+                1,
+                BTreeMap::from([(outer_argument, number(value))]),
+            )
+            .unwrap();
+        assert_eq!(initial, None);
+        assert!(
+            turn.is_some(),
+            "pending Current activation must retain its demand"
         );
-        assert!(initial.is_err());
+        session.settle_turn();
     }
 
     let nested = session

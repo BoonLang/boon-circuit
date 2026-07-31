@@ -6,7 +6,6 @@ mod dev;
 mod dev_state;
 mod distributed_program;
 mod frame;
-mod language;
 mod map_host;
 #[cfg(target_os = "linux")]
 mod native_input;

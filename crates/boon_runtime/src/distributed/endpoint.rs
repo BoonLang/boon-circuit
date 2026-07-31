@@ -36,7 +36,7 @@ struct SentCurrentCall {
 struct AcceptedCurrentCall {
     demand_revision: u64,
     result_revision: u64,
-    value: DataValue,
+    value: Option<DataValue>,
 }
 
 pub(super) struct EndpointMachine {
@@ -193,12 +193,12 @@ impl EndpointMachine {
             .map_err(runtime_error)
     }
 
-    pub(super) fn export_current(
+    pub(super) fn export_if_current(
         &mut self,
         export_id: ExportId,
-    ) -> Result<Value, DistributedRuntimeError> {
+    ) -> Result<Option<Value>, DistributedRuntimeError> {
         self.runtime
-            .distributed_export_value_current(export_id)
+            .distributed_export_value_if_current(export_id)
             .map_err(runtime_error)
     }
 
@@ -211,13 +211,13 @@ impl EndpointMachine {
             .map_err(runtime_error)
     }
 
-    pub(super) fn producer_call_result_current(
+    pub(super) fn producer_call_result_if_current(
         &mut self,
         call_site_id: RemoteCallSiteId,
         call_instance_id: DistributedCallInstanceId,
-    ) -> Result<Value, DistributedRuntimeError> {
+    ) -> Result<Option<Value>, DistributedRuntimeError> {
         self.runtime
-            .distributed_producer_call_result_current(call_site_id, call_instance_id)
+            .distributed_producer_call_result_if_current(call_site_id, call_instance_id)
             .map_err(runtime_error)
     }
 
@@ -231,6 +231,25 @@ impl EndpointMachine {
     ) -> Result<(Value, Option<RuntimeTurn>), DistributedRuntimeError> {
         self.runtime
             .evaluate_distributed_function_instance_unsettled(
+                call_site_id,
+                call_instance_id,
+                export_id,
+                content_revision,
+                arguments,
+            )
+            .map_err(runtime_error)
+    }
+
+    pub(super) fn activate_current_function_instance(
+        &mut self,
+        call_site_id: RemoteCallSiteId,
+        call_instance_id: DistributedCallInstanceId,
+        export_id: ExportId,
+        content_revision: u64,
+        arguments: BTreeMap<boon_plan::DistributedArgumentId, Value>,
+    ) -> Result<(Option<Value>, Option<RuntimeTurn>), DistributedRuntimeError> {
+        self.runtime
+            .activate_distributed_current_function_instance_unsettled(
                 call_site_id,
                 call_instance_id,
                 export_id,
@@ -722,7 +741,7 @@ impl EndpointRuntime {
                     call_key,
                     demand_revision,
                 )?;
-                let (value, turn) = self.machine.evaluate_function_instance(
+                let (value, turn) = self.machine.activate_current_function_instance(
                     call_site_id,
                     call_instance_id,
                     edge.function_export_id,
@@ -730,22 +749,25 @@ impl EndpointRuntime {
                     import_data_arguments(arguments),
                 )?;
                 let turn_pending = turn.is_some();
-                let value = match export_runtime_value(value) {
-                    Ok(value) => value,
-                    Err(error) => {
-                        if let Err(rollback) = self.machine.rollback(turn_pending) {
-                            return Err(runtime_error(format!(
-                                "distributed endpoint call preparation failed: {error}; rollback failed: {rollback}"
-                            )));
+                let value = match value {
+                    Some(value) => match export_runtime_value(value) {
+                        Ok(value) => Some(value),
+                        Err(error) => {
+                            if let Err(rollback) = self.machine.rollback(turn_pending) {
+                                return Err(runtime_error(format!(
+                                    "distributed endpoint call preparation failed: {error}; rollback failed: {rollback}"
+                                )));
+                            }
+                            return Err(error);
                         }
-                        return Err(error);
-                    }
+                    },
+                    None => None,
                 };
                 if let Some(turn) = turn {
                     machine_turn_pending = true;
                     update.turns.push(turn);
                 }
-                let result_revision = 1;
+                let result_revision = u64::from(value.is_some());
                 protocol.accepted_current_calls.insert(
                     call_key,
                     AcceptedCurrentCall {
@@ -757,17 +779,19 @@ impl EndpointRuntime {
                 protocol
                     .accepted_current_call_tombstones
                     .retain(|candidate| *candidate != call_key);
-                update.messages.push(DistributedMessage {
-                    producer: self.role,
-                    consumer: producer,
-                    payload: DistributedMessagePayload::CurrentCallResult {
-                        call_site_id,
-                        call_instance_id,
-                        demand_revision,
-                        result_revision,
-                        value,
-                    },
-                });
+                if let Some(value) = value {
+                    update.messages.push(DistributedMessage {
+                        producer: self.role,
+                        consumer: producer,
+                        payload: DistributedMessagePayload::CurrentCallResult {
+                            call_site_id,
+                            call_instance_id,
+                            demand_revision,
+                            result_revision,
+                            value,
+                        },
+                    });
+                }
             }
             DistributedMessagePayload::CurrentCallDetach {
                 call_site_id,
@@ -1152,7 +1176,10 @@ impl EndpointRuntime {
             .cloned()
             .collect::<Vec<_>>();
         for edge in value_edges {
-            let value = export_runtime_value(self.machine.export_current(edge.export_id)?)?;
+            let Some(value) = self.machine.export_if_current(edge.export_id)? else {
+                continue;
+            };
+            let value = export_runtime_value(value)?;
             let route = (edge.export_id, edge.consumer_role);
             if !force_current_to.contains(&edge.consumer_role)
                 && protocol
@@ -1196,14 +1223,18 @@ impl EndpointRuntime {
             if !publish_to.contains(&edge.caller_role) {
                 continue;
             }
-            let value = export_runtime_value(
-                self.machine
-                    .producer_call_result_current(call_site_id, call_instance_id)?,
-            )?;
-            if value == current.value {
+            let Some(value) = self
+                .machine
+                .producer_call_result_if_current(call_site_id, call_instance_id)?
+            else {
+                continue;
+            };
+            let value = export_runtime_value(value)?;
+            if current.value.as_ref() == Some(&value) {
                 continue;
             }
-            let result_revision = next_revision(Some(current.result_revision))?;
+            let result_revision =
+                next_revision((current.result_revision != 0).then_some(current.result_revision))?;
             let accepted = protocol
                 .accepted_current_calls
                 .get_mut(&(call_site_id, call_instance_id))
@@ -1216,7 +1247,7 @@ impl EndpointRuntime {
                 ));
             }
             accepted.result_revision = result_revision;
-            accepted.value = value.clone();
+            accepted.value = Some(value.clone());
             messages.push(DistributedMessage {
                 producer: self.role,
                 consumer: edge.caller_role,

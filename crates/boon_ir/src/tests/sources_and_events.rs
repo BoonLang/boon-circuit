@@ -54,6 +54,49 @@ store: [
 }
 
 #[test]
+fn scene_constructor_result_keeps_its_exact_occurrence_shape_through_a_user_call() {
+    let parsed = boon_parser::parse_project(
+        "RUN.bn",
+        [
+            (
+                "RUN.bn".to_owned(),
+                r#"
+store: [label: TEXT { ready }]
+scene: NovyView/main_scene(PASS: [store: store])
+"#
+                .to_owned(),
+            ),
+            (
+                "View/NovyView.bn".to_owned(),
+                r#"
+FUNCTION main_scene() {
+    Scene/new(
+        root: scene_root()
+        lights: [
+            key: [x: -0.4, y: -0.8, z: 1.0, intensity: 0.78]
+            rim: [x: 0.8, y: 0.2, z: 0.5, intensity: 0.22]
+        ]
+        geometry: [depth_scale: 1.0]
+    )
+}
+
+FUNCTION scene_root() {
+    Scene/Element/text(
+        element: []
+        text: PASSED.store.label
+    )
+}
+
+                "#
+                .to_owned(),
+            ),
+        ],
+    )
+    .expect("scene fixture parses");
+    lower(&parsed).expect("the exact Scene/new occurrence shape survives executable lowering");
+}
+
+#[test]
 fn source_only_group_has_no_scalar_binding_or_derived_output() {
     let parsed = boon_parser::parse_source(
         "source-only-group.bn",
@@ -750,6 +793,93 @@ document: Document/new(
             .iter()
             .all(|binding| !binding.path.starts_with("old."))
     );
+}
+
+#[test]
+fn contextual_row_projection_selector_specializes_to_the_render_argument_type() {
+    let parsed = boon_parser::parse_project(
+        "RUN.bn",
+        [
+            (
+                "RUN.bn".to_owned(),
+                r#"
+store: [
+    expansion: Expanded
+    rows: LIST {
+        [kind: A, scope_key: TEXT { child }, label: TEXT { Row }, expanded_label: TEXT { - Row }, collapsed_label: TEXT { + Row }]
+    }
+]
+document: SelectorView/main_document(PASS: [store: store])
+"#
+                .to_owned(),
+            ),
+            (
+                "View/SelectorView.bn".to_owned(),
+                r#"
+FUNCTION main_document() {
+    Document/new(
+        root: Element/stripe(
+            element: []
+            direction: Column
+            style: []
+            items: PASSED.store.rows
+                |> render_rows(old, new: render_row(item: old))
+        )
+    )
+}
+
+FUNCTION selected_label(row) {
+    row.scope_key == TEXT { child } |> WHEN {
+        True => PASSED.store.expansion |> WHEN {
+            Expanded => row.expanded_label
+            __ => row.collapsed_label
+        }
+        False => row.label
+    }
+}
+
+FUNCTION render_row(item) {
+    item.kind |> WHEN {
+        A => render_a(row: item)
+        B => render_b(row: item)
+        C => render_c(row: item)
+        __ => render_d(row: item)
+    }
+}
+
+FUNCTION render_a(row) {
+    text_row(label_text: selected_label(row: row))
+}
+
+FUNCTION render_b(row) {
+    text_row(label_text: selected_label(row: row))
+}
+
+FUNCTION render_c(row) {
+    text_row(label_text: selected_label(row: row))
+}
+
+FUNCTION render_d(row) {
+    text_row(label_text: selected_label(row: row))
+}
+
+FUNCTION text_row(label_text) {
+    Element/text(
+        element: []
+        text: label_text
+    )
+}
+
+FUNCTION render_rows(list, old: OUT, new) {
+    list |> List/map(item: old, new: new)
+}
+"#
+                .to_owned(),
+            ),
+        ],
+    )
+    .expect("contextual selector fixture parses");
+    lower(&parsed).expect("row projection selection must specialize to the TEXT render argument");
 }
 
 #[test]

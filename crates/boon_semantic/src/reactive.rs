@@ -19,8 +19,8 @@ use crate::{
     SemanticValueOrigin, StaticOwnerId,
 };
 use boon_typecheck::{
-    CheckedExprId, CheckedExternalDeclarationIdentityV1, CheckedIntrinsicV1, DeclId, FlowMode,
-    FlowType, Type,
+    CheckedExprId, CheckedExternalDeclarationIdentityV1, CheckedExternalDeclarationKind,
+    CheckedIntrinsicV1, DeclId, FlowMode, FlowType, Type,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -37,6 +37,11 @@ pub const SEMANTIC_REACTIVE_GRAPH_SCHEMA_V1: &str = "boon.semantic-reactive-grap
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SemanticReactiveGraphV1 {
     pub schema: String,
+    /// Sealed external declarations whose producer delivery was proven to be
+    /// event-backed by the atomic distributed bundle. This input is retained
+    /// so graph validation can deterministically rederive the same schedules.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub external_event_identities: Vec<CheckedExternalDeclarationIdentityV1>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub producer_instances: Vec<SemanticProducerInstanceV1>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -253,6 +258,11 @@ pub enum SemanticEventCauseV1 {
     Source(SemanticSourceId),
     State(SemanticStateId),
     Pulse(SemanticPulseBatchId),
+    /// An event-valued read whose concrete ingress SOURCE is owned by the
+    /// atomic distributed bundle boundary. Keeping the exact semantic
+    /// expression here preserves its trigger schedule before executable
+    /// source IDs exist.
+    ExternalRead(SemanticExprId),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -434,6 +444,14 @@ pub struct SemanticDerivedValueV1 {
     pub producer: SemanticExprId,
     pub value: SemanticValueId,
     pub kind: SemanticDerivedValueKindV1,
+    /// Exact whole-value HOLD state backing a producer result.
+    ///
+    /// This is semantic state identity, not a diagnostic path or an
+    /// executable-expression guess. A producer result may retain a
+    /// context-free checked fallback expression even though its expanded
+    /// value is the current value of a distinct state occurrence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_backing: Option<SemanticStateId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub materialized_list: Option<SemanticListId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -466,6 +484,10 @@ pub struct SemanticHostEffectScheduleV1 {
     pub owner: Option<StaticOwnerId>,
     pub operation: String,
     pub state_update_arms: Vec<SemanticStateUpdateArmId>,
+    /// A host result may be retained by an explicit state update or by one
+    /// compiler-owned transient derived-value lane, never both.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transient_result: Option<SemanticDerivedValueId>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -542,13 +564,57 @@ pub fn build_semantic_reactive_graph(
     resources: &SemanticResourceGraphV1,
     out_net: &ResolvedOutGraph,
 ) -> Result<SemanticReactiveGraphV1, SemanticReactiveError> {
+    build_semantic_reactive_graph_with_external_events(execution, resources, out_net, &[])
+}
+
+pub fn build_semantic_reactive_graph_with_external_events(
+    execution: &SemanticExecutionGraphV1,
+    resources: &SemanticResourceGraphV1,
+    out_net: &ResolvedOutGraph,
+    external_event_identities: &[CheckedExternalDeclarationIdentityV1],
+) -> Result<SemanticReactiveGraphV1, SemanticReactiveError> {
     execution
         .validate(out_net)
         .map_err(SemanticReactiveError::new)?;
     resources
         .validate(execution, out_net)
         .map_err(SemanticReactiveError::new)?;
-    let graph = ReactiveBuilder::new(execution, resources, out_net)?.build()?;
+    let external_event_identities = external_event_identities
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    for identity in &external_event_identities {
+        if identity.kind != CheckedExternalDeclarationKind::Value {
+            return Err(SemanticReactiveError::new(
+                "semantic external-event input carries a non-value declaration identity",
+            ));
+        }
+        let matches = execution
+            .expressions
+            .iter()
+            .filter(|expression| {
+                matches!(
+                    &expression.kind,
+                    SemanticExpressionKind::ExternalRead {
+                        external_identity: Some(candidate),
+                        ..
+                    } if candidate == identity
+                ) && matches!(
+                    expression.flow_type.mode,
+                    FlowMode::TickPresent | FlowMode::PresentOrAbsent
+                )
+            })
+            .count();
+        if matches == 0 {
+            return Err(SemanticReactiveError::new(format!(
+                "semantic external-event identity for {} declaration {} has no event-flow read occurrence",
+                identity.producer_role.namespace(),
+                identity.producer_declaration.0
+            )));
+        }
+    }
+    let graph =
+        ReactiveBuilder::new(execution, resources, out_net, external_event_identities)?.build()?;
     validate_semantic_reactive_shape(&graph, execution, resources)?;
     Ok(graph)
 }
@@ -562,7 +628,12 @@ impl SemanticReactiveGraphV1 {
         resources: &SemanticResourceGraphV1,
         out_net: &ResolvedOutGraph,
     ) -> Result<(), SemanticReactiveError> {
-        let expected = build_semantic_reactive_graph(execution, resources, out_net)?;
+        let expected = build_semantic_reactive_graph_with_external_events(
+            execution,
+            resources,
+            out_net,
+            &self.external_event_identities,
+        )?;
         if self != &expected {
             return Err(SemanticReactiveError::new(
                 "semantic reactive graph differs from its deterministic semantic derivation",
@@ -747,6 +818,7 @@ struct ReactiveBuilder<'a> {
     reachable_expressions: BTreeSet<SemanticExprId>,
     local_values: BTreeMap<SemanticLocalBindingId, (DeclId, SemanticExprId)>,
     parameter_inputs: BTreeMap<SemanticExprId, Vec<SemanticExprId>>,
+    external_event_identities: BTreeSet<CheckedExternalDeclarationIdentityV1>,
 }
 
 impl<'a> ReactiveBuilder<'a> {
@@ -754,6 +826,7 @@ impl<'a> ReactiveBuilder<'a> {
         execution: &'a SemanticExecutionGraphV1,
         resources: &'a SemanticResourceGraphV1,
         out_net: &'a ResolvedOutGraph,
+        external_event_identities: BTreeSet<CheckedExternalDeclarationIdentityV1>,
     ) -> Result<Self, SemanticReactiveError> {
         let expressions = ExpressionIndex::new(execution)?;
         let reachable_expressions = reachable_reactive_expressions(execution)?;
@@ -817,6 +890,7 @@ impl<'a> ReactiveBuilder<'a> {
             reachable_expressions,
             local_values,
             parameter_inputs,
+            external_event_identities,
         })
     }
 
@@ -1043,7 +1117,6 @@ impl<'a> ReactiveBuilder<'a> {
 
     fn build_activation_sites(
         &self,
-        batches: &[RawPulseBatch],
     ) -> Result<
         (
             Vec<SemanticActivationSiteV1>,
@@ -1052,12 +1125,14 @@ impl<'a> ReactiveBuilder<'a> {
         SemanticReactiveError,
     > {
         let mut states_by_then = BTreeMap::<SemanticExprId, BTreeSet<SemanticStateId>>::new();
-        for batch in batches {
-            if let (Some(then_expression), Some(state)) = (batch.enclosing_then, batch.state) {
+        for state in &self.resources.states {
+            if let crate::SemanticStateLifetimeV1::ActivationLocal { then_expression } =
+                state.lifetime
+            {
                 states_by_then
                     .entry(then_expression)
                     .or_default()
-                    .insert(state);
+                    .insert(state.id);
             }
         }
         let activation_ids = states_by_then
@@ -1211,7 +1286,7 @@ impl<'a> ReactiveBuilder<'a> {
         let bindings = self.build_bindings(&fields)?;
         let reads = self.build_reads(&bindings)?;
         let mut raw_pulse_batches = self.build_raw_pulse_batches()?;
-        let (activations, activation_ids) = self.build_activation_sites(&raw_pulse_batches)?;
+        let (activations, activation_ids) = self.build_activation_sites()?;
         let pulse_by_expression = raw_pulse_batches
             .iter()
             .map(|batch| (batch.call_expression, batch.id))
@@ -1241,6 +1316,7 @@ impl<'a> ReactiveBuilder<'a> {
             &pulse_by_expression,
             &pulse_states,
             &pulse_activation_expressions,
+            &self.external_event_identities,
         )?;
 
         let mut raw_pulse_starts = BTreeMap::<SemanticPulseBatchId, Vec<RawTriggerArm>>::new();
@@ -1389,6 +1465,7 @@ impl<'a> ReactiveBuilder<'a> {
                     producer: derived.producer,
                     value: derived.value,
                     kind: derived.kind,
+                    state_backing: derived.state_backing,
                     materialized_list: derived.materialized_list,
                     materialized_row_scope: derived.materialized_row_scope,
                     causes: derived.causes,
@@ -1438,6 +1515,7 @@ impl<'a> ReactiveBuilder<'a> {
         let host_effect_schedules = self.build_host_effect_schedules(
             &fields,
             &bindings,
+            &derived_values,
             &state_update_arms,
             &trigger_arms,
         )?;
@@ -1465,6 +1543,7 @@ impl<'a> ReactiveBuilder<'a> {
 
         Ok(SemanticReactiveGraphV1 {
             schema: SEMANTIC_REACTIVE_GRAPH_SCHEMA_V1.to_owned(),
+            external_event_identities: self.external_event_identities.into_iter().collect(),
             producer_instances,
             fields,
             bindings,
@@ -1711,6 +1790,13 @@ impl<'a> ReactiveBuilder<'a> {
                                 .collect::<Vec<_>>();
                             match structural.as_slice() {
                                 [value] => {
+                                    if matches!(
+                                        &self.expressions.expression(statement_producer)?.kind,
+                                        SemanticExpressionKind::Project { input, fields }
+                                            if *input == *value && fields.is_empty()
+                                    ) {
+                                        break 'producer statement_producer;
+                                    }
                                     let mut candidate = *value;
                                     loop {
                                         match &self.expressions.expression(candidate)?.kind {
@@ -1850,12 +1936,13 @@ impl<'a> ReactiveBuilder<'a> {
             .iter()
             .map(|source| (source.statement, source))
             .collect::<BTreeMap<_, _>>();
-        let state_by_statement = self
-            .resources
-            .states
-            .iter()
-            .map(|state| (state.statement, state))
-            .collect::<BTreeMap<_, _>>();
+        let mut states_by_statement = BTreeMap::<_, Vec<_>>::new();
+        for state in &self.resources.states {
+            states_by_statement
+                .entry(state.statement)
+                .or_default()
+                .push(state);
+        }
         let list_by_statement = self
             .resources
             .lists
@@ -1898,16 +1985,27 @@ impl<'a> ReactiveBuilder<'a> {
             let Some(statement_producer) = statement.value else {
                 continue;
             };
-            let (producer, target) = if let Some(state) = state_by_statement.get(&statement.id) {
-                // A lexical state binding names the exact HOLD authority.
-                // Statement-level FLUSH and DRAINING wrappers retain their own
-                // semantic identities, but must not replace the authority
-                // producer carried into executable storage/currentness.
-                (
-                    state.expression,
-                    SemanticBindingTargetV1::State { state: state.id },
-                )
-            } else if let Some(list) = list_by_statement.get(&statement.id) {
+            if let Some(states) = states_by_statement.get(&statement.id) {
+                // One lexical statement can contain more than one concrete
+                // state authority (for example nested initial LATEST/stateful
+                // expressions). Preserve every exact state binding instead of
+                // collapsing the statement to its final state.
+                for state in states {
+                    let expression = self.expressions.expression(state.expression)?;
+                    candidates.push((
+                        statement.id,
+                        declaration,
+                        statement.call_instance,
+                        expression.owner,
+                        state.expression,
+                        expression.value_id,
+                        expression.flow_type.clone(),
+                        SemanticBindingTargetV1::State { state: state.id },
+                    ));
+                }
+                continue;
+            }
+            let (producer, target) = if let Some(list) = list_by_statement.get(&statement.id) {
                 (
                     statement_producer,
                     SemanticBindingTargetV1::List { list: list.id },
@@ -2108,6 +2206,7 @@ impl<'a> ReactiveBuilder<'a> {
                     owner,
                     local,
                     projection,
+                    ..
                 } => SemanticReadTargetV1::MaterializationLocal {
                     owner: *owner,
                     local: *local,
@@ -2141,6 +2240,7 @@ impl<'a> ReactiveBuilder<'a> {
         let origin = self.expressions.origin(expression.id)?;
         lexical_binding_for_decl(
             self.execution,
+            self.resources,
             self.out_net,
             bindings,
             declaration,
@@ -2168,7 +2268,9 @@ impl<'a> ReactiveBuilder<'a> {
                             candidate.declaration == state.declaration
                                 && candidate.owner == state.owner
                         }),
-                    SemanticEventCauseV1::Source(_) | SemanticEventCauseV1::Pulse(_) => false,
+                    SemanticEventCauseV1::Source(_)
+                    | SemanticEventCauseV1::Pulse(_)
+                    | SemanticEventCauseV1::ExternalRead(_) => false,
                 };
                 if !same_state_family {
                     result.insert(RawStateUpdateArm {
@@ -2627,8 +2729,12 @@ impl<'a> ReactiveBuilder<'a> {
             if structural_group && !structural_host_output {
                 continue;
             }
+            let state_backing =
+                self.producer_result_state_backing(binding.statement, binding.producer)?;
+            let state_backed_current = state_backing.is_some();
             let triggers_for_value = if structural_group
                 || materialized.is_some()
+                || state_backed_current
                 || !self.expression_owns_event(binding.producer)?
             {
                 Vec::new()
@@ -2643,7 +2749,7 @@ impl<'a> ReactiveBuilder<'a> {
                 .collect::<Vec<_>>();
             let kind = if materialized.is_some() {
                 SemanticDerivedValueKindV1::ListView
-            } else if structural_group {
+            } else if structural_group || state_backed_current {
                 SemanticDerivedValueKindV1::Pure
             } else if !causes.is_empty() {
                 SemanticDerivedValueKindV1::SourceEventTransform
@@ -2676,6 +2782,7 @@ impl<'a> ReactiveBuilder<'a> {
                 producer: binding.producer,
                 value: binding.value,
                 kind,
+                state_backing,
                 materialized_list: materialized.map(|value| value.0),
                 materialized_row_scope: materialized.map(|value| value.1),
                 causes,
@@ -2686,6 +2793,63 @@ impl<'a> ReactiveBuilder<'a> {
         }
         result.sort_by_key(|derived| derived.binding);
         Ok(result)
+    }
+
+    fn producer_result_state_backing(
+        &self,
+        statement: SemanticStatementId,
+        expression: SemanticExprId,
+    ) -> Result<Option<SemanticStateId>, SemanticReactiveError> {
+        // A synthetic invocation wrapper can make a producer result appear
+        // event-owned even when its actual value is only current HOLD state.
+        // Preserve that result as a pure state read; the state update schedule
+        // owns any nested SOURCE or host effect.
+        let statement = self
+            .execution
+            .statements
+            .get(statement.as_usize())
+            .filter(|candidate| candidate.id == statement)
+            .ok_or_else(|| {
+                SemanticReactiveError::new(format!(
+                    "derived producer result references missing semantic statement {statement}"
+                ))
+            })?;
+        if !matches!(
+            statement.origin,
+            crate::SemanticStatementOrigin::ProducerResult { .. }
+        ) {
+            return Ok(None);
+        }
+        let expression = self.expressions.expression(expression)?;
+        let [member] = expression.provenance.members.as_slice() else {
+            return Ok(None);
+        };
+        if !member.path.is_empty() {
+            return Ok(None);
+        }
+        let SemanticValueOrigin::State { state, owner } = &member.origin else {
+            return Ok(None);
+        };
+        let state = *state;
+        let owner = *owner;
+        let resource = self
+            .resources
+            .states
+            .get(state.as_usize())
+            .filter(|candidate| candidate.id == state)
+            .ok_or_else(|| {
+                SemanticReactiveError::new(format!(
+                    "producer result expression {} references missing state {state}",
+                    expression.id
+                ))
+            })?;
+        if resource.owner != owner || resource.flow_type.ty != expression.flow_type.ty {
+            return Err(SemanticReactiveError::new(format!(
+                "producer result expression {} has stale owner/type provenance for state {state}",
+                expression.id
+            )));
+        }
+        Ok(Some(state))
     }
 
     fn expression_is_directly_source_only(
@@ -3020,6 +3184,7 @@ impl<'a> ReactiveBuilder<'a> {
                             .filter(|candidate| candidate.id == *state)
                     })
                     .is_some_and(|state| state.scoped),
+                SemanticEventCauseV1::ExternalRead(_) => false,
             };
             edges.insert((trigger.cause, arm.state, target.scoped || source_indexed));
         }
@@ -3084,6 +3249,7 @@ impl<'a> ReactiveBuilder<'a> {
         &self,
         fields: &[SemanticFieldV1],
         bindings: &[SemanticBindingV1],
+        derived_values: &[SemanticDerivedValueV1],
         state_arms: &[SemanticStateUpdateArmV1],
         triggers: &[SemanticTriggerOwnedArmV1],
     ) -> Result<Vec<SemanticHostEffectScheduleV1>, SemanticReactiveError> {
@@ -3124,6 +3290,54 @@ impl<'a> ReactiveBuilder<'a> {
                 }
             }
             if !runtime_reachable {
+                continue;
+            }
+            let mut transient_results = Vec::new();
+            for derived in derived_values.iter().filter(|derived| {
+                derived.state_backing.is_none() && !derived.trigger_arms.is_empty()
+            }) {
+                if self.expression_reaches(derived.producer, expression.id)? {
+                    transient_results.push(derived.id);
+                }
+            }
+            let transient_result = match transient_results.as_slice() {
+                [derived] => {
+                    let derived = derived_values
+                        .get(derived.as_usize())
+                        .filter(|candidate| candidate.id == *derived)
+                        .ok_or_else(|| {
+                            SemanticReactiveError::new(format!(
+                                "typed host effect `{function}` references missing transient derived value {derived}"
+                            ))
+                        })?;
+                    if derived.trigger_arms.is_empty() {
+                        return Err(SemanticReactiveError::new(format!(
+                            "typed host effect `{function}` at semantic expression {} has a transient result without an exact event trigger",
+                            expression.id
+                        )));
+                    }
+                    Some(derived.id)
+                }
+                [] => None,
+                _ => {
+                    return Err(SemanticReactiveError::new(format!(
+                        "typed host effect `{function}` at semantic expression {} reaches multiple transient result owners {transient_results:?}",
+                        expression.id
+                    )));
+                }
+            };
+            if let Some(transient_result) = transient_result {
+                schedules.push(SemanticHostEffectScheduleV1 {
+                    id: SemanticHostEffectScheduleId(schedules.len()),
+                    expression: expression.id,
+                    value: expression.value_id,
+                    call: *call,
+                    checked_expression: expression.checked_expr_id,
+                    owner: expression.owner,
+                    operation: function.clone(),
+                    state_update_arms: Vec::new(),
+                    transient_result: Some(transient_result),
+                });
                 continue;
             }
             let mut covering = Vec::new();
@@ -3196,6 +3410,7 @@ impl<'a> ReactiveBuilder<'a> {
                 owner: expression.owner,
                 operation: function.clone(),
                 state_update_arms: covering,
+                transient_result: None,
             });
         }
         Ok(schedules)
@@ -3632,6 +3847,7 @@ struct RawDerivedValue {
     producer: SemanticExprId,
     value: SemanticValueId,
     kind: SemanticDerivedValueKindV1,
+    state_backing: Option<SemanticStateId>,
     materialized_list: Option<SemanticListId>,
     materialized_row_scope: Option<SemanticRowScopeId>,
     causes: Vec<SemanticEventCauseV1>,
@@ -3731,6 +3947,7 @@ struct TriggerResolver<'a> {
     pulse_by_expression: &'a BTreeMap<SemanticExprId, SemanticPulseBatchId>,
     pulse_states: &'a BTreeMap<SemanticPulseBatchId, SemanticStateId>,
     pulse_activation_expressions: &'a BTreeSet<SemanticExprId>,
+    external_event_identities: &'a BTreeSet<CheckedExternalDeclarationIdentityV1>,
     causes_cache: BTreeMap<SemanticExprId, BTreeSet<SemanticEventCauseV1>>,
 }
 
@@ -3804,6 +4021,7 @@ fn lexical_call_frame_distance(
 
 fn lexical_binding_for_decl<'a>(
     execution: &SemanticExecutionGraphV1,
+    resources: &SemanticResourceGraphV1,
     out_net: &ResolvedOutGraph,
     bindings: &'a [SemanticBindingV1],
     declaration: DeclId,
@@ -3826,11 +4044,28 @@ fn lexical_binding_for_decl<'a>(
         else {
             continue;
         };
-        let source_priority = u8::from(matches!(
-            binding.target,
-            SemanticBindingTargetV1::Source { .. }
-        ));
-        candidates.push(((frame_distance, owner_distance, source_priority), binding));
+        let target_priority = match binding.target {
+            SemanticBindingTargetV1::State { state } => {
+                let state = resources
+                    .states
+                    .get(state.as_usize())
+                    .filter(|candidate| candidate.id == state)
+                    .ok_or_else(|| {
+                        SemanticReactiveError::new(format!(
+                            "{diagnostic} {} binding {} references missing semantic state {state}",
+                            expression.id, binding.id
+                        ))
+                    })?;
+                if state.published { 0_u8 } else { 1 }
+            }
+            SemanticBindingTargetV1::List { .. } => 0_u8,
+            SemanticBindingTargetV1::Field { .. } => 2,
+            // Invocation-mode producer results may share one declaration with
+            // their trigger SOURCE. The ordinary result field remains the
+            // lexical value; the SOURCE is only event routing metadata.
+            SemanticBindingTargetV1::Source { .. } => 3,
+        };
+        candidates.push(((frame_distance, owner_distance, target_priority), binding));
     }
     candidates.sort_by_key(|(distance, binding)| (*distance, binding.id));
     let Some((best_distance, _)) = candidates.first() else {
@@ -3878,6 +4113,7 @@ impl<'a> TriggerResolver<'a> {
         pulse_by_expression: &'a BTreeMap<SemanticExprId, SemanticPulseBatchId>,
         pulse_states: &'a BTreeMap<SemanticPulseBatchId, SemanticStateId>,
         pulse_activation_expressions: &'a BTreeSet<SemanticExprId>,
+        external_event_identities: &'a BTreeSet<CheckedExternalDeclarationIdentityV1>,
     ) -> Result<Self, SemanticReactiveError> {
         for source in &resources.sources {
             if execution
@@ -3916,6 +4152,7 @@ impl<'a> TriggerResolver<'a> {
             pulse_by_expression,
             pulse_states,
             pulse_activation_expressions,
+            external_event_identities,
             causes_cache: BTreeMap::new(),
         })
     }
@@ -3999,6 +4236,19 @@ impl<'a> TriggerResolver<'a> {
         expression: &SemanticExpression,
     ) -> Result<BTreeSet<SemanticEventCauseV1>, SemanticReactiveError> {
         let mut causes = BTreeSet::new();
+        if let SemanticExpressionKind::ExternalRead {
+            external_identity: Some(external_identity),
+            ..
+        } = &expression.kind
+            && matches!(
+                expression.flow_type.mode,
+                FlowMode::TickPresent | FlowMode::PresentOrAbsent
+            )
+            && self.external_event_identities.contains(external_identity)
+        {
+            causes.insert(SemanticEventCauseV1::ExternalRead(expression.id));
+            return Ok(causes);
+        }
         if matches!(
             &expression.kind,
             SemanticExpressionKind::Call {
@@ -4516,6 +4766,7 @@ impl<'a> TriggerResolver<'a> {
                         .filter(|candidate| candidate.id == *state)
                 })
                 .and_then(|state| state.row_scope),
+            SemanticEventCauseV1::ExternalRead(_) => None,
         };
         if cause_scope.is_some() {
             return Ok(cause_scope);
@@ -4562,6 +4813,7 @@ impl<'a> TriggerResolver<'a> {
         let origin = self.expressions.origin(expression.id)?;
         lexical_binding_for_decl(
             self.execution,
+            self.resources,
             self.out_net,
             self.bindings,
             declaration,
@@ -4823,6 +5075,7 @@ fn trigger_row_scope(
                         .filter(|candidate| candidate.id == *state)
                 })
                 .and_then(|state| state.row_scope),
+            SemanticEventCauseV1::ExternalRead(_) => None,
         })
         .collect::<BTreeSet<_>>();
     match scopes.len() {
@@ -4970,6 +5223,45 @@ fn validate_semantic_reactive_shape(
             )));
         }
         require_trigger(&graph.trigger_arms, arm.trigger)?;
+    }
+    for schedule in &graph.host_effect_schedules {
+        if schedule.state_update_arms.is_empty() == schedule.transient_result.is_none() {
+            return Err(SemanticReactiveError::new(format!(
+                "host effect schedule {} must have exactly one retained-state or transient-result owner",
+                schedule.id
+            )));
+        }
+        for arm in &schedule.state_update_arms {
+            if graph
+                .state_update_arms
+                .get(arm.as_usize())
+                .filter(|candidate| candidate.id == *arm)
+                .is_none()
+            {
+                return Err(SemanticReactiveError::new(format!(
+                    "host effect schedule {} references missing state update arm {}",
+                    schedule.id, arm
+                )));
+            }
+        }
+        if let Some(derived) = schedule.transient_result {
+            let derived = graph
+                .derived_values
+                .get(derived.as_usize())
+                .filter(|candidate| candidate.id == derived)
+                .ok_or_else(|| {
+                    SemanticReactiveError::new(format!(
+                        "host effect schedule {} references missing transient derived value {}",
+                        schedule.id, derived
+                    ))
+                })?;
+            if derived.trigger_arms.is_empty() {
+                return Err(SemanticReactiveError::new(format!(
+                    "host effect schedule {} transient result has no exact trigger arms",
+                    schedule.id
+                )));
+            }
+        }
     }
     for (index, causes) in graph.possible_causes.iter().enumerate() {
         let expected = SemanticStateId(index);

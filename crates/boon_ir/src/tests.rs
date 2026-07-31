@@ -116,6 +116,43 @@ fn outbound_http_effect_is_owned_by_one_exact_state_arm() {
 }
 
 #[test]
+fn direct_host_result_schedule_survives_erasure_without_becoming_hold_authority() {
+    let parsed = boon_parser::parse_source(
+        "direct-host-result-erasure.bn",
+        r#"
+store: [
+    start: SOURCE
+    result:
+        start |> THEN { Clock/wall() }
+    observed:
+        0 |> HOLD observed {
+            result |> WHEN {
+                WallClockRead => 1
+                __ => SKIP
+            }
+        }
+]
+"#,
+    )
+    .unwrap();
+    let program = lower(&parsed).unwrap();
+    let [schedule] = program.host_effect_schedules.as_slice() else {
+        panic!("expected one erased direct host-effect schedule");
+    };
+    assert!(schedule.state_update_arms.is_empty());
+    let derived_index = schedule
+        .transient_result
+        .expect("direct host effect retains its transient result identity");
+    let derived = program
+        .derived_values
+        .get(derived_index)
+        .expect("erased transient derived result exists");
+    assert_eq!(derived.path, "store.result");
+    assert!(derived.state_backing.is_none());
+    assert!(!derived.trigger_arms.is_empty());
+}
+
+#[test]
 fn tagged_pattern_binding_survives_a_user_function_call_as_an_exact_projection() {
     let parsed = boon_parser::parse_source(
         "pattern-binding-user-call.bn",

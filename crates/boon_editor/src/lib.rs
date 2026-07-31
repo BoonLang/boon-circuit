@@ -1,6 +1,8 @@
 use ropey::Rope;
 use unicode_segmentation::UnicodeSegmentation;
 
+pub mod language;
+
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
 pub struct Position {
     pub line: usize,

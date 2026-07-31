@@ -8,13 +8,13 @@
 
 use crate::{
     ResolvedOutGraph, SemanticBindingId, SemanticBindingTargetV1, SemanticCallId,
-    SemanticContextualOperationKind, SemanticContextualRowPredecessor, SemanticExecutionGraphV1,
-    SemanticExprId, SemanticExpressionKind, SemanticFieldId, SemanticListId,
-    SemanticLoweringContractV1, SemanticMaterializationLocalId, SemanticNamedValueId,
-    SemanticReactiveGraphV1, SemanticReadId, SemanticReadTargetV1, SemanticResourceGraphV1,
-    SemanticRowBinding, SemanticSourceId, SemanticSourceOrigin, SemanticStateId,
-    SemanticStatementId, SemanticValueId, SemanticValueListAuthorityId, SemanticValueOrigin,
-    SemanticValueProvenance, StaticOwnerId,
+    SemanticContextualMaterialization, SemanticContextualOperationKind,
+    SemanticContextualRowPredecessor, SemanticExecutionGraphV1, SemanticExprId,
+    SemanticExpressionKind, SemanticFieldId, SemanticListId, SemanticLoweringContractV1,
+    SemanticMaterializationLocalId, SemanticNamedValueId, SemanticReactiveGraphV1, SemanticReadId,
+    SemanticReadTargetV1, SemanticResourceGraphV1, SemanticRowBinding, SemanticSourceId,
+    SemanticSourceOrigin, SemanticStateId, SemanticStatementId, SemanticValueId,
+    SemanticValueListAuthorityId, SemanticValueOrigin, SemanticValueProvenance, StaticOwnerId,
 };
 use boon_contract::SourceBundleDigestV1;
 use boon_typecheck::{
@@ -397,6 +397,7 @@ pub enum SemanticNamedValueStorageTargetV1 {
 #[serde(rename_all = "snake_case")]
 pub enum SemanticNamedValueDiagnosticOnlyReasonV1 {
     NonExecutableStructuralContainer,
+    NonExecutableCheckedLeaf,
 }
 
 /// One checked and type-resolved object projection rooted at an exact semantic
@@ -492,7 +493,7 @@ pub(crate) fn build_semantic_scope_storage_graph(
     classify_resource_only_fields(execution, resources, &locals, &mut fields)?;
     let bindings = build_storage_bindings(execution, resources, reactive, &fields, &owners)?;
     let sources = build_storage_sources(resources, reactive, &owners)?;
-    let row_values = build_row_values(execution, &locals)?;
+    let row_values = build_row_values(execution, resources, &locals)?;
     let row_source_projections = build_row_source_projections(execution, resources, &locals)?;
     let external_references = build_external_references(execution, reactive)?;
     let producer_result_fields = build_producer_result_fields(reactive, &fields, &bindings)?;
@@ -1536,7 +1537,14 @@ fn build_storage_locals(
             let members = binding
                 .source
                 .map(|row| {
-                    local_members_for_row(resources, fields, row, &materialization.item_type)
+                    local_members_for_row(
+                        execution,
+                        resources,
+                        fields,
+                        row,
+                        &materialization.item_type,
+                        materialization,
+                    )
                 })
                 .transpose()?
                 .unwrap_or_default();
@@ -1554,10 +1562,12 @@ fn build_storage_locals(
 }
 
 fn local_members_for_row(
+    execution: &SemanticExecutionGraphV1,
     resources: &SemanticResourceGraphV1,
     fields: &[SemanticStorageFieldV1],
     row: SemanticRowBinding,
     item_type: &Type,
+    materialization: &SemanticContextualMaterialization,
 ) -> Result<Vec<SemanticStorageLocalMemberV1>, SemanticScopeStorageError> {
     let list = resources
         .lists
@@ -1605,13 +1615,28 @@ fn local_members_for_row(
         {
             continue;
         }
-        let candidates = fields
+        let mut storage_path = path.clone();
+        let mut candidates = fields
             .iter()
             .filter(|field| {
                 field.row == Some(row)
-                    && storage_field_item_path(field).as_deref() == Some(path.as_slice())
+                    && storage_field_item_path(field).as_deref() == Some(storage_path.as_slice())
             })
             .collect::<Vec<_>>();
+        if candidates.is_empty()
+            && let Some(forwarded) =
+                materialization_constructor_path_for_local(execution, materialization, &path)?
+        {
+            storage_path = forwarded;
+            candidates = fields
+                .iter()
+                .filter(|field| {
+                    field.row == Some(row)
+                        && storage_field_item_path(field).as_deref()
+                            == Some(storage_path.as_slice())
+                })
+                .collect();
+        }
         let constructor_authorities = candidates
             .iter()
             .copied()
@@ -1659,13 +1684,56 @@ fn local_members_for_row(
                 target: SemanticStorageLocalMemberTargetV1::Field(field.id),
                 forwarded_from: Some(SemanticStorageLocalMemberForwardingV1::Row {
                     row,
-                    path: storage_field_item_path(field).unwrap_or_default(),
+                    path: storage_path,
                 }),
             },
             "row field",
         )?;
     }
     Ok(members.into_values().collect())
+}
+
+fn materialization_constructor_path_for_local(
+    execution: &SemanticExecutionGraphV1,
+    materialization: &SemanticContextualMaterialization,
+    source_path: &[String],
+) -> Result<Option<Vec<String>>, SemanticScopeStorageError> {
+    let body = require_expression(execution, materialization.body)?;
+    let candidates = body
+        .provenance
+        .members
+        .iter()
+        .filter_map(|member| {
+            let SemanticValueOrigin::MaterializationLocal {
+                owner,
+                local,
+                projection,
+            } = &member.origin
+            else {
+                return None;
+            };
+            if *owner != materialization.owner
+                || *local != materialization.row_local
+                || !source_path.starts_with(projection)
+            {
+                return None;
+            }
+            let mut target = member.path.clone();
+            target.extend_from_slice(&source_path[projection.len()..]);
+            Some(target)
+        })
+        .collect::<BTreeSet<_>>();
+    match candidates.len() {
+        0 => Ok(None),
+        1 => Ok(candidates.into_iter().next()),
+        count => Err(SemanticScopeStorageError::new(format!(
+            "materialization {} local {}:{} source member `{}` maps to {count} constructor paths: {candidates:?}",
+            materialization.id,
+            materialization.owner,
+            materialization.row_local,
+            source_path.join("."),
+        ))),
+    }
 }
 
 fn relative_resource_path(
@@ -2006,6 +2074,7 @@ fn collect_capture_requests(
         owner,
         local,
         projection,
+        ..
     } = &value.kind
     {
         let source = locals
@@ -2017,11 +2086,24 @@ fn collect_capture_requests(
                 ))
             })?;
         if source.row != Some(target_row) {
-            if *owner == target_owner && *local == target_local {
-                // A state initialized inside the same map that constructs its
-                // target row reads through that row's constructor authority.
-                // It is not detached lexical state and must not allocate a
-                // transient capture column between predecessor and target.
+            if *owner == target_owner
+                && *local == target_local
+                && (target_constructor_carries_local_projection(
+                    execution,
+                    target_owner,
+                    target_local,
+                    projection,
+                )? || target_materialization_drains_predecessor(
+                    execution,
+                    target_owner,
+                    target_local,
+                )?)
+            {
+                // A same-map constructor can reuse either target-row authority
+                // it forwards directly or the exact predecessor authority
+                // carried by DRAIN. A DRAIN-backed indexed state initializer
+                // is lowered by the migration recipe; persisting an additional
+                // transient capture would create a second, competing transfer.
                 return Ok(());
             }
             if !owner_descends_from(target_owner, *owner, owners)? {
@@ -2067,6 +2149,81 @@ fn collect_capture_requests(
         )?;
     }
     Ok(())
+}
+
+fn target_materialization_drains_predecessor(
+    execution: &SemanticExecutionGraphV1,
+    owner: StaticOwnerId,
+    local: SemanticMaterializationLocalId,
+) -> Result<bool, SemanticScopeStorageError> {
+    let matches = execution
+        .materializations
+        .iter()
+        .filter(|materialization| {
+            materialization.owner == owner && materialization.row_local == local
+        })
+        .collect::<Vec<_>>();
+    let [materialization] = matches.as_slice() else {
+        return Err(SemanticScopeStorageError::new(format!(
+            "same-map DRAIN lookup for local {owner}:{local} resolves to {} materializations",
+            matches.len()
+        )));
+    };
+    Ok(matches!(
+        require_expression(execution, materialization.source)?.kind,
+        SemanticExpressionKind::Drain { .. }
+    ))
+}
+
+fn target_constructor_carries_local_projection(
+    execution: &SemanticExecutionGraphV1,
+    owner: StaticOwnerId,
+    local: SemanticMaterializationLocalId,
+    projection: &[String],
+) -> Result<bool, SemanticScopeStorageError> {
+    let matches = execution
+        .materializations
+        .iter()
+        .filter(|materialization| {
+            materialization.owner == owner && materialization.row_local == local
+        })
+        .collect::<Vec<_>>();
+    let [materialization] = matches.as_slice() else {
+        return Err(SemanticScopeStorageError::new(format!(
+            "same-map capture lookup for local {owner}:{local} resolves to {} materializations",
+            matches.len()
+        )));
+    };
+    let body = require_expression(execution, materialization.body)?;
+    Ok(body.provenance.members.iter().any(|member| {
+        let SemanticValueOrigin::MaterializationLocal {
+            owner: source_owner,
+            local: source_local,
+            projection: source_projection,
+        } = &member.origin
+        else {
+            return false;
+        };
+        if *source_owner != owner
+            || *source_local != local
+            || !projection.starts_with(source_projection)
+        {
+            return false;
+        }
+        let mut target = member.path.clone();
+        target.extend_from_slice(&projection[source_projection.len()..]);
+        let mut ty = &body.flow_type.ty;
+        for selector in target {
+            let Type::Object(shape) = ty else {
+                return false;
+            };
+            let Some(next) = shape.fields.get(&selector) else {
+                return false;
+            };
+            ty = next;
+        }
+        true
+    }))
 }
 
 fn append_capture_fields(
@@ -2523,14 +2680,30 @@ impl StorageProvenanceResolver<'_> {
             | SemanticContextualOperationKind::Remove
             | SemanticContextualOperationKind::SortBy
             | SemanticContextualOperationKind::ThenBy => {
-                let Some(row) = materialization
+                let Some(list) = materialization
                     .source_list_id
                     .zip(materialization.source_scope_id)
-                    .map(|(list, scope)| SemanticRowBinding { list, scope })
+                    .and_then(|(list, scope)| {
+                        self.resources
+                            .lists
+                            .get(list.as_usize())
+                            .filter(|candidate| {
+                                candidate.id == list && candidate.row_scope == scope
+                            })
+                    })
+                    .cloned()
                 else {
                     return Ok(false);
                 };
-                self.row_path_is_source_only(row, path)
+                if materialization.source_row_predecessors.is_empty() {
+                    return Ok(false);
+                }
+                for predecessor in &materialization.source_row_predecessors {
+                    if !self.predecessor_path_is_source_only(&list, predecessor, path)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
             }
             SemanticContextualOperationKind::Every
             | SemanticContextualOperationKind::Any
@@ -2630,10 +2803,11 @@ fn list_initializer_path_is_resource_only(
                 .iter()
                 .filter(|field| !field.spread && field.name == *name)
                 .collect::<Vec<_>>();
-            matches!(
-                matches.as_slice(),
-                [field] if field.value == crate::SemanticInitialValueV1::ResourceOnly
-            )
+            match matches.as_slice() {
+                [] => true,
+                [field] => field.value == crate::SemanticInitialValueV1::ResourceOnly,
+                _ => false,
+            }
         })
 }
 
@@ -2838,13 +3012,46 @@ fn build_storage_sources(
 
 fn build_row_values(
     execution: &SemanticExecutionGraphV1,
+    resources: &SemanticResourceGraphV1,
     locals: &[SemanticStorageLocalV1],
 ) -> Result<Vec<SemanticStorageRowValueV1>, SemanticScopeStorageError> {
     let local_rows = locals
         .iter()
         .map(|local| ((local.owner, local.local), local.row))
         .collect::<BTreeMap<_, _>>();
-    let mut values = BTreeSet::new();
+    let lists_by_declaration = resources
+        .lists
+        .iter()
+        .map(|list| (list.declaration, list.id))
+        .collect::<BTreeMap<_, _>>();
+    let local_bindings = execution
+        .expressions
+        .iter()
+        .filter_map(|expression| {
+            let SemanticExpressionKind::Block { bindings, .. } = &expression.kind else {
+                return None;
+            };
+            Some(
+                bindings
+                    .iter()
+                    .map(|binding| (binding.id, (binding.declaration, binding.value))),
+            )
+        })
+        .flatten()
+        .collect::<BTreeMap<_, _>>();
+    let declaration_values = execution
+        .statements
+        .iter()
+        .filter_map(|statement| Some((statement.declaration?, statement.value?)))
+        .fold(
+            BTreeMap::<DeclId, BTreeSet<SemanticExprId>>::new(),
+            |mut values, (declaration, value)| {
+                values.entry(declaration).or_default().insert(value);
+                values
+            },
+        );
+    let mut by_expression =
+        BTreeMap::<SemanticExprId, BTreeSet<(Vec<String>, SemanticRowBinding)>>::new();
     for expression in &execution.expressions {
         if let SemanticExpressionKind::Materialize { materialization } = expression.kind {
             let definition = execution
@@ -2870,11 +3077,63 @@ fn build_row_values(
                 // `List/find` returns `Found[value: row] | NotFound`. The
                 // typed operation, not a diagnostic field path, owns this
                 // exact row projection.
-                values.insert(SemanticStorageRowValueV1 {
-                    expression: expression.id,
-                    projection: vec!["value".to_owned()],
-                    row,
-                });
+                by_expression
+                    .entry(expression.id)
+                    .or_default()
+                    .insert((vec!["value".to_owned()], row));
+            }
+        }
+        if let SemanticExpressionKind::Call {
+            name, arguments, ..
+        } = &expression.kind
+            && matches!(name.as_str(), "List/get" | "List/latest")
+        {
+            let list_inputs = arguments
+                .iter()
+                .filter_map(|argument| {
+                    let input = execution
+                        .expressions
+                        .get(argument.value.as_usize())
+                        .filter(|candidate| candidate.id == argument.value)?;
+                    matches!(input.flow_type.ty, Type::List(_)).then_some(argument.value)
+                })
+                .collect::<Vec<_>>();
+            let [list_input] = list_inputs.as_slice() else {
+                return Err(SemanticScopeStorageError::new(format!(
+                    "row-returning `{name}` expression {} resolves to {} semantic list inputs",
+                    expression.id,
+                    list_inputs.len()
+                )));
+            };
+            if let Some(list_id) = crate::resource::semantic_list_id(
+                execution,
+                &lists_by_declaration,
+                &local_bindings,
+                *list_input,
+            )
+            .map_err(SemanticScopeStorageError::new)?
+            {
+                let list = resources
+                    .lists
+                    .get(list_id.as_usize())
+                    .filter(|candidate| candidate.id == list_id)
+                    .ok_or_else(|| {
+                        SemanticScopeStorageError::new(format!(
+                            "row-returning `{name}` references missing semantic list {list_id}"
+                        ))
+                    })?;
+                let projection = if name == "List/get" {
+                    vec!["value".to_owned()]
+                } else {
+                    Vec::new()
+                };
+                by_expression.entry(expression.id).or_default().insert((
+                    projection,
+                    SemanticRowBinding {
+                        list: list.id,
+                        scope: list.row_scope,
+                    },
+                ));
             }
         }
         for member in &expression.provenance.members {
@@ -2891,14 +3150,139 @@ fn build_row_values(
             };
             let mut path = member.path.clone();
             path.extend(projection.iter().cloned());
-            values.insert(SemanticStorageRowValueV1 {
-                expression: expression.id,
-                projection: path,
-                row,
-            });
+            by_expression
+                .entry(expression.id)
+                .or_default()
+                .insert((path, row));
         }
     }
-    Ok(values.into_iter().collect())
+
+    let project = |rows: &BTreeSet<(Vec<String>, SemanticRowBinding)>, projection: &[String]| {
+        rows.iter()
+            .filter_map(|(path, row)| {
+                path.strip_prefix(projection)
+                    .map(|remaining| (remaining.to_vec(), *row))
+            })
+            .collect::<BTreeSet<_>>()
+    };
+    let mut remaining = execution.expressions.len().saturating_add(1);
+    loop {
+        if remaining == 0 {
+            return Err(SemanticScopeStorageError::new(
+                "semantic row-value provenance did not converge",
+            ));
+        }
+        remaining -= 1;
+        let snapshot = by_expression.clone();
+        let mut changed = false;
+        for expression in &execution.expressions {
+            let rows = |id: SemanticExprId| snapshot.get(&id).cloned().unwrap_or_default();
+            let mut derived = BTreeSet::new();
+            match &expression.kind {
+                SemanticExpressionKind::Flush { payload: input }
+                | SemanticExpressionKind::FlushBoundary { input }
+                | SemanticExpressionKind::Draining { input }
+                | SemanticExpressionKind::Block { result: input, .. } => {
+                    derived.extend(rows(*input));
+                }
+                SemanticExpressionKind::Then {
+                    output: Some(output),
+                    ..
+                }
+                | SemanticExpressionKind::MatchArm {
+                    output: Some(output),
+                    ..
+                } => {
+                    derived.extend(rows(*output));
+                }
+                SemanticExpressionKind::When { arms, .. } => {
+                    for arm in arms {
+                        derived.extend(rows(arm.output));
+                    }
+                }
+                SemanticExpressionKind::Latest { branches } => {
+                    for branch in branches {
+                        derived.extend(rows(*branch));
+                    }
+                }
+                SemanticExpressionKind::Project { input, fields } => {
+                    derived.extend(project(&rows(*input), fields));
+                }
+                SemanticExpressionKind::CanonicalRead {
+                    target, projection, ..
+                } => {
+                    for target in declaration_values.get(target).into_iter().flatten() {
+                        derived.extend(project(&rows(*target), projection));
+                    }
+                }
+                SemanticExpressionKind::LocalRead {
+                    binding,
+                    projection,
+                    ..
+                } => {
+                    if let Some((_, target)) = local_bindings.get(binding) {
+                        derived.extend(project(&rows(*target), projection));
+                    }
+                }
+                SemanticExpressionKind::Object(fields)
+                | SemanticExpressionKind::TaggedObject { fields, .. } => {
+                    for field in fields {
+                        for (path, row) in rows(field.value) {
+                            let path = if field.spread {
+                                path
+                            } else {
+                                std::iter::once(field.name.clone()).chain(path).collect()
+                            };
+                            derived.insert((path, row));
+                        }
+                    }
+                }
+                SemanticExpressionKind::ExternalRead { .. }
+                | SemanticExpressionKind::ElementState { .. }
+                | SemanticExpressionKind::Drain { .. }
+                | SemanticExpressionKind::Text(_)
+                | SemanticExpressionKind::TextTemplate { .. }
+                | SemanticExpressionKind::Number(_)
+                | SemanticExpressionKind::BytesByte(_)
+                | SemanticExpressionKind::Absent
+                | SemanticExpressionKind::Tag(_)
+                | SemanticExpressionKind::Source { .. }
+                | SemanticExpressionKind::Call { .. }
+                | SemanticExpressionKind::Materialize { .. }
+                | SemanticExpressionKind::Hold { .. }
+                | SemanticExpressionKind::Then { output: None, .. }
+                | SemanticExpressionKind::Infix { .. }
+                | SemanticExpressionKind::MatchArm { output: None, .. }
+                | SemanticExpressionKind::List { .. }
+                | SemanticExpressionKind::Bytes { .. }
+                | SemanticExpressionKind::Delimiter
+                | SemanticExpressionKind::MaterializationLocal { .. }
+                | SemanticExpressionKind::FunctionParameter { .. }
+                | SemanticExpressionKind::MapEntry { .. }
+                | SemanticExpressionKind::Map { .. }
+                | SemanticExpressionKind::Set { .. }
+                | SemanticExpressionKind::Bits(_) => {}
+            }
+            let target = by_expression.entry(expression.id).or_default();
+            let before = target.len();
+            target.extend(derived);
+            changed |= target.len() != before;
+        }
+        if !changed {
+            break;
+        }
+    }
+    Ok(by_expression
+        .into_iter()
+        .flat_map(|(expression, rows)| {
+            rows.into_iter()
+                .map(move |(projection, row)| SemanticStorageRowValueV1 {
+                    expression,
+                    projection,
+                    row,
+                })
+        })
+        .collect())
 }
 
 fn build_row_source_projections(
@@ -3183,8 +3567,9 @@ fn build_named_value_storage(
     let mut next_projection_id = 0;
     for named_value in &lowering.metadata.named_value_types {
         for (origin_ordinal, origin) in named_value.origins.iter().enumerate() {
-            let targets =
-                named_value_targets(execution, resources, reactive, fields, bindings, origin)?;
+            let targets = named_value_targets(
+                checked, execution, resources, reactive, fields, bindings, origin,
+            )?;
             if targets.is_empty() {
                 return Err(SemanticScopeStorageError::new(format!(
                     "named value {} origin {origin_ordinal} has no exact semantic storage target",
@@ -3192,8 +3577,10 @@ fn build_named_value_storage(
                 )));
             }
             for (target_ordinal, target) in targets.into_iter().enumerate() {
-                let root_flow =
+                let public_root_flow =
                     named_value_target_flow_type(execution, resources, reactive, fields, &target)?;
+                let (root_flow, storage_consumes_flush) =
+                    named_value_storable_root_flow(execution, fields, &target, &public_root_flow)?;
                 let projection = build_named_value_projection(
                     execution,
                     fields,
@@ -3213,6 +3600,7 @@ fn build_named_value_storage(
                     &root_flow,
                     projected_storage_type,
                     &named_value.flow_type,
+                    storage_consumes_flush,
                 )
                 .map_err(|error| {
                     SemanticScopeStorageError::new(format!(
@@ -3229,25 +3617,29 @@ fn build_named_value_storage(
                         origin.value_list_authorities,
                     ))
                 })?;
-                let representation = derive_storage_representation(
-                    projected_storage_type,
-                    &contract_flow.ty,
-                )
-                .map_err(|error| {
-                    SemanticScopeStorageError::new(format!(
-                        "named value {} `{}` origin {origin_ordinal} {:?} semantic statements {:?} expressions {:?} bindings {:?} sources {:?} states {:?} lists {:?} value-list authorities {:?} target {target:?}: {error}",
-                        named_value.id,
-                        named_value.diagnostic_path,
-                        origin.checked,
-                        origin.statements,
-                        origin.expressions,
-                        origin.bindings,
-                        origin.sources,
-                        origin.states,
-                        origin.lists,
-                        origin.value_list_authorities,
-                    ))
-                })?;
+                let representation = if matches!(
+                    target,
+                    SemanticNamedValueStorageTargetV1::DiagnosticOnly { .. }
+                ) {
+                    SemanticStorageRepresentationV1::Exact
+                } else {
+                    derive_storage_representation(projected_storage_type, &contract_flow.ty)
+                        .map_err(|error| {
+                            SemanticScopeStorageError::new(format!(
+                                "named value {} `{}` origin {origin_ordinal} {:?} semantic statements {:?} expressions {:?} bindings {:?} sources {:?} states {:?} lists {:?} value-list authorities {:?} target {target:?}: {error}",
+                                named_value.id,
+                                named_value.diagnostic_path,
+                                origin.checked,
+                                origin.statements,
+                                origin.expressions,
+                                origin.bindings,
+                                origin.sources,
+                                origin.states,
+                                origin.lists,
+                                origin.value_list_authorities,
+                            ))
+                        })?
+                };
                 rows.push(SemanticNamedValueStorageV1 {
                     named_value: named_value.id,
                     origin_ordinal,
@@ -3264,6 +3656,7 @@ fn build_named_value_storage(
 }
 
 fn named_value_targets(
+    checked: &CheckedProgram,
     execution: &SemanticExecutionGraphV1,
     resources: &SemanticResourceGraphV1,
     reactive: &SemanticReactiveGraphV1,
@@ -3410,9 +3803,12 @@ fn named_value_targets(
         && origin.lists.is_empty()
         && origin.value_list_authorities.is_empty()
     {
-        targets.insert(SemanticNamedValueStorageTargetV1::DiagnosticOnly {
-            reason: SemanticNamedValueDiagnosticOnlyReasonV1::NonExecutableStructuralContainer,
-        });
+        let reason = if named_value_origin_is_structural_container(checked, origin)? {
+            SemanticNamedValueDiagnosticOnlyReasonV1::NonExecutableStructuralContainer
+        } else {
+            SemanticNamedValueDiagnosticOnlyReasonV1::NonExecutableCheckedLeaf
+        };
+        targets.insert(SemanticNamedValueStorageTargetV1::DiagnosticOnly { reason });
     }
 
     // Exact resource identities above are validated even when an executable
@@ -3648,6 +4044,45 @@ fn build_named_value_projection(
     Ok(steps)
 }
 
+fn named_value_storable_root_flow(
+    execution: &SemanticExecutionGraphV1,
+    fields: &[SemanticStorageFieldV1],
+    target: &SemanticNamedValueStorageTargetV1,
+    public_root_flow: &FlowType,
+) -> Result<(FlowType, bool), SemanticScopeStorageError> {
+    let storage_field = named_value_target_storage_field(target);
+    let mut expression = match storage_field {
+        Some(field) => require_storage_field(fields, field)?.producer,
+        None => match target {
+            SemanticNamedValueStorageTargetV1::Value { expression, .. } => Some(*expression),
+            SemanticNamedValueStorageTargetV1::Field { .. }
+            | SemanticNamedValueStorageTargetV1::List { .. }
+            | SemanticNamedValueStorageTargetV1::State { .. }
+            | SemanticNamedValueStorageTargetV1::Source { .. }
+            | SemanticNamedValueStorageTargetV1::DiagnosticOnly { .. } => None,
+        },
+    };
+    let mut consumed = false;
+    while let Some(current) = expression {
+        let value = require_expression(execution, current)?;
+        let SemanticExpressionKind::FlushBoundary { input } = value.kind else {
+            break;
+        };
+        expression = Some(input);
+        consumed = true;
+    }
+    if !consumed {
+        return Ok((public_root_flow.clone(), false));
+    }
+    let input = expression.ok_or_else(|| {
+        SemanticScopeStorageError::new("FLUSH boundary storage has no ordinary input expression")
+    })?;
+    Ok((
+        require_expression(execution, input)?.flow_type.clone(),
+        true,
+    ))
+}
+
 fn named_value_origin_contract_flow(
     checked: &CheckedProgram,
     origin: &crate::SemanticNamedValueTypeOriginV1,
@@ -3655,6 +4090,7 @@ fn named_value_origin_contract_flow(
     root_flow: &FlowType,
     projected_storage_type: &Type,
     named_flow: &FlowType,
+    storage_consumes_flush: bool,
 ) -> Result<FlowType, SemanticScopeStorageError> {
     if matches!(target, SemanticNamedValueStorageTargetV1::Source { .. }) {
         // Source payload shape/type authority is the exact CheckedSourceId ->
@@ -3676,6 +4112,52 @@ fn named_value_origin_contract_flow(
             mode: root_flow.mode,
             ty: projected_storage_type.clone(),
         });
+    }
+    if storage_consumes_flush && named_value_origin_exposes_flush_boundary(checked, origin)? {
+        // FLUSH is a private control carrier. The public reactive expression
+        // retains its ordinary closed boundary union, while a runtime storage
+        // slot can contain only the successful data input. Record that exact
+        // storable contract instead of pretending the control alternative is
+        // persisted as application data.
+        return Ok(FlowType {
+            mode: root_flow.mode,
+            ty: projected_storage_type.clone(),
+        });
+    }
+    if matches!(
+        target,
+        SemanticNamedValueStorageTargetV1::DiagnosticOnly { .. }
+    ) {
+        let checked_flow = if let Some(value) = origin.checked.value {
+            checked
+                .expressions
+                .iter()
+                .find(|expression| expression.id == value)
+                .map(|expression| expression.flow_type.clone())
+        } else if let Some(declaration) = origin.checked.declaration {
+            checked
+                .declarations
+                .iter()
+                .find(|candidate| candidate.id == declaration)
+                .map(|declaration| declaration.flow_type.clone())
+        } else {
+            None
+        };
+        let Some(checked_flow) = checked_flow else {
+            return Ok(named_flow.clone());
+        };
+        let projected_checked_type =
+            project_named_value_contract_type(&checked_flow.ty, &origin.checked.projection)?;
+        let representation =
+            derive_storage_representation(&projected_checked_type, &named_flow.ty)?;
+        if representation != SemanticStorageRepresentationV1::Exact
+            || checked_flow.mode != named_flow.mode
+        {
+            return Err(SemanticScopeStorageError::new(format!(
+                "diagnostic-only checked contract {checked_flow:?} differs from named contract {named_flow:?}"
+            )));
+        }
+        return Ok(named_flow.clone());
     }
     if named_value_origin_is_structural_container(checked, origin)? {
         // A record/list attached to a statement with structural children is
@@ -4163,12 +4645,18 @@ fn validate_named_value_storage_shape(
                         named_value.id
                     )));
                 }
-                let root_flow = named_value_target_flow_type(
+                let public_root_flow = named_value_target_flow_type(
                     execution,
                     resources,
                     reactive,
                     &graph.fields,
                     &row.target,
+                )?;
+                let (root_flow, _) = named_value_storable_root_flow(
+                    execution,
+                    &graph.fields,
+                    &row.target,
+                    &public_root_flow,
                 )?;
                 if matches!(
                     row.target,
@@ -4547,6 +5035,58 @@ mod tests {
             semantic.resolved_out_graph(),
         )
         .expect("storage graph")
+    }
+
+    fn graph_for_source(source: &str) -> (SemanticScopeStorageGraphV1, crate::SemanticProgram) {
+        let parsed =
+            boon_parser::parse_source("storage-contract-fixture.bn", source).expect("parse");
+        let output = boon_typecheck::check_program(&parsed);
+        assert!(
+            !output.report.has_errors(),
+            "unexpected diagnostics: {:#?}",
+            output.report.diagnostics
+        );
+        let checked = output.program.expect("checked");
+        let semantic = crate::elaborate(checked.clone(), &[]).expect("semantic");
+        (graph(&checked, &semantic), semantic)
+    }
+
+    #[test]
+    fn mapped_row_sources_remain_resource_only_through_absent_literal_predecessors() {
+        let (graph, semantic) = graph_for_source(
+            r#"
+store: [
+    rows:
+        LIST { [name: TEXT { primary }] }
+        |> List/map(item, new: stream_row(row: item))
+        |> List/remove(item, when: item.remove |> THEN { True })
+]
+
+FUNCTION stream_row(row) {
+    [
+        name: row.name
+        open: SOURCE
+        remove: SOURCE
+    ]
+}
+"#,
+        );
+        let row_source_fields = graph
+            .fields
+            .iter()
+            .filter(|field| matches!(field.name.as_str(), "open" | "remove"))
+            .collect::<Vec<_>>();
+        assert!(
+            !row_source_fields.is_empty(),
+            "expected mapped row source fields"
+        );
+        assert!(
+            row_source_fields.iter().all(|field| field.resource_only),
+            "mapped row source fields must not become durable storage: {row_source_fields:#?}\n\
+             lists: {:#?}\nmaterializations: {:#?}",
+            semantic.resource_graph().lists,
+            semantic.execution_graph().materializations,
+        );
     }
 
     #[test]

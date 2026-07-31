@@ -3,8 +3,11 @@ FUNCTION client_label() {
 }
 
 FUNCTION response(count) {
-    [
-        status: TEXT { accepted }
-        count: count
-    ]
+    BLOCK {
+        response_count: count
+        [
+            status: TEXT { accepted }
+            count: response_count
+        ]
+    }
 }

@@ -1291,11 +1291,7 @@ pub fn apply_checked_type_substitutions(
     ty: &Type,
     substitutions: &[CheckedTypeSubstitution],
 ) -> Type {
-    let substitutions = substitutions
-        .iter()
-        .map(|substitution| (substitution.variable, substitution.value.clone()))
-        .collect::<BTreeMap<_, _>>();
-    substitute_checked_type(ty, &substitutions)
+    substitute_checked_type_from_lookup(ty, substitutions)
 }
 
 /// An opaque, read-only product emitted only by the typechecker.
@@ -1657,6 +1653,9 @@ struct CheckedProgramBuilder<'a> {
     external_value_modes: BTreeMap<String, FlowMode>,
     external_identities: BTreeMap<String, CheckedExternalDeclarationIdentityV1>,
     local_function_requirements: BTreeMap<String, BTreeMap<String, Type>>,
+    flow_bindings: BTreeMap<String, FlowMode>,
+    named_value_modes: BTreeMap<String, FlowMode>,
+    named_value_expressions: BTreeMap<String, usize>,
     signatures: Vec<CheckedCallableSignature>,
     context_formals: Vec<CheckedContextFormal>,
     signature_by_name: BTreeMap<String, usize>,
@@ -1704,8 +1703,30 @@ struct CheckedProgramBuildInputs<'a> {
     named_value_type_table: &'a NamedValueTypeTable,
     render_slot_table: &'a RenderSlotTable,
     source_payload_shape_table: &'a [SourcePayloadSyntaxShapeEntry],
+    flow_bindings: &'a BTreeMap<String, FlowMode>,
     builtins: &'a BuiltinSignatureRegistry,
     render_contracts: &'a RenderContractRegistry,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct CheckedTypeInferenceChanges {
+    callable: bool,
+    declaration: bool,
+    call: bool,
+    selector: bool,
+    pattern: bool,
+    expression: bool,
+}
+
+impl CheckedTypeInferenceChanges {
+    fn any(self) -> bool {
+        self.callable
+            || self.declaration
+            || self.call
+            || self.selector
+            || self.pattern
+            || self.expression
+    }
 }
 
 #[cfg(test)]
@@ -1935,6 +1956,7 @@ impl<'a> CheckedProgramBuilder<'a> {
             named_value_type_table,
             render_slot_table,
             source_payload_shape_table,
+            flow_bindings,
             builtins,
             render_contracts,
         } = inputs;
@@ -1975,6 +1997,13 @@ impl<'a> CheckedProgramBuilder<'a> {
                 .collect(),
             external_identities: external_types.external_identities.clone(),
             local_function_requirements: external_types.local_function_requirements.clone(),
+            flow_bindings: flow_bindings.clone(),
+            named_value_modes: named_value_type_table
+                .entries
+                .iter()
+                .map(|entry| (entry.path.clone(), entry.flow_type.mode))
+                .collect(),
+            named_value_expressions: declaration_expression_index(program),
             signatures: Vec::new(),
             context_formals: Vec::new(),
             signature_by_name: BTreeMap::new(),
@@ -2090,6 +2119,10 @@ impl<'a> CheckedProgramBuilder<'a> {
             "validate_checked_projections",
             builder.validate_checked_type_projections()
         );
+        checked_program_phase!(
+            "validate_contextual_call_arguments",
+            builder.validate_contextual_call_arguments()
+        );
         checked_program_phase!("validate_pass_calls", builder.validate_pass_calls());
         checked_program_phase!(
             "validate_user_call_arguments",
@@ -2102,6 +2135,10 @@ impl<'a> CheckedProgramBuilder<'a> {
         let (mut statements, mut expressions) = checked_program_phase!(
             "lower_checked_tree",
             builder.lower_checked_tree(render_slot_table)
+        );
+        checked_program_phase!(
+            "reconcile_call_occurrence_results",
+            builder.reconcile_call_occurrence_results(&expressions)
         );
         checked_program_phase!(
             "validate_user_results",
@@ -2167,6 +2204,22 @@ impl<'a> CheckedProgramBuilder<'a> {
         checked.fields.order_chains = order_chains;
         builder.diagnostics.extend(order_diagnostics);
         (checked, builder.diagnostics, exact_pipeline_inputs_valid)
+    }
+
+    fn reconcile_call_occurrence_results(&mut self, expressions: &[CheckedExpression]) {
+        let occurrence_results = expressions
+            .iter()
+            .map(|expression| (expression.id, expression.flow_type.clone()))
+            .collect::<BTreeMap<_, _>>();
+        for call in &mut self.calls {
+            let Some(occurrence) = occurrence_results.get(&call.expression) else {
+                continue;
+            };
+            call.result = FlowType {
+                mode: occurrence.mode,
+                ty: specialize_checked_call_result(&call.result.ty, &occurrence.ty),
+            };
+        }
     }
 
     fn validate_exact_pipeline_inputs(&mut self) -> bool {
@@ -2570,9 +2623,18 @@ impl<'a> CheckedProgramBuilder<'a> {
     }
 
     fn register_builtin_signatures(&mut self, builtins: &BuiltinSignatureRegistry) {
-        for (name, signature) in builtins.authoritative_signatures() {
+        for (name, mut signature) in builtins.authoritative_signatures() {
             if host_effect_signature(name).is_some() {
                 continue;
+            }
+            // Schema-less legacy host operations still have ordinary typed
+            // input/result signatures, but their callable contract must carry
+            // the same consequential-effect bit as each call expression.
+            // Otherwise semantic validation sees two contradictory contracts
+            // and can fail before the retained-document effect boundary emits
+            // its intended diagnostic.
+            if boon_effect_schema::host_effect_spec(name).is_some() {
+                signature.effect.invokes_host = true;
             }
             self.register_authoritative_signature(name, CheckedCallableKind::Builtin, signature);
         }
@@ -3743,6 +3805,20 @@ impl<'a> CheckedProgramBuilder<'a> {
             );
         }
 
+        // Stabilize call-local result types before propagating requirements
+        // through user wrappers. Contextual operations such as List/find can
+        // reveal a broader tagged payload only after their call is
+        // instantiated; propagating from the pre-instantiation fallback would
+        // freeze every upstream wrapper to that one fallback variant.
+        let call_instantiation_started = Instant::now();
+        self.infer_checked_types();
+        if trace {
+            eprintln!(
+                "boon_typecheck checked_program.infer_contextual_callable_schemes.calls: {:.3}ms",
+                typecheck_elapsed_ms(call_instantiation_started)
+            );
+        }
+
         let propagation_started = Instant::now();
         let mut existing_vars = BTreeSet::new();
         for signature in &self.signatures {
@@ -3771,175 +3847,234 @@ impl<'a> CheckedProgramBuilder<'a> {
             .unwrap_or(CONTEXTUAL_RESULT_VAR.0)
             .saturating_add(1);
         let mut call_scheme_vars = BTreeMap::<(CheckedCallId, TypeVar), TypeVar>::new();
-        for _ in 0..self.signatures.len().saturating_add(1) {
-            let signatures = self.signatures.clone();
-            let calls = self.calls.clone();
-            let mut updates = Vec::new();
+        let calls = self.calls.clone();
+        let mut calls_by_owner = BTreeMap::<DeclId, Vec<usize>>::new();
+        for (call_index, call) in calls.iter().enumerate() {
+            if let Some(owner) = call.owner_callable {
+                calls_by_owner.entry(owner).or_default().push(call_index);
+            }
+        }
+        let signature_index_by_decl = self
+            .signatures
+            .iter()
+            .enumerate()
+            .map(|(index, signature)| (signature.decl_id, index))
+            .collect::<BTreeMap<_, _>>();
+        let user_owner_indices = self
+            .signatures
+            .iter()
+            .enumerate()
+            .filter_map(|(index, signature)| {
+                (signature.kind == CheckedCallableKind::User).then_some(index)
+            })
+            .collect::<BTreeSet<_>>();
+        let mut callers_by_callee = BTreeMap::<DeclId, BTreeSet<usize>>::new();
+        for call in &calls {
+            let Some(owner) = call
+                .owner_callable
+                .and_then(|owner| signature_index_by_decl.get(&owner))
+                .copied()
+                .filter(|owner| user_owner_indices.contains(owner))
+            else {
+                continue;
+            };
+            callers_by_callee
+                .entry(call.callable)
+                .or_default()
+                .insert(owner);
+        }
 
-            for (owner_index, owner) in signatures.iter().enumerate() {
-                if owner.kind != CheckedCallableKind::User {
+        // Propagation is monotone along the callee-to-caller graph. A global
+        // round used to recompute every user callable even when only one
+        // downstream signature changed, making deep wrapper chains quadratic.
+        // Seed every owner once, then revisit only callers whose callee
+        // contract actually changed.
+        let mut pending = user_owner_indices.clone();
+        let maximum_visits = user_owner_indices
+            .len()
+            .saturating_mul(self.signatures.len().saturating_add(1));
+        let mut visit_count = 0usize;
+        let mut changed_owner_count = 0usize;
+        let mut parameter_change_count = 0usize;
+        let mut result_change_count = 0usize;
+        while let Some(owner_index) = pending.pop_first() {
+            if visit_count >= maximum_visits {
+                break;
+            }
+            visit_count += 1;
+            let owner = self.signatures[owner_index].clone();
+            let owner_parameters = owner
+                .parameters
+                .iter()
+                .map(|parameter| (parameter.decl_id, parameter))
+                .collect::<BTreeMap<_, _>>();
+            let owner_parameter_ids = owner_parameters.keys().copied().collect::<BTreeSet<_>>();
+            let mut parameter_updates = BTreeMap::<DeclId, FlowType>::new();
+            let mut direct_result = None;
+
+            for call_index in calls_by_owner.get(&owner.decl_id).into_iter().flatten() {
+                let call = &calls[*call_index];
+                let Some(callee) = signature_index_by_decl
+                    .get(&call.callable)
+                    .and_then(|index| self.signatures.get(*index))
+                else {
+                    continue;
+                };
+                // Generic builtins propagate their structural scheme into
+                // forwarding user parameters. User callables must propagate
+                // even after their scheme closes.
+                if callee.kind != CheckedCallableKind::User && !checked_signature_is_generic(callee)
+                {
                     continue;
                 }
-                let owner_parameters = owner
-                    .parameters
+
+                let forwarded = call
+                    .entries
                     .iter()
-                    .map(|parameter| (parameter.decl_id, parameter))
-                    .collect::<BTreeMap<_, _>>();
-                let owner_parameter_ids = owner_parameters.keys().copied().collect::<BTreeSet<_>>();
-                let mut parameter_updates = BTreeMap::<DeclId, FlowType>::new();
-                let mut direct_result = None;
-
-                for call in calls
-                    .iter()
-                    .filter(|call| call.owner_callable == Some(owner.decl_id))
-                {
-                    let Some(callee) = signatures
-                        .iter()
-                        .find(|signature| signature.decl_id == call.callable)
-                    else {
-                        continue;
-                    };
-                    if !checked_signature_is_generic(callee) {
-                        continue;
-                    }
-
-                    let forwarded = call
-                        .entries
-                        .iter()
-                        .filter_map(|entry| {
-                            let (formal, owner_parameter, path, output_forward) = match entry {
-                                CheckedCallEntry::Input { formal, value, .. } => {
-                                    let (target, path) = self.forwarded_owner_parameter_with_path(
-                                        owner.decl_id,
-                                        &owner_parameter_ids,
-                                        *value,
-                                        &mut BTreeSet::new(),
-                                    )?;
-                                    (*formal, target, path, false)
+                    .filter_map(|entry| {
+                        let (formal, owner_parameter, path, output_forward) = match entry {
+                            CheckedCallEntry::Input { formal, value, .. } => {
+                                let (target, path) = self.forwarded_owner_parameter_with_path(
+                                    owner.decl_id,
+                                    &owner_parameter_ids,
+                                    *value,
+                                    &mut BTreeSet::new(),
+                                )?;
+                                if self.expression_is_narrowed_tag_parameter_use(*value, target) {
+                                    return None;
                                 }
-                                CheckedCallEntry::ForwardOut { formal, target, .. }
-                                    if owner_parameters.contains_key(target) =>
-                                {
-                                    (*formal, *target, Vec::new(), true)
-                                }
-                                CheckedCallEntry::FreshOut { .. }
-                                | CheckedCallEntry::ForwardOut { .. } => return None,
-                            };
-                            let callee_parameter = callee
-                                .parameters
-                                .iter()
-                                .find(|parameter| parameter.decl_id == formal)?;
-                            let callee_flow_type = FlowType {
-                                mode: callee_parameter.flow_type.mode,
-                                ty: instantiate_checked_type_scheme_for_call(
-                                    &callee_parameter.flow_type.ty,
-                                    call.id,
-                                    &mut call_scheme_vars,
-                                    &mut next_var,
-                                ),
-                            };
-                            Some((owner_parameter, path, callee_flow_type, output_forward))
-                        })
-                        .collect::<Vec<_>>();
-                    let direct_wrapper = owner.result_expression == Some(call.expression);
-
-                    let mut substitutions = BTreeMap::<TypeVar, Type>::new();
-                    for (owner_parameter, path, callee_flow_type, output_forward) in &forwarded {
-                        if direct_wrapper || *output_forward {
-                            continue;
-                        }
-                        let Some(owner_type) = owner_parameters
-                            .get(owner_parameter)
-                            .map(|parameter| &parameter.flow_type.ty)
-                            .and_then(|ty| known_type_for_forwarded_parameter_path(ty, path))
-                        else {
-                            continue;
+                                (*formal, target, path, false)
+                            }
+                            CheckedCallEntry::ForwardOut { formal, target, .. }
+                                if owner_parameters.contains_key(target) =>
+                            {
+                                (*formal, *target, Vec::new(), true)
+                            }
+                            CheckedCallEntry::FreshOut { .. }
+                            | CheckedCallEntry::ForwardOut { .. } => return None,
                         };
-                        unify_checked_type_pattern(
-                            &callee_flow_type.ty,
-                            &owner_type,
-                            &mut substitutions,
-                        );
-                    }
-
-                    for (owner_parameter, path, callee_flow_type, output_forward) in forwarded {
-                        if direct_wrapper && path.is_empty() {
-                            parameter_updates.insert(owner_parameter, callee_flow_type);
-                            continue;
-                        }
-                        let required =
-                            substitute_checked_type(&callee_flow_type.ty, &substitutions);
-                        if output_forward {
-                            parameter_updates.insert(
-                                owner_parameter,
-                                FlowType {
-                                    mode: callee_flow_type.mode,
-                                    ty: required,
-                                },
-                            );
-                            continue;
-                        }
-                        let required = forwarded_parameter_requirement_for_path(&path, required);
-                        let base = parameter_updates
-                            .get(&owner_parameter)
-                            .or_else(|| {
-                                owner_parameters
-                                    .get(&owner_parameter)
-                                    .map(|parameter| &parameter.flow_type)
-                            })
-                            .expect("forwarded owner parameter exists");
-                        parameter_updates.insert(
-                            owner_parameter,
-                            FlowType {
-                                mode: if path.is_empty() {
-                                    merge_flow_modes(base.mode, callee_flow_type.mode)
-                                } else {
-                                    base.mode
-                                },
-                                ty: merge_forwarded_parameter_type(&base.ty, &required),
-                            },
-                        );
-                    }
-
-                    if direct_wrapper {
-                        direct_result = Some(FlowType {
-                            mode: callee.result.mode,
+                        let callee_parameter = callee
+                            .parameters
+                            .iter()
+                            .find(|parameter| parameter.decl_id == formal)?;
+                        let callee_flow_type = FlowType {
+                            mode: callee_parameter.flow_type.mode,
                             ty: instantiate_checked_type_scheme_for_call(
-                                &callee.result.ty,
+                                &callee_parameter.flow_type.ty,
                                 call.id,
                                 &mut call_scheme_vars,
                                 &mut next_var,
                             ),
-                        });
+                        };
+                        Some((owner_parameter, path, callee_flow_type, output_forward))
+                    })
+                    .collect::<Vec<_>>();
+                let direct_wrapper = owner.result_expression == Some(call.expression);
+
+                let mut substitutions = BTreeMap::<TypeVar, Type>::new();
+                for (owner_parameter, path, callee_flow_type, output_forward) in &forwarded {
+                    if direct_wrapper || *output_forward {
+                        continue;
                     }
+                    let Some(owner_type) = owner_parameters
+                        .get(owner_parameter)
+                        .map(|parameter| &parameter.flow_type.ty)
+                        .and_then(|ty| known_type_for_forwarded_parameter_path(ty, path))
+                    else {
+                        continue;
+                    };
+                    unify_checked_type_pattern(
+                        &callee_flow_type.ty,
+                        &owner_type,
+                        &mut substitutions,
+                    );
                 }
-                if parameter_updates.is_empty() && direct_result.is_none() {
-                    continue;
+
+                for (owner_parameter, path, callee_flow_type, output_forward) in forwarded {
+                    if direct_wrapper && path.is_empty() {
+                        parameter_updates.insert(owner_parameter, callee_flow_type);
+                        continue;
+                    }
+                    let required = substitute_checked_type(&callee_flow_type.ty, &substitutions);
+                    if output_forward {
+                        parameter_updates.insert(
+                            owner_parameter,
+                            FlowType {
+                                mode: callee_flow_type.mode,
+                                ty: required,
+                            },
+                        );
+                        continue;
+                    }
+                    let required = forwarded_parameter_requirement_for_path(&path, required);
+                    let base = parameter_updates
+                        .get(&owner_parameter)
+                        .or_else(|| {
+                            owner_parameters
+                                .get(&owner_parameter)
+                                .map(|parameter| &parameter.flow_type)
+                        })
+                        .expect("forwarded owner parameter exists");
+                    parameter_updates.insert(
+                        owner_parameter,
+                        FlowType {
+                            mode: if path.is_empty() {
+                                merge_flow_modes(base.mode, callee_flow_type.mode)
+                            } else {
+                                base.mode
+                            },
+                            ty: merge_forwarded_parameter_type(&base.ty, &required),
+                        },
+                    );
                 }
-                updates.push((owner_index, parameter_updates, direct_result));
+
+                if direct_wrapper {
+                    direct_result = Some(FlowType {
+                        mode: callee.result.mode,
+                        ty: instantiate_checked_type_scheme_for_call(
+                            &callee.result.ty,
+                            call.id,
+                            &mut call_scheme_vars,
+                            &mut next_var,
+                        ),
+                    });
+                }
             }
 
-            let mut changed = false;
-            for (owner_index, parameter_updates, result) in updates {
-                for parameter in &mut self.signatures[owner_index].parameters {
-                    if let Some(flow_type) = parameter_updates.get(&parameter.decl_id)
-                        && parameter.flow_type != *flow_type
-                    {
-                        parameter.flow_type = flow_type.clone();
-                        changed = true;
-                    }
-                }
-                if let Some(result) = result
-                    && self.signatures[owner_index].result != result
+            let mut owner_changed = false;
+            for parameter in &mut self.signatures[owner_index].parameters {
+                if let Some(flow_type) = parameter_updates.get(&parameter.decl_id)
+                    && parameter.flow_type != *flow_type
                 {
-                    self.signatures[owner_index].result = result;
-                    changed = true;
+                    parameter.flow_type = flow_type.clone();
+                    owner_changed = true;
+                    parameter_change_count += 1;
                 }
             }
-            self.sync_signature_declaration_types();
-            if !changed {
-                break;
+            if let Some(result) = direct_result
+                && self.signatures[owner_index].result != result
+            {
+                self.signatures[owner_index].result = result;
+                owner_changed = true;
+                result_change_count += 1;
             }
+            if !owner_changed {
+                continue;
+            }
+            changed_owner_count += 1;
+            if let Some(callers) = callers_by_callee.get(&owner.decl_id) {
+                pending.extend(callers.iter().copied());
+            }
+        }
+        if changed_owner_count > 0 {
+            self.sync_signature_declaration_types();
+        }
+        if trace {
+            eprintln!(
+                "boon_typecheck checked_program.infer_contextual_callable_schemes.propagation_worklist \
+                 visits={} changed_owners={} parameter_changes={} result_changes={}",
+                visit_count, changed_owner_count, parameter_change_count, result_change_count,
+            );
         }
         if trace {
             eprintln!(
@@ -3955,6 +4090,46 @@ impl<'a> CheckedProgramBuilder<'a> {
             &mut requirements,
             &self.local_function_requirements,
         );
+        let pattern_domains = self.pattern_selector_parameter_domains();
+        let mut actual_variant_domains = BTreeMap::<DeclId, Type>::new();
+        let pattern_selector_parameters = self.pattern_selector_parameters();
+        let pattern_actuals = self
+            .calls
+            .iter()
+            .flat_map(|call| &call.entries)
+            .filter_map(|entry| match entry {
+                CheckedCallEntry::Input { formal, value, .. }
+                    if pattern_selector_parameters.contains(formal) =>
+                {
+                    Some((*formal, *value))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        self.begin_checked_flow_inference_epoch();
+        for (formal, value) in pattern_actuals {
+            let actual = self
+                .infer_checked_expr_flow(value.0 as usize, &mut BTreeSet::new())
+                .ty;
+            if !type_is_variant_domain(&actual) {
+                continue;
+            }
+            actual_variant_domains
+                .entry(formal)
+                .and_modify(|existing| {
+                    *existing = canonical_union_type(vec![existing.clone(), actual.clone()]);
+                })
+                .or_insert(actual);
+        }
+        for (formal, pattern_domain) in pattern_domains {
+            actual_variant_domains
+                .entry(formal)
+                .and_modify(|actual| {
+                    *actual =
+                        complete_pattern_selector_domain(actual.clone(), pattern_domain.clone());
+                })
+                .or_insert(pattern_domain);
+        }
         let user_signatures = self
             .signatures
             .iter()
@@ -3978,11 +4153,22 @@ impl<'a> CheckedProgramBuilder<'a> {
             .saturating_add(1);
         for (signature_index, name) in user_signatures {
             for parameter in &mut self.signatures[signature_index].parameters {
-                let seed = requirements
-                    .get(&name)
-                    .and_then(|parameters| parameters.get(&parameter.name))
+                let inferred_variant_domain = actual_variant_domains
+                    .get(&parameter.decl_id)
                     .cloned()
-                    .unwrap_or(Type::Unknown);
+                    .or_else(|| {
+                        pattern_selector_parameters
+                            .contains(&parameter.decl_id)
+                            .then(|| parameter.flow_type.ty.clone())
+                            .filter(type_is_variant_domain)
+                    });
+                let seed = inferred_variant_domain.unwrap_or_else(|| {
+                    requirements
+                        .get(&name)
+                        .and_then(|parameters| parameters.get(&parameter.name))
+                        .cloned()
+                        .unwrap_or(Type::Unknown)
+                });
                 parameter.flow_type =
                     continuous_flow_type(freshen_checked_scheme_type(&seed, &mut next_var));
             }
@@ -4838,6 +5024,102 @@ impl<'a> CheckedProgramBuilder<'a> {
         routed
     }
 
+    fn expression_is_narrowed_tag_parameter_use(
+        &self,
+        expression: CheckedExprId,
+        parameter: DeclId,
+    ) -> bool {
+        let Some(expression_scope) = self
+            .expression_scopes
+            .get(&(expression.0 as usize))
+            .copied()
+        else {
+            return false;
+        };
+        self.pattern_selectors.iter().any(|(arm, selector)| {
+            let Some(arm_scope) = self.expression_scopes.get(arm).copied() else {
+                return false;
+            };
+            if !self.scope_descends_from(expression_scope, arm_scope) {
+                return false;
+            }
+            let Some(AstExpr {
+                kind: AstExprKind::MatchArm { pattern, .. },
+                ..
+            }) = self.program.expressions.get(*arm)
+            else {
+                return false;
+            };
+            if pattern_variant(pattern).is_none() {
+                return false;
+            }
+            matches!(
+                self.direct_read_declaration_with_projection(CheckedExprId(*selector as u32)),
+                Some((target, projection)) if target == parameter && projection.is_empty()
+            )
+        })
+    }
+
+    fn pattern_selector_parameter_domains(&self) -> BTreeMap<DeclId, Type> {
+        let mut selectors = BTreeMap::<(DeclId, usize), (bool, Vec<Variant>)>::new();
+        for (arm, selector) in &self.pattern_selectors {
+            let Some((parameter, projection)) =
+                self.direct_read_declaration_with_projection(CheckedExprId(*selector as u32))
+            else {
+                continue;
+            };
+            if !projection.is_empty() {
+                continue;
+            }
+            let Some(AstExpr {
+                kind: AstExprKind::MatchArm { pattern, .. },
+                ..
+            }) = self.program.expressions.get(*arm)
+            else {
+                continue;
+            };
+            let entry = selectors.entry((parameter, *selector)).or_default();
+            if matches!(
+                pattern,
+                AstMatchPattern::Wildcard | AstMatchPattern::Binding { .. }
+            ) {
+                entry.0 = true;
+            } else if let Some(variant) = pattern_variant(pattern) {
+                entry.1.push(variant);
+            }
+        }
+
+        let mut domains = BTreeMap::<DeclId, Type>::new();
+        for ((parameter, _), (has_catch_all, variants)) in selectors {
+            // A catch-all arm accepts variants beyond the named arms, so its
+            // syntax is not a closed selector domain. Actual call types remain
+            // free to instantiate that parameter.
+            if has_catch_all || variants.is_empty() {
+                continue;
+            }
+            let pattern_domain = Type::VariantSet(variants);
+            domains
+                .entry(parameter)
+                .and_modify(|existing| {
+                    *existing =
+                        canonical_union_type(vec![existing.clone(), pattern_domain.clone()]);
+                })
+                .or_insert(pattern_domain);
+        }
+        domains
+    }
+
+    fn pattern_selector_parameters(&self) -> BTreeSet<DeclId> {
+        self.pattern_selectors
+            .values()
+            .filter_map(|selector| {
+                let (parameter, projection) =
+                    self.direct_read_declaration_with_projection(CheckedExprId(*selector as u32))?;
+                projection.is_empty().then_some(parameter)
+            })
+            .collect()
+    }
+
     fn sync_signature_declaration_types(&mut self) {
         let parameter_types = self
             .signatures
@@ -4910,34 +5192,8 @@ impl<'a> CheckedProgramBuilder<'a> {
                 })
                 .collect::<Vec<_>>();
             let boundary_expressions = self.inferred_expr_types.clone();
-            self.begin_checked_flow_inference_epoch();
-            let callable_changed = self.refresh_checked_callable_result_types();
-            if callable_changed {
-                self.begin_checked_flow_inference_epoch();
-            }
-            let declaration_changed = self.refresh_checked_declaration_types();
-            if declaration_changed {
-                self.begin_checked_flow_inference_epoch();
-            }
-            let mut call_changed = false;
-            let call_ids = self.calls.iter().map(|call| call.id).collect::<Vec<_>>();
-            for call_id in call_ids {
-                call_changed |= self.instantiate_checked_call(call_id);
-            }
-            if call_changed {
-                self.begin_checked_flow_inference_epoch();
-            }
-            let pattern_changed = self.refresh_pattern_binding_types();
-            if pattern_changed {
-                self.begin_checked_flow_inference_epoch();
-            }
-            let expression_changed = self.refresh_checked_expression_types();
-            let changed = callable_changed
-                || declaration_changed
-                || call_changed
-                || pattern_changed
-                || expression_changed;
-            if !changed {
+            let changes = self.advance_checked_type_inference();
+            if !changes.any() {
                 return;
             }
             final_boundary_unchanged = boundary_declarations
@@ -4979,6 +5235,112 @@ impl<'a> CheckedProgramBuilder<'a> {
             end: 0,
             message: "checked contextual type inference did not converge".to_owned(),
         });
+    }
+
+    fn advance_checked_type_inference(&mut self) -> CheckedTypeInferenceChanges {
+        self.begin_checked_flow_inference_epoch();
+        let callable = self.refresh_checked_callable_result_types();
+        if callable {
+            self.begin_checked_flow_inference_epoch();
+        }
+        let declaration = self.refresh_checked_declaration_types();
+        if declaration {
+            self.begin_checked_flow_inference_epoch();
+        }
+        let mut call = false;
+        let call_ids = self.calls.iter().map(|call| call.id).collect::<Vec<_>>();
+        for call_id in call_ids {
+            call |= self.instantiate_checked_call(call_id);
+        }
+        if call {
+            self.begin_checked_flow_inference_epoch();
+        }
+        let selector = self.refresh_pattern_selector_parameter_types();
+        if selector {
+            self.begin_checked_flow_inference_epoch();
+        }
+        let pattern = self.refresh_pattern_binding_types();
+        if pattern {
+            self.begin_checked_flow_inference_epoch();
+        }
+        let expression = self.refresh_checked_expression_types();
+        CheckedTypeInferenceChanges {
+            callable,
+            declaration,
+            call,
+            selector,
+            pattern,
+            expression,
+        }
+    }
+
+    fn refresh_pattern_selector_parameter_types(&mut self) -> bool {
+        let pattern_domains = self.pattern_selector_parameter_domains();
+        let mut domains = BTreeMap::<DeclId, Type>::new();
+        let selector_parameters = self.pattern_selector_parameters();
+        if selector_parameters.is_empty() {
+            return false;
+        }
+        let actuals = self
+            .calls
+            .iter()
+            .flat_map(|call| &call.entries)
+            .filter_map(|entry| match entry {
+                CheckedCallEntry::Input { formal, value, .. }
+                    if selector_parameters.contains(formal) =>
+                {
+                    Some((*formal, *value))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for (formal, value) in actuals {
+            let actual = self
+                .infer_checked_expr_flow(value.0 as usize, &mut BTreeSet::new())
+                .ty;
+            if !type_is_variant_domain(&actual) {
+                continue;
+            }
+            domains
+                .entry(formal)
+                .and_modify(|existing| {
+                    *existing = canonical_union_type(vec![existing.clone(), actual.clone()]);
+                })
+                .or_insert(actual);
+        }
+        for (formal, pattern_domain) in pattern_domains {
+            domains
+                .entry(formal)
+                .and_modify(|actual| {
+                    *actual =
+                        complete_pattern_selector_domain(actual.clone(), pattern_domain.clone());
+                })
+                .or_insert(pattern_domain);
+        }
+
+        let mut changed = false;
+        for signature in &mut self.signatures {
+            for parameter in &mut signature.parameters {
+                let Some(actual) = domains.get(&parameter.decl_id) else {
+                    continue;
+                };
+                let merged = if type_is_variant_domain(&parameter.flow_type.ty) {
+                    canonical_union_type(vec![parameter.flow_type.ty.clone(), actual.clone()])
+                } else if is_value_placeholder_type(&parameter.flow_type.ty) {
+                    actual.clone()
+                } else {
+                    continue;
+                };
+                if parameter.flow_type.ty != merged {
+                    parameter.flow_type.ty = merged;
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.sync_signature_declaration_types();
+        }
+        changed
     }
 
     fn validate_pass_calls(&mut self) {
@@ -5354,6 +5716,7 @@ impl<'a> CheckedProgramBuilder<'a> {
             return false;
         };
         let mut substitutions = BTreeMap::<TypeVar, Type>::new();
+        let mut dependency_catch_inputs = Vec::new();
 
         for entry in &call.entries {
             let CheckedCallEntry::Input {
@@ -5375,7 +5738,24 @@ impl<'a> CheckedProgramBuilder<'a> {
             let actual = self
                 .infer_checked_expr_flow(value.0 as usize, &mut BTreeSet::new())
                 .ty;
+            if signature.name == "Dependency/catch_cycle"
+                && !matches!(
+                    &actual,
+                    Type::Unknown | Type::UnresolvedShape { .. } | Type::Absent
+                )
+            {
+                dependency_catch_inputs.push(actual.clone());
+            }
             unify_checked_type_pattern(&parameter.flow_type.ty, &actual, &mut substitutions);
+        }
+        if signature.name == "Dependency/catch_cycle"
+            && let Type::Var(result_variable) = signature.result.ty
+            && !dependency_catch_inputs.is_empty()
+        {
+            substitutions.insert(
+                result_variable,
+                canonical_union_type(dependency_catch_inputs),
+            );
         }
         let context_formal = signature
             .context_formal
@@ -5432,7 +5812,6 @@ impl<'a> CheckedProgramBuilder<'a> {
                 formal,
                 value,
                 evaluation_scope: CheckedEvaluationScope::Output { .. },
-                name,
                 ..
             } = entry
             else {
@@ -5449,18 +5828,6 @@ impl<'a> CheckedProgramBuilder<'a> {
                 .infer_checked_expr_flow(value.0 as usize, &mut BTreeSet::new())
                 .ty;
             unify_checked_type_pattern(&parameter.flow_type.ty, &actual, &mut substitutions);
-            let expected = substitute_checked_type(&parameter.flow_type.ty, &substitutions);
-            if !type_is_assignable_to(&actual, &expected) {
-                self.contextual_type_diagnostic(
-                    value.0 as usize,
-                    format!(
-                        "`{}` argument `{name}` has incompatible contextual type\nexpected: {}\nfound: {}",
-                        signature.name,
-                        boon_facing_type_label(&expected),
-                        boon_facing_type_label(&actual)
-                    ),
-                );
-            }
         }
 
         for entry in &call.entries {
@@ -5581,6 +5948,55 @@ impl<'a> CheckedProgramBuilder<'a> {
         }
         changed |= self.set_inferred_expr_flow(call.expression.0 as usize, result);
         changed
+    }
+
+    fn validate_contextual_call_arguments(&mut self) {
+        let calls = self.calls.clone();
+        for call in calls {
+            let Some(signature) = self.signature_by_declaration(call.callable).cloned() else {
+                continue;
+            };
+            let mut substitutions = call
+                .type_substitutions
+                .iter()
+                .map(|substitution| (substitution.variable, substitution.value.clone()))
+                .collect::<BTreeMap<_, _>>();
+            for entry in &call.entries {
+                let CheckedCallEntry::Input {
+                    formal,
+                    value,
+                    evaluation_scope: CheckedEvaluationScope::Output { .. },
+                    name,
+                    ..
+                } = entry
+                else {
+                    continue;
+                };
+                let Some(parameter) = signature
+                    .parameters
+                    .iter()
+                    .find(|parameter| parameter.decl_id == *formal)
+                else {
+                    continue;
+                };
+                let actual = self
+                    .infer_checked_expr_flow(value.0 as usize, &mut BTreeSet::new())
+                    .ty;
+                unify_checked_type_pattern(&parameter.flow_type.ty, &actual, &mut substitutions);
+                let expected = substitute_checked_type(&parameter.flow_type.ty, &substitutions);
+                if !type_is_assignable_to(&actual, &expected) {
+                    self.contextual_type_diagnostic(
+                        value.0 as usize,
+                        format!(
+                            "`{}` argument `{name}` has incompatible contextual type\nexpected: {}\nfound: {}",
+                            signature.name,
+                            boon_facing_type_label(&expected),
+                            boon_facing_type_label(&actual)
+                        ),
+                    );
+                }
+            }
+        }
     }
 
     fn instantiate_checked_call_result_mode(
@@ -5821,6 +6237,12 @@ impl<'a> CheckedProgramBuilder<'a> {
         mode
     }
 
+    fn exact_named_value_mode(&self, path: &str) -> Option<FlowMode> {
+        declaration_expr_for_path(&self.named_value_expressions, path)
+            .and_then(|expression| self.inferred_expr_types.get(&expression))
+            .map(|flow_type| flow_type.mode)
+    }
+
     fn infer_instantiated_read_mode(
         &mut self,
         expression: CheckedExprId,
@@ -5833,8 +6255,15 @@ impl<'a> CheckedProgramBuilder<'a> {
             .get(&(expression.0 as usize))
             .copied()
             .unwrap_or(LexicalScopeId(0));
-        let (target, projection) =
-            self.resolve_checked_read_path(expression.0 as usize, scope, parts)?;
+        let Some((target, projection)) =
+            self.resolve_checked_read_path(expression.0 as usize, scope, parts)
+        else {
+            let path = parts.join(".");
+            return self
+                .exact_named_value_mode(&path)
+                .or_else(|| flow_binding_mode(&self.named_value_modes, &path))
+                .or_else(|| flow_binding_mode(&self.flow_bindings, &path));
+        };
         if let Some(mode) = bindings.get(&target) {
             return Some(*mode);
         }
@@ -6327,7 +6756,14 @@ impl<'a> CheckedProgramBuilder<'a> {
             .get(&expr_id)
             .copied()
             .unwrap_or(LexicalScopeId(0));
-        let (target, projection) = self.resolve_checked_read_path(expr_id, scope_id, parts)?;
+        let Some((target, projection)) = self.resolve_checked_read_path(expr_id, scope_id, parts)
+        else {
+            let path = parts.join(".");
+            return self
+                .exact_named_value_mode(&path)
+                .or_else(|| flow_binding_mode(&self.named_value_modes, &path))
+                .or_else(|| flow_binding_mode(&self.flow_bindings, &path));
+        };
         let declaration = self.declaration(target).cloned()?;
         if declaration.kind == CheckedDeclarationKind::ValueParameter {
             let actuals = self
@@ -7764,6 +8200,67 @@ impl<'a> CheckedProgramBuilder<'a> {
         (statements, expressions)
     }
 
+    fn checked_stateful_call_initial(&self, call: CheckedCallId) -> Option<CheckedExprId> {
+        let call = self.call_by_checked_id(call)?;
+        let signature = self
+            .signature_by_declaration(call.callable)
+            .filter(|signature| signature.kind == CheckedCallableKind::Builtin)?;
+        let parameter = signature
+            .parameters
+            .iter()
+            .filter(|parameter| parameter.kind == CheckedParameterKind::Value)
+            .min_by_key(|parameter| parameter.ordinal)?;
+        call.entries.iter().find_map(|entry| match entry {
+            CheckedCallEntry::Input { formal, value, .. } if *formal == parameter.decl_id => {
+                Some(*value)
+            }
+            CheckedCallEntry::Input { .. }
+            | CheckedCallEntry::FreshOut { .. }
+            | CheckedCallEntry::ForwardOut { .. } => None,
+        })
+    }
+
+    fn checked_initializer_is_startup_safe(
+        &self,
+        expressions: &[CheckedExpression],
+        calls: &BTreeMap<CheckedCallId, &CheckedCall>,
+        root: CheckedExprId,
+    ) -> bool {
+        let mut pending = vec![root];
+        let mut visited = BTreeSet::new();
+        while let Some(expression_id) = pending.pop() {
+            if !visited.insert(expression_id) {
+                continue;
+            }
+            let Some(expression) = expressions
+                .get(expression_id.0 as usize)
+                .filter(|candidate| candidate.id == expression_id)
+            else {
+                return false;
+            };
+            if expression.effect.invokes_host || expression.effect.emits_source {
+                return false;
+            }
+            match &expression.kind {
+                CheckedExpressionKind::Hold { initial, .. } => pending.push(*initial),
+                CheckedExpressionKind::Latest { branches } => {
+                    let Some(initial) = branches.first() else {
+                        return false;
+                    };
+                    pending.push(*initial);
+                }
+                CheckedExpressionKind::Call { call } if expression.effect.writes_state => {
+                    let Some(initial) = self.checked_stateful_call_initial(*call) else {
+                        return false;
+                    };
+                    pending.push(initial);
+                }
+                kind => pending.extend(checked_expression_children(kind, calls)),
+            }
+        }
+        true
+    }
+
     fn derive_checked_resources(
         &mut self,
         statements: &mut [CheckedStatement],
@@ -7973,6 +8470,11 @@ impl<'a> CheckedProgramBuilder<'a> {
             &declaration_statements,
             &self.calls,
         );
+        let calls_by_id = self
+            .calls
+            .iter()
+            .map(|call| (call.id, call))
+            .collect::<BTreeMap<_, _>>();
         let mut states = Vec::<CheckedState>::new();
         for expression in expressions.iter() {
             let state = match &expression.kind {
@@ -7982,9 +8484,14 @@ impl<'a> CheckedProgramBuilder<'a> {
                 CheckedExpressionKind::Latest { branches }
                     if !hold_update_mergers.contains(&expression.id)
                         && branches.first().is_some_and(|branch| {
-                            expressions
-                                .get(branch.0 as usize)
-                                .is_some_and(|branch| branch.flow_type.mode == FlowMode::Continuous)
+                            expressions.get(branch.0 as usize).is_some_and(|branch| {
+                                branch.flow_type.mode == FlowMode::Continuous
+                                    && self.checked_initializer_is_startup_safe(
+                                        expressions,
+                                        &calls_by_id,
+                                        branch.id,
+                                    )
+                            })
                         }) =>
                 {
                     branches
@@ -7992,33 +8499,9 @@ impl<'a> CheckedProgramBuilder<'a> {
                         .copied()
                         .map(|initial| (CheckedStateKind::InitialLatest, initial))
                 }
-                CheckedExpressionKind::Call { call } if expression.effect.writes_state => {
-                    self.call_by_checked_id(*call)
-                        .and_then(|call| {
-                            self.signature_by_declaration(call.callable)
-                                .filter(|signature| signature.kind == CheckedCallableKind::Builtin)
-                                .and_then(|signature| {
-                                    signature
-                                        .parameters
-                                        .iter()
-                                        .filter(|parameter| {
-                                            parameter.kind == CheckedParameterKind::Value
-                                        })
-                                        .min_by_key(|parameter| parameter.ordinal)
-                                        .and_then(|parameter| {
-                                            call.entries.iter().find_map(|entry| match entry {
-                                                CheckedCallEntry::Input {
-                                                    formal, value, ..
-                                                } if *formal == parameter.decl_id => Some(*value),
-                                                CheckedCallEntry::Input { .. }
-                                                | CheckedCallEntry::FreshOut { .. }
-                                                | CheckedCallEntry::ForwardOut { .. } => None,
-                                            })
-                                        })
-                                })
-                        })
-                        .map(|initial| (CheckedStateKind::StatefulCall, initial))
-                }
+                CheckedExpressionKind::Call { call } if expression.effect.writes_state => self
+                    .checked_stateful_call_initial(*call)
+                    .map(|initial| (CheckedStateKind::StatefulCall, initial)),
                 _ => None,
             };
             let Some((kind, initial)) = state else {
@@ -8278,23 +8761,44 @@ impl<'a> CheckedProgramBuilder<'a> {
                     let Some(input) = expression_by_id.get(input).copied() else {
                         continue;
                     };
-                    let state_transition = matches!(
-                        &input.kind,
-                        CheckedExpressionKind::Read { target, .. }
-                            if self
-                                .declaration(*target)
-                                .is_some_and(|declaration| {
-                                    declaration.kind == CheckedDeclarationKind::Hold
-                                        || declaration.value.is_some_and(|value| {
-                                            expression_by_id.get(&value).is_some_and(|value| {
-                                                matches!(
-                                                    value.kind,
-                                                    CheckedExpressionKind::Hold { .. }
-                                                )
-                                            })
-                                        })
-                                })
-                    );
+                    let checked_value_is_stateful = |value: &CheckedExpression| match &value.kind {
+                        CheckedExpressionKind::Hold { .. } => true,
+                        CheckedExpressionKind::Latest { branches } => branches
+                            .first()
+                            .and_then(|branch| expression_by_id.get(branch).copied())
+                            .is_some_and(|branch| branch.flow_type.mode == FlowMode::Continuous),
+                        CheckedExpressionKind::Call { call } => self
+                            .call_by_checked_id(*call)
+                            .and_then(|call| self.signature_by_declaration(call.callable))
+                            .is_some_and(|signature| signature.effect.writes_state),
+                        _ => false,
+                    };
+                    let state_transition = match &input.kind {
+                        CheckedExpressionKind::Read { target, .. } => {
+                            self.declaration(*target).is_some_and(|declaration| {
+                                declaration.kind == CheckedDeclarationKind::Hold
+                                    || declaration.value.is_some_and(|value| {
+                                        expression_by_id
+                                            .get(&value)
+                                            .is_some_and(|value| checked_value_is_stateful(value))
+                                    })
+                            })
+                        }
+                        CheckedExpressionKind::ExternalRead {
+                            canonical_path,
+                            external_identity: None,
+                        } => {
+                            let declaration = declaration_expr_for_path(
+                                &self.named_value_expressions,
+                                canonical_path,
+                            )
+                            .and_then(|value| {
+                                expression_by_id.get(&CheckedExprId(value as u32)).copied()
+                            });
+                            declaration.is_some_and(checked_value_is_stateful)
+                        }
+                        _ => false,
+                    };
                     let function_invocation = matches!(
                         &input.kind,
                         CheckedExpressionKind::Read { target, .. }
@@ -8434,20 +8938,32 @@ impl<'a> CheckedProgramBuilder<'a> {
             **result = result_type.clone();
         }
         if !checked_signature_is_generic(&self.signatures[signature_index]) {
-            let mut call_expressions = BTreeSet::new();
+            let mut call_results = BTreeMap::new();
             for call in self
                 .calls
                 .iter_mut()
                 .filter(|call| call.callable == callable)
             {
-                call.result = result_type.clone();
-                call_expressions.insert(call.expression);
+                let occurrence = expressions
+                    .iter()
+                    .find(|expression| expression.id == call.expression)
+                    .map(|expression| expression.flow_type.clone())
+                    .unwrap_or_else(|| call.result.clone());
+                let occurrence_result = FlowType {
+                    // Temporal gating and structural render/call refinements
+                    // are occurrence-specific. Finalizing a non-generic
+                    // callable must not collapse them back to the callable's
+                    // coarser public result shape.
+                    mode: occurrence.mode,
+                    ty: specialize_checked_call_result(&result_type.ty, &occurrence.ty),
+                };
+                call.result = occurrence_result.clone();
+                call_results.insert(call.expression, occurrence_result);
             }
-            for expression in expressions
-                .iter_mut()
-                .filter(|expression| call_expressions.contains(&expression.id))
-            {
-                expression.flow_type = result_type.clone();
+            for expression in expressions.iter_mut() {
+                if let Some(result) = call_results.get(&expression.id) {
+                    expression.flow_type = result.clone();
+                }
             }
         }
     }
@@ -8631,7 +9147,11 @@ impl<'a> CheckedProgramBuilder<'a> {
         match &expression.kind {
             CheckedExpressionKind::Read { target, .. } => self
                 .declaration(*target)
-                .filter(|declaration| self.scope_is_function_local(declaration.scope_id))
+                .filter(|declaration| {
+                    self.scope_is_function_local(declaration.scope_id)
+                        || (declaration.value == Some(expression.id)
+                            && !self.declaration_is_inside_root(declaration.id, "host_ports"))
+                })
                 .and_then(|declaration| declaration.value)
                 .into_iter()
                 .collect(),
@@ -8714,6 +9234,33 @@ impl<'a> CheckedProgramBuilder<'a> {
                 return false;
             };
             if scope.kind == CheckedScopeKind::Function {
+                return true;
+            }
+            let Some(parent) = scope.parent else {
+                return false;
+            };
+            scope_id = parent;
+        }
+        false
+    }
+
+    fn declaration_is_inside_root(&self, declaration: DeclId, root_name: &str) -> bool {
+        let Some(mut scope_id) = self
+            .declaration(declaration)
+            .map(|declaration| declaration.scope_id)
+        else {
+            return false;
+        };
+        let mut visited = BTreeSet::new();
+        while visited.insert(scope_id) {
+            let Some(scope) = self.scopes.iter().find(|scope| scope.id == scope_id) else {
+                return false;
+            };
+            if let Some(owner) = scope.owner
+                && self
+                    .declaration(owner)
+                    .is_some_and(|declaration| declaration.name == root_name)
+            {
                 return true;
             }
             let Some(parent) = scope.parent else {
@@ -11770,6 +12317,63 @@ fn checked_signature_is_generic(signature: &CheckedCallableSignature) -> bool {
         || checked_type_contains_var(&signature.result.ty)
 }
 
+fn type_is_variant_domain(ty: &Type) -> bool {
+    match ty {
+        Type::VariantSet(variants) => !variants.is_empty(),
+        Type::Union(members) => members.iter().any(type_is_variant_domain),
+        _ => false,
+    }
+}
+
+fn complete_pattern_selector_domain(actual: Type, pattern_domain: Type) -> Type {
+    fn collect_tags(ty: &Type, tags: &mut BTreeSet<String>) {
+        match ty {
+            Type::VariantSet(variants) => {
+                for variant in variants {
+                    let tag = match variant {
+                        Variant::Tag(tag) | Variant::Tagged { tag, .. } => tag,
+                    };
+                    tags.insert(tag.clone());
+                }
+            }
+            Type::Union(members) => {
+                for member in members {
+                    collect_tags(member, tags);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn remove_observed_pattern_tags(ty: Type, observed: &BTreeSet<String>) -> Type {
+        match ty {
+            Type::VariantSet(variants) => Type::VariantSet(
+                variants
+                    .into_iter()
+                    .filter(|variant| {
+                        let tag = match variant {
+                            Variant::Tag(tag) | Variant::Tagged { tag, .. } => tag,
+                        };
+                        !observed.contains(tag)
+                    })
+                    .collect(),
+            ),
+            Type::Union(members) => canonical_union_type(
+                members
+                    .into_iter()
+                    .map(|member| remove_observed_pattern_tags(member, observed))
+                    .collect(),
+            ),
+            other => other,
+        }
+    }
+
+    let mut observed = BTreeSet::new();
+    collect_tags(&actual, &mut observed);
+    let unobserved_patterns = remove_observed_pattern_tags(pattern_domain, &observed);
+    canonical_union_type(vec![actual, unobserved_patterns])
+}
+
 fn checked_type_contains_var(ty: &Type) -> bool {
     match ty {
         Type::Var(_) => true,
@@ -11829,18 +12433,43 @@ pub fn type_is_recursively_closed(ty: &Type) -> bool {
 }
 
 fn substitute_checked_type(ty: &Type, substitutions: &BTreeMap<TypeVar, Type>) -> Type {
+    substitute_checked_type_from_lookup(ty, substitutions)
+}
+
+trait CheckedTypeSubstitutionLookup {
+    fn replacement(&self, variable: TypeVar) -> Option<&Type>;
+}
+
+impl CheckedTypeSubstitutionLookup for BTreeMap<TypeVar, Type> {
+    fn replacement(&self, variable: TypeVar) -> Option<&Type> {
+        self.get(&variable)
+    }
+}
+
+impl CheckedTypeSubstitutionLookup for [CheckedTypeSubstitution] {
+    fn replacement(&self, variable: TypeVar) -> Option<&Type> {
+        self.iter()
+            .find(|substitution| substitution.variable == variable)
+            .map(|substitution| &substitution.value)
+    }
+}
+
+fn substitute_checked_type_from_lookup(
+    ty: &Type,
+    substitutions: &(impl CheckedTypeSubstitutionLookup + ?Sized),
+) -> Type {
     substitute_checked_type_inner(ty, substitutions, &mut BTreeSet::new())
 }
 
 fn substitute_checked_type_inner(
     ty: &Type,
-    substitutions: &BTreeMap<TypeVar, Type>,
+    substitutions: &(impl CheckedTypeSubstitutionLookup + ?Sized),
     active: &mut BTreeSet<TypeVar>,
 ) -> Type {
     match ty {
         Type::Var(var) => {
             let Some(replacement) = substitutions
-                .get(var)
+                .replacement(*var)
                 .filter(|replacement| *replacement != ty)
             else {
                 return ty.clone();
@@ -13847,6 +14476,7 @@ impl<'a> Checker<'a> {
                     named_value_type_table: &named_value_type_table,
                     render_slot_table: &self.render_slot_table,
                     source_payload_shape_table: &source_payload_syntax_table,
+                    flow_bindings: &self.flow_bindings,
                     builtins: &self.builtins,
                     render_contracts: &self.render_contracts,
                 },
@@ -14333,11 +14963,12 @@ impl<'a> Checker<'a> {
                         mode: FlowMode::Continuous,
                         ty: flow.ty.clone(),
                     });
+            let result = checked_result.unwrap_or_else(|| self.function_type_hint_result(&name));
             self.function_type_table.entries.push(FunctionTypeEntry {
                 callable: DeclId(u32::MAX),
                 name: name.clone(),
                 parameters,
-                result: checked_result.unwrap_or_else(|| self.function_type_hint_result(&name)),
+                result,
                 effect: CheckedEffectSummary::default(),
             });
         }
@@ -17359,13 +17990,32 @@ impl<'a> Checker<'a> {
 
     fn hold_result_type(&mut self, expr_id: usize, initial: usize) -> Type {
         let mut ty = self.ensure_expr(initial).ty;
+        let hold_name = self
+            .program
+            .expressions
+            .get(expr_id)
+            .and_then(|expression| match &expression.kind {
+                AstExprKind::Hold { name, .. } => Some(name.clone()),
+                _ => None,
+            });
         let updates = hold_update_exprs_for_expr(
             &self.program.ast.statements,
             expr_id,
             &self.program.expressions,
         );
         for update_expr_id in updates {
+            if let Some(name) = hold_name.as_ref() {
+                // The accumulator is the nearest lexical value throughout its
+                // update body, including contextual List/map bodies. Seed
+                // inference with the type accumulated so far so a same-name
+                // package field cannot leak into this recursive state type.
+                self.local_name_bindings
+                    .push(BTreeMap::from([(name.clone(), ty.clone())]));
+            }
             let update_type = self.ensure_expr(update_expr_id).ty;
+            if hold_name.is_some() {
+                self.local_name_bindings.pop();
+            }
             if !matches!(update_type, Type::Absent) {
                 ty = widen_hold_type(&ty, &update_type);
             }
@@ -17868,11 +18518,25 @@ impl<'a> Checker<'a> {
         active_functions: &mut BTreeSet<String>,
         local_bindings: &dyn StaticBindingLookup,
     ) -> Option<Type> {
-        if let Some(renderable) = statement.children.iter().find_map(|child| {
-            self.static_statement_type_with_bindings(child, active_functions, local_bindings)
-                .filter(type_contains_renderable)
-        }) {
-            return Some(renderable);
+        // Infer every child once. The old renderable probe traversed the whole
+        // body and then the ordinary block-result pass traversed it again.
+        // Transparent wrapper chains therefore doubled the recursive work at
+        // every layer even though both passes asked for the same static type.
+        let mut block_result = None;
+        for child in &statement.children {
+            let Some(ty) =
+                self.static_statement_type_with_bindings(child, active_functions, local_bindings)
+            else {
+                continue;
+            };
+            if type_contains_renderable(&ty) {
+                return Some(ty);
+            }
+            if !statement_is_source_pipe_continuation(child, &self.program.expressions)
+                || block_result.is_none()
+            {
+                block_result = Some(ty);
+            }
         }
         if statements_define_explicit_record(&statement.children, &self.program.expressions) {
             let mut fields = BTreeMap::new();
@@ -17892,11 +18556,7 @@ impl<'a> Checker<'a> {
                 }));
             }
         }
-        self.static_block_return_type_with_bindings(
-            &statement.children,
-            active_functions,
-            local_bindings,
-        )
+        block_result
     }
 
     fn user_function_static_bindings(&self, function: &str) -> StaticBindingOverlay<'_> {
@@ -24647,19 +25307,34 @@ fn collect_param_requirements_statement(
         params.contains(name).then(|| name.to_owned())
     });
     for child in &statement.children {
-        let narrowed_params = narrowed_parameter.as_ref().and_then(|parameter| {
-            let pattern = child
-                .expr
-                .and_then(|expr_id| expressions.get(expr_id))
-                .and_then(|expression| match &expression.kind {
-                    AstExprKind::MatchArm { pattern, .. } => Some(pattern),
-                    _ => None,
-                })?;
-            pattern_variant(pattern)?;
-            let mut narrowed = params.clone();
-            narrowed.remove(parameter);
-            Some(narrowed)
-        });
+        let narrowed_params = child
+            .expr
+            .and_then(|expr_id| expressions.get(expr_id))
+            .and_then(|expression| match &expression.kind {
+                AstExprKind::MatchArm { pattern, .. } => Some(pattern),
+                _ => None,
+            })
+            .and_then(|pattern| {
+                let mut narrowed = params.clone();
+                let mut changed = false;
+
+                // Match payload and whole-value bindings are declarations in
+                // the arm's lexical scope. Do not attribute requirements from
+                // a same-named arm binding to an enclosing function
+                // parameter, including when the selector is a call rather
+                // than a direct read of that parameter.
+                for binding in pattern_variable_names(pattern) {
+                    changed |= narrowed.remove(&binding);
+                }
+
+                if pattern_variant(pattern).is_some()
+                    && let Some(parameter) = narrowed_parameter.as_ref()
+                {
+                    changed |= narrowed.remove(parameter);
+                }
+
+                changed.then_some(narrowed)
+            });
         collect_param_requirements_statement(
             child,
             expressions,
@@ -26671,6 +27346,13 @@ pub fn specialize_checked_call_result(instantiated: &Type, occurrence: &Type) ->
     if is_value_placeholder_type(instantiated) {
         return occurrence.clone();
     }
+    // A recursively closed instantiation is the callable's exact result
+    // contract at this occurrence. Syntax-local inference may still carry a
+    // stale structural approximation from before generic call convergence;
+    // it must not add fields to, or otherwise widen, that closed contract.
+    if type_is_recursively_closed(instantiated) {
+        return instantiated.clone();
+    }
     match (instantiated, occurrence) {
         (Type::List(instantiated), Type::List(occurrence)) => Type::List(Box::new(
             specialize_checked_call_result(instantiated, occurrence),
@@ -26700,13 +27382,12 @@ pub fn specialize_checked_call_result(instantiated: &Type, occurrence: &Type) ->
         (Type::Object(instantiated), Type::Object(occurrence)) => {
             let mut fields = instantiated.fields.clone();
             for (name, occurrence_type) in occurrence.ordered_fields() {
-                fields
-                    .entry(name.clone())
-                    .and_modify(|instantiated_type| {
-                        *instantiated_type =
-                            specialize_checked_call_result(instantiated_type, occurrence_type);
-                    })
-                    .or_insert_with(|| occurrence_type.clone());
+                if let Some(instantiated_type) = fields.get_mut(name) {
+                    *instantiated_type =
+                        specialize_checked_call_result(instantiated_type, occurrence_type);
+                } else if instantiated.open {
+                    fields.insert(name.clone(), occurrence_type.clone());
+                }
             }
             Type::Object(ObjectShape {
                 fields,
@@ -26950,41 +27631,49 @@ pub fn canonical_union_type(candidates: Vec<Type>) -> Type {
 }
 
 fn merge_structural_variant(variants: &mut Vec<Variant>, incoming: Variant) {
-    let Variant::Tagged {
-        tag: incoming_tag,
-        fields: incoming_fields,
-    } = &incoming
-    else {
-        if !variants.contains(&incoming) {
-            variants.push(incoming);
+    match incoming {
+        Variant::Tag(incoming_tag) => {
+            if !variants.iter().any(|variant| match variant {
+                Variant::Tag(tag) | Variant::Tagged { tag, .. } => tag == &incoming_tag,
+            }) {
+                variants.push(Variant::Tag(incoming_tag));
+            }
         }
-        return;
-    };
-    let Some(index) = variants
-        .iter()
-        .position(|variant| matches!(variant, Variant::Tagged { tag, .. } if tag == incoming_tag))
-    else {
-        variants.push(incoming);
-        return;
-    };
-    let Variant::Tagged {
-        fields: existing_fields,
-        ..
-    } = &variants[index]
-    else {
-        unreachable!("only a tagged variant can match the tagged search");
-    };
-    let merged = widen_structural_type(
-        &Type::Object(existing_fields.clone()),
-        &Type::Object(incoming_fields.clone()),
-    );
-    let Type::Object(fields) = merged else {
-        unreachable!("widening two tagged payload records must produce a record");
-    };
-    variants[index] = Variant::Tagged {
-        tag: incoming_tag.clone(),
-        fields,
-    };
+        Variant::Tagged {
+            tag: incoming_tag,
+            fields: incoming_fields,
+        } => {
+            let Some(index) = variants.iter().position(|variant| match variant {
+                Variant::Tag(tag) | Variant::Tagged { tag, .. } => tag == &incoming_tag,
+            }) else {
+                variants.push(Variant::Tagged {
+                    tag: incoming_tag,
+                    fields: incoming_fields,
+                });
+                return;
+            };
+            let fields = match &variants[index] {
+                Variant::Tag(_) => incoming_fields,
+                Variant::Tagged {
+                    fields: existing_fields,
+                    ..
+                } => {
+                    let merged = widen_structural_type(
+                        &Type::Object(existing_fields.clone()),
+                        &Type::Object(incoming_fields),
+                    );
+                    let Type::Object(fields) = merged else {
+                        unreachable!("widening two tagged payload records must produce a record");
+                    };
+                    fields
+                }
+            };
+            variants[index] = Variant::Tagged {
+                tag: incoming_tag,
+                fields,
+            };
+        }
+    }
 }
 
 fn widen_hold_type(current: &Type, update: &Type) -> Type {
@@ -30625,9 +31314,6 @@ fn expr_source_payload_field(
             SourcePayloadAccess::Field(field) => Some(field),
             SourcePayloadAccess::Direct(_) | SourcePayloadAccess::UnknownField(_) => None,
         },
-        AstExprKind::Pipe { input, .. } | AstExprKind::When { input, .. } => {
-            expr_source_payload_field(*input, expressions, source_lookup)
-        }
         _ => None,
     }
 }

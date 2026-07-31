@@ -1284,3 +1284,163 @@ page: rows |> List/page(size: 0, after: Start)
         );
     }
 }
+#[test]
+fn then_accepts_transitions_from_initial_latest_state() {
+    let parsed = boon_parser::parse_source(
+        "initial-latest-state-transition.bn",
+        r#"
+store: [
+    update: SOURCE
+    selected:
+        LATEST {
+            TEXT { initial }
+            update |> THEN { TEXT { changed } }
+        }
+    observed:
+        TEXT { waiting } |> HOLD observed {
+            selected |> THEN { selected }
+        }
+]
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+    assert!(
+        !output.report.has_errors(),
+        "diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+}
+
+#[test]
+fn function_capture_preserves_global_event_flow_mode() {
+    let parsed = boon_parser::parse_source(
+        "global-event-function-capture.bn",
+        r#"
+store: [
+    choose: SOURCE
+    chosen:
+        choose |> THEN { TEXT { chosen } }
+]
+
+FUNCTION remember() {
+    TEXT { initial } |> HOLD remembered {
+        chosen |> THEN { chosen }
+    }
+}
+
+result: remember()
+"#,
+    )
+    .unwrap();
+    let modes = flow_bindings(&parsed, &ExternalTypeEnvironment::default());
+    assert_eq!(
+        flow_binding_mode(&modes, "chosen"),
+        Some(FlowMode::PresentOrAbsent)
+    );
+    let output = check_program(&parsed);
+    assert!(
+        !output.report.has_errors(),
+        "diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+    let program = output.program.expect("captured event program");
+    assert!(program.expressions.iter().any(|expression| {
+        matches!(
+            expression.kind,
+            CheckedExpressionKind::ExternalRead {
+                ref canonical_path,
+                external_identity: None,
+            } if canonical_path == "chosen"
+        ) && expression.flow_type.mode == FlowMode::PresentOrAbsent
+    }));
+}
+
+#[test]
+fn function_capture_can_trigger_on_global_initial_latest_state_transition() {
+    let parsed = boon_parser::parse_source(
+        "global-state-function-capture.bn",
+        r#"
+store: [
+    choose: SOURCE
+    chosen:
+        LATEST {
+            TEXT { initial }
+            choose |> THEN { TEXT { chosen } }
+        }
+]
+
+FUNCTION remember() {
+    TEXT { waiting } |> HOLD remembered {
+        chosen |> THEN { chosen }
+    }
+}
+
+result: remember()
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+    assert!(
+        !output.report.has_errors(),
+        "diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+    let program = output.program.expect("captured state program");
+    assert!(program.expressions.iter().any(|expression| {
+        matches!(
+            expression.kind,
+            CheckedExpressionKind::ExternalRead {
+                ref canonical_path,
+                external_identity: None,
+            } if canonical_path == "chosen"
+        ) && expression.flow_type.mode == FlowMode::Continuous
+    }));
+}
+
+#[test]
+fn function_capture_preserves_event_only_latest_flow_mode() {
+    let parsed = boon_parser::parse_source(
+        "global-event-latest-function-capture.bn",
+        r#"
+store: [
+    choose_first: SOURCE
+    choose_second: SOURCE
+    first:
+        choose_first |> THEN { TEXT { first } }
+    second:
+        choose_second |> THEN { TEXT { second } }
+    chosen:
+        LATEST {
+            first
+            second
+        }
+]
+
+FUNCTION remember() {
+    TEXT { initial } |> HOLD remembered {
+        chosen |> THEN { chosen }
+    }
+}
+
+result: remember()
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+    assert!(
+        !output.report.has_errors(),
+        "diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+    let program = output.program.expect("captured event-only latest program");
+    assert!(program.expressions.iter().any(|expression| {
+        matches!(
+            expression.kind,
+            CheckedExpressionKind::ExternalRead {
+                ref canonical_path,
+                external_identity: None,
+            } if canonical_path == "chosen"
+        ) && expression.flow_type.mode == FlowMode::PresentOrAbsent
+    }));
+}

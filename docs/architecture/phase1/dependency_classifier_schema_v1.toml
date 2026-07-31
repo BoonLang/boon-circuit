@@ -3725,13 +3725,7 @@ fields = [
   { name = "materializations", disposition = "r-r-priv-id-pc-n", reviewed = true },
   { name = "static_owners", disposition = "r-r-priv-id-pc-n", reviewed = true },
   { name = "id_map", disposition = "r-c-priv-id-pc-n", reviewed = true },
-  { name = "semantic_callable_count", disposition = "a-fc-priv-id-pc-n", reviewed = true },
-  { name = "semantic_call_count", disposition = "a-fc-priv-id-pc-n", reviewed = true },
-  { name = "semantic_scope_count", disposition = "a-fc-priv-id-pc-n", reviewed = true },
   { name = "semantic_producer_functions", disposition = "r-frc-priv-id-pc-n", reviewed = true },
-  { name = "semantic_list_count", disposition = "r-r-priv-id-pc-n", reviewed = true },
-  { name = "semantic_row_scope_count", disposition = "r-c-priv-id-pc-n", reviewed = true },
-  { name = "semantic_value_list_authority_count", disposition = "r-fr-priv-id-pc-n", reviewed = true },
 ]
 
 [[records]]
@@ -4055,7 +4049,6 @@ fields = [
   { name = "sources", disposition = "r-r-priv-id-pc-n", reviewed = true },
   { name = "state_cells", disposition = "r-r-priv-id-pc-n", reviewed = true },
   { name = "list_projections", disposition = "r-fr-priv-id-pc-n", reviewed = true },
-  { name = "erased_value_list_authority_count", disposition = "r-fr-priv-id-pc-n", reviewed = true },
 ]
 
 [[records]]
@@ -4303,23 +4296,22 @@ kind = "struct"
 source = "crates/boon_ir/src/semantic_mapping.rs"
 name = "SemanticToExecutableMap"
 fields = [
-  { name = "expressions", disposition = "r-f-priv-id-pc-n", reviewed = true },
-  { name = "values", disposition = "r-fc-priv-id-pc-n", reviewed = true },
-  { name = "statements", disposition = "r-r-priv-id-pc-n", reviewed = true },
-  { name = "lexical_scopes", disposition = "r-c-priv-id-pc-n", reviewed = true },
-  { name = "sources", disposition = "r-r-priv-id-pc-n", reviewed = true },
-  { name = "states", disposition = "r-r-priv-id-pc-n", reviewed = true },
-  { name = "callables", disposition = "r-f-priv-id-pc-n", reviewed = true },
+  { name = "expression_count", disposition = "a-fc-priv-id-pc-n", reviewed = true },
+  { name = "statement_count", disposition = "a-fc-priv-id-pc-n", reviewed = true },
+  { name = "lexical_scope_count", disposition = "a-c-priv-id-pc-n", reviewed = true },
+  { name = "source_count", disposition = "a-rc-priv-id-pc-n", reviewed = true },
+  { name = "state_count", disposition = "a-rc-priv-id-pc-n", reviewed = true },
+  { name = "callable_count", disposition = "a-fc-priv-id-pc-n", reviewed = true },
   { name = "call_expressions", disposition = "r-fc-priv-id-pc-n", reviewed = true },
   { name = "producer_functions", disposition = "r-r-priv-id-pc-n", reviewed = true },
-  { name = "materializations", disposition = "r-r-priv-id-pc-n", reviewed = true },
+  { name = "materialization_count", disposition = "a-rc-priv-id-pc-n", reviewed = true },
   { name = "local_bindings", disposition = "r-c-priv-id-pc-n", reviewed = true },
   { name = "call_instances", disposition = "r-c-priv-id-pc-n", reviewed = true },
   { name = "call_contexts", disposition = "r-c-priv-id-pc-n", reviewed = true },
   { name = "materialization_locals", disposition = "r-r-priv-id-pc-n", reviewed = true },
-  { name = "lists", disposition = "r-r-priv-id-pc-n", reviewed = true },
-  { name = "row_scopes", disposition = "r-c-priv-id-pc-n", reviewed = true },
-  { name = "value_list_authorities", disposition = "r-fr-priv-id-pc-n", reviewed = true },
+  { name = "list_count", disposition = "a-rc-priv-id-pc-n", reviewed = true },
+  { name = "row_scope_count", disposition = "a-frc-priv-id-pc-n", reviewed = true },
+  { name = "value_list_authority_count", disposition = "a-frc-priv-id-pc-n", reviewed = true },
   { name = "runtime_sources", disposition = "r-r-priv-id-pc-n", reviewed = true },
   { name = "external_event_sources", disposition = "r-r-priv-id-pc-n", reviewed = true },
   { name = "external_event_source_paths", disposition = "r-r-priv-id-pc-n", reviewed = true },

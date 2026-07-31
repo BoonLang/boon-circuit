@@ -1655,23 +1655,28 @@ fn verify_semantic_mapping_contract(source: &str) -> Result<(), String> {
         }
         if !explicit_map_storage_type(&field.ty) {
             return Err(format!(
-                "`SemanticToExecutableMap.{identifier}` is not an explicit Vec/BTreeMap allocation table"
+                "`SemanticToExecutableMap.{identifier}` is not an explicit dense-domain bound or non-identity allocation table"
             ));
         }
         map_fields.insert(identifier.to_string());
     }
 
     let required = [
-        ("expressions", "expressions", "expression"),
-        ("statements", "statements", "statement"),
-        ("sources", "sources", "source"),
-        ("states", "states", "state"),
-        ("callables", "functions", "callable"),
-        ("materializations", "materializations", "materialization"),
-        ("lists", "lists", "list"),
-        ("row_scopes", "row_scopes", "row_scope"),
+        ("expression_count", "expressions", "expression"),
+        ("statement_count", "statements", "statement"),
+        ("lexical_scope_count", "scopes", "lexical_scope"),
+        ("source_count", "sources", "source"),
+        ("state_count", "states", "state"),
+        ("callable_count", "callables", "callable"),
         (
-            "value_list_authorities",
+            "materialization_count",
+            "materializations",
+            "materialization",
+        ),
+        ("list_count", "lists", "list"),
+        ("row_scope_count", "row_scopes", "row_scope"),
+        (
+            "value_list_authority_count",
             "value_list_authorities",
             "value_list_authority",
         ),
@@ -1700,8 +1705,15 @@ fn verify_semantic_mapping_contract(source: &str) -> Result<(), String> {
             bounded_list(&missing_initializers)
         ));
     }
+    let identity_fields = required
+        .iter()
+        .map(|(field, _, _)| (*field).to_owned())
+        .collect::<BTreeSet<_>>();
     let missing_totality = map_fields
-        .difference(&collector.totality_fields)
+        .iter()
+        .filter(|field| {
+            !identity_fields.contains(*field) && !collector.totality_fields.contains(*field)
+        })
         .cloned()
         .collect::<Vec<_>>();
     if !missing_totality.is_empty() {
@@ -1732,6 +1744,16 @@ fn verify_semantic_mapping_contract(source: &str) -> Result<(), String> {
             bounded_list(&missing_lookup_methods)
         ));
     }
+    let missing_bounded_domains = identity_fields
+        .difference(&collector.bounded_identity_fields)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing_bounded_domains.is_empty() {
+        return Err(format!(
+            "`SemanticToExecutableMap` lookup methods do not bound dense identity domains: {}",
+            bounded_list(&missing_bounded_domains)
+        ));
+    }
     if !collector.has_totality_validator {
         return Err("semantic mapping omits production `validate_totality`".to_owned());
     }
@@ -1741,9 +1763,11 @@ fn verify_semantic_mapping_contract(source: &str) -> Result<(), String> {
                 .to_owned(),
         );
     }
-    if !(collector.allocate_uses_unique_set && collector.allocate_compares_unique_lengths) {
+    if !(collector.allocate_calls_bijection_validator
+        && collector.bijection_validator_uses_unique_allocation)
+    {
         return Err(
-            "`SemanticToExecutableMap::allocate_with_external_events` lacks explicit one-to-one/bijection validation"
+            "`SemanticToExecutableMap::allocate_with_external_events` lacks explicit non-identity one-to-one/bijection validation"
                 .to_owned(),
         );
     }
@@ -1756,12 +1780,13 @@ fn explicit_map_storage_type(ty: &syn::Type) -> bool {
     };
     path.qself.is_none()
         && path.path.segments.last().is_some_and(|segment| {
-            matches!(segment.ident.to_string().as_str(), "Vec" | "BTreeMap")
-                && matches!(
-                    segment.arguments,
-                    syn::PathArguments::AngleBracketed(ref arguments)
-                        if !arguments.args.is_empty()
-                )
+            segment.ident == "usize"
+                || (matches!(segment.ident.to_string().as_str(), "Vec" | "BTreeMap")
+                    && matches!(
+                        segment.arguments,
+                        syn::PathArguments::AngleBracketed(ref arguments)
+                            if !arguments.args.is_empty()
+                    ))
         })
 }
 
@@ -1774,10 +1799,11 @@ struct SemanticMappingContractCollector {
     totality_fields: BTreeSet<String>,
     dense_graph_domains: BTreeSet<String>,
     map_methods: BTreeSet<String>,
+    bounded_identity_fields: BTreeSet<String>,
     has_totality_validator: bool,
     entrypoint_allocates_map: bool,
-    allocate_uses_unique_set: bool,
-    allocate_compares_unique_lengths: bool,
+    allocate_calls_bijection_validator: bool,
+    bijection_validator_uses_unique_allocation: bool,
 }
 
 impl SemanticMappingContractCollector {
@@ -1868,6 +1894,32 @@ impl<'ast> Visit<'ast> for SemanticMappingContractCollector {
         if is_require_dense {
             self.require_dense_depth += 1;
         }
+        if self.current_impl.as_deref() == Some("SemanticToExecutableMap")
+            && matches!(
+                expression.func.as_ref(),
+                syn::Expr::Path(path)
+                    if path.path.segments.last().is_some_and(|segment| segment.ident == "exact_dense_index")
+            )
+        {
+            for argument in &expression.args {
+                if let Some(chain) = expression_chain(argument)
+                    && chain.len() == 2
+                    && chain[0] == "self"
+                {
+                    self.bounded_identity_fields.insert(chain[1].clone());
+                }
+            }
+        }
+        if self.current_impl.as_deref() == Some("SemanticToExecutableMap")
+            && self.current_function.as_deref() == Some("validate_allocation_bijections")
+            && matches!(
+                expression.func.as_ref(),
+                syn::Expr::Path(path)
+                    if path.path.segments.last().is_some_and(|segment| segment.ident == "require_unique_allocation")
+            )
+        {
+            self.bijection_validator_uses_unique_allocation = true;
+        }
         if self.current_impl.is_none()
             && self.current_function.as_deref()
                 == Some("map_semantic_execution_with_external_events")
@@ -1896,10 +1948,21 @@ impl<'ast> Visit<'ast> for SemanticMappingContractCollector {
         {
             self.dense_graph_domains.insert(chain[1].clone());
         }
+        if let Some(chain) = expression_field_chain(expression)
+            && self.in_totality_validator()
+            && chain.len() == 3
+            && chain[0] == "self"
+            && chain[1] == "id_map"
+        {
+            self.totality_fields.insert(chain[2].clone());
+        }
         syn::visit::visit_expr_field(self, expression);
     }
 
     fn visit_expr_method_call(&mut self, expression: &'ast syn::ExprMethodCall) {
+        if self.in_map_allocate() && expression.method == "validate_allocation_bijections" {
+            self.allocate_calls_bijection_validator = true;
+        }
         if self.in_totality_validator()
             && expression.method == "len"
             && let Some(chain) = expression_chain(expression.receiver.as_ref())
@@ -1910,29 +1973,6 @@ impl<'ast> Visit<'ast> for SemanticMappingContractCollector {
             self.totality_fields.insert(chain[2].clone());
         }
         syn::visit::visit_expr_method_call(self, expression);
-    }
-
-    fn visit_expr_binary(&mut self, expression: &'ast syn::ExprBinary) {
-        if self.in_map_allocate()
-            && matches!(expression.op, syn::BinOp::Ne(_))
-            && expression_is_len_call(expression.left.as_ref())
-            && expression_is_len_call(expression.right.as_ref())
-        {
-            self.allocate_compares_unique_lengths = true;
-        }
-        syn::visit::visit_expr_binary(self, expression);
-    }
-
-    fn visit_path(&mut self, path: &'ast syn::Path) {
-        if self.in_map_allocate()
-            && path
-                .segments
-                .iter()
-                .any(|segment| segment.ident == "BTreeSet")
-        {
-            self.allocate_uses_unique_set = true;
-        }
-        syn::visit::visit_path(self, path);
     }
 }
 
@@ -1968,13 +2008,6 @@ fn expression_chain(expression: &syn::Expr) -> Option<Vec<String>> {
         syn::Expr::Paren(paren) => expression_chain(paren.expr.as_ref()),
         _ => None,
     }
-}
-
-fn expression_is_len_call(expression: &syn::Expr) -> bool {
-    matches!(
-        expression,
-        syn::Expr::MethodCall(call) if call.method == "len" && call.args.is_empty()
-    )
 }
 
 fn rust_token_identifiers(tokens: &str) -> Vec<String> {
@@ -2948,29 +2981,26 @@ macro_rules! diagnostic_text {
         let mapping = include_str!("../../boon_ir/src/semantic_mapping.rs");
         verify_semantic_mapping_contract(mapping).unwrap();
 
-        let missing_totality = mapping.replacen(
-            "self.id_map.states.len()",
-            "self.executable.states.len()",
-            1,
-        );
+        let missing_totality =
+            mapping.replace("self.id_map.local_bindings", "self.id_map.call_instances");
         let error = verify_semantic_mapping_contract(&missing_totality).unwrap_err();
-        assert!(error.contains("states"), "{error}");
+        assert!(error.contains("local_bindings"), "{error}");
 
         let missing_bijection = mapping.replacen(
-            "let unique_expressions = expressions.iter().copied().collect::<BTreeSet<_>>();",
-            "let unique_expressions = expressions.iter().copied().collect::<Vec<_>>();",
+            "allocated.validate_allocation_bijections()?;",
+            "let _ = &allocated;",
             1,
         );
         let error = verify_semantic_mapping_contract(&missing_bijection).unwrap_err();
         assert!(error.contains("bijection"), "{error}");
 
-        let missing_resource_identity = mapping.replacen("    row_scopes: Vec<ScopeId>,\n", "", 1);
+        let missing_resource_identity = mapping.replacen("    row_scope_count: usize,\n", "", 1);
         let error = verify_semantic_mapping_contract(&missing_resource_identity).unwrap_err();
-        assert!(error.contains("row_scopes"), "{error}");
+        assert!(error.contains("row_scope_count"), "{error}");
 
         let missing_explicit_erasure =
-            mapping.replacen("    value_list_authorities: Vec<()>,\n", "", 1);
+            mapping.replacen("    value_list_authority_count: usize,\n", "", 1);
         let error = verify_semantic_mapping_contract(&missing_explicit_erasure).unwrap_err();
-        assert!(error.contains("value_list_authorities"), "{error}");
+        assert!(error.contains("value_list_authority_count"), "{error}");
     }
 }

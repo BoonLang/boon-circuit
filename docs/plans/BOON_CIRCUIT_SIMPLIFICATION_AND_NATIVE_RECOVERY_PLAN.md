@@ -373,6 +373,26 @@ occurrences across 147 files. Phase 0 deletion and both regenerated inventories
 pass; only the already-declared stale Cells packed baseline and its dependent
 budget report remain open.
 
+The semantic identity-map ownership cut removes allocated `0..N` vector
+mirrors for expressions, values, statements, lexical scopes, sources, states,
+callables, materializations, lists, row scopes, and value-list authorities.
+Canonical dense semantic validation plus bounded typed-ID conversion now owns
+those identity relationships; the genuinely non-identity maps remain explicit
+and retain their allocation-bijection validation. All 31 IR tests, the focused
+architecture-contract test, all 18 dependency-classifier tests, and the three
+executable Counter, Persons.pro, and TodoMVC migration scenarios pass under
+serial execution. The affected all-target compile passes without warnings.
+
+This cut removes 87 tracked Rust lines, including 4 test Rust lines. The
+current architecture report measures 417,281 tracked Rust lines and 55,083
+test Rust lines; only those two global caps fail. Runtime plus executor,
+playground, and xtask production remain within their caps at 40,503, 31,125,
+and 17,830 lines. The packed inventory now records 18,082 candidate sites
+across 80 files, and the exact container inventory records 4,812 occurrences
+across 147 files. Phase 0 deletion and both regenerated inventories pass; only
+the already-declared stale Cells packed baseline and its dependent budget
+report remain open.
+
 The nested-compositor diagnostic path has been deleted. The replacement uses
 ordinary COSMIC preview/dev windows, kernel uinput mouse and keyboard devices,
 the normal app_window callback route, and app-owned exact-frame WGPU readback.

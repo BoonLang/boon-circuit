@@ -191,29 +191,30 @@ impl std::fmt::Display for MappedReactiveTriggerId {
 /// The only semantic-ID to executable-ID allocation table.
 ///
 /// Dense semantic coordinates are not executable coordinates merely because
-/// both currently use `usize`. Every conversion below must go through this
-/// table so a later executable allocator can change without reopening semantic
-/// discovery in `boon_ir`.
+/// both currently use `usize`. Canonical identity domains retain one checked
+/// bound instead of an allocated `0..N` mirror; genuinely non-identity domains
+/// retain explicit maps. Every conversion below must go through this table so
+/// a later executable allocator can change without reopening semantic discovery
+/// in `boon_ir`.
 #[derive(Clone, Debug)]
 pub(super) struct SemanticToExecutableMap {
-    expressions: Vec<ExecutableExprId>,
-    values: Vec<ExecutableExprId>,
-    statements: Vec<ExecutableStatementId>,
-    lexical_scopes: Vec<ExecutableLexicalScopeId>,
-    sources: Vec<ExecutableSourceId>,
-    states: Vec<ExecutableStateId>,
-    callables: Vec<FunctionId>,
+    expression_count: usize,
+    statement_count: usize,
+    lexical_scope_count: usize,
+    source_count: usize,
+    state_count: usize,
+    callable_count: usize,
     call_expressions: Vec<Vec<ExecutableExprId>>,
     producer_functions: BTreeMap<ProducerFunctionId, FunctionId>,
-    materializations: Vec<usize>,
+    materialization_count: usize,
     local_bindings: BTreeMap<SemanticLocalBindingId, ExecutableLocalBindingId>,
     call_instances: BTreeMap<OutCallInstanceId, usize>,
     call_contexts: BTreeMap<SemanticCallContextId, ExecutableCallContextId>,
     materialization_locals:
         BTreeMap<(StaticOwnerId, SemanticMaterializationLocalId), MaterializationLocalId>,
-    lists: Vec<ListId>,
-    row_scopes: Vec<ScopeId>,
-    value_list_authorities: Vec<()>,
+    list_count: usize,
+    row_scope_count: usize,
+    value_list_authority_count: usize,
     runtime_sources: BTreeMap<SemanticSourceId, SourceId>,
     /// Exact event-valued external-read occurrences mapped to the distributed
     /// ingress SOURCE allocated after the local semantic source domain.
@@ -229,13 +230,7 @@ pub(super) struct MappedSemanticExecution {
     pub materializations: Vec<ContextualMaterialization>,
     pub static_owners: Vec<StaticOwnerDef>,
     pub id_map: SemanticToExecutableMap,
-    semantic_callable_count: usize,
-    semantic_call_count: usize,
-    semantic_scope_count: usize,
     semantic_producer_functions: Vec<ProducerFunctionId>,
-    semantic_list_count: usize,
-    semantic_row_scope_count: usize,
-    semantic_value_list_authority_count: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -244,7 +239,6 @@ pub(super) struct MappedSemanticResources {
     pub sources: Vec<SourcePort>,
     pub state_cells: Vec<StateCell>,
     pub list_projections: Vec<ListProjection>,
-    erased_value_list_authority_count: usize,
 }
 
 /// Exact mechanically mapped field identity. Parent/role topology remains a
@@ -790,43 +784,28 @@ impl MappedSemanticExecution {
         let exact_lengths = [
             (
                 "expression",
-                self.id_map.expressions.len(),
+                self.id_map.expression_count,
                 self.executable.expressions.len(),
             ),
             (
                 "statement",
-                self.id_map.statements.len(),
+                self.id_map.statement_count,
                 self.executable.statements.len(),
             ),
             (
-                "lexical scope",
-                self.id_map.lexical_scopes.len(),
-                self.semantic_scope_count,
-            ),
-            (
                 "source",
-                self.id_map.sources.len(),
+                self.id_map.source_count,
                 self.executable.sources.len(),
             ),
             (
                 "state",
-                self.id_map.states.len(),
+                self.id_map.state_count,
                 self.executable.states.len(),
             ),
             (
                 "value",
-                self.id_map.values.len(),
+                self.id_map.expression_count,
                 self.executable.expressions.len(),
-            ),
-            (
-                "callable identity",
-                self.id_map.callables.len(),
-                self.semantic_callable_count,
-            ),
-            (
-                "call inventory",
-                self.id_map.call_expressions.len(),
-                self.semantic_call_count,
             ),
             (
                 "call expression",
@@ -845,7 +824,7 @@ impl MappedSemanticExecution {
             ),
             (
                 "materialization",
-                self.id_map.materializations.len(),
+                self.id_map.materialization_count,
                 self.materializations.len(),
             ),
             (
@@ -888,21 +867,6 @@ impl MappedSemanticExecution {
                 self.id_map.runtime_states.len(),
                 self.executable.states.len(),
             ),
-            (
-                "list identity",
-                self.id_map.lists.len(),
-                self.semantic_list_count,
-            ),
-            (
-                "row scope identity",
-                self.id_map.row_scopes.len(),
-                self.semantic_row_scope_count,
-            ),
-            (
-                "value-list authority erasure",
-                self.id_map.value_list_authorities.len(),
-                self.semantic_value_list_authority_count,
-            ),
         ];
         for (label, mapped, emitted) in exact_lengths {
             if mapped != emitted {
@@ -912,14 +876,14 @@ impl MappedSemanticExecution {
             }
         }
         for (index, expression) in self.executable.expressions.iter().enumerate() {
-            let expected = self.id_map.expressions[index];
+            let expected = ExecutableExprId(index);
             if expression.id != expected {
                 return Err(format!(
                     "mapped expression at index {index} emitted ID {}, expected {expected}",
                     expression.id
                 ));
             }
-            let expected_value = self.id_map.values[index];
+            let expected_value = ExecutableExprId(index);
             if expression.id != expected_value {
                 return Err(format!(
                     "mapped value at index {index} emitted expression ID {}, expected {expected_value}",
@@ -928,7 +892,7 @@ impl MappedSemanticExecution {
             }
         }
         for (index, statement) in self.executable.statements.iter().enumerate() {
-            let expected = self.id_map.statements[index];
+            let expected = ExecutableStatementId(index);
             if statement.id != expected {
                 return Err(format!(
                     "mapped statement at index {index} emitted ID {}, expected {expected}",
@@ -937,7 +901,7 @@ impl MappedSemanticExecution {
             }
         }
         for (index, source) in self.executable.sources.iter().enumerate() {
-            let expected = self.id_map.sources[index];
+            let expected = ExecutableSourceId(index);
             if source.id != expected {
                 return Err(format!(
                     "mapped source at index {index} emitted ID {}, expected {expected}",
@@ -946,19 +910,11 @@ impl MappedSemanticExecution {
             }
         }
         for (index, state) in self.executable.states.iter().enumerate() {
-            let expected = self.id_map.states[index];
+            let expected = ExecutableStateId(index);
             if state.id != expected {
                 return Err(format!(
                     "mapped state at index {index} emitted ID {}, expected {expected}",
                     state.id
-                ));
-            }
-        }
-        for (index, callable) in self.id_map.callables.iter().copied().enumerate() {
-            let expected = FunctionId(index);
-            if callable != expected {
-                return Err(format!(
-                    "mapped callable at index {index} has ID {callable}, expected {expected}"
                 ));
             }
         }
@@ -973,7 +929,7 @@ impl MappedSemanticExecution {
             }
         }
         for (index, materialization) in self.materializations.iter().enumerate() {
-            let expected = self.id_map.materializations[index];
+            let expected = index;
             if materialization.id != expected {
                 return Err(format!(
                     "mapped materialization at index {index} emitted ID {}, expected {expected}",
@@ -1094,29 +1050,16 @@ impl SemanticToExecutableMap {
 
         validate_callable_and_call_inventory(graph)?;
 
-        let expressions = (0..graph.expressions.len())
-            .map(ExecutableExprId)
-            .collect::<Vec<_>>();
-        let unique_expressions = expressions.iter().copied().collect::<BTreeSet<_>>();
-        if unique_expressions.len() != expressions.len() {
-            return Err(
-                "semantic expression allocation is not a one-to-one executable mapping".to_owned(),
-            );
-        }
-        let values = allocate_values(graph, &expressions)?;
-        let callables = (0..graph.callables.len())
-            .map(FunctionId)
-            .collect::<Vec<_>>();
-        let call_expressions = allocate_call_expressions(graph, &expressions)?;
+        let call_expressions = allocate_call_expressions(graph)?;
         let mut producer_functions = BTreeMap::new();
         for (index, function) in graph.functions.iter().enumerate() {
             // A semantic callable is a syntax-wide definition. A producer
             // function is one concrete materialized occurrence and therefore
             // needs its own executable identity even when several occurrences
             // share the same callable.
-            exact_map(
-                &callables,
+            exact_dense_index(
                 function.callable.as_usize(),
+                graph.callables.len(),
                 "semantic producer callable",
                 function.callable,
             )?;
@@ -1143,27 +1086,22 @@ impl SemanticToExecutableMap {
             )?;
 
         let allocated = Self {
-            expressions,
-            values,
-            statements: (0..graph.statements.len())
-                .map(ExecutableStatementId)
-                .collect(),
-            lexical_scopes: (0..graph.scopes.len())
-                .map(ExecutableLexicalScopeId)
-                .collect(),
-            sources: (0..graph.sources.len()).map(ExecutableSourceId).collect(),
-            states: (0..graph.states.len()).map(ExecutableStateId).collect(),
-            callables,
+            expression_count: graph.expressions.len(),
+            statement_count: graph.statements.len(),
+            lexical_scope_count: graph.scopes.len(),
+            source_count: graph.sources.len(),
+            state_count: graph.states.len(),
+            callable_count: graph.callables.len(),
             call_expressions,
             producer_functions,
-            materializations: (0..graph.materializations.len()).collect(),
+            materialization_count: graph.materializations.len(),
             local_bindings,
             call_instances,
             call_contexts,
             materialization_locals,
-            lists: (0..resources.lists.len()).map(ListId).collect(),
-            row_scopes: (0..resources.row_scopes.len()).map(ScopeId).collect(),
-            value_list_authorities: vec![(); resources.value_list_authorities.len()],
+            list_count: resources.lists.len(),
+            row_scope_count: resources.row_scopes.len(),
+            value_list_authority_count: resources.value_list_authorities.len(),
             runtime_sources,
             external_event_sources,
             external_event_source_paths,
@@ -1174,29 +1112,6 @@ impl SemanticToExecutableMap {
     }
 
     fn validate_allocation_bijections(&self) -> Result<(), String> {
-        require_unique_allocation(
-            self.expressions.iter().copied(),
-            self.expressions.len(),
-            "expression",
-        )?;
-        require_unique_allocation(self.values.iter().copied(), self.values.len(), "value")?;
-        require_unique_allocation(
-            self.statements.iter().copied(),
-            self.statements.len(),
-            "statement",
-        )?;
-        require_unique_allocation(
-            self.lexical_scopes.iter().copied(),
-            self.lexical_scopes.len(),
-            "lexical scope",
-        )?;
-        require_unique_allocation(self.sources.iter().copied(), self.sources.len(), "source")?;
-        require_unique_allocation(self.states.iter().copied(), self.states.len(), "state")?;
-        require_unique_allocation(
-            self.callables.iter().copied(),
-            self.callables.len(),
-            "callable",
-        )?;
         let call_expression_count = self.call_expressions.iter().map(Vec::len).sum();
         require_unique_allocation(
             self.call_expressions.iter().flatten().copied(),
@@ -1207,11 +1122,6 @@ impl SemanticToExecutableMap {
             self.producer_functions.values().copied(),
             self.producer_functions.len(),
             "producer function",
-        )?;
-        require_unique_allocation(
-            self.materializations.iter().copied(),
-            self.materializations.len(),
-            "materialization",
         )?;
         require_unique_allocation(
             self.local_bindings.values().copied(),
@@ -1235,12 +1145,6 @@ impl SemanticToExecutableMap {
             self.materialization_locals.len(),
             "materialization local",
         )?;
-        require_unique_allocation(self.lists.iter().copied(), self.lists.len(), "list")?;
-        require_unique_allocation(
-            self.row_scopes.iter().copied(),
-            self.row_scopes.len(),
-            "row scope",
-        )?;
         require_unique_allocation(
             self.runtime_sources
                 .values()
@@ -1257,42 +1161,59 @@ impl SemanticToExecutableMap {
     }
 
     pub(super) fn expression(&self, id: SemanticExprId) -> Result<ExecutableExprId, String> {
-        exact_map(&self.expressions, id.as_usize(), "semantic expression", id)
+        exact_dense_index(
+            id.as_usize(),
+            self.expression_count,
+            "semantic expression",
+            id,
+        )
+        .map(ExecutableExprId)
     }
 
     /// V1 has exactly one value per semantic expression, so the executable
-    /// value handle is the expression that produces it. This is an allocated
-    /// lookup, not a numeric reinterpretation of `SemanticValueId`.
+    /// value handle is the expression that produces it. The checked-domain
+    /// lookup never reinterprets `SemanticValueId` without validating its bound.
     pub(super) fn value(&self, id: SemanticValueId) -> Result<ExecutableExprId, String> {
-        exact_map(&self.values, id.as_usize(), "semantic value", id)
+        exact_dense_index(id.as_usize(), self.expression_count, "semantic value", id)
+            .map(ExecutableExprId)
     }
 
     fn statement(&self, id: SemanticStatementId) -> Result<ExecutableStatementId, String> {
-        exact_map(&self.statements, id.as_usize(), "semantic statement", id)
+        exact_dense_index(
+            id.as_usize(),
+            self.statement_count,
+            "semantic statement",
+            id,
+        )
+        .map(ExecutableStatementId)
     }
 
     pub(super) fn lexical_scope(
         &self,
         id: boon_semantic::SemanticScopeId,
     ) -> Result<ExecutableLexicalScopeId, String> {
-        exact_map(
-            &self.lexical_scopes,
+        exact_dense_index(
             id.as_usize(),
+            self.lexical_scope_count,
             "semantic lexical scope",
             id,
         )
+        .map(ExecutableLexicalScopeId)
     }
 
     fn source(&self, id: SemanticSourceId) -> Result<ExecutableSourceId, String> {
-        exact_map(&self.sources, id.as_usize(), "semantic source", id)
+        exact_dense_index(id.as_usize(), self.source_count, "semantic source", id)
+            .map(ExecutableSourceId)
     }
 
     fn state(&self, id: SemanticStateId) -> Result<ExecutableStateId, String> {
-        exact_map(&self.states, id.as_usize(), "semantic state", id)
+        exact_dense_index(id.as_usize(), self.state_count, "semantic state", id)
+            .map(ExecutableStateId)
     }
 
     pub(super) fn callable(&self, id: SemanticCallableId) -> Result<FunctionId, String> {
-        exact_map(&self.callables, id.as_usize(), "semantic callable", id)
+        exact_dense_index(id.as_usize(), self.callable_count, "semantic callable", id)
+            .map(FunctionId)
     }
 
     /// Resolves an exact semantic call occurrence. `SemanticCallId` alone is
@@ -1346,9 +1267,9 @@ impl SemanticToExecutableMap {
     }
 
     fn materialization(&self, id: SemanticMaterializationId) -> Result<usize, String> {
-        exact_map(
-            &self.materializations,
+        exact_dense_index(
             id.as_usize(),
+            self.materialization_count,
             "semantic materialization",
             id,
         )
@@ -1362,20 +1283,27 @@ impl SemanticToExecutableMap {
     }
 
     fn list(&self, id: SemanticListId) -> Result<ListId, String> {
-        exact_map(&self.lists, id.as_usize(), "semantic list", id)
+        exact_dense_index(id.as_usize(), self.list_count, "semantic list", id).map(ListId)
     }
 
     fn row_scope(&self, id: SemanticRowScopeId) -> Result<ScopeId, String> {
-        exact_map(&self.row_scopes, id.as_usize(), "semantic row scope", id)
+        exact_dense_index(
+            id.as_usize(),
+            self.row_scope_count,
+            "semantic row scope",
+            id,
+        )
+        .map(ScopeId)
     }
 
     fn value_list_authority(&self, id: SemanticValueListAuthorityId) -> Result<(), String> {
-        exact_map(
-            &self.value_list_authorities,
+        exact_dense_index(
             id.as_usize(),
+            self.value_list_authority_count,
             "semantic value-list authority",
             id,
         )
+        .map(|_| ())
     }
 
     pub(super) fn parameter(
@@ -1459,62 +1387,21 @@ fn require_unique_allocation<T: Ord>(
     }
 }
 
-fn allocate_values(
-    graph: &SemanticExecutionGraphV1,
-    expressions: &[ExecutableExprId],
-) -> Result<Vec<ExecutableExprId>, String> {
-    let mut allocated = vec![None; graph.expressions.len()];
-    for expression in &graph.expressions {
-        let executable = exact_map(
-            expressions,
-            expression.id.as_usize(),
-            "semantic value expression",
-            expression.id,
-        )?;
-        let slot = allocated
-            .get_mut(expression.value_id.as_usize())
-            .ok_or_else(|| {
-                format!(
-                    "semantic value {} has no executable value slot",
-                    expression.value_id
-                )
-            })?;
-        if slot.replace(executable).is_some() {
-            return Err(format!(
-                "semantic value {} is produced by more than one expression",
-                expression.value_id
-            ));
-        }
-    }
-    allocated
-        .into_iter()
-        .enumerate()
-        .map(|(index, value)| {
-            value.ok_or_else(|| {
-                format!(
-                    "semantic value {} has no executable expression counterpart",
-                    SemanticValueId(index)
-                )
-            })
-        })
-        .collect()
-}
-
 fn allocate_call_expressions(
     graph: &SemanticExecutionGraphV1,
-    expressions: &[ExecutableExprId],
 ) -> Result<Vec<Vec<ExecutableExprId>>, String> {
     let mut allocated = vec![Vec::new(); graph.calls.len()];
     for expression in &graph.expressions {
         let SemanticExpressionKind::Call { call, .. } = &expression.kind else {
             continue;
         };
-        let executable = exact_map(
-            expressions,
+        let executable = exact_dense_index(
             expression.id.as_usize(),
+            graph.expressions.len(),
             "semantic call expression",
             expression.id,
-        )?;
+        )
+        .map(ExecutableExprId)?;
         allocated
             .get_mut(call.as_usize())
             .ok_or_else(|| {
@@ -2217,17 +2104,11 @@ fn map_semantic_execution_with_external_events(
         materializations,
         static_owners,
         id_map,
-        semantic_callable_count: graph.callables.len(),
-        semantic_call_count: graph.calls.len(),
-        semantic_scope_count: graph.scopes.len(),
         semantic_producer_functions: graph
             .functions
             .iter()
             .map(|function| function.producer)
             .collect(),
-        semantic_list_count: resources.lists.len(),
-        semantic_row_scope_count: resources.row_scopes.len(),
-        semantic_value_list_authority_count: resources.value_list_authorities.len(),
     })
 }
 
@@ -2348,7 +2229,6 @@ pub(super) fn map_semantic_resources(
         sources,
         state_cells,
         list_projections,
-        erased_value_list_authority_count: graph.value_list_authorities.len(),
     };
     mapped.validate_totality(graph, ids)?;
     Ok(mapped)
@@ -2419,11 +2299,6 @@ impl MappedSemanticResources {
                 "list projection",
                 graph.list_projections.len(),
                 self.list_projections.len(),
-            ),
-            (
-                "erased value-list authority",
-                graph.value_list_authorities.len(),
-                self.erased_value_list_authority_count,
             ),
         ];
         for (label, semantic, executable) in exact_lengths {
@@ -4534,15 +4409,13 @@ impl MappedSemanticReactive {
                     }
                 }
                 MappedSemanticDependencyTarget::ExternalCall { expression, .. } => {
-                    let expression = ids
-                        .expressions
-                        .get(expression.as_usize())
-                        .copied()
-                        .ok_or_else(|| {
-                            format!(
-                                "mapped dependency use references missing call expression {expression}"
-                            )
-                        })?;
+                    let expression = exact_dense_index(
+                        expression.as_usize(),
+                        ids.expression_count,
+                        "mapped dependency call expression",
+                        expression,
+                    )
+                    .map(ExecutableExprId)?;
                     if expression != dependency.expression {
                         return Err(
                             "mapped external-call dependency expression identity differs"
@@ -11645,6 +11518,17 @@ fn require_dense(ids: impl IntoIterator<Item = usize>, label: &str) -> Result<()
     Ok(())
 }
 
+fn exact_dense_index(
+    index: usize,
+    count: usize,
+    label: &str,
+    id: impl std::fmt::Display,
+) -> Result<usize, String> {
+    (index < count)
+        .then_some(index)
+        .ok_or_else(|| format!("{label} {id} has no executable mapping"))
+}
+
 fn exact_map<T: Copy>(
     values: &[T],
     index: usize,
@@ -11773,7 +11657,6 @@ mod tests {
         )
         .expect("value-only authority erases explicitly");
         assert!(resources.lists.is_empty());
-        assert_eq!(resources.erased_value_list_authority_count, 1);
 
         let mut malformed = semantic.resource_graph().clone();
         malformed.value_list_authorities[0].id = SemanticValueListAuthorityId(1);

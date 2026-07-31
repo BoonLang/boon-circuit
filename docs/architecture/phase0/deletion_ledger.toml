@@ -2398,8 +2398,8 @@ roots = ["crates"]
 extensions = ["rs"]
 mode = "rust-token"
 needle = "BTreeMap"
-expected_occurrences = 3006
-expected_files = 127
+expected_occurrences = 3007
+expected_files = 128
 
 [entries.scans.expected_path_occurrences]
 "crates/boon_app_package/src/build.rs" = 2
@@ -2477,7 +2477,7 @@ expected_files = 127
 "crates/boon_runtime/src/distributed/endpoint.rs" = 21
 "crates/boon_runtime/src/distributed/link.rs" = 3
 "crates/boon_runtime/src/distributed/message.rs" = 9
-"crates/boon_runtime/src/distributed/server.rs" = 50
+"crates/boon_runtime/src/distributed/server.rs" = 2
 "crates/boon_runtime/src/document.rs" = 140
 "crates/boon_runtime/src/effect_host.rs" = 5
 "crates/boon_runtime/src/effects.rs" = 2
@@ -2502,6 +2502,7 @@ expected_files = 127
 "crates/boon_server_runtime/src/distributed_sessions.rs" = 19
 "crates/boon_server_runtime/src/in_process.rs" = 3
 "crates/boon_server_runtime/src/lib.rs" = 47
+"crates/boon_server_runtime/src/router.rs" = 49
 "crates/boon_server_runtime/tests/in_process.rs" = 2
 "crates/boon_typecheck/src/lib.rs" = 381
 "crates/boon_typecheck/src/tests/calls.rs" = 1
@@ -2648,7 +2649,7 @@ expected_files = 101
 roots = ["docs/architecture/phase0/container_occurrences.tsv"]
 extensions = ["tsv"]
 needle = "\tdense-id-table\t"
-expected_occurrences = 963
+expected_occurrences = 964
 expected_files = 1
 
 [[entries.scans]]
@@ -2708,7 +2709,7 @@ measurement = "occurrence"
 roots = ["docs/architecture/phase0/container_occurrences.tsv"]
 extensions = ["tsv"]
 needle = "\tdense-id-table\t"
-expected_occurrences = 963
+expected_occurrences = 964
 expected_files = 1
 
 [[entries]]

@@ -36,6 +36,7 @@ const SCAN_ROOTS: &[&str] = &[
     "crates/boon_plan",
     "crates/boon_plan_executor",
     "crates/boon_runtime",
+    "crates/boon_server_runtime",
     "crates/boon_typecheck",
     "crates/boon_wire",
 ];
@@ -44,12 +45,14 @@ const RUNTIME_ROOTS: &[&str] = &[
     "crates/boon_list_access",
     "crates/boon_plan_executor",
     "crates/boon_runtime",
+    "crates/boon_server_runtime",
 ];
 
 const HOT_ROOTS: &[&str] = &[
     "crates/boon_list_access/src",
     "crates/boon_plan_executor/src",
     "crates/boon_runtime/src",
+    "crates/boon_server_runtime/src",
 ];
 
 const BOUNDARY_ROOTS: &[&str] = &[

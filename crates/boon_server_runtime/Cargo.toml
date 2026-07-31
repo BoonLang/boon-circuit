@@ -7,6 +7,7 @@ rust-version.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+boon_data.workspace = true
 boon_effect_schema.workspace = true
 boon_plan.workspace = true
 boon_persistence.workspace = true
@@ -16,7 +17,6 @@ boon_wire.workspace = true
 sha2.workspace = true
 
 [dev-dependencies]
-boon_data.workspace = true
 boon_host_runtime.workspace = true
 futures.workspace = true
 reqwest.workspace = true

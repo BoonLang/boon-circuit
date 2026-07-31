@@ -69,6 +69,21 @@ xtask production caps pass at 31,298 and 17,725 lines. Every non-budget
 architecture check passes. Native product reports remain stale until those
 budgets close and the compositor restart described below occurs.
 
+The first production ownership cut keeps the narrow `DistributedServerMachine`
+authority trait and opaque `SessionOrigin` in `boon_runtime`, but moves the sole
+2,287-line Server router into its only production owner,
+`boon_server_runtime`. No execution logic, migration runner, migration fixture,
+or state-draining path is removed. The runtime-plus-executor count is now
+62,224, leaving 20,224 lines above its cap; tracked Rust is 456,266 and test
+Rust remains 92,304. The packed-site inventory now explicitly scans Server
+runtime instead of letting the ownership move hide its hot container sites; it
+passes with 19,892 rows across 85 files. The focused four-case public
+Client/Session/Server integration suite passes, as does an all-target compile.
+A broader serial library run is not claimed green: 39 tests passed while two
+existing scheduling expectations failed. The moved router body is
+diff-identical to its prior `boon_runtime` body, so the failures are recorded
+rather than hidden or misreported as a passing broad suite.
+
 The nested-compositor diagnostic path has been deleted. The replacement uses
 ordinary COSMIC preview/dev windows, kernel uinput mouse and keyboard devices,
 the normal app_window callback route, and app-owned exact-frame WGPU readback.

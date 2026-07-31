@@ -12,6 +12,7 @@
 
 mod distributed_sessions;
 mod in_process;
+mod router;
 
 pub use distributed_sessions::{
     DEFAULT_SESSION_RESUME_WINDOW, DistributedSessionConnectionId,
@@ -27,6 +28,10 @@ pub use in_process::{
     InProcessPoll, InProcessTransientEffectCancellation, InProcessTransientEffectCreditGrant,
     InProcessTransientEffectInvocation, InProcessTransientEffectOwner,
 };
+pub use router::{
+    DistributedServerAuthority, DistributedServerRuntime, DistributedServerUpdate,
+    PreparedDistributedServerTransaction, ServerDelivery, ServerDeliveryTarget,
+};
 
 use async_trait::async_trait;
 use boon_persistence::{
@@ -40,13 +45,11 @@ use boon_plan::{
 };
 use boon_runtime::{
     DistributedImportUpdate, DistributedProgramBundle, DistributedRuntimeError,
-    DistributedServerMachine, DistributedServerRuntime, DistributedServerUpdate,
-    EffectHostCoreError, PersistentDispatchError, PersistentDistributedCommitOutcome,
-    PersistentProgramSession, PersistentRuntimeStartupDisposition,
-    PreparedDistributedServerTransaction, ProgramArtifact, ProgramCapabilityProfile,
-    ProgramSession, ProgramSessionDispatch, RuntimeTurn, SessionContext, SessionOrigin,
-    SessionPrincipal, SourceEvent, SourcePayload, TransientEffectCallId, TransientEffectInvocation,
-    Value,
+    DistributedServerMachine, EffectHostCoreError, PersistentDispatchError,
+    PersistentDistributedCommitOutcome, PersistentProgramSession,
+    PersistentRuntimeStartupDisposition, ProgramArtifact, ProgramCapabilityProfile, ProgramSession,
+    ProgramSessionDispatch, RuntimeTurn, SessionContext, SessionOrigin, SessionPrincipal,
+    SourceEvent, SourcePayload, TransientEffectCallId, TransientEffectInvocation, Value,
 };
 use boon_server_host::{
     CallCancellation, CancellationReason, DistributedSessionAction,

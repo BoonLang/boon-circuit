@@ -18,11 +18,7 @@ pub use client::{
 };
 pub use client_session::ClientSessionQueueLimits;
 pub use message::{DistributedMessage, DistributedMessagePayload, DistributedQueueLimits};
-pub use server::{
-    DistributedServerAuthority, DistributedServerMachine, DistributedServerRuntime,
-    DistributedServerUpdate, PreparedDistributedServerTransaction, ServerDelivery,
-    ServerDeliveryTarget, SessionOrigin,
-};
+pub use server::{DistributedServerMachine, SessionOrigin};
 pub use session::{
     DistributedSessionRuntime, DistributedSessionTemplate, DistributedSessionUpdate,
 };
@@ -97,7 +93,8 @@ impl fmt::Display for DistributedRuntimeError {
 
 impl StdError for DistributedRuntimeError {}
 
-pub(super) fn runtime_error(error: impl fmt::Display) -> DistributedRuntimeError {
+#[doc(hidden)]
+pub fn runtime_error(error: impl fmt::Display) -> DistributedRuntimeError {
     DistributedRuntimeError::Runtime(error.to_string())
 }
 
@@ -115,13 +112,13 @@ pub(super) fn exported_event_data(
     .map(Some)
 }
 
-pub(super) fn export_runtime_value(
-    value: Value,
-) -> Result<boon_data::Value, DistributedRuntimeError> {
+#[doc(hidden)]
+pub fn export_runtime_value(value: Value) -> Result<boon_data::Value, DistributedRuntimeError> {
     value.to_data().map_err(runtime_error)
 }
 
-pub(super) fn export_runtime_arguments(
+#[doc(hidden)]
+pub fn export_runtime_arguments(
     arguments: BTreeMap<DistributedArgumentId, Value>,
 ) -> Result<BTreeMap<DistributedArgumentId, boon_data::Value>, DistributedRuntimeError> {
     arguments
@@ -130,7 +127,8 @@ pub(super) fn export_runtime_arguments(
         .collect()
 }
 
-pub(super) fn import_data_arguments(
+#[doc(hidden)]
+pub fn import_data_arguments(
     arguments: BTreeMap<DistributedArgumentId, boon_data::Value>,
 ) -> BTreeMap<DistributedArgumentId, Value> {
     arguments
@@ -153,7 +151,8 @@ fn source_payload_value(payload: &SourcePayload, field: &SourcePayloadField) -> 
     }
 }
 
-pub(super) fn set_source_payload_value(
+#[doc(hidden)]
+pub fn set_source_payload_value(
     payload: &mut SourcePayload,
     field: &SourcePayloadField,
     value: Value,

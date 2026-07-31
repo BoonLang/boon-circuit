@@ -95,11 +95,11 @@ occurrence_ledger_validator = "cargo run -p xtask --example packed_site_inventor
 
 # Updated only after reviewing a deterministic generator run.
 expected_probe_set_sha256 = "74d30b30f6bcf09c10edaef60aefbae001c6bc9843751989617840593d5c7296"
-expected_file_set_sha256 = "7dd5e74a5f1a7f2671770fe655a288c06621821caff3c3762dc0678987da87ec"
-expected_scanned_files = 94
-expected_occurrence_files = 83
-expected_occurrence_ledger_sha256 = "d1285f1f137aa92a67183d3a9aac06a419ffc40ada56e9c329fd5af515dfa463"
-expected_occurrence_rows = 19514
+expected_file_set_sha256 = "4bf148d82417a80c61fdd3bf9d7823c9409be05cf009d74371b3133e0d34d0f2"
+expected_scanned_files = 91
+expected_occurrence_files = 80
+expected_occurrence_ledger_sha256 = "024f739381bd337e7d41bdf53a237092a31cb01b2e3ad42170cf9bd746e570e8"
+expected_occurrence_rows = 19317
 
 [[categories]]
 order = 0
@@ -136,9 +136,9 @@ order = 3
 id = "allocation-or-growth"
 owner_phase = "goal-phase-5-packed"
 owner_plan = "docs/plans/BOON_PACKED_DATA_AND_DENSE_INTERNALS_PLAN.md"
-expected_rows = 15293
+expected_rows = 15096
 expected_hot = 4151
-expected_cold = 9709
+expected_cold = 9512
 expected_boundary = 1433
 
 [[categories]]

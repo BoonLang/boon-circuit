@@ -1729,52 +1729,6 @@ impl CheckedTypeInferenceChanges {
     }
 }
 
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Default)]
-struct CheckedFlowInferenceTestStats {
-    epoch_count: usize,
-    current_epoch_computations: usize,
-    max_epoch_computations: usize,
-}
-
-#[cfg(test)]
-thread_local! {
-    static CHECKED_FLOW_INFERENCE_TEST_STATS: RefCell<CheckedFlowInferenceTestStats> =
-        RefCell::new(CheckedFlowInferenceTestStats::default());
-}
-
-#[cfg(test)]
-fn reset_checked_flow_inference_test_stats() {
-    CHECKED_FLOW_INFERENCE_TEST_STATS.with(|stats| {
-        *stats.borrow_mut() = CheckedFlowInferenceTestStats::default();
-    });
-}
-
-#[cfg(test)]
-fn checked_flow_inference_test_begin_epoch() {
-    CHECKED_FLOW_INFERENCE_TEST_STATS.with(|stats| {
-        let mut stats = stats.borrow_mut();
-        stats.epoch_count += 1;
-        stats.current_epoch_computations = 0;
-    });
-}
-
-#[cfg(test)]
-fn checked_flow_inference_test_record_computation() {
-    CHECKED_FLOW_INFERENCE_TEST_STATS.with(|stats| {
-        let mut stats = stats.borrow_mut();
-        stats.current_epoch_computations += 1;
-        stats.max_epoch_computations = stats
-            .max_epoch_computations
-            .max(stats.current_epoch_computations);
-    });
-}
-
-#[cfg(test)]
-fn checked_flow_inference_test_stats() -> CheckedFlowInferenceTestStats {
-    CHECKED_FLOW_INFERENCE_TEST_STATS.with(|stats| *stats.borrow())
-}
-
 #[derive(Clone, Copy, Debug)]
 enum ContextualBuiltinKind {
     Map,
@@ -5545,8 +5499,6 @@ impl<'a> CheckedProgramBuilder<'a> {
             self.checked_flow_inference_cache.clear();
             self.checked_flow_inference_epoch = 1;
         }
-        #[cfg(test)]
-        checked_flow_inference_test_begin_epoch();
     }
 
     fn flush_boundary_flow_type(&self, expression: usize, mut flow_type: FlowType) -> FlowType {
@@ -6429,8 +6381,6 @@ impl<'a> CheckedProgramBuilder<'a> {
         if !active.insert(expr_id) {
             return fallback;
         }
-        #[cfg(test)]
-        checked_flow_inference_test_record_computation();
         let Some(expr) = self.program.expressions.get(expr_id).cloned() else {
             active.remove(&expr_id);
             return fallback;

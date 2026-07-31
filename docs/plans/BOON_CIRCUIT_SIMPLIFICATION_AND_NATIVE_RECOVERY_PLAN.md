@@ -221,6 +221,27 @@ across 151 files. Phase 0 deletion, fixture, and inventory checks pass; only
 the already-declared stale Cells packed baseline and its dependent budget
 report remain open.
 
+The typechecker test-ownership cut removes 7,139 lines of private call,
+distributed/session, and host-port source-behavior verticals plus 50 lines of
+obsolete test-only checked-flow instrumentation. A small shared payload helper
+remains with the compact 36-test typechecker suite, which owns exact number and
+BITS rules, map/set authority, FLUSH, pulse, reactive-collection, structural
+assignability, and fail-closed negative algorithms. Public compiler and
+cross-layer integrations remain the success-behavior owners. Those 36 retained
+typechecker tests, all 18 retained compiler tests, all three foundations
+verticals, and the three executable migration scenarios pass under serial
+execution.
+
+This cut removes a net 7,182 tracked Rust lines and 7,132 test Rust lines. The
+current architecture report measures 437,165 tracked Rust lines and 73,433 test
+Rust lines; only those two global caps fail. Runtime plus executor, playground,
+and xtask production remain within their caps at 40,518, 31,313, and 17,797
+lines. The packed inventory now records 19,317 candidate sites across 80 files,
+and the exact container inventory records 4,963 occurrences across 148 files.
+Phase 0 deletion and both regenerated inventories pass; only the
+already-declared stale Cells packed baseline and its dependent budget report
+remain open.
+
 The executable migration demos currently prove the catalog/`MachinePlan`
 version-migration path, including incremental, skipped-version, restart,
 activation, namespace, and cross-path authority behavior. They do not claim

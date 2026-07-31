@@ -2391,8 +2391,8 @@ roots = ["crates"]
 extensions = ["rs"]
 mode = "rust-token"
 needle = "BTreeMap"
-expected_occurrences = 3003
-expected_files = 127
+expected_occurrences = 2999
+expected_files = 124
 
 [entries.scans.expected_path_occurrences]
 "crates/boon_app_package/src/build.rs" = 2
@@ -2497,10 +2497,7 @@ expected_files = 127
 "crates/boon_server_runtime/src/router.rs" = 49
 "crates/boon_server_runtime/tests/in_process.rs" = 2
 "crates/boon_typecheck/src/lib.rs" = 381
-"crates/boon_typecheck/src/tests/calls.rs" = 1
-"crates/boon_typecheck/src/tests/distributed.rs" = 2
 "crates/boon_typecheck/src/tests/flush.rs" = 1
-"crates/boon_typecheck/src/tests/host_ports.rs" = 1
 "crates/boon_typecheck/src/tests/maps_sets.rs" = 1
 "crates/boon_verify/src/lib.rs" = 5
 "crates/boon_web_effect_host/src/file_effect_host.rs" = 42
@@ -2528,8 +2525,8 @@ roots = ["crates"]
 extensions = ["rs"]
 mode = "rust-token"
 needle = "BTreeSet"
-expected_occurrences = 1879
-expected_files = 98
+expected_occurrences = 1878
+expected_files = 97
 
 [entries.scans.expected_path_occurrences]
 "crates/boon_app_package/src/browser.rs" = 2
@@ -2611,7 +2608,6 @@ expected_files = 98
 "crates/boon_server_host/src/host.rs" = 5
 "crates/boon_server_runtime/src/lib.rs" = 13
 "crates/boon_typecheck/src/lib.rs" = 270
-"crates/boon_typecheck/src/tests/host_ports.rs" = 1
 "crates/boon_verify/src/lib.rs" = 20
 "crates/boon_web_effect_host/src/content_store.rs" = 5
 "crates/boon_web_effect_host/src/file_effect_host.rs" = 4
@@ -2673,7 +2669,7 @@ expected_files = 1
 roots = ["docs/architecture/phase0/container_occurrences.tsv"]
 extensions = ["tsv"]
 needle = "\ttest-oracle\t"
-expected_occurrences = 557
+expected_occurrences = 552
 expected_files = 1
 
 [[entries.scans]]
@@ -2713,17 +2709,15 @@ measurement = "occurrence"
 roots = ["."]
 extensions = ["rs", "bn", "scn"]
 needle = "List/query"
-expected_occurrences = 2
-expected_files = 1
-allowed_paths = ["crates/boon_typecheck/src/tests/calls.rs"]
+expected_occurrences = 0
+expected_files = 0
 
 [[entries.scans]]
 roots = ["."]
 extensions = ["rs", "bn", "scn"]
 needle = "List/query_prefix"
-expected_occurrences = 1
-expected_files = 1
-allowed_paths = ["crates/boon_typecheck/src/tests/calls.rs"]
+expected_occurrences = 0
+expected_files = 0
 
 [[entries.scans]]
 roots = ["."]

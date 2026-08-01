@@ -1,5 +1,6 @@
 #![allow(clippy::too_many_arguments)]
 
+use super::{Instant, elapsed_ms};
 use boon_ir::ErasedProgram;
 use boon_plan::*;
 use boon_semantic::program_core::{
@@ -4289,6 +4290,7 @@ pub(crate) fn compile_erased_program_with_distributed_context(
     migration_predecessors: &[MigrationPredecessorBinding],
     distributed: &DistributedMachineContext,
 ) -> Result<MachinePlan, PlanError> {
+    let backend_started = Instant::now();
     let effects = effect_contracts(program)?;
     let mut effect_outbox = effect_outbox_schemas(&effects)?;
     let authority_field_ids = list_authority_field_ids(program);
@@ -5446,6 +5448,13 @@ pub(crate) fn compile_erased_program_with_distributed_context(
         operation.synchronize_expression_inputs(&row_expressions)?;
     }
     let root_computation_fields = root_computation_fields(&regions);
+    let document_started = Instant::now();
+    if std::env::var_os("BOON_COMPILER_LOWER_TRACE").is_some() {
+        eprintln!(
+            "boon_compiler backend pre_document: {:.3}ms",
+            elapsed_ms(backend_started)
+        );
+    }
     let mut document = super::document_plan_backend::compile_document_plan(
         program,
         &index,
@@ -5455,6 +5464,12 @@ pub(crate) fn compile_erased_program_with_distributed_context(
         &distributed.expression_refs,
         &distributed.path_refs,
     )?;
+    if std::env::var_os("BOON_COMPILER_LOWER_TRACE").is_some() {
+        eprintln!(
+            "boon_compiler backend document: {:.3}ms",
+            elapsed_ms(document_started)
+        );
+    }
     if let Some(document) = document.as_mut() {
         for expression in &mut document.expressions {
             if let DocumentExprOp::RuntimeExpression { expression, .. } = &mut expression.op {
@@ -6016,10 +6031,18 @@ pub(crate) fn compile_erased_program_with_distributed_context(
         },
         regions,
     };
+    let finalize_started = Instant::now();
     if !distributed_row_linking_pending(distributed) {
         finalize_machine_plan_row_expressions(&mut plan)?;
     }
     validate_resource_only_fields_excluded(program, &plan)?;
+    if std::env::var_os("BOON_COMPILER_LOWER_TRACE").is_some() {
+        eprintln!(
+            "boon_compiler backend finalize: {:.3}ms total={:.3}ms",
+            elapsed_ms(finalize_started),
+            elapsed_ms(backend_started)
+        );
+    }
     Ok(plan)
 }
 
@@ -11179,6 +11202,12 @@ fn source_event_transform_output_type(
     Ok(output_type)
 }
 
+#[derive(Clone, Copy)]
+struct ExecutableFunctionParameterBinding {
+    expression: ir::ExecutableExprId,
+    owner: Option<PlanStaticOwnerId>,
+}
+
 struct ExecutableRowLowerer<'a> {
     program: &'a ErasedProgram,
     index: &'a ValueIndex,
@@ -11197,15 +11226,20 @@ struct ExecutableRowLowerer<'a> {
     active_lexical_bindings: BTreeSet<ir::ExecutableLocalBindingId>,
     active_storage_bindings: BTreeSet<ir::ErasedBindingId>,
     bindings: BTreeMap<ir::ExecutableExprId, PlanRowExpressionId>,
-    function_parameter_bindings: Vec<BTreeMap<ir::ExecutableParameterId, PlanRowExpressionId>>,
+    function_parameter_bindings:
+        Vec<BTreeMap<ir::ExecutableParameterId, ExecutableFunctionParameterBinding>>,
     active_ordinary_functions: BTreeSet<ir::FunctionId>,
     active_user_calls: Vec<ir::ExecutableExprId>,
+    projection_overrides: Vec<(ir::ExecutableExprId, Vec<String>)>,
+    constructor_projection_overrides: Vec<(ir::ExecutableExprId, Vec<String>)>,
     memo: BTreeMap<
         (
             ir::ExecutableExprId,
             Option<PlanStaticOwnerId>,
             Vec<PlanStaticOwnerId>,
             Vec<ir::ExecutableExprId>,
+            Vec<String>,
+            Vec<String>,
         ),
         PlanRowExpressionId,
     >,
@@ -11239,6 +11273,8 @@ impl<'a> ExecutableRowLowerer<'a> {
             function_parameter_bindings: Vec::new(),
             active_ordinary_functions: BTreeSet::new(),
             active_user_calls: Vec::new(),
+            projection_overrides: Vec::new(),
+            constructor_projection_overrides: Vec::new(),
             memo: BTreeMap::new(),
         }
     }
@@ -11462,11 +11498,29 @@ impl<'a> ExecutableRowLowerer<'a> {
         if capture.projection.is_empty() {
             return match &local.item_type {
                 boon_typecheck::Type::Object(shape) => {
-                    let names = if shape.field_order.is_empty() {
+                    let mut names = if shape.field_order.is_empty() {
                         shape.fields.keys().cloned().collect::<Vec<_>>()
                     } else {
                         shape.field_order.clone()
                     };
+                    let row_binding = local
+                        .row
+                        .expect("row-owned materialization local has an exact row binding");
+                    names.retain(|name| {
+                        row_input_field_id_for_list_id(
+                            self.program,
+                            plan_list_id(row_binding.list),
+                            name,
+                        )
+                        .and_then(|field| {
+                            self.program
+                                .scope_index
+                                .fields
+                                .iter()
+                                .find(|candidate| plan_field_id(candidate.id) == field)
+                        })
+                        .is_none_or(|field| !field.resource_only)
+                    });
                     let row = self.intern(PlanRowExpressionNode::LocalRow {
                         owner,
                         local: plan_local,
@@ -11641,8 +11695,11 @@ impl<'a> ExecutableRowLowerer<'a> {
             storage_input_field_id(program, list_name, field_name, &authority_fields).ok_or_else(
                 || {
                     PlanError::new(format!(
-                        "{state_label} local {}:{} member `{field_name}` has no exact target-row constructor field",
-                        erased_owner.0, local.0
+                        "{state_label} local {}:{} member `{field_name}` from source projection `{}` and constructor projection `{}` has no exact target-row constructor field",
+                        erased_owner.0,
+                        local.0,
+                        projection.join("."),
+                        constructor_projection.join("."),
                     ))
                 },
             )
@@ -11762,6 +11819,226 @@ impl<'a> ExecutableRowLowerer<'a> {
         self.lower_scoped(root, None)
     }
 
+    fn lower_scoped_with_constructor_projection(
+        &mut self,
+        root: ir::ExecutableExprId,
+        inherited_owner: Option<PlanStaticOwnerId>,
+        constructor_projection: &[String],
+    ) -> Result<PlanRowExpressionId, PlanError> {
+        if constructor_projection.is_empty() {
+            return self.lower_scoped(root, inherited_owner);
+        }
+        self.constructor_projection_overrides
+            .push((root, constructor_projection.to_vec()));
+        let value = self.lower_scoped(root, inherited_owner);
+        self.constructor_projection_overrides.pop();
+        value
+    }
+
+    fn lower_scoped_projected(
+        &mut self,
+        root: ir::ExecutableExprId,
+        inherited_owner: Option<PlanStaticOwnerId>,
+        projection: &[String],
+    ) -> Result<PlanRowExpressionId, PlanError> {
+        self.lower_scoped_projected_for_constructor(root, inherited_owner, projection, projection)
+    }
+
+    fn lower_scoped_projected_for_constructor(
+        &mut self,
+        root: ir::ExecutableExprId,
+        inherited_owner: Option<PlanStaticOwnerId>,
+        projection: &[String],
+        constructor_projection: &[String],
+    ) -> Result<PlanRowExpressionId, PlanError> {
+        if projection.is_empty() && constructor_projection.is_empty() {
+            return self.lower_scoped(root, inherited_owner);
+        }
+        if let Some(value) = self.bindings.get(&root).copied() {
+            let mut value = value;
+            for field in projection {
+                value = self.project_field(value, field.clone())?;
+            }
+            return Ok(value);
+        }
+        let expression = self
+            .program
+            .executable
+            .expressions
+            .get(root.as_usize())
+            .filter(|expression| expression.id == root)
+            .cloned()
+            .ok_or_else(|| PlanError::new(format!("executable expression {root} is missing")))?;
+        let owner = expression
+            .owner
+            .map(|owner| PlanStaticOwnerId(owner.as_usize()))
+            .or(inherited_owner);
+        match expression.kind {
+            ir::ExecutableExpressionKind::Object { fields }
+            | ir::ExecutableExpressionKind::TaggedObject { fields, .. }
+                if !projection.is_empty() && fields.iter().all(|field| !field.spread) =>
+            {
+                let (field, nested) = projection.split_first().expect("nonempty projection");
+                let mut matches = fields
+                    .into_iter()
+                    .filter(|candidate| candidate.name == *field);
+                if let Some(selected) = matches.next()
+                    && matches.next().is_none()
+                {
+                    return self.lower_scoped_projected_for_constructor(
+                        selected.value,
+                        owner,
+                        nested,
+                        constructor_projection,
+                    );
+                }
+                // A pattern-gated tagged-union arm can legally project a field
+                // absent from the other alternatives. Preserve the dynamic
+                // projection when this static object is not the selected
+                // alternative; the enclosing selector owns reachability.
+                let mut value = self.lower_scoped_with_constructor_projection(
+                    root,
+                    owner,
+                    constructor_projection,
+                )?;
+                for field in projection {
+                    value = self.project_field(value, field.clone())?;
+                }
+                Ok(value)
+            }
+            ir::ExecutableExpressionKind::Block { bindings, result } => {
+                self.lexical_bindings.push(
+                    bindings
+                        .into_iter()
+                        .map(|binding| (binding.id, binding.value))
+                        .collect(),
+                );
+                let value = self.lower_scoped_projected_for_constructor(
+                    result,
+                    owner,
+                    projection,
+                    constructor_projection,
+                );
+                self.lexical_bindings.pop();
+                value
+            }
+            ir::ExecutableExpressionKind::Project { input, fields } => {
+                let mut combined = fields;
+                combined.extend_from_slice(projection);
+                self.lower_scoped_projected_for_constructor(
+                    input,
+                    owner,
+                    &combined,
+                    constructor_projection,
+                )
+            }
+            ir::ExecutableExpressionKind::MaterializationLocal { .. } => {
+                if !projection.is_empty() {
+                    self.projection_overrides.push((root, projection.to_vec()));
+                }
+                let value = self.lower_scoped_with_constructor_projection(
+                    root,
+                    owner,
+                    constructor_projection,
+                );
+                if !projection.is_empty() {
+                    self.projection_overrides.pop();
+                }
+                value
+            }
+            ir::ExecutableExpressionKind::FunctionParameter {
+                parameter,
+                projection: mut parameter_projection,
+            } => {
+                parameter_projection.extend_from_slice(projection);
+                let parameter_constructor_projection = constructor_projection
+                    .is_empty()
+                    .then(|| parameter_projection.clone());
+                let constructor_projection = parameter_constructor_projection
+                    .as_deref()
+                    .unwrap_or(constructor_projection);
+                let binding = self
+                    .function_parameter_bindings
+                    .iter()
+                    .rev()
+                    .find_map(|bindings| bindings.get(&parameter).copied())
+                    .ok_or_else(|| {
+                        PlanError::new(format!(
+                            "executable producer parameter {}:{} projection `{}` has no exact distributed expression binding",
+                            parameter.function.0,
+                            parameter.ordinal,
+                            parameter_projection.join(".")
+                        ))
+                    })?;
+                self.lower_scoped_projected_for_constructor(
+                    binding.expression,
+                    binding.owner,
+                    &parameter_projection,
+                    constructor_projection,
+                )
+            }
+            ir::ExecutableExpressionKind::UserCall {
+                function,
+                name,
+                arguments,
+                ..
+            } => self.lower_user_call(
+                root,
+                function,
+                &name,
+                arguments,
+                owner,
+                projection,
+                constructor_projection,
+            ),
+            ir::ExecutableExpressionKind::When { input, arms } => {
+                let input = self.lower_scoped(input, owner)?;
+                let arms = arms
+                    .into_iter()
+                    .map(|arm| {
+                        Ok(PlanRowSelectArm {
+                            pattern: executable_select_pattern(&arm.pattern)?,
+                            value: self.lower_scoped_projected_for_constructor(
+                                arm.output,
+                                owner,
+                                projection,
+                                constructor_projection,
+                            )?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, PlanError>>()?;
+                self.intern(PlanRowExpressionNode::Select { input, arms })
+            }
+            ir::ExecutableExpressionKind::FlushBoundary { input } => {
+                let input = self.lower_scoped_projected_for_constructor(
+                    input,
+                    owner,
+                    projection,
+                    constructor_projection,
+                )?;
+                self.intern(PlanRowExpressionNode::FlushBoundary { input })
+            }
+            ir::ExecutableExpressionKind::Draining { input } => self
+                .lower_scoped_projected_for_constructor(
+                    input,
+                    owner,
+                    projection,
+                    constructor_projection,
+                ),
+            _ => {
+                let mut value = self.lower_scoped_with_constructor_projection(
+                    root,
+                    owner,
+                    constructor_projection,
+                )?;
+                for field in projection {
+                    value = self.project_field(value, field.clone())?;
+                }
+                Ok(value)
+            }
+        }
+    }
+
     fn lower_reachability_gate(
         &mut self,
         root: ir::ExecutableExprId,
@@ -11870,16 +12147,30 @@ impl<'a> ExecutableRowLowerer<'a> {
         if let Some(value) = self.bindings.get(&root) {
             return Ok(*value);
         }
+        let projection_override = self
+            .projection_overrides
+            .iter()
+            .rev()
+            .find_map(|(expression, projection)| (*expression == root).then(|| projection.clone()))
+            .unwrap_or_default();
+        let constructor_projection_override = self
+            .constructor_projection_overrides
+            .iter()
+            .rev()
+            .find_map(|(expression, projection)| (*expression == root).then(|| projection.clone()))
+            .unwrap_or_default();
         let key = (
             root,
             inherited_owner,
             self.active_materialization_owners.clone(),
             self.active_user_calls.clone(),
+            projection_override.clone(),
+            constructor_projection_override.clone(),
         );
         if let Some(value) = self.memo.get(&key) {
             return Ok(*value);
         }
-        let expression = self
+        let mut expression = self
             .program
             .executable
             .expressions
@@ -11888,6 +12179,23 @@ impl<'a> ExecutableRowLowerer<'a> {
             .ok_or_else(|| {
                 PlanError::new(format!("executable expression {} is missing", root.0))
             })?;
+        if !projection_override.is_empty() {
+            match &mut expression.kind {
+                ir::ExecutableExpressionKind::MaterializationLocal { projection, .. }
+                | ir::ExecutableExpressionKind::FunctionParameter { projection, .. } => {
+                    projection.extend(projection_override);
+                }
+                _ => {}
+            }
+        }
+        if !constructor_projection_override.is_empty()
+            && let ir::ExecutableExpressionKind::MaterializationLocal {
+                constructor_projection,
+                ..
+            } = &mut expression.kind
+        {
+            *constructor_projection = constructor_projection_override.clone();
+        }
         if let Some(value) = self.index.resolve_distributed_expression(root) {
             return self.value_ref(value);
         }
@@ -11975,7 +12283,7 @@ impl<'a> ExecutableRowLowerer<'a> {
                 self.constant(PlanConstantValue::Tag { name: value })?
             }
             ir::ExecutableExpressionKind::TaggedObject { tag, fields } => {
-                let fields = self.lower_fields(fields, owner)?;
+                let fields = self.lower_fields(fields, owner, &constructor_projection_override)?;
                 self.intern(PlanRowExpressionNode::TaggedObject { tag, fields })?
             }
             ir::ExecutableExpressionKind::Source { .. } => {
@@ -12022,7 +12330,15 @@ impl<'a> ExecutableRowLowerer<'a> {
                 name,
                 arguments,
                 ..
-            } => self.lower_user_call(root, function, &name, arguments, owner)?,
+            } => self.lower_user_call(
+                root,
+                function,
+                &name,
+                arguments,
+                owner,
+                &[],
+                &constructor_projection_override,
+            )?,
             ir::ExecutableExpressionKind::Materialize { materialization } => {
                 let materialization = self
                     .program
@@ -12263,7 +12579,7 @@ impl<'a> ExecutableRowLowerer<'a> {
                 owner,
             )?,
             ir::ExecutableExpressionKind::Object { fields } => {
-                let fields = self.lower_fields(fields, owner)?;
+                let fields = self.lower_fields(fields, owner, &constructor_projection_override)?;
                 self.intern(PlanRowExpressionNode::Object { fields })?
             }
             ir::ExecutableExpressionKind::Block { bindings, result } => {
@@ -12359,11 +12675,7 @@ impl<'a> ExecutableRowLowerer<'a> {
                 )));
             }
             ir::ExecutableExpressionKind::Project { input, fields } => {
-                let mut value = self.lower_scoped(input, owner)?;
-                for field in fields {
-                    value = self.project_field(value, field)?;
-                }
-                value
+                self.lower_scoped_projected(input, owner, &fields)?
             }
             ir::ExecutableExpressionKind::MaterializationLocal {
                 owner: local_owner,
@@ -12667,7 +12979,13 @@ impl<'a> ExecutableRowLowerer<'a> {
                 parameter,
                 projection,
             } => {
-                let Some(mut value) = self
+                let parameter_constructor_projection = constructor_projection_override
+                    .is_empty()
+                    .then(|| projection.clone());
+                let constructor_projection = parameter_constructor_projection
+                    .as_deref()
+                    .unwrap_or(&constructor_projection_override);
+                let Some(binding) = self
                     .function_parameter_bindings
                     .iter()
                     .rev()
@@ -12680,10 +12998,12 @@ impl<'a> ExecutableRowLowerer<'a> {
                         projection.join(".")
                     )));
                 };
-                for field in projection {
-                    value = self.project_field(value, field)?;
-                }
-                value
+                self.lower_scoped_projected_for_constructor(
+                    binding.expression,
+                    binding.owner,
+                    &projection,
+                    constructor_projection,
+                )?
             }
         };
         self.memo.insert(key, value);
@@ -12697,6 +13017,8 @@ impl<'a> ExecutableRowLowerer<'a> {
         name: &str,
         mut arguments: Vec<ir::ExecutableCallArgument>,
         owner: Option<PlanStaticOwnerId>,
+        result_projection: &[String],
+        result_constructor_projection: &[String],
     ) -> Result<PlanRowExpressionId, PlanError> {
         let function = self
             .program
@@ -12733,8 +13055,11 @@ impl<'a> ExecutableRowLowerer<'a> {
                     argument.ordinal, parameter.id.function.0, parameter.id.ordinal, parameter.name
                 )));
             }
-            let value = self.lower_scoped(argument.value, owner)?;
-            if bindings.insert(parameter.id, value).is_some() {
+            let binding = ExecutableFunctionParameterBinding {
+                expression: argument.value,
+                owner,
+            };
+            if bindings.insert(parameter.id, binding).is_some() {
                 return Err(PlanError::new(format!(
                     "ordinary call `{name}` at expression {call_expression} binds parameter {} twice",
                     parameter.id.ordinal
@@ -12748,7 +13073,18 @@ impl<'a> ExecutableRowLowerer<'a> {
         }
         self.function_parameter_bindings.push(bindings);
         self.active_user_calls.push(call_expression);
-        let result = self.lower_scoped(function.root, owner);
+        let result = self
+            .lower_scoped_projected_for_constructor(
+                function.root,
+                owner,
+                result_projection,
+                result_constructor_projection,
+            )
+            .map_err(|error| {
+                PlanError::new(format!(
+                    "ordinary callable `{name}` body failed during executable lowering: {error}"
+                ))
+            });
         self.active_user_calls.pop();
         self.function_parameter_bindings.pop();
         self.active_ordinary_functions.remove(&function_id);
@@ -13419,6 +13755,20 @@ impl<'a> ExecutableRowLowerer<'a> {
     }
 
     fn intern(&mut self, node: PlanRowExpressionNode) -> Result<PlanRowExpressionId, PlanError> {
+        if let PlanRowExpressionNode::ListRowField { field, .. } = &node
+            && let Some(definition) = self
+                .program
+                .scope_index
+                .fields
+                .iter()
+                .find(|candidate| plan_field_id(candidate.id) == *field)
+            && definition.resource_only
+        {
+            return Err(PlanError::new(format!(
+                "structural resource field {} (`{}`) cannot be lowered as a scalar row value while evaluating ordinary call(s) {:?}",
+                field.0, definition.diagnostic_path, self.active_user_calls,
+            )));
+        }
         self.arena.intern(node)
     }
 
@@ -13444,32 +13794,95 @@ impl<'a> ExecutableRowLowerer<'a> {
         &mut self,
         fields: Vec<ir::ExecutableRecordField>,
         owner: Option<PlanStaticOwnerId>,
+        constructor_prefix: &[String],
     ) -> Result<Vec<PlanRowObjectField>, PlanError> {
-        fields
-            .into_iter()
-            .filter(|field| {
-                !self.program.scope_index.fields.iter().any(|stored| {
-                    stored.resource_only
-                        && stored.producer == Some(field.value)
-                        && stored.declaration == field.declaration
-                        && stored.name == field.name
-                        && stored
-                            .static_owner
-                            .map(|stored_owner| PlanStaticOwnerId(stored_owner.as_usize()))
-                            == owner
-                }) && !self.program.scope_index.bindings.iter().any(|binding| {
-                    matches!(binding.target, ir::ErasedBindingTarget::Source { .. })
-                        && binding.producer == field.value
-                })
+        let active_materialization_owners = self.active_materialization_owners.clone();
+        let mut lowered = Vec::with_capacity(fields.len());
+        for field in fields {
+            let stored_resource = self.program.scope_index.fields.iter().any(|stored| {
+                let stored_owner = stored
+                    .static_owner
+                    .map(|owner| PlanStaticOwnerId(owner.as_usize()));
+                stored.resource_only
+                    && stored.declaration == field.declaration
+                    && stored.name == field.name
+                    && (stored_owner == owner
+                        || stored_owner.is_some_and(|stored_owner| {
+                            active_materialization_owners.contains(&stored_owner)
+                        }))
+            });
+            let direct_source = self.program.scope_index.bindings.iter().any(|binding| {
+                matches!(binding.target, ir::ErasedBindingTarget::Source { .. })
+                    && binding.producer == field.value
+            });
+            if stored_resource
+                || direct_source
+                || self.executable_expression_is_structural_resource(field.value)
+            {
+                continue;
+            }
+            let field_name = field.name.clone();
+            let field_value = field.value;
+            let mut constructor_projection = constructor_prefix.to_vec();
+            if !field.spread {
+                constructor_projection.push(field.name.clone());
+            }
+            let value = self
+                .lower_scoped_projected_for_constructor(
+                    field.value,
+                    owner,
+                    &[],
+                    &constructor_projection,
+                )
+                .map_err(|error| {
+                    PlanError::new(format!(
+                        "record field `{field_name}` value {field_value} owned by {:?} under active materialization(s) {:?} failed scalar lowering: {error}",
+                        owner, active_materialization_owners,
+                    ))
+                })?;
+            lowered.push(PlanRowObjectField {
+                name: field.name,
+                value,
+                spread: field.spread,
+            });
+        }
+        Ok(lowered)
+    }
+
+    fn executable_expression_is_structural_resource(
+        &self,
+        expression: ir::ExecutableExprId,
+    ) -> bool {
+        let Some(expression) = self
+            .program
+            .executable
+            .expressions
+            .get(expression.as_usize())
+            .filter(|candidate| candidate.id == expression)
+        else {
+            return false;
+        };
+        let ir::ExecutableExpressionKind::MaterializationLocal {
+            owner,
+            local,
+            projection,
+            ..
+        } = &expression.kind
+        else {
+            return false;
+        };
+        self.materialization_local_member(*owner, *local, projection)
+            .is_some_and(|(target, _)| match target {
+                ir::ErasedLocalMemberTarget::Sources(_) => true,
+                ir::ErasedLocalMemberTarget::Field(field) => self
+                    .program
+                    .scope_index
+                    .fields
+                    .iter()
+                    .find(|candidate| candidate.id == field)
+                    .is_some_and(|field| field.resource_only),
+                ir::ErasedLocalMemberTarget::State(_) => false,
             })
-            .map(|field| {
-                Ok(PlanRowObjectField {
-                    name: field.name,
-                    value: self.lower_scoped(field.value, owner)?,
-                    spread: field.spread,
-                })
-            })
-            .collect()
     }
 
     fn lower_list_page(
@@ -15415,11 +15828,7 @@ store: [
         |> List/map(item, new: new_row(input: item))
     forwarded:
         rows
-        |> List/map(item, new: [
-            controls: item.controls
-            label: item.label
-            selected: item.selected
-        ])
+        |> List/map(item, new: forward_row(row: item))
 ]
 
 FUNCTION new_row(input) {
@@ -15430,6 +15839,14 @@ FUNCTION new_row(input) {
             True |> HOLD selected {
                 controls.select |> THEN { False }
             }
+    ]
+}
+
+FUNCTION forward_row(row) {
+    [
+        controls: row.controls
+        label: row.label
+        selected: row.selected
     ]
 }
 

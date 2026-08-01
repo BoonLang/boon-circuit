@@ -435,7 +435,8 @@ pub struct SemanticCallParameterBinding {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SemanticCallContextArgument {
     pub formal: ContextFormalId,
-    pub checked_value: CheckedExprId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checked_value: Option<CheckedExprId>,
     pub value: SemanticExprId,
 }
 
@@ -545,7 +546,11 @@ pub enum SemanticExpressionKind {
         role: ProgramRole,
         effect: CheckedEffectSummary,
         result: FlowType,
-        instance: OutCallInstanceId,
+        /// Concrete OUT-graph occurrence when this call participates in OUT,
+        /// contextual, effect, or distributed topology. Pure calls retained
+        /// inside a shared ordinary callable body have no OUT occurrence.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instance: Option<OutCallInstanceId>,
         arguments: Vec<SemanticCallArgument>,
         parameter_bindings: Vec<SemanticCallParameterBinding>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2163,7 +2168,9 @@ impl SemanticExecutionGraphV1 {
                 context_argument,
                 contexts,
             } => {
-                validate_call_instance(out_net, *instance, &context("call instance"))?;
+                if let Some(instance) = instance {
+                    validate_call_instance(out_net, *instance, &context("call instance"))?;
+                }
                 let call_definition = self.require_call(*call, context("call definition"))?;
                 let callable_definition =
                     self.require_callable(*callable, context("callable definition"))?;
@@ -2179,12 +2186,14 @@ impl SemanticExecutionGraphV1 {
                         ));
                     }
                 };
-                let resolved_instance = &out_net.call_instances[instance.as_usize()];
+                let resolved_instance =
+                    instance.map(|instance| &out_net.call_instances[instance.as_usize()]);
+                let expected_result = resolved_instance
+                    .map(|instance| &instance.result)
+                    .unwrap_or(&call_definition.result);
                 let expected_flow_type = FlowType {
-                    mode: resolved_instance.result.mode,
-                    ty: crate::contextual_expansion::erase_runtime_type_vars(
-                        &resolved_instance.result.ty,
-                    ),
+                    mode: expected_result.mode,
+                    ty: crate::contextual_expansion::erase_runtime_type_vars(&expected_result.ty),
                 };
                 let expression_definition =
                     self.require_expression(expression, context("call expression"))?;
@@ -2221,11 +2230,22 @@ impl SemanticExecutionGraphV1 {
                         expression_definition.flow_type,
                     ));
                 }
-                if resolved_instance.provenance.call_id != Some(call_definition.checked_call)
-                    || resolved_instance.provenance.callable != callable_definition.checked_callable
+                if let Some(resolved_instance) = resolved_instance {
+                    if resolved_instance.provenance.call_id != Some(call_definition.checked_call)
+                        || resolved_instance.provenance.callable
+                            != callable_definition.checked_callable
+                    {
+                        return Err(format!(
+                            "expression {expression} call instance {instance:?} has stale checked provenance"
+                        ));
+                    }
+                } else if !contexts.is_empty()
+                    || !call_definition.contexts.is_empty()
+                    || *effect != CheckedEffectSummary::default()
+                    || *callable_kind == SemanticCallableKind::External
                 {
                     return Err(format!(
-                        "expression {expression} call instance {instance} has stale checked provenance"
+                        "expression {expression} omits its OUT instance for a contextual, effectful, or external call"
                     ));
                 }
                 let value_parameters = callable_definition
@@ -2301,22 +2321,97 @@ impl SemanticExecutionGraphV1 {
                         if *callable_kind == SemanticCallableKind::User
                             && parameter.formal == argument.formal =>
                     {
-                        self.require_expression(
+                        let argument_definition = self.require_expression(
                             argument.value,
                             context("PASSED context argument"),
                         )?;
-                        let passed = resolved_instance.passed.ok_or_else(|| {
-                            format!(
-                                "expression {expression} retained callable {} without a resolved PASSED value",
-                                callable_definition.id
-                            )
-                        })?;
-                        if passed.formal != argument.formal
-                            || passed.value.expression != argument.checked_value
-                        {
-                            return Err(format!(
-                                "expression {expression} retained PASSED argument differs from call instance {instance}"
-                            ));
+                        if let Some(resolved_instance) = resolved_instance {
+                            let passed = resolved_instance.passed.ok_or_else(|| {
+                                format!(
+                                    "expression {expression} retained callable {} without a resolved PASSED value",
+                                    callable_definition.id
+                                )
+                            })?;
+                            if passed.formal != argument.formal
+                                || Some(passed.value.expression) != argument.checked_value
+                            {
+                                return Err(format!(
+                                    "expression {expression} retained PASSED argument differs from call instance {instance:?}"
+                                ));
+                            }
+                        } else {
+                            match (call_definition.context_binding, argument.checked_value) {
+                                (
+                                    CheckedContextBinding::Explicit { value, .. },
+                                    Some(checked_value),
+                                ) if value == checked_value => {}
+                                (CheckedContextBinding::Inherited { formal }, None) => {
+                                    let owner = call_definition.owner_callable.ok_or_else(|| {
+                                        format!(
+                                            "expression {expression} inherits PASSED without an owner callable"
+                                        )
+                                    })?;
+                                    let owner = self.require_callable(
+                                        owner,
+                                        context("PASSED owner callable"),
+                                    )?;
+                                    let owner_parameter = owner
+                                        .context_parameter
+                                        .as_ref()
+                                        .filter(|parameter| parameter.formal == formal)
+                                        .ok_or_else(|| {
+                                            format!(
+                                                "expression {expression} inherits PASSED formal {} from a mismatched owner",
+                                                formal.0
+                                            )
+                                        })?;
+                                    let mut pending = vec![argument_definition.id];
+                                    let mut visited = BTreeSet::new();
+                                    let mut captured_leaf = false;
+                                    while let Some(value) = pending.pop() {
+                                        if !visited.insert(value) {
+                                            continue;
+                                        }
+                                        let value = self.require_expression(
+                                            value,
+                                            context("PASSED capture value"),
+                                        )?;
+                                        match &value.kind {
+                                            SemanticExpressionKind::FunctionParameter {
+                                                parameter,
+                                                ..
+                                            } if *parameter == owner_parameter.id => {
+                                                captured_leaf = true;
+                                            }
+                                            SemanticExpressionKind::Project { input, .. } => {
+                                                pending.push(*input);
+                                            }
+                                            SemanticExpressionKind::Object(fields)
+                                                if !fields.is_empty()
+                                                    && fields.iter().all(|field| !field.spread) =>
+                                            {
+                                                pending
+                                                    .extend(fields.iter().map(|field| field.value));
+                                            }
+                                            _ => {
+                                                captured_leaf = false;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    if !captured_leaf {
+                                        return Err(format!(
+                                            "expression {expression} inherited PASSED argument is not an exact capture of the owner's hidden parameter: owner={} expected={:?} actual={:?}",
+                                            owner.id, owner_parameter.id, argument_definition.kind,
+                                        ));
+                                    }
+                                }
+                                _ => {
+                                    return Err(format!(
+                                        "expression {expression} retained PASSED argument has no exact checked binding"
+                                    ));
+                                }
+                            }
                         }
                     }
                     _ => {
@@ -2337,9 +2432,9 @@ impl SemanticExecutionGraphV1 {
                 let actual_contexts = contexts
                     .iter()
                     .map(|context| {
-                        if context.call_instance != *instance {
+                        if Some(context.call_instance) != *instance {
                             return Err(format!(
-                                "expression {expression} context uses call instance {} instead of {instance}",
+                                "expression {expression} context uses call instance {} instead of {instance:?}",
                                 context.call_instance
                             ));
                         }

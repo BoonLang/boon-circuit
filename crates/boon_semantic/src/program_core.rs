@@ -973,7 +973,8 @@ pub enum ExecutableExpressionKind {
         callable_kind: ExecutableCallableKind,
         name: String,
         intrinsic: Option<boon_typecheck::CheckedIntrinsicV1>,
-        instance: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instance: Option<usize>,
         arguments: Vec<ExecutableCallArgument>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         contexts: Vec<ExecutableCallContextId>,
@@ -982,7 +983,8 @@ pub enum ExecutableExpressionKind {
     UserCall {
         function: FunctionId,
         name: String,
-        instance: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        instance: Option<usize>,
         arguments: Vec<ExecutableCallArgument>,
     },
     Materialize {

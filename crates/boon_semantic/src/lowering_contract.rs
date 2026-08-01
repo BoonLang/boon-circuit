@@ -509,11 +509,49 @@ pub(crate) fn build_semantic_lowering_contract(
         .validate(execution, resources, out_net)
         .map_err(|error| SemanticLoweringContractError::new(error.to_string()))?;
 
-    let metadata = build_lowering_metadata(checked, execution, resources, reactive)?;
-    let output_contracts =
-        build_output_contracts(checked, execution, reactive, &metadata.render_slots)?;
-    let host_ports = build_host_ports(checked, resources, &output_contracts)?;
-    let transient_collections = build_transient_collections(execution, resources)?;
+    build_semantic_lowering_contract_from_validated_inputs(checked, execution, resources, reactive)
+}
+
+pub(crate) fn build_semantic_lowering_contract_from_validated_inputs(
+    checked: &CheckedProgram,
+    execution: &SemanticExecutionGraphV1,
+    resources: &SemanticResourceGraphV1,
+    reactive: &SemanticReactiveGraphV1,
+) -> Result<SemanticLoweringContractV1, SemanticLoweringContractError> {
+    let trace = std::env::var_os("BOON_SEMANTIC_TRACE").is_some();
+    macro_rules! lowering_phase {
+        ($name:literal, $expression:expr) => {{
+            let started = trace.then(std::time::Instant::now);
+            let result = $expression;
+            if let Some(started) = started {
+                eprintln!(
+                    concat!(
+                        "boon_semantic lowering_contract ",
+                        $name,
+                        ":done elapsed_ms={:.3}"
+                    ),
+                    started.elapsed().as_secs_f64() * 1000.0
+                );
+            }
+            result
+        }};
+    }
+    let metadata = lowering_phase!(
+        "metadata",
+        build_lowering_metadata(checked, execution, resources, reactive)
+    )?;
+    let output_contracts = lowering_phase!(
+        "output_contracts",
+        build_output_contracts(checked, execution, reactive, &metadata.render_slots)
+    )?;
+    let host_ports = lowering_phase!(
+        "host_ports",
+        build_host_ports(checked, resources, &output_contracts)
+    )?;
+    let transient_collections = lowering_phase!(
+        "transient_collections",
+        build_transient_collections(execution, resources)
+    )?;
     let mut contract = SemanticLoweringContractV1 {
         schema: SEMANTIC_LOWERING_CONTRACT_SCHEMA_V1.to_owned(),
         metadata,
@@ -522,7 +560,7 @@ pub(crate) fn build_semantic_lowering_contract(
         transient_collections,
         digest: SemanticLoweringContractDigestV1([0; 32]),
     };
-    contract.digest = lowering_contract_digest(&contract)?;
+    contract.digest = lowering_phase!("digest", lowering_contract_digest(&contract))?;
     Ok(contract)
 }
 
@@ -641,6 +679,21 @@ fn build_expression_types(
     execution: &SemanticExecutionGraphV1,
 ) -> Result<Vec<SemanticSourceExpressionTypeV1>, SemanticLoweringContractError> {
     let lowering = &checked.lowering_metadata;
+    let mut occurrences_by_checked = vec![Vec::new(); checked.expressions.len()];
+    for origin in &execution.checked_expression_origins {
+        let checked_index = origin.checked_expression.0 as usize;
+        let Some(occurrences) = occurrences_by_checked.get_mut(checked_index) else {
+            return Err(SemanticLoweringContractError::new(format!(
+                "semantic occurrence {} references out-of-range checked expression {}",
+                origin.expression, origin.checked_expression.0
+            )));
+        };
+        occurrences.push(origin.expression);
+    }
+    for occurrences in &mut occurrences_by_checked {
+        occurrences.sort();
+        occurrences.dedup();
+    }
     let mut entries = lowering.expr_type_table.entries.iter().collect::<Vec<_>>();
     entries.sort_by_key(|entry| entry.expr_id);
     if entries.len() != lowering.original_source_expression_count {
@@ -667,38 +720,32 @@ fn build_expression_types(
                     entry.expr_id
                 ))
             })?);
-            let checked_matches = checked
+            let checked_expression = checked
                 .expressions
-                .iter()
+                .get(entry.expr_id)
                 .filter(|expression| expression.id == checked_id)
-                .collect::<Vec<_>>();
-            let [checked_expression] = checked_matches.as_slice() else {
-                return Err(SemanticLoweringContractError::new(format!(
-                    "source expression {} resolves to {} opaque checked expressions",
-                    entry.expr_id,
-                    checked_matches.len()
-                )));
-            };
+                .ok_or_else(|| {
+                    SemanticLoweringContractError::new(format!(
+                        "source expression {} has no dense opaque checked expression",
+                        entry.expr_id
+                    ))
+                })?;
             if checked_expression.flow_type != entry.flow_type {
                 return Err(SemanticLoweringContractError::new(format!(
                     "source expression {} type table differs from its checked expression",
                     entry.expr_id
                 )));
             }
-            let mut occurrence_ids = execution
-                .checked_expression_origins
-                .iter()
-                .filter(|origin| origin.checked_expression == checked_id)
-                .map(|origin| origin.expression)
-                .collect::<Vec<_>>();
-            occurrence_ids.sort();
-            occurrence_ids.dedup();
+            let occurrence_ids = occurrences_by_checked
+                .get(entry.expr_id)
+                .expect("checked expression occurrence index is dense");
             // Function declarations and other source-only expressions can be
             // fully checked without producing a normalized runtime node. An
             // explicitly empty vector is the exact coverage result; it is not
             // a synthesized fallback identity.
             let occurrences = occurrence_ids
-                .into_iter()
+                .iter()
+                .copied()
                 .map(|occurrence| {
                     let expression = require_expression(execution, occurrence)?;
                     if expression.checked_expr_id != checked_id {

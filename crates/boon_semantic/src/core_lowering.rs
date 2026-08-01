@@ -1161,9 +1161,18 @@ fn allocate_call_identities(
                 contexts,
                 ..
             } => {
+                let Some(instance) = *instance else {
+                    if !contexts.is_empty() {
+                        return Err(format!(
+                            "semantic call expression {} has contexts without a concrete OUT instance",
+                            expression.id
+                        ));
+                    }
+                    continue;
+                };
                 let mut expression_contexts = BTreeSet::new();
                 for context in contexts {
-                    if context.call_instance != *instance {
+                    if context.call_instance != instance {
                         return Err(format!(
                             "semantic call expression {} instance {instance} contains noncanonical context {}:{}",
                             expression.id, context.call_instance, context.ordinal
@@ -1178,7 +1187,7 @@ fn allocate_call_identities(
                     context_definitions.insert(*context);
                 }
                 let definition = (*call, *callable, expression_contexts);
-                if let Some(previous) = instances.insert(*instance, definition.clone())
+                if let Some(previous) = instances.insert(instance, definition.clone())
                     && previous != definition
                 {
                     return Err(format!(
@@ -5811,7 +5820,9 @@ fn map_expression_kind(
             SemanticCallableKind::User => ExecutableExpressionKind::UserCall {
                 function: ids.callable(*callable)?,
                 name: name.clone(),
-                instance: ids.call_instance(*instance)?,
+                instance: instance
+                    .map(|instance| ids.call_instance(instance))
+                    .transpose()?,
                 arguments: {
                     let mut mapped = arguments
                         .iter()
@@ -5838,7 +5849,9 @@ fn map_expression_kind(
                     },
                     name: name.clone(),
                     intrinsic: *intrinsic,
-                    instance: ids.call_instance(*instance)?,
+                    instance: instance
+                        .map(|instance| ids.call_instance(instance))
+                        .transpose()?,
                     arguments: arguments
                         .iter()
                         .map(|argument| map_call_argument(ids, argument))
@@ -5948,10 +5961,61 @@ fn map_expression_kind(
                 .collect::<Result<Vec<_>, _>>()?,
         },
         SemanticExpressionKind::Delimiter => ExecutableExpressionKind::Delimiter,
-        SemanticExpressionKind::Project { input, fields } => ExecutableExpressionKind::Project {
-            input: ids.expression(*input)?,
-            fields: fields.clone(),
-        },
+        SemanticExpressionKind::Project { input, fields } => {
+            let mut input = *input;
+            let mut projection = fields.clone();
+            loop {
+                let input_expression = semantic_expression(graph, input)?;
+                match &input_expression.kind {
+                    SemanticExpressionKind::Project {
+                        input: nested_input,
+                        fields: nested_fields,
+                    } => {
+                        let mut flattened = nested_fields.clone();
+                        flattened.extend(projection);
+                        projection = flattened;
+                        input = *nested_input;
+                    }
+                    SemanticExpressionKind::MaterializationLocal {
+                        owner,
+                        local,
+                        projection: local_projection,
+                        constructor_projection,
+                    } => {
+                        let mut local_projection = local_projection.clone();
+                        local_projection.extend(projection);
+                        break ExecutableExpressionKind::MaterializationLocal {
+                            owner: *owner,
+                            local: ids.materialization_local(*owner, *local)?,
+                            projection: local_projection,
+                            constructor_projection: constructor_projection.clone(),
+                        };
+                    }
+                    SemanticExpressionKind::FunctionParameter {
+                        parameter,
+                        projection: parameter_projection,
+                    } => {
+                        let mut parameter_projection = parameter_projection.clone();
+                        parameter_projection.extend(projection);
+                        break ExecutableExpressionKind::FunctionParameter {
+                            parameter: executable_parameter_for_occurrence(
+                                graph,
+                                ids,
+                                input_expression,
+                                *parameter,
+                            )?,
+                            projection: parameter_projection,
+                        };
+                    }
+                    _ => {
+                        break ExecutableExpressionKind::Project {
+                            input: ids.expression(input)?,
+                            fields: projection,
+                        };
+                    }
+                }
+            }
+        }
         SemanticExpressionKind::MaterializationLocal {
             owner,
             local,

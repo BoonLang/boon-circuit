@@ -585,6 +585,27 @@ pub fn build_semantic_reactive_graph_with_external_events(
     resources
         .validate(execution, out_net)
         .map_err(SemanticReactiveError::new)?;
+    build_semantic_reactive_graph_from_validated_inputs(
+        execution,
+        resources,
+        out_net,
+        external_event_identities,
+    )
+}
+
+/// Derive the reactive graph after the caller has validated the immutable
+/// execution/resource/OUT tuple once for this construction transaction.
+///
+/// Public and deserialized-artifact validation continues to use
+/// [`build_semantic_reactive_graph_with_external_events`]. This path prevents
+/// downstream component builders from re-deriving the same graphs merely to
+/// prove inputs that were just validated by the orchestrating elaboration.
+pub(crate) fn build_semantic_reactive_graph_from_validated_inputs(
+    execution: &SemanticExecutionGraphV1,
+    resources: &SemanticResourceGraphV1,
+    out_net: &ResolvedOutGraph,
+    external_event_identities: &[CheckedExternalDeclarationIdentityV1],
+) -> Result<SemanticReactiveGraphV1, SemanticReactiveError> {
     let external_event_identities = external_event_identities
         .iter()
         .copied()

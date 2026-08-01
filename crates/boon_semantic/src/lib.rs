@@ -1352,9 +1352,12 @@ fn exact_call_expression_for_occurrence<'a>(
         {
             continue;
         }
+        let Some(instance) = *instance else {
+            continue;
+        };
         let (root, occurrence_path) = program
             .resolved_out_graph()
-            .distributed_call_occurrence(&program.checked_program, *instance)
+            .distributed_call_occurrence(&program.checked_program, instance)
             .map_err(SemanticError::new)?;
         if root == occurrence.root && occurrence_path == occurrence.occurrence_path {
             let origin = program
@@ -1368,7 +1371,7 @@ fn exact_call_expression_for_occurrence<'a>(
                         occurrence.occurrence_path, expression.id
                     ))
                 })?;
-            matches.push((expression, origin, *instance));
+            matches.push((expression, origin, instance));
         }
     }
     let [matched] = matches.as_slice() else {
@@ -1404,6 +1407,12 @@ fn exact_bundle_call_arguments(
             occurrence.occurrence_path
         )));
     };
+    let instance = instance.ok_or_else(|| {
+        SemanticError::new(format!(
+            "distributed occurrence `{}` has no concrete OUT call frame",
+            occurrence.occurrence_path
+        ))
+    })?;
     if !contexts.is_empty()
         || !call_definition.contexts.is_empty()
         || !matches!(
@@ -1539,7 +1548,7 @@ fn exact_bundle_call_arguments(
                     .resolved_out_graph()
                     .call_instances
                     .get(instance.as_usize())
-                    .filter(|candidate| candidate.id == *instance)
+                    .filter(|candidate| candidate.id == instance)
                     .ok_or_else(|| {
                         SemanticError::new(format!(
                             "distributed occurrence `{}` references missing concrete call frame {}",
@@ -2656,7 +2665,12 @@ pub fn elaborate_with_external_event_identities(
         "validate_out_contracts",
         validate_out_contracts(&checked_program, &resolved_out_graph)
     )?;
-    let (materializations, materialization_expressions) = elaboration_phase!(
+    let (
+        materializations,
+        materialization_expressions,
+        expression_builder_indexes,
+        required_ordinary_definitions,
+    ) = elaboration_phase!(
         "derive_contextual_materializations",
         contextual_expansion::derive_contextual_materializations(
             &checked_program,
@@ -2671,6 +2685,8 @@ pub fn elaborate_with_external_event_identities(
             &resolved_out_graph,
             &materializations,
             materialization_expressions,
+            &expression_builder_indexes,
+            &required_ordinary_definitions,
         )
     )
     .map_err(|error| SemanticError::new(error.to_string()))?;
@@ -2720,7 +2736,7 @@ pub fn elaborate_with_external_event_identities(
     .map_err(SemanticError::new)?;
     let reactive_graph = elaboration_phase!(
         "build_semantic_reactive_graph",
-        build_semantic_reactive_graph_with_external_events(
+        reactive::build_semantic_reactive_graph_from_validated_inputs(
             &execution_graph,
             &resource_graph,
             &resolved_out_graph,
@@ -2730,24 +2746,22 @@ pub fn elaborate_with_external_event_identities(
     .map_err(|error| SemanticError::new(error.to_string()))?;
     let lowering_contract = elaboration_phase!(
         "build_semantic_lowering_contract",
-        build_semantic_lowering_contract(
+        lowering_contract::build_semantic_lowering_contract_from_validated_inputs(
             &checked_program,
             &execution_graph,
             &resource_graph,
             &reactive_graph,
-            &resolved_out_graph,
         )
     )
     .map_err(|error| SemanticError::new(error.to_string()))?;
     let scope_storage_graph = elaboration_phase!(
         "build_semantic_scope_storage_graph",
-        build_semantic_scope_storage_graph(
+        storage_contract::build_semantic_scope_storage_graph_from_validated_inputs(
             &checked_program,
             &execution_graph,
             &resource_graph,
             &reactive_graph,
             &lowering_contract,
-            &resolved_out_graph,
         )
     )
     .map_err(|error| SemanticError::new(error.to_string()))?;

@@ -445,6 +445,9 @@ fn compile_parsed_to_machine_plan(
         migration_predecessors,
     )?;
     let compile_ms = elapsed_ms(compile_started);
+    if std::env::var_os("BOON_COMPILER_LOWER_TRACE").is_some() {
+        eprintln!("boon_compiler lower backend_compile: {compile_ms:.3}ms");
+    }
     let profile = CompileProfile {
         source_unit_count: parsed.files.len(),
         expression_count: ir.expression_count,

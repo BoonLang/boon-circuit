@@ -560,22 +560,37 @@ final packed target remains unchanged. The reconciled Phase 0 validators pass;
 the verifier grants final Phase 0 completion only from the clean committed
 revision.
 
-The current compiler-scalability recovery fixes the owning graph and manifest
-algorithms instead of extending their timeout. Static selector reachability now
-removes unselected branches before contextual expansion and OutNet
-instantiation; a 64-branch static fixture produces two call frames while the
-dynamic-selector fixture retains all alternatives. TodoMVC physical falls from
-29,949 to 2,817 OutNet call frames, and its dependency manifest falls from about
-3.08 million dependencies plus 4.18 million coverage entries to 129,662 and
-176,826 respectively. On the reference machine, a cold debug
-`boon_cli check examples/todo_mvc_physical/RUN.bn` completes in 9.08 seconds at
-693,444 KiB peak RSS, while `examples/counter.bn` completes in 0.09 seconds at
-37,100 KiB. The focused dependency-manifest suite passes all ten mutation,
-closure, ownership, and digest tests. These are development-loop measurements,
-not final release or native-performance evidence. Ordinary user-call
-preservation remains open: the same Todo fixture still has 38,202 semantic
-expressions for 4,858 checked expressions, so Phase 1 cannot exit until ordinary
-callable definitions and call edges replace recursive body cloning.
+The current compiler-scalability recovery fixes the owning graphs and fixed
+points instead of extending their timeout. Static selector reachability removes
+unselected branches before contextual expansion and OutNet instantiation; a
+64-branch static fixture produces two call frames while the dynamic-selector
+fixture retains all alternatives. Ordinary pure user calls now keep shared
+callable definitions and explicit call edges in root execution and contextual
+materializations. Materialization-only helpers schedule their definition once
+in the shared execution graph instead of recursively cloning the body per list
+operation. Dense expression-indexed inference state, a bounded callee-to-caller
+worklist, and a forward/reverse inference sweep replace logarithmic hot lookups
+and one whole-program epoch per wrapper edge. OUT manifest payloads commit
+interned type digests, local substitution deltas, and explicit parent-call
+dependencies instead of serializing inherited structural type trees at every
+frame.
+
+On the reference machine, the current debug `boon_cli` completes Counter in
+0.08 seconds at 34,668 KiB peak RSS and physical TodoMVC in 2.81 seconds at
+345,780 KiB, down from the first recovery checkpoint's 9.08 seconds and
+693,444 KiB for TodoMVC. The large 5,169-frame NovyWave fixture now completes
+successfully in 41.34 seconds at 4,012,976 KiB, down from the first successful
+55.64-second, 4,426,932-KiB run. Its checked-type fixed points require 6+6
+global epochs instead of 12+11; typechecking takes 12.31 seconds. Its semantic
+execution graph contains 43,471 expressions instead of 94,509, semantic
+elaboration takes 17.61 seconds, and its dependency manifest contains 261,728
+records plus 338,263 coverage entries and takes 5.86 seconds. These are
+development-loop measurements, not final release or native-performance
+evidence. Phase 1 still requires the focused type, semantic, manifest, IR, and
+compiler regression matrix and a committed clean-checkout remeasurement; the
+remaining measured compiler hotspots are cumulative OUT substitutions,
+dependency-closure proof construction, and executable-row backend lowering,
+not unbounded ordinary-body expansion.
 
 A clean confirmation at `de430c1` kept the million-row charged work unchanged
 but observed 14,794,406,170 ns instead of 9,712,441,796 ns for its three-sample

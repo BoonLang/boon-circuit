@@ -484,6 +484,18 @@ pub(crate) fn build_semantic_scope_storage_graph(
         .validate(execution, resources, out_net)
         .map_err(|error| SemanticScopeStorageError::new(error.to_string()))?;
 
+    build_semantic_scope_storage_graph_from_validated_inputs(
+        checked, execution, resources, reactive, lowering,
+    )
+}
+
+pub(crate) fn build_semantic_scope_storage_graph_from_validated_inputs(
+    checked: &CheckedProgram,
+    execution: &SemanticExecutionGraphV1,
+    resources: &SemanticResourceGraphV1,
+    reactive: &SemanticReactiveGraphV1,
+    lowering: &SemanticLoweringContractV1,
+) -> Result<SemanticScopeStorageGraphV1, SemanticScopeStorageError> {
     let owners = build_owners(execution, resources)?;
     let mut fields = build_storage_fields(checked, execution, resources, reactive)?;
     let mut locals = build_storage_locals(execution, resources, &fields)?;

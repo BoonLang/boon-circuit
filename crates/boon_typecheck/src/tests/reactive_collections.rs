@@ -73,6 +73,81 @@ result: wrapped_state(of: Interactive[hovered: True])
 }
 
 #[test]
+fn typed_find_branch_and_fallback_propagate_the_complete_wrapper_domain() {
+    let parsed = boon_parser::parse_source(
+        "tagged-selector-find-domain.bn",
+        r#"
+rows: LIST {
+    [id: 1, value: BinaryValue[bits: TEXT { 01 }]]
+    [id: 2, value: StringValue[text: TEXT { ready }]]
+}
+
+selected:
+    rows
+    |> List/find(item, if: item.id == 1)
+    |> WHEN {
+        Found[value] => value.value
+        NotFound => StringValue[text: Text/empty()]
+    }
+
+label: value_text(value: selected)
+segments:
+    rows
+    |> List/map(item, new: segment(transition: item))
+
+FUNCTION segment(transition) {
+    [label: value_text(value: transition.value)]
+}
+
+FUNCTION value_text(value) {
+    value |> WHEN {
+        BinaryValue => value.bits
+        StringValue => value.text
+        __ => TEXT { ? }
+    }
+}
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+    assert!(
+        !output.report.has_errors(),
+        "diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+    let program = output.program.expect("typed find program");
+    let value_type = &program
+        .callables
+        .iter()
+        .find(|callable| callable.name == "value_text")
+        .expect("value_text callable")
+        .parameters[0]
+        .flow_type
+        .ty;
+    let Type::VariantSet(variants) = value_type else {
+        panic!("value_text domain is not a variant set: {value_type:?}");
+    };
+    assert!(variants.iter().any(
+        |variant| matches!(variant, Variant::Tagged { tag, .. } if tag == "BinaryValue")
+    ));
+    assert!(variants.iter().any(
+        |variant| matches!(variant, Variant::Tagged { tag, .. } if tag == "StringValue")
+    ));
+    let transition = &program
+        .callables
+        .iter()
+        .find(|callable| callable.name == "segment")
+        .expect("segment callable")
+        .parameters[0]
+        .flow_type
+        .ty;
+    let Type::Object(transition) = transition else {
+        panic!("segment transition is not an object: {transition:?}");
+    };
+    assert_eq!(transition.fields.get("value"), Some(value_type));
+}
+
+#[test]
 fn recovery_tagged_call_discriminants_specialize_user_results() {
     let parsed = boon_parser::parse_source(
         "tagged-call-result.bn",

@@ -1282,6 +1282,7 @@ where
         mut frame_bindings: BTreeMap<DeclId, usize>,
         active_callables: &mut Vec<DeclId>,
     ) {
+        let program = self.program;
         let static_calls = self.reachable_call_indices(owner_callable, parent);
         let mut pending_calls = Vec::with_capacity(static_calls.len());
         let mut pending_forwards = Vec::new();
@@ -1290,8 +1291,8 @@ where
         // forwarding edge. DeclId resolution has already happened, so this is
         // deterministic and independent of checked-call storage order.
         for static_call_index in static_calls {
-            let checked_call = self.program.calls[static_call_index].clone();
-            let provenance = OutCallProvenance::from(&checked_call);
+            let checked_call = &program.calls[static_call_index];
+            let provenance = OutCallProvenance::from(checked_call);
             let instance = OutCallInstanceId(self.call_instances.len());
             let signature = self.signature_by_id.get(&checked_call.callable).copied();
             let inherited_parent_output_node =
@@ -1455,13 +1456,13 @@ where
                         OutPortBinding::Forward { target: *target },
                     ),
                 };
-                let contract = (self.make_contract)(&checked_call, entry_ordinal, entry);
+                let contract = (self.make_contract)(checked_call, entry_ordinal, entry);
                 let port = OutPortId(self.ports.len());
                 let union_node = self.union_find.make_set();
                 if kind.is_some_and(|kind| {
                     (self.is_structural_producer)(
                         kind,
-                        &checked_call,
+                        checked_call,
                         entry_ordinal,
                         entry,
                         &contract,

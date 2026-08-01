@@ -18,7 +18,7 @@ use std::time::Instant;
 #[cfg(target_arch = "wasm32")]
 use web_time::Instant;
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub enum Type {
     Text,
     Number,
@@ -59,19 +59,19 @@ pub enum Type {
 
 impl EqUnifyValue for Type {}
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub enum BytesType {
     Dynamic,
     Fixed(usize),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub enum Variant {
     Tag(String),
     Tagged { tag: String, fields: ObjectShape },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct ObjectShape {
     pub fields: BTreeMap<String, Type>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -233,7 +233,7 @@ pub struct TypeScheme {
     pub ty: FlowType,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub struct FlowType {
     pub mode: FlowMode,
     pub ty: Type,
@@ -322,7 +322,7 @@ impl Default for ExternalTypeEnvironment {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub enum FlowMode {
     Continuous,
     TickPresent,
@@ -1686,7 +1686,7 @@ struct CheckedProgramBuilder<'a> {
     pattern_arms_by_scope: BTreeMap<LexicalScopeId, usize>,
     nearest_pattern_arm_by_scope: Vec<Option<usize>>,
     syntax_discriminant_parameters: BTreeSet<DeclId>,
-    inferred_expr_types: BTreeMap<usize, FlowType>,
+    inferred_expr_types: DenseIndexTable<FlowType>,
     syntax_expr_types: BTreeMap<usize, FlowType>,
     /// Hidden `Flush<E>` control types keyed by parser expression. This is a
     /// checker-only side table; `E` is folded into the ordinary type exactly
@@ -1694,11 +1694,66 @@ struct CheckedProgramBuilder<'a> {
     expression_flush_types: BTreeMap<usize, Type>,
     authoritative_expr_types: BTreeSet<usize>,
     checked_flow_inference_epoch: u64,
-    checked_flow_inference_cache: BTreeMap<usize, (u64, FlowType)>,
+    checked_flow_inference_cache: DenseIndexTable<(u64, FlowType)>,
     validate_checked_projections: bool,
     source_payload_shape_table: Vec<SourcePayloadSyntaxShapeEntry>,
     exact_number_literals: BTreeMap<usize, ExactNumber>,
     diagnostics: Vec<TypeDiagnostic>,
+}
+
+/// Dense parser/checked-expression state used by the inference fixed point.
+///
+/// Expression IDs are zero-based parser arena indexes. Keeping their hot flow
+/// state in `BTreeMap` made every recursive lookup pay a logarithmic tree walk
+/// and one allocation per entry even though sparse keys are not valid here.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DenseIndexTable<T> {
+    entries: Vec<Option<T>>,
+}
+
+impl<T> Default for DenseIndexTable<T> {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+}
+
+impl<T> DenseIndexTable<T> {
+    fn with_len(len: usize) -> Self {
+        Self {
+            entries: std::iter::repeat_with(|| None).take(len).collect(),
+        }
+    }
+
+    fn get(&self, index: &usize) -> Option<&T> {
+        self.entries.get(*index).and_then(Option::as_ref)
+    }
+
+    fn insert(&mut self, index: usize, value: T) -> Option<T> {
+        if index >= self.entries.len() {
+            self.entries.resize_with(index.saturating_add(1), || None);
+        }
+        self.entries[index].replace(value)
+    }
+
+    fn values(&self) -> impl Iterator<Item = &T> {
+        self.entries.iter().filter_map(Option::as_ref)
+    }
+
+    fn clear(&mut self) {
+        self.entries.fill_with(|| None);
+    }
+}
+
+impl<T> FromIterator<(usize, T)> for DenseIndexTable<T> {
+    fn from_iter<I: IntoIterator<Item = (usize, T)>>(iter: I) -> Self {
+        let mut table = Self::default();
+        for (index, value) in iter {
+            table.insert(index, value);
+        }
+        table
+    }
 }
 
 struct CheckedProgramBuildInputs<'a> {
@@ -2000,12 +2055,12 @@ impl<'a> CheckedProgramBuilder<'a> {
                 pattern_arms_by_scope: BTreeMap::new(),
                 nearest_pattern_arm_by_scope: Vec::new(),
                 syntax_discriminant_parameters: BTreeSet::new(),
-                inferred_expr_types: BTreeMap::new(),
+                inferred_expr_types: DenseIndexTable::with_len(program.expressions.len()),
                 syntax_expr_types: BTreeMap::new(),
                 expression_flush_types: BTreeMap::new(),
                 authoritative_expr_types: BTreeSet::new(),
                 checked_flow_inference_epoch: 0,
-                checked_flow_inference_cache: BTreeMap::new(),
+                checked_flow_inference_cache: DenseIndexTable::with_len(program.expressions.len()),
                 validate_checked_projections: false,
                 source_payload_shape_table: source_payload_shape_table.to_vec(),
                 exact_number_literals: BTreeMap::new(),
@@ -3679,7 +3734,11 @@ impl<'a> CheckedProgramBuilder<'a> {
             .iter()
             .map(|entry| (entry.expr_id, entry.flow_type.clone()))
             .collect();
-        self.inferred_expr_types = self.syntax_expr_types.clone();
+        self.inferred_expr_types = self
+            .syntax_expr_types
+            .iter()
+            .map(|(expression, flow_type)| (*expression, flow_type.clone()))
+            .collect();
 
         for (expression, flow_type) in checked_source_expression_flow_types(
             &self.program.ast.statements,
@@ -5231,54 +5290,30 @@ impl<'a> CheckedProgramBuilder<'a> {
     }
 
     fn infer_checked_types(&mut self) {
+        let trace = std::env::var_os("BOON_TYPECHECK_TRACE").is_some();
         let iteration_limit = self
             .calls
             .len()
             .saturating_add(self.signatures.len())
             .saturating_add(4);
         let mut final_boundary_unchanged = false;
-        for _ in 0..iteration_limit {
-            let boundary_declarations = self
-                .declarations
-                .iter()
-                .map(|declaration| declaration.flow_type.clone())
-                .collect::<Vec<_>>();
-            let boundary_signatures = self
-                .signatures
-                .iter()
-                .map(|signature| signature.result.clone())
-                .collect::<Vec<_>>();
-            let boundary_calls = self
-                .calls
-                .iter()
-                .map(|call| {
-                    (
-                        call.result.clone(),
-                        call.type_substitutions.clone(),
-                        call.contextual_substitutions.clone(),
-                    )
-                })
-                .collect::<Vec<_>>();
-            let boundary_expressions = self.inferred_expr_types.clone();
-            let changes = self.advance_checked_type_inference();
-            if !changes.any() {
-                return;
-            }
-            final_boundary_unchanged = boundary_declarations
-                == self
-                    .declarations
-                    .iter()
-                    .map(|declaration| declaration.flow_type.clone())
-                    .collect::<Vec<_>>()
-                && boundary_signatures
-                    == self
-                        .signatures
+        for iteration in 0..iteration_limit {
+            // The boundary snapshot is only used to distinguish harmless
+            // internal churn from real non-convergence at the hard limit.
+            // Cloning the complete type state on every ordinary iteration was
+            // pure overhead for every fixed point that terminates normally.
+            let final_iteration = iteration.saturating_add(1) == iteration_limit;
+            let boundary = final_iteration.then(|| {
+                (
+                    self.declarations
+                        .iter()
+                        .map(|declaration| declaration.flow_type.clone())
+                        .collect::<Vec<_>>(),
+                    self.signatures
                         .iter()
                         .map(|signature| signature.result.clone())
-                        .collect::<Vec<_>>()
-                && boundary_calls
-                    == self
-                        .calls
+                        .collect::<Vec<_>>(),
+                    self.calls
                         .iter()
                         .map(|call| {
                             (
@@ -5287,13 +5322,72 @@ impl<'a> CheckedProgramBuilder<'a> {
                                 call.contextual_substitutions.clone(),
                             )
                         })
-                        .collect::<Vec<_>>()
-                && boundary_expressions == self.inferred_expr_types;
+                        .collect::<Vec<_>>(),
+                    self.inferred_expr_types.clone(),
+                )
+            });
+            let iteration_started = trace.then(Instant::now);
+            let changes = self.advance_checked_type_inference();
+            if let Some(iteration_started) = iteration_started {
+                eprintln!(
+                    "boon_typecheck checked_program.infer_checked_types iteration={} changes={changes:?} elapsed_ms={:.3}",
+                    iteration + 1,
+                    typecheck_elapsed_ms(iteration_started)
+                );
+            }
+            if !changes.any() {
+                if trace {
+                    eprintln!(
+                        "boon_typecheck checked_program.infer_checked_types iterations={} convergence=no_changes",
+                        iteration + 1
+                    );
+                }
+                return;
+            }
+            final_boundary_unchanged = boundary.is_some_and(
+                |(
+                    boundary_declarations,
+                    boundary_signatures,
+                    boundary_calls,
+                    boundary_expressions,
+                )| {
+                    boundary_declarations
+                        == self
+                            .declarations
+                            .iter()
+                            .map(|declaration| declaration.flow_type.clone())
+                            .collect::<Vec<_>>()
+                        && boundary_signatures
+                            == self
+                                .signatures
+                                .iter()
+                                .map(|signature| signature.result.clone())
+                                .collect::<Vec<_>>()
+                        && boundary_calls
+                            == self
+                                .calls
+                                .iter()
+                                .map(|call| {
+                                    (
+                                        call.result.clone(),
+                                        call.type_substitutions.clone(),
+                                        call.contextual_substitutions.clone(),
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                        && boundary_expressions == self.inferred_expr_types
+                },
+            );
         }
         if final_boundary_unchanged {
             // A deterministic epoch that reports internal rewrites while
             // preserving the complete externally consumed inference state is
             // a fixed point, not a user-visible non-convergence.
+            if trace {
+                eprintln!(
+                    "boon_typecheck checked_program.infer_checked_types iterations={iteration_limit} convergence=stable_boundary"
+                );
+            }
             return;
         }
         self.diagnostics.push(TypeDiagnostic {
@@ -5307,19 +5401,16 @@ impl<'a> CheckedProgramBuilder<'a> {
 
     fn advance_checked_type_inference(&mut self) -> CheckedTypeInferenceChanges {
         self.begin_checked_flow_inference_epoch();
-        let callable = self.refresh_checked_callable_result_types();
+        let mut callable = self.refresh_checked_callable_result_types();
         if callable {
             self.begin_checked_flow_inference_epoch();
         }
-        let declaration = self.refresh_checked_declaration_types();
+        let mut declaration = self.refresh_checked_declaration_types();
         if declaration {
             self.begin_checked_flow_inference_epoch();
         }
-        let mut call = false;
-        let call_ids = self.calls.iter().map(|call| call.id).collect::<Vec<_>>();
-        for call_id in call_ids {
-            call |= self.instantiate_checked_call(call_id);
-        }
+        let (propagated_callable, mut call) = self.refresh_checked_calls_and_callers();
+        callable |= propagated_callable;
         if call {
             self.begin_checked_flow_inference_epoch();
         }
@@ -5331,7 +5422,26 @@ impl<'a> CheckedProgramBuilder<'a> {
         if pattern {
             self.begin_checked_flow_inference_epoch();
         }
-        let expression = self.refresh_checked_expression_types();
+        let mut expression = self.refresh_checked_expression_types();
+        if expression {
+            // Complete the reverse half of the fixed-point sweep while the
+            // changed expressions are hot. This moves new value types through
+            // their declarations and call sites in the same global epoch
+            // instead of waiting for the next full callable/selector scan.
+            self.begin_checked_flow_inference_epoch();
+            let trailing_declaration = self.refresh_checked_declaration_types();
+            declaration |= trailing_declaration;
+            if trailing_declaration {
+                self.begin_checked_flow_inference_epoch();
+            }
+            let (trailing_callable, trailing_call) = self.refresh_checked_calls_and_callers();
+            callable |= trailing_callable;
+            call |= trailing_call;
+            if trailing_call {
+                self.begin_checked_flow_inference_epoch();
+                expression |= self.refresh_checked_expression_types();
+            }
+        }
         CheckedTypeInferenceChanges {
             callable,
             declaration,
@@ -5340,6 +5450,112 @@ impl<'a> CheckedProgramBuilder<'a> {
             pattern,
             expression,
         }
+    }
+
+    fn refresh_checked_calls_and_callers(&mut self) -> (bool, bool) {
+        let mut call = false;
+        let mut changed_call_owners = BTreeSet::new();
+        let call_ids = self.calls.iter().map(|call| call.id).collect::<Vec<_>>();
+        for call_id in call_ids {
+            if self.instantiate_checked_call(call_id) {
+                call = true;
+                if let Some(owner) = self
+                    .call_by_checked_id(call_id)
+                    .and_then(|call| call.owner_callable)
+                {
+                    changed_call_owners.insert(owner);
+                }
+            }
+        }
+        let mut callable = false;
+        if !changed_call_owners.is_empty() {
+            let (propagated_callable, propagated_call) =
+                self.propagate_changed_user_callers(changed_call_owners);
+            callable |= propagated_callable;
+            call |= propagated_call;
+        }
+        (callable, call)
+    }
+
+    /// Eagerly propagate changed user-call results through wrapper callables.
+    ///
+    /// The outer fixed point still owns declaration, selector, pattern, and
+    /// expression convergence. User-call chains, however, have an exact
+    /// callee-to-caller dependency graph. Waiting for the next global epoch at
+    /// every wrapper edge made a depth-N chain require N complete program
+    /// scans. This bounded worklist performs those same monotone signature and
+    /// call updates immediately and queues only affected callers.
+    fn propagate_changed_user_callers(&mut self, mut pending: BTreeSet<DeclId>) -> (bool, bool) {
+        let trace = std::env::var_os("BOON_TYPECHECK_TRACE").is_some();
+        let calls_by_callee = self.calls.iter().fold(
+            BTreeMap::<DeclId, Vec<CheckedCallId>>::new(),
+            |mut index, call| {
+                index.entry(call.callable).or_default().push(call.id);
+                index
+            },
+        );
+        let maximum_visits = self
+            .signatures
+            .len()
+            .saturating_mul(self.calls.len().saturating_add(1));
+        let mut visits = 0usize;
+        let mut callable_changed = false;
+        let mut call_changed = false;
+        while let Some(callable) = pending.pop_first() {
+            if visits >= maximum_visits {
+                break;
+            }
+            visits += 1;
+            let Some(signature_index) = self.signature_by_decl.get(&callable).copied() else {
+                continue;
+            };
+            let Some(result_expression) = self
+                .signatures
+                .get(signature_index)
+                .filter(|signature| signature.kind == CheckedCallableKind::User)
+                .and_then(|signature| signature.result_expression)
+            else {
+                continue;
+            };
+            self.begin_checked_flow_inference_epoch();
+            let result =
+                self.infer_checked_expr_flow(result_expression.0 as usize, &mut BTreeSet::new());
+            let result = self.flush_boundary_flow_type(result_expression.0 as usize, result);
+            if matches!(result.ty, Type::Unknown | Type::UnresolvedShape { .. })
+                || self.signatures[signature_index].result == result
+            {
+                continue;
+            }
+            self.signatures[signature_index].result = result;
+            callable_changed = true;
+            self.begin_checked_flow_inference_epoch();
+            for call_id in calls_by_callee
+                .get(&callable)
+                .into_iter()
+                .flatten()
+                .copied()
+            {
+                if !self.instantiate_checked_call(call_id) {
+                    continue;
+                }
+                call_changed = true;
+                if let Some(owner) = self
+                    .call_by_checked_id(call_id)
+                    .and_then(|call| call.owner_callable)
+                {
+                    pending.insert(owner);
+                }
+            }
+        }
+        if callable_changed {
+            self.sync_signature_declaration_types();
+        }
+        if trace && visits > 0 {
+            eprintln!(
+                "boon_typecheck checked_program.infer_checked_types.call_worklist visits={visits} callable_changed={callable_changed} call_changed={call_changed}"
+            );
+        }
+        (callable_changed, call_changed)
     }
 
     fn refresh_pattern_selector_parameter_types(&mut self) -> bool {
@@ -5775,16 +5991,33 @@ impl<'a> CheckedProgramBuilder<'a> {
     }
 
     fn instantiate_checked_call(&mut self, call_id: CheckedCallId) -> bool {
-        let Some(call) = self.call_by_checked_id(call_id).cloned() else {
+        let Some((
+            call_expression,
+            call_callable,
+            call_owner_callable,
+            call_entries,
+            call_context_binding,
+            call_result,
+        )) = self.call_by_checked_id(call_id).map(|call| {
+            (
+                call.expression,
+                call.callable,
+                call.owner_callable,
+                call.entries.clone(),
+                call.context_binding,
+                call.result.clone(),
+            )
+        })
+        else {
             return false;
         };
-        let Some(signature) = self.signature_by_declaration(call.callable).cloned() else {
+        let Some(signature) = self.signature_by_declaration(call_callable).cloned() else {
             return false;
         };
         let mut substitutions = BTreeMap::<TypeVar, Type>::new();
         let mut dependency_catch_inputs = Vec::new();
 
-        for entry in &call.entries {
+        for entry in &call_entries {
             let CheckedCallEntry::Input {
                 formal,
                 value,
@@ -5827,7 +6060,7 @@ impl<'a> CheckedProgramBuilder<'a> {
             .context_formal
             .and_then(|formal| self.context_formal(formal).cloned());
         if let Some(formal) = context_formal.as_ref() {
-            let actual = match call.context_binding {
+            let actual = match call_context_binding {
                 CheckedContextBinding::Explicit { value, .. } => Some(
                     self.infer_checked_expr_flow(value.0 as usize, &mut BTreeSet::new())
                         .ty,
@@ -5847,7 +6080,7 @@ impl<'a> CheckedProgramBuilder<'a> {
         }
 
         let mut changed = false;
-        for entry in &call.entries {
+        for entry in &call_entries {
             let (formal, output) = match entry {
                 CheckedCallEntry::FreshOut { formal, output, .. } => (*formal, *output),
                 CheckedCallEntry::ForwardOut { formal, target, .. } => (*formal, *target),
@@ -5873,7 +6106,7 @@ impl<'a> CheckedProgramBuilder<'a> {
             changed |= self.set_declaration_flow_type(output, flow_type);
         }
 
-        for entry in &call.entries {
+        for entry in &call_entries {
             let CheckedCallEntry::Input {
                 formal,
                 value,
@@ -5896,7 +6129,7 @@ impl<'a> CheckedProgramBuilder<'a> {
             unify_checked_type_pattern(&parameter.flow_type.ty, &actual, &mut substitutions);
         }
 
-        for entry in &call.entries {
+        for entry in &call_entries {
             let (formal, output) = match entry {
                 CheckedCallEntry::FreshOut { formal, output, .. } => (*formal, *output),
                 CheckedCallEntry::ForwardOut { formal, target, .. } => (*formal, *target),
@@ -5919,7 +6152,7 @@ impl<'a> CheckedProgramBuilder<'a> {
         }
 
         let mut result_instantiation = substitutions.clone();
-        if type_is_recursively_closed(&call.result.ty) {
+        if type_is_recursively_closed(&call_result.ty) {
             // Some result variables are determined by call-local syntax rather
             // than a value parameter (for example, the width argument to
             // `Bits/slice`). Seed only result variables that argument
@@ -5930,7 +6163,7 @@ impl<'a> CheckedProgramBuilder<'a> {
             let mut result_substitutions = BTreeMap::new();
             unify_checked_type_pattern(
                 &signature.result.ty,
-                &call.result.ty,
+                &call_result.ty,
                 &mut result_substitutions,
             );
             for (variable, value) in result_substitutions {
@@ -5940,20 +6173,20 @@ impl<'a> CheckedProgramBuilder<'a> {
         let instantiated_result =
             substitute_checked_type(&signature.result.ty, &result_instantiation);
         let syntax_discriminated_result = (signature.kind == CheckedCallableKind::User
-            && self.checked_call_has_syntax_discriminant(&call))
+            && self.checked_call_has_syntax_discriminant(&call_entries))
         .then(|| {
             self.syntax_expr_types
-                .get(&(call.expression.0 as usize))
+                .get(&(call_expression.0 as usize))
                 .map(|flow_type| flow_type.ty.clone())
         })
         .flatten()
         .filter(type_is_recursively_closed);
         let authoritative_result = self
             .authoritative_expr_types
-            .contains(&(call.expression.0 as usize))
+            .contains(&(call_expression.0 as usize))
             .then(|| {
                 self.inferred_expr_types
-                    .get(&(call.expression.0 as usize))
+                    .get(&(call_expression.0 as usize))
                     .map(|flow_type| flow_type.ty.clone())
             })
             .flatten();
@@ -5965,10 +6198,9 @@ impl<'a> CheckedProgramBuilder<'a> {
         // Calls owned by another callable deliberately do not use this path:
         // their expression is shared by every outer instantiation and must
         // remain generic.
-        let concrete_root_result = call
-            .owner_callable
+        let concrete_root_result = call_owner_callable
             .is_none()
-            .then(|| specialize_checked_call_result(&instantiated_result, &call.result.ty));
+            .then(|| specialize_checked_call_result(&instantiated_result, &call_result.ty));
         // A syntactically fixed outer Tag selects a stable callable branch even
         // when the principal result scheme has to summarize heterogeneous arm
         // results (for example, an object material versus a list of lights).
@@ -5981,13 +6213,13 @@ impl<'a> CheckedProgramBuilder<'a> {
             concrete
         } else if type_is_recursively_closed(&instantiated_result) {
             authoritative_result.unwrap_or(instantiated_result)
-        } else if !type_is_recursively_closed(&call.result.ty) {
+        } else if !type_is_recursively_closed(&call_result.ty) {
             authoritative_result.unwrap_or(instantiated_result)
         } else {
             instantiated_result
         };
         let result = FlowType {
-            mode: self.instantiate_checked_call_result_mode(&signature, &call),
+            mode: self.instantiate_checked_call_result_mode(&signature, &call_entries),
             ty: result_type,
         };
         let type_substitutions = substitutions
@@ -6015,7 +6247,12 @@ impl<'a> CheckedProgramBuilder<'a> {
                     })
             })
             .collect::<Vec<_>>();
-        if let Some(target) = self.calls.iter_mut().find(|call| call.id == call_id) {
+        if let Some(target) = self
+            .call_by_id
+            .get(&call_id)
+            .copied()
+            .and_then(|index| self.calls.get_mut(index))
+        {
             if target.result != result {
                 target.result = result.clone();
                 changed = true;
@@ -6029,12 +6266,12 @@ impl<'a> CheckedProgramBuilder<'a> {
                 changed = true;
             }
         }
-        changed |= self.set_inferred_expr_flow(call.expression.0 as usize, result);
+        changed |= self.set_inferred_expr_flow(call_expression.0 as usize, result);
         changed
     }
 
-    fn checked_call_has_syntax_discriminant(&self, call: &CheckedCall) -> bool {
-        call.entries.iter().any(|entry| {
+    fn checked_call_has_syntax_discriminant(&self, entries: &[CheckedCallEntry]) -> bool {
+        entries.iter().any(|entry| {
             let CheckedCallEntry::Input { formal, value, .. } = entry else {
                 return false;
             };
@@ -6104,17 +6341,17 @@ impl<'a> CheckedProgramBuilder<'a> {
     fn instantiate_checked_call_result_mode(
         &mut self,
         signature: &CheckedCallableSignature,
-        call: &CheckedCall,
+        entries: &[CheckedCallEntry],
     ) -> FlowMode {
         if signature.name == "List/map"
-            && let Some(new) = checked_call_input(call, "new")
+            && let Some(new) = checked_call_entry_input(entries, "new")
         {
             return self
                 .infer_checked_expr_flow(new.0 as usize, &mut BTreeSet::new())
                 .mode;
         }
         if signature.name == "List/latest"
-            && let Some(list) = checked_call_input(call, "list")
+            && let Some(list) = checked_call_entry_input(entries, "list")
         {
             return self
                 .infer_checked_expr_flow(list.0 as usize, &mut BTreeSet::new())
@@ -6122,18 +6359,15 @@ impl<'a> CheckedProgramBuilder<'a> {
         }
         if signature.kind == CheckedCallableKind::External {
             let mut active = BTreeSet::new();
-            return call
-                .entries
-                .iter()
-                .fold(signature.result.mode, |mode, entry| {
-                    let CheckedCallEntry::Input { value, .. } = entry else {
-                        return mode;
-                    };
-                    let argument_mode = self
-                        .infer_instantiated_expr_mode(*value, &BTreeMap::new(), &mut active)
-                        .unwrap_or(FlowMode::Continuous);
-                    merge_flow_modes(mode, argument_mode)
-                });
+            return entries.iter().fold(signature.result.mode, |mode, entry| {
+                let CheckedCallEntry::Input { value, .. } = entry else {
+                    return mode;
+                };
+                let argument_mode = self
+                    .infer_instantiated_expr_mode(*value, &BTreeMap::new(), &mut active)
+                    .unwrap_or(FlowMode::Continuous);
+                merge_flow_modes(mode, argument_mode)
+            });
         }
         if signature.kind != CheckedCallableKind::User {
             return signature.result.mode;
@@ -6142,18 +6376,19 @@ impl<'a> CheckedProgramBuilder<'a> {
             return signature.result.mode;
         };
         let mut active = BTreeSet::new();
-        let bindings = self.instantiate_checked_flow_bindings(call, &BTreeMap::new(), &mut active);
+        let bindings =
+            self.instantiate_checked_flow_bindings(entries, &BTreeMap::new(), &mut active);
         self.infer_instantiated_expr_mode(result, &bindings, &mut active)
             .unwrap_or(signature.result.mode)
     }
 
     fn instantiate_checked_flow_bindings(
         &mut self,
-        call: &CheckedCall,
+        entries: &[CheckedCallEntry],
         parent: &BTreeMap<DeclId, FlowMode>,
         active: &mut BTreeSet<CheckedExprId>,
     ) -> BTreeMap<DeclId, FlowMode> {
-        call.entries
+        entries
             .iter()
             .filter_map(|entry| match entry {
                 CheckedCallEntry::Input { formal, value, .. } => Some((
@@ -6260,7 +6495,8 @@ impl<'a> CheckedProgramBuilder<'a> {
                     && signature.kind == CheckedCallableKind::User
                     && let Some(result) = signature.result_expression
                 {
-                    let nested = self.instantiate_checked_flow_bindings(&call, bindings, active);
+                    let nested =
+                        self.instantiate_checked_flow_bindings(&call.entries, bindings, active);
                     self.infer_instantiated_expr_mode(result, &nested, active)
                         .unwrap_or(signature.result.mode)
                 } else {
@@ -7036,10 +7272,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                     } if *output == target => Some(*formal),
                     _ => None,
                 })?;
-                let signature = self
-                    .signatures
-                    .iter()
-                    .find(|signature| signature.decl_id == call.callable)?;
+                let signature = self.signature_by_declaration(call.callable)?;
                 let (list_formal, row_formal, _) =
                     checked_contextual_operation_formals(signature.contextual_operation?)?;
                 if output_formal != row_formal {
@@ -7110,15 +7343,8 @@ impl<'a> CheckedProgramBuilder<'a> {
                 })
                 .reduce(merge_flow_modes),
             AstExprKind::Call { .. } | AstExprKind::Pipe { .. } => {
-                let call = self
-                    .calls
-                    .iter()
-                    .find(|call| call.expression == root)
-                    .cloned()?;
-                let signature = self
-                    .signatures
-                    .iter()
-                    .find(|signature| signature.decl_id == call.callable)?;
+                let call = self.call_for_expression(root).cloned()?;
+                let signature = self.signature_by_declaration(call.callable).cloned()?;
                 let (list_formal, _, body_formal) =
                     checked_contextual_operation_formals(signature.contextual_operation?)?;
                 let actual = |formal| {
@@ -7214,11 +7440,7 @@ impl<'a> CheckedProgramBuilder<'a> {
             .unwrap_or(LexicalScopeId(0));
         let (target, remaining) =
             self.resolve_checked_read_path(root.0 as usize, scope_id, parts)?;
-        let mut value = self
-            .declarations
-            .iter()
-            .find(|declaration| declaration.id == target)?
-            .value?;
+        let mut value = self.declaration(target)?.value?;
         if !remaining.is_empty() {
             let (projected, consumed) = self.checked_projected_value_prefix(value, &remaining)?;
             if consumed != remaining.len() {
@@ -7297,18 +7519,16 @@ impl<'a> CheckedProgramBuilder<'a> {
             .get(&expr_id)
             .copied()
             .unwrap_or(LexicalScopeId(0));
-        let Some(declaration) = self.resolve_checked_read_name(expr_id, scope_id, name) else {
+        let Some(declaration_id) = self.resolve_checked_read_name(expr_id, scope_id, name) else {
             return fallback;
         };
         let base = self
-            .declarations
-            .iter()
-            .find(|candidate| candidate.id == declaration)
+            .declaration(declaration_id)
             .map(|declaration| declaration.flow_type.ty.clone())
             .unwrap_or(Type::Unknown);
         let projection = &parts[1..];
         let projected = self.project_checked_type(expr_id, base, projection);
-        self.narrowed_checked_read_type(expr_id, declaration, projection, &projected)
+        self.narrowed_checked_read_type(expr_id, declaration_id, projection, &projected)
             .unwrap_or(projected)
     }
 
@@ -11035,7 +11255,11 @@ impl<'a> CheckedOrderAnalyzer<'a> {
 }
 
 fn checked_call_input(call: &CheckedCall, name: &str) -> Option<CheckedExprId> {
-    call.entries.iter().find_map(|entry| match entry {
+    checked_call_entry_input(&call.entries, name)
+}
+
+fn checked_call_entry_input(entries: &[CheckedCallEntry], name: &str) -> Option<CheckedExprId> {
+    entries.iter().find_map(|entry| match entry {
         CheckedCallEntry::Input {
             name: entry_name,
             value,
@@ -13160,7 +13384,7 @@ struct CheckedFlushInference {
 
 fn infer_checked_expression_flush_types(
     program: &ParsedProgram,
-    flows: &BTreeMap<usize, FlowType>,
+    flows: &DenseIndexTable<FlowType>,
 ) -> CheckedFlushInference {
     let mut memo = BTreeMap::<usize, Option<Type>>::new();
     let mut active = BTreeSet::new();
@@ -13186,7 +13410,7 @@ fn infer_checked_expression_flush_types(
 
 fn infer_checked_expression_flush_type(
     program: &ParsedProgram,
-    flows: &BTreeMap<usize, FlowType>,
+    flows: &DenseIndexTable<FlowType>,
     expression_id: usize,
     memo: &mut BTreeMap<usize, Option<Type>>,
     active: &mut BTreeSet<usize>,

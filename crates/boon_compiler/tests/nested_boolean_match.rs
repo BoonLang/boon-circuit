@@ -96,3 +96,60 @@ document: Document/new(
     );
     assert!(compiled.plan.capability_summary.cpu_plan_executor_complete);
 }
+
+#[test]
+fn retained_value_calls_prune_static_document_branches_without_scope_explosion() {
+    let compiled = compile_test_source(
+        "retained-document-calls.bn",
+        r#"
+FUNCTION tone(choice) {
+    choice |> WHEN {
+        Alpha => TEXT { #111111 }
+        Beta => TEXT { #222222 }
+        Gamma => TEXT { #333333 }
+        Delta => TEXT { #444444 }
+        Epsilon => TEXT { #555555 }
+        Zeta => TEXT { #666666 }
+        Eta => TEXT { #777777 }
+        Theta => TEXT { #888888 }
+    }
+}
+
+FUNCTION style(choice) {
+    [color: tone(choice: choice)]
+}
+
+document: Document/new(
+    root: Element/stripe(
+        element: []
+        direction: Column
+        style: []
+        items: LIST {
+            Element/label(element: [], style: style(choice: Alpha), label: TEXT { alpha })
+            Element/label(element: [], style: style(choice: Beta), label: TEXT { beta })
+            Element/label(element: [], style: style(choice: Gamma), label: TEXT { gamma })
+            Element/label(element: [], style: style(choice: Delta), label: TEXT { delta })
+        }
+    )
+)
+"#,
+        TargetProfile::SoftwareBounded,
+    )
+    .unwrap();
+
+    let ordinary = compiled
+        .ir
+        .executable
+        .ordinary_functions
+        .iter()
+        .map(|function| function.name.as_str())
+        .collect::<Vec<_>>();
+    assert!(ordinary.iter().any(|name| name.ends_with("tone")));
+    assert!(ordinary.iter().any(|name| name.ends_with("style")));
+    let document = compiled.plan.document.as_ref().expect("document plan");
+    assert!(
+        document.expressions.len() < 120,
+        "four static calls produced {} document expressions: {ordinary:?}",
+        document.expressions.len()
+    );
+}

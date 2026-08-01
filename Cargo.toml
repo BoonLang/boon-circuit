@@ -141,6 +141,17 @@ zeroize = "1.8.2"
 static_assertions = "1.1.0"
 syn = { version = "2.0.117", features = ["full", "visit"] }
 
+[profile.dev]
+# Line tables preserve actionable panic/backtrace locations while avoiding the
+# hundreds-of-megabytes-per-binary cost of full variable-level DWARF in this
+# large workspace. This also keeps downstream CLI relinks practical.
+debug = 1
+
+[profile.test]
+# Test harnesses previously reached 500-980 MiB each and spent most of focused
+# test latency writing/linking debug data. Tests still retain line locations.
+debug = 1
+
 [profile.dev.package.boon_contract]
 opt-level = 2
 
@@ -170,6 +181,15 @@ debug = 1
 [profile.dev.package.boon_typecheck]
 opt-level = 2
 debug = 1
+
+# Large-source integration tests exercise the real compiler. Keep the two
+# graph-building stages representative of the interactive dev compiler rather
+# than running their known debug-mode hot loops at opt-level 0.
+[profile.test.package.boon_semantic]
+opt-level = 2
+
+[profile.test.package.boon_typecheck]
+opt-level = 2
 
 [profile.dev.package.ciborium]
 opt-level = 2

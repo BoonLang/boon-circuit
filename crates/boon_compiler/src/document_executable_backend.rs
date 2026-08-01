@@ -79,6 +79,34 @@ struct PatternBindingContext {
     projection: Vec<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum StaticDocumentSelector {
+    Text(String),
+    Number(boon_data::ExactNumber),
+    Bits(boon_data::Bits),
+    Tag(String),
+}
+
+impl StaticDocumentSelector {
+    fn matches(&self, pattern: &boon_typecheck::CheckedMatchPattern) -> bool {
+        use boon_typecheck::CheckedMatchPattern;
+        match (self, pattern) {
+            (_, CheckedMatchPattern::Wildcard | CheckedMatchPattern::Binding { .. }) => true,
+            (Self::Text(actual), CheckedMatchPattern::Text { value }) => actual == value,
+            (Self::Number(actual), CheckedMatchPattern::Number { value }) => actual == value,
+            (Self::Bits(actual), CheckedMatchPattern::Bits { value }) => actual == value,
+            (Self::Tag(actual), CheckedMatchPattern::Tag { name, .. }) => actual == name,
+            _ => false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct OrdinaryCallCacheKey {
+    function: ir::FunctionId,
+    arguments: Vec<(usize, usize)>,
+}
+
 struct ExecutableCall<'a> {
     expression: &'a ir::ExecutableExpression,
     callable_kind: ir::ExecutableCallableKind,
@@ -116,6 +144,7 @@ struct DocumentCompiler<'a> {
     compiled_paths: BTreeMap<(Option<ScopeId>, String), DocumentExprId>,
     compile_stack: Vec<ir::ExecutableExprId>,
     active_ordinary_functions: BTreeSet<ir::FunctionId>,
+    ordinary_call_cache_scopes: BTreeMap<OrdinaryCallCacheKey, usize>,
     next_cache_scope: usize,
     next_local: usize,
 }
@@ -271,6 +300,7 @@ impl<'a> DocumentCompiler<'a> {
             compiled_paths: BTreeMap::new(),
             compile_stack: Vec::new(),
             active_ordinary_functions: BTreeSet::new(),
+            ordinary_call_cache_scopes: BTreeMap::new(),
             next_cache_scope: program.scope_index.owners.len().saturating_add(1),
             next_local: 0,
         })
@@ -329,6 +359,21 @@ impl<'a> DocumentCompiler<'a> {
             &view_bindings,
             &self.materializations,
         );
+        if std::env::var_os("BOON_COMPILER_LOWER_TRACE").is_some() {
+            eprintln!(
+                "boon_compiler document artifacts expressions={} constants={} names={} functions={} templates={} materializations={} expression_cache={} projected_cache={} ordinary_call_scopes={} cache_scopes={}",
+                self.expressions.len(),
+                self.constants.len(),
+                self.names.len(),
+                self.functions.len(),
+                self.templates.len(),
+                self.materializations.len(),
+                self.expression_cache.len(),
+                self.projected_expression_cache.len(),
+                self.ordinary_call_cache_scopes.len(),
+                self.next_cache_scope,
+            );
+        }
         Ok(DocumentPlan {
             root,
             initial_patch_batch,
@@ -1189,9 +1234,8 @@ impl<'a> DocumentCompiler<'a> {
                 expression.id.0
             )));
         }
-        let mut context = caller_context.clone();
-        context.cache_scope = self.next_cache_scope;
-        self.next_cache_scope = self.next_cache_scope.saturating_add(1);
+        let mut bindings = BTreeMap::new();
+        let mut cache_arguments = Vec::with_capacity(arguments.len());
         for (argument, parameter) in arguments.into_iter().zip(&function.parameters) {
             if argument.ordinal != parameter.id.ordinal || argument.name != parameter.name {
                 return Err(PlanError::new(format!(
@@ -1200,14 +1244,36 @@ impl<'a> DocumentCompiler<'a> {
                 )));
             }
             let value = self.compile_call_argument(argument, caller_context, input_override)?;
+            cache_arguments.push((parameter.id.ordinal, value.0));
+            if bindings.insert(parameter.id, value).is_some() {
+                return Err(PlanError::new(format!(
+                    "ordinary document call `{name}` binds parameter {} twice",
+                    parameter.id.ordinal
+                )));
+            }
+        }
+        let cache_key = OrdinaryCallCacheKey {
+            function: function_id,
+            arguments: cache_arguments,
+        };
+        let cache_scope = if let Some(scope) = self.ordinary_call_cache_scopes.get(&cache_key) {
+            *scope
+        } else {
+            let scope = self.allocate_cache_scope();
+            self.ordinary_call_cache_scopes.insert(cache_key, scope);
+            scope
+        };
+        let mut context = caller_context.clone();
+        context.cache_scope = cache_scope;
+        for (parameter, value) in bindings {
             if context
                 .function_parameters
-                .insert(parameter.id, value)
+                .insert(parameter, value)
                 .is_some()
             {
                 return Err(PlanError::new(format!(
                     "ordinary document call `{name}` binds parameter {} twice",
-                    parameter.id.ordinal
+                    parameter.ordinal
                 )));
             }
         }
@@ -1602,6 +1668,22 @@ impl<'a> DocumentCompiler<'a> {
         executable_arms: &[ir::ExecutableSelectArm],
         context: &CompileContext,
     ) -> Result<DocumentExprId, PlanError> {
+        if let Some(selected) = self.static_select_arm(input, executable_arms) {
+            let mut arm_context = context.clone();
+            arm_context.cache_scope = self.allocate_cache_scope();
+            arm_context
+                .pattern_bindings
+                .extend(selected.bindings.iter().map(|binding| {
+                    (
+                        binding.name.clone(),
+                        PatternBindingContext {
+                            selector: expression.id.0,
+                            projection: binding.projection.clone(),
+                        },
+                    )
+                }));
+            return self.compile_expression(selected.output, &arm_context, None);
+        }
         let mut arms = Vec::with_capacity(executable_arms.len());
         for arm in executable_arms {
             let mut arm_context = context.clone();
@@ -1652,6 +1734,39 @@ impl<'a> DocumentCompiler<'a> {
             class,
             DocumentExprOp::Select { input, arms },
         ))
+    }
+
+    fn static_select_arm<'b>(
+        &self,
+        input: DocumentExprId,
+        arms: &'b [ir::ExecutableSelectArm],
+    ) -> Option<&'b ir::ExecutableSelectArm> {
+        let input = self.expressions.get(input.0)?;
+        let selector = match &input.op {
+            DocumentExprOp::Constant { constant } => {
+                let constant = self.constants.get(constant.0)?;
+                match &constant.value {
+                    DocumentConstantValue::Text { value } => {
+                        StaticDocumentSelector::Text(value.clone())
+                    }
+                    DocumentConstantValue::Number { value } => {
+                        StaticDocumentSelector::Number(value.clone())
+                    }
+                    DocumentConstantValue::Bits { value } => {
+                        StaticDocumentSelector::Bits(value.clone())
+                    }
+                    DocumentConstantValue::Tag { name } => {
+                        StaticDocumentSelector::Tag(self.names.get(name.0)?.clone())
+                    }
+                    DocumentConstantValue::Bytes { .. } => return None,
+                }
+            }
+            DocumentExprOp::TaggedRecord { tag, .. } => {
+                StaticDocumentSelector::Tag(self.names.get(tag.0)?.clone())
+            }
+            _ => return None,
+        };
+        arms.iter().find(|arm| selector.matches(&arm.pattern))
     }
 
     fn compile_pattern(

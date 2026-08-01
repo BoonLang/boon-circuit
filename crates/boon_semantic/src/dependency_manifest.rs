@@ -6,21 +6,24 @@
 //! instance receives exactly one primary callable/root owner and exactly one
 //! coverage disposition.
 
+use crate::out_net::{OutCallProvenance, OutInputValue, OutPortId, PassedBinding};
 use crate::*;
 use boon_contract::SourceBundleDigestV1;
 use boon_typecheck::{
     CheckedCallEntry, CheckedDeclarationKind, CheckedEvaluationScope, CheckedExpressionKind,
-    CheckedParameterKind, CheckedProgram, CheckedStatementKind, DeclId, FlowType, LexicalScopeId,
-    ProgramRole,
+    CheckedParameterKind, CheckedProgram, CheckedStatementKind, DeclId, FlowMode, FlowType,
+    LexicalScopeId, ProgramRole, Type, TypeVar,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 
 pub const CALLABLE_DEPENDENCY_MANIFEST_SCHEMA_V1: &str = "boon.callable-dependency-manifest.v1";
 const CHECKED_PROGRAM_DIGEST_DOMAIN: &[u8] = b"boon.checked-program.v1\0";
 const DEPENDENCY_COMPONENT_DIGEST_DOMAIN: &[u8] = b"boon.callable-dependency-components.v1\0";
 const DEPENDENCY_RECORD_PAYLOAD_DOMAIN: &[u8] = b"boon.callable-dependency-record-payload.v1\0";
+const DEPENDENCY_OUT_TYPE_DIGEST_DOMAIN: &[u8] = b"boon.callable-dependency-out-type.v1\0";
+const DEPENDENCY_FLOW_TYPE_DIGEST_DOMAIN: &[u8] = b"boon.callable-dependency-flow-type.v1\0";
 const DEPENDENCY_RECORD_DIGEST_DOMAIN: &[u8] = b"boon.callable-dependency-record.v1\0";
 const DEPENDENCY_RECORD_RANGE_DIGEST_DOMAIN: &[u8] = b"boon.callable-dependency-record-range.v1\0";
 const DEPENDENCY_RECORD_SET_DIGEST_DOMAIN: &[u8] = b"boon.callable-dependency-record-set.v1\0";
@@ -458,6 +461,33 @@ impl Default for SemanticDependencySemanticsV1 {
     }
 }
 
+/// Compact record-owned semantics.
+///
+/// Full structural types remain authoritative in the checked and semantic
+/// graphs. Dependency records commit those facts by canonical digest instead
+/// of cloning the same recursive type into every occurrence record.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SemanticDependencyRecordSemanticsV1 {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub projection: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flow_type_digest: Option<[u8; 32]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evaluation_scope: Option<CheckedEvaluationScope>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub program_role: Option<ProgramRole>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub static_owner: Option<StaticOwnerId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call_instance: Option<OutCallInstanceId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row: Option<SemanticRowBinding>,
+    pub multiplicity: SemanticDependencyMultiplicityV1,
+    pub lifetime: SemanticDependencyLifetimeV1,
+    pub phase: SemanticDependencyPhaseV1,
+    pub visibility: SemanticDependencyVisibilityV1,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SemanticDependencyRecordV1 {
     pub id: SemanticDependencyRecordId,
@@ -465,7 +495,7 @@ pub struct SemanticDependencyRecordV1 {
     pub channel: SemanticDependencyChannelV1,
     pub roles: Vec<SemanticDependencyRoleV1>,
     pub subject: SemanticDependencySubjectV1,
-    pub semantics: SemanticDependencySemanticsV1,
+    pub semantics: SemanticDependencyRecordSemanticsV1,
     pub payload_digest: [u8; 32],
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub referenced_dependencies: Vec<SemanticDependencyRecordId>,
@@ -1329,7 +1359,7 @@ struct PendingDependencyRecord {
     channel: SemanticDependencyChannelV1,
     roles: Vec<SemanticDependencyRoleV1>,
     subject: SemanticDependencySubjectV1,
-    semantics: SemanticDependencySemanticsV1,
+    semantics: SemanticDependencyRecordSemanticsV1,
     payload_digest: [u8; 32],
     references: Vec<PendingDependencyReference>,
 }
@@ -1388,6 +1418,7 @@ struct DependencyCollector {
     subjects: BTreeSet<SemanticDependencySubjectV1>,
     dependencies_by_entity: BTreeMap<SemanticDependencyEntityV1, Vec<SemanticDependencyRecordId>>,
     hash_scratch: Vec<u8>,
+    flow_type_digests: HashMap<FlowType, [u8; 32]>,
 }
 
 fn queue_unvisited_dependency(
@@ -1628,17 +1659,65 @@ fn build_dependency_closures(
 impl DependencyCollector {
     fn trace_counts(&self, phase: &str) {
         eprintln!(
-            "boon_semantic dependency_manifest {phase}:counts pending={} coverage={} subjects={} entities={}",
+            "boon_semantic dependency_manifest {phase}:counts pending={} coverage={} subjects={} entities={} flow_types={}",
             self.pending.len(),
             self.coverage.len(),
             self.subjects.len(),
             self.dependencies_by_entity.len(),
+            self.flow_type_digests.len(),
         );
+    }
+
+    fn compact_semantics(
+        &mut self,
+        semantics: SemanticDependencySemanticsV1,
+    ) -> Result<SemanticDependencyRecordSemanticsV1, CallableDependencyManifestError> {
+        let flow_type_digest = if let Some(flow_type) = semantics.flow_type {
+            if let Some(digest) = self.flow_type_digests.get(&flow_type) {
+                Some(*digest)
+            } else {
+                let digest = boon_contract::canonical_serde_hash_v1_with_buffer(
+                    DEPENDENCY_FLOW_TYPE_DIGEST_DOMAIN,
+                    &flow_type,
+                    &mut self.hash_scratch,
+                )
+                .map_err(|error| {
+                    CallableDependencyManifestError::new(format!(
+                        "failed to hash dependency flow type: {error}"
+                    ))
+                })?;
+                self.flow_type_digests.insert(flow_type, digest);
+                Some(digest)
+            }
+        } else {
+            None
+        };
+        Ok(SemanticDependencyRecordSemanticsV1 {
+            projection: semantics.projection,
+            flow_type_digest,
+            evaluation_scope: semantics.evaluation_scope,
+            program_role: semantics.program_role,
+            static_owner: semantics.static_owner,
+            call_instance: semantics.call_instance,
+            row: semantics.row,
+            multiplicity: semantics.multiplicity,
+            lifetime: semantics.lifetime,
+            phase: semantics.phase,
+            visibility: semantics.visibility,
+        })
     }
 
     fn dependency<P: Serialize>(
         &mut self,
         input: DependencyRecordInput<'_, P>,
+    ) -> Result<SemanticDependencyRecordId, CallableDependencyManifestError> {
+        self.dependency_with_flow_type_digest(input, None)
+    }
+
+    fn dependency_with_flow_type_digest<P: Serialize>(
+        &mut self,
+        input: DependencyRecordInput<'_, P>,
+        flow_type_digest: Option<[u8; 32]>,
     ) -> Result<SemanticDependencyRecordId, CallableDependencyManifestError> {
         let DependencyRecordInput {
             owner,
@@ -1650,6 +1729,15 @@ impl DependencyCollector {
             references,
         } = input;
         self.claim_subject(&subject)?;
+        if flow_type_digest.is_some() && semantics.flow_type.is_some() {
+            return Err(CallableDependencyManifestError::new(format!(
+                "dependency subject {subject:?} supplies both a structural flow type and its canonical digest"
+            )));
+        }
+        let mut semantics = self.compact_semantics(semantics)?;
+        if flow_type_digest.is_some() {
+            semantics.flow_type_digest = flow_type_digest;
+        }
         roles.sort();
         roles.dedup();
         if roles.is_empty() {
@@ -4077,21 +4165,196 @@ fn inventory_producer_requests(
     Ok(())
 }
 
+#[derive(Serialize)]
+struct CanonicalOutTypeSubstitutionV1 {
+    variable: TypeVar,
+    value_digest: [u8; 32],
+}
+
+/// Canonical semantic identity for one concrete OUT call frame.
+///
+/// Recursive structural types are committed by digest and interned across the
+/// complete OUT component. Serializing the expanded type tree once per
+/// contextual frame made equivalent inherited environments quadratic in the
+/// number of frames without adding dependency evidence.
+#[derive(Serialize)]
+struct CanonicalOutCallHeaderV1 {
+    id: OutCallInstanceId,
+    parent: Option<OutCallInstanceId>,
+    provenance: OutCallProvenance,
+    parent_output: Option<DeclId>,
+    ports: Vec<OutPortId>,
+    local_type_substitutions: Vec<CanonicalOutTypeSubstitutionV1>,
+    result_mode: FlowMode,
+    result_type_digest: [u8; 32],
+    owner: Option<StaticOwnerId>,
+}
+
+#[derive(Serialize)]
+struct CanonicalOutInputBindingV1 {
+    formal: DeclId,
+    value: CanonicalOutInputValueV1,
+}
+
+#[derive(Serialize)]
+enum CanonicalOutInputValueV1 {
+    Checked(ScopedCheckedExpr),
+    ProducerParameter {
+        parameter: ProducerParameterId,
+        flow_mode: FlowMode,
+        flow_type_digest: [u8; 32],
+    },
+}
+
+#[derive(Serialize)]
+struct CanonicalOutCallComponentV1 {
+    header: CanonicalOutCallHeaderV1,
+    inputs: Vec<CanonicalOutInputBindingV1>,
+    passed: Option<PassedBinding>,
+}
+
+fn dependency_out_type_digest<'a>(
+    ty: &'a Type,
+    cache: &mut HashMap<&'a Type, [u8; 32]>,
+    scratch: &mut Vec<u8>,
+) -> Result<[u8; 32], CallableDependencyManifestError> {
+    if let Some(digest) = cache.get(ty) {
+        return Ok(*digest);
+    }
+    let digest = boon_contract::canonical_serde_hash_v1_with_buffer(
+        DEPENDENCY_OUT_TYPE_DIGEST_DOMAIN,
+        ty,
+        scratch,
+    )
+    .map_err(|error| {
+        CallableDependencyManifestError::new(format!("failed to hash canonical OUT type: {error}"))
+    })?;
+    cache.insert(ty, digest);
+    Ok(digest)
+}
+
 fn inventory_out(
     out: &ResolvedOutGraph,
     execution: &SemanticExecutionGraphV1,
     owners: &DependencyOwnerIndex,
     collector: &mut DependencyCollector,
 ) -> Result<[u8; 32], CallableDependencyManifestError> {
+    let trace = std::env::var_os("BOON_SEMANTIC_TRACE").is_some();
+    let component_started = trace.then(std::time::Instant::now);
+    let mut type_digests = HashMap::<&Type, [u8; 32]>::new();
+    let mut type_digest_scratch = Vec::new();
+    let local_substitution_variables = execution
+        .calls
+        .iter()
+        .map(|call| {
+            (
+                call.checked_call,
+                call.type_substitutions
+                    .iter()
+                    .map(|substitution| substitution.variable)
+                    .collect::<BTreeSet<_>>(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let canonical_calls = out
+        .call_instances
+        .iter()
+        .map(|call| {
+            let local_variables = call
+                .provenance
+                .call_id
+                .and_then(|call| local_substitution_variables.get(&call));
+            let local_type_substitutions = call
+                .type_substitutions
+                .iter()
+                .filter(|substitution| {
+                    local_variables
+                        .is_some_and(|variables| variables.contains(&substitution.variable))
+                })
+                .map(|substitution| {
+                    Ok(CanonicalOutTypeSubstitutionV1 {
+                        variable: substitution.variable,
+                        value_digest: dependency_out_type_digest(
+                            &substitution.value,
+                            &mut type_digests,
+                            &mut type_digest_scratch,
+                        )?,
+                    })
+                })
+                .collect::<Result<Vec<_>, CallableDependencyManifestError>>()?;
+            let inputs = call
+                .inputs
+                .iter()
+                .map(|input| {
+                    let value = match &input.value {
+                        OutInputValue::Checked(value) => CanonicalOutInputValueV1::Checked(*value),
+                        OutInputValue::ProducerParameter {
+                            parameter,
+                            flow_type,
+                        } => CanonicalOutInputValueV1::ProducerParameter {
+                            parameter: *parameter,
+                            flow_mode: flow_type.mode,
+                            flow_type_digest: dependency_out_type_digest(
+                                &flow_type.ty,
+                                &mut type_digests,
+                                &mut type_digest_scratch,
+                            )?,
+                        },
+                    };
+                    Ok(CanonicalOutInputBindingV1 {
+                        formal: input.formal,
+                        value,
+                    })
+                })
+                .collect::<Result<Vec<_>, CallableDependencyManifestError>>()?;
+            Ok(CanonicalOutCallComponentV1 {
+                header: CanonicalOutCallHeaderV1 {
+                    id: call.id,
+                    parent: call.parent,
+                    provenance: call.provenance,
+                    parent_output: call.parent_output,
+                    ports: call.ports.clone(),
+                    local_type_substitutions,
+                    result_mode: call.result.mode,
+                    result_type_digest: dependency_out_type_digest(
+                        &call.result.ty,
+                        &mut type_digests,
+                        &mut type_digest_scratch,
+                    )?,
+                    owner: call.owner,
+                },
+                inputs,
+                passed: call.passed,
+            })
+        })
+        .collect::<Result<Vec<_>, CallableDependencyManifestError>>()?;
+    // OutNet's private lookup maps and parent-output node indexes are derived
+    // acceleration structures. The canonical payload commits the dense graph,
+    // every exact type through its domain-separated digest, and producer roots
+    // without serializing repeated inherited type trees per contextual frame.
+    let canonical_out_payload = (
+        &canonical_calls,
+        &out.ports,
+        &out.nets,
+        &out.static_owners,
+        out.producer_roots(),
+    );
     let component_digest = collector.structural_with_component_digest(
         SemanticDependencyOwnerV1::ProgramRoot,
         top_subject(
             SemanticDependencySubjectKindV1::ResolvedOutGraph,
             SemanticDependencyEntityV1::Program,
         ),
-        out,
+        &canonical_out_payload,
     )?;
-    for call in &out.call_instances {
+    if let Some(started) = component_started {
+        eprintln!(
+            "boon_semantic dependency_manifest inventory_out.component:done elapsed_ms={:.3}",
+            started.elapsed().as_secs_f64() * 1_000.0
+        );
+    }
+    let calls_started = trace.then(std::time::Instant::now);
+    for (call, canonical_call) in out.call_instances.iter().zip(&canonical_calls) {
         let owner = owners.out_call(call.id)?;
         let entity = SemanticDependencyEntityV1::indexed(
             SemanticDependencyEntityDomainV1::OutCallInstance,
@@ -4107,31 +4370,39 @@ fn inventory_out(
                     call.id, call.provenance.callable.0
                 ))
             })?;
-        collect_dependency!(
-            collector,
-            owner,
-            SemanticDependencyChannelV1::CalledCallable,
-            vec![
-                SemanticDependencyRoleV1::ResourceOrProviderBehavior,
-                SemanticDependencyRoleV1::CoverageOrRouting,
-            ],
-            top_subject(
-                SemanticDependencySubjectKindV1::OutCallInstance,
-                entity.clone(),
-            ),
-            SemanticDependencySemanticsV1 {
-                call_instance: Some(call.id),
-                static_owner: call.owner,
-                flow_type: Some(call.result.clone()),
-                lifetime: SemanticDependencyLifetimeV1::Call,
-                ..SemanticDependencySemanticsV1::default()
+        let mut call_references = vec![PendingDependencyReference::Owner(
+            SemanticDependencyOwnerV1::Callable { callable: callee },
+        )];
+        call_references.extend(call.parent.map(|parent| {
+            dependency_entity(SemanticDependencyEntityV1::indexed(
+                SemanticDependencyEntityDomainV1::OutCallInstance,
+                parent.as_usize(),
+            ))
+        }));
+        collector.dependency_with_flow_type_digest(
+            DependencyRecordInput {
+                owner,
+                channel: SemanticDependencyChannelV1::CalledCallable,
+                roles: vec![
+                    SemanticDependencyRoleV1::ResourceOrProviderBehavior,
+                    SemanticDependencyRoleV1::CoverageOrRouting,
+                ],
+                subject: top_subject(
+                    SemanticDependencySubjectKindV1::OutCallInstance,
+                    entity.clone(),
+                ),
+                semantics: SemanticDependencySemanticsV1 {
+                    call_instance: Some(call.id),
+                    static_owner: call.owner,
+                    lifetime: SemanticDependencyLifetimeV1::Call,
+                    ..SemanticDependencySemanticsV1::default()
+                },
+                payload: &canonical_call.header,
+                references: call_references,
             },
-            call,
-            vec![PendingDependencyReference::Owner(
-                SemanticDependencyOwnerV1::Callable { callable: callee },
-            )],
+            Some(canonical_call.header.result_type_digest),
         )?;
-        for (ordinal, input) in call.inputs.iter().enumerate() {
+        for (ordinal, input) in canonical_call.inputs.iter().enumerate() {
             collect_dependency!(
                 collector,
                 owner,
@@ -4174,6 +4445,13 @@ fn inventory_out(
             )?;
         }
     }
+    if let Some(started) = calls_started {
+        eprintln!(
+            "boon_semantic dependency_manifest inventory_out.calls:done elapsed_ms={:.3}",
+            started.elapsed().as_secs_f64() * 1_000.0
+        );
+    }
+    let ports_started = trace.then(std::time::Instant::now);
     for port in &out.ports {
         let owner = owners.out_call(port.call)?;
         collect_dependency!(
@@ -4201,6 +4479,13 @@ fn inventory_out(
             Vec::new(),
         )?;
     }
+    if let Some(started) = ports_started {
+        eprintln!(
+            "boon_semantic dependency_manifest inventory_out.ports:done elapsed_ms={:.3}",
+            started.elapsed().as_secs_f64() * 1_000.0
+        );
+    }
+    let nets_started = trace.then(std::time::Instant::now);
     for net in &out.nets {
         let static_owner = net.owner.ok_or_else(|| {
             CallableDependencyManifestError::new(format!(
@@ -4243,6 +4528,13 @@ fn inventory_out(
             )?;
         }
     }
+    if let Some(started) = nets_started {
+        eprintln!(
+            "boon_semantic dependency_manifest inventory_out.nets:done elapsed_ms={:.3}",
+            started.elapsed().as_secs_f64() * 1_000.0
+        );
+    }
+    let owners_started = trace.then(std::time::Instant::now);
     for owner in &out.static_owners {
         collect_dependency!(
             collector,
@@ -4263,6 +4555,12 @@ fn inventory_out(
             owner,
             Vec::new(),
         )?;
+    }
+    if let Some(started) = owners_started {
+        eprintln!(
+            "boon_semantic dependency_manifest inventory_out.owners:done elapsed_ms={:.3}",
+            started.elapsed().as_secs_f64() * 1_000.0
+        );
     }
     let _ = execution;
     Ok(component_digest)
@@ -4981,7 +5279,9 @@ fn semantic_expression_dependency(
             ..
         } => {
             references.push(dependency_entity(call_entity(*call)));
-            references.push(dependency_entity(out_call_entity(*instance)));
+            if let Some(instance) = instance {
+                references.push(dependency_entity(out_call_entity(*instance)));
+            }
             references.push(dependency_owner(SemanticDependencyOwnerV1::Callable {
                 callable: *callable,
             }));

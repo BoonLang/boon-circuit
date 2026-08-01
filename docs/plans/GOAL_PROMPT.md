@@ -174,12 +174,22 @@ Execution strategy:
   checks while fixing semantics and correctness; reserve release builds and
   end-to-end performance reports for completed milestone candidates. Never run
   multiple Cargo builds or test suites concurrently on the reference machine.
+- After one required Rust build, invoke the built `boon_cli` and focused test
+  binaries directly for repeated Boon fixtures. Do not pay a Cargo graph scan
+  and test-harness relink for every example or every unchanged focused check.
 - Treat compiler timeouts and graph explosions as architecture failures, not as
   requests for larger timeouts. A representative source compile that exceeds
   120 seconds, or growth caused by eagerly retaining statically unreachable
   branches or repeatedly cloning ordinary callable bodies, blocks the next
   production slice until the owning compiler representation is fixed and a
   focused scaling regression proves the correction.
+- The 120-second rule is only an emergency ceiling. Ratchet development-loop
+  budgets at every accepted compiler checkpoint: two consecutive runs more
+  than 25 percent slower or larger than the recorded checkpoint block the next
+  slice even below 120 seconds. The current debug checkpoints on the reference
+  machine are 0.25 seconds for Counter, 5 seconds for physical TodoMVC, and 45
+  seconds for NovyWave; these ceilings may move only downward unless a changed
+  represented workload is documented with before/after evidence.
 - After the same blocker class appears twice, stop tactical patching and change
   the owning parser, compiler, proof, runtime, currentness, document, renderer,
   host, persistence, physical-layout, or verifier architecture.

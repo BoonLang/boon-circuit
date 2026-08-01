@@ -6244,7 +6244,7 @@ kept: mapped |> List/retain(item, if: True)
                             mode: boon_typecheck::FlowMode::Continuous,
                             ty: Type::Unknown,
                         },
-                        instance: OutCallInstanceId(0),
+                        instance: Some(OutCallInstanceId(0)),
                         arguments: Vec::new(),
                         parameter_bindings: Vec::new(),
                         context_argument: None,
@@ -6441,7 +6441,7 @@ kept: mapped |> List/retain(item, if: True)
                         mode: boon_typecheck::FlowMode::Continuous,
                         ty: host_result_type.clone(),
                     },
-                    instance: OutCallInstanceId(0),
+                    instance: Some(OutCallInstanceId(0)),
                     arguments: vec![
                         crate::SemanticCallArgument {
                             formal: DeclId(40),
@@ -6642,7 +6642,7 @@ kept: mapped |> List/retain(item, if: True)
                         mode: boon_typecheck::FlowMode::Continuous,
                         ty: Type::Unknown,
                     },
-                    instance: OutCallInstanceId(0),
+                    instance: Some(OutCallInstanceId(0)),
                     arguments: vec![
                         crate::SemanticCallArgument {
                             formal: DeclId(30),

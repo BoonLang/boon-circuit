@@ -2327,7 +2327,7 @@ pub(crate) fn build_callable_dependency_manifest(
     )?;
     let resolved_out_graph_digest = dependency_manifest_inventory_phase!(
         "inventory_out",
-        inventory_out(out, execution, &owner_index, &mut collector),
+        inventory_out(out, &owner_index, &mut collector),
         collector
     )?;
     let execution_graph_digest = dependency_manifest_inventory_phase!(
@@ -4235,7 +4235,6 @@ fn dependency_out_type_digest<'a>(
 
 fn inventory_out(
     out: &ResolvedOutGraph,
-    execution: &SemanticExecutionGraphV1,
     owners: &DependencyOwnerIndex,
     collector: &mut DependencyCollector,
 ) -> Result<[u8; 32], CallableDependencyManifestError> {
@@ -4243,34 +4242,13 @@ fn inventory_out(
     let component_started = trace.then(std::time::Instant::now);
     let mut type_digests = HashMap::<&Type, [u8; 32]>::new();
     let mut type_digest_scratch = Vec::new();
-    let local_substitution_variables = execution
-        .calls
-        .iter()
-        .map(|call| {
-            (
-                call.checked_call,
-                call.type_substitutions
-                    .iter()
-                    .map(|substitution| substitution.variable)
-                    .collect::<BTreeSet<_>>(),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
     let canonical_calls = out
         .call_instances
         .iter()
         .map(|call| {
-            let local_variables = call
-                .provenance
-                .call_id
-                .and_then(|call| local_substitution_variables.get(&call));
             let local_type_substitutions = call
-                .type_substitutions
+                .local_type_substitutions
                 .iter()
-                .filter(|substitution| {
-                    local_variables
-                        .is_some_and(|variables| variables.contains(&substitution.variable))
-                })
                 .map(|substitution| {
                     Ok(CanonicalOutTypeSubstitutionV1 {
                         variable: substitution.variable,
@@ -4562,7 +4540,6 @@ fn inventory_out(
             started.elapsed().as_secs_f64() * 1_000.0
         );
     }
-    let _ = execution;
     Ok(component_digest)
 }
 

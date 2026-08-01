@@ -25,8 +25,7 @@ use boon_typecheck::{
     CheckedContextualOperation, CheckedDeclarationKind, CheckedExprId, CheckedExpression,
     CheckedExpressionKind, CheckedMatchPattern, CheckedParameterKind, CheckedParameterRequirement,
     CheckedPassedAccess, CheckedProgram, CheckedResourceBinding, CheckedTextSegment,
-    CheckedValueUse, ContextFormalId, DeclId, FlowMode, FlowType, Type,
-    apply_checked_type_substitutions, is_renderable_type,
+    CheckedValueUse, ContextFormalId, DeclId, FlowMode, FlowType, Type, is_renderable_type,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -968,12 +967,7 @@ pub(crate) fn derive_contextual_materializations(
 fn concrete_type_in_frame(out_net: &OutNet, ty: &Type, frame: Option<OutCallInstanceId>) -> Type {
     let ty = frame.map_or_else(
         || ty.clone(),
-        |instance| {
-            apply_checked_type_substitutions(
-                ty,
-                &out_net.call_instances[instance.as_usize()].type_substitutions,
-            )
-        },
+        |instance| out_net.apply_type_substitutions(instance, ty),
     );
     erase_runtime_type_vars(&ty)
 }

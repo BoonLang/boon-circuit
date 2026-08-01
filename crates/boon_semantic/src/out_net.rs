@@ -10,7 +10,8 @@ use boon_typecheck::{
     CheckedContextBinding, CheckedDeclaration, CheckedDeclarationKind, CheckedEvaluationScope,
     CheckedExprId, CheckedExpressionKind, CheckedMatchPattern, CheckedPassedAccess,
     CheckedPatternBinding, CheckedProgram, CheckedScopeKind, CheckedTypeSubstitution,
-    ContextFormalId, DeclId, FlowType, LexicalScopeId, apply_checked_type_substitutions,
+    CheckedTypeSubstitutionLookup, ContextFormalId, DeclId, FlowType, LexicalScopeId, Type,
+    TypeVar, apply_checked_type_environment, apply_checked_type_substitution_lookup,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -145,7 +146,12 @@ pub struct OutCallInstance {
     pub inputs: Vec<OutInputBinding>,
     pub passed: Option<PassedBinding>,
     pub ports: Vec<OutPortId>,
-    pub type_substitutions: Vec<CheckedTypeSubstitution>,
+    /// Substitutions introduced by this checked call only. Inherited entries
+    /// remain owned by `parent`; retaining their full structural types in
+    /// every descendant makes deep generic call graphs quadratic in memory.
+    pub local_type_substitutions: Vec<CheckedTypeSubstitution>,
+    #[serde(skip)]
+    type_substitution_count: usize,
     pub result: FlowType,
     /// Present only when this concrete user call directly allocates runtime
     /// resources. Pure forwarding wrappers deliberately have no owner.
@@ -252,6 +258,37 @@ pub struct OutNet<Contract = ()> {
     producer_root_calls: BTreeSet<OutCallInstanceId>,
 }
 
+struct OutCallTypeSubstitutionLookup<'graph, Contract> {
+    graph: &'graph OutNet<Contract>,
+    call: OutCallInstanceId,
+}
+
+impl<Contract> CheckedTypeSubstitutionLookup for OutCallTypeSubstitutionLookup<'_, Contract> {
+    fn replacement(&self, variable: TypeVar) -> Option<&Type> {
+        let mut next = Some(self.call);
+        let mut remaining = self.graph.call_instances.len().saturating_add(1);
+        while let Some(call) = next {
+            if remaining == 0 {
+                return None;
+            }
+            remaining -= 1;
+            let instance = self
+                .graph
+                .call_instances
+                .get(call.as_usize())
+                .filter(|instance| instance.id == call)?;
+            if let Ok(index) = instance
+                .local_type_substitutions
+                .binary_search_by_key(&variable, |substitution| substitution.variable)
+            {
+                return Some(&instance.local_type_substitutions[index].value);
+            }
+            next = instance.parent;
+        }
+        None
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub struct ConcreteOutProducer {
     pub call: OutCallInstanceId,
@@ -289,6 +326,59 @@ impl<Contract> OutNet<Contract> {
 
     pub fn owner_for_call(&self, call: OutCallInstanceId) -> Option<StaticOwnerId> {
         self.call_instances[call.as_usize()].owner
+    }
+
+    /// Reconstructs the exact checked type environment for one concrete call.
+    ///
+    /// Call instances retain only their local delta. Walking parents here is
+    /// intentionally paid only by consumers that need a complete mutable
+    /// environment; the common specialization path uses the same compact
+    /// ownership without permanently cloning inherited structural types.
+    pub fn type_substitution_environment(
+        &self,
+        call: OutCallInstanceId,
+    ) -> BTreeMap<TypeVar, Type> {
+        let mut ancestry = Vec::new();
+        let mut next = Some(call);
+        let mut remaining = self.call_instances.len().saturating_add(1);
+        while let Some(instance) = next {
+            if remaining == 0 {
+                break;
+            }
+            remaining -= 1;
+            let Some(instance) = self
+                .call_instances
+                .get(instance.as_usize())
+                .filter(|candidate| candidate.id == instance)
+            else {
+                break;
+            };
+            ancestry.push(instance.id);
+            next = instance.parent;
+        }
+        ancestry.reverse();
+
+        let mut environment = BTreeMap::new();
+        for instance in ancestry {
+            for substitution in &self.call_instances[instance.as_usize()].local_type_substitutions {
+                environment.insert(substitution.variable, substitution.value.clone());
+            }
+        }
+        environment
+    }
+
+    pub fn type_substitution_count(&self, call: OutCallInstanceId) -> usize {
+        self.call_instances
+            .get(call.as_usize())
+            .filter(|candidate| candidate.id == call)
+            .map_or(0, |instance| instance.type_substitution_count)
+    }
+
+    pub fn apply_type_substitutions(&self, call: OutCallInstanceId, ty: &Type) -> Type {
+        apply_checked_type_substitution_lookup(
+            ty,
+            &OutCallTypeSubstitutionLookup { graph: self, call },
+        )
     }
 
     pub fn owner_for_call_evaluation(&self, mut call: OutCallInstanceId) -> Option<StaticOwnerId> {
@@ -859,7 +949,13 @@ where
     }
 
     fn build(mut self) -> OutNetBuild<Contract> {
-        self.instantiate_frame(None, None, BTreeMap::new(), &mut Vec::new());
+        self.instantiate_frame(
+            None,
+            None,
+            BTreeMap::new(),
+            &BTreeMap::new(),
+            &mut Vec::new(),
+        );
         let producer_roots = std::mem::take(&mut self.producer_root_specs);
         for producer in producer_roots {
             self.instantiate_producer_root(producer);
@@ -900,7 +996,8 @@ where
             inputs,
             passed: None,
             ports: Vec::new(),
-            type_substitutions: Vec::new(),
+            local_type_substitutions: Vec::new(),
+            type_substitution_count: 0,
             result: signature.result.clone(),
             owner: None,
         });
@@ -910,6 +1007,7 @@ where
             Some(signature.decl_id),
             Some(call),
             BTreeMap::new(),
+            &BTreeMap::new(),
             &mut vec![signature.decl_id],
         );
     }
@@ -1280,6 +1378,7 @@ where
         owner_callable: Option<DeclId>,
         parent: Option<OutCallInstanceId>,
         mut frame_bindings: BTreeMap<DeclId, usize>,
+        inherited_type_environment: &BTreeMap<TypeVar, Type>,
         active_callables: &mut Vec<DeclId>,
     ) {
         let program = self.program;
@@ -1340,32 +1439,28 @@ where
                     None
                 }
             };
-            let inherited_substitutions = parent
-                .map(|parent| {
-                    self.call_instances[parent.as_usize()]
-                        .type_substitutions
-                        .clone()
-                })
-                .unwrap_or_default();
-            let mut substitutions = inherited_substitutions
-                .iter()
-                .map(|substitution| (substitution.variable, substitution.value.clone()))
-                .collect::<BTreeMap<_, _>>();
+            let mut local_type_environment = BTreeMap::new();
             for substitution in &checked_call.type_substitutions {
-                substitutions.insert(
+                local_type_environment.insert(
                     substitution.variable,
-                    apply_checked_type_substitutions(&substitution.value, &inherited_substitutions),
+                    apply_checked_type_environment(&substitution.value, inherited_type_environment),
                 );
             }
-            let type_substitutions = substitutions
-                .into_iter()
-                .map(|(variable, value)| CheckedTypeSubstitution { variable, value })
+            let local_type_substitutions = local_type_environment
+                .iter()
+                .map(|(variable, value)| CheckedTypeSubstitution {
+                    variable: *variable,
+                    value: value.clone(),
+                })
                 .collect::<Vec<_>>();
+            let mut type_environment = inherited_type_environment.clone();
+            type_environment.extend(local_type_environment);
+            let type_substitution_count = type_environment.len();
             let result_scheme = signature
                 .map(|signature| &signature.result)
                 .unwrap_or(&checked_call.result);
             let instantiated_result =
-                apply_checked_type_substitutions(&result_scheme.ty, &type_substitutions);
+                apply_checked_type_environment(&result_scheme.ty, &type_environment);
             let checked_result = boon_typecheck::specialize_checked_call_result(
                 &instantiated_result,
                 &checked_call.result.ty,
@@ -1376,7 +1471,7 @@ where
                 .get(checked_call.expression.0 as usize)
                 .filter(|expression| expression.id == checked_call.expression)
                 .map(|expression| {
-                    apply_checked_type_substitutions(&expression.flow_type.ty, &type_substitutions)
+                    apply_checked_type_environment(&expression.flow_type.ty, &type_environment)
                 })
                 .unwrap_or_else(|| checked_result.clone());
             let occurrence_result =
@@ -1415,7 +1510,8 @@ where
                 inputs: Vec::new(),
                 passed,
                 ports: Vec::new(),
-                type_substitutions,
+                local_type_substitutions,
+                type_substitution_count,
                 result,
                 owner: None,
             });
@@ -1635,10 +1731,18 @@ where
                 continue;
             }
             active_callables.push(pending.callable);
+            let mut type_environment = inherited_type_environment.clone();
+            type_environment.extend(
+                self.call_instances[pending.instance.as_usize()]
+                    .local_type_substitutions
+                    .iter()
+                    .map(|substitution| (substitution.variable, substitution.value.clone())),
+            );
             self.instantiate_frame(
                 Some(pending.callable),
                 Some(pending.instance),
                 pending.output_bindings,
+                &type_environment,
                 active_callables,
             );
             active_callables.pop();

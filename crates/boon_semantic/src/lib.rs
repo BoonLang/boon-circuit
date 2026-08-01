@@ -1557,10 +1557,9 @@ fn exact_bundle_call_arguments(
                     })?;
                 let instantiated_value_flow_type = boon_typecheck::FlowType {
                     mode: value_flow_type.mode,
-                    ty: boon_typecheck::apply_checked_type_substitutions(
-                        &value_flow_type.ty,
-                        &call_instance.type_substitutions,
-                    ),
+                    ty: consumer_program
+                        .resolved_out_graph()
+                        .apply_type_substitutions(call_instance.id, &value_flow_type.ty),
                 };
                 if argument.checked_value != *checked_value
                     || argument.value != *value
@@ -2649,12 +2648,31 @@ pub fn elaborate_with_external_event_identities(
     }
     let mut resolved_out_graph = out_net.graph;
     if trace_elaboration {
+        let cumulative_substitution_count = resolved_out_graph
+            .call_instances
+            .iter()
+            .map(|call| resolved_out_graph.type_substitution_count(call.id))
+            .sum::<usize>();
+        let local_substitution_count = resolved_out_graph
+            .call_instances
+            .iter()
+            .map(|call| call.local_type_substitutions.len())
+            .sum::<usize>();
+        let maximum_substitution_count = resolved_out_graph
+            .call_instances
+            .iter()
+            .map(|call| resolved_out_graph.type_substitution_count(call.id))
+            .max()
+            .unwrap_or(0);
         eprintln!(
-            "boon_semantic artifact out_graph calls={} ports={} nets={} owners={}",
+            "boon_semantic artifact out_graph calls={} ports={} nets={} owners={} cumulative_substitutions={} local_substitutions={} max_substitutions_per_call={}",
             resolved_out_graph.call_instances.len(),
             resolved_out_graph.ports.len(),
             resolved_out_graph.nets.len(),
             resolved_out_graph.static_owners.len(),
+            cumulative_substitution_count,
+            local_substitution_count,
+            maximum_substitution_count,
         );
     }
     elaboration_phase!(
@@ -3052,21 +3070,10 @@ fn resolve_out_contracts(
                     formal.0
                 ))
             })?;
-        let mut substitutions = instance
-            .type_substitutions
-            .iter()
-            .map(|substitution| (substitution.variable, substitution.value.clone()))
-            .collect::<BTreeMap<_, _>>();
+        let mut substitutions = graph.type_substitution_environment(call_id);
         let parent_substitutions = instance
             .parent
-            .and_then(|parent| graph.call_instances.get(parent.as_usize()))
-            .map(|parent| {
-                parent
-                    .type_substitutions
-                    .iter()
-                    .map(|substitution| (substitution.variable, substitution.value.clone()))
-                    .collect::<BTreeMap<_, _>>()
-            })
+            .map(|parent| graph.type_substitution_environment(parent))
             .unwrap_or_default();
         let ordered_inputs = instance
             .inputs
@@ -3111,17 +3118,16 @@ fn resolve_out_contracts(
                     {
                         if evaluation_call == call_id {
                             input_substitutions = substitutions.clone();
-                        } else if let Some(evaluation_instance) =
-                            graph.call_instances.get(evaluation_call.as_usize())
+                        } else if graph
+                            .call_instances
+                            .get(evaluation_call.as_usize())
+                            .is_some_and(|instance| instance.id == evaluation_call)
                         {
+                            let evaluation_substitutions =
+                                graph.type_substitution_environment(evaluation_call);
                             merge_out_contract_substitutions(
                                 &mut input_substitutions,
-                                evaluation_instance
-                                    .type_substitutions
-                                    .iter()
-                                    .map(|substitution| {
-                                        (substitution.variable, substitution.value.clone())
-                                    }),
+                                evaluation_substitutions,
                             );
                         }
                     }
@@ -3290,13 +3296,8 @@ fn concrete_checked_expression_type(
                         ))
                     })?;
                 let mut substitutions = active_substitutions.clone();
-                merge_out_contract_substitutions(
-                    &mut substitutions,
-                    instance
-                        .type_substitutions
-                        .iter()
-                        .map(|substitution| (substitution.variable, substitution.value.clone())),
-                );
+                let instance_type_environment = graph.type_substitution_environment(instance_id);
+                merge_out_contract_substitutions(&mut substitutions, instance_type_environment);
                 let checked_result =
                     apply_out_contract_substitutions(&callable.result.ty, &substitutions);
                 if out_contract_type_is_resolved(&checked_result) {
@@ -3351,16 +3352,16 @@ fn concrete_checked_expression_type(
                             {
                                 if evaluation_call == instance_id {
                                     input_substitutions = substitutions.clone();
-                                } else if let Some(evaluation_instance) =
-                                    graph.call_instances.get(evaluation_call.as_usize())
+                                } else if graph
+                                    .call_instances
+                                    .get(evaluation_call.as_usize())
+                                    .is_some_and(|instance| instance.id == evaluation_call)
                                 {
+                                    let evaluation_substitutions =
+                                        graph.type_substitution_environment(evaluation_call);
                                     merge_out_contract_substitutions(
                                         &mut input_substitutions,
-                                        evaluation_instance.type_substitutions.iter().map(
-                                            |substitution| {
-                                                (substitution.variable, substitution.value.clone())
-                                            },
-                                        ),
+                                        evaluation_substitutions,
                                     );
                                 }
                             }
@@ -3622,28 +3623,26 @@ fn concrete_checked_expression_type(
                     return Ok(payload_type);
                 }
                 let mut expression_substitutions = active_substitutions.clone();
-                merge_out_contract_substitutions(
-                    &mut expression_substitutions,
-                    scoped
-                        .frame
-                        .map(|frame| {
-                            graph
+                let frame_type_environment = scoped
+                    .frame
+                    .map(|frame| {
+                        graph
                             .call_instances
                             .get(frame.as_usize())
                             .filter(|instance| instance.id == frame)
-                            .map(|instance| instance.type_substitutions.as_slice())
                             .ok_or_else(|| {
                                 SemanticError::new(format!(
                                     "READ expression {} references missing OUT call frame {frame}",
                                     scoped.expression.0
                                 ))
-                            })
-                        })
-                        .transpose()?
-                        .unwrap_or_default()
-                        .iter()
-                        .map(|substitution| (substitution.variable, substitution.value.clone()))
-                        .collect::<BTreeMap<_, _>>(),
+                            })?;
+                        Ok(graph.type_substitution_environment(frame))
+                    })
+                    .transpose()?
+                    .unwrap_or_default();
+                merge_out_contract_substitutions(
+                    &mut expression_substitutions,
+                    frame_type_environment,
                 );
                 let expression_substitutions = expression_substitutions
                     .into_iter()
@@ -3710,16 +3709,13 @@ fn concrete_checked_expression_type(
                                     "evaluation port {port_id} references missing OUT formal {}",
                                     port.formal.0
                                 ))
-                            })?;
+                        })?;
                         let mut output_substitutions = active_substitutions.clone();
+                        let instance_type_environment =
+                            graph.type_substitution_environment(port.call);
                         merge_out_contract_substitutions(
                             &mut output_substitutions,
-                            instance
-                                .type_substitutions
-                                .iter()
-                                .map(|substitution| {
-                                    (substitution.variable, substitution.value.clone())
-                                }),
+                            instance_type_environment,
                         );
                         Ok(Some(apply_out_contract_substitutions(
                             &parameter.flow_type.ty,
@@ -3878,7 +3874,7 @@ fn concrete_checked_expression_type(
                             instance.id,
                             instance.parent,
                             instance.provenance.expression.0,
-                            instance.type_substitutions.len(),
+                            graph.type_substitution_count(instance.id),
                         )
                     })
                     .unwrap_or_else(|| "none".to_owned());
@@ -3891,29 +3887,24 @@ fn concrete_checked_expression_type(
             }
             _ => {
                 let mut substitutions = active_substitutions.clone();
-                merge_out_contract_substitutions(
-                    &mut substitutions,
-                    scoped
-                        .frame
-                        .map(|frame| {
-                            graph
-                                .call_instances
-                                .get(frame.as_usize())
-                                .filter(|instance| instance.id == frame)
-                                .map(|instance| instance.type_substitutions.as_slice())
-                                .ok_or_else(|| {
-                                    SemanticError::new(format!(
-                                        "expression {} references missing OUT call frame {frame}",
-                                        scoped.expression.0
-                                    ))
-                                })
-                        })
-                        .transpose()?
-                        .unwrap_or_default()
-                        .iter()
-                        .map(|substitution| (substitution.variable, substitution.value.clone()))
-                        .collect::<BTreeMap<_, _>>(),
-                );
+                let frame_type_environment = scoped
+                    .frame
+                    .map(|frame| {
+                        graph
+                            .call_instances
+                            .get(frame.as_usize())
+                            .filter(|instance| instance.id == frame)
+                            .ok_or_else(|| {
+                                SemanticError::new(format!(
+                                    "expression {} references missing OUT call frame {frame}",
+                                    scoped.expression.0
+                                ))
+                            })?;
+                        Ok(graph.type_substitution_environment(frame))
+                    })
+                    .transpose()?
+                    .unwrap_or_default();
+                merge_out_contract_substitutions(&mut substitutions, frame_type_environment);
                 let substitutions = substitutions
                     .into_iter()
                     .map(
@@ -3953,29 +3944,24 @@ fn concrete_checked_branch_expression_type(
             ))
         })?;
     let mut substitutions = active_substitutions.clone();
-    merge_out_contract_substitutions(
-        &mut substitutions,
-        scoped
-            .frame
-            .map(|frame| {
-                graph
-                    .call_instances
-                    .get(frame.as_usize())
-                    .filter(|instance| instance.id == frame)
-                    .map(|instance| instance.type_substitutions.as_slice())
-                    .ok_or_else(|| {
-                        SemanticError::new(format!(
-                            "branch expression {} references missing OUT call frame {frame}",
-                            scoped.expression.0
-                        ))
-                    })
-            })
-            .transpose()?
-            .unwrap_or_default()
-            .iter()
-            .map(|substitution| (substitution.variable, substitution.value.clone()))
-            .collect::<BTreeMap<_, _>>(),
-    );
+    let frame_type_environment = scoped
+        .frame
+        .map(|frame| {
+            graph
+                .call_instances
+                .get(frame.as_usize())
+                .filter(|instance| instance.id == frame)
+                .ok_or_else(|| {
+                    SemanticError::new(format!(
+                        "branch expression {} references missing OUT call frame {frame}",
+                        scoped.expression.0
+                    ))
+                })?;
+            Ok(graph.type_substitution_environment(frame))
+        })
+        .transpose()?
+        .unwrap_or_default();
+    merge_out_contract_substitutions(&mut substitutions, frame_type_environment);
 
     let mut concrete_branches = Vec::new();
     for branch in branches {
@@ -6576,14 +6562,40 @@ FUNCTION lane_row(row) {
             &[],
         )
         .expect("nested generic map results resolve through concrete call frames");
+        let out = semantic.resolved_out_graph();
         assert!(
-            semantic
-                .resolved_out_graph()
-                .ports
+            out.ports
                 .iter()
                 .all(|port| out_contract_type_is_resolved(&port.contract.resolved_type)),
             "every nested generic map OUT port must have a concrete contract"
         );
+        let retained_substitutions = out
+            .call_instances
+            .iter()
+            .map(|call| call.local_type_substitutions.len())
+            .sum::<usize>();
+        let logical_substitutions = out
+            .call_instances
+            .iter()
+            .map(|call| out.type_substitution_count(call.id))
+            .sum::<usize>();
+        assert!(
+            retained_substitutions < logical_substitutions,
+            "nested generic frames must retain local deltas instead of inherited copies"
+        );
+        let inherited = out
+            .call_instances
+            .iter()
+            .find(|call| out.type_substitution_count(call.id) > call.local_type_substitutions.len())
+            .expect("nested generic fixture has an inherited type environment");
+        let environment = out.type_substitution_environment(inherited.id);
+        for variable in environment.keys() {
+            assert_eq!(
+                out.apply_type_substitutions(inherited.id, &Type::Var(*variable)),
+                boon_typecheck::apply_checked_type_environment(&Type::Var(*variable), &environment,),
+                "parent-linked lookup must match the flattened checked environment"
+            );
+        }
     }
 
     fn assert_contract_rejection(

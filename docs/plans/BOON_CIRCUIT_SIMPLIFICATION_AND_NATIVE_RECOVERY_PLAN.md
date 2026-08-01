@@ -576,21 +576,31 @@ dependencies instead of serializing inherited structural type trees at every
 frame.
 
 On the reference machine, the current debug `boon_cli` completes Counter in
-0.08 seconds at 34,668 KiB peak RSS and physical TodoMVC in 2.81 seconds at
-345,780 KiB, down from the first recovery checkpoint's 9.08 seconds and
+0.08 seconds at 34,820 KiB peak RSS and physical TodoMVC in 2.74 seconds at
+155,032 KiB, down from the first recovery checkpoint's 9.08 seconds and
 693,444 KiB for TodoMVC. The large 5,169-frame NovyWave fixture now completes
-successfully in 41.34 seconds at 4,012,976 KiB, down from the first successful
-55.64-second, 4,426,932-KiB run. Its checked-type fixed points require 6+6
-global epochs instead of 12+11; typechecking takes 12.31 seconds. Its semantic
-execution graph contains 43,471 expressions instead of 94,509, semantic
-elaboration takes 17.61 seconds, and its dependency manifest contains 261,728
-records plus 338,263 coverage entries and takes 5.86 seconds. These are
-development-loop measurements, not final release or native-performance
-evidence. Phase 1 still requires the focused type, semantic, manifest, IR, and
-compiler regression matrix and a committed clean-checkout remeasurement; the
-remaining measured compiler hotspots are cumulative OUT substitutions,
-dependency-closure proof construction, and executable-row backend lowering,
-not unbounded ordinary-body expansion.
+successfully in 38.81 seconds at 1,034,180 KiB, down from the first successful
+55.64-second, 4,426,932-KiB run and the preceding checkpoint's 41.34 seconds at
+4,012,976 KiB. Its checked-type fixed points require 6+6 global epochs instead
+of 12+11; typechecking takes 12.31 seconds. Its semantic execution graph
+contains 43,471 expressions instead of 94,509, and its dependency manifest
+contains 261,728 records plus 338,263 coverage entries.
+
+The OUT graph exposes why peak memory remained excessive after manifest
+compaction: only 4,391 substitutions are introduced locally, but retaining a
+flattened environment on every concrete frame copied 2,879,351 substitutions,
+with as many as 756 on one call. `OutCallInstance` now owns only its local delta
+and resolves inherited variables through its parent chain. The generated
+NovyWave `MachinePlan` is byte-identical across the representation change; OUT
+construction falls from 4.79 to 3.01 seconds while NovyWave peak RSS falls by
+about 74 percent. A focused nested-generic regression proves that compact and
+flattened lookup produce the same concrete types. These are development-loop
+measurements, not final release or native-performance evidence. Phase 1 still
+requires the focused type, semantic, manifest, IR, and compiler regression
+matrix and a committed clean-checkout remeasurement; the remaining measured
+compiler hotspots are dependency-closure proof construction and executable-row
+backend lowering, not unbounded ordinary-body expansion or retained inherited
+OUT environments.
 
 A clean confirmation at `de430c1` kept the million-row charged work unchanged
 but observed 14,794,406,170 ns instead of 9,712,441,796 ns for its three-sample

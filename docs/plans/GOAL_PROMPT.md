@@ -186,9 +186,10 @@ Execution strategy:
 - The 120-second rule is only an emergency ceiling. Ratchet development-loop
   budgets at every accepted compiler checkpoint: two consecutive runs more
   than 25 percent slower or larger than the recorded checkpoint block the next
-  slice even below 120 seconds. The current debug checkpoints on the reference
-  machine are 0.25 seconds for Counter, 5 seconds for physical TodoMVC, and 45
-  seconds for NovyWave; these ceilings may move only downward unless a changed
+  slice even below 120 seconds. The current debug time ceilings on the reference
+  machine are 0.25 seconds for Counter, 5 seconds for physical TodoMVC, and 42
+  seconds for NovyWave. Their peak-RSS ceilings are respectively 64 MiB, 200
+  MiB, and 1.2 GiB. These ceilings may move only downward unless a changed
   represented workload is documented with before/after evidence.
 - After the same blocker class appears twice, stop tactical patching and change
   the owning parser, compiler, proof, runtime, currentness, document, renderer,

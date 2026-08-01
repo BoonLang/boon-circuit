@@ -1294,6 +1294,24 @@ pub fn apply_checked_type_substitutions(
     substitute_checked_type_from_lookup(ty, substitutions)
 }
 
+/// Applies a checked type environment without first copying it into the
+/// serialized call-substitution representation.
+///
+/// Compiler phases that compose inherited environments use this boundary to
+/// keep their indexed lookup structure intact while specializing a type.
+pub fn apply_checked_type_environment(ty: &Type, substitutions: &BTreeMap<TypeVar, Type>) -> Type {
+    substitute_checked_type_from_lookup(ty, substitutions)
+}
+
+/// Applies substitutions supplied by an indexed or persistent compiler-owned
+/// environment without materializing a flat checked-call vector.
+pub fn apply_checked_type_substitution_lookup(
+    ty: &Type,
+    substitutions: &(impl CheckedTypeSubstitutionLookup + ?Sized),
+) -> Type {
+    substitute_checked_type_from_lookup(ty, substitutions)
+}
+
 /// An opaque, read-only product emitted only by the typechecker.
 ///
 /// External crates may inspect the public DTO fields through [`std::ops::Deref`],
@@ -12856,7 +12874,7 @@ fn substitute_checked_type(ty: &Type, substitutions: &BTreeMap<TypeVar, Type>) -
     substitute_checked_type_from_lookup(ty, substitutions)
 }
 
-trait CheckedTypeSubstitutionLookup {
+pub trait CheckedTypeSubstitutionLookup {
     fn replacement(&self, variable: TypeVar) -> Option<&Type>;
 }
 

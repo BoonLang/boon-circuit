@@ -156,16 +156,19 @@ Current checkpoints to preserve and audit rather than redo:
   cut must preserve and freshly prove them;
 - the current compiler-throughput checkpoint keeps Counter, physical TodoMVC,
   and NovyWave `MachinePlan` output deterministic while replacing copied OUT
-  type environments with active-path overlays, compacting exact dependency
-  closure proofs into manifest V2 digests, retaining canonical-root-reading
-  ordinary callables, and replacing repeated whole-program type inference with
-  a dependency-indexed dirty worklist plus a fail-closed full-sweep audit; two
-  final-source runs measure 0.08/0.08, 2.31/2.18, and 26.59/26.34 seconds
-  respectively;
-- the next compiler-performance blocker is the dependency manifest's roughly
-  4.8-second enumeration of about 15.6 million transitive closure IDs. Replace
-  that retained closure work with a compact exact proof before resuming the
-  production recovery slice; do not return to tactical type-cache changes;
+  type environments with active-path overlays, retaining canonical-root-reading
+  ordinary callables, replacing repeated whole-program type inference with a
+  dependency-indexed dirty worklist plus a fail-closed full-sweep audit, and
+  replacing manifest V2's per-owner closure enumeration with an exact
+  content-addressed SCC graph proof; two final-source runs measure 0.07/0.08,
+  2.14/2.12, and 25.48/25.82 seconds respectively, with all three emitted plans
+  byte-identical to the preceding checkpoint;
+- the next compiler-performance blocker is contextual callable-scheme
+  inference: the traced NovyWave source spends about 2.11 seconds rebuilding
+  call instances and 1.35 seconds propagating callable-owner changes inside a
+  7.10-second typecheck. Replace repeated per-call scheme reconstruction with
+  an explicit dependency-indexed callable/call graph before resuming the
+  production recovery slice; do not return to tactical type-cache invalidation;
 - FjordPulse currently has no basis for weakening the 108-story/340-scenario
   acceptance inventory. Only its two explicitly deferred backup/restore
   automation scenarios may retain that final status.
@@ -199,7 +202,7 @@ Execution strategy:
   budgets at every accepted compiler checkpoint: two consecutive runs more
   than 25 percent slower or larger than the recorded checkpoint block the next
   slice even below 120 seconds. The current debug time ceilings on the reference
-  machine are 0.20 seconds for Counter, 3.5 seconds for physical TodoMVC, and 30
+  machine are 0.20 seconds for Counter, 3.5 seconds for physical TodoMVC, and 28
   seconds for NovyWave. Their peak-RSS ceilings are respectively 48 MiB, 180
   MiB, and 1.1 GiB. These ceilings may move only downward unless a changed
   represented workload is documented with before/after evidence.

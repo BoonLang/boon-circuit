@@ -39,8 +39,8 @@ use std::fmt;
 pub const SEMANTIC_PROGRAM_SCHEMA_V1: &str = "boon.semantic-program.v1";
 pub const BUNDLE_SEMANTIC_PROGRAM_SCHEMA_V1: &str = "boon.bundle-semantic-program.v1";
 pub const DEPENDENCY_CLASSIFIER_SCHEMA_DIGEST_V1: [u8; 32] = [
-    0xd4, 0x1e, 0xfa, 0x9d, 0x40, 0x09, 0x9b, 0xfa, 0xd8, 0x36, 0x12, 0x16, 0x26, 0x3d, 0xc5, 0x44,
-    0x87, 0x1d, 0x3a, 0x85, 0xc9, 0x96, 0x31, 0x2c, 0x92, 0xea, 0x54, 0xb4, 0xa8, 0x24, 0xa3, 0xef,
+    0xe2, 0x62, 0x4e, 0x70, 0x5c, 0x74, 0x97, 0x4e, 0xf9, 0x9a, 0xa2, 0x9a, 0x6c, 0x53, 0x81, 0xcf,
+    0xae, 0x6a, 0x40, 0x37, 0xe6, 0x57, 0x46, 0x8c, 0x87, 0x1d, 0x22, 0x62, 0xd5, 0xa4, 0xbe, 0xb1,
 ];
 pub const MAX_BUNDLE_SEMANTIC_PRODUCER_REQUESTS_V1: usize = 4_096;
 pub const MAX_BUNDLE_SEMANTIC_PRODUCER_REQUEST_BYTES_V1: usize = 4 * 1024 * 1024;
@@ -628,7 +628,7 @@ pub struct SemanticProgram {
     scope_storage_graph: SemanticScopeStorageGraphV1,
     memory_graph: SemanticMemoryGraphV1,
     canonical_core: program_core::CanonicalProgramCoreV1,
-    dependency_manifest: CallableDependencyManifestV2,
+    dependency_manifest: CallableDependencyManifestV3,
     digest: SemanticProgramDigestV1,
 }
 
@@ -777,7 +777,7 @@ impl SemanticProgram {
         self.digest
     }
 
-    pub const fn dependency_manifest(&self) -> &CallableDependencyManifestV2 {
+    pub const fn dependency_manifest(&self) -> &CallableDependencyManifestV3 {
         &self.dependency_manifest
     }
 

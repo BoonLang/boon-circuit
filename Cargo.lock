@@ -1077,6 +1077,7 @@ dependencies = [
  "boon_parser",
  "boon_typecheck",
  "serde",
+ "sha2",
 ]
 
 [[package]]

@@ -576,20 +576,25 @@ call inputs/OUTs/callees, selector actuals, HOLD updates, and pattern selectors.
 It schedules only dirty entities and retains a complete full-sweep no-change
 audit as a fail-closed convergence check. OUT manifest payloads commit interned
 type digests, local substitution deltas, and explicit parent-call dependencies
-instead of serializing inherited structural type trees at every frame.
+instead of serializing inherited structural type trees at every frame. Manifest
+V3 commits the exact owner/record dependency graph through a content-addressed
+SCC DAG, so shared transitive dependencies are hashed once rather than
+enumerated independently for every callable.
 
 On the reference machine, two consecutive final-source debug `boon_cli` runs
-complete Counter in 0.08/0.08 seconds at 29,792/29,408 KiB peak RSS and
-physical TodoMVC in 2.31/2.18 seconds at 148,152/147,344 KiB. The large
-5,169-frame NovyWave fixture completes in 26.59/26.34 seconds at
-1,003,720/1,003,064 KiB. This is down from the preceding checkpoint's
-31.26/30.86-second, 1,005,068/1,004,712-KiB pair, its predecessor's
+complete Counter in 0.07/0.08 seconds at 29,592/29,636 KiB peak RSS and
+physical TodoMVC in 2.14/2.12 seconds at 146,856/146,544 KiB. The large
+5,169-frame NovyWave fixture completes in 25.48/25.82 seconds at
+1,000,224/1,000,104 KiB. This is down from the preceding checkpoint's
+26.59/26.34-second, 1,003,720/1,003,064-KiB pair, its predecessor's
+31.26/30.86-second, 1,005,068/1,004,712-KiB pair, the earlier
 38.81-second, 1,034,180-KiB run, the first successful 55.64-second,
 4,426,932-KiB run, and the earlier 41.34-second, 4,012,976-KiB checkpoint.
 Counter, TodoMVC, and NovyWave produce byte-identical `MachinePlan` files across
 the paired runs. Counter and TodoMVC remain byte-identical to the saved
 pre-worklist plans; the type-worklist change is byte-identical to the
-immediately preceding NovyWave plan.
+immediately preceding NovyWave plan, and the manifest V3 proof cut changes none
+of the three emitted plan bytes.
 
 The OUT graph exposes why peak memory remained excessive after manifest
 compaction: only 4,391 substitutions are introduced locally, but retaining a
@@ -605,17 +610,23 @@ children without copying sibling environments, reducing the measured OUT phase
 from 2.739 to about 0.27 seconds. A focused nested-generic regression proves
 that compact and flattened lookup produce the same concrete types.
 
-The dependency manifest is now schema V2. It persists direct dependency IDs
-and exact transitive implementation digests rather than retaining every
-owner's closure ranges, while deep integrity validation independently
-re-derives each closure and rejects a stale digest even if the outer manifest
-hash is recomputed. Bounded workers hash each closure as it is derived instead
-of retaining all closures for a second serial pass; the measured manifest phase
-falls from 5.933 to 4.795 seconds. Optimized debug profiles for the compiler,
-IR, and plan crates preserve assertions and line tables while reducing measured
-backend lowering from 4.804 to 0.930 seconds. All 11 focused manifest tests and
-all 47 typechecker tests pass, including the stale-hash negative and exact flow
-capture regressions.
+Manifest V2 first removed persisted owner closure ranges: it retained direct
+dependency IDs and exact transitive implementation digests, and deep integrity
+validation independently re-derived each closure and rejected a stale digest
+even when the outer manifest hash was recomputed. Bounded workers reduced that
+manifest phase from 5.933 to 4.795 seconds, but still enumerated about 15.6
+million reachable record IDs. Manifest V3 replaces that repeated work with one
+261,704-node, 1,151,128-edge owner/record graph. It condenses 1,654 cyclic
+components into a 209,404-component DAG and streams stable, domain-separated
+hashes over each shared component once. The exact graph proof falls from about
+1.30 seconds for the first canonical implementation to 0.57 seconds, and the
+complete manifest phase falls to 3.99-4.02 seconds. Mutations inside a reachable
+component invalidate the owning proof, unrelated components do not, cycles are
+bounded by one SCC digest, and deep integrity still rejects a stale proof after
+the outer manifest hash is recomputed. All 12 focused manifest tests and all 47
+typechecker tests pass. Optimized debug profiles for the compiler, IR, and plan
+crates preserve assertions and line tables while keeping backend lowering near
+1.12 seconds on the traced final source.
 
 These are development-loop measurements, not final release or native-
 performance evidence. The dependency-indexed type worklist replaces the two
@@ -635,12 +646,15 @@ compiler regression proves this case. NovyWave retains eight more ordinary
 helpers, removes 201 semantic expressions, and emits a plan about 33 KiB
 smaller; the dirty type worklist owns the material wall-time reduction.
 
-The next compiler-performance target is the dependency manifest's roughly
-4.8-second enumeration of about 15.6 million transitive closure IDs. Replace
-that retained closure work with a compact exact dependency proof before
-returning to production recovery; do not resume tactical type-cache changes.
-Phase 1 still requires the remaining focused semantic, IR, and compiler
-regression matrix plus a committed clean-checkout remeasurement.
+The next compiler-performance target is contextual callable-scheme inference,
+not another manifest collection tweak. The traced final source spends about
+2.11 seconds rebuilding call instances and 1.35 seconds propagating 684
+callable-owner visits inside a 7.10-second typecheck. Replace repeated per-call
+scheme reconstruction with an explicit dependency-indexed callable/call graph
+while preserving the fail-closed full inference audit; do not return to
+tactical type-cache invalidation. Phase 1 still requires the remaining focused
+semantic, IR, and compiler regression matrix plus a committed clean-checkout
+remeasurement.
 
 A clean confirmation at `de430c1` kept the million-row charged work unchanged
 but observed 14,794,406,170 ns instead of 9,712,441,796 ns for its three-sample

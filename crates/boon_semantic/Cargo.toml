@@ -10,6 +10,7 @@ boon_contract.workspace = true
 boon_data.workspace = true
 boon_typecheck.workspace = true
 serde.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 boon_parser.workspace = true

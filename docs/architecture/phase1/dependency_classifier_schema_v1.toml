@@ -4579,7 +4579,7 @@ fields = [
 [[records]]
 kind = "struct"
 source = "crates/boon_semantic/src/dependency_manifest.rs"
-name = "CallableDependencyEntryV2"
+name = "CallableDependencyEntryV3"
 fields = [
   { name = "callable", disposition = "r-fc-priv-sp-id-pc-n", reviewed = true },
   { name = "checked_callable", disposition = "r-fc-priv-sp-id-pc-n", reviewed = true },
@@ -4599,7 +4599,7 @@ fields = [
 [[records]]
 kind = "struct"
 source = "crates/boon_semantic/src/dependency_manifest.rs"
-name = "CallableDependencyManifestV2"
+name = "CallableDependencyManifestV3"
 fields = [
   { name = "schema", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
   { name = "source_bundle_digest_v1", disposition = "a-frca-priv-sp-id-pc-n", reviewed = true },
@@ -4616,7 +4616,7 @@ fields = [
 [[records]]
 kind = "struct"
 source = "crates/boon_semantic/src/dependency_manifest.rs"
-name = "ProgramRootDependencyEntryV2"
+name = "ProgramRootDependencyEntryV3"
 fields = [
   { name = "direct_dependency_ids", disposition = "a-c-priv-sp-id-pc-n", reviewed = true },
   { name = "public_shape_digest", disposition = "a-ca-priv-sp-id-pc-n", reviewed = true },

@@ -1,4 +1,4 @@
-//! Exhaustive callable dependency closure for verification and lowering.
+//! Exhaustive callable dependency graph for verification and lowering.
 //!
 //! The manifest is derived only after every semantic graph is final. Checked
 //! IDs are retained as source provenance; semantic IDs and explicit child
@@ -15,23 +15,27 @@ use boon_typecheck::{
     LexicalScopeId, ProgramRole, Type, TypeVar,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt;
 
-pub const CALLABLE_DEPENDENCY_MANIFEST_SCHEMA_V2: &str = "boon.callable-dependency-manifest.v2";
+pub const CALLABLE_DEPENDENCY_MANIFEST_SCHEMA_V3: &str = "boon.callable-dependency-manifest.v3";
 const CHECKED_PROGRAM_DIGEST_DOMAIN: &[u8] = b"boon.checked-program.v1\0";
 const DEPENDENCY_COMPONENT_DIGEST_DOMAIN: &[u8] = b"boon.callable-dependency-components.v1\0";
 const DEPENDENCY_RECORD_PAYLOAD_DOMAIN: &[u8] = b"boon.callable-dependency-record-payload.v1\0";
 const DEPENDENCY_OUT_TYPE_DIGEST_DOMAIN: &[u8] = b"boon.callable-dependency-out-type.v1\0";
 const DEPENDENCY_FLOW_TYPE_DIGEST_DOMAIN: &[u8] = b"boon.callable-dependency-flow-type.v1\0";
 const DEPENDENCY_RECORD_DIGEST_DOMAIN: &[u8] = b"boon.callable-dependency-record.v1\0";
-const DEPENDENCY_RECORD_RANGE_DIGEST_DOMAIN: &[u8] = b"boon.callable-dependency-record-range.v1\0";
-const DEPENDENCY_RECORD_SET_DIGEST_DOMAIN: &[u8] = b"boon.callable-dependency-record-set.v1\0";
+const DEPENDENCY_RECORD_SET_DIGEST_DOMAIN: &[u8] = b"boon.callable-dependency-record-set.v2\0";
 const DEPENDENCY_COVERAGE_SET_DIGEST_DOMAIN: &[u8] = b"boon.callable-dependency-coverage-set.v1\0";
-const DEPENDENCY_CALLABLE_SET_DIGEST_DOMAIN: &[u8] = b"boon.callable-dependency-callable-set.v2\0";
+const DEPENDENCY_CALLABLE_SET_DIGEST_DOMAIN: &[u8] = b"boon.callable-dependency-callable-set.v3\0";
 const DEPENDENCY_PUBLIC_SHAPE_DOMAIN: &[u8] = b"boon.callable-dependency-public-shape.v1\0";
-const DEPENDENCY_IMPLEMENTATION_DOMAIN: &[u8] = b"boon.callable-dependency-implementation.v1\0";
-const DEPENDENCY_MANIFEST_DIGEST_DOMAIN: &[u8] = b"boon.callable-dependency-manifest.v2\0";
+const DEPENDENCY_IMPLEMENTATION_OWNER_DOMAIN: &[u8] =
+    b"boon.callable-dependency-implementation-owner.v2\0";
+const DEPENDENCY_IMPLEMENTATION_COMPONENT_DOMAIN: &[u8] =
+    b"boon.callable-dependency-implementation-component.v2\0";
+const DEPENDENCY_IMPLEMENTATION_DOMAIN: &[u8] = b"boon.callable-dependency-implementation.v2\0";
+const DEPENDENCY_MANIFEST_DIGEST_DOMAIN: &[u8] = b"boon.callable-dependency-manifest.v3\0";
 const DEPENDENCY_MANIFEST_WORKER_LIMIT: usize = 4;
 
 macro_rules! dependency_id {
@@ -68,18 +72,6 @@ macro_rules! dependency_id {
 }
 
 dependency_id!(SemanticDependencyRecordId, SemanticDependencyCoverageId);
-
-/// Transient inclusive-start/exclusive-end run of dense dependency records.
-///
-/// The manifest derives exact implementation digests from these ranges, then
-/// discards them. Direct dependency IDs plus the record/owner reference graph
-/// are the compact canonical proof source from which deep validation rederives
-/// the same transitive closure.
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-struct SemanticDependencyRecordRangeV1 {
-    start: SemanticDependencyRecordId,
-    length: usize,
-}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -529,14 +521,14 @@ pub struct SemanticDependencyCoverageV1 {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ProgramRootDependencyEntryV2 {
+pub struct ProgramRootDependencyEntryV3 {
     pub direct_dependency_ids: Vec<SemanticDependencyRecordId>,
     pub public_shape_digest: [u8; 32],
     pub implementation_dependency_digest: [u8; 32],
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct CallableDependencyEntryV2 {
+pub struct CallableDependencyEntryV3 {
     pub callable: SemanticCallableId,
     pub checked_callable: DeclId,
     pub direct_dependency_ids: Vec<SemanticDependencyRecordId>,
@@ -558,14 +550,14 @@ pub struct CallableDependencyComponentDigestsV1 {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct CallableDependencyManifestV2 {
+pub struct CallableDependencyManifestV3 {
     pub schema: String,
     pub source_bundle_digest_v1: SourceBundleDigestV1,
     pub checked_program_digest: CheckedProgramDigestV1,
     pub dependency_classifier_schema_digest: DependencyClassifierSchemaDigestV1,
     pub component_digests: CallableDependencyComponentDigestsV1,
-    pub program_root: ProgramRootDependencyEntryV2,
-    pub callable_entries: Vec<CallableDependencyEntryV2>,
+    pub program_root: ProgramRootDependencyEntryV3,
+    pub callable_entries: Vec<CallableDependencyEntryV3>,
     pub dependencies: Vec<SemanticDependencyRecordV1>,
     pub coverage: Vec<SemanticDependencyCoverageV1>,
     pub manifest_digest: CallableDependencyManifestDigestV1,
@@ -1418,304 +1410,535 @@ struct DependencyCollector {
     flow_type_digests: HashMap<FlowType, [u8; 32]>,
 }
 
-fn queue_unvisited_dependency(
-    dependency: SemanticDependencyRecordId,
-    owner_ordinal: usize,
-    records: &[SemanticDependencyRecordV1],
-    visit_generation: &mut [usize],
-    pending: &mut Vec<SemanticDependencyRecordId>,
-) -> Result<(), CallableDependencyManifestError> {
-    let dependency_index = dependency.as_usize();
-    records
-        .get(dependency_index)
-        .filter(|record| record.id == dependency)
-        .ok_or_else(|| {
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+enum DependencyProofNodeV3 {
+    Owner { owner: SemanticDependencyOwnerV1 },
+    Record { record: SemanticDependencyRecordId },
+}
+
+struct DependencyProofGraph<'a> {
+    owners: &'a [SemanticDependencyOwnerV1],
+    owner_ordinals: HashMap<SemanticDependencyOwnerV1, usize>,
+    direct_by_owner: Vec<&'a [SemanticDependencyRecordId]>,
+    records: &'a [SemanticDependencyRecordV1],
+}
+
+impl<'a> DependencyProofGraph<'a> {
+    fn new(
+        owners: &'a [SemanticDependencyOwnerV1],
+        records: &'a [SemanticDependencyRecordV1],
+        direct: &'a BTreeMap<SemanticDependencyOwnerV1, Vec<SemanticDependencyRecordId>>,
+    ) -> Result<Self, CallableDependencyManifestError> {
+        let owner_ordinals = owners
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(ordinal, owner)| (owner, ordinal))
+            .collect::<HashMap<_, _>>();
+        if owner_ordinals.len() != owners.len() {
+            return Err(CallableDependencyManifestError::new(
+                "dependency proof graph has duplicate owners",
+            ));
+        }
+        let direct_by_owner = owners
+            .iter()
+            .map(|owner| {
+                direct.get(owner).map(Vec::as_slice).ok_or_else(|| {
+                    CallableDependencyManifestError::new(format!(
+                        "dependency proof graph has no direct entry for owner {owner:?}"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            owners,
+            owner_ordinals,
+            direct_by_owner,
+            records,
+        })
+    }
+
+    fn node_count(&self) -> Result<usize, CallableDependencyManifestError> {
+        self.owners
+            .len()
+            .checked_add(self.records.len())
+            .ok_or_else(|| {
+                CallableDependencyManifestError::new(
+                    "dependency proof graph node count overflows usize",
+                )
+            })
+    }
+
+    fn record_node(
+        &self,
+        record: SemanticDependencyRecordId,
+    ) -> Result<usize, CallableDependencyManifestError> {
+        self.records
+            .get(record.as_usize())
+            .filter(|candidate| candidate.id == record)
+            .ok_or_else(|| {
+                CallableDependencyManifestError::new(format!(
+                    "dependency proof graph references missing record {record}"
+                ))
+            })?;
+        Ok(self.owners.len() + record.as_usize())
+    }
+
+    fn node_identity(
+        &self,
+        node: usize,
+    ) -> Result<DependencyProofNodeV3, CallableDependencyManifestError> {
+        if let Some(owner) = self.owners.get(node).copied() {
+            return Ok(DependencyProofNodeV3::Owner { owner });
+        }
+        let record_index = node.checked_sub(self.owners.len()).ok_or_else(|| {
             CallableDependencyManifestError::new(format!(
-                "dependency closure references missing record {dependency}"
+                "dependency proof graph references invalid node {node}"
             ))
         })?;
-    if visit_generation[dependency_index] != owner_ordinal {
-        visit_generation[dependency_index] = owner_ordinal;
-        pending.push(dependency);
+        let record = self.records.get(record_index).ok_or_else(|| {
+            CallableDependencyManifestError::new(format!(
+                "dependency proof graph references invalid node {node}"
+            ))
+        })?;
+        Ok(DependencyProofNodeV3::Record { record: record.id })
+    }
+
+    fn out_degree(&self, node: usize) -> Result<usize, CallableDependencyManifestError> {
+        if let Some(direct) = self.direct_by_owner.get(node) {
+            return Ok(direct.len());
+        }
+        let record_index = node.checked_sub(self.owners.len()).ok_or_else(|| {
+            CallableDependencyManifestError::new(format!(
+                "dependency proof graph references invalid node {node}"
+            ))
+        })?;
+        let record = self.records.get(record_index).ok_or_else(|| {
+            CallableDependencyManifestError::new(format!(
+                "dependency proof graph references invalid node {node}"
+            ))
+        })?;
+        record
+            .referenced_dependencies
+            .len()
+            .checked_add(record.referenced_owners.len())
+            .ok_or_else(|| {
+                CallableDependencyManifestError::new(format!(
+                    "dependency record {} edge count overflows usize",
+                    record.id
+                ))
+            })
+    }
+
+    fn edge_target(
+        &self,
+        node: usize,
+        edge: usize,
+    ) -> Result<usize, CallableDependencyManifestError> {
+        if let Some(direct) = self.direct_by_owner.get(node) {
+            let dependency = direct.get(edge).copied().ok_or_else(|| {
+                CallableDependencyManifestError::new(format!(
+                    "dependency owner {:?} has no edge {edge}",
+                    self.owners[node]
+                ))
+            })?;
+            return self.record_node(dependency);
+        }
+        let record_index = node.checked_sub(self.owners.len()).ok_or_else(|| {
+            CallableDependencyManifestError::new(format!(
+                "dependency proof graph references invalid node {node}"
+            ))
+        })?;
+        let record = self.records.get(record_index).ok_or_else(|| {
+            CallableDependencyManifestError::new(format!(
+                "dependency proof graph references invalid node {node}"
+            ))
+        })?;
+        if let Some(dependency) = record.referenced_dependencies.get(edge).copied() {
+            return self.record_node(dependency);
+        }
+        let owner_edge = edge - record.referenced_dependencies.len();
+        let owner = record
+            .referenced_owners
+            .get(owner_edge)
+            .copied()
+            .ok_or_else(|| {
+                CallableDependencyManifestError::new(format!(
+                    "dependency record {} has no edge {edge}",
+                    record.id
+                ))
+            })?;
+        self.owner_ordinals.get(&owner).copied().ok_or_else(|| {
+            CallableDependencyManifestError::new(format!(
+                "dependency proof graph references missing owner {owner:?}"
+            ))
+        })
+    }
+}
+
+struct DependencyProofTopology {
+    forward_offsets: Vec<usize>,
+    targets: Vec<usize>,
+    reverse_offsets: Vec<usize>,
+    sources: Vec<usize>,
+}
+
+impl DependencyProofTopology {
+    fn build(graph: &DependencyProofGraph<'_>) -> Result<Self, CallableDependencyManifestError> {
+        let node_count = graph.node_count()?;
+        let mut forward_offsets = vec![0usize; node_count + 1];
+        let mut reverse_offsets = vec![0usize; node_count + 1];
+        for source in 0..node_count {
+            let degree = graph.out_degree(source)?;
+            forward_offsets[source + 1] =
+                forward_offsets[source].checked_add(degree).ok_or_else(|| {
+                    CallableDependencyManifestError::new(
+                        "dependency proof graph edge count overflows usize",
+                    )
+                })?;
+            for edge in 0..degree {
+                let target = graph.edge_target(source, edge)?;
+                reverse_offsets[target + 1] =
+                    reverse_offsets[target + 1].checked_add(1).ok_or_else(|| {
+                        CallableDependencyManifestError::new(
+                            "dependency proof reverse degree overflows usize",
+                        )
+                    })?;
+            }
+        }
+        for node in 0..node_count {
+            reverse_offsets[node + 1] = reverse_offsets[node + 1]
+                .checked_add(reverse_offsets[node])
+                .ok_or_else(|| {
+                    CallableDependencyManifestError::new(
+                        "dependency proof reverse offsets overflow usize",
+                    )
+                })?;
+        }
+        let edge_count = forward_offsets[node_count];
+        let mut targets = vec![0usize; edge_count];
+        let mut next = reverse_offsets[..node_count].to_vec();
+        let mut sources = vec![0usize; edge_count];
+        for source in 0..node_count {
+            for edge in 0..graph.out_degree(source)? {
+                let target = graph.edge_target(source, edge)?;
+                targets[forward_offsets[source] + edge] = target;
+                let slot = next[target];
+                sources[slot] = source;
+                next[target] += 1;
+            }
+        }
+        Ok(Self {
+            forward_offsets,
+            targets,
+            reverse_offsets,
+            sources,
+        })
+    }
+
+    fn dependencies(&self, node: usize) -> &[usize] {
+        &self.targets[self.forward_offsets[node]..self.forward_offsets[node + 1]]
+    }
+
+    fn predecessors(&self, node: usize) -> &[usize] {
+        &self.sources[self.reverse_offsets[node]..self.reverse_offsets[node + 1]]
+    }
+}
+
+fn dependency_proof_postorder(topology: &DependencyProofTopology) -> Vec<usize> {
+    let node_count = topology.forward_offsets.len() - 1;
+    let mut visited = vec![false; node_count];
+    let mut order = Vec::with_capacity(node_count);
+    let mut pending = Vec::new();
+    for start in 0..node_count {
+        if visited[start] {
+            continue;
+        }
+        visited[start] = true;
+        pending.push((start, 0usize));
+        while let Some((node, next_edge)) = pending.last_mut() {
+            if *next_edge < topology.dependencies(*node).len() {
+                let target = topology.dependencies(*node)[*next_edge];
+                *next_edge += 1;
+                if !visited[target] {
+                    visited[target] = true;
+                    pending.push((target, 0));
+                }
+            } else {
+                order.push(*node);
+                pending.pop();
+            }
+        }
+    }
+    order
+}
+
+fn dependency_proof_components(
+    topology: &DependencyProofTopology,
+) -> (Vec<usize>, Vec<Vec<usize>>) {
+    let order = dependency_proof_postorder(topology);
+    let node_count = topology.forward_offsets.len() - 1;
+    let mut component_by_node = vec![usize::MAX; node_count];
+    let mut components = Vec::new();
+    let mut pending = Vec::new();
+    for start in order.into_iter().rev() {
+        if component_by_node[start] != usize::MAX {
+            continue;
+        }
+        let component = components.len();
+        let mut members = Vec::new();
+        component_by_node[start] = component;
+        pending.push(start);
+        while let Some(node) = pending.pop() {
+            members.push(node);
+            for predecessor in topology.predecessors(node).iter().copied() {
+                if component_by_node[predecessor] == usize::MAX {
+                    component_by_node[predecessor] = component;
+                    pending.push(predecessor);
+                }
+            }
+        }
+        members.sort_unstable();
+        components.push(members);
+    }
+    (component_by_node, components)
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct DependencyGraphDigestStats {
+    nodes: usize,
+    edges: usize,
+    components: usize,
+    cyclic_components: usize,
+    maximum_component_nodes: usize,
+    component_edges: usize,
+}
+
+type DependencyGraphDigestMap = BTreeMap<SemanticDependencyOwnerV1, [u8; 32]>;
+
+fn dependency_proof_update_usize(
+    hasher: &mut Sha256,
+    value: usize,
+    context: &str,
+) -> Result<(), CallableDependencyManifestError> {
+    let value = u64::try_from(value).map_err(|_| {
+        CallableDependencyManifestError::new(format!(
+            "{context} exceeds the dependency proof u64 encoding"
+        ))
+    })?;
+    hasher.update(value.to_be_bytes());
+    Ok(())
+}
+
+fn dependency_proof_update_owner(
+    hasher: &mut Sha256,
+    owner: SemanticDependencyOwnerV1,
+) -> Result<(), CallableDependencyManifestError> {
+    match owner {
+        SemanticDependencyOwnerV1::ProgramRoot => hasher.update([0]),
+        SemanticDependencyOwnerV1::Callable { callable } => {
+            hasher.update([1]);
+            dependency_proof_update_usize(hasher, callable.as_usize(), "semantic callable ID")?;
+        }
     }
     Ok(())
 }
 
-fn dependency_ranges_for_generation(
-    visit_generation: &[usize],
-    owner_ordinal: usize,
-) -> Vec<SemanticDependencyRecordRangeV1> {
-    let mut ranges = Vec::new();
-    let mut run_start = None;
-    for (index, generation) in visit_generation.iter().copied().enumerate() {
-        if generation == owner_ordinal {
-            run_start.get_or_insert(index);
-        } else if let Some(start) = run_start.take() {
-            ranges.push(SemanticDependencyRecordRangeV1 {
-                start: SemanticDependencyRecordId(start),
-                length: index - start,
-            });
+fn dependency_proof_update_node(
+    hasher: &mut Sha256,
+    node: DependencyProofNodeV3,
+) -> Result<(), CallableDependencyManifestError> {
+    match node {
+        DependencyProofNodeV3::Owner { owner } => {
+            hasher.update([0]);
+            dependency_proof_update_owner(hasher, owner)?;
+        }
+        DependencyProofNodeV3::Record { record } => {
+            hasher.update([1]);
+            dependency_proof_update_usize(hasher, record.as_usize(), "dependency record ID")?;
         }
     }
-    if let Some(start) = run_start {
-        ranges.push(SemanticDependencyRecordRangeV1 {
-            start: SemanticDependencyRecordId(start),
-            length: visit_generation.len() - start,
-        });
-    }
-    ranges
+    Ok(())
 }
 
-fn dependency_closure_for_owner(
-    owner_ordinal: usize,
+fn dependency_proof_owner_digest(
     owner: SemanticDependencyOwnerV1,
-    records: &[SemanticDependencyRecordV1],
-    direct: &BTreeMap<SemanticDependencyOwnerV1, Vec<SemanticDependencyRecordId>>,
-    owner_ordinals: &BTreeMap<SemanticDependencyOwnerV1, usize>,
-    direct_by_owner: &[Vec<SemanticDependencyRecordId>],
-    visit_generation: &mut [usize],
-) -> Result<Vec<SemanticDependencyRecordRangeV1>, CallableDependencyManifestError> {
-    let mut pending = Vec::new();
-    for dependency in direct.get(&owner).into_iter().flatten().copied() {
-        queue_unvisited_dependency(
-            dependency,
-            owner_ordinal,
-            records,
-            visit_generation,
-            &mut pending,
+    direct: &[SemanticDependencyRecordId],
+) -> Result<[u8; 32], CallableDependencyManifestError> {
+    let mut hasher = Sha256::new();
+    hasher.update(DEPENDENCY_IMPLEMENTATION_OWNER_DOMAIN);
+    dependency_proof_update_owner(&mut hasher, owner)?;
+    dependency_proof_update_usize(&mut hasher, direct.len(), "owner dependency count")?;
+    for dependency in direct {
+        dependency_proof_update_usize(
+            &mut hasher,
+            dependency.as_usize(),
+            "owner dependency record ID",
         )?;
     }
-    while let Some(dependency) = pending.pop() {
-        let dependency_index = dependency.as_usize();
-        let record = &records[dependency_index];
-        for referenced_dependency in &record.referenced_dependencies {
-            queue_unvisited_dependency(
-                *referenced_dependency,
-                owner_ordinal,
-                records,
-                visit_generation,
-                &mut pending,
-            )?;
-        }
-        for referenced_owner in &record.referenced_owners {
-            let referenced_owner_ordinal = owner_ordinals
-                .get(referenced_owner)
-                .copied()
-                .ok_or_else(|| {
-                    CallableDependencyManifestError::new(format!(
-                        "dependency closure references missing owner {referenced_owner:?}"
-                    ))
-                })?;
-            for referenced_dependency in direct_by_owner
-                .get(referenced_owner_ordinal)
-                .ok_or_else(|| {
-                    CallableDependencyManifestError::new(format!(
-                        "dependency closure has no dense direct entry for owner {referenced_owner:?}"
-                    ))
-                })?
-            {
-                queue_unvisited_dependency(
-                    *referenced_dependency,
-                    owner_ordinal,
-                    records,
-                    visit_generation,
-                    &mut pending,
-                )?;
+    Ok(hasher.finalize().into())
+}
+
+fn dependency_proof_component_digest(
+    graph: &DependencyProofGraph<'_>,
+    members: &[usize],
+    dependencies: &[usize],
+    representatives: &[usize],
+    component_digests: &[Option<[u8; 32]>],
+    record_digest_index: &DependencyRecordDigestIndex,
+) -> Result<[u8; 32], CallableDependencyManifestError> {
+    let mut hasher = Sha256::new();
+    hasher.update(DEPENDENCY_IMPLEMENTATION_COMPONENT_DOMAIN);
+    dependency_proof_update_usize(&mut hasher, members.len(), "proof component member count")?;
+    for node in members.iter().copied() {
+        let node_identity = graph.node_identity(node)?;
+        dependency_proof_update_node(&mut hasher, node_identity)?;
+        let local_digest = match node_identity {
+            DependencyProofNodeV3::Owner { owner } => {
+                let owner_ordinal = graph.owner_ordinals[&owner];
+                dependency_proof_owner_digest(owner, graph.direct_by_owner[owner_ordinal])?
+            }
+            DependencyProofNodeV3::Record { record } => {
+                record_digest_index.record_digest(record)?
+            }
+        };
+        hasher.update(local_digest);
+    }
+    dependency_proof_update_usize(
+        &mut hasher,
+        dependencies.len(),
+        "proof component dependency count",
+    )?;
+    for dependency in dependencies.iter().copied() {
+        dependency_proof_update_node(
+            &mut hasher,
+            graph.node_identity(representatives[dependency])?,
+        )?;
+        hasher.update(component_digests[dependency].ok_or_else(|| {
+            CallableDependencyManifestError::new(
+                "dependency proof component was hashed before its dependency",
+            )
+        })?);
+    }
+    Ok(hasher.finalize().into())
+}
+
+fn dependency_proof_implementation_digest(
+    owner: SemanticDependencyOwnerV1,
+    representative: DependencyProofNodeV3,
+    component_digest: [u8; 32],
+) -> Result<[u8; 32], CallableDependencyManifestError> {
+    let mut hasher = Sha256::new();
+    hasher.update(DEPENDENCY_IMPLEMENTATION_DOMAIN);
+    dependency_proof_update_owner(&mut hasher, owner)?;
+    dependency_proof_update_node(&mut hasher, representative)?;
+    hasher.update(component_digest);
+    Ok(hasher.finalize().into())
+}
+
+/// Commits the exact reachable implementation graph once rather than
+/// enumerating every owner's transitive record set. Strongly connected
+/// components make cycles explicit; the condensed graph is a DAG whose
+/// content-addressed child digests propagate every reachable record and edge
+/// change to the owning callable without pulling in unrelated components.
+fn build_dependency_graph_digests(
+    owners: &[SemanticDependencyOwnerV1],
+    records: &[SemanticDependencyRecordV1],
+    direct: &BTreeMap<SemanticDependencyOwnerV1, Vec<SemanticDependencyRecordId>>,
+    record_digest_index: &DependencyRecordDigestIndex,
+) -> Result<(DependencyGraphDigestMap, DependencyGraphDigestStats), CallableDependencyManifestError>
+{
+    let graph = DependencyProofGraph::new(owners, records, direct)?;
+    let topology = DependencyProofTopology::build(&graph)?;
+    let (component_by_node, components) = dependency_proof_components(&topology);
+    let representatives = components
+        .iter()
+        .map(|members| {
+            members.first().copied().ok_or_else(|| {
+                CallableDependencyManifestError::new(
+                    "dependency proof graph produced an empty component",
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut outgoing = vec![Vec::new(); components.len()];
+    let node_count = graph.node_count()?;
+    for source in 0..node_count {
+        let source_component = component_by_node[source];
+        for target in topology.dependencies(source).iter().copied() {
+            let target_component = component_by_node[target];
+            if source_component != target_component {
+                outgoing[source_component].push(target_component);
             }
         }
     }
-    Ok(dependency_ranges_for_generation(
-        visit_generation,
-        owner_ordinal,
-    ))
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct DependencyClosureDigestStats {
-    total_ids: usize,
-    total_ranges: usize,
-    maximum_ids: usize,
-}
-
-impl DependencyClosureDigestStats {
-    fn record(&mut self, ranges: &[SemanticDependencyRecordRangeV1]) {
-        let ids = ranges.iter().map(|range| range.length).sum::<usize>();
-        self.total_ids = self.total_ids.saturating_add(ids);
-        self.total_ranges = self.total_ranges.saturating_add(ranges.len());
-        self.maximum_ids = self.maximum_ids.max(ids);
+    for dependencies in &mut outgoing {
+        dependencies.sort_unstable_by_key(|component| representatives[*component]);
+        dependencies.dedup();
     }
 
-    fn merge(&mut self, other: Self) {
-        self.total_ids = self.total_ids.saturating_add(other.total_ids);
-        self.total_ranges = self.total_ranges.saturating_add(other.total_ranges);
-        self.maximum_ids = self.maximum_ids.max(other.maximum_ids);
+    let mut parents = vec![Vec::new(); components.len()];
+    let mut remaining_dependencies = Vec::with_capacity(components.len());
+    for (component, dependencies) in outgoing.iter().enumerate() {
+        remaining_dependencies.push(dependencies.len());
+        for dependency in dependencies {
+            parents[*dependency].push(component);
+        }
     }
-}
-
-type DependencyClosureDigestMap = BTreeMap<SemanticDependencyOwnerV1, [u8; 32]>;
-
-fn dependency_closure_digest_for_owner(
-    owner_ordinal: usize,
-    owner: SemanticDependencyOwnerV1,
-    records: &[SemanticDependencyRecordV1],
-    direct: &BTreeMap<SemanticDependencyOwnerV1, Vec<SemanticDependencyRecordId>>,
-    owner_ordinals: &BTreeMap<SemanticDependencyOwnerV1, usize>,
-    direct_by_owner: &[Vec<SemanticDependencyRecordId>],
-    visit_generation: &mut [usize],
-    record_digest_index: &DependencyRecordDigestIndex,
-) -> Result<([u8; 32], DependencyClosureDigestStats), CallableDependencyManifestError> {
-    let ranges = dependency_closure_for_owner(
-        owner_ordinal,
-        owner,
-        records,
-        direct,
-        owner_ordinals,
-        direct_by_owner,
-        visit_generation,
-    )?;
-    let mut stats = DependencyClosureDigestStats::default();
-    stats.record(&ranges);
-    Ok((
-        implementation_dependency_digest(owner, &ranges, record_digest_index)?,
-        stats,
-    ))
-}
-
-/// Re-derives every owner's exact transitive closure and immediately commits
-/// it to the implementation digest. V2 does not persist closure ranges, so
-/// retaining all owner/range vectors and walking them again serially would be
-/// duplicate transient state. Each bounded worker keeps only its generation
-/// marks and the current owner's ranges.
-#[cfg(not(target_arch = "wasm32"))]
-fn build_dependency_closure_digests(
-    owners: &[SemanticDependencyOwnerV1],
-    records: &[SemanticDependencyRecordV1],
-    direct: &BTreeMap<SemanticDependencyOwnerV1, Vec<SemanticDependencyRecordId>>,
-    owner_ordinals: &BTreeMap<SemanticDependencyOwnerV1, usize>,
-    direct_by_owner: &[Vec<SemanticDependencyRecordId>],
-    record_digest_index: &DependencyRecordDigestIndex,
-) -> Result<
-    (
-        DependencyClosureDigestMap,
-        DependencyClosureDigestStats,
-        usize,
-    ),
-    CallableDependencyManifestError,
-> {
-    const PARALLEL_OWNER_THRESHOLD: usize = 8;
-    const PARALLEL_RECORD_THRESHOLD: usize = 4_096;
-
-    let worker_count = std::thread::available_parallelism()
-        .map(usize::from)
-        .unwrap_or(1)
-        .min(DEPENDENCY_MANIFEST_WORKER_LIMIT)
-        .min(owners.len().max(1));
-    if worker_count == 1
-        || owners.len() < PARALLEL_OWNER_THRESHOLD
-        || records.len() < PARALLEL_RECORD_THRESHOLD
-    {
-        let mut visit_generation = vec![usize::MAX; records.len()];
-        let mut digests = BTreeMap::new();
-        let mut stats = DependencyClosureDigestStats::default();
-        for (owner_ordinal, owner) in owners.iter().copied().enumerate() {
-            let (digest, owner_stats) = dependency_closure_digest_for_owner(
-                owner_ordinal,
-                owner,
-                records,
-                direct,
-                owner_ordinals,
-                direct_by_owner,
-                &mut visit_generation,
-                record_digest_index,
-            )?;
-            digests.insert(owner, digest);
-            stats.merge(owner_stats);
-        }
-        return Ok((digests, stats, 1));
-    }
-
-    std::thread::scope(|scope| {
-        let handles = (0..worker_count)
-            .map(|worker| {
-                scope.spawn(move || {
-                    let mut visit_generation = vec![usize::MAX; records.len()];
-                    let mut digests = Vec::new();
-                    for owner_ordinal in (worker..owners.len()).step_by(worker_count) {
-                        let owner = owners[owner_ordinal];
-                        let (digest, stats) = dependency_closure_digest_for_owner(
-                            owner_ordinal,
-                            owner,
-                            records,
-                            direct,
-                            owner_ordinals,
-                            direct_by_owner,
-                            &mut visit_generation,
-                            record_digest_index,
-                        )?;
-                        digests.push((owner_ordinal, owner, digest, stats));
-                    }
-                    Ok::<_, CallableDependencyManifestError>(digests)
-                })
-            })
-            .collect::<Vec<_>>();
-        let mut digests = Vec::with_capacity(owners.len());
-        for handle in handles {
-            digests.extend(handle.join().map_err(|_| {
-                CallableDependencyManifestError::new(
-                    "dependency closure digest worker terminated unexpectedly",
-                )
-            })??);
-        }
-        digests.sort_by_key(|(owner_ordinal, _, _, _)| *owner_ordinal);
-        let mut stats = DependencyClosureDigestStats::default();
-        for (_, _, _, owner_stats) in &digests {
-            stats.merge(*owner_stats);
-        }
-        Ok((
-            digests
-                .into_iter()
-                .map(|(_, owner, digest, _)| (owner, digest))
-                .collect(),
-            stats,
-            worker_count,
-        ))
-    })
-}
-
-#[cfg(target_arch = "wasm32")]
-fn build_dependency_closure_digests(
-    owners: &[SemanticDependencyOwnerV1],
-    records: &[SemanticDependencyRecordV1],
-    direct: &BTreeMap<SemanticDependencyOwnerV1, Vec<SemanticDependencyRecordId>>,
-    owner_ordinals: &BTreeMap<SemanticDependencyOwnerV1, usize>,
-    direct_by_owner: &[Vec<SemanticDependencyRecordId>],
-    record_digest_index: &DependencyRecordDigestIndex,
-) -> Result<
-    (
-        DependencyClosureDigestMap,
-        DependencyClosureDigestStats,
-        usize,
-    ),
-    CallableDependencyManifestError,
-> {
-    let mut visit_generation = vec![usize::MAX; records.len()];
-    let mut digests = BTreeMap::new();
-    let mut stats = DependencyClosureDigestStats::default();
-    for (owner_ordinal, owner) in owners.iter().copied().enumerate() {
-        let (digest, owner_stats) = dependency_closure_digest_for_owner(
-            owner_ordinal,
-            owner,
-            records,
-            direct,
-            owner_ordinals,
-            direct_by_owner,
-            &mut visit_generation,
+    let mut ready = remaining_dependencies
+        .iter()
+        .enumerate()
+        .filter_map(|(component, remaining)| (*remaining == 0).then_some(component))
+        .collect::<VecDeque<_>>();
+    let mut component_digests = vec![None; components.len()];
+    let mut completed_components = 0usize;
+    while let Some(component) = ready.pop_front() {
+        component_digests[component] = Some(dependency_proof_component_digest(
+            &graph,
+            &components[component],
+            &outgoing[component],
+            &representatives,
+            &component_digests,
             record_digest_index,
+        )?);
+        completed_components += 1;
+        for parent in parents[component].iter().copied() {
+            remaining_dependencies[parent] -= 1;
+            if remaining_dependencies[parent] == 0 {
+                ready.push_back(parent);
+            }
+        }
+    }
+    if completed_components != components.len() {
+        return Err(CallableDependencyManifestError::new(
+            "dependency proof condensation graph is unexpectedly cyclic",
+        ));
+    }
+
+    let mut digests = BTreeMap::new();
+    for (owner_ordinal, owner) in owners.iter().copied().enumerate() {
+        let component = component_by_node[owner_ordinal];
+        let digest = dependency_proof_implementation_digest(
+            owner,
+            graph.node_identity(representatives[component])?,
+            component_digests[component].expect("all dependency proof components were hashed"),
         )?;
         digests.insert(owner, digest);
-        stats.merge(owner_stats);
     }
-    Ok((digests, stats, 1))
+
+    let stats = DependencyGraphDigestStats {
+        nodes: node_count,
+        edges: topology.targets.len(),
+        components: components.len(),
+        cyclic_components: components
+            .iter()
+            .filter(|members| members.len() > 1)
+            .count(),
+        maximum_component_nodes: components.iter().map(Vec::len).max().unwrap_or(0),
+        component_edges: outgoing.iter().map(Vec::len).sum(),
+    };
+    Ok((digests, stats))
 }
 
 impl DependencyCollector {
@@ -2276,7 +2499,7 @@ pub(crate) fn build_callable_dependency_manifest(
     view: &SemanticViewBindingGraphV1,
     storage: &SemanticScopeStorageGraphV1,
     memory: &SemanticMemoryGraphV1,
-) -> Result<CallableDependencyManifestV2, CallableDependencyManifestError> {
+) -> Result<CallableDependencyManifestV3, CallableDependencyManifestError> {
     let trace_dependency_manifest = std::env::var_os("BOON_SEMANTIC_TRACE").is_some();
     macro_rules! dependency_manifest_phase {
         ($name:literal, $expression:expr) => {{
@@ -2405,31 +2628,24 @@ pub(crate) fn build_callable_dependency_manifest(
         DependencyRecordDigestIndex::build(&dependencies)
     )?;
     let owner_list = owners.iter().copied().collect::<Vec<_>>();
-    let owner_ordinals = owner_list
-        .iter()
-        .copied()
-        .enumerate()
-        .map(|(ordinal, owner)| (owner, ordinal))
-        .collect::<BTreeMap<_, _>>();
-    let direct_by_owner = owner_list
-        .iter()
-        .map(|owner| direct.get(owner).cloned().unwrap_or_default())
-        .collect::<Vec<_>>();
-    let (closure_digests, closure_stats, closure_worker_count) = dependency_manifest_phase!(
-        "dependency_closure_digests",
-        build_dependency_closure_digests(
+    let (graph_digests, graph_stats) = dependency_manifest_phase!(
+        "dependency_graph_digests",
+        build_dependency_graph_digests(
             &owner_list,
             &dependencies,
             &direct,
-            &owner_ordinals,
-            &direct_by_owner,
             &dependency_record_digest_index,
         )
     )?;
     if trace_dependency_manifest {
         eprintln!(
-            "boon_semantic dependency_manifest closure:counts total_ids={} total_ranges={} maximum_ids={} workers={closure_worker_count}",
-            closure_stats.total_ids, closure_stats.total_ranges, closure_stats.maximum_ids,
+            "boon_semantic dependency_manifest graph:counts nodes={} edges={} components={} cyclic_components={} maximum_component_nodes={} component_edges={}",
+            graph_stats.nodes,
+            graph_stats.edges,
+            graph_stats.components,
+            graph_stats.cyclic_components,
+            graph_stats.maximum_component_nodes,
+            graph_stats.component_edges,
         );
     }
     let component_digests = dependency_manifest_phase!("component_digests", {
@@ -2452,14 +2668,14 @@ pub(crate) fn build_callable_dependency_manifest(
     let root_owner = SemanticDependencyOwnerV1::ProgramRoot;
     let root_direct = direct.get(&root_owner).cloned().unwrap_or_default();
     let root_implementation_dependency_digest =
-        closure_digests.get(&root_owner).copied().ok_or_else(|| {
+        graph_digests.get(&root_owner).copied().ok_or_else(|| {
             CallableDependencyManifestError::new(
                 "program root has no rederived implementation dependency digest",
             )
         })?;
     let program_root = dependency_manifest_phase!(
         "program_root_digest",
-        ProgramRootDependencyEntryV2 {
+        ProgramRootDependencyEntryV3 {
             public_shape_digest: canonical_dependency_hash(
                 DEPENDENCY_PUBLIC_SHAPE_DOMAIN,
                 &(checked.role, checked.source_bundle_digest_v1),
@@ -2491,13 +2707,13 @@ pub(crate) fn build_callable_dependency_manifest(
             ))
         })?;
         let implementation_dependency_digest =
-            closure_digests.get(&owner).copied().ok_or_else(|| {
+            graph_digests.get(&owner).copied().ok_or_else(|| {
                 CallableDependencyManifestError::new(format!(
                     "callable {} has no rederived implementation dependency digest",
                     callable.id
                 ))
             })?;
-        callable_entries.push(CallableDependencyEntryV2 {
+        callable_entries.push(CallableDependencyEntryV3 {
             callable: callable.id,
             checked_callable: callable.checked_callable,
             public_shape_digest: callable_public_shape_digest(callable)?,
@@ -2519,8 +2735,8 @@ pub(crate) fn build_callable_dependency_manifest(
             checked
         )?,)
     );
-    let mut manifest = CallableDependencyManifestV2 {
-        schema: CALLABLE_DEPENDENCY_MANIFEST_SCHEMA_V2.to_owned(),
+    let mut manifest = CallableDependencyManifestV3 {
+        schema: CALLABLE_DEPENDENCY_MANIFEST_SCHEMA_V3.to_owned(),
         source_bundle_digest_v1: checked.source_bundle_digest_v1,
         checked_program_digest,
         dependency_classifier_schema_digest: DependencyClassifierSchemaDigestV1(
@@ -2561,7 +2777,7 @@ pub(crate) fn build_callable_dependency_manifest(
     Ok(manifest)
 }
 
-impl CallableDependencyManifestV2 {
+impl CallableDependencyManifestV3 {
     pub(crate) fn validate_integrity(
         &self,
         dependency_classifier_schema_digest: [u8; 32],
@@ -2711,16 +2927,8 @@ fn callable_public_shape_digest(
     )
 }
 
-#[derive(Serialize)]
-struct DependencyRecordDigestRange {
-    start: usize,
-    length: usize,
-    digest: [u8; 32],
-}
-
 struct DependencyRecordDigestIndex {
-    levels: Vec<Vec<[u8; 32]>>,
-    record_count: usize,
+    record_digests: Vec<[u8; 32]>,
 }
 
 fn dependency_record_leaf_digests(
@@ -2802,172 +3010,63 @@ impl DependencyRecordDigestIndex {
                 started.elapsed().as_secs_f64() * 1000.0,
             );
         }
-        let levels_started = trace_dependency_manifest.then(std::time::Instant::now);
-        let mut scratch = Vec::new();
-        let record_count = leaves.len();
-        let mut levels = vec![leaves];
-        let mut width = 2usize;
-        while width <= record_count {
-            let previous = levels
-                .last()
-                .expect("dependency record digest index always has a leaf level");
-            let node_count = record_count / width;
-            let mut next = Vec::with_capacity(node_count);
-            for node_index in 0..node_count {
-                let start = node_index * width;
-                next.push(canonical_dependency_hash_with_buffer(
-                    DEPENDENCY_RECORD_RANGE_DIGEST_DOMAIN,
-                    &(
-                        start,
-                        width,
-                        previous[node_index * 2],
-                        previous[node_index * 2 + 1],
-                    ),
-                    &mut scratch,
-                )?);
-            }
-            levels.push(next);
-            let Some(next_width) = width.checked_mul(2) else {
-                break;
-            };
-            width = next_width;
-        }
-        if let Some(started) = levels_started {
-            eprintln!(
-                "boon_semantic dependency_manifest digest_index.levels:done elapsed_ms={:.3}",
-                started.elapsed().as_secs_f64() * 1000.0,
-            );
-        }
         Ok(Self {
-            levels,
-            record_count,
+            record_digests: leaves,
         })
     }
 
-    fn digest_ranges(
+    fn record_digest(
         &self,
-        closure: &[SemanticDependencyRecordRangeV1],
-    ) -> Result<Vec<DependencyRecordDigestRange>, CallableDependencyManifestError> {
-        let mut previous_end = None;
-        for range in closure {
-            let start = range.start.as_usize();
-            if range.length == 0 {
-                return Err(CallableDependencyManifestError::new(format!(
-                    "implementation dependency closure range at {start} is empty"
-                )));
-            }
-            let end = start.checked_add(range.length).ok_or_else(|| {
-                CallableDependencyManifestError::new(
-                    "implementation dependency closure range overflows usize",
-                )
-            })?;
-            if end > self.record_count {
-                return Err(CallableDependencyManifestError::new(format!(
-                    "implementation dependency closure range {start}..{end} exceeds {} records",
-                    self.record_count
-                )));
-            }
-            if previous_end.is_some_and(|previous_end| previous_end >= start) {
-                return Err(CallableDependencyManifestError::new(
-                    "implementation dependency closure ranges overlap, touch, or are not sorted",
-                ));
-            }
-            previous_end = Some(end);
-        }
-
-        let mut ranges = Vec::new();
-        for closure_range in closure {
-            let mut start = closure_range.start.as_usize();
-            let run_end = start + closure_range.length;
-            while start < run_end {
-                let remaining = run_end - start;
-                let largest_remaining = 1usize << (usize::BITS - 1 - remaining.leading_zeros());
-                let alignment = if start == 0 {
-                    largest_remaining
-                } else {
-                    1usize << start.trailing_zeros()
-                };
-                let length = largest_remaining.min(alignment);
-                let level = length.trailing_zeros() as usize;
-                let digest = self
-                    .levels
-                    .get(level)
-                    .and_then(|nodes| nodes.get(start / length))
-                    .copied()
-                    .ok_or_else(|| {
-                        CallableDependencyManifestError::new(format!(
-                            "dependency record digest index has no aligned range {start}..{}",
-                            start + length
-                        ))
-                    })?;
-                ranges.push(DependencyRecordDigestRange {
-                    start,
-                    length,
-                    digest,
-                });
-                start += length;
-            }
-        }
-        Ok(ranges)
+        record: SemanticDependencyRecordId,
+    ) -> Result<[u8; 32], CallableDependencyManifestError> {
+        self.record_digests
+            .get(record.as_usize())
+            .copied()
+            .ok_or_else(|| {
+                CallableDependencyManifestError::new(format!(
+                    "dependency record digest index has no record {record}"
+                ))
+            })
     }
 
     fn record_set_digest(&self) -> Result<[u8; 32], CallableDependencyManifestError> {
-        let full_range = (self.record_count != 0).then_some(SemanticDependencyRecordRangeV1 {
-            start: SemanticDependencyRecordId(0),
-            length: self.record_count,
-        });
-        let ranges = self.digest_ranges(full_range.as_slice())?;
-        canonical_dependency_hash(
-            DEPENDENCY_RECORD_SET_DIGEST_DOMAIN,
-            &(self.record_count, ranges),
-        )
+        let mut hasher = Sha256::new();
+        hasher.update(DEPENDENCY_RECORD_SET_DIGEST_DOMAIN);
+        dependency_proof_update_usize(
+            &mut hasher,
+            self.record_digests.len(),
+            "dependency record digest count",
+        )?;
+        for digest in &self.record_digests {
+            hasher.update(digest);
+        }
+        Ok(hasher.finalize().into())
     }
 }
 
-fn implementation_dependency_digest(
-    owner: SemanticDependencyOwnerV1,
-    closure: &[SemanticDependencyRecordRangeV1],
-    record_digest_index: &DependencyRecordDigestIndex,
-) -> Result<[u8; 32], CallableDependencyManifestError> {
-    let ranges = record_digest_index.digest_ranges(closure)?;
-    canonical_dependency_hash(DEPENDENCY_IMPLEMENTATION_DOMAIN, &(owner, ranges))
-}
-
 fn validate_implementation_dependency_digests(
-    manifest: &CallableDependencyManifestV2,
+    manifest: &CallableDependencyManifestV3,
     owners: &BTreeSet<SemanticDependencyOwnerV1>,
     direct: &BTreeMap<SemanticDependencyOwnerV1, Vec<SemanticDependencyRecordId>>,
 ) -> Result<(), CallableDependencyManifestError> {
     let owner_list = owners.iter().copied().collect::<Vec<_>>();
-    let owner_ordinals = owner_list
-        .iter()
-        .copied()
-        .enumerate()
-        .map(|(ordinal, owner)| (owner, ordinal))
-        .collect::<BTreeMap<_, _>>();
-    let direct_by_owner = owner_list
-        .iter()
-        .map(|owner| direct.get(owner).cloned().unwrap_or_default())
-        .collect::<Vec<_>>();
     let record_digest_index = DependencyRecordDigestIndex::build(&manifest.dependencies)?;
-    let (closure_digests, _, _) = build_dependency_closure_digests(
+    let (graph_digests, _) = build_dependency_graph_digests(
         &owner_list,
         &manifest.dependencies,
         direct,
-        &owner_ordinals,
-        &direct_by_owner,
         &record_digest_index,
     )?;
 
     let root_owner = SemanticDependencyOwnerV1::ProgramRoot;
-    let expected_root_digest = closure_digests.get(&root_owner).copied().ok_or_else(|| {
+    let expected_root_digest = graph_digests.get(&root_owner).copied().ok_or_else(|| {
         CallableDependencyManifestError::new(
             "program root has no rederived implementation dependency digest",
         )
     })?;
     if manifest.program_root.implementation_dependency_digest != expected_root_digest {
         return Err(CallableDependencyManifestError::new(
-            "program-root implementation dependency digest differs from its exact transitive closure",
+            "program-root implementation dependency digest differs from its exact dependency graph proof",
         ));
     }
 
@@ -2975,7 +3074,7 @@ fn validate_implementation_dependency_digests(
         let owner = SemanticDependencyOwnerV1::Callable {
             callable: entry.callable,
         };
-        let expected_digest = closure_digests.get(&owner).copied().ok_or_else(|| {
+        let expected_digest = graph_digests.get(&owner).copied().ok_or_else(|| {
             CallableDependencyManifestError::new(format!(
                 "callable {} has no rederived implementation dependency digest",
                 entry.callable
@@ -2983,7 +3082,7 @@ fn validate_implementation_dependency_digests(
         })?;
         if entry.implementation_dependency_digest != expected_digest {
             return Err(CallableDependencyManifestError::new(format!(
-                "callable {} implementation dependency digest differs from its exact transitive closure",
+                "callable {} implementation dependency digest differs from its exact dependency graph proof",
                 entry.callable
             )));
         }
@@ -2992,13 +3091,13 @@ fn validate_implementation_dependency_digests(
 }
 
 fn validate_manifest_shape(
-    manifest: &CallableDependencyManifestV2,
+    manifest: &CallableDependencyManifestV3,
     owners: &BTreeSet<SemanticDependencyOwnerV1>,
 ) -> Result<
     BTreeMap<SemanticDependencyOwnerV1, Vec<SemanticDependencyRecordId>>,
     CallableDependencyManifestError,
 > {
-    if manifest.schema != CALLABLE_DEPENDENCY_MANIFEST_SCHEMA_V2 {
+    if manifest.schema != CALLABLE_DEPENDENCY_MANIFEST_SCHEMA_V3 {
         return Err(CallableDependencyManifestError::new(format!(
             "unsupported callable dependency manifest schema `{}`",
             manifest.schema
@@ -3168,14 +3267,14 @@ struct CallableDependencyManifestDigestPayload<'a> {
     checked_program_digest: CheckedProgramDigestV1,
     dependency_classifier_schema_digest: DependencyClassifierSchemaDigestV1,
     component_digests: &'a CallableDependencyComponentDigestsV1,
-    program_root: &'a ProgramRootDependencyEntryV2,
+    program_root: &'a ProgramRootDependencyEntryV3,
     callable_entries_digest: [u8; 32],
     dependency_records_digest: [u8; 32],
     coverage_digest: [u8; 32],
 }
 
 fn callable_entries_digest(
-    entries: &[CallableDependencyEntryV2],
+    entries: &[CallableDependencyEntryV3],
 ) -> Result<[u8; 32], CallableDependencyManifestError> {
     canonical_dependency_hash(DEPENDENCY_CALLABLE_SET_DIGEST_DOMAIN, &entries)
 }
@@ -3187,7 +3286,7 @@ fn dependency_coverage_digest(
 }
 
 fn callable_dependency_manifest_digest_from_content(
-    manifest: &CallableDependencyManifestV2,
+    manifest: &CallableDependencyManifestV3,
     callable_entries_digest: [u8; 32],
     dependency_records_digest: [u8; 32],
     coverage_digest: [u8; 32],
@@ -3210,7 +3309,7 @@ fn callable_dependency_manifest_digest_from_content(
 }
 
 fn callable_dependency_manifest_digest(
-    manifest: &CallableDependencyManifestV2,
+    manifest: &CallableDependencyManifestV3,
 ) -> Result<CallableDependencyManifestDigestV1, CallableDependencyManifestError> {
     let dependency_record_digest_index =
         DependencyRecordDigestIndex::build(&manifest.dependencies)?;
@@ -8810,7 +8909,7 @@ FUNCTION add(value) {
     fn assert_manifest_mutation_rejected(
         program: &SemanticProgram,
         context: &str,
-        mutate: impl FnOnce(&mut CallableDependencyManifestV2),
+        mutate: impl FnOnce(&mut CallableDependencyManifestV3),
     ) {
         let mut manifest = program.dependency_manifest.clone();
         mutate(&mut manifest);
@@ -8851,38 +8950,21 @@ FUNCTION add(value) {
         )
     }
 
-    fn test_dependency_closure(
-        owner: SemanticDependencyOwnerV1,
+    fn test_dependency_graph_digests(
         owners: &BTreeSet<SemanticDependencyOwnerV1>,
         records: &[SemanticDependencyRecordV1],
         direct: &BTreeMap<SemanticDependencyOwnerV1, Vec<SemanticDependencyRecordId>>,
-    ) -> Vec<SemanticDependencyRecordRangeV1> {
+    ) -> DependencyGraphDigestMap {
         let owner_list = owners.iter().copied().collect::<Vec<_>>();
-        let owner_ordinals = owner_list
-            .iter()
-            .copied()
-            .enumerate()
-            .map(|(ordinal, owner)| (owner, ordinal))
-            .collect::<BTreeMap<_, _>>();
-        let direct_by_owner = owner_list
-            .iter()
-            .map(|owner| direct.get(owner).cloned().unwrap_or_default())
-            .collect::<Vec<_>>();
-        let owner_ordinal = owner_ordinals[&owner];
-        dependency_closure_for_owner(
-            owner_ordinal,
-            owner,
-            records,
-            direct,
-            &owner_ordinals,
-            &direct_by_owner,
-            &mut vec![usize::MAX; records.len()],
-        )
-        .expect("test dependency closure")
+        let record_digest_index =
+            DependencyRecordDigestIndex::build(records).expect("dependency record digests");
+        build_dependency_graph_digests(&owner_list, records, direct, &record_digest_index)
+            .expect("test dependency graph proof")
+            .0
     }
 
     #[test]
-    fn closure_follows_exact_owner_and_entity_edges() {
+    fn graph_proof_follows_exact_owner_and_entity_edges() {
         let root = SemanticDependencyOwnerV1::ProgramRoot;
         let caller = owner(0);
         let callee = owner(1);
@@ -8912,19 +8994,20 @@ FUNCTION add(value) {
         )
         .expect("caller dependency");
         let (records, coverage, direct) = collector.finish(&owners).expect("collector finish");
-        let closure = test_dependency_closure(caller, &owners, &records, &direct);
+        let original = test_dependency_graph_digests(&owners, &records, &direct);
 
         assert_eq!(coverage.len(), 2);
         assert_eq!(direct[&caller], vec![caller_dependency]);
         assert_eq!(direct[&callee], vec![callee_dependency]);
-        assert_eq!(
-            closure,
-            vec![SemanticDependencyRecordRangeV1 {
-                start: callee_dependency,
-                length: caller_dependency.as_usize() - callee_dependency.as_usize() + 1,
-            }],
-            "caller closure must include both exact entity and callable-owner dependencies"
+        let mut mutated = records;
+        mutated[callee_dependency.as_usize()].payload_digest[0] ^= 1;
+        let changed = test_dependency_graph_digests(&owners, &mutated, &direct);
+        assert_ne!(
+            original[&caller], changed[&caller],
+            "caller proof must include both exact entity and callable-owner dependencies"
         );
+        assert_ne!(original[&callee], changed[&callee]);
+        assert_eq!(original[&root], changed[&root]);
     }
 
     #[test]
@@ -8996,84 +9079,99 @@ FUNCTION add(value) {
         )
         .expect("dependency");
         let (records, _, direct) = collector.finish(&owners).expect("collector finish");
-        let closure = test_dependency_closure(root, &owners, &records, &direct);
-        let original_record_digest_index =
-            DependencyRecordDigestIndex::build(&records).expect("record digest index");
-        let original =
-            implementation_dependency_digest(root, &closure, &original_record_digest_index)
-                .expect("digest");
+        let original = test_dependency_graph_digests(&owners, &records, &direct);
         let mut mutated = records;
         mutated[0].payload_digest[0] ^= 1;
-        let mutated_record_digest_index =
-            DependencyRecordDigestIndex::build(&mutated).expect("mutated record digest index");
-        let changed =
-            implementation_dependency_digest(root, &closure, &mutated_record_digest_index)
-                .expect("digest");
-        assert_ne!(original, changed);
+        let changed = test_dependency_graph_digests(&owners, &mutated, &direct);
+        assert_ne!(original[&root], changed[&root]);
     }
 
     #[test]
-    fn implementation_digest_merkle_ranges_cover_only_the_exact_closure() {
+    fn implementation_digest_covers_only_exact_reachable_components() {
         let root = SemanticDependencyOwnerV1::ProgramRoot;
-        let owners = BTreeSet::from([root]);
+        let isolated = owner(0);
+        let owners = BTreeSet::from([root, isolated]);
         let mut collector = DependencyCollector::default();
-        for index in 0..16 {
-            collect_dependency!(
-                collector,
-                root,
-                SemanticDependencyChannelV1::StructuralRepresentation,
-                vec![SemanticDependencyRoleV1::FixedDefinition],
-                test_subject(index),
-                SemanticDependencySemanticsV1::default(),
-                &index,
-                Vec::new(),
-            )
-            .expect("dependency");
-        }
-        let (records, _, _) = collector.finish(&owners).expect("collector finish");
-        let closure = vec![
-            SemanticDependencyRecordRangeV1 {
-                start: SemanticDependencyRecordId(0),
-                length: 4,
-            },
-            SemanticDependencyRecordRangeV1 {
-                start: SemanticDependencyRecordId(8),
-                length: 2,
-            },
-        ];
-        let index = DependencyRecordDigestIndex::build(&records).expect("record digest index");
-        let ranges = index.digest_ranges(&closure).expect("closure ranges");
-        assert_eq!(
-            ranges
-                .iter()
-                .map(|range| (range.start, range.length))
-                .collect::<Vec<_>>(),
-            vec![(0, 4), (8, 2)]
-        );
-        let original =
-            implementation_dependency_digest(root, &closure, &index).expect("original digest");
+        let root_dependency = collect_dependency!(
+            collector,
+            root,
+            SemanticDependencyChannelV1::StructuralRepresentation,
+            vec![SemanticDependencyRoleV1::FixedDefinition],
+            test_subject(0),
+            SemanticDependencySemanticsV1::default(),
+            &"root",
+            Vec::new(),
+        )
+        .expect("root dependency");
+        let isolated_dependency = collect_dependency!(
+            collector,
+            isolated,
+            SemanticDependencyChannelV1::StructuralRepresentation,
+            vec![SemanticDependencyRoleV1::FixedDefinition],
+            test_subject(1),
+            SemanticDependencySemanticsV1::default(),
+            &"isolated",
+            Vec::new(),
+        )
+        .expect("isolated dependency");
+        let (records, _, direct) = collector.finish(&owners).expect("collector finish");
+        let original = test_dependency_graph_digests(&owners, &records, &direct);
 
         let mut outside_mutation = records.clone();
-        outside_mutation[6].payload_digest[0] ^= 1;
-        let outside_index =
-            DependencyRecordDigestIndex::build(&outside_mutation).expect("outside mutation index");
+        outside_mutation[isolated_dependency.as_usize()].payload_digest[0] ^= 1;
+        let outside = test_dependency_graph_digests(&owners, &outside_mutation, &direct);
         assert_eq!(
-            original,
-            implementation_dependency_digest(root, &closure, &outside_index)
-                .expect("outside mutation digest"),
-            "a dependency outside the exact closure must not invalidate the callable"
+            original[&root], outside[&root],
+            "a dependency outside the exact reachable graph must not invalidate the owner"
         );
+        assert_ne!(original[&isolated], outside[&isolated]);
 
         let mut inside_mutation = records;
-        inside_mutation[8].payload_digest[0] ^= 1;
-        let inside_index =
-            DependencyRecordDigestIndex::build(&inside_mutation).expect("inside mutation index");
+        inside_mutation[root_dependency.as_usize()].payload_digest[0] ^= 1;
+        let inside = test_dependency_graph_digests(&owners, &inside_mutation, &direct);
         assert_ne!(
-            original,
-            implementation_dependency_digest(root, &closure, &inside_index)
-                .expect("inside mutation digest"),
-            "a dependency inside an aligned range must invalidate the callable"
+            original[&root], inside[&root],
+            "a reachable dependency must invalidate the owner"
         );
+    }
+
+    #[test]
+    fn implementation_digest_handles_owner_cycles_once() {
+        let root = SemanticDependencyOwnerV1::ProgramRoot;
+        let first = owner(0);
+        let second = owner(1);
+        let owners = BTreeSet::from([root, first, second]);
+        let mut collector = DependencyCollector::default();
+        collect_dependency!(
+            collector,
+            first,
+            SemanticDependencyChannelV1::CalledCallable,
+            vec![SemanticDependencyRoleV1::ResourceOrProviderBehavior],
+            test_subject(0),
+            SemanticDependencySemanticsV1::default(),
+            &"first",
+            vec![dependency_owner(second)],
+        )
+        .expect("first dependency");
+        let second_dependency = collect_dependency!(
+            collector,
+            second,
+            SemanticDependencyChannelV1::CalledCallable,
+            vec![SemanticDependencyRoleV1::ResourceOrProviderBehavior],
+            test_subject(1),
+            SemanticDependencySemanticsV1::default(),
+            &"second",
+            vec![dependency_owner(first)],
+        )
+        .expect("second dependency");
+        let (records, _, direct) = collector.finish(&owners).expect("collector finish");
+        let original = test_dependency_graph_digests(&owners, &records, &direct);
+        let mut mutated = records;
+        mutated[second_dependency.as_usize()].payload_digest[0] ^= 1;
+        let changed = test_dependency_graph_digests(&owners, &mutated, &direct);
+        assert_ne!(original[&first], changed[&first]);
+        assert_ne!(original[&second], changed[&second]);
+        assert_eq!(original[&root], changed[&root]);
     }
 
     #[test]
@@ -9282,7 +9380,7 @@ ordinary: serve(value: 1)
     }
 
     #[test]
-    fn integrity_rederives_compact_callable_dependency_closures() {
+    fn integrity_rederives_compact_callable_dependency_graph_proofs() {
         let program = semantic_program_fixture();
         let mut manifest = program.dependency_manifest.clone();
         let callable = manifest
@@ -9299,9 +9397,9 @@ ordinary: serve(value: 1)
                 &program.checked_program,
                 &program.execution_graph,
             )
-            .expect_err("canonical payload cannot hide a stale transitive-closure digest");
+            .expect_err("canonical payload cannot hide a stale dependency graph proof");
         assert!(
-            error.to_string().contains("exact transitive closure"),
+            error.to_string().contains("exact dependency graph proof"),
             "{error}"
         );
     }

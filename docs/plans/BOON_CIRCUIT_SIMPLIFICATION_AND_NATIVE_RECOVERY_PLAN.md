@@ -642,6 +642,17 @@ post-scheme worklists both exhaust with a no-change audit; neither enters the
 global-sweep fallback. All 47 typechecker tests pass, and Counter, TodoMVC, and
 NovyWave preserve deterministic plans.
 
+The forwarding propagation profile then exposed a hidden quadratic scope
+query: 1.319 seconds of a 1.329-second owner worklist repeatedly scanned every
+pattern arm and linearly walked scope ancestry for each forwarded parameter.
+The existing dense nearest-pattern-arm index now answers the same enclosing-arm
+query directly. Propagation falls from about 1.34 seconds to 18 ms, including
+an 11 ms 684-owner worklist, and the traced complete typecheck falls from 5.79
+to 4.59 seconds. A single later cold whole-pipeline sample was 26.38 seconds, so
+no total-wall-time improvement is claimed from scheduler-sensitive evidence;
+the exact phase reduction, all 47 typechecker tests, and byte-identical Counter,
+TodoMVC, and NovyWave plans are the accepted checkpoint evidence.
+
 Pure functions that read canonical program-root values now retain one ordinary
 callable body instead of forcing an occurrence copy. The executable backend
 keeps source and constructor projections distinct across that boundary, so a
@@ -650,15 +661,33 @@ compiler regression proves this case. NovyWave retains eight more ordinary
 helpers, removes 201 semantic expressions, and emits a plan about 33 KiB
 smaller; the dirty type worklist owns the material wall-time reduction.
 
-The next compiler-performance target is contextual callable-scheme inference,
-not another manifest collection tweak. The traced final source spends about
-1.75 seconds rebuilding call instances and 1.40 seconds propagating 684
-callable-owner visits inside a 5.79-second typecheck. Replace repeated per-call
-scheme reconstruction with an explicit dependency-indexed callable/call graph
-while preserving the fail-closed full inference audit; do not return to
-tactical type-cache invalidation. Phase 1 still requires the remaining focused
-semantic, IR, and compiler regression matrix plus a committed clean-checkout
-remeasurement.
+The contextual owner-propagation blocker is closed; do not build a larger graph
+around an 18 ms phase. The remaining cold typecheck blocker is the roughly
+1.75-second pre-scheme call/type worklist. The larger whole-compiler blocker is
+semantic elaboration/contextual expansion at about 11.56 seconds, followed by
+the roughly 4-second proof manifest. The next performance slice must retain
+shared semantic callable definitions and invalidate only affected contextual
+instances, then separate interactive diagnostics/preview compilation from
+explicit proof and debug-artifact generation. Do not return to tactical type-
+cache invalidation or another manifest collection tweak. Phase 1 still requires
+the remaining focused semantic, IR, and compiler regression matrix plus a
+committed clean-checkout remeasurement.
+
+Cold `dump-plan` throughput is not the interactive acceptance target. Before
+production recovery resumes, the playground/editor path must own a persistent
+compiler session with stable source-unit, declaration, call, semantic-node, and
+artifact identities. A warm affected-source edit must publish its complete
+diagnostic generation within 16.7 ms p95. Switching among already loaded
+example source bundles must never block rendering for more than 16.7 ms and
+must publish the complete checked preview or diagnostics within 100 ms p95;
+stale generations are cancelled and the last good preview remains visible.
+Parsing, typechecking, and semantic invalidation stay on this critical path.
+Whole-graph dependency proof, handoff reports, and large debug JSON
+serialization run only for an explicit build/handoff request or from a valid
+content-addressed cache; they never delay a diagnostic generation or UI frame.
+The performance report must measure cold source-to-checked, cold
+source-to-semantic, warm affected edit, example switch, proof, and artifact
+serialization separately rather than hiding them in one permissive timeout.
 
 A clean confirmation at `de430c1` kept the million-row charged work unchanged
 but observed 14,794,406,170 ns instead of 9,712,441,796 ns for its three-sample

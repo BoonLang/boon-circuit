@@ -5227,35 +5227,56 @@ impl<'a> CheckedProgramBuilder<'a> {
         expression: CheckedExprId,
         parameter: DeclId,
     ) -> bool {
-        let Some(expression_scope) = self
+        let Some(mut scope) = self
             .expression_scopes
             .get(&(expression.0 as usize))
             .copied()
         else {
             return false;
         };
-        self.pattern_selectors.iter().any(|(arm, selector)| {
-            let Some(arm_scope) = self.expression_scopes.get(arm).copied() else {
-                return false;
-            };
-            if !self.scope_descends_from(expression_scope, arm_scope) {
-                return false;
-            }
-            let Some(AstExpr {
-                kind: AstExprKind::MatchArm { pattern, .. },
-                ..
-            }) = self.program.expressions.get(*arm)
+        let mut visited = BTreeSet::new();
+        while visited.insert(scope) {
+            let Some(arm) = self
+                .nearest_pattern_arm_by_scope
+                .get(scope.0 as usize)
+                .copied()
+                .flatten()
             else {
                 return false;
             };
-            if pattern_variant(pattern).is_none() {
+            let Some(arm_scope) = self.expression_scopes.get(&arm).copied() else {
                 return false;
+            };
+            let Some(AstExpr {
+                kind: AstExprKind::MatchArm { pattern, .. },
+                ..
+            }) = self.program.expressions.get(arm)
+            else {
+                return false;
+            };
+            if pattern_variant(pattern).is_some()
+                && matches!(
+                    self.pattern_selectors
+                        .get(&arm)
+                        .and_then(|selector| self.direct_read_declaration_with_projection(
+                            CheckedExprId(*selector as u32)
+                        )),
+                    Some((target, projection)) if target == parameter && projection.is_empty()
+                )
+            {
+                return true;
             }
-            matches!(
-                self.direct_read_declaration_with_projection(CheckedExprId(*selector as u32)),
-                Some((target, projection)) if target == parameter && projection.is_empty()
-            )
-        })
+            let Some(parent) = self
+                .scopes
+                .get(arm_scope.0 as usize)
+                .filter(|candidate| candidate.id == arm_scope)
+                .and_then(|scope| scope.parent)
+            else {
+                return false;
+            };
+            scope = parent;
+        }
+        false
     }
 
     fn pattern_selector_parameter_domains(&self) -> BTreeMap<DeclId, Type> {

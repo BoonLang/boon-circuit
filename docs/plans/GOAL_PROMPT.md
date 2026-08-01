@@ -162,15 +162,19 @@ Current checkpoints to preserve and audit rather than redo:
   replacing manifest V2's per-owner closure enumeration with an exact
   content-addressed SCC graph proof; both inference worklists now exhaust with
   clean no-change audits, including exact actual-to-formal parameter and
-  selector-dependent arm-scope invalidation; two final-source runs measure
-  0.07/0.07, 2.09/2.12, and 25.79/25.20 seconds respectively, with all three
-  emitted plans byte-identical to the preceding checkpoint;
-- the next compiler-performance blocker is contextual callable-scheme
-  inference: the traced NovyWave source spends about 1.75 seconds rebuilding
-  call instances and 1.40 seconds propagating callable-owner changes inside a
-  5.79-second typecheck. Replace repeated per-call scheme reconstruction with
-  an explicit dependency-indexed callable/call graph before resuming the
-  production recovery slice; do not return to tactical type-cache invalidation;
+  selector-dependent arm-scope invalidation; the dense nearest-pattern-arm
+  index replaces a quadratic forwarding query, reducing contextual owner
+  propagation from about 1.34 seconds to 18 ms and the traced typecheck from
+  5.79 to 4.59 seconds; two final-source runs before that final indexed query
+  measured 0.07/0.07, 2.09/2.12, and 25.79/25.20 seconds respectively, and the
+  later Counter, TodoMVC, and NovyWave plans remain byte-identical;
+- the next compiler-performance blockers are the roughly 1.75-second
+  pre-scheme call/type worklist and, more importantly, the roughly 11.56-second
+  semantic elaboration/contextual expansion phase. Retain shared semantic
+  callable definitions, invalidate only affected contextual instances, and
+  keep proof/debug-artifact generation outside the interactive critical path
+  before resuming production recovery; do not return to tactical type-cache
+  invalidation or another manifest collection tweak;
 - FjordPulse currently has no basis for weakening the 108-story/340-scenario
   acceptance inventory. Only its two explicitly deferred backup/restore
   automation scenarios may retain that final status.
@@ -208,6 +212,20 @@ Execution strategy:
   seconds for NovyWave. Their peak-RSS ceilings are respectively 48 MiB, 180
   MiB, and 1.1 GiB. These ceilings may move only downward unless a changed
   represented workload is documented with before/after evidence.
+- Those cold `dump-plan` ceilings are emergency regression bounds, not
+  interactive usability targets. Before production recovery resumes, the
+  playground/editor must use a persistent compiler session with dependency-
+  indexed invalidation and stable identities. A warm affected-source edit must
+  publish its complete diagnostic generation within 16.7 ms p95. Switching an
+  already loaded example source bundle must not block rendering for more than
+  16.7 ms and must publish the complete checked preview or diagnostics within
+  100 ms p95. Cancel stale generations and retain the last good preview.
+- Parsing, typechecking, and affected semantic invalidation are on the
+  interactive critical path. Whole-graph proof, handoff reports, and large
+  debug JSON serialization run only for explicit build/handoff work or from a
+  valid content-addressed cache. Measure cold checked, cold semantic, warm edit,
+  example switch, proof, and serialization independently; never use fast UI
+  scheduling to conceal unchanged compiler graph explosion.
 - After the same blocker class appears twice, stop tactical patching and change
   the owning parser, compiler, proof, runtime, currentness, document, renderer,
   host, persistence, physical-layout, or verifier architecture.

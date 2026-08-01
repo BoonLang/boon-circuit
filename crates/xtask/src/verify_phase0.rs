@@ -27,6 +27,10 @@ const BASELINE_MANIFEST: &str = "docs/architecture/phase0/baselines.toml";
 const PACKED_BUDGET_MANIFEST: &str = "budgets/packed-data.toml";
 const CONTAINER_OCCURRENCE_LEDGER_PROTOCOL: &str = "boon-phase0-container-occurrences-v1";
 const CLEAN_BASELINE_HEAD: &str = "4a820727d339038826a9d589c207ef5f973dad83";
+const PACKED_SEMANTIC_BASELINE_HEAD: &str = "faef7fc0a5b6ceca55f89107885fc4640f7ff4da";
+const PACKED_PREDECESSOR_BUDGET_COMMIT: &str = "5b791d5de40c84477df2ba72fe9e98ad850bf991";
+const PACKED_SEMANTIC_BASELINE_SCOPE: &str = "exact-number-tags-one-based-current-runtime";
+const PACKED_PREDECESSOR_BASELINE_SCOPE: &str = "current-runtime-before-goal-flag-days";
 const MAX_MANIFEST_BYTES: u64 = 256 * 1024;
 const MAX_OCCURRENCE_LEDGER_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_TEXT_PROBE_BYTES: u64 = 8 * 1024 * 1024;
@@ -974,6 +978,9 @@ struct PackedBudgetManifest {
     owner_plan: String,
     baseline_source_head: String,
     baseline_scope: String,
+    predecessor_baseline_source_head: String,
+    predecessor_baseline_scope: String,
+    predecessor_budget_commit: String,
     current_runtime_report: String,
     fixture_manifest: String,
     protocol: PackedProtocol,
@@ -3706,21 +3713,36 @@ fn validate_packed_budget(
     workspace: &Path,
     manifest: &PackedBudgetManifest,
 ) -> Result<PackedSummary, String> {
-    if manifest.format_version != 3 {
+    if manifest.format_version != 4 {
         return Err(format!(
-            "{PACKED_BUDGET_MANIFEST} format_version is {}; expected 3",
+            "{PACKED_BUDGET_MANIFEST} format_version is {}; expected 4",
             manifest.format_version
         ));
     }
     require_exact(
         &manifest.baseline_source_head,
-        CLEAN_BASELINE_HEAD,
+        PACKED_SEMANTIC_BASELINE_HEAD,
         "packed budget baseline",
     )?;
     require_exact(
         &manifest.baseline_scope,
-        "current-worktree",
+        PACKED_SEMANTIC_BASELINE_SCOPE,
         "packed budget baseline_scope",
+    )?;
+    require_exact(
+        &manifest.predecessor_baseline_source_head,
+        CLEAN_BASELINE_HEAD,
+        "packed budget predecessor baseline",
+    )?;
+    require_exact(
+        &manifest.predecessor_baseline_scope,
+        PACKED_PREDECESSOR_BASELINE_SCOPE,
+        "packed budget predecessor baseline_scope",
+    )?;
+    require_exact(
+        &manifest.predecessor_budget_commit,
+        PACKED_PREDECESSOR_BUDGET_COMMIT,
+        "packed budget predecessor commit",
     )?;
     require_exact(
         &manifest.owner_phase,

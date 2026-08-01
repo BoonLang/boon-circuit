@@ -865,6 +865,11 @@ branches as a second compatibility semantics.
   ceilings, boundary materialization bytes, queue high-water limits, index
   work, sparse and dense latency/throughput ceilings, and allowed regression
   ratchets.
+- If a landed semantic flag day changes the represented values or measured
+  fixture work before Phase 1, preserve the predecessor identity and evidence,
+  then freeze an explicitly versioned current-semantic baseline with measured
+  before/after attribution. Do not silently carry a cross-epoch ratchet or
+  weaken any final packed target.
 - Reconcile active semantic documents where legacy values conflict with the
   foundations plan.
 

@@ -547,6 +547,19 @@ pass with 17,750 packed candidate sites and 4,751 container occurrences. Phase
 0 remains open only on the declared stale Cells dataset digest and its dependent
 packed-baseline source identity.
 
+The semantic-epoch baseline reconciliation replaces that stale identity with a
+fresh measurement from `faef7fc` and records the pre-flag-day baseline and its
+owning budget commit as an explicit predecessor. The two epochs are not treated
+as performance-equivalent: exact `NUMBER`, first-class Tags, one-based Cells
+addresses, and richer formula/error results changed the represented values and
+fixture work. The measured aggregate allocation count moves from 52,089,871 to
+70,952,857, while Cells sparse headless p95 moves from 1,187,934 ns to
+17,707,985 ns. Those numbers are an honest current-runtime starting point, not
+the final packed target and not native 16.7 ms interaction evidence. Every
+final packed target remains unchanged. The reconciled Phase 0 validators pass;
+the verifier grants final Phase 0 completion only from the clean committed
+revision.
+
 The historical `9b4ed71` checkpoint proves that an earlier, smaller feature set
 fit below the former 240,000 tracked-Rust and 32,000 test-Rust limits, but it
 does not prove that the current feature set can do so without loss. Those two

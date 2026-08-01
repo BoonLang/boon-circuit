@@ -43,6 +43,7 @@ const SCAN_ROOTS: &[&str] = &[
     "crates/boon_plan_executor",
     "crates/boon_program_runtime",
     "crates/boon_runtime",
+    "crates/boon_semantic/src/core_lowering.rs",
     "crates/boon_semantic/src/program_core.rs",
     "crates/boon_server_runtime",
     "crates/boon_typecheck",

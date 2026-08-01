@@ -3078,7 +3078,7 @@ impl ExecutableMigrationExpressionLowerer<'_> {
                         expression.checked_expr_id.0
                     ))
                 }),
-            ir::ExecutableExpressionKind::Text(value) => {
+            ir::ExecutableExpressionKind::Text { value } => {
                 Ok(MigrationExpressionPlan::Text { value })
             }
             ir::ExecutableExpressionKind::TextTemplate { segments } => {
@@ -3094,13 +3094,13 @@ impl ExecutableMigrationExpressionLowerer<'_> {
                         .collect::<Result<Vec<_>, PlanError>>()?,
                 })
             }
-            ir::ExecutableExpressionKind::Number(value) => {
+            ir::ExecutableExpressionKind::Number { value } => {
                 Ok(MigrationExpressionPlan::Number { value })
             }
-            ir::ExecutableExpressionKind::Bits(value) => {
+            ir::ExecutableExpressionKind::Bits { value } => {
                 Ok(MigrationExpressionPlan::Bits { value })
             }
-            ir::ExecutableExpressionKind::BytesByte(value) => {
+            ir::ExecutableExpressionKind::BytesByte { value } => {
                 Ok(MigrationExpressionPlan::Number {
                     value: ExactNumber::from_i64(i64::from(value)),
                 })
@@ -3114,7 +3114,7 @@ impl ExecutableMigrationExpressionLowerer<'_> {
                     "live FLUSH control at executable expression {expr_id} cannot be migration data"
                 )))
             }
-            ir::ExecutableExpressionKind::Tag(tag) => {
+            ir::ExecutableExpressionKind::Tag { value: tag } => {
                 Ok(MigrationExpressionPlan::Variant { tag })
             }
             ir::ExecutableExpressionKind::TaggedObject { tag, fields } => {
@@ -3123,7 +3123,7 @@ impl ExecutableMigrationExpressionLowerer<'_> {
                     fields: self.lower_fields(&fields)?,
                 })
             }
-            ir::ExecutableExpressionKind::Object(fields) => {
+            ir::ExecutableExpressionKind::Object { fields } => {
                 Ok(MigrationExpressionPlan::Record {
                     fields: self.lower_fields(&fields)?,
                 })
@@ -5614,6 +5614,12 @@ pub(crate) fn compile_erased_program_with_distributed_context(
             )));
         }
         let fusion = match &batch.fusion {
+            ir::PulseFusionEligibility::PendingVerification => {
+                return Err(PlanError::new(format!(
+                    "pulse batch {} reached MachinePlan lowering before verification",
+                    batch.id
+                )));
+            }
             ir::PulseFusionEligibility::VerifiedActivationLocalRecurrence {
                 activation,
                 state,
@@ -6992,15 +6998,15 @@ fn constant_executable_expression_value_inner(
         .get(expression_id.as_usize())
         .filter(|candidate| candidate.id == expression_id)?;
     let value = match &expression.kind {
-        ir::ExecutableExpressionKind::Text(value) => Some(PlanConstantValue::Text {
+        ir::ExecutableExpressionKind::Text { value } => Some(PlanConstantValue::Text {
             value: value.clone(),
         }),
-        ir::ExecutableExpressionKind::Number(value) => Some(PlanConstantValue::Number {
+        ir::ExecutableExpressionKind::Number { value } => Some(PlanConstantValue::Number {
             value: value.clone(),
         }),
-        ir::ExecutableExpressionKind::BytesByte(value) => bytes_plan_constant(&[*value]),
+        ir::ExecutableExpressionKind::BytesByte { value } => bytes_plan_constant(&[*value]),
         ir::ExecutableExpressionKind::Absent => None,
-        ir::ExecutableExpressionKind::Tag(value) => Some(PlanConstantValue::Tag {
+        ir::ExecutableExpressionKind::Tag { value } => Some(PlanConstantValue::Tag {
             name: value.clone(),
         }),
         ir::ExecutableExpressionKind::Bytes { .. } => {
@@ -7297,13 +7303,13 @@ fn inferred_executable_expression_value_type_inner(
         return None;
     }
     let value_type = match &expression.kind {
-        ir::ExecutableExpressionKind::Text(_)
+        ir::ExecutableExpressionKind::Text { .. }
         | ir::ExecutableExpressionKind::TextTemplate { .. } => Some(PlanValueType::Text),
-        ir::ExecutableExpressionKind::Number(_) => Some(PlanValueType::Number),
-        ir::ExecutableExpressionKind::Bits(value) => Some(PlanValueType::Bits {
+        ir::ExecutableExpressionKind::Number { .. } => Some(PlanValueType::Number),
+        ir::ExecutableExpressionKind::Bits { value } => Some(PlanValueType::Bits {
             width: value.width(),
         }),
-        ir::ExecutableExpressionKind::BytesByte(_) => {
+        ir::ExecutableExpressionKind::BytesByte { .. } => {
             Some(PlanValueType::Bytes { fixed_len: Some(1) })
         }
         ir::ExecutableExpressionKind::Absent => None,
@@ -7311,7 +7317,7 @@ fn inferred_executable_expression_value_type_inner(
         | ir::ExecutableExpressionKind::FlushBoundary { input: payload } => {
             inferred_executable_expression_value_type_inner(program, *payload, visiting)
         }
-        ir::ExecutableExpressionKind::Tag(_)
+        ir::ExecutableExpressionKind::Tag { .. }
         | ir::ExecutableExpressionKind::TaggedObject { .. } => Some(PlanValueType::Tag),
         ir::ExecutableExpressionKind::Bytes {
             fixed_size: Some(len),
@@ -7373,7 +7379,7 @@ fn inferred_executable_expression_value_type_inner(
         | ir::ExecutableExpressionKind::Draining { .. }
         | ir::ExecutableExpressionKind::When { .. }
         | ir::ExecutableExpressionKind::MatchArm { .. }
-        | ir::ExecutableExpressionKind::Object(_)
+        | ir::ExecutableExpressionKind::Object { .. }
         | ir::ExecutableExpressionKind::List { .. }
         | ir::ExecutableExpressionKind::MapEntry { .. }
         | ir::ExecutableExpressionKind::Map { .. }
@@ -11821,7 +11827,7 @@ impl<'a> ExecutableRowLowerer<'a> {
                     root.0
                 )));
             }
-            ir::ExecutableExpressionKind::Text(value) => {
+            ir::ExecutableExpressionKind::Text { value } => {
                 self.constant(PlanConstantValue::Text { value })?
             }
             ir::ExecutableExpressionKind::TextTemplate { segments } => {
@@ -11838,13 +11844,15 @@ impl<'a> ExecutableRowLowerer<'a> {
                     .collect::<Result<Vec<_>, PlanError>>()?;
                 self.intern(PlanRowExpressionNode::TextConcat { parts })?
             }
-            ir::ExecutableExpressionKind::Number(value) => {
+            ir::ExecutableExpressionKind::Number { value } => {
                 self.constant(PlanConstantValue::Number { value })?
             }
-            ir::ExecutableExpressionKind::Bits(value) => {
+            ir::ExecutableExpressionKind::Bits { value } => {
                 self.constant(PlanConstantValue::Bits { value })?
             }
-            ir::ExecutableExpressionKind::BytesByte(value) => self.bytes_constant(vec![value])?,
+            ir::ExecutableExpressionKind::BytesByte { value } => {
+                self.bytes_constant(vec![value])?
+            }
             ir::ExecutableExpressionKind::Absent => self.intern(PlanRowExpressionNode::Absent)?,
             ir::ExecutableExpressionKind::Flush { payload } => {
                 let payload = self.lower_scoped(payload, owner)?;
@@ -11854,7 +11862,7 @@ impl<'a> ExecutableRowLowerer<'a> {
                 let input = self.lower_scoped(input, owner)?;
                 self.intern(PlanRowExpressionNode::FlushBoundary { input })?
             }
-            ir::ExecutableExpressionKind::Tag(value) => {
+            ir::ExecutableExpressionKind::Tag { value } => {
                 self.constant(PlanConstantValue::Tag { name: value })?
             }
             ir::ExecutableExpressionKind::TaggedObject { tag, fields } => {
@@ -12139,7 +12147,7 @@ impl<'a> ExecutableRowLowerer<'a> {
                 output.ok_or_else(|| PlanError::new("match arm has no output"))?,
                 owner,
             )?,
-            ir::ExecutableExpressionKind::Object(fields) => {
+            ir::ExecutableExpressionKind::Object { fields } => {
                 let fields = self.lower_fields(fields, owner)?;
                 self.intern(PlanRowExpressionNode::Object { fields })?
             }
@@ -13362,8 +13370,8 @@ impl<'a> ExecutableRowLowerer<'a> {
         for argument in arguments {
             let value = if row_builtin_arg_expects_symbol(function, &argument.name) {
                 match &self.program.executable.expressions[argument.value.as_usize()].kind {
-                    ir::ExecutableExpressionKind::Tag(value)
-                    | ir::ExecutableExpressionKind::Text(value) => {
+                    ir::ExecutableExpressionKind::Tag { value }
+                    | ir::ExecutableExpressionKind::Text { value } => {
                         self.constant(PlanConstantValue::Text {
                             value: value.clone(),
                         })?
@@ -13482,7 +13490,7 @@ fn executable_select_pattern(
 
 fn executable_static_bytes(program: &ErasedProgram, root: ir::ExecutableExprId) -> Option<Vec<u8>> {
     match &program.executable.expressions.get(root.as_usize())?.kind {
-        ir::ExecutableExpressionKind::BytesByte(value) => Some(vec![*value]),
+        ir::ExecutableExpressionKind::BytesByte { value } => Some(vec![*value]),
         ir::ExecutableExpressionKind::Bytes { items, .. } => {
             let mut bytes = Vec::new();
             for item in items {

@@ -674,7 +674,7 @@ fn verified_semantic_compiler_spine(workspace: &Path) -> Result<String, String> 
     let distributed =
         read_text(&workspace.join("crates/boon_compiler/src/distributed_compiler.rs"))?;
 
-    verify_boon_ir_phase1_boundary(workspace)?;
+    verify_semantic_core_ownership_boundary(workspace)?;
     verify_opaque_artifact(&parser, "ParsedProgram", true)?;
     verify_opaque_artifact(&typecheck, "CheckedProgram", true)?;
     verify_opaque_artifact(&semantic, "SemanticProgram", false)?;
@@ -697,6 +697,12 @@ fn verified_semantic_compiler_spine(workspace: &Path) -> Result<String, String> 
         "SemanticProgram",
         "source_bundle_digest_v1",
         "SourceBundleDigestV1",
+    )?;
+    verify_required_direct_field(
+        &semantic,
+        "SemanticProgram",
+        "canonical_core",
+        "CanonicalProgramCoreV1",
     )?;
     verify_required_direct_field(&ir, "ErasedProgram", "fields", "CanonicalProgramCoreV1")?;
     verify_required_direct_field(
@@ -1025,643 +1031,114 @@ fn verify_required_direct_field(
     Ok(())
 }
 
-const BOON_IR_LIB: &str = "crates/boon_ir/src/lib.rs";
-const BOON_IR_SEMANTIC_MAPPING: &str = "crates/boon_ir/src/semantic_mapping.rs";
-
-const FORBIDDEN_IR_ARTIFACT_IDENTIFIERS: [&str; 3] =
-    ["CheckedProgram", "CheckedProgramFields", "ResolvedOutGraph"];
-
-const FORBIDDEN_IR_DISCOVERY_IDENTIFIERS: [(&str, &str); 24] = [
-    (
-        "legacy_checked_semantic_lowering_pending_extraction",
-        "legacy semantic lowering",
-    ),
-    ("derive_contextual_materializations", "contextual discovery"),
-    ("derive_executable_program", "contextual discovery"),
-    ("contextual_materializations", "contextual discovery"),
-    (
-        "lower_semantic_memory_and_migrations",
-        "migration discovery",
-    ),
-    (
-        "classify_transitive_row_resource_fields",
-        "resource discovery",
-    ),
-    (
-        "canonicalize_runtime_resource_metadata",
-        "resource discovery",
-    ),
-    ("bind_executable_source_resources", "resource discovery"),
-    ("bind_executable_state_resources", "resource discovery"),
-    (
-        "collect_detached_state_capture_requests",
-        "reactive discovery",
-    ),
-    ("materialization_target_lists", "reactive discovery"),
-    (
-        "bind_contextual_materialization_targets",
-        "reactive discovery",
-    ),
-    (
-        "bind_contextual_materialization_storage",
-        "reactive discovery",
-    ),
-    (
-        "bind_contextual_materialization_lineage",
-        "reactive discovery",
-    ),
-    ("collect_input_materializations", "reactive discovery"),
-    (
-        "collect_input_materializations_at_projection",
-        "reactive discovery",
-    ),
-    ("exact_list_mutations", "reactive discovery"),
-    ("collect_exact_list_mutations", "reactive discovery"),
-    ("exact_dependency_edges", "reactive discovery"),
-    ("exact_possible_causes", "reactive discovery"),
-    ("state_update_arms", "reactive discovery"),
-    ("distributed_references", "distributed discovery"),
-    ("concrete_distributed_calls", "distributed discovery"),
-    (
-        "bind_distributed_reference_aliases",
-        "distributed discovery",
-    ),
-];
-
-fn verify_boon_ir_phase1_boundary(workspace: &Path) -> Result<(), String> {
-    let files = boon_ir_rust_file_inventory(workspace)?;
-    verify_boon_ir_file_inventory(&files)?;
-
-    let semantic_execution_types = semantic_execution_type_inventory(workspace)?;
-    let mut violations = Vec::new();
-    let mut mapping_delegation_functions = BTreeSet::new();
-    let mut resource_mapping_delegation_functions = BTreeSet::new();
-    let mut graph_handoff_functions = BTreeSet::new();
-    let mut totality_validation_functions = BTreeSet::new();
-
-    for relative in files.iter().filter(|relative| !is_test_path(relative)) {
-        let source = read_text(&workspace.join(relative))?;
-        let syntax = syn::parse_file(&source).map_err(|error| {
-            format!("cannot parse production boon_ir source `{relative}`: {error}")
-        })?;
-        if relative == BOON_IR_LIB {
-            verify_semantic_mapping_module_declaration(&syntax)?;
-        }
-        if relative == BOON_IR_SEMANTIC_MAPPING {
-            verify_semantic_mapping_contract(&source)?;
-        }
-
-        let mut collector = IrPhase1BoundaryCollector::new(
-            relative == BOON_IR_SEMANTIC_MAPPING,
-            &semantic_execution_types,
-        );
-        collector.visit_file(&syntax);
-        violations.extend(
-            collector
-                .violations
-                .into_iter()
-                .map(|violation| format!("{relative}:{violation}")),
-        );
-        mapping_delegation_functions.extend(
-            collector
-                .mapping_delegation_functions
-                .into_iter()
-                .map(|function| format!("{relative}:{function}")),
-        );
-        resource_mapping_delegation_functions.extend(
-            collector
-                .resource_mapping_delegation_functions
-                .into_iter()
-                .map(|function| format!("{relative}:{function}")),
-        );
-        graph_handoff_functions.extend(
-            collector
-                .graph_handoff_functions
-                .into_iter()
-                .map(|function| format!("{relative}:{function}")),
-        );
-        totality_validation_functions.extend(
-            collector
-                .totality_validation_functions
-                .into_iter()
-                .map(|function| format!("{relative}:{function}")),
-        );
-    }
-
-    violations.sort();
-    violations.dedup();
-    if !violations.is_empty() {
-        return Err(format!(
-            "boon_ir retains forbidden Phase-1 semantic authority: {}",
-            bounded_list(&violations)
-        ));
-    }
-
-    let expected_handoff =
-        BTreeSet::from([format!("{BOON_IR_LIB}:lower_verified_semantic_execution")]);
-    if graph_handoff_functions != expected_handoff {
-        return Err(format!(
-            "SemanticExecutionGraphV1 handoff inventory differs; expected: {}; observed: {}",
-            bounded_list(&expected_handoff.iter().cloned().collect::<Vec<_>>()),
-            bounded_list(&graph_handoff_functions.iter().cloned().collect::<Vec<_>>())
-        ));
-    }
-    if mapping_delegation_functions != expected_handoff {
-        return Err(format!(
-            "semantic-to-executable conversion must delegate exactly once from the verified handoff to `semantic_mapping`; expected: {}; observed: {}",
-            bounded_list(&expected_handoff.iter().cloned().collect::<Vec<_>>()),
-            bounded_list(
-                &mapping_delegation_functions
-                    .iter()
-                    .cloned()
-                    .collect::<Vec<_>>()
-            )
-        ));
-    }
-    if resource_mapping_delegation_functions != expected_handoff {
-        return Err(format!(
-            "semantic resource conversion must delegate exactly once from the verified handoff to `semantic_mapping`; expected: {}; observed: {}",
-            bounded_list(&expected_handoff.iter().cloned().collect::<Vec<_>>()),
-            bounded_list(
-                &resource_mapping_delegation_functions
-                    .iter()
-                    .cloned()
-                    .collect::<Vec<_>>()
-            )
-        ));
-    }
-    if totality_validation_functions != expected_handoff {
-        return Err(format!(
-            "the verified semantic handoff must validate mapping totality exactly once; expected: {}; observed: {}",
-            bounded_list(&expected_handoff.iter().cloned().collect::<Vec<_>>()),
-            bounded_list(
-                &totality_validation_functions
-                    .iter()
-                    .cloned()
-                    .collect::<Vec<_>>()
-            )
-        ));
-    }
-    Ok(())
-}
-
-fn boon_ir_rust_file_inventory(workspace: &Path) -> Result<BTreeSet<String>, String> {
-    fn collect(
-        workspace: &Path,
-        directory: &Path,
-        files: &mut BTreeSet<String>,
-    ) -> Result<(), String> {
-        let entries = fs::read_dir(directory)
-            .map_err(|error| format!("cannot inventory `{}`: {error}", directory.display()))?;
-        for entry in entries {
-            let entry = entry.map_err(|error| {
-                format!(
-                    "cannot inventory entry below `{}`: {error}",
-                    directory.display()
-                )
-            })?;
-            let file_type = entry
-                .file_type()
-                .map_err(|error| format!("cannot inspect `{}`: {error}", entry.path().display()))?;
-            let path = entry.path();
-            if file_type.is_dir() {
-                collect(workspace, &path, files)?;
-            } else if file_type.is_file()
-                && path.extension().is_some_and(|extension| extension == "rs")
-            {
-                let relative = path.strip_prefix(workspace).map_err(|error| {
-                    format!(
-                        "cannot make `{}` workspace-relative: {error}",
-                        path.display()
-                    )
-                })?;
-                files.insert(relative.to_string_lossy().replace('\\', "/"));
-            }
-        }
-        Ok(())
-    }
-
-    let mut files = BTreeSet::new();
-    collect(workspace, &workspace.join("crates/boon_ir/src"), &mut files)?;
-    Ok(files)
-}
-
-fn verify_boon_ir_file_inventory(files: &BTreeSet<String>) -> Result<(), String> {
-    for required in [BOON_IR_LIB, BOON_IR_SEMANTIC_MAPPING] {
-        if !files.contains(required) {
+fn verify_semantic_core_ownership_boundary(workspace: &Path) -> Result<(), String> {
+    let ir_path = workspace.join("crates/boon_ir/src/lib.rs");
+    let semantic_path = workspace.join("crates/boon_semantic/src/lib.rs");
+    let lowering_path = workspace.join("crates/boon_semantic/src/core_lowering.rs");
+    for obsolete in [
+        workspace.join("crates/boon_ir/src/semantic_mapping.rs"),
+        workspace.join("crates/boon_ir/src/semantic_mapping"),
+        workspace.join("crates/boon_ir/src/contextual_expansion.rs"),
+        workspace.join("crates/boon_ir/src/semantic_migration.rs"),
+    ] {
+        if obsolete.exists() {
             return Err(format!(
-                "boon_ir production source inventory omits `{required}`"
+                "obsolete post-verification lowering owner remains at `{}`",
+                obsolete.display()
             ));
         }
     }
 
-    let old_module_files = files
-        .iter()
-        .filter(|relative| {
-            [
-                "crates/boon_ir/src/contextual_expansion.rs",
-                "crates/boon_ir/src/semantic_migration.rs",
-            ]
-            .contains(&relative.as_str())
-                || [
-                    "crates/boon_ir/src/contextual_expansion/",
-                    "crates/boon_ir/src/semantic_migration/",
-                ]
-                .iter()
-                .any(|prefix| relative.starts_with(prefix))
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    if !old_module_files.is_empty() {
-        return Err(format!(
-            "old production contextual/migration module files remain: {}",
-            bounded_list(&old_module_files)
-        ));
+    let ir = read_text(&ir_path)?;
+    let semantic = read_text(&semantic_path)?;
+    let lowering = read_text(&lowering_path)?;
+    syn::parse_file(&ir)
+        .map_err(|error| format!("cannot parse `{}`: {error}", ir_path.display()))?;
+    syn::parse_file(&lowering)
+        .map_err(|error| format!("cannot parse `{}`: {error}", lowering_path.display()))?;
+
+    for forbidden in [
+        "mod semantic_mapping",
+        "SemanticExecutionGraphV1",
+        "SemanticResourceGraphV1",
+        "SemanticReactiveGraphV1",
+        "map_semantic_execution",
+        "map_semantic_resources",
+        "lower_verified_semantic_execution",
+        "build_canonical_program_core",
+        "CanonicalProgramCoreV1 {",
+    ] {
+        if ir.contains(forbidden) {
+            return Err(format!(
+                "boon_ir retains semantic-core construction authority via `{forbidden}`"
+            ));
+        }
+    }
+    for required in [
+        "bind_verified_pulse_fusion(&mut fields, &pulse_fusion_decisions)?;",
+        "PulseFusionEligibility::PendingVerification",
+        "semantic.into_lowering_parts()",
+    ] {
+        if !ir.contains(required) {
+            return Err(format!(
+                "boon_ir omits verification-gated core handoff `{required}`"
+            ));
+        }
     }
 
-    let mapping_files = files
-        .iter()
-        .filter(|relative| {
-            relative.as_str() == BOON_IR_SEMANTIC_MAPPING
-                || relative.starts_with("crates/boon_ir/src/semantic_mapping/")
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    if mapping_files != [BOON_IR_SEMANTIC_MAPPING.to_owned()] {
-        return Err(format!(
-            "semantic-to-executable conversion must occupy exactly `{BOON_IR_SEMANTIC_MAPPING}`; observed: {}",
-            bounded_list(&mapping_files)
-        ));
+    for required in [
+        "mod core_lowering;",
+        "canonical_core: program_core::CanonicalProgramCoreV1",
+        "canonical_core: &'a program_core::CanonicalProgramCoreV1",
+        "validate_canonical_core_handoff(self)?;",
+        "core_lowering::build_canonical_program_core(",
+    ] {
+        if !semantic.contains(required) {
+            return Err(format!(
+                "SemanticProgram omits canonical-core ownership join `{required}`"
+            ));
+        }
     }
-    Ok(())
-}
-
-fn verify_semantic_mapping_module_declaration(syntax: &syn::File) -> Result<(), String> {
-    let declarations = syntax
-        .items
-        .iter()
-        .filter_map(|item| {
-            let syn::Item::Mod(module) = item else {
-                return None;
-            };
-            if cfg_is_test_only(&module.attrs) || module.ident != "semantic_mapping" {
-                return None;
-            }
-            Some(module)
-        })
-        .collect::<Vec<_>>();
-    let [declaration] = declarations.as_slice() else {
-        return Err(format!(
-            "boon_ir must declare exactly one production `mod semantic_mapping;`; observed {}",
-            declarations.len()
-        ));
-    };
-    if declaration.content.is_some()
-        || declaration
-            .attrs
-            .iter()
-            .any(|attribute| attribute.path().is_ident("path"))
+    if semantic
+        .matches("core_lowering::build_canonical_program_core(")
+        .count()
+        != 1
     {
         return Err(
-            "boon_ir `semantic_mapping` must be the exact external `src/semantic_mapping.rs` module"
+            "semantic elaboration must construct exactly one retained canonical core".to_owned(),
+        );
+    }
+
+    if lowering.contains("boon_verify::") || lowering.contains("#[cfg(test)]\nmod tests") {
+        return Err(
+            "semantic core construction depends on verification or retains private mapping tests"
                 .to_owned(),
         );
     }
-    Ok(())
-}
-
-fn semantic_execution_type_inventory(workspace: &Path) -> Result<BTreeSet<String>, String> {
-    let path = workspace.join("crates/boon_semantic/src/execution.rs");
-    let source = read_text(&path)?;
-    let syntax = syn::parse_file(&source)
-        .map_err(|error| format!("cannot parse `{}`: {error}", path.display()))?;
-    let mut types = BTreeSet::new();
-    for item in &syntax.items {
-        if item_attributes(item).is_some_and(cfg_is_test_only) {
-            continue;
-        }
-        let identifier = match item {
-            syn::Item::Enum(item) => Some(&item.ident),
-            syn::Item::Struct(item) => Some(&item.ident),
-            syn::Item::Type(item) => Some(&item.ident),
-            syn::Item::Union(item) => Some(&item.ident),
-            syn::Item::Macro(item)
-                if item
-                    .mac
-                    .path
-                    .segments
-                    .last()
-                    .is_some_and(|segment| segment.ident == "typed_semantic_id") =>
-            {
-                for identifier in rust_token_identifiers(&item.mac.tokens.to_string()) {
-                    if identifier.starts_with("Semantic") {
-                        types.insert(identifier);
-                    }
-                }
-                None
-            }
-            _ => None,
-        };
-        if let Some(identifier) = identifier
-            && identifier.to_string().starts_with("Semantic")
-        {
-            types.insert(identifier.to_string());
-        }
-    }
-    if !types.contains("SemanticExecutionGraphV1")
-        || !types.contains("SemanticExprId")
-        || !types.contains("SemanticExpression")
-    {
-        return Err(format!(
-            "semantic execution DTO inventory is incomplete: {}",
-            bounded_list(&types.iter().cloned().collect::<Vec<_>>())
-        ));
-    }
-    Ok(types)
-}
-
-struct IrPhase1BoundaryCollector<'a> {
-    in_semantic_mapping: bool,
-    semantic_execution_types: &'a BTreeSet<String>,
-    current_function: Option<String>,
-    violations: Vec<String>,
-    mapping_delegation_functions: BTreeSet<String>,
-    resource_mapping_delegation_functions: BTreeSet<String>,
-    graph_handoff_functions: BTreeSet<String>,
-    totality_validation_functions: BTreeSet<String>,
-}
-
-impl<'a> IrPhase1BoundaryCollector<'a> {
-    fn new(in_semantic_mapping: bool, semantic_execution_types: &'a BTreeSet<String>) -> Self {
-        Self {
-            in_semantic_mapping,
-            semantic_execution_types,
-            current_function: None,
-            violations: Vec::new(),
-            mapping_delegation_functions: BTreeSet::new(),
-            resource_mapping_delegation_functions: BTreeSet::new(),
-            graph_handoff_functions: BTreeSet::new(),
-            totality_validation_functions: BTreeSet::new(),
-        }
-    }
-
-    fn function(&self) -> String {
-        self.current_function
-            .clone()
-            .unwrap_or_else(|| "<module>".to_owned())
-    }
-
-    fn inspect_identifier(&mut self, identifier: &str, kind: &str, macro_tokens: bool) {
-        if FORBIDDEN_IR_ARTIFACT_IDENTIFIERS.contains(&identifier) {
-            self.violations
-                .push(format!("{kind} references forbidden `{identifier}`"));
-        }
-        if matches!(
-            identifier,
-            "contextual_expansion" | "semantic_migration" | "lower_semantic_unverified" | "out_net"
-        ) {
-            self.violations
-                .push(format!("{kind} references forbidden `{identifier}`"));
-        }
-        if let Some((_, category)) = FORBIDDEN_IR_DISCOVERY_IDENTIFIERS
-            .iter()
-            .find(|(forbidden, _)| *forbidden == identifier)
-        {
-            self.violations.push(format!(
-                "{kind} retains old {category} helper `{identifier}`"
+    for required in [
+        "pub(crate) fn build_canonical_program_core(",
+        "mapped.validate_totality()?;",
+        "struct SemanticToExecutableMap",
+        "fn validate_allocation_bijections(",
+        "struct SemanticReactiveToMappedMap",
+        "struct SemanticStorageToErasedMap",
+        "fusion: program_core::PulseFusionEligibility::PendingVerification",
+    ] {
+        if !lowering.contains(required) {
+            return Err(format!(
+                "semantic core construction omits ownership proof `{required}`"
             ));
         }
-        if !self.in_semantic_mapping && self.semantic_execution_types.contains(identifier) {
-            let verified_graph_handoff = !macro_tokens
-                && identifier == "SemanticExecutionGraphV1"
-                && self.current_function.as_deref() == Some("lower_verified_semantic_execution");
-            if verified_graph_handoff {
-                self.graph_handoff_functions.insert(self.function());
-            } else {
-                self.violations.push(format!(
-                    "{kind} references semantic execution DTO `{identifier}` outside `semantic_mapping`"
-                ));
-            }
-        }
     }
-
-    fn inspect_path(&mut self, path: &syn::Path, kind: &str) {
-        let segments = path
-            .segments
-            .iter()
-            .map(|segment| segment.ident.to_string())
-            .collect::<Vec<_>>();
-        for identifier in &segments {
-            self.inspect_identifier(identifier, kind, false);
-        }
-        if !self.in_semantic_mapping
-            && segments
-                .last()
-                .is_some_and(|segment| segment == "map_semantic_execution_with_reactive")
-            && segments.iter().any(|segment| segment == "semantic_mapping")
-        {
-            self.mapping_delegation_functions.insert(self.function());
-        }
-        if !self.in_semantic_mapping
-            && segments
-                .last()
-                .is_some_and(|segment| segment == "map_semantic_resources")
-            && segments.iter().any(|segment| segment == "semantic_mapping")
-        {
-            self.resource_mapping_delegation_functions
-                .insert(self.function());
-        }
+    if lowering
+        .matches("program_core::CanonicalProgramCoreV1 {")
+        .count()
+        != 1
+    {
+        return Err(
+            "semantic core construction must emit exactly one CanonicalProgramCoreV1".to_owned(),
+        );
     }
-
-    fn inspect_macro_tokens(&mut self, tokens: &str) {
-        for identifier in rust_token_identifiers(tokens) {
-            self.inspect_identifier(&identifier, "macro tokens", true);
-            if !self.in_semantic_mapping
-                && matches!(
-                    identifier.as_str(),
-                    "map_semantic_execution" | "map_semantic_execution_with_reactive"
-                )
-            {
-                self.violations.push(
-                    "macro tokens hide semantic-to-executable conversion outside `semantic_mapping`"
-                        .to_owned(),
-                );
-            }
-            if !self.in_semantic_mapping && identifier == "map_semantic_resources" {
-                self.violations.push(
-                    "macro tokens hide semantic resource conversion outside `semantic_mapping`"
-                        .to_owned(),
-                );
-            }
-        }
-    }
-
-    fn enter_function(&mut self, identifier: &syn::Ident) -> Option<String> {
-        let previous = self.current_function.replace(identifier.to_string());
-        self.inspect_identifier(&identifier.to_string(), "function", false);
-        previous
-    }
-}
-
-impl<'ast> Visit<'ast> for IrPhase1BoundaryCollector<'_> {
-    fn visit_item(&mut self, item: &'ast syn::Item) {
-        if item_attributes(item).is_some_and(cfg_is_test_only) {
-            return;
-        }
-        syn::visit::visit_item(self, item);
-    }
-
-    fn visit_impl_item(&mut self, item: &'ast syn::ImplItem) {
-        if impl_item_attributes(item).is_some_and(cfg_is_test_only) {
-            return;
-        }
-        syn::visit::visit_impl_item(self, item);
-    }
-
-    fn visit_trait_item(&mut self, item: &'ast syn::TraitItem) {
-        if trait_item_attributes(item).is_some_and(cfg_is_test_only) {
-            return;
-        }
-        syn::visit::visit_trait_item(self, item);
-    }
-
-    fn visit_field(&mut self, field: &'ast syn::Field) {
-        if cfg_is_test_only(&field.attrs) {
-            return;
-        }
-        syn::visit::visit_field(self, field);
-    }
-
-    fn visit_local(&mut self, local: &'ast syn::Local) {
-        if cfg_is_test_only(&local.attrs) {
-            return;
-        }
-        syn::visit::visit_local(self, local);
-    }
-
-    fn visit_item_mod(&mut self, item: &'ast syn::ItemMod) {
-        self.inspect_identifier(&item.ident.to_string(), "module", false);
-        syn::visit::visit_item_mod(self, item);
-    }
-
-    fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
-        let previous = self.enter_function(&item.sig.ident);
-        syn::visit::visit_item_fn(self, item);
-        self.current_function = previous;
-    }
-
-    fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
-        let previous = self.enter_function(&item.sig.ident);
-        syn::visit::visit_impl_item_fn(self, item);
-        self.current_function = previous;
-    }
-
-    fn visit_trait_item_fn(&mut self, item: &'ast syn::TraitItemFn) {
-        let previous = self.enter_function(&item.sig.ident);
-        syn::visit::visit_trait_item_fn(self, item);
-        self.current_function = previous;
-    }
-
-    fn visit_item_use(&mut self, item: &'ast syn::ItemUse) {
-        let mut imports = Vec::new();
-        flatten_use_tree(&item.tree, &mut Vec::new(), &mut imports);
-        for import in imports {
-            for identifier in import.path {
-                self.inspect_identifier(&identifier, "import", false);
-            }
-        }
-        syn::visit::visit_item_use(self, item);
-    }
-
-    fn visit_path(&mut self, path: &'ast syn::Path) {
-        self.inspect_path(path, "path");
-        syn::visit::visit_path(self, path);
-    }
-
-    fn visit_expr_method_call(&mut self, expression: &'ast syn::ExprMethodCall) {
-        let method = expression.method.to_string();
-        self.inspect_identifier(&method, "method call", false);
-        if !self.in_semantic_mapping && method == "validate_totality" {
-            self.totality_validation_functions.insert(self.function());
-        }
-        syn::visit::visit_expr_method_call(self, expression);
-    }
-
-    fn visit_macro(&mut self, item: &'ast syn::Macro) {
-        self.inspect_macro_tokens(&item.tokens.to_string());
-        syn::visit::visit_macro(self, item);
-    }
-}
-
-#[derive(Clone, Debug)]
-struct FlattenedImport {
-    path: Vec<String>,
-}
-
-fn flatten_use_tree(
-    tree: &syn::UseTree,
-    prefix: &mut Vec<String>,
-    output: &mut Vec<FlattenedImport>,
-) {
-    match tree {
-        syn::UseTree::Path(path) => {
-            prefix.push(path.ident.to_string());
-            flatten_use_tree(&path.tree, prefix, output);
-            prefix.pop();
-        }
-        syn::UseTree::Name(name) => {
-            prefix.push(name.ident.to_string());
-            output.push(FlattenedImport {
-                path: prefix.clone(),
-            });
-            prefix.pop();
-        }
-        syn::UseTree::Rename(rename) => {
-            prefix.push(rename.ident.to_string());
-            output.push(FlattenedImport {
-                path: prefix.clone(),
-            });
-            prefix.pop();
-        }
-        syn::UseTree::Group(group) => {
-            for tree in &group.items {
-                flatten_use_tree(tree, prefix, output);
-            }
-        }
-        syn::UseTree::Glob(_) => output.push(FlattenedImport {
-            path: prefix.clone(),
-        }),
-    }
-}
-
-fn verify_semantic_mapping_contract(source: &str) -> Result<(), String> {
-    let syntax = syn::parse_file(source)
-        .map_err(|error| format!("cannot parse semantic mapping: {error}"))?;
-    verify_dense_stage_map_contract(
-        &syntax,
-        "SemanticReactiveToMappedMap",
-        &[
-            "field_count",
-            "binding_count",
-            "read_count",
-            "trigger_arm_count",
-            "state_update_arm_count",
-            "list_mutation_count",
-        ],
-        None,
-    )?;
-    verify_dense_stage_map_contract(
-        &syntax,
-        "SemanticStorageToErasedMap",
-        &[
-            "storage_field_count",
-            "reactive_fields",
-            "binding_count",
-            "read_count",
-            "external_reference_count",
-        ],
-        Some(("reactive_fields", "FieldId")),
-    )?;
     for forbidden in [
         "MappedSemanticNamedValue",
         "MappedSemanticNamedValueProjection",
@@ -1670,561 +1147,13 @@ fn verify_semantic_mapping_contract(source: &str) -> Result<(), String> {
         "MappedSemanticStorageRepresentation",
         "MappedSemanticStorageTypePathSegment",
     ] {
-        if syntax.items.iter().any(|item| match item {
-            syn::Item::Struct(item) => item.ident == forbidden,
-            syn::Item::Enum(item) => item.ident == forbidden,
-            _ => false,
-        }) {
+        if lowering.contains(forbidden) {
             return Err(format!(
-                "`semantic_mapping` restores forbidden post-verification proof shadow `{forbidden}`"
-            ));
-        }
-    }
-    let definitions = syntax
-        .items
-        .iter()
-        .filter_map(|item| match item {
-            syn::Item::Struct(definition)
-                if definition.ident == "SemanticToExecutableMap"
-                    && !cfg_is_test_only(&definition.attrs) =>
-            {
-                Some(definition)
-            }
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    let [definition] = definitions.as_slice() else {
-        return Err(format!(
-            "`semantic_mapping` must define exactly one production `SemanticToExecutableMap`; observed {}",
-            definitions.len()
-        ));
-    };
-    let syn::Fields::Named(fields) = &definition.fields else {
-        return Err("`SemanticToExecutableMap` must use explicit named map fields".to_owned());
-    };
-    let mut map_fields = BTreeSet::new();
-    for field in &fields.named {
-        let Some(identifier) = &field.ident else {
-            return Err("`SemanticToExecutableMap` contains an unnamed field".to_owned());
-        };
-        if !matches!(field.vis, syn::Visibility::Inherited) {
-            return Err(format!(
-                "`SemanticToExecutableMap.{identifier}` must remain private"
-            ));
-        }
-        if !explicit_map_storage_type(&field.ty) {
-            return Err(format!(
-                "`SemanticToExecutableMap.{identifier}` is not an explicit dense-domain bound or non-identity allocation table"
-            ));
-        }
-        map_fields.insert(identifier.to_string());
-    }
-
-    let required = [
-        ("expression_count", "expressions", "expression"),
-        ("statement_count", "statements", "statement"),
-        ("lexical_scope_count", "scopes", "lexical_scope"),
-        ("source_count", "sources", "source"),
-        ("state_count", "states", "state"),
-        ("callable_count", "callables", "callable"),
-        (
-            "materialization_count",
-            "materializations",
-            "materialization",
-        ),
-        ("list_count", "lists", "list"),
-        ("row_scope_count", "row_scopes", "row_scope"),
-        (
-            "value_list_authority_count",
-            "value_list_authorities",
-            "value_list_authority",
-        ),
-    ];
-    let missing_fields = required
-        .iter()
-        .filter(|(field, _, _)| !map_fields.contains(*field))
-        .map(|(field, _, _)| (*field).to_owned())
-        .collect::<Vec<_>>();
-    if !missing_fields.is_empty() {
-        return Err(format!(
-            "`SemanticToExecutableMap` omits required identity domains: {}",
-            bounded_list(&missing_fields)
-        ));
-    }
-
-    let mut collector = SemanticMappingContractCollector::default();
-    collector.visit_file(&syntax);
-    let missing_initializers = map_fields
-        .difference(&collector.allocated_fields)
-        .cloned()
-        .collect::<Vec<_>>();
-    if !missing_initializers.is_empty() {
-        return Err(format!(
-            "`SemanticToExecutableMap::allocate_with_external_events` does not initialize every explicit map: {}",
-            bounded_list(&missing_initializers)
-        ));
-    }
-    let identity_fields = required
-        .iter()
-        .map(|(field, _, _)| (*field).to_owned())
-        .collect::<BTreeSet<_>>();
-    let missing_totality = map_fields
-        .iter()
-        .filter(|field| {
-            !identity_fields.contains(*field) && !collector.totality_fields.contains(*field)
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    if !missing_totality.is_empty() {
-        return Err(format!(
-            "`validate_totality` does not compare every explicit map with emitted output: {}",
-            bounded_list(&missing_totality)
-        ));
-    }
-    let missing_dense_domains = required
-        .iter()
-        .filter(|(_, graph_field, _)| !collector.dense_graph_domains.contains(*graph_field))
-        .map(|(_, graph_field, _)| (*graph_field).to_owned())
-        .collect::<Vec<_>>();
-    if !missing_dense_domains.is_empty() {
-        return Err(format!(
-            "`SemanticToExecutableMap::allocate_with_external_events` does not validate dense source identities for: {}",
-            bounded_list(&missing_dense_domains)
-        ));
-    }
-    let missing_lookup_methods = required
-        .iter()
-        .filter(|(_, _, method)| !collector.map_methods.contains(*method))
-        .map(|(_, _, method)| (*method).to_owned())
-        .collect::<Vec<_>>();
-    if !missing_lookup_methods.is_empty() {
-        return Err(format!(
-            "`SemanticToExecutableMap` omits explicit lookup methods: {}",
-            bounded_list(&missing_lookup_methods)
-        ));
-    }
-    let missing_bounded_domains = identity_fields
-        .difference(&collector.bounded_identity_fields)
-        .cloned()
-        .collect::<Vec<_>>();
-    if !missing_bounded_domains.is_empty() {
-        return Err(format!(
-            "`SemanticToExecutableMap` lookup methods do not bound dense identity domains: {}",
-            bounded_list(&missing_bounded_domains)
-        ));
-    }
-    if !collector.has_totality_validator {
-        return Err("semantic mapping omits production `validate_totality`".to_owned());
-    }
-    if !collector.entrypoint_allocates_map {
-        return Err(
-            "`map_semantic_execution_with_external_events` does not allocate `SemanticToExecutableMap`"
-                .to_owned(),
-        );
-    }
-    if !(collector.allocate_calls_bijection_validator
-        && collector.bijection_validator_uses_unique_allocation)
-    {
-        return Err(
-            "`SemanticToExecutableMap::allocate_with_external_events` lacks explicit non-identity one-to-one/bijection validation"
-                .to_owned(),
-        );
-    }
-    Ok(())
-}
-
-fn verify_dense_stage_map_contract(
-    syntax: &syn::File,
-    name: &str,
-    expected_fields: &[&str],
-    non_identity_vec: Option<(&str, &str)>,
-) -> Result<(), String> {
-    let definitions = syntax
-        .items
-        .iter()
-        .filter_map(|item| match item {
-            syn::Item::Struct(definition)
-                if definition.ident == name && !cfg_is_test_only(&definition.attrs) =>
-            {
-                Some(definition)
-            }
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    let [definition] = definitions.as_slice() else {
-        return Err(format!(
-            "`semantic_mapping` must define exactly one production `{name}`; observed {}",
-            definitions.len()
-        ));
-    };
-    let syn::Fields::Named(fields) = &definition.fields else {
-        return Err(format!("`{name}` must use named fields"));
-    };
-    let actual_fields = fields
-        .named
-        .iter()
-        .filter_map(|field| field.ident.as_ref().map(ToString::to_string))
-        .collect::<BTreeSet<_>>();
-    let expected_fields = expected_fields
-        .iter()
-        .map(|field| (*field).to_owned())
-        .collect::<BTreeSet<_>>();
-    if actual_fields != expected_fields {
-        return Err(format!(
-            "`{name}` fields differ from the canonical dense-domain ownership contract"
-        ));
-    }
-    for field in &fields.named {
-        let identifier = field.ident.as_ref().expect("named field");
-        if !matches!(field.vis, syn::Visibility::Inherited) {
-            return Err(format!("`{name}.{identifier}` must remain private"));
-        }
-        let valid = match non_identity_vec {
-            Some((field_name, element)) if identifier == field_name => {
-                direct_vec_element_is(&field.ty, element)
-            }
-            _ => direct_type_is(&field.ty, "usize"),
-        };
-        if !valid {
-            return Err(format!(
-                "`{name}.{identifier}` must be a dense-domain count or the declared non-identity allocation table"
+                "semantic core construction restores proof shadow `{forbidden}`"
             ));
         }
     }
     Ok(())
-}
-
-fn direct_type_is(ty: &syn::Type, expected: &str) -> bool {
-    matches!(
-        ty,
-        syn::Type::Path(path)
-            if path.qself.is_none()
-                && path.path.segments.len() == 1
-                && path.path.segments[0].ident == expected
-                && path.path.segments[0].arguments.is_empty()
-    )
-}
-
-fn direct_vec_element_is(ty: &syn::Type, expected: &str) -> bool {
-    let syn::Type::Path(path) = ty else {
-        return false;
-    };
-    let Some(segment) = path.path.segments.last() else {
-        return false;
-    };
-    let syn::PathArguments::AngleBracketed(arguments) = &segment.arguments else {
-        return false;
-    };
-    segment.ident == "Vec"
-        && arguments.args.len() == 1
-        && matches!(
-            arguments.args.first(),
-            Some(syn::GenericArgument::Type(element)) if direct_type_is(element, expected)
-        )
-}
-
-fn explicit_map_storage_type(ty: &syn::Type) -> bool {
-    let syn::Type::Path(path) = ty else {
-        return false;
-    };
-    path.qself.is_none()
-        && path.path.segments.last().is_some_and(|segment| {
-            segment.ident == "usize"
-                || (matches!(segment.ident.to_string().as_str(), "Vec" | "BTreeMap")
-                    && matches!(
-                        segment.arguments,
-                        syn::PathArguments::AngleBracketed(ref arguments)
-                            if !arguments.args.is_empty()
-                    ))
-        })
-}
-
-#[derive(Default)]
-struct SemanticMappingContractCollector {
-    current_impl: Option<String>,
-    current_function: Option<String>,
-    require_dense_depth: usize,
-    allocated_fields: BTreeSet<String>,
-    totality_fields: BTreeSet<String>,
-    dense_graph_domains: BTreeSet<String>,
-    map_methods: BTreeSet<String>,
-    bounded_identity_fields: BTreeSet<String>,
-    has_totality_validator: bool,
-    entrypoint_allocates_map: bool,
-    allocate_calls_bijection_validator: bool,
-    bijection_validator_uses_unique_allocation: bool,
-}
-
-impl SemanticMappingContractCollector {
-    fn in_map_allocate(&self) -> bool {
-        self.current_impl.as_deref() == Some("SemanticToExecutableMap")
-            && self.current_function.as_deref() == Some("allocate_with_external_events")
-    }
-
-    fn in_totality_validator(&self) -> bool {
-        self.current_function.as_deref() == Some("validate_totality")
-    }
-
-    fn enter_function(&mut self, identifier: &syn::Ident) -> Option<String> {
-        self.current_function.replace(identifier.to_string())
-    }
-}
-
-impl<'ast> Visit<'ast> for SemanticMappingContractCollector {
-    fn visit_item(&mut self, item: &'ast syn::Item) {
-        if item_attributes(item).is_some_and(cfg_is_test_only) {
-            return;
-        }
-        syn::visit::visit_item(self, item);
-    }
-
-    fn visit_impl_item(&mut self, item: &'ast syn::ImplItem) {
-        if impl_item_attributes(item).is_some_and(cfg_is_test_only) {
-            return;
-        }
-        syn::visit::visit_impl_item(self, item);
-    }
-
-    fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
-        let previous = self.current_impl.clone();
-        self.current_impl = simple_type_name(item.self_ty.as_ref());
-        syn::visit::visit_item_impl(self, item);
-        self.current_impl = previous;
-    }
-
-    fn visit_item_fn(&mut self, item: &'ast syn::ItemFn) {
-        let previous = self.enter_function(&item.sig.ident);
-        syn::visit::visit_item_fn(self, item);
-        self.current_function = previous;
-    }
-
-    fn visit_impl_item_fn(&mut self, item: &'ast syn::ImplItemFn) {
-        let previous = self.enter_function(&item.sig.ident);
-        if self.current_impl.as_deref() == Some("SemanticToExecutableMap") {
-            self.map_methods.insert(item.sig.ident.to_string());
-        }
-        if item.sig.ident == "validate_totality" {
-            self.has_totality_validator = true;
-        }
-        syn::visit::visit_impl_item_fn(self, item);
-        self.current_function = previous;
-    }
-
-    fn visit_expr_struct(&mut self, expression: &'ast syn::ExprStruct) {
-        if self.in_map_allocate()
-            && expression.path.segments.last().is_some_and(|segment| {
-                matches!(
-                    segment.ident.to_string().as_str(),
-                    "Self" | "SemanticToExecutableMap"
-                )
-            })
-        {
-            self.allocated_fields
-                .extend(
-                    expression
-                        .fields
-                        .iter()
-                        .filter_map(|field| match &field.member {
-                            syn::Member::Named(identifier) => Some(identifier.to_string()),
-                            syn::Member::Unnamed(_) => None,
-                        }),
-                );
-        }
-        syn::visit::visit_expr_struct(self, expression);
-    }
-
-    fn visit_expr_call(&mut self, expression: &'ast syn::ExprCall) {
-        let is_require_dense = self.in_map_allocate()
-            && matches!(
-                expression.func.as_ref(),
-                syn::Expr::Path(path)
-                    if path.path.segments.last().is_some_and(|segment| segment.ident == "require_dense")
-            );
-        if is_require_dense {
-            self.require_dense_depth += 1;
-        }
-        if self.current_impl.as_deref() == Some("SemanticToExecutableMap")
-            && matches!(
-                expression.func.as_ref(),
-                syn::Expr::Path(path)
-                    if path.path.segments.last().is_some_and(|segment| segment.ident == "exact_dense_index")
-            )
-        {
-            for argument in &expression.args {
-                if let Some(chain) = expression_chain(argument)
-                    && chain.len() == 2
-                    && chain[0] == "self"
-                {
-                    self.bounded_identity_fields.insert(chain[1].clone());
-                }
-            }
-        }
-        if self.current_impl.as_deref() == Some("SemanticToExecutableMap")
-            && self.current_function.as_deref() == Some("validate_allocation_bijections")
-            && matches!(
-                expression.func.as_ref(),
-                syn::Expr::Path(path)
-                    if path.path.segments.last().is_some_and(|segment| segment.ident == "require_unique_allocation")
-            )
-        {
-            self.bijection_validator_uses_unique_allocation = true;
-        }
-        if self.current_impl.is_none()
-            && self.current_function.as_deref()
-                == Some("map_semantic_execution_with_external_events")
-            && matches!(
-                expression.func.as_ref(),
-                syn::Expr::Path(path)
-                    if path.path.segments.last().is_some_and(|segment| segment.ident == "allocate_with_external_events")
-                        && path.path.segments.iter().any(|segment| segment.ident == "SemanticToExecutableMap")
-            )
-        {
-            self.entrypoint_allocates_map = true;
-        }
-        syn::visit::visit_expr_call(self, expression);
-        if is_require_dense {
-            self.require_dense_depth -= 1;
-        }
-    }
-
-    fn visit_expr_field(&mut self, expression: &'ast syn::ExprField) {
-        if let Some(chain) = expression_field_chain(expression)
-            && self.require_dense_depth > 0
-            && chain
-                .first()
-                .is_some_and(|root| root == "graph" || root == "resources")
-            && chain.len() >= 2
-        {
-            self.dense_graph_domains.insert(chain[1].clone());
-        }
-        if let Some(chain) = expression_field_chain(expression)
-            && self.in_totality_validator()
-            && chain.len() == 3
-            && chain[0] == "self"
-            && chain[1] == "id_map"
-        {
-            self.totality_fields.insert(chain[2].clone());
-        }
-        syn::visit::visit_expr_field(self, expression);
-    }
-
-    fn visit_expr_method_call(&mut self, expression: &'ast syn::ExprMethodCall) {
-        if self.in_map_allocate() && expression.method == "validate_allocation_bijections" {
-            self.allocate_calls_bijection_validator = true;
-        }
-        if self.in_totality_validator()
-            && expression.method == "len"
-            && let Some(chain) = expression_chain(expression.receiver.as_ref())
-            && chain.len() == 3
-            && chain[0] == "self"
-            && chain[1] == "id_map"
-        {
-            self.totality_fields.insert(chain[2].clone());
-        }
-        syn::visit::visit_expr_method_call(self, expression);
-    }
-}
-
-fn simple_type_name(ty: &syn::Type) -> Option<String> {
-    let syn::Type::Path(path) = ty else {
-        return None;
-    };
-    path.path
-        .segments
-        .last()
-        .map(|segment| segment.ident.to_string())
-}
-
-fn expression_field_chain(expression: &syn::ExprField) -> Option<Vec<String>> {
-    let mut chain = expression_chain(expression.base.as_ref())?;
-    let syn::Member::Named(identifier) = &expression.member else {
-        return None;
-    };
-    chain.push(identifier.to_string());
-    Some(chain)
-}
-
-fn expression_chain(expression: &syn::Expr) -> Option<Vec<String>> {
-    match expression {
-        syn::Expr::Path(path) if path.qself.is_none() => Some(
-            path.path
-                .segments
-                .iter()
-                .map(|segment| segment.ident.to_string())
-                .collect(),
-        ),
-        syn::Expr::Field(field) => expression_field_chain(field),
-        syn::Expr::Paren(paren) => expression_chain(paren.expr.as_ref()),
-        _ => None,
-    }
-}
-
-fn rust_token_identifiers(tokens: &str) -> Vec<String> {
-    let bytes = tokens.as_bytes();
-    let mut identifiers = Vec::new();
-    let mut index = 0;
-    while index < bytes.len() {
-        let byte = bytes[index];
-        if byte == b'"' {
-            index = skip_quoted_token(bytes, index + 1, b'"');
-            continue;
-        }
-        if byte == b'\'' && index + 2 < bytes.len() && bytes[index + 2] == b'\'' {
-            index += 3;
-            continue;
-        }
-        if byte == b'r' {
-            let mut cursor = index + 1;
-            while cursor < bytes.len() && bytes[cursor] == b'#' {
-                cursor += 1;
-            }
-            if cursor < bytes.len() && bytes[cursor] == b'"' {
-                let hashes = cursor - index - 1;
-                cursor += 1;
-                while cursor < bytes.len() {
-                    if bytes[cursor] == b'"'
-                        && bytes
-                            .get(cursor + 1..cursor + 1 + hashes)
-                            .is_some_and(|suffix| suffix.iter().all(|byte| *byte == b'#'))
-                    {
-                        index = cursor + 1 + hashes;
-                        break;
-                    }
-                    cursor += 1;
-                }
-                if cursor >= bytes.len() {
-                    index = bytes.len();
-                }
-                continue;
-            }
-        }
-        if byte == b'_' || byte.is_ascii_alphabetic() {
-            let start = index;
-            index += 1;
-            while index < bytes.len()
-                && (bytes[index] == b'_' || bytes[index].is_ascii_alphanumeric())
-            {
-                index += 1;
-            }
-            identifiers.push(tokens[start..index].to_owned());
-            continue;
-        }
-        index += 1;
-    }
-    identifiers
-}
-
-fn skip_quoted_token(bytes: &[u8], mut index: usize, quote: u8) -> usize {
-    while index < bytes.len() {
-        if bytes[index] == b'\\' {
-            index = (index + 2).min(bytes.len());
-        } else if bytes[index] == quote {
-            return index + 1;
-        } else {
-            index += 1;
-        }
-    }
-    bytes.len()
 }
 
 const VERIFIED_BOUNDARY_FUNCTIONS: [&str; 7] = [
@@ -2954,221 +1883,5 @@ impl Artifact {
             .unwrap_err()
             .contains("nonoptional")
         );
-    }
-
-    fn phase1_boundary_analysis(
-        source: &str,
-    ) -> (
-        Vec<String>,
-        BTreeSet<String>,
-        BTreeSet<String>,
-        BTreeSet<String>,
-        BTreeSet<String>,
-    ) {
-        let semantic_types = BTreeSet::from([
-            "SemanticExecutionGraphV1".to_owned(),
-            "SemanticExprId".to_owned(),
-            "SemanticExpression".to_owned(),
-        ]);
-        let syntax = syn::parse_file(source).unwrap();
-        let mut collector = IrPhase1BoundaryCollector::new(false, &semantic_types);
-        collector.visit_file(&syntax);
-        collector.violations.sort();
-        collector.violations.dedup();
-        (
-            collector.violations,
-            collector.graph_handoff_functions,
-            collector.mapping_delegation_functions,
-            collector.resource_mapping_delegation_functions,
-            collector.totality_validation_functions,
-        )
-    }
-
-    #[test]
-    fn phase1_boundary_accepts_only_the_verified_mapping_handoff() {
-        let (
-            violations,
-            graph_handoffs,
-            mapping_delegations,
-            resource_mapping_delegations,
-            totality_validations,
-        ) = phase1_boundary_analysis(
-            r#"
-fn lower_verified_semantic_execution(
-    graph: boon_semantic::SemanticExecutionGraphV1,
-    resources: Resources,
-    reactive: Reactive,
-) -> Result<(), String> {
-    let mapped =
-        semantic_mapping::map_semantic_execution_with_reactive(&graph, &resources, &reactive)?;
-    mapped.validate_totality()?;
-    let _resources =
-        semantic_mapping::map_semantic_resources(&graph, &resources, &mapped.id_map)?;
-    Ok(())
-}
-
-fn package_mapped_state_arms(mapped_state_update_arms: Vec<Arm>) -> PulseBatch {
-    PulseBatch {
-        state_update_arms: mapped_state_update_arms,
-    }
-}
-
-#[cfg(test)]
-mod arbitrary_test_support_name {
-    use boon_typecheck::CheckedProgram as CP;
-    use boon_semantic::{out_net as hidden, SemanticExpression as Input};
-
-    macro_rules! test_bypass {
-        () => { lower_semantic_unverified::<CP, Input, hidden>() };
-    }
-}
-
-macro_rules! diagnostic_text {
-    () => { "CheckedProgram contextual_expansion lower_semantic_unverified" };
-}
-"#,
-        );
-        assert!(violations.is_empty(), "{violations:#?}");
-        let expected = BTreeSet::from(["lower_verified_semantic_execution".to_owned()]);
-        assert_eq!(graph_handoffs, expected);
-        assert_eq!(mapping_delegations, expected);
-        assert_eq!(resource_mapping_delegations, expected);
-        assert_eq!(totality_validations, expected);
-    }
-
-    #[test]
-    fn phase1_boundary_rejects_aliases_imports_macros_and_production_cfgs() {
-        for (label, source, expected) in [
-            (
-                "renamed checked artifact",
-                "use boon_typecheck::{CheckedProgram as CP}; fn bypass(_: CP) {}",
-                "CheckedProgram",
-            ),
-            (
-                "renamed out net",
-                "use boon_semantic::out_net as hidden; fn bypass() { hidden::build(); }",
-                "out_net",
-            ),
-            (
-                "renamed old helper",
-                "use crate::contextual_expansion::derive_executable_program as convert;",
-                "derive_executable_program",
-            ),
-            (
-                "old reactive discovery helper",
-                "fn state_update_arms() {} fn bypass() { state_update_arms(); }",
-                "state_update_arms",
-            ),
-            (
-                "semantic DTO outside map",
-                "use boon_semantic::SemanticExpression as Input; fn convert(_: Input) {}",
-                "SemanticExpression",
-            ),
-            (
-                "macro-hidden artifact",
-                "macro_rules! bypass { () => { let _: CheckedProgram = forge!(); }; }",
-                "CheckedProgram",
-            ),
-            (
-                "macro-hidden raw lowerer",
-                "macro_rules! bypass { () => { lower_semantic_unverified(graph); }; }",
-                "lower_semantic_unverified",
-            ),
-            (
-                "macro-hidden resource mapper",
-                "macro_rules! bypass { () => { map_semantic_resources(graph); }; }",
-                "semantic resource conversion",
-            ),
-            (
-                "production-capable cfg",
-                "#[cfg(any(test, feature = \"audit\"))] fn bypass(_: CheckedProgram) {}",
-                "CheckedProgram",
-            ),
-            (
-                "not-test cfg",
-                "#[cfg(not(test))] fn bypass(_: ResolvedOutGraph) {}",
-                "ResolvedOutGraph",
-            ),
-        ] {
-            let (violations, _, _, _, _) = phase1_boundary_analysis(source);
-            assert!(
-                violations
-                    .iter()
-                    .any(|violation| violation.contains(expected)),
-                "{label}: expected `{expected}` in {violations:#?}"
-            );
-        }
-    }
-
-    #[test]
-    fn phase1_file_inventory_is_exact_and_rejects_old_module_files() {
-        let valid = BTreeSet::from([
-            BOON_IR_LIB.to_owned(),
-            BOON_IR_SEMANTIC_MAPPING.to_owned(),
-            "crates/boon_ir/src/tests.rs".to_owned(),
-        ]);
-        verify_boon_ir_file_inventory(&valid).unwrap();
-
-        for old in [
-            "crates/boon_ir/src/contextual_expansion.rs",
-            "crates/boon_ir/src/semantic_migration/mod.rs",
-        ] {
-            let mut invalid = valid.clone();
-            invalid.insert(old.to_owned());
-            let error = verify_boon_ir_file_inventory(&invalid).unwrap_err();
-            assert!(error.contains(old), "{error}");
-        }
-
-        let mut split_mapping = valid;
-        split_mapping.insert("crates/boon_ir/src/semantic_mapping/helpers.rs".to_owned());
-        assert!(
-            verify_boon_ir_file_inventory(&split_mapping)
-                .unwrap_err()
-                .contains("exactly")
-        );
-    }
-
-    #[test]
-    fn semantic_mapping_contract_requires_totality_and_bijection_evidence() {
-        let mapping = include_str!("../../boon_ir/src/semantic_mapping.rs");
-        verify_semantic_mapping_contract(mapping).unwrap();
-
-        let missing_totality =
-            mapping.replace("self.id_map.local_bindings", "self.id_map.call_instances");
-        let error = verify_semantic_mapping_contract(&missing_totality).unwrap_err();
-        assert!(error.contains("local_bindings"), "{error}");
-
-        let missing_bijection = mapping.replacen(
-            "allocated.validate_allocation_bijections()?;",
-            "let _ = &allocated;",
-            1,
-        );
-        let error = verify_semantic_mapping_contract(&missing_bijection).unwrap_err();
-        assert!(error.contains("bijection"), "{error}");
-
-        let missing_resource_identity = mapping.replacen("    row_scope_count: usize,\n", "", 1);
-        let error = verify_semantic_mapping_contract(&missing_resource_identity).unwrap_err();
-        assert!(error.contains("row_scope_count"), "{error}");
-
-        let missing_explicit_erasure =
-            mapping.replacen("    value_list_authority_count: usize,\n", "", 1);
-        let error = verify_semantic_mapping_contract(&missing_explicit_erasure).unwrap_err();
-        assert!(error.contains("value_list_authority_count"), "{error}");
-
-        let restored_identity_vector = mapping.replacen(
-            "    field_count: usize,",
-            "    fields: Vec<MappedReactiveFieldId>,",
-            1,
-        );
-        let error = verify_semantic_mapping_contract(&restored_identity_vector).unwrap_err();
-        assert!(error.contains("SemanticReactiveToMappedMap"), "{error}");
-
-        let restored_proof_shadow = mapping.replacen(
-            "struct MappedSemanticDerivedValue",
-            "struct MappedSemanticNamedValue",
-            1,
-        );
-        let error = verify_semantic_mapping_contract(&restored_proof_shadow).unwrap_err();
-        assert!(error.contains("proof shadow"), "{error}");
     }
 }

@@ -8,24 +8,24 @@ lexical_scope = "all-source-text"
 test_scope_policy = "test-oracle"
 non_code_policy = "unrelated-host-code"
 expected_file_count = 147
-expected_file_set_sha256 = "4adabe2b6003989645a14f971c78601d9a5cd139d7d3428d0c4931a4ad94d480"
+expected_file_set_sha256 = "fc1b50e18bbf7a61b766078ef0fd3a7180cf12c177dd46cd363b9cb743523763"
 occurrence_ledger_path = "docs/architecture/phase0/container_occurrences.tsv"
 occurrence_ledger_protocol = "boon-phase0-container-occurrences-v1"
 occurrence_ledger_generator = "cargo test -p xtask verify_phase0::tests::regenerate_container_occurrence_ledger -- --ignored --exact"
-expected_occurrence_ledger_sha256 = "3f6f05aa95e8b8b55a85c7008389cc947331db0177583309d82e9e9cd29a0d2b"
-expected_occurrence_rows = 4808
+expected_occurrence_ledger_sha256 = "23fca99bb237650d0b55e5871304b8ddef137c4478b691a279b9041175379c3c"
+expected_occurrence_rows = 4770
 within_file_classification = "complete"
 within_file_owner_phase = "goal-phase-5-packed"
 within_file_owner_action = "Maintain one checked-in row per exact identifier occurrence; mixed files retain distinct per-use categories."
 
 [[constructs]]
 id = "BTreeMap"
-expected_occurrences = 2864
-expected_files = 122
+expected_occurrences = 2863
+expected_files = 121
 
 [[constructs]]
 id = "BTreeSet"
-expected_occurrences = 1858
+expected_occurrences = 1821
 expected_files = 97
 
 [[constructs]]
@@ -56,7 +56,7 @@ owner_phase = "goal-phase-5-packed"
 owner_plan = "docs/plans/BOON_PACKED_DATA_AND_DENSE_INTERNALS_PLAN.md"
 expected_files = 88
 expected_btree_map = 0
-expected_btree_set = 1718
+expected_btree_set = 1688
 expected_hash_map = 0
 expected_hash_set = 28
 
@@ -100,7 +100,7 @@ owner_phase = "goal-phase-0"
 owner_plan = "docs/plans/GOAL_PROMPT.md"
 expected_files = 51
 expected_btree_map = 297
-expected_btree_set = 96
+expected_btree_set = 89
 expected_hash_map = 7
 expected_hash_set = 2
 
@@ -109,8 +109,8 @@ order = 6
 id = "unrelated-host-code"
 owner_phase = "goal-phase-0"
 owner_plan = "docs/plans/GOAL_PROMPT.md"
-expected_files = 70
-expected_btree_map = 595
+expected_files = 69
+expected_btree_map = 594
 expected_btree_set = 5
 expected_hash_map = 33
 expected_hash_set = 4

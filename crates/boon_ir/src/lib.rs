@@ -8,8 +8,6 @@ use std::time::Instant;
 #[cfg(all(test, target_arch = "wasm32"))]
 use web_time::Instant;
 
-mod semantic_mapping;
-
 /// Opaque executable IR whose complete provenance is fixed at the sole
 /// verification-gated lowering boundary.
 ///
@@ -318,28 +316,9 @@ fn erase_semantic_program(
     }
     let verification_manifest_digest = verification_manifest.manifest_digest;
     let pulse_fusion_decisions = verification_manifest.pulse_fusion_decisions;
-    let (
-        source_bundle_digest_v1,
-        execution_graph,
-        resource_graph,
-        reactive_graph,
-        lowering_contract,
-        view_binding_graph,
-        scope_storage_graph,
-        memory_graph,
-        semantic_program_digest,
-        _dependency_manifest_digest,
-    ) = semantic.into_lowering_parts();
-    let fields = lower_verified_semantic_execution(
-        execution_graph,
-        resource_graph,
-        reactive_graph,
-        lowering_contract,
-        view_binding_graph,
-        scope_storage_graph,
-        memory_graph,
-        &pulse_fusion_decisions,
-    )?;
+    let (source_bundle_digest_v1, mut fields, semantic_program_digest, _dependency_manifest_digest) =
+        semantic.into_lowering_parts();
+    bind_verified_pulse_fusion(&mut fields, &pulse_fusion_decisions)?;
     let erased = ErasedProgram {
         fields,
         source_bundle_digest_v1,
@@ -355,10 +334,6 @@ fn erase_semantic_program(
 #[cfg(test)]
 fn lower(program: &ParsedProgram) -> Result<ErasedProgram, String> {
     lower_with_typecheck(program, &boon_typecheck::ExternalTypeEnvironment::default())
-}
-
-fn producer_identity_text(identity: [u8; 32]) -> String {
-    identity.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 #[cfg(test)]
@@ -444,40 +419,114 @@ fn lower_with_typecheck(
     erase_and_lower(verified)
 }
 
-fn lower_verified_semantic_execution(
-    execution_graph: boon_semantic::SemanticExecutionGraphV1,
-    resource_graph: boon_semantic::SemanticResourceGraphV1,
-    reactive_graph: boon_semantic::SemanticReactiveGraphV1,
-    lowering_contract: boon_semantic::SemanticLoweringContractV1,
-    view_binding_graph: boon_semantic::SemanticViewBindingGraphV1,
-    scope_storage_graph: boon_semantic::SemanticScopeStorageGraphV1,
-    memory_graph: boon_semantic::SemanticMemoryGraphV1,
-    pulse_fusion_decisions: &[boon_verify::VerifiedPulseFusionDecisionV1],
-) -> Result<CanonicalProgramCoreV1, String> {
-    let mapped = semantic_mapping::map_semantic_execution_with_reactive(
-        &execution_graph,
-        &resource_graph,
-        &reactive_graph,
-    )?;
-    mapped.validate_totality()?;
-    let resources = semantic_mapping::map_semantic_resources(
-        &execution_graph,
-        &resource_graph,
-        &mapped.id_map,
-    )?;
-    let fields = semantic_mapping::finish_verified_semantic_lowering(
-        &execution_graph,
-        &resource_graph,
-        &reactive_graph,
-        &lowering_contract,
-        &view_binding_graph,
-        &scope_storage_graph,
-        &memory_graph,
-        pulse_fusion_decisions,
-        mapped,
-        resources,
-    )?;
-    Ok(fields)
+fn bind_verified_pulse_fusion(
+    fields: &mut CanonicalProgramCoreV1,
+    decisions: &[boon_verify::VerifiedPulseFusionDecisionV1],
+) -> Result<(), String> {
+    if decisions.len() != fields.pulse_batches.len() {
+        return Err(format!(
+            "verification manifest has {} pulse-fusion decisions for {} canonical pulse batches",
+            decisions.len(),
+            fields.pulse_batches.len()
+        ));
+    }
+    for (index, (batch, decision)) in fields.pulse_batches.iter_mut().zip(decisions).enumerate() {
+        if batch.id != PulseBatchId(index)
+            || decision.pulse_batch.as_usize() != index
+            || decision.semantic_slice_digest.0 != batch.semantic_slice_digest
+            || batch.fusion != PulseFusionEligibility::PendingVerification
+        {
+            return Err(format!(
+                "pulse-fusion decision {} does not bind pending canonical pulse batch {} and its exact slice digest",
+                decision.pulse_batch, batch.id
+            ));
+        }
+        batch.fusion = match &decision.status {
+            boon_verify::VerifiedPulseFusionStatusV1::Eligible { fact } => {
+                if fact.count_policy
+                    != boon_verify::VerifiedPulseFusionCountPolicyV1::FrozenAndRuntimeTargetGuardedBeforeFirstMicroturn
+                    || fact.elision_policy
+                        != boon_verify::VerifiedPulseFusionElisionPolicyV1::ElideOnlyUnobservedRecurrenceStateRouting
+                {
+                    return Err(format!(
+                        "verified pulse-fusion fact for batch {} uses an unsupported proof policy",
+                        batch.id
+                    ));
+                }
+                let proof = match (fact.trace_policy, batch.list_mutations.is_empty()) {
+                    (
+                        boon_verify::VerifiedPulseFusionTracePolicyV1::PreserveCommittedStateDeltasAndEmissionRoutes,
+                        true,
+                    ) => PulseFusionProof::FrozenRuntimeTargetGuardedFullTraceEmptySideLanes,
+                    (
+                        boon_verify::VerifiedPulseFusionTracePolicyV1::PreserveCommittedStateAndListDeltasAndEmissionRoutes,
+                        false,
+                    ) => PulseFusionProof::FrozenRuntimeTargetGuardedFullTracePreservedListMutations,
+                    _ => {
+                        return Err(format!(
+                            "verified pulse-fusion fact for batch {} changed its list-mutation trace policy",
+                            batch.id
+                        ));
+                    }
+                };
+                let activation = ActivationId(fact.activation.as_usize());
+                let state = StateId(fact.state.as_usize());
+                if batch.enclosing_activation != Some(activation)
+                    || batch.state != Some(state)
+                    || fields
+                        .activations
+                        .get(activation.as_usize())
+                        .is_none_or(|candidate| {
+                            candidate.id != activation || !candidate.states.contains(&state)
+                        })
+                    || fields
+                        .state_cells
+                        .get(state.as_usize())
+                        .is_none_or(|candidate| candidate.id != state)
+                {
+                    return Err(format!(
+                        "verified pulse-fusion fact for batch {} changed its activation-local state",
+                        batch.id
+                    ));
+                }
+                let update = fields
+                    .state_update_arms
+                    .get(fact.state_update_arm.as_usize())
+                    .filter(|update| update.state == state)
+                    .ok_or_else(|| {
+                        format!(
+                            "verified pulse-fusion fact for batch {} references missing update arm {}",
+                            batch.id, fact.state_update_arm
+                        )
+                    })?;
+                let state_update_arm_index = batch
+                    .state_update_arms
+                    .iter()
+                    .position(|candidate| candidate == update)
+                    .ok_or_else(|| {
+                        format!(
+                            "verified pulse-fusion fact for batch {} lost update arm {}",
+                            batch.id, fact.state_update_arm
+                        )
+                    })?;
+                PulseFusionEligibility::VerifiedActivationLocalRecurrence {
+                    activation,
+                    state,
+                    state_update_arm_index,
+                    proof,
+                }
+            }
+            boon_verify::VerifiedPulseFusionStatusV1::Ineligible { reasons } => {
+                PulseFusionEligibility::Ineligible {
+                    diagnostics: reasons
+                        .iter()
+                        .map(|reason| reason.diagnostic().to_owned())
+                        .collect(),
+                }
+            }
+        };
+    }
+    Ok(())
 }
 
 fn validate_erased_bundle_role_crossings(
@@ -2093,6 +2142,16 @@ pub fn verify_static_schedule(program: &ErasedProgram) -> Result<(), String> {
             program.executable.expressions.len()
         ));
     }
+    if let Some(batch) = program
+        .pulse_batches
+        .iter()
+        .find(|batch| matches!(batch.fusion, PulseFusionEligibility::PendingVerification))
+    {
+        return Err(format!(
+            "pulse batch {} reached executable validation before verification",
+            batch.id
+        ));
+    }
     verify_distributed_reference_schedule(program)?;
     verify_executable_schedule(program)?;
 
@@ -3350,7 +3409,9 @@ fn executable_list_item_field_names(
             continue;
         };
         match &expression.kind {
-            ExecutableExpressionKind::Object(record_fields)
+            ExecutableExpressionKind::Object {
+                fields: record_fields,
+            }
             | ExecutableExpressionKind::TaggedObject {
                 fields: record_fields,
                 ..
@@ -3397,12 +3458,12 @@ fn executable_list_item_field_names(
             | ExecutableExpressionKind::ExternalRead { .. }
             | ExecutableExpressionKind::ElementState { .. }
             | ExecutableExpressionKind::Drain { .. }
-            | ExecutableExpressionKind::Text(_)
-            | ExecutableExpressionKind::Number(_)
-            | ExecutableExpressionKind::Bits(_)
-            | ExecutableExpressionKind::BytesByte(_)
+            | ExecutableExpressionKind::Text { .. }
+            | ExecutableExpressionKind::Number { .. }
+            | ExecutableExpressionKind::Bits { .. }
+            | ExecutableExpressionKind::BytesByte { .. }
             | ExecutableExpressionKind::Absent
-            | ExecutableExpressionKind::Tag(_)
+            | ExecutableExpressionKind::Tag { .. }
             | ExecutableExpressionKind::Source { .. }
             | ExecutableExpressionKind::Call { .. }
             | ExecutableExpressionKind::Infix { .. }
@@ -3612,30 +3673,6 @@ fn event_cause_path_owned(
             .map(|_| format!("$pulse.p{}", pulse_id.as_usize()))
             .ok_or_else(|| format!("state update arm references missing PulseBatchId {pulse_id}")),
     }
-}
-
-fn hidden_key_type(name: &str) -> String {
-    let singular = name
-        .strip_suffix("ies")
-        .map(|prefix| format!("{prefix}y"))
-        .or_else(|| name.strip_suffix('s').map(ToOwned::to_owned))
-        .unwrap_or_else(|| name.to_owned());
-    let mut output = String::new();
-    let mut uppercase_next = true;
-    for ch in singular.chars() {
-        if ch == '_' || ch == '-' {
-            uppercase_next = true;
-            continue;
-        }
-        if uppercase_next {
-            output.push(ch.to_ascii_uppercase());
-            uppercase_next = false;
-        } else {
-            output.push(ch);
-        }
-    }
-    output.push_str("Key");
-    output
 }
 
 #[cfg(test)]

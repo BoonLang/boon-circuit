@@ -776,6 +776,10 @@ pub enum PulseStart {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PulseFusionEligibility {
+    /// Semantic elaboration has frozen the exact pulse slice, but the verifier
+    /// has not yet bound its optimization decision. Opaque IR erasure must
+    /// replace every pending value before a compiler backend can consume it.
+    PendingVerification,
     VerifiedActivationLocalRecurrence {
         activation: ActivationId,
         state: StateId,
@@ -933,12 +937,18 @@ pub enum ExecutableExpressionKind {
         path: String,
         projection: Vec<String>,
     },
-    Text(String),
+    Text {
+        value: String,
+    },
     TextTemplate {
         segments: Vec<ExecutableTextSegment>,
     },
-    Number(boon_data::ExactNumber),
-    BytesByte(u8),
+    Number {
+        value: boon_data::ExactNumber,
+    },
+    BytesByte {
+        value: u8,
+    },
     /// Private flow absence. It cannot be materialized as public data.
     Absent,
     /// Private fail-fast control; the carrier is consumed by
@@ -949,7 +959,9 @@ pub enum ExecutableExpressionKind {
     FlushBoundary {
         input: ExecutableExprId,
     },
-    Tag(String),
+    Tag {
+        value: String,
+    },
     TaggedObject {
         tag: String,
         fields: Vec<ExecutableRecordField>,
@@ -1000,7 +1012,9 @@ pub enum ExecutableExpressionKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         output: Option<ExecutableExprId>,
     },
-    Object(Vec<ExecutableRecordField>),
+    Object {
+        fields: Vec<ExecutableRecordField>,
+    },
     Block {
         bindings: Vec<ExecutableBlockBinding>,
         result: ExecutableExprId,
@@ -1041,7 +1055,9 @@ pub enum ExecutableExpressionKind {
     Set {
         items: Vec<ExecutableExprId>,
     },
-    Bits(boon_data::Bits),
+    Bits {
+        value: boon_data::Bits,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1799,12 +1815,12 @@ pub fn executable_expression_children(kind: &ExecutableExpressionKind) -> Vec<Ex
         | ExecutableExpressionKind::ExternalRead { .. }
         | ExecutableExpressionKind::ElementState { .. }
         | ExecutableExpressionKind::Drain { .. }
-        | ExecutableExpressionKind::Text(_)
-        | ExecutableExpressionKind::Number(_)
-        | ExecutableExpressionKind::Bits(_)
-        | ExecutableExpressionKind::BytesByte(_)
+        | ExecutableExpressionKind::Text { .. }
+        | ExecutableExpressionKind::Number { .. }
+        | ExecutableExpressionKind::Bits { .. }
+        | ExecutableExpressionKind::BytesByte { .. }
         | ExecutableExpressionKind::Absent
-        | ExecutableExpressionKind::Tag(_)
+        | ExecutableExpressionKind::Tag { .. }
         | ExecutableExpressionKind::Source { .. }
         | ExecutableExpressionKind::Materialize { .. }
         | ExecutableExpressionKind::Delimiter
@@ -1818,7 +1834,7 @@ pub fn executable_expression_children(kind: &ExecutableExpressionKind) -> Vec<Ex
             })
             .collect(),
         ExecutableExpressionKind::TaggedObject { fields, .. }
-        | ExecutableExpressionKind::Object(fields) => {
+        | ExecutableExpressionKind::Object { fields } => {
             fields.iter().map(|field| field.value).collect()
         }
         ExecutableExpressionKind::Block { bindings, result } => bindings

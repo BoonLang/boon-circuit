@@ -403,8 +403,8 @@ impl<'a> DocumentCompiler<'a> {
                 Ok(self.project_fields(expression_id.0, input, projection, final_class))
             } else {
                 match &expression.kind {
-                    ir::ExecutableExpressionKind::Object(fields)
-                    | ir::ExecutableExpressionKind::Object(fields)
+                    ir::ExecutableExpressionKind::Object { fields }
+                    | ir::ExecutableExpressionKind::TaggedObject { fields, .. }
                         if fields.iter().all(|field| !field.spread) =>
                     {
                         let matches = fields
@@ -701,7 +701,7 @@ impl<'a> DocumentCompiler<'a> {
             ir::ExecutableExpressionKind::Drain { path, .. } => Err(PlanError::new(format!(
                 "migration drain `{path}` at executable expression {compiler_id} cannot be lowered as a document value"
             ))),
-            ir::ExecutableExpressionKind::Text(value) => Ok(self.constant_expr(
+            ir::ExecutableExpressionKind::Text { value } => Ok(self.constant_expr(
                 compiler_id,
                 DocumentConstantValue::Text {
                     value: value.clone(),
@@ -710,19 +710,19 @@ impl<'a> DocumentCompiler<'a> {
             ir::ExecutableExpressionKind::TextTemplate { segments } => {
                 self.compile_text_template(compiler_id, segments, context)
             }
-            ir::ExecutableExpressionKind::Number(value) => Ok(self.constant_expr(
+            ir::ExecutableExpressionKind::Number { value } => Ok(self.constant_expr(
                 compiler_id,
                 DocumentConstantValue::Number {
                     value: value.clone(),
                 },
             )),
-            ir::ExecutableExpressionKind::Bits(value) => Ok(self.constant_expr(
+            ir::ExecutableExpressionKind::Bits { value } => Ok(self.constant_expr(
                 compiler_id,
                 DocumentConstantValue::Bits {
                     value: value.clone(),
                 },
             )),
-            ir::ExecutableExpressionKind::BytesByte(value) => Ok(self.constant_expr(
+            ir::ExecutableExpressionKind::BytesByte { value } => Ok(self.constant_expr(
                 compiler_id,
                 DocumentConstantValue::Bytes {
                     value: vec![*value],
@@ -767,7 +767,7 @@ impl<'a> DocumentCompiler<'a> {
                     },
                 ))
             }
-            ir::ExecutableExpressionKind::Tag(value) => self.compile_tag(compiler_id, value),
+            ir::ExecutableExpressionKind::Tag { value } => self.compile_tag(compiler_id, value),
             ir::ExecutableExpressionKind::TaggedObject { tag, fields } => {
                 self.compile_record_fields(compiler_id, Some(tag), fields, context)
             }
@@ -982,7 +982,7 @@ impl<'a> DocumentCompiler<'a> {
                         "match arm executable expression {compiler_id} has no output"
                     ))
                 }),
-            ir::ExecutableExpressionKind::Object(fields) => {
+            ir::ExecutableExpressionKind::Object { fields } => {
                 self.compile_record_fields(compiler_id, None, fields, context)
             }
             ir::ExecutableExpressionKind::Block { bindings, result } => {
@@ -1012,7 +1012,7 @@ impl<'a> DocumentCompiler<'a> {
                 let bytes = items
                     .iter()
                     .map(|item| match self.expression_kind(*item)? {
-                        ir::ExecutableExpressionKind::BytesByte(value) => Ok(*value),
+                        ir::ExecutableExpressionKind::BytesByte { value } => Ok(*value),
                         other => Err(PlanError::new(format!(
                             "dynamic byte executable expression {} ({other:?}) is not a document constant",
                             item.0
@@ -2828,7 +2828,7 @@ fn executable_debug_label(program: &ErasedProgram, id: ir::ExecutableExprId) -> 
         ir::ExecutableExpressionKind::Project { fields, .. } => {
             format!("project {}", fields.join("."))
         }
-        ir::ExecutableExpressionKind::Object(_) => "object".to_owned(),
+        ir::ExecutableExpressionKind::Object { .. } => "object".to_owned(),
         ir::ExecutableExpressionKind::List { .. } => "list".to_owned(),
         _ => format!("{:?}", std::mem::discriminant(&expression.kind)),
     };

@@ -220,7 +220,7 @@ fn required_source_specs() -> Vec<SourceSpecV1> {
             additional_types: Vec::new(),
         },
         SourceSpecV1 {
-            path: "crates/boon_ir/src/semantic_mapping.rs".to_owned(),
+            path: "crates/boon_semantic/src/core_lowering.rs".to_owned(),
             selection: SourceSelectionV1::Explicit,
             prefixes: Vec::new(),
             explicit_types: [
@@ -1905,7 +1905,7 @@ fields = [
         }
 
         let mapped_binding = suggest_disposition(
-            "crates/boon_ir/src/semantic_mapping.rs",
+            "crates/boon_semantic/src/core_lowering.rs",
             "SemanticToExecutableMap",
             "local_bindings",
             None,
@@ -1916,7 +1916,7 @@ fields = [
                 .contains(&DependencyRoleV1::FormulaBinder)
         );
         let mapped_row_scope = suggest_disposition(
-            "crates/boon_ir/src/semantic_mapping.rs",
+            "crates/boon_semantic/src/core_lowering.rs",
             "SemanticToExecutableMap",
             "row_scopes",
             None,

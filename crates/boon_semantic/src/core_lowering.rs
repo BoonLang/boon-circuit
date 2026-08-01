@@ -1,26 +1,5 @@
+use crate::program_core;
 use crate::{
-    ContextualMaterialization, ContextualOperationKind, ContextualOrderKey,
-    ContextualRowPredecessor, DependencyEdge, DerivedValue, DerivedValueKind, ErasedBinding,
-    ErasedBindingId, ErasedBindingTarget, ErasedDependencyTiming, ErasedFieldDef, ErasedFieldRole,
-    ErasedLocalCapture, ErasedLocalDef, ErasedLocalMember, ErasedLocalMemberForwarding,
-    ErasedLocalMemberTarget, ErasedOwnerDef, ErasedReadId, ErasedRowBinding,
-    ErasedRowSourceProjection, ErasedRowValue, ErasedSourceDef, ErasedSourceOrigin,
-    ErasedTemporalBoundary, EventCause, ExecutableBlockBinding, ExecutableCallArgument,
-    ExecutableCallContextId, ExecutableCallableKind, ExecutableExprId, ExecutableExpression,
-    ExecutableExpressionKind, ExecutableFunction, ExecutableFunctionParameter,
-    ExecutableLocalBindingId, ExecutableParameterId, ExecutablePatternBinding, ExecutableProgram,
-    ExecutableRecordField, ExecutableRoot, ExecutableSelectArm, ExecutableSourceDef,
-    ExecutableSourceId, ExecutableSourceOrigin, ExecutableStateDef, ExecutableStateId,
-    ExecutableStatement, ExecutableStatementId, ExecutableStatementKind, ExecutableTextSegment,
-    ExecutableValueMember, ExecutableValueOrigin, ExecutableValueProvenance, ExprId, FieldId,
-    FunctionId, InitialValue, ListId, ListInitialRecord, ListInitializer, ListInitializerInput,
-    ListMemory, ListMutation, ListMutationKind, ListProjection, ListProjectionKind,
-    ListRowInitialField, MaterializationLocalId, MaterializationResultKind,
-    ProducerFunctionArgument, ProducerFunctionInstance, ScopeId, SourceId, SourcePayloadDescriptor,
-    SourcePayloadField, SourcePayloadSchema, SourcePort, StateCell, StateId, StateUpdateArm,
-    TriggerOwnedArm, producer_identity_text,
-};
-use boon_semantic::{
     OutCallInstanceId, ProducerFunctionId, SemanticBindingId, SemanticBindingTargetV1,
     SemanticBlockBinding, SemanticCall, SemanticCallArgument, SemanticCallContextId,
     SemanticCallEntry, SemanticCallId, SemanticCallParameterBinding,
@@ -49,6 +28,28 @@ use boon_typecheck::{
     CheckedExternalDeclarationIdentityV1, CheckedExternalDeclarationKind, CheckedParameterKind,
     CheckedParameterRequirement, DeclId, FlowMode, FlowType,
 };
+use program_core::{
+    ContextualMaterialization, ContextualOperationKind, ContextualOrderKey,
+    ContextualRowPredecessor, DependencyEdge, DerivedValue, DerivedValueKind, ErasedBinding,
+    ErasedBindingId, ErasedBindingTarget, ErasedDependencyTiming, ErasedFieldDef, ErasedFieldRole,
+    ErasedLocalCapture, ErasedLocalDef, ErasedLocalMember, ErasedLocalMemberForwarding,
+    ErasedLocalMemberTarget, ErasedOwnerDef, ErasedReadId, ErasedRowBinding,
+    ErasedRowSourceProjection, ErasedRowValue, ErasedSourceDef, ErasedSourceOrigin,
+    ErasedTemporalBoundary, EventCause, ExecutableBlockBinding, ExecutableCallArgument,
+    ExecutableCallContextId, ExecutableCallableKind, ExecutableExprId, ExecutableExpression,
+    ExecutableExpressionKind, ExecutableFunction, ExecutableFunctionParameter,
+    ExecutableLocalBindingId, ExecutableParameterId, ExecutablePatternBinding, ExecutableProgram,
+    ExecutableRecordField, ExecutableRoot, ExecutableSelectArm, ExecutableSourceDef,
+    ExecutableSourceId, ExecutableSourceOrigin, ExecutableStateDef, ExecutableStateId,
+    ExecutableStatement, ExecutableStatementId, ExecutableStatementKind, ExecutableTextSegment,
+    ExecutableValueMember, ExecutableValueOrigin, ExecutableValueProvenance, ExprId, FieldId,
+    FunctionId, InitialValue, ListId, ListInitialRecord, ListInitializer, ListInitializerInput,
+    ListMemory, ListMutation, ListMutationKind, ListProjection, ListProjectionKind,
+    ListRowInitialField, MaterializationLocalId, MaterializationResultKind,
+    ProducerFunctionArgument, ProducerFunctionInstance, ScopeId, SourceId, SourcePayloadDescriptor,
+    SourcePayloadField, SourcePayloadSchema, SourcePort, StateCell, StateId, StateUpdateArm,
+    TriggerOwnedArm,
+};
 use std::collections::{BTreeMap, BTreeSet};
 
 type ExecutableCallInstanceMap = BTreeMap<OutCallInstanceId, usize>;
@@ -58,71 +59,103 @@ type RuntimeSourceMap = BTreeMap<SemanticSourceId, SourceId>;
 type RuntimeStateMap = BTreeMap<SemanticStateId, StateId>;
 type AllocatedRuntimeResourceIds = (RuntimeSourceMap, RuntimeStateMap);
 
-fn semantic_data_type(value: &boon_typecheck::Type) -> crate::SemanticDataType {
+fn producer_identity_text(identity: [u8; 32]) -> String {
+    identity.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn hidden_key_type(name: &str) -> String {
+    let singular = name
+        .strip_suffix("ies")
+        .map(|prefix| format!("{prefix}y"))
+        .or_else(|| name.strip_suffix('s').map(ToOwned::to_owned))
+        .unwrap_or_else(|| name.to_owned());
+    let mut output = String::new();
+    let mut uppercase_next = true;
+    for ch in singular.chars() {
+        if ch == '_' || ch == '-' {
+            uppercase_next = true;
+        } else if uppercase_next {
+            output.push(ch.to_ascii_uppercase());
+            uppercase_next = false;
+        } else {
+            output.push(ch);
+        }
+    }
+    output.push_str("Key");
+    output
+}
+
+fn semantic_data_type(value: &boon_typecheck::Type) -> program_core::SemanticDataType {
     match value {
-        boon_typecheck::Type::Text => crate::SemanticDataType::Text,
-        boon_typecheck::Type::Number => crate::SemanticDataType::Number,
+        boon_typecheck::Type::Text => program_core::SemanticDataType::Text,
+        boon_typecheck::Type::Number => program_core::SemanticDataType::Number,
         boon_typecheck::Type::Bytes(boon_typecheck::BytesType::Dynamic) => {
-            crate::SemanticDataType::Bytes { fixed_len: None }
+            program_core::SemanticDataType::Bytes { fixed_len: None }
         }
         boon_typecheck::Type::Bytes(boon_typecheck::BytesType::Fixed(fixed_len)) => {
-            crate::SemanticDataType::Bytes {
+            program_core::SemanticDataType::Bytes {
                 fixed_len: Some(*fixed_len),
             }
         }
-        boon_typecheck::Type::Bits { width } => crate::SemanticDataType::Bits { width: *width },
-        boon_typecheck::Type::Absent => crate::SemanticDataType::Unknown {
+        boon_typecheck::Type::Bits { width } => {
+            program_core::SemanticDataType::Bits { width: *width }
+        }
+        boon_typecheck::Type::Absent => program_core::SemanticDataType::Unknown {
             reason: "private absence is not semantic data".to_owned(),
         },
         boon_typecheck::Type::VariantSet(variants) => {
             let mut variants = variants
                 .iter()
                 .map(|variant| match variant {
-                    boon_typecheck::Variant::Tag(tag) => crate::SemanticVariantType {
+                    boon_typecheck::Variant::Tag(tag) => program_core::SemanticVariantType {
                         tag: tag.clone(),
                         fields: Vec::new(),
                         open: false,
                     },
-                    boon_typecheck::Variant::Tagged { tag, fields } => crate::SemanticVariantType {
-                        tag: tag.clone(),
-                        fields: semantic_type_fields(&fields.fields),
-                        open: fields.open,
-                    },
+                    boon_typecheck::Variant::Tagged { tag, fields } => {
+                        program_core::SemanticVariantType {
+                            tag: tag.clone(),
+                            fields: semantic_type_fields(&fields.fields),
+                            open: fields.open,
+                        }
+                    }
                 })
                 .collect::<Vec<_>>();
             variants.sort_by(|left, right| left.tag.cmp(&right.tag));
-            crate::SemanticDataType::Variant { variants }
+            program_core::SemanticDataType::Variant { variants }
         }
-        boon_typecheck::Type::Object(shape) => crate::SemanticDataType::Record {
+        boon_typecheck::Type::Object(shape) => program_core::SemanticDataType::Record {
             fields: semantic_type_fields(&shape.fields),
             open: shape.open,
         },
-        boon_typecheck::Type::List(item) => crate::SemanticDataType::List {
+        boon_typecheck::Type::List(item) => program_core::SemanticDataType::List {
             item: Box::new(semantic_data_type(item)),
         },
-        boon_typecheck::Type::Map { key, value } => crate::SemanticDataType::Map {
+        boon_typecheck::Type::Map { key, value } => program_core::SemanticDataType::Map {
             key: Box::new(semantic_data_type(key)),
             value: Box::new(semantic_data_type(value)),
         },
-        boon_typecheck::Type::Set(item) => crate::SemanticDataType::Set {
+        boon_typecheck::Type::Set(item) => program_core::SemanticDataType::Set {
             item: Box::new(semantic_data_type(item)),
         },
-        boon_typecheck::Type::Union(members) => crate::SemanticDataType::Union {
+        boon_typecheck::Type::Union(members) => program_core::SemanticDataType::Union {
             members: members.iter().map(semantic_data_type).collect(),
         },
-        boon_typecheck::Type::Function { .. } => crate::SemanticDataType::Unknown {
+        boon_typecheck::Type::Function { .. } => program_core::SemanticDataType::Unknown {
             reason: "function values are not semantic memory data".to_owned(),
         },
-        boon_typecheck::Type::RenderContract => crate::SemanticDataType::Unknown {
+        boon_typecheck::Type::RenderContract => program_core::SemanticDataType::Unknown {
             reason: "render contracts are not semantic memory data".to_owned(),
         },
-        boon_typecheck::Type::UnresolvedShape { reason } => crate::SemanticDataType::Unknown {
-            reason: reason.clone(),
-        },
-        boon_typecheck::Type::Var(var) => crate::SemanticDataType::Unknown {
+        boon_typecheck::Type::UnresolvedShape { reason } => {
+            program_core::SemanticDataType::Unknown {
+                reason: reason.clone(),
+            }
+        }
+        boon_typecheck::Type::Var(var) => program_core::SemanticDataType::Unknown {
             reason: format!("unresolved type variable {}", var.0),
         },
-        boon_typecheck::Type::Unknown => crate::SemanticDataType::Unknown {
+        boon_typecheck::Type::Unknown => program_core::SemanticDataType::Unknown {
             reason: "unknown type".to_owned(),
         },
     }
@@ -130,10 +163,10 @@ fn semantic_data_type(value: &boon_typecheck::Type) -> crate::SemanticDataType {
 
 fn semantic_type_fields(
     fields: &BTreeMap<String, boon_typecheck::Type>,
-) -> Vec<crate::SemanticTypeField> {
+) -> Vec<program_core::SemanticTypeField> {
     fields
         .iter()
-        .map(|(name, data_type)| crate::SemanticTypeField {
+        .map(|(name, data_type)| program_core::SemanticTypeField {
             name: name.clone(),
             data_type: semantic_data_type(data_type),
         })
@@ -149,7 +182,7 @@ fn semantic_type_fields(
 pub(super) struct ExecutableLexicalScopeId(pub(super) usize);
 
 /// Staged allocation for reactive field anchors. This is not a final
-/// [`crate::FieldId`]: the lowering contract's complete storage-field domain
+/// [`program_core::FieldId`]: the lowering contract's complete storage-field domain
 /// also owns list-authority, nested-record, and capture fields.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(super) struct MappedReactiveFieldId(pub(super) usize);
@@ -242,7 +275,7 @@ pub(super) struct MappedSemanticResources {
 
 /// Exact mechanically mapped field identity. Parent/role topology remains a
 /// lowering-contract responsibility, so this is intentionally not an
-/// [`crate::ErasedFieldDef`].
+/// [`program_core::ErasedFieldDef`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct MappedSemanticField {
     pub id: MappedReactiveFieldId,
@@ -388,7 +421,7 @@ pub(super) struct MappedSemanticProducerInstance {
     pub result_field: MappedReactiveFieldId,
     pub result_path: String,
     pub root: ExecutableExprId,
-    pub mode: boon_semantic::ProducerMaterializationMode,
+    pub mode: crate::ProducerMaterializationMode,
     pub invocation_source: Option<SourceId>,
     pub arguments: Vec<ProducerFunctionArgument>,
 }
@@ -1101,7 +1134,7 @@ impl SemanticToExecutableMap {
 
     pub(super) fn lexical_scope(
         &self,
-        id: boon_semantic::SemanticScopeId,
+        id: crate::SemanticScopeId,
     ) -> Result<ExecutableLexicalScopeId, String> {
         exact_dense_index(
             id.as_usize(),
@@ -1511,7 +1544,7 @@ fn callable_parameter<'a>(
     ordinal: usize,
     call: SemanticCallId,
     context: &str,
-) -> Result<&'a boon_semantic::SemanticCallableParameter, String> {
+) -> Result<&'a crate::SemanticCallableParameter, String> {
     callable.parameters.get(ordinal).ok_or_else(|| {
         format!(
             "semantic call {call} {context} references missing callable {} parameter ordinal {ordinal}",
@@ -1544,7 +1577,7 @@ fn semantic_call(
 
 fn require_semantic_scope(
     graph: &SemanticExecutionGraphV1,
-    id: boon_semantic::SemanticScopeId,
+    id: crate::SemanticScopeId,
     context: &str,
 ) -> Result<(), String> {
     if graph
@@ -1911,7 +1944,7 @@ fn allocate_external_event_source_ids(
                 .checked_add(ordinal)
                 .ok_or_else(|| "distributed ingress SOURCE IDs exhausted".to_owned())?,
         );
-        let runtime_path = crate::distributed_event_source_path(&canonical_path);
+        let runtime_path = program_core::distributed_event_source_path(&canonical_path);
         if paths.insert(source, runtime_path).is_some() {
             return Err(format!(
                 "distributed ingress SOURCE {source} was allocated more than once"
@@ -2034,8 +2067,8 @@ pub(super) fn map_semantic_resources(
         ids.statement(authority.statement)?;
         ids.expression(authority.producer)?;
         match &authority.origin {
-            boon_semantic::SemanticListResourceOriginV1::CheckedLiteral { .. } => {}
-            boon_semantic::SemanticListResourceOriginV1::Derived {
+            crate::SemanticListResourceOriginV1::CheckedLiteral { .. } => {}
+            crate::SemanticListResourceOriginV1::Derived {
                 statement,
                 producer,
             } => {
@@ -2052,8 +2085,8 @@ pub(super) fn map_semantic_resources(
             ids.statement(list.statement)?;
             ids.expression(list.producer)?;
             match &list.origin {
-                boon_semantic::SemanticListResourceOriginV1::CheckedLiteral { .. } => {}
-                boon_semantic::SemanticListResourceOriginV1::Derived {
+                crate::SemanticListResourceOriginV1::CheckedLiteral { .. } => {}
+                crate::SemanticListResourceOriginV1::Derived {
                     statement,
                     producer,
                 } => {
@@ -2064,7 +2097,7 @@ pub(super) fn map_semantic_resources(
             validate_initializer_references(ids, &list.initializer)?;
             let (has_generation, hidden_key_type) = match list.key_policy {
                 SemanticListKeyPolicyV1::GeneratedOccurrenceU64 { has_generation } => {
-                    (has_generation, crate::hidden_key_type(&list.semantic_path))
+                    (has_generation, hidden_key_type(&list.semantic_path))
                 }
             };
             Ok(ListMemory {
@@ -2151,10 +2184,10 @@ fn validate_erased_resource_metadata(
 ) -> Result<(), String> {
     for alias in &graph.aliases {
         match alias.target {
-            boon_semantic::SemanticResourceAliasTargetV1::Source(source) => {
+            crate::SemanticResourceAliasTargetV1::Source(source) => {
                 ids.source(source)?;
             }
-            boon_semantic::SemanticResourceAliasTargetV1::State(state) => {
+            crate::SemanticResourceAliasTargetV1::State(state) => {
                 ids.state(state)?;
             }
         }
@@ -2404,10 +2437,7 @@ impl SemanticReactiveToMappedMap {
         .map(MappedReactiveTriggerId)
     }
 
-    fn state_update_arm(
-        &self,
-        id: boon_semantic::SemanticStateUpdateArmId,
-    ) -> Result<usize, String> {
+    fn state_update_arm(&self, id: crate::SemanticStateUpdateArmId) -> Result<usize, String> {
         exact_dense_index(
             id.as_usize(),
             self.state_update_arm_count,
@@ -2416,7 +2446,7 @@ impl SemanticReactiveToMappedMap {
         )
     }
 
-    fn list_mutation(&self, id: boon_semantic::SemanticListMutationId) -> Result<usize, String> {
+    fn list_mutation(&self, id: crate::SemanticListMutationId) -> Result<usize, String> {
         exact_dense_index(
             id.as_usize(),
             self.list_mutation_count,
@@ -2623,7 +2653,7 @@ pub(super) fn map_semantic_reactive(
         &mut referenced_trigger_ids,
     )?;
     for batch in &graph.pulse_batches {
-        if let boon_semantic::SemanticPulseStartV1::Triggered { arms } = &batch.start {
+        if let crate::SemanticPulseStartV1::Triggered { arms } = &batch.start {
             for arm in arms {
                 let trigger = reactive_ids.trigger(*arm)?;
                 trigger_arms.get(trigger.0).ok_or_else(|| {
@@ -2715,7 +2745,7 @@ fn semantic_execution_expression(
 fn semantic_source_resource(
     graph: &SemanticResourceGraphV1,
     id: SemanticSourceId,
-) -> Result<&boon_semantic::SemanticSourceResourceV1, String> {
+) -> Result<&crate::SemanticSourceResourceV1, String> {
     graph
         .sources
         .get(id.as_usize())
@@ -2726,7 +2756,7 @@ fn semantic_source_resource(
 fn semantic_state_resource(
     graph: &SemanticResourceGraphV1,
     id: SemanticStateId,
-) -> Result<&boon_semantic::SemanticStateResourceV1, String> {
+) -> Result<&crate::SemanticStateResourceV1, String> {
     graph
         .states
         .get(id.as_usize())
@@ -2765,7 +2795,7 @@ fn map_reactive_field(
     execution: &SemanticExecutionGraphV1,
     ids: &SemanticToExecutableMap,
     reactive_ids: &SemanticReactiveToMappedMap,
-    field: &boon_semantic::SemanticFieldV1,
+    field: &crate::SemanticFieldV1,
 ) -> Result<MappedSemanticField, String> {
     let statement = semantic_execution_statement(execution, field.statement)?;
     if statement.declaration != Some(field.declaration)
@@ -2892,7 +2922,7 @@ fn map_reactive_binding(
     ids: &SemanticToExecutableMap,
     reactive_ids: &SemanticReactiveToMappedMap,
     fields: &[MappedSemanticField],
-    binding: &boon_semantic::SemanticBindingV1,
+    binding: &crate::SemanticBindingV1,
 ) -> Result<MappedSemanticBinding, String> {
     let statement = semantic_execution_statement(execution, binding.statement)?;
     let expression = semantic_execution_expression(execution, binding.producer)?;
@@ -3143,7 +3173,7 @@ fn map_reactive_read(
     resources: &SemanticResourceGraphV1,
     ids: &SemanticToExecutableMap,
     reactive_ids: &SemanticReactiveToMappedMap,
-    read: &boon_semantic::SemanticReadBindingV1,
+    read: &crate::SemanticReadBindingV1,
 ) -> Result<MappedSemanticRead, String> {
     let expression = semantic_execution_expression(execution, read.expression)?;
     if expression.value_id != read.value {
@@ -3282,9 +3312,9 @@ fn map_semantic_event_cause(
     match cause {
         SemanticEventCauseV1::Source(source) => Ok(EventCause::Source(ids.runtime_source(source)?)),
         SemanticEventCauseV1::State(state) => Ok(EventCause::State(ids.runtime_state(state)?)),
-        SemanticEventCauseV1::Pulse(pulse) => {
-            Ok(EventCause::Pulse(crate::PulseBatchId(pulse.as_usize())))
-        }
+        SemanticEventCauseV1::Pulse(pulse) => Ok(EventCause::Pulse(program_core::PulseBatchId(
+            pulse.as_usize(),
+        ))),
         SemanticEventCauseV1::ExternalRead(expression) => {
             Ok(EventCause::Source(ids.external_event_source(expression)?))
         }
@@ -3317,7 +3347,7 @@ fn map_reactive_trigger(
     execution: &SemanticExecutionGraphV1,
     ids: &SemanticToExecutableMap,
     reactive_ids: &SemanticReactiveToMappedMap,
-    trigger: &boon_semantic::SemanticTriggerOwnedArmV1,
+    trigger: &crate::SemanticTriggerOwnedArmV1,
 ) -> Result<MappedSemanticTriggerArm, String> {
     let gate = semantic_execution_expression(execution, trigger.gate_expression)?;
     let output = semantic_execution_expression(execution, trigger.output_expression)?;
@@ -3359,8 +3389,8 @@ fn map_reactive_trigger(
 
 fn exact_mutation_trigger<'a>(
     graph: &'a SemanticReactiveGraphV1,
-    mutation: &boon_semantic::SemanticListMutationV1,
-) -> Result<&'a boon_semantic::SemanticTriggerOwnedArmV1, String> {
+    mutation: &crate::SemanticListMutationV1,
+) -> Result<&'a crate::SemanticTriggerOwnedArmV1, String> {
     let (gate, gate_value, output, output_value) = match mutation.kind {
         SemanticListMutationKindV1::Append {
             gate,
@@ -3421,7 +3451,7 @@ fn map_reactive_list_mutation(
     graph: &SemanticReactiveGraphV1,
     ids: &SemanticToExecutableMap,
     reactive_ids: &SemanticReactiveToMappedMap,
-    mutation: &boon_semantic::SemanticListMutationV1,
+    mutation: &crate::SemanticListMutationV1,
     referenced_trigger_ids: &mut BTreeSet<MappedReactiveTriggerId>,
 ) -> Result<MappedSemanticListMutation, String> {
     let site = semantic_execution_expression(execution, mutation.site)?;
@@ -3519,7 +3549,7 @@ struct ReactiveDerivedMappingContext<'a> {
 
 fn map_reactive_derived_value(
     context: &ReactiveDerivedMappingContext<'_>,
-    derived: &boon_semantic::SemanticDerivedValueV1,
+    derived: &crate::SemanticDerivedValueV1,
     referenced_trigger_ids: &mut BTreeSet<MappedReactiveTriggerId>,
 ) -> Result<MappedSemanticDerivedValue, String> {
     let field = mapped_field(context.fields, context.reactive_ids.field(derived.field)?)?;
@@ -3688,7 +3718,7 @@ fn map_reactive_derived_value(
                 derived.id
             ));
         };
-        let boon_semantic::SemanticValueOrigin::State {
+        let crate::SemanticValueOrigin::State {
             state: semantic_state,
             owner,
         } = &member.origin
@@ -3759,7 +3789,7 @@ fn map_reactive_dependency_use(
     graph: &SemanticReactiveGraphV1,
     ids: &SemanticToExecutableMap,
     reactive_ids: &SemanticReactiveToMappedMap,
-    dependency: &boon_semantic::SemanticDependencyUseV1,
+    dependency: &crate::SemanticDependencyUseV1,
 ) -> Result<MappedSemanticDependencyUse, String> {
     let expression = ids.expression(dependency.expression)?;
     let target = match dependency.target {
@@ -3912,7 +3942,7 @@ fn map_reactive_producer_instance(
     resources: &SemanticResourceGraphV1,
     ids: &SemanticToExecutableMap,
     fields: &[MappedSemanticField],
-    instance: &boon_semantic::SemanticProducerInstanceV1,
+    instance: &crate::SemanticProducerInstanceV1,
 ) -> Result<MappedSemanticProducerInstance, String> {
     let function = execution
         .functions
@@ -4246,7 +4276,7 @@ impl MappedSemanticReactive {
         for (index, arm) in self.state_update_arms.iter().enumerate() {
             let expected = self
                 .id_map
-                .state_update_arm(boon_semantic::SemanticStateUpdateArmId(index))?;
+                .state_update_arm(crate::SemanticStateUpdateArmId(index))?;
             if arm.id != expected {
                 return Err(format!(
                     "mapped semantic state update arm at index {index} emitted {}, expected {expected}",
@@ -6884,7 +6914,7 @@ impl MappedSemanticStorage {
 fn semantic_list_resource(
     graph: &SemanticResourceGraphV1,
     id: SemanticListId,
-) -> Result<&boon_semantic::SemanticListResourceV1, String> {
+) -> Result<&crate::SemanticListResourceV1, String> {
     graph
         .lists
         .get(id.as_usize())
@@ -7012,7 +7042,7 @@ fn map_initial_value(value: &SemanticInitialValueV1) -> InitialValue {
 fn map_source_resource(
     execution: &SemanticExecutionGraphV1,
     ids: &SemanticToExecutableMap,
-    source: &boon_semantic::SemanticSourceResourceV1,
+    source: &crate::SemanticSourceResourceV1,
 ) -> Result<SourcePort, String> {
     ids.statement(source.statement)?;
     if let Some(target) = source.target_list {
@@ -7043,15 +7073,13 @@ fn map_source_resource(
     })
 }
 
-fn map_source_payload_schema(
-    source: &boon_semantic::SemanticSourceResourceV1,
-) -> SourcePayloadSchema {
+fn map_source_payload_schema(source: &crate::SemanticSourceResourceV1) -> SourcePayloadSchema {
     let typed_fields = source
         .payload_fields
         .iter()
         .filter_map(|field| {
             let data_type = semantic_data_type(&field.data_type);
-            (!matches!(data_type, crate::SemanticDataType::Unknown { .. })).then(|| {
+            (!matches!(data_type, program_core::SemanticDataType::Unknown { .. })).then(|| {
                 SourcePayloadDescriptor {
                     field: SourcePayloadField::from_name(&field.name),
                     data_type,
@@ -7071,7 +7099,7 @@ fn map_source_payload_schema(
 fn map_state_resource(
     execution: &SemanticExecutionGraphV1,
     ids: &SemanticToExecutableMap,
-    state: &boon_semantic::SemanticStateResourceV1,
+    state: &crate::SemanticStateResourceV1,
 ) -> Result<StateCell, String> {
     ids.expression(state.expression)?;
     ids.expression(state.initial)?;
@@ -7091,11 +7119,11 @@ fn map_state_resource(
         executable_state_id: Some(ids.state(state.id)?),
         static_owner: state.owner,
         lifetime: match state.lifetime {
-            boon_semantic::SemanticStateLifetimeV1::Persistent => {
-                crate::StateCellLifetimeV1::Persistent
+            crate::SemanticStateLifetimeV1::Persistent => {
+                program_core::StateCellLifetimeV1::Persistent
             }
-            boon_semantic::SemanticStateLifetimeV1::ActivationLocal { then_expression } => {
-                crate::StateCellLifetimeV1::ActivationLocal {
+            crate::SemanticStateLifetimeV1::ActivationLocal { then_expression } => {
+                program_core::StateCellLifetimeV1::ActivationLocal {
                     then_expression: ids.expression(then_expression)?,
                 }
             }
@@ -7217,7 +7245,9 @@ fn map_expression_kind(
             path: path.clone(),
             projection: projection.clone(),
         },
-        SemanticExpressionKind::Text(value) => ExecutableExpressionKind::Text(value.clone()),
+        SemanticExpressionKind::Text(value) => ExecutableExpressionKind::Text {
+            value: value.clone(),
+        },
         SemanticExpressionKind::TextTemplate { segments } => {
             ExecutableExpressionKind::TextTemplate {
                 segments: segments
@@ -7226,9 +7256,15 @@ fn map_expression_kind(
                     .collect::<Result<Vec<_>, _>>()?,
             }
         }
-        SemanticExpressionKind::Number(value) => ExecutableExpressionKind::Number(value.clone()),
-        SemanticExpressionKind::Bits(value) => ExecutableExpressionKind::Bits(value.clone()),
-        SemanticExpressionKind::BytesByte(value) => ExecutableExpressionKind::BytesByte(*value),
+        SemanticExpressionKind::Number(value) => ExecutableExpressionKind::Number {
+            value: value.clone(),
+        },
+        SemanticExpressionKind::Bits(value) => ExecutableExpressionKind::Bits {
+            value: value.clone(),
+        },
+        SemanticExpressionKind::BytesByte(value) => {
+            ExecutableExpressionKind::BytesByte { value: *value }
+        }
         SemanticExpressionKind::Absent => ExecutableExpressionKind::Absent,
         SemanticExpressionKind::Flush { payload } => ExecutableExpressionKind::Flush {
             payload: ids.expression(*payload)?,
@@ -7238,7 +7274,9 @@ fn map_expression_kind(
                 input: ids.expression(*input)?,
             }
         }
-        SemanticExpressionKind::Tag(value) => ExecutableExpressionKind::Tag(value.clone()),
+        SemanticExpressionKind::Tag(value) => ExecutableExpressionKind::Tag {
+            value: value.clone(),
+        },
         SemanticExpressionKind::TaggedObject { tag, fields } => {
             ExecutableExpressionKind::TaggedObject {
                 tag: tag.clone(),
@@ -7333,12 +7371,12 @@ fn map_expression_kind(
                 output: output.map(|output| ids.expression(output)).transpose()?,
             }
         }
-        SemanticExpressionKind::Object(fields) => ExecutableExpressionKind::Object(
-            fields
+        SemanticExpressionKind::Object(fields) => ExecutableExpressionKind::Object {
+            fields: fields
                 .iter()
                 .map(|field| map_record_field(ids, field))
                 .collect::<Result<Vec<_>, _>>()?,
-        ),
+        },
         SemanticExpressionKind::Block { bindings, result } => ExecutableExpressionKind::Block {
             bindings: bindings
                 .iter()
@@ -8353,8 +8391,8 @@ fn map_row_predecessor(
 fn map_row_binding(
     ids: &SemanticToExecutableMap,
     row: SemanticRowBinding,
-) -> Result<crate::ErasedRowBinding, String> {
-    Ok(crate::ErasedRowBinding {
+) -> Result<program_core::ErasedRowBinding, String> {
+    Ok(program_core::ErasedRowBinding {
         list: ids.list(row.list)?,
         scope: ids.row_scope(row.scope)?,
     })
@@ -8395,7 +8433,7 @@ const fn map_result_kind(kind: SemanticMaterializationResultKind) -> Materializa
 fn map_activation_sites(
     graph: &SemanticReactiveGraphV1,
     ids: &SemanticToExecutableMap,
-) -> Result<Vec<crate::ActivationSite>, String> {
+) -> Result<Vec<program_core::ActivationSite>, String> {
     require_dense(
         graph
             .activations
@@ -8425,8 +8463,8 @@ fn map_activation_sites(
                 .iter()
                 .map(|state| ids.runtime_state(*state))
                 .collect::<Result<Vec<_>, String>>()?;
-            Ok(crate::ActivationSite {
-                id: crate::ActivationId(index),
+            Ok(program_core::ActivationSite {
+                id: program_core::ActivationId(index),
                 then_expression,
                 input_expression,
                 output_expression,
@@ -8441,39 +8479,17 @@ fn map_pulse_batches(
     graph: &SemanticReactiveGraphV1,
     ids: &SemanticToExecutableMap,
     storage: &MappedSemanticStorage,
-    fusion_decisions: &[boon_verify::VerifiedPulseFusionDecisionV1],
-) -> Result<Vec<crate::PulseBatch>, String> {
+) -> Result<Vec<program_core::PulseBatch>, String> {
     require_dense(
         graph.pulse_batches.iter().map(|batch| batch.id.as_usize()),
         "semantic pulse batch",
     )?;
-    if fusion_decisions.len() != graph.pulse_batches.len() {
-        return Err(format!(
-            "verification manifest has {} pulse-fusion decisions for {} semantic pulse batches",
-            fusion_decisions.len(),
-            graph.pulse_batches.len()
-        ));
-    }
     graph
         .pulse_batches
         .iter()
         .enumerate()
         .map(|(index, batch)| {
-            let id = crate::PulseBatchId(index);
-            let fusion_decision = fusion_decisions.get(index).ok_or_else(|| {
-                format!(
-                    "verification manifest is missing pulse-fusion decision {}",
-                    batch.id
-                )
-            })?;
-            if fusion_decision.pulse_batch != batch.id
-                || fusion_decision.semantic_slice_digest != batch.slice_digest
-            {
-                return Err(format!(
-                    "pulse-fusion decision {} does not bind semantic pulse batch {} and its exact slice digest",
-                    fusion_decision.pulse_batch, batch.id
-                ));
-            }
+            let id = program_core::PulseBatchId(index);
             let enclosing_activation = batch
                 .enclosing_activation
                 .map(|activation| {
@@ -8481,7 +8497,7 @@ fn map_pulse_batches(
                         .activations
                         .get(activation.as_usize())
                         .filter(|candidate| candidate.id == activation)
-                        .map(|_| crate::ActivationId(activation.as_usize()))
+                        .map(|_| program_core::ActivationId(activation.as_usize()))
                         .ok_or_else(|| {
                             format!(
                                 "semantic pulse batch {} references missing activation {}",
@@ -8535,7 +8551,7 @@ fn map_pulse_batches(
                 .transition_output
                 .map(|expression| ids.expression(expression))
                 .transpose()?;
-            let map_trigger_arm = |trigger_id: &boon_semantic::SemanticTriggerArmId| {
+            let map_trigger_arm = |trigger_id: &crate::SemanticTriggerArmId| {
                     let semantic = graph
                         .trigger_arms
                         .get(trigger_id.as_usize())
@@ -8565,8 +8581,8 @@ fn map_pulse_batches(
                     Ok(mapped)
                 };
             let start = match &batch.start {
-                boon_semantic::SemanticPulseStartV1::Startup => crate::PulseStart::Startup,
-                boon_semantic::SemanticPulseStartV1::Triggered { arms } => {
+                crate::SemanticPulseStartV1::Startup => program_core::PulseStart::Startup,
+                crate::SemanticPulseStartV1::Triggered { arms } => {
                     let arms = arms
                         .iter()
                         .map(&map_trigger_arm)
@@ -8574,14 +8590,14 @@ fn map_pulse_batches(
                     if arms.is_empty()
                         || arms
                             .iter()
-                            .any(|arm| matches!(arm.cause, crate::EventCause::Pulse(_)))
+                            .any(|arm| matches!(arm.cause, program_core::EventCause::Pulse(_)))
                     {
                         return Err(format!(
                             "semantic pulse batch {} has an empty or pulse-recursive start",
                             batch.id
                         ));
                     }
-                    crate::PulseStart::Triggered { arms }
+                    program_core::PulseStart::Triggered { arms }
                 }
             };
             let trigger_arms = batch
@@ -8614,7 +8630,7 @@ fn map_pulse_batches(
                             )
                         })?;
                     if mapped.state != ids.runtime_state(semantic.state)?
-                        || mapped.cause != crate::EventCause::Pulse(id)
+                        || mapped.cause != program_core::EventCause::Pulse(id)
                     {
                         return Err(format!(
                             "semantic pulse batch {} state update arm {} changed target or cause during lowering",
@@ -8648,8 +8664,8 @@ fn map_pulse_batches(
                                 batch.id, mutation_id
                             )
                         })?;
-                    if semantic.cause != boon_semantic::SemanticEventCauseV1::Pulse(batch.id)
-                        || mapped.cause != crate::EventCause::Pulse(id)
+                    if semantic.cause != crate::SemanticEventCauseV1::Pulse(batch.id)
+                        || mapped.cause != program_core::EventCause::Pulse(id)
                     {
                         return Err(format!(
                             "semantic pulse batch {} list mutation {} changed cause during lowering",
@@ -8676,7 +8692,7 @@ fn map_pulse_batches(
                     storage
                         .derived_values
                         .get(derived_id.as_usize())
-                        .filter(|derived| derived.causes.contains(&crate::EventCause::Pulse(id)))
+                        .filter(|derived| derived.causes.contains(&program_core::EventCause::Pulse(id)))
                         .map(|_| derived_id.as_usize())
                         .ok_or_else(|| {
                             format!(
@@ -8710,7 +8726,7 @@ fn map_pulse_batches(
                                 batch.id, schedule_id
                             )
                         })?;
-                    Ok(crate::PulseHostEffect {
+                    Ok(program_core::PulseHostEffect {
                         expression: schedule.expression,
                         operation: schedule.operation.clone(),
                     })
@@ -8730,10 +8746,10 @@ fn map_pulse_batches(
                         .map(|expression| ids.expression(expression))
                         .transpose()?;
                     let filter = match &route.filter {
-                        boon_semantic::SemanticPulseEmissionFilterV1::Passthrough => {
-                            crate::PulseEmissionFilter::Passthrough
+                        crate::SemanticPulseEmissionFilterV1::Passthrough => {
+                            program_core::PulseEmissionFilter::Passthrough
                         }
-                        boon_semantic::SemanticPulseEmissionFilterV1::Skip {
+                        crate::SemanticPulseEmissionFilterV1::Skip {
                             call,
                             expression,
                             count_expression,
@@ -8753,101 +8769,16 @@ fn map_pulse_batches(
                                     batch.id
                                 ));
                             }
-                            crate::PulseEmissionFilter::Skip {
+                            program_core::PulseEmissionFilter::Skip {
                                 expression,
                                 count_expression,
                             }
                         }
                     };
-                    Ok(crate::PulseEmissionRoute { consumer, filter })
+                    Ok(program_core::PulseEmissionRoute { consumer, filter })
                 })
                 .collect::<Result<Vec<_>, String>>()?;
-            let fusion = match &fusion_decision.status {
-                boon_verify::VerifiedPulseFusionStatusV1::Eligible { fact } => {
-                    if fact.count_policy
-                        != boon_verify::VerifiedPulseFusionCountPolicyV1::FrozenAndRuntimeTargetGuardedBeforeFirstMicroturn
-                        || fact.elision_policy
-                            != boon_verify::VerifiedPulseFusionElisionPolicyV1::ElideOnlyUnobservedRecurrenceStateRouting
-                    {
-                        return Err(format!(
-                            "verified pulse-fusion fact for batch {} uses an unsupported proof policy",
-                            batch.id
-                        ));
-                    }
-                    let proof = match (
-                        fact.trace_policy,
-                        batch.list_mutations.is_empty(),
-                    ) {
-                        (
-                            boon_verify::VerifiedPulseFusionTracePolicyV1::PreserveCommittedStateDeltasAndEmissionRoutes,
-                            true,
-                        ) => crate::PulseFusionProof::FrozenRuntimeTargetGuardedFullTraceEmptySideLanes,
-                        (
-                            boon_verify::VerifiedPulseFusionTracePolicyV1::PreserveCommittedStateAndListDeltasAndEmissionRoutes,
-                            false,
-                        ) => crate::PulseFusionProof::FrozenRuntimeTargetGuardedFullTracePreservedListMutations,
-                        _ => {
-                            return Err(format!(
-                                "verified pulse-fusion fact for batch {} changed its list-mutation trace policy",
-                                batch.id
-                            ));
-                        }
-                    };
-                    let activation = crate::ActivationId(fact.activation.as_usize());
-                    let state = ids.runtime_state(fact.state)?;
-                    if enclosing_activation != Some(activation) || batch.state != Some(fact.state) {
-                        return Err(format!(
-                            "verified pulse-fusion fact for batch {} changed its activation-local state",
-                            batch.id
-                        ));
-                    }
-                    let state_update_arm_index = batch
-                        .state_update_arms
-                        .iter()
-                        .position(|arm| *arm == fact.state_update_arm)
-                        .ok_or_else(|| {
-                            format!(
-                                "verified pulse-fusion fact for batch {} references missing update arm {}",
-                                batch.id, fact.state_update_arm
-                            )
-                        })?;
-                    let update = graph
-                        .state_update_arms
-                        .get(fact.state_update_arm.as_usize())
-                        .filter(|arm| arm.id == fact.state_update_arm)
-                        .ok_or_else(|| {
-                            format!(
-                                "verified pulse-fusion fact for batch {} lost update arm {}",
-                                batch.id, fact.state_update_arm
-                            )
-                        })?;
-                    if update.state != fact.state
-                        || mapped_state_update_arms
-                            .get(state_update_arm_index)
-                            .is_none_or(|arm| arm.state != state)
-                    {
-                        return Err(format!(
-                            "verified pulse-fusion fact for batch {} changed its recurrence target",
-                            batch.id
-                        ));
-                    }
-                    crate::PulseFusionEligibility::VerifiedActivationLocalRecurrence {
-                        activation,
-                        state,
-                        state_update_arm_index,
-                        proof,
-                    }
-                }
-                boon_verify::VerifiedPulseFusionStatusV1::Ineligible { reasons } => {
-                    crate::PulseFusionEligibility::Ineligible {
-                        diagnostics: reasons
-                            .iter()
-                            .map(|reason| reason.diagnostic().to_owned())
-                            .collect(),
-                    }
-                }
-            };
-            Ok(crate::PulseBatch {
+            Ok(program_core::PulseBatch {
                 id,
                 enclosing_activation,
                 state,
@@ -8865,16 +8796,16 @@ fn map_pulse_batches(
                 flush_roots,
                 emission_routes,
                 schedule: match batch.schedule {
-                    boon_semantic::SemanticPulseScheduleV1::StageArbitrateCommitPublishBeforeNext => {
-                        crate::PulseSchedule::StageArbitrateCommitPublishBeforeNext
+                    crate::SemanticPulseScheduleV1::StageArbitrateCommitPublishBeforeNext => {
+                        program_core::PulseSchedule::StageArbitrateCommitPublishBeforeNext
                     }
                 },
                 flush_policy: match batch.flush_policy {
-                    boon_semantic::SemanticPulseFlushPolicyV1::DiscardCurrentStopRemainingKeepPriorCommits => {
-                        crate::PulseFlushPolicy::DiscardCurrentStopRemainingKeepPriorCommits
+                    crate::SemanticPulseFlushPolicyV1::DiscardCurrentStopRemainingKeepPriorCommits => {
+                        program_core::PulseFlushPolicy::DiscardCurrentStopRemainingKeepPriorCommits
                     }
                 },
-                fusion,
+                fusion: program_core::PulseFusionEligibility::PendingVerification,
                 semantic_slice_digest: batch.slice_digest.0,
             })
         })
@@ -8882,18 +8813,44 @@ fn map_pulse_batches(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(super) fn finish_verified_semantic_lowering(
+pub(crate) fn build_canonical_program_core(
     execution_graph: &SemanticExecutionGraphV1,
     resource_graph: &SemanticResourceGraphV1,
     reactive_graph: &SemanticReactiveGraphV1,
     lowering_contract: &SemanticLoweringContractV1,
-    view_binding_graph: &boon_semantic::SemanticViewBindingGraphV1,
+    view_binding_graph: &crate::SemanticViewBindingGraphV1,
     scope_storage_graph: &SemanticScopeStorageGraphV1,
-    memory_graph: &boon_semantic::SemanticMemoryGraphV1,
-    pulse_fusion_decisions: &[boon_verify::VerifiedPulseFusionDecisionV1],
+    memory_graph: &crate::SemanticMemoryGraphV1,
+) -> Result<program_core::CanonicalProgramCoreV1, String> {
+    let mapped =
+        map_semantic_execution_with_reactive(execution_graph, resource_graph, reactive_graph)?;
+    mapped.validate_totality()?;
+    let resources = map_semantic_resources(execution_graph, resource_graph, &mapped.id_map)?;
+    finish_canonical_program_core(
+        execution_graph,
+        resource_graph,
+        reactive_graph,
+        lowering_contract,
+        view_binding_graph,
+        scope_storage_graph,
+        memory_graph,
+        mapped,
+        resources,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_canonical_program_core(
+    execution_graph: &SemanticExecutionGraphV1,
+    resource_graph: &SemanticResourceGraphV1,
+    reactive_graph: &SemanticReactiveGraphV1,
+    lowering_contract: &SemanticLoweringContractV1,
+    view_binding_graph: &crate::SemanticViewBindingGraphV1,
+    scope_storage_graph: &SemanticScopeStorageGraphV1,
+    memory_graph: &crate::SemanticMemoryGraphV1,
     mapped: MappedSemanticExecution,
     resources: MappedSemanticResources,
-) -> Result<crate::CanonicalProgramCoreV1, String> {
+) -> Result<program_core::CanonicalProgramCoreV1, String> {
     let mut resources = resources;
     let reactive = map_semantic_reactive(
         execution_graph,
@@ -8958,12 +8915,7 @@ pub(super) fn finish_verified_semantic_lowering(
         &resources.state_cells,
     );
     let activations = map_activation_sites(reactive_graph, &mapped.id_map)?;
-    let pulse_batches = map_pulse_batches(
-        reactive_graph,
-        &mapped.id_map,
-        &storage,
-        pulse_fusion_decisions,
-    )?;
+    let pulse_batches = map_pulse_batches(reactive_graph, &mapped.id_map, &storage)?;
     let external_storage_sources = mapped
         .id_map
         .external_event_source_paths
@@ -9017,9 +8969,9 @@ pub(super) fn finish_verified_semantic_lowering(
     }
     let graph_node_count = executable.expressions.len();
 
-    Ok(crate::CanonicalProgramCoreV1 {
+    Ok(program_core::CanonicalProgramCoreV1 {
         executable,
-        scope_index: crate::ErasedScopeIndex {
+        scope_index: program_core::ErasedScopeIndex {
             owners,
             locals,
             fields,
@@ -9051,7 +9003,7 @@ pub(super) fn finish_verified_semantic_lowering(
         state_update_arms: finalized_state_transitions,
         host_effect_schedules: host_effect_schedules
             .into_iter()
-            .map(|schedule| crate::HostEffectSchedule {
+            .map(|schedule| program_core::HostEffectSchedule {
                 id: schedule.id,
                 expression: schedule.expression,
                 checked_expression: schedule.checked_expression,
@@ -9079,7 +9031,7 @@ fn map_distributed_references(
     storage: &MappedSemanticStorage,
 ) -> Result<
     (
-        crate::DistributedReferences,
+        program_core::DistributedReferences,
         ExternalReferenceMap,
         ExternalReferenceMap,
     ),
@@ -9152,7 +9104,7 @@ fn map_distributed_references(
                             && binding.flow_type == executable.flow_type
                             && matches!(
                                 binding.target,
-                                crate::ErasedBindingTarget::Value {
+                                program_core::ErasedBindingTarget::Value {
                                     field: Some(_),
                                     row: None,
                                 }
@@ -9162,7 +9114,7 @@ fn map_distributed_references(
                     .collect::<Vec<_>>();
                 local_alias_paths.sort();
                 local_alias_paths.dedup();
-                value_references.push(crate::DistributedValueReference {
+                value_references.push(program_core::DistributedValueReference {
                     expr_id: ExprId(executable.checked_expr_id.0 as usize),
                     canonical_path: reference.canonical_path.clone(),
                     local_alias_paths,
@@ -9236,7 +9188,7 @@ fn map_distributed_references(
                                     argument.name, argument.value
                                 )
                             })?;
-                        Ok(crate::DistributedCallArgument {
+                        Ok(program_core::DistributedCallArgument {
                             name: argument.name.clone(),
                             value: argument.value,
                             flow_type: value.flow_type.clone(),
@@ -9261,7 +9213,7 @@ fn map_distributed_references(
                         reference.id
                     ));
                 }
-                calls.push(crate::DistributedCall {
+                calls.push(program_core::DistributedCall {
                     expression,
                     owner: executable.owner,
                     occurrence_path: format!(
@@ -9287,7 +9239,7 @@ fn map_distributed_references(
         );
     }
     Ok((
-        crate::DistributedReferences {
+        program_core::DistributedReferences {
             value_references,
             calls,
         },
@@ -9310,7 +9262,7 @@ fn finalize_storage_reads(
     storage: &MappedSemanticStorage,
     resources: &MappedSemanticResources,
     external_values: &ExternalReferenceMap,
-) -> Result<Vec<crate::ErasedReadBinding>, String> {
+) -> Result<Vec<program_core::ErasedReadBinding>, String> {
     storage
         .reads
         .iter()
@@ -9319,7 +9271,7 @@ fn finalize_storage_reads(
                 MappedSemanticStorageReadTarget::Binding {
                     binding,
                     projection,
-                } => crate::ErasedReadTarget::Binding {
+                } => program_core::ErasedReadTarget::Binding {
                     binding: *binding,
                     projection: projection.clone(),
                 },
@@ -9340,10 +9292,10 @@ fn finalize_storage_reads(
                             )
                         })?;
                     let Some((field_name, projection)) = payload_projection.split_first() else {
-                        return Ok(crate::ErasedReadBinding {
+                        return Ok(program_core::ErasedReadBinding {
                             id: read.id,
                             expression: read.expression,
-                            target: crate::ErasedReadTarget::Binding {
+                            target: program_core::ErasedReadTarget::Binding {
                                 binding: *binding,
                                 projection: Vec::new(),
                             },
@@ -9362,7 +9314,7 @@ fn finalize_storage_reads(
                             fields.len()
                         ));
                     };
-                    crate::ErasedReadTarget::SourcePayload {
+                    program_core::ErasedReadTarget::SourcePayload {
                         binding: *binding,
                         source: *source,
                         field: (*field).clone(),
@@ -9375,12 +9327,12 @@ fn finalize_storage_reads(
                     projection,
                 } => {
                     if projection.is_empty() {
-                        crate::ErasedReadTarget::Binding {
+                        program_core::ErasedReadTarget::Binding {
                             binding: *binding,
                             projection: Vec::new(),
                         }
                     } else {
-                        crate::ErasedReadTarget::StateProjection {
+                        program_core::ErasedReadTarget::StateProjection {
                             binding: *binding,
                             state: *state,
                             fields: projection.clone(),
@@ -9392,7 +9344,7 @@ fn finalize_storage_reads(
                     declaration,
                     producer,
                     projection,
-                } => crate::ErasedReadTarget::Local {
+                } => program_core::ErasedReadTarget::Local {
                     binding: *binding,
                     declaration: *declaration,
                     value: *producer,
@@ -9405,12 +9357,12 @@ fn finalize_storage_reads(
                             read.id
                         )
                     })?;
-                    crate::ErasedReadTarget::ExternalValue { reference }
+                    program_core::ErasedReadTarget::ExternalValue { reference }
                 }
                 MappedSemanticStorageReadTarget::ElementState {
                     context,
                     projection,
-                } => crate::ErasedReadTarget::ElementState {
+                } => program_core::ErasedReadTarget::ElementState {
                     context: *context,
                     projection: projection.clone(),
                 },
@@ -9418,7 +9370,7 @@ fn finalize_storage_reads(
                     owner,
                     local,
                     projection,
-                } => crate::ErasedReadTarget::MaterializationLocal {
+                } => program_core::ErasedReadTarget::MaterializationLocal {
                     owner: *owner,
                     local: *local,
                     projection: projection.clone(),
@@ -9426,12 +9378,12 @@ fn finalize_storage_reads(
                 MappedSemanticStorageReadTarget::FunctionParameter {
                     parameter,
                     projection,
-                } => crate::ErasedReadTarget::FunctionParameter {
+                } => program_core::ErasedReadTarget::FunctionParameter {
                     parameter: *parameter,
                     projection: projection.clone(),
                 },
             };
-            Ok(crate::ErasedReadBinding {
+            Ok(program_core::ErasedReadBinding {
                 id: read.id,
                 expression: read.expression,
                 target,
@@ -9443,14 +9395,14 @@ fn finalize_storage_reads(
 fn finalize_storage_dependency_uses(
     storage: &MappedSemanticStorage,
     external_calls: &ExternalReferenceMap,
-) -> Result<Vec<crate::ErasedDependencyUse>, String> {
+) -> Result<Vec<program_core::ErasedDependencyUse>, String> {
     storage
         .dependency_uses
         .iter()
         .map(|dependency| {
             let target = match dependency.target {
                 MappedSemanticStorageDependencyTarget::BundleExternalRead { read, .. } => {
-                    crate::ErasedDependencyTarget::ExternalRead { read }
+                    program_core::ErasedDependencyTarget::ExternalRead { read }
                 }
                 MappedSemanticStorageDependencyTarget::BundleExternalCall { reference } => {
                     let reference = external_calls.get(&reference).copied().ok_or_else(|| {
@@ -9459,10 +9411,10 @@ fn finalize_storage_dependency_uses(
                             dependency.expression
                         )
                     })?;
-                    crate::ErasedDependencyTarget::ExternalCall { reference }
+                    program_core::ErasedDependencyTarget::ExternalCall { reference }
                 }
             };
-            Ok(crate::ErasedDependencyUse {
+            Ok(program_core::ErasedDependencyUse {
                 dependent: dependency.dependent,
                 expression: dependency.expression,
                 target,
@@ -9476,7 +9428,7 @@ fn map_output_values(
     lowering: &SemanticLoweringContractV1,
     ids: &SemanticToExecutableMap,
     storage_ids: &SemanticStorageToErasedMap,
-) -> Result<Vec<crate::OutputRootValue>, String> {
+) -> Result<Vec<program_core::OutputRootValue>, String> {
     lowering
         .output_contracts
         .iter()
@@ -9489,26 +9441,26 @@ fn map_output_values(
                 ));
             }
             let contract = match output.contract {
-                boon_semantic::SemanticOutputContractKindV1::RetainedVisualDocument => {
-                    crate::SemanticOutputContractKind::RetainedVisual {
-                        kind: crate::SemanticRetainedVisualKind::Document,
+                crate::SemanticOutputContractKindV1::RetainedVisualDocument => {
+                    program_core::SemanticOutputContractKind::RetainedVisual {
+                        kind: program_core::SemanticRetainedVisualKind::Document,
                     }
                 }
-                boon_semantic::SemanticOutputContractKindV1::RetainedVisualScene => {
-                    crate::SemanticOutputContractKind::RetainedVisual {
-                        kind: crate::SemanticRetainedVisualKind::Scene,
+                crate::SemanticOutputContractKindV1::RetainedVisualScene => {
+                    program_core::SemanticOutputContractKind::RetainedVisual {
+                        kind: program_core::SemanticRetainedVisualKind::Scene,
                     }
                 }
-                boon_semantic::SemanticOutputContractKindV1::HostValue => {
-                    crate::SemanticOutputContractKind::HostValue
+                crate::SemanticOutputContractKindV1::HostValue => {
+                    program_core::SemanticOutputContractKind::HostValue
                 }
             };
             let demand = match output.demand {
-                boon_semantic::SemanticOutputDemandPolicyV1::HostDemanded => {
-                    crate::SemanticOutputDemandPolicy::HostDemanded
+                crate::SemanticOutputDemandPolicyV1::HostDemanded => {
+                    program_core::SemanticOutputDemandPolicy::HostDemanded
                 }
             };
-            Ok(crate::OutputRootValue {
+            Ok(program_core::OutputRootValue {
                 root: output.root.clone(),
                 value_path: output.value_path.clone(),
                 contract,
@@ -9526,16 +9478,16 @@ fn map_output_values(
         .collect()
 }
 
-fn map_host_ports(lowering: &SemanticLoweringContractV1) -> Vec<crate::HostPortDeclaration> {
+fn map_host_ports(lowering: &SemanticLoweringContractV1) -> Vec<program_core::HostPortDeclaration> {
     lowering
         .host_ports
         .iter()
         .map(|port| match &port.kind {
-            boon_semantic::SemanticHostPortKindV1::HttpServer {
+            crate::SemanticHostPortKindV1::HttpServer {
                 request,
                 disconnect,
                 response,
-            } => crate::HostPortDeclaration::HttpServer {
+            } => program_core::HostPortDeclaration::HttpServer {
                 line: port.line,
                 request_source: request.diagnostic_path.clone(),
                 disconnect_source: disconnect
@@ -9543,13 +9495,13 @@ fn map_host_ports(lowering: &SemanticLoweringContractV1) -> Vec<crate::HostPortD
                     .map(|binding| binding.diagnostic_path.clone()),
                 response_output: response.diagnostic_name.clone(),
             },
-            boon_semantic::SemanticHostPortKindV1::WebSocketServer {
+            crate::SemanticHostPortKindV1::WebSocketServer {
                 open,
                 message,
                 close,
                 error,
                 actions,
-            } => crate::HostPortDeclaration::WebSocketServer {
+            } => program_core::HostPortDeclaration::WebSocketServer {
                 line: port.line,
                 open_source: open.diagnostic_path.clone(),
                 message_source: message.diagnostic_path.clone(),
@@ -9562,11 +9514,11 @@ fn map_host_ports(lowering: &SemanticLoweringContractV1) -> Vec<crate::HostPortD
 }
 
 fn map_view_bindings(
-    graph: &boon_semantic::SemanticViewBindingGraphV1,
+    graph: &crate::SemanticViewBindingGraphV1,
     ids: &SemanticToExecutableMap,
     storage_ids: &SemanticStorageToErasedMap,
     storage: &MappedSemanticStorage,
-) -> Result<Vec<crate::ViewBinding>, String> {
+) -> Result<Vec<program_core::ViewBinding>, String> {
     graph
         .bindings
         .iter()
@@ -9599,35 +9551,33 @@ fn map_view_bindings(
                     )
                 })?;
             let path = match binding.target {
-                boon_semantic::SemanticViewBindingTargetV1::Data { read } => mapped_view_read_path(
+                crate::SemanticViewBindingTargetV1::Data { read } => mapped_view_read_path(
                     storage,
                     storage_ids.read(MappedReactiveReadId(read.as_usize()))?,
                 )
                 .unwrap_or_else(|| binding.diagnostic_path.clone()),
-                boon_semantic::SemanticViewBindingTargetV1::Event { .. } => {
-                    binding.diagnostic_path.clone()
-                }
+                crate::SemanticViewBindingTargetV1::Event { .. } => binding.diagnostic_path.clone(),
             };
             let target = match binding.target {
-                boon_semantic::SemanticViewBindingTargetV1::Data { read } => {
-                    crate::ViewBindingTarget::Read {
+                crate::SemanticViewBindingTargetV1::Data { read } => {
+                    program_core::ViewBindingTarget::Read {
                         read: storage_ids.read(MappedReactiveReadId(read.as_usize()))?,
                         additional_projection: binding.additional_projection.clone(),
                     }
                 }
-                boon_semantic::SemanticViewBindingTargetV1::Event { source } => {
-                    crate::ViewBindingTarget::Source {
+                crate::SemanticViewBindingTargetV1::Event { source } => {
+                    program_core::ViewBindingTarget::Source {
                         source: ids.runtime_source(source)?,
                     }
                 }
             };
             let kind = match binding.kind {
-                boon_semantic::SemanticViewBindingKindV1::Data => crate::ViewBindingKind::Data,
-                boon_semantic::SemanticViewBindingKindV1::Source => crate::ViewBindingKind::Source,
-                boon_semantic::SemanticViewBindingKindV1::Target => crate::ViewBindingKind::Target,
+                crate::SemanticViewBindingKindV1::Data => program_core::ViewBindingKind::Data,
+                crate::SemanticViewBindingKindV1::Source => program_core::ViewBindingKind::Source,
+                crate::SemanticViewBindingKindV1::Target => program_core::ViewBindingKind::Target,
             };
-            Ok(crate::ViewBinding {
-                id: crate::ViewBindingId(index),
+            Ok(program_core::ViewBinding {
+                id: program_core::ViewBindingId(index),
                 node_expression: ids.expression(node.expression)?,
                 argument_expression: ids.expression(argument.expression)?,
                 node_kind: node.diagnostic_kind.clone(),
@@ -9727,7 +9677,7 @@ fn join_diagnostic_projection(base: &str, projection: &[String]) -> String {
 }
 
 fn map_expression_types(
-    metadata: &boon_semantic::SemanticLoweringMetadataV1,
+    metadata: &crate::SemanticLoweringMetadataV1,
 ) -> boon_typecheck::ExprTypeTable {
     boon_typecheck::ExprTypeTable {
         entries: metadata
@@ -9742,7 +9692,7 @@ fn map_expression_types(
 }
 
 fn map_function_types(
-    metadata: &boon_semantic::SemanticLoweringMetadataV1,
+    metadata: &crate::SemanticLoweringMetadataV1,
 ) -> boon_typecheck::FunctionTypeTable {
     boon_typecheck::FunctionTypeTable {
         entries: metadata
@@ -9769,7 +9719,7 @@ fn map_function_types(
 }
 
 fn map_named_value_types(
-    metadata: &boon_semantic::SemanticLoweringMetadataV1,
+    metadata: &crate::SemanticLoweringMetadataV1,
 ) -> boon_typecheck::NamedValueTypeTable {
     boon_typecheck::NamedValueTypeTable {
         checked_statement_sites: metadata
@@ -9794,8 +9744,8 @@ fn map_named_value_types(
 }
 
 fn map_debug_source_units(
-    metadata: &boon_semantic::SemanticLoweringMetadataV1,
-) -> Result<Vec<crate::SemanticSourceUnit>, String> {
+    metadata: &crate::SemanticLoweringMetadataV1,
+) -> Result<Vec<program_core::SemanticSourceUnit>, String> {
     metadata
         .source_units
         .iter()
@@ -9807,8 +9757,8 @@ fn map_debug_source_units(
                     unit.id
                 ));
             }
-            Ok(crate::SemanticSourceUnit {
-                id: crate::SourceUnitId(index),
+            Ok(program_core::SemanticSourceUnit {
+                id: program_core::SourceUnitId(index),
                 path: unit.path.clone(),
                 module: unit.module.clone(),
                 start_line: unit.start_line,
@@ -9822,11 +9772,11 @@ fn map_semantic_field_entries(
     fields: &[ErasedFieldDef],
     derived_values: &[DerivedValue],
     state_cells: &[StateCell],
-) -> Vec<crate::SemanticFieldEntry> {
+) -> Vec<program_core::SemanticFieldEntry> {
     fields
         .iter()
         .filter(|field| field.role.is_value())
-        .map(|field| crate::SemanticFieldEntry {
+        .map(|field| program_core::SemanticFieldEntry {
             id: field.id,
             path: field.diagnostic_path.clone(),
             local_name: field.name.clone(),
@@ -9873,10 +9823,16 @@ fn map_semantic_field_entries(
 fn map_semantic_memory(
     execution: &SemanticExecutionGraphV1,
     reactive: &SemanticReactiveGraphV1,
-    graph: &boon_semantic::SemanticMemoryGraphV1,
+    graph: &crate::SemanticMemoryGraphV1,
     ids: &SemanticToExecutableMap,
     storage_ids: &SemanticStorageToErasedMap,
-) -> Result<(Vec<crate::SemanticMemory>, Vec<crate::MigrationEdge>), String> {
+) -> Result<
+    (
+        Vec<program_core::SemanticMemory>,
+        Vec<program_core::MigrationEdge>,
+    ),
+    String,
+> {
     let memories = graph
         .memories
         .iter()
@@ -9890,7 +9846,7 @@ fn map_semantic_memory(
             }
             let kind = map_semantic_memory_kind(memory.identity.kind);
             let runtime_backing = match memory.backing {
-                boon_semantic::SemanticMemoryBackingV1::State {
+                crate::SemanticMemoryBackingV1::State {
                     storage_field,
                     state,
                     row,
@@ -9899,12 +9855,12 @@ fn map_semantic_memory(
                     let state_id = ids.runtime_state(state)?;
                     let field_id = Some(storage_ids.storage_field(storage_field)?);
                     match (kind, row) {
-                        (crate::SemanticMemoryKind::RootScalar, None) => {
-                            crate::SemanticMemoryRuntimeBacking::RootState { state_id, field_id }
+                        (program_core::SemanticMemoryKind::RootScalar, None) => {
+                            program_core::SemanticMemoryRuntimeBacking::RootState { state_id, field_id }
                         }
-                        (crate::SemanticMemoryKind::IndexedField, Some(row)) => {
+                        (program_core::SemanticMemoryKind::IndexedField, Some(row)) => {
                             let row = map_row_binding(ids, row)?;
-                            crate::SemanticMemoryRuntimeBacking::IndexedState {
+                            program_core::SemanticMemoryRuntimeBacking::IndexedState {
                                 state_id,
                                 field_id,
                                 scope_id: row.scope,
@@ -9919,13 +9875,13 @@ fn map_semantic_memory(
                         }
                     }
                 }
-                boon_semantic::SemanticMemoryBackingV1::List {
+                crate::SemanticMemoryBackingV1::List {
                     storage_field,
                     list,
                     row,
                     ..
                 } => {
-                    if kind != crate::SemanticMemoryKind::ListOwner {
+                    if kind != program_core::SemanticMemoryKind::ListOwner {
                         return Err(format!(
                             "semantic memory {} has list backing for non-list kind {:?}",
                             memory.id, memory.identity.kind
@@ -9940,21 +9896,21 @@ fn map_semantic_memory(
                             memory.id
                         ));
                     }
-                    crate::SemanticMemoryRuntimeBacking::List {
+                    program_core::SemanticMemoryRuntimeBacking::List {
                         list_id,
                         row_scope_id: Some(row.scope),
                     }
                 }
-                boon_semantic::SemanticMemoryBackingV1::Collection { expression, owner } => {
+                crate::SemanticMemoryBackingV1::Collection { expression, owner } => {
                     let semantic_expression =
                         semantic_execution_expression(execution, expression)?;
                     let kind_matches = matches!(
                         (kind, &semantic_expression.kind),
                         (
-                            crate::SemanticMemoryKind::Map,
+                            program_core::SemanticMemoryKind::Map,
                             SemanticExpressionKind::Map { .. }
                         ) | (
-                            crate::SemanticMemoryKind::Set,
+                            program_core::SemanticMemoryKind::Set,
                             SemanticExpressionKind::Set { .. }
                         )
                     );
@@ -9964,17 +9920,17 @@ fn map_semantic_memory(
                             memory.id, memory.identity.kind, owner
                         ));
                     }
-                    crate::SemanticMemoryRuntimeBacking::Collection {
+                    program_core::SemanticMemoryRuntimeBacking::Collection {
                         expression: ids.expression(expression)?,
                         owner,
                     }
                 }
             };
             let status = match memory.status {
-                boon_semantic::SemanticMemoryStatusV1::Active => {
-                    crate::SemanticMemoryStatus::Active
+                crate::SemanticMemoryStatusV1::Active => {
+                    program_core::SemanticMemoryStatus::Active
                 }
-                boon_semantic::SemanticMemoryStatusV1::Draining { marker } => {
+                crate::SemanticMemoryStatusV1::Draining { marker } => {
                     let migration = reactive
                         .migration_inputs
                         .get(marker.as_usize())
@@ -9986,14 +9942,14 @@ fn map_semantic_memory(
                             )
                         })?;
                     let marker = semantic_execution_expression(execution, migration.marker)?;
-                    crate::SemanticMemoryStatus::Draining {
+                    program_core::SemanticMemoryStatus::Draining {
                         marker_expr_id: ExprId(marker.checked_expr_id.0 as usize),
                     }
                 }
             };
-            Ok(crate::SemanticMemory {
-                id: crate::SemanticMemoryId(index),
-                identity: crate::SemanticMemoryIdentity {
+            Ok(program_core::SemanticMemory {
+                id: program_core::SemanticMemoryId(index),
+                identity: program_core::SemanticMemoryIdentity {
                     canonical_module: memory.identity.canonical_module.clone(),
                     owner_path: memory.identity.owner_path.clone(),
                     semantic_path: memory.identity.semantic_path.clone(),
@@ -10003,7 +9959,7 @@ fn map_semantic_memory(
                 leaves: memory
                     .leaves
                     .iter()
-                    .map(|leaf| crate::SemanticMemoryLeaf {
+                    .map(|leaf| program_core::SemanticMemoryLeaf {
                         semantic_path: semantic_region_path(
                             &memory.identity.semantic_path,
                             &leaf.projection,
@@ -10042,8 +9998,8 @@ fn map_semantic_memory(
                     let data_type =
                         semantic_region_type(&memory.data_type, &input.source.projection)?;
                     let expression = semantic_execution_expression(execution, input.expression)?;
-                    Ok(crate::MigrationSourceLeaf {
-                        memory_id: crate::SemanticMemoryId(input.source.memory.as_usize()),
+                    Ok(program_core::MigrationSourceLeaf {
+                        memory_id: program_core::SemanticMemoryId(input.source.memory.as_usize()),
                         semantic_path: semantic_region_path(
                             &memory.identity.semantic_path,
                             &input.source.projection,
@@ -10057,39 +10013,39 @@ fn map_semantic_memory(
             let destination_type =
                 semantic_region_type(&destination_memory.data_type, &edge.destination.projection)?;
             let transfer_kind = match edge.transfer {
-                boon_semantic::SemanticMigrationTransferV1::Scalar => {
-                    crate::MigrationTransferKind::Scalar
+                crate::SemanticMigrationTransferV1::Scalar => {
+                    program_core::MigrationTransferKind::Scalar
                 }
-                boon_semantic::SemanticMigrationTransferV1::IndexedField { owner } => {
+                crate::SemanticMigrationTransferV1::IndexedField { owner } => {
                     map_row_binding(ids, owner)?;
-                    crate::MigrationTransferKind::IndexedField
+                    program_core::MigrationTransferKind::IndexedField
                 }
-                boon_semantic::SemanticMigrationTransferV1::List {
+                crate::SemanticMigrationTransferV1::List {
                     source,
                     destination,
                 } => {
                     map_row_binding(ids, source)?;
                     map_row_binding(ids, destination)?;
-                    crate::MigrationTransferKind::List
+                    program_core::MigrationTransferKind::List
                 }
             };
             let transform = match edge.transform {
-                boon_semantic::SemanticMigrationTransformV1::Identity { input } => {
+                crate::SemanticMigrationTransformV1::Identity { input } => {
                     semantic_execution_expression(execution, input)?;
-                    crate::MigrationTransform::Identity
+                    program_core::MigrationTransform::Identity
                 }
-                boon_semantic::SemanticMigrationTransformV1::PureExpression { root } => {
+                crate::SemanticMigrationTransformV1::PureExpression { root } => {
                     let root = semantic_execution_expression(execution, root)?;
-                    crate::MigrationTransform::PureExpression {
+                    program_core::MigrationTransform::PureExpression {
                         expression_root: ExprId(root.checked_expr_id.0 as usize),
                         pipeline: Vec::new(),
                     }
                 }
             };
-            Ok(crate::MigrationEdge {
+            Ok(program_core::MigrationEdge {
                 source_leaves,
-                destination: crate::MigrationDestination {
-                    memory_id: crate::SemanticMemoryId(edge.destination.memory.as_usize()),
+                destination: program_core::MigrationDestination {
+                    memory_id: program_core::SemanticMemoryId(edge.destination.memory.as_usize()),
                     semantic_path: semantic_region_path(
                         &destination_memory.identity.semantic_path,
                         &edge.destination.projection,
@@ -10106,16 +10062,14 @@ fn map_semantic_memory(
 
 fn map_transient_collections(
     lowering: &SemanticLoweringContractV1,
-    memory: &boon_semantic::SemanticMemoryGraphV1,
+    memory: &crate::SemanticMemoryGraphV1,
     ids: &SemanticToExecutableMap,
-) -> Result<Vec<crate::TransientCollection>, String> {
+) -> Result<Vec<program_core::TransientCollection>, String> {
     let durable_constructors = memory
         .memories
         .iter()
         .filter_map(|memory| match memory.backing {
-            boon_semantic::SemanticMemoryBackingV1::Collection { expression, .. } => {
-                Some(expression)
-            }
+            crate::SemanticMemoryBackingV1::Collection { expression, .. } => Some(expression),
             _ => None,
         })
         .collect::<BTreeSet<_>>();
@@ -10143,14 +10097,14 @@ fn map_transient_collections(
                 ));
             }
             let kind = match region.kind {
-                boon_semantic::SemanticTransientCollectionKindV1::List => {
-                    crate::TransientCollectionKind::List
+                crate::SemanticTransientCollectionKindV1::List => {
+                    program_core::TransientCollectionKind::List
                 }
-                boon_semantic::SemanticTransientCollectionKindV1::Map => {
-                    crate::TransientCollectionKind::Map
+                crate::SemanticTransientCollectionKindV1::Map => {
+                    program_core::TransientCollectionKind::Map
                 }
-                boon_semantic::SemanticTransientCollectionKindV1::Set => {
-                    crate::TransientCollectionKind::Set
+                crate::SemanticTransientCollectionKindV1::Set => {
+                    program_core::TransientCollectionKind::Set
                 }
             };
             let list_items = region
@@ -10163,7 +10117,7 @@ fn map_transient_collections(
                 .map_entries
                 .iter()
                 .map(|entry| {
-                    Ok(crate::TransientMapEntry {
+                    Ok(program_core::TransientMapEntry {
                         key: ids.expression(entry.key)?,
                         value: ids.expression(entry.value)?,
                     })
@@ -10180,40 +10134,40 @@ fn map_transient_collections(
                 .iter()
                 .map(|step| {
                     Ok(match step {
-                        boon_semantic::SemanticTransientCollectionStepV1::ListAppend {
+                        crate::SemanticTransientCollectionStepV1::ListAppend {
                             expression,
                             item,
-                        } => crate::TransientCollectionStep::ListAppend {
+                        } => program_core::TransientCollectionStep::ListAppend {
                             expression: ids.expression(*expression)?,
                             item: ids.expression(*item)?,
                         },
-                        boon_semantic::SemanticTransientCollectionStepV1::MapUpsert {
+                        crate::SemanticTransientCollectionStepV1::MapUpsert {
                             expression,
                             key,
                             value,
-                        } => crate::TransientCollectionStep::MapUpsert {
+                        } => program_core::TransientCollectionStep::MapUpsert {
                             expression: ids.expression(*expression)?,
                             key: ids.expression(*key)?,
                             value: ids.expression(*value)?,
                         },
-                        boon_semantic::SemanticTransientCollectionStepV1::MapRemove {
+                        crate::SemanticTransientCollectionStepV1::MapRemove {
                             expression,
                             key,
-                        } => crate::TransientCollectionStep::MapRemove {
+                        } => program_core::TransientCollectionStep::MapRemove {
                             expression: ids.expression(*expression)?,
                             key: ids.expression(*key)?,
                         },
-                        boon_semantic::SemanticTransientCollectionStepV1::SetAdd {
+                        crate::SemanticTransientCollectionStepV1::SetAdd {
                             expression,
                             item,
-                        } => crate::TransientCollectionStep::SetAdd {
+                        } => program_core::TransientCollectionStep::SetAdd {
                             expression: ids.expression(*expression)?,
                             item: ids.expression(*item)?,
                         },
-                        boon_semantic::SemanticTransientCollectionStepV1::SetRemove {
+                        crate::SemanticTransientCollectionStepV1::SetRemove {
                             expression,
                             item,
-                        } => crate::TransientCollectionStep::SetRemove {
+                        } => program_core::TransientCollectionStep::SetRemove {
                             expression: ids.expression(*expression)?,
                             item: ids.expression(*item)?,
                         },
@@ -10221,39 +10175,39 @@ fn map_transient_collections(
                 })
                 .collect::<Result<Vec<_>, String>>()?;
             let result = match &region.result {
-                boon_semantic::SemanticTransientCollectionResultV1::ListGet {
+                crate::SemanticTransientCollectionResultV1::ListGet {
                     expression,
                     position,
-                } => crate::TransientCollectionResult::ListGet {
+                } => program_core::TransientCollectionResult::ListGet {
                     expression: ids.expression(*expression)?,
                     position: ids.expression(*position)?,
                 },
-                boon_semantic::SemanticTransientCollectionResultV1::ListLength {
+                crate::SemanticTransientCollectionResultV1::ListLength {
                     expression,
-                } => crate::TransientCollectionResult::ListLength {
+                } => program_core::TransientCollectionResult::ListLength {
                     expression: ids.expression(*expression)?,
                 },
-                boon_semantic::SemanticTransientCollectionResultV1::ListIsNotEmpty {
+                crate::SemanticTransientCollectionResultV1::ListIsNotEmpty {
                     expression,
-                } => crate::TransientCollectionResult::ListIsNotEmpty {
+                } => program_core::TransientCollectionResult::ListIsNotEmpty {
                     expression: ids.expression(*expression)?,
                 },
-                boon_semantic::SemanticTransientCollectionResultV1::MapGet {
+                crate::SemanticTransientCollectionResultV1::MapGet {
                     expression,
                     key,
-                } => crate::TransientCollectionResult::MapGet {
+                } => program_core::TransientCollectionResult::MapGet {
                     expression: ids.expression(*expression)?,
                     key: ids.expression(*key)?,
                 },
-                boon_semantic::SemanticTransientCollectionResultV1::SetContains {
+                crate::SemanticTransientCollectionResultV1::SetContains {
                     expression,
                     item,
-                } => crate::TransientCollectionResult::SetContains {
+                } => program_core::TransientCollectionResult::SetContains {
                     expression: ids.expression(*expression)?,
                     item: ids.expression(*item)?,
                 },
             };
-            Ok(crate::TransientCollection {
+            Ok(program_core::TransientCollection {
                 kind,
                 constructor: ids.expression(region.constructor)?,
                 declared_capacity: region.declared_capacity,
@@ -10277,23 +10231,21 @@ fn map_transient_collections(
 }
 
 const fn map_semantic_memory_kind(
-    kind: boon_semantic::SemanticMemoryKindV1,
-) -> crate::SemanticMemoryKind {
+    kind: crate::SemanticMemoryKindV1,
+) -> program_core::SemanticMemoryKind {
     match kind {
-        boon_semantic::SemanticMemoryKindV1::RootScalar => crate::SemanticMemoryKind::RootScalar,
-        boon_semantic::SemanticMemoryKindV1::IndexedField => {
-            crate::SemanticMemoryKind::IndexedField
-        }
-        boon_semantic::SemanticMemoryKindV1::ListOwner => crate::SemanticMemoryKind::ListOwner,
-        boon_semantic::SemanticMemoryKindV1::Map => crate::SemanticMemoryKind::Map,
-        boon_semantic::SemanticMemoryKindV1::Set => crate::SemanticMemoryKind::Set,
+        crate::SemanticMemoryKindV1::RootScalar => program_core::SemanticMemoryKind::RootScalar,
+        crate::SemanticMemoryKindV1::IndexedField => program_core::SemanticMemoryKind::IndexedField,
+        crate::SemanticMemoryKindV1::ListOwner => program_core::SemanticMemoryKind::ListOwner,
+        crate::SemanticMemoryKindV1::Map => program_core::SemanticMemoryKind::Map,
+        crate::SemanticMemoryKindV1::Set => program_core::SemanticMemoryKind::Set,
     }
 }
 
 fn semantic_memory_record(
-    graph: &boon_semantic::SemanticMemoryGraphV1,
-    id: boon_semantic::SemanticMemoryId,
-) -> Result<&boon_semantic::SemanticMemoryV1, String> {
+    graph: &crate::SemanticMemoryGraphV1,
+    id: crate::SemanticMemoryId,
+) -> Result<&crate::SemanticMemoryV1, String> {
     graph
         .memories
         .get(id.as_usize())
@@ -10402,1647 +10354,4 @@ fn exact_map<T: Copy>(
         .get(index)
         .copied()
         .ok_or_else(|| format!("{label} {id} has no executable mapping"))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn runtime_generic_scheme_requires_one_consistent_concrete_substitution() {
-        let variable = boon_typecheck::TypeVar(0);
-        let scheme = boon_typecheck::Type::Function {
-            args: vec![
-                boon_typecheck::Type::Var(variable),
-                boon_typecheck::Type::Var(variable),
-            ],
-            result: Box::new(FlowType {
-                mode: boon_typecheck::FlowMode::Continuous,
-                ty: boon_typecheck::Type::Var(variable),
-            }),
-        };
-        let consistent = boon_typecheck::Type::Function {
-            args: vec![boon_typecheck::Type::Text, boon_typecheck::Type::Text],
-            result: Box::new(FlowType {
-                mode: boon_typecheck::FlowMode::Continuous,
-                ty: boon_typecheck::Type::Text,
-            }),
-        };
-        let inconsistent = boon_typecheck::Type::Function {
-            args: vec![boon_typecheck::Type::Text, boon_typecheck::Type::Number],
-            result: Box::new(FlowType {
-                mode: boon_typecheck::FlowMode::Continuous,
-                ty: boon_typecheck::Type::Text,
-            }),
-        };
-
-        assert!(runtime_type_matches_scheme(&consistent, &scheme));
-        assert!(!runtime_type_matches_scheme(&inconsistent, &scheme));
-        assert!(!runtime_type_matches_scheme(
-            &boon_typecheck::Type::Var(boon_typecheck::TypeVar(1)),
-            &boon_typecheck::Type::Var(variable),
-        ));
-    }
-
-    #[test]
-    fn non_dense_semantic_resource_identity_has_no_executable_mapping() {
-        let parsed = boon_parser::parse_source(
-            "semantic-resource-mapping-invalid.bn",
-            "rows: LIST { [value: 1] }",
-        )
-        .unwrap();
-        let checked = boon_typecheck::check_program(&parsed)
-            .program
-            .expect("fixture typechecks");
-        let semantic = boon_semantic::elaborate(checked, &[]).expect("fixture elaborates");
-        let mut resources = semantic.resource_graph().clone();
-        resources.row_scopes[0].id = SemanticRowScopeId(1);
-        let error = map_semantic_execution(semantic.execution_graph(), &resources).unwrap_err();
-        assert!(error.contains("not dense"), "{error}");
-    }
-
-    #[test]
-    fn scalar_list_authority_is_explicitly_erased_without_runtime_row_storage() {
-        let parsed = boon_parser::parse_source(
-            "semantic-value-list-erasure.bn",
-            "numbers: List/range(from: -2, to: 3)",
-        )
-        .unwrap();
-        let checked = boon_typecheck::check_program(&parsed)
-            .program
-            .expect("fixture typechecks");
-        let semantic = boon_semantic::elaborate(checked, &[]).expect("fixture elaborates");
-        assert!(semantic.resource_graph().lists.is_empty());
-        assert_eq!(semantic.resource_graph().value_list_authorities.len(), 1);
-
-        let execution =
-            map_semantic_execution(semantic.execution_graph(), semantic.resource_graph())
-                .expect("semantic execution maps");
-        let resources = map_semantic_resources(
-            semantic.execution_graph(),
-            semantic.resource_graph(),
-            &execution.id_map,
-        )
-        .expect("value-only authority erases explicitly");
-        assert!(resources.lists.is_empty());
-
-        let mut malformed = semantic.resource_graph().clone();
-        malformed.value_list_authorities[0].id = SemanticValueListAuthorityId(1);
-        let error = map_semantic_execution(semantic.execution_graph(), &malformed).unwrap_err();
-        assert!(error.contains("not dense"), "{error}");
-
-        let mut malformed = semantic.resource_graph().clone();
-        let SemanticListInitializerV1::Range { to_expression, .. } =
-            &mut malformed.value_list_authorities[0].initializer
-        else {
-            panic!("fixture value authority is not a range");
-        };
-        *to_expression = SemanticExprId(usize::MAX);
-        let execution = map_semantic_execution(semantic.execution_graph(), &malformed)
-            .expect("identity allocation is independent of erased provenance");
-        let error =
-            map_semantic_resources(semantic.execution_graph(), &malformed, &execution.id_map)
-                .unwrap_err();
-        assert!(error.contains("has no executable mapping"), "{error}");
-    }
-
-    #[test]
-    fn non_dense_semantic_identity_has_no_executable_mapping() {
-        let parsed = boon_parser::parse_source(
-            "semantic-mapping-invalid.bn",
-            "value: TEXT { value } |> Text/trim()",
-        )
-        .unwrap();
-        let checked = boon_typecheck::check_program(&parsed)
-            .program
-            .expect("fixture typechecks");
-        let semantic = boon_semantic::elaborate(checked, &[]).expect("fixture elaborates");
-        let mut graph = semantic.execution_graph().clone();
-        graph.expressions[0].id = SemanticExprId(1);
-        let error = map_semantic_execution(&graph, semantic.resource_graph()).unwrap_err();
-        assert!(error.contains("not dense"), "{error}");
-
-        let mut graph = semantic.execution_graph().clone();
-        graph.expressions[0].value_id = SemanticValueId(1);
-        let error = map_semantic_execution(&graph, semantic.resource_graph()).unwrap_err();
-        assert!(error.contains("semantic value"), "{error}");
-        assert!(error.contains("not dense"), "{error}");
-
-        let mut graph = semantic.execution_graph().clone();
-        graph.callables[0].id = SemanticCallableId(1);
-        let error = map_semantic_execution(&graph, semantic.resource_graph()).unwrap_err();
-        assert!(error.contains("semantic callable"), "{error}");
-        assert!(error.contains("not dense"), "{error}");
-
-        let mut graph = semantic.execution_graph().clone();
-        graph.calls[0].id = SemanticCallId(1);
-        let error = map_semantic_execution(&graph, semantic.resource_graph()).unwrap_err();
-        assert!(error.contains("semantic call"), "{error}");
-        assert!(error.contains("not dense"), "{error}");
-    }
-
-    #[test]
-    fn local_binding_allocation_rejects_noncanonical_duplicate_and_dangling_ids() {
-        let parsed =
-            boon_parser::parse_source("semantic-local-map-invalid.bn", "value: 1").unwrap();
-        let checked = boon_typecheck::check_program(&parsed)
-            .program
-            .expect("fixture typechecks");
-        let semantic = boon_semantic::elaborate(checked, &[]).expect("fixture elaborates");
-        let declaration = semantic.execution_graph().statements[0]
-            .declaration
-            .expect("fixture statement declaration");
-        let value = semantic.execution_graph().expressions[0].id;
-
-        let mut noncanonical = semantic.execution_graph().clone();
-        noncanonical.expressions[0].kind = SemanticExpressionKind::Block {
-            bindings: vec![SemanticBlockBinding {
-                id: SemanticLocalBindingId(1),
-                declaration,
-                value,
-            }],
-            result: value,
-        };
-        let error = map_semantic_execution(&noncanonical, semantic.resource_graph()).unwrap_err();
-        assert!(error.contains("noncanonical"), "{error}");
-
-        let mut duplicate = semantic.execution_graph().clone();
-        duplicate.expressions[0].kind = SemanticExpressionKind::Block {
-            bindings: vec![
-                SemanticBlockBinding {
-                    id: SemanticLocalBindingId(0),
-                    declaration,
-                    value,
-                },
-                SemanticBlockBinding {
-                    id: SemanticLocalBindingId(0),
-                    declaration,
-                    value,
-                },
-            ],
-            result: value,
-        };
-        let error = map_semantic_execution(&duplicate, semantic.resource_graph()).unwrap_err();
-        assert!(error.contains("defined by both expressions"), "{error}");
-
-        let mut dangling = semantic.execution_graph().clone();
-        dangling.expressions[0].kind = SemanticExpressionKind::LocalRead {
-            binding: SemanticLocalBindingId(0),
-            declaration,
-            projection: Vec::new(),
-        };
-        let error = map_semantic_execution(&dangling, semantic.resource_graph()).unwrap_err();
-        assert!(error.contains("referenced without a definition"), "{error}");
-    }
-
-    #[test]
-    fn call_identity_allocation_rejects_duplicate_noncanonical_and_dangling_ids() {
-        let parsed = boon_parser::parse_source(
-            "semantic-call-map-invalid.bn",
-            "joined: TEXT { a } |> Text/concat(with: TEXT { b })\nspare: 0",
-        )
-        .unwrap();
-        let checked = boon_typecheck::check_program(&parsed)
-            .program
-            .expect("fixture typechecks");
-        let semantic = boon_semantic::elaborate(checked, &[]).expect("fixture elaborates");
-        let valid = semantic.execution_graph().clone();
-        let call_index = valid
-            .expressions
-            .iter()
-            .position(|expression| matches!(&expression.kind, SemanticExpressionKind::Call { .. }))
-            .expect("fixture has a call expression");
-        let call_expression = valid.expressions[call_index].clone();
-        let SemanticExpressionKind::Call {
-            call,
-            callable,
-            instance: call_instance,
-            ..
-        } = &call_expression.kind
-        else {
-            unreachable!()
-        };
-        let call = *call;
-        let callable = *callable;
-        let call_instance = *call_instance;
-        let spare_index = valid
-            .expressions
-            .iter()
-            .position(|expression| {
-                matches!(
-                    &expression.kind,
-                    SemanticExpressionKind::Number(value)
-                        if value == &boon_data::ExactNumber::zero()
-                )
-            })
-            .expect("fixture has an unrelated spare expression");
-
-        let mut inconsistent = valid.clone();
-        inconsistent.expressions[spare_index].kind = call_expression.kind.clone();
-        let SemanticExpressionKind::Call {
-            callable: mutated_callable,
-            ..
-        } = &mut inconsistent.expressions[spare_index].kind
-        else {
-            unreachable!()
-        };
-        *mutated_callable = SemanticCallableId(usize::MAX);
-        let error = map_semantic_execution(&inconsistent, semantic.resource_graph()).unwrap_err();
-        assert!(error.contains("inconsistent call, callable"), "{error}");
-
-        let mut dangling = valid.clone();
-        dangling.expressions[spare_index].kind = SemanticExpressionKind::ElementState {
-            context: SemanticCallContextId {
-                call_instance,
-                ordinal: usize::MAX,
-            },
-            projection: Vec::new(),
-        };
-        let error = map_semantic_execution(&dangling, semantic.resource_graph()).unwrap_err();
-        assert!(
-            error.contains("referenced without a call definition"),
-            "{error}"
-        );
-
-        let mut mapped = map_semantic_execution(&valid, semantic.resource_graph())
-            .expect("valid call identities map");
-        assert_eq!(
-            mapped
-                .id_map
-                .call_expression(call, call_expression.id)
-                .unwrap(),
-            mapped.id_map.expression(call_expression.id).unwrap()
-        );
-        assert_eq!(
-            mapped.id_map.callable(callable).unwrap(),
-            FunctionId(callable.as_usize())
-        );
-        for expression in &valid.expressions {
-            assert_eq!(
-                mapped.id_map.value(expression.value_id).unwrap(),
-                mapped.id_map.expression(expression.id).unwrap()
-            );
-        }
-        let instance = mapped
-            .executable
-            .expressions
-            .iter_mut()
-            .find_map(|expression| match &mut expression.kind {
-                ExecutableExpressionKind::Call { instance, .. } => Some(instance),
-                _ => None,
-            })
-            .expect("mapped call expression");
-        *instance = usize::MAX;
-        let error = mapped.validate_totality().unwrap_err();
-        assert!(error.contains("call instance"), "{error}");
-
-        let mut missing_binding = valid.clone();
-        let SemanticExpressionKind::Call {
-            parameter_bindings, ..
-        } = &mut missing_binding.expressions[call_index].kind
-        else {
-            unreachable!()
-        };
-        parameter_bindings.clear();
-        let error =
-            map_semantic_execution(&missing_binding, semantic.resource_graph()).unwrap_err();
-        assert!(error.contains("parameter bindings"), "{error}");
-
-        let mut mismatched_binding = valid.clone();
-        let SemanticExpressionKind::Call {
-            parameter_bindings, ..
-        } = &mut mismatched_binding.expressions[call_index].kind
-        else {
-            unreachable!()
-        };
-        let SemanticCallParameterBindingKind::Explicit { from_pipe, .. } = &mut parameter_bindings
-            .iter_mut()
-            .find(|binding| {
-                matches!(
-                    &binding.kind,
-                    SemanticCallParameterBindingKind::Explicit { .. }
-                )
-            })
-            .expect("fixture has an explicit binding")
-            .kind
-        else {
-            unreachable!()
-        };
-        *from_pipe = !*from_pipe;
-        let error =
-            map_semantic_execution(&mismatched_binding, semantic.resource_graph()).unwrap_err();
-        assert!(error.contains("differs from its argument"), "{error}");
-
-        let mut required_omission = valid.clone();
-        let SemanticExpressionKind::Call {
-            arguments,
-            parameter_bindings,
-            ..
-        } = &mut required_omission.expressions[call_index].kind
-        else {
-            unreachable!()
-        };
-        let required = parameter_bindings
-            .iter_mut()
-            .find(|binding| {
-                binding.requirement == CheckedParameterRequirement::Required
-                    && matches!(
-                        &binding.kind,
-                        SemanticCallParameterBindingKind::Explicit { .. }
-                    )
-            })
-            .expect("fixture has a required explicit binding");
-        arguments.retain(|argument| argument.formal != required.formal);
-        required.kind = SemanticCallParameterBindingKind::Omitted;
-        let error =
-            map_semantic_execution(&required_omission, semantic.resource_graph()).unwrap_err();
-        assert!(error.contains("omits required parameter"), "{error}");
-
-        let SemanticExpressionKind::Call {
-            parameter_bindings, ..
-        } = &valid.expressions[call_index].kind
-        else {
-            unreachable!()
-        };
-        assert!(
-            parameter_bindings
-                .iter()
-                .any(|binding| matches!(&binding.kind, SemanticCallParameterBindingKind::Omitted)),
-            "fixture exercises a real callable-profile omission"
-        );
-
-        let mut ambiguous = valid.clone();
-        let new_instance = OutCallInstanceId::from_usize(call_instance.as_usize() + 1);
-        ambiguous.expressions[spare_index].checked_expr_id = call_expression.checked_expr_id;
-        ambiguous.expressions[spare_index].flow_type = call_expression.flow_type.clone();
-        ambiguous.expressions[spare_index].effect = call_expression.effect;
-        ambiguous.expressions[spare_index].kind = call_expression.kind.clone();
-        let SemanticExpressionKind::Call { instance, .. } =
-            &mut ambiguous.expressions[spare_index].kind
-        else {
-            unreachable!()
-        };
-        *instance = new_instance;
-        let ambiguous = map_semantic_execution(&ambiguous, semantic.resource_graph())
-            .expect("multiple genuine call expressions map without inventing a singular ID");
-        assert_eq!(
-            ambiguous
-                .id_map
-                .call_expression(call, call_expression.id)
-                .unwrap(),
-            ambiguous.id_map.expression(call_expression.id).unwrap()
-        );
-        let error = ambiguous.id_map.unique_call_expression(call).unwrap_err();
-        assert!(error.contains("no exact singular mapping"), "{error}");
-    }
-
-    #[test]
-    fn expanded_user_calls_report_that_no_executable_call_counterpart_exists() {
-        let parsed = boon_parser::parse_source(
-            "semantic-expanded-user-call-map.bn",
-            r#"
-FUNCTION identity(value) {
-    value
-}
-
-result: identity(value: 1)
-"#,
-        )
-        .unwrap();
-        let checked = boon_typecheck::check_program(&parsed)
-            .program
-            .expect("fixture typechecks");
-        let semantic = boon_semantic::elaborate(checked, &[]).expect("fixture elaborates");
-        let graph = semantic.execution_graph();
-        let user_call = graph
-            .calls
-            .iter()
-            .find(|call| {
-                semantic_callable(graph, call.callable).is_ok_and(|callable| {
-                    callable.kind == boon_typecheck::CheckedCallableKind::User
-                })
-            })
-            .expect("fixture has a user call");
-        let mapped = map_semantic_execution(graph, semantic.resource_graph())
-            .expect("expanded user call graph maps");
-        let error = mapped
-            .id_map
-            .unique_call_expression(user_call.id)
-            .unwrap_err();
-        assert!(
-            error.contains("no executable call-expression counterpart"),
-            "{error}"
-        );
-    }
-
-    #[test]
-    fn external_identity_erasure_is_kind_checked_and_call_provenance_is_exact() {
-        let parsed = boon_parser::parse_source(
-            "semantic-external-identity-map.bn",
-            "called: TEXT { value } |> Text/trim()\nread: 1",
-        )
-        .unwrap();
-        let checked = boon_typecheck::check_program(&parsed)
-            .program
-            .expect("fixture typechecks");
-        let semantic = boon_semantic::elaborate(checked, &[]).expect("fixture elaborates");
-        let identity = boon_typecheck::CheckedExternalDeclarationIdentityV1 {
-            producer_role: boon_typecheck::ProgramRole::Server,
-            producer_source_bundle_digest_v1: semantic.source_bundle_digest_v1(),
-            producer_declaration: semantic.execution_graph().callables[0].checked_callable,
-            kind: CheckedExternalDeclarationKind::Callable,
-        };
-
-        let mut stale_call = semantic.execution_graph().clone();
-        stale_call.calls[0].external_identity = Some(identity);
-        let error = map_semantic_execution(&stale_call, semantic.resource_graph()).unwrap_err();
-        assert!(error.contains("external identity differs"), "{error}");
-
-        let mut illegal_builtin = semantic.execution_graph().clone();
-        let callable = illegal_builtin.calls[0].callable;
-        illegal_builtin.callables[callable.as_usize()].external_identity = Some(identity);
-        illegal_builtin.calls[0].external_identity = Some(identity);
-        let error =
-            map_semantic_execution(&illegal_builtin, semantic.resource_graph()).unwrap_err();
-        assert!(error.contains("non-external callable"), "{error}");
-
-        let mut wrong_value_kind = semantic.execution_graph().clone();
-        let read = wrong_value_kind
-            .expressions
-            .iter_mut()
-            .find(|expression| {
-                matches!(
-                    &expression.kind,
-                    SemanticExpressionKind::Number(value)
-                        if value == &boon_data::ExactNumber::one()
-                )
-            })
-            .expect("fixture has a read replacement expression");
-        read.kind = SemanticExpressionKind::ExternalRead {
-            canonical_path: "Server/value".to_owned(),
-            external_identity: Some(identity),
-        };
-        let error =
-            map_semantic_execution(&wrong_value_kind, semantic.resource_graph()).unwrap_err();
-        assert!(error.contains("non-value external identity"), "{error}");
-
-        let mut exact_value = semantic.execution_graph().clone();
-        let read = exact_value
-            .expressions
-            .iter_mut()
-            .find(|expression| {
-                matches!(
-                    &expression.kind,
-                    SemanticExpressionKind::Number(value)
-                        if value == &boon_data::ExactNumber::one()
-                )
-            })
-            .expect("fixture has a read replacement expression");
-        read.kind = SemanticExpressionKind::ExternalRead {
-            canonical_path: "Server/value".to_owned(),
-            external_identity: Some(boon_typecheck::CheckedExternalDeclarationIdentityV1 {
-                kind: CheckedExternalDeclarationKind::Value,
-                ..identity
-            }),
-        };
-        map_semantic_execution(&exact_value, semantic.resource_graph())
-            .expect("exact value identity is validated before executable erasure");
-    }
-
-    #[test]
-    fn sealed_external_identities_map_only_after_exact_semantic_validation() {
-        let producer = boon_parser::parse_source(
-            "semantic-external-producer.bn",
-            "store: [count: 1]\nFUNCTION add(value) { value }\n",
-        )
-        .unwrap();
-        let consumer = boon_parser::parse_source(
-            "semantic-external-consumer.bn",
-            "count: Session/store.count\nnext: Session/add(value: count)\n",
-        )
-        .unwrap();
-        let number = boon_typecheck::FlowType {
-            mode: boon_typecheck::FlowMode::Continuous,
-            ty: boon_typecheck::Type::Number,
-        };
-        let value_identity = boon_typecheck::CheckedExternalDeclarationIdentityV1 {
-            producer_role: boon_typecheck::ProgramRole::Session,
-            producer_source_bundle_digest_v1: producer.source_bundle_digest_v1,
-            producer_declaration: boon_typecheck::DeclId(41),
-            kind: CheckedExternalDeclarationKind::Value,
-        };
-        let callable_identity = boon_typecheck::CheckedExternalDeclarationIdentityV1 {
-            producer_declaration: boon_typecheck::DeclId(42),
-            kind: CheckedExternalDeclarationKind::Callable,
-            ..value_identity
-        };
-        let mut environment =
-            boon_typecheck::ExternalTypeEnvironment::sealed(boon_typecheck::ProgramRole::Client);
-        environment
-            .values
-            .insert("Session/store.count".to_owned(), number.clone());
-        environment.functions.insert(
-            "Session/add".to_owned(),
-            boon_typecheck::ExternalFunctionType {
-                args: vec![boon_typecheck::ExternalFunctionArgument {
-                    name: "value".to_owned(),
-                    flow_type: number.clone(),
-                }],
-                result: number,
-                effect: boon_typecheck::CheckedEffectSummary::default(),
-            },
-        );
-        environment
-            .external_identities
-            .insert("Session/store.count".to_owned(), value_identity);
-        environment
-            .external_identities
-            .insert("Session/add".to_owned(), callable_identity);
-        let checked = boon_typecheck::check_program_with_external_types(&consumer, &environment);
-        assert!(
-            !checked.report.has_errors(),
-            "diagnostics: {:#?}",
-            checked.report.diagnostics
-        );
-        let semantic = boon_semantic::elaborate(
-            checked
-                .program
-                .expect("sealed external fixture has a checked program"),
-            &[],
-        )
-        .expect("sealed external fixture elaborates");
-        assert!(
-            semantic
-                .execution_graph()
-                .expressions
-                .iter()
-                .any(|expression| {
-                    matches!(
-                        &expression.kind,
-                        SemanticExpressionKind::ExternalRead {
-                            external_identity: Some(identity),
-                            ..
-                        } if *identity == value_identity
-                    )
-                })
-        );
-        let external_call = semantic
-            .execution_graph()
-            .expressions
-            .iter()
-            .find(|expression| {
-                matches!(
-                    &expression.kind,
-                    SemanticExpressionKind::Call {
-                        callable_kind: SemanticCallableKind::External,
-                        ..
-                    }
-                )
-            })
-            .expect("sealed external fixture has an external call");
-        let SemanticExpressionKind::Call { call, callable, .. } = &external_call.kind else {
-            unreachable!()
-        };
-        assert_eq!(
-            semantic.execution_graph().calls[call.as_usize()].external_identity,
-            Some(callable_identity)
-        );
-        assert_eq!(
-            semantic.execution_graph().callables[callable.as_usize()].external_identity,
-            Some(callable_identity)
-        );
-        let mapped = map_semantic_execution(semantic.execution_graph(), semantic.resource_graph())
-            .expect("sealed external identities validate and erase");
-        assert_eq!(
-            mapped
-                .id_map
-                .call_expression(*call, external_call.id)
-                .unwrap(),
-            mapped.id_map.expression(external_call.id).unwrap()
-        );
-        assert!(matches!(
-            &mapped.executable.expressions[external_call.id.as_usize()].kind,
-            ExecutableExpressionKind::Call {
-                callable_kind: ExecutableCallableKind::External,
-                ..
-            }
-        ));
-        let mapped_resources = map_semantic_resources(
-            semantic.execution_graph(),
-            semantic.resource_graph(),
-            &mapped.id_map,
-        )
-        .expect("sealed external resources map");
-        let mapped_reactive = map_semantic_reactive(
-            semantic.execution_graph(),
-            semantic.resource_graph(),
-            semantic.reactive_graph(),
-            &mapped.id_map,
-            &mapped_resources,
-        )
-        .expect("sealed external reactive graph maps");
-        let mapped_storage = map_semantic_storage_join(
-            semantic.execution_graph(),
-            semantic.resource_graph(),
-            semantic.reactive_graph(),
-            semantic.scope_storage_graph(),
-            &mapped.id_map,
-            &mapped_resources,
-            &mapped_reactive,
-        )
-        .expect("sealed external storage joins without assigning bundle ordinals");
-        assert_eq!(mapped_storage.external_references.len(), 2);
-        assert_eq!(mapped_storage.call_invocations.len(), 1);
-        assert!(
-            mapped_storage.external_references.iter().all(|reference| {
-                reference.bundle_ready && reference.external_identity.is_some()
-            })
-        );
-
-        let map_storage = |storage: &SemanticScopeStorageGraphV1| {
-            map_semantic_storage_join(
-                semantic.execution_graph(),
-                semantic.resource_graph(),
-                semantic.reactive_graph(),
-                storage,
-                &mapped.id_map,
-                &mapped_resources,
-                &mapped_reactive,
-            )
-        };
-        let mut noncanonical = semantic.scope_storage_graph().clone();
-        noncanonical.external_references[0].id = SemanticStorageExternalReferenceId(usize::MAX);
-        let error = map_storage(&noncanonical).unwrap_err();
-        assert!(error.contains("external reference"), "{error}");
-        assert!(error.contains("not dense"), "{error}");
-
-        let mut stale_identity = semantic.scope_storage_graph().clone();
-        let identity = stale_identity.external_references[0]
-            .external_identity
-            .as_mut()
-            .expect("sealed reference has identity");
-        identity.producer_declaration = DeclId(u32::MAX);
-        let error = map_storage(&stale_identity).unwrap_err();
-        assert!(error.contains("exact staged identity"), "{error}");
-
-        let mut stale_schedule = mapped_storage.clone();
-        stale_schedule.call_invocations[0].expression = ExecutableExprId(usize::MAX);
-        let error = stale_schedule
-            .validate_totality(
-                semantic.scope_storage_graph(),
-                semantic.reactive_graph(),
-                &mapped.id_map,
-            )
-            .unwrap_err();
-        assert!(error.contains("call-invocation schedule"), "{error}");
-
-        let mut stale_mapped = mapped_storage;
-        stale_mapped.external_references[0].external_identity = None;
-        let error = stale_mapped
-            .validate_totality(
-                semantic.scope_storage_graph(),
-                semantic.reactive_graph(),
-                &mapped.id_map,
-            )
-            .unwrap_err();
-        assert!(error.contains("external reference"), "{error}");
-    }
-
-    #[test]
-    fn producer_function_ids_are_dense_per_materialized_occurrence() {
-        let parsed = boon_parser::parse_source(
-            "semantic-producer-callable-map.bn",
-            r#"
-FUNCTION serve(value) {
-    value + 0
-}
-
-seed: 0
-"#,
-        )
-        .unwrap();
-        let checked = boon_typecheck::check_program(&parsed)
-            .program
-            .expect("fixture typechecks");
-        let callable = SemanticCallableId(
-            checked
-                .callables
-                .iter()
-                .position(|callable| callable.name == "serve")
-                .expect("fixture has serve callable"),
-        );
-        let semantic = boon_semantic::elaborate(
-            checked,
-            &[boon_semantic::ProducerMaterializationRequest {
-                identity: [7; 32],
-                callable,
-                local_function: "serve".to_owned(),
-                mode: boon_semantic::ProducerMaterializationMode::Current,
-            }],
-        )
-        .expect("producer fixture elaborates");
-        let mapped = map_semantic_execution(semantic.execution_graph(), semantic.resource_graph())
-            .expect("producer fixture maps");
-        let function = &semantic.execution_graph().functions[0];
-        mapped.id_map.callable(function.callable).unwrap();
-        let expected = mapped.id_map.producer_function(function.producer).unwrap();
-        assert_eq!(mapped.executable.functions[0].id, expected);
-        assert_eq!(expected, FunctionId(function.producer.as_usize()));
-        mapped.validate_totality().unwrap();
-
-        let resources = map_semantic_resources(
-            semantic.execution_graph(),
-            semantic.resource_graph(),
-            &mapped.id_map,
-        )
-        .expect("producer resources map");
-        let reactive = map_semantic_reactive(
-            semantic.execution_graph(),
-            semantic.resource_graph(),
-            semantic.reactive_graph(),
-            &mapped.id_map,
-            &resources,
-        )
-        .expect("producer reactive graph maps");
-        let storage = map_semantic_storage_join(
-            semantic.execution_graph(),
-            semantic.resource_graph(),
-            semantic.reactive_graph(),
-            semantic.scope_storage_graph(),
-            &mapped.id_map,
-            &resources,
-            &reactive,
-        )
-        .expect("producer result joins through D storage");
-        assert_eq!(storage.producer_function_instances.len(), 1);
-        assert_eq!(
-            storage.producer_function_instances[0].result_field,
-            storage
-                .id_map
-                .storage_field(
-                    semantic.scope_storage_graph().producer_result_fields[0].storage_field,
-                )
-                .unwrap()
-        );
-
-        let mut stale_result = semantic.scope_storage_graph().clone();
-        stale_result.producer_result_fields[0].storage_field = SemanticStorageFieldId(usize::MAX);
-        let error = map_semantic_storage_join(
-            semantic.execution_graph(),
-            semantic.resource_graph(),
-            semantic.reactive_graph(),
-            &stale_result,
-            &mapped.id_map,
-            &resources,
-            &reactive,
-        )
-        .unwrap_err();
-        assert!(error.contains("storage field"), "{error}");
-    }
-
-    #[test]
-    fn materialization_local_allocation_rejects_noncanonical_overflow_and_dangling_ids() {
-        let parsed = boon_parser::parse_source(
-            "semantic-materialization-local-map-invalid.bn",
-            r#"
-rows: LIST { [value: 1] }
-result: rows |> List/map(item, new: item.value + 1)
-"#,
-        )
-        .unwrap();
-        let checked = boon_typecheck::check_program(&parsed)
-            .program
-            .expect("fixture typechecks");
-        let semantic = boon_semantic::elaborate(checked, &[]).expect("fixture elaborates");
-        let owner = semantic.execution_graph().materializations[0].owner;
-
-        let mut noncanonical = semantic.execution_graph().clone();
-        rewrite_materialization_local(
-            &mut noncanonical,
-            owner,
-            SemanticMaterializationLocalId(0),
-            SemanticMaterializationLocalId(1),
-        );
-        let error = map_semantic_execution(&noncanonical, semantic.resource_graph()).unwrap_err();
-        assert!(error.contains("noncanonical"), "{error}");
-
-        let mut overflow = semantic.execution_graph().clone();
-        rewrite_materialization_local(
-            &mut overflow,
-            owner,
-            SemanticMaterializationLocalId(0),
-            SemanticMaterializationLocalId(usize::MAX),
-        );
-        let error = map_semantic_execution(&overflow, semantic.resource_graph()).unwrap_err();
-        assert!(error.contains("exceeds executable u32"), "{error}");
-
-        let mut dangling = semantic.execution_graph().clone();
-        dangling
-            .expressions
-            .iter_mut()
-            .next()
-            .expect("fixture expression")
-            .kind = SemanticExpressionKind::MaterializationLocal {
-            owner,
-            local: SemanticMaterializationLocalId(1),
-            projection: Vec::new(),
-            constructor_projection: Vec::new(),
-        };
-        let error = map_semantic_execution(&dangling, semantic.resource_graph()).unwrap_err();
-        assert!(error.contains("referenced without a definition"), "{error}");
-
-        let mut mapped =
-            map_semantic_execution(semantic.execution_graph(), semantic.resource_graph())
-                .expect("valid materialization locals map");
-        mapped.materializations[0].row_local = MaterializationLocalId(1);
-        let error = mapped.validate_totality().unwrap_err();
-        assert!(error.contains("materialization local"), "{error}");
-    }
-
-    fn rewrite_materialization_local(
-        graph: &mut SemanticExecutionGraphV1,
-        owner: StaticOwnerId,
-        from: SemanticMaterializationLocalId,
-        to: SemanticMaterializationLocalId,
-    ) {
-        for materialization in &mut graph.materializations {
-            if materialization.owner == owner && materialization.row_local == from {
-                materialization.row_local = to;
-            }
-        }
-        for expression in &mut graph.expressions {
-            if let SemanticExpressionKind::MaterializationLocal {
-                owner: candidate,
-                local,
-                ..
-            } = &mut expression.kind
-                && *candidate == owner
-                && *local == from
-            {
-                *local = to;
-            }
-            for member in &mut expression.provenance.members {
-                if let SemanticValueOrigin::MaterializationLocal {
-                    owner: candidate,
-                    local,
-                    ..
-                } = &mut member.origin
-                    && *candidate == owner
-                    && *local == from
-                {
-                    *local = to;
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn runtime_resource_allocation_rejects_noncanonical_and_missing_domains() {
-        let parsed = boon_parser::parse_source(
-            "semantic-runtime-resource-map-invalid.bn",
-            r#"
-pulse: SOURCE
-selected:
-    False |> HOLD selected {
-        pulse |> THEN { True }
-    }
-"#,
-        )
-        .unwrap();
-        let checked = boon_typecheck::check_program(&parsed)
-            .program
-            .expect("fixture typechecks");
-        let semantic = boon_semantic::elaborate(checked, &[]).expect("fixture elaborates");
-
-        let mut noncanonical_source = semantic.resource_graph().clone();
-        noncanonical_source.sources[0].id = SemanticSourceId(1);
-        let error =
-            map_semantic_execution(semantic.execution_graph(), &noncanonical_source).unwrap_err();
-        assert!(error.contains("runtime source"), "{error}");
-        assert!(error.contains("noncanonical"), "{error}");
-
-        let mut noncanonical_state = semantic.resource_graph().clone();
-        noncanonical_state.states[0].id = SemanticStateId(1);
-        let error =
-            map_semantic_execution(semantic.execution_graph(), &noncanonical_state).unwrap_err();
-        assert!(error.contains("runtime state"), "{error}");
-        assert!(error.contains("noncanonical"), "{error}");
-
-        let mut missing_source = semantic.resource_graph().clone();
-        missing_source.sources.clear();
-        let error =
-            map_semantic_execution(semantic.execution_graph(), &missing_source).unwrap_err();
-        assert!(error.contains("runtime source domain"), "{error}");
-
-        let execution =
-            map_semantic_execution(semantic.execution_graph(), semantic.resource_graph())
-                .expect("valid execution mapping");
-        let mut resources = map_semantic_resources(
-            semantic.execution_graph(),
-            semantic.resource_graph(),
-            &execution.id_map,
-        )
-        .expect("valid resource mapping");
-        resources.sources[0].id = SourceId(usize::MAX);
-        let error = resources
-            .validate_totality(semantic.resource_graph(), &execution.id_map)
-            .unwrap_err();
-        assert!(error.contains("runtime ID"), "{error}");
-    }
-
-    #[test]
-    fn semantic_storage_join_rejects_owner_ancestry_order_mutation() {
-        let parsed = boon_parser::parse_source(
-            "semantic-storage-owner-order.bn",
-            r#"
-flavors: LIST { [suffix: TEXT { left }] }
-rows: LIST { [name: TEXT { A }] }
-projected:
-    flavors |> List/map(item, new: projected_flavor(flavor: item))
-
-FUNCTION projected_flavor(flavor) {
-    [
-        detail_label:
-            rows
-            |> List/map(item, new:
-                detail_row(row: item, suffix: flavor.suffix).label
-            )
-            |> List/latest()
-    ]
-}
-
-FUNCTION detail_row(row, suffix) {
-    [label: row.name |> Text/concat(with: suffix, separator: ":")]
-}
-"#,
-        )
-        .unwrap();
-        let checked = boon_typecheck::check_program(&parsed)
-            .program
-            .expect("nested owner fixture typechecks");
-        let semantic =
-            boon_semantic::elaborate(checked, &[]).expect("nested owner fixture elaborates");
-        let execution =
-            map_semantic_execution(semantic.execution_graph(), semantic.resource_graph())
-                .expect("nested execution maps");
-        let resources = map_semantic_resources(
-            semantic.execution_graph(),
-            semantic.resource_graph(),
-            &execution.id_map,
-        )
-        .expect("nested resources map");
-        let reactive = map_semantic_reactive(
-            semantic.execution_graph(),
-            semantic.resource_graph(),
-            semantic.reactive_graph(),
-            &execution.id_map,
-            &resources,
-        )
-        .expect("nested reactive graph maps");
-        map_semantic_storage_join(
-            semantic.execution_graph(),
-            semantic.resource_graph(),
-            semantic.reactive_graph(),
-            semantic.scope_storage_graph(),
-            &execution.id_map,
-            &resources,
-            &reactive,
-        )
-        .expect("root-to-leaf D ancestry maps directly");
-
-        let mut noncanonical_owner = semantic.scope_storage_graph().clone();
-        noncanonical_owner.owners[0].id = StaticOwnerId(usize::MAX);
-        let error = map_semantic_storage_join(
-            semantic.execution_graph(),
-            semantic.resource_graph(),
-            semantic.reactive_graph(),
-            &noncanonical_owner,
-            &execution.id_map,
-            &resources,
-            &reactive,
-        )
-        .unwrap_err();
-        assert!(error.contains("storage owner"), "{error}");
-
-        let mut reversed = semantic.scope_storage_graph().clone();
-        let (canonical, expected_error) = if let Some(binding) = reversed
-            .bindings
-            .iter_mut()
-            .find(|binding| binding.owner_ancestry.len() > 1)
-        {
-            let canonical = binding.owner_ancestry.clone();
-            binding.owner_ancestry.reverse();
-            (canonical, "owner/path metadata")
-        } else if let Some(source) = reversed
-            .sources
-            .iter_mut()
-            .find(|source| source.owner_ancestry.len() > 1)
-        {
-            let canonical = source.owner_ancestry.clone();
-            source.owner_ancestry.reverse();
-            (canonical, "exact resource/staged identity")
-        } else {
-            let child = reversed
-                .owners
-                .iter()
-                .find(|owner| owner.parent.is_some())
-                .expect("nested fixture has a child storage owner");
-            let canonical = vec![child.parent.expect("child owner has a parent"), child.id];
-            let mut noncanonical = canonical.clone();
-            noncanonical.reverse();
-            if let Some(binding) = reversed.bindings.first_mut() {
-                binding.owner_ancestry = noncanonical;
-                (canonical, "owner/path metadata")
-            } else if let Some(source) = reversed.sources.first_mut() {
-                source.owner_ancestry = noncanonical;
-                (canonical, "exact resource/staged identity")
-            } else {
-                panic!("nested fixture has no storage carrier");
-            }
-        };
-        assert!(
-            canonical
-                .windows(2)
-                .all(|pair| { reversed.owners[pair[1].as_usize()].parent == Some(pair[0]) })
-        );
-        let error = map_semantic_storage_join(
-            semantic.execution_graph(),
-            semantic.resource_graph(),
-            semantic.reactive_graph(),
-            &reversed,
-            &execution.id_map,
-            &resources,
-            &reactive,
-        )
-        .unwrap_err();
-        assert!(error.contains(expected_error), "{error}");
-    }
-
-    #[test]
-    fn semantic_storage_join_rejects_detached_capture_identity_mutation() {
-        let parsed = boon_parser::parse_source(
-            "semantic-storage-detached-capture.bn",
-            r#"
-flavors: LIST { [suffix: TEXT { left }] }
-rows: LIST { [name: TEXT { A }] }
-projected:
-    flavors |> List/map(item, new: projected_flavor(flavor: item))
-
-FUNCTION projected_flavor(flavor) {
-    [
-        nested:
-            rows
-            |> List/map(item, new: [
-                name: item.name
-                retained:
-                    flavor.suffix |> HOLD retained { LATEST {} }
-            ])
-    ]
-}
-"#,
-        )
-        .unwrap();
-        let checked = boon_typecheck::check_program(&parsed)
-            .program
-            .expect("detached-capture fixture typechecks");
-        let semantic =
-            boon_semantic::elaborate(checked, &[]).expect("detached-capture fixture elaborates");
-        let storage = semantic.scope_storage_graph();
-        assert!(
-            storage
-                .locals
-                .iter()
-                .flat_map(|local| &local.captures)
-                .next()
-                .is_some(),
-            "fixture derives at least one exact detached capture"
-        );
-        let execution =
-            map_semantic_execution(semantic.execution_graph(), semantic.resource_graph())
-                .expect("detached-capture execution maps");
-        let resources = map_semantic_resources(
-            semantic.execution_graph(),
-            semantic.resource_graph(),
-            &execution.id_map,
-        )
-        .expect("detached-capture resources map");
-        let reactive = map_semantic_reactive(
-            semantic.execution_graph(),
-            semantic.resource_graph(),
-            semantic.reactive_graph(),
-            &execution.id_map,
-            &resources,
-        )
-        .expect("detached-capture reactive graph maps");
-        map_semantic_storage_join(
-            semantic.execution_graph(),
-            semantic.resource_graph(),
-            semantic.reactive_graph(),
-            storage,
-            &execution.id_map,
-            &resources,
-            &reactive,
-        )
-        .expect("detached capture joins to its final FieldId");
-
-        let mut noncanonical = storage.clone();
-        noncanonical
-            .locals
-            .iter_mut()
-            .flat_map(|local| &mut local.captures)
-            .next()
-            .expect("fixture has a capture")
-            .id = boon_semantic::SemanticStorageCaptureId(usize::MAX);
-        let error = map_semantic_storage_join(
-            semantic.execution_graph(),
-            semantic.resource_graph(),
-            semantic.reactive_graph(),
-            &noncanonical,
-            &execution.id_map,
-            &resources,
-            &reactive,
-        )
-        .unwrap_err();
-        assert!(error.contains("semantic storage capture"), "{error}");
-        assert!(error.contains("not dense"), "{error}");
-    }
-
-    #[test]
-    fn semantic_storage_join_rejects_row_source_projection_identity_mutation() {
-        let parsed = boon_parser::parse_source(
-            "semantic-storage-row-source.bn",
-            r#"
-seed: LIST { [key: TEXT { row }] }
-rows:
-    seed |> List/map(item, new: selectable_row(seed: item))
-
-FUNCTION selectable_row(seed) {
-    [key: seed.key, select: SOURCE]
-}
-"#,
-        )
-        .unwrap();
-        let checked = boon_typecheck::check_program(&parsed)
-            .program
-            .expect("indexed source fixture typechecks");
-        let semantic =
-            boon_semantic::elaborate(checked, &[]).expect("indexed source fixture elaborates");
-        assert!(
-            !semantic
-                .scope_storage_graph()
-                .row_source_projections
-                .is_empty(),
-            "fixture has exact row source projections"
-        );
-        assert!(
-            !semantic.scope_storage_graph().row_values.is_empty(),
-            "fixture has exact row-value projections"
-        );
-        let execution =
-            map_semantic_execution(semantic.execution_graph(), semantic.resource_graph())
-                .expect("indexed execution maps");
-        let resources = map_semantic_resources(
-            semantic.execution_graph(),
-            semantic.resource_graph(),
-            &execution.id_map,
-        )
-        .expect("indexed resources map");
-        let reactive = map_semantic_reactive(
-            semantic.execution_graph(),
-            semantic.resource_graph(),
-            semantic.reactive_graph(),
-            &execution.id_map,
-            &resources,
-        )
-        .expect("indexed reactive graph maps");
-        map_semantic_storage_join(
-            semantic.execution_graph(),
-            semantic.resource_graph(),
-            semantic.reactive_graph(),
-            semantic.scope_storage_graph(),
-            &execution.id_map,
-            &resources,
-            &reactive,
-        )
-        .expect("indexed storage joins");
-
-        let mut mutated = semantic.scope_storage_graph().clone();
-        mutated.row_source_projections[0].source = SemanticSourceId(usize::MAX);
-        let error = map_semantic_storage_join(
-            semantic.execution_graph(),
-            semantic.resource_graph(),
-            semantic.reactive_graph(),
-            &mutated,
-            &execution.id_map,
-            &resources,
-            &reactive,
-        )
-        .unwrap_err();
-        assert!(error.contains("runtime source"), "{error}");
-        assert!(error.contains("no executable mapping"), "{error}");
-
-        let mut stale_row_value = semantic.scope_storage_graph().clone();
-        stale_row_value.row_values[0].expression = SemanticExprId(usize::MAX);
-        let error = map_semantic_storage_join(
-            semantic.execution_graph(),
-            semantic.resource_graph(),
-            semantic.reactive_graph(),
-            &stale_row_value,
-            &execution.id_map,
-            &resources,
-            &reactive,
-        )
-        .unwrap_err();
-        assert!(error.contains("semantic expression"), "{error}");
-        assert!(error.contains("no executable mapping"), "{error}");
-    }
-
-    #[test]
-    fn semantic_storage_join_maps_host_effect_schedules_without_rediscovery() {
-        let parsed = boon_parser::parse_source(
-            "semantic-storage-host-effect-schedule.bn",
-            r#"
-start: SOURCE
-result:
-    NotRequested |> HOLD result {
-        start |> THEN { Clock/wall() }
-    }
-"#,
-        )
-        .unwrap();
-        let checked = boon_typecheck::check_program(&parsed)
-            .program
-            .expect("host-effect fixture typechecks");
-        let semantic =
-            boon_semantic::elaborate(checked, &[]).expect("host-effect fixture elaborates");
-        assert_eq!(semantic.reactive_graph().host_effect_schedules.len(), 1);
-        let execution =
-            map_semantic_execution(semantic.execution_graph(), semantic.resource_graph())
-                .expect("host-effect execution maps");
-        let resources = map_semantic_resources(
-            semantic.execution_graph(),
-            semantic.resource_graph(),
-            &execution.id_map,
-        )
-        .expect("host-effect resources map");
-        let reactive = map_semantic_reactive(
-            semantic.execution_graph(),
-            semantic.resource_graph(),
-            semantic.reactive_graph(),
-            &execution.id_map,
-            &resources,
-        )
-        .expect("host-effect reactive graph maps");
-        let mut storage = map_semantic_storage_join(
-            semantic.execution_graph(),
-            semantic.resource_graph(),
-            semantic.reactive_graph(),
-            semantic.scope_storage_graph(),
-            &execution.id_map,
-            &resources,
-            &reactive,
-        )
-        .expect("host-effect schedule joins exact state-update arms");
-        assert_eq!(storage.host_effect_schedules.len(), 1);
-        assert_eq!(
-            storage.host_effect_schedules[0].state_update_arms,
-            storage.state_update_arms
-        );
-
-        storage.host_effect_schedules[0]
-            .operation
-            .push_str("/stale");
-        let error = storage
-            .validate_totality(
-                semantic.scope_storage_graph(),
-                semantic.reactive_graph(),
-                &execution.id_map,
-            )
-            .unwrap_err();
-        assert!(error.contains("host-effect schedule"), "{error}");
-    }
-
-    #[test]
-    fn semantic_storage_join_maps_list_mutation_schedule_ordinals() {
-        let parsed = boon_parser::parse_source(
-            "semantic-storage-list-mutation-schedule.bn",
-            r#"
-store: [
-    elements: [create: SOURCE]
-    group_to_create:
-        elements.create.event.press |> THEN { TEXT { core } }
-    groups:
-        LIST {}
-        |> List/append(item: group_to_create |> THEN {
-            [name: group_to_create]
-        })
-        |> List/map(item, new: [name: item.name])
-]
-"#,
-        )
-        .unwrap();
-        let checked = boon_typecheck::check_program(&parsed)
-            .program
-            .expect("list-mutation fixture typechecks");
-        let semantic =
-            boon_semantic::elaborate(checked, &[]).expect("list-mutation fixture elaborates");
-        assert_eq!(semantic.reactive_graph().list_mutations.len(), 1);
-        let execution =
-            map_semantic_execution(semantic.execution_graph(), semantic.resource_graph())
-                .expect("list-mutation execution maps");
-        let resources = map_semantic_resources(
-            semantic.execution_graph(),
-            semantic.resource_graph(),
-            &execution.id_map,
-        )
-        .expect("list-mutation resources map");
-        let reactive = map_semantic_reactive(
-            semantic.execution_graph(),
-            semantic.resource_graph(),
-            semantic.reactive_graph(),
-            &execution.id_map,
-            &resources,
-        )
-        .expect("list-mutation reactive graph maps");
-        let mut storage = map_semantic_storage_join(
-            semantic.execution_graph(),
-            semantic.resource_graph(),
-            semantic.reactive_graph(),
-            semantic.scope_storage_graph(),
-            &execution.id_map,
-            &resources,
-            &reactive,
-        )
-        .expect("list mutation joins to its final schedule ordinal");
-        assert_eq!(storage.list_mutations[0].ordinal, 0);
-
-        storage.list_mutations[0].ordinal = u32::MAX;
-        let error = storage
-            .validate_totality(
-                semantic.scope_storage_graph(),
-                semantic.reactive_graph(),
-                &execution.id_map,
-            )
-            .unwrap_err();
-        assert!(error.contains("mapped list mutation"), "{error}");
-    }
-
-    #[test]
-    fn semantic_reactive_records_map_once_without_fabricating_contract_topology() {
-        let parsed = boon_parser::parse_source(
-            "semantic-reactive-mapping.bn",
-            r#"
-rows: LIST {
-    [value: 1]
-    [value: 2]
-}
-page: rows |> List/chunk(size: 1)
-store: [
-    pulse: SOURCE
-    selected:
-        False |> HOLD selected {
-            pulse |> THEN { True }
-        }
-]
-"#,
-        )
-        .unwrap();
-        let checked = boon_typecheck::check_program(&parsed);
-        assert!(
-            !checked.report.has_errors(),
-            "diagnostics: {:#?}",
-            checked.report.diagnostics
-        );
-        let semantic = boon_semantic::elaborate(
-            checked
-                .program
-                .expect("reactive fixture has checked program"),
-            &[],
-        )
-        .expect("reactive fixture elaborates");
-        let execution =
-            map_semantic_execution(semantic.execution_graph(), semantic.resource_graph())
-                .expect("semantic execution maps");
-        let resources = map_semantic_resources(
-            semantic.execution_graph(),
-            semantic.resource_graph(),
-            &execution.id_map,
-        )
-        .expect("semantic resources map");
-        let reactive = map_semantic_reactive(
-            semantic.execution_graph(),
-            semantic.resource_graph(),
-            semantic.reactive_graph(),
-            &execution.id_map,
-            &resources,
-        )
-        .expect("stable semantic reactive records map");
-        reactive
-            .validate_totality(
-                semantic.reactive_graph(),
-                semantic.resource_graph(),
-                &execution.id_map,
-            )
-            .unwrap();
-        let remap_reactive = |graph: &SemanticReactiveGraphV1| {
-            map_semantic_reactive(
-                semantic.execution_graph(),
-                semantic.resource_graph(),
-                graph,
-                &execution.id_map,
-                &resources,
-            )
-        };
-
-        assert_eq!(
-            reactive.fields.len(),
-            semantic.reactive_graph().fields.len()
-        );
-        assert_eq!(
-            reactive.bindings.len(),
-            semantic.reactive_graph().bindings.len()
-        );
-        assert_eq!(reactive.reads.len(), semantic.reactive_graph().reads.len());
-        assert_eq!(
-            reactive.list_mutations.len(),
-            semantic.reactive_graph().list_mutations.len()
-        );
-        assert!(
-            !reactive.state_update_arms.is_empty(),
-            "fixture exercises exact trigger/state-arm mapping"
-        );
-        assert!(
-            reactive
-                .fields
-                .iter()
-                .enumerate()
-                .all(|(index, field)| field.id == MappedReactiveFieldId(index))
-        );
-        assert!(
-            reactive
-                .trigger_arms
-                .iter()
-                .enumerate()
-                .all(|(index, trigger)| trigger.id == MappedReactiveTriggerId(index))
-        );
-
-        let mut extra_trigger = semantic.reactive_graph().clone();
-        let mut trigger = extra_trigger.trigger_arms[0].clone();
-        trigger.id = SemanticTriggerArmId(extra_trigger.trigger_arms.len());
-        extra_trigger.trigger_arms.push(trigger);
-        let error = remap_reactive(&extra_trigger).unwrap_err();
-        assert!(error.contains("expected exact set"), "{error}");
-
-        let mut dangling_trigger = semantic.reactive_graph().clone();
-        dangling_trigger.state_update_arms[0].trigger = SemanticTriggerArmId(usize::MAX);
-        let error = remap_reactive(&dangling_trigger).unwrap_err();
-        assert!(error.contains("references missing trigger"), "{error}");
-
-        let mut noncanonical_field = semantic.reactive_graph().clone();
-        noncanonical_field.fields[0].id = SemanticFieldId(usize::MAX);
-        let error = remap_reactive(&noncanonical_field).unwrap_err();
-        assert!(error.contains("semantic reactive field"), "{error}");
-        assert!(error.contains("not dense"), "{error}");
-
-        assert!(
-            !semantic.reactive_graph().dependencies.is_empty(),
-            "fixture exercises exact dependency closure"
-        );
-        let mut extra_dependency = semantic.reactive_graph().clone();
-        let mut dependency = extra_dependency.dependencies[0].clone();
-        dependency.id =
-            boon_semantic::SemanticExternalDependencyId(extra_dependency.dependencies.len());
-        extra_dependency.dependencies.push(dependency);
-        let error = remap_reactive(&extra_dependency).unwrap_err();
-        assert!(error.contains("dependency closure"), "{error}");
-
-        let mut dangling_dependency = semantic.reactive_graph().clone();
-        dangling_dependency.dependencies[0].to = SemanticStateId(usize::MAX);
-        let error = remap_reactive(&dangling_dependency).unwrap_err();
-        assert!(error.contains("dependency edge"), "{error}");
-
-        let mapped_storage = map_semantic_storage_join(
-            semantic.execution_graph(),
-            semantic.resource_graph(),
-            semantic.reactive_graph(),
-            semantic.scope_storage_graph(),
-            &execution.id_map,
-            &resources,
-            &reactive,
-        )
-        .expect("complete semantic storage topology joins mechanically");
-        mapped_storage
-            .validate_totality(
-                semantic.scope_storage_graph(),
-                semantic.reactive_graph(),
-                &execution.id_map,
-            )
-            .unwrap();
-        assert_eq!(
-            mapped_storage.fields.len(),
-            semantic.scope_storage_graph().fields.len()
-        );
-        assert_eq!(
-            mapped_storage.bindings.len(),
-            semantic.reactive_graph().bindings.len()
-        );
-        assert_eq!(
-            mapped_storage.reads.len(),
-            semantic.reactive_graph().reads.len()
-        );
-        assert_eq!(
-            mapped_storage.call_invocations.len(),
-            semantic.reactive_graph().call_invocations.len()
-        );
-        assert!(
-            !mapped_storage.derived_values.is_empty(),
-            "fixture exercises final derived-value FieldId joins"
-        );
-
-        let map_storage = |storage: &SemanticScopeStorageGraphV1| {
-            map_semantic_storage_join(
-                semantic.execution_graph(),
-                semantic.resource_graph(),
-                semantic.reactive_graph(),
-                storage,
-                &execution.id_map,
-                &resources,
-                &reactive,
-            )
-        };
-
-        let mut noncanonical_field = semantic.scope_storage_graph().clone();
-        noncanonical_field.fields[0].id = SemanticStorageFieldId(usize::MAX);
-        let error = map_storage(&noncanonical_field).unwrap_err();
-        assert!(error.contains("storage field"), "{error}");
-        assert!(error.contains("not dense"), "{error}");
-
-        let mut broken_reactive_join = semantic.scope_storage_graph().clone();
-        let reactive_field = broken_reactive_join
-            .fields
-            .iter_mut()
-            .find(|field| field.reactive_field.is_some())
-            .expect("fixture has a reactive storage field");
-        reactive_field.reactive_field = None;
-        let error = map_storage(&broken_reactive_join).unwrap_err();
-        assert!(
-            error.contains("reactive origin") || error.contains("no exact semantic storage field"),
-            "{error}"
-        );
-
-        let mut missing_binding = semantic.scope_storage_graph().clone();
-        missing_binding.bindings.pop();
-        let error = map_storage(&missing_binding).unwrap_err();
-        assert!(error.contains("semantic storage binding map"), "{error}");
-
-        let mut bad_source = semantic.scope_storage_graph().clone();
-        bad_source
-            .sources
-            .first_mut()
-            .expect("fixture has a storage source")
-            .binding = SemanticBindingId(usize::MAX);
-        let error = map_storage(&bad_source).unwrap_err();
-        assert!(error.contains("storage source"), "{error}");
-
-        let mut bad_mapped_field = mapped_storage.clone();
-        bad_mapped_field.fields[0].id = FieldId(usize::MAX);
-        let error = bad_mapped_field
-            .validate_totality(
-                semantic.scope_storage_graph(),
-                semantic.reactive_graph(),
-                &execution.id_map,
-            )
-            .unwrap_err();
-        assert!(error.contains("mapped storage field"), "{error}");
-
-        let mut bad_derived = mapped_storage.clone();
-        bad_derived
-            .derived_values
-            .first_mut()
-            .expect("fixture has a derived value")
-            .id = FieldId(usize::MAX);
-        let error = bad_derived
-            .validate_totality(
-                semantic.scope_storage_graph(),
-                semantic.reactive_graph(),
-                &execution.id_map,
-            )
-            .unwrap_err();
-        assert!(error.contains("mapped derived value"), "{error}");
-
-        let mut bad_mapped_read = mapped_storage;
-        bad_mapped_read
-            .reads
-            .first_mut()
-            .expect("fixture has a staged read")
-            .id = ErasedReadId(usize::MAX);
-        let error = bad_mapped_read
-            .validate_totality(
-                semantic.scope_storage_graph(),
-                semantic.reactive_graph(),
-                &execution.id_map,
-            )
-            .unwrap_err();
-        assert!(error.contains("mapped storage read"), "{error}");
-    }
 }

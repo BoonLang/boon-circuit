@@ -445,6 +445,42 @@ baseline and its dependent budget report. This preparatory ownership move adds
 a net 44 tracked Rust lines, including 16 test lines, to establish the final
 owner before deleting the roughly 10,400-line mapping island.
 
+The semantic-core construction checkpoint deletes the old
+`boon_ir::semantic_mapping` owner and makes semantic elaboration construct and
+privately retain `CanonicalProgramCoreV1` after all semantic graphs and
+manifests join. `boon_ir` now consumes that retained core, binds only the
+post-verification pulse-fusion decisions, and wraps the result in opaque
+`ErasedProgram`; both IR schedule validation and the `MachinePlan` backend fail
+closed if pending fusion reaches them. The canonical semantic digest includes
+the retained core. Restoring that digest coverage exposed an impossible Serde
+shape in six internally tagged executable literal variants; those variants now
+use named payload fields, so the documented canonical core is actually
+serializable instead of relying on a digest omission.
+
+This checkpoint removes the old mapping file and its 18 private proof-shadow
+tests, but it does not pretend that the mapping implementation has disappeared:
+the private semantic-owned `core_lowering.rs` is still 10,357 lines. Collapsing
+that builder into the semantic producers, then deleting the resulting
+superseded joins, is the next production-reduction target. No migration recipe,
+predecessor handling, persistence owner, semantic memory, state/list schedule,
+or draining behavior is removed, and this checkpoint does not claim the future
+Boon `DRAIN`/`DRAINING` source surface is complete.
+
+The affected compiler all-target check, all 10 retained IR tests, the IR
+opacity compile-fail doctest, all 8 public pulse/fusion tests, all 18 active
+dependency-classifier tests, all 4 architecture contract tests, and the three
+executable Counter, Persons.pro, and TodoMVC migration scenarios pass under
+serial execution. The current architecture report fails only the two global
+line caps, at 413,120 tracked Rust lines and 53,065 test Rust lines. This is a
+net reduction of 2,828 tracked lines and 1,665 test lines from the preceding
+canonical-core prerequisite. Runtime plus executor, playground, and xtask
+production remain within their caps at 40,503, 31,125, and 16,724 lines. The
+packed inventory records 17,921 exact candidate sites across 81 occurrence
+files, and the container inventory records 4,770 exact occurrences across 147
+Rust files. Phase 0 deletion and both regenerated inventories pass; only the
+already-declared stale Cells packed baseline and its dependent budget report
+remain open.
+
 The nested-compositor diagnostic path has been deleted. The replacement uses
 ordinary COSMIC preview/dev windows, kernel uinput mouse and keyboard devices,
 the normal app_window callback route, and app-owned exact-frame WGPU readback.

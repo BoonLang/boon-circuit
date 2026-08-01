@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod contextual_expansion;
+mod core_lowering;
 mod dependency_manifest;
 mod execution;
 mod lowering_contract;
@@ -38,8 +39,8 @@ use std::fmt;
 pub const SEMANTIC_PROGRAM_SCHEMA_V1: &str = "boon.semantic-program.v1";
 pub const BUNDLE_SEMANTIC_PROGRAM_SCHEMA_V1: &str = "boon.bundle-semantic-program.v1";
 pub const DEPENDENCY_CLASSIFIER_SCHEMA_DIGEST_V1: [u8; 32] = [
-    0xc8, 0x8d, 0x9a, 0x63, 0x91, 0x76, 0xb1, 0x88, 0xb4, 0xd2, 0x58, 0x1c, 0x56, 0x5f, 0x35, 0x58,
-    0xb1, 0x5d, 0x9f, 0xc2, 0x08, 0xb3, 0xe0, 0xbc, 0x8d, 0xa0, 0x49, 0x69, 0x81, 0xf1, 0x39, 0x8f,
+    0x58, 0xe8, 0xa1, 0x0c, 0x72, 0x75, 0x86, 0x7b, 0x9b, 0xb8, 0xac, 0x3b, 0xb4, 0x8e, 0x54, 0x2e,
+    0xc5, 0xb9, 0x40, 0x60, 0x0f, 0x7a, 0x83, 0xb5, 0x5f, 0xfa, 0xf0, 0x75, 0x67, 0xd6, 0xaa, 0xdb,
 ];
 pub const MAX_BUNDLE_SEMANTIC_PRODUCER_REQUESTS_V1: usize = 4_096;
 pub const MAX_BUNDLE_SEMANTIC_PRODUCER_REQUEST_BYTES_V1: usize = 4 * 1024 * 1024;
@@ -625,6 +626,7 @@ pub struct SemanticProgram {
     view_binding_graph: SemanticViewBindingGraphV1,
     scope_storage_graph: SemanticScopeStorageGraphV1,
     memory_graph: SemanticMemoryGraphV1,
+    canonical_core: program_core::CanonicalProgramCoreV1,
     dependency_manifest: CallableDependencyManifestV1,
     digest: SemanticProgramDigestV1,
 }
@@ -927,6 +929,7 @@ impl SemanticProgram {
                 &self.execution_graph,
             )
             .map_err(|error| SemanticError::new(error.to_string()))?;
+        validate_canonical_core_handoff(self)?;
         let expected = semantic_program_digest(self)?;
         if self.digest != expected {
             return Err(SemanticError::new(
@@ -943,29 +946,97 @@ impl SemanticProgram {
         self,
     ) -> (
         SourceBundleDigestV1,
-        SemanticExecutionGraphV1,
-        SemanticResourceGraphV1,
-        SemanticReactiveGraphV1,
-        SemanticLoweringContractV1,
-        SemanticViewBindingGraphV1,
-        SemanticScopeStorageGraphV1,
-        SemanticMemoryGraphV1,
+        program_core::CanonicalProgramCoreV1,
         SemanticProgramDigestV1,
         CallableDependencyManifestDigestV1,
     ) {
         (
             self.source_bundle_digest_v1,
-            self.execution_graph,
-            self.resource_graph,
-            self.reactive_graph,
-            self.lowering_contract,
-            self.view_binding_graph,
-            self.scope_storage_graph,
-            self.memory_graph,
+            self.canonical_core,
             self.digest,
             self.dependency_manifest.manifest_digest,
         )
     }
+}
+
+fn validate_canonical_core_handoff(program: &SemanticProgram) -> Result<(), SemanticError> {
+    let core = &program.canonical_core;
+    let execution = &program.execution_graph;
+    if core.graph_node_count != core.executable.expressions.len()
+        || core.executable.expressions.len() != execution.expressions.len()
+        || core.executable.statements.len() != execution.statements.len()
+        || core.executable.sources.len() != execution.sources.len()
+        || core.executable.states.len() != execution.states.len()
+        || core.executable.roots.len() != execution.roots.len()
+        || core.executable.functions.len() != execution.functions.len()
+        || core.materializations.len() != execution.materializations.len()
+        || core.sources.len() != program.resource_graph.sources.len()
+        || core.state_cells.len() != program.resource_graph.states.len()
+        || core.lists.len() != program.resource_graph.lists.len()
+        || core.activations.len() != program.reactive_graph.activations.len()
+        || core.pulse_batches.len() != program.reactive_graph.pulse_batches.len()
+        || core.semantic_memory.len() != program.memory_graph.memories.len()
+        || core.migration_edges.len() != program.memory_graph.migration_edges.len()
+        || core.expression_count
+            != program
+                .lowering_contract
+                .metadata
+                .original_source_expression_count
+    {
+        return Err(SemanticError::new(
+            "canonical program core inventory differs from its semantic graphs",
+        ));
+    }
+    for (semantic, executable) in execution
+        .expressions
+        .iter()
+        .zip(&core.executable.expressions)
+    {
+        if semantic.id.as_usize() != executable.id.as_usize()
+            || semantic.checked_expr_id != executable.checked_expr_id
+            || semantic.flow_type != executable.flow_type
+            || semantic.effect != executable.effect
+            || semantic.owner != executable.owner
+            || semantic.resource_binding_path != executable.resource_binding_path
+        {
+            return Err(SemanticError::new(format!(
+                "canonical executable expression {} differs from semantic expression {}",
+                executable.id, semantic.id
+            )));
+        }
+    }
+    for (semantic, executable) in execution.statements.iter().zip(&core.executable.statements) {
+        if semantic.id.as_usize() != executable.id.as_usize()
+            || semantic.declaration != executable.declaration
+            || semantic.flow_type != executable.flow_type
+            || semantic.value.map(SemanticExprId::as_usize)
+                != executable
+                    .value
+                    .map(program_core::ExecutableExprId::as_usize)
+        {
+            return Err(SemanticError::new(format!(
+                "canonical executable statement {} differs from semantic statement {}",
+                executable.id, semantic.id
+            )));
+        }
+    }
+    for (semantic, executable) in program
+        .reactive_graph
+        .pulse_batches
+        .iter()
+        .zip(&core.pulse_batches)
+    {
+        if semantic.id.as_usize() != executable.id.as_usize()
+            || semantic.slice_digest.0 != executable.semantic_slice_digest
+            || executable.fusion != program_core::PulseFusionEligibility::PendingVerification
+        {
+            return Err(SemanticError::new(format!(
+                "canonical pulse batch {} is not the pending semantic pulse batch {}",
+                executable.id, semantic.id
+            )));
+        }
+    }
+    Ok(())
 }
 
 impl BundleSemanticProgramV1 {
@@ -2626,6 +2697,19 @@ pub fn elaborate_with_external_event_identities(
         )
     )
     .map_err(|error| SemanticError::new(error.to_string()))?;
+    let canonical_core = elaboration_phase!(
+        "build_canonical_program_core",
+        core_lowering::build_canonical_program_core(
+            &execution_graph,
+            &resource_graph,
+            &reactive_graph,
+            &lowering_contract,
+            &view_binding_graph,
+            &scope_storage_graph,
+            &memory_graph,
+        )
+    )
+    .map_err(SemanticError::new)?;
     let mut semantic = SemanticProgram {
         source_bundle_digest_v1,
         checked_program,
@@ -2638,6 +2722,7 @@ pub fn elaborate_with_external_event_identities(
         view_binding_graph,
         scope_storage_graph,
         memory_graph,
+        canonical_core,
         dependency_manifest,
         digest: SemanticProgramDigestV1([0; 32]),
     };
@@ -4854,6 +4939,7 @@ fn semantic_program_digest(
         view_binding_graph: &'a SemanticViewBindingGraphV1,
         scope_storage_graph: &'a SemanticScopeStorageGraphV1,
         memory_graph: &'a SemanticMemoryGraphV1,
+        canonical_core: &'a program_core::CanonicalProgramCoreV1,
         dependency_manifest_digest: CallableDependencyManifestDigestV1,
     }
     Ok(SemanticProgramDigestV1(canonical_hash(
@@ -4871,6 +4957,7 @@ fn semantic_program_digest(
             view_binding_graph: &program.view_binding_graph,
             scope_storage_graph: &program.scope_storage_graph,
             memory_graph: &program.memory_graph,
+            canonical_core: &program.canonical_core,
             dependency_manifest_digest: program.dependency_manifest.manifest_digest,
         },
     )?))

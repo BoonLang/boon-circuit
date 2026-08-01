@@ -16,7 +16,7 @@ const DEFAULT_REPORT: &str = "target/reports/phase0-v1/evidence.json";
 const VERSIONS_MANIFEST: &str = "docs/architecture/phase0/versions.toml";
 const DELETION_MANIFEST: &str = "docs/architecture/phase0/deletion_ledger.toml";
 const DELETION_MANIFEST_SHA256: &str =
-    "cd4a535935d0036d21696607ab2e51d97d16164930340e013f61b352d96e2f39";
+    "4ee9327c31644cc400d046238af15c31efa97aed6e66ffb1833869c88405bdca";
 const CONTAINER_MANIFEST: &str = "docs/architecture/phase0/container_inventory.toml";
 #[cfg(test)]
 const CONTAINER_OCCURRENCE_LEDGER: &str = "docs/architecture/phase0/container_occurrences.tsv";
@@ -2577,6 +2577,7 @@ fn classify_generated_container_occurrence(
         "crates/boon_plan_executor/",
         "crates/boon_program_runtime/",
         "crates/boon_runtime/",
+        "crates/boon_semantic/src/core_lowering.rs",
         "crates/boon_server_runtime/src/router.rs",
         "crates/boon_typecheck/",
         "crates/boon_web_host/src/web_persistent.rs",

@@ -560,6 +560,12 @@ final packed target remains unchanged. The reconciled Phase 0 validators pass;
 the verifier grants final Phase 0 completion only from the clean committed
 revision.
 
+A clean confirmation at `de430c1` kept the million-row charged work unchanged
+but observed 14,794,406,170 ns instead of 9,712,441,796 ns for its three-sample
+dense p95, where p95 is necessarily the sample maximum. The current diagnostic
+ratchet records the worse clean observation instead of retrying for favorable
+scheduler noise. Its final 2,000,000,000 ns packed target is still unchanged.
+
 The historical `9b4ed71` checkpoint proves that an earlier, smaller feature set
 fit below the former 240,000 tracked-Rust and 32,000 test-Rust limits, but it
 does not prove that the current feature set can do so without loss. Those two

@@ -4,10 +4,17 @@ Status: active implementation contract for the destructive cleanup.
 
 ## Objective
 
-Reduce the current roughly 472,000 tracked Rust lines to at most 240,000 while
+Reduce the current 411,982 tracked Rust lines to at most 240,000 while
 restoring a responsive native playground. The final repository has one
 execution engine, one typed document/render update path, one native input path,
 compact verification tooling, and no executable 3D/manufacturing island.
+
+The numerical caps are forcing targets, not permission to delete unique
+product behavior or its only effective tests. Every reduction checkpoint must
+name the surviving behavior owner and independent verification path. If an
+ownership and representation audit establishes that the unique implementation
+floor is above a cap, reconcile the plan and cap explicitly instead of deleting
+essential logic or weakening a gate.
 
 The checkpoint at `6935352` is intentionally not a completed native-input fix:
 the automated Counter TEST route passed while physical COSMIC dev-window input
@@ -480,6 +487,46 @@ files, and the container inventory records 4,770 exact occurrences across 147
 Rust files. Phase 0 deletion and both regenerated inventories pass; only the
 already-declared stale Cells packed baseline and its dependent budget report
 remain open.
+
+The semantic-core self-audit checkpoint deletes 1,174 lines from the private
+`core_lowering.rs`, reducing it from 10,357 to 9,183 lines. The deleted code
+consists of five post-construction totality or closure rescans, one producer-ID
+sequence retained only for those rescans, and two `#[cfg(test)]` helpers with no
+remaining callers; it removes no test case or assertion. A 36-line net addition
+to the independent canonical-core handoff validator fixes the distributed
+event-source inventory bug exposed by the retained imported-event/HOLD test,
+for a net reduction of 1,138 tracked production lines. No constructor, mapped
+payload, migration recipe, predecessor rule, persistence owner,
+semantic-memory record, state/list schedule, draining path, runtime behavior,
+fixture, or test is removed. Allocation bijections remain checked while IDs
+are assigned, `SemanticReactiveGraphV1::validate` deterministically re-derives
+the reactive graph, semantic shape validation checks dense domains and
+references, the semantic-program handoff validates the canonical core and its
+exact external-event paths, and IR plus compiler backends still reject an
+invalid or pending schedule. The architecture contract now rejects restoration
+of the private `validate_totality` proof-shadow family.
+
+The affected compiler all-target check, all 10 retained IR tests, all 8 public
+pulse/fusion tests, all 18 active dependency-classifier tests, all 4
+architecture contract tests, and the three executable Counter, Persons.pro,
+and TodoMVC migration scenarios pass under serial execution. The architecture
+report again fails only the global caps, now at 411,982 tracked Rust lines and
+53,065 test Rust lines. Runtime plus executor, playground, and xtask production
+remain within their caps at 40,503, 31,125, and 16,724 lines. The packed
+inventory records 17,815 exact candidate sites across 81 occurrence files, and
+the container inventory records 4,761 exact occurrences across 147 Rust files.
+Phase 0 deletion and both regenerated inventories pass; only the declared
+stale Cells packed baseline and its dependent budget report remain open.
+
+The full semantic library run passed 99 tests and exposed one imported-event
+inventory failure; after the engine validator fix, that exact retained test
+passes on its focused rerun. This leaves 171,982 tracked lines and 21,065 test
+lines above the global caps.
+
+The historical `9b4ed71` checkpoint proves that an earlier, smaller feature set
+fit below both caps, but it does not prove that the current feature set can do
+so without loss. Subsequent cuts therefore require an explicit duplicate-owner
+or duplicate-representation proof; line count alone is not a deletion reason.
 
 The nested-compositor diagnostic path has been deleted. The replacement uses
 ordinary COSMIC preview/dev windows, kernel uinput mouse and keyboard devices,

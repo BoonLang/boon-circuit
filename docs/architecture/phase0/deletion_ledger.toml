@@ -2391,7 +2391,7 @@ roots = ["crates"]
 extensions = ["rs"]
 mode = "rust-token"
 needle = "BTreeMap"
-expected_occurrences = 2863
+expected_occurrences = 2862
 expected_files = 121
 
 [entries.scans.expected_path_occurrences]
@@ -2477,7 +2477,7 @@ expected_files = 121
 "crates/boon_runtime/src/host_capability.rs" = 3
 "crates/boon_runtime/src/lib.rs" = 17
 "crates/boon_semantic/src/contextual_expansion.rs" = 88
-"crates/boon_semantic/src/core_lowering.rs" = 42
+"crates/boon_semantic/src/core_lowering.rs" = 41
 "crates/boon_semantic/src/dependency_manifest.rs" = 18
 "crates/boon_semantic/src/execution.rs" = 7
 "crates/boon_semantic/src/lib.rs" = 26
@@ -2522,7 +2522,7 @@ roots = ["crates"]
 extensions = ["rs"]
 mode = "rust-token"
 needle = "BTreeSet"
-expected_occurrences = 1821
+expected_occurrences = 1813
 expected_files = 97
 
 [entries.scans.expected_path_occurrences]
@@ -2589,10 +2589,10 @@ expected_files = 97
 "crates/boon_runtime/src/effect_host.rs" = 2
 "crates/boon_runtime/src/lib.rs" = 2
 "crates/boon_semantic/src/contextual_expansion.rs" = 18
-"crates/boon_semantic/src/core_lowering.rs" = 46
+"crates/boon_semantic/src/core_lowering.rs" = 35
 "crates/boon_semantic/src/dependency_manifest.rs" = 17
 "crates/boon_semantic/src/execution.rs" = 19
-"crates/boon_semantic/src/lib.rs" = 16
+"crates/boon_semantic/src/lib.rs" = 19
 "crates/boon_semantic/src/lowering_contract.rs" = 24
 "crates/boon_semantic/src/memory_contract.rs" = 37
 "crates/boon_semantic/src/out_net.rs" = 13
@@ -2631,14 +2631,14 @@ expected_files = 97
 roots = ["docs/architecture/phase0/container_occurrences.tsv"]
 extensions = ["tsv"]
 needle = "\tdense-id-table\t"
-expected_occurrences = 967
+expected_occurrences = 966
 expected_files = 1
 
 [[entries.scans]]
 roots = ["docs/architecture/phase0/container_occurrences.tsv"]
 extensions = ["tsv"]
 needle = "\tmembership\t"
-expected_occurrences = 1716
+expected_occurrences = 1708
 expected_files = 1
 
 [[entries.scans]]
@@ -2691,7 +2691,7 @@ measurement = "occurrence"
 roots = ["docs/architecture/phase0/container_occurrences.tsv"]
 extensions = ["tsv"]
 needle = "\tdense-id-table\t"
-expected_occurrences = 967
+expected_occurrences = 966
 expected_files = 1
 
 [[entries]]

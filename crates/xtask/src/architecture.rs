@@ -1117,7 +1117,6 @@ fn verify_semantic_core_ownership_boundary(workspace: &Path) -> Result<(), Strin
     }
     for required in [
         "pub(crate) fn build_canonical_program_core(",
-        "mapped.validate_totality()?;",
         "struct SemanticToExecutableMap",
         "fn validate_allocation_bijections(",
         "struct SemanticReactiveToMappedMap",
@@ -1140,6 +1139,7 @@ fn verify_semantic_core_ownership_boundary(workspace: &Path) -> Result<(), Strin
         );
     }
     for forbidden in [
+        "fn validate_totality(",
         "MappedSemanticNamedValue",
         "MappedSemanticNamedValueProjection",
         "MappedSemanticNamedValueTarget",

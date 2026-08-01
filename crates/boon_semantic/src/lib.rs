@@ -39,8 +39,8 @@ use std::fmt;
 pub const SEMANTIC_PROGRAM_SCHEMA_V1: &str = "boon.semantic-program.v1";
 pub const BUNDLE_SEMANTIC_PROGRAM_SCHEMA_V1: &str = "boon.bundle-semantic-program.v1";
 pub const DEPENDENCY_CLASSIFIER_SCHEMA_DIGEST_V1: [u8; 32] = [
-    0x58, 0xe8, 0xa1, 0x0c, 0x72, 0x75, 0x86, 0x7b, 0x9b, 0xb8, 0xac, 0x3b, 0xb4, 0x8e, 0x54, 0x2e,
-    0xc5, 0xb9, 0x40, 0x60, 0x0f, 0x7a, 0x83, 0xb5, 0x5f, 0xfa, 0xf0, 0x75, 0x67, 0xd6, 0xaa, 0xdb,
+    0x4d, 0xd2, 0x71, 0x07, 0x01, 0xb0, 0x6a, 0xd6, 0x6a, 0x46, 0xcc, 0x3a, 0x17, 0x37, 0x7f, 0xd7,
+    0x24, 0x45, 0x8c, 0xdc, 0xb0, 0xfe, 0x10, 0x0b, 0xb9, 0xd2, 0x12, 0xba, 0x20, 0xcb, 0xaf, 0x59,
 ];
 pub const MAX_BUNDLE_SEMANTIC_PRODUCER_REQUESTS_V1: usize = 4_096;
 pub const MAX_BUNDLE_SEMANTIC_PRODUCER_REQUEST_BYTES_V1: usize = 4 * 1024 * 1024;
@@ -962,6 +962,30 @@ impl SemanticProgram {
 fn validate_canonical_core_handoff(program: &SemanticProgram) -> Result<(), SemanticError> {
     let core = &program.canonical_core;
     let execution = &program.execution_graph;
+    let external_event_identities = program
+        .reactive_graph
+        .external_event_identities
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let expected_external_event_paths = execution
+        .expressions
+        .iter()
+        .filter_map(|expression| {
+            let SemanticExpressionKind::ExternalRead {
+                canonical_path,
+                external_identity: Some(identity),
+            } = &expression.kind
+            else {
+                return None;
+            };
+            (matches!(
+                expression.flow_type.mode,
+                boon_typecheck::FlowMode::TickPresent | boon_typecheck::FlowMode::PresentOrAbsent
+            ) && external_event_identities.contains(identity))
+            .then(|| program_core::distributed_event_source_path(canonical_path))
+        })
+        .collect::<BTreeSet<_>>();
     if core.graph_node_count != core.executable.expressions.len()
         || core.executable.expressions.len() != execution.expressions.len()
         || core.executable.statements.len() != execution.statements.len()
@@ -970,7 +994,8 @@ fn validate_canonical_core_handoff(program: &SemanticProgram) -> Result<(), Sema
         || core.executable.roots.len() != execution.roots.len()
         || core.executable.functions.len() != execution.functions.len()
         || core.materializations.len() != execution.materializations.len()
-        || core.sources.len() != program.resource_graph.sources.len()
+        || core.sources.len()
+            != program.resource_graph.sources.len() + expected_external_event_paths.len()
         || core.state_cells.len() != program.resource_graph.states.len()
         || core.lists.len() != program.resource_graph.lists.len()
         || core.activations.len() != program.reactive_graph.activations.len()
@@ -985,6 +1010,17 @@ fn validate_canonical_core_handoff(program: &SemanticProgram) -> Result<(), Sema
     {
         return Err(SemanticError::new(
             "canonical program core inventory differs from its semantic graphs",
+        ));
+    }
+    let mapped_external_event_paths = core
+        .sources
+        .iter()
+        .skip(program.resource_graph.sources.len())
+        .map(|source| source.path.clone())
+        .collect::<BTreeSet<_>>();
+    if mapped_external_event_paths != expected_external_event_paths {
+        return Err(SemanticError::new(
+            "canonical program core distributed event sources differ from semantic external-event reads",
         ));
     }
     for (semantic, executable) in execution

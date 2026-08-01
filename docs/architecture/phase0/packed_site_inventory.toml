@@ -100,8 +100,8 @@ expected_probe_set_sha256 = "2346e6b824b635dac808a86bf6cc836c9e7ab851afdd63e95f5
 expected_file_set_sha256 = "7ec08602bcd3380f86cd5c2f8f73182c60d841d4f5b7e01808184cce9e160aca"
 expected_scanned_files = 91
 expected_occurrence_files = 81
-expected_occurrence_ledger_sha256 = "2f43067cb7d94a286a908ed30845300cf7512c6284f5b1f750049bc008300179"
-expected_occurrence_rows = 17921
+expected_occurrence_ledger_sha256 = "7ad801b99acf8548c66915bcdb9a0fb237cd0fdb42fec5ec03252fdcf83feded"
+expected_occurrence_rows = 17815
 
 [[categories]]
 order = 0
@@ -138,9 +138,9 @@ order = 3
 id = "allocation-or-growth"
 owner_phase = "goal-phase-5-packed"
 owner_plan = "docs/plans/BOON_PACKED_DATA_AND_DENSE_INTERNALS_PLAN.md"
-expected_rows = 14092
+expected_rows = 14001
 expected_hot = 4151
-expected_cold = 8508
+expected_cold = 8417
 expected_boundary = 1433
 
 [[categories]]
@@ -158,7 +158,7 @@ order = 5
 id = "boundary-or-runtime-materialization"
 owner_phase = "goal-phase-5-packed"
 owner_plan = "docs/plans/BOON_PACKED_DATA_AND_DENSE_INTERNALS_PLAN.md"
-expected_rows = 1245
+expected_rows = 1230
 expected_hot = 442
-expected_cold = 692
+expected_cold = 677
 expected_boundary = 111

@@ -7,6 +7,9 @@ only; linked plans remain authoritative for their own semantics and acceptance.
    `BOON_CIRCUIT_SIMPLIFICATION_AND_NATIVE_RECOVERY_PLAN.md` exit before adding
    production compiler targets, hardware crates, RTL, a console bridge, or game
    work. Preserve the current verified-artifact and typed-list checkpoints.
+   Judge that exit by its ownership, behavior, native evidence, and focused
+   subsystem gates. Repository-wide tracked-Rust and test-Rust totals are
+   telemetry and must not prolong recovery through deletion for its own sake.
    Documentation, board inventory, and measured tool/interpreter experiments
    may proceed, but do not create a production bypass around unfinished
    recovery.

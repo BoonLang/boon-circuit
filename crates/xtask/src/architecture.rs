@@ -5,8 +5,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use syn::visit::Visit;
 
-const TOTAL_RUST_CAP: usize = 240_000;
-const TEST_RUST_CAP: usize = 32_000;
 const PLAYGROUND_RUST_CAP: usize = 32_000;
 const XTASK_RUST_CAP: usize = 25_000;
 const RUNTIME_EXECUTOR_RUST_CAP: usize = 42_000;
@@ -88,20 +86,22 @@ pub fn collect_architecture_evidence(workspace: &Path) -> GateEvidence {
 
     match rust_line_counts(workspace) {
         Ok(counts) => {
-            push_cap(
-                &mut checks,
-                "tracked-rust-loc-cap",
-                counts.total,
-                TOTAL_RUST_CAP,
-                "tracked Rust",
-            );
-            push_cap(
-                &mut checks,
-                "test-rust-loc-cap",
-                counts.tests,
-                TEST_RUST_CAP,
-                "test Rust",
-            );
+            checks.push(check(
+                "tracked-rust-loc-inventory",
+                CheckOutcome::Pass,
+                format!(
+                    "tracked Rust: {} lines; repository-wide count is telemetry, not a deletion gate",
+                    counts.total
+                ),
+            ));
+            checks.push(check(
+                "test-rust-loc-inventory",
+                CheckOutcome::Pass,
+                format!(
+                    "test Rust: {} lines; repository-wide count is telemetry, not a deletion gate",
+                    counts.tests
+                ),
+            ));
             push_cap(
                 &mut checks,
                 "playground-rust-loc-cap",
@@ -1140,6 +1140,11 @@ fn verify_semantic_core_ownership_boundary(workspace: &Path) -> Result<(), Strin
     }
     for forbidden in [
         "fn validate_totality(",
+        "fn validate_callable_and_call_inventory(",
+        "fn validate_erased_resource_metadata(",
+        "fn validate_reactive_call_and_host_schedules(",
+        "fn validate_call_expression(",
+        "fn runtime_type_matches_scheme(",
         "MappedSemanticNamedValue",
         "MappedSemanticNamedValueProjection",
         "MappedSemanticNamedValueTarget",

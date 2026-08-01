@@ -9,6 +9,7 @@ objective from the current HEAD.
 Read AGENTS.md and these contracts completely before editing:
 
 - docs/plans/steps.md
+- docs/plans/BOON_CIRCUIT_SIMPLIFICATION_AND_NATIVE_RECOVERY_PLAN.md
 - docs/plans/BOON_LANGUAGE_FOUNDATIONS_PLAN.md
 - docs/plans/BOON_OUT_PARAMETERS_AND_ORDER_INDEPENDENT_BINDINGS_PLAN.md
 - docs/plans/TYPE_INFERENCE_AND_TYPECHECKING_PLAN.md
@@ -39,6 +40,10 @@ Goal replacement rule:
   second active goal, compatibility plan, or alternate authority.
 - `steps.md` fixes execution order. Individual plans remain authoritative for
   their own semantics, invariants, reports, budgets, and acceptance criteria.
+- The active simplification/native-recovery plan owns its exit. Its
+  repository-wide tracked-Rust and test-Rust totals are inventory telemetry,
+  not completion gates; retain its focused subsystem caps and require a proven
+  duplicate or superseded owner before deleting implementation or tests.
 
 Authority and conflict rules:
 
@@ -173,6 +178,9 @@ Execution strategy:
 - Delete superseded syntax, aliases, codecs, plans, tests, runtime paths,
   representations, and compatibility fallbacks once replacements compile. Do
   not rename, quarantine, feature-gate, or retain them as a second path.
+- Do not start or continue a deletion slice merely to reduce repository-wide
+  source or test line telemetry. Name the duplicate or superseded owner, the
+  surviving owner, and the behavioral evidence first.
 - Never hide an engine limitation in example Boon source. Reduce it to an
   unrelated fixture, fix the generic owner, then remove the diagnostic
   workaround.

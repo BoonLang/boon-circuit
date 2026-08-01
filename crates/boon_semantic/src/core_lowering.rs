@@ -2,8 +2,7 @@ use crate::program_core;
 use crate::{
     OutCallInstanceId, ProducerFunctionId, SemanticBindingId, SemanticBindingTargetV1,
     SemanticBlockBinding, SemanticCall, SemanticCallArgument, SemanticCallContextId,
-    SemanticCallEntry, SemanticCallId, SemanticCallParameterBinding,
-    SemanticCallParameterBindingKind, SemanticCallable, SemanticCallableId, SemanticCallableKind,
+    SemanticCallId, SemanticCallable, SemanticCallableId, SemanticCallableKind,
     SemanticContextualMaterialization, SemanticContextualOperationKind, SemanticContextualOrderKey,
     SemanticContextualRowPredecessor, SemanticDependencyTargetV1, SemanticDependencyTimingV1,
     SemanticDerivedValueKindV1, SemanticEventCauseV1, SemanticExecutionGraphV1, SemanticExprId,
@@ -25,8 +24,8 @@ use crate::{
     SemanticValueProvenance, StaticOwnerDef, StaticOwnerId,
 };
 use boon_typecheck::{
-    CheckedExternalDeclarationIdentityV1, CheckedExternalDeclarationKind, CheckedParameterKind,
-    CheckedParameterRequirement, DeclId, FlowMode, FlowType,
+    CheckedExternalDeclarationIdentityV1, CheckedExternalDeclarationKind, DeclId, FlowMode,
+    FlowType,
 };
 use program_core::{
     ContextualMaterialization, ContextualOperationKind, ContextualOrderKey,
@@ -729,8 +728,6 @@ impl SemanticToExecutableMap {
             "semantic value-list authority",
         )?;
 
-        validate_callable_and_call_inventory(graph)?;
-
         let call_expressions = allocate_call_expressions(graph)?;
         let mut producer_functions = BTreeMap::new();
         for (index, function) in graph.functions.iter().enumerate() {
@@ -1078,200 +1075,6 @@ fn allocate_call_expressions(
     Ok(allocated)
 }
 
-fn validate_callable_and_call_inventory(graph: &SemanticExecutionGraphV1) -> Result<(), String> {
-    let mut checked_callables = BTreeSet::new();
-    for callable in &graph.callables {
-        if !checked_callables.insert(callable.checked_callable) {
-            return Err(format!(
-                "semantic callable {} duplicates checked callable {}",
-                callable.id, callable.checked_callable.0
-            ));
-        }
-        require_semantic_scope(graph, callable.scope, "semantic callable")?;
-        validate_external_callable_identity(callable)?;
-        for (ordinal, parameter) in callable.parameters.iter().enumerate() {
-            let expected = SemanticParameterId {
-                callable: callable.id,
-                ordinal,
-            };
-            if parameter.id != expected || parameter.ordinal != ordinal {
-                return Err(format!(
-                    "semantic callable {} parameter at index {ordinal} has noncanonical identity {:?}",
-                    callable.id, parameter.id
-                ));
-            }
-            if let CheckedParameterRequirement::Optional {
-                default: boon_typecheck::CheckedParameterDefault::CallableProfile { profile },
-            } = &parameter.requirement
-                && profile.is_empty()
-            {
-                return Err(format!(
-                    "semantic callable {} parameter {} has an empty default profile",
-                    callable.id, parameter.name
-                ));
-            }
-        }
-    }
-
-    let mut checked_calls = BTreeSet::new();
-    for call in &graph.calls {
-        if !checked_calls.insert(call.checked_call) {
-            return Err(format!(
-                "semantic call {} duplicates checked call {}",
-                call.id, call.checked_call.0
-            ));
-        }
-        let callable = semantic_callable(graph, call.callable)?;
-        if call.external_identity != callable.external_identity {
-            return Err(format!(
-                "semantic call {} external identity differs from callable {}",
-                call.id, callable.id
-            ));
-        }
-        if call.function != callable.name
-            || call.effect != callable.effect
-            || call.role != callable.role
-        {
-            return Err(format!(
-                "semantic call {} name/role/effect provenance differs from callable {}",
-                call.id, callable.id
-            ));
-        }
-        if let Some(owner) = call.owner_callable {
-            semantic_callable(graph, owner).map_err(|error| {
-                format!(
-                    "semantic call {} has invalid owner callable: {error}",
-                    call.id
-                )
-            })?;
-        }
-        if call.occurrence_segment.is_empty() {
-            return Err(format!(
-                "semantic call {} has an empty occurrence segment",
-                call.id
-            ));
-        }
-        let mut bound_formals = BTreeSet::new();
-        for entry in &call.entries {
-            let (formal, ordinal, name) = match entry {
-                SemanticCallEntry::Input {
-                    formal,
-                    ordinal,
-                    name,
-                    evaluation_scope,
-                    requirement,
-                    ..
-                } => {
-                    let parameter = callable_parameter(callable, *ordinal, call.id, "input entry")?;
-                    if parameter.kind != CheckedParameterKind::Value
-                        || parameter.evaluation_scope != *evaluation_scope
-                        || parameter.requirement != *requirement
-                    {
-                        return Err(format!(
-                            "semantic call {} input ordinal {ordinal} has stale callable provenance",
-                            call.id
-                        ));
-                    }
-                    (*formal, *ordinal, name)
-                }
-                SemanticCallEntry::FreshOut {
-                    formal,
-                    ordinal,
-                    name,
-                    scope,
-                    ..
-                } => {
-                    let parameter =
-                        callable_parameter(callable, *ordinal, call.id, "fresh OUT entry")?;
-                    if parameter.kind != CheckedParameterKind::Out {
-                        return Err(format!(
-                            "semantic call {} fresh OUT ordinal {ordinal} is not an OUT parameter",
-                            call.id
-                        ));
-                    }
-                    require_semantic_scope(graph, *scope, "semantic call fresh OUT")?;
-                    (*formal, *ordinal, name)
-                }
-                SemanticCallEntry::ForwardOut {
-                    formal,
-                    ordinal,
-                    name,
-                    ..
-                } => {
-                    let parameter =
-                        callable_parameter(callable, *ordinal, call.id, "forward OUT entry")?;
-                    if parameter.kind != CheckedParameterKind::Out {
-                        return Err(format!(
-                            "semantic call {} forwarded ordinal {ordinal} is not an OUT parameter",
-                            call.id
-                        ));
-                    }
-                    (*formal, *ordinal, name)
-                }
-            };
-            let parameter = callable_parameter(callable, ordinal, call.id, "entry")?;
-            if parameter.formal != formal || parameter.name != *name {
-                return Err(format!(
-                    "semantic call {} entry ordinal {ordinal} differs from callable {}",
-                    call.id, callable.id
-                ));
-            }
-            if !bound_formals.insert(formal) {
-                return Err(format!(
-                    "semantic call {} binds formal {} more than once",
-                    call.id, formal.0
-                ));
-            }
-        }
-        for context in &call.contexts {
-            require_semantic_scope(graph, context.scope, "semantic call context")?;
-            if callable.contexts.get(context.signature).is_none() {
-                return Err(format!(
-                    "semantic call {} context signature {} is absent from callable {}",
-                    call.id, context.signature, callable.id
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
-fn validate_external_callable_identity(callable: &SemanticCallable) -> Result<(), String> {
-    match (callable.kind, callable.external_identity) {
-        (boon_typecheck::CheckedCallableKind::External, Some(identity))
-            if identity.kind != CheckedExternalDeclarationKind::Callable =>
-        {
-            Err(format!(
-                "semantic external callable {} carries a non-callable external identity",
-                callable.id
-            ))
-        }
-        (
-            boon_typecheck::CheckedCallableKind::Builtin
-            | boon_typecheck::CheckedCallableKind::User,
-            Some(_),
-        ) => Err(format!(
-            "semantic non-external callable {} carries an external identity",
-            callable.id
-        )),
-        _ => Ok(()),
-    }
-}
-
-fn callable_parameter<'a>(
-    callable: &'a SemanticCallable,
-    ordinal: usize,
-    call: SemanticCallId,
-    context: &str,
-) -> Result<&'a crate::SemanticCallableParameter, String> {
-    callable.parameters.get(ordinal).ok_or_else(|| {
-        format!(
-            "semantic call {call} {context} references missing callable {} parameter ordinal {ordinal}",
-            callable.id
-        )
-    })
-}
-
 fn semantic_callable(
     graph: &SemanticExecutionGraphV1,
     id: SemanticCallableId,
@@ -1292,21 +1095,6 @@ fn semantic_call(
         .get(id.as_usize())
         .filter(|call| call.id == id)
         .ok_or_else(|| format!("missing semantic call {id}"))
-}
-
-fn require_semantic_scope(
-    graph: &SemanticExecutionGraphV1,
-    id: crate::SemanticScopeId,
-    context: &str,
-) -> Result<(), String> {
-    if graph
-        .scopes
-        .get(id.as_usize())
-        .is_none_or(|scope| scope.id != id)
-    {
-        return Err(format!("{context} references missing semantic scope {id}"));
-    }
-    Ok(())
 }
 
 fn allocate_local_bindings(
@@ -1767,7 +1555,6 @@ pub(super) fn map_semantic_resources(
     graph: &SemanticResourceGraphV1,
     ids: &SemanticToExecutableMap,
 ) -> Result<MappedSemanticResources, String> {
-    validate_erased_resource_metadata(graph, ids)?;
     for authority in &graph.value_list_authorities {
         ids.value_list_authority(authority.id)?;
         ids.statement(authority.statement)?;
@@ -1881,43 +1668,6 @@ pub(super) fn map_semantic_resources(
         list_projections,
     };
     Ok(mapped)
-}
-
-fn validate_erased_resource_metadata(
-    graph: &SemanticResourceGraphV1,
-    ids: &SemanticToExecutableMap,
-) -> Result<(), String> {
-    for alias in &graph.aliases {
-        match alias.target {
-            crate::SemanticResourceAliasTargetV1::Source(source) => {
-                ids.source(source)?;
-            }
-            crate::SemanticResourceAliasTargetV1::State(state) => {
-                ids.state(state)?;
-            }
-        }
-    }
-    for binding in &graph.materialization_bindings {
-        ids.materialization(binding.materialization)?;
-        if let Some(source) = binding.source {
-            map_row_binding(ids, source)?;
-        }
-        if let Some(target) = binding.target {
-            map_row_binding(ids, target)?;
-        }
-        for predecessor in &binding.predecessors {
-            map_row_predecessor(ids, predecessor)?;
-        }
-    }
-    for producer in &graph.producer_resources {
-        ids.callable(producer.callable)?;
-        ids.producer_function(producer.function)?;
-        ids.statement(producer.result_statement)?;
-        if let Some(source) = producer.invocation_source {
-            ids.source(source)?;
-        }
-    }
-    Ok(())
 }
 
 impl SemanticReactiveToMappedMap {
@@ -2129,13 +1879,11 @@ pub(super) fn map_semantic_reactive(
             map_reactive_derived_value(&derived_mapping, derived, &mut referenced_trigger_ids)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    validate_reactive_call_and_host_schedules(
-        execution,
-        graph,
-        ids,
-        &reactive_ids,
-        &mut referenced_trigger_ids,
-    )?;
+    for schedule in &graph.call_invocations {
+        for trigger in &schedule.invocation_arms {
+            referenced_trigger_ids.insert(reactive_ids.trigger(*trigger)?);
+        }
+    }
     for batch in &graph.pulse_batches {
         if let crate::SemanticPulseStartV1::Triggered { arms } = &batch.start {
             for arm in arms {
@@ -3344,80 +3092,6 @@ fn map_reactive_dependency_use(
         target,
         timing: map_dependency_timing(&dependency.timing, ids)?,
     })
-}
-
-fn validate_reactive_call_and_host_schedules(
-    execution: &SemanticExecutionGraphV1,
-    graph: &SemanticReactiveGraphV1,
-    ids: &SemanticToExecutableMap,
-    reactive_ids: &SemanticReactiveToMappedMap,
-    referenced_trigger_ids: &mut BTreeSet<MappedReactiveTriggerId>,
-) -> Result<(), String> {
-    let mut previous_expression = None;
-    for schedule in &graph.call_invocations {
-        if previous_expression.is_some_and(|previous| previous >= schedule.expression) {
-            return Err(
-                "semantic call invocation schedules are not strictly expression-ordered".to_owned(),
-            );
-        }
-        previous_expression = Some(schedule.expression);
-        let expression = semantic_execution_expression(execution, schedule.expression)?;
-        if expression.value_id != schedule.value
-            || !matches!(
-                expression.kind,
-                SemanticExpressionKind::Call { call, .. } if call == schedule.call
-            )
-            || ids.call_expression(schedule.call, schedule.expression)?
-                != validate_value_producer(
-                    ids,
-                    schedule.expression,
-                    schedule.value,
-                    "semantic call invocation schedule",
-                )?
-        {
-            return Err(format!(
-                "semantic call invocation schedule for expression {} has stale call/value provenance",
-                schedule.expression
-            ));
-        }
-        for binding in &schedule.dependent_bindings {
-            reactive_ids.binding(*binding)?;
-        }
-        for trigger in &schedule.invocation_arms {
-            referenced_trigger_ids.insert(reactive_ids.trigger(*trigger)?);
-        }
-    }
-
-    for schedule in &graph.host_effect_schedules {
-        let expression = semantic_execution_expression(execution, schedule.expression)?;
-        let mapped = validate_value_producer(
-            ids,
-            schedule.expression,
-            schedule.value,
-            "semantic host-effect schedule",
-        )?;
-        if expression.checked_expr_id != schedule.checked_expression
-            || expression.owner != schedule.owner
-            || !matches!(
-                &expression.kind,
-                SemanticExpressionKind::Call {
-                    call,
-                    function,
-                    ..
-                } if *call == schedule.call && function == &schedule.operation
-            )
-            || ids.call_expression(schedule.call, schedule.expression)? != mapped
-        {
-            return Err(format!(
-                "semantic host-effect schedule {} has stale call/operation/owner provenance",
-                schedule.id
-            ));
-        }
-        for arm in &schedule.state_update_arms {
-            reactive_ids.state_update_arm(*arm)?;
-        }
-    }
-    Ok(())
 }
 
 fn map_reactive_producer_instance(
@@ -6124,26 +5798,23 @@ fn map_expression_kind(
             arguments,
             contexts,
             ..
-        } => {
-            validate_call_expression(graph, ids, expression)?;
-            ExecutableExpressionKind::Call {
-                callable_kind: match callable_kind {
-                    SemanticCallableKind::Builtin => ExecutableCallableKind::Builtin,
-                    SemanticCallableKind::External => ExecutableCallableKind::External,
-                },
-                name: name.clone(),
-                intrinsic: *intrinsic,
-                instance: ids.call_instance(*instance)?,
-                arguments: arguments
-                    .iter()
-                    .map(|argument| map_call_argument(ids, argument))
-                    .collect::<Result<Vec<_>, _>>()?,
-                contexts: contexts
-                    .iter()
-                    .map(|context| ids.call_context(*context))
-                    .collect::<Result<Vec<_>, _>>()?,
-            }
-        }
+        } => ExecutableExpressionKind::Call {
+            callable_kind: match callable_kind {
+                SemanticCallableKind::Builtin => ExecutableCallableKind::Builtin,
+                SemanticCallableKind::External => ExecutableCallableKind::External,
+            },
+            name: name.clone(),
+            intrinsic: *intrinsic,
+            instance: ids.call_instance(*instance)?,
+            arguments: arguments
+                .iter()
+                .map(|argument| map_call_argument(ids, argument))
+                .collect::<Result<Vec<_>, _>>()?,
+            contexts: contexts
+                .iter()
+                .map(|context| ids.call_context(*context))
+                .collect::<Result<Vec<_>, _>>()?,
+        },
         SemanticExpressionKind::Materialize { materialization } => {
             ExecutableExpressionKind::Materialize {
                 materialization: ids.materialization(*materialization)?,
@@ -6445,464 +6116,6 @@ fn validate_external_value_identity(
         return Err(format!(
             "semantic external-read expression {expression} carries a non-value external identity"
         ));
-    }
-    Ok(())
-}
-
-fn runtime_type_contains_var(ty: &boon_typecheck::Type) -> bool {
-    match ty {
-        boon_typecheck::Type::Var(_) => true,
-        boon_typecheck::Type::List(item) => runtime_type_contains_var(item),
-        boon_typecheck::Type::Map { key, value } => {
-            runtime_type_contains_var(key) || runtime_type_contains_var(value)
-        }
-        boon_typecheck::Type::Set(item) => runtime_type_contains_var(item),
-        boon_typecheck::Type::Function { args, result } => {
-            args.iter().any(runtime_type_contains_var) || runtime_type_contains_var(&result.ty)
-        }
-        boon_typecheck::Type::Object(shape) => shape.fields.values().any(runtime_type_contains_var),
-        boon_typecheck::Type::VariantSet(variants) => {
-            variants.iter().any(|variant| match variant {
-                boon_typecheck::Variant::Tag(_) => false,
-                boon_typecheck::Variant::Tagged { fields, .. } => {
-                    fields.fields.values().any(runtime_type_contains_var)
-                }
-            })
-        }
-        boon_typecheck::Type::Union(members) => members.iter().any(runtime_type_contains_var),
-        boon_typecheck::Type::Text
-        | boon_typecheck::Type::Number
-        | boon_typecheck::Type::Bytes(_)
-        | boon_typecheck::Type::Bits { .. }
-        | boon_typecheck::Type::Absent
-        | boon_typecheck::Type::RenderContract
-        | boon_typecheck::Type::UnresolvedShape { .. }
-        | boon_typecheck::Type::Unknown => false,
-    }
-}
-
-fn runtime_type_matches_scheme(
-    actual: &boon_typecheck::Type,
-    scheme: &boon_typecheck::Type,
-) -> bool {
-    fn matches(
-        actual: &boon_typecheck::Type,
-        scheme: &boon_typecheck::Type,
-        bindings: &mut BTreeMap<boon_typecheck::TypeVar, boon_typecheck::Type>,
-    ) -> bool {
-        match (actual, scheme) {
-            (actual, boon_typecheck::Type::Var(variable)) => {
-                if runtime_type_contains_var(actual) {
-                    return false;
-                }
-                match bindings.get(variable) {
-                    Some(bound) => bound == actual,
-                    None => {
-                        bindings.insert(*variable, actual.clone());
-                        true
-                    }
-                }
-            }
-            (boon_typecheck::Type::List(actual), boon_typecheck::Type::List(scheme)) => {
-                matches(actual, scheme, bindings)
-            }
-            (
-                boon_typecheck::Type::Function {
-                    args: actual_args,
-                    result: actual_result,
-                },
-                boon_typecheck::Type::Function {
-                    args: scheme_args,
-                    result: scheme_result,
-                },
-            ) => {
-                actual_args.len() == scheme_args.len()
-                    && actual_args
-                        .iter()
-                        .zip(scheme_args)
-                        .all(|(actual, scheme)| matches(actual, scheme, bindings))
-                    && actual_result.mode == scheme_result.mode
-                    && matches(&actual_result.ty, &scheme_result.ty, bindings)
-            }
-            (boon_typecheck::Type::Object(actual), boon_typecheck::Type::Object(scheme)) => {
-                // Checked calls retain their syntax-wide structural contract,
-                // while each semantic call instance carries the exact
-                // occurrence flow. A concrete occurrence may close an open
-                // row or add fields proven by that occurrence, but it may not
-                // discard or widen any field required by the checked contract.
-                (!actual.open || scheme.open)
-                    && actual.fields.len() >= scheme.fields.len()
-                    && scheme.fields.iter().all(|(name, scheme)| {
-                        actual
-                            .fields
-                            .get(name)
-                            .is_some_and(|actual| matches(actual, scheme, bindings))
-                    })
-            }
-            (
-                boon_typecheck::Type::VariantSet(actual),
-                boon_typecheck::Type::VariantSet(scheme),
-            ) => {
-                actual.len() == scheme.len()
-                    && scheme.iter().all(|scheme_variant| match scheme_variant {
-                        boon_typecheck::Variant::Tag(scheme_tag) => {
-                            actual.iter().any(|actual_variant| {
-                                matches!(
-                                    actual_variant,
-                                    boon_typecheck::Variant::Tag(actual_tag)
-                                        if actual_tag == scheme_tag
-                                )
-                            })
-                        }
-                        boon_typecheck::Variant::Tagged {
-                            tag: scheme_tag,
-                            fields: scheme_fields,
-                        } => {
-                            let Some(boon_typecheck::Variant::Tagged {
-                                fields: actual_fields,
-                                ..
-                            }) = actual.iter().find(|actual_variant| {
-                                matches!(
-                                    actual_variant,
-                                    boon_typecheck::Variant::Tagged { tag, .. }
-                                        if tag == scheme_tag
-                                )
-                            })
-                            else {
-                                return false;
-                            };
-                            matches(
-                                &boon_typecheck::Type::Object(actual_fields.clone()),
-                                &boon_typecheck::Type::Object(scheme_fields.clone()),
-                                bindings,
-                            )
-                        }
-                    })
-            }
-            (boon_typecheck::Type::Union(actual), boon_typecheck::Type::Union(scheme)) => {
-                actual.len() == scheme.len()
-                    && actual
-                        .iter()
-                        .zip(scheme)
-                        .all(|(actual, scheme)| matches(actual, scheme, bindings))
-            }
-            _ => actual == scheme,
-        }
-    }
-
-    matches(actual, scheme, &mut BTreeMap::new())
-}
-
-fn runtime_flow_matches_scheme(actual: &FlowType, scheme: &FlowType) -> bool {
-    actual.mode == scheme.mode && runtime_type_matches_scheme(&actual.ty, &scheme.ty)
-}
-
-fn validate_call_expression(
-    graph: &SemanticExecutionGraphV1,
-    ids: &SemanticToExecutableMap,
-    expression: &SemanticExpression,
-) -> Result<(), String> {
-    let SemanticExpressionKind::Call {
-        call,
-        callable,
-        callable_kind,
-        name,
-        function,
-        intrinsic,
-        role,
-        effect,
-        result,
-        instance,
-        arguments,
-        parameter_bindings,
-        contexts,
-    } = &expression.kind
-    else {
-        return Err(format!(
-            "semantic expression {} is not a call expression",
-            expression.id
-        ));
-    };
-    let call_definition = semantic_call(graph, *call)?;
-    let callable_definition = semantic_callable(graph, *callable)?;
-    ids.call_expression(*call, expression.id)?;
-    ids.callable(*callable)?;
-    let expected_kind = match callable_definition.kind {
-        boon_typecheck::CheckedCallableKind::Builtin => SemanticCallableKind::Builtin,
-        boon_typecheck::CheckedCallableKind::External => SemanticCallableKind::External,
-        boon_typecheck::CheckedCallableKind::User => {
-            return Err(format!(
-                "semantic expression {} retains expanded user call {call}",
-                expression.id
-            ));
-        }
-    };
-    if call_definition.callable != *callable
-        || *callable_kind != expected_kind
-        || name != &callable_definition.name
-        || function != &call_definition.function
-        || *intrinsic != call_definition.intrinsic
-        || *role != call_definition.role
-        || *effect != call_definition.effect
-        || result != &call_definition.result
-        || expression.checked_expr_id != call_definition.checked_expression
-        || expression.effect != *effect
-        || !runtime_flow_matches_scheme(&expression.flow_type, result)
-    {
-        return Err(format!(
-            "semantic expression {} call contract differs from semantic call {call}: callable={callable:?}/{:?}, kind={callable_kind:?}/{expected_kind:?}, name={name:?}/{:?}, function={function:?}/{:?}, role={role:?}/{:?}, effect={effect:?}/{:?}, result={result:?}/{:?}, checked={:?}/{:?}, expression_effect={:?}, expression_flow={:?}",
-            expression.id,
-            call_definition.callable,
-            callable_definition.name,
-            call_definition.function,
-            call_definition.role,
-            call_definition.effect,
-            call_definition.result,
-            expression.checked_expr_id,
-            call_definition.checked_expression,
-            expression.effect,
-            expression.flow_type,
-        ));
-    }
-    if call_definition.external_identity != callable_definition.external_identity {
-        return Err(format!(
-            "semantic expression {} call {call} has stale external identity provenance",
-            expression.id
-        ));
-    }
-    if !matches!(
-        call_definition.context_binding,
-        boon_typecheck::CheckedContextBinding::None
-    ) {
-        return Err(format!(
-            "semantic expression {} retains non-erased contextual PASS binding for call {call}",
-            expression.id
-        ));
-    }
-
-    validate_call_parameter_bindings(
-        *instance,
-        callable_definition,
-        arguments,
-        parameter_bindings,
-    )?;
-    validate_call_input_provenance(call_definition, arguments)?;
-
-    let expected_contexts = call_definition
-        .contexts
-        .iter()
-        .map(|context| context.signature)
-        .collect::<Vec<_>>();
-    let actual_contexts = contexts
-        .iter()
-        .map(|context| {
-            if context.call_instance != *instance {
-                return Err(format!(
-                    "semantic call {call} context {} uses call instance {} instead of {instance}",
-                    context.ordinal, context.call_instance
-                ));
-            }
-            Ok(context.ordinal)
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-    if actual_contexts != expected_contexts {
-        return Err(format!(
-            "semantic expression {} contexts differ from semantic call {call}",
-            expression.id
-        ));
-    }
-    Ok(())
-}
-
-fn validate_call_input_provenance(
-    call: &SemanticCall,
-    arguments: &[SemanticCallArgument],
-) -> Result<(), String> {
-    let inputs = call
-        .entries
-        .iter()
-        .filter_map(|entry| match entry {
-            SemanticCallEntry::Input {
-                formal,
-                ordinal,
-                name,
-                checked_value,
-                value_flow_type,
-                from_pipe,
-                ..
-            } => Some((
-                *formal,
-                *ordinal,
-                name,
-                *checked_value,
-                value_flow_type,
-                *from_pipe,
-            )),
-            SemanticCallEntry::FreshOut { .. } | SemanticCallEntry::ForwardOut { .. } => None,
-        })
-        .collect::<Vec<_>>();
-    if inputs.len() != arguments.len() {
-        return Err(format!(
-            "semantic call {} has {} input provenance entries for {} concrete arguments",
-            call.id,
-            inputs.len(),
-            arguments.len()
-        ));
-    }
-    for argument in arguments {
-        let matches = inputs
-            .iter()
-            .filter(
-                |(formal, ordinal, name, checked_value, _flow_type, from_pipe)| {
-                    *formal == argument.formal
-                        && *ordinal == argument.ordinal
-                        && *name == &argument.name
-                        && *checked_value == argument.checked_value
-                        && *from_pipe == argument.from_pipe
-                },
-            )
-            .count();
-        if matches != 1 {
-            return Err(format!(
-                "semantic call {} argument ordinal {} has {matches} exact call-table provenance entries",
-                call.id, argument.ordinal
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn validate_call_parameter_bindings(
-    instance: OutCallInstanceId,
-    callable: &SemanticCallable,
-    arguments: &[SemanticCallArgument],
-    bindings: &[SemanticCallParameterBinding],
-) -> Result<(), String> {
-    let value_parameters = callable
-        .parameters
-        .iter()
-        .filter(|parameter| parameter.kind == CheckedParameterKind::Value)
-        .collect::<Vec<_>>();
-    if bindings.len() != value_parameters.len() {
-        return Err(format!(
-            "semantic call {instance} has {} parameter bindings for {} value parameters",
-            bindings.len(),
-            value_parameters.len()
-        ));
-    }
-    let mut arguments_by_formal = BTreeMap::new();
-    let mut argument_ordinals = BTreeSet::new();
-    let mut previous_ordinal = None;
-    for argument in arguments {
-        if previous_ordinal.is_some_and(|previous| previous >= argument.ordinal) {
-            return Err(format!(
-                "semantic call {instance} arguments are not strictly ordered by ordinal"
-            ));
-        }
-        previous_ordinal = Some(argument.ordinal);
-        if arguments_by_formal
-            .insert(argument.formal, argument)
-            .is_some()
-        {
-            return Err(format!(
-                "semantic call {instance} has duplicate argument formal {}",
-                argument.formal.0
-            ));
-        }
-        if !argument_ordinals.insert(argument.ordinal) {
-            return Err(format!(
-                "semantic call {instance} has duplicate argument ordinal {}",
-                argument.ordinal
-            ));
-        }
-    }
-
-    let mut bindings_by_formal = BTreeMap::new();
-    let mut binding_ordinals = BTreeSet::new();
-    previous_ordinal = None;
-    for (binding, parameter) in bindings.iter().zip(value_parameters) {
-        if previous_ordinal.is_some_and(|previous| previous >= binding.ordinal) {
-            return Err(format!(
-                "semantic call {instance} parameter bindings are not strictly ordered by ordinal"
-            ));
-        }
-        previous_ordinal = Some(binding.ordinal);
-        if bindings_by_formal.insert(binding.formal, binding).is_some() {
-            return Err(format!(
-                "semantic call {instance} has duplicate parameter formal {}",
-                binding.formal.0
-            ));
-        }
-        if !binding_ordinals.insert(binding.ordinal) {
-            return Err(format!(
-                "semantic call {instance} has duplicate parameter ordinal {}",
-                binding.ordinal
-            ));
-        }
-        if binding.formal != parameter.formal
-            || binding.ordinal != parameter.ordinal
-            || binding.name != parameter.name
-            || binding.requirement != parameter.requirement
-        {
-            return Err(format!(
-                "semantic call {instance} parameter binding {} differs from callable {}",
-                binding.ordinal, callable.id
-            ));
-        }
-        // `SemanticExpressionKind::Call` carries value-parameter bindings only.
-        // Calls with OUT formals must already be represented by `Materialize`;
-        // any future OUT binding variant is deliberately an exhaustive-match
-        // failure here until its executable erasure is defined.
-        match &binding.kind {
-            SemanticCallParameterBindingKind::Explicit {
-                checked_value,
-                value,
-                from_pipe,
-            } => {
-                let argument = arguments_by_formal.get(&binding.formal).ok_or_else(|| {
-                    format!(
-                        "semantic call {instance} explicit parameter {} has no argument",
-                        binding.formal.0
-                    )
-                })?;
-                if argument.ordinal != binding.ordinal
-                    || argument.name != binding.name
-                    || argument.checked_value != *checked_value
-                    || argument.value != *value
-                    || argument.from_pipe != *from_pipe
-                {
-                    return Err(format!(
-                        "semantic call {instance} explicit parameter {} differs from its argument",
-                        binding.formal.0
-                    ));
-                }
-            }
-            SemanticCallParameterBindingKind::Omitted => {
-                if !matches!(
-                    binding.requirement,
-                    CheckedParameterRequirement::Optional { .. }
-                ) {
-                    return Err(format!(
-                        "semantic call {instance} omits required parameter {}",
-                        binding.formal.0
-                    ));
-                }
-                if arguments_by_formal.contains_key(&binding.formal) {
-                    return Err(format!(
-                        "semantic call {instance} omitted parameter {} still has an argument",
-                        binding.formal.0
-                    ));
-                }
-            }
-        }
-    }
-    for formal in arguments_by_formal.keys() {
-        if !bindings_by_formal.contains_key(formal) {
-            return Err(format!(
-                "semantic call {instance} argument formal {} has no parameter binding",
-                formal.0
-            ));
-        }
     }
     Ok(())
 }

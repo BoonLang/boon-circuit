@@ -2024,6 +2024,17 @@ fields = [
 ]
 
 [[records.variants]]
+name = "UserCall"
+disposition = "r-fc-priv-id-pc-n"
+reviewed = true
+fields = [
+  { name = "function", disposition = "r-fc-priv-id-pc-n", reviewed = true },
+  { name = "name", disposition = "a-fc-priv-id-pc-n", reviewed = true },
+  { name = "instance", disposition = "r-fc-priv-id-pc-n", reviewed = true },
+  { name = "arguments", disposition = "r-fc-priv-id-pc-n", reviewed = true },
+]
+
+[[records.variants]]
 name = "Materialize"
 disposition = "r-fc-priv-id-pc-n"
 reviewed = true
@@ -2234,6 +2245,18 @@ fields = [
 [[records]]
 kind = "struct"
 source = "crates/boon_semantic/src/program_core.rs"
+name = "ExecutableOrdinaryFunction"
+fields = [
+  { name = "id", disposition = "a-fc-priv-id-pc-n", reviewed = true },
+  { name = "name", disposition = "a-fc-priv-id-pc-n", reviewed = true },
+  { name = "parameters", disposition = "r-fc-priv-id-pc-n", reviewed = true },
+  { name = "result_type", disposition = "r-fc-priv-id-pc-n", reviewed = true },
+  { name = "root", disposition = "r-fc-priv-id-pc-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_semantic/src/program_core.rs"
 name = "ExecutableParameterId"
 fields = [
   { name = "function", disposition = "r-fc-priv-id-pc-n", reviewed = true },
@@ -2260,6 +2283,7 @@ fields = [
   { name = "states", disposition = "r-rc-priv-id-pc-n", reviewed = true },
   { name = "roots", disposition = "r-fc-priv-id-pc-n", reviewed = true },
   { name = "functions", disposition = "r-fc-priv-id-pc-n", reviewed = true },
+  { name = "ordinary_functions", disposition = "r-fc-priv-id-pc-n", reviewed = true },
 ]
 
 [[records]]
@@ -4555,12 +4579,11 @@ fields = [
 [[records]]
 kind = "struct"
 source = "crates/boon_semantic/src/dependency_manifest.rs"
-name = "CallableDependencyEntryV1"
+name = "CallableDependencyEntryV2"
 fields = [
   { name = "callable", disposition = "r-fc-priv-sp-id-pc-n", reviewed = true },
   { name = "checked_callable", disposition = "r-fc-priv-sp-id-pc-n", reviewed = true },
   { name = "direct_dependency_ids", disposition = "a-fc-priv-sp-id-pc-n", reviewed = true },
-  { name = "closure_dependency_ranges", disposition = "a-fc-priv-sp-id-pc-n", reviewed = true },
   { name = "public_shape_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
   { name = "implementation_dependency_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
 ]
@@ -4576,7 +4599,7 @@ fields = [
 [[records]]
 kind = "struct"
 source = "crates/boon_semantic/src/dependency_manifest.rs"
-name = "CallableDependencyManifestV1"
+name = "CallableDependencyManifestV2"
 fields = [
   { name = "schema", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
   { name = "source_bundle_digest_v1", disposition = "a-frca-priv-sp-id-pc-n", reviewed = true },
@@ -4593,10 +4616,9 @@ fields = [
 [[records]]
 kind = "struct"
 source = "crates/boon_semantic/src/dependency_manifest.rs"
-name = "ProgramRootDependencyEntryV1"
+name = "ProgramRootDependencyEntryV2"
 fields = [
   { name = "direct_dependency_ids", disposition = "a-c-priv-sp-id-pc-n", reviewed = true },
-  { name = "closure_dependency_ranges", disposition = "a-c-priv-sp-id-pc-n", reviewed = true },
   { name = "public_shape_digest", disposition = "a-ca-priv-sp-id-pc-n", reviewed = true },
   { name = "implementation_dependency_digest", disposition = "a-ca-priv-sp-id-pc-n", reviewed = true },
 ]
@@ -5551,10 +5573,19 @@ fields = [
 [[records]]
 kind = "struct"
 source = "crates/boon_semantic/src/dependency_manifest.rs"
-name = "SemanticDependencyRecordRangeV1"
+name = "SemanticDependencyRecordSemanticsV1"
 fields = [
-  { name = "start", disposition = "a-c-priv-sp-id-pc-n", reviewed = true },
-  { name = "length", disposition = "a-c-priv-sp-id-pc-n", reviewed = true },
+  { name = "projection", disposition = "r-fc-priv-sp-id-pc-n", reviewed = true },
+  { name = "flow_type_digest", disposition = "a-fc-priv-sp-id-pc-n", reviewed = true },
+  { name = "evaluation_scope", disposition = "r-c-priv-sp-id-pc-n", reviewed = true },
+  { name = "program_role", disposition = "r-fc-priv-sp-id-pc-n", reviewed = true },
+  { name = "static_owner", disposition = "r-rc-priv-sp-id-pc-n", reviewed = true },
+  { name = "call_instance", disposition = "r-fc-priv-sp-id-pc-n", reviewed = true },
+  { name = "row", disposition = "r-frc-priv-sp-id-pc-n", reviewed = true },
+  { name = "multiplicity", disposition = "r-c-priv-sp-id-pc-n", reviewed = true },
+  { name = "lifetime", disposition = "r-c-priv-sp-id-pc-n", reviewed = true },
+  { name = "phase", disposition = "r-c-priv-sp-id-pc-n", reviewed = true },
+  { name = "visibility", disposition = "r-c-priv-sp-id-pc-n", reviewed = true },
 ]
 
 [[records]]
@@ -6595,6 +6626,16 @@ fields = [
 [[records]]
 kind = "struct"
 source = "crates/boon_semantic/src/execution.rs"
+name = "SemanticCallContextArgument"
+fields = [
+  { name = "formal", disposition = "r-fc-priv-sp-id-n", reviewed = true },
+  { name = "checked_value", disposition = "r-fc-priv-sp-id-n", reviewed = true },
+  { name = "value", disposition = "r-fc-priv-sp-id-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_semantic/src/execution.rs"
 name = "SemanticCallContextBinding"
 fields = [
   { name = "declaration", disposition = "r-fc-priv-sp-id-pc-n", reviewed = true },
@@ -6711,12 +6752,14 @@ fields = [
   { name = "parameters", disposition = "r-fc-priv-sp-id-pc-n", reviewed = true },
   { name = "contexts", disposition = "r-fc-priv-sp-id-pc-n", reviewed = true },
   { name = "context_formal", disposition = "r-fc-priv-sp-id-pc-n", reviewed = true },
+  { name = "context_parameter", disposition = "r-fc-priv-sp-id-pc-n", reviewed = true },
   { name = "result", disposition = "r-fc-priv-sp-id-pc-n", reviewed = true },
   { name = "role", disposition = "r-fc-priv-sp-id-pc-n", reviewed = true },
   { name = "effect", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
   { name = "body", disposition = "r-fc-priv-sp-id-pc-n", reviewed = true },
   { name = "result_expression", disposition = "r-fc-priv-sp-id-pc-n", reviewed = true },
   { name = "contextual_operation", disposition = "r-fc-priv-sp-id-pc-n", reviewed = true },
+  { name = "semantic_root", disposition = "r-fc-priv-sp-id-pc-n", reviewed = true },
 ]
 
 [[records]]
@@ -6733,6 +6776,17 @@ fields = [
 [[records]]
 kind = "struct"
 source = "crates/boon_semantic/src/execution.rs"
+name = "SemanticCallableContextParameter"
+fields = [
+  { name = "id", disposition = "a-fc-priv-sp-id-pc-n", reviewed = true },
+  { name = "formal", disposition = "r-fc-priv-sp-id-pc-n", reviewed = true },
+  { name = "name", disposition = "a-fc-priv-sp-id-pc-n", reviewed = true },
+  { name = "flow_type", disposition = "r-fc-priv-sp-id-pc-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_semantic/src/execution.rs"
 name = "SemanticCallableId"
 fields = [
   { name = "0", disposition = "r-fc-priv-sp-id-n", reviewed = true },
@@ -6742,6 +6796,13 @@ fields = [
 kind = "enum"
 source = "crates/boon_semantic/src/execution.rs"
 name = "SemanticCallableKind"
+
+[[records.variants]]
+name = "User"
+disposition = "r-fc-priv-sp-id-n"
+reviewed = true
+fields = [
+]
 
 [[records.variants]]
 name = "Builtin"
@@ -7129,6 +7190,7 @@ fields = [
   { name = "instance", disposition = "r-fc-priv-sp-id-n", reviewed = true },
   { name = "arguments", disposition = "r-fc-priv-sp-id-n", reviewed = true },
   { name = "parameter_bindings", disposition = "r-fc-priv-sp-id-n", reviewed = true },
+  { name = "context_argument", disposition = "r-fc-priv-sp-id-n", reviewed = true },
   { name = "contexts", disposition = "r-fc-priv-sp-id-n", reviewed = true },
 ]
 
@@ -9176,7 +9238,8 @@ fields = [
   { name = "inputs", disposition = "r-r-priv-sp-id-pc-n", reviewed = true },
   { name = "passed", disposition = "r-r-priv-sp-id-pc-n", reviewed = true },
   { name = "ports", disposition = "r-r-priv-sp-id-pc-n", reviewed = true },
-  { name = "type_substitutions", disposition = "r-fr-priv-sp-id-pc-n", reviewed = true },
+  { name = "local_type_substitutions", disposition = "r-fr-priv-sp-id-pc-n", reviewed = true },
+  { name = "type_substitution_count", disposition = "n-i-priv-n-n", reviewed = true },
   { name = "result", disposition = "r-r-priv-sp-id-pc-n", reviewed = true },
   { name = "owner", disposition = "r-r-priv-sp-id-pc-n", reviewed = true },
 ]

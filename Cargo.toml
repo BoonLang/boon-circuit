@@ -155,8 +155,16 @@ debug = 1
 [profile.dev.package.boon_contract]
 opt-level = 2
 
+[profile.dev.package.boon_compiler]
+opt-level = 2
+debug = 1
+
 [profile.dev.package.boon_document]
 opt-level = 2
+
+[profile.dev.package.boon_ir]
+opt-level = 2
+debug = 1
 
 [profile.dev.package.boon_native_app_window]
 opt-level = 2
@@ -166,6 +174,13 @@ opt-level = 2
 
 [profile.dev.package.boon_native_playground]
 opt-level = 2
+
+# MachinePlan construction and validation are part of every source edit/run
+# loop. These crates retain dev assertions and line tables, but must not execute
+# their large deterministic lowering passes at opt-level 0.
+[profile.dev.package.boon_plan]
+opt-level = 2
+debug = 1
 
 # Semantic elaboration is part of the interactive compiler path. Keeping this
 # crate completely unoptimized turns canonical dependency inventories into

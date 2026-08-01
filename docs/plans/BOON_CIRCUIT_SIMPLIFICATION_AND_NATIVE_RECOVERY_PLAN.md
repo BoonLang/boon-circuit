@@ -575,16 +575,16 @@ interned type digests, local substitution deltas, and explicit parent-call
 dependencies instead of serializing inherited structural type trees at every
 frame.
 
-On the reference machine, the current debug `boon_cli` completes Counter in
-0.08 seconds at 34,820 KiB peak RSS and physical TodoMVC in 2.74 seconds at
-155,032 KiB, down from the first recovery checkpoint's 9.08 seconds and
-693,444 KiB for TodoMVC. The large 5,169-frame NovyWave fixture now completes
-successfully in 38.81 seconds at 1,034,180 KiB, down from the first successful
-55.64-second, 4,426,932-KiB run and the preceding checkpoint's 41.34 seconds at
-4,012,976 KiB. Its checked-type fixed points require 6+6 global epochs instead
-of 12+11; typechecking takes 12.31 seconds. Its semantic execution graph
-contains 43,471 expressions instead of 94,509, and its dependency manifest
-contains 261,728 records plus 338,263 coverage entries.
+On the reference machine, two consecutive final-source debug `boon_cli` runs
+complete Counter in 0.08/0.08 seconds at 29,248/29,336 KiB peak RSS and
+physical TodoMVC in 2.34/2.29 seconds at 147,372/147,580 KiB. The large
+5,169-frame NovyWave fixture completes in 31.26/30.86 seconds at
+1,005,068/1,004,712 KiB. This is down from the preceding checkpoint's
+38.81-second, 1,034,180-KiB run, the first successful 55.64-second,
+4,426,932-KiB run, and the earlier 41.34-second, 4,012,976-KiB checkpoint.
+Counter, TodoMVC, and NovyWave produce byte-identical `MachinePlan` files across
+the paired runs; TodoMVC is also byte-identical to the saved pre-optimization
+plan.
 
 The OUT graph exposes why peak memory remained excessive after manifest
 compaction: only 4,391 substitutions are introduced locally, but retaining a
@@ -593,14 +593,37 @@ with as many as 756 on one call. `OutCallInstance` now owns only its local delta
 and resolves inherited variables through its parent chain. The generated
 NovyWave `MachinePlan` is byte-identical across the representation change; OUT
 construction falls from 4.79 to 3.01 seconds while NovyWave peak RSS falls by
-about 74 percent. A focused nested-generic regression proves that compact and
-flattened lookup produce the same concrete types. These are development-loop
-measurements, not final release or native-performance evidence. Phase 1 still
-requires the focused type, semantic, manifest, IR, and compiler regression
-matrix and a committed clean-checkout remeasurement; the remaining measured
-compiler hotspots are dependency-closure proof construction and executable-row
-backend lowering, not unbounded ordinary-body expansion or retained inherited
-OUT environments.
+about 74 percent. The builder previously reconstructed that flattened map for
+every recursive frame even though the artifact retained only local deltas. A
+reversible active-path overlay now exposes the same inherited substitutions to
+children without copying sibling environments, reducing the measured OUT phase
+from 2.739 to about 0.27 seconds. A focused nested-generic regression proves
+that compact and flattened lookup produce the same concrete types.
+
+The dependency manifest is now schema V2. It persists direct dependency IDs
+and exact transitive implementation digests rather than retaining every
+owner's closure ranges, while deep integrity validation independently
+re-derives each closure and rejects a stale digest even if the outer manifest
+hash is recomputed. Bounded workers hash each closure as it is derived instead
+of retaining all closures for a second serial pass; the measured manifest phase
+falls from 5.933 to 4.795 seconds. Optimized debug profiles for the compiler,
+IR, and plan crates preserve assertions and line tables while reducing measured
+backend lowering from 4.804 to 0.930 seconds. All 11 focused manifest tests and
+all 47 typechecker tests pass, including the stale-hash negative and exact flow
+capture regressions.
+
+These are development-loop measurements, not final release or native-
+performance evidence. Typechecking remains the largest single architectural
+blocker: contextual callable inference and the final program inference each
+take six whole-program epochs, together about 12.24 seconds on NovyWave.
+Attempts to weaken global cache invalidation failed exact stream-pulse and
+capture-mode regressions and were discarded. The next compiler slice must
+replace those implicit global sweeps with an explicit dependency-indexed
+worklist that separates pure type-query reuse from flow/currentness
+propagation. The next production slice remains blocked until that work has a
+focused scaling regression; Phase 1 still requires the remaining focused
+semantic, IR, and compiler regression matrix plus a committed clean-checkout
+remeasurement.
 
 A clean confirmation at `de430c1` kept the million-row charged work unchanged
 but observed 14,794,406,170 ns instead of 9,712,441,796 ns for its three-sample

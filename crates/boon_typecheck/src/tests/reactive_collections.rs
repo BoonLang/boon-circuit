@@ -688,6 +688,25 @@ store: [
     );
 }
 
+fn assert_named_capture_mode(program: &CheckedProgram, name: &str, expected: FlowMode) {
+    let targets = program
+        .declarations
+        .iter()
+        .filter(|declaration| declaration.name == name)
+        .map(|declaration| declaration.id)
+        .collect::<Vec<_>>();
+    assert!(!targets.is_empty(), "missing `{name}` declaration");
+    assert!(
+        program.expressions.iter().any(|expression| {
+            matches!(
+                expression.kind,
+                CheckedExpressionKind::Read { target, .. } if targets.contains(&target)
+            ) && expression.flow_type.mode == expected
+        }),
+        "no exact `{name}` capture has {expected:?} flow"
+    );
+}
+
 #[test]
 fn function_capture_preserves_global_event_flow_mode() {
     let parsed = boon_parser::parse_source(
@@ -721,15 +740,7 @@ result: remember()
         output.report.diagnostics
     );
     let program = output.program.expect("captured event program");
-    assert!(program.expressions.iter().any(|expression| {
-        matches!(
-            expression.kind,
-            CheckedExpressionKind::ExternalRead {
-                ref canonical_path,
-                external_identity: None,
-            } if canonical_path == "chosen"
-        ) && expression.flow_type.mode == FlowMode::PresentOrAbsent
-    }));
+    assert_named_capture_mode(&program, "chosen", FlowMode::PresentOrAbsent);
 }
 
 #[test]
@@ -763,15 +774,7 @@ result: remember()
         output.report.diagnostics
     );
     let program = output.program.expect("captured state program");
-    assert!(program.expressions.iter().any(|expression| {
-        matches!(
-            expression.kind,
-            CheckedExpressionKind::ExternalRead {
-                ref canonical_path,
-                external_identity: None,
-            } if canonical_path == "chosen"
-        ) && expression.flow_type.mode == FlowMode::Continuous
-    }));
+    assert_named_capture_mode(&program, "chosen", FlowMode::Continuous);
 }
 
 #[test]
@@ -810,13 +813,5 @@ result: remember()
         output.report.diagnostics
     );
     let program = output.program.expect("captured event-only latest program");
-    assert!(program.expressions.iter().any(|expression| {
-        matches!(
-            expression.kind,
-            CheckedExpressionKind::ExternalRead {
-                ref canonical_path,
-                external_identity: None,
-            } if canonical_path == "chosen"
-        ) && expression.flow_type.mode == FlowMode::PresentOrAbsent
-    }));
+    assert_named_capture_mode(&program, "chosen", FlowMode::PresentOrAbsent);
 }

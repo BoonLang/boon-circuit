@@ -746,7 +746,7 @@ fn verified_semantic_compiler_spine(workspace: &Path) -> Result<String, String> 
     for required in [
         "pub struct SemanticProgram",
         "pub fn elaborate(",
-        "CallableDependencyManifestV1",
+        "CallableDependencyManifestV2",
     ] {
         if !semantic.contains(required) {
             return Err(format!("boon_semantic omits `{required}`"));

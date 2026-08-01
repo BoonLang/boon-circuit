@@ -9177,32 +9177,33 @@ impl<'a> CheckedProgramBuilder<'a> {
                             .is_some_and(|signature| signature.effect.writes_state),
                         _ => false,
                     };
-                    let state_transition = match &input.kind {
-                        CheckedExpressionKind::Read { target, .. } => {
-                            self.declaration(*target).is_some_and(|declaration| {
-                                declaration.kind == CheckedDeclarationKind::Hold
-                                    || declaration.value.is_some_and(|value| {
-                                        expression_by_id
-                                            .get(&value)
-                                            .is_some_and(|value| checked_value_is_stateful(value))
-                                    })
-                            })
-                        }
-                        CheckedExpressionKind::ExternalRead {
-                            canonical_path,
-                            external_identity: None,
-                        } => {
-                            let declaration = declaration_expr_for_path(
-                                &self.named_value_expressions,
+                    let state_transition = checked_value_is_stateful(input)
+                        || match &input.kind {
+                            CheckedExpressionKind::Read { target, .. } => {
+                                self.declaration(*target).is_some_and(|declaration| {
+                                    declaration.kind == CheckedDeclarationKind::Hold
+                                        || declaration.value.is_some_and(|value| {
+                                            expression_by_id.get(&value).is_some_and(|value| {
+                                                checked_value_is_stateful(value)
+                                            })
+                                        })
+                                })
+                            }
+                            CheckedExpressionKind::ExternalRead {
                                 canonical_path,
-                            )
-                            .and_then(|value| {
-                                expression_by_id.get(&CheckedExprId(value as u32)).copied()
-                            });
-                            declaration.is_some_and(checked_value_is_stateful)
-                        }
-                        _ => false,
-                    };
+                                external_identity: None,
+                            } => {
+                                let declaration = declaration_expr_for_path(
+                                    &self.named_value_expressions,
+                                    canonical_path,
+                                )
+                                .and_then(|value| {
+                                    expression_by_id.get(&CheckedExprId(value as u32)).copied()
+                                });
+                                declaration.is_some_and(checked_value_is_stateful)
+                            }
+                            _ => false,
+                        };
                     let function_invocation = matches!(
                         &input.kind,
                         CheckedExpressionKind::Read { target, .. }

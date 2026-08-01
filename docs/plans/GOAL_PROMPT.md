@@ -154,6 +154,16 @@ Current checkpoints to preserve and audit rather than redo:
   are stale and cannot prove the final revision;
 - Cells previously met interaction budgets, but every semantic/compiler/runtime
   cut must preserve and freshly prove them;
+- the current compiler-throughput checkpoint keeps Counter, physical TodoMVC,
+  and NovyWave `MachinePlan` output deterministic while replacing copied OUT
+  type environments with active-path overlays, compacting exact dependency
+  closure proofs into manifest V2 digests, and optimizing the compiler/IR/plan
+  debug path; two final-source runs measure 0.08/0.08, 2.34/2.29, and
+  31.26/30.86 seconds respectively;
+- NovyWave typechecking still spends about 12.24 seconds in two six-epoch
+  whole-program fixed points. Keep the next production slice blocked until an
+  explicit dependency-indexed worklist separates pure type-query reuse from
+  flow/currentness propagation and a focused scaling regression proves it;
 - FjordPulse currently has no basis for weakening the 108-story/340-scenario
   acceptance inventory. Only its two explicitly deferred backup/restore
   automation scenarios may retain that final status.
@@ -187,9 +197,9 @@ Execution strategy:
   budgets at every accepted compiler checkpoint: two consecutive runs more
   than 25 percent slower or larger than the recorded checkpoint block the next
   slice even below 120 seconds. The current debug time ceilings on the reference
-  machine are 0.25 seconds for Counter, 5 seconds for physical TodoMVC, and 42
-  seconds for NovyWave. Their peak-RSS ceilings are respectively 64 MiB, 200
-  MiB, and 1.2 GiB. These ceilings may move only downward unless a changed
+  machine are 0.20 seconds for Counter, 3.5 seconds for physical TodoMVC, and 36
+  seconds for NovyWave. Their peak-RSS ceilings are respectively 48 MiB, 180
+  MiB, and 1.1 GiB. These ceilings may move only downward unless a changed
   represented workload is documented with before/after evidence.
 - After the same blocker class appears twice, stop tactical patching and change
   the owning parser, compiler, proof, runtime, currentness, document, renderer,

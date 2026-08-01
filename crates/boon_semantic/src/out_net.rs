@@ -837,6 +837,36 @@ enum StaticOwnerNode {
     Call(OutCallInstanceId),
 }
 
+type TypeEnvironmentRollback = Vec<(TypeVar, Option<Type>)>;
+
+fn push_type_environment_overlay(
+    environment: &mut BTreeMap<TypeVar, Type>,
+    substitutions: &[CheckedTypeSubstitution],
+) -> TypeEnvironmentRollback {
+    substitutions
+        .iter()
+        .map(|substitution| {
+            (
+                substitution.variable,
+                environment.insert(substitution.variable, substitution.value.clone()),
+            )
+        })
+        .collect()
+}
+
+fn pop_type_environment_overlay(
+    environment: &mut BTreeMap<TypeVar, Type>,
+    rollback: TypeEnvironmentRollback,
+) {
+    for (variable, previous) in rollback.into_iter().rev() {
+        if let Some(previous) = previous {
+            environment.insert(variable, previous);
+        } else {
+            environment.remove(&variable);
+        }
+    }
+}
+
 struct OutNetBuilder<'program, Contract, MakeContract, IsProducer> {
     program: &'program CheckedProgram,
     signature_by_id: BTreeMap<DeclId, &'program CheckedCallableSignature>,
@@ -949,11 +979,12 @@ where
     }
 
     fn build(mut self) -> OutNetBuild<Contract> {
+        let mut type_environment = BTreeMap::new();
         self.instantiate_frame(
             None,
             None,
             BTreeMap::new(),
-            &BTreeMap::new(),
+            &mut type_environment,
             &mut Vec::new(),
         );
         let producer_roots = std::mem::take(&mut self.producer_root_specs);
@@ -1003,11 +1034,12 @@ where
         });
         self.producer_identity_by_call.insert(call, spec.identity);
         self.producer_roots.push(ProducerRoot { spec, call });
+        let mut type_environment = BTreeMap::new();
         self.instantiate_frame(
             Some(signature.decl_id),
             Some(call),
             BTreeMap::new(),
-            &BTreeMap::new(),
+            &mut type_environment,
             &mut vec![signature.decl_id],
         );
     }
@@ -1378,7 +1410,7 @@ where
         owner_callable: Option<DeclId>,
         parent: Option<OutCallInstanceId>,
         mut frame_bindings: BTreeMap<DeclId, usize>,
-        inherited_type_environment: &BTreeMap<TypeVar, Type>,
+        active_type_environment: &mut BTreeMap<TypeVar, Type>,
         active_callables: &mut Vec<DeclId>,
     ) {
         let program = self.program;
@@ -1443,7 +1475,7 @@ where
             for substitution in &checked_call.type_substitutions {
                 local_type_environment.insert(
                     substitution.variable,
-                    apply_checked_type_environment(&substitution.value, inherited_type_environment),
+                    apply_checked_type_environment(&substitution.value, active_type_environment),
                 );
             }
             let local_type_substitutions = local_type_environment
@@ -1453,14 +1485,14 @@ where
                     value: value.clone(),
                 })
                 .collect::<Vec<_>>();
-            let mut type_environment = inherited_type_environment.clone();
-            type_environment.extend(local_type_environment);
-            let type_substitution_count = type_environment.len();
+            let type_environment_rollback =
+                push_type_environment_overlay(active_type_environment, &local_type_substitutions);
+            let type_substitution_count = active_type_environment.len();
             let result_scheme = signature
                 .map(|signature| &signature.result)
                 .unwrap_or(&checked_call.result);
             let instantiated_result =
-                apply_checked_type_environment(&result_scheme.ty, &type_environment);
+                apply_checked_type_environment(&result_scheme.ty, active_type_environment);
             let checked_result = boon_typecheck::specialize_checked_call_result(
                 &instantiated_result,
                 &checked_call.result.ty,
@@ -1471,7 +1503,10 @@ where
                 .get(checked_call.expression.0 as usize)
                 .filter(|expression| expression.id == checked_call.expression)
                 .map(|expression| {
-                    apply_checked_type_environment(&expression.flow_type.ty, &type_environment)
+                    apply_checked_type_environment(
+                        &expression.flow_type.ty,
+                        active_type_environment,
+                    )
                 })
                 .unwrap_or_else(|| checked_result.clone());
             let occurrence_result =
@@ -1501,6 +1536,7 @@ where
                     .unwrap_or(checked_call.result.mode),
                 ty: result_type,
             };
+            pop_type_environment_overlay(active_type_environment, type_environment_rollback);
             self.call_instances.push(OutCallInstance {
                 id: instance,
                 parent,
@@ -1731,20 +1767,19 @@ where
                 continue;
             }
             active_callables.push(pending.callable);
-            let mut type_environment = inherited_type_environment.clone();
-            type_environment.extend(
-                self.call_instances[pending.instance.as_usize()]
-                    .local_type_substitutions
-                    .iter()
-                    .map(|substitution| (substitution.variable, substitution.value.clone())),
-            );
+            let local_type_substitutions = self.call_instances[pending.instance.as_usize()]
+                .local_type_substitutions
+                .clone();
+            let type_environment_rollback =
+                push_type_environment_overlay(active_type_environment, &local_type_substitutions);
             self.instantiate_frame(
                 Some(pending.callable),
                 Some(pending.instance),
                 pending.output_bindings,
-                &type_environment,
+                active_type_environment,
                 active_callables,
             );
+            pop_type_environment_overlay(active_type_environment, type_environment_rollback);
             active_callables.pop();
         }
     }

@@ -4364,18 +4364,24 @@ fn ordinary_callable_body_is_closed(
                 let Some(declaration) = lookup.declaration(program, *target) else {
                     return false;
                 };
-                if enclosing_function_owner(program, lookup, declaration.scope_id)
-                    != Some(callable.decl_id)
-                {
-                    return false;
-                }
-                if let Some(value) = declaration.value
-                    && !callable
-                        .parameters
-                        .iter()
-                        .any(|parameter| parameter.decl_id == *target)
-                {
-                    pending.push(value);
+                match enclosing_function_owner(program, lookup, declaration.scope_id) {
+                    Some(owner) if owner == callable.decl_id => {
+                        if let Some(value) = declaration.value
+                            && !callable
+                                .parameters
+                                .iter()
+                                .any(|parameter| parameter.decl_id == *target)
+                        {
+                            pending.push(value);
+                        }
+                    }
+                    None if canonical_declaration_path(program, lookup, *target).is_some() => {
+                        // Program-root values already have stable canonical
+                        // read authority in the shared semantic body. They are
+                        // not lexical captures and must not force one body copy
+                        // per call occurrence.
+                    }
+                    Some(_) | None => return false,
                 }
             }
             CheckedExpressionKind::Call { call } => {
@@ -7432,6 +7438,54 @@ FUNCTION double(value) {
             "shared materialization helper expanded to {} semantic expressions",
             graph.expressions.len()
         );
+    }
+
+    #[test]
+    fn ordinary_definition_retains_canonical_program_root_reads() {
+        let graph = semantic_graph(
+            r#"
+store: [offset: 2]
+first: add(value: 1)
+second: add(value: 3)
+
+FUNCTION add(value) {
+    value + store.offset
+}
+"#,
+        );
+
+        let add = graph
+            .callables
+            .iter()
+            .find(|callable| callable.name.ends_with("add"))
+            .expect("add callable");
+        assert!(
+            add.semantic_root.is_some(),
+            "a pure canonical program-root read must remain in one shared body"
+        );
+        assert_eq!(
+            graph
+                .expressions
+                .iter()
+                .filter(|expression| matches!(
+                    &expression.kind,
+                    SemanticExpressionKind::Call {
+                        callable,
+                        callable_kind: SemanticCallableKind::User,
+                        ..
+                    } if *callable == add.id
+                ))
+                .count(),
+            2,
+            "both occurrences must retain call edges to the shared definition"
+        );
+        assert!(graph.expressions.iter().any(|expression| matches!(
+            &expression.kind,
+            SemanticExpressionKind::CanonicalRead {
+                projection,
+                ..
+            } if projection.len() == 1 && projection[0] == "offset"
+        )));
     }
 
     #[test]

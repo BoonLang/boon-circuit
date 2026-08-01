@@ -1807,6 +1807,50 @@ impl CheckedTypeInferenceChanges {
     }
 }
 
+#[derive(Default)]
+struct CheckedTypeInferencePending {
+    expressions: BTreeSet<usize>,
+    declarations: BTreeSet<DeclId>,
+    callables: BTreeSet<DeclId>,
+    calls: BTreeSet<CheckedCallId>,
+    selector_parameters: bool,
+    pattern_bindings: bool,
+}
+
+impl CheckedTypeInferencePending {
+    fn any(&self) -> bool {
+        !self.expressions.is_empty()
+            || !self.declarations.is_empty()
+            || !self.callables.is_empty()
+            || !self.calls.is_empty()
+            || self.selector_parameters
+            || self.pattern_bindings
+    }
+}
+
+struct CheckedTypeInferenceDependencies {
+    expression_parents: Vec<Vec<usize>>,
+    declarations_by_value: Vec<Vec<DeclId>>,
+    callables_by_result: Vec<Vec<DeclId>>,
+    calls_by_input: Vec<Vec<CheckedCallId>>,
+    declaration_readers: BTreeMap<DeclId, Vec<usize>>,
+    calls_by_output: BTreeMap<DeclId, Vec<CheckedCallId>>,
+    calls_by_callee: BTreeMap<DeclId, Vec<CheckedCallId>>,
+    selector_actuals: BTreeSet<usize>,
+    pattern_selectors: BTreeSet<usize>,
+}
+
+#[derive(Default)]
+struct CheckedTypeInferenceWorkStats {
+    rounds: usize,
+    expression_visits: usize,
+    declaration_visits: usize,
+    callable_visits: usize,
+    call_visits: usize,
+    selector_visits: usize,
+    pattern_visits: usize,
+}
+
 #[derive(Clone, Copy, Debug)]
 enum ContextualBuiltinKind {
     Map,
@@ -5309,6 +5353,472 @@ impl<'a> CheckedProgramBuilder<'a> {
 
     fn infer_checked_types(&mut self) {
         let trace = std::env::var_os("BOON_TYPECHECK_TRACE").is_some();
+        let dependencies = self.checked_type_inference_dependencies();
+        let mut pending = CheckedTypeInferencePending {
+            expressions: self
+                .program
+                .expressions
+                .iter()
+                .map(|expression| expression.id)
+                .collect(),
+            declarations: self
+                .declarations
+                .iter()
+                .filter_map(|declaration| declaration.value.map(|_| declaration.id))
+                .collect(),
+            callables: self
+                .signatures
+                .iter()
+                .filter(|signature| signature.kind == CheckedCallableKind::User)
+                .filter_map(|signature| signature.result_expression.map(|_| signature.decl_id))
+                .collect(),
+            calls: self.calls.iter().map(|call| call.id).collect(),
+            selector_parameters: true,
+            pattern_bindings: true,
+        };
+        let mut stats = CheckedTypeInferenceWorkStats::default();
+        let maximum_rounds = 64usize;
+
+        while pending.any() && stats.rounds < maximum_rounds {
+            stats.rounds += 1;
+
+            let expressions = std::mem::take(&mut pending.expressions);
+            if !expressions.is_empty() {
+                self.begin_checked_flow_inference_epoch();
+            }
+            stats.expression_visits += expressions.len();
+            let mut changed_expressions = Vec::new();
+            for expression in expressions {
+                let flow_type = self.infer_checked_expr_flow(expression, &mut BTreeSet::new());
+                if matches!(flow_type.ty, Type::Unknown | Type::UnresolvedShape { .. }) {
+                    continue;
+                }
+                if self.set_inferred_expr_flow(expression, flow_type) {
+                    changed_expressions.push(expression);
+                }
+            }
+            for expression in changed_expressions {
+                Self::enqueue_checked_expression_dependents(
+                    expression,
+                    &dependencies,
+                    &mut pending,
+                );
+            }
+
+            let declarations = std::mem::take(&mut pending.declarations);
+            stats.declaration_visits += declarations.len();
+            for declaration in declarations {
+                let Some(value) = self
+                    .declaration(declaration)
+                    .and_then(|declaration| declaration.value)
+                else {
+                    continue;
+                };
+                let Some(flow_type) = self.inferred_expr_types.get(&(value.0 as usize)).cloned()
+                else {
+                    continue;
+                };
+                let flow_type = self.flush_boundary_flow_type(value.0 as usize, flow_type);
+                if matches!(flow_type.ty, Type::Unknown | Type::UnresolvedShape { .. }) {
+                    continue;
+                }
+                if self.set_declaration_flow_type(declaration, flow_type) {
+                    Self::enqueue_checked_declaration_dependents(
+                        declaration,
+                        &dependencies,
+                        &mut pending,
+                    );
+                }
+            }
+
+            let callables = std::mem::take(&mut pending.callables);
+            stats.callable_visits += callables.len();
+            for callable in callables {
+                let Some(index) = self.signature_by_decl.get(&callable).copied() else {
+                    continue;
+                };
+                let Some(result_expression) = self
+                    .signatures
+                    .get(index)
+                    .filter(|signature| signature.kind == CheckedCallableKind::User)
+                    .and_then(|signature| signature.result_expression)
+                else {
+                    continue;
+                };
+                let Some(result) = self
+                    .inferred_expr_types
+                    .get(&(result_expression.0 as usize))
+                    .cloned()
+                else {
+                    continue;
+                };
+                let result = self.flush_boundary_flow_type(result_expression.0 as usize, result);
+                if matches!(result.ty, Type::Unknown | Type::UnresolvedShape { .. })
+                    || self.signatures[index].result == result
+                {
+                    continue;
+                }
+                self.signatures[index].result = result;
+                let declaration_type = self.checked_callable_declaration_flow_type(index);
+                if self.set_declaration_flow_type(callable, declaration_type) {
+                    Self::enqueue_checked_declaration_dependents(
+                        callable,
+                        &dependencies,
+                        &mut pending,
+                    );
+                }
+                if let Some(calls) = dependencies.calls_by_callee.get(&callable) {
+                    pending.calls.extend(calls.iter().copied());
+                }
+            }
+
+            let calls = std::mem::take(&mut pending.calls);
+            if !calls.is_empty() {
+                self.begin_checked_flow_inference_epoch();
+            }
+            stats.call_visits += calls.len();
+            for call_id in calls {
+                let Some(call) = self.call_by_checked_id(call_id).cloned() else {
+                    continue;
+                };
+                let before_expression = self
+                    .inferred_expr_types
+                    .get(&(call.expression.0 as usize))
+                    .cloned();
+                let output_declarations = call
+                    .entries
+                    .iter()
+                    .filter_map(|entry| match entry {
+                        CheckedCallEntry::FreshOut { output, .. } => Some(*output),
+                        CheckedCallEntry::ForwardOut { target, .. } => Some(*target),
+                        CheckedCallEntry::Input { .. } => None,
+                    })
+                    .collect::<BTreeSet<_>>();
+                let before_outputs = output_declarations
+                    .iter()
+                    .filter_map(|declaration| {
+                        self.declaration(*declaration)
+                            .map(|definition| (*declaration, definition.flow_type.clone()))
+                    })
+                    .collect::<BTreeMap<_, _>>();
+                if !self.instantiate_checked_call(call_id) {
+                    continue;
+                }
+                let after_expression = self
+                    .inferred_expr_types
+                    .get(&(call.expression.0 as usize))
+                    .cloned();
+                if before_expression != after_expression {
+                    Self::enqueue_checked_expression_dependents(
+                        call.expression.0 as usize,
+                        &dependencies,
+                        &mut pending,
+                    );
+                }
+                for declaration in output_declarations {
+                    let after = self
+                        .declaration(declaration)
+                        .map(|definition| definition.flow_type.clone());
+                    if before_outputs.get(&declaration) != after.as_ref() {
+                        Self::enqueue_checked_declaration_dependents(
+                            declaration,
+                            &dependencies,
+                            &mut pending,
+                        );
+                    }
+                }
+                // Call-local substitutions can stabilize one step after the
+                // externally visible result or OUT types. Revisit only this
+                // call once more; a stable revisit does not enqueue itself.
+                pending.calls.insert(call_id);
+            }
+
+            if std::mem::take(&mut pending.selector_parameters) {
+                stats.selector_visits += 1;
+                let before = self.checked_selector_parameter_state();
+                self.begin_checked_flow_inference_epoch();
+                if self.refresh_pattern_selector_parameter_types() {
+                    let after = self.checked_selector_parameter_state();
+                    for (formal, (owner, flow_type)) in after {
+                        if before
+                            .get(&formal)
+                            .is_some_and(|before| before.0 == owner && before.1 == flow_type)
+                        {
+                            continue;
+                        }
+                        Self::enqueue_checked_declaration_dependents(
+                            formal,
+                            &dependencies,
+                            &mut pending,
+                        );
+                        Self::enqueue_checked_declaration_dependents(
+                            owner,
+                            &dependencies,
+                            &mut pending,
+                        );
+                        if let Some(calls) = dependencies.calls_by_callee.get(&owner) {
+                            pending.calls.extend(calls.iter().copied());
+                        }
+                    }
+                }
+            }
+
+            if std::mem::take(&mut pending.pattern_bindings) {
+                stats.pattern_visits += 1;
+                let pattern_declarations = self
+                    .pattern_declarations
+                    .values()
+                    .copied()
+                    .collect::<BTreeSet<_>>();
+                let before = pattern_declarations
+                    .iter()
+                    .filter_map(|declaration| {
+                        self.declaration(*declaration)
+                            .map(|definition| (*declaration, definition.flow_type.clone()))
+                    })
+                    .collect::<BTreeMap<_, _>>();
+                self.begin_checked_flow_inference_epoch();
+                if self.refresh_pattern_binding_types() {
+                    for declaration in pattern_declarations {
+                        let after = self
+                            .declaration(declaration)
+                            .map(|definition| definition.flow_type.clone());
+                        if before.get(&declaration) != after.as_ref() {
+                            Self::enqueue_checked_declaration_dependents(
+                                declaration,
+                                &dependencies,
+                                &mut pending,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        let worklist_exhausted = !pending.any();
+        let audit_started = trace.then(Instant::now);
+        let audit = worklist_exhausted.then(|| self.advance_checked_type_inference());
+        let audit_clean = audit.is_some_and(|changes| !changes.any());
+        if trace {
+            eprintln!(
+                "boon_typecheck checked_program.infer_checked_types.worklist rounds={} expression_visits={} declaration_visits={} callable_visits={} call_visits={} selector_visits={} pattern_visits={} exhausted={} audit={audit:?} audit_clean={} audit_ms={:.3}",
+                stats.rounds,
+                stats.expression_visits,
+                stats.declaration_visits,
+                stats.callable_visits,
+                stats.call_visits,
+                stats.selector_visits,
+                stats.pattern_visits,
+                worklist_exhausted,
+                audit_clean,
+                audit_started.map(typecheck_elapsed_ms).unwrap_or(0.0),
+            );
+        }
+        if audit_clean {
+            return;
+        }
+        if trace {
+            eprintln!(
+                "boon_typecheck checked_program.infer_checked_types.worklist fallback=full_sweeps"
+            );
+        }
+        self.infer_checked_types_full_sweeps();
+    }
+
+    fn checked_type_inference_dependencies(&self) -> CheckedTypeInferenceDependencies {
+        let expression_count = self.program.expressions.len();
+        let mut dependencies = CheckedTypeInferenceDependencies {
+            expression_parents: vec![Vec::new(); expression_count],
+            declarations_by_value: vec![Vec::new(); expression_count],
+            callables_by_result: vec![Vec::new(); expression_count],
+            calls_by_input: vec![Vec::new(); expression_count],
+            declaration_readers: BTreeMap::new(),
+            calls_by_output: BTreeMap::new(),
+            calls_by_callee: BTreeMap::new(),
+            selector_actuals: BTreeSet::new(),
+            pattern_selectors: self.pattern_selectors.values().copied().collect(),
+        };
+        for expression in &self.program.expressions {
+            let mut children = direct_expression_children(expression);
+            if matches!(&expression.kind, AstExprKind::Hold { .. }) {
+                children.extend(hold_update_exprs_for_expr(
+                    &self.program.ast.statements,
+                    expression.id,
+                    &self.program.expressions,
+                ));
+            }
+            for child in children {
+                if let Some(parents) = dependencies.expression_parents.get_mut(child) {
+                    parents.push(expression.id);
+                }
+            }
+            if let Some((declaration, _)) =
+                self.direct_read_declaration_with_projection(CheckedExprId(expression.id as u32))
+            {
+                dependencies
+                    .declaration_readers
+                    .entry(declaration)
+                    .or_default()
+                    .push(expression.id);
+            }
+        }
+        for declaration in &self.declarations {
+            if let Some(value) = declaration.value
+                && let Some(declarations) =
+                    dependencies.declarations_by_value.get_mut(value.0 as usize)
+            {
+                declarations.push(declaration.id);
+            }
+        }
+        for signature in &self.signatures {
+            if let Some(result) = signature.result_expression
+                && let Some(callables) = dependencies.callables_by_result.get_mut(result.0 as usize)
+            {
+                callables.push(signature.decl_id);
+            }
+        }
+        for call in &self.calls {
+            dependencies
+                .calls_by_callee
+                .entry(call.callable)
+                .or_default()
+                .push(call.id);
+            for entry in &call.entries {
+                match entry {
+                    CheckedCallEntry::Input { formal, value, .. } => {
+                        if let Some(calls) = dependencies.calls_by_input.get_mut(value.0 as usize) {
+                            calls.push(call.id);
+                        }
+                        if self.syntax_discriminant_parameters.contains(formal) {
+                            dependencies.selector_actuals.insert(value.0 as usize);
+                        }
+                    }
+                    CheckedCallEntry::FreshOut { output, .. } => dependencies
+                        .calls_by_output
+                        .entry(*output)
+                        .or_default()
+                        .push(call.id),
+                    CheckedCallEntry::ForwardOut { target, .. } => dependencies
+                        .calls_by_output
+                        .entry(*target)
+                        .or_default()
+                        .push(call.id),
+                }
+            }
+            if let CheckedContextBinding::Explicit { value, .. } = call.context_binding
+                && let Some(calls) = dependencies.calls_by_input.get_mut(value.0 as usize)
+            {
+                calls.push(call.id);
+            }
+        }
+        for values in &mut dependencies.expression_parents {
+            values.sort();
+            values.dedup();
+        }
+        for values in &mut dependencies.declarations_by_value {
+            values.sort();
+            values.dedup();
+        }
+        for values in &mut dependencies.callables_by_result {
+            values.sort();
+            values.dedup();
+        }
+        for values in &mut dependencies.calls_by_input {
+            values.sort();
+            values.dedup();
+        }
+        for values in dependencies.declaration_readers.values_mut() {
+            values.sort();
+            values.dedup();
+        }
+        for values in dependencies.calls_by_output.values_mut() {
+            values.sort();
+            values.dedup();
+        }
+        for values in dependencies.calls_by_callee.values_mut() {
+            values.sort();
+            values.dedup();
+        }
+        dependencies
+    }
+
+    fn enqueue_checked_expression_dependents(
+        expression: usize,
+        dependencies: &CheckedTypeInferenceDependencies,
+        pending: &mut CheckedTypeInferencePending,
+    ) {
+        if let Some(parents) = dependencies.expression_parents.get(expression) {
+            pending.expressions.extend(parents.iter().copied());
+        }
+        if let Some(declarations) = dependencies.declarations_by_value.get(expression) {
+            pending.declarations.extend(declarations.iter().copied());
+        }
+        if let Some(callables) = dependencies.callables_by_result.get(expression) {
+            pending.callables.extend(callables.iter().copied());
+        }
+        if let Some(calls) = dependencies.calls_by_input.get(expression) {
+            pending.calls.extend(calls.iter().copied());
+        }
+        if dependencies.selector_actuals.contains(&expression) {
+            pending.selector_parameters = true;
+        }
+        if dependencies.pattern_selectors.contains(&expression) {
+            pending.pattern_bindings = true;
+        }
+    }
+
+    fn enqueue_checked_declaration_dependents(
+        declaration: DeclId,
+        dependencies: &CheckedTypeInferenceDependencies,
+        pending: &mut CheckedTypeInferencePending,
+    ) {
+        if let Some(readers) = dependencies.declaration_readers.get(&declaration) {
+            pending.expressions.extend(readers.iter().copied());
+        }
+        if let Some(calls) = dependencies.calls_by_output.get(&declaration) {
+            pending.calls.extend(calls.iter().copied());
+        }
+        if let Some(calls) = dependencies.calls_by_callee.get(&declaration) {
+            pending.calls.extend(calls.iter().copied());
+        }
+    }
+
+    fn checked_callable_declaration_flow_type(&self, signature_index: usize) -> FlowType {
+        let signature = &self.signatures[signature_index];
+        FlowType {
+            mode: FlowMode::Continuous,
+            ty: Type::Function {
+                args: signature
+                    .parameters
+                    .iter()
+                    .filter(|parameter| parameter.kind == CheckedParameterKind::Value)
+                    .map(|parameter| parameter.flow_type.ty.clone())
+                    .collect(),
+                result: Box::new(signature.result.clone()),
+            },
+        }
+    }
+
+    fn checked_selector_parameter_state(&self) -> BTreeMap<DeclId, (DeclId, FlowType)> {
+        let mut state = BTreeMap::new();
+        for signature in &self.signatures {
+            for parameter in &signature.parameters {
+                if self
+                    .syntax_discriminant_parameters
+                    .contains(&parameter.decl_id)
+                {
+                    state.insert(
+                        parameter.decl_id,
+                        (signature.decl_id, parameter.flow_type.clone()),
+                    );
+                }
+            }
+        }
+        state
+    }
+
+    fn infer_checked_types_full_sweeps(&mut self) {
+        let trace = std::env::var_os("BOON_TYPECHECK_TRACE").is_some();
         let iteration_limit = self
             .calls
             .len()
@@ -5882,7 +6392,10 @@ impl<'a> CheckedProgramBuilder<'a> {
         }
 
         self.begin_checked_flow_inference_epoch();
-        self.infer_checked_types();
+        // The main worklist has already converged. Installing FLUSH metadata
+        // only removes stale authoritative shortcuts; the bounded full audit
+        // is cheaper here than reseeding every inference entity.
+        self.infer_checked_types_full_sweeps();
     }
 
     fn invalidate_flush_boundary_authoritative_types(&mut self) {

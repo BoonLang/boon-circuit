@@ -11781,7 +11781,12 @@ impl<'a> ExecutableRowLowerer<'a> {
             }
             return Ok(value);
         }
-        if let Some((first, nested)) = projection.split_first() {
+        let target_projection = if constructor_projection.is_empty() {
+            projection
+        } else {
+            constructor_projection
+        };
+        if let Some((first, nested)) = target_projection.split_first() {
             let mut value = self.intern(PlanRowExpressionNode::Field {
                 input: ValueRef::Field(field_id(first)?),
             })?;
@@ -16354,6 +16359,62 @@ store: [
 #[cfg(test)]
 mod nested_state_persistence_tests {
     use super::*;
+
+    #[test]
+    fn ordinary_row_constructor_preserves_renamed_state_input() {
+        let source = r#"
+FUNCTION catalog_row(input) {
+    [
+        key: input.origin_key
+        family: store.family
+    ]
+}
+
+FUNCTION reactive_row(row, toggle) {
+    [
+        key: row.key
+        selected:
+            True |> HOLD selected {
+                toggle |> THEN { row.key == TEXT { one } }
+            }
+    ]
+}
+
+store: [
+    family: TEXT { demo }
+    toggle: SOURCE
+    inputs: LIST { [origin_key: TEXT { one }] }
+    rows:
+        inputs
+        |> List/map(
+            item,
+            new: reactive_row(
+                row: catalog_row(input: item),
+                toggle: toggle,
+            ),
+        )
+]
+"#;
+        let compiled = crate::compile_machine_plan(crate::CompileRequest::source_text(
+            "ordinary-renamed-state-input.bn",
+            source,
+            TargetProfile::SoftwareDefault,
+            ProgramRole::Server,
+            ApplicationIdentity::compiler_default(),
+        ))
+        .expect("ordinary row constructor preserves the target constructor field");
+        assert!(
+            compiled
+                .ir
+                .executable
+                .ordinary_functions
+                .iter()
+                .any(|function| function.name == "catalog_row"),
+            "fixture must retain the canonical-root-reading row constructor"
+        );
+        let verification = verify_plan(&compiled.plan).expect("MachinePlan verifies");
+        assert_eq!(verification.status, "pass", "{:#?}", verification.checks);
+    }
 
     #[test]
     fn unpublished_nested_state_fields_do_not_become_list_authority_memory() {

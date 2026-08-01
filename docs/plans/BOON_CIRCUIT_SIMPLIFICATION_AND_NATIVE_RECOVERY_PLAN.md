@@ -570,21 +570,26 @@ materializations. Materialization-only helpers schedule their definition once
 in the shared execution graph instead of recursively cloning the body per list
 operation. Dense expression-indexed inference state, a bounded callee-to-caller
 worklist, and a forward/reverse inference sweep replace logarithmic hot lookups
-and one whole-program epoch per wrapper edge. OUT manifest payloads commit
-interned type digests, local substitution deltas, and explicit parent-call
-dependencies instead of serializing inherited structural type trees at every
-frame.
+and one whole-program epoch per wrapper edge. The completed inference cut also
+indexes expression parents, declaration readers and values, callable results,
+call inputs/OUTs/callees, selector actuals, HOLD updates, and pattern selectors.
+It schedules only dirty entities and retains a complete full-sweep no-change
+audit as a fail-closed convergence check. OUT manifest payloads commit interned
+type digests, local substitution deltas, and explicit parent-call dependencies
+instead of serializing inherited structural type trees at every frame.
 
 On the reference machine, two consecutive final-source debug `boon_cli` runs
-complete Counter in 0.08/0.08 seconds at 29,248/29,336 KiB peak RSS and
-physical TodoMVC in 2.34/2.29 seconds at 147,372/147,580 KiB. The large
-5,169-frame NovyWave fixture completes in 31.26/30.86 seconds at
-1,005,068/1,004,712 KiB. This is down from the preceding checkpoint's
+complete Counter in 0.08/0.08 seconds at 29,792/29,408 KiB peak RSS and
+physical TodoMVC in 2.31/2.18 seconds at 148,152/147,344 KiB. The large
+5,169-frame NovyWave fixture completes in 26.59/26.34 seconds at
+1,003,720/1,003,064 KiB. This is down from the preceding checkpoint's
+31.26/30.86-second, 1,005,068/1,004,712-KiB pair, its predecessor's
 38.81-second, 1,034,180-KiB run, the first successful 55.64-second,
 4,426,932-KiB run, and the earlier 41.34-second, 4,012,976-KiB checkpoint.
 Counter, TodoMVC, and NovyWave produce byte-identical `MachinePlan` files across
-the paired runs; TodoMVC is also byte-identical to the saved pre-optimization
-plan.
+the paired runs. Counter and TodoMVC remain byte-identical to the saved
+pre-worklist plans; the type-worklist change is byte-identical to the
+immediately preceding NovyWave plan.
 
 The OUT graph exposes why peak memory remained excessive after manifest
 compaction: only 4,391 substitutions are introduced locally, but retaining a
@@ -613,17 +618,29 @@ all 47 typechecker tests pass, including the stale-hash negative and exact flow
 capture regressions.
 
 These are development-loop measurements, not final release or native-
-performance evidence. Typechecking remains the largest single architectural
-blocker: contextual callable inference and the final program inference each
-take six whole-program epochs, together about 12.24 seconds on NovyWave.
-Attempts to weaken global cache invalidation failed exact stream-pulse and
-capture-mode regressions and were discarded. The next compiler slice must
-replace those implicit global sweeps with an explicit dependency-indexed
-worklist that separates pure type-query reuse from flow/currentness
-propagation. The next production slice remains blocked until that work has a
-focused scaling regression; Phase 1 still requires the remaining focused
-semantic, IR, and compiler regression matrix plus a committed clean-checkout
-remeasurement.
+performance evidence. The dependency-indexed type worklist replaces the two
+six-epoch whole-program fixed points. On the traced NovyWave run,
+`CheckedProgram` construction falls from about 10.93 seconds to 6.60 seconds;
+the post-scheme inference falls from about 4.30 seconds to 1.68 seconds. The
+first pre-scheme pass retains a full audit that catches one expression-table-
+only update and then proves a no-change boundary; callable, declaration, call,
+selector, and pattern state are already stable. All 47 typechecker tests pass,
+and Counter, TodoMVC, and NovyWave preserve deterministic plans.
+
+Pure functions that read canonical program-root values now retain one ordinary
+callable body instead of forcing an occurrence copy. The executable backend
+keeps source and constructor projections distinct across that boundary, so a
+renamed row field still resolves the exact indexed-state input. A focused
+compiler regression proves this case. NovyWave retains eight more ordinary
+helpers, removes 201 semantic expressions, and emits a plan about 33 KiB
+smaller; the dirty type worklist owns the material wall-time reduction.
+
+The next compiler-performance target is the dependency manifest's roughly
+4.8-second enumeration of about 15.6 million transitive closure IDs. Replace
+that retained closure work with a compact exact dependency proof before
+returning to production recovery; do not resume tactical type-cache changes.
+Phase 1 still requires the remaining focused semantic, IR, and compiler
+regression matrix plus a committed clean-checkout remeasurement.
 
 A clean confirmation at `de430c1` kept the million-row charged work unchanged
 but observed 14,794,406,170 ns instead of 9,712,441,796 ns for its three-sample

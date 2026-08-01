@@ -157,13 +157,15 @@ Current checkpoints to preserve and audit rather than redo:
 - the current compiler-throughput checkpoint keeps Counter, physical TodoMVC,
   and NovyWave `MachinePlan` output deterministic while replacing copied OUT
   type environments with active-path overlays, compacting exact dependency
-  closure proofs into manifest V2 digests, and optimizing the compiler/IR/plan
-  debug path; two final-source runs measure 0.08/0.08, 2.34/2.29, and
-  31.26/30.86 seconds respectively;
-- NovyWave typechecking still spends about 12.24 seconds in two six-epoch
-  whole-program fixed points. Keep the next production slice blocked until an
-  explicit dependency-indexed worklist separates pure type-query reuse from
-  flow/currentness propagation and a focused scaling regression proves it;
+  closure proofs into manifest V2 digests, retaining canonical-root-reading
+  ordinary callables, and replacing repeated whole-program type inference with
+  a dependency-indexed dirty worklist plus a fail-closed full-sweep audit; two
+  final-source runs measure 0.08/0.08, 2.31/2.18, and 26.59/26.34 seconds
+  respectively;
+- the next compiler-performance blocker is the dependency manifest's roughly
+  4.8-second enumeration of about 15.6 million transitive closure IDs. Replace
+  that retained closure work with a compact exact proof before resuming the
+  production recovery slice; do not return to tactical type-cache changes;
 - FjordPulse currently has no basis for weakening the 108-story/340-scenario
   acceptance inventory. Only its two explicitly deferred backup/restore
   automation scenarios may retain that final status.
@@ -197,7 +199,7 @@ Execution strategy:
   budgets at every accepted compiler checkpoint: two consecutive runs more
   than 25 percent slower or larger than the recorded checkpoint block the next
   slice even below 120 seconds. The current debug time ceilings on the reference
-  machine are 0.20 seconds for Counter, 3.5 seconds for physical TodoMVC, and 36
+  machine are 0.20 seconds for Counter, 3.5 seconds for physical TodoMVC, and 30
   seconds for NovyWave. Their peak-RSS ceilings are respectively 48 MiB, 180
   MiB, and 1.1 GiB. These ceilings may move only downward unless a changed
   represented workload is documented with before/after evidence.

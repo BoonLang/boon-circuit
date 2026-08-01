@@ -29,6 +29,7 @@ const DEPENDENCY_CALLABLE_SET_DIGEST_DOMAIN: &[u8] = b"boon.callable-dependency-
 const DEPENDENCY_PUBLIC_SHAPE_DOMAIN: &[u8] = b"boon.callable-dependency-public-shape.v1\0";
 const DEPENDENCY_IMPLEMENTATION_DOMAIN: &[u8] = b"boon.callable-dependency-implementation.v1\0";
 const DEPENDENCY_MANIFEST_DIGEST_DOMAIN: &[u8] = b"boon.callable-dependency-manifest.v1\0";
+const DEPENDENCY_MANIFEST_WORKER_LIMIT: usize = 4;
 
 macro_rules! dependency_id {
     ($($name:ident),+ $(,)?) => {
@@ -1437,6 +1438,193 @@ fn dependency_ranges_for_generation(
     ranges
 }
 
+fn dependency_closure_for_owner(
+    owner_ordinal: usize,
+    owner: SemanticDependencyOwnerV1,
+    records: &[SemanticDependencyRecordV1],
+    direct: &BTreeMap<SemanticDependencyOwnerV1, Vec<SemanticDependencyRecordId>>,
+    owner_ordinals: &BTreeMap<SemanticDependencyOwnerV1, usize>,
+    direct_by_owner: &[Vec<SemanticDependencyRecordId>],
+    visit_generation: &mut [usize],
+) -> Result<Vec<SemanticDependencyRecordRangeV1>, CallableDependencyManifestError> {
+    let mut pending = Vec::new();
+    for dependency in direct.get(&owner).into_iter().flatten().copied() {
+        queue_unvisited_dependency(
+            dependency,
+            owner_ordinal,
+            records,
+            visit_generation,
+            &mut pending,
+        )?;
+    }
+    while let Some(dependency) = pending.pop() {
+        let dependency_index = dependency.as_usize();
+        let record = &records[dependency_index];
+        for referenced_dependency in &record.referenced_dependencies {
+            queue_unvisited_dependency(
+                *referenced_dependency,
+                owner_ordinal,
+                records,
+                visit_generation,
+                &mut pending,
+            )?;
+        }
+        for referenced_owner in &record.referenced_owners {
+            let referenced_owner_ordinal = owner_ordinals
+                .get(referenced_owner)
+                .copied()
+                .ok_or_else(|| {
+                    CallableDependencyManifestError::new(format!(
+                        "dependency closure references missing owner {referenced_owner:?}"
+                    ))
+                })?;
+            for referenced_dependency in direct_by_owner
+                .get(referenced_owner_ordinal)
+                .ok_or_else(|| {
+                    CallableDependencyManifestError::new(format!(
+                        "dependency closure has no dense direct entry for owner {referenced_owner:?}"
+                    ))
+                })?
+            {
+                queue_unvisited_dependency(
+                    *referenced_dependency,
+                    owner_ordinal,
+                    records,
+                    visit_generation,
+                    &mut pending,
+                )?;
+            }
+        }
+    }
+    Ok(dependency_ranges_for_generation(
+        visit_generation,
+        owner_ordinal,
+    ))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn build_dependency_closures(
+    owners: &[SemanticDependencyOwnerV1],
+    records: &[SemanticDependencyRecordV1],
+    direct: &BTreeMap<SemanticDependencyOwnerV1, Vec<SemanticDependencyRecordId>>,
+    owner_ordinals: &BTreeMap<SemanticDependencyOwnerV1, usize>,
+    direct_by_owner: &[Vec<SemanticDependencyRecordId>],
+) -> Result<
+    (
+        BTreeMap<SemanticDependencyOwnerV1, Vec<SemanticDependencyRecordRangeV1>>,
+        usize,
+    ),
+    CallableDependencyManifestError,
+> {
+    const PARALLEL_OWNER_THRESHOLD: usize = 8;
+    const PARALLEL_RECORD_THRESHOLD: usize = 4_096;
+
+    let worker_count = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .min(DEPENDENCY_MANIFEST_WORKER_LIMIT)
+        .min(owners.len().max(1));
+    if worker_count == 1
+        || owners.len() < PARALLEL_OWNER_THRESHOLD
+        || records.len() < PARALLEL_RECORD_THRESHOLD
+    {
+        let mut visit_generation = vec![usize::MAX; records.len()];
+        let mut closure = BTreeMap::new();
+        for (owner_ordinal, owner) in owners.iter().copied().enumerate() {
+            closure.insert(
+                owner,
+                dependency_closure_for_owner(
+                    owner_ordinal,
+                    owner,
+                    records,
+                    direct,
+                    owner_ordinals,
+                    direct_by_owner,
+                    &mut visit_generation,
+                )?,
+            );
+        }
+        return Ok((closure, 1));
+    }
+
+    std::thread::scope(|scope| {
+        let handles = (0..worker_count)
+            .map(|worker| {
+                scope.spawn(move || {
+                    let mut visit_generation = vec![usize::MAX; records.len()];
+                    let mut closures = Vec::new();
+                    for owner_ordinal in (worker..owners.len()).step_by(worker_count) {
+                        let owner = owners[owner_ordinal];
+                        closures.push((
+                            owner_ordinal,
+                            owner,
+                            dependency_closure_for_owner(
+                                owner_ordinal,
+                                owner,
+                                records,
+                                direct,
+                                owner_ordinals,
+                                direct_by_owner,
+                                &mut visit_generation,
+                            )?,
+                        ));
+                    }
+                    Ok::<_, CallableDependencyManifestError>(closures)
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut closures = Vec::with_capacity(owners.len());
+        for handle in handles {
+            closures.extend(handle.join().map_err(|_| {
+                CallableDependencyManifestError::new(
+                    "dependency closure worker terminated unexpectedly",
+                )
+            })??);
+        }
+        closures.sort_by_key(|(owner_ordinal, _, _)| *owner_ordinal);
+        Ok((
+            closures
+                .into_iter()
+                .map(|(_, owner, ranges)| (owner, ranges))
+                .collect(),
+            worker_count,
+        ))
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
+fn build_dependency_closures(
+    owners: &[SemanticDependencyOwnerV1],
+    records: &[SemanticDependencyRecordV1],
+    direct: &BTreeMap<SemanticDependencyOwnerV1, Vec<SemanticDependencyRecordId>>,
+    owner_ordinals: &BTreeMap<SemanticDependencyOwnerV1, usize>,
+    direct_by_owner: &[Vec<SemanticDependencyRecordId>],
+) -> Result<
+    (
+        BTreeMap<SemanticDependencyOwnerV1, Vec<SemanticDependencyRecordRangeV1>>,
+        usize,
+    ),
+    CallableDependencyManifestError,
+> {
+    let mut visit_generation = vec![usize::MAX; records.len()];
+    let mut closure = BTreeMap::new();
+    for (owner_ordinal, owner) in owners.iter().copied().enumerate() {
+        closure.insert(
+            owner,
+            dependency_closure_for_owner(
+                owner_ordinal,
+                owner,
+                records,
+                direct,
+                owner_ordinals,
+                direct_by_owner,
+                &mut visit_generation,
+            )?,
+        );
+    }
+    Ok((closure, 1))
+}
+
 impl DependencyCollector {
     fn trace_counts(&self, phase: &str) {
         eprintln!(
@@ -1512,6 +1700,36 @@ impl DependencyCollector {
         Ok(())
     }
 
+    fn structural_with_component_digest(
+        &mut self,
+        owner: SemanticDependencyOwnerV1,
+        subject: SemanticDependencySubjectV1,
+        payload: &impl Serialize,
+    ) -> Result<[u8; 32], CallableDependencyManifestError> {
+        self.claim_subject(&subject)?;
+        let [payload_digest, component_digest] =
+            boon_contract::canonical_serde_hashes_v1_with_buffer(
+                [
+                    DEPENDENCY_RECORD_PAYLOAD_DOMAIN,
+                    DEPENDENCY_COMPONENT_DIGEST_DOMAIN,
+                ],
+                payload,
+                &mut self.hash_scratch,
+            )
+            .map_err(|error| {
+                CallableDependencyManifestError::new(format!(
+                    "failed to hash dependency component payload: {error}"
+                ))
+            })?;
+        self.coverage.push(SemanticDependencyCoverageV1 {
+            id: SemanticDependencyCoverageId(self.coverage.len()),
+            subject,
+            primary_owner: owner,
+            disposition: SemanticDependencyCoverageDispositionV1::Structural { payload_digest },
+        });
+        Ok(component_digest)
+    }
+
     fn diagnostic(
         &mut self,
         owner: SemanticDependencyOwnerV1,
@@ -1560,6 +1778,7 @@ impl DependencyCollector {
             ids.dedup();
         }
 
+        let records_started = trace_dependency_manifest.then(std::time::Instant::now);
         let mut records = Vec::with_capacity(self.pending.len());
         for pending in self.pending {
             let mut referenced_dependencies = Vec::new();
@@ -1607,11 +1826,17 @@ impl DependencyCollector {
         }
         if trace_dependency_manifest {
             eprintln!(
-                "boon_semantic dependency_manifest finish:records_done records={}",
-                records.len()
+                "boon_semantic dependency_manifest finish:records_done records={} elapsed_ms={:.3}",
+                records.len(),
+                records_started
+                    .expect("traced dependency records have a start time")
+                    .elapsed()
+                    .as_secs_f64()
+                    * 1000.0,
             );
         }
 
+        let direct_started = trace_dependency_manifest.then(std::time::Instant::now);
         let mut direct = owners
             .iter()
             .copied()
@@ -1633,7 +1858,14 @@ impl DependencyCollector {
             ids.dedup();
         }
         if trace_dependency_manifest {
-            eprintln!("boon_semantic dependency_manifest finish:direct_done");
+            eprintln!(
+                "boon_semantic dependency_manifest finish:direct_done elapsed_ms={:.3}",
+                direct_started
+                    .expect("traced direct dependencies have a start time")
+                    .elapsed()
+                    .as_secs_f64()
+                    * 1000.0,
+            );
         }
 
         // Dependency IDs are dense, and the owner set is canonical. Use those
@@ -1643,81 +1875,37 @@ impl DependencyCollector {
         // that legitimate sharing into O(owners * dependencies * log N)
         // behavior. Generation marks retain the exact same reachability and
         // sorted output while making membership and reset constant-time.
-        let owner_ordinals = owners
+        let owner_list = owners.iter().copied().collect::<Vec<_>>();
+        let owner_ordinals = owner_list
             .iter()
             .copied()
             .enumerate()
             .map(|(ordinal, owner)| (owner, ordinal))
             .collect::<BTreeMap<_, _>>();
-        let direct_by_owner = owners
+        let direct_by_owner = owner_list
             .iter()
             .map(|owner| direct.get(owner).cloned().unwrap_or_default())
             .collect::<Vec<_>>();
-        let mut visit_generation = vec![usize::MAX; records.len()];
-        let mut closure = BTreeMap::new();
-        for (owner_ordinal, owner) in owners.iter().enumerate() {
-            if trace_dependency_manifest && owner_ordinal.is_multiple_of(64) {
-                eprintln!(
-                    "boon_semantic dependency_manifest finish:closure_progress owner={owner_ordinal}/{}",
-                    owners.len()
-                );
-            }
-            let mut pending = Vec::new();
-            for dependency in direct.get(owner).into_iter().flatten().copied() {
-                queue_unvisited_dependency(
-                    dependency,
-                    owner_ordinal,
-                    &records,
-                    &mut visit_generation,
-                    &mut pending,
-                )?;
-            }
-            while let Some(dependency) = pending.pop() {
-                let dependency_index = dependency.as_usize();
-                let record = &records[dependency_index];
-                for referenced_dependency in &record.referenced_dependencies {
-                    queue_unvisited_dependency(
-                        *referenced_dependency,
-                        owner_ordinal,
-                        &records,
-                        &mut visit_generation,
-                        &mut pending,
-                    )?;
-                }
-                for referenced_owner in &record.referenced_owners {
-                    let referenced_owner_ordinal = owner_ordinals
-                        .get(referenced_owner)
-                        .copied()
-                        .ok_or_else(|| {
-                            CallableDependencyManifestError::new(format!(
-                                "dependency closure references missing owner {referenced_owner:?}"
-                            ))
-                        })?;
-                    for referenced_dependency in direct_by_owner
-                        .get(referenced_owner_ordinal)
-                        .ok_or_else(|| {
-                            CallableDependencyManifestError::new(format!(
-                                "dependency closure has no dense direct entry for owner {referenced_owner:?}"
-                            ))
-                        })?
-                    {
-                        queue_unvisited_dependency(
-                            *referenced_dependency,
-                            owner_ordinal,
-                            &records,
-                            &mut visit_generation,
-                            &mut pending,
-                        )?;
-                    }
-                }
-            }
-            let complete = dependency_ranges_for_generation(&visit_generation, owner_ordinal);
-            closure.insert(*owner, complete);
-        }
+        let closure_started = trace_dependency_manifest.then(std::time::Instant::now);
+        let (closure, closure_worker_count) = build_dependency_closures(
+            &owner_list,
+            &records,
+            &direct,
+            &owner_ordinals,
+            &direct_by_owner,
+        )?;
         if trace_dependency_manifest {
-            eprintln!("boon_semantic dependency_manifest finish:closure_done");
+            eprintln!(
+                "boon_semantic dependency_manifest finish:closure_done elapsed_ms={:.3} workers={closure_worker_count}",
+                closure_started
+                    .expect("traced dependency closure has a start time")
+                    .elapsed()
+                    .as_secs_f64()
+                    * 1000.0,
+            );
         }
 
+        let coverage_started = trace_dependency_manifest.then(std::time::Instant::now);
         for (index, coverage) in self.coverage.iter().enumerate() {
             if coverage.id != SemanticDependencyCoverageId(index) {
                 return Err(CallableDependencyManifestError::new(
@@ -1726,7 +1914,14 @@ impl DependencyCollector {
             }
         }
         if trace_dependency_manifest {
-            eprintln!("boon_semantic dependency_manifest finish:done");
+            eprintln!(
+                "boon_semantic dependency_manifest finish:done coverage_elapsed_ms={:.3}",
+                coverage_started
+                    .expect("traced dependency coverage has a start time")
+                    .elapsed()
+                    .as_secs_f64()
+                    * 1000.0,
+            );
         }
         Ok((records, self.coverage, direct, closure))
     }
@@ -2042,12 +2237,12 @@ pub(crate) fn build_callable_dependency_manifest(
         inventory_producer_requests(producer_materializations, &owner_index, &mut collector),
         collector
     )?;
-    dependency_manifest_inventory_phase!(
+    let resolved_out_graph_digest = dependency_manifest_inventory_phase!(
         "inventory_out",
         inventory_out(out, execution, &owner_index, &mut collector),
         collector
     )?;
-    dependency_manifest_inventory_phase!(
+    let execution_graph_digest = dependency_manifest_inventory_phase!(
         "inventory_execution",
         inventory_execution(execution, &owner_index, &mut collector),
         collector
@@ -2057,7 +2252,7 @@ pub(crate) fn build_callable_dependency_manifest(
         inventory_resources(resources, execution, &owner_index, &mut collector),
         collector
     )?;
-    dependency_manifest_inventory_phase!(
+    let reactive_graph_digest = dependency_manifest_inventory_phase!(
         "inventory_reactive",
         inventory_reactive(reactive, execution, &owner_index, &mut collector),
         collector
@@ -2118,16 +2313,10 @@ pub(crate) fn build_callable_dependency_manifest(
                 DEPENDENCY_COMPONENT_DIGEST_DOMAIN,
                 &producer_materializations,
             )?,
-            resolved_out_graph: canonical_dependency_hash(DEPENDENCY_COMPONENT_DIGEST_DOMAIN, out)?,
-            execution_graph: canonical_dependency_hash(
-                DEPENDENCY_COMPONENT_DIGEST_DOMAIN,
-                execution,
-            )?,
+            resolved_out_graph: resolved_out_graph_digest,
+            execution_graph: execution_graph_digest,
             resource_graph: *resources.digest.as_bytes(),
-            reactive_graph: canonical_dependency_hash(
-                DEPENDENCY_COMPONENT_DIGEST_DOMAIN,
-                reactive,
-            )?,
+            reactive_graph: reactive_graph_digest,
             lowering_contract: *lowering.digest.as_bytes(),
             view_binding_graph: *view.digest.as_bytes(),
             scope_storage_graph: *storage.digest.as_bytes(),
@@ -2403,25 +2592,87 @@ struct DependencyRecordDigestIndex {
     record_count: usize,
 }
 
+fn dependency_record_leaf_digests(
+    dependencies: &[SemanticDependencyRecordV1],
+    index_offset: usize,
+) -> Result<Vec<[u8; 32]>, CallableDependencyManifestError> {
+    let mut scratch = Vec::new();
+    let mut leaves = Vec::with_capacity(dependencies.len());
+    for (local_index, dependency) in dependencies.iter().enumerate() {
+        let index = index_offset + local_index;
+        if dependency.id != SemanticDependencyRecordId(index) {
+            return Err(CallableDependencyManifestError::new(format!(
+                "dependency record {} is not dense index {index}",
+                dependency.id
+            )));
+        }
+        leaves.push(canonical_dependency_hash_with_buffer(
+            DEPENDENCY_RECORD_DIGEST_DOMAIN,
+            dependency,
+            &mut scratch,
+        )?);
+    }
+    Ok(leaves)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn build_dependency_record_leaves(
+    dependencies: &[SemanticDependencyRecordV1],
+) -> Result<(Vec<[u8; 32]>, usize), CallableDependencyManifestError> {
+    const PARALLEL_THRESHOLD: usize = 4_096;
+    let worker_count = std::thread::available_parallelism()
+        .map(usize::from)
+        .unwrap_or(1)
+        .min(DEPENDENCY_MANIFEST_WORKER_LIMIT)
+        .min(dependencies.len().max(1));
+    if worker_count == 1 || dependencies.len() < PARALLEL_THRESHOLD {
+        return dependency_record_leaf_digests(dependencies, 0).map(|leaves| (leaves, 1));
+    }
+
+    let chunk_len = dependencies.len().div_ceil(worker_count);
+    std::thread::scope(|scope| {
+        let handles = dependencies
+            .chunks(chunk_len)
+            .enumerate()
+            .map(|(chunk_ordinal, chunk)| {
+                scope
+                    .spawn(move || dependency_record_leaf_digests(chunk, chunk_ordinal * chunk_len))
+            })
+            .collect::<Vec<_>>();
+        let mut leaves = Vec::with_capacity(dependencies.len());
+        for handle in handles {
+            leaves.extend(handle.join().map_err(|_| {
+                CallableDependencyManifestError::new(
+                    "dependency record digest worker terminated unexpectedly",
+                )
+            })??);
+        }
+        Ok((leaves, worker_count))
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
+fn build_dependency_record_leaves(
+    dependencies: &[SemanticDependencyRecordV1],
+) -> Result<(Vec<[u8; 32]>, usize), CallableDependencyManifestError> {
+    dependency_record_leaf_digests(dependencies, 0).map(|leaves| (leaves, 1))
+}
+
 impl DependencyRecordDigestIndex {
     fn build(
         dependencies: &[SemanticDependencyRecordV1],
     ) -> Result<Self, CallableDependencyManifestError> {
-        let mut scratch = Vec::new();
-        let mut leaves = Vec::with_capacity(dependencies.len());
-        for (index, dependency) in dependencies.iter().enumerate() {
-            if dependency.id != SemanticDependencyRecordId(index) {
-                return Err(CallableDependencyManifestError::new(format!(
-                    "dependency record {} is not dense index {index}",
-                    dependency.id
-                )));
-            }
-            leaves.push(canonical_dependency_hash_with_buffer(
-                DEPENDENCY_RECORD_DIGEST_DOMAIN,
-                dependency,
-                &mut scratch,
-            )?);
+        let trace_dependency_manifest = std::env::var_os("BOON_SEMANTIC_TRACE").is_some();
+        let leaves_started = trace_dependency_manifest.then(std::time::Instant::now);
+        let (leaves, worker_count) = build_dependency_record_leaves(dependencies)?;
+        if let Some(started) = leaves_started {
+            eprintln!(
+                "boon_semantic dependency_manifest digest_index.leaves:done elapsed_ms={:.3} workers={worker_count}",
+                started.elapsed().as_secs_f64() * 1000.0,
+            );
         }
+        let levels_started = trace_dependency_manifest.then(std::time::Instant::now);
+        let mut scratch = Vec::new();
         let record_count = leaves.len();
         let mut levels = vec![leaves];
         let mut width = 2usize;
@@ -2449,6 +2700,12 @@ impl DependencyRecordDigestIndex {
                 break;
             };
             width = next_width;
+        }
+        if let Some(started) = levels_started {
+            eprintln!(
+                "boon_semantic dependency_manifest digest_index.levels:done elapsed_ms={:.3}",
+                started.elapsed().as_secs_f64() * 1000.0,
+            );
         }
         Ok(Self {
             levels,
@@ -3825,8 +4082,8 @@ fn inventory_out(
     execution: &SemanticExecutionGraphV1,
     owners: &DependencyOwnerIndex,
     collector: &mut DependencyCollector,
-) -> Result<(), CallableDependencyManifestError> {
-    collector.structural(
+) -> Result<[u8; 32], CallableDependencyManifestError> {
+    let component_digest = collector.structural_with_component_digest(
         SemanticDependencyOwnerV1::ProgramRoot,
         top_subject(
             SemanticDependencySubjectKindV1::ResolvedOutGraph,
@@ -4008,15 +4265,15 @@ fn inventory_out(
         )?;
     }
     let _ = execution;
-    Ok(())
+    Ok(component_digest)
 }
 
 fn inventory_execution(
     execution: &SemanticExecutionGraphV1,
     owners: &DependencyOwnerIndex,
     collector: &mut DependencyCollector,
-) -> Result<(), CallableDependencyManifestError> {
-    collector.structural(
+) -> Result<[u8; 32], CallableDependencyManifestError> {
+    let component_digest = collector.structural_with_component_digest(
         SemanticDependencyOwnerV1::ProgramRoot,
         top_subject(
             SemanticDependencySubjectKindV1::ExecutionGraph,
@@ -4232,6 +4489,12 @@ fn inventory_execution(
                 expression.0,
             ))
         }));
+        references.extend(
+            callable
+                .semantic_root
+                .map(expression_entity)
+                .map(dependency_entity),
+        );
         collect_dependency!(
             collector,
             owner,
@@ -4633,7 +4896,7 @@ fn inventory_execution(
                 .collect(),
         )?;
     }
-    Ok(())
+    Ok(component_digest)
 }
 
 fn semantic_expression_dependency(
@@ -4714,6 +4977,7 @@ fn semantic_expression_dependency(
             instance,
             arguments,
             parameter_bindings,
+            context_argument,
             ..
         } => {
             references.push(dependency_entity(call_entity(*call)));
@@ -4736,6 +5000,13 @@ fn semantic_expression_dependency(
                     SemanticCallParameterBindingKind::Omitted => None,
                 },
             ));
+            references.extend(
+                context_argument
+                    .iter()
+                    .map(|argument| argument.value)
+                    .map(expression_entity)
+                    .map(dependency_entity),
+            );
             (
                 SemanticDependencyChannelV1::CalledCallable,
                 vec![
@@ -5427,8 +5698,8 @@ fn inventory_reactive(
     execution: &SemanticExecutionGraphV1,
     owners: &DependencyOwnerIndex,
     collector: &mut DependencyCollector,
-) -> Result<(), CallableDependencyManifestError> {
-    collector.structural(
+) -> Result<[u8; 32], CallableDependencyManifestError> {
+    let component_digest = collector.structural_with_component_digest(
         SemanticDependencyOwnerV1::ProgramRoot,
         top_subject(
             SemanticDependencySubjectKindV1::ReactiveGraph,
@@ -6253,7 +6524,7 @@ fn inventory_reactive(
         )?;
     }
     let _ = execution;
-    Ok(())
+    Ok(component_digest)
 }
 
 fn owner_for_expression_and_static(

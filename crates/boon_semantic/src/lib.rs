@@ -1012,6 +1012,12 @@ fn validate_canonical_core_handoff(program: &SemanticProgram) -> Result<(), Sema
         || core.executable.states.len() != execution.states.len()
         || core.executable.roots.len() != execution.roots.len()
         || core.executable.functions.len() != execution.functions.len()
+        || core.executable.ordinary_functions.len()
+            != execution
+                .callables
+                .iter()
+                .filter(|callable| callable.semantic_root.is_some())
+                .count()
         || core.materializations.len() != execution.materializations.len()
         || core.sources.len()
             != program.resource_graph.sources.len() + expected_external_event_paths.len()

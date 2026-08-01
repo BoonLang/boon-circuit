@@ -5204,6 +5204,7 @@ mod tests {
             ],
             contexts: Vec::new(),
             context_formal: None,
+            context_parameter: None,
             result: FlowType {
                 ty: Type::List(Box::new(Type::Text)),
                 mode: FlowMode::Continuous,
@@ -5213,6 +5214,7 @@ mod tests {
             body: None,
             result_expression: None,
             contextual_operation: None,
+            semantic_root: None,
         }
     }
 

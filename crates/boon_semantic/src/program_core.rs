@@ -978,6 +978,13 @@ pub enum ExecutableExpressionKind {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         contexts: Vec<ExecutableCallContextId>,
     },
+    /// A call to one shared, context-free semantic callable body.
+    UserCall {
+        function: FunctionId,
+        name: String,
+        instance: usize,
+        arguments: Vec<ExecutableCallArgument>,
+    },
     Materialize {
         materialization: usize,
     },
@@ -1086,6 +1093,8 @@ pub struct ExecutableProgram {
     pub roots: Vec<ExecutableRoot>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub functions: Vec<ExecutableFunction>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ordinary_functions: Vec<ExecutableOrdinaryFunction>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1146,6 +1155,15 @@ pub struct ExecutableFunction {
     pub root: ExecutableExprId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub invocation_source: Option<ExecutableExprId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ExecutableOrdinaryFunction {
+    pub id: FunctionId,
+    pub name: String,
+    pub parameters: Vec<ExecutableFunctionParameter>,
+    pub result_type: boon_typecheck::FlowType,
+    pub root: ExecutableExprId,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1842,7 +1860,8 @@ pub fn executable_expression_children(kind: &ExecutableExpressionKind) -> Vec<Ex
             .map(|binding| binding.value)
             .chain(std::iter::once(*result))
             .collect(),
-        ExecutableExpressionKind::Call { arguments, .. } => {
+        ExecutableExpressionKind::Call { arguments, .. }
+        | ExecutableExpressionKind::UserCall { arguments, .. } => {
             arguments.iter().map(|argument| argument.value).collect()
         }
         ExecutableExpressionKind::Flush { payload: input }

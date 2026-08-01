@@ -69,6 +69,7 @@ struct CompileContext {
     materialization_locals:
         BTreeMap<(ir::StaticOwnerId, ir::MaterializationLocalId), DocumentParameterId>,
     locals: BTreeMap<ir::ExecutableLocalBindingId, DocumentLocalId>,
+    function_parameters: BTreeMap<ir::ExecutableParameterId, DocumentExprId>,
     pattern_bindings: BTreeMap<String, PatternBindingContext>,
 }
 
@@ -114,6 +115,7 @@ struct DocumentCompiler<'a> {
     compiled_materializations: BTreeSet<usize>,
     compiled_paths: BTreeMap<(Option<ScopeId>, String), DocumentExprId>,
     compile_stack: Vec<ir::ExecutableExprId>,
+    active_ordinary_functions: BTreeSet<ir::FunctionId>,
     next_cache_scope: usize,
     next_local: usize,
 }
@@ -268,6 +270,7 @@ impl<'a> DocumentCompiler<'a> {
             compiled_materializations: BTreeSet::new(),
             compiled_paths: BTreeMap::new(),
             compile_stack: Vec::new(),
+            active_ordinary_functions: BTreeSet::new(),
             next_cache_scope: program.scope_index.owners.len().saturating_add(1),
             next_local: 0,
         })
@@ -833,6 +836,19 @@ impl<'a> DocumentCompiler<'a> {
                 context,
                 input_override,
             ),
+            ir::ExecutableExpressionKind::UserCall {
+                function,
+                name,
+                arguments,
+                ..
+            } => self.compile_user_call(
+                expression,
+                *function,
+                name,
+                arguments,
+                context,
+                input_override,
+            ),
             ir::ExecutableExpressionKind::Materialize { materialization } => {
                 let info = self
                     .materializations_by_id
@@ -1083,11 +1099,22 @@ impl<'a> DocumentCompiler<'a> {
                     },
                 ))
             }
-            ir::ExecutableExpressionKind::FunctionParameter { parameter, .. } => {
-                Err(PlanError::new(format!(
-                    "standalone executable function parameter {}:{} reached retained document lowering",
-                    parameter.function.0, parameter.ordinal
-                )))
+            ir::ExecutableExpressionKind::FunctionParameter {
+                parameter,
+                projection,
+            } => {
+                let Some(value) = context.function_parameters.get(parameter).copied() else {
+                    return Err(PlanError::new(format!(
+                        "standalone executable function parameter {}:{} reached retained document lowering",
+                        parameter.function.0, parameter.ordinal
+                    )));
+                };
+                Ok(self.project_fields(
+                    compiler_id,
+                    value,
+                    projection,
+                    value_class_for_type(&expression.flow_type.ty),
+                ))
             }
         }
     }
@@ -1130,6 +1157,68 @@ impl<'a> DocumentCompiler<'a> {
                 result,
             },
         ))
+    }
+
+    fn compile_user_call(
+        &mut self,
+        expression: &ir::ExecutableExpression,
+        function_id: ir::FunctionId,
+        name: &str,
+        arguments: &[ir::ExecutableCallArgument],
+        caller_context: &CompileContext,
+        input_override: Option<DocumentExprId>,
+    ) -> Result<DocumentExprId, PlanError> {
+        let function = self
+            .program
+            .executable
+            .ordinary_functions
+            .iter()
+            .find(|function| function.id == function_id)
+            .cloned()
+            .ok_or_else(|| {
+                PlanError::new(format!(
+                    "ordinary document call `{name}` at expression {} references missing function {}",
+                    expression.id.0, function_id.0
+                ))
+            })?;
+        let mut arguments = arguments.iter().collect::<Vec<_>>();
+        arguments.sort_by_key(|argument| argument.ordinal);
+        if function.name != name || arguments.len() != function.parameters.len() {
+            return Err(PlanError::new(format!(
+                "ordinary document call `{name}` at expression {} differs from its retained function contract",
+                expression.id.0
+            )));
+        }
+        let mut context = caller_context.clone();
+        context.cache_scope = self.next_cache_scope;
+        self.next_cache_scope = self.next_cache_scope.saturating_add(1);
+        for (argument, parameter) in arguments.into_iter().zip(&function.parameters) {
+            if argument.ordinal != parameter.id.ordinal || argument.name != parameter.name {
+                return Err(PlanError::new(format!(
+                    "ordinary document call `{name}` at expression {} has a stale parameter binding",
+                    expression.id.0
+                )));
+            }
+            let value = self.compile_call_argument(argument, caller_context, input_override)?;
+            if context
+                .function_parameters
+                .insert(parameter.id, value)
+                .is_some()
+            {
+                return Err(PlanError::new(format!(
+                    "ordinary document call `{name}` binds parameter {} twice",
+                    parameter.id.ordinal
+                )));
+            }
+        }
+        if !self.active_ordinary_functions.insert(function_id) {
+            return Err(PlanError::new(format!(
+                "ordinary document callable `{name}` is recursive"
+            )));
+        }
+        let result = self.compile_expression(function.root, &context, None);
+        self.active_ordinary_functions.remove(&function_id);
+        result
     }
 
     fn compile_call(

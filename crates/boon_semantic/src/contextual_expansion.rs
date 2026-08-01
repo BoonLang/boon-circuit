@@ -1,14 +1,15 @@
 use crate::execution::{
-    SemanticBlockBinding, SemanticCall, SemanticCallArgument, SemanticCallContextBinding,
-    SemanticCallContextId, SemanticCallEntry, SemanticCallId, SemanticCallParameterBinding,
-    SemanticCallParameterBindingKind, SemanticCallable, SemanticCallableContext,
-    SemanticCallableId, SemanticCallableKind, SemanticCallableParameter,
-    SemanticContextualMaterialization, SemanticContextualOperationKind, SemanticContextualOrderKey,
-    SemanticExecutionGraphV1, SemanticExprId, SemanticExpression, SemanticExpressionKind,
-    SemanticExpressionOrigin, SemanticFunction, SemanticFunctionParameter, SemanticLocalBindingId,
-    SemanticMaterializationId, SemanticMaterializationLocalId, SemanticMaterializationResultKind,
-    SemanticParameterId, SemanticPatternBinding, SemanticRecordField, SemanticRoot, SemanticScope,
-    SemanticScopeId, SemanticSelectArm, SemanticSelectKind, SemanticSourceDef, SemanticSourceId,
+    SemanticBlockBinding, SemanticCall, SemanticCallArgument, SemanticCallContextArgument,
+    SemanticCallContextBinding, SemanticCallContextId, SemanticCallEntry, SemanticCallId,
+    SemanticCallParameterBinding, SemanticCallParameterBindingKind, SemanticCallable,
+    SemanticCallableContext, SemanticCallableContextParameter, SemanticCallableId,
+    SemanticCallableKind, SemanticCallableParameter, SemanticContextualMaterialization,
+    SemanticContextualOperationKind, SemanticContextualOrderKey, SemanticExecutionGraphV1,
+    SemanticExprId, SemanticExpression, SemanticExpressionKind, SemanticExpressionOrigin,
+    SemanticFunction, SemanticFunctionParameter, SemanticLocalBindingId, SemanticMaterializationId,
+    SemanticMaterializationLocalId, SemanticMaterializationResultKind, SemanticParameterId,
+    SemanticPatternBinding, SemanticRecordField, SemanticRoot, SemanticScope, SemanticScopeId,
+    SemanticSelectArm, SemanticSelectKind, SemanticSourceDef, SemanticSourceId,
     SemanticSourceOrigin, SemanticSourceRead, SemanticStateDef, SemanticStateId,
     SemanticStateLifetimeDeriverV1, SemanticStatement, SemanticStatementId, SemanticStatementKind,
     SemanticStatementOrigin, SemanticStaticOwner, SemanticTextSegment, SemanticValueId,
@@ -1236,12 +1237,22 @@ fn semantic_callable_inventory(
                 })
                 .collect(),
             context_formal: callable.context_formal,
+            context_parameter: callable
+                .context_formal
+                .and_then(|formal| program.context_formal(formal))
+                .map(|formal| SemanticCallableContextParameter {
+                    id: semantic_parameter_id(id, callable.parameters.len()),
+                    formal: formal.id,
+                    name: "PASSED".to_owned(),
+                    flow_type: formal.scheme.flow_type.clone(),
+                }),
             result: callable.result.clone(),
             role: callable.role,
             effect: callable.effect,
             body: callable.body,
             result_expression: callable.result_expression,
             contextual_operation: callable.contextual_operation,
+            semantic_root: None,
         });
     }
     Ok((callables, callable_ids))
@@ -1425,7 +1436,11 @@ pub(crate) fn validate_checked_callable_and_call_inventory(
             .map_err(|error| error.to_string())?;
     let (expected_calls, _) = semantic_call_inventory(program, &semantic_scope_ids, &callable_ids)
         .map_err(|error| error.to_string())?;
-    if execution.callables != expected_callables {
+    let mut actual_callables = execution.callables.clone();
+    for callable in &mut actual_callables {
+        callable.semantic_root = None;
+    }
+    if actual_callables != expected_callables {
         return Err(
             "semantic callable inventory does not exactly cover the checked callable schema"
                 .to_owned(),
@@ -1477,7 +1492,7 @@ pub(crate) fn derive_semantic_execution_graph(
             })
         })
         .collect::<Result<Vec<_>, ExpansionError>>()?;
-    let (callables, callable_ids) = semantic_callable_inventory(program, &semantic_scope_ids)?;
+    let (mut callables, callable_ids) = semantic_callable_inventory(program, &semantic_scope_ids)?;
     let (calls, _) = semantic_call_inventory(program, &semantic_scope_ids, &callable_ids)?;
     let materializations_by_owner = materializations
         .iter()
@@ -1499,6 +1514,7 @@ pub(crate) fn derive_semantic_execution_graph(
         &materializations_by_owner,
         &materialization_result_types,
     );
+    builder.enable_ordinary_call_boundaries();
     let included = program
         .statements
         .iter()
@@ -1703,6 +1719,8 @@ pub(crate) fn derive_semantic_execution_graph(
         producer_bodies.push((producer, result, owner, body, semantic_statement));
     }
     builder.set_current_statement(None);
+    builder.expand_pending_ordinary_definitions()?;
+    let ordinary_definition_roots = builder.ordinary_definition_roots.clone();
 
     statements.sort_by_key(|statement| statement.id);
     let offset = arena.expressions.len();
@@ -1713,6 +1731,28 @@ pub(crate) fn derive_semantic_execution_graph(
         }
     }
     append_expression_arena_without_roots(&mut arena, local_expressions);
+    for (callable, root) in ordinary_definition_roots {
+        let definition = callables
+            .get_mut(callable.as_usize())
+            .filter(|definition| definition.id == callable)
+            .ok_or_else(|| {
+                ExpansionError::InvalidLocalBindings(format!(
+                    "ordinary callable {callable} has no dense semantic definition"
+                ))
+            })?;
+        definition.semantic_root = Some(rebase_expr_id(root, offset));
+    }
+    if std::env::var_os("BOON_SEMANTIC_TRACE").is_some() {
+        let ordinary = callables
+            .iter()
+            .filter(|callable| callable.semantic_root.is_some())
+            .map(|callable| callable.name.as_str())
+            .collect::<Vec<_>>();
+        eprintln!(
+            "boon_semantic ordinary_callable_boundaries count={} names={ordinary:?}",
+            ordinary.len()
+        );
+    }
     let mut functions = Vec::with_capacity(producer_bodies.len());
     let mut producer_sources = Vec::new();
     for (producer, checked_result, owner, body, semantic_statement) in producer_bodies {
@@ -4158,6 +4198,231 @@ struct SemanticExpressionBuilderIndexes {
     callable_ids: BTreeMap<DeclId, SemanticCallableId>,
     call_ids: BTreeMap<CheckedCallId, SemanticCallId>,
     producer_callable_ids: BTreeMap<crate::ProducerFunctionId, SemanticCallableId>,
+    ordinary_callable_ids: BTreeSet<SemanticCallableId>,
+}
+
+fn ordinary_boundary_type(ty: &Type) -> bool {
+    match ty {
+        Type::Text | Type::Number | Type::Bytes(_) | Type::Absent | Type::Bits { .. } => true,
+        Type::VariantSet(variants) => variants.iter().all(|variant| match variant {
+            boon_typecheck::Variant::Tag(_) => true,
+            boon_typecheck::Variant::Tagged { fields, .. } => {
+                !fields.open && fields.fields.values().all(ordinary_boundary_type)
+            }
+        }),
+        Type::Object(shape) => !shape.open && shape.fields.values().all(ordinary_boundary_type),
+        Type::Union(members) => !members.is_empty() && members.iter().all(ordinary_boundary_type),
+        Type::RenderContract
+        | Type::List(_)
+        | Type::Map { .. }
+        | Type::Set(_)
+        | Type::Function { .. }
+        | Type::UnresolvedShape { .. }
+        | Type::Var(_)
+        | Type::Unknown => false,
+    }
+}
+
+fn enclosing_function_owner(
+    program: &CheckedProgram,
+    lookup: &CheckedProgramLookup,
+    mut scope: boon_typecheck::LexicalScopeId,
+) -> Option<DeclId> {
+    let mut visited = BTreeSet::new();
+    while visited.insert(scope) {
+        let definition = lookup.scope(program, scope)?;
+        if definition.kind == boon_typecheck::CheckedScopeKind::Function {
+            return definition.owner;
+        }
+        scope = definition.parent?;
+    }
+    None
+}
+
+fn ordinary_callable_base_candidate(callable: &boon_typecheck::CheckedCallableSignature) -> bool {
+    callable.kind == CheckedCallableKind::User
+        && callable.effect == boon_typecheck::CheckedEffectSummary::default()
+        && callable.contexts.is_empty()
+        && callable.contextual_operation.is_none()
+        && callable.result_expression.is_some()
+        && ordinary_boundary_type(&callable.result.ty)
+        && callable.parameters.iter().all(|parameter| {
+            parameter.kind == CheckedParameterKind::Value
+                && parameter.evaluation_scope == boon_typecheck::CheckedEvaluationScope::Parent
+                && matches!(parameter.requirement, CheckedParameterRequirement::Required)
+                && ordinary_boundary_type(&parameter.flow_type.ty)
+        })
+}
+
+fn ordinary_callable_body_is_closed(
+    program: &CheckedProgram,
+    lookup: &CheckedProgramLookup,
+    callable: &boon_typecheck::CheckedCallableSignature,
+    candidates: &BTreeSet<DeclId>,
+) -> bool {
+    let Some(root) = callable.result_expression else {
+        return false;
+    };
+    let mut pending = vec![root];
+    let mut visited = BTreeSet::new();
+    while let Some(expression_id) = pending.pop() {
+        if !visited.insert(expression_id) {
+            continue;
+        }
+        let Some(expression) = lookup.expression(program, expression_id) else {
+            return false;
+        };
+        if expression.effect != boon_typecheck::CheckedEffectSummary::default() {
+            return false;
+        }
+        match &expression.kind {
+            CheckedExpressionKind::Read { target, source, .. } => {
+                if source.is_some()
+                    || enclosing_function_owner(program, lookup, expression.scope_id)
+                        != Some(callable.decl_id)
+                {
+                    return false;
+                }
+                let Some(declaration) = lookup.declaration(program, *target) else {
+                    return false;
+                };
+                if enclosing_function_owner(program, lookup, declaration.scope_id)
+                    != Some(callable.decl_id)
+                {
+                    return false;
+                }
+                if let Some(value) = declaration.value
+                    && !callable
+                        .parameters
+                        .iter()
+                        .any(|parameter| parameter.decl_id == *target)
+                {
+                    pending.push(value);
+                }
+            }
+            CheckedExpressionKind::Call { call } => {
+                let Some(call) = lookup.call(program, *call) else {
+                    return false;
+                };
+                if !call.contexts.is_empty()
+                    || call
+                        .entries
+                        .iter()
+                        .any(|entry| !matches!(entry, CheckedCallEntry::Input { .. }))
+                {
+                    return false;
+                }
+                let Some(target) = lookup.callable(program, call.callable) else {
+                    return false;
+                };
+                let context_matches = match target.context_formal {
+                    None => matches!(call.context_binding, CheckedContextBinding::None),
+                    Some(_) => matches!(
+                        call.context_binding,
+                        CheckedContextBinding::Explicit { .. }
+                            | CheckedContextBinding::Inherited { .. }
+                    ),
+                };
+                if !context_matches {
+                    return false;
+                }
+                match target.kind {
+                    CheckedCallableKind::Builtin
+                        if target.effect == boon_typecheck::CheckedEffectSummary::default()
+                            && target.contexts.is_empty()
+                            && target.context_formal.is_none() => {}
+                    CheckedCallableKind::User if candidates.contains(&target.decl_id) => {}
+                    CheckedCallableKind::User
+                    | CheckedCallableKind::Builtin
+                    | CheckedCallableKind::External => return false,
+                }
+                pending.extend(call.entries.iter().filter_map(|entry| match entry {
+                    CheckedCallEntry::Input { value, .. } => Some(*value),
+                    CheckedCallEntry::FreshOut { .. } | CheckedCallEntry::ForwardOut { .. } => None,
+                }));
+            }
+            CheckedExpressionKind::TextTemplate { segments } => {
+                pending.extend(segments.iter().filter_map(|segment| match segment {
+                    CheckedTextSegment::Dynamic { value } => Some(*value),
+                    CheckedTextSegment::Static { .. } => None,
+                }))
+            }
+            CheckedExpressionKind::TaggedObject { fields, .. }
+            | CheckedExpressionKind::Object { fields } => {
+                pending.extend(fields.iter().map(|field| field.value));
+            }
+            CheckedExpressionKind::Flush { payload } => pending.push(*payload),
+            CheckedExpressionKind::When { input, arms } => {
+                pending.push(*input);
+                pending.extend(arms.iter().copied());
+            }
+            CheckedExpressionKind::Infix { left, right, .. }
+            | CheckedExpressionKind::MapEntry {
+                key: left,
+                value: right,
+            } => {
+                pending.push(*left);
+                pending.push(*right);
+            }
+            CheckedExpressionKind::MatchArm { output, .. } => pending.extend(*output),
+            CheckedExpressionKind::Block { bindings, result } => {
+                pending.extend(bindings.iter().map(|binding| binding.value));
+                pending.extend(*result);
+            }
+            CheckedExpressionKind::Bytes { items, .. } => pending.extend(items.iter().copied()),
+            CheckedExpressionKind::Passed {
+                formal,
+                access: CheckedPassedAccess::Read,
+                ..
+            } if callable.context_formal == Some(*formal) => {}
+            CheckedExpressionKind::Text { .. }
+            | CheckedExpressionKind::Number { .. }
+            | CheckedExpressionKind::Bits { .. }
+            | CheckedExpressionKind::BytesByte { .. }
+            | CheckedExpressionKind::Absent
+            | CheckedExpressionKind::Tag { .. }
+            | CheckedExpressionKind::Delimiter => {}
+            CheckedExpressionKind::Passed { .. }
+            | CheckedExpressionKind::ExternalRead { .. }
+            | CheckedExpressionKind::Drain { .. }
+            | CheckedExpressionKind::Source
+            | CheckedExpressionKind::Draining { .. }
+            | CheckedExpressionKind::Hold { .. }
+            | CheckedExpressionKind::Latest { .. }
+            | CheckedExpressionKind::While { .. }
+            | CheckedExpressionKind::Then { .. }
+            | CheckedExpressionKind::List { .. }
+            | CheckedExpressionKind::Map { .. }
+            | CheckedExpressionKind::Set { .. }
+            | CheckedExpressionKind::Invalid { .. } => return false,
+        }
+    }
+    true
+}
+
+fn ordinary_callable_declarations(program: &CheckedProgram) -> BTreeSet<DeclId> {
+    let lookup = CheckedProgramLookup::new(program);
+    let mut candidates = program
+        .callables
+        .iter()
+        .filter(|callable| ordinary_callable_base_candidate(callable))
+        .map(|callable| callable.decl_id)
+        .collect::<BTreeSet<_>>();
+    loop {
+        let retained = program
+            .callables
+            .iter()
+            .filter(|callable| candidates.contains(&callable.decl_id))
+            .filter(|callable| {
+                ordinary_callable_body_is_closed(program, &lookup, callable, &candidates)
+            })
+            .map(|callable| callable.decl_id)
+            .collect::<BTreeSet<_>>();
+        if retained == candidates {
+            return retained;
+        }
+        candidates = retained;
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4205,10 +4470,15 @@ impl SemanticExpressionBuilderIndexes {
                     .map(|callable| (producer.spec.function, callable))
             })
             .collect::<BTreeMap<_, _>>();
+        let ordinary_callable_ids = ordinary_callable_declarations(program)
+            .into_iter()
+            .filter_map(|callable| callable_ids.get(&callable).copied())
+            .collect();
         Self {
             callable_ids,
             call_ids,
             producer_callable_ids,
+            ordinary_callable_ids,
         }
     }
 }
@@ -4233,6 +4503,11 @@ pub(crate) struct SemanticExpressionBuilder<'a> {
     value_frame_by_key: BTreeMap<SemanticValueFrameKey, usize>,
     next_local_binding: usize,
     defer_nested_expansion: bool,
+    ordinary_definition_frames: BTreeMap<OutCallInstanceId, SemanticCallableId>,
+    ordinary_definition_instances: BTreeMap<SemanticCallableId, OutCallInstanceId>,
+    ordinary_definition_order: Vec<SemanticCallableId>,
+    ordinary_definition_roots: BTreeMap<SemanticCallableId, SemanticExprId>,
+    retain_ordinary_calls: bool,
 }
 
 impl<'a> SemanticExpressionBuilder<'a> {
@@ -4266,7 +4541,79 @@ impl<'a> SemanticExpressionBuilder<'a> {
             value_frame_by_key: BTreeMap::new(),
             next_local_binding: 0,
             defer_nested_expansion: false,
+            ordinary_definition_frames: BTreeMap::new(),
+            ordinary_definition_instances: BTreeMap::new(),
+            ordinary_definition_order: Vec::new(),
+            ordinary_definition_roots: BTreeMap::new(),
+            retain_ordinary_calls: false,
         }
+    }
+
+    fn enable_ordinary_call_boundaries(&mut self) {
+        self.retain_ordinary_calls = true;
+    }
+
+    fn schedule_ordinary_definition(
+        &mut self,
+        callable: SemanticCallableId,
+        instance: OutCallInstanceId,
+    ) {
+        if let std::collections::btree_map::Entry::Vacant(entry) =
+            self.ordinary_definition_instances.entry(callable)
+        {
+            entry.insert(instance);
+            self.ordinary_definition_order.push(callable);
+        }
+    }
+
+    fn expand_pending_ordinary_definitions(&mut self) -> Result<(), ExpansionError> {
+        let mut next = 0;
+        while next < self.ordinary_definition_order.len() {
+            let semantic_callable = self.ordinary_definition_order[next];
+            next += 1;
+            if self
+                .ordinary_definition_roots
+                .contains_key(&semantic_callable)
+            {
+                continue;
+            }
+            let instance = self.ordinary_definition_instances[&semantic_callable];
+            self.ordinary_definition_frames
+                .insert(instance, semantic_callable);
+            let checked_callable = self.out_net.call_instances[instance.as_usize()]
+                .provenance
+                .callable;
+            let callable = self
+                .lookup
+                .callable(self.program, checked_callable)
+                .cloned()
+                .ok_or(ExpansionError::MissingCallable(checked_callable))?;
+            if self.indexes.callable_ids.get(&checked_callable).copied() != Some(semantic_callable)
+            {
+                return Err(ExpansionError::InvalidLocalBindings(format!(
+                    "ordinary callable {semantic_callable} representative frame {instance} has stale checked identity"
+                )));
+            }
+            let checked_root = callable
+                .result_expression
+                .ok_or(ExpansionError::MissingFunctionResult(checked_callable))?;
+            let root = self.expand_with_inherited_owner(
+                ScopedCheckedExpr {
+                    expression: checked_root,
+                    frame: Some(instance),
+                    evaluation_port: None,
+                    value_frame: None,
+                },
+                None,
+            )?;
+            let flow_type = self.expressions[root.as_usize()].flow_type.clone();
+            let boundary_expression = self.flush_boundary_origin_for_value(checked_root, root);
+            let root =
+                self.wrap_flush_boundary(boundary_expression, root, None, Some(flow_type))?;
+            self.ordinary_definition_roots
+                .insert(semantic_callable, root);
+        }
+        Ok(())
     }
 
     fn set_local_type(
@@ -4854,6 +5201,48 @@ impl<'a> SemanticExpressionBuilder<'a> {
                     }
                     return Ok(local_expression);
                 }
+                if let Some((frame, semantic_callable)) = scoped.frame.and_then(|frame| {
+                    self.ordinary_definition_frames
+                        .get(&frame)
+                        .copied()
+                        .map(|callable| (frame, callable))
+                }) {
+                    let instance = &self.out_net.call_instances[frame.as_usize()];
+                    if let Some(parameter) = self
+                        .lookup
+                        .callable(self.program, instance.provenance.callable)
+                        .and_then(|callable| {
+                            callable
+                                .parameters
+                                .iter()
+                                .find(|parameter| parameter.decl_id == target)
+                        })
+                    {
+                        let mut flow_type = parameter.flow_type.clone();
+                        flow_type.ty =
+                            concrete_type_in_frame(self.out_net, &flow_type.ty, Some(frame));
+                        flow_type.ty = project_concrete_type(flow_type.ty, &projection)
+                            .ok_or_else(|| {
+                                ExpansionError::InvalidLocalBindings(format!(
+                                    "ordinary callable {semantic_callable} parameter {} cannot project checked fields {:?}",
+                                    parameter.ordinal, projection
+                                ))
+                            })?;
+                        let parameter = self.push(
+                            &expression,
+                            owner,
+                            SemanticExpressionKind::FunctionParameter {
+                                parameter: semantic_parameter_id(
+                                    semantic_callable,
+                                    parameter.ordinal,
+                                ),
+                                projection,
+                            },
+                        );
+                        self.expressions[parameter.as_usize()].flow_type = flow_type;
+                        return Ok(parameter);
+                    }
+                }
                 if let Some((frame, actual, argument_owner)) = scoped.frame.and_then(|frame| {
                     self.out_net.call_instances[frame.as_usize()]
                         .inputs
@@ -5019,6 +5408,67 @@ impl<'a> SemanticExpressionBuilder<'a> {
                 projection,
                 access,
             } => {
+                if let Some((frame, semantic_callable)) = scoped.frame.and_then(|frame| {
+                    self.ordinary_definition_frames
+                        .get(&frame)
+                        .copied()
+                        .map(|callable| (frame, callable))
+                }) {
+                    if access != CheckedPassedAccess::Read {
+                        return Err(ExpansionError::InvalidPassedDrainTarget(scoped.expression));
+                    }
+                    let callable = self
+                        .lookup
+                        .callable(
+                            self.program,
+                            self.out_net.call_instances[frame.as_usize()]
+                                .provenance
+                                .callable,
+                        )
+                        .ok_or(ExpansionError::MissingCallable(
+                            self.out_net.call_instances[frame.as_usize()]
+                                .provenance
+                                .callable,
+                        ))?;
+                    if callable.context_formal != Some(formal) {
+                        return Err(ExpansionError::MismatchedPassedFormal {
+                            expression: scoped.expression,
+                            expected: callable.context_formal.unwrap_or(formal),
+                            found: formal,
+                        });
+                    }
+                    let passed = self.out_net.call_instances[frame.as_usize()]
+                        .passed
+                        .ok_or(ExpansionError::MissingPassedContext(scoped.expression))?;
+                    let actual = self
+                        .lookup
+                        .expression(self.program, passed.value.expression)
+                        .ok_or(ExpansionError::MissingExpression(passed.value.expression))?;
+                    let mut flow_type = actual.flow_type.clone();
+                    flow_type.ty =
+                        concrete_type_in_frame(self.out_net, &flow_type.ty, passed.value.frame);
+                    flow_type.ty = project_concrete_type(flow_type.ty, &projection).ok_or_else(
+                        || {
+                            ExpansionError::InvalidLocalBindings(format!(
+                                "ordinary callable {semantic_callable} PASSED parameter cannot project checked fields {:?}",
+                                projection
+                            ))
+                        },
+                    )?;
+                    let parameter = self.push(
+                        &expression,
+                        owner,
+                        SemanticExpressionKind::FunctionParameter {
+                            parameter: semantic_parameter_id(
+                                semantic_callable,
+                                callable.parameters.len(),
+                            ),
+                            projection,
+                        },
+                    );
+                    self.expressions[parameter.as_usize()].flow_type = flow_type;
+                    return Ok(parameter);
+                }
                 let passed = scoped
                     .frame
                     .and_then(|frame| self.out_net.call_instances[frame.as_usize()].passed)
@@ -5349,7 +5799,14 @@ impl<'a> SemanticExpressionBuilder<'a> {
             }
             return Ok(expression_id);
         }
-        if callable.kind == CheckedCallableKind::User {
+        let retained_user_call = self.retain_ordinary_calls
+            && callable.kind == CheckedCallableKind::User
+            && self
+                .indexes
+                .callable_ids
+                .get(&callable.decl_id)
+                .is_some_and(|callable| self.indexes.ordinary_callable_ids.contains(callable));
+        if callable.kind == CheckedCallableKind::User && !retained_user_call {
             let result = callable
                 .result_expression
                 .ok_or(ExpansionError::MissingFunctionResult(callable.decl_id))?;
@@ -5394,7 +5851,9 @@ impl<'a> SemanticExpressionBuilder<'a> {
                 Some(concrete_result),
             );
         }
-        if !matches!(checked_call.context_binding, CheckedContextBinding::None) {
+        if !retained_user_call
+            && !matches!(checked_call.context_binding, CheckedContextBinding::None)
+        {
             return Err(ExpansionError::PassOnNonexpandedCall(call_id));
         }
         let inputs = self.out_net.call_instances[instance.as_usize()]
@@ -5475,10 +5934,38 @@ impl<'a> SemanticExpressionBuilder<'a> {
             });
         }
         parameter_bindings.sort_by_key(|binding| binding.ordinal);
+        let context_argument = if retained_user_call {
+            match callable.context_formal {
+                Some(formal) => {
+                    let passed = self.out_net.call_instances[instance.as_usize()]
+                        .passed
+                        .ok_or(ExpansionError::MissingPassedContext(expression.id))?;
+                    if passed.formal != formal {
+                        return Err(ExpansionError::MismatchedPassedFormal {
+                            expression: expression.id,
+                            expected: formal,
+                            found: passed.formal,
+                        });
+                    }
+                    let argument_owner = self
+                        .out_net
+                        .owner_for_call_evaluation(passed.evaluation_call);
+                    Some(SemanticCallContextArgument {
+                        formal,
+                        checked_value: passed.value.expression,
+                        value: self.expand_with_inherited_owner(passed.value, argument_owner)?,
+                    })
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
         let kind = match callable.kind {
+            CheckedCallableKind::User if retained_user_call => SemanticCallableKind::User,
             CheckedCallableKind::Builtin => SemanticCallableKind::Builtin,
             CheckedCallableKind::External => SemanticCallableKind::External,
-            CheckedCallableKind::User => unreachable!("user calls are expanded above"),
+            CheckedCallableKind::User => unreachable!("specialized user calls are expanded above"),
         };
         let contexts = checked_call
             .contexts
@@ -5510,7 +5997,10 @@ impl<'a> SemanticExpressionBuilder<'a> {
                     call_id.0, checked_call.callable.0
                 ))
             })?;
-        Ok(self.push(
+        if retained_user_call {
+            self.schedule_ordinary_definition(semantic_callable, instance);
+        }
+        let call_expression = self.push(
             expression,
             owner,
             SemanticExpressionKind::Call {
@@ -5526,9 +6016,23 @@ impl<'a> SemanticExpressionBuilder<'a> {
                 instance,
                 arguments,
                 parameter_bindings,
+                context_argument,
                 contexts,
             },
-        ))
+        );
+        if retained_user_call {
+            let checked_root = callable
+                .result_expression
+                .ok_or(ExpansionError::MissingFunctionResult(callable.decl_id))?;
+            let flow_type = self.expressions[call_expression.as_usize()]
+                .flow_type
+                .clone();
+            let boundary_expression =
+                self.flush_boundary_origin_for_value(checked_root, call_expression);
+            self.wrap_flush_boundary(boundary_expression, call_expression, owner, Some(flow_type))
+        } else {
+            Ok(call_expression)
+        }
     }
 
     fn expand_in_frame(

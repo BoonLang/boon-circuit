@@ -1939,77 +1939,79 @@ impl<'a> CheckedProgramBuilder<'a> {
         }
         let expression_owner =
             checked_program_phase!("expression_owner", expression_owner_functions(program));
-        let expressions_by_owner = expression_owner.iter().fold(
-            BTreeMap::<String, Vec<usize>>::new(),
-            |mut owners, (expression, owner)| {
-                owners.entry(owner.clone()).or_default().push(*expression);
-                owners
-            },
-        );
-        let mut builder = Self {
-            program,
-            role: external_types.current_role,
-            external_value_modes: external_types
-                .values
-                .iter()
-                .map(|(path, value)| (path.clone(), value.mode))
-                .collect(),
-            external_identities: external_types.external_identities.clone(),
-            local_function_requirements: external_types.local_function_requirements.clone(),
-            flow_bindings: flow_bindings.clone(),
-            named_value_modes: named_value_type_table
-                .entries
-                .iter()
-                .map(|entry| (entry.path.clone(), entry.flow_type.mode))
-                .collect(),
-            named_value_expressions: declaration_expression_index(program),
-            signatures: Vec::new(),
-            context_formals: Vec::new(),
-            signature_by_name: BTreeMap::new(),
-            signature_by_decl: BTreeMap::new(),
-            expression_owner,
-            expressions_by_owner,
-            next_decl_id: 1,
-            next_scope_id: 1,
-            next_call_id: 0,
-            visited_exprs: BTreeSet::new(),
-            calls: Vec::new(),
-            call_by_id: BTreeMap::new(),
-            call_by_expression: BTreeMap::new(),
-            scopes: vec![CheckedScope {
-                id: LexicalScopeId(0),
-                parent: None,
-                owner: None,
-                kind: CheckedScopeKind::Root,
-                span: CheckedSpan::default(),
-            }],
-            declarations: Vec::new(),
-            declaration_by_id: BTreeMap::new(),
-            occurrences: Vec::new(),
-            statement_declarations: BTreeMap::new(),
-            statement_scopes: BTreeMap::new(),
-            statement_body_scopes: BTreeMap::new(),
-            expression_scopes: BTreeMap::new(),
-            expression_declarations: BTreeMap::new(),
-            expression_call_contexts: BTreeMap::new(),
-            scope_declarations: BTreeMap::new(),
-            pattern_declarations: BTreeMap::new(),
-            pattern_selectors: BTreeMap::new(),
-            pattern_parents: BTreeMap::new(),
-            pattern_arms_by_scope: BTreeMap::new(),
-            nearest_pattern_arm_by_scope: Vec::new(),
-            syntax_discriminant_parameters: BTreeSet::new(),
-            inferred_expr_types: BTreeMap::new(),
-            syntax_expr_types: BTreeMap::new(),
-            expression_flush_types: BTreeMap::new(),
-            authoritative_expr_types: BTreeSet::new(),
-            checked_flow_inference_epoch: 0,
-            checked_flow_inference_cache: BTreeMap::new(),
-            validate_checked_projections: false,
-            source_payload_shape_table: source_payload_shape_table.to_vec(),
-            exact_number_literals: BTreeMap::new(),
-            diagnostics: Vec::new(),
-        };
+        let mut builder = checked_program_phase!("initialize_builder", {
+            let expressions_by_owner = expression_owner.iter().fold(
+                BTreeMap::<String, Vec<usize>>::new(),
+                |mut owners, (expression, owner)| {
+                    owners.entry(owner.clone()).or_default().push(*expression);
+                    owners
+                },
+            );
+            Self {
+                program,
+                role: external_types.current_role,
+                external_value_modes: external_types
+                    .values
+                    .iter()
+                    .map(|(path, value)| (path.clone(), value.mode))
+                    .collect(),
+                external_identities: external_types.external_identities.clone(),
+                local_function_requirements: external_types.local_function_requirements.clone(),
+                flow_bindings: flow_bindings.clone(),
+                named_value_modes: named_value_type_table
+                    .entries
+                    .iter()
+                    .map(|entry| (entry.path.clone(), entry.flow_type.mode))
+                    .collect(),
+                named_value_expressions: declaration_expression_index(program),
+                signatures: Vec::new(),
+                context_formals: Vec::new(),
+                signature_by_name: BTreeMap::new(),
+                signature_by_decl: BTreeMap::new(),
+                expression_owner,
+                expressions_by_owner,
+                next_decl_id: 1,
+                next_scope_id: 1,
+                next_call_id: 0,
+                visited_exprs: BTreeSet::new(),
+                calls: Vec::new(),
+                call_by_id: BTreeMap::new(),
+                call_by_expression: BTreeMap::new(),
+                scopes: vec![CheckedScope {
+                    id: LexicalScopeId(0),
+                    parent: None,
+                    owner: None,
+                    kind: CheckedScopeKind::Root,
+                    span: CheckedSpan::default(),
+                }],
+                declarations: Vec::new(),
+                declaration_by_id: BTreeMap::new(),
+                occurrences: Vec::new(),
+                statement_declarations: BTreeMap::new(),
+                statement_scopes: BTreeMap::new(),
+                statement_body_scopes: BTreeMap::new(),
+                expression_scopes: BTreeMap::new(),
+                expression_declarations: BTreeMap::new(),
+                expression_call_contexts: BTreeMap::new(),
+                scope_declarations: BTreeMap::new(),
+                pattern_declarations: BTreeMap::new(),
+                pattern_selectors: BTreeMap::new(),
+                pattern_parents: BTreeMap::new(),
+                pattern_arms_by_scope: BTreeMap::new(),
+                nearest_pattern_arm_by_scope: Vec::new(),
+                syntax_discriminant_parameters: BTreeSet::new(),
+                inferred_expr_types: BTreeMap::new(),
+                syntax_expr_types: BTreeMap::new(),
+                expression_flush_types: BTreeMap::new(),
+                authoritative_expr_types: BTreeSet::new(),
+                checked_flow_inference_epoch: 0,
+                checked_flow_inference_cache: BTreeMap::new(),
+                validate_checked_projections: false,
+                source_payload_shape_table: source_payload_shape_table.to_vec(),
+                exact_number_literals: BTreeMap::new(),
+                diagnostics: Vec::new(),
+            }
+        });
         let exact_pipeline_inputs_valid = checked_program_phase!(
             "validate_exact_pipeline_inputs",
             builder.validate_exact_pipeline_inputs()
@@ -2138,33 +2140,39 @@ impl<'a> CheckedProgramBuilder<'a> {
                 &sources,
             )
         );
-        refine_checked_source_payload_types_from_requirements(
-            &mut sources,
-            &resource_projection_requirements,
-        );
-        let mut checked = CheckedProgram::from_typechecker_fields(CheckedProgramFields {
-            source_bundle_digest_v1: builder.program.source_bundle_digest_v1,
-            role: builder.role,
-            external_types: ExternalTypeEnvironment::default(),
-            lowering_metadata: CheckedProgramLoweringMetadata::default(),
-            root_scope: LexicalScopeId(0),
-            scopes: builder.scopes,
-            declarations: builder.declarations,
-            statements,
-            expressions,
-            callables: builder.signatures,
-            context_formals: builder.context_formals,
-            calls: builder.calls,
-            call_result_paths,
-            order_chains: Vec::new(),
-            pattern_bindings,
-            resource_projection_requirements,
-            sources,
-            states,
-            lists,
-            occurrences: builder.occurrences,
+        checked_program_phase!("refine_source_payload_types", {
+            refine_checked_source_payload_types_from_requirements(
+                &mut sources,
+                &resource_projection_requirements,
+            )
         });
-        let (order_chains, order_diagnostics) = derive_checked_order_chains(&checked);
+        let mut checked = checked_program_phase!(
+            "assemble_checked_program",
+            CheckedProgram::from_typechecker_fields(CheckedProgramFields {
+                source_bundle_digest_v1: builder.program.source_bundle_digest_v1,
+                role: builder.role,
+                external_types: ExternalTypeEnvironment::default(),
+                lowering_metadata: CheckedProgramLoweringMetadata::default(),
+                root_scope: LexicalScopeId(0),
+                scopes: builder.scopes,
+                declarations: builder.declarations,
+                statements,
+                expressions,
+                callables: builder.signatures,
+                context_formals: builder.context_formals,
+                calls: builder.calls,
+                call_result_paths,
+                order_chains: Vec::new(),
+                pattern_bindings,
+                resource_projection_requirements,
+                sources,
+                states,
+                lists,
+                occurrences: builder.occurrences,
+            })
+        );
+        let (order_chains, order_diagnostics) =
+            checked_program_phase!("derive_order_chains", derive_checked_order_chains(&checked));
         checked.fields.order_chains = order_chains;
         builder.diagnostics.extend(order_diagnostics);
         (checked, builder.diagnostics, exact_pipeline_inputs_valid)
@@ -14654,6 +14662,7 @@ impl<'a> Checker<'a> {
             eprintln!("boon_typecheck checked_program:start");
         }
         let checked_program_started = Instant::now();
+        let checked_program_build_started = Instant::now();
         let (checked_program, call_diagnostics, exact_pipeline_inputs_valid) =
             CheckedProgramBuilder::build(
                 self.program,
@@ -14669,22 +14678,57 @@ impl<'a> Checker<'a> {
                     render_contracts: &self.render_contracts,
                 },
             );
+        trace_phase(
+            "checked_program.build",
+            typecheck_elapsed_ms(checked_program_build_started),
+        );
+        let reconcile_functions_started = Instant::now();
         self.reconcile_function_type_table(&checked_program);
+        trace_phase(
+            "checked_program.reconcile_function_types",
+            typecheck_elapsed_ms(reconcile_functions_started),
+        );
+        let host_ports_started = Instant::now();
         if let Err(error) =
             validate_checked_host_port_source_payload_types(&checked_program, &self.host_port_table)
         {
             self.diagnostics.push(diagnostic_at_line(1, error));
         }
+        trace_phase(
+            "checked_program.validate_host_ports",
+            typecheck_elapsed_ms(host_ports_started),
+        );
+        let deferred_styles_started = Instant::now();
         let deferred_style_diagnostics =
             validate_deferred_style_constraints(&checked_program, &self.deferred_style_constraints);
         self.diagnostics.extend(deferred_style_diagnostics);
+        trace_phase(
+            "checked_program.validate_deferred_styles",
+            typecheck_elapsed_ms(deferred_styles_started),
+        );
+        let match_patterns_started = Instant::now();
         self.diagnostics
             .extend(validate_checked_match_patterns(&checked_program));
+        trace_phase(
+            "checked_program.validate_match_patterns",
+            typecheck_elapsed_ms(match_patterns_started),
+        );
+        let collection_authority_started = Instant::now();
         self.diagnostics
             .extend(validate_checked_collection_authority_attachments(
                 &checked_program,
             ));
+        trace_phase(
+            "checked_program.validate_collection_authority",
+            typecheck_elapsed_ms(collection_authority_started),
+        );
+        let payload_shape_started = Instant::now();
         let source_payload_shape_table = checked_source_payload_shape_table(&checked_program);
+        trace_phase(
+            "checked_program.source_payload_shapes",
+            typecheck_elapsed_ms(payload_shape_started),
+        );
+        let refresh_named_values_started = Instant::now();
         if let Err(error) = refresh_named_value_types_from_checked_program(
             &mut named_value_type_table,
             &named_value_syntax_sites,
@@ -14692,6 +14736,10 @@ impl<'a> Checker<'a> {
         ) {
             self.diagnostics.push(diagnostic_at_line(1, error));
         }
+        trace_phase(
+            "checked_program.refresh_named_value_types",
+            typecheck_elapsed_ms(refresh_named_values_started),
+        );
         trace_phase(
             "checked_program",
             typecheck_elapsed_ms(checked_program_started),
@@ -23641,21 +23689,7 @@ fn validate_deferred_style_constraints(
                 substitute_checked_type(&substitution.value, &combined),
             );
         }
-        normalize_substitutions(&mut combined);
         combined
-    }
-
-    fn normalize_substitutions(substitutions: &mut BTreeMap<TypeVar, Type>) {
-        for _ in 0..substitutions.len().saturating_add(1) {
-            let next = substitutions
-                .iter()
-                .map(|(variable, value)| (*variable, substitute_checked_type(value, substitutions)))
-                .collect::<BTreeMap<_, _>>();
-            if next == *substitutions {
-                break;
-            }
-            *substitutions = next;
-        }
     }
 
     fn accepts(expectation: DeferredStyleExpectation, ty: &Type) -> bool {
@@ -23727,9 +23761,16 @@ fn validate_deferred_style_constraints(
         inherited: &BTreeMap<TypeVar, Type>,
         constraints_by_owner: &BTreeMap<Option<DeclId>, Vec<&DeferredStyleConstraint>>,
         calls_by_owner: &BTreeMap<Option<DeclId>, Vec<&CheckedCall>>,
+        relevant_callables: &BTreeSet<DeclId>,
+        user_callables: &BTreeSet<DeclId>,
         active: &mut BTreeSet<DeclId>,
+        visited_calls: &mut usize,
         diagnostics: &mut Vec<TypeDiagnostic>,
     ) {
+        if !relevant_callables.contains(&call.callable) {
+            return;
+        }
+        *visited_calls += 1;
         let substitutions = compose_substitutions(inherited, &call.type_substitutions);
         validate_owner(
             program,
@@ -23738,19 +23779,14 @@ fn validate_deferred_style_constraints(
             constraints_by_owner,
             diagnostics,
         );
-        let Some(signature) = program
-            .callables
-            .iter()
-            .find(|signature| signature.decl_id == call.callable)
-            .filter(|signature| signature.kind == CheckedCallableKind::User)
-        else {
+        if !user_callables.contains(&call.callable) {
             return;
-        };
-        if !active.insert(signature.decl_id) {
+        }
+        if !active.insert(call.callable) {
             return;
         }
         for nested in calls_by_owner
-            .get(&Some(signature.decl_id))
+            .get(&Some(call.callable))
             .into_iter()
             .flatten()
             .copied()
@@ -23761,11 +23797,14 @@ fn validate_deferred_style_constraints(
                 &substitutions,
                 constraints_by_owner,
                 calls_by_owner,
+                relevant_callables,
+                user_callables,
                 active,
+                visited_calls,
                 diagnostics,
             );
         }
-        active.remove(&signature.decl_id);
+        active.remove(&call.callable);
     }
 
     let mut constraints = constraints.to_vec();
@@ -23790,6 +23829,29 @@ fn validate_deferred_style_constraints(
             .or_default()
             .push(call);
     }
+    let user_callables = program
+        .callables
+        .iter()
+        .filter(|callable| callable.kind == CheckedCallableKind::User)
+        .map(|callable| callable.decl_id)
+        .collect::<BTreeSet<_>>();
+    let mut relevant_callables = constraints_by_owner
+        .keys()
+        .filter_map(|owner| *owner)
+        .collect::<BTreeSet<_>>();
+    loop {
+        let mut changed = false;
+        for call in &program.calls {
+            if relevant_callables.contains(&call.callable)
+                && let Some(owner) = call.owner_callable
+            {
+                changed |= relevant_callables.insert(owner);
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
 
     let mut diagnostics = Vec::new();
     validate_owner(
@@ -23799,6 +23861,7 @@ fn validate_deferred_style_constraints(
         &constraints_by_owner,
         &mut diagnostics,
     );
+    let mut visited_calls = 0;
     for call in calls_by_owner.get(&None).into_iter().flatten().copied() {
         visit_call(
             program,
@@ -23806,8 +23869,18 @@ fn validate_deferred_style_constraints(
             &BTreeMap::new(),
             &constraints_by_owner,
             &calls_by_owner,
+            &relevant_callables,
+            &user_callables,
             &mut BTreeSet::new(),
+            &mut visited_calls,
             &mut diagnostics,
+        );
+    }
+    if std::env::var_os("BOON_TYPECHECK_TRACE").is_some() {
+        eprintln!(
+            "boon_typecheck deferred_styles constraints={} relevant_callables={} visited_calls={visited_calls}",
+            constraints.len(),
+            relevant_callables.len(),
         );
     }
     diagnostics.sort_by(|left, right| {

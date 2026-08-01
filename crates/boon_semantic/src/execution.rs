@@ -317,6 +317,14 @@ pub struct SemanticCallableContext {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SemanticCallableContextParameter {
+    pub id: SemanticParameterId,
+    pub formal: ContextFormalId,
+    pub name: String,
+    pub flow_type: FlowType,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SemanticCallable {
     pub id: SemanticCallableId,
     pub checked_callable: DeclId,
@@ -330,6 +338,8 @@ pub struct SemanticCallable {
     pub contexts: Vec<SemanticCallableContext>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_formal: Option<ContextFormalId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_parameter: Option<SemanticCallableContextParameter>,
     pub result: FlowType,
     pub role: ProgramRole,
     pub effect: CheckedEffectSummary,
@@ -339,6 +349,14 @@ pub struct SemanticCallable {
     pub result_expression: Option<CheckedExprId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contextual_operation: Option<CheckedContextualOperation>,
+    /// Canonical semantic body for an ordinary context-free value callable.
+    ///
+    /// Contextual, effectful, OUT-owning, render, and open-typed callables are
+    /// still specialized at their call sites.  A retained body is shared by
+    /// every ordinary call occurrence and reads its inputs through
+    /// [`SemanticExpressionKind::FunctionParameter`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_root: Option<SemanticExprId>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -415,6 +433,13 @@ pub struct SemanticCallParameterBinding {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SemanticCallContextArgument {
+    pub formal: ContextFormalId,
+    pub checked_value: CheckedExprId,
+    pub value: SemanticExprId,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SemanticCallParameterBindingKind {
     Explicit {
@@ -443,6 +468,7 @@ pub struct SemanticPatternBinding {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SemanticCallableKind {
+    User,
     Builtin,
     External,
 }
@@ -522,6 +548,8 @@ pub enum SemanticExpressionKind {
         instance: OutCallInstanceId,
         arguments: Vec<SemanticCallArgument>,
         parameter_bindings: Vec<SemanticCallParameterBinding>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context_argument: Option<SemanticCallContextArgument>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         contexts: Vec<SemanticCallContextId>,
     },
@@ -639,9 +667,15 @@ impl SemanticExpressionKind {
             Self::TaggedObject { fields, .. } | Self::Object(fields) => {
                 fields.iter().map(|field| field.value).collect()
             }
-            Self::Call { arguments, .. } => {
-                arguments.iter().map(|argument| argument.value).collect()
-            }
+            Self::Call {
+                arguments,
+                context_argument,
+                ..
+            } => arguments
+                .iter()
+                .map(|argument| argument.value)
+                .chain(context_argument.iter().map(|argument| argument.value))
+                .collect(),
             Self::Flush { payload: input }
             | Self::FlushBoundary { input }
             | Self::Draining { input }
@@ -1842,6 +1876,7 @@ impl SemanticExecutionGraphV1 {
 
     fn validate_callable_and_call_tables(&self) -> Result<(), String> {
         let mut checked_callables = BTreeSet::new();
+        let mut semantic_roots = BTreeSet::new();
         for callable in &self.callables {
             if !checked_callables.insert(callable.checked_callable) {
                 return Err(format!(
@@ -1869,6 +1904,48 @@ impl SemanticExecutionGraphV1 {
                     return Err(format!(
                         "semantic callable {} parameter {} has an empty default profile",
                         callable.id, parameter.name
+                    ));
+                }
+            }
+            if let Some(root) = callable.semantic_root {
+                if callable.kind != CheckedCallableKind::User
+                    || callable.effect != CheckedEffectSummary::default()
+                    || !callable.contexts.is_empty()
+                    || callable.contextual_operation.is_some()
+                    || callable.parameters.iter().any(|parameter| {
+                        parameter.kind != CheckedParameterKind::Value
+                            || !matches!(
+                                parameter.requirement,
+                                CheckedParameterRequirement::Required
+                            )
+                    })
+                {
+                    return Err(format!(
+                        "semantic callable {} retains a body across a specialization-sensitive boundary",
+                        callable.id
+                    ));
+                }
+                match (&callable.context_formal, &callable.context_parameter) {
+                    (None, None) => {}
+                    (Some(formal), Some(parameter))
+                        if parameter.formal == *formal
+                            && parameter.id
+                                == (SemanticParameterId {
+                                    callable: callable.id,
+                                    ordinal: callable.parameters.len(),
+                                }) => {}
+                    _ => {
+                        return Err(format!(
+                            "semantic callable {} has a stale retained PASSED parameter",
+                            callable.id
+                        ));
+                    }
+                }
+                self.require_expression(root, format!("callable {} semantic root", callable.id))?;
+                if !semantic_roots.insert(root) {
+                    return Err(format!(
+                        "semantic callable {} shares semantic root {root} with another callable",
+                        callable.id
                     ));
                 }
             }
@@ -2083,6 +2160,7 @@ impl SemanticExecutionGraphV1 {
                 instance,
                 arguments,
                 parameter_bindings,
+                context_argument,
                 contexts,
             } => {
                 validate_call_instance(out_net, *instance, &context("call instance"))?;
@@ -2090,11 +2168,14 @@ impl SemanticExecutionGraphV1 {
                 let callable_definition =
                     self.require_callable(*callable, context("callable definition"))?;
                 let expected_kind = match callable_definition.kind {
+                    CheckedCallableKind::User if callable_definition.semantic_root.is_some() => {
+                        SemanticCallableKind::User
+                    }
                     CheckedCallableKind::Builtin => SemanticCallableKind::Builtin,
                     CheckedCallableKind::External => SemanticCallableKind::External,
                     CheckedCallableKind::User => {
                         return Err(format!(
-                            "expression {expression} retains an unexpanded user call"
+                            "expression {expression} retains a user call without a semantic callable body"
                         ));
                     }
                 };
@@ -2214,6 +2295,37 @@ impl SemanticExecutionGraphV1 {
                         "expression {expression} has an argument without an exact parameter binding"
                     ));
                 }
+                match (&callable_definition.context_parameter, context_argument) {
+                    (None, None) => {}
+                    (Some(parameter), Some(argument))
+                        if *callable_kind == SemanticCallableKind::User
+                            && parameter.formal == argument.formal =>
+                    {
+                        self.require_expression(
+                            argument.value,
+                            context("PASSED context argument"),
+                        )?;
+                        let passed = resolved_instance.passed.ok_or_else(|| {
+                            format!(
+                                "expression {expression} retained callable {} without a resolved PASSED value",
+                                callable_definition.id
+                            )
+                        })?;
+                        if passed.formal != argument.formal
+                            || passed.value.expression != argument.checked_value
+                        {
+                            return Err(format!(
+                                "expression {expression} retained PASSED argument differs from call instance {instance}"
+                            ));
+                        }
+                    }
+                    _ => {
+                        return Err(format!(
+                            "expression {expression} retained PASSED argument differs from callable {}",
+                            callable_definition.id
+                        ));
+                    }
+                }
                 for argument in arguments {
                     self.require_expression(argument.value, context("call argument"))?;
                 }
@@ -2324,13 +2436,24 @@ impl SemanticExecutionGraphV1 {
             SemanticExpressionKind::FunctionParameter { parameter, .. } => {
                 let callable =
                     self.require_callable(parameter.callable, context("function parameter"))?;
-                let expected = callable.parameters.get(parameter.ordinal).ok_or_else(|| {
-                    format!(
-                        "expression {expression} references missing parameter {}:{}",
-                        parameter.callable, parameter.ordinal
-                    )
-                })?;
-                if expected.id != *parameter {
+                let expected = callable
+                    .parameters
+                    .get(parameter.ordinal)
+                    .map(|parameter| parameter.id)
+                    .or_else(|| {
+                        callable
+                            .context_parameter
+                            .as_ref()
+                            .filter(|context| context.id.ordinal == parameter.ordinal)
+                            .map(|context| context.id)
+                    })
+                    .ok_or_else(|| {
+                        format!(
+                            "expression {expression} references missing parameter {}:{}",
+                            parameter.callable, parameter.ordinal
+                        )
+                    })?;
+                if expected != *parameter {
                     return Err(format!(
                         "expression {expression} parameter {}:{} does not match function table",
                         parameter.callable, parameter.ordinal

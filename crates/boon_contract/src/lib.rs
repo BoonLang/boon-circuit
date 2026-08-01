@@ -43,18 +43,33 @@ pub fn canonical_serde_hash_v1_with_buffer<T: Serialize + ?Sized>(
     value: &T,
     bytes: &mut Vec<u8>,
 ) -> Result<[u8; 32], CanonicalEncodingError> {
+    canonical_serde_hashes_v1_with_buffer([domain], value, bytes).map(|[digest]| digest)
+}
+
+/// Canonically serializes `value` once and hashes those exact bytes under
+/// multiple domains.
+///
+/// This preserves the byte contract of [`canonical_serde_hash_v1`] for each
+/// result while avoiding repeated serialization when one compiler artifact is
+/// intentionally committed by more than one domain-separated digest.
+pub fn canonical_serde_hashes_v1_with_buffer<const N: usize, T: Serialize + ?Sized>(
+    domains: [&[u8]; N],
+    value: &T,
+    bytes: &mut Vec<u8>,
+) -> Result<[[u8; 32]; N], CanonicalEncodingError> {
     bytes.clear();
     ciborium::ser::into_writer(value, &mut *bytes)
         .map_err(|error| CanonicalEncodingError::new(error.to_string()))?;
-    let mut hasher = Sha256::new();
-    hasher.update(domain);
-    hasher.update(
-        u64::try_from(bytes.len())
-            .map_err(|_| CanonicalEncodingError::new("canonical payload exceeds u64"))?
-            .to_be_bytes(),
-    );
-    hasher.update(bytes.as_slice());
-    Ok(hasher.finalize().into())
+    let length = u64::try_from(bytes.len())
+        .map_err(|_| CanonicalEncodingError::new("canonical payload exceeds u64"))?
+        .to_be_bytes();
+    Ok(domains.map(|domain| {
+        let mut hasher = Sha256::new();
+        hasher.update(domain);
+        hasher.update(length);
+        hasher.update(bytes.as_slice());
+        hasher.finalize().into()
+    }))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -500,6 +515,20 @@ mod tests {
             canonical_serde_hash_v1(b"first-domain\0", &value).unwrap(),
             canonical_serde_hash_v1_with_buffer(b"first-domain\0", &value, &mut scratch).unwrap(),
             "caller-owned encoding storage must not change canonical hashes"
+        );
+        let [first_domain, second_domain] = canonical_serde_hashes_v1_with_buffer(
+            [b"first-domain\0", b"second-domain\0"],
+            &value,
+            &mut scratch,
+        )
+        .unwrap();
+        assert_eq!(
+            first_domain,
+            canonical_serde_hash_v1(b"first-domain\0", &value).unwrap()
+        );
+        assert_eq!(
+            second_domain,
+            canonical_serde_hash_v1(b"second-domain\0", &value).unwrap()
         );
         assert_eq!(
             canonical_serde_hash_v1(b"first-domain\0", &value).unwrap(),

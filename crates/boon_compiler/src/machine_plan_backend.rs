@@ -3060,6 +3060,8 @@ struct ExecutableMigrationExpressionLowerer<'a> {
     active_expressions: BTreeSet<ir::ExecutableExprId>,
     lexical_bindings: Vec<BTreeMap<ir::ExecutableLocalBindingId, ir::ExecutableExprId>>,
     active_lexical_bindings: BTreeSet<ir::ExecutableLocalBindingId>,
+    function_parameter_bindings: Vec<BTreeMap<ir::ExecutableParameterId, MigrationExpressionPlan>>,
+    active_ordinary_functions: BTreeSet<ir::FunctionId>,
 }
 
 impl ExecutableMigrationExpressionLowerer<'_> {
@@ -3195,6 +3197,12 @@ impl ExecutableMigrationExpressionLowerer<'_> {
             } => Err(PlanError::new(format!(
                 "migration executable expression {expr_id} invokes external function `{name}`"
             ))),
+            ir::ExecutableExpressionKind::UserCall {
+                function,
+                name,
+                arguments,
+                ..
+            } => self.lower_user_call(expr_id, function, &name, arguments),
             ir::ExecutableExpressionKind::When { input, arms } => {
                 Ok(MigrationExpressionPlan::Match {
                     input: Box::new(self.lower_expr(input)?),
@@ -3224,21 +3232,36 @@ impl ExecutableMigrationExpressionLowerer<'_> {
                 parameter,
                 projection,
             } => {
-                let index = u16::try_from(parameter.ordinal).map_err(|_| {
-                    PlanError::new(format!(
-                        "migration function parameter {}:{} exceeds the recipe VM index range",
-                        parameter.function, parameter.ordinal
-                    ))
-                })?;
-                let parameter = MigrationExpressionPlan::Parameter { index };
-                Ok(if projection.is_empty() {
-                    parameter
-                } else {
-                    MigrationExpressionPlan::Project {
-                        input: Box::new(parameter),
-                        fields: projection,
+                if let Some(mut value) = self
+                    .function_parameter_bindings
+                    .iter()
+                    .rev()
+                    .find_map(|bindings| bindings.get(&parameter).cloned())
+                {
+                    if !projection.is_empty() {
+                        value = MigrationExpressionPlan::Project {
+                            input: Box::new(value),
+                            fields: projection,
+                        };
                     }
-                })
+                    Ok(value)
+                } else {
+                    let index = u16::try_from(parameter.ordinal).map_err(|_| {
+                        PlanError::new(format!(
+                            "migration function parameter {}:{} exceeds the recipe VM index range",
+                            parameter.function, parameter.ordinal
+                        ))
+                    })?;
+                    let parameter = MigrationExpressionPlan::Parameter { index };
+                    Ok(if projection.is_empty() {
+                        parameter
+                    } else {
+                        MigrationExpressionPlan::Project {
+                            input: Box::new(parameter),
+                            fields: projection,
+                        }
+                    })
+                }
             }
             ir::ExecutableExpressionKind::LocalRead {
                 binding,
@@ -3383,6 +3406,53 @@ impl ExecutableMigrationExpressionLowerer<'_> {
             input,
             arguments,
         })
+    }
+
+    fn lower_user_call(
+        &mut self,
+        expression: ir::ExecutableExprId,
+        function_id: ir::FunctionId,
+        name: &str,
+        mut arguments: Vec<ir::ExecutableCallArgument>,
+    ) -> Result<MigrationExpressionPlan, PlanError> {
+        let function = self
+            .program
+            .executable
+            .ordinary_functions
+            .iter()
+            .find(|function| function.id == function_id)
+            .cloned()
+            .ok_or_else(|| {
+                PlanError::new(format!(
+                    "migration ordinary call `{name}` at expression {expression} references missing function {}",
+                    function_id.0
+                ))
+            })?;
+        arguments.sort_by_key(|argument| argument.ordinal);
+        if function.name != name || arguments.len() != function.parameters.len() {
+            return Err(PlanError::new(format!(
+                "migration ordinary call `{name}` at expression {expression} differs from its retained function contract"
+            )));
+        }
+        let mut bindings = BTreeMap::new();
+        for (argument, parameter) in arguments.into_iter().zip(&function.parameters) {
+            if argument.ordinal != parameter.id.ordinal || argument.name != parameter.name {
+                return Err(PlanError::new(format!(
+                    "migration ordinary call `{name}` at expression {expression} has a stale parameter binding"
+                )));
+            }
+            bindings.insert(parameter.id, self.lower_expr(argument.value)?);
+        }
+        if !self.active_ordinary_functions.insert(function_id) {
+            return Err(PlanError::new(format!(
+                "migration ordinary callable `{name}` is recursive"
+            )));
+        }
+        self.function_parameter_bindings.push(bindings);
+        let result = self.lower_expr(function.root);
+        self.function_parameter_bindings.pop();
+        self.active_ordinary_functions.remove(&function_id);
+        result
     }
 }
 
@@ -3629,6 +3699,8 @@ fn migration_recipe(
                     active_expressions: BTreeSet::new(),
                     lexical_bindings: Vec::new(),
                     active_lexical_bindings: BTreeSet::new(),
+                    function_parameter_bindings: Vec::new(),
+                    active_ordinary_functions: BTreeSet::new(),
                 };
                 MigrationTransformPlan::Expression {
                     root: lowerer.lower_expr(root)?,
@@ -7344,6 +7416,14 @@ fn inferred_executable_expression_value_type_inner(
             fixed_len: Some(*len as u64),
         }),
         ir::ExecutableExpressionKind::Call { name, .. } => inferred_builtin_call_value_type(name),
+        ir::ExecutableExpressionKind::UserCall { function, .. } => program
+            .executable
+            .ordinary_functions
+            .iter()
+            .find(|candidate| candidate.id == *function)
+            .and_then(|function| {
+                inferred_executable_expression_value_type_inner(program, function.root, visiting)
+            }),
         ir::ExecutableExpressionKind::Infix { left, op, right } if op == "+" => {
             let left_type =
                 inferred_executable_expression_value_type_inner(program, *left, visiting);
@@ -11117,11 +11197,15 @@ struct ExecutableRowLowerer<'a> {
     active_lexical_bindings: BTreeSet<ir::ExecutableLocalBindingId>,
     active_storage_bindings: BTreeSet<ir::ErasedBindingId>,
     bindings: BTreeMap<ir::ExecutableExprId, PlanRowExpressionId>,
+    function_parameter_bindings: Vec<BTreeMap<ir::ExecutableParameterId, PlanRowExpressionId>>,
+    active_ordinary_functions: BTreeSet<ir::FunctionId>,
+    active_user_calls: Vec<ir::ExecutableExprId>,
     memo: BTreeMap<
         (
             ir::ExecutableExprId,
             Option<PlanStaticOwnerId>,
             Vec<PlanStaticOwnerId>,
+            Vec<ir::ExecutableExprId>,
         ),
         PlanRowExpressionId,
     >,
@@ -11152,6 +11236,9 @@ impl<'a> ExecutableRowLowerer<'a> {
             active_lexical_bindings: BTreeSet::new(),
             active_storage_bindings: BTreeSet::new(),
             bindings: BTreeMap::new(),
+            function_parameter_bindings: Vec::new(),
+            active_ordinary_functions: BTreeSet::new(),
+            active_user_calls: Vec::new(),
             memo: BTreeMap::new(),
         }
     }
@@ -11787,6 +11874,7 @@ impl<'a> ExecutableRowLowerer<'a> {
             root,
             inherited_owner,
             self.active_materialization_owners.clone(),
+            self.active_user_calls.clone(),
         );
         if let Some(value) = self.memo.get(&key) {
             return Ok(*value);
@@ -11929,6 +12017,12 @@ impl<'a> ExecutableRowLowerer<'a> {
                 }
                 self.lower_call(&name, arguments, owner)?
             }
+            ir::ExecutableExpressionKind::UserCall {
+                function,
+                name,
+                arguments,
+                ..
+            } => self.lower_user_call(root, function, &name, arguments, owner)?,
             ir::ExecutableExpressionKind::Materialize { materialization } => {
                 let materialization = self
                     .program
@@ -12573,16 +12667,92 @@ impl<'a> ExecutableRowLowerer<'a> {
                 parameter,
                 projection,
             } => {
-                return Err(PlanError::new(format!(
-                    "executable producer parameter {}:{} projection `{}` has no exact distributed expression binding",
-                    parameter.function.0,
-                    parameter.ordinal,
-                    projection.join(".")
-                )));
+                let Some(mut value) = self
+                    .function_parameter_bindings
+                    .iter()
+                    .rev()
+                    .find_map(|bindings| bindings.get(&parameter).copied())
+                else {
+                    return Err(PlanError::new(format!(
+                        "executable producer parameter {}:{} projection `{}` has no exact distributed expression binding",
+                        parameter.function.0,
+                        parameter.ordinal,
+                        projection.join(".")
+                    )));
+                };
+                for field in projection {
+                    value = self.project_field(value, field)?;
+                }
+                value
             }
         };
         self.memo.insert(key, value);
         Ok(value)
+    }
+
+    fn lower_user_call(
+        &mut self,
+        call_expression: ir::ExecutableExprId,
+        function_id: ir::FunctionId,
+        name: &str,
+        mut arguments: Vec<ir::ExecutableCallArgument>,
+        owner: Option<PlanStaticOwnerId>,
+    ) -> Result<PlanRowExpressionId, PlanError> {
+        let function = self
+            .program
+            .executable
+            .ordinary_functions
+            .iter()
+            .find(|function| function.id == function_id)
+            .cloned()
+            .ok_or_else(|| {
+                PlanError::new(format!(
+                    "ordinary call `{name}` at expression {call_expression} references missing function {}",
+                    function_id.0
+                ))
+            })?;
+        if function.name != name {
+            return Err(PlanError::new(format!(
+                "ordinary call `{name}` at expression {call_expression} resolves to function `{}`",
+                function.name
+            )));
+        }
+        arguments.sort_by_key(|argument| argument.ordinal);
+        if arguments.len() != function.parameters.len() {
+            return Err(PlanError::new(format!(
+                "ordinary call `{name}` at expression {call_expression} supplies {} arguments for {} parameters",
+                arguments.len(),
+                function.parameters.len()
+            )));
+        }
+        let mut bindings = BTreeMap::new();
+        for (argument, parameter) in arguments.into_iter().zip(&function.parameters) {
+            if argument.ordinal != parameter.id.ordinal || argument.name != parameter.name {
+                return Err(PlanError::new(format!(
+                    "ordinary call `{name}` at expression {call_expression} argument {} does not match parameter {}:{} `{}`",
+                    argument.ordinal, parameter.id.function.0, parameter.id.ordinal, parameter.name
+                )));
+            }
+            let value = self.lower_scoped(argument.value, owner)?;
+            if bindings.insert(parameter.id, value).is_some() {
+                return Err(PlanError::new(format!(
+                    "ordinary call `{name}` at expression {call_expression} binds parameter {} twice",
+                    parameter.id.ordinal
+                )));
+            }
+        }
+        if !self.active_ordinary_functions.insert(function_id) {
+            return Err(PlanError::new(format!(
+                "ordinary callable `{name}` forms a recursive executable cycle"
+            )));
+        }
+        self.function_parameter_bindings.push(bindings);
+        self.active_user_calls.push(call_expression);
+        let result = self.lower_scoped(function.root, owner);
+        self.active_user_calls.pop();
+        self.function_parameter_bindings.pop();
+        self.active_ordinary_functions.remove(&function_id);
+        result
     }
 
     fn lower_transient_collection(

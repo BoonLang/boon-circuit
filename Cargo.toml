@@ -162,9 +162,14 @@ opt-level = 2
 # debug assertions and debuginfo while making the compiler usable in dev builds.
 [profile.dev.package.boon_semantic]
 opt-level = 2
+# Full variable-level DWARF makes each semantic rlib hundreds of megabytes and
+# turns every downstream compiler edit into a long relink. Line tables retain
+# useful panic/backtrace locations without paying that interactive-build cost.
+debug = 1
 
 [profile.dev.package.boon_typecheck]
 opt-level = 2
+debug = 1
 
 [profile.dev.package.ciborium]
 opt-level = 2

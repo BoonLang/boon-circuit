@@ -1746,13 +1746,26 @@ fn verify_erased_scope_index(program: &ErasedProgram) -> Result<(), String> {
                 }
             }
             ErasedReadTarget::FunctionParameter { parameter, .. } => {
-                if !program.executable.functions.iter().any(|function| {
+                let producer_parameter = program.executable.functions.iter().any(|function| {
                     function.id == parameter.function
                         && function
                             .parameters
                             .iter()
                             .any(|candidate| candidate.id == *parameter)
-                }) {
+                });
+                let ordinary_parameter =
+                    program
+                        .executable
+                        .ordinary_functions
+                        .iter()
+                        .any(|function| {
+                            function.id == parameter.function
+                                && function
+                                    .parameters
+                                    .iter()
+                                    .any(|candidate| candidate.id == *parameter)
+                        });
+                if !producer_parameter && !ordinary_parameter {
                     return Err(format!(
                         "erased read {} references missing function parameter {:?}",
                         read.id, parameter
@@ -3466,6 +3479,7 @@ fn executable_list_item_field_names(
             | ExecutableExpressionKind::Tag { .. }
             | ExecutableExpressionKind::Source { .. }
             | ExecutableExpressionKind::Call { .. }
+            | ExecutableExpressionKind::UserCall { .. }
             | ExecutableExpressionKind::Infix { .. }
             | ExecutableExpressionKind::MapEntry { .. }
             | ExecutableExpressionKind::Map { .. }

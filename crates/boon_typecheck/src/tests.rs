@@ -17,3 +17,4 @@ include!("tests/maps_sets.rs");
 include!("tests/bits.rs");
 include!("tests/numbers.rs");
 include!("tests/pulses.rs");
+include!("tests/styles.rs");

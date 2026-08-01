@@ -37,17 +37,17 @@ use program_core::{
     ErasedTemporalBoundary, EventCause, ExecutableBlockBinding, ExecutableCallArgument,
     ExecutableCallContextId, ExecutableCallableKind, ExecutableExprId, ExecutableExpression,
     ExecutableExpressionKind, ExecutableFunction, ExecutableFunctionParameter,
-    ExecutableLocalBindingId, ExecutableParameterId, ExecutablePatternBinding, ExecutableProgram,
-    ExecutableRecordField, ExecutableRoot, ExecutableSelectArm, ExecutableSourceDef,
-    ExecutableSourceId, ExecutableSourceOrigin, ExecutableStateDef, ExecutableStateId,
-    ExecutableStatement, ExecutableStatementId, ExecutableStatementKind, ExecutableTextSegment,
-    ExecutableValueMember, ExecutableValueOrigin, ExecutableValueProvenance, ExprId, FieldId,
-    FunctionId, InitialValue, ListId, ListInitialRecord, ListInitializer, ListInitializerInput,
-    ListMemory, ListMutation, ListMutationKind, ListProjection, ListProjectionKind,
-    ListRowInitialField, MaterializationLocalId, MaterializationResultKind,
-    ProducerFunctionArgument, ProducerFunctionInstance, ScopeId, SourceId, SourcePayloadDescriptor,
-    SourcePayloadField, SourcePayloadSchema, SourcePort, StateCell, StateId, StateUpdateArm,
-    TriggerOwnedArm,
+    ExecutableLocalBindingId, ExecutableOrdinaryFunction, ExecutableParameterId,
+    ExecutablePatternBinding, ExecutableProgram, ExecutableRecordField, ExecutableRoot,
+    ExecutableSelectArm, ExecutableSourceDef, ExecutableSourceId, ExecutableSourceOrigin,
+    ExecutableStateDef, ExecutableStateId, ExecutableStatement, ExecutableStatementId,
+    ExecutableStatementKind, ExecutableTextSegment, ExecutableValueMember, ExecutableValueOrigin,
+    ExecutableValueProvenance, ExprId, FieldId, FunctionId, InitialValue, ListId,
+    ListInitialRecord, ListInitializer, ListInitializerInput, ListMemory, ListMutation,
+    ListMutationKind, ListProjection, ListProjectionKind, ListRowInitialField,
+    MaterializationLocalId, MaterializationResultKind, ProducerFunctionArgument,
+    ProducerFunctionInstance, ScopeId, SourceId, SourcePayloadDescriptor, SourcePayloadField,
+    SourcePayloadSchema, SourcePort, StateCell, StateId, StateUpdateArm, TriggerOwnedArm,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -1520,6 +1520,12 @@ fn map_semantic_execution_with_external_events(
         .iter()
         .map(|function| map_function(graph, &id_map, function))
         .collect::<Result<Vec<_>, _>>()?;
+    let ordinary_functions = graph
+        .callables
+        .iter()
+        .filter(|callable| callable.semantic_root.is_some())
+        .map(|callable| map_ordinary_function(&id_map, callable))
+        .collect::<Result<Vec<_>, _>>()?;
     let materializations = graph
         .materializations
         .iter()
@@ -1543,6 +1549,7 @@ fn map_semantic_execution_with_external_events(
             states,
             roots,
             functions,
+            ordinary_functions,
         },
         materializations,
         static_owners,
@@ -5791,29 +5798,57 @@ fn map_expression_kind(
             binding_path: binding_path.clone(),
         },
         SemanticExpressionKind::Call {
+            callable,
             callable_kind,
             name,
             intrinsic,
             instance,
             arguments,
+            context_argument,
             contexts,
             ..
-        } => ExecutableExpressionKind::Call {
-            callable_kind: match callable_kind {
-                SemanticCallableKind::Builtin => ExecutableCallableKind::Builtin,
-                SemanticCallableKind::External => ExecutableCallableKind::External,
+        } => match callable_kind {
+            SemanticCallableKind::User => ExecutableExpressionKind::UserCall {
+                function: ids.callable(*callable)?,
+                name: name.clone(),
+                instance: ids.call_instance(*instance)?,
+                arguments: {
+                    let mut mapped = arguments
+                        .iter()
+                        .map(|argument| map_call_argument(ids, argument))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    if let Some(argument) = context_argument {
+                        let callable = semantic_callable(graph, *callable)?;
+                        mapped.push(ExecutableCallArgument {
+                            ordinal: callable.parameters.len(),
+                            name: "PASSED".to_owned(),
+                            value: ids.expression(argument.value)?,
+                            from_pipe: false,
+                        });
+                    }
+                    mapped
+                },
             },
-            name: name.clone(),
-            intrinsic: *intrinsic,
-            instance: ids.call_instance(*instance)?,
-            arguments: arguments
-                .iter()
-                .map(|argument| map_call_argument(ids, argument))
-                .collect::<Result<Vec<_>, _>>()?,
-            contexts: contexts
-                .iter()
-                .map(|context| ids.call_context(*context))
-                .collect::<Result<Vec<_>, _>>()?,
+            SemanticCallableKind::Builtin | SemanticCallableKind::External => {
+                ExecutableExpressionKind::Call {
+                    callable_kind: match callable_kind {
+                        SemanticCallableKind::Builtin => ExecutableCallableKind::Builtin,
+                        SemanticCallableKind::External => ExecutableCallableKind::External,
+                        SemanticCallableKind::User => unreachable!(),
+                    },
+                    name: name.clone(),
+                    intrinsic: *intrinsic,
+                    instance: ids.call_instance(*instance)?,
+                    arguments: arguments
+                        .iter()
+                        .map(|argument| map_call_argument(ids, argument))
+                        .collect::<Result<Vec<_>, _>>()?,
+                    contexts: contexts
+                        .iter()
+                        .map(|context| ids.call_context(*context))
+                        .collect::<Result<Vec<_>, _>>()?,
+                }
+            }
         },
         SemanticExpressionKind::Materialize { materialization } => {
             ExecutableExpressionKind::Materialize {
@@ -5954,17 +5989,45 @@ fn executable_parameter_for_occurrence(
             })
         })
         .collect::<Vec<_>>();
-    let [function] = functions.as_slice() else {
+    if let [function] = functions.as_slice() {
+        return Ok(ExecutableParameterId {
+            function: ids.producer_function(function.producer)?,
+            ordinal: parameter.ordinal,
+        });
+    }
+    if !functions.is_empty() {
         return Err(format!(
             "semantic function-parameter expression {} resolves to {} exact producer occurrences",
             expression.id,
             functions.len()
         ));
+    }
+    let callable = semantic_callable(graph, parameter.callable)?;
+    let Some(root) = callable.semantic_root else {
+        return Err(format!(
+            "semantic function-parameter expression {} has neither a producer nor ordinary callable root",
+            expression.id
+        ));
     };
-    Ok(ExecutableParameterId {
-        function: ids.producer_function(function.producer)?,
-        ordinal: parameter.ordinal,
-    })
+    let mut pending = vec![root];
+    let mut visited = BTreeSet::new();
+    while let Some(candidate) = pending.pop() {
+        if !visited.insert(candidate) {
+            continue;
+        }
+        if candidate == expression.id {
+            return ids.parameter(parameter);
+        }
+        pending.extend(
+            semantic_expression(graph, candidate)?
+                .kind
+                .direct_children(),
+        );
+    }
+    Err(format!(
+        "semantic function-parameter expression {} is outside ordinary callable {} root {}",
+        expression.id, parameter.callable, root
+    ))
 }
 
 fn map_provenance(
@@ -6356,6 +6419,52 @@ fn map_function_parameter(
         },
         name: parameter.name.clone(),
         flow_type: parameter.flow_type.clone(),
+    })
+}
+
+fn map_ordinary_function(
+    ids: &SemanticToExecutableMap,
+    callable: &SemanticCallable,
+) -> Result<ExecutableOrdinaryFunction, String> {
+    let root = callable.semantic_root.ok_or_else(|| {
+        format!(
+            "ordinary semantic callable {} has no retained root",
+            callable.id
+        )
+    })?;
+    let function = ids.callable(callable.id)?;
+    let mut parameters = callable
+        .parameters
+        .iter()
+        .map(|parameter| {
+            ids.parameter(parameter.id)?;
+            Ok(ExecutableFunctionParameter {
+                id: ExecutableParameterId {
+                    function,
+                    ordinal: parameter.ordinal,
+                },
+                name: parameter.name.clone(),
+                flow_type: parameter.flow_type.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    if let Some(parameter) = &callable.context_parameter {
+        ids.parameter(parameter.id)?;
+        parameters.push(ExecutableFunctionParameter {
+            id: ExecutableParameterId {
+                function,
+                ordinal: parameter.id.ordinal,
+            },
+            name: parameter.name.clone(),
+            flow_type: parameter.flow_type.clone(),
+        });
+    }
+    Ok(ExecutableOrdinaryFunction {
+        id: function,
+        name: callable.name.clone(),
+        parameters,
+        result_type: callable.result.clone(),
+        root: ids.expression(root)?,
     })
 }
 

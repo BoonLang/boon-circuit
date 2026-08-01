@@ -160,13 +160,15 @@ Current checkpoints to preserve and audit rather than redo:
   ordinary callables, replacing repeated whole-program type inference with a
   dependency-indexed dirty worklist plus a fail-closed full-sweep audit, and
   replacing manifest V2's per-owner closure enumeration with an exact
-  content-addressed SCC graph proof; two final-source runs measure 0.07/0.08,
-  2.14/2.12, and 25.48/25.82 seconds respectively, with all three emitted plans
-  byte-identical to the preceding checkpoint;
+  content-addressed SCC graph proof; both inference worklists now exhaust with
+  clean no-change audits, including exact actual-to-formal parameter and
+  selector-dependent arm-scope invalidation; two final-source runs measure
+  0.07/0.07, 2.09/2.12, and 25.79/25.20 seconds respectively, with all three
+  emitted plans byte-identical to the preceding checkpoint;
 - the next compiler-performance blocker is contextual callable-scheme
-  inference: the traced NovyWave source spends about 2.11 seconds rebuilding
-  call instances and 1.35 seconds propagating callable-owner changes inside a
-  7.10-second typecheck. Replace repeated per-call scheme reconstruction with
+  inference: the traced NovyWave source spends about 1.75 seconds rebuilding
+  call instances and 1.40 seconds propagating callable-owner changes inside a
+  5.79-second typecheck. Replace repeated per-call scheme reconstruction with
   an explicit dependency-indexed callable/call graph before resuming the
   production recovery slice; do not return to tactical type-cache invalidation;
 - FjordPulse currently has no basis for weakening the 108-story/340-scenario

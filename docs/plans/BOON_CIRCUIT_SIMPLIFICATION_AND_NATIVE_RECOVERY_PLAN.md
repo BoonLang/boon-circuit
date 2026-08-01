@@ -572,9 +572,12 @@ operation. Dense expression-indexed inference state, a bounded callee-to-caller
 worklist, and a forward/reverse inference sweep replace logarithmic hot lookups
 and one whole-program epoch per wrapper edge. The completed inference cut also
 indexes expression parents, declaration readers and values, callable results,
-call inputs/OUTs/callees, selector actuals, HOLD updates, and pattern selectors.
-It schedules only dirty entities and retains a complete full-sweep no-change
-audit as a fail-closed convergence check. OUT manifest payloads commit interned
+call inputs/OUTs/callees, actual-to-formal parameter flow, selector actuals,
+HOLD updates, and selector-dependent pattern scopes. Declaration invalidation
+walks the dynamic expression-ancestor closure through the indexed parent graph;
+it does not precompute or persist transitive closures. Both inference worklists
+now finish with a clean full-sweep no-change audit instead of entering the
+fallback sweep. OUT manifest payloads commit interned
 type digests, local substitution deltas, and explicit parent-call dependencies
 instead of serializing inherited structural type trees at every frame. Manifest
 V3 commits the exact owner/record dependency graph through a content-addressed
@@ -582,11 +585,12 @@ SCC DAG, so shared transitive dependencies are hashed once rather than
 enumerated independently for every callable.
 
 On the reference machine, two consecutive final-source debug `boon_cli` runs
-complete Counter in 0.07/0.08 seconds at 29,592/29,636 KiB peak RSS and
-physical TodoMVC in 2.14/2.12 seconds at 146,856/146,544 KiB. The large
-5,169-frame NovyWave fixture completes in 25.48/25.82 seconds at
-1,000,224/1,000,104 KiB. This is down from the preceding checkpoint's
-26.59/26.34-second, 1,003,720/1,003,064-KiB pair, its predecessor's
+complete Counter in 0.07/0.07 seconds at 30,400/30,316 KiB peak RSS and
+physical TodoMVC in 2.09/2.12 seconds at 146,788/146,624 KiB. The large
+5,169-frame NovyWave fixture completes in 25.79/25.20 seconds at
+999,312/998,360 KiB. This remains close to the immediately preceding
+25.48/25.82-second, 1,000,224/1,000,104-KiB pair and is down from the earlier
+26.59/26.34-second, 1,003,720/1,003,064-KiB checkpoint and its predecessor's
 31.26/30.86-second, 1,005,068/1,004,712-KiB pair, the earlier
 38.81-second, 1,034,180-KiB run, the first successful 55.64-second,
 4,426,932-KiB run, and the earlier 41.34-second, 4,012,976-KiB checkpoint.
@@ -631,12 +635,12 @@ crates preserve assertions and line tables while keeping backend lowering near
 These are development-loop measurements, not final release or native-
 performance evidence. The dependency-indexed type worklist replaces the two
 six-epoch whole-program fixed points. On the traced NovyWave run,
-`CheckedProgram` construction falls from about 10.93 seconds to 6.60 seconds;
-the post-scheme inference falls from about 4.30 seconds to 1.68 seconds. The
-first pre-scheme pass retains a full audit that catches one expression-table-
-only update and then proves a no-change boundary; callable, declaration, call,
-selector, and pattern state are already stable. All 47 typechecker tests pass,
-and Counter, TodoMVC, and NovyWave preserve deterministic plans.
+`CheckedProgram` construction is 5.67 seconds and the complete typecheck is
+5.79 seconds, down from 6.14 and 7.10 seconds at the preceding manifest V3
+checkpoint. The post-scheme inference is 1.20 seconds. The pre-scheme and dirty
+post-scheme worklists both exhaust with a no-change audit; neither enters the
+global-sweep fallback. All 47 typechecker tests pass, and Counter, TodoMVC, and
+NovyWave preserve deterministic plans.
 
 Pure functions that read canonical program-root values now retain one ordinary
 callable body instead of forcing an occurrence copy. The executable backend
@@ -648,8 +652,8 @@ smaller; the dirty type worklist owns the material wall-time reduction.
 
 The next compiler-performance target is contextual callable-scheme inference,
 not another manifest collection tweak. The traced final source spends about
-2.11 seconds rebuilding call instances and 1.35 seconds propagating 684
-callable-owner visits inside a 7.10-second typecheck. Replace repeated per-call
+1.75 seconds rebuilding call instances and 1.40 seconds propagating 684
+callable-owner visits inside a 5.79-second typecheck. Replace repeated per-call
 scheme reconstruction with an explicit dependency-indexed callable/call graph
 while preserving the fail-closed full inference audit; do not return to
 tactical type-cache invalidation. Phase 1 still requires the remaining focused

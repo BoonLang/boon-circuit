@@ -1833,11 +1833,13 @@ struct CheckedTypeInferenceDependencies {
     declarations_by_value: Vec<Vec<DeclId>>,
     callables_by_result: Vec<Vec<DeclId>>,
     calls_by_input: Vec<Vec<CheckedCallId>>,
+    parameters_by_actual: Vec<Vec<DeclId>>,
     declaration_readers: BTreeMap<DeclId, Vec<usize>>,
     calls_by_output: BTreeMap<DeclId, Vec<CheckedCallId>>,
     calls_by_callee: BTreeMap<DeclId, Vec<CheckedCallId>>,
     selector_actuals: BTreeSet<usize>,
     pattern_selectors: BTreeSet<usize>,
+    pattern_dependents_by_selector: Vec<Vec<usize>>,
 }
 
 #[derive(Default)]
@@ -2189,11 +2191,14 @@ impl<'a> CheckedProgramBuilder<'a> {
                 external_types,
             )
         });
-        checked_program_phase!(
+        let changed_contextual_schemes = checked_program_phase!(
             "infer_contextual_callable_schemes",
             builder.infer_contextual_callable_schemes()
         );
-        checked_program_phase!("infer_checked_types", builder.infer_checked_types());
+        checked_program_phase!(
+            "infer_checked_types",
+            builder.infer_checked_types_after_scheme_changes(&changed_contextual_schemes)
+        );
         checked_program_phase!(
             "install_flush_control_contract",
             builder.install_flush_control_contract()
@@ -3967,7 +3972,7 @@ impl<'a> CheckedProgramBuilder<'a> {
         }
     }
 
-    fn infer_contextual_callable_schemes(&mut self) {
+    fn infer_contextual_callable_schemes(&mut self) -> BTreeSet<DeclId> {
         let trace = std::env::var_os("BOON_TYPECHECK_TRACE").is_some();
         let projected_started = Instant::now();
         self.infer_user_parameter_schemes();
@@ -4086,6 +4091,7 @@ impl<'a> CheckedProgramBuilder<'a> {
         let mut changed_owner_count = 0usize;
         let mut parameter_change_count = 0usize;
         let mut result_change_count = 0usize;
+        let mut changed_declarations = BTreeSet::new();
         while let Some(owner_index) = pending.pop_first() {
             if visit_count >= maximum_visits {
                 break;
@@ -4238,6 +4244,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                     parameter.flow_type = flow_type.clone();
                     owner_changed = true;
                     parameter_change_count += 1;
+                    changed_declarations.insert(parameter.decl_id);
                 }
             }
             if let Some(result) = direct_result
@@ -4251,6 +4258,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                 continue;
             }
             changed_owner_count += 1;
+            changed_declarations.insert(owner.decl_id);
             if let Some(callers) = callers_by_callee.get(&owner.decl_id) {
                 pending.extend(callers.iter().copied());
             }
@@ -4271,6 +4279,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                 typecheck_elapsed_ms(propagation_started)
             );
         }
+        changed_declarations
     }
 
     fn infer_user_parameter_schemes(&mut self) {
@@ -5352,29 +5361,64 @@ impl<'a> CheckedProgramBuilder<'a> {
     }
 
     fn infer_checked_types(&mut self) {
+        self.infer_checked_types_with_seed(None);
+    }
+
+    fn infer_checked_types_after_scheme_changes(&mut self, changed: &BTreeSet<DeclId>) {
+        self.infer_checked_types_with_seed(Some(changed));
+    }
+
+    fn infer_checked_types_with_seed(&mut self, changed: Option<&BTreeSet<DeclId>>) {
         let trace = std::env::var_os("BOON_TYPECHECK_TRACE").is_some();
         let dependencies = self.checked_type_inference_dependencies();
-        let mut pending = CheckedTypeInferencePending {
-            expressions: self
-                .program
-                .expressions
-                .iter()
-                .map(|expression| expression.id)
-                .collect(),
-            declarations: self
-                .declarations
-                .iter()
-                .filter_map(|declaration| declaration.value.map(|_| declaration.id))
-                .collect(),
-            callables: self
-                .signatures
-                .iter()
-                .filter(|signature| signature.kind == CheckedCallableKind::User)
-                .filter_map(|signature| signature.result_expression.map(|_| signature.decl_id))
-                .collect(),
-            calls: self.calls.iter().map(|call| call.id).collect(),
-            selector_parameters: true,
-            pattern_bindings: true,
+        let mut pending = if let Some(changed) = changed {
+            let mut pending = CheckedTypeInferencePending {
+                selector_parameters: true,
+                pattern_bindings: true,
+                ..CheckedTypeInferencePending::default()
+            };
+            for declaration in changed {
+                if self
+                    .signature_by_decl
+                    .get(declaration)
+                    .and_then(|index| self.signatures.get(*index))
+                    .is_some_and(|signature| {
+                        signature.kind == CheckedCallableKind::User
+                            && signature.result_expression.is_some()
+                    })
+                {
+                    pending.callables.insert(*declaration);
+                }
+                Self::enqueue_checked_declaration_dependents(
+                    *declaration,
+                    &dependencies,
+                    &mut pending,
+                );
+            }
+            pending
+        } else {
+            CheckedTypeInferencePending {
+                expressions: self
+                    .program
+                    .expressions
+                    .iter()
+                    .map(|expression| expression.id)
+                    .collect(),
+                declarations: self
+                    .declarations
+                    .iter()
+                    .filter_map(|declaration| declaration.value.map(|_| declaration.id))
+                    .collect(),
+                callables: self
+                    .signatures
+                    .iter()
+                    .filter(|signature| signature.kind == CheckedCallableKind::User)
+                    .filter_map(|signature| signature.result_expression.map(|_| signature.decl_id))
+                    .collect(),
+                calls: self.calls.iter().map(|call| call.id).collect(),
+                selector_parameters: true,
+                pattern_bindings: true,
+            }
         };
         let mut stats = CheckedTypeInferenceWorkStats::default();
         let maximum_rounds = 64usize;
@@ -5601,7 +5645,12 @@ impl<'a> CheckedProgramBuilder<'a> {
         let audit_clean = audit.is_some_and(|changes| !changes.any());
         if trace {
             eprintln!(
-                "boon_typecheck checked_program.infer_checked_types.worklist rounds={} expression_visits={} declaration_visits={} callable_visits={} call_visits={} selector_visits={} pattern_visits={} exhausted={} audit={audit:?} audit_clean={} audit_ms={:.3}",
+                "boon_typecheck checked_program.infer_checked_types.worklist seed={} rounds={} expression_visits={} declaration_visits={} callable_visits={} call_visits={} selector_visits={} pattern_visits={} exhausted={} audit={audit:?} audit_clean={} audit_ms={:.3}",
+                if changed.is_some() {
+                    "scheme_changes"
+                } else {
+                    "full_program"
+                },
                 stats.rounds,
                 stats.expression_visits,
                 stats.declaration_visits,
@@ -5632,11 +5681,13 @@ impl<'a> CheckedProgramBuilder<'a> {
             declarations_by_value: vec![Vec::new(); expression_count],
             callables_by_result: vec![Vec::new(); expression_count],
             calls_by_input: vec![Vec::new(); expression_count],
+            parameters_by_actual: vec![Vec::new(); expression_count],
             declaration_readers: BTreeMap::new(),
             calls_by_output: BTreeMap::new(),
             calls_by_callee: BTreeMap::new(),
             selector_actuals: BTreeSet::new(),
             pattern_selectors: self.pattern_selectors.values().copied().collect(),
+            pattern_dependents_by_selector: vec![Vec::new(); expression_count],
         };
         for expression in &self.program.expressions {
             let mut children = direct_expression_children(expression);
@@ -5660,6 +5711,27 @@ impl<'a> CheckedProgramBuilder<'a> {
                     .entry(declaration)
                     .or_default()
                     .push(expression.id);
+            }
+            if let Some(arm) = self
+                .expression_scopes
+                .get(&expression.id)
+                .and_then(|scope| self.nearest_pattern_arm_by_scope.get(scope.0 as usize))
+                .copied()
+                .flatten()
+                && let Some(selector) = self.pattern_selectors.get(&arm).copied()
+                && let Some(dependents) = dependencies
+                    .pattern_dependents_by_selector
+                    .get_mut(selector)
+            {
+                dependents.push(expression.id);
+            }
+        }
+        for (arm, selector) in &self.pattern_selectors {
+            if let Some(dependents) = dependencies
+                .pattern_dependents_by_selector
+                .get_mut(*selector)
+            {
+                dependents.push(*arm);
             }
         }
         for declaration in &self.declarations {
@@ -5688,6 +5760,11 @@ impl<'a> CheckedProgramBuilder<'a> {
                     CheckedCallEntry::Input { formal, value, .. } => {
                         if let Some(calls) = dependencies.calls_by_input.get_mut(value.0 as usize) {
                             calls.push(call.id);
+                        }
+                        if let Some(parameters) =
+                            dependencies.parameters_by_actual.get_mut(value.0 as usize)
+                        {
+                            parameters.push(*formal);
                         }
                         if self.syntax_discriminant_parameters.contains(formal) {
                             dependencies.selector_actuals.insert(value.0 as usize);
@@ -5727,6 +5804,14 @@ impl<'a> CheckedProgramBuilder<'a> {
             values.sort();
             values.dedup();
         }
+        for values in &mut dependencies.parameters_by_actual {
+            values.sort();
+            values.dedup();
+        }
+        for values in &mut dependencies.pattern_dependents_by_selector {
+            values.sort();
+            values.dedup();
+        }
         for values in dependencies.declaration_readers.values_mut() {
             values.sort();
             values.dedup();
@@ -5748,7 +5833,9 @@ impl<'a> CheckedProgramBuilder<'a> {
         pending: &mut CheckedTypeInferencePending,
     ) {
         if let Some(parents) = dependencies.expression_parents.get(expression) {
-            pending.expressions.extend(parents.iter().copied());
+            for parent in parents {
+                Self::enqueue_checked_expression_with_ancestors(*parent, dependencies, pending);
+            }
         }
         if let Some(declarations) = dependencies.declarations_by_value.get(expression) {
             pending.declarations.extend(declarations.iter().copied());
@@ -5759,11 +5846,37 @@ impl<'a> CheckedProgramBuilder<'a> {
         if let Some(calls) = dependencies.calls_by_input.get(expression) {
             pending.calls.extend(calls.iter().copied());
         }
+        if let Some(parameters) = dependencies.parameters_by_actual.get(expression) {
+            for parameter in parameters {
+                Self::enqueue_checked_declaration_dependents(*parameter, dependencies, pending);
+            }
+        }
         if dependencies.selector_actuals.contains(&expression) {
             pending.selector_parameters = true;
         }
         if dependencies.pattern_selectors.contains(&expression) {
             pending.pattern_bindings = true;
+        }
+        if let Some(dependents) = dependencies.pattern_dependents_by_selector.get(expression) {
+            for dependent in dependents {
+                Self::enqueue_checked_expression_with_ancestors(*dependent, dependencies, pending);
+            }
+        }
+    }
+
+    fn enqueue_checked_expression_with_ancestors(
+        expression: usize,
+        dependencies: &CheckedTypeInferenceDependencies,
+        pending: &mut CheckedTypeInferencePending,
+    ) {
+        let mut frontier = vec![expression];
+        while let Some(expression) = frontier.pop() {
+            if !pending.expressions.insert(expression) {
+                continue;
+            }
+            if let Some(parents) = dependencies.expression_parents.get(expression) {
+                frontier.extend(parents.iter().copied());
+            }
         }
     }
 
@@ -5773,7 +5886,9 @@ impl<'a> CheckedProgramBuilder<'a> {
         pending: &mut CheckedTypeInferencePending,
     ) {
         if let Some(readers) = dependencies.declaration_readers.get(&declaration) {
-            pending.expressions.extend(readers.iter().copied());
+            for reader in readers {
+                Self::enqueue_checked_expression_with_ancestors(*reader, dependencies, pending);
+            }
         }
         if let Some(calls) = dependencies.calls_by_output.get(&declaration) {
             pending.calls.extend(calls.iter().copied());

@@ -7,9 +7,10 @@
 use crate::ProducerMaterializationMode;
 use boon_typecheck::{
     CheckedCall, CheckedCallEntry, CheckedCallId, CheckedCallableKind, CheckedCallableSignature,
-    CheckedContextBinding, CheckedEvaluationScope, CheckedExprId, CheckedProgram, CheckedScopeKind,
-    CheckedTypeSubstitution, ContextFormalId, DeclId, FlowType, LexicalScopeId,
-    apply_checked_type_substitutions,
+    CheckedContextBinding, CheckedDeclaration, CheckedDeclarationKind, CheckedEvaluationScope,
+    CheckedExprId, CheckedExpressionKind, CheckedMatchPattern, CheckedPassedAccess,
+    CheckedPatternBinding, CheckedProgram, CheckedScopeKind, CheckedTypeSubstitution,
+    ContextFormalId, DeclId, FlowType, LexicalScopeId, apply_checked_type_substitutions,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -719,6 +720,27 @@ struct PendingUnifiedNet {
     owner_anchors: Vec<OutPortId>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum CheckedStaticSelectorValue {
+    Number(boon_data::ExactNumber),
+    Text(String),
+    Tag(String),
+    Bits(boon_data::Bits),
+}
+
+impl CheckedStaticSelectorValue {
+    fn matches(&self, pattern: &CheckedMatchPattern) -> bool {
+        match (self, pattern) {
+            (_, CheckedMatchPattern::Wildcard | CheckedMatchPattern::Binding { .. }) => true,
+            (Self::Number(actual), CheckedMatchPattern::Number { value }) => actual == value,
+            (Self::Text(actual), CheckedMatchPattern::Text { value }) => actual == value,
+            (Self::Tag(actual), CheckedMatchPattern::Tag { name, .. }) => actual == name,
+            (Self::Bits(actual), CheckedMatchPattern::Bits { value }) => actual == value,
+            _ => false,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 enum StaticOwnerNode {
     Net(OutNetId),
@@ -729,6 +751,11 @@ struct OutNetBuilder<'program, Contract, MakeContract, IsProducer> {
     program: &'program CheckedProgram,
     signature_by_id: BTreeMap<DeclId, &'program CheckedCallableSignature>,
     calls_by_owner: BTreeMap<Option<DeclId>, Vec<usize>>,
+    call_index_by_id: BTreeMap<CheckedCallId, usize>,
+    declaration_by_id: BTreeMap<DeclId, &'program CheckedDeclaration>,
+    pattern_binding_by_declaration: BTreeMap<DeclId, &'program CheckedPatternBinding>,
+    function_owner_by_scope: BTreeMap<LexicalScopeId, Option<DeclId>>,
+    root_expressions: Vec<CheckedExprId>,
     resource_owning_callables: BTreeSet<DeclId>,
     producer_root_specs: Vec<ProducerRootSpec>,
     producer_roots: Vec<ProducerRoot>,
@@ -761,11 +788,13 @@ where
             .map(|signature| (signature.decl_id, signature))
             .collect();
         let mut calls_by_owner = BTreeMap::<Option<DeclId>, Vec<usize>>::new();
+        let mut call_index_by_id = BTreeMap::new();
         for (index, call) in program.calls.iter().enumerate() {
             calls_by_owner
                 .entry(call.owner_callable)
                 .or_default()
                 .push(index);
+            call_index_by_id.insert(call.id, index);
         }
         for calls in calls_by_owner.values_mut() {
             calls.sort_by_key(|index| {
@@ -775,10 +804,46 @@ where
         }
 
         let resource_owning_callables = resource_owning_callables(program, &signature_by_id);
+        let declaration_by_id = program
+            .declarations
+            .iter()
+            .map(|declaration| (declaration.id, declaration))
+            .collect();
+        let pattern_binding_by_declaration = program
+            .pattern_bindings
+            .iter()
+            .map(|binding| (binding.declaration, binding))
+            .collect();
+        let function_owner_by_scope = program
+            .scopes
+            .iter()
+            .map(|scope| (scope.id, function_owner_for_scope(program, scope.id)))
+            .collect::<BTreeMap<_, _>>();
+        let root_expressions = program
+            .statements
+            .iter()
+            .filter(|statement| {
+                function_owner_by_scope
+                    .get(&statement.scope_id)
+                    .copied()
+                    .flatten()
+                    .is_none()
+                    && !matches!(
+                        statement.kind,
+                        boon_typecheck::CheckedStatementKind::Function { .. }
+                    )
+            })
+            .filter_map(|statement| statement.value)
+            .collect();
         Self {
             program,
             signature_by_id,
             calls_by_owner,
+            call_index_by_id,
+            declaration_by_id,
+            pattern_binding_by_declaration,
+            function_owner_by_scope,
+            root_expressions,
             resource_owning_callables,
             producer_root_specs,
             producer_roots: Vec::new(),
@@ -849,6 +914,367 @@ where
         );
     }
 
+    fn reachable_call_indices(
+        &self,
+        owner_callable: Option<DeclId>,
+        frame: Option<OutCallInstanceId>,
+    ) -> Vec<usize> {
+        let all_calls = self
+            .calls_by_owner
+            .get(&owner_callable)
+            .cloned()
+            .unwrap_or_default();
+        if owner_callable.is_some_and(|owner| {
+            self.resource_owning_callables.contains(&owner)
+                || self.signature_by_id.get(&owner).is_some_and(|callable| {
+                    callable.effect.writes_state
+                        || callable.effect.emits_source
+                        || callable.effect.invokes_host
+                })
+        }) {
+            // Stateful/effectful callable bodies can contain update expressions
+            // rooted by statement scheduling rather than their result value.
+            // Keep their complete lexical call inventory until that scheduling
+            // is represented by the same explicit expression roots.
+            return all_calls;
+        }
+
+        let mut pending = owner_callable.map_or_else(
+            || self.root_expressions.clone(),
+            |owner| {
+                self.signature_by_id
+                    .get(&owner)
+                    .and_then(|callable| callable.result_expression)
+                    .into_iter()
+                    .collect()
+            },
+        );
+        let mut visited = BTreeSet::new();
+        let mut reachable = BTreeSet::new();
+        while let Some(expression) = pending.pop() {
+            if !visited.insert(expression) {
+                continue;
+            }
+            let Some(expression) = self
+                .program
+                .expressions
+                .get(expression.0 as usize)
+                .filter(|candidate| candidate.id == expression)
+            else {
+                continue;
+            };
+            match &expression.kind {
+                CheckedExpressionKind::Read { target, .. } => {
+                    if let Some(declaration) = self.declaration_by_id.get(target)
+                        && declaration.kind == CheckedDeclarationKind::Field
+                        && self
+                            .function_owner_by_scope
+                            .get(&declaration.scope_id)
+                            .copied()
+                            .flatten()
+                            == owner_callable
+                    {
+                        pending.extend(declaration.value);
+                    }
+                }
+                CheckedExpressionKind::Call { call } => {
+                    let Some(index) = self.call_index_by_id.get(call).copied() else {
+                        continue;
+                    };
+                    reachable.insert(index);
+                    let call = &self.program.calls[index];
+                    pending.extend(call.entries.iter().filter_map(|entry| match entry {
+                        CheckedCallEntry::Input { value, .. } => Some(*value),
+                        CheckedCallEntry::FreshOut { .. } | CheckedCallEntry::ForwardOut { .. } => {
+                            None
+                        }
+                    }));
+                    pending.extend(call.context_binding.explicit().map(|(value, _)| value));
+                }
+                CheckedExpressionKind::When { input, arms } => {
+                    pending.push(*input);
+                    let selected = self
+                        .static_checked_selector_value(
+                            *input,
+                            frame,
+                            Vec::new(),
+                            &mut BTreeSet::new(),
+                        )
+                        .and_then(|selector| self.selected_checked_arm(&selector, arms));
+                    if let Some(selected) = selected {
+                        pending.push(selected);
+                    } else {
+                        pending.extend(arms.iter().copied());
+                    }
+                }
+                CheckedExpressionKind::While { input, arms } => {
+                    pending.push(*input);
+                    pending.extend(arms.iter().copied());
+                }
+                CheckedExpressionKind::TextTemplate { segments } => {
+                    pending.extend(segments.iter().filter_map(|segment| match segment {
+                        boon_typecheck::CheckedTextSegment::Static { .. } => None,
+                        boon_typecheck::CheckedTextSegment::Dynamic { value } => Some(*value),
+                    }));
+                }
+                CheckedExpressionKind::TaggedObject { fields, .. }
+                | CheckedExpressionKind::Object { fields } => {
+                    pending.extend(fields.iter().map(|field| field.value));
+                }
+                CheckedExpressionKind::Flush { payload: input }
+                | CheckedExpressionKind::Draining { input } => pending.push(*input),
+                CheckedExpressionKind::Hold { initial, .. } => {
+                    pending.push(*initial);
+                    pending.extend(self.checked_statement_child_values(expression.id));
+                }
+                CheckedExpressionKind::Latest { branches } => {
+                    pending.extend(branches.iter().copied());
+                }
+                CheckedExpressionKind::Then { input, output } => {
+                    pending.push(*input);
+                    pending.extend(*output);
+                }
+                CheckedExpressionKind::Infix { left, right, .. }
+                | CheckedExpressionKind::MapEntry {
+                    key: left,
+                    value: right,
+                } => {
+                    pending.push(*left);
+                    pending.push(*right);
+                }
+                CheckedExpressionKind::MatchArm { output, .. } => {
+                    pending.extend(*output);
+                    pending.extend(self.checked_statement_child_values(expression.id));
+                }
+                CheckedExpressionKind::Block { bindings, result } => {
+                    pending.extend(bindings.iter().map(|binding| binding.value));
+                    pending.extend(*result);
+                }
+                CheckedExpressionKind::List { items, .. }
+                | CheckedExpressionKind::Bytes { items, .. }
+                | CheckedExpressionKind::Set { items }
+                | CheckedExpressionKind::Map { entries: items } => {
+                    pending.extend(items.iter().copied());
+                }
+                CheckedExpressionKind::Passed { .. }
+                | CheckedExpressionKind::ExternalRead { .. }
+                | CheckedExpressionKind::Drain { .. }
+                | CheckedExpressionKind::Text { .. }
+                | CheckedExpressionKind::Number { .. }
+                | CheckedExpressionKind::Bits { .. }
+                | CheckedExpressionKind::BytesByte { .. }
+                | CheckedExpressionKind::Absent
+                | CheckedExpressionKind::Tag { .. }
+                | CheckedExpressionKind::Source
+                | CheckedExpressionKind::Delimiter
+                | CheckedExpressionKind::Invalid { .. } => {}
+            }
+        }
+        all_calls
+            .into_iter()
+            .filter(|call| reachable.contains(call))
+            .collect()
+    }
+
+    fn checked_statement_child_values(
+        &self,
+        parent_expression: CheckedExprId,
+    ) -> Vec<CheckedExprId> {
+        let Some(statement) = self.program.statements.iter().find(|statement| {
+            statement.value == Some(parent_expression) && !statement.children.is_empty()
+        }) else {
+            return Vec::new();
+        };
+        let mut statements = statement.children.iter().rev().copied().collect::<Vec<_>>();
+        let mut visited = BTreeSet::new();
+        let mut values = Vec::new();
+        while let Some(statement_id) = statements.pop() {
+            if !visited.insert(statement_id) {
+                continue;
+            }
+            let Some(statement) = self
+                .program
+                .statements
+                .get(statement_id.0 as usize)
+                .filter(|candidate| candidate.id == statement_id)
+            else {
+                continue;
+            };
+            match statement.value {
+                Some(value) if value == parent_expression => {
+                    statements.extend(statement.children.iter().rev().copied());
+                }
+                Some(value) => values.push(value),
+                None => statements.extend(statement.children.iter().rev().copied()),
+            }
+        }
+        values
+    }
+
+    fn selected_checked_arm(
+        &self,
+        selector: &CheckedStaticSelectorValue,
+        arms: &[CheckedExprId],
+    ) -> Option<CheckedExprId> {
+        arms.iter().copied().find(|arm| {
+            self.program
+                .expressions
+                .get(arm.0 as usize)
+                .filter(|candidate| candidate.id == *arm)
+                .and_then(|expression| match &expression.kind {
+                    CheckedExpressionKind::MatchArm { pattern, .. } => Some(pattern),
+                    _ => None,
+                })
+                .is_some_and(|pattern| selector.matches(pattern))
+        })
+    }
+
+    fn static_checked_selector_value(
+        &self,
+        expression: CheckedExprId,
+        frame: Option<OutCallInstanceId>,
+        mut projection: Vec<String>,
+        visited: &mut BTreeSet<(CheckedExprId, Option<OutCallInstanceId>, Vec<String>)>,
+    ) -> Option<CheckedStaticSelectorValue> {
+        if !visited.insert((expression, frame, projection.clone())) {
+            return None;
+        }
+        let definition = self
+            .program
+            .expressions
+            .get(expression.0 as usize)
+            .filter(|candidate| candidate.id == expression)?;
+        match &definition.kind {
+            CheckedExpressionKind::Read {
+                target,
+                projection: read_projection,
+                ..
+            } => {
+                let mut fields = read_projection.clone();
+                fields.extend(projection);
+                if let Some(actual) = frame.and_then(|frame| {
+                    self.call_instances
+                        .get(frame.as_usize())?
+                        .inputs
+                        .iter()
+                        .find(|binding| binding.formal == *target)
+                        .map(|binding| binding.value.clone())
+                }) {
+                    return match actual {
+                        OutInputValue::Checked(actual) => self.static_checked_selector_value(
+                            actual.expression,
+                            actual.frame,
+                            fields,
+                            visited,
+                        ),
+                        OutInputValue::ProducerParameter { .. } => None,
+                    };
+                }
+                if let Some(binding) = self.pattern_binding_by_declaration.get(target) {
+                    let mut binding_projection = binding.projection.clone();
+                    binding_projection.extend(fields);
+                    return self.static_checked_selector_value(
+                        binding.selector,
+                        frame,
+                        binding_projection,
+                        visited,
+                    );
+                }
+                let declaration = self.declaration_by_id.get(target)?;
+                if declaration.kind == CheckedDeclarationKind::Field
+                    && self
+                        .function_owner_by_scope
+                        .get(&declaration.scope_id)
+                        .copied()
+                        .flatten()
+                        .is_some()
+                {
+                    return self.static_checked_selector_value(
+                        declaration.value?,
+                        frame,
+                        fields,
+                        visited,
+                    );
+                }
+                None
+            }
+            CheckedExpressionKind::Passed {
+                formal,
+                projection: passed_projection,
+                access: CheckedPassedAccess::Read,
+            } => {
+                let passed = frame
+                    .and_then(|frame| self.call_instances.get(frame.as_usize()))?
+                    .passed?;
+                if passed.formal != *formal {
+                    return None;
+                }
+                let mut fields = passed_projection.clone();
+                fields.extend(projection);
+                self.static_checked_selector_value(
+                    passed.value.expression,
+                    passed.value.frame,
+                    fields,
+                    visited,
+                )
+            }
+            CheckedExpressionKind::TaggedObject { fields, .. }
+            | CheckedExpressionKind::Object { fields }
+                if !projection.is_empty() && fields.iter().all(|field| !field.spread) =>
+            {
+                let field = projection.remove(0);
+                let value = fields
+                    .iter()
+                    .rev()
+                    .find(|candidate| candidate.name == field)?
+                    .value;
+                self.static_checked_selector_value(value, frame, projection, visited)
+            }
+            CheckedExpressionKind::Block { result, .. } => {
+                self.static_checked_selector_value((*result)?, frame, projection, visited)
+            }
+            CheckedExpressionKind::Flush { payload }
+            | CheckedExpressionKind::Draining { input: payload } => {
+                self.static_checked_selector_value(*payload, frame, projection, visited)
+            }
+            CheckedExpressionKind::When { input, arms } if projection.is_empty() => {
+                let selector =
+                    self.static_checked_selector_value(*input, frame, Vec::new(), visited)?;
+                let selected = self.selected_checked_arm(&selector, arms)?;
+                let output = self
+                    .program
+                    .expressions
+                    .get(selected.0 as usize)
+                    .filter(|candidate| candidate.id == selected)
+                    .and_then(|expression| match &expression.kind {
+                        CheckedExpressionKind::MatchArm { output, .. } => *output,
+                        _ => None,
+                    })?;
+                self.static_checked_selector_value(output, frame, Vec::new(), visited)
+            }
+            CheckedExpressionKind::MatchArm {
+                output: Some(output),
+                ..
+            } => self.static_checked_selector_value(*output, frame, projection, visited),
+            CheckedExpressionKind::Number { value } if projection.is_empty() => {
+                Some(CheckedStaticSelectorValue::Number(value.clone()))
+            }
+            CheckedExpressionKind::Text { value } if projection.is_empty() => {
+                Some(CheckedStaticSelectorValue::Text(value.clone()))
+            }
+            CheckedExpressionKind::Tag { name } if projection.is_empty() => {
+                Some(CheckedStaticSelectorValue::Tag(name.clone()))
+            }
+            CheckedExpressionKind::TaggedObject { tag, .. } if projection.is_empty() => {
+                Some(CheckedStaticSelectorValue::Tag(tag.clone()))
+            }
+            CheckedExpressionKind::Bits { value } if projection.is_empty() => {
+                Some(CheckedStaticSelectorValue::Bits(value.clone()))
+            }
+            _ => None,
+        }
+    }
+
     fn instantiate_frame(
         &mut self,
         owner_callable: Option<DeclId>,
@@ -856,11 +1282,7 @@ where
         mut frame_bindings: BTreeMap<DeclId, usize>,
         active_callables: &mut Vec<DeclId>,
     ) {
-        let static_calls = self
-            .calls_by_owner
-            .get(&owner_callable)
-            .cloned()
-            .unwrap_or_default();
+        let static_calls = self.reachable_call_indices(owner_callable, parent);
         let mut pending_calls = Vec::with_capacity(static_calls.len());
         let mut pending_forwards = Vec::new();
 
@@ -1669,26 +2091,23 @@ impl UnionFind {
     }
 }
 
+fn function_owner_for_scope(program: &CheckedProgram, mut scope: LexicalScopeId) -> Option<DeclId> {
+    loop {
+        let checked = program
+            .scopes
+            .iter()
+            .find(|candidate| candidate.id == scope)?;
+        if checked.kind == CheckedScopeKind::Function {
+            return checked.owner;
+        }
+        scope = checked.parent?;
+    }
+}
+
 fn resource_owning_callables(
     program: &CheckedProgram,
     signatures: &BTreeMap<DeclId, &CheckedCallableSignature>,
 ) -> BTreeSet<DeclId> {
-    fn function_owner_for_scope(
-        program: &CheckedProgram,
-        mut scope: LexicalScopeId,
-    ) -> Option<DeclId> {
-        loop {
-            let checked = program
-                .scopes
-                .iter()
-                .find(|candidate| candidate.id == scope)?;
-            if checked.kind == CheckedScopeKind::Function {
-                return checked.owner;
-            }
-            scope = checked.parent?;
-        }
-    }
-
     let calls = program
         .calls
         .iter()
@@ -1892,6 +2311,141 @@ converted: 255 |> Number/to_bits(width: 8, interpretation: Unsigned)
                 .result
                 .ty,
             boon_typecheck::Type::Bits { width: 3 }
+        );
+    }
+
+    #[test]
+    fn static_dispatch_instantiates_only_the_selected_call_path() {
+        let mut source = String::new();
+        for index in 0..64 {
+            source.push_str(&format!(
+                "FUNCTION branch_{index}() {{\n    {index}\n}}\n\n"
+            ));
+        }
+        source.push_str("FUNCTION dispatch(choice) {\n    choice |> WHEN {\n");
+        for index in 0..64 {
+            source.push_str(&format!("        Choice{index} => branch_{index}()\n"));
+        }
+        source.push_str("    }\n}\n\nresult: dispatch(choice: Choice0)\n");
+
+        let program = checked_program("out-net-static-dispatch.bn", &source);
+        let built = OutNet::build(&program);
+        assert!(!built.has_errors(), "{:#?}", built.diagnostics);
+        assert_eq!(built.graph.call_instances.len(), 2);
+        assert_eq!(
+            built
+                .graph
+                .call_instances
+                .iter()
+                .filter_map(|instance| instance.provenance.call_id)
+                .filter_map(|call| {
+                    program
+                        .calls
+                        .iter()
+                        .find(|candidate| candidate.id == call)
+                        .map(|call| call.function.as_str())
+                })
+                .collect::<Vec<_>>(),
+            vec!["dispatch", "branch_0"]
+        );
+    }
+
+    #[test]
+    fn static_structural_dispatch_keeps_selected_statement_child_calls() {
+        let program = checked_program(
+            "out-net-static-structural-dispatch.bn",
+            r#"
+FUNCTION branch_a() {
+    [a: 1]
+}
+
+FUNCTION branch_b() {
+    [b: 2]
+}
+
+FUNCTION dispatch(choice) {
+    choice |> WHEN {
+        A => [
+            ...branch_a()
+        ]
+
+        __ => [
+            ...branch_b()
+        ]
+    }
+}
+
+result: dispatch(choice: A)
+"#,
+        );
+        let built = OutNet::build(&program);
+        assert!(!built.has_errors(), "{:#?}", built.diagnostics);
+        let functions = built
+            .graph
+            .call_instances
+            .iter()
+            .filter_map(|instance| instance.provenance.call_id)
+            .filter_map(|call| {
+                program
+                    .calls
+                    .iter()
+                    .find(|candidate| candidate.id == call)
+                    .map(|call| call.function.as_str())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(functions, vec!["dispatch", "branch_a"]);
+    }
+
+    #[test]
+    fn dynamic_dispatch_retains_every_reachable_call_path() {
+        let program = checked_program(
+            "out-net-dynamic-dispatch.bn",
+            r#"
+FUNCTION branch_a() {
+    1
+}
+
+FUNCTION branch_b() {
+    2
+}
+
+FUNCTION branch_c() {
+    3
+}
+
+FUNCTION dispatch(choice) {
+    choice |> WHEN {
+        A => branch_a()
+        B => branch_b()
+        C => branch_c()
+    }
+}
+
+choice:
+    A |> HOLD selected {
+        LATEST {}
+    }
+result: dispatch(choice: choice)
+"#,
+        );
+        let built = OutNet::build(&program);
+        assert!(!built.has_errors(), "{:#?}", built.diagnostics);
+        let functions = built
+            .graph
+            .call_instances
+            .iter()
+            .filter_map(|instance| instance.provenance.call_id)
+            .filter_map(|call| {
+                program
+                    .calls
+                    .iter()
+                    .find(|candidate| candidate.id == call)
+                    .map(|call| call.function.as_str())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            functions,
+            vec!["dispatch", "branch_a", "branch_b", "branch_c"]
         );
     }
 

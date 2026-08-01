@@ -1,75 +1,96 @@
 FUNCTION material(of) {
-    [
-        ...get(from: Material, of: of)
-        ...shared_material(of: of)
-    ]
+    of |> WHEN {
+        NewTodoRowFrame => frame_material(of: of)
+        TodoListFrame => frame_material(of: of)
+        TodoRowFrame => frame_material(of: of)
+        PanelFooterFrame => frame_material(of: of)
+        __ => [
+            ...get(request: Material[of: of])
+            ...shared_material(of: of)
+        ]
+    }
 }
 
 FUNCTION checkbox_material() {
     [
-        ...get(from: Material, of: CheckboxGlyph)
+        ...get(request: Material[of: CheckboxGlyph])
     ]
 }
 
 FUNCTION font(of) {
-    get(from: Font, of: of)
+    get(request: Font[of: of])
 }
 
 FUNCTION text(of) {
-    get(from: Text, of: of)
+    get(request: Text[of: of])
 }
 
 FUNCTION depth(of) {
-    get(from: Depth, of: of)
+    get(request: Depth[of: of])
 }
 
 FUNCTION elevation(of) {
-    get(from: Elevation, of: of)
+    get(request: Elevation[of: of])
 }
 
 FUNCTION corners(of) {
-    get(from: Corners, of: of)
+    get(request: Corners[of: of])
 }
 
 FUNCTION lights() {
-    get(from: Lights, of: [])
+    get(request: Lights)
 }
 
 FUNCTION geometry() {
-    get(from: Geometry, of: [])
+    get(request: Geometry)
 }
 
 FUNCTION sizing(of) {
     of |> WHEN {
         TouchTarget => 40
-        ToggleControl => get(from: Sizing, of: of)
+        ToggleControl => theme_sizing(of: of)
         IconContainer => 34
         EditingInputWidth => 405
-        __ => get(from: Sizing, of: of)
+        __ => theme_sizing(of: of)
     }
 }
 
 FUNCTION spacing(of) {
     of |> WHEN {
         TitlePanelGap => 0
-        NewTodoInputInset => get(from: Spacing, of: of)
+        NewTodoInputInset => theme_spacing(of: of)
         Section => 10
         SwitcherBottomPush => 0
-        __ => get(from: Spacing, of: of)
+        __ => theme_spacing(of: of)
     }
 }
 
 FUNCTION spring_range(of) {
-    get(from: SpringRange, of: of)
+    get(request: SpringRange[of: of])
 }
 
-FUNCTION get(from, of) {
+FUNCTION frame_material(of) {
     PASSED.theme_options.name |> WHEN {
-        Classic => Classic/get(from: from, of: of, PASS: PASSED.theme_options)
-        Professional => Professional/get(from: from, of: of, PASS: PASSED.theme_options)
-        Glassmorphism => Glassmorphism/get(from: from, of: of, PASS: PASSED.theme_options)
-        Neobrutalism => Neobrutalism/get(from: from, of: of, PASS: PASSED.theme_options)
-        Neumorphism => Neumorphism/get(from: from, of: of, PASS: PASSED.theme_options)
+        Classic => Classic/get(request: Material[of: of], PASS: PASSED.theme_options)
+        __ => shared_material(of: of)
+    }
+}
+
+FUNCTION theme_sizing(of) {
+    get(request: Sizing[of: of])
+}
+
+FUNCTION theme_spacing(of) {
+    get(request: Spacing[of: of])
+}
+
+FUNCTION get(request) {
+    PASSED.theme_options.name |> WHEN {
+        Classic => Classic/get(request: request, PASS: PASSED.theme_options)
+        Professional => Professional/get(request: request, PASS: PASSED.theme_options)
+        Glassmorphism => Glassmorphism/get(request: request, PASS: PASSED.theme_options)
+        Neobrutalism => Neobrutalism/get(request: request, PASS: PASSED.theme_options)
+        Neumorphism => Neumorphism/get(request: request, PASS: PASSED.theme_options)
     }
 }
 

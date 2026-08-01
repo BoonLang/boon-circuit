@@ -39,8 +39,8 @@ use std::fmt;
 pub const SEMANTIC_PROGRAM_SCHEMA_V1: &str = "boon.semantic-program.v1";
 pub const BUNDLE_SEMANTIC_PROGRAM_SCHEMA_V1: &str = "boon.bundle-semantic-program.v1";
 pub const DEPENDENCY_CLASSIFIER_SCHEMA_DIGEST_V1: [u8; 32] = [
-    0x4d, 0xd2, 0x71, 0x07, 0x01, 0xb0, 0x6a, 0xd6, 0x6a, 0x46, 0xcc, 0x3a, 0x17, 0x37, 0x7f, 0xd7,
-    0x24, 0x45, 0x8c, 0xdc, 0xb0, 0xfe, 0x10, 0x0b, 0xb9, 0xd2, 0x12, 0xba, 0x20, 0xcb, 0xaf, 0x59,
+    0xb7, 0x3e, 0x75, 0xef, 0xbe, 0x91, 0x7a, 0xee, 0xd3, 0x4e, 0x46, 0xbe, 0x8b, 0x26, 0x6b, 0xad,
+    0x95, 0x71, 0x60, 0x57, 0x36, 0xf9, 0x9c, 0xe5, 0xb8, 0xe3, 0x65, 0x84, 0x74, 0x23, 0x46, 0x1c,
 ];
 pub const MAX_BUNDLE_SEMANTIC_PRODUCER_REQUESTS_V1: usize = 4_096;
 pub const MAX_BUNDLE_SEMANTIC_PRODUCER_REQUEST_BYTES_V1: usize = 4 * 1024 * 1024;
@@ -49,6 +49,7 @@ pub const MAX_BUNDLE_SEMANTIC_CALL_CROSSING_BYTES_V1: usize = 32 * 1024 * 1024;
 pub const MAX_BUNDLE_SEMANTIC_VALUE_CROSSINGS_V1: usize = 16_384;
 pub const MAX_BUNDLE_SEMANTIC_VALUE_CROSSING_BYTES_V1: usize = 32 * 1024 * 1024;
 const SEMANTIC_PROGRAM_DIGEST_DOMAIN: &[u8] = b"boon.semantic-program.v1\0";
+const CANONICAL_PROGRAM_CORE_DIGEST_DOMAIN: &[u8] = b"boon.canonical-program-core.v1\0";
 const BUNDLE_SEMANTIC_PROGRAM_DIGEST_DOMAIN: &[u8] = b"boon.bundle-semantic-program.v1\0";
 const OUT_PORT_SHAPE_DIGEST_DOMAIN: &[u8] = b"boon.out-port-shape.v1\0";
 const PRODUCER_MATERIALIZATION_IDENTITY_DOMAIN: &[u8] =
@@ -922,6 +923,24 @@ impl SemanticProgram {
             &self.resource_graph,
         )
         .map_err(SemanticError::new)?;
+        self.validate_integrity_handoff()
+    }
+
+    fn validate_freshly_constructed(&self) -> Result<(), SemanticError> {
+        if self.source_bundle_digest_v1 != self.checked_program.source_bundle_digest_v1 {
+            return Err(SemanticError::new(
+                "semantic source bundle digest does not match its checked program",
+            ));
+        }
+        // Every component builder has just validated its inputs and exact
+        // output shape, and the manifest/digest builders consumed those same
+        // immutable values directly. Preserve the independent public deep
+        // validator above, but do not immediately serialize and hash the whole
+        // artifact a second time before returning it.
+        validate_canonical_core_handoff(self)
+    }
+
+    fn validate_integrity_handoff(&self) -> Result<(), SemanticError> {
         self.dependency_manifest
             .validate_integrity(
                 DEPENDENCY_CLASSIFIER_SCHEMA_DIGEST_V1,
@@ -2566,12 +2585,16 @@ pub fn elaborate_with_external_event_identities(
     let trace_elaboration = std::env::var_os("BOON_SEMANTIC_TRACE").is_some();
     macro_rules! elaboration_phase {
         ($name:literal, $expression:expr) => {{
+            let started = trace_elaboration.then(std::time::Instant::now);
             if trace_elaboration {
                 eprintln!(concat!("boon_semantic phase ", $name, ":start"));
             }
             let result = $expression;
-            if trace_elaboration {
-                eprintln!(concat!("boon_semantic phase ", $name, ":done"));
+            if let Some(started) = started {
+                eprintln!(
+                    concat!("boon_semantic phase ", $name, ":done elapsed_ms={:.3}"),
+                    started.elapsed().as_secs_f64() * 1000.0,
+                );
             }
             result
         }};
@@ -2610,6 +2633,15 @@ pub fn elaborate_with_external_event_identities(
         ));
     }
     let mut resolved_out_graph = out_net.graph;
+    if trace_elaboration {
+        eprintln!(
+            "boon_semantic artifact out_graph calls={} ports={} nets={} owners={}",
+            resolved_out_graph.call_instances.len(),
+            resolved_out_graph.ports.len(),
+            resolved_out_graph.nets.len(),
+            resolved_out_graph.static_owners.len(),
+        );
+    }
     elaboration_phase!(
         "resolve_out_contracts",
         resolve_out_contracts(&checked_program, &mut resolved_out_graph)
@@ -2636,6 +2668,26 @@ pub fn elaborate_with_external_event_identities(
         )
     )
     .map_err(|error| SemanticError::new(error.to_string()))?;
+    if trace_elaboration {
+        eprintln!(
+            "boon_semantic artifact execution_graph scopes={} expressions={} statements={} callables={} calls={} functions={} materializations={}",
+            execution_graph.scopes.len(),
+            execution_graph.expressions.len(),
+            execution_graph.statements.len(),
+            execution_graph.callables.len(),
+            execution_graph.calls.len(),
+            execution_graph.functions.len(),
+            execution_graph.materializations.len(),
+        );
+    }
+    elaboration_phase!(
+        "validate_checked_callable_and_call_inventory",
+        contextual_expansion::validate_checked_callable_and_call_inventory(
+            &checked_program,
+            &execution_graph,
+        )
+    )
+    .map_err(SemanticError::new)?;
     elaboration_phase!(
         "validate_checked_roots",
         execution_graph.validate_checked_roots(&checked_program)
@@ -2766,7 +2818,10 @@ pub fn elaborate_with_external_event_identities(
         "semantic_program_digest",
         semantic_program_digest(&semantic)
     )?;
-    elaboration_phase!("semantic_validate", semantic.validate())?;
+    elaboration_phase!(
+        "semantic_validate_freshly_constructed",
+        semantic.validate_freshly_constructed()
+    )?;
     Ok(semantic)
 }
 
@@ -4965,35 +5020,23 @@ fn semantic_program_digest(
     struct Payload<'a> {
         schema: &'static str,
         source_bundle_digest_v1: SourceBundleDigestV1,
-        checked: &'a CheckedProgram,
-        producer_materializations: &'a [ProducerMaterializationRequest],
-        resolved_out_graph: &'a ResolvedOutGraph,
-        execution_graph: &'a SemanticExecutionGraphV1,
-        resource_graph: &'a SemanticResourceGraphV1,
-        reactive_graph: &'a SemanticReactiveGraphV1,
-        lowering_contract: &'a SemanticLoweringContractV1,
-        view_binding_graph: &'a SemanticViewBindingGraphV1,
-        scope_storage_graph: &'a SemanticScopeStorageGraphV1,
-        memory_graph: &'a SemanticMemoryGraphV1,
-        canonical_core: &'a program_core::CanonicalProgramCoreV1,
+        checked_program_digest: CheckedProgramDigestV1,
+        component_digests: &'a CallableDependencyComponentDigestsV1,
+        canonical_core_digest: [u8; 32],
         dependency_manifest_digest: CallableDependencyManifestDigestV1,
     }
+    let canonical_core_digest = canonical_hash(
+        CANONICAL_PROGRAM_CORE_DIGEST_DOMAIN,
+        &program.canonical_core,
+    )?;
     Ok(SemanticProgramDigestV1(canonical_hash(
         SEMANTIC_PROGRAM_DIGEST_DOMAIN,
         &Payload {
             schema: SEMANTIC_PROGRAM_SCHEMA_V1,
             source_bundle_digest_v1: program.source_bundle_digest_v1,
-            checked: &program.checked_program,
-            producer_materializations: &program.producer_materializations,
-            resolved_out_graph: &program.resolved_out_graph,
-            execution_graph: &program.execution_graph,
-            resource_graph: &program.resource_graph,
-            reactive_graph: &program.reactive_graph,
-            lowering_contract: &program.lowering_contract,
-            view_binding_graph: &program.view_binding_graph,
-            scope_storage_graph: &program.scope_storage_graph,
-            memory_graph: &program.memory_graph,
-            canonical_core: &program.canonical_core,
+            checked_program_digest: program.dependency_manifest.checked_program_digest,
+            component_digests: &program.dependency_manifest.component_digests,
+            canonical_core_digest,
             dependency_manifest_digest: program.dependency_manifest.manifest_digest,
         },
     )?))

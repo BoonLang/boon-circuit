@@ -411,17 +411,54 @@ pub(crate) fn build_semantic_resource_graph(
     out_net: &ResolvedOutGraph,
     execution: &mut SemanticExecutionGraphV1,
 ) -> Result<SemanticResourceGraphV1, String> {
-    let (row_scopes, mut lists, value_list_authorities) =
-        discover_list_resources(checked, execution)?;
-    let target_lists = materialization_target_lists(execution, &lists)?;
-    bind_materialization_targets(execution, &lists, &target_lists)?;
-    bind_materialization_sources(execution, &lists)?;
-    bind_materialization_lineage(execution, &lists)?;
-    bind_list_lineage(execution, &mut lists)?;
+    let trace_resources = std::env::var_os("BOON_SEMANTIC_TRACE").is_some();
+    macro_rules! resource_phase {
+        ($name:literal, $expression:expr) => {{
+            if trace_resources {
+                eprintln!(concat!("boon_semantic resource phase ", $name, ":start"));
+            }
+            let result = $expression;
+            if trace_resources {
+                eprintln!(concat!("boon_semantic resource phase ", $name, ":done"));
+            }
+            result
+        }};
+    }
+
+    let (row_scopes, mut lists, value_list_authorities) = resource_phase!(
+        "discover_list_resources",
+        discover_list_resources(checked, execution)
+    )?;
+    let target_lists = resource_phase!(
+        "materialization_target_lists",
+        materialization_target_lists(execution, &lists)
+    )?;
+    resource_phase!(
+        "bind_materialization_targets",
+        bind_materialization_targets(execution, &lists, &target_lists)
+    )?;
+    resource_phase!(
+        "bind_materialization_sources",
+        bind_materialization_sources(execution, &lists)
+    )?;
+    resource_phase!(
+        "bind_materialization_lineage",
+        bind_materialization_lineage(execution, &lists)
+    )?;
+    resource_phase!(
+        "bind_list_lineage",
+        bind_list_lineage(execution, &mut lists)
+    )?;
 
     let mut aliases = Vec::new();
-    let sources = build_source_resources(checked, execution, &lists, &mut aliases)?;
-    let states = build_state_resources(checked, execution, &lists, &mut aliases)?;
+    let sources = resource_phase!(
+        "build_source_resources",
+        build_source_resources(checked, execution, &lists, &mut aliases)
+    )?;
+    let states = resource_phase!(
+        "build_state_resources",
+        build_state_resources(checked, execution, &lists, &mut aliases)
+    )?;
     aliases.sort();
     aliases.dedup();
     let materialization_bindings = execution
@@ -447,8 +484,14 @@ pub(crate) fn build_semantic_resource_graph(
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
-    let list_projections = discover_list_projections(execution, &lists)?;
-    let producer_resources = build_producer_resources(out_net, execution)?;
+    let list_projections = resource_phase!(
+        "discover_list_projections",
+        discover_list_projections(execution, &lists)
+    )?;
+    let producer_resources = resource_phase!(
+        "build_producer_resources",
+        build_producer_resources(out_net, execution)
+    )?;
     let mut graph = SemanticResourceGraphV1 {
         schema: SEMANTIC_RESOURCE_GRAPH_SCHEMA_V1.to_owned(),
         row_scopes,
@@ -462,10 +505,16 @@ pub(crate) fn build_semantic_resource_graph(
         producer_resources,
         digest: SemanticResourceGraphDigestV1([0; 32]),
     };
-    graph.digest = resource_graph_digest(&graph)?;
-    graph.validate(execution, out_net)?;
-    validate_checked_list_classification(checked, execution, &graph)?;
-    validate_checked_resource_provenance(checked, execution, &graph)?;
+    graph.digest = resource_phase!("resource_graph_digest", resource_graph_digest(&graph))?;
+    resource_phase!("validate", graph.validate(execution, out_net))?;
+    resource_phase!(
+        "validate_checked_list_classification",
+        validate_checked_list_classification(checked, execution, &graph)
+    )?;
+    resource_phase!(
+        "validate_checked_resource_provenance",
+        validate_checked_resource_provenance(checked, execution, &graph)
+    )?;
     Ok(graph)
 }
 
@@ -719,11 +768,40 @@ fn typed_list_targets(
                     )
                 })
                 .collect::<Vec<_>>();
+            let checked_binding = CheckedResourceBinding::ListAuthority {
+                list: checked_list.id,
+            };
+            let copy_ids = semantic_copies
+                .iter()
+                .map(|(expression, ..)| *expression)
+                .collect::<Vec<_>>();
+            let binding_statements = execution
+                .statements
+                .iter()
+                .filter(|statement| statement.checked_resources.contains(&checked_binding))
+                .map(|statement| {
+                    let reaches = statement.value.map(|root| {
+                        copy_ids
+                            .iter()
+                            .map(|copy| expression_reaches(execution, root, *copy))
+                            .collect::<Result<Vec<_>, _>>()
+                    });
+                    (
+                        statement.id,
+                        statement.origin.clone(),
+                        statement.declaration,
+                        format!("{:?}", statement.kind),
+                        statement.value,
+                        reaches,
+                    )
+                })
+                .collect::<Vec<_>>();
             return Err(format!(
-                "reachable checked list {} producer {} declaration {} at line {} path `{path}` maps to {} exact semantic list producers; semantic copies: {semantic_copies:?}",
+                "reachable checked list {} producer {} declaration {} statement {} at line {} path `{path}` maps to {} exact semantic list producers; semantic copies: {semantic_copies:?}; binding statements: {binding_statements:?}",
                 checked_list.id.0,
                 checked_list.producer.0,
                 checked_list.declaration.0,
+                checked_list.statement.0,
                 checked_list.span.line,
                 matches.len()
             ));
@@ -2466,7 +2544,8 @@ fn statement_value_occurrences(
                 CheckedResourceBinding::ListAuthority { .. } => {
                     let exact_list = matches!(expression.kind, SemanticExpressionKind::List { .. });
                     resource_definition |= exact_list;
-                    declaration_authority |= exact_list;
+                    declaration_authority |=
+                        inline_list_authority_root(execution, value)?.is_some();
                 }
                 CheckedResourceBinding::ListAlias { .. } => {}
             }
@@ -3240,11 +3319,7 @@ fn bind_materialization_lineage(
     execution: &mut SemanticExecutionGraphV1,
     lists: &[SemanticListResourceV1],
 ) -> Result<(), String> {
-    let statement_values = execution
-        .statements
-        .iter()
-        .filter_map(|statement| Some((statement.declaration?, statement.value?)))
-        .collect::<BTreeMap<_, _>>();
+    let statement_values = statement_value_occurrences(execution)?;
     let statement_rows = lists
         .iter()
         .map(|list| {
@@ -3292,7 +3367,13 @@ fn bind_materialization_lineage(
             &statement_values,
             &statement_rows,
             &locals,
-        )?;
+        )
+        .map_err(|error| {
+            format!(
+                "materialization {} {:?} source {} has invalid lineage: {error}",
+                materialization.id, materialization.operation, materialization.source
+            )
+        })?;
         let source_row = rows
             .get(materialization.id.as_usize())
             .map(|(source, _)| *source)
@@ -3397,11 +3478,7 @@ fn bind_list_lineage(
     execution: &SemanticExecutionGraphV1,
     lists: &mut [SemanticListResourceV1],
 ) -> Result<(), String> {
-    let statement_values = execution
-        .statements
-        .iter()
-        .filter_map(|statement| Some((statement.declaration?, statement.value?)))
-        .collect::<BTreeMap<_, _>>();
+    let statement_values = statement_value_occurrences(execution)?;
     let statement_rows = lists
         .iter()
         .map(|list| {
@@ -3509,7 +3586,7 @@ fn type_may_supply_projection(ty: &Type, projection: &[String]) -> bool {
 fn collect_lineage_leaves(
     execution: &SemanticExecutionGraphV1,
     root: SemanticExprId,
-    statement_values: &BTreeMap<DeclId, SemanticExprId>,
+    statement_values: &BTreeMap<DeclId, Vec<StatementValueOccurrence>>,
     statement_rows: &BTreeMap<DeclId, SemanticRowBinding>,
     locals: &BTreeMap<SemanticLocalBindingId, (DeclId, SemanticExprId)>,
 ) -> Result<BTreeSet<LineageLeaf>, String> {
@@ -3530,8 +3607,10 @@ fn collect_lineage_leaves(
                 } => {
                     let mut combined = read_projection.clone();
                     combined.extend(projection);
-                    if let Some(value) = statement_values.get(target) {
-                        pending.push((*value, combined, row_identity));
+                    if let Some(value) =
+                        statement_value_for_expression(execution, statement_values, *target, id)?
+                    {
+                        pending.push((value, combined, row_identity));
                     } else if row_identity {
                         leaves.insert(LineageLeaf::Value);
                     }
@@ -3682,11 +3761,15 @@ fn collect_lineage_leaves(
                     if row_identity {
                         leaves.insert(LineageLeaf::Stored(*row));
                     }
-                    if let Some(value) = statement_values.get(target) {
-                        pending.push((*value, Vec::new(), false));
+                    if let Some(value) =
+                        statement_value_for_expression(execution, statement_values, *target, id)?
+                    {
+                        pending.push((value, Vec::new(), false));
                     }
-                } else if let Some(value) = statement_values.get(target) {
-                    pending.push((*value, projection.clone(), row_identity));
+                } else if let Some(value) =
+                    statement_value_for_expression(execution, statement_values, *target, id)?
+                {
+                    pending.push((value, projection.clone(), row_identity));
                 } else if row_identity {
                     leaves.insert(LineageLeaf::Value);
                 }
@@ -5928,6 +6011,102 @@ FUNCTION comparison_segments() {
                 .count(),
             1,
             "only the outer LATEST publishes the page_result declaration"
+        );
+    }
+
+    #[test]
+    fn nested_root_reactive_list_keeps_its_exact_literal_authority() {
+        let semantic = elaborate_source(
+            r#"
+store: [
+    remove: SOURCE
+    todos:
+        LIST { [completed: False] }
+        |> List/retain(item, if: LATEST {
+            True
+            remove |> THEN { item.completed |> Bool/not() }
+        })
+]
+
+count: store.todos |> List/count()
+"#,
+        );
+        let todos = semantic
+            .resource_graph
+            .lists
+            .iter()
+            .find(|list| list.semantic_path == "store.todos")
+            .expect("store.todos list authority");
+        assert!(matches!(
+            todos.origin,
+            SemanticListResourceOriginV1::CheckedLiteral { .. }
+        ));
+        let predicate_state = semantic
+            .resource_graph
+            .states
+            .iter()
+            .find(|state| state.declared_path == "store.todos.state_0")
+            .expect("retain predicate state");
+        assert_eq!(predicate_state.target_list, Some(todos.id));
+        assert_eq!(predicate_state.row_scope, Some(todos.row_scope));
+    }
+
+    #[test]
+    fn mapped_row_sources_keep_the_input_literal_authority() {
+        let semantic = elaborate_source(
+            r#"
+store: [
+    add: SOURCE
+    remove_all: SOURCE
+    todos: LIST {
+            [completed: False]
+            [completed: True]
+            [completed: False]
+            [completed: False]
+        }
+        |> List/append(item: add |> THEN { [completed: False] })
+        |> List/map(item, new: todo_row(initial_completed: item.completed))
+        |> List/retain(item, if: LATEST {
+            True
+            item.remove |> THEN { False }
+            remove_all |> THEN { item.completed |> Bool/not() }
+        })
+]
+
+FUNCTION todo_row(initial_completed) {
+    [
+        remove: SOURCE
+        toggle: SOURCE
+        edit: SOURCE
+        title_to_update:
+            LATEST {
+                edit |> THEN { TEXT { updated } }
+                toggle |> THEN { TEXT { toggled } }
+            }
+        title: LATEST {
+            TEXT { initial }
+            title_to_update
+        }
+        edited: title_to_update |> THEN { title_to_update }
+        completed:
+            initial_completed |> HOLD completed {
+                toggle |> THEN { completed |> Bool/not() }
+            }
+    ]
+}
+
+remaining:
+    store.todos
+    |> List/retain(item, if: item.completed |> Bool/not())
+count: store.todos |> List/count()
+"#,
+        );
+        assert!(
+            semantic
+                .resource_graph
+                .lists
+                .iter()
+                .any(|list| list.semantic_path == "store.todos")
         );
     }
 

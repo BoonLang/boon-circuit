@@ -840,6 +840,7 @@ CheckedProgram (boon_typecheck)
 
 SemanticProgram (boon_semantic)
   expanded contextual functions
+  retained ordinary callable definitions and call edges
   unified and validated OutNet graph
   structural OwnerInstanceId anchors
   typed list views and dependency manifests
@@ -885,6 +886,17 @@ assigned. The authoritative structural owner belongs to the outer fresh-output
 operator call; forwarding wrappers add debug provenance only. This guarantees
 that direct, one-wrapper, and multi-wrapper forms produce identical executable
 ownership and work.
+
+Ordinary user functions are not transparent wrappers. `SemanticProgram`
+retains one typed definition plus explicit call edges for them; it does not
+recursively clone the complete body at every call site. Only contextual
+functions and wrappers whose scope effects require specialization are expanded.
+Statically unselected structural branches are pruned before OutNet,
+dependency-manifest, and proof-graph construction. Dynamic selections retain
+every reachable alternative. Scaling fixtures must vary ordinary call depth,
+call-site count, and static branch count so a later implementation cannot
+silently restore multiplicative graph growth while preserving small-example
+answers.
 
 ### Incremental Collection Lowering
 
@@ -1111,6 +1123,13 @@ dual execution path, or permanent syntax adapter may ship.
     reports from `native_gpu_handoff_manifest.json` and the manifest-backed
     aggregate. Avoid repeatedly refreshing expensive reports between small
     edits.
+16. **Gate compiler scalability before continuing product work.** Use focused
+    debug-profile checks for correctness work and release builds only for final
+    milestone measurement. Reject a compiler recovery that merely raises a
+    timeout: static branch fanout and ordinary call depth/count fixtures must
+    demonstrate bounded semantic, manifest, and proof-artifact growth. A
+    representative source compile exceeding 120 seconds blocks the next
+    production slice until the owning representation is corrected.
 
 ## Verification Matrix
 

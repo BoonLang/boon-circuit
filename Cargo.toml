@@ -141,6 +141,9 @@ zeroize = "1.8.2"
 static_assertions = "1.1.0"
 syn = { version = "2.0.117", features = ["full", "visit"] }
 
+[profile.dev.package.boon_contract]
+opt-level = 2
+
 [profile.dev.package.boon_document]
 opt-level = 2
 
@@ -153,6 +156,25 @@ opt-level = 2
 [profile.dev.package.boon_native_playground]
 opt-level = 2
 
+# Semantic elaboration is part of the interactive compiler path. Keeping this
+# crate completely unoptimized turns canonical dependency inventories into
+# minute-scale debug runs even after graph growth is bounded. Level 2 retains
+# debug assertions and debuginfo while making the compiler usable in dev builds.
+[profile.dev.package.boon_semantic]
+opt-level = 2
+
+[profile.dev.package.boon_typecheck]
+opt-level = 2
+
+[profile.dev.package.ciborium]
+opt-level = 2
+
+[profile.dev.package.ciborium-io]
+opt-level = 2
+
+[profile.dev.package.ciborium-ll]
+opt-level = 2
+
 [profile.dev.package.glyphon]
 opt-level = 2
 
@@ -160,6 +182,9 @@ opt-level = 2
 opt-level = 2
 
 [profile.dev.package.png]
+opt-level = 2
+
+[profile.dev.package.sha2]
 opt-level = 2
 
 [profile.dev.package.fdeflate]

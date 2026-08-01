@@ -1,19 +1,19 @@
 -- Classic Theme
 -- Flat scene materials shaped to match the document-api TodoMVC reference.
 
-FUNCTION get(from, of) {
-    from |> WHEN {
-        Material => of |> material()
-        Font => of |> font()
-        Text => of |> text()
-        Depth => of |> depth()
-        Elevation => of |> elevation()
-        Corners => of |> corners()
+FUNCTION get(request) {
+    request |> WHEN {
+        Material[of] => material(material: of)
+        Font[of] => font(font: of)
+        Text[of] => text(of: of)
+        Depth[of] => depth(of: of)
+        Elevation[of] => elevation(of: of)
+        Corners[of] => corners(of: of)
         Lights => lights()
         Geometry => geometry()
-        Sizing => of |> sizing()
-        Spacing => of |> spacing()
-        SpringRange => of |> spring_range()
+        Sizing[of] => sizing(of: of)
+        Spacing[of] => spacing(of: of)
+        SpringRange[of] => spring_range(of: of)
     }
 }
 

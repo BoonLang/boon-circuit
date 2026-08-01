@@ -43,6 +43,337 @@ store: [
     ));
 }
 
+#[test]
+fn recovery_tagged_pattern_domains_preserve_payload_shape_through_wrappers() {
+    let parsed = boon_parser::parse_source(
+        "tagged-pattern-wrapper.bn",
+        r#"
+FUNCTION interactive_state(of) {
+    of |> WHEN {
+        Interactive[hovered] => hovered
+        Plain => False
+    }
+}
+
+FUNCTION wrapped_state(of) {
+    interactive_state(of: of)
+}
+
+result: wrapped_state(of: Interactive[hovered: True])
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+
+    assert!(
+        !output.report.has_errors(),
+        "tagged wrapper diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+}
+
+#[test]
+fn recovery_tagged_call_discriminants_specialize_user_results() {
+    let parsed = boon_parser::parse_source(
+        "tagged-call-result.bn",
+        r#"
+FUNCTION dispatch(request) {
+    request |> WHEN {
+        TextRequest[value] => value
+        ListRequest[value] => LIST { value }
+    }
+}
+
+FUNCTION requires_text(value) {
+    value |> Text/is_empty()
+}
+
+FUNCTION wrapper(request) {
+    dispatch(request: request)
+}
+
+result:
+    wrapper(request: TextRequest[value: TEXT { ready }])
+    |> requires_text()
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+
+    assert!(
+        !output.report.has_errors(),
+        "tag-discriminated result diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+}
+
+#[test]
+fn recovery_tagged_constructor_wrappers_propagate_payload_domains() {
+    let parsed = boon_parser::parse_source(
+        "tagged-constructor-wrapper.bn",
+        r#"
+FUNCTION leaf(value) {
+    value |> WHEN {
+        Plain => 1
+        Fancy[hovered] => 2
+    }
+}
+
+FUNCTION dispatch(request) {
+    request |> WHEN {
+        Request[of] => leaf(value: of)
+    }
+}
+
+FUNCTION wrapper(of) {
+    dispatch(request: Request[of: of])
+}
+
+first: wrapper(of: Plain)
+second: wrapper(of: Fancy[hovered: True])
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+    assert!(
+        !output.report.has_errors(),
+        "tagged constructor wrapper diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+    let request = output
+        .report
+        .function_type_table
+        .entries
+        .iter()
+        .find(|entry| entry.name == "dispatch")
+        .and_then(|entry| entry.parameters.iter().find(|parameter| parameter.name == "request"))
+        .expect("dispatch request parameter");
+    assert!(matches!(
+        &request.flow_type.ty,
+        Type::VariantSet(variants) if variants.iter().any(|variant| matches!(
+            variant,
+            Variant::Tagged { tag, fields } if tag == "Request"
+                && matches!(fields.fields.get("of"), Some(Type::VariantSet(payloads))
+                    if payloads.iter().any(|payload| matches!(payload,
+                        Variant::Tagged { tag, .. } if tag == "Fancy")))
+        ))
+    ));
+}
+
+#[test]
+fn recovery_when_arm_reads_use_the_reachable_selector_domain() {
+    let parsed = boon_parser::parse_source(
+        "narrowed-when-call-argument.bn",
+        r#"
+FUNCTION exact(of) {
+    of |> WHEN { Exact => 1 }
+}
+
+FUNCTION residual(of) {
+    of |> WHEN { Other => 2, Third => 3 }
+}
+
+FUNCTION wrapper(of) {
+    of |> WHEN {
+        Exact => exact(of: of)
+        __ => residual(of: of)
+    }
+}
+
+first: wrapper(of: Exact)
+second: wrapper(of: Other)
+third: wrapper(of: Third)
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+
+    assert!(
+        !output.report.has_errors(),
+        "narrowed selector diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+}
+
+#[test]
+fn recovery_reactive_latest_boundaries_do_not_form_pure_expansion_cycles() {
+    let parsed = boon_parser::parse_source(
+        "reactive-local-cycle.bn",
+        r#"
+FUNCTION editor(events) {
+    committed:
+        LATEST {
+            events.blur |> THEN { draft }
+            events.key_down |> THEN { draft }
+        }
+    draft:
+        LATEST {
+            TEXT {}
+            events.change.text
+            committed |> THEN { TEXT {} }
+        }
+    draft
+}
+
+store: [
+    events: [
+        blur: SOURCE
+        change: SOURCE
+        key_down: SOURCE
+    ]
+    value: editor(events: events) |> Text/is_empty()
+]
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+
+    assert!(
+        !output.report.has_errors(),
+        "reactive boundary diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+}
+
+#[test]
+fn recovery_block_locals_do_not_replace_the_final_value() {
+    let parsed = boon_parser::parse_source(
+        "block-local-result.bn",
+        r#"
+FUNCTION make() {
+    [
+        edited_title: BLOCK {
+            draft_title: TEXT { ready }
+            draft_title
+        }
+    ]
+}
+
+FUNCTION consume(item) {
+    item.edited_title |> Text/is_empty()
+}
+
+result: make() |> consume()
+"#,
+    )
+    .unwrap();
+    {
+        let (checker, _) = Checker::new_profiled(&parsed);
+        let statement = checker
+            .function_statements
+            .get("make")
+            .copied()
+            .expect("make function statement");
+        let Type::Object(result) = checker
+            .function_body_return_type("make", statement, &mut BTreeSet::new())
+            .expect("static make result")
+        else {
+            panic!("make must return an object");
+        };
+        assert!(
+            matches!(result.fields.get("edited_title"), Some(Type::Text)),
+            "static make result: {result:#?}"
+        );
+    }
+    let output = check_program(&parsed);
+
+    assert!(
+        !output.report.has_errors(),
+        "block-local result diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+}
+
+#[test]
+fn recovery_reactive_block_forward_references_preserve_the_final_value() {
+    let parsed = boon_parser::parse_source(
+        "reactive-block-forward-result.bn",
+        r#"
+FUNCTION reactive_item(title, events) {
+    [
+        title_to_update:
+            LATEST {
+                events.blur |> THEN { edited_title }
+                events.key_down |> THEN { edited_title }
+            }
+        title:
+            LATEST {
+                title
+                title_to_update
+            }
+        edited_title: BLOCK {
+            draft_title:
+                LATEST {
+                    Text/empty()
+                    events.change.text
+                    title_to_update |> THEN { Text/empty() }
+                }
+            LATEST {
+                draft_title
+                events.begin |> THEN {
+                    draft_title
+                        |> Text/is_empty()
+                        |> WHEN { True => title, False => SKIP }
+                }
+            }
+        }
+    ]
+}
+
+FUNCTION consume(item) {
+    item.edited_title |> Text/is_empty()
+}
+
+store: [
+    events: [
+        begin: SOURCE
+        blur: SOURCE
+        change: SOURCE
+        key_down: SOURCE
+    ]
+    items:
+        LIST { [title: TEXT { ready }] }
+        |> List/map(item, new: reactive_item(title: item.title, events: events))
+        |> List/retain(item, if: True)
+    visible: items |> List/retain(item, if: True)
+    value: visible |> List/map(item, new: consume(item: item))
+]
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+
+    assert!(
+        !output.report.has_errors(),
+        "reactive block diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+}
+
+#[test]
+fn recovery_pure_local_expansion_cycles_remain_rejected() {
+    let parsed = boon_parser::parse_source(
+        "pure-local-cycle.bn",
+        r#"
+FUNCTION invalid_cycle() {
+    left: right
+    right: left
+    left
+}
+
+value: invalid_cycle()
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+
+    assert!(output.report.diagnostics.iter().any(|diagnostic| {
+        diagnostic
+            .message
+            .contains("canonical checked value contains an expansion cycle")
+    }));
+}
+
 
 
 

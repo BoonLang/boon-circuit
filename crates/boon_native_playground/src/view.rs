@@ -264,6 +264,22 @@ impl RetainedView {
         target_text: Option<&str>,
     ) -> Option<HitTarget> {
         self.target_for_scenario(source_path, None, target_text, None, None)
+            .or_else(|| {
+                self.retained.hits().entries.iter().find_map(|entry| {
+                    if entry.source_path.as_deref() != Some(source_path)
+                        || entry.source_route.is_some()
+                    {
+                        return None;
+                    }
+                    if let Some(expected) = target_text {
+                        let node = self.retained.frame().nodes.get(&entry.node)?;
+                        if !subtree_matches_semantic_text(self.retained.frame(), node, expected) {
+                            return None;
+                        }
+                    }
+                    self.visible_hit_target(entry)
+                })
+            })
     }
 
     pub fn visible_source_action_bounds(&self) -> Vec<(String, String, Rect)> {
@@ -636,7 +652,9 @@ fn rect_area(rect: Rect) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use boon_document::{DocumentNode, StyleValue};
+    use boon_document::render_scene::ApproximateTextColumnMeasurer;
+    use boon_document::{DocumentNode, StyleValue, TextValue};
+    use boon_document_model::{SourceBinding, SourceBindingId};
 
     fn add_child(frame: &mut DocumentFrame, mut node: DocumentNode) {
         node.parent = Some(frame.root.clone());
@@ -695,5 +713,48 @@ mod tests {
             root,
             "missing target"
         ));
+    }
+
+    #[test]
+    fn route_free_native_binding_remains_discoverable_by_source_path() {
+        let mut frame = DocumentFrame::empty("root");
+        let mut button = DocumentNode::new("dev.test", DocumentNodeKind::Button);
+        button
+            .style
+            .insert("width".to_owned(), StyleValue::Number(120.0));
+        button
+            .style
+            .insert("height".to_owned(), StyleValue::Number(32.0));
+        button.text = Some(TextValue {
+            text: "TEST".to_owned(),
+        });
+        button.source_bindings.push(SourceBinding {
+            id: SourceBindingId("binding:dev.test".to_owned()),
+            source_path: "dev.test".to_owned(),
+            intent: "press".to_owned(),
+            route: None,
+        });
+        add_child(&mut frame, button);
+
+        let mut columns = ApproximateTextColumnMeasurer;
+        let view = RetainedView::new(
+            frame,
+            Viewport {
+                surface: 1,
+                width: 320.0,
+                height: 200.0,
+                scale: 1.0,
+            },
+            &mut columns,
+        )
+        .expect("native frame must lower");
+
+        let target = view
+            .target_for_source("dev.test", Some("TEST"))
+            .expect("native route-free binding must remain targetable");
+        assert_eq!(target.node, "dev.test");
+        assert_eq!(target.source_path.as_deref(), Some("dev.test"));
+        assert!(target.source_route.is_none());
+        assert!(view.target_for_source("dev.test", Some("Run")).is_none());
     }
 }

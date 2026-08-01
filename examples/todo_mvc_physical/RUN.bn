@@ -127,7 +127,7 @@ FUNCTION new_todo(title, initial_completed) {
                 todo_elements.editing_todo_title_element.events.blur
                     |> THEN { edited_title }
                 todo_elements.editing_todo_title_element.events.key_down.key
-                    |> WHEN { Enter => edited_title, __ => SKIP }
+                    |> WHEN { TEXT { Enter } => edited_title, __ => SKIP }
             }
         title: LATEST {
             title

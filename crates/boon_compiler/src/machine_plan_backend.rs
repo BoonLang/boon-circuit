@@ -2352,6 +2352,23 @@ fn semantic_list_memory_plan(
             _ => None,
         })
         .collect::<BTreeSet<_>>();
+    // State-backed row fields belong to scalar semantic memory. The list
+    // memory owns only structural row authority plus the durable indexed
+    // state memories appended below. In particular, an unpublished nested
+    // state has no stable semantic identity and must not be promoted to a
+    // generated `@authority:sN` persistence leaf merely because its runtime
+    // slot is stored in the row.
+    let state_backed_runtime_fields = program
+        .scope_index
+        .bindings
+        .iter()
+        .filter_map(|binding| match binding.target {
+            ir::ErasedBindingTarget::State {
+                field: Some(field), ..
+            } => Some(plan_field_id(field)),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
     let has_indexed_memory = !indexed_memory.is_empty();
     let semantic_list_type = semantic_data_type_plan(&memory.data_type).canonicalized();
     let DataTypePlan::List { item } = semantic_list_type.clone() else {
@@ -2372,6 +2389,7 @@ fn semantic_list_memory_plan(
             field.row.map(|row| row.list) == Some(list.id)
                 && field.role.is_authority()
                 && slot.contains_row_field(plan_field_id(field.id))
+                && !state_backed_runtime_fields.contains(&plan_field_id(field.id))
         })
         .collect::<Vec<_>>();
     let mut row_fields = Vec::new();
@@ -11093,6 +11111,8 @@ struct ExecutableRowLowerer<'a> {
     active_state_update: Option<ir::ExecutableStateId>,
     state_initializer: Option<ir::StateId>,
     active_materialization_owners: Vec<PlanStaticOwnerId>,
+    global_lexical_bindings:
+        &'a BTreeMap<ir::ExecutableLocalBindingId, (boon_typecheck::DeclId, ir::ExecutableExprId)>,
     lexical_bindings: Vec<BTreeMap<ir::ExecutableLocalBindingId, ir::ExecutableExprId>>,
     active_lexical_bindings: BTreeSet<ir::ExecutableLocalBindingId>,
     active_storage_bindings: BTreeSet<ir::ErasedBindingId>,
@@ -11127,6 +11147,7 @@ impl<'a> ExecutableRowLowerer<'a> {
             active_state_update: None,
             state_initializer: None,
             active_materialization_owners: Vec::new(),
+            global_lexical_bindings: &index.lexical_binding_values,
             lexical_bindings: Vec::new(),
             active_lexical_bindings: BTreeSet::new(),
             active_storage_bindings: BTreeSet::new(),
@@ -12678,6 +12699,42 @@ impl<'a> ExecutableRowLowerer<'a> {
         })
     }
 
+    fn lexical_binding_value(
+        &self,
+        binding: ir::ExecutableLocalBindingId,
+        declaration: boon_typecheck::DeclId,
+    ) -> Result<ir::ExecutableExprId, PlanError> {
+        let (defined_declaration, defined_value) = self
+            .global_lexical_bindings
+            .get(&binding)
+            .copied()
+            .ok_or_else(|| {
+                PlanError::new(format!(
+                    "lexical binding {} for declaration {} has no erased BLOCK definition",
+                    binding.0, declaration.0
+                ))
+            })?;
+        if defined_declaration != declaration {
+            return Err(PlanError::new(format!(
+                "lexical binding {} read names declaration {} but its erased BLOCK defines declaration {}",
+                binding.0, declaration.0, defined_declaration.0
+            )));
+        }
+        if let Some(active_value) = self
+            .lexical_bindings
+            .iter()
+            .rev()
+            .find_map(|bindings| bindings.get(&binding).copied())
+            && active_value != defined_value
+        {
+            return Err(PlanError::new(format!(
+                "lexical binding {} active value {} differs from erased BLOCK value {}",
+                binding.0, active_value.0, defined_value.0
+            )));
+        }
+        Ok(defined_value)
+    }
+
     fn lower_local_read(
         &mut self,
         binding: ir::ExecutableLocalBindingId,
@@ -12685,17 +12742,7 @@ impl<'a> ExecutableRowLowerer<'a> {
         projection: &[String],
         inherited_owner: Option<PlanStaticOwnerId>,
     ) -> Result<PlanRowExpressionId, PlanError> {
-        let value = self
-            .lexical_bindings
-            .iter()
-            .rev()
-            .find_map(|bindings| bindings.get(&binding).copied())
-            .ok_or_else(|| {
-                PlanError::new(format!(
-                    "lexical binding {} for declaration {} has no active erased BLOCK binding",
-                    binding.0, declaration.0
-                ))
-            })?;
+        let value = self.lexical_binding_value(binding, declaration)?;
         if !self.active_lexical_bindings.insert(binding) {
             return Err(PlanError::new(format!(
                 "lexical binding {} for declaration {} forms an executable value cycle",
@@ -12849,17 +12896,7 @@ impl<'a> ExecutableRowLowerer<'a> {
                 value,
                 projection,
             } => {
-                let active = self
-                    .lexical_bindings
-                    .iter()
-                    .rev()
-                    .find_map(|bindings| bindings.get(binding).copied())
-                    .ok_or_else(|| {
-                        PlanError::new(format!(
-                            "lexical binding {} for declaration {} has no active erased BLOCK binding",
-                            binding.0, declaration.0
-                        ))
-                    })?;
+                let active = self.lexical_binding_value(*binding, *declaration)?;
                 if active != *value {
                     return Err(PlanError::new(format!(
                         "lexical declaration {} active value {active} does not match erased value {value}",
@@ -14783,6 +14820,8 @@ pub(super) struct ValueIndex {
     distributed_by_expression: BTreeMap<ir::ExecutableExprId, ValueRef>,
     source_by_executable: BTreeMap<ir::ExecutableSourceId, ValueRef>,
     state_by_executable: BTreeMap<ir::ExecutableStateId, ValueRef>,
+    lexical_binding_values:
+        BTreeMap<ir::ExecutableLocalBindingId, (boon_typecheck::DeclId, ir::ExecutableExprId)>,
     state_value_types: BTreeMap<String, PlanValueType>,
     state_data_types: BTreeMap<StateId, DataTypePlan>,
     field_value_types: BTreeMap<FieldId, PlanValueType>,
@@ -15016,6 +15055,22 @@ impl ValueIndex {
         for (path, value_ref) in distributed_by_path {
             by_path.insert(path.clone(), value_ref.clone());
         }
+        let mut lexical_binding_values = BTreeMap::new();
+        for expression in &program.executable.expressions {
+            let ir::ExecutableExpressionKind::Block { bindings, .. } = &expression.kind else {
+                continue;
+            };
+            for binding in bindings {
+                if let Some(previous) =
+                    lexical_binding_values.insert(binding.id, (binding.declaration, binding.value))
+                {
+                    return Err(PlanError::new(format!(
+                        "executable lexical binding {} is defined by both {:?} and ({}, {})",
+                        binding.id.0, previous, binding.declaration.0, binding.value.0,
+                    )));
+                }
+            }
+        }
         Ok(Self {
             by_path,
             by_storage,
@@ -15029,6 +15084,7 @@ impl ValueIndex {
             distributed_by_expression: distributed_by_expression.clone(),
             source_by_executable,
             state_by_executable,
+            lexical_binding_values,
             state_value_types,
             state_data_types,
             field_value_types,
@@ -15665,6 +15721,116 @@ outputs: [
         }));
 
         let verification = verify_plan(&compiled.plan).unwrap();
+        assert_eq!(verification.status, "pass", "{:#?}", verification.checks);
+    }
+}
+
+#[cfg(test)]
+mod lexical_state_initializer_tests {
+    use super::*;
+
+    #[test]
+    fn block_local_state_initializers_capture_exact_lexical_bindings() {
+        let source = r#"
+FUNCTION reactive_item(title, events) {
+    [
+        edited_title: BLOCK {
+            draft_title: title
+            LATEST {
+                draft_title
+                events.change |> THEN { draft_title }
+            }
+        }
+    ]
+}
+
+store: [
+    events: [change: SOURCE]
+    items:
+        LIST { [title: TEXT { ready }] }
+        |> List/map(item, new: reactive_item(title: item.title, events: events))
+]
+"#;
+        let compiled = crate::compile_machine_plan(crate::CompileRequest::source_text(
+            "block-local-state-initializer.bn",
+            source,
+            TargetProfile::SoftwareDefault,
+            ProgramRole::Server,
+            ApplicationIdentity::compiler_default(),
+        ))
+        .expect("BLOCK-local state initializer compiles through MachinePlan");
+        let verification = verify_plan(&compiled.plan).expect("MachinePlan verifies");
+        assert_eq!(verification.status, "pass", "{:#?}", verification.checks);
+    }
+}
+
+#[cfg(test)]
+mod nested_state_persistence_tests {
+    use super::*;
+
+    #[test]
+    fn unpublished_nested_state_fields_do_not_become_list_authority_memory() {
+        let source = r#"
+FUNCTION reactive_row(initial, toggle, replace) {
+    [
+        completed:
+            LATEST {
+                initial
+                replace |> THEN { True }
+            }
+            |> Bool/toggle(when: toggle)
+    ]
+}
+
+store: [
+    toggle: SOURCE
+    replace: SOURCE
+    rows:
+        LIST { [completed: False] }
+        |> List/map(
+            item,
+            new: reactive_row(
+                initial: item.completed,
+                toggle: toggle,
+                replace: replace,
+            ),
+        )
+]
+"#;
+        let compiled = crate::compile_machine_plan(crate::CompileRequest::source_text(
+            "nested-state-persistence.bn",
+            source,
+            TargetProfile::SoftwareDefault,
+            ProgramRole::Server,
+            ApplicationIdentity::compiler_default(),
+        ))
+        .expect("nested indexed states compile through MachinePlan");
+        let unpublished_fields = compiled
+            .ir
+            .scope_index
+            .bindings
+            .iter()
+            .filter_map(|binding| match binding.target {
+                ir::ErasedBindingTarget::State {
+                    published: false,
+                    field: Some(field),
+                    ..
+                } => Some(plan_field_id(field)),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        assert!(
+            !unpublished_fields.is_empty(),
+            "fixture must contain an unpublished nested indexed state"
+        );
+        assert!(compiled.plan.persistence.lists.iter().all(|list| {
+            list.row_fields.iter().all(|leaf| {
+                leaf.runtime_field_id
+                    .is_none_or(|field| !unpublished_fields.contains(&field))
+            })
+        }));
+
+        let verification = verify_plan(&compiled.plan).expect("MachinePlan verifies");
         assert_eq!(verification.status, "pass", "{:#?}", verification.checks);
     }
 }

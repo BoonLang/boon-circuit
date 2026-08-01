@@ -1505,6 +1505,9 @@ fn link_multiline_expression_structure_with_input(
             expressions,
             child_input,
         );
+        if let Some(base) = statement_structure_pipeline_base(statement, expressions) {
+            relink_direct_structure_pipeline(&statement.children, expressions, base);
+        }
         if let Some(output) = leading_pipeline_continuation_result(&statement.children, expressions)
         {
             replace_statement_inline_output(statement, expressions, output);
@@ -1614,6 +1617,55 @@ fn statement_child_pipeline_input(
     }
 }
 
+fn statement_structure_pipeline_base(
+    statement: &AstStatement,
+    expressions: &[AstExpr],
+) -> Option<usize> {
+    let owner = statement_structure_owner(statement.expr?, expressions);
+    expressions.get(owner).and_then(|expression| {
+        matches!(
+            &expression.kind,
+            AstExprKind::Block { .. }
+                | AstExprKind::Object(_)
+                | AstExprKind::ListLiteral { .. }
+                | AstExprKind::BytesLiteral { .. }
+                | AstExprKind::MapLiteral { .. }
+                | AstExprKind::SetLiteral { .. }
+                | AstExprKind::Flush { .. }
+                | AstExprKind::Hold { .. }
+                | AstExprKind::Latest { .. }
+                | AstExprKind::When { .. }
+        )
+        .then_some(owner)
+        .or_else(|| {
+            matches!(&expression.kind, AstExprKind::Pipe { op, .. } if op == "WHILE")
+                .then_some(owner)
+        })
+    })
+}
+
+fn relink_direct_structure_pipeline(
+    statements: &[AstStatement],
+    expressions: &mut [AstExpr],
+    base: usize,
+) {
+    let mut previous = base;
+    for statement in statements {
+        let Some(target) = statement_pipeline_continuation_target(statement, expressions) else {
+            continue;
+        };
+        if let Some(expression) = expressions.get_mut(target) {
+            expression.linked_input = Some(previous);
+            if let AstExprKind::Infix { left, .. } = &mut expression.kind {
+                *left = previous;
+            }
+        }
+        if let Some(value) = statement_value_expression(statement, expressions) {
+            previous = value;
+        }
+    }
+}
+
 fn leading_pipeline_continuation_result(
     statements: &[AstStatement],
     expressions: &[AstExpr],
@@ -1695,6 +1747,13 @@ fn validate_pipeline_inputs(
 fn materialize_statement_structure(statement: &mut AstStatement, expressions: &mut [AstExpr]) {
     let child_values = statement_sequence_values(&statement.children, expressions);
     let child_result = child_values.last().copied();
+    let structural_child_values = statement
+        .children
+        .iter()
+        .filter(|child| !statement_is_pipeline_continuation(child, expressions))
+        .filter_map(|child| statement_value_expression(child, expressions))
+        .collect::<Vec<_>>();
+    let structural_child_result = structural_child_values.last().copied();
 
     let Some(expr_id) = statement.expr else {
         return;
@@ -1708,15 +1767,15 @@ fn materialize_statement_structure(statement: &mut AstStatement, expressions: &m
         .get(expr_id)
         .is_some_and(|expression| matches!(expression.kind, AstExprKind::MapLiteral { .. }));
     if selector_parent {
-        for child in &child_values {
+        for child in &structural_child_values {
             consume_arrow_as_match_arm(*child, expressions);
         }
     } else if map_parent {
-        for child in &child_values {
+        for child in &structural_child_values {
             consume_arrow_as_map_entry(*child, expressions);
         }
     }
-    let child_arms = child_values
+    let child_arms = structural_child_values
         .iter()
         .copied()
         .filter(|expr_id| {
@@ -1725,7 +1784,7 @@ fn materialize_statement_structure(statement: &mut AstStatement, expressions: &m
                 .is_some_and(|expr| matches!(expr.kind, AstExprKind::MatchArm { .. }))
         })
         .collect::<Vec<_>>();
-    let map_entries = child_values
+    let map_entries = structural_child_values
         .iter()
         .copied()
         .filter(|expr_id| {
@@ -1778,7 +1837,7 @@ fn materialize_statement_structure(statement: &mut AstStatement, expressions: &m
         }
         AstExprKind::Latest { branches } => {
             if branches.is_empty() {
-                *branches = child_values;
+                *branches = structural_child_values;
             }
         }
         AstExprKind::Pipe { op, arms, .. } if op == "WHILE" => {
@@ -1795,7 +1854,7 @@ fn materialize_statement_structure(statement: &mut AstStatement, expressions: &m
         }
         AstExprKind::Flush { payload } => {
             if payload.is_none() {
-                *payload = child_result;
+                *payload = structural_child_result;
             }
         }
         AstExprKind::Block { bindings, result } => {
@@ -1803,7 +1862,7 @@ fn materialize_statement_structure(statement: &mut AstStatement, expressions: &m
                 *bindings = block_bindings;
             }
             if result.is_none() {
-                *result = child_result;
+                *result = structural_child_result;
             }
         }
         AstExprKind::Object(fields) => {
@@ -1812,10 +1871,10 @@ fn materialize_statement_structure(statement: &mut AstStatement, expressions: &m
             }
         }
         AstExprKind::ListLiteral { items, .. } if items.is_empty() => {
-            *items = child_values;
+            *items = structural_child_values;
         }
         AstExprKind::SetLiteral { items } if items.is_empty() => {
-            *items = child_values;
+            *items = structural_child_values;
         }
         AstExprKind::MapLiteral { entries } if entries.is_empty() => {
             *entries = map_entries;
@@ -5799,6 +5858,64 @@ rows: LIST {
                 _ => None,
             });
         assert_eq!(list_items.expect("multiline list items").len(), 2);
+    }
+
+    #[test]
+    fn multiline_list_pipeline_does_not_replace_the_last_item() {
+        let parsed = parse_ast(
+            "multiline-list-pipeline.bn",
+            r#"
+rows:
+    LIST {
+        [value: 1]
+        [value: 2]
+        [value: 3]
+        [value: 4]
+    }
+    |> List/map(item, new: item)
+    |> List/retain(item, if: True)
+"#,
+        )
+        .unwrap();
+
+        let list = parsed
+            .expressions
+            .iter()
+            .find(|expression| {
+                matches!(
+                    &expression.kind,
+                    AstExprKind::ListLiteral { items, .. } if items.len() == 4
+                )
+            })
+            .expect("four-item multiline list");
+        let AstExprKind::ListLiteral { items, .. } = &list.kind else {
+            unreachable!();
+        };
+        assert!(items.iter().all(|item| {
+            parsed
+                .expressions
+                .get(*item)
+                .is_some_and(|item| matches!(item.kind, AstExprKind::Object(_)))
+        }));
+
+        let map = parsed
+            .expressions
+            .iter()
+            .find(|expression| {
+                matches!(&expression.kind, AstExprKind::Pipe { op, .. } if op == "List/map")
+            })
+            .expect("map continuation");
+        let retain = parsed
+            .expressions
+            .iter()
+            .find(|expression| {
+                matches!(&expression.kind, AstExprKind::Pipe { op, .. } if op == "List/retain")
+            })
+            .expect("retain continuation");
+        assert_eq!(map.linked_input, Some(list.id));
+        assert_eq!(retain.linked_input, Some(map.id));
+        assert!(!items.contains(&map.id));
+        assert!(!items.contains(&retain.id));
     }
 
     #[test]

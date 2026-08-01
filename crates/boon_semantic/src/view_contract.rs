@@ -15,7 +15,7 @@ use crate::{
 use boon_contract::SourceBundleDigestV1;
 use boon_typecheck::{CheckedCallableKind, DeclId, Type};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 
@@ -793,17 +793,24 @@ fn derive_semantic_view_binding_graph(
                 }
 
                 let argument_reachable =
-                    binding_input_expressions(execution, call_argument.value, output.contract)?;
+                    binding_input_reachability(execution, call_argument.value, output.contract)?;
                 let mut captures = reactive
                     .view_captures
                     .iter()
                     .filter(|capture| {
                         capture.output_ordinal == reactive_output.ordinal
-                            && argument_reachable.contains(&capture.expression)
+                            && argument_reachable.expressions.contains(&capture.expression)
                     })
                     .collect::<Vec<_>>();
                 captures.sort_by_key(|capture| capture.id);
                 for capture in captures {
+                    let capture_ancestors = argument_reachable.ancestors_of(capture.expression);
+                    if !capture_ancestors.contains(&call_argument.value) {
+                        return Err(SemanticViewBindingError::new(format!(
+                            "view capture {} has no exact ancestor path from argument expression {}",
+                            capture.id, call_argument.value
+                        )));
+                    }
                     let routes = match capture.target {
                         SemanticViewCaptureTargetV1::Read { read } => {
                             let read_definition = reactive
@@ -906,6 +913,7 @@ fn derive_semantic_view_binding_graph(
                             execution,
                             call_argument.value,
                             capture.expression,
+                            &capture_ancestors,
                             route.leaf_capture_target,
                             function,
                             &parameter.name,
@@ -1054,12 +1062,35 @@ fn reachable_expressions(
     Ok(reachable)
 }
 
-fn binding_input_expressions(
+struct BindingInputReachability {
+    expressions: BTreeSet<SemanticExprId>,
+    parents: BTreeMap<SemanticExprId, BTreeSet<SemanticExprId>>,
+}
+
+impl BindingInputReachability {
+    fn ancestors_of(&self, expression: SemanticExprId) -> BTreeSet<SemanticExprId> {
+        if !self.expressions.contains(&expression) {
+            return BTreeSet::new();
+        }
+        let mut ancestors = BTreeSet::new();
+        let mut pending = vec![expression];
+        while let Some(expression) = pending.pop() {
+            if !ancestors.insert(expression) {
+                continue;
+            }
+            pending.extend(self.parents.get(&expression).into_iter().flatten().copied());
+        }
+        ancestors
+    }
+}
+
+fn binding_input_reachability(
     execution: &SemanticExecutionGraphV1,
     root: SemanticExprId,
     contract: SemanticOutputContractKindV1,
-) -> Result<BTreeSet<SemanticExprId>, SemanticViewBindingError> {
+) -> Result<BindingInputReachability, SemanticViewBindingError> {
     let mut reachable = BTreeSet::new();
+    let mut parents = BTreeMap::<SemanticExprId, BTreeSet<SemanticExprId>>::new();
     let mut pending = vec![root];
     while let Some(expression) = pending.pop() {
         if !reachable.insert(expression) {
@@ -1075,9 +1106,15 @@ fn binding_input_expressions(
         {
             continue;
         }
-        pending.extend(expression_children(execution, &expression.kind)?);
+        for child in expression_children(execution, &expression.kind)? {
+            parents.entry(child).or_default().insert(expression.id);
+            pending.push(child);
+        }
     }
-    Ok(reachable)
+    Ok(BindingInputReachability {
+        expressions: reachable,
+        parents,
+    })
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -1105,6 +1142,7 @@ enum BindingLeafMode {
 struct BindingLeafTraversal<'a> {
     execution: &'a SemanticExecutionGraphV1,
     capture: SemanticExprId,
+    capture_ancestors: &'a BTreeSet<SemanticExprId>,
     capture_target: SemanticViewCaptureTargetV1,
     constructor: &'a str,
     source_fallback_attribute: &'a str,
@@ -1117,6 +1155,7 @@ fn binding_leaf_metadata(
     execution: &SemanticExecutionGraphV1,
     root: SemanticExprId,
     capture: SemanticExprId,
+    capture_ancestors: &BTreeSet<SemanticExprId>,
     capture_target: SemanticViewCaptureTargetV1,
     constructor: &str,
     argument: &str,
@@ -1140,6 +1179,7 @@ fn binding_leaf_metadata(
     let mut traversal = BindingLeafTraversal {
         execution,
         capture,
+        capture_ancestors,
         capture_target,
         constructor,
         source_fallback_attribute,
@@ -1159,6 +1199,9 @@ impl BindingLeafTraversal<'_> {
         additional_projection: Vec<String>,
         is_root: bool,
     ) -> Result<(), SemanticViewBindingError> {
+        if !self.capture_ancestors.contains(&id) {
+            return Ok(());
+        }
         if !self.visiting.insert(id) {
             return Ok(());
         }

@@ -2030,13 +2030,21 @@ fn nearest_target_materialization(
             .collect::<Vec<_>>();
         match matches.as_slice() {
             [materialization]
-                if materialization.operation == SemanticContextualOperationKind::Map =>
+                if materialization.operation == SemanticContextualOperationKind::Map
+                    || (materialization
+                        .source_list_id
+                        .zip(materialization.source_scope_id)
+                        == Some((row.list, row.scope))
+                        && materialization
+                            .target_list_id
+                            .zip(materialization.target_scope_id)
+                            .is_none_or(|target| target == (row.list, row.scope))) =>
             {
                 return Ok((owner, materialization.row_local));
             }
             [materialization] => {
                 return Err(SemanticScopeStorageError::new(format!(
-                    "row {}/{} state owner {owner} is bound by non-map operation {:?}",
+                    "row {}/{} state owner {owner} is bound by operation {:?} that does not preserve the authority row",
                     row.list, row.scope, materialization.operation
                 )));
             }

@@ -1994,8 +1994,29 @@ enum TransientCollectionTerminal {
     SetContains,
 }
 
+fn transient_local_values(
+    execution: &SemanticExecutionGraphV1,
+) -> Result<BTreeMap<SemanticLocalBindingId, SemanticExprId>, SemanticLoweringContractError> {
+    let mut local_values = BTreeMap::new();
+    for expression in &execution.expressions {
+        let SemanticExpressionKind::Block { bindings, .. } = &expression.kind else {
+            continue;
+        };
+        for binding in bindings {
+            if local_values.insert(binding.id, binding.value).is_some() {
+                return Err(SemanticLoweringContractError::new(format!(
+                    "semantic transient analysis found duplicate local binding {}",
+                    binding.id
+                )));
+            }
+        }
+    }
+    Ok(local_values)
+}
+
 fn reachable_lowering_expressions(
     execution: &SemanticExecutionGraphV1,
+    local_values: &BTreeMap<SemanticLocalBindingId, SemanticExprId>,
 ) -> Result<BTreeSet<SemanticExprId>, SemanticLoweringContractError> {
     let child_statements = execution
         .statements
@@ -2027,6 +2048,15 @@ fn reachable_lowering_expressions(
                         "transient reachability references missing expression {expression_id}"
                     ))
                 })?;
+            if let SemanticExpressionKind::LocalRead { binding, .. } = &expression.kind {
+                let value = local_values.get(binding).copied().ok_or_else(|| {
+                    SemanticLoweringContractError::new(format!(
+                        "semantic transient reachability cannot resolve local binding {binding} \
+                         read by expression {expression_id}"
+                    ))
+                })?;
+                pending.push(value);
+            }
             pending.extend(expression.kind.direct_children());
         }
         let reverse_markers = execution
@@ -2053,7 +2083,8 @@ fn build_transient_collections(
     execution: &SemanticExecutionGraphV1,
     resources: &SemanticResourceGraphV1,
 ) -> Result<Vec<SemanticTransientCollectionV1>, SemanticLoweringContractError> {
-    let reachable = reachable_lowering_expressions(execution)?;
+    let local_values = transient_local_values(execution)?;
+    let reachable = reachable_lowering_expressions(execution, &local_values)?;
     let durable_list_constructors = resources
         .lists
         .iter()
@@ -2068,24 +2099,6 @@ fn build_transient_collections(
                 .map(|authority| authority.producer),
         )
         .collect::<BTreeSet<_>>();
-    let mut local_values = BTreeMap::<SemanticLocalBindingId, SemanticExprId>::new();
-    for expression in execution
-        .expressions
-        .iter()
-        .filter(|expression| reachable.contains(&expression.id))
-    {
-        if let SemanticExpressionKind::Block { bindings, .. } = &expression.kind {
-            for binding in bindings {
-                if local_values.insert(binding.id, binding.value).is_some() {
-                    return Err(SemanticLoweringContractError::new(format!(
-                        "semantic transient analysis found duplicate local binding {}",
-                        binding.id
-                    )));
-                }
-            }
-        }
-    }
-
     // Value-consumer edges deliberately omit a BLOCK's declaration edge for
     // binding values. A binding owns a value lexically; its LocalRead nodes
     // are the actual consumers and are added as explicit alias edges below.
@@ -2793,6 +2806,45 @@ mod tests {
             semantic.resolved_out_graph(),
         )
         .expect("semantic lowering contract")
+    }
+
+    #[test]
+    fn transient_reachability_follows_nested_function_block_locals() {
+        let (_, semantic) = checked_and_semantic(
+            "nested-function-block-local.bn",
+            r#"
+store: [
+    rows:
+        LIST { [value: 1] }
+        |> List/map(item, new: make_row(initial: item.value))
+    count: rows |> List/count()
+]
+
+FUNCTION make_row(initial) {
+    [
+        edit: SOURCE
+        edited: BLOCK {
+            draft: LATEST {
+                initial
+                edit |> THEN { initial }
+            }
+            draft
+        }
+    ]
+}
+"#,
+        );
+        assert!(
+            semantic
+                .execution_graph()
+                .expressions
+                .iter()
+                .any(|expression| matches!(
+                    expression.kind,
+                    SemanticExpressionKind::LocalRead { .. }
+                )),
+            "the fixture must retain a semantic local read"
+        );
     }
 
     #[test]

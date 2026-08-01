@@ -4560,7 +4560,7 @@ fields = [
   { name = "callable", disposition = "r-fc-priv-sp-id-pc-n", reviewed = true },
   { name = "checked_callable", disposition = "r-fc-priv-sp-id-pc-n", reviewed = true },
   { name = "direct_dependency_ids", disposition = "a-fc-priv-sp-id-pc-n", reviewed = true },
-  { name = "closure_dependency_ids", disposition = "a-fc-priv-sp-id-pc-n", reviewed = true },
+  { name = "closure_dependency_ranges", disposition = "a-fc-priv-sp-id-pc-n", reviewed = true },
   { name = "public_shape_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
   { name = "implementation_dependency_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
 ]
@@ -4596,7 +4596,7 @@ source = "crates/boon_semantic/src/dependency_manifest.rs"
 name = "ProgramRootDependencyEntryV1"
 fields = [
   { name = "direct_dependency_ids", disposition = "a-c-priv-sp-id-pc-n", reviewed = true },
-  { name = "closure_dependency_ids", disposition = "a-c-priv-sp-id-pc-n", reviewed = true },
+  { name = "closure_dependency_ranges", disposition = "a-c-priv-sp-id-pc-n", reviewed = true },
   { name = "public_shape_digest", disposition = "a-ca-priv-sp-id-pc-n", reviewed = true },
   { name = "implementation_dependency_digest", disposition = "a-ca-priv-sp-id-pc-n", reviewed = true },
 ]
@@ -5546,6 +5546,15 @@ source = "crates/boon_semantic/src/dependency_manifest.rs"
 name = "SemanticDependencyRecordId"
 fields = [
   { name = "0", disposition = "a-c-priv-sp-id-pc-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_semantic/src/dependency_manifest.rs"
+name = "SemanticDependencyRecordRangeV1"
+fields = [
+  { name = "start", disposition = "a-c-priv-sp-id-pc-n", reviewed = true },
+  { name = "length", disposition = "a-c-priv-sp-id-pc-n", reviewed = true },
 ]
 
 [[records]]

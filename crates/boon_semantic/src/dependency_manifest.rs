@@ -23,6 +23,9 @@ const DEPENDENCY_COMPONENT_DIGEST_DOMAIN: &[u8] = b"boon.callable-dependency-com
 const DEPENDENCY_RECORD_PAYLOAD_DOMAIN: &[u8] = b"boon.callable-dependency-record-payload.v1\0";
 const DEPENDENCY_RECORD_DIGEST_DOMAIN: &[u8] = b"boon.callable-dependency-record.v1\0";
 const DEPENDENCY_RECORD_RANGE_DIGEST_DOMAIN: &[u8] = b"boon.callable-dependency-record-range.v1\0";
+const DEPENDENCY_RECORD_SET_DIGEST_DOMAIN: &[u8] = b"boon.callable-dependency-record-set.v1\0";
+const DEPENDENCY_COVERAGE_SET_DIGEST_DOMAIN: &[u8] = b"boon.callable-dependency-coverage-set.v1\0";
+const DEPENDENCY_CALLABLE_SET_DIGEST_DOMAIN: &[u8] = b"boon.callable-dependency-callable-set.v1\0";
 const DEPENDENCY_PUBLIC_SHAPE_DOMAIN: &[u8] = b"boon.callable-dependency-public-shape.v1\0";
 const DEPENDENCY_IMPLEMENTATION_DOMAIN: &[u8] = b"boon.callable-dependency-implementation.v1\0";
 const DEPENDENCY_MANIFEST_DIGEST_DOMAIN: &[u8] = b"boon.callable-dependency-manifest.v1\0";
@@ -61,6 +64,18 @@ macro_rules! dependency_id {
 }
 
 dependency_id!(SemanticDependencyRecordId, SemanticDependencyCoverageId);
+
+/// Canonical inclusive-start/exclusive-end run of dense dependency records.
+///
+/// Closure membership is stored as maximal non-adjacent runs instead of one
+/// `usize`-backed ID per member. Large call graphs share broad dependency
+/// regions, so retaining the expanded IDs once per callable multiplies both
+/// memory and canonical-serialization work without adding evidence.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct SemanticDependencyRecordRangeV1 {
+    pub start: SemanticDependencyRecordId,
+    pub length: usize,
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -485,7 +500,7 @@ pub struct SemanticDependencyCoverageV1 {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ProgramRootDependencyEntryV1 {
     pub direct_dependency_ids: Vec<SemanticDependencyRecordId>,
-    pub closure_dependency_ids: Vec<SemanticDependencyRecordId>,
+    pub closure_dependency_ranges: Vec<SemanticDependencyRecordRangeV1>,
     pub public_shape_digest: [u8; 32],
     pub implementation_dependency_digest: [u8; 32],
 }
@@ -495,7 +510,7 @@ pub struct CallableDependencyEntryV1 {
     pub callable: SemanticCallableId,
     pub checked_callable: DeclId,
     pub direct_dependency_ids: Vec<SemanticDependencyRecordId>,
-    pub closure_dependency_ids: Vec<SemanticDependencyRecordId>,
+    pub closure_dependency_ranges: Vec<SemanticDependencyRecordRangeV1>,
     pub public_shape_digest: [u8; 32],
     pub implementation_dependency_digest: [u8; 32],
 }
@@ -1355,7 +1370,7 @@ type FinishedDependencyCollection = (
     Vec<SemanticDependencyRecordV1>,
     Vec<SemanticDependencyCoverageV1>,
     BTreeMap<SemanticDependencyOwnerV1, Vec<SemanticDependencyRecordId>>,
-    BTreeMap<SemanticDependencyOwnerV1, Vec<SemanticDependencyRecordId>>,
+    BTreeMap<SemanticDependencyOwnerV1, Vec<SemanticDependencyRecordRangeV1>>,
 );
 
 type ExpressionDependency = (
@@ -1371,6 +1386,7 @@ struct DependencyCollector {
     coverage: Vec<SemanticDependencyCoverageV1>,
     subjects: BTreeSet<SemanticDependencySubjectV1>,
     dependencies_by_entity: BTreeMap<SemanticDependencyEntityV1, Vec<SemanticDependencyRecordId>>,
+    hash_scratch: Vec<u8>,
 }
 
 fn queue_unvisited_dependency(
@@ -1396,7 +1412,42 @@ fn queue_unvisited_dependency(
     Ok(())
 }
 
+fn dependency_ranges_for_generation(
+    visit_generation: &[usize],
+    owner_ordinal: usize,
+) -> Vec<SemanticDependencyRecordRangeV1> {
+    let mut ranges = Vec::new();
+    let mut run_start = None;
+    for (index, generation) in visit_generation.iter().copied().enumerate() {
+        if generation == owner_ordinal {
+            run_start.get_or_insert(index);
+        } else if let Some(start) = run_start.take() {
+            ranges.push(SemanticDependencyRecordRangeV1 {
+                start: SemanticDependencyRecordId(start),
+                length: index - start,
+            });
+        }
+    }
+    if let Some(start) = run_start {
+        ranges.push(SemanticDependencyRecordRangeV1 {
+            start: SemanticDependencyRecordId(start),
+            length: visit_generation.len() - start,
+        });
+    }
+    ranges
+}
+
 impl DependencyCollector {
+    fn trace_counts(&self, phase: &str) {
+        eprintln!(
+            "boon_semantic dependency_manifest {phase}:counts pending={} coverage={} subjects={} entities={}",
+            self.pending.len(),
+            self.coverage.len(),
+            self.subjects.len(),
+            self.dependencies_by_entity.len(),
+        );
+    }
+
     fn dependency<P: Serialize>(
         &mut self,
         input: DependencyRecordInput<'_, P>,
@@ -1418,7 +1469,7 @@ impl DependencyCollector {
                 "dependency subject {subject:?} has no explicit semantic role"
             )));
         }
-        let payload_digest = dependency_payload_digest(payload)?;
+        let payload_digest = dependency_payload_digest(payload, &mut self.hash_scratch)?;
         let id = SemanticDependencyRecordId(self.pending.len());
         self.pending.push(PendingDependencyRecord {
             id,
@@ -1455,7 +1506,7 @@ impl DependencyCollector {
             subject,
             primary_owner: owner,
             disposition: SemanticDependencyCoverageDispositionV1::Structural {
-                payload_digest: dependency_payload_digest(payload)?,
+                payload_digest: dependency_payload_digest(payload, &mut self.hash_scratch)?,
             },
         });
         Ok(())
@@ -1473,7 +1524,7 @@ impl DependencyCollector {
             subject,
             primary_owner: owner,
             disposition: SemanticDependencyCoverageDispositionV1::Diagnostic {
-                payload_digest: dependency_payload_digest(payload)?,
+                payload_digest: dependency_payload_digest(payload, &mut self.hash_scratch)?,
             },
         });
         Ok(())
@@ -1660,13 +1711,7 @@ impl DependencyCollector {
                     }
                 }
             }
-            let complete = visit_generation
-                .iter()
-                .enumerate()
-                .filter_map(|(index, generation)| {
-                    (*generation == owner_ordinal).then_some(SemanticDependencyRecordId(index))
-                })
-                .collect();
+            let complete = dependency_ranges_for_generation(&visit_generation, owner_ordinal);
             closure.insert(*owner, complete);
         }
         if trace_dependency_manifest {
@@ -1873,14 +1918,18 @@ fn dependency_owner(owner: SemanticDependencyOwnerV1) -> PendingDependencyRefere
 
 fn dependency_payload_digest(
     payload: &impl Serialize,
+    scratch: &mut Vec<u8>,
 ) -> Result<[u8; 32], CallableDependencyManifestError> {
-    boon_contract::canonical_serde_hash_v1(DEPENDENCY_RECORD_PAYLOAD_DOMAIN, payload).map_err(
-        |error| {
-            CallableDependencyManifestError::new(format!(
-                "failed to hash dependency record payload: {error}"
-            ))
-        },
+    boon_contract::canonical_serde_hash_v1_with_buffer(
+        DEPENDENCY_RECORD_PAYLOAD_DOMAIN,
+        payload,
+        scratch,
     )
+    .map_err(|error| {
+        CallableDependencyManifestError::new(format!(
+            "failed to hash dependency record payload: {error}"
+        ))
+    })
 }
 
 fn canonical_dependency_hash(
@@ -1888,6 +1937,18 @@ fn canonical_dependency_hash(
     payload: &impl Serialize,
 ) -> Result<[u8; 32], CallableDependencyManifestError> {
     boon_contract::canonical_serde_hash_v1(domain, payload).map_err(|error| {
+        CallableDependencyManifestError::new(format!(
+            "failed to hash callable dependency payload: {error}"
+        ))
+    })
+}
+
+fn canonical_dependency_hash_with_buffer(
+    domain: &[u8],
+    payload: &impl Serialize,
+    scratch: &mut Vec<u8>,
+) -> Result<[u8; 32], CallableDependencyManifestError> {
+    boon_contract::canonical_serde_hash_v1_with_buffer(domain, payload, scratch).map_err(|error| {
         CallableDependencyManifestError::new(format!(
             "failed to hash callable dependency payload: {error}"
         ))
@@ -1911,6 +1972,7 @@ pub(crate) fn build_callable_dependency_manifest(
     let trace_dependency_manifest = std::env::var_os("BOON_SEMANTIC_TRACE").is_some();
     macro_rules! dependency_manifest_phase {
         ($name:literal, $expression:expr) => {{
+            let started = trace_dependency_manifest.then(std::time::Instant::now);
             if trace_dependency_manifest {
                 eprintln!(concat!(
                     "boon_semantic dependency_manifest ",
@@ -1919,12 +1981,25 @@ pub(crate) fn build_callable_dependency_manifest(
                 ));
             }
             let result = $expression;
+            if let Some(started) = started {
+                eprintln!(
+                    concat!(
+                        "boon_semantic dependency_manifest ",
+                        $name,
+                        ":done elapsed_ms={:.3}"
+                    ),
+                    started.elapsed().as_secs_f64() * 1000.0,
+                );
+            }
+            result
+        }};
+    }
+
+    macro_rules! dependency_manifest_inventory_phase {
+        ($name:literal, $expression:expr, $collector:expr) => {{
+            let result = dependency_manifest_phase!($name, $expression);
             if trace_dependency_manifest {
-                eprintln!(concat!(
-                    "boon_semantic dependency_manifest ",
-                    $name,
-                    ":done"
-                ));
+                $collector.trace_counts($name);
             }
             result
         }};
@@ -1957,39 +2032,47 @@ pub(crate) fn build_callable_dependency_manifest(
     );
 
     let mut collector = DependencyCollector::default();
-    dependency_manifest_phase!(
+    dependency_manifest_inventory_phase!(
         "inventory_checked",
-        inventory_checked(checked, execution, &owner_index, &mut collector)
+        inventory_checked(checked, execution, &owner_index, &mut collector),
+        collector
     )?;
-    dependency_manifest_phase!(
+    dependency_manifest_inventory_phase!(
         "inventory_producer_requests",
-        inventory_producer_requests(producer_materializations, &owner_index, &mut collector)
+        inventory_producer_requests(producer_materializations, &owner_index, &mut collector),
+        collector
     )?;
-    dependency_manifest_phase!(
+    dependency_manifest_inventory_phase!(
         "inventory_out",
-        inventory_out(out, execution, &owner_index, &mut collector)
+        inventory_out(out, execution, &owner_index, &mut collector),
+        collector
     )?;
-    dependency_manifest_phase!(
+    dependency_manifest_inventory_phase!(
         "inventory_execution",
-        inventory_execution(execution, &owner_index, &mut collector)
+        inventory_execution(execution, &owner_index, &mut collector),
+        collector
     )?;
-    dependency_manifest_phase!(
+    dependency_manifest_inventory_phase!(
         "inventory_resources",
-        inventory_resources(resources, execution, &owner_index, &mut collector)
+        inventory_resources(resources, execution, &owner_index, &mut collector),
+        collector
     )?;
-    dependency_manifest_phase!(
+    dependency_manifest_inventory_phase!(
         "inventory_reactive",
-        inventory_reactive(reactive, execution, &owner_index, &mut collector)
+        inventory_reactive(reactive, execution, &owner_index, &mut collector),
+        collector
     )?;
-    dependency_manifest_phase!(
+    dependency_manifest_inventory_phase!(
         "inventory_lowering",
-        inventory_lowering(lowering, execution, resources, &owner_index, &mut collector)
+        inventory_lowering(lowering, execution, resources, &owner_index, &mut collector),
+        collector
     )?;
-    dependency_manifest_phase!(
+    dependency_manifest_inventory_phase!(
         "inventory_view",
-        inventory_view(view, execution, reactive, &owner_index, &mut collector)
+        inventory_view(view, execution, reactive, &owner_index, &mut collector),
+        collector
     )?;
-    dependency_manifest_phase!(
+    dependency_manifest_inventory_phase!(
         "inventory_storage",
         inventory_storage(
             storage,
@@ -1998,15 +2081,33 @@ pub(crate) fn build_callable_dependency_manifest(
             reactive,
             &owner_index,
             &mut collector,
-        )
+        ),
+        collector
     )?;
-    dependency_manifest_phase!(
+    dependency_manifest_inventory_phase!(
         "inventory_memory",
-        inventory_memory(memory, execution, &owner_index, &mut collector)
+        inventory_memory(memory, execution, &owner_index, &mut collector),
+        collector
     )?;
 
     let (dependencies, coverage, direct, closure) =
         dependency_manifest_phase!("finish", collector.finish(&owners))?;
+    if trace_dependency_manifest {
+        let total_closure_ranges = closure.values().map(Vec::len).sum::<usize>();
+        let total_closure_ids = closure
+            .values()
+            .flatten()
+            .map(|range| range.length)
+            .sum::<usize>();
+        let maximum_closure_ids = closure
+            .values()
+            .map(|ranges| ranges.iter().map(|range| range.length).sum::<usize>())
+            .max()
+            .unwrap_or(0);
+        eprintln!(
+            "boon_semantic dependency_manifest closure:counts total_ids={total_closure_ids} total_ranges={total_closure_ranges} maximum_ids={maximum_closure_ids}"
+        );
+    }
     let dependency_record_digest_index = dependency_manifest_phase!(
         "dependency_record_digest_index",
         DependencyRecordDigestIndex::build(&dependencies)
@@ -2022,33 +2123,21 @@ pub(crate) fn build_callable_dependency_manifest(
                 DEPENDENCY_COMPONENT_DIGEST_DOMAIN,
                 execution,
             )?,
-            resource_graph: canonical_dependency_hash(
-                DEPENDENCY_COMPONENT_DIGEST_DOMAIN,
-                resources,
-            )?,
+            resource_graph: *resources.digest.as_bytes(),
             reactive_graph: canonical_dependency_hash(
                 DEPENDENCY_COMPONENT_DIGEST_DOMAIN,
                 reactive,
             )?,
-            lowering_contract: canonical_dependency_hash(
-                DEPENDENCY_COMPONENT_DIGEST_DOMAIN,
-                lowering,
-            )?,
-            view_binding_graph: canonical_dependency_hash(
-                DEPENDENCY_COMPONENT_DIGEST_DOMAIN,
-                view,
-            )?,
-            scope_storage_graph: canonical_dependency_hash(
-                DEPENDENCY_COMPONENT_DIGEST_DOMAIN,
-                storage,
-            )?,
-            memory_graph: canonical_dependency_hash(DEPENDENCY_COMPONENT_DIGEST_DOMAIN, memory)?,
+            lowering_contract: *lowering.digest.as_bytes(),
+            view_binding_graph: *view.digest.as_bytes(),
+            scope_storage_graph: *storage.digest.as_bytes(),
+            memory_graph: *memory.digest.as_bytes(),
         }
     });
 
     let root_owner = SemanticDependencyOwnerV1::ProgramRoot;
     let root_direct = direct.get(&root_owner).cloned().unwrap_or_default();
-    let root_closure = closure.get(&root_owner).cloned().unwrap_or_default();
+    let root_closure_ranges = closure.get(&root_owner).cloned().unwrap_or_default();
     let program_root = dependency_manifest_phase!(
         "program_root_digest",
         ProgramRootDependencyEntryV1 {
@@ -2058,14 +2147,15 @@ pub(crate) fn build_callable_dependency_manifest(
             )?,
             implementation_dependency_digest: implementation_dependency_digest(
                 root_owner,
-                &root_closure,
+                &root_closure_ranges,
                 &dependency_record_digest_index,
             )?,
             direct_dependency_ids: root_direct,
-            closure_dependency_ids: root_closure,
+            closure_dependency_ranges: root_closure_ranges,
         }
     );
 
+    let callable_entries_started = trace_dependency_manifest.then(std::time::Instant::now);
     if trace_dependency_manifest {
         eprintln!("boon_semantic dependency_manifest callable_entries:start");
     }
@@ -2086,7 +2176,7 @@ pub(crate) fn build_callable_dependency_manifest(
                 callable.id
             ))
         })?;
-        let closure_dependency_ids = closure.get(&owner).cloned().ok_or_else(|| {
+        let closure_dependency_ranges = closure.get(&owner).cloned().ok_or_else(|| {
             CallableDependencyManifestError::new(format!(
                 "callable {} has no initialized dependency closure",
                 callable.id
@@ -2098,15 +2188,18 @@ pub(crate) fn build_callable_dependency_manifest(
             public_shape_digest: callable_public_shape_digest(callable)?,
             implementation_dependency_digest: implementation_dependency_digest(
                 owner,
-                &closure_dependency_ids,
+                &closure_dependency_ranges,
                 &dependency_record_digest_index,
             )?,
             direct_dependency_ids,
-            closure_dependency_ids,
+            closure_dependency_ranges,
         });
     }
-    if trace_dependency_manifest {
-        eprintln!("boon_semantic dependency_manifest callable_entries:done");
+    if let Some(started) = callable_entries_started {
+        eprintln!(
+            "boon_semantic dependency_manifest callable_entries:done elapsed_ms={:.3}",
+            started.elapsed().as_secs_f64() * 1000.0,
+        );
     }
 
     let checked_program_digest = dependency_manifest_phase!(
@@ -2134,9 +2227,26 @@ pub(crate) fn build_callable_dependency_manifest(
         "validate_shape",
         validate_manifest_shape(&manifest, &owners)
     )?;
+    let callable_entries_digest = dependency_manifest_phase!(
+        "callable_entries_digest",
+        callable_entries_digest(&manifest.callable_entries)
+    )?;
+    let dependency_records_digest = dependency_manifest_phase!(
+        "dependency_records_digest",
+        dependency_record_digest_index.record_set_digest()
+    )?;
+    let coverage_digest = dependency_manifest_phase!(
+        "coverage_digest",
+        dependency_coverage_digest(&manifest.coverage)
+    )?;
     manifest.manifest_digest = dependency_manifest_phase!(
         "manifest_digest",
-        callable_dependency_manifest_digest(&manifest)
+        callable_dependency_manifest_digest_from_content(
+            &manifest,
+            callable_entries_digest,
+            dependency_records_digest,
+            coverage_digest,
+        )
     )?;
     Ok(manifest)
 }
@@ -2297,19 +2407,21 @@ impl DependencyRecordDigestIndex {
     fn build(
         dependencies: &[SemanticDependencyRecordV1],
     ) -> Result<Self, CallableDependencyManifestError> {
-        let leaves = dependencies
-            .iter()
-            .enumerate()
-            .map(|(index, dependency)| {
-                if dependency.id != SemanticDependencyRecordId(index) {
-                    return Err(CallableDependencyManifestError::new(format!(
-                        "dependency record {} is not dense index {index}",
-                        dependency.id
-                    )));
-                }
-                canonical_dependency_hash(DEPENDENCY_RECORD_DIGEST_DOMAIN, dependency)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut scratch = Vec::new();
+        let mut leaves = Vec::with_capacity(dependencies.len());
+        for (index, dependency) in dependencies.iter().enumerate() {
+            if dependency.id != SemanticDependencyRecordId(index) {
+                return Err(CallableDependencyManifestError::new(format!(
+                    "dependency record {} is not dense index {index}",
+                    dependency.id
+                )));
+            }
+            leaves.push(canonical_dependency_hash_with_buffer(
+                DEPENDENCY_RECORD_DIGEST_DOMAIN,
+                dependency,
+                &mut scratch,
+            )?);
+        }
         let record_count = leaves.len();
         let mut levels = vec![leaves];
         let mut width = 2usize;
@@ -2321,7 +2433,7 @@ impl DependencyRecordDigestIndex {
             let mut next = Vec::with_capacity(node_count);
             for node_index in 0..node_count {
                 let start = node_index * width;
-                next.push(canonical_dependency_hash(
+                next.push(canonical_dependency_hash_with_buffer(
                     DEPENDENCY_RECORD_RANGE_DIGEST_DOMAIN,
                     &(
                         start,
@@ -2329,6 +2441,7 @@ impl DependencyRecordDigestIndex {
                         previous[node_index * 2],
                         previous[node_index * 2 + 1],
                     ),
+                    &mut scratch,
                 )?);
             }
             levels.push(next);
@@ -2343,38 +2456,41 @@ impl DependencyRecordDigestIndex {
         })
     }
 
-    fn closure_ranges(
+    fn digest_ranges(
         &self,
-        closure: &[SemanticDependencyRecordId],
+        closure: &[SemanticDependencyRecordRangeV1],
     ) -> Result<Vec<DependencyRecordDigestRange>, CallableDependencyManifestError> {
-        let mut previous = None;
-        for dependency in closure {
-            let index = dependency.as_usize();
-            if index >= self.record_count {
+        let mut previous_end = None;
+        for range in closure {
+            let start = range.start.as_usize();
+            if range.length == 0 {
                 return Err(CallableDependencyManifestError::new(format!(
-                    "implementation dependency closure references missing record {dependency}"
+                    "implementation dependency closure range at {start} is empty"
                 )));
             }
-            if previous.is_some_and(|previous| previous >= index) {
+            let end = start.checked_add(range.length).ok_or_else(|| {
+                CallableDependencyManifestError::new(
+                    "implementation dependency closure range overflows usize",
+                )
+            })?;
+            if end > self.record_count {
+                return Err(CallableDependencyManifestError::new(format!(
+                    "implementation dependency closure range {start}..{end} exceeds {} records",
+                    self.record_count
+                )));
+            }
+            if previous_end.is_some_and(|previous_end| previous_end >= start) {
                 return Err(CallableDependencyManifestError::new(
-                    "implementation dependency closure IDs are not strictly sorted and unique",
+                    "implementation dependency closure ranges overlap, touch, or are not sorted",
                 ));
             }
-            previous = Some(index);
+            previous_end = Some(end);
         }
 
         let mut ranges = Vec::new();
-        let mut ordinal = 0usize;
-        while ordinal < closure.len() {
-            let run_start = closure[ordinal].as_usize();
-            let mut run_end = run_start + 1;
-            ordinal += 1;
-            while ordinal < closure.len() && closure[ordinal].as_usize() == run_end {
-                run_end += 1;
-                ordinal += 1;
-            }
-
-            let mut start = run_start;
+        for closure_range in closure {
+            let mut start = closure_range.start.as_usize();
+            let run_end = start + closure_range.length;
             while start < run_end {
                 let remaining = run_end - start;
                 let largest_remaining = 1usize << (usize::BITS - 1 - remaining.leading_zeros());
@@ -2406,14 +2522,26 @@ impl DependencyRecordDigestIndex {
         }
         Ok(ranges)
     }
+
+    fn record_set_digest(&self) -> Result<[u8; 32], CallableDependencyManifestError> {
+        let full_range = (self.record_count != 0).then_some(SemanticDependencyRecordRangeV1 {
+            start: SemanticDependencyRecordId(0),
+            length: self.record_count,
+        });
+        let ranges = self.digest_ranges(full_range.as_slice())?;
+        canonical_dependency_hash(
+            DEPENDENCY_RECORD_SET_DIGEST_DOMAIN,
+            &(self.record_count, ranges),
+        )
+    }
 }
 
 fn implementation_dependency_digest(
     owner: SemanticDependencyOwnerV1,
-    closure: &[SemanticDependencyRecordId],
+    closure: &[SemanticDependencyRecordRangeV1],
     record_digest_index: &DependencyRecordDigestIndex,
 ) -> Result<[u8; 32], CallableDependencyManifestError> {
-    let ranges = record_digest_index.closure_ranges(closure)?;
+    let ranges = record_digest_index.digest_ranges(closure)?;
     canonical_dependency_hash(DEPENDENCY_IMPLEMENTATION_DOMAIN, &(owner, ranges))
 }
 
@@ -2512,13 +2640,28 @@ struct CallableDependencyManifestDigestPayload<'a> {
     dependency_classifier_schema_digest: DependencyClassifierSchemaDigestV1,
     component_digests: &'a CallableDependencyComponentDigestsV1,
     program_root: &'a ProgramRootDependencyEntryV1,
-    callable_entries: &'a [CallableDependencyEntryV1],
-    dependencies: &'a [SemanticDependencyRecordV1],
-    coverage: &'a [SemanticDependencyCoverageV1],
+    callable_entries_digest: [u8; 32],
+    dependency_records_digest: [u8; 32],
+    coverage_digest: [u8; 32],
 }
 
-fn callable_dependency_manifest_digest(
+fn callable_entries_digest(
+    entries: &[CallableDependencyEntryV1],
+) -> Result<[u8; 32], CallableDependencyManifestError> {
+    canonical_dependency_hash(DEPENDENCY_CALLABLE_SET_DIGEST_DOMAIN, &entries)
+}
+
+fn dependency_coverage_digest(
+    coverage: &[SemanticDependencyCoverageV1],
+) -> Result<[u8; 32], CallableDependencyManifestError> {
+    canonical_dependency_hash(DEPENDENCY_COVERAGE_SET_DIGEST_DOMAIN, &coverage)
+}
+
+fn callable_dependency_manifest_digest_from_content(
     manifest: &CallableDependencyManifestV1,
+    callable_entries_digest: [u8; 32],
+    dependency_records_digest: [u8; 32],
+    coverage_digest: [u8; 32],
 ) -> Result<CallableDependencyManifestDigestV1, CallableDependencyManifestError> {
     canonical_dependency_hash(
         DEPENDENCY_MANIFEST_DIGEST_DOMAIN,
@@ -2529,12 +2672,25 @@ fn callable_dependency_manifest_digest(
             dependency_classifier_schema_digest: manifest.dependency_classifier_schema_digest,
             component_digests: &manifest.component_digests,
             program_root: &manifest.program_root,
-            callable_entries: &manifest.callable_entries,
-            dependencies: &manifest.dependencies,
-            coverage: &manifest.coverage,
+            callable_entries_digest,
+            dependency_records_digest,
+            coverage_digest,
         },
     )
     .map(CallableDependencyManifestDigestV1)
+}
+
+fn callable_dependency_manifest_digest(
+    manifest: &CallableDependencyManifestV1,
+) -> Result<CallableDependencyManifestDigestV1, CallableDependencyManifestError> {
+    let dependency_record_digest_index =
+        DependencyRecordDigestIndex::build(&manifest.dependencies)?;
+    callable_dependency_manifest_digest_from_content(
+        manifest,
+        callable_entries_digest(&manifest.callable_entries)?,
+        dependency_record_digest_index.record_set_digest()?,
+        dependency_coverage_digest(&manifest.coverage)?,
+    )
 }
 
 fn inventory_checked(
@@ -8000,7 +8156,10 @@ FUNCTION add(value) {
         assert_eq!(direct[&callee], vec![callee_dependency]);
         assert_eq!(
             closure[&caller],
-            vec![callee_dependency, caller_dependency],
+            vec![SemanticDependencyRecordRangeV1 {
+                start: callee_dependency,
+                length: caller_dependency.as_usize() - callee_dependency.as_usize() + 1,
+            }],
             "caller closure must include both exact entity and callable-owner dependencies"
         );
     }
@@ -8108,12 +8267,18 @@ FUNCTION add(value) {
             .expect("dependency");
         }
         let (records, _, _, _) = collector.finish(&owners).expect("collector finish");
-        let closure = (0..4)
-            .chain(8..10)
-            .map(SemanticDependencyRecordId)
-            .collect::<Vec<_>>();
+        let closure = vec![
+            SemanticDependencyRecordRangeV1 {
+                start: SemanticDependencyRecordId(0),
+                length: 4,
+            },
+            SemanticDependencyRecordRangeV1 {
+                start: SemanticDependencyRecordId(8),
+                length: 2,
+            },
+        ];
         let index = DependencyRecordDigestIndex::build(&records).expect("record digest index");
-        let ranges = index.closure_ranges(&closure).expect("closure ranges");
+        let ranges = index.digest_ranges(&closure).expect("closure ranges");
         assert_eq!(
             ranges
                 .iter()
@@ -8349,10 +8514,10 @@ ordinary: serve(value: 1)
                 .first_mut()
                 .expect("fixture has a callable dependency entry");
             assert!(
-                !callable.closure_dependency_ids.is_empty(),
+                !callable.closure_dependency_ranges.is_empty(),
                 "fixture callable closure is nonempty"
             );
-            callable.closure_dependency_ids.pop();
+            callable.closure_dependency_ranges.pop();
         });
     }
 }

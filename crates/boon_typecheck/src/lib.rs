@@ -1682,7 +1682,12 @@ struct CheckedProgramBuilder<'a> {
     scope_declarations: BTreeMap<(LexicalScopeId, String), DeclId>,
     pattern_declarations: BTreeMap<(usize, String), DeclId>,
     pattern_selectors: BTreeMap<usize, usize>,
+    pattern_parents: BTreeMap<usize, usize>,
+    pattern_arms_by_scope: BTreeMap<LexicalScopeId, usize>,
+    nearest_pattern_arm_by_scope: Vec<Option<usize>>,
+    syntax_discriminant_parameters: BTreeSet<DeclId>,
     inferred_expr_types: BTreeMap<usize, FlowType>,
+    syntax_expr_types: BTreeMap<usize, FlowType>,
     /// Hidden `Flush<E>` control types keyed by parser expression. This is a
     /// checker-only side table; `E` is folded into the ordinary type exactly
     /// at documented lexical boundaries and never serialized as a public type.
@@ -1990,7 +1995,12 @@ impl<'a> CheckedProgramBuilder<'a> {
             scope_declarations: BTreeMap::new(),
             pattern_declarations: BTreeMap::new(),
             pattern_selectors: BTreeMap::new(),
+            pattern_parents: BTreeMap::new(),
+            pattern_arms_by_scope: BTreeMap::new(),
+            nearest_pattern_arm_by_scope: Vec::new(),
+            syntax_discriminant_parameters: BTreeSet::new(),
             inferred_expr_types: BTreeMap::new(),
+            syntax_expr_types: BTreeMap::new(),
             expression_flush_types: BTreeMap::new(),
             authoritative_expr_types: BTreeSet::new(),
             checked_flow_inference_epoch: 0,
@@ -2392,6 +2402,101 @@ impl<'a> CheckedProgramBuilder<'a> {
             .map(|(index, declaration)| (declaration.id, index))
             .collect();
         self.rebuild_call_indexes();
+        self.rebuild_pattern_arm_scope_index();
+        self.rebuild_syntax_discriminant_parameter_index();
+    }
+
+    fn rebuild_syntax_discriminant_parameter_index(&mut self) {
+        let mut parameters = self.pattern_selector_parameters();
+        loop {
+            let mut changed = false;
+            for call in &self.calls {
+                let Some(owner) = call.owner_callable else {
+                    continue;
+                };
+                let Some(owner_signature) = self.signature_by_declaration(owner) else {
+                    continue;
+                };
+                let owner_parameters = owner_signature
+                    .parameters
+                    .iter()
+                    .map(|parameter| parameter.decl_id)
+                    .collect::<BTreeSet<_>>();
+                for entry in &call.entries {
+                    let CheckedCallEntry::Input { formal, value, .. } = entry else {
+                        continue;
+                    };
+                    if !parameters.contains(formal) {
+                        continue;
+                    }
+                    for forwarded in
+                        self.owner_parameters_referenced_by_expression(*value, &owner_parameters)
+                    {
+                        changed |= parameters.insert(forwarded);
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        self.syntax_discriminant_parameters = parameters;
+    }
+
+    fn owner_parameters_referenced_by_expression(
+        &self,
+        expression: CheckedExprId,
+        owner_parameters: &BTreeSet<DeclId>,
+    ) -> BTreeSet<DeclId> {
+        let mut referenced = BTreeSet::new();
+        let mut pending = vec![expression.0 as usize];
+        let mut visited = BTreeSet::new();
+        while let Some(expression) = pending.pop() {
+            if !visited.insert(expression) {
+                continue;
+            }
+            if let Some((target, _)) =
+                self.direct_read_declaration_with_projection(CheckedExprId(expression as u32))
+                && owner_parameters.contains(&target)
+            {
+                referenced.insert(target);
+            }
+            if let Some(expression) = self.program.expressions.get(expression) {
+                pending.extend(direct_expression_children(expression));
+            }
+        }
+        referenced
+    }
+
+    fn rebuild_pattern_arm_scope_index(&mut self) {
+        self.nearest_pattern_arm_by_scope = vec![None; self.scopes.len()];
+        for scope in &self.scopes {
+            let mut current = scope.id;
+            let mut visited = BTreeSet::new();
+            let nearest = loop {
+                if !visited.insert(current) {
+                    break None;
+                }
+                if let Some(arm) = self.pattern_arms_by_scope.get(&current).copied() {
+                    break Some(arm);
+                }
+                let Some(parent) = self
+                    .scopes
+                    .get(current.0 as usize)
+                    .filter(|candidate| candidate.id == current)
+                    .and_then(|scope| scope.parent)
+                else {
+                    break None;
+                };
+                current = parent;
+            };
+            if let Some(slot) = self
+                .nearest_pattern_arm_by_scope
+                .get_mut(scope.id.0 as usize)
+            {
+                *slot = nearest;
+            }
+        }
     }
 
     fn rebuild_call_indexes(&mut self) {
@@ -3561,11 +3666,12 @@ impl<'a> CheckedProgramBuilder<'a> {
             })
             .map(|entry| entry.expr_id)
             .collect();
-        self.inferred_expr_types = expr_type_table
+        self.syntax_expr_types = expr_type_table
             .entries
             .iter()
             .map(|entry| (entry.expr_id, entry.flow_type.clone()))
             .collect();
+        self.inferred_expr_types = self.syntax_expr_types.clone();
 
         for (expression, flow_type) in checked_source_expression_flow_types(
             &self.program.ast.statements,
@@ -4046,7 +4152,7 @@ impl<'a> CheckedProgramBuilder<'a> {
         );
         let pattern_domains = self.pattern_selector_parameter_domains();
         let mut actual_variant_domains = BTreeMap::<DeclId, Type>::new();
-        let pattern_selector_parameters = self.pattern_selector_parameters();
+        let pattern_selector_parameters = self.syntax_discriminant_parameters.clone();
         let pattern_actuals = self
             .calls
             .iter()
@@ -5038,7 +5144,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                 AstMatchPattern::Wildcard | AstMatchPattern::Binding { .. }
             ) {
                 entry.0 = true;
-            } else if let Some(variant) = pattern_variant(pattern) {
+            } else if let Some(variant) = pattern_domain_variant(pattern) {
                 entry.1.push(variant);
             }
         }
@@ -5231,7 +5337,7 @@ impl<'a> CheckedProgramBuilder<'a> {
     fn refresh_pattern_selector_parameter_types(&mut self) -> bool {
         let pattern_domains = self.pattern_selector_parameter_domains();
         let mut domains = BTreeMap::<DeclId, Type>::new();
-        let selector_parameters = self.pattern_selector_parameters();
+        let selector_parameters = self.syntax_discriminant_parameters.clone();
         if selector_parameters.is_empty() {
             return false;
         }
@@ -5825,6 +5931,15 @@ impl<'a> CheckedProgramBuilder<'a> {
         }
         let instantiated_result =
             substitute_checked_type(&signature.result.ty, &result_instantiation);
+        let syntax_discriminated_result = (signature.kind == CheckedCallableKind::User
+            && self.checked_call_has_syntax_discriminant(&call))
+        .then(|| {
+            self.syntax_expr_types
+                .get(&(call.expression.0 as usize))
+                .map(|flow_type| flow_type.ty.clone())
+        })
+        .flatten()
+        .filter(type_is_recursively_closed);
         let authoritative_result = self
             .authoritative_expr_types
             .contains(&(call.expression.0 as usize))
@@ -5846,7 +5961,15 @@ impl<'a> CheckedProgramBuilder<'a> {
             .owner_callable
             .is_none()
             .then(|| specialize_checked_call_result(&instantiated_result, &call.result.ty));
-        let result_type = if let Some(concrete) = concrete_root_result {
+        // A syntactically fixed outer Tag selects a stable callable branch even
+        // when the principal result scheme has to summarize heterogeneous arm
+        // results (for example, an object material versus a list of lights).
+        // The call-specific syntax pass has already evaluated that branch with
+        // its payload bindings, so its closed result is more precise than the
+        // deliberately occurrence-independent principal scheme.
+        let result_type = if let Some(syntax) = syntax_discriminated_result {
+            syntax
+        } else if let Some(concrete) = concrete_root_result {
             concrete
         } else if type_is_recursively_closed(&instantiated_result) {
             authoritative_result.unwrap_or(instantiated_result)
@@ -5900,6 +6023,25 @@ impl<'a> CheckedProgramBuilder<'a> {
         }
         changed |= self.set_inferred_expr_flow(call.expression.0 as usize, result);
         changed
+    }
+
+    fn checked_call_has_syntax_discriminant(&self, call: &CheckedCall) -> bool {
+        call.entries.iter().any(|entry| {
+            let CheckedCallEntry::Input { formal, value, .. } = entry else {
+                return false;
+            };
+            if !self.syntax_discriminant_parameters.contains(formal) {
+                return false;
+            }
+            self.program
+                .expressions
+                .get(value.0 as usize)
+                .is_some_and(|expression| match &expression.kind {
+                    AstExprKind::Tag(tag) => tag != "SKIP",
+                    AstExprKind::TaggedObject { .. } => true,
+                    _ => false,
+                })
+        })
     }
 
     fn validate_contextual_call_arguments(&mut self) {
@@ -7156,7 +7298,60 @@ impl<'a> CheckedProgramBuilder<'a> {
             .find(|candidate| candidate.id == declaration)
             .map(|declaration| declaration.flow_type.ty.clone())
             .unwrap_or(Type::Unknown);
-        self.project_checked_type(expr_id, base, &parts[1..])
+        let projection = &parts[1..];
+        let projected = self.project_checked_type(expr_id, base, projection);
+        self.narrowed_checked_read_type(expr_id, declaration, projection, &projected)
+            .unwrap_or(projected)
+    }
+
+    fn narrowed_checked_read_type(
+        &self,
+        expr_id: usize,
+        declaration: DeclId,
+        projection: &[String],
+        selector_type: &Type,
+    ) -> Option<Type> {
+        let mut scope = self.expression_scopes.get(&expr_id).copied()?;
+        let mut visited = BTreeSet::new();
+        while visited.insert(scope) {
+            let arm = self
+                .nearest_pattern_arm_by_scope
+                .get(scope.0 as usize)
+                .copied()
+                .flatten()?;
+            let arm_scope = self.expression_scopes.get(&arm).copied()?;
+            let Some(selector) = self.pattern_selectors.get(&arm).copied() else {
+                break;
+            };
+            let Some((target, selector_projection)) =
+                self.direct_read_declaration_with_projection(CheckedExprId(selector as u32))
+            else {
+                break;
+            };
+            if target != declaration || selector_projection != projection {
+                let Some(parent) = self
+                    .scopes
+                    .get(arm_scope.0 as usize)
+                    .filter(|candidate| candidate.id == arm_scope)
+                    .and_then(|scope| scope.parent)
+                else {
+                    break;
+                };
+                scope = parent;
+                continue;
+            }
+            let parent = self.pattern_parents.get(&arm)?;
+            let Some(narrowed) =
+                reachable_static_when_arms(*parent, &self.program.expressions, Some(selector_type))
+                    .into_iter()
+                    .find(|candidate| candidate.expression == arm)
+                    .and_then(|candidate| candidate.selector_type)
+            else {
+                return None;
+            };
+            return Some(narrowed);
+        }
+        None
     }
 
     fn checked_passed_flow_type(&self, expr_id: usize, projection: &[String]) -> Option<FlowType> {
@@ -7951,7 +8146,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                 .copied()
                 .unwrap_or(LexicalScopeId(0));
             for arm in arms {
-                self.predeclare_pattern_arm(arm, selector, parent);
+                self.predeclare_pattern_arm(arm, selector, expr_id, parent);
             }
         }
         for child in direct_expression_children(&expr) {
@@ -7959,7 +8154,13 @@ impl<'a> CheckedProgramBuilder<'a> {
         }
     }
 
-    fn predeclare_pattern_arm(&mut self, expr_id: usize, selector: usize, parent: LexicalScopeId) {
+    fn predeclare_pattern_arm(
+        &mut self,
+        expr_id: usize,
+        selector: usize,
+        pattern_parent: usize,
+        parent: LexicalScopeId,
+    ) {
         let Some(AstExpr {
             kind: AstExprKind::MatchArm { pattern, output },
             ..
@@ -7996,6 +8197,8 @@ impl<'a> CheckedProgramBuilder<'a> {
             self.assign_expression_scope_override(output, arm_scope);
         }
         self.pattern_selectors.insert(expr_id, selector);
+        self.pattern_parents.insert(expr_id, pattern_parent);
+        self.pattern_arms_by_scope.insert(arm_scope, expr_id);
 
         for name in pattern_variable_names(&pattern) {
             let declaration = self.allocate_decl();
@@ -8497,13 +8700,18 @@ impl<'a> CheckedProgramBuilder<'a> {
                 expression.id,
             )
             .unwrap_or_default();
-            if projection.is_empty()
-                && self
-                    .declarations
-                    .iter()
-                    .find(|candidate| candidate.id == declaration)
-                    .is_some_and(|declaration| declaration.kind == CheckedDeclarationKind::Function)
-            {
+            let declaration_state_authority =
+                declaration_values
+                    .get(&declaration)
+                    .is_some_and(|(root, _)| {
+                        checked_state_is_declaration_result(expressions, *root, expression.id)
+                    });
+            let function_declaration = self
+                .declarations
+                .iter()
+                .find(|candidate| candidate.id == declaration)
+                .is_some_and(|declaration| declaration.kind == CheckedDeclarationKind::Function);
+            if projection.is_empty() && (!declaration_state_authority || function_declaration) {
                 projection = vec![format!(
                     "state_{}",
                     states
@@ -9098,9 +9306,30 @@ impl<'a> CheckedProgramBuilder<'a> {
             CheckedExpressionKind::Read { target, .. } => self
                 .declaration(*target)
                 .filter(|declaration| {
-                    self.scope_is_function_local(declaration.scope_id)
-                        || (declaration.value == Some(expression.id)
-                            && !self.declaration_is_inside_root(declaration.id, "host_ports"))
+                    if declaration.value == Some(expression.id)
+                        && !self.declaration_is_inside_root(declaration.id, "host_ports")
+                    {
+                        return true;
+                    }
+                    if !self.scope_is_function_local(declaration.scope_id) {
+                        return false;
+                    }
+                    declaration
+                        .value
+                        .and_then(|value| expression_by_id.get(&value))
+                        .and_then(|index| expressions.get(*index))
+                        .is_some_and(|value| {
+                            !value.effect.writes_state
+                                && !value.effect.emits_source
+                                && !value.effect.invokes_host
+                                && !matches!(
+                                    value.kind,
+                                    CheckedExpressionKind::Hold { .. }
+                                        | CheckedExpressionKind::Latest { .. }
+                                        | CheckedExpressionKind::Source
+                                        | CheckedExpressionKind::Draining { .. }
+                                )
+                        })
                 })
                 .and_then(|declaration| declaration.value)
                 .into_iter()
@@ -9629,7 +9858,16 @@ impl<'a> CheckedProgramBuilder<'a> {
             }
             (_, Some(contextual)) => contextual,
             (Some(lexical), None) => lexical,
-            (None, None) => return None,
+            (None, None) => {
+                // Static inference already permits an unqualified reference to
+                // a uniquely named nested root value (for example `rows` for
+                // `store.rows`). Preserve that exact declaration identity in
+                // the checked program instead of lowering the same read as an
+                // ambient external that semantic expansion must rediscover
+                // from a call-site scope.
+                let expression = declaration_expr_for_path(&self.named_value_expressions, name)?;
+                self.expression_declarations.get(&expression).copied()?
+            }
         };
         Some(target)
     }
@@ -17870,9 +18108,16 @@ impl<'a> Checker<'a> {
         {
             let pattern = arm.pattern;
             let arm_expr_id = arm.output;
-            let narrowed = selector_type
+            let narrowed = arm
+                .selector_type
                 .as_ref()
-                .and_then(|selector_type| narrowed_pattern_binding(selector_type, &pattern));
+                .and_then(|selector_type| narrowed_pattern_binding(selector_type, &pattern))
+                .or_else(|| arm.catch_all.then(|| arm.selector_type.clone()).flatten())
+                .or_else(|| {
+                    selector_type
+                        .as_ref()
+                        .and_then(|selector_type| narrowed_pattern_binding(selector_type, &pattern))
+                });
             let payload_bindings = selector_type
                 .as_ref()
                 .map(|selector_type| pattern_payload_bindings(selector_type, &pattern))
@@ -18583,7 +18828,7 @@ impl<'a> Checker<'a> {
         active_functions: &mut BTreeSet<String>,
         bindings: &dyn StaticBindingLookup,
     ) -> Option<Type> {
-        if semantic_block_statement(statement, &self.program.expressions) {
+        if statement_has_block_value(statement, &self.program.expressions) {
             return self.static_block_return_type_with_bindings(
                 &statement.children,
                 active_functions,
@@ -18697,7 +18942,7 @@ impl<'a> Checker<'a> {
         statement: &AstStatement,
         active_functions: &mut BTreeSet<String>,
     ) -> Option<Type> {
-        if semantic_block_statement(statement, &self.program.expressions) {
+        if statement_has_block_value(statement, &self.program.expressions) {
             return self.static_block_return_type(&statement.children, active_functions);
         }
         if let Some(arm_type) = self.static_match_arm_statement_type(statement, active_functions) {
@@ -18943,6 +19188,11 @@ impl<'a> Checker<'a> {
                 arm_bindings.insert(path.clone(), narrowed.clone());
                 if let Some(name) = path.rsplit('.').next() {
                     arm_bindings.insert(name.to_owned(), narrowed);
+                }
+            }
+            if let Some(arm_selector_type) = arm.selector_type.as_ref().or(selector_type.as_ref()) {
+                for (name, ty) in pattern_payload_bindings(arm_selector_type, &arm.pattern) {
+                    arm_bindings.insert(name, ty);
                 }
             }
             let arm_type = self.static_expr_type_for_pipeline_expr(
@@ -20752,6 +21002,26 @@ fn pattern_selector_expr_id(expr_id: usize, expressions: &[AstExpr]) -> Option<u
 fn pattern_variant(pattern: &AstMatchPattern) -> Option<Variant> {
     match pattern {
         AstMatchPattern::Tag { name, .. } => Some(Variant::Tag(name.clone())),
+        _ => None,
+    }
+}
+
+fn pattern_domain_variant(pattern: &AstMatchPattern) -> Option<Variant> {
+    match pattern {
+        AstMatchPattern::Tag { name, fields } if fields.is_empty() => {
+            Some(Variant::Tag(name.clone()))
+        }
+        AstMatchPattern::Tag { name, fields } => Some(Variant::Tagged {
+            tag: name.clone(),
+            fields: ObjectShape {
+                fields: fields
+                    .iter()
+                    .map(|field| (field.clone(), Type::Unknown))
+                    .collect(),
+                field_order: fields.clone(),
+                open: false,
+            },
+        }),
         _ => None,
     }
 }
@@ -23984,6 +24254,40 @@ fn checked_inline_list_authority_root(
     None
 }
 
+fn checked_state_is_declaration_result(
+    expressions: &[CheckedExpression],
+    root: CheckedExprId,
+    target: CheckedExprId,
+) -> bool {
+    let mut current = root;
+    let mut visited = BTreeSet::new();
+    while visited.insert(current) {
+        if current == target {
+            return true;
+        }
+        let Some(expression) = expressions
+            .get(current.0 as usize)
+            .filter(|expression| expression.id == current)
+        else {
+            return false;
+        };
+        current = match &expression.kind {
+            CheckedExpressionKind::Draining { input } => *input,
+            CheckedExpressionKind::Flush { payload } => *payload,
+            CheckedExpressionKind::Block {
+                result: Some(result),
+                ..
+            } => *result,
+            CheckedExpressionKind::MatchArm {
+                output: Some(output),
+                ..
+            } => *output,
+            _ => return false,
+        };
+    }
+    false
+}
+
 fn when_arms(expr_id: usize, expressions: &[AstExpr]) -> Vec<(AstMatchPattern, usize)> {
     let Some(expression) = expressions.get(expr_id) else {
         return Vec::new();
@@ -24794,6 +25098,11 @@ fn static_when_type_from_bindings(
                 arm_bindings.insert(name.to_owned(), narrowed);
             }
         }
+        if let Some(arm_selector_type) = arm.selector_type.as_ref().or(selector_type.as_ref()) {
+            for (name, ty) in pattern_payload_bindings(arm_selector_type, &arm.pattern) {
+                arm_bindings.insert(name, ty);
+            }
+        }
         let Some(arm_type) = expressions
             .get(arm.output)
             .and_then(|arm| static_expr_type_from_bindings(arm, expressions, &arm_bindings))
@@ -24813,6 +25122,7 @@ fn static_when_type_from_bindings(
 
 #[derive(Clone, Debug)]
 struct ReachableStaticWhenArm {
+    expression: usize,
     pattern: AstMatchPattern,
     output: usize,
     selector_type: Option<Type>,
@@ -24844,6 +25154,7 @@ fn reachable_static_when_arms(
                     return None;
                 };
                 Some(ReachableStaticWhenArm {
+                    expression: *arm,
                     pattern: pattern.clone(),
                     output: *output,
                     selector_type: None,
@@ -24887,6 +25198,7 @@ fn reachable_static_when_arms(
             remaining = unmatched;
             if !matched.is_empty() {
                 reachable.push(ReachableStaticWhenArm {
+                    expression: *arm,
                     pattern: pattern.clone(),
                     output: *output,
                     selector_type: Some(Type::VariantSet(matched)),
@@ -24898,6 +25210,7 @@ fn reachable_static_when_arms(
         match pattern {
             AstMatchPattern::Wildcard | AstMatchPattern::Binding { .. } => {
                 reachable.push(ReachableStaticWhenArm {
+                    expression: *arm,
                     pattern: pattern.clone(),
                     output: *output,
                     selector_type: Some(Type::VariantSet(std::mem::take(&mut remaining))),
@@ -27474,10 +27787,14 @@ fn statements_define_explicit_record(statements: &[AstStatement], expressions: &
 
 fn semantic_block_statement(statement: &AstStatement, expressions: &[AstExpr]) -> bool {
     matches!(statement.kind, AstStatementKind::Block)
-        && statement
-            .expr
-            .and_then(|expr_id| expressions.get(expr_id))
-            .is_some_and(|expr| matches!(&expr.kind, AstExprKind::Block { .. }))
+        && statement_has_block_value(statement, expressions)
+}
+
+fn statement_has_block_value(statement: &AstStatement, expressions: &[AstExpr]) -> bool {
+    statement
+        .expr
+        .and_then(|expr_id| expressions.get(expr_id))
+        .is_some_and(|expr| matches!(&expr.kind, AstExprKind::Block { .. }))
 }
 
 fn semantic_block_return_statement(statements: &[AstStatement]) -> Option<&AstStatement> {

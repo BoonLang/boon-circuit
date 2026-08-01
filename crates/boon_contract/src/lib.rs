@@ -30,7 +30,22 @@ pub fn canonical_serde_hash_v1<T: Serialize + ?Sized>(
     domain: &[u8],
     value: &T,
 ) -> Result<[u8; 32], CanonicalEncodingError> {
-    let bytes = canonical_serde_cbor_v1(value)?;
+    canonical_serde_hash_v1_with_buffer(domain, value, &mut Vec::new())
+}
+
+/// Canonically hashes `value` while reusing caller-owned encoding storage.
+///
+/// This is byte-for-byte equivalent to [`canonical_serde_hash_v1`]. It exists
+/// for compiler passes that hash large inventories of small records and would
+/// otherwise allocate a fresh `Vec` for every record.
+pub fn canonical_serde_hash_v1_with_buffer<T: Serialize + ?Sized>(
+    domain: &[u8],
+    value: &T,
+    bytes: &mut Vec<u8>,
+) -> Result<[u8; 32], CanonicalEncodingError> {
+    bytes.clear();
+    ciborium::ser::into_writer(value, &mut *bytes)
+        .map_err(|error| CanonicalEncodingError::new(error.to_string()))?;
     let mut hasher = Sha256::new();
     hasher.update(domain);
     hasher.update(
@@ -38,7 +53,7 @@ pub fn canonical_serde_hash_v1<T: Serialize + ?Sized>(
             .map_err(|_| CanonicalEncodingError::new("canonical payload exceeds u64"))?
             .to_be_bytes(),
     );
-    hasher.update(bytes);
+    hasher.update(bytes.as_slice());
     Ok(hasher.finalize().into())
 }
 
@@ -479,6 +494,12 @@ mod tests {
         assert_eq!(
             canonical_serde_hash_v1(b"first-domain\0", &value).unwrap(),
             canonical_serde_hash_v1(b"first-domain\0", &value).unwrap()
+        );
+        let mut scratch = Vec::new();
+        assert_eq!(
+            canonical_serde_hash_v1(b"first-domain\0", &value).unwrap(),
+            canonical_serde_hash_v1_with_buffer(b"first-domain\0", &value, &mut scratch).unwrap(),
+            "caller-owned encoding storage must not change canonical hashes"
         );
         assert_eq!(
             canonical_serde_hash_v1(b"first-domain\0", &value).unwrap(),

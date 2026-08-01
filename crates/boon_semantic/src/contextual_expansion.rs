@@ -22,9 +22,10 @@ use crate::{
 use boon_typecheck::{
     CheckedCallEntry, CheckedCallId, CheckedCallableKind, CheckedContextBinding,
     CheckedContextualOperation, CheckedDeclarationKind, CheckedExprId, CheckedExpression,
-    CheckedExpressionKind, CheckedParameterKind, CheckedParameterRequirement, CheckedPassedAccess,
-    CheckedProgram, CheckedResourceBinding, CheckedTextSegment, CheckedValueUse, ContextFormalId,
-    DeclId, FlowMode, FlowType, Type, apply_checked_type_substitutions, is_renderable_type,
+    CheckedExpressionKind, CheckedMatchPattern, CheckedParameterKind, CheckedParameterRequirement,
+    CheckedPassedAccess, CheckedProgram, CheckedResourceBinding, CheckedTextSegment,
+    CheckedValueUse, ContextFormalId, DeclId, FlowMode, FlowType, Type,
+    apply_checked_type_substitutions, is_renderable_type,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -526,6 +527,7 @@ struct ContextualCandidate {
 pub(crate) struct SemanticExpressionArena {
     expressions: Vec<SemanticExpression>,
     checked_expression_origins: Vec<SemanticExpressionOrigin>,
+    next_local_binding: usize,
 }
 
 impl SemanticExpressionArena {
@@ -3464,18 +3466,10 @@ fn append_expression_arena_without_roots(
     mut source: SemanticExpressionArena,
 ) {
     let offset = target.expressions.len();
-    let local_binding_offset = target
-        .expressions
-        .iter()
-        .flat_map(|expression| match &expression.kind {
-            SemanticExpressionKind::Block { bindings, .. } => {
-                bindings.iter().map(|binding| binding.id).collect()
-            }
-            _ => Vec::new(),
-        })
-        .map(SemanticLocalBindingId::as_usize)
-        .max()
-        .map_or(0, |maximum| maximum + 1);
+    let local_binding_offset = target.next_local_binding;
+    target.next_local_binding = target
+        .next_local_binding
+        .saturating_add(source.next_local_binding);
     for expression in &mut source.expressions {
         expression.id = rebase_expr_id(expression.id, offset);
         expression.value_id = SemanticValueId(expression.id.as_usize());
@@ -4166,6 +4160,27 @@ struct SemanticExpressionBuilderIndexes {
     producer_callable_ids: BTreeMap<crate::ProducerFunctionId, SemanticCallableId>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum StaticSelectorValue {
+    Number(boon_data::ExactNumber),
+    Text(String),
+    Tag(String),
+    Bits(boon_data::Bits),
+}
+
+impl StaticSelectorValue {
+    fn matches(&self, pattern: &CheckedMatchPattern) -> bool {
+        match (self, pattern) {
+            (_, CheckedMatchPattern::Wildcard | CheckedMatchPattern::Binding { .. }) => true,
+            (Self::Number(actual), CheckedMatchPattern::Number { value }) => actual == value,
+            (Self::Text(actual), CheckedMatchPattern::Text { value }) => actual == value,
+            (Self::Tag(actual), CheckedMatchPattern::Tag { name, .. }) => actual == name,
+            (Self::Bits(actual), CheckedMatchPattern::Bits { value }) => actual == value,
+            _ => false,
+        }
+    }
+}
+
 impl SemanticExpressionBuilderIndexes {
     fn new(program: &CheckedProgram, out_net: &OutNet) -> Self {
         let callable_ids = program
@@ -4645,6 +4660,7 @@ impl<'a> SemanticExpressionBuilder<'a> {
         SemanticExpressionArena {
             expressions: self.expressions,
             checked_expression_origins: self.checked_expression_origins,
+            next_local_binding: self.next_local_binding,
         }
     }
 
@@ -4790,7 +4806,14 @@ impl<'a> SemanticExpressionBuilder<'a> {
                         } => {
                             let input = self.expand(input)?;
                             binding_fields.extend(projection);
-                            self.project(&expression, owner, input, binding_fields)
+                            let projected =
+                                self.project(&expression, owner, input, binding_fields)?;
+                            let required = concrete_type_in_frame(
+                                self.out_net,
+                                &expression.flow_type.ty,
+                                scoped.frame,
+                            );
+                            Ok(self.wrap_type_refinement(&expression, owner, projected, required))
                         }
                     };
                 }
@@ -4898,7 +4921,13 @@ impl<'a> SemanticExpressionBuilder<'a> {
                                             expanded.flow_type
                                         ))
                                     })?;
-                                self.expressions[expanded.as_usize()].flow_type.ty = refined;
+                                let expanded = self.wrap_type_refinement(
+                                    &expression,
+                                    owner,
+                                    expanded,
+                                    refined,
+                                );
+                                return self.project(&expression, owner, expanded, projection);
                             }
                             return self.project(&expression, owner, expanded, projection);
                         }
@@ -4955,22 +4984,17 @@ impl<'a> SemanticExpressionBuilder<'a> {
                 }
                 if declaration.kind == boon_typecheck::CheckedDeclarationKind::Field
                     && declaration_is_function_local(self.program, declaration.scope_id)
-                    && declaration.value.is_some_and(|value| {
-                        self.lookup
-                            .expression(self.program, value)
-                            .is_some_and(|value| {
-                                !value.effect.writes_state
-                                    && !value.effect.emits_source
-                                    && !value.effect.invokes_host
-                                    && !matches!(
-                                        value.kind,
-                                        CheckedExpressionKind::Hold { .. }
-                                            | CheckedExpressionKind::Latest { .. }
-                                            | CheckedExpressionKind::Source
-                                            | CheckedExpressionKind::Draining { .. }
-                                    )
-                            })
-                    })
+                    && !self
+                        .program
+                        .states
+                        .iter()
+                        .any(|state| state.declaration == declaration.id)
+                    && !self
+                        .program
+                        .sources
+                        .iter()
+                        .any(|source| source.declaration == declaration.id)
+                    && declaration.value.is_some()
                 {
                     let expanded = self.expand_in_frame(
                         declaration.value.expect("checked local value exists"),
@@ -5121,6 +5145,9 @@ impl<'a> SemanticExpressionBuilder<'a> {
                 let checked_input = input;
                 let input =
                     self.expand_in_frame(checked_input, scoped.frame, scoped.value_frame)?;
+                let arms = self
+                    .statically_selected_arm(input, &arms)
+                    .map_or(arms, |selected| vec![selected]);
                 SemanticExpressionKind::When {
                     select_kind: SemanticSelectKind::When,
                     input,
@@ -5266,13 +5293,31 @@ impl<'a> SemanticExpressionBuilder<'a> {
             .callable(self.program, checked_call.callable)
             .cloned()
             .ok_or(ExpansionError::MissingCallable(checked_call.callable))?;
-        let instance = self
+        let Some(instance) = self
             .out_net
             .call_instance_for_checked_call(call_id, scoped.frame)
-            .ok_or(ExpansionError::MissingCallInstance {
+        else {
+            if std::env::var_os("BOON_SEMANTIC_TRACE").is_some() {
+                eprintln!(
+                    "boon_semantic missing_call_instance checked_call={} function={} owner={:?} expression={} span={:?} frame={:?} frame_provenance={:?}",
+                    call_id.0,
+                    checked_call.function,
+                    checked_call.owner_callable,
+                    checked_call.expression.0,
+                    checked_call.span,
+                    scoped.frame,
+                    scoped.frame.and_then(|frame| self
+                        .out_net
+                        .call_instances
+                        .get(frame.as_usize())
+                        .map(|instance| instance.provenance)),
+                );
+            }
+            return Err(ExpansionError::MissingCallInstance {
                 call: call_id,
                 frame: scoped.frame,
-            })?;
+            });
+        };
         let has_out = checked_call
             .entries
             .iter()
@@ -5642,6 +5687,15 @@ impl<'a> SemanticExpressionBuilder<'a> {
         arm_ids: &[CheckedExprId],
     ) -> Result<Vec<SemanticSelectArm>, ExpansionError> {
         let mut arms = Vec::new();
+        let selector_binding = self
+            .lookup
+            .expression(self.program, input)
+            .and_then(|selector| match &selector.kind {
+                CheckedExpressionKind::Read {
+                    target, projection, ..
+                } if projection.is_empty() => Some((*target, Vec::new())),
+                _ => None,
+            });
         for child in arm_ids {
             let Some(expression) = self.lookup.expression(self.program, *child).cloned() else {
                 continue;
@@ -5654,21 +5708,28 @@ impl<'a> SemanticExpressionBuilder<'a> {
             else {
                 continue;
             };
-            let value_frame = if bindings.is_empty() {
+            let mut frame_bindings = bindings
+                .iter()
+                .map(|binding| {
+                    let projection = self
+                        .lookup
+                        .pattern_binding(self.program, *binding)
+                        .ok_or(ExpansionError::MissingDeclaration(*binding))?
+                        .projection
+                        .clone();
+                    Ok((*binding, projection))
+                })
+                .collect::<Result<Vec<_>, ExpansionError>>()?;
+            if let Some(selector_binding) = &selector_binding
+                && !frame_bindings
+                    .iter()
+                    .any(|(declaration, _)| *declaration == selector_binding.0)
+            {
+                frame_bindings.push(selector_binding.clone());
+            }
+            let value_frame = if frame_bindings.is_empty() {
                 scoped.value_frame
             } else {
-                let frame_bindings = bindings
-                    .iter()
-                    .map(|binding| {
-                        let projection = self
-                            .lookup
-                            .pattern_binding(self.program, *binding)
-                            .ok_or(ExpansionError::MissingDeclaration(*binding))?
-                            .projection
-                            .clone();
-                        Ok((*binding, projection))
-                    })
-                    .collect::<Result<Vec<_>, ExpansionError>>()?;
                 Some(self.intern_select_value_frame(scoped, owner, *child, input, &frame_bindings))
             };
             arms.push(SemanticSelectArm {
@@ -5702,6 +5763,83 @@ impl<'a> SemanticExpressionBuilder<'a> {
             });
         }
         Ok(arms)
+    }
+
+    fn statically_selected_arm(
+        &self,
+        input: SemanticExprId,
+        arms: &[CheckedExprId],
+    ) -> Option<CheckedExprId> {
+        let selector = self.static_selector_value(input)?;
+        arms.iter().copied().find(|arm| {
+            self.lookup
+                .expression(self.program, *arm)
+                .and_then(|expression| match &expression.kind {
+                    CheckedExpressionKind::MatchArm { pattern, .. } => Some(pattern),
+                    _ => None,
+                })
+                .is_some_and(|pattern| selector.matches(pattern))
+        })
+    }
+
+    fn static_selector_value(&self, expression: SemanticExprId) -> Option<StaticSelectorValue> {
+        let mut expression = expression;
+        let mut projection = Vec::<String>::new();
+        let mut visited = BTreeSet::new();
+        loop {
+            if !visited.insert((expression, projection.clone())) {
+                return None;
+            }
+            let definition = self.expressions.get(expression.as_usize())?;
+            match &definition.kind {
+                SemanticExpressionKind::Project { input, fields } => {
+                    let mut combined = fields.clone();
+                    combined.extend(projection);
+                    projection = combined;
+                    expression = *input;
+                }
+                SemanticExpressionKind::Block { result, .. }
+                | SemanticExpressionKind::Flush { payload: result }
+                | SemanticExpressionKind::FlushBoundary { input: result }
+                | SemanticExpressionKind::Draining { input: result }
+                    if projection.is_empty() =>
+                {
+                    expression = *result;
+                }
+                SemanticExpressionKind::When { arms, .. }
+                    if projection.is_empty() && arms.len() == 1 =>
+                {
+                    expression = arms[0].output;
+                }
+                SemanticExpressionKind::Object(fields)
+                | SemanticExpressionKind::TaggedObject { fields, .. }
+                    if !projection.is_empty() && fields.iter().all(|field| !field.spread) =>
+                {
+                    let field = projection.remove(0);
+                    expression = fields
+                        .iter()
+                        .rev()
+                        .find(|candidate| candidate.name == field)?
+                        .value;
+                }
+                SemanticExpressionKind::Number(value) if projection.is_empty() => {
+                    return Some(StaticSelectorValue::Number(value.clone()));
+                }
+                SemanticExpressionKind::Text(value) if projection.is_empty() => {
+                    return Some(StaticSelectorValue::Text(value.clone()));
+                }
+                SemanticExpressionKind::Tag(value) if projection.is_empty() => {
+                    return Some(StaticSelectorValue::Tag(value.clone()));
+                }
+                SemanticExpressionKind::TaggedObject { tag, .. } if projection.is_empty() => {
+                    return Some(StaticSelectorValue::Tag(tag.clone()));
+                }
+                SemanticExpressionKind::Bits(value) if projection.is_empty() => {
+                    return Some(StaticSelectorValue::Bits(value.clone()));
+                }
+                _ => return None,
+            }
+        }
     }
 
     fn expand_select_arm_output(
@@ -6006,6 +6144,31 @@ impl<'a> SemanticExpressionBuilder<'a> {
             self.expressions[projected.as_usize()].flow_type.ty = erase_runtime_type_vars(&ty);
         }
         Ok(projected)
+    }
+
+    fn wrap_type_refinement(
+        &mut self,
+        expression: &CheckedExpression,
+        owner: Option<StaticOwnerId>,
+        input: SemanticExprId,
+        required: Type,
+    ) -> SemanticExprId {
+        let required = erase_runtime_type_vars(&required);
+        if matches!(required, Type::Unknown | Type::UnresolvedShape { .. })
+            || self.expressions[input.as_usize()].flow_type.ty == required
+        {
+            return input;
+        }
+        let refined = self.push(
+            expression,
+            owner,
+            SemanticExpressionKind::Project {
+                input,
+                fields: Vec::new(),
+            },
+        );
+        self.expressions[refined.as_usize()].flow_type.ty = required;
+        refined
     }
 
     fn evaluation_owner(&self, scoped: ScopedCheckedExpr) -> Option<StaticOwnerId> {
@@ -6453,6 +6616,83 @@ result:
             multiply_wrapped.expressions[multiply_wrapped_materialization.body.as_usize()].owner,
             Some(multiply_wrapped_materialization.owner)
         );
+    }
+
+    #[test]
+    fn function_contextual_source_resolves_unique_root_named_value() {
+        let graph = semantic_graph(
+            r#"
+store: [
+    rows: LIST { [value: 1] }
+]
+
+FUNCTION row_values() {
+    rows |> List/map(item, new: item.value)
+}
+
+result: row_values()
+"#,
+        );
+        assert_eq!(
+            only_materialization(&graph).operation,
+            SemanticContextualOperationKind::Map
+        );
+    }
+
+    #[test]
+    fn select_arm_forwarding_keeps_call_occurrence_refinements_isolated() {
+        semantic_graph(
+            r#"
+FUNCTION identity(value) {
+    value
+}
+
+FUNCTION choose(value) {
+    value |> WHEN {
+        First => identity(value: value)
+        __ => identity(value: value)
+    }
+}
+
+first: choose(value: First)
+second: choose(value: Second)
+"#,
+        );
+    }
+
+    #[test]
+    fn static_dispatch_does_not_expand_unselected_callable_bodies() {
+        fn dispatch_graph(branch_count: usize) -> SemanticExecutionGraphV1 {
+            let mut source = String::new();
+            for index in 0..branch_count {
+                source.push_str(&format!(
+                    "FUNCTION branch_{index}() {{\n    {index}\n}}\n\n"
+                ));
+            }
+            source.push_str("FUNCTION dispatch(choice) {\n    choice |> WHEN {\n");
+            for index in 0..branch_count {
+                source.push_str(&format!("        Choice{index} => branch_{index}()\n"));
+            }
+            source.push_str("    }\n}\n\nresult: dispatch(choice: Choice0)\n");
+            semantic_graph(&source)
+        }
+
+        let small = dispatch_graph(4);
+        let large = dispatch_graph(64);
+        assert!(large.expressions.len() <= small.expressions.len() + 4);
+        let selected = large
+            .expressions
+            .iter()
+            .find_map(|expression| match &expression.kind {
+                SemanticExpressionKind::When { arms, .. } => Some(arms),
+                _ => None,
+            })
+            .expect("static dispatcher retains its semantic selection");
+        assert_eq!(selected.len(), 1);
+        assert!(matches!(
+            &selected[0].pattern,
+            CheckedMatchPattern::Tag { name, .. } if name == "Choice0"
+        ));
     }
 
     #[test]

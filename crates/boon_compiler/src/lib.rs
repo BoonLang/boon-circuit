@@ -365,11 +365,18 @@ fn compile_parsed_to_machine_plan(
 ) -> CompilerResult<CompiledMachinePlanFromSource> {
     let lower_started = Instant::now();
     let external_types = boon_typecheck::ExternalTypeEnvironment::empty(program_role);
+    let typecheck_started = Instant::now();
     let check_output = boon_typecheck::check_runtime_program_profiled_with_external_types(
         &parsed,
         &external_types,
     )
     .0;
+    if std::env::var_os("BOON_COMPILER_LOWER_TRACE").is_some() {
+        eprintln!(
+            "boon_compiler lower typecheck: {:.3}ms",
+            elapsed_ms(typecheck_started)
+        );
+    }
     if check_output.report.has_errors() {
         let diagnostics = check_output
             .report
@@ -411,6 +418,17 @@ fn compile_parsed_to_machine_plan(
     let checked = check_output
         .program
         .ok_or_else(|| PlanError::new("typecheck produced no CheckedProgram for valid source"))?;
+    if std::env::var_os("BOON_COMPILER_LOWER_TRACE").is_some() {
+        eprintln!(
+            "boon_compiler checked_program scopes={} declarations={} statements={} expressions={} callables={} calls={}",
+            checked.scopes.len(),
+            checked.declarations.len(),
+            checked.statements.len(),
+            checked.expressions.len(),
+            checked.callables.len(),
+            checked.calls.len(),
+        );
+    }
     let ir = verify_and_lower_checked(checked, &[])?;
     let lower_ms = elapsed_ms(lower_started);
     let verify_started = Instant::now();

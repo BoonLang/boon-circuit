@@ -560,6 +560,23 @@ final packed target remains unchanged. The reconciled Phase 0 validators pass;
 the verifier grants final Phase 0 completion only from the clean committed
 revision.
 
+The current compiler-scalability recovery fixes the owning graph and manifest
+algorithms instead of extending their timeout. Static selector reachability now
+removes unselected branches before contextual expansion and OutNet
+instantiation; a 64-branch static fixture produces two call frames while the
+dynamic-selector fixture retains all alternatives. TodoMVC physical falls from
+29,949 to 2,817 OutNet call frames, and its dependency manifest falls from about
+3.08 million dependencies plus 4.18 million coverage entries to 129,662 and
+176,826 respectively. On the reference machine, a cold debug
+`boon_cli check examples/todo_mvc_physical/RUN.bn` completes in 9.08 seconds at
+693,444 KiB peak RSS, while `examples/counter.bn` completes in 0.09 seconds at
+37,100 KiB. The focused dependency-manifest suite passes all ten mutation,
+closure, ownership, and digest tests. These are development-loop measurements,
+not final release or native-performance evidence. Ordinary user-call
+preservation remains open: the same Todo fixture still has 38,202 semantic
+expressions for 4,858 checked expressions, so Phase 1 cannot exit until ordinary
+callable definitions and call edges replace recursive body cloning.
+
 A clean confirmation at `de430c1` kept the million-row charged work unchanged
 but observed 14,794,406,170 ns instead of 9,712,441,796 ns for its three-sample
 dense p95, where p95 is necessarily the sample maximum. The current diagnostic

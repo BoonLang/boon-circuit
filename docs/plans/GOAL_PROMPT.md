@@ -170,6 +170,16 @@ Execution strategy:
   slice boundaries. Run broad workspace, product, and report gates only at major
   milestones. Generate final reports only after the final tracked edit for the
   relevant milestone.
+- Keep compiler development feedback practical. Use focused debug-profile
+  checks while fixing semantics and correctness; reserve release builds and
+  end-to-end performance reports for completed milestone candidates. Never run
+  multiple Cargo builds or test suites concurrently on the reference machine.
+- Treat compiler timeouts and graph explosions as architecture failures, not as
+  requests for larger timeouts. A representative source compile that exceeds
+  120 seconds, or growth caused by eagerly retaining statically unreachable
+  branches or repeatedly cloning ordinary callable bodies, blocks the next
+  production slice until the owning compiler representation is fixed and a
+  focused scaling regression proves the correction.
 - After the same blocker class appears twice, stop tactical patching and change
   the owning parser, compiler, proof, runtime, currentness, document, renderer,
   host, persistence, physical-layout, or verifier architecture.
@@ -237,6 +247,13 @@ Phase 1: establish OUT and the verified semantic compiler spine
 - `SemanticProgram` preserves callable boundaries, OutNet, typed logical views,
   semantic ownership, complete dependency/resource manifests, WHERE obligations,
   and source provenance without carrying parser ambiguity.
+- Preserve ordinary callable identity instead of recursively cloning every user
+  function body into each call site. Expand only contextual functions and
+  transparent wrappers whose semantics require specialization; prune statically
+  unselected structural branches before OutNet, dependency-manifest, and proof
+  graph construction. Add scaling fixtures that vary call depth, call count,
+  and static branch count and assert bounded artifact growth as well as result
+  correctness.
 - Initially contract-free programs still traverse a completeness-checked
   verification gate. There is no unchecked or direct CheckedProgram-to-backend
   path.
@@ -249,8 +266,11 @@ Phase 1: establish OUT and the verified semantic compiler spine
   2,600-row window, wrapper-equivalence, default-stack, and deletion evidence.
 
 Exit: every executable path has one verified semantic source and one opaque
-`ErasedProgram` boundary, and the OUT structural/compiler slice passes. The
-full OUT Clear End Condition remains open until Phase 4.
+`ErasedProgram` boundary, the OUT structural/compiler slice passes, ordinary
+calls retain callable boundaries, static dead branches do not enter downstream
+semantic/proof graphs, and representative debug compiles complete without the
+120-second recovery timeout. The full OUT Clear End Condition remains open
+until Phase 4.
 
 Phase 2: implement universal language foundations
 

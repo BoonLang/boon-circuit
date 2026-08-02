@@ -1123,6 +1123,7 @@ dependencies = [
  "ena",
  "serde",
  "serde_json",
+ "smallvec",
  "web-time",
 ]
 

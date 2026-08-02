@@ -183,102 +183,369 @@ pub struct ParseProfile {
 
 struct ParseWorkRecorder {
     enabled: bool,
-    counters: Cell<ParseWorkCounters>,
+    source_units_attempted: Cell<usize>,
+    source_units_parsed: Cell<usize>,
+    source_bytes_inspected: Cell<usize>,
+    token_inspections: Cell<usize>,
+    symbol_inspections: Cell<usize>,
+    statement_visits: Cell<usize>,
+    expression_visits: Cell<usize>,
+    nodes_rebased: Cell<usize>,
+    validation_visits: Cell<usize>,
 }
 
 impl ParseWorkRecorder {
-    fn disabled() -> Self {
+    fn with_enabled(enabled: bool) -> Self {
         Self {
-            enabled: false,
-            counters: Cell::new(ParseWorkCounters::default()),
+            enabled,
+            source_units_attempted: Cell::new(0),
+            source_units_parsed: Cell::new(0),
+            source_bytes_inspected: Cell::new(0),
+            token_inspections: Cell::new(0),
+            symbol_inspections: Cell::new(0),
+            statement_visits: Cell::new(0),
+            expression_visits: Cell::new(0),
+            nodes_rebased: Cell::new(0),
+            validation_visits: Cell::new(0),
         }
+    }
+
+    fn disabled() -> Self {
+        Self::with_enabled(false)
     }
 
     fn enabled() -> Self {
-        Self {
-            enabled: true,
-            counters: Cell::new(ParseWorkCounters::default()),
-        }
+        Self::with_enabled(true)
     }
 
     #[inline]
-    fn update(&self, update: impl FnOnce(&mut ParseWorkCounters)) {
-        if !self.enabled {
-            return;
+    fn add(&self, counter: &Cell<usize>, count: usize) {
+        if self.enabled {
+            counter.set(counter.get().saturating_add(count));
         }
-        let mut counters = self.counters.get();
-        update(&mut counters);
-        self.counters.set(counters);
     }
 
     #[inline]
     fn source_unit_attempted(&self) {
-        self.update(|counters| {
-            counters.source_units_attempted = counters.source_units_attempted.saturating_add(1);
-        });
+        self.add(&self.source_units_attempted, 1);
     }
 
     #[inline]
     fn source_unit_parsed(&self) {
-        self.update(|counters| {
-            counters.source_units_parsed = counters.source_units_parsed.saturating_add(1);
-        });
+        self.add(&self.source_units_parsed, 1);
     }
 
     #[inline]
     fn source_bytes(&self, count: usize) {
-        self.update(|counters| {
-            counters.source_bytes_inspected = counters.source_bytes_inspected.saturating_add(count);
-        });
+        self.add(&self.source_bytes_inspected, count);
     }
 
     #[inline]
     fn tokens(&self, count: usize) {
-        self.update(|counters| {
-            counters.token_inspections = counters.token_inspections.saturating_add(count);
-        });
+        self.add(&self.token_inspections, count);
     }
 
     #[inline]
     fn symbols(&self, count: usize) {
-        self.update(|counters| {
-            counters.symbol_inspections = counters.symbol_inspections.saturating_add(count);
-        });
+        self.add(&self.symbol_inspections, count);
     }
 
     #[inline]
     fn statement(&self) {
-        self.update(|counters| {
-            counters.statement_visits = counters.statement_visits.saturating_add(1);
-        });
+        self.add(&self.statement_visits, 1);
     }
 
     #[inline]
     fn expression(&self) {
-        self.update(|counters| {
-            counters.expression_visits = counters.expression_visits.saturating_add(1);
-        });
+        self.add(&self.expression_visits, 1);
     }
 
     #[inline]
     fn rebased_node(&self) {
-        self.update(|counters| {
-            counters.nodes_rebased = counters.nodes_rebased.saturating_add(1);
-        });
+        self.add(&self.nodes_rebased, 1);
     }
 
     #[inline]
     fn validation(&self) {
-        self.update(|counters| {
-            counters.validation_visits = counters.validation_visits.saturating_add(1);
-        });
+        self.add(&self.validation_visits, 1);
     }
 
     fn finish(&self) -> ParseProfile {
         ParseProfile {
-            work_counters: self.counters.get(),
+            work_counters: ParseWorkCounters {
+                source_units_attempted: self.source_units_attempted.get(),
+                source_units_parsed: self.source_units_parsed.get(),
+                source_bytes_inspected: self.source_bytes_inspected.get(),
+                token_inspections: self.token_inspections.get(),
+                symbol_inspections: self.symbol_inspections.get(),
+                statement_visits: self.statement_visits.get(),
+                expression_visits: self.expression_visits.get(),
+                nodes_rebased: self.nodes_rebased.get(),
+                validation_visits: self.validation_visits.get(),
+            },
         }
     }
+}
+
+/// Ephemeral facts shared by the ordered parser validation pipeline.
+///
+/// This index is deliberately neither serialized nor retained by
+/// `ParsedProgram`: it removes repeated document-mask and source-token scans
+/// while the existing validator call order remains the diagnostic authority.
+struct ValidationIndex {
+    semantic_token_ids: Box<[usize]>,
+    semantic_token_line_ranges: Box<[(usize, usize)]>,
+    semantic_item_ids: Box<[usize]>,
+    drain_token_ids: Box<[usize]>,
+    text_literal_spans: Box<[(usize, usize)]>,
+    list_sites: Box<[(usize, usize)]>,
+    bits_sites: Box<[(usize, usize)]>,
+    bytes_sites: Box<[(usize, usize)]>,
+    bits_encoded_spans: Box<[(usize, usize)]>,
+}
+
+#[derive(Clone, Copy)]
+enum ValidationIndexScope {
+    Boundary,
+    Full,
+}
+
+impl ValidationIndex {
+    fn build(ast: &AstProgram, work: &ParseWorkRecorder) -> Self {
+        Self::build_scoped(ast, work, ValidationIndexScope::Full)
+    }
+
+    fn build_boundary(ast: &AstProgram, work: &ParseWorkRecorder) -> Self {
+        Self::build_scoped(ast, work, ValidationIndexScope::Boundary)
+    }
+
+    fn build_scoped(
+        ast: &AstProgram,
+        work: &ParseWorkRecorder,
+        scope: ValidationIndexScope,
+    ) -> Self {
+        let document_lines = document_line_mask_with_work(ast, work);
+        let mut text_literal_spans = ast
+            .expressions
+            .iter()
+            .filter_map(|expression| {
+                work.expression();
+                work.validation();
+                matches!(expression.kind, AstExprKind::TextLiteral(_))
+                    .then_some((expression.start, expression.end))
+            })
+            .collect::<Vec<_>>();
+        text_literal_spans.extend(text_literal_token_spans_with_work(&ast.tokens, work));
+        let text_literal_spans = normalized_source_spans(text_literal_spans).into_boxed_slice();
+
+        if matches!(scope, ValidationIndexScope::Boundary) {
+            let semantic_item_ids = ast
+                .items
+                .iter()
+                .enumerate()
+                .find_map(|(item_id, item)| {
+                    work.validation();
+                    (!document_lines.get(item.line).copied().unwrap_or(false)).then_some(item_id)
+                })
+                .into_iter()
+                .collect::<Vec<_>>()
+                .into_boxed_slice();
+            return Self {
+                semantic_token_ids: Box::new([]),
+                semantic_token_line_ranges: Box::new([]),
+                semantic_item_ids,
+                drain_token_ids: Box::new([]),
+                text_literal_spans,
+                list_sites: Box::new([]),
+                bits_sites: Box::new([]),
+                bytes_sites: Box::new([]),
+                bits_encoded_spans: Box::new([]),
+            };
+        }
+
+        let maximum_line = ast
+            .tokens
+            .last()
+            .map_or(0, |token| token.line)
+            .max(ast.lines.last().map_or(0, |line| line.line));
+        let mut semantic_token_ids = Vec::new();
+        let mut semantic_token_line_ranges = vec![(usize::MAX, usize::MAX); maximum_line + 1];
+        let mut drain_token_ids = Vec::new();
+        for (token_id, token) in ast.tokens.iter().enumerate() {
+            work.tokens(1);
+            work.validation();
+            if !matches!(token.kind, AstTokenKind::Comment | AstTokenKind::String)
+                && !document_lines.get(token.line).copied().unwrap_or(false)
+            {
+                let position = semantic_token_ids.len();
+                semantic_token_ids.push(token_id);
+                if let Some((start, end)) = semantic_token_line_ranges.get_mut(token.line) {
+                    if *start == usize::MAX {
+                        *start = position;
+                    }
+                    *end = position + 1;
+                }
+            }
+            if !matches!(token.kind, AstTokenKind::Comment | AstTokenKind::Newline) {
+                let containing_text =
+                    containing_source_span(&text_literal_spans, token.start, token.end);
+                if containing_text.is_none_or(|(start, _)| token.start == start) {
+                    drain_token_ids.push(token_id);
+                }
+            }
+        }
+
+        let mut list_sites = Vec::new();
+        for (line_id, line) in ast.lines.iter().enumerate() {
+            work.validation();
+            if line.symbols.is_empty() || document_lines.get(line.line).copied().unwrap_or(false) {
+                continue;
+            }
+            work.symbols(line.symbols.len());
+            if let Some(list_index) = line.symbols.iter().position(|lexeme| lexeme == "LIST") {
+                list_sites.push((line_id, list_index));
+            }
+        }
+
+        let mut semantic_item_ids = Vec::new();
+        let mut bits_sites = Vec::new();
+        let mut bytes_sites = Vec::new();
+        for (item_id, item) in ast.items.iter().enumerate() {
+            work.validation();
+            if !document_lines.get(item.line).copied().unwrap_or(false) {
+                semantic_item_ids.push(item_id);
+            }
+            work.symbols(item.symbols.len());
+            for (symbol_index, symbol) in item.symbols.iter().enumerate() {
+                match symbol.as_str() {
+                    "BITS" => bits_sites.push((item_id, symbol_index)),
+                    "BYTES" => bytes_sites.push((item_id, symbol_index)),
+                    _ => {}
+                }
+            }
+        }
+
+        let bits_encoded_spans = bits_sites
+            .iter()
+            .filter_map(|(item_id, bits_index)| {
+                let item = ast.items.get(*item_id)?;
+                parse_bits_literal_tokens(bits_literal_tokens_at(&item.symbols, *bits_index))
+                    .ok()
+                    .and_then(|(_, _, _, base_index, suffix_index)| {
+                        Some((
+                            item.symbol_spans.get(*bits_index + base_index)?.0,
+                            item.symbol_spans.get(*bits_index + suffix_index)?.1,
+                        ))
+                    })
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+
+        Self {
+            semantic_token_ids: semantic_token_ids.into_boxed_slice(),
+            semantic_token_line_ranges: semantic_token_line_ranges.into_boxed_slice(),
+            semantic_item_ids: semantic_item_ids.into_boxed_slice(),
+            drain_token_ids: drain_token_ids.into_boxed_slice(),
+            text_literal_spans,
+            list_sites: list_sites.into_boxed_slice(),
+            bits_sites: bits_sites.into_boxed_slice(),
+            bytes_sites: bytes_sites.into_boxed_slice(),
+            bits_encoded_spans,
+        }
+    }
+
+    fn semantic_tokens<'a>(
+        &'a self,
+        ast: &'a AstProgram,
+    ) -> impl Iterator<Item = &'a AstToken> + 'a {
+        self.semantic_token_ids
+            .iter()
+            .filter_map(|index| ast.tokens.get(*index))
+    }
+
+    fn semantic_items<'a>(
+        &'a self,
+        ast: &'a AstProgram,
+    ) -> impl Iterator<Item = &'a ParserItem> + 'a {
+        self.semantic_item_ids
+            .iter()
+            .filter_map(|index| ast.items.get(*index))
+    }
+
+    fn semantic_tokens_on_line<'a>(
+        &'a self,
+        ast: &'a AstProgram,
+        line: usize,
+    ) -> impl Iterator<Item = &'a AstToken> + 'a {
+        let range = self
+            .semantic_token_line_ranges
+            .get(line)
+            .copied()
+            .filter(|(start, end)| *start != usize::MAX && *end != usize::MAX)
+            .unwrap_or((0, 0));
+        self.semantic_token_ids[range.0..range.1]
+            .iter()
+            .filter_map(|index| ast.tokens.get(*index))
+    }
+
+    fn drain_tokens<'a>(&'a self, ast: &'a AstProgram) -> impl Iterator<Item = &'a AstToken> + 'a {
+        self.drain_token_ids
+            .iter()
+            .filter_map(|index| ast.tokens.get(*index))
+    }
+
+    fn token_at_start<'a>(
+        &self,
+        ast: &'a AstProgram,
+        start: usize,
+        work: &ParseWorkRecorder,
+    ) -> Option<&'a AstToken> {
+        let mut left = 0usize;
+        let mut right = ast.tokens.len();
+        while left < right {
+            let middle = left + (right - left) / 2;
+            work.tokens(1);
+            work.validation();
+            if ast.tokens[middle].start < start {
+                left = middle + 1;
+            } else {
+                right = middle;
+            }
+        }
+        ast.tokens.get(left).filter(|token| token.start == start)
+    }
+}
+
+fn document_line_mask_with_work(ast: &AstProgram, work: &ParseWorkRecorder) -> Vec<bool> {
+    fn mark(statement: &AstStatement, lines: &mut [bool], work: &ParseWorkRecorder) {
+        work.statement();
+        work.validation();
+        if let Some(line) = lines.get_mut(statement.line) {
+            *line = true;
+        }
+        for child in &statement.children {
+            mark(child, lines, work);
+        }
+    }
+
+    let Some(document) = ast.statements.iter().find(|statement| {
+        work.statement();
+        work.validation();
+        matches!(
+            &statement.kind,
+            AstStatementKind::Field { name } if name == "document"
+        )
+    }) else {
+        return Vec::new();
+    };
+    let maximum_line = ast
+        .tokens
+        .last()
+        .map_or(document.line, |token| token.line)
+        .max(document.line);
+    let mut lines = vec![false; maximum_line.saturating_add(1)];
+    mark(document, &mut lines, work);
+    lines
 }
 
 /// Parses one source unit without applying entrypoint/module context.
@@ -318,15 +585,16 @@ fn parse_source_unit_with_work(
     let path = source_unit_id.as_str().to_owned();
     reject_reserved_module_path(&path)?;
 
-    let parsed = parse_normalized_source_unit_syntax(
+    let (parsed, validation_index) = parse_normalized_source_unit_syntax(
         source_unit_id,
         source,
         ParserTrace::from_environment(),
+        ValidationIndexScope::Full,
         work,
     )?;
-    validate_source_syntax_with_work(&parsed.path, &parsed.ast, work)?;
-    validate_list_capacities_with_work(&parsed.path, &parsed.ast, work)?;
-    validate_no_hidden_identity_leak_with_work(&parsed.path, &parsed.ast, work)?;
+    validate_source_syntax_with_work(&parsed.path, &parsed.ast, &validation_index, work)?;
+    validate_list_capacities_with_work(&parsed.path, &parsed.ast, &validation_index, work)?;
+    validate_no_hidden_identity_leak_with_work(&parsed.path, &parsed.ast, &validation_index, work)?;
     Ok(parsed)
 }
 
@@ -339,22 +607,28 @@ fn parse_normalized_source_unit_syntax(
     source_unit_id: SourceUnitId,
     source: String,
     trace: ParserTrace,
+    validation_scope: ValidationIndexScope,
     work: &ParseWorkRecorder,
-) -> Result<ParsedSourceUnit, ParseError> {
+) -> Result<(ParsedSourceUnit, ValidationIndex), ParseError> {
     let path = source_unit_id.as_str().to_owned();
     let ast = parse_ast_traced(&path, &source, trace, work)?;
-    validate_source_unit_boundary_with_work(&path, &source, &ast, work)?;
+    let validation_index = match validation_scope {
+        ValidationIndexScope::Boundary => ValidationIndex::build_boundary(&ast, work),
+        ValidationIndexScope::Full => ValidationIndex::build(&ast, work),
+    };
+    validate_source_unit_boundary_with_work(&path, &source, &ast, &validation_index, work)?;
     let declared_functions = collect_raw_declared_functions_with_work(&ast.statements, work);
     work.source_unit_parsed();
 
-    Ok(ParsedSourceUnit::from_parser_fields(
-        ParsedSourceUnitFields {
+    Ok((
+        ParsedSourceUnit::from_parser_fields(ParsedSourceUnitFields {
             source_unit_id,
             path,
             source,
             ast,
             declared_functions,
-        },
+        }),
+        validation_index,
     ))
 }
 
@@ -1235,14 +1509,15 @@ fn assemble_canonical_parsed_source_units(
         statements,
         expressions: expressions.into(),
     };
+    let validation_index = ValidationIndex::build(&ast, work);
     let validations_started = trace.start();
     let kind = (|| {
-        validate_source_syntax_with_work(&entrypoint, &ast, work)?;
+        validate_source_syntax_with_work(&entrypoint, &ast, &validation_index, work)?;
         validate_balanced_brackets_with_work(&entrypoint, &ast, work)?;
-        validate_list_capacities_with_work(&entrypoint, &ast, work)?;
-        validate_no_reducer_style_update_with_work(&entrypoint, &ast, work)?;
+        validate_list_capacities_with_work(&entrypoint, &ast, &validation_index, work)?;
+        validate_no_reducer_style_update_with_work(&entrypoint, &ast, &validation_index, work)?;
         let kind = detect_program_kind();
-        validate_no_hidden_identity_leak_with_work(&entrypoint, &ast, work)?;
+        validate_no_hidden_identity_leak_with_work(&entrypoint, &ast, &validation_index, work)?;
         Ok::<_, ParseError>(kind)
     })()
     .map_err(|error| project_source_error(error, &entrypoint, &files))?;
@@ -1259,8 +1534,8 @@ fn assemble_canonical_parsed_source_units(
             )
         },
     );
-    let functions = collect_functions_with_work(&ast, work);
-    let operators = collect_operators_with_work(&ast, work);
+    let functions = collect_functions_with_work(&ast, &validation_index, work);
+    let operators = collect_operators_with_work(&ast, &validation_index, work);
     let expressions = ast.expressions.clone();
     let parsed = ParsedProgram::from_parser_fields(ParsedProgramFields {
         source_bundle_digest_v1,
@@ -1318,8 +1593,10 @@ fn parse_canonical_source_bundle(
                 source_unit_id,
                 unit.source().to_owned(),
                 trace,
+                ValidationIndexScope::Boundary,
                 work,
             )
+            .map(|(unit, _validation_index)| unit)
         })
         .collect::<Result<Vec<_>, ParseError>>()?;
     trace.phase(
@@ -1542,9 +1819,11 @@ pub fn format_source_unit(
     let path = path.into();
     let source = source.into();
     let ast = parse_ast(&path, &source)?;
-    validate_source_syntax(&path, &ast)?;
-    validate_balanced_brackets(&path, &ast)?;
-    validate_list_capacities(&path, &ast)?;
+    let work = ParseWorkRecorder::disabled();
+    let validation_index = ValidationIndex::build(&ast, &work);
+    validate_source_syntax_with_work(&path, &ast, &validation_index, &work)?;
+    validate_balanced_brackets_with_work(&path, &ast, &work)?;
+    validate_list_capacities_with_work(&path, &ast, &validation_index, &work)?;
     Ok(format_source_text(&source))
 }
 
@@ -4810,32 +5089,19 @@ fn detect_program_kind() -> ProgramKind {
     ProgramKind::Generic
 }
 
-fn validate_source_syntax(path: &str, ast: &AstProgram) -> Result<(), ParseError> {
-    validate_source_syntax_with_work(path, ast, &ParseWorkRecorder::disabled())
-}
-
 fn validate_source_syntax_with_work(
     path: &str,
     ast: &AstProgram,
+    validation_index: &ValidationIndex,
     work: &ParseWorkRecorder,
 ) -> Result<(), ParseError> {
     let example_source = path.contains("/examples/") || path.starts_with("examples/");
-    let mut text_literal_spans = ast
-        .expressions
-        .iter()
-        .filter_map(|expr| {
-            work.expression();
-            work.validation();
-            matches!(expr.kind, AstExprKind::TextLiteral(_)).then_some((expr.start, expr.end))
-        })
-        .collect::<Vec<_>>();
-    text_literal_spans.extend(text_literal_token_spans_with_work(&ast.tokens, work));
-    let text_literal_spans = normalized_source_spans(text_literal_spans);
     for token in &ast.tokens {
         work.tokens(1);
         work.validation();
         if matches!(token.kind, AstTokenKind::String | AstTokenKind::Comment)
-            || containing_source_span(&text_literal_spans, token.start, token.end).is_some()
+            || containing_source_span(&validation_index.text_literal_spans, token.start, token.end)
+                .is_some()
         {
             continue;
         }
@@ -4950,9 +5216,9 @@ fn validate_source_syntax_with_work(
             ));
         }
     }
-    validate_drain_syntax(path, ast, &text_literal_spans, work)?;
-    validate_bits_syntax(path, ast, &text_literal_spans, work)?;
-    validate_bytes_syntax(path, ast, &text_literal_spans, work)?;
+    validate_drain_syntax(path, ast, validation_index, work)?;
+    validate_bits_syntax(path, ast, validation_index, work)?;
+    validate_bytes_syntax(path, ast, validation_index, work)?;
     Ok(())
 }
 
@@ -5233,23 +5499,10 @@ fn validate_role_qualified_value_syntax(
 fn validate_drain_syntax(
     path: &str,
     ast: &AstProgram,
-    text_literal_spans: &[(usize, usize)],
+    validation_index: &ValidationIndex,
     work: &ParseWorkRecorder,
 ) -> Result<(), ParseError> {
-    let tokens = ast
-        .tokens
-        .iter()
-        .filter(|token| {
-            work.tokens(1);
-            work.validation();
-            if matches!(token.kind, AstTokenKind::Comment | AstTokenKind::Newline) {
-                return false;
-            }
-            let containing_text =
-                containing_source_span(text_literal_spans, token.start, token.end);
-            containing_text.is_none_or(|(start, _)| token.start == start)
-        })
-        .collect::<Vec<_>>();
+    let tokens = validation_index.drain_tokens(ast).collect::<Vec<_>>();
 
     let mut index = 0usize;
     while let Some(token) = tokens.get(index) {
@@ -5409,10 +5662,9 @@ fn draining_has_trailing_pipeline_syntax(
 fn validate_bytes_syntax(
     path: &str,
     ast: &AstProgram,
-    text_literal_spans: &[(usize, usize)],
+    validation_index: &ValidationIndex,
     work: &ParseWorkRecorder,
 ) -> Result<(), ParseError> {
-    let bits_encoded_spans = bits_literal_encoded_spans(ast, work);
     for window in ast.tokens.windows(2) {
         work.tokens(window.len());
         work.validation();
@@ -5429,10 +5681,18 @@ fn validate_bytes_syntax(
                 suffix_token.kind,
                 AstTokenKind::Comment | AstTokenKind::String | AstTokenKind::Newline
             )
-            || containing_source_span(text_literal_spans, base_token.start, base_token.end)
-                .is_some()
-            || containing_source_span(text_literal_spans, suffix_token.start, suffix_token.end)
-                .is_some()
+            || containing_source_span(
+                &validation_index.text_literal_spans,
+                base_token.start,
+                base_token.end,
+            )
+            .is_some()
+            || containing_source_span(
+                &validation_index.text_literal_spans,
+                suffix_token.start,
+                suffix_token.end,
+            )
+            .is_some()
         {
             continue;
         }
@@ -5440,7 +5700,8 @@ fn validate_bytes_syntax(
         {
             continue;
         }
-        if bits_encoded_spans
+        if validation_index
+            .bits_encoded_spans
             .iter()
             .any(|(start, end)| base_token.start == *start && suffix_token.end == *end)
         {
@@ -5449,38 +5710,20 @@ fn validate_bytes_syntax(
         parse_byte_literal_parts(&base_token.lexeme, &suffix_token.lexeme)
             .map_err(|message| error(path, base_token.line, base_token.column, message.as_str()))?;
     }
-    for item in &ast.items {
+    for (item_id, bytes_index) in &validation_index.bytes_sites {
+        let Some(item) = ast.items.get(*item_id) else {
+            continue;
+        };
         work.validation();
-        work.symbols(item.symbols.len());
-        validate_bytes_item_syntax(path, ast, item, text_literal_spans, work)?;
+        validate_bytes_site_syntax(
+            path,
+            item,
+            *bytes_index,
+            &validation_index.text_literal_spans,
+            work,
+        )?;
     }
     Ok(())
-}
-
-fn bits_literal_encoded_spans(ast: &AstProgram, work: &ParseWorkRecorder) -> Vec<(usize, usize)> {
-    ast.items
-        .iter()
-        .flat_map(|item| {
-            work.validation();
-            work.symbols(item.symbols.len());
-            item.symbols
-                .iter()
-                .enumerate()
-                .filter_map(|(bits_index, symbol)| {
-                    work.symbols(1);
-                    (symbol == "BITS").then(|| {
-                        parse_bits_literal_tokens(bits_literal_tokens_at(&item.symbols, bits_index))
-                            .ok()
-                            .and_then(|(_, _, _, base_index, suffix_index)| {
-                                Some((
-                                    item.symbol_spans.get(bits_index + base_index)?.0,
-                                    item.symbol_spans.get(bits_index + suffix_index)?.1,
-                                ))
-                            })
-                    })?
-                })
-        })
-        .collect()
 }
 
 fn bits_literal_tokens_at(symbols: &[String], bits_index: usize) -> &[String] {
@@ -5498,148 +5741,121 @@ fn bits_literal_tokens_at(symbols: &[String], bits_index: usize) -> &[String] {
 fn validate_bits_syntax(
     path: &str,
     ast: &AstProgram,
-    text_literal_spans: &[(usize, usize)],
+    validation_index: &ValidationIndex,
     work: &ParseWorkRecorder,
 ) -> Result<(), ParseError> {
-    for item in &ast.items {
+    for (item_id, bits_index) in &validation_index.bits_sites {
+        let Some(item) = ast.items.get(*item_id) else {
+            continue;
+        };
         work.validation();
-        work.symbols(item.symbols.len());
-        for bits_index in item
-            .symbols
-            .iter()
-            .enumerate()
-            .filter_map(|(index, symbol)| {
-                work.symbols(1);
-                (symbol == "BITS").then_some(index)
-            })
+        let token_start = item
+            .symbol_spans
+            .get(*bits_index)
+            .map(|(start, _)| *start)
+            .unwrap_or(item.start);
+        if containing_source_span(
+            &validation_index.text_literal_spans,
+            token_start,
+            token_start,
+        )
+        .is_some()
         {
-            let token_start = item
-                .symbol_spans
-                .get(bits_index)
-                .map(|(start, _)| *start)
-                .unwrap_or(item.start);
-            if containing_source_span(text_literal_spans, token_start, token_start).is_some() {
-                continue;
-            }
-            let literal = bits_literal_tokens_at(&item.symbols, bits_index);
-            work.symbols(literal.len());
-            let (_, radix, digits, base_index, suffix_index) =
-                parse_bits_literal_tokens(literal)
-                    .map_err(|message| error(path, item.line, item.indent + 1, message.as_str()))?;
-            let base_span = item
-                .symbol_spans
-                .get(bits_index + base_index)
-                .ok_or_else(|| {
-                    error(
-                        path,
-                        item.line,
-                        item.indent + 1,
-                        "BITS literal base token is unavailable",
-                    )
-                })?;
-            let suffix_span = item
-                .symbol_spans
-                .get(bits_index + suffix_index)
-                .ok_or_else(|| {
-                    error(
-                        path,
-                        item.line,
-                        item.indent + 1,
-                        "BITS literal digit token is unavailable",
-                    )
-                })?;
-            let base_token = ast
-                .tokens
-                .iter()
-                .find(|token| {
-                    work.tokens(1);
-                    work.validation();
-                    token.start == base_span.0
-                })
-                .ok_or_else(|| {
-                    error(
-                        path,
-                        item.line,
-                        item.indent + 1,
-                        "BITS literal base source token is unavailable",
-                    )
-                })?;
-            if base_token
-                .start
-                .checked_add(base_token.lexeme.len())
-                .is_none_or(|end| end != suffix_span.0)
-            {
-                return Err(error(
+            continue;
+        }
+        let literal = bits_literal_tokens_at(&item.symbols, *bits_index);
+        work.symbols(literal.len());
+        let (_, radix, digits, base_index, suffix_index) = parse_bits_literal_tokens(literal)
+            .map_err(|message| error(path, item.line, item.indent + 1, message.as_str()))?;
+        let base_span = item
+            .symbol_spans
+            .get(*bits_index + base_index)
+            .ok_or_else(|| {
+                error(
                     path,
                     item.line,
                     item.indent + 1,
-                    "BITS body must contain one adjacent encoded integer token such as `2u1010`; whitespace and fragments are invalid",
-                ));
-            }
-            let _ = (radix, digits);
+                    "BITS literal base token is unavailable",
+                )
+            })?;
+        let suffix_span = item
+            .symbol_spans
+            .get(*bits_index + suffix_index)
+            .ok_or_else(|| {
+                error(
+                    path,
+                    item.line,
+                    item.indent + 1,
+                    "BITS literal digit token is unavailable",
+                )
+            })?;
+        let base_token = validation_index
+            .token_at_start(ast, base_span.0, work)
+            .ok_or_else(|| {
+                error(
+                    path,
+                    item.line,
+                    item.indent + 1,
+                    "BITS literal base source token is unavailable",
+                )
+            })?;
+        if base_token
+            .start
+            .checked_add(base_token.lexeme.len())
+            .is_none_or(|end| end != suffix_span.0)
+        {
+            return Err(error(
+                path,
+                item.line,
+                item.indent + 1,
+                "BITS body must contain one adjacent encoded integer token such as `2u1010`; whitespace and fragments are invalid",
+            ));
         }
+        let _ = (radix, digits);
     }
     Ok(())
 }
 
-fn validate_bytes_item_syntax(
+fn validate_bytes_site_syntax(
     path: &str,
-    _ast: &AstProgram,
     item: &ParserItem,
+    bytes_index: usize,
     text_literal_spans: &[(usize, usize)],
     work: &ParseWorkRecorder,
 ) -> Result<(), ParseError> {
-    for bytes_index in item
-        .symbols
-        .iter()
-        .enumerate()
-        .filter_map(|(index, symbol)| {
-            work.symbols(1);
-            (symbol == "BYTES").then_some(index)
-        })
-    {
-        let token_start = item
-            .symbol_spans
-            .get(bytes_index)
-            .map(|(start, _)| *start)
-            .unwrap_or(item.start);
-        if containing_source_span(text_literal_spans, token_start, token_start).is_some() {
-            continue;
+    let token_start = item
+        .symbol_spans
+        .get(bytes_index)
+        .map(|(start, _)| *start)
+        .unwrap_or(item.start);
+    if containing_source_span(text_literal_spans, token_start, token_start).is_some() {
+        return Ok(());
+    }
+    match item.symbols.get(bytes_index + 1).map(String::as_str) {
+        Some("{") => {
+            validate_bytes_body_consumption(path, item, bytes_index + 1, work)?;
         }
-        match item.symbols.get(bytes_index + 1).map(String::as_str) {
-            Some("{") => {
-                validate_bytes_body_consumption(path, item, bytes_index + 1, work)?;
+        Some("[") => {
+            let Some(close) = matching_close(&item.symbols, bytes_index + 1) else {
+                return Err(error(
+                    path,
+                    item.line,
+                    item.indent + 1,
+                    "BYTES size is missing closing `]`",
+                ));
+            };
+            let size_tokens = &item.symbols[bytes_index + 2..close];
+            let valid_size =
+                matches!(size_tokens, [value] if value == "__" || value.parse::<usize>().is_ok());
+            if !valid_size {
+                return Err(error(
+                    path,
+                    item.line,
+                    item.indent + 1,
+                    "BYTES size must be `__` or a non-negative decimal integer in v1",
+                ));
             }
-            Some("[") => {
-                let Some(close) = matching_close(&item.symbols, bytes_index + 1) else {
-                    return Err(error(
-                        path,
-                        item.line,
-                        item.indent + 1,
-                        "BYTES size is missing closing `]`",
-                    ));
-                };
-                let size_tokens = &item.symbols[bytes_index + 2..close];
-                let valid_size = matches!(size_tokens, [value] if value == "__" || value.parse::<usize>().is_ok());
-                if !valid_size {
-                    return Err(error(
-                        path,
-                        item.line,
-                        item.indent + 1,
-                        "BYTES size must be `__` or a non-negative decimal integer in v1",
-                    ));
-                }
-                if item.symbols.get(close + 1).map(String::as_str) != Some("{") {
-                    return Err(error(
-                        path,
-                        item.line,
-                        item.indent + 1,
-                        "BYTES constructor requires a `{ ... }` body",
-                    ));
-                }
-                validate_bytes_body_consumption(path, item, close + 1, work)?;
-            }
-            _ => {
+            if item.symbols.get(close + 1).map(String::as_str) != Some("{") {
                 return Err(error(
                     path,
                     item.line,
@@ -5647,6 +5863,15 @@ fn validate_bytes_item_syntax(
                     "BYTES constructor requires a `{ ... }` body",
                 ));
             }
+            validate_bytes_body_consumption(path, item, close + 1, work)?;
+        }
+        _ => {
+            return Err(error(
+                path,
+                item.line,
+                item.indent + 1,
+                "BYTES constructor requires a `{ ... }` body",
+            ));
         }
     }
     Ok(())
@@ -5799,10 +6024,11 @@ fn validate_source_unit_boundary_with_work(
     path: &str,
     source: &str,
     ast: &AstProgram,
+    validation_index: &ValidationIndex,
     work: &ParseWorkRecorder,
 ) -> Result<(), ParseError> {
     validate_balanced_brackets_with_work(path, ast, work)?;
-    if let Some(item) = ast.semantic_parser_items().next() {
+    if let Some(item) = validation_index.semantic_items(ast).next() {
         work.symbols(item.symbols.len());
         work.validation();
         let indentation = source
@@ -5822,23 +6048,13 @@ fn validate_source_unit_boundary_with_work(
         }
     }
 
-    let mut text_literal_spans = ast
-        .expressions
-        .iter()
-        .filter_map(|expr| {
-            work.expression();
-            work.validation();
-            matches!(expr.kind, AstExprKind::TextLiteral(_)).then_some((expr.start, expr.end))
-        })
-        .collect::<Vec<_>>();
-    text_literal_spans.extend(text_literal_token_spans_with_work(&ast.tokens, work));
-    let text_literal_spans = normalized_source_spans(text_literal_spans);
     for token in &ast.tokens {
         work.tokens(1);
         work.validation();
         if token.kind != AstTokenKind::Unknown
             || token.lexeme != "\""
-            || containing_source_span(&text_literal_spans, token.start, token.end).is_some()
+            || containing_source_span(&validation_index.text_literal_spans, token.start, token.end)
+                .is_some()
         {
             continue;
         }
@@ -5858,10 +6074,6 @@ fn validate_source_unit_boundary_with_work(
         ));
     }
     Ok(())
-}
-
-fn validate_balanced_brackets(path: &str, ast: &AstProgram) -> Result<(), ParseError> {
-    validate_balanced_brackets_with_work(path, ast, &ParseWorkRecorder::disabled())
 }
 
 fn validate_balanced_brackets_with_work(
@@ -5910,28 +6122,25 @@ fn validate_balanced_brackets_with_work(
     }
 }
 
-fn validate_list_capacities(path: &str, ast: &AstProgram) -> Result<(), ParseError> {
-    validate_list_capacities_with_work(path, ast, &ParseWorkRecorder::disabled())
-}
-
 fn validate_list_capacities_with_work(
     path: &str,
     ast: &AstProgram,
+    validation_index: &ValidationIndex,
     work: &ParseWorkRecorder,
 ) -> Result<(), ParseError> {
-    for line in ast.semantic_parser_lines() {
-        work.symbols(line.symbols.len());
-        work.validation();
-        let Some(list_index) = line.symbols.iter().position(|lexeme| lexeme == "LIST") else {
+    for (line_id, list_index) in &validation_index.list_sites {
+        let Some(line) = ast.lines.get(*line_id) else {
             continue;
         };
-        if line.symbols.get(list_index + 1).map(String::as_str) != Some("[") {
+        work.validation();
+        if line.symbols.get(*list_index + 1).map(String::as_str) != Some("[") {
             continue;
         }
-        let capacity_column = ast_token_for_parser_line_symbol(ast, line, list_index + 2)
-            .map(|token| token.column)
-            .unwrap_or(line.indent + 1);
-        let Some(close_offset) = line.symbols[list_index + 2..]
+        let capacity_column =
+            ast_token_for_parser_line_symbol(ast, validation_index, line, *list_index + 2)
+                .map(|token| token.column)
+                .unwrap_or(line.indent + 1);
+        let Some(close_offset) = line.symbols[*list_index + 2..]
             .iter()
             .position(|lexeme| lexeme == "]")
         else {
@@ -5942,7 +6151,7 @@ fn validate_list_capacities_with_work(
                 "LIST capacity is missing closing `]`",
             ));
         };
-        let capacity_parts = &line.symbols[list_index + 2..list_index + 2 + close_offset];
+        let capacity_parts = &line.symbols[*list_index + 2..*list_index + 2 + close_offset];
         if capacity_parts.len() != 1
             || capacity_parts
                 .first()
@@ -5973,9 +6182,10 @@ fn validate_list_capacities_with_work(
 fn validate_no_reducer_style_update_with_work(
     path: &str,
     ast: &AstProgram,
+    validation_index: &ValidationIndex,
     work: &ParseWorkRecorder,
 ) -> Result<(), ParseError> {
-    if ast.semantic_parser_items().any(|item| {
+    if validation_index.semantic_items(ast).any(|item| {
         work.symbols(item.symbols.len());
         work.validation();
         reducer_update_signature(item)
@@ -5987,12 +6197,12 @@ fn validate_no_reducer_style_update_with_work(
             message: "central reducer `FUNCTION update(state, event)` is not allowed; define local HOLD equations for each value".to_owned(),
         });
     }
-    let has_event_source_when = ast.semantic_parser_items().any(|item| {
+    let has_event_source_when = validation_index.semantic_items(ast).any(|item| {
         work.symbols(item.symbols.len());
         work.validation();
         item.contains_sequence(&["event", ".", "source", "|>", "WHEN"])
     });
-    let has_state_pipe = ast.semantic_parser_items().any(|item| {
+    let has_state_pipe = validation_index.semantic_items(ast).any(|item| {
         work.symbols(item.symbols.len());
         work.validation();
         item.contains_sequence(&["state", "|>"])
@@ -6017,9 +6227,10 @@ fn reducer_update_signature(item: &ParserItem) -> bool {
 fn validate_no_hidden_identity_leak_with_work(
     path: &str,
     ast: &AstProgram,
+    validation_index: &ValidationIndex,
     work: &ParseWorkRecorder,
 ) -> Result<(), ParseError> {
-    for token in ast.semantic_tokens() {
+    for token in validation_index.semantic_tokens(ast) {
         work.tokens(1);
         work.validation();
         if let Some(needle) = hidden_runtime_identity_token(&token.lexeme) {
@@ -6031,7 +6242,7 @@ fn validate_no_hidden_identity_leak_with_work(
             });
         }
     }
-    for item in ast.semantic_parser_items() {
+    for item in validation_index.semantic_items(ast) {
         work.symbols(item.symbols.len());
         work.validation();
         if item.field.as_deref() == Some("alive") {
@@ -6189,16 +6400,22 @@ fn is_operator_lexeme(lexeme: &str) -> bool {
 
 fn ast_token_for_parser_line_symbol<'a>(
     ast: &'a AstProgram,
+    validation_index: &'a ValidationIndex,
     line: &ParserLine,
     lexeme_index: usize,
 ) -> Option<&'a AstToken> {
-    ast.semantic_tokens()
-        .filter(|token| token.line == line.line)
+    validation_index
+        .semantic_tokens_on_line(ast, line.line)
         .nth(lexeme_index)
 }
 
-fn collect_functions_with_work(ast: &AstProgram, work: &ParseWorkRecorder) -> Vec<String> {
-    ast.semantic_parser_items()
+fn collect_functions_with_work(
+    ast: &AstProgram,
+    validation_index: &ValidationIndex,
+    work: &ParseWorkRecorder,
+) -> Vec<String> {
+    validation_index
+        .semantic_items(ast)
         .filter_map(|item| {
             work.symbols(item.symbols.len());
             item.function.clone()
@@ -6230,9 +6447,13 @@ fn collect_raw_declared_functions_with_work(
     functions
 }
 
-fn collect_operators_with_work(ast: &AstProgram, work: &ParseWorkRecorder) -> Vec<String> {
+fn collect_operators_with_work(
+    ast: &AstProgram,
+    validation_index: &ValidationIndex,
+    work: &ParseWorkRecorder,
+) -> Vec<String> {
     let mut operators = Vec::new();
-    for token in ast.semantic_tokens() {
+    for token in validation_index.semantic_tokens(ast) {
         work.tokens(1);
         if is_operator_lexeme(&token.lexeme)
             && !operators.iter().any(|operator| operator == &token.lexeme)
@@ -6430,6 +6651,88 @@ mod tests {
                 | AstExprKind::BitsLiteral { .. } => {}
             }
         }
+    }
+
+    #[test]
+    fn validation_index_preserves_semantic_views_and_exact_source_order() {
+        let ast = parse_ast(
+            "validation/index.bn",
+            r#"
+rows: LIST[4] {}
+opcode: BITS[7] { 2u011_0011 }
+payload: BYTES[2] { 16u01, 16u02 }
+label: TEXT { DRAIN LIST[99] BITS[1] { 2u0 } }
+document:
+    hidden_rows: LIST[8] {}
+"#,
+        )
+        .unwrap();
+        let work = ParseWorkRecorder::enabled();
+        let index = ValidationIndex::build(&ast, &work);
+
+        let canonical_tokens = ast
+            .semantic_tokens()
+            .map(|token| (token.start, token.end, token.lexeme.as_str()))
+            .collect::<Vec<_>>();
+        let indexed_tokens = index
+            .semantic_tokens(&ast)
+            .map(|token| (token.start, token.end, token.lexeme.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(indexed_tokens, canonical_tokens);
+
+        let canonical_items = ast
+            .semantic_parser_items()
+            .map(|item| (item.line, item.start, item.end))
+            .collect::<Vec<_>>();
+        let indexed_items = index
+            .semantic_items(&ast)
+            .map(|item| (item.line, item.start, item.end))
+            .collect::<Vec<_>>();
+        assert_eq!(indexed_items, canonical_items);
+
+        for line in ast.semantic_parser_lines() {
+            let canonical = ast
+                .semantic_tokens()
+                .filter(|token| token.line == line.line)
+                .map(|token| token.start)
+                .collect::<Vec<_>>();
+            let indexed = index
+                .semantic_tokens_on_line(&ast, line.line)
+                .map(|token| token.start)
+                .collect::<Vec<_>>();
+            assert_eq!(indexed, canonical);
+        }
+        for token in &ast.tokens {
+            assert_eq!(
+                index
+                    .token_at_start(&ast, token.start, &work)
+                    .map(|found| found.start),
+                Some(token.start)
+            );
+        }
+
+        let canonical_list_sites = ast
+            .semantic_parser_lines()
+            .enumerate()
+            .filter_map(|(_, line)| {
+                line.symbols
+                    .iter()
+                    .position(|symbol| symbol == "LIST")
+                    .map(|symbol| (line.line, symbol))
+            })
+            .collect::<Vec<_>>();
+        let indexed_list_sites = index
+            .list_sites
+            .iter()
+            .map(|(line_id, symbol)| (ast.lines[*line_id].line, *symbol))
+            .collect::<Vec<_>>();
+        assert_eq!(indexed_list_sites, canonical_list_sites);
+
+        let boundary = ValidationIndex::build_boundary(&ast, &work);
+        assert_eq!(boundary.semantic_items(&ast).count(), 1);
+        assert!(boundary.semantic_token_ids.is_empty());
+        assert!(boundary.list_sites.is_empty());
+        assert!(work.finish().work_counters.validation_visits > 0);
     }
 
     #[test]

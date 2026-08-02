@@ -5,18 +5,41 @@ use boon_compiler::{
 use boon_plan::{ApplicationIdentity, ProgramRole, TargetProfile, verify_plan};
 use boon_runtime::{LiveRuntime, parse_scenario, source_units_for_path};
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 mod compiler_sample;
 
 struct CompilerCountingAllocator;
 
-static ALLOCATION_CALLS: AtomicU64 = AtomicU64::new(0);
-static ALLOCATED_BYTES: AtomicU64 = AtomicU64::new(0);
-static DEALLOCATION_CALLS: AtomicU64 = AtomicU64::new(0);
-static DEALLOCATED_BYTES: AtomicU64 = AtomicU64::new(0);
+thread_local! {
+    // The compiler-performance protocol requires exactly one compiler thread.
+    // Const-initialized thread-local cells keep allocation accounting exact on
+    // that thread without putting four atomic read-modify-writes around every
+    // allocator call. A future parallel compiler must replace this with an
+    // explicitly aggregated per-worker counter before changing the protocol.
+    static ALLOCATION_CALLS: Cell<u64> = const { Cell::new(0) };
+    static ALLOCATED_BYTES: Cell<u64> = const { Cell::new(0) };
+    static DEALLOCATION_CALLS: Cell<u64> = const { Cell::new(0) };
+    static DEALLOCATED_BYTES: Cell<u64> = const { Cell::new(0) };
+}
+
+#[inline]
+fn add_thread_counter(counter: &'static std::thread::LocalKey<Cell<u64>>, amount: u64) {
+    // Allocation can occur while another thread-local destructor is running.
+    // `try_with` keeps that shutdown path non-panicking; compiler measurement
+    // reads the counters before main-thread teardown.
+    let _ = counter.try_with(|value| value.set(value.get().saturating_add(amount)));
+}
+
+fn reset_thread_counter(counter: &'static std::thread::LocalKey<Cell<u64>>) {
+    counter.set(0);
+}
+
+fn thread_counter(counter: &'static std::thread::LocalKey<Cell<u64>>) -> u64 {
+    counter.get()
+}
 
 #[global_allocator]
 static GLOBAL_ALLOCATOR: CompilerCountingAllocator = CompilerCountingAllocator;
@@ -26,33 +49,33 @@ static GLOBAL_ALLOCATOR: CompilerCountingAllocator = CompilerCountingAllocator;
 // addresses, sizes, alignment, or lifetimes.
 unsafe impl GlobalAlloc for CompilerCountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        ALLOCATION_CALLS.fetch_add(1, Ordering::Relaxed);
-        ALLOCATED_BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
+        add_thread_counter(&ALLOCATION_CALLS, 1);
+        add_thread_counter(&ALLOCATED_BYTES, layout.size() as u64);
         // SAFETY: this method has exactly the `GlobalAlloc::alloc` contract and
         // forwards the same valid layout to `System`.
         unsafe { System.alloc(layout) }
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        ALLOCATION_CALLS.fetch_add(1, Ordering::Relaxed);
-        ALLOCATED_BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
+        add_thread_counter(&ALLOCATION_CALLS, 1);
+        add_thread_counter(&ALLOCATED_BYTES, layout.size() as u64);
         // SAFETY: this method forwards the same valid layout to `System`.
         unsafe { System.alloc_zeroed(layout) }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        DEALLOCATION_CALLS.fetch_add(1, Ordering::Relaxed);
-        DEALLOCATED_BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
+        add_thread_counter(&DEALLOCATION_CALLS, 1);
+        add_thread_counter(&DEALLOCATED_BYTES, layout.size() as u64);
         // SAFETY: this method forwards the allocation pointer and its original
         // layout unchanged to `System`.
         unsafe { System.dealloc(ptr, layout) }
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        DEALLOCATION_CALLS.fetch_add(1, Ordering::Relaxed);
-        DEALLOCATED_BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
-        ALLOCATION_CALLS.fetch_add(1, Ordering::Relaxed);
-        ALLOCATED_BYTES.fetch_add(new_size as u64, Ordering::Relaxed);
+        add_thread_counter(&DEALLOCATION_CALLS, 1);
+        add_thread_counter(&DEALLOCATED_BYTES, layout.size() as u64);
+        add_thread_counter(&ALLOCATION_CALLS, 1);
+        add_thread_counter(&ALLOCATED_BYTES, new_size as u64);
         // SAFETY: this method forwards the allocation pointer, original
         // layout, and requested size unchanged to `System`.
         unsafe { System.realloc(ptr, layout, new_size) }
@@ -68,18 +91,18 @@ pub(crate) struct CompilerAllocationCounters {
 }
 
 pub(crate) fn reset_compiler_allocation_counters() {
-    ALLOCATION_CALLS.store(0, Ordering::Relaxed);
-    ALLOCATED_BYTES.store(0, Ordering::Relaxed);
-    DEALLOCATION_CALLS.store(0, Ordering::Relaxed);
-    DEALLOCATED_BYTES.store(0, Ordering::Relaxed);
+    reset_thread_counter(&ALLOCATION_CALLS);
+    reset_thread_counter(&ALLOCATED_BYTES);
+    reset_thread_counter(&DEALLOCATION_CALLS);
+    reset_thread_counter(&DEALLOCATED_BYTES);
 }
 
 pub(crate) fn compiler_allocation_counters() -> CompilerAllocationCounters {
     CompilerAllocationCounters {
-        allocation_calls: ALLOCATION_CALLS.load(Ordering::Relaxed),
-        allocated_bytes: ALLOCATED_BYTES.load(Ordering::Relaxed),
-        deallocation_calls: DEALLOCATION_CALLS.load(Ordering::Relaxed),
-        deallocated_bytes: DEALLOCATED_BYTES.load(Ordering::Relaxed),
+        allocation_calls: thread_counter(&ALLOCATION_CALLS),
+        allocated_bytes: thread_counter(&ALLOCATED_BYTES),
+        deallocation_calls: thread_counter(&DEALLOCATION_CALLS),
+        deallocated_bytes: thread_counter(&DEALLOCATED_BYTES),
     }
 }
 

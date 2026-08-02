@@ -1136,6 +1136,37 @@ fn novywave_checked_builder_is_seed_free_and_deterministic() {
         baseline.program.is_some(),
         "NovyWave must remain executable"
     );
+    let checked = baseline.program.as_ref().expect("checked NovyWave");
+    let selected_signal_defaults = checked
+        .lowering_metadata
+        .named_value_type_table
+        .entries
+        .iter()
+        .find(|entry| entry.path == "store.selected_signal_defaults")
+        .expect("selected_signal_defaults checked named value");
+    let Type::List(item) = &selected_signal_defaults.flow_type.ty else {
+        panic!(
+            "selected_signal_defaults must remain a list: {:#?}",
+            selected_signal_defaults.flow_type.ty
+        );
+    };
+    let selected_item_actual = checked
+        .calls
+        .iter()
+        .find(|call| call.function == "new_selected_visible_item")
+        .and_then(|call| {
+            call.entries.iter().find_map(|entry| match entry {
+                CheckedCallEntry::Input { name, value, .. } if name == "row" => checked
+                    .expressions
+                    .get(value.0 as usize)
+                    .map(|expression| &expression.flow_type.ty),
+                _ => None,
+            })
+        });
+    assert!(
+        type_is_recursively_closed(item),
+        "the concrete projected-discriminant map occurrence must seal its item:\nitem={item:#?}\nactual={selected_item_actual:#?}"
+    );
     assert_eq!(
         repeated, baseline,
         "seed-free checked output must be stable"

@@ -141,6 +141,7 @@ wasm-bindgen-cli-support = "=0.2.121"
 zeroize = "1.8.2"
 static_assertions = "1.1.0"
 syn = { version = "2.0.117", features = ["full", "visit"] }
+smallvec = "1.15.1"
 
 [profile.dev]
 # Line tables preserve actionable panic/backtrace locations while avoiding the
@@ -175,6 +176,13 @@ opt-level = 2
 
 [profile.dev.package.boon_native_playground]
 opt-level = 2
+
+# Parsing is on every editor diagnostic request. Keep assertions and line
+# tables, but avoid making the development frontend several times slower than
+# the release compiler solely because this crate remained at opt-level 0.
+[profile.dev.package.boon_parser]
+opt-level = 2
+debug = 1
 
 # MachinePlan construction and validation are part of every source edit/run
 # loop. These crates retain dev assertions and line tables, but must not execute

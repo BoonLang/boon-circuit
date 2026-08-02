@@ -14,6 +14,7 @@ boon_parser.workspace = true
 boon_syntax.workspace = true
 ena.workspace = true
 serde.workspace = true
+smallvec.workspace = true
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 web-time.workspace = true

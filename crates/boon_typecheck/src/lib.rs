@@ -12,11 +12,12 @@ use boon_syntax::{
 };
 use ena::unify::{EqUnifyValue, InPlaceUnificationTable, UnifyKey};
 use serde::{Deserialize, Serialize};
+use smallvec::SmallVec;
 use std::borrow::Cow;
 #[cfg(test)]
 use std::cell::Cell;
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::hash::Hash;
 use std::ops::Deref;
 use std::sync::Arc;
@@ -1836,6 +1837,13 @@ struct CheckedProgramBuilder<'a> {
     pattern_arms_by_scope: BTreeMap<LexicalScopeId, usize>,
     nearest_pattern_arm_by_scope: Vec<Option<usize>>,
     syntax_discriminant_parameters: BTreeSet<DeclId>,
+    /// Exact selector paths read by user-callable static branches. Unlike
+    /// `syntax_discriminant_parameters`, this retains projected selectors such
+    /// as `row.item_kind` and list-item forwarding so a concrete call
+    /// occurrence can specialize without closing the callable's principal
+    /// scheme.
+    syntax_discriminant_parameter_paths:
+        BTreeMap<DeclId, BTreeSet<Vec<ForwardedParameterPathSegment>>>,
     inferred_expr_types: DenseIndexTable<FlowType>,
     /// Hidden `Flush<E>` control types keyed by parser expression. This is a
     /// checker-only side table; `E` is folded into the ordinary type exactly
@@ -2319,6 +2327,8 @@ struct CheckedDiagnosticReplayInputs {
     named_value_expressions: DeclarationExprIndex,
     builtins: BuiltinSignatureRegistry,
     render_contracts: RenderContractRegistry,
+    render_slot_statements: BTreeSet<usize>,
+    inference_dependencies: Arc<CheckedTypeInferenceDependencies>,
 }
 
 struct CheckedProgramBuildOutput {
@@ -2446,24 +2456,63 @@ impl CheckedTypeInferenceChanges {
     }
 }
 
+/// Dense, deterministic membership for the solver's arena-backed identities.
+///
+/// The previous `HashSet` paid hashing plus a fresh collect-and-sort allocation
+/// at every propagation round. All IDs accepted here come from dense checked
+/// arenas, so one byte per possible ID and a compact touched list provide
+/// constant-time deduplication while retaining the exact sorted drain order.
+trait PendingDenseId: Copy + Ord {
+    fn pending_index(self) -> usize;
+}
+
+impl PendingDenseId for usize {
+    fn pending_index(self) -> usize {
+        self
+    }
+}
+
+impl PendingDenseId for DeclId {
+    fn pending_index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+impl PendingDenseId for CheckedCallId {
+    fn pending_index(self) -> usize {
+        self.0 as usize
+    }
+}
+
 struct PendingIdSet<T> {
-    members: HashSet<T>,
+    present: Vec<u8>,
+    members: Vec<T>,
 }
 
 impl<T> Default for PendingIdSet<T> {
     fn default() -> Self {
         Self {
-            members: HashSet::new(),
+            present: Vec::new(),
+            members: Vec::new(),
         }
     }
 }
 
 impl<T> PendingIdSet<T>
 where
-    T: Eq + Hash + Ord,
+    T: PendingDenseId,
 {
     fn insert(&mut self, value: T) -> bool {
-        self.members.insert(value)
+        let index = value.pending_index();
+        if index >= self.present.len() {
+            self.present.resize(index.saturating_add(1), 0);
+        }
+        if self.present[index] != 0 {
+            return false;
+        }
+        self.present[index] = 1;
+        self.members.push(value);
+        true
     }
 
     fn is_empty(&self) -> bool {
@@ -2471,35 +2520,40 @@ where
     }
 
     fn drain_sorted(&mut self) -> Vec<T> {
-        let mut values = self.members.drain().collect::<Vec<_>>();
+        let mut values = std::mem::take(&mut self.members);
         values.sort_unstable();
+        for value in &values {
+            self.present[value.pending_index()] = 0;
+        }
         values
     }
 }
 
 impl<T> Extend<T> for PendingIdSet<T>
 where
-    T: Eq + Hash,
+    T: PendingDenseId,
 {
     fn extend<I>(&mut self, iter: I)
     where
         I: IntoIterator<Item = T>,
     {
-        self.members.extend(iter);
+        for value in iter {
+            self.insert(value);
+        }
     }
 }
 
 impl<T> FromIterator<T> for PendingIdSet<T>
 where
-    T: Eq + Hash,
+    T: PendingDenseId,
 {
     fn from_iter<I>(iter: I) -> Self
     where
         I: IntoIterator<Item = T>,
     {
-        Self {
-            members: HashSet::from_iter(iter),
-        }
+        let mut pending = Self::default();
+        pending.extend(iter);
+        pending
     }
 }
 
@@ -2509,7 +2563,7 @@ struct CheckedTypeInferencePending {
     declarations: PendingIdSet<DeclId>,
     callables: PendingIdSet<DeclId>,
     calls: PendingIdSet<CheckedCallId>,
-    selector_parameters: bool,
+    selector_parameters: PendingIdSet<DeclId>,
     pattern_bindings: bool,
 }
 
@@ -2519,7 +2573,7 @@ impl CheckedTypeInferencePending {
             || !self.declarations.is_empty()
             || !self.callables.is_empty()
             || !self.calls.is_empty()
-            || self.selector_parameters
+            || !self.selector_parameters.is_empty()
             || self.pattern_bindings
     }
 }
@@ -2595,16 +2649,22 @@ struct CheckedCallInferencePlan {
     explicit_context_input: Option<CheckedExprId>,
     inherited_context_formal_index: Option<usize>,
     dependency_catch_cycle: bool,
-    has_syntax_discriminant: bool,
+    syntax_discriminants: Box<[CheckedCallSyntaxDiscriminantPlan]>,
     is_user_callable: bool,
     result_expression: Option<CheckedExprId>,
     mode: CheckedCallModeInferencePlan,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CheckedCallSyntaxDiscriminantPlan {
+    value: CheckedExprId,
+    paths: Box<[Box<[ForwardedParameterPathSegment]>]>,
+}
+
 struct CheckedCallInferenceSnapshot {
     call_result: FlowType,
     signature_result: FlowType,
-    parameter_flow_types: Box<[Option<FlowType>]>,
+    parameter_flow_types: SmallVec<[Option<FlowType>; 4]>,
     context_formal: Option<FlowType>,
     inherited_context: Option<FlowType>,
 }
@@ -2678,7 +2738,9 @@ struct CheckedTypeInferenceDependencies {
     /// worklist ordering when a callee changes.
     wrapper_callers_by_callee: Vec<Vec<usize>>,
     wrapper_user_signature_indices: BTreeSet<usize>,
-    selector_actuals: BTreeSet<usize>,
+    selector_parameters: Box<[DeclId]>,
+    selector_parameters_by_actual: Vec<Vec<DeclId>>,
+    pattern_selector_domains: BTreeMap<DeclId, Type>,
     pattern_selectors: BTreeSet<usize>,
     pattern_binding_sites: Vec<CheckedPatternBindingSite>,
     pattern_dependents_by_selector: Vec<Vec<usize>>,
@@ -2793,7 +2855,7 @@ struct StructuralStatementPlan {
     children: Box<[usize]>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum ForwardedParameterPathSegment {
     Field(String),
     ListItem,
@@ -3017,6 +3079,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                 pattern_arms_by_scope: BTreeMap::new(),
                 nearest_pattern_arm_by_scope: Vec::new(),
                 syntax_discriminant_parameters: BTreeSet::new(),
+                syntax_discriminant_parameter_paths: BTreeMap::new(),
                 inferred_expr_types: DenseIndexTable::with_len(program.expressions.len()),
                 expression_flush_types: BTreeMap::new(),
                 checked_flow_inference_cache: CheckedFlowInferenceCache::with_len(
@@ -3210,6 +3273,12 @@ impl<'a> CheckedProgramBuilder<'a> {
             checked_program_phase!("derive_order_chains", derive_checked_order_chains(&checked));
         checked.fields.order_chains = order_chains;
         builder.diagnostics.extend(order_diagnostics);
+        let inference_dependencies = Arc::clone(
+            builder
+                .checked_type_inference_dependencies
+                .as_ref()
+                .expect("checked inference dependencies initialized"),
+        );
         let mut work_counters = builder.work_counters;
         work_counters.record_flow_cache(builder.checked_flow_inference_cache.stats);
         CheckedProgramBuildOutput {
@@ -3222,6 +3291,8 @@ impl<'a> CheckedProgramBuilder<'a> {
                 named_value_expressions: builder.named_value_expressions,
                 builtins,
                 render_contracts,
+                render_slot_statements,
+                inference_dependencies,
             }),
         }
     }
@@ -3529,7 +3600,85 @@ impl<'a> CheckedProgramBuilder<'a> {
                 break;
             }
         }
+        let mut parameter_paths = self.pattern_selector_parameter_paths();
+        let direct_path_parameters = parameter_paths.keys().copied().collect::<BTreeSet<_>>();
+        // Retain the pre-existing whole-parameter forwarding contract for
+        // wrappers whose argument syntax constructs a tagged value around an
+        // outer parameter. The call-local overlay still needs to enter those
+        // wrappers even when an exact structural path cannot be composed.
+        for parameter in &parameters {
+            parameter_paths
+                .entry(*parameter)
+                .or_default()
+                .insert(Vec::new());
+        }
+        let mut overlay_parameters = direct_path_parameters.clone();
+        loop {
+            let mut changed = false;
+            for call in &self.calls {
+                let Some(owner) = call.owner_callable else {
+                    continue;
+                };
+                let Some(owner_signature) = self.signature_by_declaration(owner) else {
+                    continue;
+                };
+                let owner_parameters = owner_signature
+                    .parameters
+                    .iter()
+                    .map(|parameter| parameter.decl_id)
+                    .collect::<BTreeSet<_>>();
+                for entry in &call.entries {
+                    let CheckedCallEntry::Input { formal, value, .. } = entry else {
+                        continue;
+                    };
+                    if !overlay_parameters.contains(formal) {
+                        continue;
+                    }
+                    for forwarded in
+                        self.owner_parameters_referenced_by_expression(*value, &owner_parameters)
+                    {
+                        changed |= overlay_parameters.insert(forwarded);
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        // A wrapper may construct or route the eventual selector through
+        // syntax that has no single structural projection. Enter its overlay
+        // once the outer actual is a concrete singleton and let the nested
+        // call apply the exact direct selector path.
+        for parameter in overlay_parameters {
+            if !direct_path_parameters.contains(&parameter) {
+                parameter_paths
+                    .entry(parameter)
+                    .or_default()
+                    .insert(Vec::new());
+            }
+        }
         self.syntax_discriminant_parameters = parameters;
+        self.syntax_discriminant_parameter_paths = parameter_paths;
+    }
+
+    fn pattern_selector_parameter_paths(
+        &self,
+    ) -> BTreeMap<DeclId, BTreeSet<Vec<ForwardedParameterPathSegment>>> {
+        let mut paths = BTreeMap::<DeclId, BTreeSet<Vec<ForwardedParameterPathSegment>>>::new();
+        for selector in self.pattern_selectors.values() {
+            let Some((parameter, projection)) =
+                self.direct_read_declaration_with_projection(CheckedExprId(*selector as u32))
+            else {
+                continue;
+            };
+            paths.entry(parameter).or_default().insert(
+                projection
+                    .into_iter()
+                    .map(ForwardedParameterPathSegment::Field)
+                    .collect(),
+            );
+        }
+        paths
     }
 
     fn owner_parameters_referenced_by_expression(
@@ -5104,7 +5253,6 @@ impl<'a> CheckedProgramBuilder<'a> {
     }
 
     fn infer_user_parameter_schemes(&mut self) {
-        let pattern_domains = self.pattern_selector_parameter_domains();
         let mut actual_variant_candidates = BTreeMap::<DeclId, Vec<Type>>::new();
         let pattern_selector_parameters = self.syntax_discriminant_parameters.clone();
         // Selector actuals have heavily overlapping expression subtrees. Build
@@ -5116,6 +5264,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                 .as_ref()
                 .expect("checked inference dependencies initialized"),
         );
+        let pattern_domains = dependencies.pattern_selector_domains.clone();
         let mut pattern_actuals = Vec::new();
         for formal in &pattern_selector_parameters {
             if let Some(actuals) = dependencies.actuals_by_parameter.get(formal) {
@@ -6433,10 +6582,12 @@ impl<'a> CheckedProgramBuilder<'a> {
         let mut stats = CheckedTypeInferenceWorkStats::default();
         let mut pending = if let Some(changed) = changed {
             let mut pending = CheckedTypeInferencePending {
-                selector_parameters: true,
                 pattern_bindings: true,
                 ..CheckedTypeInferencePending::default()
             };
+            pending
+                .selector_parameters
+                .extend(dependencies.selector_parameters.iter().copied());
             self.enqueue_checked_scheme_changes(changed, &dependencies, &mut pending, &mut stats);
             for expression in changed_expressions.into_iter().flatten() {
                 pending.expressions.insert(*expression);
@@ -6474,7 +6625,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                     .filter_map(|signature| signature.result_expression.map(|_| signature.decl_id))
                     .collect(),
                 calls: self.calls.iter().map(|call| call.id).collect(),
-                selector_parameters: true,
+                selector_parameters: dependencies.selector_parameters.iter().copied().collect(),
                 pattern_bindings: true,
             }
         };
@@ -6661,10 +6812,13 @@ impl<'a> CheckedProgramBuilder<'a> {
                 stats.call_ms += calls_started.map(typecheck_elapsed_ms).unwrap_or(0.0);
                 self.flush_checked_flow_invalidations();
 
-                if std::mem::take(&mut pending.selector_parameters) {
+                let selector_parameters = pending.selector_parameters.drain_sorted();
+                if !selector_parameters.is_empty() {
                     let selector_started = trace.then(Instant::now);
                     stats.selector_visits += 1;
-                    for (formal, owner) in self.refresh_pattern_selector_parameter_types() {
+                    for (formal, owner) in
+                        self.refresh_pattern_selector_parameter_types(&selector_parameters)
+                    {
                         Self::enqueue_checked_declaration_dependents(
                             formal,
                             &dependencies,
@@ -6729,7 +6883,9 @@ impl<'a> CheckedProgramBuilder<'a> {
                 let changed = self.propagate_contextual_user_wrapper_schemes();
                 wrapper_changed_declarations = changed.len();
                 if !changed.is_empty() {
-                    pending.selector_parameters = true;
+                    pending
+                        .selector_parameters
+                        .extend(dependencies.selector_parameters.iter().copied());
                     pending.pattern_bindings = true;
                     self.enqueue_checked_scheme_changes(
                         &changed,
@@ -7236,8 +7392,11 @@ impl<'a> CheckedProgramBuilder<'a> {
             explicit_context_input,
             inherited_context_formal_index,
             dependency_catch_cycle: signature.name == "Dependency/catch_cycle",
-            has_syntax_discriminant: signature.kind == CheckedCallableKind::User
-                && self.checked_call_has_syntax_discriminant(&call.entries),
+            syntax_discriminants: if signature.kind == CheckedCallableKind::User {
+                self.checked_call_syntax_discriminants(&call.entries)
+            } else {
+                Box::new([])
+            },
             is_user_callable: signature.kind == CheckedCallableKind::User,
             result_expression: signature.result_expression,
             mode,
@@ -7276,6 +7435,13 @@ impl<'a> CheckedProgramBuilder<'a> {
 
     fn build_checked_type_inference_dependencies(&self) -> CheckedTypeInferenceDependencies {
         let expression_count = self.program.expressions.len();
+        let selector_parameters = self
+            .syntax_discriminant_parameters
+            .iter()
+            .copied()
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let pattern_selector_domains = self.pattern_selector_parameter_domains();
         let context_formal_indices = self
             .context_formals
             .iter()
@@ -7329,7 +7495,9 @@ impl<'a> CheckedProgramBuilder<'a> {
                     (signature.kind == CheckedCallableKind::User).then_some(index)
                 })
                 .collect(),
-            selector_actuals: BTreeSet::new(),
+            selector_parameters,
+            selector_parameters_by_actual: vec![Vec::new(); expression_count],
+            pattern_selector_domains,
             pattern_selectors: self.pattern_selectors.values().copied().collect(),
             pattern_binding_sites,
             pattern_dependents_by_selector: vec![Vec::new(); expression_count],
@@ -7491,7 +7659,12 @@ impl<'a> CheckedProgramBuilder<'a> {
                             .or_default()
                             .push(*value);
                         if self.syntax_discriminant_parameters.contains(formal) {
-                            dependencies.selector_actuals.insert(value.0 as usize);
+                            if let Some(parameters) = dependencies
+                                .selector_parameters_by_actual
+                                .get_mut(value.0 as usize)
+                            {
+                                parameters.push(*formal);
+                            }
                         }
                     }
                     CheckedCallEntry::FreshOut { formal, output, .. }
@@ -7555,6 +7728,10 @@ impl<'a> CheckedProgramBuilder<'a> {
             values.dedup();
         }
         for values in &mut dependencies.parameters_by_actual {
+            values.sort();
+            values.dedup();
+        }
+        for values in &mut dependencies.selector_parameters_by_actual {
             values.sort();
             values.dedup();
         }
@@ -7992,8 +8169,10 @@ impl<'a> CheckedProgramBuilder<'a> {
                 );
             }
         }
-        if dependencies.selector_actuals.contains(&expression) {
-            pending.selector_parameters = true;
+        if let Some(parameters) = dependencies.selector_parameters_by_actual.get(expression) {
+            pending
+                .selector_parameters
+                .extend(parameters.iter().copied());
         }
         if dependencies.pattern_selectors.contains(&expression) {
             pending.pattern_bindings = true;
@@ -8091,7 +8270,14 @@ impl<'a> CheckedProgramBuilder<'a> {
         let mut declaration = self.refresh_checked_declaration_types();
         let (propagated_callable, mut call) = self.refresh_checked_calls_and_callers();
         callable |= propagated_callable;
-        let selector = !self.refresh_pattern_selector_parameter_types().is_empty();
+        let selector_parameters = self
+            .syntax_discriminant_parameters
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        let selector = !self
+            .refresh_pattern_selector_parameter_types(&selector_parameters)
+            .is_empty();
         let pattern = !self.refresh_pattern_binding_types().is_empty();
         let mut expression = self.refresh_checked_expression_types();
         if expression {
@@ -8221,9 +8407,10 @@ impl<'a> CheckedProgramBuilder<'a> {
         (callable_changed, call_changed)
     }
 
-    fn refresh_pattern_selector_parameter_types(&mut self) -> Vec<(DeclId, DeclId)> {
-        let pattern_domains = self.pattern_selector_parameter_domains();
-        let selector_parameters = self.syntax_discriminant_parameters.clone();
+    fn refresh_pattern_selector_parameter_types(
+        &mut self,
+        selector_parameters: &[DeclId],
+    ) -> Vec<(DeclId, DeclId)> {
         if selector_parameters.is_empty() {
             return Vec::new();
         }
@@ -8232,8 +8419,9 @@ impl<'a> CheckedProgramBuilder<'a> {
                 .as_ref()
                 .expect("checked inference dependencies initialized"),
         );
-        let mut actual_variant_candidates = BTreeMap::<DeclId, Vec<Type>>::new();
-        for formal in &selector_parameters {
+        let mut domains = Vec::with_capacity(selector_parameters.len());
+        for formal in selector_parameters {
+            let mut candidates = Vec::new();
             for value in dependencies
                 .actuals_by_parameter
                 .get(formal)
@@ -8242,25 +8430,22 @@ impl<'a> CheckedProgramBuilder<'a> {
             {
                 let actual = self.infer_checked_expr_flow_root(value.0 as usize).ty;
                 if type_is_variant_domain(&actual) {
-                    actual_variant_candidates
-                        .entry(*formal)
-                        .or_default()
-                        .push(actual);
+                    candidates.push(actual);
                 }
             }
-        }
-        let mut domains = actual_variant_candidates
-            .into_iter()
-            .map(|(formal, candidates)| (formal, canonical_union_type(candidates)))
-            .collect::<BTreeMap<_, _>>();
-        for (formal, pattern_domain) in pattern_domains {
-            domains
-                .entry(formal)
-                .and_modify(|actual| {
-                    *actual =
-                        complete_pattern_selector_domain(actual.clone(), pattern_domain.clone());
-                })
-                .or_insert(pattern_domain);
+            let actual = (!candidates.is_empty()).then(|| canonical_union_type(candidates));
+            let pattern = dependencies.pattern_selector_domains.get(formal).cloned();
+            let domain = match (actual, pattern) {
+                (Some(actual), Some(pattern)) => {
+                    Some(complete_pattern_selector_domain(actual, pattern))
+                }
+                (Some(actual), None) => Some(actual),
+                (None, Some(pattern)) => Some(pattern),
+                (None, None) => None,
+            };
+            if let Some(domain) = domain {
+                domains.push((*formal, domain));
+            }
         }
 
         let mut changed_by_signature = BTreeMap::<usize, Vec<DeclId>>::new();
@@ -8712,11 +8897,20 @@ impl<'a> CheckedProgramBuilder<'a> {
             for entry in &plan.entries {
                 match *entry {
                     CheckedCallInferenceEntryPlan::Input { formal, value, .. } => {
-                        let ty = self.infer_checked_overlay_expr_type(
-                            value.0 as usize,
-                            caller_bindings,
-                            active_callables,
-                        )?;
+                        let ty = if caller_bindings.is_empty() {
+                            // Root-call actuals already have an exact
+                            // occurrence type in the authoritative checked
+                            // worklist. Re-entering a generic user callable
+                            // here loses that occurrence precision and can
+                            // resurrect stale scheme variables.
+                            self.infer_checked_expr_flow_root(value.0 as usize).ty
+                        } else {
+                            self.infer_checked_overlay_expr_type(
+                                value.0 as usize,
+                                caller_bindings,
+                                active_callables,
+                            )?
+                        };
                         bindings.insert(formal, ty);
                     }
                     CheckedCallInferenceEntryPlan::Output {
@@ -9060,8 +9254,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                     .filter(|parameter| parameter.decl_id == entry.formal())
                     .map(|parameter| parameter.flow_type.clone())
             })
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
+            .collect::<SmallVec<[_; 4]>>();
         let context_formal = plan.context_formal_index.and_then(|index| {
             self.context_formals
                 .get(index)
@@ -9099,8 +9292,8 @@ impl<'a> CheckedProgramBuilder<'a> {
         let Some(snapshot) = self.snapshot_checked_call_inference(plan) else {
             return CheckedCallInstantiationChanges::default();
         };
-        let mut substitutions = BTreeMap::<TypeVar, Type>::new();
-        let mut dependency_catch_inputs = Vec::new();
+        let mut substitutions = InlineTypeSubstitutions::default();
+        let mut dependency_catch_inputs = SmallVec::<[Type; 4]>::new();
 
         for entry_index in plan.parent_inputs.iter().copied() {
             let Some(CheckedCallInferenceEntryPlan::Input { value, .. }) =
@@ -9132,7 +9325,7 @@ impl<'a> CheckedProgramBuilder<'a> {
         {
             substitutions.insert(
                 *result_variable,
-                canonical_union_type(dependency_catch_inputs),
+                canonical_union_type(dependency_catch_inputs.into_vec()),
             );
         }
         if let Some(formal) = snapshot.context_formal.as_ref() {
@@ -9172,7 +9365,7 @@ impl<'a> CheckedProgramBuilder<'a> {
             }
             let flow_type = FlowType {
                 mode: parameter.mode,
-                ty: substitute_checked_type(&parameter.ty, &substitutions),
+                ty: substitute_checked_type_from_lookup(&parameter.ty, &substitutions),
             };
             if self.set_declaration_flow_type(output, flow_type) {
                 changes.any = true;
@@ -9215,7 +9408,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                 output,
                 FlowType {
                     mode: parameter.mode,
-                    ty: substitute_checked_type(&parameter.ty, &substitutions),
+                    ty: substitute_checked_type_from_lookup(&parameter.ty, &substitutions),
                 },
             ) {
                 changes.any = true;
@@ -9234,23 +9427,31 @@ impl<'a> CheckedProgramBuilder<'a> {
             // bound to an enclosing generic parameter must remain generic here;
             // replacing the whole result with a prior closed inference would
             // specialize the callable body to one unrelated call site.
-            let mut result_substitutions = BTreeMap::new();
+            let mut result_substitutions = InlineTypeSubstitutions::default();
             unify_checked_type_pattern(
                 &snapshot.signature_result.ty,
                 &snapshot.call_result.ty,
                 &mut result_substitutions,
             );
             for (variable, value) in result_substitutions {
-                result_instantiation.entry(variable).or_insert(value);
+                result_instantiation.insert_if_absent(variable, value);
             }
         }
-        let instantiated_result =
-            substitute_checked_type(&snapshot.signature_result.ty, &result_instantiation);
-        let syntax_discriminated_result = plan
-            .has_syntax_discriminant
+        let instantiated_result = substitute_checked_type_from_lookup(
+            &snapshot.signature_result.ty,
+            &result_instantiation,
+        );
+        let syntax_discriminated_candidate = self
+            .checked_call_has_concrete_syntax_discriminant(plan)
             .then(|| self.infer_checked_syntax_call_result(call_id))
             .flatten()
-            .filter(type_is_recursively_closed);
+            .map(|candidate| {
+                substitute_checked_type_from_lookup(&candidate, &result_instantiation)
+            });
+        let syntax_discriminated_result = syntax_discriminated_candidate
+            .as_ref()
+            .filter(|ty| type_has_concrete_outer_shape(ty))
+            .cloned();
         // A root call expression is a concrete instantiation site. The
         // syntax-wide scheme remains open inside its callable, but the exact
         // structural result inferred at this occurrence must not be widened
@@ -9284,9 +9485,9 @@ impl<'a> CheckedProgramBuilder<'a> {
             .iter()
             .map(|(variable, value)| CheckedTypeSubstitution {
                 variable: *variable,
-                value: substitute_checked_type(value, &substitutions),
+                value: substitute_checked_type_from_lookup(value, &substitutions),
             })
-            .collect::<Vec<_>>();
+            .collect::<SmallVec<[_; 4]>>();
         let mut context_variables = BTreeSet::new();
         if let Some(formal) = snapshot.context_formal.as_ref() {
             collect_type_vars(&formal.ty, &mut context_variables);
@@ -9305,7 +9506,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                         value: substitution.value.clone(),
                     })
             })
-            .collect::<Vec<_>>();
+            .collect::<SmallVec<[_; 4]>>();
         if let Some(target) = self
             .calls
             .get_mut(plan.call_index)
@@ -9315,12 +9516,12 @@ impl<'a> CheckedProgramBuilder<'a> {
                 target.result = result.clone();
                 changes.any = true;
             }
-            if target.type_substitutions != type_substitutions {
-                target.type_substitutions = type_substitutions;
+            if target.type_substitutions.as_slice() != type_substitutions.as_slice() {
+                target.type_substitutions = type_substitutions.into_vec();
                 changes.any = true;
             }
-            if target.contextual_substitutions != contextual_substitutions {
-                target.contextual_substitutions = contextual_substitutions;
+            if target.contextual_substitutions.as_slice() != contextual_substitutions.as_slice() {
+                target.contextual_substitutions = contextual_substitutions.into_vec();
                 changes.any = true;
             }
         }
@@ -9333,22 +9534,49 @@ impl<'a> CheckedProgramBuilder<'a> {
         changes
     }
 
-    fn checked_call_has_syntax_discriminant(&self, entries: &[CheckedCallEntry]) -> bool {
-        entries.iter().any(|entry| {
-            let CheckedCallEntry::Input { formal, value, .. } = entry else {
-                return false;
-            };
-            if !self.syntax_discriminant_parameters.contains(formal) {
-                return false;
-            }
-            self.program
-                .expressions
-                .get(value.0 as usize)
-                .is_some_and(|expression| match &expression.kind {
-                    AstExprKind::Tag(tag) => tag != "SKIP",
-                    AstExprKind::TaggedObject { .. } => true,
-                    _ => false,
+    fn checked_call_syntax_discriminants(
+        &self,
+        entries: &[CheckedCallEntry],
+    ) -> Box<[CheckedCallSyntaxDiscriminantPlan]> {
+        entries
+            .iter()
+            .filter_map(|entry| {
+                let CheckedCallEntry::Input { formal, value, .. } = entry else {
+                    return None;
+                };
+                let paths = self.syntax_discriminant_parameter_paths.get(formal)?;
+                Some(CheckedCallSyntaxDiscriminantPlan {
+                    value: *value,
+                    paths: paths.iter().cloned().map(Vec::into_boxed_slice).collect(),
                 })
+            })
+            .collect()
+    }
+
+    fn checked_call_has_concrete_syntax_discriminant(
+        &mut self,
+        plan: &CheckedCallInferencePlan,
+    ) -> bool {
+        plan.syntax_discriminants.iter().any(|discriminant| {
+            let actual = self
+                .infer_checked_expr_flow_root(discriminant.value.0 as usize)
+                .ty;
+            discriminant.paths.iter().any(|path| {
+                if path.is_empty() {
+                    self.program
+                        .expressions
+                        .get(discriminant.value.0 as usize)
+                        .is_some_and(|expression| match &expression.kind {
+                            AstExprKind::Tag(tag) => tag != "SKIP",
+                            AstExprKind::TaggedObject { .. } => true,
+                            _ => false,
+                        })
+                } else {
+                    known_type_for_forwarded_parameter_path(&actual, path)
+                        .as_ref()
+                        .is_some_and(type_is_singleton_syntax_discriminant)
+                }
+            })
         })
     }
 
@@ -16101,6 +16329,10 @@ fn type_is_variant_domain(ty: &Type) -> bool {
     }
 }
 
+fn type_is_singleton_syntax_discriminant(ty: &Type) -> bool {
+    matches!(ty, Type::VariantSet(variants) if variants.len() == 1)
+}
+
 fn complete_pattern_selector_domain(actual: Type, pattern_domain: Type) -> Type {
     fn collect_tags(ty: &Type, tags: &mut BTreeSet<String>) {
         match ty {
@@ -16208,6 +16440,25 @@ pub fn type_is_recursively_closed(ty: &Type) -> bool {
     }
 }
 
+fn type_has_concrete_outer_shape(ty: &Type) -> bool {
+    match ty {
+        Type::Object(shape) => !shape.open,
+        Type::VariantSet(variants) => !variants.is_empty(),
+        Type::Union(members) => !members.is_empty(),
+        Type::Unknown | Type::UnresolvedShape { .. } | Type::Var(_) => false,
+        Type::Text
+        | Type::Number
+        | Type::Bytes(_)
+        | Type::Bits { .. }
+        | Type::Absent
+        | Type::List(_)
+        | Type::Map { .. }
+        | Type::Set(_)
+        | Type::Function { .. }
+        | Type::RenderContract => true,
+    }
+}
+
 fn substitute_checked_type(ty: &Type, substitutions: &BTreeMap<TypeVar, Type>) -> Type {
     substitute_checked_type_from_lookup(ty, substitutions)
 }
@@ -16216,9 +16467,74 @@ pub trait CheckedTypeSubstitutionLookup {
     fn replacement(&self, variable: TypeVar) -> Option<&Type>;
 }
 
+#[derive(Clone, Default)]
+struct InlineTypeSubstitutions {
+    entries: SmallVec<[(TypeVar, Type); 4]>,
+}
+
+impl InlineTypeSubstitutions {
+    fn insert(&mut self, variable: TypeVar, value: Type) {
+        if let Some((_, existing)) = self
+            .entries
+            .iter_mut()
+            .find(|(candidate, _)| *candidate == variable)
+        {
+            *existing = value;
+        } else {
+            self.entries.push((variable, value));
+        }
+    }
+
+    fn insert_if_absent(&mut self, variable: TypeVar, value: Type) {
+        if self.replacement(variable).is_none() {
+            self.entries.push((variable, value));
+        }
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&TypeVar, &Type)> {
+        self.entries
+            .iter()
+            .map(|(variable, value)| (variable, value))
+    }
+}
+
+impl IntoIterator for InlineTypeSubstitutions {
+    type Item = (TypeVar, Type);
+    type IntoIter = smallvec::IntoIter<[(TypeVar, Type); 4]>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.into_iter()
+    }
+}
+
 impl CheckedTypeSubstitutionLookup for BTreeMap<TypeVar, Type> {
     fn replacement(&self, variable: TypeVar) -> Option<&Type> {
         self.get(&variable)
+    }
+}
+
+impl CheckedTypeSubstitutionLookup for InlineTypeSubstitutions {
+    fn replacement(&self, variable: TypeVar) -> Option<&Type> {
+        self.entries
+            .iter()
+            .find(|(candidate, _)| *candidate == variable)
+            .map(|(_, value)| value)
+    }
+}
+
+trait CheckedTypeSubstitutionStore: CheckedTypeSubstitutionLookup {
+    fn bind(&mut self, variable: TypeVar, value: Type);
+}
+
+impl CheckedTypeSubstitutionStore for BTreeMap<TypeVar, Type> {
+    fn bind(&mut self, variable: TypeVar, value: Type) {
+        self.insert(variable, value);
+    }
+}
+
+impl CheckedTypeSubstitutionStore for InlineTypeSubstitutions {
+    fn bind(&mut self, variable: TypeVar, value: Type) {
+        self.insert(variable, value);
     }
 }
 
@@ -16390,19 +16706,19 @@ fn substitute_checked_type_inner(
     }
 }
 
-fn unify_checked_type_pattern(
+fn unify_checked_type_pattern<S: CheckedTypeSubstitutionStore>(
     pattern: &Type,
     actual: &Type,
-    substitutions: &mut BTreeMap<TypeVar, Type>,
+    substitutions: &mut S,
 ) {
     match (pattern, actual) {
         (Type::Var(var), Type::Unknown | Type::UnresolvedShape { .. } | Type::Absent) => {
             let _ = var;
         }
-        (Type::Var(var), actual) => match substitutions.get(var) {
+        (Type::Var(var), actual) => match substitutions.replacement(*var) {
             Some(existing) if !is_value_placeholder_type(existing) => {}
             _ => {
-                substitutions.insert(*var, actual.clone());
+                substitutions.bind(*var, actual.clone());
             }
         },
         (Type::List(pattern), Type::List(actual)) => {
@@ -18193,6 +18509,10 @@ struct Checker<'a> {
     vars: TypeVarStore,
     builtins: BuiltinSignatureRegistry,
     render_contracts: RenderContractRegistry,
+    render_context_function_statements: BTreeSet<usize>,
+    render_slot_statements: BTreeSet<usize>,
+    structured_delimiter_fields: DenseIndexTable<Box<[(String, usize)]>>,
+    diagnostic_inference_dependencies: Option<Arc<CheckedTypeInferenceDependencies>>,
     source_payload_lookup: SourcePayloadPathLookup,
     source_payload_shape_table: Vec<SourcePayloadSyntaxShapeEntry>,
     source_payload_types: BTreeMap<String, Type>,
@@ -18216,6 +18536,7 @@ struct Checker<'a> {
     expr_type_vars: DenseIndexTable<TypeVar>,
     builtin_symbol_exprs: BTreeSet<usize>,
     expr_type_cache: Vec<Option<FlowType>>,
+    checked_statement_values: DenseIndexTable<CheckedExprId>,
     checked_diagnostic_replay: bool,
     diagnostic_replayed: DenseFlagSet,
     diagnostic_ensure_requests: usize,
@@ -18394,6 +18715,10 @@ impl<'a> Checker<'a> {
             vars: TypeVarStore::with_reserved_vars(BUILTIN_TYPE_VAR_COUNT),
             builtins: BuiltinSignatureRegistry::default(),
             render_contracts,
+            render_context_function_statements: BTreeSet::new(),
+            render_slot_statements: BTreeSet::new(),
+            structured_delimiter_fields: DenseIndexTable::with_len(program.expressions.len()),
+            diagnostic_inference_dependencies: None,
             source_payload_lookup,
             source_payload_shape_table,
             source_payload_types,
@@ -18417,6 +18742,7 @@ impl<'a> Checker<'a> {
             expr_type_vars: DenseIndexTable::with_len(program.expressions.len()),
             builtin_symbol_exprs,
             expr_type_cache: vec![None; program.expressions.len()],
+            checked_statement_values: DenseIndexTable::default(),
             checked_diagnostic_replay: false,
             diagnostic_replayed: DenseFlagSet::with_len(program.expressions.len()),
             diagnostic_ensure_requests: 0,
@@ -18504,7 +18830,10 @@ impl<'a> Checker<'a> {
     }
 
     fn build_checked_program_first(&mut self) -> CheckedProgramBuildOutput {
-        let render_slot_statements = render_slot_statement_ids(self.program);
+        let render_context = render_context_syntax_index(self.program);
+        self.render_context_function_statements = render_context.function_statements;
+        let render_slot_statements = render_context.render_slot_statements;
+        self.structured_delimiter_fields = structured_delimiter_field_index(self.program);
         let builtins = std::mem::replace(
             &mut self.builtins,
             BuiltinSignatureRegistry {
@@ -18540,6 +18869,8 @@ impl<'a> Checker<'a> {
         self.declaration_exprs = replay_inputs.named_value_expressions;
         self.builtins = replay_inputs.builtins;
         self.render_contracts = replay_inputs.render_contracts;
+        self.render_slot_statements = replay_inputs.render_slot_statements;
+        self.diagnostic_inference_dependencies = Some(replay_inputs.inference_dependencies);
 
         // The authoritative CheckedProgram must retain its external environment
         // while the legacy diagnostic replay still reads it from Checker.
@@ -18553,6 +18884,15 @@ impl<'a> Checker<'a> {
     /// this path and cannot start the superseded provisional inference solve.
     fn install_checked_diagnostic_lookups(&mut self, program: &CheckedProgram) {
         self.expr_type_cache.fill(None);
+        self.checked_statement_values = program
+            .statements
+            .iter()
+            .filter_map(|statement| {
+                statement
+                    .value
+                    .map(|value| (statement.id.0 as usize, value))
+            })
+            .collect();
         self.checked_flow_install_count = 0;
         self.checked_flow_duplicate_ids = 0;
         self.checked_flow_out_of_range_ids = 0;
@@ -18984,15 +19324,6 @@ impl<'a> Checker<'a> {
             type_hint_table_ms = typecheck_elapsed_ms(type_hint_table_started);
         }
         trace_phase("type_hint_table", type_hint_table_ms);
-        for slot in &mut self.render_slot_table.slots {
-            if let Some(statement) = checked_program
-                .statements
-                .iter()
-                .find(|statement| statement.id == CheckedStatementId(slot.slot_statement_id as u32))
-            {
-                slot.value_expr_id = statement.value.map(|expression| expression.0 as usize);
-            }
-        }
         trace_phase(
             "rebuild_tables",
             typecheck_elapsed_ms(rebuild_tables_started),
@@ -19224,7 +19555,9 @@ impl<'a> Checker<'a> {
         let next_in_document = in_document
             || statement_field(statement).as_deref() == Some("document")
             || statement_field(statement).as_deref() == Some("scene")
-            || self.statement_enters_render_context(statement);
+            || self
+                .render_context_function_statements
+                .contains(&statement.id);
         if let Some(expr_id) = statement.expr {
             let flow = self.ensure_expr(expr_id);
             if !next_in_document
@@ -19246,12 +19579,7 @@ impl<'a> Checker<'a> {
         self.check_pattern_constraints(statement);
         self.check_hold_update_compatibility(statement);
         self.check_latest_branch_compatibility(statement);
-        if next_in_document
-            && matches!(
-                statement_field(statement).as_deref(),
-                Some("root" | "child" | "items" | "children")
-            )
-        {
+        if self.render_slot_statements.contains(&statement.id) {
             self.check_render_slot(statement);
         }
         let has_function_bindings = function_signature
@@ -19705,11 +20033,10 @@ impl<'a> Checker<'a> {
     fn check_render_slot(&mut self, statement: &AstStatement) {
         let slot_name = statement_field(statement).unwrap_or_else(|| "items".to_owned());
         let expected_contract = self.render_contracts.slot_contract(&slot_name).to_owned();
-        let value_expr_id = canonical_statement_value_expression(
-            &self.program.ast.statements,
-            statement,
-            &self.program.expressions,
-        );
+        let value_expr_id = self
+            .checked_statement_values
+            .get(&statement.id)
+            .map(|expression| expression.0 as usize);
         let actual_type = value_expr_id
             .map(|expr_id| self.ensure_expr(expr_id).ty)
             .unwrap_or_else(|| {
@@ -19863,35 +20190,11 @@ impl<'a> Checker<'a> {
     }
 
     fn infer_delimiter_type(&mut self, expr_id: usize) -> Type {
-        let fields = structured_delimiter_statement(
-            &self.program.ast.statements,
-            &self.program.expressions,
-            expr_id,
-        )
-        .map(|statement| {
-            statement
-                .children
-                .iter()
-                .filter_map(|child| {
-                    let name = match &child.kind {
-                        AstStatementKind::Field { name } => Some(name.clone()),
-                        AstStatementKind::Source { field, .. }
-                        | AstStatementKind::Hold { field, .. }
-                        | AstStatementKind::List { field, .. } => field.clone(),
-                        AstStatementKind::Function { .. }
-                        | AstStatementKind::Block
-                        | AstStatementKind::Spread
-                        | AstStatementKind::Expression => None,
-                    }?;
-                    let value = canonical_checked_statement_value_expression(
-                        child,
-                        &self.program.expressions,
-                    )?;
-                    Some((name, value))
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+        let fields = self
+            .structured_delimiter_fields
+            .get(&expr_id)
+            .cloned()
+            .unwrap_or_default();
         if fields.is_empty() {
             return Type::List(Box::new(open_object_type()));
         }
@@ -22696,11 +22999,22 @@ impl<'a> Checker<'a> {
                 AstExprKind::Hold { name, .. } => Some(name.clone()),
                 _ => None,
             });
-        let updates = hold_update_exprs_for_expr(
-            &self.program.ast.statements,
-            expr_id,
-            &self.program.expressions,
-        );
+        let Some(updates) = self
+            .diagnostic_inference_dependencies
+            .as_ref()
+            .and_then(|dependencies| dependencies.hold_updates_by_expression.get(&expr_id))
+            .cloned()
+        else {
+            self.diagnostics.push(
+                self.diagnostic_for_expr(
+                    expr_id,
+                    "internal checked diagnostic projection is missing HOLD update ownership"
+                        .to_owned(),
+                ),
+            );
+            return ty;
+        };
+        let updates = Vec::from(updates);
         for update_expr_id in updates {
             if let Some(name) = hold_name.as_ref() {
                 // The accumulator is the nearest lexical value throughout its
@@ -23804,11 +24118,6 @@ impl<'a> Checker<'a> {
         Some(Type::List(Box::new(
             item_type.unwrap_or_else(|| unresolved_shape("empty list item")),
         )))
-    }
-
-    fn statement_enters_render_context(&self, statement: &AstStatement) -> bool {
-        matches!(statement.kind, AstStatementKind::Function { .. })
-            && statement_contains_render_context_syntax(statement, &self.program.expressions)
     }
 
     fn flow_mode_for_expr(&self, expr: &AstExpr) -> FlowMode {
@@ -25689,19 +25998,54 @@ fn statement_field(statement: &AstStatement) -> Option<String> {
     }
 }
 
-fn render_slot_statement_ids(program: &ParsedProgram) -> BTreeSet<usize> {
-    fn collect(
+struct RenderContextSyntaxIndex {
+    function_statements: BTreeSet<usize>,
+    render_slot_statements: BTreeSet<usize>,
+}
+
+fn render_context_syntax_index(program: &ParsedProgram) -> RenderContextSyntaxIndex {
+    // Resolve the expensive "does this function subtree render?" question
+    // once, bottom-up. The legacy diagnostic walk used to rescan a complete
+    // function subtree for every function statement, after checked lowering
+    // had already performed the same classification for render slots.
+    fn collect_function_contexts(
         statements: &[AstStatement],
         expressions: &[AstExpr],
+        function_statements: &mut BTreeSet<usize>,
+    ) -> bool {
+        let mut any = false;
+        for statement in statements {
+            let child_contains =
+                collect_function_contexts(&statement.children, expressions, function_statements);
+            let field_contains = statement_field(statement).as_deref().is_some_and(|field| {
+                matches!(
+                    field,
+                    "document" | "scene" | "root" | "child" | "items" | "children"
+                )
+            });
+            let expression_contains = statement.expr.is_some_and(|expression| {
+                expr_contains_render_constructor(expression, expressions)
+            });
+            let contains = field_contains || expression_contains || child_contains;
+            if contains && matches!(statement.kind, AstStatementKind::Function { .. }) {
+                function_statements.insert(statement.id);
+            }
+            any |= contains;
+        }
+        any
+    }
+
+    fn collect_slots(
+        statements: &[AstStatement],
         in_render_context: bool,
+        function_statements: &BTreeSet<usize>,
         slots: &mut BTreeSet<usize>,
     ) {
         for statement in statements {
             let field = statement_field(statement);
             let next_in_render_context = in_render_context
                 || matches!(field.as_deref(), Some("document" | "scene"))
-                || (matches!(statement.kind, AstStatementKind::Function { .. })
-                    && statement_contains_render_context_syntax(statement, expressions));
+                || function_statements.contains(&statement.id);
             if next_in_render_context
                 && matches!(
                     field.as_deref(),
@@ -25710,23 +26054,32 @@ fn render_slot_statement_ids(program: &ParsedProgram) -> BTreeSet<usize> {
             {
                 slots.insert(statement.id);
             }
-            collect(
+            collect_slots(
                 &statement.children,
-                expressions,
                 next_in_render_context,
+                function_statements,
                 slots,
             );
         }
     }
 
-    let mut slots = BTreeSet::new();
-    collect(
+    let mut function_statements = BTreeSet::new();
+    collect_function_contexts(
         &program.ast.statements,
         &program.expressions,
-        false,
-        &mut slots,
+        &mut function_statements,
     );
-    slots
+    let mut render_slot_statements = BTreeSet::new();
+    collect_slots(
+        &program.ast.statements,
+        false,
+        &function_statements,
+        &mut render_slot_statements,
+    );
+    RenderContextSyntaxIndex {
+        function_statements,
+        render_slot_statements,
+    }
 }
 
 fn statement_output_name(statement: &AstStatement) -> Option<String> {
@@ -28998,6 +29351,81 @@ fn exact_statement_by_root_expression(
     output
 }
 
+fn structured_delimiter_field_index(
+    program: &ParsedProgram,
+) -> DenseIndexTable<Box<[(String, usize)]>> {
+    fn collect(
+        statements: &[AstStatement],
+        expressions: &[AstExpr],
+        output: &mut DenseIndexTable<Box<[(String, usize)]>>,
+    ) {
+        for statement in statements {
+            // The legacy lookup was child-statement-first. Preserve that
+            // precedence for malformed arenas where one delimiter is
+            // reachable from more than one structural statement.
+            collect(&statement.children, expressions, output);
+            if !statement.children.iter().any(|child| {
+                matches!(
+                    child.kind,
+                    AstStatementKind::Field { .. }
+                        | AstStatementKind::Source { field: Some(_), .. }
+                        | AstStatementKind::Hold { field: Some(_), .. }
+                        | AstStatementKind::List { field: Some(_), .. }
+                )
+            }) {
+                continue;
+            }
+            let fields = statement
+                .children
+                .iter()
+                .filter_map(|child| {
+                    let name = match &child.kind {
+                        AstStatementKind::Field { name } => Some(name.clone()),
+                        AstStatementKind::Source { field, .. }
+                        | AstStatementKind::Hold { field, .. }
+                        | AstStatementKind::List { field, .. } => field.clone(),
+                        AstStatementKind::Function { .. }
+                        | AstStatementKind::Block
+                        | AstStatementKind::Spread
+                        | AstStatementKind::Expression => None,
+                    }?;
+                    let value = canonical_checked_statement_value_expression(child, expressions)?;
+                    Some((name, value))
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice();
+            let mut delimiters = Vec::new();
+            if let Some(expression) = statement.expr {
+                if expressions
+                    .get(expression)
+                    .is_some_and(|expression| matches!(expression.kind, AstExprKind::Delimiter))
+                {
+                    delimiters.push(expression);
+                }
+                if let Some(expression) = expressions.get(expression) {
+                    delimiters.extend(direct_expression_children(expression).into_iter().filter(
+                        |child| {
+                            expressions
+                                .get(*child)
+                                .is_some_and(|child| matches!(child.kind, AstExprKind::Delimiter))
+                        },
+                    ));
+                }
+            }
+            for delimiter in delimiters {
+                if output.get(&delimiter).is_none() {
+                    output.insert_if_in_bounds(delimiter, fields.clone());
+                }
+            }
+        }
+    }
+
+    let mut output = DenseIndexTable::with_len(program.expressions.len());
+    collect(&program.ast.statements, &program.expressions, &mut output);
+    output
+}
+
+#[cfg(test)]
 fn structured_delimiter_statement<'a>(
     statements: &'a [AstStatement],
     expressions: &[AstExpr],
@@ -30370,24 +30798,6 @@ fn render_constructor_for_expr(expr_id: usize, expressions: &[AstExpr]) -> Optio
         }
         _ => None,
     }
-}
-
-fn statement_contains_render_context_syntax(
-    statement: &AstStatement,
-    expressions: &[AstExpr],
-) -> bool {
-    statement_field(statement).as_deref().is_some_and(|field| {
-        matches!(
-            field,
-            "document" | "scene" | "root" | "child" | "items" | "children"
-        )
-    }) || statement
-        .expr
-        .is_some_and(|expr_id| expr_contains_render_constructor(expr_id, expressions))
-        || statement
-            .children
-            .iter()
-            .any(|child| statement_contains_render_context_syntax(child, expressions))
 }
 
 fn expr_contains_render_constructor(expr_id: usize, expressions: &[AstExpr]) -> bool {

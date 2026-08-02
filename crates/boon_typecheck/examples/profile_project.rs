@@ -5,10 +5,24 @@
 //! an inference-only optimization does not require a multi-minute release
 //! rebuild before its first measurement.
 
+use serde::Serialize;
 use std::env;
 use std::fs;
 use std::path::PathBuf;
 use std::time::Instant;
+
+#[derive(Serialize)]
+struct FrontendProfile<'a> {
+    parse_ms: f64,
+    typecheck_ms: f64,
+    expressions: usize,
+    checked_expressions: usize,
+    diagnostics: usize,
+    errors: bool,
+    program_available: bool,
+    parse_work: boon_parser::ParseWorkCounters,
+    typecheck_work: &'a boon_typecheck::TypeCheckWorkCounters,
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = env::args().skip(1);
@@ -30,18 +44,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let parse_started = Instant::now();
-    let parsed = boon_parser::parse_project(entrypoint, units)?;
+    let (parsed, parse_profile) = boon_parser::parse_project_profiled(entrypoint, units);
+    let parsed = parsed?;
     let parse_ms = parse_started.elapsed().as_secs_f64() * 1_000.0;
     let typecheck_started = Instant::now();
-    let output = boon_typecheck::check_diagnostics_program_profiled(&parsed).0;
+    let external_types =
+        boon_typecheck::ExternalTypeEnvironment::empty(boon_document_model::ProgramRole::Client);
+    let (output, typecheck_profile) =
+        boon_typecheck::check_diagnostics_program_profiled_with_external_types(
+            &parsed,
+            &external_types,
+        );
     let typecheck_ms = typecheck_started.elapsed().as_secs_f64() * 1_000.0;
-    println!(
-        "parse_ms={parse_ms:.3} typecheck_ms={typecheck_ms:.3} expressions={} checked={} diagnostics={} errors={} program={}",
-        parsed.expressions.len(),
-        output.report.checked_expression_count,
-        output.report.diagnostics.len(),
-        output.report.has_errors(),
-        output.program.is_some(),
-    );
+    serde_json::to_writer(
+        std::io::stdout().lock(),
+        &FrontendProfile {
+            parse_ms,
+            typecheck_ms,
+            expressions: parsed.expressions.len(),
+            checked_expressions: output.report.checked_expression_count,
+            diagnostics: output.report.diagnostics.len(),
+            errors: output.report.has_errors(),
+            program_available: output.program.is_some(),
+            parse_work: parse_profile.work_counters,
+            typecheck_work: &typecheck_profile.work_counters,
+        },
+    )?;
+    println!();
     Ok(())
 }

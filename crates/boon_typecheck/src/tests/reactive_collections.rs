@@ -183,6 +183,67 @@ result:
 }
 
 #[test]
+fn projected_tag_discriminants_specialize_only_the_concrete_call_occurrence() {
+    let parsed = boon_parser::parse_source(
+        "projected-tag-call-result.bn",
+        r#"
+FUNCTION make_row() {
+    [item_kind: VariableRow, label: TEXT { ready }]
+}
+
+FUNCTION selected_item(row) {
+    row.item_kind |> WHEN {
+        VariableRow => [item_kind: VariableRow, label: row.label]
+        __ => row
+    }
+}
+
+rows:
+    LIST { 1 }
+    |> List/map(item, new: selected_item(row: make_row()))
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+
+    assert!(
+        !output.report.has_errors(),
+        "projected discriminant diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+    let rows = output
+        .report
+        .named_value_type_table
+        .entries
+        .iter()
+        .find(|entry| entry.path == "rows")
+        .expect("rows type");
+    let Type::List(item) = &rows.flow_type.ty else {
+        panic!("rows must remain a list: {:#?}", rows.flow_type.ty);
+    };
+    let Type::Object(item) = item.as_ref() else {
+        panic!("rows item must be an object: {item:#?}");
+    };
+    assert!(
+        !item.open,
+        "the exact selected_item occurrence must close the mapped item: {item:#?}"
+    );
+
+    let principal = output
+        .report
+        .function_type_table
+        .entries
+        .iter()
+        .find(|entry| entry.name == "selected_item")
+        .expect("selected_item principal signature");
+    assert!(
+        matches!(&principal.result.ty, Type::Object(shape) if shape.open),
+        "the wildcard callable principal must remain open: {:#?}",
+        principal.result.ty
+    );
+}
+
+#[test]
 fn recovery_tagged_constructor_wrappers_propagate_payload_domains() {
     let parsed = boon_parser::parse_source(
         "tagged-constructor-wrapper.bn",

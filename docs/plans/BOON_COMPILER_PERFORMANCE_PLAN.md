@@ -81,7 +81,7 @@ evidence, not an accepted performance ceiling:
 | Fixture | Package / compiler-input lines | Source to `MachinePlan` | Peak RSS | Plan SHA-256 |
 | --- | ---: | ---: | ---: | --- |
 | Counter | 140 / 140 | 0.09 s | 29,992 KiB | `dc1fe51b659d1746a0b0b4ae2dcba21d50a9426499eb2bde28dbed988e6cfb08` |
-| Physical TodoMVC | 3,576 / 3,576 | 2.02 s | 146,340 KiB | `c9a12cd0a1bcf748a20e3a072afa09d0f923c2c9dbd664f2343d343494404f96` |
+| Physical TodoMVC | 3,647 / 3,576 | 2.02 s | 146,340 KiB | `c9a12cd0a1bcf748a20e3a072afa09d0f923c2c9dbd664f2343d343494404f96` |
 | NovyWave | 11,994 / 11,923 | 20.68 s | 1,000,416 KiB | `4d3c284a9240cdc68c70aff7f30c570367e285cc1e8f823585900829bafd8ff7` |
 
 NovyWave's package count includes its separate 71-line `BUILD.bn`; the compiler

@@ -1,5 +1,23 @@
 use super::*;
 
+#[test]
+fn concrete_syntax_result_survives_closed_principal_finalization() {
+    let principal = Type::Number;
+    let occurrence = Type::object(ObjectShape::from_ordered_fields(
+        [("color".to_owned(), Type::Text)],
+        false,
+    ));
+
+    assert_eq!(
+        finalize_checked_call_occurrence_result(&principal, &occurrence, true),
+        occurrence
+    );
+    assert_eq!(
+        finalize_checked_call_occurrence_result(&principal, &occurrence, false),
+        principal
+    );
+}
+
 fn found_payload_type(ty: &Type) -> Option<&Type> {
     let Type::VariantSet(variants) = ty else {
         return None;

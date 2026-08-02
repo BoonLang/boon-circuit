@@ -2420,20 +2420,33 @@ fn relink_direct_structure_pipeline(
     expressions: &mut [AstExpr],
     base: usize,
 ) {
+    let structural_predecessor_indents = statements
+        .iter()
+        .filter(|statement| {
+            statement_pipeline_continuation_target(statement, expressions).is_none()
+        })
+        .filter_map(|statement| {
+            statement_value_expression(statement, expressions)
+                .map(|expression| (expression, statement.indent))
+        })
+        .collect::<BTreeMap<_, _>>();
     let mut previous = base;
     for statement in statements {
         let Some(target) = statement_pipeline_continuation_target(statement, expressions) else {
             continue;
         };
-        // Recursive lexical linking runs first and owns an exact local
-        // predecessor. Structural relinking is only the fallback for a
-        // leading continuation that has no lexical predecessor; overwriting
-        // an existing edge can incorrectly point a BLOCK/HOLD body pipeline
-        // at its enclosing structure.
-        if let Some(expression) = expressions
-            .get_mut(target)
-            .filter(|expression| expression.linked_input.is_none())
-        {
+        // Recursive lexical linking runs before the enclosing structure is
+        // materialized. For an inline multiline LIST/record, that provisional
+        // predecessor can therefore be the last structural child rather than
+        // the structure itself. Replace exactly those child edges while
+        // preserving a genuinely local BLOCK/HOLD body predecessor.
+        if let Some(expression) = expressions.get_mut(target).filter(|expression| {
+            expression.linked_input.is_none()
+                || expression
+                    .linked_input
+                    .and_then(|input| structural_predecessor_indents.get(&input))
+                    .is_some_and(|predecessor_indent| *predecessor_indent > statement.indent)
+        }) {
             expression.linked_input = Some(previous);
             if let AstExprKind::Infix { left, .. } = &mut expression.kind {
                 *left = previous;
@@ -8102,6 +8115,7 @@ rows:
         [value: 3]
         [value: 4]
     }
+
     |> List/map(item, new: item)
     |> List/retain(item, if: True)
 "#,
@@ -8146,6 +8160,55 @@ rows:
         assert_eq!(retain.linked_input, Some(map.id));
         assert!(!items.contains(&map.id));
         assert!(!items.contains(&retain.id));
+    }
+
+    #[test]
+    fn inline_multiline_list_pipeline_links_from_the_list_not_its_last_item() {
+        let parsed = parse_ast(
+            "inline-multiline-list-pipeline.bn",
+            r#"
+rows: LIST {
+        [value: 1, retained: True]
+        [value: 2, retained: False]
+    }
+    |> List/append(item: [value: 3])
+    |> List/map(item, new: item)
+"#,
+        )
+        .unwrap();
+
+        let list = parsed
+            .expressions
+            .iter()
+            .find(|expression| {
+                matches!(
+                    &expression.kind,
+                    AstExprKind::ListLiteral { items, .. } if items.len() == 2
+                )
+            })
+            .expect("two-item inline multiline list");
+        let AstExprKind::ListLiteral { items, .. } = &list.kind else {
+            unreachable!();
+        };
+        let append = parsed
+            .expressions
+            .iter()
+            .find(|expression| {
+                matches!(&expression.kind, AstExprKind::Pipe { op, .. } if op == "List/append")
+            })
+            .expect("append continuation");
+        let map = parsed
+            .expressions
+            .iter()
+            .find(|expression| {
+                matches!(&expression.kind, AstExprKind::Pipe { op, .. } if op == "List/map")
+            })
+            .expect("map continuation");
+
+        assert_eq!(append.linked_input, Some(list.id));
+        assert_eq!(map.linked_input, Some(append.id));
+        assert!(!items.contains(&append.id));
+        assert!(!items.contains(&map.id));
     }
 
     #[test]

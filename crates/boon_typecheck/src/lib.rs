@@ -1836,6 +1836,12 @@ struct CheckedProgramBuilder<'a> {
     pattern_parents: DenseIndexTable<usize>,
     pattern_arms_by_scope: DenseIndexTable<usize>,
     nearest_pattern_arm_by_scope: Vec<Option<usize>>,
+    /// Parser delimiters carry their ordered object fields in the statement
+    /// tree rather than directly in `AstExprKind`. Call-local result
+    /// specialization needs the same structural index as diagnostic replay so
+    /// a selected delimiter branch does not collapse back to its provisional
+    /// fallback type.
+    structured_delimiter_fields: DenseIndexTable<Box<[(String, usize)]>>,
     syntax_discriminant_parameters: BTreeSet<DeclId>,
     /// Exact selector paths read by user-callable static branches. Unlike
     /// `syntax_discriminant_parameters`, this retains projected selectors such
@@ -2335,6 +2341,7 @@ struct OwnedCheckedConstruction {
     source_payload_shape_table: Vec<SourcePayloadSyntaxShapeEntry>,
     flow_bindings: FlowModeIndex,
     expression_owner: DenseIndexTable<String>,
+    structured_delimiter_fields: DenseIndexTable<Box<[(String, usize)]>>,
     named_value_expressions: DeclarationExprIndex,
     function_param_requirements: BTreeMap<String, BTreeMap<String, Type>>,
     builtins: BuiltinSignatureRegistry,
@@ -2347,6 +2354,7 @@ struct CheckedDiagnosticReplayInputs {
     builtins: BuiltinSignatureRegistry,
     render_contracts: RenderContractRegistry,
     render_slot_statements: BTreeSet<usize>,
+    structured_delimiter_fields: DenseIndexTable<Box<[(String, usize)]>>,
     hold_updates_by_expression: DenseIndexTable<Box<[usize]>>,
 }
 
@@ -3019,6 +3027,7 @@ impl<'a> CheckedProgramBuilder<'a> {
             source_payload_shape_table,
             flow_bindings,
             expression_owner,
+            structured_delimiter_fields,
             named_value_expressions,
             function_param_requirements,
             builtins,
@@ -3106,6 +3115,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                 pattern_parents: DenseIndexTable::with_len(program.expressions.len()),
                 pattern_arms_by_scope: DenseIndexTable::default(),
                 nearest_pattern_arm_by_scope: Vec::new(),
+                structured_delimiter_fields,
                 syntax_discriminant_parameters: BTreeSet::new(),
                 syntax_discriminant_parameter_paths: BTreeMap::new(),
                 inferred_expr_types: DenseIndexTable::with_len(program.expressions.len()),
@@ -3322,6 +3332,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                 builtins,
                 render_contracts,
                 render_slot_statements,
+                structured_delimiter_fields: builder.structured_delimiter_fields,
                 hold_updates_by_expression: inference_dependencies.hold_updates_by_expression,
             }),
         }
@@ -5301,10 +5312,7 @@ impl<'a> CheckedProgramBuilder<'a> {
         let pattern_domains = dependencies.pattern_selector_domains.clone();
         let mut pattern_actuals = Vec::new();
         for formal in &pattern_selector_parameters {
-            if let Some(actuals) = dependencies
-                .actuals_by_parameter
-                .get(formal.0 as usize)
-            {
+            if let Some(actuals) = dependencies.actuals_by_parameter.get(formal.0 as usize) {
                 pattern_actuals.extend(actuals.iter().copied().map(|value| (*formal, value)));
             }
         }
@@ -6760,10 +6768,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                 let callables_started = trace.then(Instant::now);
                 stats.callable_visits += callables.len();
                 for callable in callables {
-                    let Some(index) = self
-                        .signature_by_decl
-                        .get(&(callable.0 as usize))
-                        .copied()
+                    let Some(index) = self.signature_by_decl.get(&(callable.0 as usize)).copied()
                     else {
                         continue;
                     };
@@ -7671,10 +7676,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                 readers.push(call.expression.0 as usize);
             }
             if let Some(owner) = call.owner_callable
-                && let Some(owner_index) = self
-                    .signature_by_decl
-                    .get(&(owner.0 as usize))
-                    .copied()
+                && let Some(owner_index) = self.signature_by_decl.get(&(owner.0 as usize)).copied()
                 && self
                     .signatures
                     .get(owner_index)
@@ -7704,9 +7706,8 @@ impl<'a> CheckedProgramBuilder<'a> {
                         {
                             parameters.push(*formal);
                         }
-                        if let Some(actuals) = dependencies
-                            .actuals_by_parameter
-                            .get_mut(formal.0 as usize)
+                        if let Some(actuals) =
+                            dependencies.actuals_by_parameter.get_mut(formal.0 as usize)
                         {
                             actuals.push(*value);
                         }
@@ -7725,9 +7726,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                         target: output,
                         ..
                     } => {
-                        if let Some(calls) = dependencies
-                            .calls_by_output
-                            .get_mut(output.0 as usize)
+                        if let Some(calls) = dependencies.calls_by_output.get_mut(output.0 as usize)
                         {
                             calls.push(call.id);
                         }
@@ -8411,10 +8410,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                 break;
             }
             visits += 1;
-            let Some(signature_index) = self
-                .signature_by_decl
-                .get(&(callable.0 as usize))
-                .copied()
+            let Some(signature_index) = self.signature_by_decl.get(&(callable.0 as usize)).copied()
             else {
                 continue;
             };
@@ -9232,7 +9228,37 @@ impl<'a> CheckedProgramBuilder<'a> {
                 .filter(|branch| !matches!(branch, Type::Absent))
                 .reduce(|existing, branch| widen_structural_type(&existing, &branch))
                 .unwrap_or(fallback),
-            AstExprKind::Source | AstExprKind::Delimiter | AstExprKind::Unknown(_) => fallback,
+            AstExprKind::Delimiter => {
+                let fields = self
+                    .structured_delimiter_fields
+                    .get(&expr_id)
+                    .cloned()
+                    .unwrap_or_default();
+                if fields.is_empty() {
+                    // Empty brackets are deliberately context-sensitive in
+                    // Boon (`[]` can be an empty record or collection). The
+                    // ordinary checked solve has already resolved that
+                    // context; only reconstruct non-empty structured records
+                    // here.
+                    fallback
+                } else {
+                    Type::object(ObjectShape::from_ordered_fields(
+                        fields.into_iter().map(|(name, value)| {
+                            (
+                                name,
+                                self.infer_checked_overlay_expr_type(
+                                    value,
+                                    bindings,
+                                    active_callables,
+                                )
+                                .unwrap_or(Type::Unknown),
+                            )
+                        }),
+                        false,
+                    ))
+                }
+            }
+            AstExprKind::Source | AstExprKind::Unknown(_) => fallback,
         };
         Some(ty)
     }
@@ -9248,11 +9274,12 @@ impl<'a> CheckedProgramBuilder<'a> {
         let selector_type =
             self.infer_checked_overlay_expr_type(selector, bindings, active_callables)?;
         let mut result = None;
-        for arm in reachable_static_when_arms(
+        let reachable_arms = reachable_static_when_arms(
             expression.id,
             &self.program.expressions,
             Some(&selector_type),
-        ) {
+        );
+        for arm in reachable_arms {
             let arm_selector = arm.selector_type.as_ref().unwrap_or(&selector_type);
             let mut arm_bindings = bindings.clone();
             for (name, ty) in pattern_payload_bindings(arm_selector, &arm.pattern) {
@@ -9499,8 +9526,9 @@ impl<'a> CheckedProgramBuilder<'a> {
             &snapshot.signature_result.ty,
             &result_instantiation,
         );
-        let syntax_discriminated_candidate = self
-            .checked_call_has_concrete_syntax_discriminant(plan)
+        let has_concrete_syntax_discriminant =
+            self.checked_call_has_concrete_syntax_discriminant(plan);
+        let syntax_discriminated_candidate = has_concrete_syntax_discriminant
             .then(|| self.infer_checked_syntax_call_result(call_id))
             .flatten()
             .map(|candidate| {
@@ -10596,9 +10624,7 @@ impl<'a> CheckedProgramBuilder<'a> {
             // use `self` without retaining a borrow into the builder.
             let actuals = dependencies
                 .as_ref()
-                .and_then(|dependencies| {
-                    dependencies.actuals_by_parameter.get(target.0 as usize)
-                })
+                .and_then(|dependencies| dependencies.actuals_by_parameter.get(target.0 as usize))
                 .cloned()
                 .unwrap_or_else(|| {
                     // Outside the indexed solver (principally diagnostic
@@ -12907,9 +12933,7 @@ impl<'a> CheckedProgramBuilder<'a> {
             let indexed_calls = self
                 .checked_type_inference_dependencies
                 .as_ref()
-                .and_then(|dependencies| {
-                    dependencies.calls_by_callee.get(callable.0 as usize)
-                })
+                .and_then(|dependencies| dependencies.calls_by_callee.get(callable.0 as usize))
                 .cloned()
                 .unwrap_or_else(|| {
                     self.calls
@@ -12919,6 +12943,16 @@ impl<'a> CheckedProgramBuilder<'a> {
                         .collect()
                 });
             for call_id in indexed_calls {
+                let syntax_plan = self
+                    .checked_type_inference_dependencies
+                    .as_ref()
+                    .and_then(|dependencies| {
+                        dependencies.call_inference_plans.get(&(call_id.0 as usize))
+                    })
+                    .cloned();
+                let concrete_syntax_result = syntax_plan
+                    .as_ref()
+                    .is_some_and(|plan| self.checked_call_has_concrete_syntax_discriminant(plan));
                 let Some(call_index) = self.call_by_id.get(&(call_id.0 as usize)).copied() else {
                     continue;
                 };
@@ -12938,7 +12972,11 @@ impl<'a> CheckedProgramBuilder<'a> {
                     // callable must not collapse them back to the callable's
                     // coarser public result shape.
                     mode: occurrence.mode,
-                    ty: specialize_checked_call_result(&result_type.ty, &occurrence.ty),
+                    ty: finalize_checked_call_occurrence_result(
+                        &result_type.ty,
+                        &occurrence.ty,
+                        concrete_syntax_result,
+                    ),
                 };
                 call.result = occurrence_result.clone();
                 if let Some(expression) = occurrence_expression {
@@ -14022,6 +14060,10 @@ enum CheckedOrderSemanticTextSegment {
 
 struct CheckedOrderAnalyzer<'a> {
     program: &'a CheckedProgram,
+    calls: DenseIndexTable<&'a CheckedCall>,
+    declarations: DenseIndexTable<&'a CheckedDeclaration>,
+    callables: DenseIndexTable<&'a CheckedCallableSignature>,
+    pattern_bindings: DenseIndexTable<&'a CheckedPatternBinding>,
     active: BTreeSet<(CheckedExprId, Vec<CheckedCallId>)>,
 }
 
@@ -14029,8 +14071,44 @@ impl<'a> CheckedOrderAnalyzer<'a> {
     fn new(program: &'a CheckedProgram) -> Self {
         Self {
             program,
+            calls: program
+                .calls
+                .iter()
+                .map(|call| (call.id.0 as usize, call))
+                .collect(),
+            declarations: program
+                .declarations
+                .iter()
+                .map(|declaration| (declaration.id.0 as usize, declaration))
+                .collect(),
+            callables: program
+                .callables
+                .iter()
+                .map(|callable| (callable.decl_id.0 as usize, callable))
+                .collect(),
+            pattern_bindings: program
+                .pattern_bindings
+                .iter()
+                .map(|binding| (binding.declaration.0 as usize, binding))
+                .collect(),
             active: BTreeSet::new(),
         }
+    }
+
+    fn call(&self, id: CheckedCallId) -> Option<&'a CheckedCall> {
+        self.calls.get(&(id.0 as usize)).copied()
+    }
+
+    fn declaration(&self, id: DeclId) -> Option<&'a CheckedDeclaration> {
+        self.declarations.get(&(id.0 as usize)).copied()
+    }
+
+    fn callable(&self, id: DeclId) -> Option<&'a CheckedCallableSignature> {
+        self.callables.get(&(id.0 as usize)).copied()
+    }
+
+    fn pattern_binding(&self, id: DeclId) -> Option<&'a CheckedPatternBinding> {
+        self.pattern_bindings.get(&(id.0 as usize)).copied()
     }
 
     fn expression_state(
@@ -14046,10 +14124,7 @@ impl<'a> CheckedOrderAnalyzer<'a> {
             CheckedOrderState::Unordered,
             |expression| match &expression.kind {
                 CheckedExpressionKind::Call { call } => self
-                    .program
-                    .calls
-                    .iter()
-                    .find(|candidate| candidate.id == *call)
+                    .call(*call)
                     .map_or(CheckedOrderState::Unordered, |call| {
                         self.call_state(call, frames)
                     }),
@@ -14069,10 +14144,7 @@ impl<'a> CheckedOrderAnalyzer<'a> {
                     {
                         self.expression_state(value, &frames[..frame_index])
                     } else if let Some(value) = self
-                        .program
-                        .declarations
-                        .iter()
-                        .find(|declaration| declaration.id == *target)
+                        .declaration(*target)
                         .and_then(|declaration| declaration.value)
                         .or_else(|| {
                             source
@@ -14081,15 +14153,9 @@ impl<'a> CheckedOrderAnalyzer<'a> {
                         })
                     {
                         self.expression_state(value, frames)
-                    } else if self
-                        .program
-                        .declarations
-                        .iter()
-                        .find(|declaration| declaration.id == *target)
-                        .is_some_and(|declaration| {
-                            declaration.kind == CheckedDeclarationKind::ValueParameter
-                        })
-                    {
+                    } else if self.declaration(*target).is_some_and(|declaration| {
+                        declaration.kind == CheckedDeclarationKind::ValueParameter
+                    }) {
                         CheckedOrderState::Deferred
                     } else {
                         CheckedOrderState::Unordered
@@ -14124,6 +14190,13 @@ impl<'a> CheckedOrderAnalyzer<'a> {
         call: &CheckedCall,
         frames: &[CheckedOrderFrame],
     ) -> CheckedOrderState {
+        // Calls nested inside a non-list result are visited independently by
+        // the outer program walk; the enclosing scalar/object call cannot
+        // itself carry list-order metadata. This type boundary prevents every
+        // UI constructor from recursively reanalyzing its complete body.
+        if !type_may_be_ordered_list(&call.result.ty) {
+            return CheckedOrderState::Unordered;
+        }
         match call.function.as_str() {
             "List/sort_by" => {
                 let Some(key) = checked_call_input(call, "key") else {
@@ -14168,12 +14241,7 @@ impl<'a> CheckedOrderAnalyzer<'a> {
                     self.expression_state(list, frames)
                 }),
             _ => {
-                let Some(signature) = self
-                    .program
-                    .callables
-                    .iter()
-                    .find(|signature| signature.decl_id == call.callable)
-                else {
+                let Some(signature) = self.callable(call.callable) else {
                     return CheckedOrderState::Unordered;
                 };
                 if signature.kind != CheckedCallableKind::User {
@@ -14220,12 +14288,7 @@ impl<'a> CheckedOrderAnalyzer<'a> {
             .unwrap_or(Type::Unknown);
         key_type = apply_checked_type_substitutions(&key_type, &call.type_substitutions);
         for frame in frames.iter().rev() {
-            if let Some(frame_call) = self
-                .program
-                .calls
-                .iter()
-                .find(|candidate| candidate.id == frame.call)
-            {
+            if let Some(frame_call) = self.call(frame.call) {
                 key_type =
                     apply_checked_type_substitutions(&key_type, &frame_call.type_substitutions);
             }
@@ -14320,11 +14383,7 @@ impl<'a> CheckedOrderAnalyzer<'a> {
                     self.semantic_expression(value, &frames[..frame_index], active)
                         .map(|value| project(value, projection))
                 } else {
-                    let declaration = self
-                        .program
-                        .declarations
-                        .iter()
-                        .find(|declaration| declaration.id == *target);
+                    let declaration = self.declaration(*target);
                     if declaration.is_some_and(|declaration| {
                         matches!(
                             declaration.kind,
@@ -14332,12 +14391,7 @@ impl<'a> CheckedOrderAnalyzer<'a> {
                         )
                     }) {
                         Some(CheckedOrderSemanticExpression::Row(projection.clone()))
-                    } else if let Some(binding) = self
-                        .program
-                        .pattern_bindings
-                        .iter()
-                        .find(|binding| binding.declaration == *target)
-                    {
+                    } else if let Some(binding) = self.pattern_binding(*target) {
                         let mut fields = binding.projection.clone();
                         fields.extend(projection.iter().cloned());
                         self.semantic_expression(binding.selector, frames, active)
@@ -14399,16 +14453,8 @@ impl<'a> CheckedOrderAnalyzer<'a> {
                 Some(CheckedOrderSemanticExpression::Tag(name.clone()))
             }
             CheckedExpressionKind::Call { call } => {
-                let call = self
-                    .program
-                    .calls
-                    .iter()
-                    .find(|candidate| candidate.id == *call)?;
-                let signature = self
-                    .program
-                    .callables
-                    .iter()
-                    .find(|signature| signature.decl_id == call.callable)?;
+                let call = self.call(*call)?;
+                let signature = self.callable(call.callable)?;
                 if signature.kind == CheckedCallableKind::User {
                     let result = signature.result_expression?;
                     let bindings = call
@@ -14557,10 +14603,7 @@ impl<'a> CheckedOrderAnalyzer<'a> {
                 {
                     self.expression_is_total(value, &frames[..frame_index], active)
                 } else {
-                    self.program
-                        .declarations
-                        .iter()
-                        .find(|declaration| declaration.id == *target)
+                    self.declaration(*target)
                         .and_then(|declaration| declaration.value)
                         .or_else(|| {
                             source
@@ -14571,21 +14614,11 @@ impl<'a> CheckedOrderAnalyzer<'a> {
                 }
             }
             CheckedExpressionKind::Call { call } => {
-                let Some(call) = self
-                    .program
-                    .calls
-                    .iter()
-                    .find(|candidate| candidate.id == *call)
-                else {
+                let Some(call) = self.call(*call) else {
                     active.remove(&(expression, frame_path));
                     return false;
                 };
-                let Some(signature) = self
-                    .program
-                    .callables
-                    .iter()
-                    .find(|signature| signature.decl_id == call.callable)
-                else {
+                let Some(signature) = self.callable(call.callable) else {
                     active.remove(&(expression, frame_path));
                     return false;
                 };
@@ -14764,10 +14797,7 @@ impl<'a> CheckedOrderAnalyzer<'a> {
                     active.remove(&(expression.id, frame_path));
                     return pure;
                 }
-                self.program
-                    .declarations
-                    .iter()
-                    .find(|declaration| declaration.id == *target)
+                self.declaration(*target)
                     .and_then(|declaration| declaration.value)
                     .or_else(|| {
                         source
@@ -14778,10 +14808,7 @@ impl<'a> CheckedOrderAnalyzer<'a> {
                     .collect()
             }
             CheckedExpressionKind::Call { call } => self
-                .program
-                .calls
-                .iter()
-                .find(|candidate| candidate.id == *call)
+                .call(*call)
                 .map(|call| {
                     call.entries
                         .iter()
@@ -15769,6 +15796,24 @@ fn type_is_orderable_key(ty: &Type) -> bool {
         )
 }
 
+fn type_may_be_ordered_list(ty: &Type) -> bool {
+    match ty {
+        Type::List(_) | Type::Var(_) | Type::Unknown | Type::UnresolvedShape { .. } => true,
+        Type::Union(members) => members.iter().any(type_may_be_ordered_list),
+        Type::Number
+        | Type::Text
+        | Type::Bits { .. }
+        | Type::Bytes(_)
+        | Type::Object(_)
+        | Type::RenderContract
+        | Type::Map { .. }
+        | Type::Set(_)
+        | Type::VariantSet(_)
+        | Type::Function { .. }
+        | Type::Absent => false,
+    }
+}
+
 fn type_is_deferred_order_key(ty: &Type) -> bool {
     matches!(
         ty,
@@ -15782,8 +15827,8 @@ fn derive_checked_order_chains(
     let mut order_chains = Vec::new();
     let mut diagnostics = Vec::new();
     let mut seen = BTreeSet::new();
+    let mut analyzer = CheckedOrderAnalyzer::new(program);
     for call in &program.calls {
-        let mut analyzer = CheckedOrderAnalyzer::new(program);
         match analyzer.call_state(call, &[]) {
             CheckedOrderState::Invalid { call_path } => {
                 let span = order_chain_diagnostic_span(program, &call_path, call.span);
@@ -16534,7 +16579,13 @@ pub fn type_is_recursively_closed(ty: &Type) -> bool {
 
 fn type_has_concrete_outer_shape(ty: &Type) -> bool {
     match ty {
-        Type::Object(shape) => !shape.open,
+        // A selected syntax branch can legitimately merge multiple record
+        // implementations (for example, theme backends). Their shared result
+        // may be a fieldless open record when no field is common to every
+        // implementation, but `Type::Object` still proves the outer value is
+        // record-shaped and therefore valid for projections/spreads. A fully
+        // unconstrained result is represented by `Unknown`/`Var`, below.
+        Type::Object(_) => true,
         Type::VariantSet(variants) => !variants.is_empty(),
         Type::Union(members) => !members.is_empty(),
         Type::Unknown | Type::UnresolvedShape { .. } | Type::Var(_) => false,
@@ -19076,6 +19127,7 @@ impl<'a> Checker<'a> {
                 source_payload_shape_table: std::mem::take(&mut self.source_payload_shape_table),
                 flow_bindings: std::mem::take(&mut self.flow_bindings),
                 expression_owner: std::mem::take(&mut self.expression_owner),
+                structured_delimiter_fields: std::mem::take(&mut self.structured_delimiter_fields),
                 named_value_expressions: std::mem::take(&mut self.declaration_exprs),
                 function_param_requirements: std::mem::take(&mut self.function_param_requirements),
                 builtins,
@@ -19091,6 +19143,7 @@ impl<'a> Checker<'a> {
         self.builtins = replay_inputs.builtins;
         self.render_contracts = replay_inputs.render_contracts;
         self.render_slot_statements = replay_inputs.render_slot_statements;
+        self.structured_delimiter_fields = replay_inputs.structured_delimiter_fields;
         self.diagnostic_hold_updates = replay_inputs.hold_updates_by_expression;
 
         // The authoritative CheckedProgram must retain its external environment
@@ -34101,6 +34154,22 @@ pub fn specialize_checked_call_result(instantiated: &Type, occurrence: &Type) ->
         // allowed to replace an already concrete substituted type with a
         // conflicting syntax-local approximation.
         _ => instantiated.clone(),
+    }
+}
+
+fn finalize_checked_call_occurrence_result(
+    principal: &Type,
+    occurrence: &Type,
+    concrete_syntax_result: bool,
+) -> Type {
+    if concrete_syntax_result && type_has_concrete_outer_shape(occurrence) {
+        // A heterogeneous syntax dispatcher can have a closed scalar public
+        // summary while a concrete tagged request selects a record/list arm.
+        // The checked fixed point has already evaluated that occurrence; do
+        // not erase it while finalizing the callable's principal signature.
+        occurrence.clone()
+    } else {
+        specialize_checked_call_result(principal, occurrence)
     }
 }
 

@@ -44,6 +44,42 @@ store: [
 }
 
 #[test]
+fn inline_multiline_list_append_preserves_the_base_row_shape() {
+    let parsed = boon_parser::parse_source(
+        "inline-multiline-list-append-row.bn",
+        r#"
+rows: LIST {
+        [title: TEXT { existing }, completed: True]
+    }
+    |> List/append(item: [title: TEXT { added }])
+    |> List/map(item, new: item.completed |> WHEN {
+        True => True
+        False => False
+        __ => False
+    })
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+
+    assert!(
+        !output.report.has_errors(),
+        "inline list append diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+    assert!(matches!(
+        output
+            .report
+            .named_value_type_table
+            .entries
+            .iter()
+            .find(|entry| entry.path == "rows")
+            .map(|entry| &entry.flow_type.ty),
+        Some(Type::List(item)) if matches!(item.as_ref(), Type::VariantSet(_))
+    ));
+}
+
+#[test]
 fn recovery_tagged_pattern_domains_preserve_payload_shape_through_wrappers() {
     let parsed = boon_parser::parse_source(
         "tagged-pattern-wrapper.bn",
@@ -241,6 +277,75 @@ rows:
         "the wildcard callable principal must remain open: {:#?}",
         principal.result.ty
     );
+}
+
+#[test]
+fn nested_tag_dispatch_preserves_structured_delimiter_results_for_spreads() {
+    let parsed = boon_parser::parse_source(
+        "nested-tag-dispatch-delimiter-result.bn",
+        r#"
+FUNCTION text_style(of, backend) {
+    backend |> WHEN {
+        Classic => of |> WHEN {
+            Hero => [font_size: 64, weight: 300]
+            Body => [font_size: 16, weight: 400]
+        }
+        Alternate => of |> WHEN {
+            Hero => [font_size: 62, weight: 500, tracking: 1]
+            Body => [font_size: 15, weight: 450, tracking: 0]
+        }
+    }
+}
+
+FUNCTION theme_get(request, backend) {
+    request |> WHEN {
+        Text[of] => text_style(of: of, backend: backend)
+        Spacing[of] => 10
+    }
+}
+
+FUNCTION theme_text(of, backend) {
+    theme_get(request: Text[of: of], backend: backend)
+}
+
+FUNCTION make_style(backend) {
+    [
+        ...theme_text(of: Hero, backend: backend)
+        width: 320
+    ]
+}
+
+FUNCTION make_fixed_style() {
+    [
+        ...theme_get(request: Text[of: Hero], backend: Classic)
+        width: 320
+    ]
+}
+
+classic_style: make_style(backend: Classic)
+alternate_style: make_style(backend: Alternate)
+fixed_style: make_fixed_style()
+"#,
+    )
+    .unwrap();
+    let output = check_program(&parsed);
+
+    assert!(
+        !output.report.has_errors(),
+        "nested delimiter result diagnostics: {:#?}",
+        output.report.diagnostics
+    );
+    let style = output
+        .report
+        .named_value_type_table
+        .entries
+        .iter()
+        .find(|entry| entry.path == "classic_style")
+        .expect("classic style type");
+    let Type::Object(style) = &style.flow_type.ty else {
+        panic!("spread result must remain an object: {:#?}", style.flow_type.ty);
+    };
+    assert_eq!(style.fields.get("width"), Some(&Type::Number));
 }
 
 #[test]

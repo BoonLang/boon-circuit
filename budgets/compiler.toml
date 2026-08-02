@@ -28,7 +28,7 @@ machine_plan_sha256 = "dc1fe51b659d1746a0b0b4ae2dcba21d50a9426499eb2bde28dbed988
 [[fixtures]]
 id = "todo-mvc-physical"
 source = "examples/todo_mvc_physical/RUN.bn"
-package_source_lines = 3576
+package_source_lines = 3647
 compiler_input_source_lines = 3576
 checked_diagnostics_p95_ms = 75.0
 verified_machine_plan_p95_ms = 300.0

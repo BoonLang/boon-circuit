@@ -1,8 +1,87 @@
-use boon_compiler::{CompileRequest, compile_machine_plan};
+use boon_compiler::{
+    CancellationToken, CompileIntent, CompileRequest, CompilerProject, CompilerSession,
+    compile_machine_plan, compiler_source_project_for_path,
+};
 use boon_plan::{ApplicationIdentity, ProgramRole, TargetProfile, verify_plan};
 use boon_runtime::{LiveRuntime, parse_scenario, source_units_for_path};
+use std::alloc::{GlobalAlloc, Layout, System};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+mod compiler_sample;
+
+struct CompilerCountingAllocator;
+
+static ALLOCATION_CALLS: AtomicU64 = AtomicU64::new(0);
+static ALLOCATED_BYTES: AtomicU64 = AtomicU64::new(0);
+static DEALLOCATION_CALLS: AtomicU64 = AtomicU64::new(0);
+static DEALLOCATED_BYTES: AtomicU64 = AtomicU64::new(0);
+
+#[global_allocator]
+static GLOBAL_ALLOCATOR: CompilerCountingAllocator = CompilerCountingAllocator;
+
+// SAFETY: every operation is forwarded unchanged to the process System
+// allocator. The atomics are observation-only and do not influence allocation
+// addresses, sizes, alignment, or lifetimes.
+unsafe impl GlobalAlloc for CompilerCountingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        ALLOCATION_CALLS.fetch_add(1, Ordering::Relaxed);
+        ALLOCATED_BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
+        // SAFETY: this method has exactly the `GlobalAlloc::alloc` contract and
+        // forwards the same valid layout to `System`.
+        unsafe { System.alloc(layout) }
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        ALLOCATION_CALLS.fetch_add(1, Ordering::Relaxed);
+        ALLOCATED_BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
+        // SAFETY: this method forwards the same valid layout to `System`.
+        unsafe { System.alloc_zeroed(layout) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        DEALLOCATION_CALLS.fetch_add(1, Ordering::Relaxed);
+        DEALLOCATED_BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
+        // SAFETY: this method forwards the allocation pointer and its original
+        // layout unchanged to `System`.
+        unsafe { System.dealloc(ptr, layout) }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        DEALLOCATION_CALLS.fetch_add(1, Ordering::Relaxed);
+        DEALLOCATED_BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
+        ALLOCATION_CALLS.fetch_add(1, Ordering::Relaxed);
+        ALLOCATED_BYTES.fetch_add(new_size as u64, Ordering::Relaxed);
+        // SAFETY: this method forwards the allocation pointer, original
+        // layout, and requested size unchanged to `System`.
+        unsafe { System.realloc(ptr, layout, new_size) }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct CompilerAllocationCounters {
+    pub allocation_calls: u64,
+    pub allocated_bytes: u64,
+    pub deallocation_calls: u64,
+    pub deallocated_bytes: u64,
+}
+
+pub(crate) fn reset_compiler_allocation_counters() {
+    ALLOCATION_CALLS.store(0, Ordering::Relaxed);
+    ALLOCATED_BYTES.store(0, Ordering::Relaxed);
+    DEALLOCATION_CALLS.store(0, Ordering::Relaxed);
+    DEALLOCATED_BYTES.store(0, Ordering::Relaxed);
+}
+
+pub(crate) fn compiler_allocation_counters() -> CompilerAllocationCounters {
+    CompilerAllocationCounters {
+        allocation_calls: ALLOCATION_CALLS.load(Ordering::Relaxed),
+        allocated_bytes: ALLOCATED_BYTES.load(Ordering::Relaxed),
+        deallocation_calls: DEALLOCATION_CALLS.load(Ordering::Relaxed),
+        deallocated_bytes: DEALLOCATED_BYTES.load(Ordering::Relaxed),
+    }
+}
 
 const HELP: &str = "\
 usage:
@@ -10,6 +89,7 @@ usage:
   boon_cli check <source> [--target <profile>]
   boon_cli dump-plan <source> [--target <profile>] [--out <path>]
   boon_cli dump-ir <source> [--out <path>]
+  boon_cli compiler-sample <source> --intent <diagnostics|verified> --mode <fresh-process|empty-session> [--samples <count>]
 ";
 
 fn main() {
@@ -35,6 +115,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "check" => check_source(&args),
         "dump-plan" => dump_plan(&args),
         "dump-ir" => dump_ir(&args),
+        "compiler-sample" => compiler_sample::run(&args),
         other => Err(format!("unknown command `{other}`").into()),
     }
 }
@@ -63,12 +144,25 @@ fn check_source(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let source = args.first().ok_or("check requires a source path")?;
     let target = target_profile(args)?;
     reject_unknown_options(args, &["--target"])?;
-    let compiled = compile_machine_plan(CompileRequest::source_path(
-        Path::new(source),
+    let (entrypoint, units) = compiler_source_project_for_path(Path::new(source))?;
+    let mut compiler = CompilerSession::new();
+    let project = compiler.open_project(CompilerProject::new(
+        entrypoint,
+        units,
         target,
         ProgramRole::Client,
         ApplicationIdentity::compiler_default(),
     ))?;
+    let revision = compiler.revision(project)?;
+    let result = compiler.request(
+        project,
+        revision,
+        CompileIntent::VerifiedCheck,
+        &CancellationToken::new(),
+    )?;
+    let compiled = result
+        .compiled()
+        .ok_or("verified check produced no compiled artifact")?;
     let verification = verify_plan(&compiled.plan)?;
     if verification.status != "pass" {
         let failed = verification

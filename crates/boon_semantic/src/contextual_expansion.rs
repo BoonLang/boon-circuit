@@ -988,7 +988,7 @@ pub(crate) fn erase_runtime_type_vars(ty: &Type) -> Type {
                 ty: erase_runtime_type_vars(&result.ty),
             }),
         },
-        Type::Object(shape) => Type::Object(boon_typecheck::ObjectShape {
+        Type::Object(shape) => Type::object(boon_typecheck::ObjectShape {
             fields: shape
                 .fields
                 .iter()
@@ -1013,7 +1013,8 @@ pub(crate) fn erase_runtime_type_vars(ty: &Type) -> Type {
                                     .collect(),
                                 field_order: fields.field_order.clone(),
                                 open: fields.open,
-                            },
+                            }
+                            .into(),
                         }
                     }
                 })
@@ -1094,6 +1095,7 @@ fn concrete_record_type(
             let Type::Object(shape) = value_type else {
                 return None;
             };
+            let shape = shape.into_owned();
             for name in shape.field_order.iter().chain(shape.fields.keys()) {
                 if !ordered.contains(name) {
                     ordered.push(name.clone());
@@ -1107,7 +1109,7 @@ fn concrete_record_type(
             typed.insert(field.name.clone(), value_type);
         }
     }
-    Some(Type::Object(boon_typecheck::ObjectShape {
+    Some(Type::object(boon_typecheck::ObjectShape {
         fields: typed,
         field_order: ordered,
         open: false,
@@ -4323,17 +4325,18 @@ fn ordinary_callable_base_rejection(
     None
 }
 
-fn ordinary_callable_body_is_closed(
+fn ordinary_callable_body_dependencies(
     program: &CheckedProgram,
     lookup: &CheckedProgramLookup,
     callable: &boon_typecheck::CheckedCallableSignature,
     candidates: &BTreeSet<DeclId>,
-) -> bool {
+) -> Option<BTreeSet<DeclId>> {
     let Some(root) = callable.result_expression else {
-        return false;
+        return None;
     };
     let mut pending = vec![root];
     let mut visited = BTreeSet::new();
+    let mut dependencies = BTreeSet::new();
     while let Some(expression_id) = pending.pop() {
         if !visited.insert(expression_id) {
             continue;
@@ -4345,13 +4348,13 @@ fn ordinary_callable_body_is_closed(
                 requirement.expression == expression_id && !requirement.source_origins.is_empty()
             })
         {
-            return false;
+            return None;
         }
         let Some(expression) = lookup.expression(program, expression_id) else {
-            return false;
+            return None;
         };
         if expression.effect != boon_typecheck::CheckedEffectSummary::default() {
-            return false;
+            return None;
         }
         match &expression.kind {
             CheckedExpressionKind::Read { target, source, .. } => {
@@ -4359,10 +4362,10 @@ fn ordinary_callable_body_is_closed(
                     || enclosing_function_owner(program, lookup, expression.scope_id)
                         != Some(callable.decl_id)
                 {
-                    return false;
+                    return None;
                 }
                 let Some(declaration) = lookup.declaration(program, *target) else {
-                    return false;
+                    return None;
                 };
                 match enclosing_function_owner(program, lookup, declaration.scope_id) {
                     Some(owner) if owner == callable.decl_id => {
@@ -4381,12 +4384,12 @@ fn ordinary_callable_body_is_closed(
                         // not lexical captures and must not force one body copy
                         // per call occurrence.
                     }
-                    Some(_) | None => return false,
+                    Some(_) | None => return None,
                 }
             }
             CheckedExpressionKind::Call { call } => {
                 let Some(call) = lookup.call(program, *call) else {
-                    return false;
+                    return None;
                 };
                 if !call.contexts.is_empty()
                     || call
@@ -4394,10 +4397,10 @@ fn ordinary_callable_body_is_closed(
                         .iter()
                         .any(|entry| !matches!(entry, CheckedCallEntry::Input { .. }))
                 {
-                    return false;
+                    return None;
                 }
                 let Some(target) = lookup.callable(program, call.callable) else {
-                    return false;
+                    return None;
                 };
                 let context_matches = match target.context_formal {
                     None => matches!(call.context_binding, CheckedContextBinding::None),
@@ -4408,7 +4411,7 @@ fn ordinary_callable_body_is_closed(
                     ),
                 };
                 if !context_matches {
-                    return false;
+                    return None;
                 }
                 match target.kind {
                     CheckedCallableKind::Builtin
@@ -4418,10 +4421,12 @@ fn ordinary_callable_body_is_closed(
                             && !boon_typecheck::is_registered_render_constructor(
                                 &call.function,
                             ) => {}
-                    CheckedCallableKind::User if candidates.contains(&target.decl_id) => {}
+                    CheckedCallableKind::User if candidates.contains(&target.decl_id) => {
+                        dependencies.insert(target.decl_id);
+                    }
                     CheckedCallableKind::User
                     | CheckedCallableKind::Builtin
-                    | CheckedCallableKind::External => return false,
+                    | CheckedCallableKind::External => return None,
                 }
                 pending.extend(call.entries.iter().filter_map(|entry| match entry {
                     CheckedCallEntry::Input { value, .. } => Some(*value),
@@ -4481,65 +4486,96 @@ fn ordinary_callable_body_is_closed(
             | CheckedExpressionKind::Latest { .. }
             | CheckedExpressionKind::While { .. }
             | CheckedExpressionKind::Then { .. }
-            | CheckedExpressionKind::Invalid { .. } => return false,
+            | CheckedExpressionKind::Invalid { .. } => return None,
         }
     }
-    true
+    Some(dependencies)
 }
 
 fn ordinary_callable_declarations(program: &CheckedProgram) -> BTreeSet<DeclId> {
+    let trace = std::env::var_os("BOON_SEMANTIC_TRACE").is_some();
+    let started = trace.then(std::time::Instant::now);
     let lookup = CheckedProgramLookup::new(program);
-    let mut candidates = program
+    let base_candidates = program
         .callables
         .iter()
         .filter(|callable| ordinary_callable_base_candidate(program, callable))
         .map(|callable| callable.decl_id)
         .collect::<BTreeSet<_>>();
-    loop {
-        let retained = program
+    let mut dependents = BTreeMap::<DeclId, BTreeSet<DeclId>>::new();
+    let mut pending_rejections = Vec::new();
+    for callable in program
+        .callables
+        .iter()
+        .filter(|callable| base_candidates.contains(&callable.decl_id))
+    {
+        match ordinary_callable_body_dependencies(program, &lookup, callable, &base_candidates) {
+            Some(dependencies) => {
+                for dependency in dependencies {
+                    dependents
+                        .entry(dependency)
+                        .or_default()
+                        .insert(callable.decl_id);
+                }
+            }
+            None => pending_rejections.push(callable.decl_id),
+        }
+    }
+    let direct_rejection_count = pending_rejections.len();
+    let mut retained = base_candidates.clone();
+    while let Some(rejected) = pending_rejections.pop() {
+        if !retained.remove(&rejected) {
+            continue;
+        }
+        pending_rejections.extend(
+            dependents
+                .get(&rejected)
+                .into_iter()
+                .flat_map(|callers| callers.iter().copied()),
+        );
+    }
+    if trace {
+        let mut rejections = BTreeMap::<&'static str, Vec<String>>::new();
+        for callable in program
             .callables
             .iter()
-            .filter(|callable| candidates.contains(&callable.decl_id))
-            .filter(|callable| {
-                ordinary_callable_body_is_closed(program, &lookup, callable, &candidates)
-            })
-            .map(|callable| callable.decl_id)
-            .collect::<BTreeSet<_>>();
-        if retained == candidates {
-            if std::env::var_os("BOON_SEMANTIC_TRACE").is_some() {
-                let mut rejections = BTreeMap::<&'static str, Vec<String>>::new();
-                for callable in program
-                    .callables
-                    .iter()
-                    .filter(|callable| callable.kind == CheckedCallableKind::User)
-                {
-                    let reason =
-                        ordinary_callable_base_rejection(program, callable).or_else(|| {
-                            (!retained.contains(&callable.decl_id)).then_some("body_not_closed")
-                        });
-                    if let Some(reason) = reason {
-                        rejections
-                            .entry(reason)
-                            .or_default()
-                            .push(callable.name.clone());
-                    }
-                }
-                eprintln!(
-                    "boon_semantic ordinary_callable_rejections {:?}",
-                    rejections
-                        .into_iter()
-                        .map(|(reason, names)| {
-                            let count = names.len();
-                            let sample = names.into_iter().take(12).collect::<Vec<_>>();
-                            (reason, count, sample)
-                        })
-                        .collect::<Vec<_>>()
-                );
+            .filter(|callable| callable.kind == CheckedCallableKind::User)
+        {
+            let reason = ordinary_callable_base_rejection(program, callable)
+                .or_else(|| (!retained.contains(&callable.decl_id)).then_some("body_not_closed"));
+            if let Some(reason) = reason {
+                rejections
+                    .entry(reason)
+                    .or_default()
+                    .push(callable.name.clone());
             }
-            return retained;
         }
-        candidates = retained;
+        eprintln!(
+            "boon_semantic ordinary_callable_analysis base={} direct_rejections={} propagated_rejections={} retained={} elapsed_ms={:.3}",
+            base_candidates.len(),
+            direct_rejection_count,
+            base_candidates
+                .len()
+                .saturating_sub(retained.len())
+                .saturating_sub(direct_rejection_count),
+            retained.len(),
+            started
+                .map(|started| started.elapsed().as_secs_f64() * 1000.0)
+                .unwrap_or(0.0),
+        );
+        eprintln!(
+            "boon_semantic ordinary_callable_rejections {:?}",
+            rejections
+                .into_iter()
+                .map(|(reason, names)| {
+                    let count = names.len();
+                    let sample = names.into_iter().take(12).collect::<Vec<_>>();
+                    (reason, count, sample)
+                })
+                .collect::<Vec<_>>()
+        );
     }
+    retained
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

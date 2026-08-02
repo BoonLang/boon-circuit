@@ -22,6 +22,15 @@ Boon `NUMBER` is an exact normalized rational, `True` and `False` are ordinary
 Tags, and no public Boolean, floating-point, absence, or fault value is
 introduced by formal verification.
 
+Reconciled on 2026-08-02 with
+[`BOON_COMPILER_PERFORMANCE_PLAN.md`](BOON_COMPILER_PERFORMANCE_PLAN.md).
+That plan owns compiler latency and memory budgets, compiler-session and
+invalidation architecture, cancellation, profiling, and the compiler-side
+dense representations pulled forward to meet those budgets. This plan retains
+exclusive ownership of proof meaning, required obligations, accepted evidence,
+assurance policy, verifier manifests, and the rule that no executable artifact
+may bypass `ContractVerifiedProgram`.
+
 ## Executive Decision
 
 Boon gets exactly two application-facing formal-verification forms:
@@ -2428,11 +2437,19 @@ CheckedProgram
     -> ErasedProgram
 ```
 
-Every production frontend and backend follows that exact ownership order,
-including programs that author no local `WHERE`. `ParsedProgram` precedes it;
-`MachinePlan`, `PhysicalPlan`, native/Wasm code, and hardware IR follow it.
-No compiler flag, cache format, precompiled package, distributed role, test
-fixture, or target-specific lowering may skip the gate.
+Every artifact-producing production frontend and every backend follows that
+exact ownership order, including programs that author no local `WHERE`.
+`ParsedProgram` precedes it; `MachinePlan`, `PhysicalPlan`, native/Wasm code,
+and hardware IR follow it. No compiler flag, cache format, precompiled package,
+distributed role, test fixture, or target-specific lowering may skip the gate.
+
+That rule applies to every request capable of publishing an executable
+artifact. A diagnostics-only compiler request may stop after its complete
+checked diagnostics are available, but it produces no `SemanticProgram`,
+`ContractVerifiedProgram`, `ErasedProgram`, `MachinePlan`, verified preview,
+package, or runnable cache entry. Switching request profiles is not a bypass:
+any later executable request continues through the mandatory semantic and
+verification spine from exact source-bound inputs.
 
 The complete required pipeline is:
 
@@ -2508,6 +2525,17 @@ one semantic model while executing another. `docs/architecture/LANGUAGE_SEMANTIC
 must ultimately state that the verifier consumes `SemanticProgram`, while
 backends consume its proof-erased `ErasedProgram` lowering.
 
+The compiler may construct private `SemanticCore` shards while discovering
+contextual materializations and distributed dependencies. A core is an
+unsealed builder representation: it is not serializable as a runnable artifact,
+cannot be accepted by `boon_verify` or `boon_ir`, and cannot escape through an
+artifact-producing compiler result. `SemanticProgram::seal` freezes the exact
+resolved graph, callable-dependency manifest, proof-context identities,
+semantic-profile inputs, source mapping, and canonical verifier inputs. The
+verifier derives its required-obligation and evidence manifests from that
+sealed program; compiler-side sharding may accelerate construction but may not
+replace, weaken, or privately reinterpret those canonical manifests.
+
 The compiler packages these projections without putting proof nodes into
 executable IR:
 
@@ -2531,11 +2559,12 @@ consume the verified bundles. Tooling follows the report reference. This side
 path prevents both silent contract loss at erasure and accidental proof objects
 as Boon runtime values.
 
-Every compiler entrypoint imports transitive public contracts, elaborates the
-semantic graph, constructs its complete required-obligation manifest, verifies
-it, and only then lowers. A trivial successful manifest is allowed only when
-that complete set is empty. The absence of a local `WHERE` token is not enough:
-an imported contracted call can still create an obligation.
+Every artifact-producing compiler entrypoint imports transitive public
+contracts, elaborates the semantic graph, constructs its complete
+required-obligation manifest, verifies it, and only then lowers. A trivial
+successful manifest is allowed only when that complete set is empty. The
+absence of a local `WHERE` token is not enough: an imported contracted call can
+still create an obligation.
 
 ### Semantic And Executable Type Ownership
 
@@ -2584,17 +2613,21 @@ contextual materializations are still changing. Its required order is:
 1. parse and check every role;
 2. solve checked type and authored-theorem interfaces without assuming the
    theorems valid;
-3. elaborate each role `SemanticProgram`;
-4. link the role semantic graphs and discover distributed calls;
-5. derive `ProducerMaterializationRequest`s and re-elaborate semantic graphs
+3. elaborate private role `SemanticCore` shards;
+4. link those cores and discover distributed calls;
+5. derive `ProducerMaterializationRequest`s and update only affected cores
    until the bundle reaches a deterministic fixed point;
-6. freeze a `BundleSemanticProgram` digest and construct complete bundle/role
+6. seal each role exactly once as a `SemanticProgram`, freeze the
+   `BundleSemanticProgram` digest, and construct complete canonical bundle/role
    obligation manifests;
-7. verify under one compatible policy;
+7. verify the sealed programs under one compatible policy;
 8. erase verified roles and produce executable plans and interface bundles.
 
 No pre-verification `boon_ir` lowering may be used for call discovery, and no
-semantic relinking may occur after `ContractVerifiedProgram` construction.
+semantic relinking may occur after `SemanticProgram::seal` or
+`ContractVerifiedProgram` construction. A changed core invalidates its seal;
+the bundle must return to the fixed-point step rather than patch a sealed or
+verified artifact.
 V1 rejects a contracted role/external crossing; the fixed point still applies
 to all existing uncontracted distributed compilation so it cannot become a
 verification bypass. Phase 7 adds verified cross-role contract transport.
@@ -3276,10 +3309,16 @@ therefore does not make the provider manifest depend on its own export.
 An edit invalidates only dependent obligations. Reports expose cold and
 incremental parse, typecheck, VC-generation, and solver timing separately.
 
-No hard latency target is set before measuring the first implementation on the
-repository's real examples. After baseline measurement, each formal example
-receives cold and incremental proof budgets. A timeout remains failure even
-when a budget is missed.
+`BOON_COMPILER_PERFORMANCE_PLAN.md` owns the hard end-to-end cold/no-cache and
+warm compiler budgets, including the time spent sealing and verifying an
+executable request. Accepted evidence caches and compiler-session reuse cannot
+satisfy either cold gate. This plan owns the additional solver-mode resource
+and timeout ceilings: the first implementation freezes them in a
+machine-readable verifier budget manifest from the measured phase breakdown
+before proof implementation is accepted. No formal phase may defer those
+ceilings to a later unspecified measurement. A timeout, `unknown`, unsupported
+theory, invalid evidence, or missed soundness condition remains failure even
+when a performance budget is missed.
 
 ### IR Erasure
 
@@ -3965,7 +4004,8 @@ Exit:
   reasoning, finite `MAP`/`SET` operations, `FLUSH` paths, ordinary and
   `PASSED` contextual substitution, lexical capture closure, and
   continuous-value `WHEN`/`WHILE` branch path facts.
-- Route every compiler entrypoint through verification.
+- Route every verified-check and artifact-producing compiler entrypoint through
+  verification; diagnostics-only requests stop before artifact construction.
 - Remove/private all raw source-to-IR entrypoints and require opaque,
   verification-derived `ErasedProgram` at compiler backends.
 - Add `CompileOutcome`, source-bound per-source reports with deterministic
@@ -4404,8 +4444,10 @@ reports.
 7. Only `valid` results with V1-allowed assurance dependencies satisfy an
    obligation; arbitrary bounded search and platform-conditional evidence do
    not.
-8. Every compile path constructs the shared `SemanticProgram`, complete
-   verification manifest, and `ContractVerifiedProgram` before IR lowering.
+8. Every artifact-producing compile path constructs the shared
+   `SemanticProgram`, complete verification manifest, and
+   `ContractVerifiedProgram` before IR lowering. Diagnostics-only requests
+   produce no executable or verified artifact.
 9. Required obligation ids and evidence ids match exactly, including imported
    contracted calls in sources with no local `WHERE`; every authored
    `ContractId` and child `ConditionId` has definition and required

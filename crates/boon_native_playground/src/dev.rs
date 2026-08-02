@@ -31,7 +31,7 @@ use crate::view::RetainedView;
 use crate::workspace::{
     PersistRequest, PersistenceWorker, ProjectOrigin, ProjectStore, StoredProject,
 };
-use boon_editor::language::{LanguageSnapshot, LanguageWorker, SemanticItem};
+use boon_editor::language::{LanguageProjectSnapshot, LanguageSnapshot, SemanticItem};
 
 pub fn connect(path: &Path) -> Result<Connection, Box<dyn std::error::Error + Send + Sync>> {
     Ok(Connection::connect(path, Role::Dev)?)
@@ -48,8 +48,8 @@ struct DevModel {
     pending_inspection: Option<(u64, u64, String)>,
     runtime_sequence: Option<(u64, u64)>,
     runtime_value_path: Option<(u64, u64, String)>,
+    language_project: Option<LanguageProjectSnapshot>,
     language: Option<LanguageSnapshot>,
-    source_publication_revision: Option<u64>,
     migration: Option<MigrationBundle>,
     active_migration_stage: Option<String>,
     selected_migration_stage: Option<String>,
@@ -88,8 +88,8 @@ impl DevModel {
             pending_inspection: None,
             runtime_sequence: None,
             runtime_value_path: None,
+            language_project: None,
             language: None,
-            source_publication_revision: None,
             migration: None,
             active_migration_stage: None,
             selected_migration_stage: None,
@@ -117,15 +117,6 @@ impl DevModel {
         }
     }
 
-    fn take_source_publication(&mut self, revision: u64) -> bool {
-        if self.source_publication_revision == Some(revision) {
-            self.source_publication_revision = None;
-            true
-        } else {
-            false
-        }
-    }
-
     fn source_paths(&self) -> Vec<String> {
         self.active
             .units
@@ -139,6 +130,34 @@ impl DevModel {
             .units
             .get(self.active_file)
             .map_or_else(String::new, |unit| unit.source.clone())
+    }
+
+    fn clear_language(&mut self) {
+        self.language_project = None;
+        self.language = None;
+    }
+
+    fn materialize_active_language(&mut self) {
+        self.language = self
+            .language_project
+            .as_ref()
+            .filter(|snapshot| snapshot.revision == self.revision)
+            .and_then(|snapshot| {
+                self.active
+                    .units
+                    .get(self.active_file)
+                    .and_then(|unit| snapshot.materialize_file(self.active_file, unit))
+            });
+    }
+
+    fn accept_language_project(&mut self, snapshot: LanguageProjectSnapshot) -> bool {
+        if snapshot.revision != self.revision || !snapshot.matches_source_units(&self.active.units)
+        {
+            return false;
+        }
+        self.language_project = Some(snapshot);
+        self.materialize_active_language();
+        true
     }
 
     fn set_catalog(&mut self, built_ins: Vec<CatalogItem>) {
@@ -251,8 +270,6 @@ pub async fn run(mut host: NativeSurfaceHost, mut writer: Connection) -> NativeR
         .map(|project| (project.id.clone(), project))
         .collect::<BTreeMap<_, _>>();
     let persistence = PersistenceWorker::new()?;
-    let mut language_worker = LanguageWorker::new();
-    let mut language_output = language_worker.take_output();
     let mut model = DevModel::waiting();
     model.custom = custom_projects;
     let mut state = DevState::new(String::new());
@@ -290,17 +307,14 @@ pub async fn run(mut host: NativeSurfaceHost, mut writer: Connection) -> NativeR
         enum Wake {
             Native(Result<HostEventEnvelope, boon_native_app_window::NativeHostError>),
             Ipc(Option<Result<Message, String>>),
-            Language(Option<LanguageSnapshot>),
         }
         let wake = {
             let native = host.next_event().fuse();
             let command = incoming.next().fuse();
-            let language = language_output.next().fuse();
-            pin_mut!(native, command, language);
+            pin_mut!(native, command);
             select! {
                 event = native => Wake::Native(event),
                 message = command => Wake::Ipc(message),
-                snapshot = language => Wake::Language(snapshot),
             }
         };
         let mut transaction = NativeFrameTransaction::default();
@@ -336,12 +350,12 @@ pub async fn run(mut host: NativeSurfaceHost, mut writer: Connection) -> NativeR
                         if result.change == DevChange::EditorText {
                             model.sync_editor(&state);
                             model.revision = model.revision.saturating_add(1);
-                            model.source_publication_revision = Some(model.revision);
-                            language_worker.submit(
-                                model.revision,
-                                model.active_file,
-                                model.active.units.clone(),
-                            );
+                            model.clear_language();
+                            writer.send(&Message::DevSourceChanged {
+                                application: model.active.application.clone(),
+                                revision: model.revision,
+                                units: model.active.units.clone(),
+                            })?;
                         } else if result.change == DevChange::EditorSelection {
                             request_inspection(&mut model, &state, &mut writer)?;
                         }
@@ -389,7 +403,6 @@ pub async fn run(mut host: NativeSurfaceHost, mut writer: Connection) -> NativeR
                             &mut state,
                             &store,
                             &persistence,
-                            &language_worker,
                             &mut writer,
                             &mut clipboard,
                         )?;
@@ -437,18 +450,23 @@ pub async fn run(mut host: NativeSurfaceHost, mut writer: Connection) -> NativeR
                         model.pending_inspection = None;
                         model.runtime_sequence = None;
                         model.runtime_value_path = None;
-                        model.language = None;
-                        model.source_publication_revision = None;
+                        model.clear_language();
                         model.install_migration(migration, migration_stage);
                         model.clear_persistence_cache();
                         model.runtime_value = "Compiling preview...".to_owned();
                         state.replace_source(model.source());
-                        language_worker.submit(
-                            model.revision,
-                            model.active_file,
-                            model.active.units.clone(),
-                        );
                         frame_changed = true;
+                    }
+                    Message::PreviewLanguageSnapshot { snapshot } => {
+                        if model.accept_language_project(snapshot) {
+                            model.sync_editor(&state);
+                            if model.active.origin == ProjectOrigin::Custom {
+                                persistence
+                                    .submit(PersistRequest::Save(model.active.clone()))
+                                    .map_err(|error| format!("custom autosave failed: {error}"))?;
+                            }
+                            frame_changed = true;
+                        }
                     }
                     Message::PreviewStats(stats) => {
                         model.perf = perf_line(&stats);
@@ -565,27 +583,6 @@ pub async fn run(mut host: NativeSurfaceHost, mut writer: Connection) -> NativeR
                     }
                 }
             }
-            Wake::Language(Some(snapshot)) => {
-                if snapshot.revision == model.revision && snapshot.file_index == model.active_file {
-                    let snapshot_revision = snapshot.revision;
-                    model.language = Some(snapshot);
-                    model.sync_editor(&state);
-                    if model.active.origin == ProjectOrigin::Custom {
-                        persistence
-                            .submit(PersistRequest::Save(model.active.clone()))
-                            .map_err(|error| format!("custom autosave failed: {error}"))?;
-                    }
-                    if model.take_source_publication(snapshot_revision) {
-                        writer.send(&Message::DevSourceChanged {
-                            application: model.active.application.clone(),
-                            revision: model.revision,
-                            units: model.active.units.clone(),
-                        })?;
-                    }
-                    frame_changed = true;
-                }
-            }
-            Wake::Language(None) => return Err("language worker stopped".into()),
         }
 
         while let Some(result) = persistence.try_result() {
@@ -627,7 +624,6 @@ fn handle_action(
     state: &mut DevState,
     store: &ProjectStore,
     persistence: &PersistenceWorker,
-    language: &LanguageWorker,
     writer: &mut Connection,
     clipboard: &mut Option<arboard::Clipboard>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -646,19 +642,17 @@ fn handle_action(
             if let Some(id) =
                 adjacent_id(&model.catalog, &model.active.id, action == DevAction::Next)
             {
-                select_project(id, model, state, persistence, language, writer)?;
+                select_project(id, model, state, persistence, writer)?;
             }
         }
         DevAction::SelectExample(id) => {
-            select_project(id, model, state, persistence, language, writer)?;
+            select_project(id, model, state, persistence, writer)?;
         }
         DevAction::SelectFile(index) if index < model.active.units.len() => {
             model.sync_editor(state);
             model.active_file = index;
-            model.language = None;
-            model.source_publication_revision = None;
             state.replace_source(model.source());
-            language.submit(model.revision, index, model.active.units.clone());
+            model.materialize_active_language();
         }
         DevAction::SelectFile(_) => {}
         navigation @ (DevAction::NavigateDefinition | DevAction::NavigateReference) => {
@@ -667,12 +661,7 @@ fn handle_action(
             if let Some(destination) = destination {
                 let file_changed = apply_semantic_navigation(model, state, &destination);
                 if file_changed {
-                    model.language = None;
-                    language.submit(
-                        model.revision,
-                        model.active_file,
-                        model.active.units.clone(),
-                    );
+                    model.materialize_active_language();
                 }
                 state.set_status(destination.label);
             } else if definition {
@@ -702,11 +691,9 @@ fn handle_action(
             model.install_migration(None, None);
             model.active_file = 0;
             model.revision = model.revision.saturating_add(1);
-            model.language = None;
-            model.source_publication_revision = None;
+            model.clear_language();
             state.replace_source(model.source());
             state.begin_rename(&model.active.label);
-            language.submit(model.revision, 0, model.active.units.clone());
             writer.send(&Message::DevRun {
                 application: model.active.application.clone(),
                 revision: model.revision,
@@ -770,7 +757,6 @@ fn handle_action(
                                 model,
                                 state,
                                 persistence,
-                                language,
                                 writer,
                                 "Created source file",
                             )?;
@@ -787,7 +773,6 @@ fn handle_action(
                                 model,
                                 state,
                                 persistence,
-                                language,
                                 writer,
                                 "Renamed source file",
                             )?;
@@ -827,7 +812,6 @@ fn handle_action(
                         model,
                         state,
                         persistence,
-                        language,
                         writer,
                         "Removed source file",
                     )?;
@@ -839,7 +823,7 @@ fn handle_action(
         DevAction::Run => {
             model.sync_editor(state);
             model.revision = model.revision.saturating_add(1);
-            model.source_publication_revision = None;
+            model.clear_language();
             writer.send(&Message::DevRun {
                 application: model.active.application.clone(),
                 revision: model.revision,
@@ -859,6 +843,7 @@ fn handle_action(
                     .unwrap_or_else(|| model.active.clone());
                 model.active = project;
                 model.active_file = model.active_file.min(model.active.units.len() - 1);
+                model.clear_language();
                 state.replace_source(model.source());
                 state.set_status("Reloaded local example");
             }
@@ -867,8 +852,8 @@ fn handle_action(
             model.sync_editor(state);
             if model.migration.is_none() {
                 model.revision = model.revision.saturating_add(1);
+                model.clear_language();
             }
-            model.source_publication_revision = None;
             model.request_id = model.request_id.saturating_add(1);
             writer.send(&Message::DevTest {
                 request_id: model.request_id,
@@ -1062,12 +1047,12 @@ fn handle_action(
                     state.format(source);
                     model.sync_editor(state);
                     model.revision = model.revision.saturating_add(1);
-                    model.source_publication_revision = Some(model.revision);
-                    language.submit(
-                        model.revision,
-                        model.active_file,
-                        model.active.units.clone(),
-                    );
+                    model.clear_language();
+                    writer.send(&Message::DevSourceChanged {
+                        application: model.active.application.clone(),
+                        revision: model.revision,
+                        units: model.active.units.clone(),
+                    })?;
                 }
                 Err(error) => state.set_status(format!("Format failed: {error}")),
             }
@@ -1097,12 +1082,12 @@ fn handle_action(
             if edited {
                 model.sync_editor(state);
                 model.revision = model.revision.saturating_add(1);
-                model.source_publication_revision = Some(model.revision);
-                language.submit(
-                    model.revision,
-                    model.active_file,
-                    model.active.units.clone(),
-                );
+                model.clear_language();
+                writer.send(&Message::DevSourceChanged {
+                    application: model.active.application.clone(),
+                    revision: model.revision,
+                    units: model.active.units.clone(),
+                })?;
             }
         }
         DevAction::Close => {
@@ -1117,7 +1102,6 @@ fn select_project(
     model: &mut DevModel,
     state: &mut DevState,
     persistence: &PersistenceWorker,
-    language: &LanguageWorker,
     writer: &mut Connection,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     model.sync_editor(state);
@@ -1129,14 +1113,8 @@ fn select_project(
         model.install_migration(None, None);
         model.active_file = model.active.units.len().saturating_sub(1);
         model.revision = model.revision.saturating_add(1);
-        model.language = None;
-        model.source_publication_revision = None;
+        model.clear_language();
         state.replace_source(model.source());
-        language.submit(
-            model.revision,
-            model.active_file,
-            model.active.units.clone(),
-        );
         writer.send(&Message::DevRun {
             application: model.active.application.clone(),
             revision: model.revision,
@@ -1711,7 +1689,6 @@ fn commit_custom_file_change(
     model: &mut DevModel,
     state: &mut DevState,
     persistence: &PersistenceWorker,
-    language: &LanguageWorker,
     writer: &mut Connection,
     status: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -1720,14 +1697,8 @@ fn commit_custom_file_change(
         .insert(model.active.id.clone(), model.active.clone());
     persistence.submit(PersistRequest::Save(model.active.clone()))?;
     model.revision = model.revision.saturating_add(1);
-    model.language = None;
-    model.source_publication_revision = None;
+    model.clear_language();
     state.replace_source(model.source());
-    language.submit(
-        model.revision,
-        model.active_file,
-        model.active.units.clone(),
-    );
     writer.send(&Message::DevRun {
         application: model.active.application.clone(),
         revision: model.revision,

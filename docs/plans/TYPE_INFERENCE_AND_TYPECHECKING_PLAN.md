@@ -15,6 +15,14 @@ The public value algebra and compiler artifact ownership follow
 file defines structural inference within that contract; it does not introduce
 alternate type/value profiles.
 
+Cold and interactive compiler representation, invalidation, cancellation, and
+latency/RSS acceptance are governed by
+[`BOON_COMPILER_PERFORMANCE_PLAN.md`](BOON_COMPILER_PERFORMANCE_PLAN.md). This
+plan continues to own the type terms, constraints, diagnostics, and accepted
+language. Performance work may change their internal storage and scheduling,
+but it must not change type semantics, relax the v1 recursion rejection, or
+bypass the verified compiler spine.
+
 ## Purpose
 
 Add fully inferred Boon typechecking so source code stays annotation-free while
@@ -71,7 +79,10 @@ variant constraints, flow/presence rules, render contracts, and diagnostics.
 Do not use these as the v1 checker core:
 
 - Chalk: Rust trait-solver oriented, too specific and too heavy for Boon.
-- Salsa: useful later for incremental compiler queries, not a type solver.
+- Salsa: not a type solver and not mandated for compiler reuse. The persistent,
+  dependency-indexed invalidation required by the compiler-performance plan
+  remains behind Boon-owned compiler-session interfaces whether it uses Salsa
+  internally or not.
 - Generic HM crates: useful for reading, but Boon's object rows, variants,
   presence, source flow, hidden scopes, and render contracts require custom
   constraint generation.
@@ -231,8 +242,19 @@ not reject ordinary structural data such as `TodoId[id: ...]`.
   `FlowType`, `Constraint`, `TypeDiagnostic`, `ExprTypeTable`,
   `FunctionTypeTable`, `TypedCallTable`, `RenderContractTable`,
   `CheckedRenderSlotTable`, `CollectionShapeTable`, and `TypeCheckReport`.
-- Make these tables fields of `CheckedProgram`; no parser AST table or
-  render-template binder is authoritative after typechecking.
+- Make each `CheckedProgram` snapshot an owned, self-contained compiler
+  database containing these tables. It must not borrow a `ParsedProgram`, and
+  no second builder may reconstruct the checked tables after solving. No parser
+  AST table or render-template binder is authoritative after typechecking.
+- Preserve source-unit and declaration identities across `CompilerSession`
+  revisions when the corresponding declarations survive an edit. Keep compact
+  expression, type, constraint, and graph indexes dense and snapshot-local;
+  those indexes are never persistence, runtime, or cross-revision identity.
+- Store reverse dependency indexes for declarations, expressions, constraints,
+  render contracts, and semantic consumers so an update can invalidate its
+  exact affected cone. The same indexes must support a fresh in-process
+  database with no reused artifacts; persistent reuse is an optimization, not
+  a prerequisite for correctness or cold-speed acceptance.
 - Keep `TypeVarStore` as the only abstraction that depends on `ena`.
 
 ### Phase 3: Constraint Generation And Solving
@@ -490,7 +512,9 @@ Both commands must return no matches.
 - No public absence or runtime-fault value types.
 - No automatic list flattening.
 - No recursive function inference unless designed separately.
-- No broad compiler incrementalization with Salsa in the first pass.
+- No Salsa mandate and no incremental-query framework inside the type solver.
+  Boon-owned `CompilerSession` invalidation and reuse are nevertheless required
+  by the compiler-performance plan after the cache-disabled cold core passes.
 
 ## Acceptance Criteria
 
@@ -510,6 +534,10 @@ Both commands must return no matches.
   `SemanticProgram` owns typed contextual/list views, ownership, dependencies,
   and proof obligations; no parser/template metadata survives as an
   authoritative side channel.
+- `CheckedProgram` is an owned database rather than a borrowed checker result;
+  session-stable declaration identity is distinct from snapshot-local dense
+  indexes, and dependency-indexed reuse produces the same diagnostics and
+  artifact hashes as a fresh cache-disabled database.
 - Every accepted program reaches `ContractVerifiedProgram` before
   `ErasedProgram`, and no runtime/backend consumes an unverified or parser-level
   artifact.

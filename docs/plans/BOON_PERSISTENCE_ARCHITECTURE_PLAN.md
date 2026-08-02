@@ -20,6 +20,12 @@ second active persistence plan.
 
 The implementation is split along existing ownership boundaries:
 
+- [`BOON_COMPILER_PERFORMANCE_PLAN.md`](BOON_COMPILER_PERFORMANCE_PLAN.md)
+  owns the derived `CompilerSession`, source revisions, dependency-indexed
+  invalidation, cancellation, compiler-artifact reuse, and compiler latency and
+  memory budgets. A `CompilerSession` is disposable compiler working state; it
+  is not `boon_plan_executor::Session`, persisted product authority, or a
+  candidate runtime owner.
 - The compiler follows `ParsedProgram -> CheckedProgram -> SemanticProgram ->
   ContractVerifiedProgram -> ErasedProgram -> MachinePlan`.
   `boon_semantic` owns semantic memory/authority and migration meaning;
@@ -788,6 +794,18 @@ events remain separate streams.
 Compiler caches may retain immutable parse/type/IR/MachinePlan artifacts keyed
 by content. They must never retain a mutable `Session` as a reusable compiled
 artifact.
+
+The compiler service may retain a derived `CompilerSession` containing source
+revisions, immutable compiler snapshots, intern tables, dependency indexes,
+and cancelable in-progress work as specified by
+`BOON_COMPILER_PERFORMANCE_PLAN.md`. This state is reconstructible from source
+and exact compiler inputs, contains no runtime authority or live host handles,
+is never serialized as application state, and may be discarded without a
+migration. Persistent compiler artifacts are immutable and exactly keyed by at
+least source-bundle identity, compiler and schema versions, semantic profile,
+target/request profile, and every applicable persistence schema and migration
+catalog digest. A compiler cache hit never reuses, clones, or owns a runtime
+`Session`.
 
 Hot reload creates one candidate Session, restores/migrates authority into it,
 settles demanded outputs, then atomically swaps ownership. Failure leaves the

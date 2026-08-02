@@ -17,22 +17,85 @@ use web_time::Instant;
 mod distributed_compiler;
 mod document_plan_backend;
 mod machine_plan_backend;
+mod session;
 
 pub use distributed_compiler::{
-    CompiledDistributedMachinePlans, DistributedCompilerProgram,
+    CompiledDistributedMachinePlans, DistributedClientProjectionSource, DistributedCompilerProgram,
     compile_distributed_runtime_source_programs,
+    compile_distributed_runtime_source_programs_with_client_projection,
+};
+pub use session::{
+    CancellationToken, CompileIntent, CompilerProject, CompilerSession, CompilerSessionResult,
+    ProjectId, Revision, UnitUpdate,
 };
 
 pub type CompilerResult<T> = Result<T, Box<dyn std::error::Error>>;
 
 pub const COMPILER_ID: &str = concat!("boon-compiler/", env!("CARGO_PKG_VERSION"));
 
-fn verify_and_lower_checked(
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct SemanticLowerProfile {
+    semantic_ms: f64,
+    contract_verify_ms: f64,
+    ir_lower_ms: f64,
+}
+
+fn verify_and_lower_checked_profiled(
     checked: boon_typecheck::CheckedProgram,
     producer_requests: &[boon_semantic::ProducerMaterializationRequest],
-) -> Result<ErasedProgram, String> {
+    cancellation: &mut CancellationProbe<'_>,
+) -> Result<(ErasedProgram, SemanticLowerProfile), String> {
+    cancellation.checkpoint()?;
+    let semantic_started = Instant::now();
     let semantic = elaborate_checked(checked, producer_requests)?;
-    verify_and_lower_semantic(semantic)
+    let semantic_ms = elapsed_ms(semantic_started);
+    cancellation.checkpoint()?;
+    let contract_verify_started = Instant::now();
+    let verified =
+        boon_verify::verify_explicit_contracts(semantic).map_err(|error| error.to_string())?;
+    let contract_verify_ms = elapsed_ms(contract_verify_started);
+    if std::env::var_os("BOON_COMPILER_LOWER_TRACE").is_some() {
+        eprintln!("boon_compiler lower semantic_verification: {contract_verify_ms:.3}ms");
+    }
+    cancellation.checkpoint()?;
+    let ir_lower_started = Instant::now();
+    let ir = boon_ir::erase_and_lower(verified)?;
+    let ir_lower_ms = elapsed_ms(ir_lower_started);
+    if std::env::var_os("BOON_COMPILER_LOWER_TRACE").is_some() {
+        eprintln!("boon_compiler lower ir_erasure: {ir_lower_ms:.3}ms");
+    }
+    cancellation.checkpoint()?;
+    Ok((
+        ir,
+        SemanticLowerProfile {
+            semantic_ms,
+            contract_verify_ms,
+            ir_lower_ms,
+        },
+    ))
+}
+
+struct CancellationProbe<'a> {
+    token: Option<&'a CancellationToken>,
+    checkpoints: usize,
+}
+
+impl<'a> CancellationProbe<'a> {
+    const fn new(token: Option<&'a CancellationToken>) -> Self {
+        Self {
+            token,
+            checkpoints: 0,
+        }
+    }
+
+    fn checkpoint(&mut self) -> Result<(), String> {
+        self.checkpoints = self.checkpoints.saturating_add(1);
+        if self.token.is_some_and(CancellationToken::is_canceled) {
+            Err("compiler request canceled".to_owned())
+        } else {
+            Ok(())
+        }
+    }
 }
 
 fn elaborate_checked(
@@ -63,29 +126,6 @@ fn elaborate_checked_with_external_event_identities(
     Ok(semantic)
 }
 
-fn verify_and_lower_semantic(
-    semantic: boon_semantic::SemanticProgram,
-) -> Result<ErasedProgram, String> {
-    let verify_started = Instant::now();
-    let verified =
-        boon_verify::verify_explicit_contracts(semantic).map_err(|error| error.to_string())?;
-    if std::env::var_os("BOON_COMPILER_LOWER_TRACE").is_some() {
-        eprintln!(
-            "boon_compiler lower semantic_verification: {:.3}ms",
-            elapsed_ms(verify_started)
-        );
-    }
-    let erase_started = Instant::now();
-    let lowered = boon_ir::erase_and_lower(verified)?;
-    if std::env::var_os("BOON_COMPILER_LOWER_TRACE").is_some() {
-        eprintln!(
-            "boon_compiler lower ir_erasure: {:.3}ms",
-            elapsed_ms(erase_started)
-        );
-    }
-    Ok(lowered)
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompilerSourceUnit {
     /// Canonical UTF-8 project-relative path used in source identity.
@@ -102,6 +142,22 @@ pub struct CompilerDiagnostic {
     pub start: Option<usize>,
     pub end: Option<usize>,
     pub message: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CheckedDiagnosticsProfile {
+    pub source_unit_count: usize,
+    pub expression_count: usize,
+    pub diagnostic_count: usize,
+    pub parse_ms: f64,
+    pub typecheck_ms: f64,
+    pub total_ms: f64,
+}
+
+pub struct CheckedSourceFromSource {
+    pub parsed: ParsedProgram,
+    pub output: boon_typecheck::CheckOutput,
+    pub profile: CheckedDiagnosticsProfile,
 }
 
 /// Produces structured parser/type diagnostics for a failed runtime compile.
@@ -187,8 +243,15 @@ fn grapheme_column(source: &str, line: usize, byte: usize) -> Option<usize> {
 pub struct CompileProfile {
     pub source_unit_count: usize,
     pub expression_count: usize,
+    pub checked_expression_count: usize,
+    pub checked_call_count: usize,
     pub graph_node_count: usize,
+    pub cancellation_checkpoint_count: usize,
     pub parse_ms: f64,
+    pub typecheck_ms: f64,
+    pub semantic_ms: f64,
+    pub contract_verify_ms: f64,
+    pub ir_lower_ms: f64,
     pub lower_ms: f64,
     pub verify_ms: f64,
     pub compile_ms: f64,
@@ -223,6 +286,49 @@ enum CompileSource<'a> {
         source_label: &'a str,
         units: &'a [CompilerSourceUnit],
     },
+}
+
+#[derive(Debug)]
+pub struct CompilerCheckRequest<'a> {
+    source: CompileSource<'a>,
+    program_role: ProgramRole,
+}
+
+impl<'a> CompilerCheckRequest<'a> {
+    pub fn source_path(source_path: &'a Path, program_role: ProgramRole) -> Self {
+        Self {
+            source: CompileSource::Path(source_path),
+            program_role,
+        }
+    }
+
+    pub fn source_text(
+        source_label: &'a str,
+        source_text: &'a str,
+        program_role: ProgramRole,
+    ) -> Self {
+        Self {
+            source: CompileSource::Text {
+                source_label,
+                source_text,
+            },
+            program_role,
+        }
+    }
+
+    pub fn source_units(
+        source_label: &'a str,
+        units: &'a [CompilerSourceUnit],
+        program_role: ProgramRole,
+    ) -> Self {
+        Self {
+            source: CompileSource::Units {
+                source_label,
+                units,
+            },
+            program_role,
+        }
+    }
 }
 
 impl<'a> CompileRequest<'a> {
@@ -305,6 +411,41 @@ impl<'a> CompileRequest<'a> {
     }
 }
 
+#[derive(Debug)]
+pub struct CheckedCompileRequest<'a> {
+    target_profile: TargetProfile,
+    program_role: ProgramRole,
+    application_identity: ApplicationIdentity,
+    schema_version: u64,
+    migration_predecessors: &'a [MigrationPredecessorBinding],
+}
+
+impl<'a> CheckedCompileRequest<'a> {
+    pub fn new(
+        target_profile: TargetProfile,
+        program_role: ProgramRole,
+        application_identity: ApplicationIdentity,
+    ) -> Self {
+        Self {
+            target_profile,
+            program_role,
+            application_identity,
+            schema_version: boon_plan::DEFAULT_PERSISTENCE_SCHEMA_VERSION,
+            migration_predecessors: &[],
+        }
+    }
+
+    pub fn with_persistence_catalog(
+        mut self,
+        schema_version: u64,
+        migration_predecessors: &'a [MigrationPredecessorBinding],
+    ) -> Self {
+        self.schema_version = schema_version;
+        self.migration_predecessors = migration_predecessors;
+        self
+    }
+}
+
 pub fn compile_erased_program(
     program: &ErasedProgram,
     target_profile: TargetProfile,
@@ -328,17 +469,7 @@ pub fn compile_machine_plan(
 ) -> CompilerResult<CompiledMachinePlanFromSource> {
     let total_started = Instant::now();
     let parse_started = Instant::now();
-    let parsed = match request.source {
-        CompileSource::Path(source_path) => parse_source_path_or_manifest_project(source_path)?,
-        CompileSource::Text {
-            source_label,
-            source_text,
-        } => parse_source(source_label.to_owned(), source_text.to_owned())?,
-        CompileSource::Units {
-            source_label,
-            units,
-        } => parse_source_units(source_label, units)?,
-    };
+    let parsed = parse_compile_source(request.source)?;
     let parse_ms = elapsed_ms(parse_started);
     compile_parsed_to_machine_plan(
         parsed,
@@ -352,6 +483,127 @@ pub fn compile_machine_plan(
     )
 }
 
+pub fn check_source(request: CompilerCheckRequest<'_>) -> CompilerResult<CheckedSourceFromSource> {
+    check_source_with_ownership(request, CheckedSourceOwnership::Report)
+}
+
+/// Checks one compiler-service revision while retaining editor projections and
+/// transferring lowering-owned tables into the checked artifact. A subsequent
+/// verified request can therefore consume this exact result without retaining
+/// a second copy of the runtime tables.
+pub fn check_editor_source(
+    request: CompilerCheckRequest<'_>,
+) -> CompilerResult<CheckedSourceFromSource> {
+    check_source_with_ownership(request, CheckedSourceOwnership::Editor)
+}
+
+/// Compiler-service diagnostics path. It returns the complete checked
+/// diagnostic set while deferring the global editor type-hint sidecar until a
+/// language client explicitly projects it.
+pub fn check_diagnostics_source(
+    request: CompilerCheckRequest<'_>,
+) -> CompilerResult<CheckedSourceFromSource> {
+    check_source_with_ownership(request, CheckedSourceOwnership::Diagnostics)
+}
+
+/// Checks source for a request that will continue through semantic sealing and
+/// lowering. Successful checks keep lowering-owned tables only in the
+/// `CheckedProgram`; error results retain the same complete diagnostics as
+/// [`check_source`].
+///
+/// A compiler session uses this path when a verified request is the first
+/// request for a revision. If diagnostics were already requested, it consumes
+/// that exact checked artifact instead of checking the revision again.
+pub fn check_runtime_source(
+    request: CompilerCheckRequest<'_>,
+) -> CompilerResult<CheckedSourceFromSource> {
+    check_source_with_ownership(request, CheckedSourceOwnership::Runtime)
+}
+
+#[derive(Clone, Copy)]
+enum CheckedSourceOwnership {
+    Report,
+    Editor,
+    Diagnostics,
+    Runtime,
+}
+
+fn check_source_with_ownership(
+    request: CompilerCheckRequest<'_>,
+    ownership: CheckedSourceOwnership,
+) -> CompilerResult<CheckedSourceFromSource> {
+    let total_started = Instant::now();
+    let parse_started = Instant::now();
+    let parsed = parse_compile_source(request.source)?;
+    let parse_ms = elapsed_ms(parse_started);
+    let source_unit_count = parsed.files.len();
+    let expression_count = parsed.expressions.len();
+    let external_types = boon_typecheck::ExternalTypeEnvironment::empty(request.program_role);
+    let typecheck_started = Instant::now();
+    let output = match ownership {
+        CheckedSourceOwnership::Report => {
+            boon_typecheck::check_program_profiled_with_external_types(&parsed, &external_types).0
+        }
+        CheckedSourceOwnership::Editor => {
+            boon_typecheck::check_editor_program_profiled_with_external_types(
+                &parsed,
+                &external_types,
+            )
+            .0
+        }
+        CheckedSourceOwnership::Diagnostics => {
+            boon_typecheck::check_diagnostics_program_profiled_with_external_types(
+                &parsed,
+                &external_types,
+            )
+            .0
+        }
+        CheckedSourceOwnership::Runtime => {
+            boon_typecheck::check_runtime_program_profiled_with_external_types(
+                &parsed,
+                &external_types,
+            )
+            .0
+        }
+    };
+    let typecheck_ms = elapsed_ms(typecheck_started);
+    let diagnostic_count = output.report.diagnostics.len()
+        + output
+            .report
+            .render_slot_table
+            .slots
+            .iter()
+            .map(|slot| slot.diagnostics.len())
+            .sum::<usize>();
+    Ok(CheckedSourceFromSource {
+        parsed,
+        output,
+        profile: CheckedDiagnosticsProfile {
+            source_unit_count,
+            expression_count,
+            diagnostic_count,
+            parse_ms,
+            typecheck_ms,
+            total_ms: elapsed_ms(total_started),
+        },
+    })
+}
+
+fn parse_compile_source(source: CompileSource<'_>) -> CompilerResult<ParsedProgram> {
+    let parsed = match source {
+        CompileSource::Path(source_path) => parse_source_path_or_manifest_project(source_path)?,
+        CompileSource::Text {
+            source_label,
+            source_text,
+        } => parse_source(source_label.to_owned(), source_text.to_owned())?,
+        CompileSource::Units {
+            source_label,
+            units,
+        } => parse_source_units(source_label, units)?,
+    };
+    Ok(parsed)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn compile_parsed_to_machine_plan(
     parsed: ParsedProgram,
@@ -363,7 +615,6 @@ fn compile_parsed_to_machine_plan(
     schema_version: u64,
     migration_predecessors: &[MigrationPredecessorBinding],
 ) -> CompilerResult<CompiledMachinePlanFromSource> {
-    let lower_started = Instant::now();
     let external_types = boon_typecheck::ExternalTypeEnvironment::empty(program_role);
     let typecheck_started = Instant::now();
     let check_output = boon_typecheck::check_runtime_program_profiled_with_external_types(
@@ -371,24 +622,161 @@ fn compile_parsed_to_machine_plan(
         &external_types,
     )
     .0;
+    let typecheck_ms = elapsed_ms(typecheck_started);
+    if std::env::var_os("BOON_COMPILER_LOWER_TRACE").is_some() {
+        eprintln!("boon_compiler lower typecheck: {:.3}ms", typecheck_ms);
+    }
+    let source_unit_count = parsed.files.len();
+    let parsed_expression_count = parsed.expressions.len();
+    let checked = checked_program_from_output(&parsed, check_output)?;
+    finish_checked_program_to_machine_plan(
+        checked,
+        source_unit_count,
+        parsed_expression_count,
+        parse_ms,
+        typecheck_ms,
+        elapsed_ms(total_started),
+        target_profile,
+        program_role,
+        application_identity,
+        schema_version,
+        migration_predecessors,
+        CancellationProbe::new(None),
+    )
+}
+
+pub fn finish_checked_machine_plan(
+    checked_source: CheckedSourceFromSource,
+    request: CheckedCompileRequest<'_>,
+) -> CompilerResult<CompiledMachinePlanFromSource> {
+    finish_checked_machine_plan_with_cancellation(checked_source, request, None)
+}
+
+pub(crate) fn finish_checked_machine_plan_with_cancellation(
+    checked_source: CheckedSourceFromSource,
+    request: CheckedCompileRequest<'_>,
+    cancellation: Option<&CancellationToken>,
+) -> CompilerResult<CompiledMachinePlanFromSource> {
+    let mut cancellation = CancellationProbe::new(cancellation);
+    cancellation.checkpoint().map_err(PlanError::new)?;
+    let CheckedSourceFromSource {
+        parsed,
+        output,
+        profile,
+    } = checked_source;
+    let checked = checked_program_from_output(&parsed, output)?;
+    if checked.role != request.program_role {
+        return Err(PlanError::new(format!(
+            "checked program role {:?} differs from requested backend role {:?}",
+            checked.role, request.program_role
+        ))
+        .into());
+    }
+    finish_checked_program_to_machine_plan(
+        checked,
+        profile.source_unit_count,
+        profile.expression_count,
+        profile.parse_ms,
+        profile.typecheck_ms,
+        profile.total_ms,
+        request.target_profile,
+        request.program_role,
+        request.application_identity,
+        request.schema_version,
+        request.migration_predecessors,
+        cancellation,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_checked_program_to_machine_plan(
+    checked: boon_typecheck::CheckedProgram,
+    source_unit_count: usize,
+    parsed_expression_count: usize,
+    parse_ms: f64,
+    typecheck_ms: f64,
+    elapsed_before_finish_ms: f64,
+    target_profile: TargetProfile,
+    program_role: ProgramRole,
+    application_identity: ApplicationIdentity,
+    schema_version: u64,
+    migration_predecessors: &[MigrationPredecessorBinding],
+    mut cancellation: CancellationProbe<'_>,
+) -> CompilerResult<CompiledMachinePlanFromSource> {
+    let finish_started = Instant::now();
+    let checked_expression_count = checked.expressions.len();
+    let checked_call_count = checked.calls.len();
     if std::env::var_os("BOON_COMPILER_LOWER_TRACE").is_some() {
         eprintln!(
-            "boon_compiler lower typecheck: {:.3}ms",
-            elapsed_ms(typecheck_started)
+            "boon_compiler checked_program scopes={} declarations={} statements={} expressions={} callables={} calls={}",
+            checked.scopes.len(),
+            checked.declarations.len(),
+            checked.statements.len(),
+            checked.expressions.len(),
+            checked.callables.len(),
+            checked.calls.len(),
         );
     }
-    if check_output.report.has_errors() {
-        let diagnostics = check_output
+    let lower_started = Instant::now();
+    let (ir, semantic_profile) =
+        verify_and_lower_checked_profiled(checked, &[], &mut cancellation)?;
+    let lower_ms = elapsed_ms(lower_started);
+    cancellation.checkpoint().map_err(PlanError::new)?;
+    let verify_started = Instant::now();
+    verify_hidden_identity(&ir)?;
+    verify_static_schedule(&ir)?;
+    let verify_ms = elapsed_ms(verify_started);
+    cancellation.checkpoint().map_err(PlanError::new)?;
+    let compile_started = Instant::now();
+    let plan = compile_erased_program(
+        &ir,
+        target_profile,
+        program_role,
+        &application_identity,
+        schema_version,
+        migration_predecessors,
+    )?;
+    let compile_ms = elapsed_ms(compile_started);
+    cancellation.checkpoint().map_err(PlanError::new)?;
+    if std::env::var_os("BOON_COMPILER_LOWER_TRACE").is_some() {
+        eprintln!("boon_compiler lower backend_compile: {compile_ms:.3}ms");
+    }
+    let profile = CompileProfile {
+        source_unit_count,
+        expression_count: parsed_expression_count,
+        checked_expression_count,
+        checked_call_count,
+        graph_node_count: ir.graph_node_count,
+        cancellation_checkpoint_count: cancellation.checkpoints,
+        parse_ms,
+        typecheck_ms,
+        semantic_ms: semantic_profile.semantic_ms,
+        contract_verify_ms: semantic_profile.contract_verify_ms,
+        ir_lower_ms: semantic_profile.ir_lower_ms,
+        lower_ms,
+        verify_ms,
+        compile_ms,
+        total_ms: elapsed_before_finish_ms + elapsed_ms(finish_started),
+    };
+    Ok(CompiledMachinePlanFromSource { ir, plan, profile })
+}
+
+fn checked_program_from_output(
+    parsed: &ParsedProgram,
+    output: boon_typecheck::CheckOutput,
+) -> CompilerResult<boon_typecheck::CheckedProgram> {
+    if output.report.has_errors() {
+        let diagnostics = output
             .report
             .diagnostics
             .iter()
             .filter(|diagnostic| diagnostic.severity == boon_typecheck::DiagnosticSeverity::Error)
             .map(|diagnostic| {
-                let (path, line) = source_file_location(&parsed, diagnostic.line);
+                let (path, line) = source_file_location(parsed, diagnostic.line);
                 format!("{path}:{line}: {}", diagnostic.message)
             })
             .chain(
-                check_output
+                output
                     .report
                     .render_slot_table
                     .slots
@@ -415,50 +803,9 @@ fn compile_parsed_to_machine_plan(
         ))
         .into());
     }
-    let checked = check_output
-        .program
-        .ok_or_else(|| PlanError::new("typecheck produced no CheckedProgram for valid source"))?;
-    if std::env::var_os("BOON_COMPILER_LOWER_TRACE").is_some() {
-        eprintln!(
-            "boon_compiler checked_program scopes={} declarations={} statements={} expressions={} callables={} calls={}",
-            checked.scopes.len(),
-            checked.declarations.len(),
-            checked.statements.len(),
-            checked.expressions.len(),
-            checked.callables.len(),
-            checked.calls.len(),
-        );
-    }
-    let ir = verify_and_lower_checked(checked, &[])?;
-    let lower_ms = elapsed_ms(lower_started);
-    let verify_started = Instant::now();
-    verify_hidden_identity(&ir)?;
-    verify_static_schedule(&ir)?;
-    let verify_ms = elapsed_ms(verify_started);
-    let compile_started = Instant::now();
-    let plan = compile_erased_program(
-        &ir,
-        target_profile,
-        program_role,
-        &application_identity,
-        schema_version,
-        migration_predecessors,
-    )?;
-    let compile_ms = elapsed_ms(compile_started);
-    if std::env::var_os("BOON_COMPILER_LOWER_TRACE").is_some() {
-        eprintln!("boon_compiler lower backend_compile: {compile_ms:.3}ms");
-    }
-    let profile = CompileProfile {
-        source_unit_count: parsed.files.len(),
-        expression_count: ir.expression_count,
-        graph_node_count: ir.graph_node_count,
-        parse_ms,
-        lower_ms,
-        verify_ms,
-        compile_ms,
-        total_ms: elapsed_ms(total_started),
-    };
-    Ok(CompiledMachinePlanFromSource { ir, plan, profile })
+    output.program.ok_or_else(|| {
+        PlanError::new("typecheck produced no CheckedProgram for valid source").into()
+    })
 }
 
 fn parse_source_units(
@@ -474,7 +821,29 @@ fn parse_source_units(
 }
 
 pub fn compiler_source_units_for_path(path: &Path) -> CompilerResult<Vec<CompilerSourceUnit>> {
-    compiler_source_units_for_files(compiler_source_files_for_path(path)?)
+    compiler_source_project_for_path(path).map(|(_, units)| units)
+}
+
+pub fn compiler_source_project_for_path(
+    path: &Path,
+) -> CompilerResult<(String, Vec<CompilerSourceUnit>)> {
+    let entrypoint = resolve_repo_file(path);
+    let files = compiler_source_files_for_path(path)?;
+    let entrypoint_index = files
+        .iter()
+        .position(|candidate| paths_match(candidate, &entrypoint))
+        .ok_or_else(|| {
+            format!(
+                "source entrypoint `{}` is absent from its compiler source bundle",
+                path.display()
+            )
+        })?;
+    let units = compiler_source_units_for_files(files)?;
+    let entrypoint = units
+        .get(entrypoint_index)
+        .map(|unit| unit.path.clone())
+        .ok_or_else(|| "compiler source entrypoint index is stale".to_owned())?;
+    Ok((entrypoint, units))
 }
 
 pub fn compiler_source_units_for_manifest_source(
@@ -530,22 +899,7 @@ fn compiler_source_units_for_files(files: Vec<PathBuf>) -> CompilerResult<Vec<Co
 }
 
 fn parse_source_path_or_manifest_project(source_path: &Path) -> CompilerResult<ParsedProgram> {
-    let entrypoint = resolve_repo_file(source_path);
-    let files = compiler_source_files_for_path(source_path)?;
-    let entrypoint_index = files
-        .iter()
-        .position(|path| paths_match(path, &entrypoint))
-        .ok_or_else(|| {
-            format!(
-                "source entrypoint `{}` is absent from its compiler source bundle",
-                source_path.display()
-            )
-        })?;
-    let units = compiler_source_units_for_files(files)?;
-    let entrypoint = units
-        .get(entrypoint_index)
-        .map(|unit| unit.path.clone())
-        .ok_or_else(|| "compiler source entrypoint index is stale".to_owned())?;
+    let (entrypoint, units) = compiler_source_project_for_path(source_path)?;
     parse_source_units(&entrypoint, &units)
 }
 

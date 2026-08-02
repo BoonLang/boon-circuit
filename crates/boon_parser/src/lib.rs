@@ -1,8 +1,49 @@
-use boon_contract::{CanonicalSourceBundleV1, SourceBundleDigestV1, SourceBundleUnit};
-use chumsky::prelude::*;
+use boon_contract::{
+    CanonicalSourceBundleV1, SourceBundleDigestV1, SourceBundleError, SourceBundleUnit,
+    normalize_source_path,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fmt;
+use std::sync::{Arc, OnceLock};
+use std::time::Instant;
+
+#[derive(Clone, Copy)]
+struct ParserTrace {
+    enabled: bool,
+}
+
+impl ParserTrace {
+    fn from_environment() -> Self {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        Self {
+            enabled: *ENABLED.get_or_init(|| std::env::var_os("BOON_PARSER_TRACE").is_some()),
+        }
+    }
+
+    #[inline]
+    fn start(self) -> Option<Instant> {
+        self.enabled.then(Instant::now)
+    }
+
+    #[inline]
+    fn phase(
+        self,
+        scope: &str,
+        phase: &str,
+        started: Option<Instant>,
+        counters: impl FnOnce() -> String,
+    ) {
+        let Some(started) = started else {
+            return;
+        };
+        eprintln!(
+            "boon_parser {scope} {phase}: {:.3}ms {}",
+            started.elapsed().as_secs_f64() * 1_000.0,
+            counters(),
+        );
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StandardRootKind {
@@ -421,7 +462,7 @@ pub struct ParsedProgramFields {
     pub files: Vec<ParsedSourceFile>,
     pub kind: ProgramKind,
     pub ast: AstProgram,
-    pub expressions: Vec<AstExpr>,
+    pub expressions: SharedAstExpressions,
     pub functions: Vec<String>,
     pub operators: Vec<String>,
 }
@@ -448,45 +489,218 @@ pub struct ParsedSourceFile {
     pub module: Option<String>,
 }
 
+/// Stable, project-scoped identity of one canonical source unit.
+///
+/// Identity follows the normalized project-relative path, not source content
+/// or the unit's position in a canonical bundle. An edit therefore preserves
+/// identity, insertion of an earlier-sorting unit cannot renumber existing
+/// units, and a rename deliberately creates a different identity. The owning
+/// compiler project supplies the outer project identity.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct SourceUnitId(String);
+
+impl SourceUnitId {
+    pub fn from_path(path: &str) -> Result<Self, SourceBundleError> {
+        normalize_source_path(path).map(Self)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl fmt::Display for SourceUnitId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// Context-independent syntax artifact for one canonical source unit.
+///
+/// The path and [`SourceUnitId`] are the exact normalized project-relative
+/// identity of the unit. All token, statement, expression, line, and byte
+/// positions in `ast` are local to `source`; no module role or project-global
+/// rebasing has been applied. Function names are retained exactly as declared
+/// so project assembly can apply its context once, after cache lookup.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ParsedSourceUnit {
+    #[serde(flatten)]
+    fields: ParsedSourceUnitFields,
+}
+
+/// Public read-only schema projected by an opaque [`ParsedSourceUnit`].
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ParsedSourceUnitFields {
+    pub source_unit_id: SourceUnitId,
+    pub path: String,
+    pub source: String,
+    pub ast: AstProgram,
+    pub declared_functions: Vec<String>,
+}
+
+impl std::ops::Deref for ParsedSourceUnit {
+    type Target = ParsedSourceUnitFields;
+
+    fn deref(&self) -> &Self::Target {
+        &self.fields
+    }
+}
+
+impl ParsedSourceUnit {
+    fn from_parser_fields(fields: ParsedSourceUnitFields) -> Self {
+        Self { fields }
+    }
+}
+
+impl ParsedSourceFile {
+    pub fn source_unit_id(&self) -> Result<SourceUnitId, SourceBundleError> {
+        SourceUnitId::from_path(&self.path)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AstProgram {
     pub tokens: Vec<AstToken>,
     pub lines: Vec<ParserLine>,
     pub items: Vec<ParserItem>,
     pub statements: Vec<AstStatement>,
-    pub expressions: Vec<AstExpr>,
+    pub expressions: SharedAstExpressions,
+}
+
+/// Immutable, cheaply cloned ownership for a parsed expression arena.
+///
+/// Parser-produced [`ParsedProgram`] values use one shared allocation for the
+/// convenience `expressions` field and `ast.expressions`. The wrapper retains
+/// slice indexing and iteration while preventing either public view from
+/// mutating an arena that may be shared by another view.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SharedAstExpressions {
+    expressions: Arc<[AstExpr]>,
+}
+
+impl SharedAstExpressions {
+    pub fn as_slice(&self) -> &[AstExpr] {
+        &self.expressions
+    }
+
+    fn make_mut(&mut self) -> &mut [AstExpr] {
+        Arc::make_mut(&mut self.expressions)
+    }
+}
+
+impl From<Vec<AstExpr>> for SharedAstExpressions {
+    fn from(expressions: Vec<AstExpr>) -> Self {
+        Self {
+            expressions: expressions.into(),
+        }
+    }
+}
+
+impl std::ops::Deref for SharedAstExpressions {
+    type Target = [AstExpr];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
+impl AsRef<[AstExpr]> for SharedAstExpressions {
+    fn as_ref(&self) -> &[AstExpr] {
+        self.as_slice()
+    }
+}
+
+impl<'a> IntoIterator for &'a SharedAstExpressions {
+    type Item = &'a AstExpr;
+    type IntoIter = std::slice::Iter<'a, AstExpr>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl IntoIterator for SharedAstExpressions {
+    type Item = AstExpr;
+    type IntoIter = std::vec::IntoIter<AstExpr>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter().cloned().collect::<Vec<_>>().into_iter()
+    }
+}
+
+impl Serialize for SharedAstExpressions {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.as_slice().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SharedAstExpressions {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Vec::<AstExpr>::deserialize(deserializer).map(Self::from)
+    }
 }
 
 impl AstProgram {
     pub fn semantic_tokens(&self) -> impl Iterator<Item = &AstToken> {
-        self.tokens.iter().filter(|token| {
+        let document_lines = self.document_line_mask();
+        self.tokens.iter().filter(move |token| {
             !matches!(token.kind, AstTokenKind::Comment | AstTokenKind::String)
-                && !self.line_is_document(token.line)
+                && !document_lines.get(token.line).copied().unwrap_or(false)
         })
     }
 
     pub fn semantic_parser_lines(&self) -> impl Iterator<Item = &ParserLine> {
-        self.lines
-            .iter()
-            .filter(|line| !line.symbols.is_empty() && !self.line_is_document(line.line))
+        let document_lines = self.document_line_mask();
+        self.lines.iter().filter(move |line| {
+            !line.symbols.is_empty() && !document_lines.get(line.line).copied().unwrap_or(false)
+        })
     }
 
     pub fn semantic_parser_items(&self) -> impl Iterator<Item = &ParserItem> {
+        let document_lines = self.document_line_mask();
         self.items
             .iter()
-            .filter(|item| !self.line_is_document(item.line))
+            .filter(move |item| !document_lines.get(item.line).copied().unwrap_or(false))
     }
 
-    fn line_is_document(&self, line: usize) -> bool {
-        self.statements
-            .iter()
-            .find(|statement| {
-                matches!(
-                    &statement.kind,
-                    AstStatementKind::Field { name } if name == "document"
-                )
-            })
-            .is_some_and(|statement| statement_contains_line(statement, line))
+    fn document_line_mask(&self) -> Vec<bool> {
+        fn mark(statement: &AstStatement, lines: &mut [bool]) {
+            if let Some(line) = lines.get_mut(statement.line) {
+                *line = true;
+            }
+            for child in &statement.children {
+                mark(child, lines);
+            }
+        }
+
+        let Some(document) = self.statements.iter().find(|statement| {
+            matches!(
+                &statement.kind,
+                AstStatementKind::Field { name } if name == "document"
+            )
+        }) else {
+            return Vec::new();
+        };
+        let maximum_line = self
+            .tokens
+            .last()
+            .map(|token| token.line)
+            .unwrap_or(document.line)
+            .max(document.line);
+        let mut lines = vec![false; maximum_line.saturating_add(1)];
+        mark(document, &mut lines);
+        lines
     }
 }
 
@@ -872,6 +1086,60 @@ impl fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
+/// Parses one source unit without applying entrypoint/module context.
+///
+/// This is the cacheable raw parser boundary. It accepts multiline syntax
+/// wholly contained by the unit, but requires lexical strings and explicit
+/// delimiters to close before EOF and rejects a leading pipeline that would
+/// need an input from another unit.
+pub fn parse_source_unit(
+    path: impl Into<String>,
+    source: impl Into<String>,
+) -> Result<ParsedSourceUnit, ParseError> {
+    let input_path = path.into();
+    let source = source.into();
+    let source_unit_id = SourceUnitId::from_path(&input_path)
+        .map_err(|error| source_unit_parse_error(&input_path, error))?;
+    let path = source_unit_id.as_str().to_owned();
+    reject_reserved_module_path(&path)?;
+
+    let parsed = parse_normalized_source_unit_syntax(
+        source_unit_id,
+        source,
+        ParserTrace::from_environment(),
+    )?;
+    validate_source_syntax(&parsed.path, &parsed.ast)?;
+    validate_list_capacities(&parsed.path, &parsed.ast)?;
+    validate_no_hidden_identity_leak(&parsed.path, &parsed.ast)?;
+    Ok(parsed)
+}
+
+/// Parses context-independent syntax for one already-normalized source unit.
+///
+/// Project parsing deliberately defers source-policy validation until all raw
+/// units have been namespaced and assembled. This preserves the historical
+/// entrypoint-owned project policy without reparsing a concatenated bundle.
+fn parse_normalized_source_unit_syntax(
+    source_unit_id: SourceUnitId,
+    source: String,
+    trace: ParserTrace,
+) -> Result<ParsedSourceUnit, ParseError> {
+    let path = source_unit_id.as_str().to_owned();
+    let ast = parse_ast_traced(&path, &source, trace)?;
+    validate_source_unit_boundary(&path, &source, &ast)?;
+    let declared_functions = collect_raw_declared_functions(&ast.statements);
+
+    Ok(ParsedSourceUnit::from_parser_fields(
+        ParsedSourceUnitFields {
+            source_unit_id,
+            path,
+            source,
+            ast,
+            declared_functions,
+        },
+    ))
+}
+
 pub fn parse_source(
     path: impl Into<String>,
     source: impl Into<String>,
@@ -904,6 +1172,15 @@ pub fn parse_project(
     parse_canonical_source_bundle(bundle)
 }
 
+fn source_unit_parse_error(path: &str, error: SourceBundleError) -> ParseError {
+    ParseError {
+        path: path.to_owned(),
+        line: None,
+        column: None,
+        message: format!("invalid source unit: {error}"),
+    }
+}
+
 fn source_bundle_parse_error(
     entrypoint: &str,
     error: boon_contract::SourceBundleError,
@@ -916,12 +1193,789 @@ fn source_bundle_parse_error(
     }
 }
 
+fn parsed_source_unit_invariant_error(path: &str, detail: impl fmt::Display) -> ParseError {
+    ParseError {
+        path: path.to_owned(),
+        line: None,
+        column: None,
+        message: format!("invalid parsed source unit invariant: {detail}"),
+    }
+}
+
+fn dense_statement_count(path: &str, statements: &[AstStatement]) -> Result<usize, ParseError> {
+    fn visit(
+        path: &str,
+        statements: &[AstStatement],
+        next_id: &mut usize,
+    ) -> Result<(), ParseError> {
+        for statement in statements {
+            if statement.id != *next_id {
+                return Err(parsed_source_unit_invariant_error(
+                    path,
+                    format!(
+                        "statement id {} is not the expected dense id {}",
+                        statement.id, *next_id
+                    ),
+                ));
+            }
+            *next_id = (*next_id).checked_add(1).ok_or_else(|| {
+                parsed_source_unit_invariant_error(path, "statement count overflows usize")
+            })?;
+            visit(path, &statement.children, next_id)?;
+        }
+        Ok(())
+    }
+
+    let mut count = 0usize;
+    visit(path, statements, &mut count)?;
+    Ok(count)
+}
+
+#[derive(Clone, Copy)]
+struct SourceUnitAstRebase<'a> {
+    path: &'a str,
+    byte_offset: usize,
+    line_offset: usize,
+    expression_offset: usize,
+    statement_offset: usize,
+    local_source_len: usize,
+    local_line_count: usize,
+    local_expression_count: usize,
+    local_statement_count: usize,
+}
+
+impl SourceUnitAstRebase<'_> {
+    fn fail(&self, detail: impl fmt::Display) -> ParseError {
+        parsed_source_unit_invariant_error(self.path, detail)
+    }
+
+    fn checked_offset(
+        &self,
+        value: usize,
+        offset: usize,
+        field: &str,
+    ) -> Result<usize, ParseError> {
+        value
+            .checked_add(offset)
+            .ok_or_else(|| self.fail(format!("{field} overflows usize while rebasing")))
+    }
+
+    fn line(&self, value: usize, field: &str) -> Result<usize, ParseError> {
+        if value == 0 || value > self.local_line_count {
+            return Err(self.fail(format!(
+                "{field} line {value} is outside local lines 1..={}",
+                self.local_line_count
+            )));
+        }
+        self.checked_offset(value, self.line_offset, field)
+    }
+
+    fn span(&self, start: &mut usize, end: &mut usize, field: &str) -> Result<(), ParseError> {
+        if *start > *end || *end > self.local_source_len {
+            return Err(self.fail(format!(
+                "{field} span {}..{} is outside local source bytes 0..={}",
+                *start, *end, self.local_source_len
+            )));
+        }
+        let rebased_start = self.checked_offset(*start, self.byte_offset, field)?;
+        let rebased_end = self.checked_offset(*end, self.byte_offset, field)?;
+        *start = rebased_start;
+        *end = rebased_end;
+        Ok(())
+    }
+
+    fn expression_id(&self, id: &mut usize, field: &str) -> Result<(), ParseError> {
+        if *id >= self.local_expression_count {
+            return Err(self.fail(format!(
+                "{field} expression id {} is outside local arena length {}",
+                *id, self.local_expression_count
+            )));
+        }
+        *id = self.checked_offset(*id, self.expression_offset, field)?;
+        Ok(())
+    }
+
+    fn optional_expression_id(
+        &self,
+        id: &mut Option<usize>,
+        field: &str,
+    ) -> Result<(), ParseError> {
+        if let Some(id) = id {
+            self.expression_id(id, field)?;
+        }
+        Ok(())
+    }
+
+    fn expression_ids(&self, ids: &mut [usize], field: &str) -> Result<(), ParseError> {
+        for id in ids {
+            self.expression_id(id, field)?;
+        }
+        Ok(())
+    }
+
+    fn statement_id(&self, id: &mut usize, field: &str) -> Result<(), ParseError> {
+        if *id >= self.local_statement_count {
+            return Err(self.fail(format!(
+                "{field} statement id {} is outside local statement count {}",
+                *id, self.local_statement_count
+            )));
+        }
+        *id = self.checked_offset(*id, self.statement_offset, field)?;
+        Ok(())
+    }
+
+    fn parser_line(&self, line: &mut ParserLine) -> Result<(), ParseError> {
+        if line.symbols.len() != line.symbol_spans.len() {
+            return Err(self.fail(format!(
+                "parser line {} has {} symbols but {} symbol spans",
+                line.line,
+                line.symbols.len(),
+                line.symbol_spans.len()
+            )));
+        }
+        line.line = self.line(line.line, "parser line")?;
+        self.span(&mut line.start, &mut line.end, "parser line")?;
+        for span in &mut line.symbol_spans {
+            self.span(&mut span.0, &mut span.1, "parser line symbol")?;
+        }
+        Ok(())
+    }
+
+    fn parser_item(&self, item: &mut ParserItem) -> Result<(), ParseError> {
+        if item.symbols.len() != item.symbol_spans.len() {
+            return Err(self.fail(format!(
+                "parser item on line {} has {} symbols but {} symbol spans",
+                item.line,
+                item.symbols.len(),
+                item.symbol_spans.len()
+            )));
+        }
+        item.line = self.line(item.line, "parser item")?;
+        self.span(&mut item.start, &mut item.end, "parser item")?;
+        for span in &mut item.symbol_spans {
+            self.span(&mut span.0, &mut span.1, "parser item symbol")?;
+        }
+        Ok(())
+    }
+
+    fn token(&self, token: &mut AstToken) -> Result<(), ParseError> {
+        if token.column == 0 {
+            return Err(self.fail("token column must be one-based"));
+        }
+        token.line = self.line(token.line, "token")?;
+        self.span(&mut token.start, &mut token.end, "token")?;
+        Ok(())
+    }
+
+    fn statement(&self, statement: &mut AstStatement) -> Result<(), ParseError> {
+        self.statement_id(&mut statement.id, "statement")?;
+        statement.line = self.line(statement.line, "statement")?;
+        self.span(&mut statement.start, &mut statement.end, "statement")?;
+        self.optional_expression_id(&mut statement.expr, "statement expression")?;
+        if let AstStatementKind::Function { parameters, .. } = &mut statement.kind {
+            for parameter in parameters {
+                self.span(
+                    &mut parameter.start,
+                    &mut parameter.end,
+                    "function parameter",
+                )?;
+            }
+        }
+        for child in &mut statement.children {
+            self.statement(child)?;
+        }
+        Ok(())
+    }
+
+    fn call_arg(&self, arg: &mut AstCallArg) -> Result<(), ParseError> {
+        self.expression_id(&mut arg.value, "call argument value")?;
+        self.span(&mut arg.start, &mut arg.end, "call argument")
+    }
+
+    fn pass_context(&self, pass: &mut AstPassContext) -> Result<(), ParseError> {
+        self.expression_id(&mut pass.value, "PASS value")?;
+        self.span(&mut pass.start, &mut pass.end, "PASS context")
+    }
+
+    fn record_field(&self, field: &mut AstRecordField) -> Result<(), ParseError> {
+        self.expression_id(&mut field.value, "record field value")?;
+        self.span(&mut field.start, &mut field.end, "record field")
+    }
+
+    fn expression(&self, expression: &mut AstExpr) -> Result<(), ParseError> {
+        self.expression_id(&mut expression.id, "expression")?;
+        expression.line = self.line(expression.line, "expression")?;
+        self.span(&mut expression.start, &mut expression.end, "expression")?;
+        self.optional_expression_id(&mut expression.linked_input, "linked input")?;
+
+        match &mut expression.kind {
+            AstExprKind::TextTemplate { segments } => {
+                for segment in segments {
+                    if let AstTextSegment::Dynamic { value } = segment {
+                        self.expression_id(value, "text template dynamic value")?;
+                    }
+                }
+            }
+            AstExprKind::TaggedObject { fields, .. } | AstExprKind::Object(fields) => {
+                for field in fields {
+                    self.record_field(field)?;
+                }
+            }
+            AstExprKind::Flush { payload } => {
+                self.optional_expression_id(payload, "FLUSH payload")?;
+            }
+            AstExprKind::Call { args, pass, .. } => {
+                for arg in args {
+                    self.call_arg(arg)?;
+                }
+                if let Some(pass) = pass {
+                    self.pass_context(pass)?;
+                }
+            }
+            AstExprKind::Pipe {
+                input,
+                args,
+                pass,
+                arms,
+                ..
+            } => {
+                self.expression_id(input, "pipe input")?;
+                for arg in args {
+                    self.call_arg(arg)?;
+                }
+                if let Some(pass) = pass {
+                    self.pass_context(pass)?;
+                }
+                self.expression_ids(arms, "pipe arm")?;
+            }
+            AstExprKind::Draining { input } => {
+                self.expression_id(input, "DRAINING input")?;
+            }
+            AstExprKind::Hold { initial, .. } => {
+                self.expression_id(initial, "HOLD initial value")?;
+            }
+            AstExprKind::Latest { branches } => {
+                self.expression_ids(branches, "LATEST branch")?;
+            }
+            AstExprKind::When { input, arms } => {
+                self.expression_id(input, "WHEN input")?;
+                self.expression_ids(arms, "WHEN arm")?;
+            }
+            AstExprKind::Then { input, output } => {
+                self.expression_id(input, "THEN input")?;
+                self.optional_expression_id(output, "THEN output")?;
+            }
+            AstExprKind::Infix { left, right, .. } => {
+                self.expression_id(left, "infix left operand")?;
+                self.expression_id(right, "infix right operand")?;
+            }
+            AstExprKind::MatchArm { output, .. } => {
+                self.optional_expression_id(output, "match-arm output")?;
+            }
+            AstExprKind::Block { bindings, result } => {
+                for binding in bindings {
+                    self.statement_id(&mut binding.statement, "block binding statement")?;
+                    self.expression_id(&mut binding.value, "block binding value")?;
+                    self.span(&mut binding.start, &mut binding.end, "block binding")?;
+                }
+                self.optional_expression_id(result, "block result")?;
+            }
+            AstExprKind::ListLiteral { items, .. }
+            | AstExprKind::BytesLiteral { items, .. }
+            | AstExprKind::SetLiteral { items } => {
+                self.expression_ids(items, "collection item")?;
+            }
+            AstExprKind::Arrow { left, output, .. } => {
+                self.expression_id(left, "arrow left operand")?;
+                self.optional_expression_id(output, "arrow output")?;
+            }
+            AstExprKind::MapEntry { key, value } => {
+                self.expression_id(key, "map entry key")?;
+                self.expression_id(value, "map entry value")?;
+            }
+            AstExprKind::MapLiteral { entries } => {
+                self.expression_ids(entries, "map entry")?;
+            }
+            AstExprKind::Identifier(_)
+            | AstExprKind::Path(_)
+            | AstExprKind::Drain { .. }
+            | AstExprKind::StringLiteral(_)
+            | AstExprKind::TextLiteral(_)
+            | AstExprKind::Number(_)
+            | AstExprKind::ByteLiteral { .. }
+            | AstExprKind::Tag(_)
+            | AstExprKind::Source
+            | AstExprKind::Delimiter
+            | AstExprKind::Unknown(_)
+            | AstExprKind::BitsLiteral { .. } => {}
+        }
+        Ok(())
+    }
+}
+
+fn rebase_source_unit_ast(
+    mut ast: AstProgram,
+    rebase: SourceUnitAstRebase<'_>,
+) -> Result<AstProgram, ParseError> {
+    for (expected, expression) in ast.expressions.iter().enumerate() {
+        if expression.id != expected {
+            return Err(rebase.fail(format!(
+                "expression id {} is not the expected dense id {expected}",
+                expression.id
+            )));
+        }
+    }
+    if ast.expressions.len() != rebase.local_expression_count {
+        return Err(rebase.fail("expression arena length changed during assembly"));
+    }
+    let statement_count = dense_statement_count(rebase.path, &ast.statements)?;
+    if statement_count != rebase.local_statement_count {
+        return Err(rebase.fail("statement count changed during assembly"));
+    }
+
+    for token in &mut ast.tokens {
+        rebase.token(token)?;
+    }
+    for line in &mut ast.lines {
+        rebase.parser_line(line)?;
+    }
+    for item in &mut ast.items {
+        rebase.parser_item(item)?;
+    }
+    for statement in &mut ast.statements {
+        rebase.statement(statement)?;
+    }
+    for expression in ast.expressions.make_mut() {
+        rebase.expression(expression)?;
+    }
+    Ok(ast)
+}
+
+fn eof_column(source: &str) -> Result<usize, ParseError> {
+    source
+        .rsplit('\n')
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .count()
+        .checked_add(1)
+        .ok_or_else(|| {
+            parsed_source_unit_invariant_error("<assembly>", "EOF column overflows usize")
+        })
+}
+
+/// Flattens independent raw syntax artifacts without reparsing source.
+///
+/// Batch 3 owns module namespacing and the remaining project-context
+/// validations before this may replace the public canonical-bundle route.
+fn assemble_parsed_source_units(
+    entrypoint: &str,
+    mut units: Vec<ParsedSourceUnit>,
+) -> Result<ParsedProgram, ParseError> {
+    for unit in &units {
+        if unit.path != unit.source_unit_id.as_str() {
+            return Err(parsed_source_unit_invariant_error(
+                &unit.path,
+                format!(
+                    "artifact path `{}` does not match source-unit id `{}`",
+                    unit.path, unit.source_unit_id
+                ),
+            ));
+        }
+    }
+    units.sort_by(|left, right| {
+        left.source_unit_id
+            .as_str()
+            .as_bytes()
+            .cmp(right.source_unit_id.as_str().as_bytes())
+    });
+
+    let bundle = CanonicalSourceBundleV1::new(
+        entrypoint,
+        units
+            .iter()
+            .map(|unit| SourceBundleUnit::new(&unit.path, &unit.source)),
+    )
+    .map_err(|error| source_bundle_parse_error(entrypoint, error))?;
+    let entrypoint = bundle.entrypoint().to_owned();
+    let source_bundle_digest_v1 = bundle.digest();
+    drop(bundle);
+
+    assemble_canonical_parsed_source_units(entrypoint, source_bundle_digest_v1, units)
+}
+
+/// Assembles source units already validated and ordered by a canonical bundle.
+///
+/// The public project route uses this directly so path sorting and source
+/// hashing happen exactly once. The wrapper above remains useful for focused
+/// invariant tests that deliberately supply arbitrary unit order.
+fn assemble_canonical_parsed_source_units(
+    entrypoint: String,
+    source_bundle_digest_v1: SourceBundleDigestV1,
+    units: Vec<ParsedSourceUnit>,
+) -> Result<ParsedProgram, ParseError> {
+    for unit in &units {
+        if unit.path != unit.source_unit_id.as_str() {
+            return Err(parsed_source_unit_invariant_error(
+                &unit.path,
+                format!(
+                    "artifact path `{}` does not match source-unit id `{}`",
+                    unit.path, unit.source_unit_id
+                ),
+            ));
+        }
+    }
+    for adjacent in units.windows(2) {
+        let left = adjacent[0].source_unit_id.as_str();
+        let right = adjacent[1].source_unit_id.as_str();
+        if left.as_bytes() >= right.as_bytes() {
+            return Err(parsed_source_unit_invariant_error(
+                right,
+                format!("canonical source-unit order requires `{left}` to sort before `{right}`"),
+            ));
+        }
+    }
+
+    let mut statement_counts = Vec::with_capacity(units.len());
+    let mut total_source_bytes = 0usize;
+    let mut total_expression_count = 0usize;
+    let mut total_statement_count = 0usize;
+    let mut total_token_capacity = 0usize;
+    let mut total_line_capacity = 0usize;
+    let mut total_item_count = 0usize;
+    let mut total_function_count = 0usize;
+    for (index, unit) in units.iter().enumerate() {
+        let statement_count = dense_statement_count(&unit.path, &unit.ast.statements)?;
+        let declared_functions = collect_raw_declared_functions(&unit.ast.statements);
+        if declared_functions != unit.declared_functions {
+            return Err(parsed_source_unit_invariant_error(
+                &unit.path,
+                "raw declared-function metadata does not match the unit AST",
+            ));
+        }
+        for (expected, expression) in unit.ast.expressions.iter().enumerate() {
+            if expression.id != expected {
+                return Err(parsed_source_unit_invariant_error(
+                    &unit.path,
+                    format!(
+                        "expression id {} is not the expected dense id {expected}",
+                        expression.id
+                    ),
+                ));
+            }
+        }
+        statement_counts.push(statement_count);
+        total_statement_count = total_statement_count
+            .checked_add(statement_count)
+            .ok_or_else(|| {
+                parsed_source_unit_invariant_error(
+                    &unit.path,
+                    "assembled statement count overflows usize",
+                )
+            })?;
+        total_expression_count = total_expression_count
+            .checked_add(unit.ast.expressions.len())
+            .ok_or_else(|| {
+                parsed_source_unit_invariant_error(
+                    &unit.path,
+                    "assembled expression count overflows usize",
+                )
+            })?;
+        total_token_capacity = total_token_capacity
+            .checked_add(unit.ast.tokens.len())
+            .ok_or_else(|| {
+                parsed_source_unit_invariant_error(
+                    &unit.path,
+                    "assembled token count overflows usize",
+                )
+            })?;
+        total_line_capacity = total_line_capacity
+            .checked_add(unit.ast.lines.len())
+            .ok_or_else(|| {
+                parsed_source_unit_invariant_error(
+                    &unit.path,
+                    "assembled parser-line count overflows usize",
+                )
+            })?;
+        total_item_count = total_item_count
+            .checked_add(unit.ast.items.len())
+            .ok_or_else(|| {
+                parsed_source_unit_invariant_error(
+                    &unit.path,
+                    "assembled parser-item count overflows usize",
+                )
+            })?;
+        total_function_count = total_function_count
+            .checked_add(unit.declared_functions.len())
+            .ok_or_else(|| {
+                parsed_source_unit_invariant_error(
+                    &unit.path,
+                    "assembled declared-function count overflows usize",
+                )
+            })?;
+        total_source_bytes = total_source_bytes
+            .checked_add(unit.source.len())
+            .ok_or_else(|| {
+                parsed_source_unit_invariant_error(
+                    &unit.path,
+                    "assembled source length overflows usize",
+                )
+            })?;
+        if index + 1 < units.len() && !unit.source.ends_with('\n') {
+            total_source_bytes = total_source_bytes.checked_add(1).ok_or_else(|| {
+                parsed_source_unit_invariant_error(
+                    &unit.path,
+                    "assembled source separator overflows usize",
+                )
+            })?;
+            total_token_capacity = total_token_capacity.checked_add(1).ok_or_else(|| {
+                parsed_source_unit_invariant_error(
+                    &unit.path,
+                    "assembled separator-token count overflows usize",
+                )
+            })?;
+            total_line_capacity = total_line_capacity.checked_add(1).ok_or_else(|| {
+                parsed_source_unit_invariant_error(
+                    &unit.path,
+                    "assembled separator-line capacity overflows usize",
+                )
+            })?;
+        }
+    }
+
+    let unit_count = units.len();
+    let mut source = String::new();
+    source
+        .try_reserve_exact(total_source_bytes)
+        .map_err(|error| {
+            parsed_source_unit_invariant_error(
+                &entrypoint,
+                format!("cannot reserve assembled source bytes: {error}"),
+            )
+        })?;
+    let mut files = Vec::new();
+    files.try_reserve_exact(unit_count).map_err(|error| {
+        parsed_source_unit_invariant_error(
+            &entrypoint,
+            format!("cannot reserve assembled source-file table: {error}"),
+        )
+    })?;
+    let mut tokens = Vec::new();
+    tokens
+        .try_reserve_exact(total_token_capacity)
+        .map_err(|error| {
+            parsed_source_unit_invariant_error(
+                &entrypoint,
+                format!("cannot reserve assembled token table: {error}"),
+            )
+        })?;
+    let mut lines = Vec::new();
+    lines
+        .try_reserve_exact(total_line_capacity)
+        .map_err(|error| {
+            parsed_source_unit_invariant_error(
+                &entrypoint,
+                format!("cannot reserve assembled parser-line table: {error}"),
+            )
+        })?;
+    let mut items = Vec::new();
+    items.try_reserve_exact(total_item_count).map_err(|error| {
+        parsed_source_unit_invariant_error(
+            &entrypoint,
+            format!("cannot reserve assembled parser-item table: {error}"),
+        )
+    })?;
+    let mut statements = Vec::new();
+    statements
+        .try_reserve_exact(total_statement_count)
+        .map_err(|error| {
+            parsed_source_unit_invariant_error(
+                &entrypoint,
+                format!("cannot reserve assembled statement table: {error}"),
+            )
+        })?;
+    let mut expressions = Vec::new();
+    expressions
+        .try_reserve_exact(total_expression_count)
+        .map_err(|error| {
+            parsed_source_unit_invariant_error(
+                &entrypoint,
+                format!("cannot reserve assembled expression arena: {error}"),
+            )
+        })?;
+    let mut functions = Vec::new();
+    functions
+        .try_reserve_exact(total_function_count)
+        .map_err(|error| {
+            parsed_source_unit_invariant_error(
+                &entrypoint,
+                format!("cannot reserve assembled declared-function table: {error}"),
+            )
+        })?;
+    let mut next_line = 1usize;
+    let mut statement_offset = 0usize;
+
+    for (index, (unit, local_statement_count)) in units
+        .into_iter()
+        .zip(statement_counts.into_iter())
+        .enumerate()
+    {
+        let ParsedSourceUnitFields {
+            source_unit_id: _source_unit_id,
+            path,
+            source: unit_source,
+            ast,
+            declared_functions,
+        } = unit.fields;
+        let local_line_count = unit_source.lines().count().max(1);
+        let start_line = next_line;
+        let line_offset = start_line.checked_sub(1).ok_or_else(|| {
+            parsed_source_unit_invariant_error(&path, "source start line underflows")
+        })?;
+        let byte_offset = source.len();
+        let expression_offset = expressions.len();
+        let local_expression_count = ast.expressions.len();
+        let rebase = SourceUnitAstRebase {
+            path: &path,
+            byte_offset,
+            line_offset,
+            expression_offset,
+            statement_offset,
+            local_source_len: unit_source.len(),
+            local_line_count,
+            local_expression_count,
+            local_statement_count,
+        };
+        let ast = rebase_source_unit_ast(ast, rebase)?;
+        let AstProgram {
+            tokens: mut unit_tokens,
+            lines: mut unit_lines,
+            items: unit_items,
+            statements: unit_statements,
+            expressions: unit_expressions,
+        } = ast;
+
+        source.push_str(&unit_source);
+        tokens.append(&mut unit_tokens);
+        lines.append(&mut unit_lines);
+        items.extend(unit_items);
+        statements.extend(unit_statements);
+        expressions.extend(unit_expressions);
+        functions.extend(declared_functions);
+
+        let needs_separator = index + 1 < unit_count && !unit_source.ends_with('\n');
+        if needs_separator {
+            let separator_start = byte_offset.checked_add(unit_source.len()).ok_or_else(|| {
+                parsed_source_unit_invariant_error(&path, "separator byte start overflows usize")
+            })?;
+            let separator_end = separator_start.checked_add(1).ok_or_else(|| {
+                parsed_source_unit_invariant_error(&path, "separator byte end overflows usize")
+            })?;
+            let separator_line = rebase.line(local_line_count, "unit separator")?;
+            let separator_column = eof_column(&unit_source).map_err(|mut error| {
+                error.path.clone_from(&path);
+                error
+            })?;
+            tokens.push(AstToken {
+                kind: AstTokenKind::Newline,
+                lexeme: "\n".to_owned(),
+                line: separator_line,
+                column: separator_column,
+                start: separator_start,
+                end: separator_end,
+            });
+            if let Some(line) = lines
+                .last_mut()
+                .filter(|line| line.line == separator_line && line.end == separator_start)
+            {
+                line.end = separator_end;
+            } else {
+                lines.push(ParserLine {
+                    line: separator_line,
+                    indent: separator_column.saturating_sub(1),
+                    symbols: Vec::new(),
+                    symbol_spans: Vec::new(),
+                    start: separator_start,
+                    end: separator_end,
+                });
+            }
+            source.push('\n');
+        }
+
+        files.push(ParsedSourceFile {
+            module: module_name_for_project_file(&entrypoint, &path),
+            path,
+            source: unit_source,
+            start_line,
+        });
+        next_line = next_line.checked_add(local_line_count).ok_or_else(|| {
+            parsed_source_unit_invariant_error(
+                files
+                    .last()
+                    .map_or(entrypoint.as_str(), |file| file.path.as_str()),
+                "assembled line count overflows usize",
+            )
+        })?;
+        statement_offset = statement_offset
+            .checked_add(local_statement_count)
+            .ok_or_else(|| {
+                parsed_source_unit_invariant_error(
+                    files
+                        .last()
+                        .map_or(entrypoint.as_str(), |file| file.path.as_str()),
+                    "assembled statement offset overflows usize",
+                )
+            })?;
+    }
+
+    if source.len() != total_source_bytes
+        || tokens.len() != total_token_capacity
+        || items.len() != total_item_count
+        || expressions.len() != total_expression_count
+        || statement_offset != total_statement_count
+        || functions.len() != total_function_count
+    {
+        return Err(parsed_source_unit_invariant_error(
+            &entrypoint,
+            "assembled totals do not match their checked capacities",
+        ));
+    }
+
+    let ast = AstProgram {
+        tokens,
+        lines,
+        items,
+        statements,
+        expressions: expressions.into(),
+    };
+    let operators = collect_operators(&ast);
+    let expressions = ast.expressions.clone();
+    Ok(ParsedProgram::from_parser_fields(ParsedProgramFields {
+        source_bundle_digest_v1,
+        path: entrypoint,
+        source,
+        files,
+        kind: detect_program_kind(),
+        expressions,
+        functions,
+        operators,
+        ast,
+    }))
+}
+
+// `parse_source_unit` establishes the cacheable raw syntax boundary, but this
+// legacy route intentionally remains a whole canonical-bundle parse until the
+// separate assembly/rebasing cutover lands. Do not add a whole-bundle fallback
+// disguised as unit parsing or mix module context into ParsedSourceUnit.
 fn parse_canonical_source_bundle(
     bundle: CanonicalSourceBundleV1<'_>,
 ) -> Result<ParsedProgram, ParseError> {
+    let trace = ParserTrace::from_environment();
+    let total_started = trace.start();
+    let bundle_assembly_started = trace.start();
     let entrypoint = bundle.entrypoint().to_owned();
     let source_bundle_digest_v1 = bundle.digest();
-    let mut parsed_files = Vec::new();
+    let mut parsed_files = Vec::with_capacity(bundle.units().len());
     let mut source = String::new();
     let mut next_line = 1usize;
     for (index, unit) in bundle.units().iter().enumerate() {
@@ -941,13 +1995,38 @@ fn parse_canonical_source_bundle(
             start_line,
         });
     }
-    parse_combined_source(
-        entrypoint.clone(),
+    trace.phase(
+        "canonical_bundle",
+        "bundle_assembly",
+        bundle_assembly_started,
+        || {
+            format!(
+                "units={} combined_source_bytes={} combined_source_lines={} retained_file_source_bytes={}",
+                parsed_files.len(),
+                source.len(),
+                source.lines().count().max(1),
+                parsed_files.iter().map(|file| file.source.len()).sum::<usize>(),
+            )
+        },
+    );
+    let parsed = parse_combined_source(
+        entrypoint,
         source,
-        parsed_files.clone(),
+        parsed_files,
         source_bundle_digest_v1,
-    )
-    .map_err(|error| project_source_error(error, &entrypoint, &parsed_files))
+        trace,
+    )?;
+    trace.phase("canonical_bundle", "total", total_started, || {
+        format!(
+            "files={} source_bytes={} tokens={} items={} expressions={}",
+            parsed.files.len(),
+            parsed.source.len(),
+            parsed.ast.tokens.len(),
+            parsed.ast.items.len(),
+            parsed.ast.expressions.len(),
+        )
+    });
+    Ok(parsed)
 }
 
 fn project_source_error(
@@ -982,20 +2061,74 @@ fn parse_combined_source(
     source: String,
     files: Vec<ParsedSourceFile>,
     source_bundle_digest_v1: SourceBundleDigestV1,
+    trace: ParserTrace,
 ) -> Result<ParsedProgram, ParseError> {
-    let mut ast = parse_ast(&path, &source)?;
-    namespace_project_modules(&mut ast, &files);
-    validate_source_syntax(&path, &ast)?;
-    validate_balanced_brackets(&path, &ast)?;
-    validate_list_capacities(&path, &ast)?;
-    validate_no_reducer_style_update(&path, &ast)?;
-    let kind = detect_program_kind();
-    validate_no_hidden_identity_leak(&path, &ast)?;
+    let parsed = (|| {
+        let mut ast = parse_ast_traced(&path, &source, trace)?;
+        let namespacing_started = trace.start();
+        namespace_project_modules(&mut ast, &files);
+        trace.phase(
+            "canonical_bundle",
+            "namespacing",
+            namespacing_started,
+            || {
+                format!(
+                    "files={} module_files={} items={} expressions={}",
+                    files.len(),
+                    files.iter().filter(|file| file.module.is_some()).count(),
+                    ast.items.len(),
+                    ast.expressions.len(),
+                )
+            },
+        );
+
+        let validations_started = trace.start();
+        validate_source_syntax(&path, &ast)?;
+        validate_balanced_brackets(&path, &ast)?;
+        validate_list_capacities(&path, &ast)?;
+        validate_no_reducer_style_update(&path, &ast)?;
+        let kind = detect_program_kind();
+        validate_no_hidden_identity_leak(&path, &ast)?;
+        trace.phase(
+            "canonical_bundle",
+            "validations",
+            validations_started,
+            || {
+                format!(
+                    "files={} root_statements={} expressions={}",
+                    files.len(),
+                    ast.statements.len(),
+                    ast.expressions.len(),
+                )
+            },
+        );
+        Ok::<_, ParseError>((ast, kind))
+    })()
+    .map_err(|error| project_source_error(error, &path, &files))?;
+    let (ast, kind) = parsed;
+
+    let program_assembly_started = trace.start();
+    let functions = collect_functions(&ast);
+    let operators = collect_operators(&ast);
+    let expressions = ast.expressions.clone();
+    trace.phase(
+        "canonical_bundle",
+        "program_assembly",
+        program_assembly_started,
+        || {
+            format!(
+                "functions={} operators={} expressions={}",
+                functions.len(),
+                operators.len(),
+                expressions.len(),
+            )
+        },
+    );
     Ok(ParsedProgram::from_parser_fields(ParsedProgramFields {
         source_bundle_digest_v1,
-        expressions: ast.expressions.clone(),
-        functions: collect_functions(&ast),
-        operators: collect_operators(&ast),
+        expressions,
+        functions,
+        operators,
         path,
         source,
         files,
@@ -1054,7 +2187,7 @@ fn namespace_project_modules(ast: &mut AstProgram, files: &[ParsedSourceFile]) {
     let mut functions_by_module = std::collections::BTreeMap::<String, Vec<String>>::new();
     collect_module_functions(&ast.statements, &ranges, &mut functions_by_module);
     namespace_statement_functions(&mut ast.statements, &ranges, &functions_by_module);
-    namespace_expr_functions(&mut ast.expressions, &ranges, &functions_by_module);
+    namespace_expr_functions(ast.expressions.make_mut(), &ranges, &functions_by_module);
     namespace_parser_items(&mut ast.items, &ranges, &functions_by_module);
 }
 
@@ -1168,7 +2301,7 @@ pub fn parsed_document(program: &ParsedProgram) -> Option<DocumentAst> {
         .cloned()
         .map(|root| DocumentAst {
             root,
-            expressions: program.ast.expressions.clone(),
+            expressions: program.ast.expressions.to_vec(),
         })
 }
 
@@ -1177,7 +2310,7 @@ pub fn parsed_scene(program: &ParsedProgram) -> Option<DocumentAst> {
         .cloned()
         .map(|root| DocumentAst {
             root,
-            expressions: program.ast.expressions.clone(),
+            expressions: program.ast.expressions.to_vec(),
         })
 }
 
@@ -1419,27 +2552,96 @@ fn bracket_inline(prefix: &str, inner: &str) -> String {
 }
 
 pub fn parse_ast(path: &str, source: &str) -> Result<AstProgram, ParseError> {
+    parse_ast_traced(path, source, ParserTrace::from_environment())
+}
+
+fn parse_ast_traced(
+    path: &str,
+    source: &str,
+    trace: ParserTrace,
+) -> Result<AstProgram, ParseError> {
+    let total_started = trace.start();
+    let lex_started = trace.start();
     let tokens = lex_source(path, source)?;
+    trace.phase("ast", "lex", lex_started, || {
+        format!("source_bytes={} tokens={}", source.len(), tokens.len())
+    });
+
+    let line_merging_started = trace.start();
     let text_body_line_ranges = text_literal_body_line_ranges(&tokens);
     let lines = parser_lines(&tokens);
-    let item_lines = merge_multiline_bytes_lines(&lines, &text_body_line_ranges);
-    let item_lines = merge_multiline_drain_lines(&item_lines, &text_body_line_ranges);
-    let item_lines = merge_multiline_call_expression_lines(&item_lines, &text_body_line_ranges);
-    let items = parser_items(&item_lines, &text_body_line_ranges);
+    let item_lines = merge_multiline_bytes_lines(lines.clone(), &text_body_line_ranges);
+    let item_lines = merge_multiline_drain_lines(item_lines, &text_body_line_ranges);
+    let item_lines = merge_multiline_call_expression_lines(item_lines, &text_body_line_ranges);
+    trace.phase("ast", "line_merging", line_merging_started, || {
+        format!(
+            "logical_lines={} merged_item_lines={} text_body_line_ranges={}",
+            lines.len(),
+            item_lines.len(),
+            text_body_line_ranges.len(),
+        )
+    });
+
+    let items_started = trace.start();
+    let item_line_count = item_lines.len();
+    let items = parser_items(item_lines, &text_body_line_ranges);
+    trace.phase("ast", "items", items_started, || {
+        format!("item_lines={} items={}", item_line_count, items.len())
+    });
+
+    let ast_tree_started = trace.start();
     let mut expressions = Vec::new();
     let mut statements = ast_statement_tree(&items, &mut expressions, source);
+    trace.phase("ast", "ast_tree", ast_tree_started, || {
+        format!(
+            "items={} root_statements={} expressions={}",
+            items.len(),
+            statements.len(),
+            expressions.len(),
+        )
+    });
+
+    let linking_started = trace.start();
     resolve_statement_arrow_contexts(&statements, &mut expressions, ArrowContext::None);
     link_multiline_expression_structure(&mut statements, &mut expressions);
     normalize_unlinked_unary_negation(&mut expressions);
+    trace.phase("ast", "linking_normalization", linking_started, || {
+        format!(
+            "root_statements={} expressions={}",
+            statements.len(),
+            expressions.len(),
+        )
+    });
+
+    let validations_started = trace.start();
     validate_pipeline_inputs(path, source, &expressions)?;
     let ast = AstProgram {
         tokens,
         lines,
         items,
         statements,
-        expressions,
+        expressions: expressions.into(),
     };
     validate_match_patterns(path, &ast)?;
+    trace.phase("ast", "validations", validations_started, || {
+        format!(
+            "tokens={} root_statements={} expressions={}",
+            ast.tokens.len(),
+            ast.statements.len(),
+            ast.expressions.len(),
+        )
+    });
+    trace.phase("ast", "total", total_started, || {
+        format!(
+            "source_bytes={} tokens={} logical_lines={} items={} root_statements={} expressions={}",
+            source.len(),
+            ast.tokens.len(),
+            ast.lines.len(),
+            ast.items.len(),
+            ast.statements.len(),
+            ast.expressions.len(),
+        )
+    });
     Ok(ast)
 }
 
@@ -1654,7 +2856,15 @@ fn relink_direct_structure_pipeline(
         let Some(target) = statement_pipeline_continuation_target(statement, expressions) else {
             continue;
         };
-        if let Some(expression) = expressions.get_mut(target) {
+        // Recursive lexical linking runs first and owns an exact local
+        // predecessor. Structural relinking is only the fallback for a
+        // leading continuation that has no lexical predecessor; overwriting
+        // an existing edge can incorrectly point a BLOCK/HOLD body pipeline
+        // at its enclosing structure.
+        if let Some(expression) = expressions
+            .get_mut(target)
+            .filter(|expression| expression.linked_input.is_none())
+        {
             expression.linked_input = Some(previous);
             if let AstExprKind::Infix { left, .. } = &mut expression.kind {
                 *left = previous;
@@ -2094,45 +3304,185 @@ fn statement_binding_name(statement: &AstStatement) -> Option<&str> {
 /// Editor tooling uses this surface so highlighting and semantic inspection do
 /// not need a second, drifting approximation of the language grammar.
 pub fn lex_source(path: &str, source: &str) -> Result<Vec<AstToken>, ParseError> {
-    let source_index = SourceIndex::new(source);
-    let spanned = token_parser()
-        .repeated()
-        .then_ignore(end())
-        .parse(source)
-        .map_err(|errors| {
-            let message = errors
-                .into_iter()
-                .next()
-                .map(|error| format!("syntax error near {:?}", error.span()))
-                .unwrap_or_else(|| "syntax error".to_owned());
-            ParseError {
-                path: path.to_owned(),
-                line: None,
-                column: None,
-                message,
+    let bytes = source.as_bytes();
+    let mut tokens = Vec::<AstToken>::with_capacity(source.len() / 6);
+    let mut cursor = 0usize;
+    let mut line = 1usize;
+    let mut column = 1usize;
+
+    while cursor < bytes.len() {
+        let start = cursor;
+        let token_line = line;
+        let token_column = column;
+        while bytes
+            .get(cursor)
+            .is_some_and(|byte| matches!(byte, b' ' | b'\t' | b'\r'))
+        {
+            cursor += 1;
+        }
+        if cursor == bytes.len() {
+            if tokens.is_empty() {
+                return Err(ParseError {
+                    path: path.to_owned(),
+                    line: None,
+                    column: None,
+                    message: format!("syntax error near {cursor}..{cursor}"),
+                });
             }
-        })?;
-    Ok(spanned
-        .into_iter()
-        .map(|(kind, span)| {
-            let start = source_index.char_offset_to_byte(span.start);
-            let end = source_index.char_offset_to_byte(span.end);
-            let (line, column) = source_index.line_column(source, start);
-            let raw_lexeme = source.get(start..end).unwrap_or_default();
-            let lexeme = match kind {
-                AstTokenKind::String | AstTokenKind::Comment | AstTokenKind::Newline => raw_lexeme,
-                _ => raw_lexeme.trim_matches(|ch| matches!(ch, ' ' | '\t' | '\r')),
-            };
-            AstToken {
-                kind,
-                lexeme: lexeme.to_owned(),
-                line,
-                column,
-                start,
-                end,
+            // Horizontal padding belongs to the preceding token, just as it
+            // did in the grammar-combinator lexer.
+            let token = tokens.last_mut().expect("non-empty token stream");
+            token.end = cursor;
+            if matches!(
+                token.kind,
+                AstTokenKind::String | AstTokenKind::Comment | AstTokenKind::Newline
+            ) {
+                token.lexeme = source[token.start..cursor].to_owned();
             }
-        })
-        .collect())
+            advance_lexer_position(&source[start..cursor], &mut line, &mut column);
+            break;
+        }
+
+        let semantic_start = cursor;
+        let kind = match bytes[cursor] {
+            byte if byte.is_ascii_alphabetic() || byte == b'_' => {
+                cursor += 1;
+                while bytes.get(cursor).is_some_and(|byte| {
+                    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'/')
+                }) {
+                    cursor += 1;
+                }
+                AstTokenKind::Identifier
+            }
+            byte if byte.is_ascii_digit() => {
+                cursor += 1;
+                while bytes.get(cursor).is_some_and(u8::is_ascii_digit) {
+                    cursor += 1;
+                }
+                AstTokenKind::Number
+            }
+            b'"' => {
+                let mut scan = cursor + 1;
+                let mut close = None;
+                while scan < bytes.len() {
+                    match bytes[scan] {
+                        b'\\' => {
+                            scan += 1;
+                            if scan < bytes.len() {
+                                let character = source[scan..]
+                                    .chars()
+                                    .next()
+                                    .expect("valid UTF-8 character boundary");
+                                scan += character.len_utf8();
+                            }
+                        }
+                        b'"' => {
+                            close = Some(scan + 1);
+                            break;
+                        }
+                        _ => {
+                            let character = source[scan..]
+                                .chars()
+                                .next()
+                                .expect("valid UTF-8 character boundary");
+                            scan += character.len_utf8();
+                        }
+                    }
+                }
+                if let Some(close) = close {
+                    cursor = close;
+                    AstTokenKind::String
+                } else {
+                    cursor += 1;
+                    AstTokenKind::Unknown
+                }
+            }
+            b'-' if bytes.get(cursor + 1) == Some(&b'-') => {
+                cursor += 2;
+                while bytes.get(cursor).is_some_and(|byte| *byte != b'\n') {
+                    cursor += 1;
+                }
+                AstTokenKind::Comment
+            }
+            first
+                if matches!(
+                    (first, bytes.get(cursor + 1).copied()),
+                    (b'=', Some(b'>'))
+                        | (b'|', Some(b'>'))
+                        | (b'=', Some(b'='))
+                        | (b'>', Some(b'='))
+                        | (b'<', Some(b'='))
+                        | (b'!', Some(b'='))
+                ) =>
+            {
+                cursor += 2;
+                AstTokenKind::Operator
+            }
+            byte if matches!(
+                byte,
+                b'>' | b'<' | b'=' | b'|' | b'+' | b'-' | b'%' | b'*' | b'/'
+            ) =>
+            {
+                cursor += 1;
+                AstTokenKind::Operator
+            }
+            byte if matches!(
+                byte,
+                b'[' | b']' | b'{' | b'}' | b'(' | b')' | b':' | b',' | b'.' | b'$' | b'#'
+            ) =>
+            {
+                cursor += 1;
+                AstTokenKind::Symbol
+            }
+            b'\n' => {
+                cursor += 1;
+                AstTokenKind::Newline
+            }
+            _ => {
+                let character = source[cursor..]
+                    .chars()
+                    .next()
+                    .expect("valid UTF-8 character boundary");
+                cursor += character.len_utf8();
+                AstTokenKind::Unknown
+            }
+        };
+        while bytes
+            .get(cursor)
+            .is_some_and(|byte| matches!(byte, b' ' | b'\t' | b'\r'))
+        {
+            cursor += 1;
+        }
+
+        let raw_lexeme = &source[start..cursor];
+        let lexeme = match kind {
+            AstTokenKind::String | AstTokenKind::Comment | AstTokenKind::Newline => raw_lexeme,
+            _ => source[semantic_start..cursor]
+                .trim_matches(|character| matches!(character, ' ' | '\t' | '\r')),
+        };
+        tokens.push(AstToken {
+            kind,
+            lexeme: lexeme.to_owned(),
+            line: token_line,
+            column: token_column,
+            start,
+            end: cursor,
+        });
+        advance_lexer_position(&source[start..cursor], &mut line, &mut column);
+    }
+
+    Ok(tokens)
+}
+
+fn advance_lexer_position(source: &str, line: &mut usize, column: &mut usize) {
+    for character in source.chars() {
+        if character == '\n' {
+            *line += 1;
+            *column = 1;
+        } else {
+            *column += 1;
+        }
+    }
 }
 
 fn document_statement(ast: &AstProgram) -> Option<&AstStatement> {
@@ -2151,103 +3501,6 @@ fn scene_statement(ast: &AstProgram) -> Option<&AstStatement> {
             AstStatementKind::Field { name } if name == "scene"
         )
     })
-}
-
-fn statement_contains_line(statement: &AstStatement, line: usize) -> bool {
-    statement.line == line
-        || statement
-            .children
-            .iter()
-            .any(|child| statement_contains_line(child, line))
-}
-
-fn token_parser() -> impl Parser<char, (AstTokenKind, std::ops::Range<usize>), Error = Simple<char>>
-{
-    let horizontal_space = one_of(" \t\r").repeated().ignored();
-    let ident_start = filter(|ch: &char| ch.is_ascii_alphabetic() || *ch == '_');
-    let ident_tail =
-        filter(|ch: &char| ch.is_ascii_alphanumeric() || matches!(*ch, '_' | '-' | '/'));
-    let identifier = ident_start
-        .then(ident_tail.repeated())
-        .to(AstTokenKind::Identifier);
-    let number = text::int(10).to(AstTokenKind::Number);
-    let string = just('"')
-        .ignore_then(
-            choice((
-                just('\\').ignore_then(any()).ignored(),
-                none_of('"').ignored(),
-            ))
-            .repeated(),
-        )
-        .then_ignore(just('"'))
-        .to(AstTokenKind::String);
-    let comment = just("--")
-        .ignore_then(none_of('\n').repeated())
-        .to(AstTokenKind::Comment);
-    let operator = choice((
-        just("=>").ignored(),
-        just("|>").ignored(),
-        just("==").ignored(),
-        just(">=").ignored(),
-        just("<=").ignored(),
-        just("!=").ignored(),
-        one_of("><=|+-%*/").ignored(),
-    ))
-    .to(AstTokenKind::Operator);
-    let symbol = one_of("[]{}():,.$#").to(AstTokenKind::Symbol);
-    let newline = just('\n').to(AstTokenKind::Newline);
-    let unknown = any().to(AstTokenKind::Unknown);
-
-    choice((
-        string, comment, identifier, number, operator, symbol, newline, unknown,
-    ))
-    .padded_by(horizontal_space)
-    .map_with_span(|kind, span| (kind, span))
-}
-
-struct SourceIndex {
-    char_to_byte: Vec<usize>,
-    line_starts: Vec<usize>,
-}
-
-impl SourceIndex {
-    fn new(source: &str) -> Self {
-        let mut char_to_byte = source
-            .char_indices()
-            .map(|(byte, _)| byte)
-            .collect::<Vec<_>>();
-        char_to_byte.push(source.len());
-        let mut line_starts = vec![0];
-        for (byte, ch) in source.char_indices() {
-            if ch == '\n' {
-                line_starts.push(byte + ch.len_utf8());
-            }
-        }
-        Self {
-            char_to_byte,
-            line_starts,
-        }
-    }
-
-    fn char_offset_to_byte(&self, char_offset: usize) -> usize {
-        self.char_to_byte
-            .get(char_offset)
-            .copied()
-            .unwrap_or_else(|| *self.char_to_byte.last().unwrap_or(&0))
-    }
-
-    fn line_column(&self, source: &str, byte_index: usize) -> (usize, usize) {
-        let line_index = self
-            .line_starts
-            .partition_point(|start| *start <= byte_index);
-        let line = line_index.max(1);
-        let line_start = self.line_starts[line - 1];
-        let column = source
-            .get(line_start..byte_index)
-            .map(|slice| slice.chars().count() + 1)
-            .unwrap_or(1);
-        (line, column)
-    }
 }
 
 fn parser_lines(tokens: &[AstToken]) -> Vec<ParserLine> {
@@ -2296,63 +3549,76 @@ fn parser_lines(tokens: &[AstToken]) -> Vec<ParserLine> {
 }
 
 fn merge_multiline_bytes_lines(
-    lines: &[ParserLine],
+    lines: Vec<ParserLine>,
     text_body_line_ranges: &[(usize, usize)],
 ) -> Vec<ParserLine> {
     merge_multiline_braced_lines(lines, text_body_line_ranges, unclosed_bytes_body_open)
 }
 
 fn merge_multiline_drain_lines(
-    lines: &[ParserLine],
+    lines: Vec<ParserLine>,
     text_body_line_ranges: &[(usize, usize)],
 ) -> Vec<ParserLine> {
     merge_multiline_braced_lines(lines, text_body_line_ranges, unclosed_drain_body_open)
 }
 
 fn merge_multiline_call_expression_lines(
-    lines: &[ParserLine],
+    lines: Vec<ParserLine>,
     text_body_line_ranges: &[(usize, usize)],
 ) -> Vec<ParserLine> {
-    let mut merged = Vec::new();
-    let mut index = 0usize;
-    while let Some(line) = lines.get(index) {
+    let mut merged = Vec::with_capacity(lines.len());
+    let mut remaining = lines.into_iter().peekable();
+    let mut replay = Vec::new();
+    let mut delimiter_stack = Vec::new();
+    while let Some(line) = replay.pop().or_else(|| remaining.next()) {
         if line_is_in_ranges(line.line, text_body_line_ranges) {
-            merged.push(line.clone());
-            index += 1;
+            merged.push(line);
             continue;
         }
         let Some(open) = line.symbols.iter().position(|symbol| symbol == "(") else {
-            merged.push(line.clone());
-            index += 1;
+            merged.push(line);
             continue;
         };
-        if matching_close(&line.symbols, open).is_some() {
-            merged.push(line.clone());
-            index += 1;
-            continue;
+        delimiter_stack.clear();
+        delimiter_stack.push(")");
+        match advance_delimiter_stack(&line.symbols, open + 1, &mut delimiter_stack).0 {
+            DelimiterProgress::Closed | DelimiterProgress::Mismatched => {
+                merged.push(line);
+                continue;
+            }
+            DelimiterProgress::Open => {}
         }
 
-        let mut end_index = index;
-        let mut candidate = line.symbols.clone();
-        let mut outer_close = None;
-        while outer_close.is_none() {
-            end_index += 1;
-            let Some(next) = lines.get(end_index) else {
+        let mut buffered = Vec::new();
+        let mut outer_closed = false;
+        while !outer_closed {
+            let Some(next) = replay.last().or_else(|| remaining.peek()) else {
                 break;
             };
             if line_is_in_ranges(next.line, text_body_line_ranges) {
                 break;
             }
-            candidate.extend(next.symbols.iter().cloned());
-            outer_close = matching_close(&candidate, open);
+            let next = replay
+                .pop()
+                .or_else(|| remaining.next())
+                .expect("peeked multiline expression line");
+            match advance_delimiter_stack(&next.symbols, 0, &mut delimiter_stack).0 {
+                DelimiterProgress::Open => {}
+                DelimiterProgress::Closed => outer_closed = true,
+                DelimiterProgress::Mismatched => {
+                    buffered.push(next);
+                    break;
+                }
+            }
+            buffered.push(next);
         }
-        let Some(_) = outer_close else {
-            merged.push(line.clone());
-            index += 1;
+        if !outer_closed {
+            replay.extend(buffered.into_iter().rev());
+            merged.push(line);
             continue;
-        };
-        let mut expression_line = line.clone();
-        for next in &lines[index + 1..=end_index] {
+        }
+        let mut expression_line = line;
+        for next in buffered {
             if multiline_expression_needs_separator(&expression_line.symbols, &next.symbols) {
                 let separator = expression_line
                     .symbol_spans
@@ -2363,15 +3629,48 @@ fn merge_multiline_call_expression_lines(
                 expression_line.symbol_spans.push(separator);
             }
             expression_line.end = next.end;
-            expression_line.symbols.extend(next.symbols.iter().cloned());
-            expression_line
-                .symbol_spans
-                .extend(next.symbol_spans.iter().copied());
+            expression_line.symbols.extend(next.symbols);
+            expression_line.symbol_spans.extend(next.symbol_spans);
         }
         merged.push(expression_line);
-        index = end_index + 1;
     }
     merged
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DelimiterProgress {
+    Open,
+    Closed,
+    Mismatched,
+}
+
+/// Advance one multiline delimiter stack across a symbol slice.
+///
+/// The returned count is the exact number of symbols inspected, allowing
+/// tests to prove that a sequence of physical lines is scanned once rather
+/// than repeatedly rescanning a growing prefix.
+fn advance_delimiter_stack(
+    symbols: &[String],
+    start: usize,
+    stack: &mut Vec<&'static str>,
+) -> (DelimiterProgress, usize) {
+    for (offset, symbol) in symbols.iter().skip(start).enumerate() {
+        match symbol.as_str() {
+            "(" => stack.push(")"),
+            "[" => stack.push("]"),
+            "{" => stack.push("}"),
+            ")" | "]" | "}" => {
+                if stack.pop() != Some(symbol.as_str()) {
+                    return (DelimiterProgress::Mismatched, offset + 1);
+                }
+                if stack.is_empty() {
+                    return (DelimiterProgress::Closed, offset + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    (DelimiterProgress::Open, symbols.len().saturating_sub(start))
 }
 
 fn multiline_expression_needs_separator(current: &[String], next: &[String]) -> bool {
@@ -2386,38 +3685,32 @@ fn multiline_expression_needs_separator(current: &[String], next: &[String]) -> 
 }
 
 fn merge_multiline_braced_lines(
-    lines: &[ParserLine],
+    lines: Vec<ParserLine>,
     text_body_line_ranges: &[(usize, usize)],
     unclosed_body_open: fn(&[String]) -> Option<usize>,
 ) -> Vec<ParserLine> {
-    let mut merged = Vec::new();
-    let mut index = 0usize;
-    while let Some(line) = lines.get(index) {
-        if line_is_in_ranges(line.line, text_body_line_ranges) {
-            merged.push(line.clone());
-            index += 1;
+    let mut merged = Vec::with_capacity(lines.len());
+    let mut remaining = lines.into_iter().peekable();
+    while let Some(mut current) = remaining.next() {
+        if line_is_in_ranges(current.line, text_body_line_ranges) {
+            merged.push(current);
             continue;
         }
-        let Some(body_open) = unclosed_body_open(&line.symbols) else {
-            merged.push(line.clone());
-            index += 1;
+        let Some(body_open) = unclosed_body_open(&current.symbols) else {
+            merged.push(current);
             continue;
         };
-        let mut current = line.clone();
-        index += 1;
         while matching_close(&current.symbols, body_open).is_none() {
-            let Some(next) = lines.get(index) else {
+            let Some(next) = remaining.peek() else {
                 break;
             };
             if line_is_in_ranges(next.line, text_body_line_ranges) {
                 break;
             }
+            let next = remaining.next().expect("peeked multiline braced line");
             current.end = next.end;
-            current.symbols.extend(next.symbols.iter().cloned());
-            current
-                .symbol_spans
-                .extend(next.symbol_spans.iter().copied());
-            index += 1;
+            current.symbols.extend(next.symbols);
+            current.symbol_spans.extend(next.symbol_spans);
         }
         merged.push(current);
     }
@@ -2455,9 +3748,12 @@ fn unclosed_drain_body_open(symbols: &[String]) -> Option<usize> {
         .then_some(body_open)
 }
 
-fn parser_items(lines: &[ParserLine], text_body_line_ranges: &[(usize, usize)]) -> Vec<ParserItem> {
+fn parser_items(
+    lines: Vec<ParserLine>,
+    text_body_line_ranges: &[(usize, usize)],
+) -> Vec<ParserItem> {
     lines
-        .iter()
+        .into_iter()
         .filter(|line| {
             !text_body_line_ranges
                 .iter()
@@ -2468,28 +3764,38 @@ fn parser_items(lines: &[ParserLine], text_body_line_ranges: &[(usize, usize)]) 
         .collect()
 }
 
-fn parser_item(line: &ParserLine) -> ParserItem {
-    let symbols = line.symbols.clone();
-    let symbol_spans = line.symbol_spans.clone();
+fn parser_item(line: ParserLine) -> ParserItem {
+    let ParserLine {
+        line,
+        indent,
+        symbols,
+        symbol_spans,
+        start,
+        end,
+    } = line;
     let field = ast_field_name(&symbols).map(ToOwned::to_owned);
     let function = (symbols.first().map(String::as_str) == Some("FUNCTION"))
         .then(|| symbols.get(1).cloned())
         .flatten();
     let source_event = ast_insource_slice_event(&symbols).map(ToOwned::to_owned);
+    let hold = ast_hold_name(&symbols).map(ToOwned::to_owned);
+    let list_capacity = ast_list_capacity(&symbols);
+    let opens_scope = ast_opens_scope(&symbols);
+    let closes_scope =
+        symbols.len() == 1 && matches!(symbols.first().map(String::as_str), Some("}" | "]" | ")"));
     let operators = ast_expression_operators(&symbols);
     let is_list = symbols.iter().any(|lexeme| is_list_constructor(lexeme))
         && find_top_level_pipe(&symbols).is_none();
     ParserItem {
-        line: line.line,
-        indent: line.indent,
-        start: line.start,
-        end: line.end,
+        line,
+        indent,
+        start,
+        end,
         source_event,
-        hold: ast_hold_name(&symbols).map(ToOwned::to_owned),
-        list_capacity: ast_list_capacity(&symbols),
-        opens_scope: ast_opens_scope(&symbols),
-        closes_scope: symbols.len() == 1
-            && matches!(symbols.first().map(String::as_str), Some("}" | "]" | ")")),
+        hold,
+        list_capacity,
+        opens_scope,
+        closes_scope,
         operators,
         symbols,
         symbol_spans,
@@ -2612,7 +3918,7 @@ fn ast_statement(
         ))
     } else {
         let expr_tokens = statement_expression_tokens(item);
-        (!expr_tokens.is_empty()).then(|| parse_ast_expr(&expr_tokens, item, expressions, source))
+        (!expr_tokens.is_empty()).then(|| parse_ast_expr(expr_tokens, item, expressions, source))
     };
     AstStatement {
         id,
@@ -2626,18 +3932,18 @@ fn ast_statement(
     }
 }
 
-fn statement_expression_tokens(item: &ParserItem) -> Vec<String> {
+fn statement_expression_tokens(item: &ParserItem) -> &[String] {
     if item.field.is_some() && item.symbols.get(1).map(String::as_str) == Some(":") {
         if matches!(
             item.symbols.get(2).map(String::as_str),
             Some("[") | Some("{")
         ) && item.symbols.len() == 3
         {
-            return Vec::new();
+            return &[];
         }
-        return item.symbols[2..].to_vec();
+        return &item.symbols[2..];
     }
-    item.symbols.clone()
+    &item.symbols
 }
 
 fn parse_ast_expr(
@@ -3150,6 +4456,9 @@ fn ast_byte_literal(
     let [base, suffix] = tokens else {
         return None;
     };
+    if !matches!(base.as_str(), "2" | "8" | "10" | "16") || !suffix.starts_with('u') {
+        return None;
+    }
     let adjacent_text = format!("{base}{suffix}");
     let adjacent_in_source = source
         .get(item.start..item.end)
@@ -3197,6 +4506,9 @@ fn ast_bits_literal(
     item: &ParserItem,
     source: &str,
 ) -> Option<(u32, u32, String)> {
+    if tokens.first().map(String::as_str) != Some("BITS") {
+        return None;
+    }
     let (width, radix, digits, _, _) = parse_bits_literal_tokens(tokens).ok()?;
     let (start, end) = span_for_tokens(tokens, item)?;
     if source
@@ -3349,7 +4661,7 @@ fn ast_record_fields(
         .filter_map(|(index, part)| {
             if part.starts_with(&[".".to_owned(), ".".to_owned(), ".".to_owned()]) && part.len() > 3
             {
-                let (start, end) = span_for_tokens(&part, item).unwrap_or((item.start, item.end));
+                let (start, end) = span_for_tokens(part, item).unwrap_or((item.start, item.end));
                 return Some(AstRecordField {
                     name: format!("__spread_{index}"),
                     value: parse_ast_expr(&part[3..], item, expressions, source),
@@ -3361,7 +4673,7 @@ fn ast_record_fields(
             if part.len() < 3 || part.get(1).map(String::as_str) != Some(":") {
                 return None;
             }
-            let (start, end) = span_for_tokens(&part, item).unwrap_or((item.start, item.end));
+            let (start, end) = span_for_tokens(part, item).unwrap_or((item.start, item.end));
             Some(AstRecordField {
                 name: part[0].clone(),
                 value: parse_ast_expr(&part[2..], item, expressions, source),
@@ -3421,7 +4733,7 @@ fn ast_call_parts(
     let mut args = Vec::new();
     let mut pass = None;
     let parts = split_top_level(tokens, ",");
-    for (index, part) in parts.iter().enumerate() {
+    for (index, part) in parts.iter().copied().enumerate() {
         if part.first().map(String::as_str) == Some("PASS")
             && part.get(1).map(String::as_str) == Some(":")
         {
@@ -3599,7 +4911,7 @@ fn parse_inline_match_arms(
         .into_iter()
         .filter(|part| part.iter().any(|token| token == "=>"))
         .map(|part| {
-            let expression = parse_ast_expr(&part, item, expressions, source);
+            let expression = parse_ast_expr(part, item, expressions, source);
             consume_arrow_as_match_arm(expression, expressions);
             expression
         })
@@ -3657,7 +4969,7 @@ fn ast_function_parameters(tokens: &[String], item: &ParserItem) -> Vec<AstParam
             } else {
                 AstParameterKind::Value
             };
-            let (start, end) = span_for_tokens(&part, item).unwrap_or((item.start, item.end));
+            let (start, end) = span_for_tokens(part, item).unwrap_or((item.start, item.end));
             Some(AstParameter {
                 name,
                 kind,
@@ -3785,24 +5097,23 @@ fn matching_close(tokens: &[String], open: usize) -> Option<usize> {
     None
 }
 
-fn split_top_level(tokens: &[String], separator: &str) -> Vec<Vec<String>> {
+fn split_top_level<'a>(tokens: &'a [String], separator: &str) -> Vec<&'a [String]> {
     let mut groups = Vec::new();
-    let mut current = Vec::new();
+    let mut start = 0usize;
     let mut depth = 0i32;
-    for token in tokens {
+    for (index, token) in tokens.iter().enumerate() {
         match token.as_str() {
             "[" | "{" | "(" => depth += 1,
             "]" | "}" | ")" => depth -= 1,
             _ => {}
         }
         if token == separator && depth == 0 {
-            groups.push(std::mem::take(&mut current));
-        } else {
-            current.push(token.clone());
+            groups.push(&tokens[start..index]);
+            start = index + 1;
         }
     }
-    if !current.is_empty() {
-        groups.push(current);
+    if start < tokens.len() {
+        groups.push(&tokens[start..]);
     }
     groups
 }
@@ -4126,7 +5437,7 @@ fn ast_collection_items(
     split_top_level(&tokens[open + 1..close], ",")
         .into_iter()
         .filter(|part| !part.is_empty())
-        .map(|part| parse_ast_expr(&part, item, expressions, source))
+        .map(|part| parse_ast_expr(part, item, expressions, source))
         .collect()
 }
 
@@ -4149,7 +5460,7 @@ fn ast_map_entries(
         .into_iter()
         .filter(|part| !part.is_empty())
         .map(|part| {
-            let expression = parse_ast_expr(&part, item, expressions, source);
+            let expression = parse_ast_expr(part, item, expressions, source);
             consume_arrow_as_map_entry(expression, expressions);
             expression
         })
@@ -4192,7 +5503,7 @@ fn ast_bytes_literal(
         split_top_level(&tokens[body_open + 1..body_close], ",")
             .into_iter()
             .filter(|part| !part.is_empty())
-            .map(|part| parse_ast_expr(&part, item, expressions, source))
+            .map(|part| parse_ast_expr(part, item, expressions, source))
             .collect()
     };
     Some((size, items))
@@ -4208,8 +5519,7 @@ fn ast_opens_scope(symbols: &[String]) -> bool {
 }
 
 fn ast_expression_operators(symbols: &[String]) -> Vec<String> {
-    let refs = symbols.iter().map(String::as_str).collect::<Vec<_>>();
-    expression_operators(&refs)
+    expression_operators(symbols.iter().map(String::as_str))
 }
 
 fn is_name(name: &str) -> bool {
@@ -4234,11 +5544,10 @@ fn validate_source_syntax(path: &str, ast: &AstProgram) -> Result<(), ParseError
         })
         .collect::<Vec<_>>();
     text_literal_spans.extend(text_literal_token_spans(&ast.tokens));
+    let text_literal_spans = normalized_source_spans(text_literal_spans);
     for token in &ast.tokens {
         if matches!(token.kind, AstTokenKind::String | AstTokenKind::Comment)
-            || text_literal_spans
-                .iter()
-                .any(|(start, end)| token.start >= *start && token.end <= *end)
+            || containing_source_span(&text_literal_spans, token.start, token.end).is_some()
         {
             continue;
         }
@@ -4399,8 +5708,8 @@ fn validate_function_parameter_syntax(path: &str, ast: &AstProgram) -> Result<()
             if part.is_empty() {
                 continue;
             }
-            let valid = matches!(part.as_slice(), [name] if is_name(name))
-                || matches!(part.as_slice(), [name, colon, out] if is_name(name) && colon == ":" && out == "OUT");
+            let valid = matches!(part, [name] if is_name(name))
+                || matches!(part, [name, colon, out] if is_name(name) && colon == ":" && out == "OUT");
             let name = part.first().map(String::as_str).unwrap_or_default();
             let column = item
                 .symbol_spans
@@ -4498,8 +5807,9 @@ fn validate_call_entry_syntax(path: &str, ast: &AstProgram) -> Result<(), ParseE
 
 fn parser_column_for_offset(ast: &AstProgram, line: usize, offset: usize) -> usize {
     ast.lines
-        .iter()
-        .find(|candidate| candidate.line == line)
+        .binary_search_by_key(&line, |candidate| candidate.line)
+        .ok()
+        .and_then(|index| ast.lines.get(index))
         .map_or(1, |candidate| offset.saturating_sub(candidate.start) + 1)
 }
 
@@ -4600,10 +5910,9 @@ fn validate_drain_syntax(
             if matches!(token.kind, AstTokenKind::Comment | AstTokenKind::Newline) {
                 return false;
             }
-            let containing_text = text_literal_spans
-                .iter()
-                .find(|(start, end)| token.start >= *start && token.end <= *end);
-            containing_text.is_none_or(|(start, _)| token.start == *start)
+            let containing_text =
+                containing_source_span(text_literal_spans, token.start, token.end);
+            containing_text.is_none_or(|(start, _)| token.start == start)
         })
         .collect::<Vec<_>>();
 
@@ -4766,12 +6075,10 @@ fn validate_bytes_syntax(
                 suffix_token.kind,
                 AstTokenKind::Comment | AstTokenKind::String | AstTokenKind::Newline
             )
-            || text_literal_spans
-                .iter()
-                .any(|(start, end)| base_token.start >= *start && base_token.end <= *end)
-            || text_literal_spans
-                .iter()
-                .any(|(start, end)| suffix_token.start >= *start && suffix_token.end <= *end)
+            || containing_source_span(text_literal_spans, base_token.start, base_token.end)
+                .is_some()
+            || containing_source_span(text_literal_spans, suffix_token.start, suffix_token.end)
+                .is_some()
         {
             continue;
         }
@@ -4846,10 +6153,7 @@ fn validate_bits_syntax(
                 .get(bits_index)
                 .map(|(start, _)| *start)
                 .unwrap_or(item.start);
-            if text_literal_spans
-                .iter()
-                .any(|(start, end)| token_start >= *start && token_start <= *end)
-            {
+            if containing_source_span(text_literal_spans, token_start, token_start).is_some() {
                 continue;
             }
             let literal = bits_literal_tokens_at(&item.symbols, bits_index);
@@ -4925,10 +6229,7 @@ fn validate_bytes_item_syntax(
             .get(bytes_index)
             .map(|(start, _)| *start)
             .unwrap_or(item.start);
-        if text_literal_spans
-            .iter()
-            .any(|(start, end)| token_start >= *start && token_start <= *end)
-        {
+        if containing_source_span(text_literal_spans, token_start, token_start).is_some() {
             continue;
         }
         match item.symbols.get(bytes_index + 1).map(String::as_str) {
@@ -5033,6 +6334,37 @@ fn text_literal_token_spans(tokens: &[AstToken]) -> Vec<(usize, usize)> {
     spans
 }
 
+/// Sorts and merges overlapping source intervals once so all later syntax
+/// validators can use a logarithmic containment lookup instead of scanning
+/// every text literal for every token. Adjacent intervals remain distinct:
+/// membership in two neighboring literals must not create one larger literal.
+fn normalized_source_spans(mut spans: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    spans.sort_unstable();
+    let mut normalized = Vec::<(usize, usize)>::with_capacity(spans.len());
+    for (start, end) in spans {
+        if let Some((_, previous_end)) = normalized.last_mut()
+            && start < *previous_end
+        {
+            *previous_end = (*previous_end).max(end);
+        } else {
+            normalized.push((start, end));
+        }
+    }
+    normalized
+}
+
+fn containing_source_span(
+    spans: &[(usize, usize)],
+    start: usize,
+    end: usize,
+) -> Option<(usize, usize)> {
+    let insertion = spans.partition_point(|(span_start, _)| *span_start <= start);
+    insertion
+        .checked_sub(1)
+        .and_then(|index| spans.get(index).copied())
+        .filter(|(_, span_end)| end <= *span_end)
+}
+
 fn text_literal_body_line_ranges(tokens: &[AstToken]) -> Vec<(usize, usize)> {
     let mut ranges = Vec::new();
     let mut index = 0usize;
@@ -5071,6 +6403,47 @@ fn statement_has_field(statement: &AstStatement, needle: &str) -> bool {
             .children
             .iter()
             .any(|child| statement_has_field(child, needle))
+}
+
+fn validate_source_unit_boundary(
+    path: &str,
+    source: &str,
+    ast: &AstProgram,
+) -> Result<(), ParseError> {
+    validate_balanced_brackets(path, ast)?;
+
+    let mut text_literal_spans = ast
+        .expressions
+        .iter()
+        .filter_map(|expr| {
+            matches!(expr.kind, AstExprKind::TextLiteral(_)).then_some((expr.start, expr.end))
+        })
+        .collect::<Vec<_>>();
+    text_literal_spans.extend(text_literal_token_spans(&ast.tokens));
+    let text_literal_spans = normalized_source_spans(text_literal_spans);
+    for token in &ast.tokens {
+        if token.kind != AstTokenKind::Unknown
+            || token.lexeme != "\""
+            || containing_source_span(&text_literal_spans, token.start, token.end).is_some()
+        {
+            continue;
+        }
+        let quote_column = source
+            .get(token.start..token.end)
+            .and_then(|lexeme| {
+                lexeme
+                    .find('"')
+                    .map(|offset| token.column + lexeme[..offset].chars().count())
+            })
+            .unwrap_or(token.column);
+        return Err(error(
+            path,
+            token.line,
+            quote_column,
+            "unclosed string literal at end of source unit",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_balanced_brackets(path: &str, ast: &AstProgram) -> Result<(), ParseError> {
@@ -5222,11 +6595,14 @@ fn validate_no_hidden_identity_leak(path: &str, ast: &AstProgram) -> Result<(), 
 }
 
 fn hidden_runtime_identity_token(value: &str) -> Option<&'static str> {
-    let lower = value.to_ascii_lowercase();
-    if lower.contains("$boon") {
+    if value
+        .as_bytes()
+        .windows(b"$boon".len())
+        .any(|window| window.eq_ignore_ascii_case(b"$boon"))
+    {
         return Some("$boon");
     }
-    let tokens = lower
+    let tokens = value
         .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
         .filter(|token| !token.is_empty());
     const FORBIDDEN: &[&str] = &[
@@ -5247,15 +6623,15 @@ fn hidden_runtime_identity_token(value: &str) -> Option<&'static str> {
         FORBIDDEN
             .iter()
             .copied()
-            .find(|forbidden| token == *forbidden)
+            .find(|forbidden| token.eq_ignore_ascii_case(forbidden))
     })
 }
 
-fn expression_operators(symbols: &[&str]) -> Vec<String> {
+fn expression_operators<'a>(symbols: impl IntoIterator<Item = &'a str>) -> Vec<String> {
     let mut operators = Vec::new();
     for lexeme in symbols {
         if is_operator_lexeme(lexeme) && !operators.iter().any(|operator| operator == lexeme) {
-            operators.push((*lexeme).to_owned());
+            operators.push(lexeme.to_owned());
         }
     }
     operators
@@ -5372,6 +6748,21 @@ fn collect_functions(ast: &AstProgram) -> Vec<String> {
         .collect()
 }
 
+fn collect_raw_declared_functions(statements: &[AstStatement]) -> Vec<String> {
+    fn visit(statements: &[AstStatement], functions: &mut Vec<String>) {
+        for statement in statements {
+            if let AstStatementKind::Function { name, .. } = &statement.kind {
+                functions.push(name.clone());
+            }
+            visit(&statement.children, functions);
+        }
+    }
+
+    let mut functions = Vec::new();
+    visit(statements, &mut functions);
+    functions
+}
+
 fn collect_operators(ast: &AstProgram) -> Vec<String> {
     let mut operators = Vec::new();
     for token in ast.semantic_tokens() {
@@ -5396,6 +6787,667 @@ fn error(path: &str, line: usize, column: usize, message: &str) -> ParseError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parser_line_fixture(
+        line: usize,
+        indent: usize,
+        symbols: &[&str],
+        start: usize,
+    ) -> ParserLine {
+        let symbol_spans = (0..symbols.len())
+            .map(|offset| (start + offset, start + offset + 1))
+            .collect::<Vec<_>>();
+        ParserLine {
+            line,
+            indent,
+            symbols: symbols.iter().map(|symbol| (*symbol).to_owned()).collect(),
+            symbol_spans,
+            start,
+            end: start + symbols.len(),
+        }
+    }
+
+    fn assert_assembled_references_are_dense_and_in_range(ast: &AstProgram) {
+        fn statement_count(statements: &[AstStatement]) -> usize {
+            statements
+                .iter()
+                .map(|statement| 1 + statement_count(&statement.children))
+                .sum()
+        }
+
+        fn expression_id(id: usize, count: usize) {
+            assert!(id < count, "expression id {id} is outside 0..{count}");
+        }
+
+        fn optional_expression_id(id: Option<usize>, count: usize) {
+            if let Some(id) = id {
+                expression_id(id, count);
+            }
+        }
+
+        fn call_arg(arg: &AstCallArg, expression_count: usize) {
+            expression_id(arg.value, expression_count);
+        }
+
+        fn pass_context(pass: &AstPassContext, expression_count: usize) {
+            expression_id(pass.value, expression_count);
+        }
+
+        fn record_field(field: &AstRecordField, expression_count: usize) {
+            expression_id(field.value, expression_count);
+        }
+
+        fn assert_statements(nodes: &[AstStatement], next_id: &mut usize, expression_count: usize) {
+            for statement in nodes {
+                assert_eq!(statement.id, *next_id);
+                *next_id += 1;
+                optional_expression_id(statement.expr, expression_count);
+                assert_statements(&statement.children, next_id, expression_count);
+            }
+        }
+
+        let expression_count = ast.expressions.len();
+        let statement_count = statement_count(&ast.statements);
+        let mut next_statement_id = 0usize;
+        assert_statements(&ast.statements, &mut next_statement_id, expression_count);
+        assert_eq!(next_statement_id, statement_count);
+
+        for (expected_id, expression) in ast.expressions.iter().enumerate() {
+            assert_eq!(expression.id, expected_id);
+            optional_expression_id(expression.linked_input, expression_count);
+            match &expression.kind {
+                AstExprKind::TextTemplate { segments } => {
+                    for segment in segments {
+                        if let AstTextSegment::Dynamic { value } = segment {
+                            expression_id(*value, expression_count);
+                        }
+                    }
+                }
+                AstExprKind::TaggedObject { fields, .. } | AstExprKind::Object(fields) => {
+                    for field in fields {
+                        record_field(field, expression_count);
+                    }
+                }
+                AstExprKind::Flush { payload } => {
+                    optional_expression_id(*payload, expression_count);
+                }
+                AstExprKind::Call { args, pass, .. } => {
+                    for arg in args {
+                        call_arg(arg, expression_count);
+                    }
+                    if let Some(pass) = pass {
+                        pass_context(pass, expression_count);
+                    }
+                }
+                AstExprKind::Pipe {
+                    input,
+                    args,
+                    pass,
+                    arms,
+                    ..
+                } => {
+                    expression_id(*input, expression_count);
+                    for arg in args {
+                        call_arg(arg, expression_count);
+                    }
+                    if let Some(pass) = pass {
+                        pass_context(pass, expression_count);
+                    }
+                    for arm in arms {
+                        expression_id(*arm, expression_count);
+                    }
+                }
+                AstExprKind::Draining { input } => expression_id(*input, expression_count),
+                AstExprKind::Hold { initial, .. } => expression_id(*initial, expression_count),
+                AstExprKind::Latest { branches } => {
+                    for branch in branches {
+                        expression_id(*branch, expression_count);
+                    }
+                }
+                AstExprKind::When { input, arms } => {
+                    expression_id(*input, expression_count);
+                    for arm in arms {
+                        expression_id(*arm, expression_count);
+                    }
+                }
+                AstExprKind::Then { input, output } => {
+                    expression_id(*input, expression_count);
+                    optional_expression_id(*output, expression_count);
+                }
+                AstExprKind::Infix { left, right, .. } => {
+                    expression_id(*left, expression_count);
+                    expression_id(*right, expression_count);
+                }
+                AstExprKind::MatchArm { output, .. } => {
+                    optional_expression_id(*output, expression_count);
+                }
+                AstExprKind::Block { bindings, result } => {
+                    for binding in bindings {
+                        assert!(binding.statement < statement_count);
+                        expression_id(binding.value, expression_count);
+                    }
+                    optional_expression_id(*result, expression_count);
+                }
+                AstExprKind::ListLiteral { items, .. }
+                | AstExprKind::BytesLiteral { items, .. }
+                | AstExprKind::SetLiteral { items } => {
+                    for item in items {
+                        expression_id(*item, expression_count);
+                    }
+                }
+                AstExprKind::Arrow { left, output, .. } => {
+                    expression_id(*left, expression_count);
+                    optional_expression_id(*output, expression_count);
+                }
+                AstExprKind::MapEntry { key, value } => {
+                    expression_id(*key, expression_count);
+                    expression_id(*value, expression_count);
+                }
+                AstExprKind::MapLiteral { entries } => {
+                    for entry in entries {
+                        expression_id(*entry, expression_count);
+                    }
+                }
+                AstExprKind::Identifier(_)
+                | AstExprKind::Path(_)
+                | AstExprKind::Drain { .. }
+                | AstExprKind::StringLiteral(_)
+                | AstExprKind::TextLiteral(_)
+                | AstExprKind::Number(_)
+                | AstExprKind::ByteLiteral { .. }
+                | AstExprKind::Tag(_)
+                | AstExprKind::Source
+                | AstExprKind::Delimiter
+                | AstExprKind::Unknown(_)
+                | AstExprKind::BitsLiteral { .. } => {}
+            }
+        }
+    }
+
+    #[test]
+    fn multiline_call_delimiter_scan_visits_each_nested_symbol_once() {
+        let mut stack = vec![")"];
+        let opening = ["[", "{"].map(str::to_owned);
+        let body = ["value", ","].map(str::to_owned);
+        let closing = ["}", "]", ")", "ignored", ")"].map(str::to_owned);
+        let mut visits = 0usize;
+
+        let (progress, inspected) = advance_delimiter_stack(&opening, 0, &mut stack);
+        visits += inspected;
+        assert_eq!(progress, DelimiterProgress::Open);
+        for _ in 0..512 {
+            let (progress, inspected) = advance_delimiter_stack(&body, 0, &mut stack);
+            visits += inspected;
+            assert_eq!(progress, DelimiterProgress::Open);
+        }
+        let (progress, inspected) = advance_delimiter_stack(&closing, 0, &mut stack);
+        visits += inspected;
+
+        assert_eq!(progress, DelimiterProgress::Closed);
+        assert_eq!(visits, opening.len() + 512 * body.len() + 3);
+        assert!(stack.is_empty());
+    }
+
+    #[test]
+    fn multiline_call_merger_preserves_separators_spans_and_following_lines() {
+        let lines = vec![
+            parser_line_fixture(1, 0, &["value", ":", "call", "(", "first", ":", "1"], 0),
+            parser_line_fixture(2, 4, &["nested", ":", "[", "2", "]"], 20),
+            parser_line_fixture(3, 0, &[")", "trailing"], 40),
+            parser_line_fixture(4, 0, &["after", ":", "3"], 60),
+        ];
+
+        let merged = merge_multiline_call_expression_lines(lines.clone(), &[]);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].line, 1);
+        assert_eq!(merged[0].indent, 0);
+        assert_eq!(merged[0].start, 0);
+        assert_eq!(merged[0].end, lines[2].end);
+        assert_eq!(
+            merged[0].symbols,
+            [
+                "value", ":", "call", "(", "first", ":", "1", ",", "nested", ":", "[", "2", "]",
+                ")", "trailing",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+        );
+        assert_eq!(merged[0].symbol_spans[7], (7, 7));
+        assert_eq!(merged[1], lines[3]);
+
+        let mismatched = vec![
+            parser_line_fixture(1, 0, &["value", ":", "call", "("], 0),
+            parser_line_fixture(2, 4, &["wrong", "]"], 10),
+            parser_line_fixture(3, 0, &["after", ":", "3"], 20),
+        ];
+        assert_eq!(
+            merge_multiline_call_expression_lines(mismatched.clone(), &[]),
+            mismatched
+        );
+        assert_eq!(
+            merge_multiline_call_expression_lines(lines[..3].to_vec(), &[(2, 3)]),
+            lines[..3]
+        );
+    }
+
+    #[test]
+    fn normalized_source_spans_preserve_exact_literal_boundaries() {
+        let spans = normalized_source_spans(vec![(20, 30), (5, 12), (5, 10), (10, 18), (30, 40)]);
+        assert_eq!(spans, vec![(5, 18), (20, 30), (30, 40)]);
+        assert_eq!(containing_source_span(&spans, 6, 17), Some((5, 18)));
+        assert_eq!(containing_source_span(&spans, 20, 30), Some((20, 30)));
+        assert_eq!(containing_source_span(&spans, 30, 40), Some((30, 40)));
+        assert_eq!(containing_source_span(&spans, 18, 20), None);
+        assert_eq!(containing_source_span(&spans, 29, 31), None);
+    }
+
+    #[test]
+    fn source_unit_identity_is_normalized_stable_and_not_bundle_positional() {
+        let main = SourceUnitId::from_path("app\\main.bn").unwrap();
+        let same_main = SourceUnitId::from_path("app/main.bn").unwrap();
+        let helper = SourceUnitId::from_path("app/helper.bn").unwrap();
+        assert_eq!(main, same_main);
+        assert_ne!(main, helper);
+        assert_eq!(main.as_str(), "app/main.bn");
+
+        let before = parse_project(
+            "app/main.bn",
+            [
+                ("app/main.bn".to_owned(), "value: 1\n".to_owned()),
+                ("app/zebra.bn".to_owned(), "zebra: 2\n".to_owned()),
+            ],
+        )
+        .unwrap();
+        let after = parse_project(
+            "app/main.bn",
+            [
+                ("app/alpha.bn".to_owned(), "alpha: 0\n".to_owned()),
+                ("app/main.bn".to_owned(), "value: 3\n".to_owned()),
+                ("app/zebra.bn".to_owned(), "zebra: 2\n".to_owned()),
+            ],
+        )
+        .unwrap();
+
+        for path in ["app/main.bn", "app/zebra.bn"] {
+            let before_id = before
+                .files
+                .iter()
+                .find(|file| file.path == path)
+                .unwrap()
+                .source_unit_id()
+                .unwrap();
+            let after_id = after
+                .files
+                .iter()
+                .find(|file| file.path == path)
+                .unwrap()
+                .source_unit_id()
+                .unwrap();
+            assert_eq!(before_id, after_id);
+        }
+
+        assert!(SourceUnitId::from_path("/absolute/main.bn").is_err());
+        assert!(
+            !serde_json::to_string(&before)
+                .unwrap()
+                .contains("source_unit_id")
+        );
+    }
+
+    #[test]
+    fn parsed_source_unit_is_normalized_raw_and_unit_local() {
+        fn statement_ids(statements: &[AstStatement], source_len: usize, ids: &mut Vec<usize>) {
+            for statement in statements {
+                assert!(statement.line >= 1);
+                assert!(statement.start <= statement.end);
+                assert!(statement.end <= source_len);
+                ids.push(statement.id);
+                statement_ids(&statement.children, source_len, ids);
+            }
+        }
+
+        let source = r#"FUNCTION helper(value) {
+    value
+}
+
+result: helper(value: 1)
+"#;
+        let parsed = parse_source_unit("app\\Math.bn", source).unwrap();
+
+        assert_eq!(parsed.source_unit_id.as_str(), "app/Math.bn");
+        assert_eq!(parsed.path, "app/Math.bn");
+        assert_eq!(parsed.source, source);
+        assert_eq!(parsed.declared_functions, ["helper"]);
+        assert!(
+            parsed
+                .declared_functions
+                .iter()
+                .all(|name| !name.contains('/'))
+        );
+
+        let mut ids = Vec::new();
+        statement_ids(&parsed.ast.statements, source.len(), &mut ids);
+        assert_eq!(ids, (0..ids.len()).collect::<Vec<_>>());
+        assert!(
+            parsed
+                .ast
+                .expressions
+                .iter()
+                .enumerate()
+                .all(|(id, expression)| expression.id == id)
+        );
+        assert!(parsed.ast.expressions.iter().all(|expression| {
+            expression.line >= 1
+                && expression.start <= expression.end
+                && expression.end <= source.len()
+        }));
+        assert!(parsed.ast.tokens.iter().all(|token| {
+            token.line >= 1 && token.start <= token.end && token.end <= source.len()
+        }));
+        assert!(
+            parsed.ast.lines.iter().all(|line| {
+                line.line >= 1 && line.start <= line.end && line.end <= source.len()
+            })
+        );
+        assert!(
+            parsed.ast.items.iter().all(|item| {
+                item.line >= 1 && item.start <= item.end && item.end <= source.len()
+            })
+        );
+    }
+
+    #[test]
+    fn source_unit_eof_is_a_hard_lexical_and_delimiter_boundary() {
+        for (source, expected) in [
+            ("value: \"unterminated\n", "unclosed string literal"),
+            ("continued\"\n", "unclosed string literal"),
+            ("value: call(\n    input: 1\n", "unclosed `(`"),
+            ("value: [\n    child: 1\n", "unclosed `[`"),
+            ("value: TEXT {\n    unfinished\n", "unclosed `{`"),
+            ("value: BYTES {\n    16uFF\n", "unclosed `{`"),
+            (")\n", "unbalanced `)`"),
+        ] {
+            let error = parse_source_unit("units\\boundary.bn", source).unwrap_err();
+            assert_eq!(error.path, "units/boundary.bn");
+            assert!(error.message.contains(expected), "{source:?}: {error}");
+        }
+
+        let error = parse_source_unit("units/tail.bn", "|> Number/abs()\n").unwrap_err();
+        assert!(
+            error
+                .message
+                .contains("pipeline continuation has no preceding value"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn source_unit_accepts_valid_within_unit_multiline_syntax() {
+        let source = r#"FUNCTION helper(value) {
+    value
+}
+
+label: "first
+second"
+description: TEXT {
+    a raw " remains text
+}
+result:
+    helper(
+        value: label
+    )
+"#;
+        let parsed = parse_source_unit("units/multiline.bn", source).unwrap();
+
+        assert_eq!(parsed.declared_functions, ["helper"]);
+        assert!(
+            parsed
+                .ast
+                .expressions
+                .iter()
+                .any(|expression| matches!(expression.kind, AstExprKind::StringLiteral(_)))
+        );
+        assert!(
+            parsed
+                .ast
+                .expressions
+                .iter()
+                .any(|expression| matches!(expression.kind, AstExprKind::TextLiteral(_)))
+        );
+        assert!(parsed.ast.expressions.iter().any(|expression| {
+            matches!(&expression.kind, AstExprKind::Call { function, .. } if function == "helper")
+        }));
+    }
+
+    #[test]
+    fn source_unit_assembler_rebases_dense_ids_and_every_nested_reference() {
+        let base = parse_source_unit("project/a_base.bn", "seed: 1\n").unwrap();
+        let base_expression_count = base.ast.expressions.len();
+        let base_statement_count = dense_statement_count(&base.path, &base.ast.statements).unwrap();
+        let main = parse_source_unit(
+            "project/z_main.bn",
+            r#"FUNCTION calculate(input) {
+    BLOCK {
+        answer: normalized
+        normalized:
+            input
+            |> Number/abs()
+        answer
+    }
+}
+
+selected:
+    candidate |> WHEN {
+        True => calculate(input: seed)
+        False => 0
+    }
+"#,
+        )
+        .unwrap();
+
+        let assembled =
+            assemble_parsed_source_units("project/z_main.bn", vec![main, base]).unwrap();
+
+        assert_eq!(
+            assembled
+                .files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+            ["project/a_base.bn", "project/z_main.bn"]
+        );
+        assert_eq!(assembled.functions, ["calculate"]);
+        assert_assembled_references_are_dense_and_in_range(&assembled.ast);
+        assert!(assembled.ast.expressions.iter().any(|expression| {
+            expression.id >= base_expression_count
+                && matches!(expression.kind, AstExprKind::Block { .. })
+        }));
+        assert!(assembled.ast.expressions.iter().any(|expression| {
+            matches!(&expression.kind, AstExprKind::Block { bindings, .. }
+                if bindings.iter().any(|binding| binding.statement >= base_statement_count))
+        }));
+        assert!(assembled.ast.expressions.iter().any(|expression| {
+            matches!(&expression.kind, AstExprKind::Call { args, .. }
+                if args.iter().any(|arg| arg.value >= base_expression_count))
+        }));
+    }
+
+    #[test]
+    fn source_unit_assembler_has_exact_placements_newline_isolation_and_order() {
+        let alpha = parse_source_unit("project/a.bn", "alpha: 1").unwrap();
+        let middle = parse_source_unit("project/middle.bn", "middle: 2\n").unwrap();
+        let omega = parse_source_unit("project/z.bn", "omega: 3").unwrap();
+
+        let first = assemble_parsed_source_units(
+            "project/z.bn",
+            vec![omega.clone(), alpha.clone(), middle.clone()],
+        )
+        .unwrap();
+        let second = assemble_parsed_source_units(
+            "project/z.bn",
+            vec![middle.clone(), omega.clone(), alpha.clone()],
+        )
+        .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.source, "alpha: 1\nmiddle: 2\nomega: 3");
+        assert_eq!(
+            first
+                .files
+                .iter()
+                .map(|file| (file.path.as_str(), file.start_line))
+                .collect::<Vec<_>>(),
+            [
+                ("project/a.bn", 1),
+                ("project/middle.bn", 2),
+                ("project/z.bn", 3),
+            ]
+        );
+        assert_eq!(first.ast.statements.len(), 3);
+        assert!(
+            first
+                .ast
+                .statements
+                .iter()
+                .all(|statement| statement.children.is_empty())
+        );
+
+        let canonical_units = [&alpha, &middle, &omega];
+        let mut byte_offset = 0usize;
+        let mut line_offset = 0usize;
+        let mut expression_offset = 0usize;
+        let mut statement_offset = 0usize;
+        let mut token_index = 0usize;
+        let mut line_index = 0usize;
+        let mut item_index = 0usize;
+        for (unit_index, unit) in canonical_units.iter().enumerate() {
+            let has_separator =
+                unit_index + 1 < canonical_units.len() && !unit.source.ends_with('\n');
+            let local_line_count = unit.source.lines().count().max(1);
+
+            for local in &unit.ast.tokens {
+                let global = &first.ast.tokens[token_index];
+                assert_eq!(global.kind, local.kind);
+                assert_eq!(global.lexeme, local.lexeme);
+                assert_eq!(global.line, local.line + line_offset);
+                assert_eq!(global.column, local.column);
+                assert_eq!(global.start, local.start + byte_offset);
+                assert_eq!(global.end, local.end + byte_offset);
+                token_index += 1;
+            }
+            if has_separator {
+                let separator = &first.ast.tokens[token_index];
+                assert_eq!(separator.kind, AstTokenKind::Newline);
+                assert_eq!(separator.lexeme, "\n");
+                assert_eq!(separator.line, local_line_count + line_offset);
+                assert_eq!(separator.start, byte_offset + unit.source.len());
+                assert_eq!(separator.end, separator.start + 1);
+                token_index += 1;
+            }
+
+            for local in &unit.ast.lines {
+                let global = &first.ast.lines[line_index];
+                let extends_to_separator = has_separator
+                    && local.line == local_line_count
+                    && local.end == unit.source.len();
+                assert_eq!(global.line, local.line + line_offset);
+                assert_eq!(global.start, local.start + byte_offset);
+                assert_eq!(
+                    global.end,
+                    local.end + byte_offset + usize::from(extends_to_separator)
+                );
+                assert_eq!(global.symbols, local.symbols);
+                assert_eq!(
+                    global.symbol_spans,
+                    local
+                        .symbol_spans
+                        .iter()
+                        .map(|(start, end)| (start + byte_offset, end + byte_offset))
+                        .collect::<Vec<_>>()
+                );
+                line_index += 1;
+            }
+
+            for local in &unit.ast.items {
+                let global = &first.ast.items[item_index];
+                assert_eq!(global.line, local.line + line_offset);
+                assert_eq!(global.start, local.start + byte_offset);
+                assert_eq!(global.end, local.end + byte_offset);
+                assert_eq!(
+                    global.symbol_spans,
+                    local
+                        .symbol_spans
+                        .iter()
+                        .map(|(start, end)| (start + byte_offset, end + byte_offset))
+                        .collect::<Vec<_>>()
+                );
+                item_index += 1;
+            }
+
+            for local in &unit.ast.expressions {
+                let global = &first.ast.expressions[local.id + expression_offset];
+                assert_eq!(global.id, local.id + expression_offset);
+                assert_eq!(global.line, local.line + line_offset);
+                assert_eq!(global.start, local.start + byte_offset);
+                assert_eq!(global.end, local.end + byte_offset);
+            }
+            let local_statement = unit.ast.statements.first().unwrap();
+            let global_statement = &first.ast.statements[unit_index];
+            assert_eq!(global_statement.id, local_statement.id + statement_offset);
+            assert_eq!(global_statement.line, local_statement.line + line_offset);
+            assert_eq!(global_statement.start, local_statement.start + byte_offset);
+            assert_eq!(global_statement.end, local_statement.end + byte_offset);
+
+            byte_offset += unit.source.len() + usize::from(has_separator);
+            line_offset += local_line_count;
+            expression_offset += unit.ast.expressions.len();
+            statement_offset += dense_statement_count(&unit.path, &unit.ast.statements).unwrap();
+        }
+        assert_eq!(token_index, first.ast.tokens.len());
+        assert_eq!(line_index, first.ast.lines.len());
+        assert_eq!(item_index, first.ast.items.len());
+        assert_eq!(byte_offset, first.source.len());
+        assert_assembled_references_are_dense_and_in_range(&first.ast);
+    }
+
+    #[test]
+    fn source_unit_assembler_fails_closed_on_bad_references_and_overflow() {
+        let mut corrupt =
+            parse_source_unit("project/main.bn", "value: helper(input: 1)\n").unwrap();
+        let call = corrupt
+            .fields
+            .ast
+            .expressions
+            .make_mut()
+            .iter_mut()
+            .find_map(|expression| match &mut expression.kind {
+                AstExprKind::Call { args, .. } => Some(args),
+                _ => None,
+            })
+            .expect("call expression");
+        call[0].value = usize::MAX;
+        let error = assemble_parsed_source_units("project/main.bn", vec![corrupt]).unwrap_err();
+        assert_eq!(error.path, "project/main.bn");
+        assert!(error.message.contains("call argument value expression id"));
+
+        let rebase = SourceUnitAstRebase {
+            path: "project/overflow.bn",
+            byte_offset: 1,
+            line_offset: 0,
+            expression_offset: 0,
+            statement_offset: 0,
+            local_source_len: usize::MAX,
+            local_line_count: 1,
+            local_expression_count: 0,
+            local_statement_count: 0,
+        };
+        let mut start = usize::MAX;
+        let mut end = usize::MAX;
+        let error = rebase
+            .span(&mut start, &mut end, "overflow fixture")
+            .unwrap_err();
+        assert!(error.message.contains("overflows usize while rebasing"));
+    }
 
     #[test]
     fn true_and_false_use_the_canonical_tag_ast_and_match_pattern() {
@@ -5619,12 +7671,18 @@ selected:
     #[test]
     fn parsed_program_serialization_includes_unforgeable_provenance_fields() {
         let parsed = parse_source("app/main.bn", "value: 1\n").unwrap();
+        assert!(Arc::ptr_eq(
+            &parsed.expressions.expressions,
+            &parsed.ast.expressions.expressions,
+        ));
         let serialized = serde_json::to_value(&parsed).unwrap();
         assert_eq!(
             serialized["source_bundle_digest_v1"],
             parsed.source_bundle_digest_v1.to_string()
         );
         assert_eq!(serialized["path"], "app/main.bn");
+        assert!(serialized["expressions"].is_array());
+        assert_eq!(serialized["expressions"], serialized["ast"]["expressions"]);
 
         let fields: ParsedProgramFields = serde_json::from_value(serialized).unwrap();
         assert_eq!(
@@ -6124,6 +8182,118 @@ while_value:
                 AstExprKind::Identifier(name) if name == input_name
             ));
         }
+    }
+
+    #[test]
+    fn nested_hold_pipeline_links_to_its_local_predecessor() {
+        let parsed = parse_ast(
+            "nested-hold-pipeline.bn",
+            r#"
+value:
+    selector |> WHEN {
+        Ready =>
+            [previous: 0, current: 1]
+            |> HOLD state {
+                count - 1
+                |> Stream/pulses()
+                |> THEN { state.current }
+            }
+    }
+"#,
+        )
+        .unwrap();
+        let pulses = parsed
+            .expressions
+            .iter()
+            .find(|expression| {
+                matches!(
+                    &expression.kind,
+                    AstExprKind::Pipe { op, .. } if op == "Stream/pulses"
+                )
+            })
+            .expect("nested Stream/pulses expression");
+        let linked = pulses.linked_input.expect("nested pulse predecessor");
+        assert!(
+            matches!(
+                &parsed.expressions[linked].kind,
+                AstExprKind::Infix { op, .. } if op == "-"
+            ),
+            "nested pulse linked to {:?}",
+            parsed.expressions[linked].kind,
+        );
+        let then = parsed
+            .expressions
+            .iter()
+            .find(|expression| matches!(expression.kind, AstExprKind::Then { .. }))
+            .expect("nested THEN expression");
+        assert_eq!(then.linked_input, Some(pulses.id));
+    }
+
+    #[test]
+    fn nested_block_pipeline_links_to_its_local_predecessor() {
+        let parsed = parse_ast(
+            "nested-block-pipeline.bn",
+            r#"
+value:
+    BLOCK {
+        items: LIST { 6 }
+        items
+        |> List/is_not_empty()
+    }
+"#,
+        )
+        .unwrap();
+        let is_not_empty = parsed
+            .expressions
+            .iter()
+            .find(|expression| {
+                matches!(
+                    &expression.kind,
+                    AstExprKind::Pipe { op, .. } if op == "List/is_not_empty"
+                )
+            })
+            .expect("nested List/is_not_empty expression");
+        let linked = is_not_empty
+            .linked_input
+            .expect("nested block pipeline predecessor");
+        assert!(
+            matches!(
+                &parsed.expressions[linked].kind,
+                AstExprKind::Identifier(name) if name == "items"
+            ),
+            "nested block pipeline linked to {:?}",
+            parsed.expressions[linked].kind,
+        );
+    }
+
+    #[test]
+    fn multiline_list_item_pipeline_keeps_its_local_predecessor() {
+        let parsed = parse_ast(
+            "multiline-list-item-pipeline.bn",
+            r#"
+value:
+    LIST {
+        input
+        |> Number/abs()
+    }
+"#,
+        )
+        .unwrap();
+        let input = parsed
+            .expressions
+            .iter()
+            .find(|expression| {
+                matches!(&expression.kind, AstExprKind::Identifier(name) if name == "input")
+            })
+            .expect("list item input");
+        let abs = parsed
+            .expressions
+            .iter()
+            .find(|expression| {
+                matches!(&expression.kind, AstExprKind::Pipe { op, .. } if op == "Number/abs")
+            })
+            .expect("list item pipeline");
+        assert_eq!(abs.linked_input, Some(input.id));
     }
 
     #[test]
@@ -7034,5 +9204,50 @@ mapped:
                 "unexpected {namespace} diagnostic: {error}"
             );
         }
+    }
+
+    #[test]
+    fn byte_lexer_preserves_padded_spans_columns_and_fail_closed_edges() {
+        let tokens = lex_source("probe.bn", "  alpha  \n\twide <= \"h\\\"i\" -- note\n").unwrap();
+        assert_eq!(
+            tokens
+                .iter()
+                .map(|token| {
+                    (
+                        token.kind,
+                        token.lexeme.as_str(),
+                        token.line,
+                        token.column,
+                        token.start,
+                        token.end,
+                    )
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                (AstTokenKind::Identifier, "alpha", 1, 1, 0, 9),
+                (AstTokenKind::Newline, "\n\t", 1, 10, 9, 11),
+                (AstTokenKind::Identifier, "wide", 2, 2, 11, 16),
+                (AstTokenKind::Operator, "<=", 2, 7, 16, 19),
+                (AstTokenKind::String, "\"h\\\"i\" ", 2, 10, 19, 26),
+                (AstTokenKind::Comment, "-- note", 2, 17, 26, 33),
+                (AstTokenKind::Newline, "\n", 2, 24, 33, 34),
+            ]
+        );
+        assert_eq!(
+            lex_source("probe.bn", "   ").unwrap_err().message,
+            "syntax error near 3..3"
+        );
+        assert_eq!(lex_source("probe.bn", "foo   ").unwrap()[0].end, 6);
+        let unterminated = lex_source("probe.bn", "\"oops").unwrap();
+        assert_eq!(unterminated[0].kind, AstTokenKind::Unknown);
+        assert_eq!(unterminated[0].lexeme, "\"");
+        assert_eq!(unterminated[1].lexeme, "oops");
+
+        let unicode = lex_source("unicode.bn", "é x\n\"ž\"").unwrap();
+        assert_eq!(unicode[0].kind, AstTokenKind::Unknown);
+        assert_eq!(unicode[0].lexeme, "é");
+        assert_eq!((unicode[0].start, unicode[0].end), (0, 3));
+        assert_eq!((unicode[1].column, unicode[1].start), (3, 3));
+        assert_eq!((unicode[3].line, unicode[3].column), (2, 1));
     }
 }

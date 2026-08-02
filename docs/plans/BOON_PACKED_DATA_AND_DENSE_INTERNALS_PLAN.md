@@ -47,6 +47,10 @@ The following documents remain authoritative for their existing domains:
 - [`BOON_FORMAL_VERIFICATION_AND_WHERE_PLAN.md`](BOON_FORMAL_VERIFICATION_AND_WHERE_PLAN.md)
   owns proof obligations, `ContractVerifiedProgram`, and proof-backed
   optimization eligibility.
+- [`BOON_COMPILER_PERFORMANCE_PLAN.md`](BOON_COMPILER_PERFORMANCE_PLAN.md)
+  owns compiler latency and memory budgets, compiler sessions, invalidation,
+  cancellation, profiling, and the compiler-artifact representation work
+  pulled forward from this plan to satisfy its cold and warm gates.
 - [`../architecture/RUNTIME_MODEL.md`](../architecture/RUNTIME_MODEL.md) owns
   the static graph, typed-slot, dirty-key, candidate/commit, and delta model.
 - [`../architecture/LIST_MODEL.md`](../architecture/LIST_MODEL.md) owns hidden
@@ -56,7 +60,7 @@ This plan owns:
 
 - executable physical layouts;
 - packed runtime cells and handles;
-- dense compiler and runtime tables;
+- the final dense compiler-artifact and runtime-table invariants;
 - scheduler/currentness/dependency storage;
 - target-neutral collection storage primitives;
 - boundary materialization rules;
@@ -156,6 +160,23 @@ The expression arena is not the finish line. Its nodes may have dense IDs while
 interning, normalization, runtime lookup, and materialization still use trees,
 strings, recursive values, and cloned vectors. Dense IDs are useful only when
 the full consumer chain keeps them dense.
+
+### Compiler-Performance Pull-Forward
+
+The compiler-performance plan implements its compiler-only subset before the
+remaining packed-runtime phases. That subset may use dense typed tables,
+`Vec<T>`/boxed-slice arenas, one compact expression arena, offset-plus-edge
+adjacency, bitsets, sparse or generation-stamped membership, typed interners,
+bounded iterative worklists, streamed canonical hashing, and detachable debug
+sidecars across `CheckedProgram` through `MachinePlan` construction.
+
+Pulling these representations forward does not implement packed runtime cells,
+columnar authorities, physical-plan specialization, sparse/dense runtime
+dispatch, hardware eligibility, or any later phase exit in this plan. The
+compiler slice must preserve the current public language and proof semantics,
+and it is accepted against `BOON_COMPILER_PERFORMANCE_PLAN.md`'s cold/no-cache
+and warm compiler gates. This plan still owns the final cross-target packed
+representation and runtime acceptance contract.
 
 ## Non-Negotiable Semantic Boundary
 
@@ -848,6 +869,12 @@ Reference oracles for a landed packed slice implement only the final algebra.
 They may not preserve legacy `Bool`, `Null`, privileged `Error`, or binary64
 branches as a second compatibility semantics.
 
+The compiler-artifact subset of Phase 1 is explicitly pulled forward by
+`BOON_COMPILER_PERFORMANCE_PLAN.md` and does not wait for packed runtime Phases
+2-8. It may land only where the represented public semantics are already
+authoritative; it cannot pre-implement or claim completion of a future
+foundations flag day.
+
 ## Implementation Phases
 
 ### Phase 0: Inventory And Baseline
@@ -877,6 +904,11 @@ Exit: a machine-readable inventory, fresh baseline, and checked numeric budget
 manifest exist; no category is hidden inside an aggregate "map count."
 
 ### Phase 1: Dense Semantic Artifacts
+
+Compiler-side work in this phase is scheduled first by
+`BOON_COMPILER_PERFORMANCE_PLAN.md`; the exit below remains the shared final
+artifact invariant rather than a claim that later packed-runtime phases have
+completed.
 
 - Freeze dense-ID invariants and validation.
 - Finish expression, type, shape, constant, source, state, owner, and field

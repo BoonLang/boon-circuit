@@ -68,6 +68,12 @@ in older plans and architecture documents:
 It does not supersede unrelated native GPU, renderer, persistence durability,
 distributed topology, or performance contracts.
 
+`BOON_COMPILER_PERFORMANCE_PLAN.md` owns current compiler latency, memory,
+session, invalidation, cancellation, and scaling work. It may pull forward the
+compiler-internal arenas, interners, bounded worklists, and transient builders
+described here when they preserve today's public semantics. Doing so does not
+implement or claim any future foundations phase.
+
 There is no compatibility mode for the old behavior. Each implementation phase
 is an atomic flag-day replacement for its topic and must update source examples,
 tests, schemas, persistence fixtures, wire fixtures, documentation, and target
@@ -2456,6 +2462,10 @@ semantics.
 - Add authority escape/lifetime analysis.
 - Lower non-escaping compiler maps, sets, lists, queues, arenas, and builders to
   efficient mutable storage.
+- Treat the compatible compiler-hot-path subset already landed under
+  `BOON_COMPILER_PERFORMANCE_PLAN.md` as an implementation input, then prove
+  that it follows the general lifetime, uniqueness, escape, and access rules
+  here rather than preserving a compiler-name special case.
 - Preserve public immutable/delta semantics.
 - Prohibit lowering when incremental observation, persistence, or escape makes
   it visible.

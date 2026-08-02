@@ -3496,7 +3496,7 @@ fn concrete_checked_expression_type(
                         concrete_fields.insert(field.name.clone(), field_type);
                     }
                 }
-                Ok(boon_typecheck::Type::Object(boon_typecheck::ObjectShape {
+                Ok(boon_typecheck::Type::object(boon_typecheck::ObjectShape {
                     fields: concrete_fields,
                     field_order,
                     open,
@@ -3550,7 +3550,8 @@ fn concrete_checked_expression_type(
                             fields: concrete_fields,
                             field_order,
                             open,
-                        },
+                        }
+                        .into(),
                     },
                 ]))
             }
@@ -4204,7 +4205,7 @@ fn contextualize_empty_list_placeholders(
             )))
         }
         (boon_typecheck::Type::Object(actual), boon_typecheck::Type::Object(expected)) => {
-            let mut contextual = actual.clone();
+            let mut contextual = actual.as_ref().clone();
             for (name, actual_field) in &actual.fields {
                 if !out_contract_type_contains_empty_list_placeholder(actual_field) {
                     continue;
@@ -4215,7 +4216,7 @@ fn contextualize_empty_list_placeholders(
                     contextualize_empty_list_placeholders(actual_field, expected_field)?,
                 );
             }
-            Some(boon_typecheck::Type::Object(contextual))
+            Some(boon_typecheck::Type::object(contextual))
         }
         (
             boon_typecheck::Type::Function {

@@ -16,6 +16,13 @@ The public value algebra, truth model, and compiler artifact spine are governed
 by [`BOON_LANGUAGE_FOUNDATIONS_PLAN.md`](BOON_LANGUAGE_FOUNDATIONS_PLAN.md).
 This plan specializes that universal contract for contextual calls and `OUT`.
 
+Compiler representation, source-unit snapshots, invalidation, cancellation,
+and latency/RSS gates are governed by
+[`BOON_COMPILER_PERFORMANCE_PLAN.md`](BOON_COMPILER_PERFORMANCE_PLAN.md). This
+plan continues to own `OUT`, `PASS`, contextual-scope, identity, and erasure
+semantics. Performance changes must preserve the exact verified spine and do
+not relax the initial rejection of recursive contextual functions.
+
 The design must remain a general Boon feature. `List/map` is the motivating
 case, but compiler, runtime, document, distributed, and verifier code must not
 special-case `List/map` or any example.
@@ -654,9 +661,12 @@ The same rule applies to `SOURCE`, `HOLD`, and host effects:
 
 ## Identity And Performance Contract
 
-Contextual calls are elaborated and output nets are unified before final dense
-`ScopeId`, `SourceId`, machine-plan, document-plan, or distributed-plan IDs are
-assigned.
+Declaration collection assigns session-stable source-unit, `DeclId`, and
+lexical-scope identities before contextual elaboration. Contextual calls are
+then elaborated and output nets are unified before snapshot-local dense
+`ScopeId`, `SourceId`, machine-plan, document-plan, or distributed-plan indexes
+are assigned. Dense indexes may change between snapshots and are never
+persistence, wire, runtime-owner, or cross-revision identity.
 
 Runtime identity is based on structural provenance and every repeated ancestor,
 not only the nearest row:
@@ -770,11 +780,20 @@ callee signature is resolved.
 One declaration-collection and resolution model should serve functions,
 modules, `BLOCK`, record fields, and call outputs:
 
-1. Collect declarations and allocate stable declaration IDs.
+1. Collect declarations and allocate session-stable declaration IDs, then
+   project the current snapshot into compact dense tables.
 2. Resolve names and shadowing against those IDs.
 3. Build type, alias, value, temporal, and distributed dependency graphs.
 4. Validate graph-specific cycles and compatibility.
 5. Topologically elaborate valid expressions.
+
+The owned `CheckedProgram` snapshot retains those declarations, typed tables,
+and forward/reverse dependency indexes. It does not borrow parser storage or
+require a second whole-program checked-artifact builder. A `CompilerSession`
+may reuse unaffected entries across revisions through the dependency indexes,
+but a fresh cache-disabled database must produce the same diagnostics and
+canonical artifacts without that reuse. Salsa is neither required nor allowed
+to define Boon type or contextual semantics.
 
 Machine and document compilers must consume the same typed contextual-call
 representation. They must not independently rediscover contextual semantics.
@@ -830,7 +849,8 @@ The `OUT`-specific contents of those products are:
 
 ```text
 CheckedProgram (boon_typecheck)
-  stable DeclId and LexicalScopeId
+  session-stable DeclId and LexicalScopeId
+  snapshot-local dense table indexes
   resolved callable identity
   exact typed call entries
   polymorphic contextual signatures
@@ -889,14 +909,16 @@ ownership and work.
 
 Ordinary user functions are not transparent wrappers. `SemanticProgram`
 retains one typed definition plus explicit call edges for them; it does not
-recursively clone the complete body at every call site. Only contextual
-functions and wrappers whose scope effects require specialization are expanded.
-Statically unselected structural branches are pruned before OutNet,
-dependency-manifest, and proof-graph construction. Dynamic selections retain
-every reachable alternative. Scaling fixtures must vary ordinary call depth,
-call-site count, and static branch count so a later implementation cannot
-silently restore multiplicative graph growth while preserving small-example
-answers.
+recursively clone the complete body at every call site. A contextual
+specialization is a compact overlay that references that retained typed body
+and records only substitutions, scope effects, `OutNet` bindings, ownership
+anchors, and proof-relevant choices. Only contextual functions and wrappers
+whose scope effects require specialization receive such overlays. Statically
+unselected structural branches are pruned before OutNet, dependency-manifest,
+and proof-graph construction. Dynamic selections retain every reachable
+alternative. Scaling fixtures must vary ordinary call depth, call-site count,
+and static branch count so a later implementation cannot silently restore
+multiplicative graph growth while preserving small-example answers.
 
 ### Incremental Collection Lowering
 
@@ -1050,14 +1072,17 @@ dual execution path, or permanent syntax adapter may ship.
    field. Keep syntax errors local and deterministic.
 3. **Build the two-pass resolver.** Predeclare functions, modules, `BLOCK`
    bindings, explicit record fields, parameters, and fresh call outputs with
-   stable `DeclId`/`LexicalScopeId`; then resolve references independently of
-   textual order. Build labeled type, alias, value, temporal, and distributed
-   edges and reject illegal SCCs.
+   session-stable `DeclId`/`LexicalScopeId`; then resolve references
+   independently of textual order. Project each snapshot into compact dense
+   tables, build labeled forward and reverse type, alias, value, temporal, and
+   distributed edges, and reject illegal SCCs.
 4. **Create the authoritative `CheckedProgram`.** Resolve every callable once,
    bind exact call entries against the unified typed signature registry, infer
    output scope effects and correlation, and emit semantic occurrences for
-   tooling. Remove parser-level row-scope inference as soon as consumers use
-   this representation.
+   tooling. Make it an owned database with dependency-indexed invalidation, not
+   a view borrowing parser storage or a result rebuilt by a second builder.
+   Remove parser-level row-scope inference as soon as consumers use this
+   representation.
 5. **Enforce the new call model atomically.** Require parentheses, named
    ordinary inputs, canonical bare fresh outputs, named compatible forwarding,
    declaration order, a pipe only for the first ordinary input, and the
@@ -1066,9 +1091,10 @@ dual execution path, or permanent syntax adapter may ship.
 6. **Implement semantic elaboration in `boon_semantic`.** Allocate and unify
    `OutNet`s, validate one producer and
    type/shape/role/generation/correlation compatibility, expand contextual
-   functions in their declaring island, assign structural semantic ownership,
-   build typed list views and dependency manifests, and emit all proof
-   obligations in `SemanticProgram`.
+   functions in their declaring island through overlays referencing retained
+   typed bodies, assign structural semantic ownership, build typed list views
+   and dependency manifests, and emit all proof obligations in
+   `SemanticProgram`.
 7. **Install verification and erasure as mandatory boundaries.** Make
    `boon_verify` certify the exact `SemanticProgram` as
    `ContractVerifiedProgram`, including programs without authored `WHERE`.
@@ -1127,9 +1153,11 @@ dual execution path, or permanent syntax adapter may ship.
     debug-profile checks for correctness work and release builds only for final
     milestone measurement. Reject a compiler recovery that merely raises a
     timeout: static branch fanout and ordinary call depth/count fixtures must
-    demonstrate bounded semantic, manifest, and proof-artifact growth. A
-    representative source compile exceeding 120 seconds blocks the next
-    production slice until the owning representation is corrected.
+    demonstrate bounded semantic, manifest, and proof-artifact growth. The
+    exact cold, warm, cancellation, and RSS limits in the compiler-performance
+    plan are the acceptance gates. A 120-second limit is only an emergency
+    watchdog for a runaway diagnostic process; reaching it is a hard failure,
+    never a performance target or permission to continue product work.
 
 ## Verification Matrix
 
@@ -1309,6 +1337,11 @@ editor evidence, and fresh manifest-backed verification are all mandatory.
   dependency manifests, and proof obligations; `boon_verify` owns
   `ContractVerifiedProgram`; and `boon_ir` owns verified erasure into
   `ErasedProgram`.
+- `CheckedProgram` snapshots are owned and dependency-indexed. Session-stable
+  declaration identities are distinct from snapshot-local dense indexes, and
+  compiler-session reuse must be observationally equivalent to a fresh
+  cache-disabled compilation. No choice of incremental framework changes the
+  language model or the mandatory verification boundary.
 - Source migration is parser-aware Rust code that is deleted after use. No
   Python, regex-only source rewriting, or permanent compatibility translator is
   added.

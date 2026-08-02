@@ -1,6 +1,6 @@
 #[test]
 fn map_keys_accept_only_closed_recursive_key_safe_data() {
-    let closed_record = Type::Object(ObjectShape::from_ordered_fields(
+    let closed_record = Type::object(ObjectShape::from_ordered_fields(
         [
             ("scope".to_owned(), Type::Text),
             (
@@ -12,10 +12,7 @@ fn map_keys_accept_only_closed_recursive_key_safe_data() {
     ));
     let closed_tagged = Type::VariantSet(vec![Variant::Tagged {
         tag: "Cell".to_owned(),
-        fields: ObjectShape::from_ordered_fields(
-            [("column".to_owned(), Type::Number)],
-            false,
-        ),
+        fields: ObjectShape::from_ordered_fields([("column".to_owned(), Type::Number)], false),
     }]);
 
     for key in [
@@ -35,7 +32,7 @@ fn map_keys_accept_only_closed_recursive_key_safe_data() {
             key: Box::new(Type::Text),
             value: Box::new(Type::Number),
         },
-        Type::Object(ObjectShape::new(BTreeMap::new(), true)),
+        Type::object(ObjectShape::new(BTreeMap::new(), true)),
         Type::Union(vec![Type::Text, Type::Number]),
         Type::Unknown,
     ] {
@@ -103,7 +100,9 @@ parents: LIST {
     assert!(second_parent.program.is_none());
     assert!(second_parent.report.diagnostics.iter().any(|diagnostic| {
         diagnostic.message.contains("second parent")
-            || diagnostic.message.contains("more than one structural parent")
+            || diagnostic
+                .message
+                .contains("more than one structural parent")
     }));
 
     let cycle = boon_parser::parse_source(
@@ -150,10 +149,14 @@ escaped:
     .unwrap();
     let escaped = check_program(&escaped);
     assert!(escaped.program.is_none());
-    assert!(escaped.report.diagnostics.iter().any(|diagnostic| {
-        diagnostic.message.contains("escapes its owner")
-            || diagnostic.message.contains("beyond its owner lifetime")
-    }), "diagnostics: {:#?}", escaped.report.diagnostics);
+    assert!(
+        escaped.report.diagnostics.iter().any(|diagnostic| {
+            diagnostic.message.contains("escapes its owner")
+                || diagnostic.message.contains("beyond its owner lifetime")
+        }),
+        "diagnostics: {:#?}",
+        escaped.report.diagnostics
+    );
 }
 
 #[test]

@@ -4,9 +4,13 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use boon_compiler::{
-    CompileRequest as MachinePlanCompileRequest, CompilerSourceUnit, compile_machine_plan,
+    CancellationToken, CompileIntent, CompilerProject, CompilerSession, CompilerSourceUnit,
+    ProjectId, Revision as CompilerRevision, UnitUpdate,
 };
 use boon_contract::{CanonicalSourceBundleV1, SourceBundleDigestV1, SourceBundleUnit};
+use boon_editor::language::{
+    LanguageProjectSnapshot, project_checked_language, project_parse_error_language,
+};
 use boon_plan::{
     DEFAULT_PERSISTENCE_SCHEMA_VERSION, MachinePlan, MigrationPredecessorBinding, ProgramRole,
     TargetProfile,
@@ -55,19 +59,63 @@ pub struct CompiledPreview {
 pub struct CompileOutcome {
     pub job_id: u64,
     pub revision: u64,
+    /// Editor data projected from the exact checked artifact used by this
+    /// compile attempt. This remains publishable when verification rejects a
+    /// type-invalid revision, but never for a superseded worker generation.
+    pub language: Option<LanguageProjectSnapshot>,
     pub result: Result<CompiledPreview, String>,
+}
+
+struct CompileAttempt {
+    language: Option<LanguageProjectSnapshot>,
+    result: Result<CompiledPreview, String>,
 }
 
 #[derive(Default)]
 struct State {
-    pending: Option<CompileRequest>,
+    generation: u64,
+    pending: Option<PendingCompile>,
+    active: bool,
+    active_cancellation: Option<CancellationToken>,
     closing: bool,
     replaced: u64,
+}
+
+struct PendingCompile {
+    generation: u64,
+    request: CompileRequest,
+    cancellation: CancellationToken,
 }
 
 pub struct CompileWorker {
     state: Arc<(Mutex<State>, Condvar)>,
     thread: Option<JoinHandle<()>>,
+}
+
+#[derive(Default)]
+struct PreviewCompiler {
+    session: CompilerSession,
+    built_in: Option<BuiltInProjectSlot>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct BuiltInProjectConfig {
+    entrypoint: String,
+    unit_paths: Vec<String>,
+    target_profile: TargetProfile,
+    program_role: ProgramRole,
+    application_identity: ApplicationIdentity,
+    schema_version: u64,
+    migration_predecessors: Vec<MigrationPredecessorBinding>,
+}
+
+struct BuiltInProjectSlot {
+    config: BuiltInProjectConfig,
+    project: ProjectId,
+    revision: CompilerRevision,
+    unit_sources: BTreeMap<String, String>,
+    language: Option<(CompilerRevision, LanguageProjectSnapshot)>,
+    verified_plan: Option<(CompilerRevision, Arc<MachinePlan>)>,
 }
 
 impl CompileWorker {
@@ -91,9 +139,22 @@ impl CompileWorker {
     pub fn replace(&self, request: CompileRequest) {
         let (lock, wake) = &*self.state;
         let mut state = lock.lock().expect("compile worker lock");
-        if state.pending.replace(request).is_some() {
+        state.generation = state.generation.saturating_add(1);
+        if state.pending.is_some() || state.active {
             state.replaced = state.replaced.saturating_add(1);
         }
+        if let Some(pending) = state.pending.take() {
+            pending.cancellation.cancel();
+        }
+        if let Some(active) = state.active_cancellation.as_ref() {
+            active.cancel();
+        }
+        let generation = state.generation;
+        state.pending = Some(PendingCompile {
+            generation,
+            request,
+            cancellation: CancellationToken::new(),
+        });
         wake.notify_one();
     }
 
@@ -105,7 +166,15 @@ impl CompileWorker {
 impl Drop for CompileWorker {
     fn drop(&mut self) {
         let (lock, wake) = &*self.state;
-        lock.lock().expect("compile worker lock").closing = true;
+        let mut state = lock.lock().expect("compile worker lock");
+        state.closing = true;
+        if let Some(pending) = state.pending.as_ref() {
+            pending.cancellation.cancel();
+        }
+        if let Some(active) = state.active_cancellation.as_ref() {
+            active.cancel();
+        }
+        drop(state);
         wake.notify_one();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
@@ -277,8 +346,9 @@ fn compile_loop(
     state: Arc<(Mutex<State>, Condvar)>,
     output: mpsc::UnboundedSender<CompileOutcome>,
 ) {
+    let mut compiler = PreviewCompiler::default();
     loop {
-        let request = {
+        let pending = {
             let (lock, wake) = &*state;
             let mut state = lock.lock().expect("compile worker lock");
             while state.pending.is_none() && !state.closing {
@@ -287,15 +357,33 @@ fn compile_loop(
             if state.closing {
                 return;
             }
-            state.pending.take().expect("pending compile request")
+            state.active = true;
+            let pending = state.pending.take().expect("pending compile request");
+            state.active_cancellation = Some(pending.cancellation.clone());
+            pending
         };
+        let PendingCompile {
+            generation,
+            request,
+            cancellation,
+        } = pending;
         let job_id = request.job_id;
         let revision = request.revision;
-        let result = compile(request);
+        let CompileAttempt { language, result } = compiler.compile(request, &cancellation);
+        let mut state = state.0.lock().expect("compile worker lock");
+        state.active = false;
+        state.active_cancellation = None;
+        if state.closing {
+            return;
+        }
+        if state.generation != generation {
+            continue;
+        }
         if output
             .unbounded_send(CompileOutcome {
                 job_id,
                 revision,
+                language,
                 result,
             })
             .is_err()
@@ -305,91 +393,324 @@ fn compile_loop(
     }
 }
 
-fn compile(request: CompileRequest) -> Result<CompiledPreview, String> {
-    let started = Instant::now();
-    let source_key = preview_project_key(
-        &request.source,
-        request.migration.as_ref(),
-        request.migration_stage.as_deref(),
-    )?;
-    let executable = match &request.source {
-        PreviewSource::BuiltInSingleRole {
-            application,
-            entry_path,
-            units,
-        } => {
-            if units.is_empty() {
-                return Err("preview source bundle is empty".to_owned());
-            }
-            let plan = match (&request.migration, request.migration_stage.as_deref()) {
-                (Some(migration), Some(stage_id)) => compile_migration_stage_with_units(
-                    application,
-                    migration,
-                    stage_id,
-                    Some((entry_path, units)),
-                )?,
-                (None, None) => {
-                    let bundle = canonical_preview_source_bundle(entry_path, units)?;
-                    let entry_path = bundle.entrypoint().to_owned();
-                    let units = bundle
-                        .units()
-                        .iter()
-                        .map(|unit| CompilerSourceUnit {
-                            path: unit.path().to_owned(),
-                            source: unit.source().to_owned(),
-                        })
-                        .collect::<Vec<_>>();
-                    Arc::new(
-                        compile_machine_plan(
-                            MachinePlanCompileRequest::source_units(
-                                &entry_path,
-                                &units,
-                                TargetProfile::SoftwareDefault,
-                                ProgramRole::Client,
-                                application.clone(),
-                            )
-                            .with_persistence_catalog(
-                                DEFAULT_PERSISTENCE_SCHEMA_VERSION,
-                                &[] as &[MigrationPredecessorBinding],
-                            ),
-                        )
-                        .map_err(|error| error.to_string())?
-                        .plan,
-                    )
+impl PreviewCompiler {
+    fn compile(
+        &mut self,
+        request: CompileRequest,
+        cancellation: &CancellationToken,
+    ) -> CompileAttempt {
+        let mut language = None;
+        let result = self.compile_result(request, cancellation, &mut language);
+        CompileAttempt { language, result }
+    }
+
+    fn compile_result(
+        &mut self,
+        request: CompileRequest,
+        cancellation: &CancellationToken,
+        language: &mut Option<LanguageProjectSnapshot>,
+    ) -> Result<CompiledPreview, String> {
+        let started = Instant::now();
+        cancellation_checkpoint(cancellation)?;
+        let source_key = preview_project_key(
+            &request.source,
+            request.migration.as_ref(),
+            request.migration_stage.as_deref(),
+        )?;
+        cancellation_checkpoint(cancellation)?;
+        let executable = match &request.source {
+            PreviewSource::BuiltInSingleRole {
+                application,
+                entry_path,
+                units,
+            } => {
+                if units.is_empty() {
+                    return Err("preview source bundle is empty".to_owned());
                 }
-                _ => {
+                let plan = match (&request.migration, request.migration_stage.as_deref()) {
+                    (Some(migration), Some(stage_id)) => compile_migration_stage_with_units(
+                        application,
+                        migration,
+                        stage_id,
+                        Some((entry_path, units)),
+                        Some(request.revision),
+                        language,
+                        cancellation,
+                    )?,
+                    (None, None) => self.compile_built_in(
+                        entry_path,
+                        units,
+                        application,
+                        request.revision,
+                        language,
+                        cancellation,
+                    )?,
+                    _ => {
+                        return Err(
+                            "migration source compile requires both a bundle and an active stage"
+                                .to_owned(),
+                        );
+                    }
+                };
+                CompiledExecutable::BuiltInSingleRole(plan)
+            }
+            PreviewSource::DistributedPackage { programs } => {
+                if programs.is_empty() {
+                    return Err("distributed package source is empty".to_owned());
+                }
+                if request.migration.is_some() || request.migration_stage.is_some() {
                     return Err(
-                        "migration source compile requires both a bundle and an active stage"
-                            .to_owned(),
+                        "distributed packages cannot use single-role migration bundles".to_owned(),
                     );
                 }
+                cancellation_checkpoint(cancellation)?;
+                let compiled = compile_distributed_program(programs.clone(), request.revision)
+                    .map_err(|error| error.to_string())?;
+                cancellation_checkpoint(cancellation)?;
+                *language = Some(compiled.client_projection);
+                CompiledExecutable::DistributedPackage(compiled.bundle)
+            }
+        };
+        cancellation_checkpoint(cancellation)?;
+        Ok(CompiledPreview {
+            job_id: request.job_id,
+            intent: request.intent,
+            request_id: request.request_id,
+            revision: request.revision,
+            elapsed: started.elapsed(),
+            source_key,
+            executable,
+            test_steps: request.test_steps,
+        })
+    }
+
+    fn compile_built_in(
+        &mut self,
+        entry_path: &str,
+        units: &[SourceUnit],
+        application: &ApplicationIdentity,
+        language_revision: u64,
+        language: &mut Option<LanguageProjectSnapshot>,
+        cancellation: &CancellationToken,
+    ) -> Result<Arc<MachinePlan>, String> {
+        cancellation_checkpoint(cancellation)?;
+        let bundle = canonical_preview_source_bundle(entry_path, units)?;
+        let project = CompilerProject::new(
+            bundle.entrypoint().to_owned(),
+            bundle
+                .units()
+                .iter()
+                .map(|unit| CompilerSourceUnit {
+                    path: unit.path().to_owned(),
+                    source: unit.source().to_owned(),
+                })
+                .collect(),
+            TargetProfile::SoftwareDefault,
+            ProgramRole::Client,
+            application.clone(),
+        )
+        .with_persistence_catalog(DEFAULT_PERSISTENCE_SCHEMA_VERSION, Vec::new());
+        let (project, revision) = self.sync_built_in_project(project)?;
+        cancellation_checkpoint(cancellation)?;
+        let cached_plan = self.built_in.as_ref().and_then(|slot| {
+            slot.verified_plan
+                .as_ref()
+                .filter(|(cached_revision, _)| *cached_revision == revision)
+                .map(|(_, plan)| Arc::clone(plan))
+        });
+        if let Some(mut snapshot) = self.built_in.as_ref().and_then(|slot| {
+            slot.language
+                .as_ref()
+                .filter(|(cached_revision, _)| *cached_revision == revision)
+                .map(|(_, snapshot)| snapshot.clone())
+        }) {
+            snapshot.revision = language_revision;
+            *language = Some(snapshot);
+        }
+        if let (Some(plan), Some(_)) = (cached_plan.as_ref(), language.as_ref()) {
+            return Ok(Arc::clone(plan));
+        }
+
+        if language.is_none() {
+            let projected = {
+                let result = match self.session.request(
+                    project,
+                    revision,
+                    CompileIntent::Diagnostics,
+                    cancellation,
+                ) {
+                    Ok(result) => result,
+                    Err(error) => {
+                        let error_text = error.to_string();
+                        if let Some(parse_error) = error.downcast_ref::<boon_parser::ParseError>() {
+                            let snapshot = project_parse_error_language(
+                                language_revision,
+                                entry_path,
+                                units,
+                                parse_error,
+                            )
+                            .map_err(|projection| {
+                                format!(
+                                    "{error_text}; parser diagnostic projection failed: {projection}"
+                                )
+                            })?;
+                            self.cache_built_in_language(project, revision, snapshot.clone())?;
+                            *language = Some(snapshot);
+                        }
+                        return Err(error_text);
+                    }
+                };
+                let checked = result.diagnostics().ok_or_else(|| {
+                    "diagnostics compiler request produced no checked source".to_owned()
+                })?;
+                project_checked_language(
+                    language_revision,
+                    units,
+                    &checked.parsed,
+                    &checked.output,
+                )?
             };
-            CompiledExecutable::BuiltInSingleRole(plan)
+            cancellation_checkpoint(cancellation)?;
+            self.cache_built_in_language(project, revision, projected.clone())?;
+            *language = Some(projected);
         }
-        PreviewSource::DistributedPackage { programs } => {
-            if programs.is_empty() {
-                return Err("distributed package source is empty".to_owned());
-            }
-            if request.migration.is_some() || request.migration_stage.is_some() {
-                return Err(
-                    "distributed packages cannot use single-role migration bundles".to_owned(),
-                );
-            }
-            CompiledExecutable::DistributedPackage(
-                compile_distributed_program(programs.clone()).map_err(|error| error.to_string())?,
-            )
+
+        if let Some(plan) = cached_plan {
+            return Ok(plan);
         }
-    };
-    Ok(CompiledPreview {
-        job_id: request.job_id,
-        intent: request.intent,
-        request_id: request.request_id,
-        revision: request.revision,
-        elapsed: started.elapsed(),
-        source_key,
-        executable,
-        test_steps: request.test_steps,
-    })
+        let plan = {
+            let result = self
+                .session
+                .request(
+                    project,
+                    revision,
+                    CompileIntent::VerifiedPreview,
+                    cancellation,
+                )
+                .map_err(|error| error.to_string())?;
+            let plan = result
+                .compiled()
+                .ok_or_else(|| "verified compiler request produced no MachinePlan".to_owned())?
+                .plan
+                .clone();
+            Arc::new(plan)
+        };
+        cancellation_checkpoint(cancellation)?;
+        let slot = self
+            .built_in
+            .as_mut()
+            .ok_or_else(|| "built-in compiler project slot disappeared".to_owned())?;
+        if slot.project != project || slot.revision != revision {
+            return Err("built-in compiler project changed before publication".to_owned());
+        }
+        slot.verified_plan = Some((revision, Arc::clone(&plan)));
+        Ok(plan)
+    }
+
+    fn cache_built_in_language(
+        &mut self,
+        project: ProjectId,
+        revision: CompilerRevision,
+        snapshot: LanguageProjectSnapshot,
+    ) -> Result<(), String> {
+        let slot = self
+            .built_in
+            .as_mut()
+            .ok_or_else(|| "built-in compiler project slot disappeared".to_owned())?;
+        if slot.project != project || slot.revision != revision {
+            return Err("built-in compiler project changed before language publication".to_owned());
+        }
+        slot.language = Some((revision, snapshot));
+        Ok(())
+    }
+
+    fn sync_built_in_project(
+        &mut self,
+        project: CompilerProject,
+    ) -> Result<(ProjectId, CompilerRevision), String> {
+        let config = BuiltInProjectConfig {
+            entrypoint: project.entrypoint.clone(),
+            unit_paths: project.units.iter().map(|unit| unit.path.clone()).collect(),
+            target_profile: project.target_profile,
+            program_role: project.program_role,
+            application_identity: project.application_identity.clone(),
+            schema_version: project.schema_version,
+            migration_predecessors: project.migration_predecessors.clone(),
+        };
+        let unit_sources = project
+            .units
+            .iter()
+            .map(|unit| (unit.path.clone(), unit.source.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let reuse = self
+            .built_in
+            .as_ref()
+            .is_some_and(|slot| slot.config == config);
+        if !reuse {
+            if let Some(replaced) = self.built_in.take() {
+                self.session
+                    .close_project(replaced.project)
+                    .map_err(|error| error.to_string())?;
+            }
+            let project_id = self
+                .session
+                .open_project(project)
+                .map_err(|error| error.to_string())?;
+            let revision = self
+                .session
+                .revision(project_id)
+                .map_err(|error| error.to_string())?;
+            self.built_in = Some(BuiltInProjectSlot {
+                config,
+                project: project_id,
+                revision,
+                unit_sources,
+                language: None,
+                verified_plan: None,
+            });
+            return Ok((project_id, revision));
+        }
+
+        let slot = self
+            .built_in
+            .as_ref()
+            .ok_or_else(|| "reusable built-in compiler project is absent".to_owned())?;
+        let project_id = slot.project;
+        let updates = unit_sources
+            .iter()
+            .filter(|(path, source)| {
+                slot.unit_sources
+                    .get(path.as_str())
+                    .is_none_or(|current| current != *source)
+            })
+            .map(|(path, source)| UnitUpdate::new(path.clone(), source.clone()))
+            .collect::<Vec<_>>();
+        let revision = self
+            .session
+            .apply_updates(project_id, updates)
+            .map_err(|error| error.to_string())?;
+        let slot = self
+            .built_in
+            .as_mut()
+            .ok_or_else(|| "reusable built-in compiler project is absent".to_owned())?;
+        if revision != slot.revision {
+            slot.language = None;
+            slot.verified_plan = None;
+        }
+        slot.revision = revision;
+        slot.unit_sources = unit_sources;
+        Ok((project_id, revision))
+    }
+}
+
+#[cfg(test)]
+fn compile(
+    request: CompileRequest,
+    cancellation: &CancellationToken,
+) -> Result<CompiledPreview, String> {
+    PreviewCompiler::default()
+        .compile(request, cancellation)
+        .result
 }
 
 pub fn compile_migration_stage(
@@ -397,7 +718,16 @@ pub fn compile_migration_stage(
     migration: &MigrationBundle,
     target_stage: &str,
 ) -> Result<Arc<MachinePlan>, String> {
-    compile_migration_stage_with_units(application, migration, target_stage, None)
+    let mut language = None;
+    compile_migration_stage_with_units(
+        application,
+        migration,
+        target_stage,
+        None,
+        None,
+        &mut language,
+        &CancellationToken::new(),
+    )
 }
 
 fn compile_migration_stage_with_units(
@@ -405,12 +735,16 @@ fn compile_migration_stage_with_units(
     migration: &MigrationBundle,
     target_stage: &str,
     target_source: Option<(&str, &[SourceUnit])>,
+    language_revision: Option<u64>,
+    language: &mut Option<LanguageProjectSnapshot>,
+    cancellation: &CancellationToken,
 ) -> Result<Arc<MachinePlan>, String> {
     if migration.stage(target_stage).is_none() {
         return Err(format!("migration stage `{target_stage}` is absent"));
     }
     let mut predecessor = None::<MigrationPredecessorBinding>;
     for stage in &migration.stages {
+        cancellation_checkpoint(cancellation)?;
         let source_units = if stage.id == target_stage {
             if let Some((entry_path, units)) = target_source {
                 let working_entrypoint = canonical_preview_source_bundle(entry_path, units)?
@@ -441,27 +775,132 @@ fn compile_migration_stage_with_units(
                 source: unit.source().to_owned(),
             })
             .collect::<Vec<_>>();
-        let predecessors = predecessor.as_slice();
-        let plan = Arc::new(
-            compile_machine_plan(
-                MachinePlanCompileRequest::source_units(
-                    &entry_path,
-                    &units,
-                    TargetProfile::SoftwareDefault,
-                    ProgramRole::Client,
-                    application.clone(),
-                )
-                .with_persistence_catalog(stage.schema_version, predecessors),
-            )
-            .map_err(|error| format!("migration stage `{}` failed to compile: {error}", stage.id))?
-            .plan,
-        );
+        let plan = compile_source_bundle(
+            entry_path,
+            units,
+            TargetProfile::SoftwareDefault,
+            ProgramRole::Client,
+            application.clone(),
+            stage.schema_version,
+            predecessor.iter().cloned().collect(),
+            CompileIntent::VerifiedPreview,
+            (stage.id == target_stage)
+                .then_some(language_revision)
+                .flatten(),
+            language,
+            cancellation,
+        )
+        .map_err(|error| format!("migration stage `{}` failed to compile: {error}", stage.id))?;
         if stage.id == target_stage {
             return Ok(plan);
         }
         predecessor = Some(MigrationPredecessorBinding::from_machine_plan(&plan));
     }
     Err(format!("migration stage `{target_stage}` is absent"))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compile_source_bundle(
+    entry_path: String,
+    units: Vec<CompilerSourceUnit>,
+    target_profile: TargetProfile,
+    program_role: ProgramRole,
+    application_identity: ApplicationIdentity,
+    schema_version: u64,
+    migration_predecessors: Vec<MigrationPredecessorBinding>,
+    intent: CompileIntent,
+    language_revision: Option<u64>,
+    language: &mut Option<LanguageProjectSnapshot>,
+    cancellation: &CancellationToken,
+) -> Result<Arc<MachinePlan>, String> {
+    cancellation_checkpoint(cancellation)?;
+    let editor_projection_source = language_revision.map(|_| {
+        (
+            entry_path.clone(),
+            units
+                .iter()
+                .map(|unit| SourceUnit {
+                    path: unit.path.clone(),
+                    source: unit.source.clone(),
+                })
+                .collect::<Vec<_>>(),
+        )
+    });
+    let project = CompilerProject::new(
+        entry_path,
+        units,
+        target_profile,
+        program_role,
+        application_identity,
+    )
+    .with_persistence_catalog(schema_version, migration_predecessors);
+    let mut session = CompilerSession::new();
+    let project = session
+        .open_project(project)
+        .map_err(|error| error.to_string())?;
+    let revision = session
+        .revision(project)
+        .map_err(|error| error.to_string())?;
+    if let Some(language_revision) = language_revision {
+        let (editor_entrypoint, editor_units) = editor_projection_source
+            .as_ref()
+            .ok_or_else(|| "migration editor projection source disappeared".to_owned())?;
+        let diagnostics = match session.request(
+            project,
+            revision,
+            CompileIntent::Diagnostics,
+            cancellation,
+        ) {
+            Ok(result) => result,
+            Err(error) => {
+                let error_text = error.to_string();
+                if let Some(parse_error) = error.downcast_ref::<boon_parser::ParseError>() {
+                    *language = Some(
+                        project_parse_error_language(
+                            language_revision,
+                            editor_entrypoint,
+                            editor_units,
+                            parse_error,
+                        )
+                        .map_err(|projection| {
+                            format!(
+                                "{error_text}; migration parser diagnostic projection failed: {projection}"
+                            )
+                        })?,
+                    );
+                }
+                return Err(error_text);
+            }
+        };
+        let checked = diagnostics
+            .diagnostics()
+            .ok_or_else(|| "migration diagnostics request produced no checked source".to_owned())?;
+        *language = Some(project_checked_language(
+            language_revision,
+            editor_units,
+            &checked.parsed,
+            &checked.output,
+        )?);
+        cancellation_checkpoint(cancellation)?;
+    }
+    let result = session
+        .request(project, revision, intent, cancellation)
+        .map_err(|error| error.to_string())?;
+    let plan = result
+        .compiled()
+        .ok_or_else(|| "verified compiler request produced no MachinePlan".to_owned())?
+        .plan
+        .clone();
+    cancellation_checkpoint(cancellation)?;
+    Ok(Arc::new(plan))
+}
+
+fn cancellation_checkpoint(cancellation: &CancellationToken) -> Result<(), String> {
+    if cancellation.is_canceled() {
+        Err("compiler request canceled".to_owned())
+    } else {
+        Ok(())
+    }
 }
 
 fn canonical_preview_source_bundle<'a>(
@@ -636,6 +1075,185 @@ mod tests {
         ApplicationIdentity::new("dev.boon.test", namespace, "test")
     }
 
+    fn mailbox_request(job_id: u64) -> CompileRequest {
+        CompileRequest {
+            job_id,
+            intent: PreviewIntent::Replace,
+            request_id: None,
+            revision: 7,
+            source: PreviewSource::BuiltInSingleRole {
+                application: application(&format!("mailbox-{job_id}")),
+                entry_path: "RUN.bn".to_owned(),
+                units: Vec::new(),
+            },
+            test_steps: Vec::new(),
+            migration: None,
+            migration_stage: None,
+        }
+    }
+
+    fn built_in_project(
+        application: ApplicationIdentity,
+        units: Vec<CompilerSourceUnit>,
+    ) -> CompilerProject {
+        CompilerProject::new(
+            "RUN.bn",
+            units,
+            TargetProfile::SoftwareDefault,
+            ProgramRole::Client,
+            application,
+        )
+        .with_persistence_catalog(DEFAULT_PERSISTENCE_SCHEMA_VERSION, Vec::new())
+    }
+
+    #[test]
+    fn built_in_project_slot_reuses_updates_and_closes_replacements() {
+        let mut compiler = PreviewCompiler::default();
+        let first_application = application("persistent-slot");
+        let (first_project, first_revision) = compiler
+            .sync_built_in_project(built_in_project(
+                first_application.clone(),
+                vec![CompilerSourceUnit {
+                    path: "RUN.bn".to_owned(),
+                    source: "value: 1".to_owned(),
+                }],
+            ))
+            .unwrap();
+        assert_eq!(first_revision, CompilerRevision(0));
+
+        let (same_project, unchanged_revision) = compiler
+            .sync_built_in_project(built_in_project(
+                first_application.clone(),
+                vec![CompilerSourceUnit {
+                    path: "RUN.bn".to_owned(),
+                    source: "value: 1".to_owned(),
+                }],
+            ))
+            .unwrap();
+        assert_eq!(same_project, first_project);
+        assert_eq!(unchanged_revision, first_revision);
+
+        let (updated_project, updated_revision) = compiler
+            .sync_built_in_project(built_in_project(
+                first_application.clone(),
+                vec![CompilerSourceUnit {
+                    path: "RUN.bn".to_owned(),
+                    source: "value: 2".to_owned(),
+                }],
+            ))
+            .unwrap();
+        assert_eq!(updated_project, first_project);
+        assert_eq!(updated_revision, CompilerRevision(1));
+
+        let (topology_replacement, topology_revision) = compiler
+            .sync_built_in_project(built_in_project(
+                first_application,
+                vec![
+                    CompilerSourceUnit {
+                        path: "RUN.bn".to_owned(),
+                        source: "value: 2".to_owned(),
+                    },
+                    CompilerSourceUnit {
+                        path: "Shared.bn".to_owned(),
+                        source: "shared: 1".to_owned(),
+                    },
+                ],
+            ))
+            .unwrap();
+        assert_ne!(topology_replacement, first_project);
+        assert_eq!(topology_revision, CompilerRevision(0));
+        assert!(compiler.session.revision(first_project).is_err());
+
+        let (config_replacement, replacement_revision) = compiler
+            .sync_built_in_project(built_in_project(
+                application("replacement-slot"),
+                vec![
+                    CompilerSourceUnit {
+                        path: "RUN.bn".to_owned(),
+                        source: "value: 2".to_owned(),
+                    },
+                    CompilerSourceUnit {
+                        path: "Shared.bn".to_owned(),
+                        source: "shared: 1".to_owned(),
+                    },
+                ],
+            ))
+            .unwrap();
+        assert_ne!(config_replacement, topology_replacement);
+        assert_eq!(replacement_revision, CompilerRevision(0));
+        assert!(compiler.session.revision(topology_replacement).is_err());
+    }
+
+    #[test]
+    fn unchanged_built_in_bytes_reuse_the_verified_plan_arc() {
+        let mut compiler = PreviewCompiler::default();
+        let application = application("verified-plan-reuse");
+        let units = vec![SourceUnit {
+            path: "examples/minimal.bn".to_owned(),
+            source: include_str!("../../../examples/minimal.bn").to_owned(),
+        }];
+        let cancellation = CancellationToken::new();
+        let mut first_language = None;
+        let first = compiler
+            .compile_built_in(
+                "examples/minimal.bn",
+                &units,
+                &application,
+                7,
+                &mut first_language,
+                &cancellation,
+            )
+            .unwrap();
+        let mut second_language = None;
+        let second = compiler
+            .compile_built_in(
+                "examples/minimal.bn",
+                &units,
+                &application,
+                8,
+                &mut second_language,
+                &cancellation,
+            )
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(
+            first_language.as_ref().map(|snapshot| snapshot.revision),
+            Some(7)
+        );
+        assert_eq!(
+            second_language.as_ref().map(|snapshot| snapshot.revision),
+            Some(8)
+        );
+    }
+
+    #[test]
+    fn parser_failure_still_publishes_exact_revision_language_diagnostics() {
+        let request = CompileRequest {
+            job_id: 11,
+            intent: PreviewIntent::Replace,
+            request_id: None,
+            revision: 19,
+            source: PreviewSource::BuiltInSingleRole {
+                application: application("parse-error-language"),
+                entry_path: "RUN.bn".to_owned(),
+                units: vec![SourceUnit {
+                    path: "RUN.bn".to_owned(),
+                    source: "value: [".to_owned(),
+                }],
+            },
+            test_steps: Vec::new(),
+            migration: None,
+            migration_stage: None,
+        };
+        let attempt = PreviewCompiler::default().compile(request, &CancellationToken::new());
+        assert!(attempt.result.is_err());
+        let language = attempt.language.expect("parse diagnostic projection");
+        assert_eq!(language.revision, 19);
+        assert_eq!(language.source_bundle_digest_v1.to_string().len(), 64);
+        assert_eq!(language.diagnostics.len(), 1);
+        assert_eq!(language.diagnostics[0].location.path, "RUN.bn");
+    }
+
     #[test]
     fn mailbox_is_depth_one_and_latest_wins() {
         let worker = CompileWorker {
@@ -643,27 +1261,44 @@ mod tests {
             thread: None,
         };
         for job_id in 1..=4 {
-            worker.replace(CompileRequest {
-                job_id,
-                intent: PreviewIntent::Replace,
-                request_id: None,
-                revision: 7,
-                source: PreviewSource::BuiltInSingleRole {
-                    application: application(&format!("mailbox-{job_id}")),
-                    entry_path: "RUN.bn".to_owned(),
-                    units: Vec::new(),
-                },
-                test_steps: Vec::new(),
-                migration: None,
-                migration_stage: None,
-            });
+            let superseded = worker
+                .state
+                .0
+                .lock()
+                .unwrap()
+                .pending
+                .as_ref()
+                .map(|pending| pending.cancellation.clone());
+            worker.replace(mailbox_request(job_id));
+            if let Some(superseded) = superseded {
+                assert!(superseded.is_canceled());
+            }
         }
         assert_eq!(worker.replaced_count(), 3);
         {
             let state = worker.state.0.lock().unwrap();
-            assert_eq!(state.pending.as_ref().unwrap().job_id, 4);
-            assert_eq!(state.pending.as_ref().unwrap().revision, 7);
+            assert_eq!(state.pending.as_ref().unwrap().request.job_id, 4);
+            assert_eq!(state.pending.as_ref().unwrap().request.revision, 7);
         }
+    }
+
+    #[test]
+    fn replacing_an_active_compile_cancels_its_generation() {
+        let active = CancellationToken::new();
+        let worker = CompileWorker {
+            state: Arc::new((
+                Mutex::new(State {
+                    active: true,
+                    active_cancellation: Some(active.clone()),
+                    ..State::default()
+                }),
+                Condvar::new(),
+            )),
+            thread: None,
+        };
+        worker.replace(mailbox_request(2));
+        assert!(active.is_canceled());
+        assert_eq!(worker.replaced_count(), 1);
     }
 
     #[test]
@@ -968,16 +1603,19 @@ mod tests {
                 application: application("distributed-server"),
             },
         ];
-        let compiled = compile(CompileRequest {
-            job_id: 7,
-            intent: PreviewIntent::Replace,
-            request_id: None,
-            revision: 7,
-            source: PreviewSource::DistributedPackage { programs },
-            test_steps: Vec::new(),
-            migration: None,
-            migration_stage: None,
-        })
+        let compiled = compile(
+            CompileRequest {
+                job_id: 7,
+                intent: PreviewIntent::Replace,
+                request_id: None,
+                revision: 7,
+                source: PreviewSource::DistributedPackage { programs },
+                test_steps: Vec::new(),
+                migration: None,
+                migration_stage: None,
+            },
+            &CancellationToken::new(),
+        )
         .expect("compile distributed preview");
         let CompiledExecutable::DistributedPackage(bundle) = compiled.executable else {
             panic!("distributed source collapsed to a single-role executable");
@@ -995,23 +1633,26 @@ mod tests {
     #[test]
     fn compile_installs_the_host_application_identity_in_the_machine_plan() {
         let application = application("compile-propagation");
-        let compiled = compile(CompileRequest {
-            job_id: 1,
-            intent: PreviewIntent::Replace,
-            request_id: None,
-            revision: 1,
-            source: PreviewSource::BuiltInSingleRole {
-                application: application.clone(),
-                entry_path: "examples/minimal.bn".to_owned(),
-                units: vec![SourceUnit {
-                    path: "examples/minimal.bn".to_owned(),
-                    source: include_str!("../../../examples/minimal.bn").to_owned(),
-                }],
+        let compiled = compile(
+            CompileRequest {
+                job_id: 1,
+                intent: PreviewIntent::Replace,
+                request_id: None,
+                revision: 1,
+                source: PreviewSource::BuiltInSingleRole {
+                    application: application.clone(),
+                    entry_path: "examples/minimal.bn".to_owned(),
+                    units: vec![SourceUnit {
+                        path: "examples/minimal.bn".to_owned(),
+                        source: include_str!("../../../examples/minimal.bn").to_owned(),
+                    }],
+                },
+                test_steps: Vec::new(),
+                migration: None,
+                migration_stage: None,
             },
-            test_steps: Vec::new(),
-            migration: None,
-            migration_stage: None,
-        })
+            &CancellationToken::new(),
+        )
         .expect("compile preview with host identity");
         let CompiledExecutable::BuiltInSingleRole(plan) = compiled.executable else {
             panic!("single-role source compiled as a distributed package");

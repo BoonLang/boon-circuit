@@ -2,6 +2,12 @@
 
 Status: active implementation contract for the destructive cleanup.
 
+`BOON_COMPILER_PERFORMANCE_PLAN.md` is now the blocking prerequisite and sole
+owner of compiler latency, memory, scaling, session, invalidation, and
+cancellation acceptance. This recovery plan retains the measured history below
+as baseline evidence and resumes its native closure only after that plan's
+Clear End Condition passes.
+
 ## Objective
 
 Finish the ownership simplification while restoring a responsive native
@@ -557,8 +563,8 @@ fixture work. The measured aggregate allocation count moves from 52,089,871 to
 17,707,985 ns. Those numbers are an honest current-runtime starting point, not
 the final packed target and not native 16.7 ms interaction evidence. Every
 final packed target remains unchanged. The reconciled Phase 0 validators pass;
-the verifier grants final Phase 0 completion only from the clean committed
-revision.
+the verifier grants final Phase 0 completion only from a clean,
+revision-identified remeasurement at the next user-authorized checkpoint.
 
 The current compiler-scalability recovery fixes the owning graphs and fixed
 points instead of extending their timeout. Static selector reachability removes
@@ -662,16 +668,34 @@ helpers, removes 201 semantic expressions, and emits a plan about 33 KiB
 smaller; the dirty type worklist owns the material wall-time reduction.
 
 The contextual owner-propagation blocker is closed; do not build a larger graph
-around an 18 ms phase. The remaining cold typecheck blocker is the roughly
-1.75-second pre-scheme call/type worklist. The larger whole-compiler blocker is
-semantic elaboration/contextual expansion at about 11.56 seconds, followed by
-the roughly 4-second proof manifest. The next performance slice must retain
-shared semantic callable definitions and invalidate only affected contextual
-instances, then separate interactive diagnostics/preview compilation from
-explicit proof and debug-artifact generation. Do not return to tactical type-
-cache invalidation or another manifest collection tweak. Phase 1 still requires
-the remaining focused semantic, IR, and compiler regression matrix plus a
-committed clean-checkout remeasurement.
+around an 18 ms phase. The reactive profile then exposed another explicit
+cross-product: each typed host-effect occurrence restarted value reachability
+from every runtime root and state-update arm, and structural reachability from
+every transient derived value. One dense reverse structural/value index now
+uses canonical semantic read identities, local producers, function inputs, and
+expression edges once. On the same 43,270-expression NovyWave graph, index
+construction takes about 10 ms, host-effect scheduling falls from about 1.51
+seconds to 5.7 ms, and complete reactive construction falls from about 1.87
+seconds to 0.35 seconds. Ordinary-callable eligibility likewise analyzes each
+body once and propagates invalid callees through a reverse dependency worklist
+instead of rescanning callable bodies to a fixed point.
+
+The post-reboot debug checkpoint completes Counter in 0.09 seconds at 29,992
+KiB, physical TodoMVC in 2.02 seconds at 146,340 KiB, and NovyWave in 20.68
+seconds at 1,000,416 KiB. Their exact plan SHA-256 values remain respectively
+`dc1fe51b659d1746a0b0b4ae2dcba21d50a9426499eb2bde28dbed988e6cfb08`,
+`c9a12cd0a1bcf748a20e3a072afa09d0f923c2c9dbd664f2343d343494404f96`,
+and `4d3c284a9240cdc68c70aff7f30c570367e285cc1e8f823585900829bafd8ff7`.
+The traced NovyWave cold path is now about 4.84 seconds of typechecking, 2.84
+seconds of contextual materialization/execution expansion, 3.81 seconds of
+whole-program dependency proof, and 9.51 seconds for semantic elaboration in
+total. The next performance slice must retain more shared semantic callable
+definitions and invalidate only affected contextual instances, then separate
+interactive diagnostics/preview compilation from explicit proof and debug-
+artifact generation. Do not return to tactical type-cache invalidation or
+another manifest collection tweak. Phase 1 still requires the remaining
+focused semantic, IR, and compiler regression matrix plus a clean,
+revision-identified remeasurement at the next user-authorized checkpoint.
 
 Cold `dump-plan` throughput is not the interactive acceptance target. Before
 production recovery resumes, the playground/editor path must own a persistent
@@ -682,9 +706,11 @@ example source bundles must never block rendering for more than 16.7 ms and
 must publish the complete checked preview or diagnostics within 100 ms p95;
 stale generations are cancelled and the last good preview remains visible.
 Parsing, typechecking, and semantic invalidation stay on this critical path.
-Whole-graph dependency proof, handoff reports, and large debug JSON
-serialization run only for an explicit build/handoff request or from a valid
-content-addressed cache; they never delay a diagnostic generation or UI frame.
+Exact callable-dependency sealing and `boon_verify` also remain mandatory before
+an executable preview may publish. Flattened proof/debug graphs, handoff
+reports, and large debug JSON serialization run only for an explicit
+build/handoff request or from a valid content-addressed cache; they never delay
+a diagnostics-only generation or UI frame.
 The performance report must measure cold source-to-checked, cold
 source-to-semantic, warm affected edit, example switch, proof, and artifact
 serialization separately rather than hiding them in one permissive timeout.
@@ -720,10 +746,13 @@ The remaining completion work is explicit and ordered:
    further deletion is non-blocking and is allowed only when a new audit names
    a duplicated or superseded owner, its surviving owner, and retained
    behavioral evidence;
-2. restart the COSMIC session so the installed compositor exposes launch-scoped
+2. complete `BOON_COMPILER_PERFORMANCE_PLAN.md`, including both cache-disabled
+   cold modes, verified-preview, warm edit/switch, cancellation, scaling,
+   deterministic-artifact, and RSS gates;
+3. restart the COSMIC session so the installed compositor exposes launch-scoped
    window reconciliation, then refresh all seven manifest reports and the
    aggregate from one unchanged revision;
-3. launch the release playground with demand pacing and obtain the required
+4. launch the release playground with demand pacing and obtain the required
    physical human confirmation.
 
 ## Non-Negotiable Rules
@@ -823,8 +852,8 @@ The remaining completion work is explicit and ordered:
   the same runtime and document APIs.
 - Window callback to HostEvent p99 is at most 1 ms. Warm visible interaction and
   scroll p95 are at most 16.7 ms and max at most 33.4 ms. Warm example-switch
-  acknowledgement p95 is at most 16.7 ms; final preview p95 is at most 250 ms
-  and max at most 500 ms.
+  acknowledgement p95 is at most 16.7 ms; a loaded verified example's final
+  preview p95 is at most 100 ms and max at most 200 ms.
 - Settled release preview plus dev CPU is below 1% of one core with zero
   unsolicited frames.
 - Formatting, workspace check/test, scenarios, all fresh manifest gates, report

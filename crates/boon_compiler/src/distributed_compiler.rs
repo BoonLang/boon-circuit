@@ -17,7 +17,7 @@ use boon_plan::{
 };
 use boon_semantic::program_core::{self as core, DistributedCall};
 use boon_typecheck::{
-    CheckedCallEntry, CheckedCallableKind, CheckedContextBinding,
+    CheckOutput, CheckedCallEntry, CheckedCallableKind, CheckedContextBinding,
     CheckedExternalDeclarationIdentityV1, CheckedExternalDeclarationKind, CheckedParameterKind,
     CheckedProgram, ExternalFunctionArgument, ExternalFunctionType, ExternalTypeEnvironment,
     FlowMode, FlowType, FunctionTypeEntry, ObjectShape, Type, TypeCheckReport, Variant,
@@ -39,10 +39,21 @@ pub struct DistributedCompilerProgram {
     pub migration_predecessors: Vec<MigrationPredecessorBinding>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct CompiledDistributedMachinePlans {
     pub graph: DistributedGraphPlan,
     pub programs: Vec<(ProgramRole, CompiledMachinePlanFromSource)>,
+    client_projection: Option<DistributedClientProjectionSource>,
+}
+
+/// Exact settled Client source/check pair retained for an outer presentation
+/// layer to project editor data. This DTO is compiler-neutral: it owns no
+/// `boon_editor` types and performs no second parse or typecheck.
+#[derive(Debug)]
+pub struct DistributedClientProjectionSource {
+    pub revision: u64,
+    pub parsed: boon_parser::ParsedProgram,
+    pub output: CheckOutput,
 }
 
 impl CompiledDistributedMachinePlans {
@@ -54,6 +65,15 @@ impl CompiledDistributedMachinePlans {
 
     pub fn into_programs(self) -> Vec<(ProgramRole, CompiledMachinePlanFromSource)> {
         self.programs
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        Vec<(ProgramRole, CompiledMachinePlanFromSource)>,
+        Option<DistributedClientProjectionSource>,
+    ) {
+        (self.programs, self.client_projection)
     }
 }
 
@@ -74,7 +94,20 @@ struct ParsedRole {
 }
 
 struct SolvedBundleInterfaces {
-    checked: BTreeMap<ProgramRole, CheckedProgram>,
+    checks: BTreeMap<ProgramRole, SettledRoleCheck>,
+}
+
+struct SettledRoleCheck {
+    output: CheckOutput,
+}
+
+impl SettledRoleCheck {
+    fn checked(&self) -> &CheckedProgram {
+        self.output
+            .program
+            .as_ref()
+            .expect("settled distributed check owns its CheckedProgram")
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -188,13 +221,31 @@ pub fn compile_distributed_runtime_source_programs(
     programs: &[DistributedCompilerProgram],
     target_profile: TargetProfile,
 ) -> CompilerResult<CompiledDistributedMachinePlans> {
+    compile_distributed_runtime_source_programs_inner(programs, target_profile, false)
+}
+
+/// Compiles the same atomic distributed bundle while retaining the exact
+/// settled Client `ParsedProgram` plus editor-owned `CheckOutput` for the
+/// presentation layer. Session and Server remain runtime-owned checks.
+pub fn compile_distributed_runtime_source_programs_with_client_projection(
+    programs: &[DistributedCompilerProgram],
+    target_profile: TargetProfile,
+) -> CompilerResult<CompiledDistributedMachinePlans> {
+    compile_distributed_runtime_source_programs_inner(programs, target_profile, true)
+}
+
+fn compile_distributed_runtime_source_programs_inner(
+    programs: &[DistributedCompilerProgram],
+    target_profile: TargetProfile,
+    retain_client_projection: bool,
+) -> CompilerResult<CompiledDistributedMachinePlans> {
     validate_bundle_requests(programs)?;
     let requests = programs
         .iter()
         .cloned()
         .map(|program| (program.role, program))
         .collect::<BTreeMap<_, _>>();
-    let parsed = requests
+    let mut parsed = requests
         .values()
         .map(parse_role)
         .collect::<CompilerResult<Vec<_>>>()?
@@ -202,12 +253,12 @@ pub fn compile_distributed_runtime_source_programs(
         .map(|program| (program.request.role, program))
         .collect::<BTreeMap<_, _>>();
     let references = collect_provisional_bundle_interface_demands(&parsed)?;
-    let solved = solve_bundle_interfaces(&parsed, &references)?;
+    let mut solved = solve_bundle_interfaces(&parsed, &references, retain_client_projection)?;
     let prelude = distributed_graph_prelude(&requests)?;
     let DistributedSemanticFixedPoint {
         bundle,
         prelinked_calls,
-    } = resolve_distributed_semantic_fixed_point(&solved.checked)?;
+    } = resolve_distributed_semantic_fixed_point(&solved.checks)?;
     let lower_started = Instant::now();
     let verified_bundle = boon_verify::verify_bundle(
         bundle,
@@ -234,7 +285,25 @@ pub fn compile_distributed_runtime_source_programs(
         )?;
         lowered.insert(role, program);
     }
-    link_lowered_roles(lowered, target_profile, prelude, prelinked_calls)
+    let client_projection = if retain_client_projection {
+        let parsed_client = parsed
+            .remove(&ProgramRole::Client)
+            .expect("validated parsed Client role");
+        let settled_client = solved
+            .checks
+            .remove(&ProgramRole::Client)
+            .expect("settled Client check retained for projection");
+        Some(DistributedClientProjectionSource {
+            revision: parsed_client.request.revision,
+            parsed: parsed_client.parsed,
+            output: settled_client.output,
+        })
+    } else {
+        None
+    };
+    let mut compiled = link_lowered_roles(lowered, target_profile, prelude, prelinked_calls)?;
+    compiled.client_projection = client_projection;
+    Ok(compiled)
 }
 
 fn validate_bundle_requests(programs: &[DistributedCompilerProgram]) -> Result<(), PlanError> {
@@ -339,7 +408,7 @@ struct DistributedSemanticFixedPoint {
 }
 
 fn resolve_distributed_semantic_fixed_point(
-    checked: &BTreeMap<ProgramRole, CheckedProgram>,
+    checks: &BTreeMap<ProgramRole, SettledRoleCheck>,
 ) -> CompilerResult<DistributedSemanticFixedPoint> {
     let roles = [
         ProgramRole::Client,
@@ -361,9 +430,10 @@ fn resolve_distributed_semantic_fixed_point(
     let mut external_event_identities = roles
         .into_iter()
         .map(|role| {
-            let identities = checked
+            let identities = checks
                 .get(&role)
                 .expect("checked program exists for every role")
+                .checked()
                 .expressions
                 .iter()
                 .filter_map(|expression| {
@@ -386,14 +456,14 @@ fn resolve_distributed_semantic_fixed_point(
         })
         .collect::<BTreeMap<_, _>>();
     let mut external_event_identities_are_exact = false;
-    let producer_callable_count = checked
+    let producer_callable_count = checks
         .values()
-        .flat_map(|program| &program.callables)
+        .flat_map(|check| check.checked().callables.iter())
         .filter(|callable| callable.kind == CheckedCallableKind::User)
         .count();
-    let external_value_count = checked
+    let external_value_count = checks
         .values()
-        .flat_map(|program| &program.expressions)
+        .flat_map(|check| check.checked().expressions.iter())
         .filter_map(|expression| {
             let boon_typecheck::CheckedExpressionKind::ExternalRead {
                 external_identity: Some(identity),
@@ -418,7 +488,7 @@ fn resolve_distributed_semantic_fixed_point(
 
     for round in 0..max_rounds {
         let programs = elaborate_distributed_roles_with_external_events(
-            checked,
+            checks,
             &requests,
             &external_event_identities,
         )?;
@@ -503,7 +573,7 @@ fn resolve_distributed_semantic_fixed_point(
                 continue;
             }
             let confirmed_programs = elaborate_distributed_roles_with_external_events(
-                checked,
+                checks,
                 &requests,
                 &external_event_identities,
             )?;
@@ -550,7 +620,7 @@ fn resolve_distributed_semantic_fixed_point(
 }
 
 fn elaborate_distributed_roles_with_external_events(
-    checked: &BTreeMap<ProgramRole, CheckedProgram>,
+    checks: &BTreeMap<ProgramRole, SettledRoleCheck>,
     requests: &BTreeMap<ProgramRole, BTreeSet<boon_semantic::ProducerMaterializationRequest>>,
     external_event_identities: &BTreeMap<
         ProgramRole,
@@ -578,7 +648,11 @@ fn elaborate_distributed_roles_with_external_events(
             .copied()
             .collect::<Vec<_>>();
         let semantic = super::elaborate_checked_with_external_event_identities(
-            checked.get(&role).expect("checked role authority").clone(),
+            checks
+                .get(&role)
+                .expect("checked role authority")
+                .checked()
+                .clone(),
             &role_requests,
             &role_external_events,
         )?;
@@ -1103,6 +1177,7 @@ fn validate_distributed_reference_roles(
 fn solve_bundle_interfaces(
     programs: &BTreeMap<ProgramRole, ParsedRole>,
     references: &ProvisionalBundleInterfaceDemands,
+    retain_client_projection: bool,
 ) -> Result<SolvedBundleInterfaces, PlanError> {
     let mut value_types = references
         .values
@@ -1339,23 +1414,32 @@ fn solve_bundle_interfaces(
         false,
         Some(&external_identities),
     );
-    let checked = seal_solved_bundle_checks(programs, &environments)?;
-    Ok(SolvedBundleInterfaces { checked })
+    let checks = seal_solved_bundle_checks(programs, &environments, retain_client_projection)?;
+    Ok(SolvedBundleInterfaces { checks })
 }
 
 fn seal_solved_bundle_checks(
     programs: &BTreeMap<ProgramRole, ParsedRole>,
     environments: &BTreeMap<ProgramRole, ExternalTypeEnvironment>,
-) -> Result<BTreeMap<ProgramRole, CheckedProgram>, PlanError> {
+    retain_client_projection: bool,
+) -> Result<BTreeMap<ProgramRole, SettledRoleCheck>, PlanError> {
     programs
         .iter()
         .map(|(role, program)| {
-            let (output, _) = boon_typecheck::check_runtime_program_profiled_with_external_types(
-                &program.parsed,
-                environments
-                    .get(role)
-                    .expect("settled environment exists for every role"),
-            );
+            let environment = environments
+                .get(role)
+                .expect("settled environment exists for every role");
+            let (output, _) = if retain_client_projection && *role == ProgramRole::Client {
+                boon_typecheck::check_editor_program_profiled_with_external_types(
+                    &program.parsed,
+                    environment,
+                )
+            } else {
+                boon_typecheck::check_runtime_program_profiled_with_external_types(
+                    &program.parsed,
+                    environment,
+                )
+            };
             if output.report.has_errors() {
                 let diagnostics = output
                     .report
@@ -1372,7 +1456,7 @@ fn seal_solved_bundle_checks(
                     role.namespace()
                 )));
             }
-            let checked = output.program.ok_or_else(|| {
+            let checked = output.program.as_ref().ok_or_else(|| {
                 PlanError::new(format!(
                     "{} settled typecheck produced no CheckedProgram",
                     role.namespace()
@@ -1384,7 +1468,10 @@ fn seal_solved_bundle_checks(
                     .get(role)
                     .expect("settled environment exists for every role")
             );
-            Ok((*role, checked))
+            if !retain_client_projection || *role != ProgramRole::Client {
+                debug_assert!(output.report.type_hint_table.entries.is_empty());
+            }
+            Ok((*role, SettledRoleCheck { output }))
         })
         .collect()
 }
@@ -1698,7 +1785,7 @@ fn merge_closed_boundary_types(left: &Type, right: &Type) -> Option<Type> {
                     ))
                 })
                 .collect::<Option<Vec<_>>>()?;
-            Some(Type::Object(ObjectShape {
+            Some(Type::object(ObjectShape {
                 fields: ordered_fields.iter().cloned().collect(),
                 field_order: ordered_fields.into_iter().map(|(name, _)| name).collect(),
                 open: false,
@@ -2451,8 +2538,15 @@ fn link_lowered_roles(
                 profile: CompileProfile {
                     source_unit_count: program.source_unit_count,
                     expression_count: program.ir.expression_count,
+                    checked_expression_count: 0,
+                    checked_call_count: 0,
                     graph_node_count: program.ir.graph_node_count,
+                    cancellation_checkpoint_count: 0,
                     parse_ms: program.parse_ms,
+                    typecheck_ms: 0.0,
+                    semantic_ms: 0.0,
+                    contract_verify_ms: 0.0,
+                    ir_lower_ms: 0.0,
                     lower_ms: program.lower_ms,
                     verify_ms: program.verify_ms,
                     compile_ms,
@@ -2815,6 +2909,7 @@ fn link_lowered_roles(
         .into_iter()
         .map(|role| (role, compiled.remove(&role).expect("compiled role")))
         .collect(),
+        client_projection: None,
     })
 }
 

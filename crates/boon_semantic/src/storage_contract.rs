@@ -1062,7 +1062,7 @@ fn ensure_value_authority_parent(
                     resource_only: false,
                     flow_type: FlowType {
                         mode: FlowMode::Continuous,
-                        ty: Type::Object(boon_typecheck::ObjectShape {
+                        ty: Type::object(boon_typecheck::ObjectShape {
                             fields: BTreeMap::new(),
                             field_order: Vec::new(),
                             open: false,
@@ -1135,7 +1135,7 @@ fn ensure_authority_parent(
                     resource_only: false,
                     flow_type: FlowType {
                         mode: FlowMode::Continuous,
-                        ty: Type::Object(boon_typecheck::ObjectShape {
+                        ty: Type::object(boon_typecheck::ObjectShape {
                             fields: BTreeMap::new(),
                             field_order: Vec::new(),
                             open: false,
@@ -5270,7 +5270,7 @@ store: [
                 .iter()
                 .map(|(name, _)| (*name).to_owned())
                 .collect::<Vec<_>>();
-            Type::Object(boon_typecheck::ObjectShape {
+            Type::object(boon_typecheck::ObjectShape {
                 fields: fields
                     .into_iter()
                     .map(|(name, ty)| (name.to_owned(), ty))

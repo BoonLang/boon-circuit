@@ -11,8 +11,14 @@ use boon_parser::{
 };
 use ena::unify::{EqUnifyValue, InPlaceUnificationTable, UnifyKey};
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
+#[cfg(test)]
+use std::cell::Cell;
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::hash::Hash;
+use std::ops::Deref;
+use std::sync::Arc;
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
 #[cfg(target_arch = "wasm32")]
@@ -25,7 +31,7 @@ pub enum Type {
     Bytes(BytesType),
     Absent,
     VariantSet(Vec<Variant>),
-    Object(ObjectShape),
+    Object(SharedObjectShape),
     RenderContract,
     List(Box<Type>),
     Function {
@@ -59,6 +65,13 @@ pub enum Type {
 
 impl EqUnifyValue for Type {}
 
+impl Type {
+    /// Seal an owned object shape into a cheaply cloneable type node.
+    pub fn object(shape: ObjectShape) -> Self {
+        Self::Object(shape.into())
+    }
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub enum BytesType {
     Dynamic,
@@ -68,7 +81,20 @@ pub enum BytesType {
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub enum Variant {
     Tag(String),
-    Tagged { tag: String, fields: ObjectShape },
+    Tagged {
+        tag: String,
+        fields: SharedObjectShape,
+    },
+}
+
+impl Variant {
+    /// Seal an owned tagged-payload shape into a cheaply cloneable variant.
+    pub fn tagged(tag: String, fields: ObjectShape) -> Self {
+        Self::Tagged {
+            tag,
+            fields: fields.into(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
@@ -77,6 +103,67 @@ pub struct ObjectShape {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub field_order: Vec<String>,
     pub open: bool,
+}
+
+/// An immutable, reference-counted object shape used by sealed [`Type`] values.
+///
+/// Object shapes remain ordinary owned values while they are being assembled.
+/// Converting one into this wrapper seals it so cloning a `Type::Object` shares
+/// the complete shape (including all recursively nested field types) instead of
+/// cloning the field tree.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct SharedObjectShape(Arc<ObjectShape>);
+
+impl SharedObjectShape {
+    pub fn new(shape: ObjectShape) -> Self {
+        Self(Arc::new(shape))
+    }
+
+    pub fn ptr_eq(left: &Self, right: &Self) -> bool {
+        Arc::ptr_eq(&left.0, &right.0)
+    }
+
+    pub fn into_owned(self) -> ObjectShape {
+        Arc::unwrap_or_clone(self.0)
+    }
+}
+
+impl AsRef<ObjectShape> for SharedObjectShape {
+    fn as_ref(&self) -> &ObjectShape {
+        &self.0
+    }
+}
+
+impl Deref for SharedObjectShape {
+    type Target = ObjectShape;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl From<ObjectShape> for SharedObjectShape {
+    fn from(shape: ObjectShape) -> Self {
+        Self::new(shape)
+    }
+}
+
+impl Serialize for SharedObjectShape {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.as_ref().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SharedObjectShape {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        ObjectShape::deserialize(deserializer).map(Self::new)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -130,16 +217,23 @@ pub struct TypeDisplayFunctionArg {
 }
 
 impl ObjectShape {
-    fn new(fields: BTreeMap<String, Type>, open: bool) -> Self {
+    fn new<T>(fields: BTreeMap<String, Type>, open: bool) -> T
+    where
+        T: From<Self>,
+    {
         let field_order = fields.keys().cloned().collect();
         Self {
             fields,
             field_order,
             open,
         }
+        .into()
     }
 
-    fn from_ordered_fields(fields: impl IntoIterator<Item = (String, Type)>, open: bool) -> Self {
+    fn from_ordered_fields<T>(fields: impl IntoIterator<Item = (String, Type)>, open: bool) -> T
+    where
+        T: From<Self>,
+    {
         let mut shape_fields = BTreeMap::new();
         let mut field_order = Vec::new();
         for (field, ty) in fields {
@@ -153,6 +247,7 @@ impl ObjectShape {
             field_order,
             open,
         }
+        .into()
     }
 
     fn ordered_fields(&self) -> Vec<(&String, &Type)> {
@@ -1645,6 +1740,35 @@ pub struct CheckOutput {
     pub report: TypeCheckReport,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CheckOutputOwnership {
+    /// Preserve every editor/report projection alongside the checked artifact.
+    ReportOwned,
+    /// Preserve editor diagnostics and hints while transferring successful
+    /// lowering tables into the checked artifact instead of cloning them.
+    EditorOwned,
+    /// Return complete checked diagnostics and transfer successful lowering
+    /// tables, but defer editor-only type-hint materialization until a client
+    /// explicitly projects them.
+    DiagnosticsOwned,
+    /// On a successful runtime check, transfer lowering tables into the
+    /// checked artifact instead of retaining a second report-owned copy.
+    RuntimeOwned,
+}
+
+impl CheckOutputOwnership {
+    fn includes_type_hints(self) -> bool {
+        matches!(self, Self::ReportOwned | Self::EditorOwned)
+    }
+
+    fn transfers_lowering_tables(self) -> bool {
+        matches!(
+            self,
+            Self::EditorOwned | Self::DiagnosticsOwned | Self::RuntimeOwned
+        )
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct OutputRootTypeEntry {
     /// Diagnostic spelling retained for host/editor presentation.
@@ -1670,14 +1794,15 @@ struct CheckedProgramBuilder<'a> {
     role: ProgramRole,
     external_value_modes: BTreeMap<String, FlowMode>,
     external_identities: BTreeMap<String, CheckedExternalDeclarationIdentityV1>,
-    local_function_requirements: BTreeMap<String, BTreeMap<String, Type>>,
-    flow_bindings: BTreeMap<String, FlowMode>,
-    named_value_modes: BTreeMap<String, FlowMode>,
-    named_value_expressions: BTreeMap<String, usize>,
+    function_param_requirements: BTreeMap<String, BTreeMap<String, Type>>,
+    flow_bindings: FlowModeIndex,
+    named_value_modes: FlowModeIndex,
+    named_value_expressions: DeclarationExprIndex,
     signatures: Vec<CheckedCallableSignature>,
     context_formals: Vec<CheckedContextFormal>,
     signature_by_name: BTreeMap<String, usize>,
     signature_by_decl: BTreeMap<DeclId, usize>,
+    parameter_location_by_decl: DenseIndexTable<CheckedParameterLocation>,
     expression_owner: BTreeMap<usize, String>,
     expressions_by_owner: BTreeMap<String, Vec<usize>>,
     next_decl_id: u32,
@@ -1694,10 +1819,16 @@ struct CheckedProgramBuilder<'a> {
     statement_declarations: BTreeMap<usize, DeclId>,
     statement_scopes: BTreeMap<usize, LexicalScopeId>,
     statement_body_scopes: BTreeMap<usize, LexicalScopeId>,
+    exact_statement_by_root_expression: DenseIndexTable<usize>,
     expression_scopes: BTreeMap<usize, LexicalScopeId>,
     expression_declarations: BTreeMap<usize, DeclId>,
     expression_call_contexts: BTreeMap<(usize, String), DeclId>,
     scope_declarations: BTreeMap<(LexicalScopeId, String), DeclId>,
+    /// Dense exact-name lookup used by read lowering. The canonical ordered
+    /// map above remains the serialized/deterministic construction index;
+    /// this projection removes a fresh `String` allocation at every parent
+    /// scope visited by `resolve_name`.
+    scope_declarations_by_scope: Vec<BTreeMap<String, DeclId>>,
     pattern_declarations: BTreeMap<(usize, String), DeclId>,
     pattern_selectors: BTreeMap<usize, usize>,
     pattern_parents: BTreeMap<usize, usize>,
@@ -1705,18 +1836,396 @@ struct CheckedProgramBuilder<'a> {
     nearest_pattern_arm_by_scope: Vec<Option<usize>>,
     syntax_discriminant_parameters: BTreeSet<DeclId>,
     inferred_expr_types: DenseIndexTable<FlowType>,
-    syntax_expr_types: BTreeMap<usize, FlowType>,
     /// Hidden `Flush<E>` control types keyed by parser expression. This is a
     /// checker-only side table; `E` is folded into the ordinary type exactly
     /// at documented lexical boundaries and never serialized as a public type.
     expression_flush_types: BTreeMap<usize, Type>,
-    authoritative_expr_types: BTreeSet<usize>,
-    checked_flow_inference_epoch: u64,
-    checked_flow_inference_cache: DenseIndexTable<(u64, FlowType)>,
-    validate_checked_projections: bool,
+    checked_flow_inference_cache: CheckedFlowInferenceCache,
+    checked_flow_inference_cache_enabled: bool,
+    checked_flow_recursion: DenseRecursionGuard,
+    checked_flow_declaration_invalidation_seen: DenseGenerationSet,
+    checked_flow_pending_expression_invalidations: PendingIdSet<usize>,
+    checked_flow_pending_declaration_invalidations: PendingIdSet<DeclId>,
+    checked_flow_pending_signature_invalidations: PendingIdSet<DeclId>,
+    /// Recursive flow inference can refresh a child cache entry while solving
+    /// a different root. Such a child still has to pass through the ordinary
+    /// solver publication lane so its dense value and non-expression
+    /// dependents observe the refinement.
+    checked_flow_pending_expression_publications: PendingIdSet<usize>,
+    checked_type_inference_dependencies: Option<Arc<CheckedTypeInferenceDependencies>>,
+    /// Stable per-call alpha-renaming state shared by the pre-solver wrapper
+    /// transfer and its post-quiescence audit.
+    wrapper_call_scheme_vars: BTreeMap<(CheckedCallId, TypeVar), TypeVar>,
+    /// One monotonic allocator shared by parameter, context, and wrapper
+    /// schemes. It is initialized once from every live checked type before
+    /// scheme construction so later phases neither rescan the program nor
+    /// collide with an existing variable.
+    next_checked_scheme_type_var: Option<u32>,
+    projection_sites: Vec<CheckedProjectionSite>,
     source_payload_shape_table: Vec<SourcePayloadSyntaxShapeEntry>,
     exact_number_literals: BTreeMap<usize, ExactNumber>,
     diagnostics: Vec<TypeDiagnostic>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum CheckedProjectionBase {
+    Declaration(DeclId),
+    Expression(usize),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CheckedProjectionSite {
+    expression: usize,
+    base: CheckedProjectionBase,
+    fields: Box<[String]>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CheckedParameterLocation {
+    signature: usize,
+    parameter: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CheckedPatternBindingSite {
+    arm_expression: usize,
+    name: String,
+    declaration: DeclId,
+    selector_expression: usize,
+}
+
+/// Dense membership state for IDs from an immutable arena snapshot.
+///
+/// Out-of-range IDs are rejected rather than extending the allocation. This
+/// keeps corrupt or stale expression identities fail-closed while preserving
+/// constant-time membership updates for valid parser IDs.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DenseFlagSet {
+    flags: Vec<u8>,
+    len: usize,
+}
+
+impl DenseFlagSet {
+    fn with_len(len: usize) -> Self {
+        Self {
+            flags: vec![0; len],
+            len: 0,
+        }
+    }
+
+    fn insert(&mut self, index: usize) -> bool {
+        let Some(flag) = self.flags.get_mut(index) else {
+            return false;
+        };
+        if *flag != 0 {
+            return false;
+        }
+        *flag = 1;
+        self.len += 1;
+        true
+    }
+
+    fn contains(&self, index: &usize) -> bool {
+        self.flags.get(*index).is_some_and(|flag| *flag != 0)
+    }
+
+    fn remove(&mut self, index: &usize) -> bool {
+        let Some(flag) = self.flags.get_mut(*index) else {
+            return false;
+        };
+        if *flag == 0 {
+            return false;
+        }
+        *flag = 0;
+        self.len -= 1;
+        true
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+}
+
+/// Reusable, allocation-free recursion membership for expression arena IDs.
+///
+/// Each root evaluation advances the generation, so an interrupted traversal
+/// cannot leak membership into the next root. Invalid IDs are rejected without
+/// growing the arena, matching the checked-expression fail-closed contract.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DenseRecursionGuard {
+    generations: Vec<u32>,
+    generation: u32,
+    len: usize,
+}
+
+impl DenseRecursionGuard {
+    fn with_len(len: usize) -> Self {
+        Self {
+            generations: vec![0; len],
+            generation: 0,
+            len: 0,
+        }
+    }
+
+    fn begin_root(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        if self.generation == 0 {
+            self.generations.fill(0);
+            self.generation = 1;
+        }
+        self.len = 0;
+    }
+
+    fn insert(&mut self, index: usize) -> bool {
+        let Some(generation) = self.generations.get_mut(index) else {
+            return false;
+        };
+        if *generation == self.generation {
+            return false;
+        }
+        *generation = self.generation;
+        self.len += 1;
+        true
+    }
+
+    fn remove(&mut self, index: &usize) -> bool {
+        let Some(generation) = self.generations.get_mut(*index) else {
+            return false;
+        };
+        if *generation != self.generation {
+            return false;
+        }
+        *generation = 0;
+        self.len -= 1;
+        true
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+}
+
+/// Reusable visited state for reverse-cache invalidation traversals.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DenseGenerationSet {
+    generations: Vec<u32>,
+    generation: u32,
+}
+
+impl DenseGenerationSet {
+    fn with_len(len: usize) -> Self {
+        Self {
+            generations: vec![0; len],
+            generation: 0,
+        }
+    }
+
+    fn begin(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        if self.generation == 0 {
+            self.generations.fill(0);
+            self.generation = 1;
+        }
+    }
+
+    fn insert(&mut self, index: usize) -> bool {
+        let Some(generation) = self.generations.get_mut(index) else {
+            return false;
+        };
+        if *generation == self.generation {
+            return false;
+        }
+        *generation = self.generation;
+        true
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct CheckedFlowInferenceCacheStats {
+    hits: u64,
+    misses: u64,
+    invalidations: u64,
+    reverse_invalidation_traversals: u64,
+    full_resets: u64,
+    rejected_invalid_ids: u64,
+    indexed_read_hits: u64,
+    indexed_read_missing: u64,
+    indexed_read_rejected: u64,
+    indexed_out_hits: u64,
+    indexed_out_missing: u64,
+}
+
+impl CheckedFlowInferenceCacheStats {
+    fn since(self, before: Self) -> Self {
+        Self {
+            hits: self.hits.saturating_sub(before.hits),
+            misses: self.misses.saturating_sub(before.misses),
+            invalidations: self.invalidations.saturating_sub(before.invalidations),
+            reverse_invalidation_traversals: self
+                .reverse_invalidation_traversals
+                .saturating_sub(before.reverse_invalidation_traversals),
+            full_resets: self.full_resets.saturating_sub(before.full_resets),
+            rejected_invalid_ids: self
+                .rejected_invalid_ids
+                .saturating_sub(before.rejected_invalid_ids),
+            indexed_read_hits: self
+                .indexed_read_hits
+                .saturating_sub(before.indexed_read_hits),
+            indexed_read_missing: self
+                .indexed_read_missing
+                .saturating_sub(before.indexed_read_missing),
+            indexed_read_rejected: self
+                .indexed_read_rejected
+                .saturating_sub(before.indexed_read_rejected),
+            indexed_out_hits: self
+                .indexed_out_hits
+                .saturating_sub(before.indexed_out_hits),
+            indexed_out_missing: self
+                .indexed_out_missing
+                .saturating_sub(before.indexed_out_missing),
+        }
+    }
+}
+
+/// Persistent expression-flow memoization over one immutable checked topology.
+///
+/// Entries are removed only through the exact reverse dependency graph. The
+/// sole full reset is the explicit new-topology/external-environment boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CheckedFlowInferenceCache {
+    entries: DenseIndexTable<FlowType>,
+    /// Last value removed by invalidation. Retaining the tombstone lets a
+    /// recomputation distinguish a real cache-value transition from stable
+    /// invalidation noise without walking the reverse closure eagerly.
+    invalidated_entries: DenseIndexTable<FlowType>,
+    stats: CheckedFlowInferenceCacheStats,
+}
+
+impl CheckedFlowInferenceCache {
+    fn with_len(len: usize) -> Self {
+        Self {
+            entries: DenseIndexTable::with_len(len),
+            invalidated_entries: DenseIndexTable::with_len(len),
+            stats: CheckedFlowInferenceCacheStats::default(),
+        }
+    }
+
+    fn get_cloned(&mut self, index: usize) -> Option<FlowType> {
+        let result = self.entries.get(&index).cloned();
+        if result.is_some() {
+            self.stats.hits = self.stats.hits.saturating_add(1);
+        } else {
+            self.stats.misses = self.stats.misses.saturating_add(1);
+            if index >= self.entries.entries.len() {
+                self.stats.rejected_invalid_ids = self.stats.rejected_invalid_ids.saturating_add(1);
+            }
+        }
+        result
+    }
+
+    fn insert(&mut self, index: usize, flow_type: FlowType) -> bool {
+        if !self.entries.insert_if_in_bounds(index, flow_type) {
+            self.stats.rejected_invalid_ids = self.stats.rejected_invalid_ids.saturating_add(1);
+            return false;
+        }
+        self.invalidated_entries.take(index);
+        true
+    }
+
+    fn insert_recomputed(&mut self, index: usize, flow_type: FlowType) -> (bool, Option<FlowType>) {
+        if !self.entries.insert_if_in_bounds(index, flow_type) {
+            self.stats.rejected_invalid_ids = self.stats.rejected_invalid_ids.saturating_add(1);
+            return (false, None);
+        }
+        (true, self.invalidated_entries.take(index))
+    }
+
+    fn invalidate(&mut self, index: usize) -> bool {
+        let Some(previous) = self.entries.take(index) else {
+            if index >= self.entries.entries.len() {
+                self.stats.rejected_invalid_ids = self.stats.rejected_invalid_ids.saturating_add(1);
+            }
+            return false;
+        };
+        if !self
+            .invalidated_entries
+            .insert_if_in_bounds(index, previous)
+        {
+            self.stats.rejected_invalid_ids = self.stats.rejected_invalid_ids.saturating_add(1);
+            return false;
+        }
+        self.stats.invalidations = self.stats.invalidations.saturating_add(1);
+        true
+    }
+
+    fn reset_for_new_topology(&mut self) {
+        self.entries.clear();
+        self.invalidated_entries.clear();
+        self.stats.full_resets = self.stats.full_resets.saturating_add(1);
+    }
+}
+
+#[cfg(test)]
+fn invalidate_checked_flow_cache_reverse_closure(
+    cache: &mut CheckedFlowInferenceCache,
+    dependents: &[Vec<usize>],
+    roots: impl IntoIterator<Item = usize>,
+    seen: &mut DenseGenerationSet,
+) {
+    seen.begin();
+    let mut frontier = roots.into_iter().collect::<Vec<_>>();
+    if !frontier.is_empty() {
+        cache.stats.reverse_invalidation_traversals = cache
+            .stats
+            .reverse_invalidation_traversals
+            .saturating_add(1);
+    }
+    while let Some(expression) = frontier.pop() {
+        if expression >= dependents.len() {
+            // Keep stale/corrupt IDs bounded while making their rejection
+            // visible in the same trace counter as invalid cache accesses.
+            cache.invalidate(expression);
+            continue;
+        }
+        if !seen.insert(expression) {
+            continue;
+        }
+        cache.invalidate(expression);
+        if let Some(children) = dependents.get(expression) {
+            frontier.extend(children.iter().copied());
+        }
+    }
+}
+
+#[cfg(test)]
+fn checked_flow_declaration_invalidation_roots(
+    readers: &BTreeMap<DeclId, Vec<usize>>,
+    dependents: &BTreeMap<DeclId, Vec<DeclId>>,
+    declaration: DeclId,
+    seen: &mut DenseGenerationSet,
+) -> Vec<usize> {
+    checked_flow_declarations_invalidation_roots(readers, dependents, [declaration], seen)
+}
+
+fn checked_flow_declarations_invalidation_roots(
+    readers: &BTreeMap<DeclId, Vec<usize>>,
+    dependents: &BTreeMap<DeclId, Vec<DeclId>>,
+    declarations: impl IntoIterator<Item = DeclId>,
+    seen: &mut DenseGenerationSet,
+) -> Vec<usize> {
+    seen.begin();
+    let mut declarations = declarations.into_iter().collect::<Vec<_>>();
+    let mut roots = Vec::new();
+    while let Some(declaration) = declarations.pop() {
+        if !seen.insert(declaration.0 as usize) {
+            continue;
+        }
+        roots.extend(readers.get(&declaration).into_iter().flatten().copied());
+        declarations.extend(dependents.get(&declaration).into_iter().flatten().copied());
+    }
+    roots.sort_unstable();
+    roots.dedup();
+    roots
 }
 
 /// Dense parser/checked-expression state used by the inference fixed point.
@@ -1748,11 +2257,23 @@ impl<T> DenseIndexTable<T> {
         self.entries.get(*index).and_then(Option::as_ref)
     }
 
+    fn take(&mut self, index: usize) -> Option<T> {
+        self.entries.get_mut(index).and_then(Option::take)
+    }
+
     fn insert(&mut self, index: usize, value: T) -> Option<T> {
         if index >= self.entries.len() {
             self.entries.resize_with(index.saturating_add(1), || None);
         }
         self.entries[index].replace(value)
+    }
+
+    fn insert_if_in_bounds(&mut self, index: usize, value: T) -> bool {
+        let Some(entry) = self.entries.get_mut(index) else {
+            return false;
+        };
+        entry.replace(value);
+        true
     }
 
     fn values(&self) -> impl Iterator<Item = &T> {
@@ -1774,16 +2295,131 @@ impl<T> FromIterator<(usize, T)> for DenseIndexTable<T> {
     }
 }
 
-struct CheckedProgramBuildInputs<'a> {
-    external_types: &'a ExternalTypeEnvironment,
-    expr_type_table: &'a ExprTypeTable,
-    function_type_table: &'a FunctionTypeTable,
-    named_value_type_table: &'a NamedValueTypeTable,
-    render_slot_table: &'a RenderSlotTable,
-    source_payload_shape_table: &'a [SourcePayloadSyntaxShapeEntry],
-    flow_bindings: &'a BTreeMap<String, FlowMode>,
-    builtins: &'a BuiltinSignatureRegistry,
-    render_contracts: &'a RenderContractRegistry,
+/// Syntax and environment inputs for authoritative checked construction.
+///
+/// Provisional checker type tables deliberately do not cross this boundary.
+/// The checked builder owns the only structural type database; legacy report
+/// projections remain outside until diagnostic replay replaces their owner.
+struct OwnedCheckedConstruction {
+    external_types: ExternalTypeEnvironment,
+    render_slot_statements: BTreeSet<usize>,
+    source_payload_shape_table: Vec<SourcePayloadSyntaxShapeEntry>,
+    flow_bindings: FlowModeIndex,
+    expression_owner: BTreeMap<usize, String>,
+    named_value_expressions: DeclarationExprIndex,
+    function_param_requirements: BTreeMap<String, BTreeMap<String, Type>>,
+    builtins: BuiltinSignatureRegistry,
+    render_contracts: RenderContractRegistry,
+}
+
+struct CheckedDiagnosticReplayInputs {
+    source_payload_shape_table: Vec<SourcePayloadSyntaxShapeEntry>,
+    named_value_expressions: DeclarationExprIndex,
+    builtins: BuiltinSignatureRegistry,
+    render_contracts: RenderContractRegistry,
+}
+
+struct CheckedProgramBuildOutput {
+    program: CheckedProgram,
+    diagnostics: Vec<TypeDiagnostic>,
+    exact_pipeline_inputs_valid: bool,
+    diagnostic_replay_inputs: Option<CheckedDiagnosticReplayInputs>,
+}
+
+fn proper_dotted_suffixes(path: &str) -> impl Iterator<Item = &str> {
+    path.match_indices('.').map(|(index, _)| &path[index + 1..])
+}
+
+fn dotted_prefixes(path: &str) -> impl Iterator<Item = &str> {
+    path.match_indices('.')
+        .map(|(index, _)| &path[..index])
+        .chain(std::iter::once(path))
+}
+
+#[derive(Clone, Debug, Default)]
+struct DeclarationExprIndex {
+    exact: BTreeMap<String, usize>,
+    unique_suffix: BTreeMap<String, Option<usize>>,
+}
+
+impl DeclarationExprIndex {
+    fn from_exact(exact: BTreeMap<String, usize>) -> Self {
+        let mut unique_suffix = BTreeMap::<String, Option<usize>>::new();
+        for (path, expression) in &exact {
+            for suffix in proper_dotted_suffixes(path) {
+                unique_suffix
+                    .entry(suffix.to_owned())
+                    .and_modify(|candidate| *candidate = None)
+                    .or_insert(Some(*expression));
+            }
+        }
+        Self {
+            exact,
+            unique_suffix,
+        }
+    }
+
+    fn resolve(&self, path: &str) -> Option<usize> {
+        self.exact
+            .get(path)
+            .copied()
+            .or_else(|| self.unique_suffix.get(path).copied().flatten())
+    }
+}
+
+impl Deref for DeclarationExprIndex {
+    type Target = BTreeMap<String, usize>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.exact
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct FlowModeIndex {
+    exact: BTreeMap<String, FlowMode>,
+    suffix_merged: BTreeMap<String, FlowMode>,
+    subtree_merged: BTreeMap<String, FlowMode>,
+}
+
+impl FlowModeIndex {
+    fn insert(&mut self, path: String, mode: FlowMode) {
+        self.exact
+            .entry(path.clone())
+            .and_modify(|existing| *existing = merge_flow_modes(*existing, mode))
+            .or_insert(mode);
+        for suffix in proper_dotted_suffixes(&path) {
+            self.suffix_merged
+                .entry(suffix.to_owned())
+                .and_modify(|existing| *existing = merge_flow_modes(*existing, mode))
+                .or_insert(mode);
+        }
+        for prefix in dotted_prefixes(&path) {
+            self.subtree_merged
+                .entry(prefix.to_owned())
+                .and_modify(|existing| *existing = merge_flow_modes(*existing, mode))
+                .or_insert(mode);
+        }
+    }
+
+    fn resolve(&self, path: &str) -> Option<FlowMode> {
+        self.exact
+            .get(path)
+            .copied()
+            .or_else(|| self.suffix_merged.get(path).copied())
+    }
+
+    fn subtree_mode(&self, path: &str) -> Option<FlowMode> {
+        self.subtree_merged.get(path).copied()
+    }
+}
+
+impl Deref for FlowModeIndex {
+    type Target = BTreeMap<String, FlowMode>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.exact
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -1807,12 +2443,69 @@ impl CheckedTypeInferenceChanges {
     }
 }
 
+struct PendingIdSet<T> {
+    members: HashSet<T>,
+}
+
+impl<T> Default for PendingIdSet<T> {
+    fn default() -> Self {
+        Self {
+            members: HashSet::new(),
+        }
+    }
+}
+
+impl<T> PendingIdSet<T>
+where
+    T: Eq + Hash + Ord,
+{
+    fn insert(&mut self, value: T) -> bool {
+        self.members.insert(value)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.members.is_empty()
+    }
+
+    fn drain_sorted(&mut self) -> Vec<T> {
+        let mut values = self.members.drain().collect::<Vec<_>>();
+        values.sort_unstable();
+        values
+    }
+}
+
+impl<T> Extend<T> for PendingIdSet<T>
+where
+    T: Eq + Hash,
+{
+    fn extend<I>(&mut self, iter: I)
+    where
+        I: IntoIterator<Item = T>,
+    {
+        self.members.extend(iter);
+    }
+}
+
+impl<T> FromIterator<T> for PendingIdSet<T>
+where
+    T: Eq + Hash,
+{
+    fn from_iter<I>(iter: I) -> Self
+    where
+        I: IntoIterator<Item = T>,
+    {
+        Self {
+            members: HashSet::from_iter(iter),
+        }
+    }
+}
+
 #[derive(Default)]
 struct CheckedTypeInferencePending {
-    expressions: BTreeSet<usize>,
-    declarations: BTreeSet<DeclId>,
-    callables: BTreeSet<DeclId>,
-    calls: BTreeSet<CheckedCallId>,
+    expressions: PendingIdSet<usize>,
+    declarations: PendingIdSet<DeclId>,
+    callables: PendingIdSet<DeclId>,
+    calls: PendingIdSet<CheckedCallId>,
     selector_parameters: bool,
     pattern_bindings: bool,
 }
@@ -1828,18 +2521,175 @@ impl CheckedTypeInferencePending {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CheckedTypeInferenceQuiescenceHook {
+    None,
+    PropagateContextualUserWrappers,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CheckedCallInferenceEntryPlan {
+    Input {
+        formal: DeclId,
+        value: CheckedExprId,
+        parameter_index: Option<usize>,
+    },
+    Output {
+        formal: DeclId,
+        output: DeclId,
+        forwarded: bool,
+        parameter_index: Option<usize>,
+    },
+}
+
+impl CheckedCallInferenceEntryPlan {
+    fn formal(self) -> DeclId {
+        match self {
+            Self::Input { formal, .. } | Self::Output { formal, .. } => formal,
+        }
+    }
+
+    fn parameter_index(self) -> Option<usize> {
+        match self {
+            Self::Input {
+                parameter_index, ..
+            }
+            | Self::Output {
+                parameter_index, ..
+            } => parameter_index,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum CheckedCallModeInferencePlan {
+    Input(CheckedExprId),
+    External(Box<[CheckedExprId]>),
+    Fixed,
+    User(CheckedExprId),
+}
+
+/// Immutable call topology consumed by the checked-type fixed point.
+///
+/// Calls, their entry order, and signature/formal identity remain stable until
+/// `sort_calls`, after inference. Dynamic flow types deliberately do not live
+/// here: each visit snapshots only those values from the mutable checked
+/// tables before recursive inference begins.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CheckedCallInferencePlan {
+    call_id: CheckedCallId,
+    call_index: usize,
+    signature_index: usize,
+    call_expression: CheckedExprId,
+    callable: DeclId,
+    owner_callable: Option<DeclId>,
+    entries: Box<[CheckedCallInferenceEntryPlan]>,
+    parent_inputs: Box<[usize]>,
+    output_scope_inputs: Box<[usize]>,
+    outputs: Box<[usize]>,
+    context_formal: Option<ContextFormalId>,
+    context_formal_index: Option<usize>,
+    explicit_context_input: Option<CheckedExprId>,
+    inherited_context_formal_index: Option<usize>,
+    dependency_catch_cycle: bool,
+    has_syntax_discriminant: bool,
+    is_user_callable: bool,
+    result_expression: Option<CheckedExprId>,
+    mode: CheckedCallModeInferencePlan,
+}
+
+struct CheckedCallInferenceSnapshot {
+    call_result: FlowType,
+    signature_result: FlowType,
+    parameter_flow_types: Box<[Option<FlowType>]>,
+    context_formal: Option<FlowType>,
+    inherited_context: Option<FlowType>,
+}
+
+/// Immutable resolution of one read-shaped parser expression.
+///
+/// `root_target` preserves checked type inference's root-declaration lookup,
+/// while `path_target`/`path_projection` preserve the full lexical path used
+/// by mode inference and checked lowering. Keeping both is intentional: a
+/// nested declaration path and a structural projection are observationally
+/// equivalent in many programs, but they are not the same inference edge.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CheckedReadInferencePlan {
+    source_parts: Box<[String]>,
+    canonical_path: Box<str>,
+    root_target: Option<DeclId>,
+    path_target: Option<DeclId>,
+    path_projection: Box<[String]>,
+}
+
+enum CheckedReadPathInferenceLookup<'a> {
+    Resolved {
+        target: DeclId,
+        projection: &'a [String],
+    },
+    Unresolved {
+        canonical_path: &'a str,
+    },
+    Missing,
+    Rejected,
+}
+
+enum CheckedReadRootInferenceLookup {
+    Resolved(DeclId),
+    Unresolved,
+    Missing,
+    Rejected,
+}
+
 struct CheckedTypeInferenceDependencies {
+    /// Dense immutable plans keyed by `CheckedCallId.0`.
+    call_inference_plans: DenseIndexTable<CheckedCallInferencePlan>,
+    /// Dense immutable read resolutions keyed by parser expression ID.
+    read_inference_plans: DenseIndexTable<CheckedReadInferencePlan>,
+    /// Exact Hold update expressions keyed by the Hold parser expression.
+    hold_updates_by_expression: DenseIndexTable<Box<[usize]>>,
     expression_parents: Vec<Vec<usize>>,
     declarations_by_value: Vec<Vec<DeclId>>,
     callables_by_result: Vec<Vec<DeclId>>,
     calls_by_input: Vec<Vec<CheckedCallId>>,
     parameters_by_actual: Vec<Vec<DeclId>>,
+    /// Exact reverse of `parameters_by_actual`: every checked input expression
+    /// supplied to one formal declaration. Flow inference reads this lane on
+    /// parameter cache misses, so it must not rediscover the same relation by
+    /// scanning every call in the program.
+    actuals_by_parameter: BTreeMap<DeclId, Vec<CheckedExprId>>,
     declaration_readers: BTreeMap<DeclId, Vec<usize>>,
     calls_by_output: BTreeMap<DeclId, Vec<CheckedCallId>>,
     calls_by_callee: BTreeMap<DeclId, Vec<CheckedCallId>>,
+    /// Every concrete OUT declaration supplied for an OUT formal, keyed by
+    /// `DeclId.0`. This is the recursive projected-OUT lane.
+    outputs_by_formal: Vec<Vec<DeclId>>,
+    /// Contextual list inputs whose row output is the indexed declaration.
+    /// Projected row modes read the list item projection directly.
+    contextual_list_inputs_by_output: Vec<Vec<CheckedExprId>>,
+    /// Immutable call-vector indexes for contextual wrapper transfer. Call
+    /// order remains stable until the post-inference `sort_calls` boundary.
+    wrapper_calls_by_owner: Vec<Vec<usize>>,
+    /// User signature indexes that directly call each callable declaration.
+    /// Each lane is sorted and deduplicated to preserve the former BTreeSet
+    /// worklist ordering when a callee changes.
+    wrapper_callers_by_callee: Vec<Vec<usize>>,
+    wrapper_user_signature_indices: BTreeSet<usize>,
     selector_actuals: BTreeSet<usize>,
     pattern_selectors: BTreeSet<usize>,
+    pattern_binding_sites: Vec<CheckedPatternBindingSite>,
     pattern_dependents_by_selector: Vec<Vec<usize>>,
+    /// Every expression whose cached flow may change immediately when the
+    /// indexed expression's authoritative inferred flow changes. This extends
+    /// syntax parents with read, call-output, contextual, and pattern lanes.
+    flow_cache_dependents: Vec<Vec<usize>>,
+    /// Expressions whose cached flow directly reads a declaration.
+    flow_cache_declaration_readers: BTreeMap<DeclId, Vec<usize>>,
+    /// Declaration-level reverse edges for forwarded OUT formals. They remain
+    /// separate from expression edges so long forwarding chains do not require
+    /// a precomputed quadratic transitive closure.
+    flow_cache_declaration_dependents: BTreeMap<DeclId, Vec<DeclId>>,
+    signature_expression_readers: BTreeMap<DeclId, Vec<usize>>,
 }
 
 #[derive(Default)]
@@ -1849,8 +2699,44 @@ struct CheckedTypeInferenceWorkStats {
     declaration_visits: usize,
     callable_visits: usize,
     call_visits: usize,
+    call_changed_visits: usize,
+    call_noop_visits: usize,
+    call_seed_enqueues: usize,
+    call_input_enqueues: usize,
+    call_output_enqueues: usize,
+    call_callee_enqueues: usize,
+    call_selector_enqueues: usize,
+    call_output_scope_enqueues: usize,
+    call_output_origin_skips: usize,
     selector_visits: usize,
     pattern_visits: usize,
+    expression_ms: f64,
+    declaration_ms: f64,
+    callable_ms: f64,
+    call_ms: f64,
+    selector_ms: f64,
+    pattern_ms: f64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CheckedCallEnqueueCause {
+    Input,
+    Output,
+    Callee,
+    Selector,
+    OutputScope,
+}
+
+#[derive(Default)]
+struct CheckedCallInstantiationChanges {
+    any: bool,
+    expression: Option<usize>,
+    outputs: Vec<DeclId>,
+    /// The first OUT pass changed a declaration read by an output-scoped
+    /// actual. That actual may still have a pre-invalidation cached value, so
+    /// this call alone needs one post-flush revisit. Result/substitution
+    /// metadata changes do not require another solver visit.
+    needs_output_scope_revisit: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1895,6 +2781,13 @@ struct AuthoritativeCallContext {
 struct InferredStructuralValue {
     flow_type: FlowType,
     structural_record: bool,
+}
+
+struct StructuralStatementPlan {
+    statement: usize,
+    is_function: bool,
+    value: Option<CheckedExprId>,
+    children: Box<[usize]>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2025,16 +2918,16 @@ fn checked_contextual_operation_formals(
 impl<'a> CheckedProgramBuilder<'a> {
     fn build(
         program: &'a ParsedProgram,
-        inputs: CheckedProgramBuildInputs<'_>,
-    ) -> (CheckedProgram, Vec<TypeDiagnostic>, bool) {
-        let CheckedProgramBuildInputs {
+        inputs: OwnedCheckedConstruction,
+    ) -> CheckedProgramBuildOutput {
+        let OwnedCheckedConstruction {
             external_types,
-            expr_type_table,
-            function_type_table,
-            named_value_type_table,
-            render_slot_table,
+            render_slot_statements,
             source_payload_shape_table,
             flow_bindings,
+            expression_owner,
+            named_value_expressions,
+            function_param_requirements,
             builtins,
             render_contracts,
         } = inputs;
@@ -2056,9 +2949,12 @@ impl<'a> CheckedProgramBuilder<'a> {
                 result
             }};
         }
-        let expression_owner =
-            checked_program_phase!("expression_owner", expression_owner_functions(program));
+        let transferred_source_shape_count = source_payload_shape_table.len();
         let mut builder = checked_program_phase!("initialize_builder", {
+            let exact_statement_by_root_expression = exact_statement_by_root_expression(
+                &program.ast.statements,
+                program.expressions.len(),
+            );
             let expressions_by_owner = expression_owner.iter().fold(
                 BTreeMap::<String, Vec<usize>>::new(),
                 |mut owners, (expression, owner)| {
@@ -2075,18 +2971,15 @@ impl<'a> CheckedProgramBuilder<'a> {
                     .map(|(path, value)| (path.clone(), value.mode))
                     .collect(),
                 external_identities: external_types.external_identities.clone(),
-                local_function_requirements: external_types.local_function_requirements.clone(),
-                flow_bindings: flow_bindings.clone(),
-                named_value_modes: named_value_type_table
-                    .entries
-                    .iter()
-                    .map(|entry| (entry.path.clone(), entry.flow_type.mode))
-                    .collect(),
-                named_value_expressions: declaration_expression_index(program),
+                function_param_requirements,
+                flow_bindings,
+                named_value_modes: FlowModeIndex::default(),
+                named_value_expressions,
                 signatures: Vec::new(),
                 context_formals: Vec::new(),
                 signature_by_name: BTreeMap::new(),
                 signature_by_decl: BTreeMap::new(),
+                parameter_location_by_decl: DenseIndexTable::with_len(0),
                 expression_owner,
                 expressions_by_owner,
                 next_decl_id: 1,
@@ -2109,10 +3002,12 @@ impl<'a> CheckedProgramBuilder<'a> {
                 statement_declarations: BTreeMap::new(),
                 statement_scopes: BTreeMap::new(),
                 statement_body_scopes: BTreeMap::new(),
+                exact_statement_by_root_expression,
                 expression_scopes: BTreeMap::new(),
                 expression_declarations: BTreeMap::new(),
                 expression_call_contexts: BTreeMap::new(),
                 scope_declarations: BTreeMap::new(),
+                scope_declarations_by_scope: Vec::new(),
                 pattern_declarations: BTreeMap::new(),
                 pattern_selectors: BTreeMap::new(),
                 pattern_parents: BTreeMap::new(),
@@ -2120,13 +3015,22 @@ impl<'a> CheckedProgramBuilder<'a> {
                 nearest_pattern_arm_by_scope: Vec::new(),
                 syntax_discriminant_parameters: BTreeSet::new(),
                 inferred_expr_types: DenseIndexTable::with_len(program.expressions.len()),
-                syntax_expr_types: BTreeMap::new(),
                 expression_flush_types: BTreeMap::new(),
-                authoritative_expr_types: BTreeSet::new(),
-                checked_flow_inference_epoch: 0,
-                checked_flow_inference_cache: DenseIndexTable::with_len(program.expressions.len()),
-                validate_checked_projections: false,
-                source_payload_shape_table: source_payload_shape_table.to_vec(),
+                checked_flow_inference_cache: CheckedFlowInferenceCache::with_len(
+                    program.expressions.len(),
+                ),
+                checked_flow_inference_cache_enabled: false,
+                checked_flow_recursion: DenseRecursionGuard::with_len(program.expressions.len()),
+                checked_flow_declaration_invalidation_seen: DenseGenerationSet::with_len(0),
+                checked_flow_pending_expression_invalidations: PendingIdSet::default(),
+                checked_flow_pending_declaration_invalidations: PendingIdSet::default(),
+                checked_flow_pending_signature_invalidations: PendingIdSet::default(),
+                checked_flow_pending_expression_publications: PendingIdSet::default(),
+                checked_type_inference_dependencies: None,
+                wrapper_call_scheme_vars: BTreeMap::new(),
+                next_checked_scheme_type_var: None,
+                projection_sites: Vec::new(),
+                source_payload_shape_table,
                 exact_number_literals: BTreeMap::new(),
                 diagnostics: Vec::new(),
             }
@@ -2145,13 +3049,13 @@ impl<'a> CheckedProgramBuilder<'a> {
             builder.collect_user_signatures(&program.ast.statements)
         );
         checked_program_phase!("register_signatures", {
-            builder.register_builtin_signatures(builtins);
-            builder.register_stream_signatures(builtins);
-            builder.register_field_projection_signatures(expr_type_table);
+            builder.register_builtin_signatures(&builtins);
+            builder.register_stream_signatures(&builtins);
+            builder.register_field_projection_signatures();
             builder.register_session_info_intrinsics();
-            builder.register_render_signatures(render_contracts);
+            builder.register_render_signatures(&render_contracts);
             builder.register_host_effect_signatures();
-            builder.register_external_signatures(external_types);
+            builder.register_external_signatures(&external_types);
         });
         checked_program_phase!("predeclare", {
             builder.predeclare_statement_tree(&program.ast.statements, LexicalScopeId(0));
@@ -2180,24 +3084,29 @@ impl<'a> CheckedProgramBuilder<'a> {
             builder.infer_contextual_scope_effects()
         );
         checked_program_phase!(
+            "index_checked_projections",
+            builder.rebuild_projection_sites()
+        );
+        checked_program_phase!(
             "validate_output_producers",
             builder.validate_output_producers()
         );
         checked_program_phase!("apply_inferred_types", {
-            builder.apply_inferred_types(
-                expr_type_table,
-                function_type_table,
-                named_value_type_table,
-                external_types,
-            )
+            builder.apply_inferred_types(&external_types)
         });
-        let changed_contextual_schemes = checked_program_phase!(
+        if trace_checked_program {
+            eprintln!(
+                "boon_typecheck checked_program.construction_inputs source_shapes={}",
+                transferred_source_shape_count,
+            );
+        }
+        checked_program_phase!(
             "infer_contextual_callable_schemes",
-            builder.infer_contextual_callable_schemes()
+            builder.prepare_contextual_callable_schemes()
         );
         checked_program_phase!(
             "infer_checked_types",
-            builder.infer_checked_types_after_scheme_changes(&changed_contextual_schemes)
+            builder.infer_checked_types_with_contextual_wrapper_propagation()
         );
         checked_program_phase!(
             "install_flush_control_contract",
@@ -2222,7 +3131,7 @@ impl<'a> CheckedProgramBuilder<'a> {
         });
         let (mut statements, mut expressions) = checked_program_phase!(
             "lower_checked_tree",
-            builder.lower_checked_tree(render_slot_table)
+            builder.lower_checked_tree(&render_slot_statements)
         );
         checked_program_phase!(
             "reconcile_call_occurrence_results",
@@ -2273,7 +3182,7 @@ impl<'a> CheckedProgramBuilder<'a> {
             CheckedProgram::from_typechecker_fields(CheckedProgramFields {
                 source_bundle_digest_v1: builder.program.source_bundle_digest_v1,
                 role: builder.role,
-                external_types: ExternalTypeEnvironment::default(),
+                external_types,
                 lowering_metadata: CheckedProgramLoweringMetadata::default(),
                 root_scope: LexicalScopeId(0),
                 scopes: builder.scopes,
@@ -2297,7 +3206,17 @@ impl<'a> CheckedProgramBuilder<'a> {
             checked_program_phase!("derive_order_chains", derive_checked_order_chains(&checked));
         checked.fields.order_chains = order_chains;
         builder.diagnostics.extend(order_diagnostics);
-        (checked, builder.diagnostics, exact_pipeline_inputs_valid)
+        CheckedProgramBuildOutput {
+            program: checked,
+            diagnostics: builder.diagnostics,
+            exact_pipeline_inputs_valid,
+            diagnostic_replay_inputs: Some(CheckedDiagnosticReplayInputs {
+                source_payload_shape_table: builder.source_payload_shape_table,
+                named_value_expressions: builder.named_value_expressions,
+                builtins,
+                render_contracts,
+            }),
+        }
     }
 
     fn reconcile_call_occurrence_results(&mut self, expressions: &[CheckedExpression]) {
@@ -2453,7 +3372,15 @@ impl<'a> CheckedProgramBuilder<'a> {
     }
 
     fn exact_pipeline_input(&self, expr: &AstExpr, raw_input: usize) -> Option<usize> {
-        match expr.linked_input {
+        self.exact_pipeline_input_parts(expr.linked_input, raw_input)
+    }
+
+    fn exact_pipeline_input_parts(
+        &self,
+        linked_input: Option<usize>,
+        raw_input: usize,
+    ) -> Option<usize> {
+        match linked_input {
             Some(linked_input) => self
                 .program
                 .expressions
@@ -2478,7 +3405,7 @@ impl<'a> CheckedProgramBuilder<'a> {
             if !visited.insert(scope_id) {
                 return None;
             }
-            let scope = self.scopes.iter().find(|scope| scope.id == scope_id)?;
+            let scope = self.scope(scope_id)?;
             if scope.owner.is_some() {
                 return scope.owner;
             }
@@ -2525,12 +3452,37 @@ impl<'a> CheckedProgramBuilder<'a> {
             .enumerate()
             .map(|(index, signature)| (signature.decl_id, index))
             .collect();
+        self.parameter_location_by_decl = DenseIndexTable::with_len(self.next_decl_id as usize);
+        for (signature_index, signature) in self.signatures.iter().enumerate() {
+            for (parameter_index, parameter) in signature.parameters.iter().enumerate() {
+                let previous = self.parameter_location_by_decl.insert(
+                    parameter.decl_id.0 as usize,
+                    CheckedParameterLocation {
+                        signature: signature_index,
+                        parameter: parameter_index,
+                    },
+                );
+                debug_assert!(previous.is_none());
+            }
+        }
         self.declaration_by_id = self
             .declarations
             .iter()
             .enumerate()
             .map(|(index, declaration)| (declaration.id, index))
             .collect();
+        self.scope_declarations_by_scope = vec![BTreeMap::new(); self.scopes.len()];
+        for ((scope, name), declaration) in &self.scope_declarations {
+            let valid_scope = self
+                .scopes
+                .get(scope.0 as usize)
+                .is_some_and(|entry| entry.id == *scope);
+            if valid_scope
+                && let Some(names) = self.scope_declarations_by_scope.get_mut(scope.0 as usize)
+            {
+                names.insert(name.clone(), *declaration);
+            }
+        }
         self.rebuild_call_indexes();
         self.rebuild_pattern_arm_scope_index();
         self.rebuild_syntax_discriminant_parameter_index();
@@ -2648,6 +3600,20 @@ impl<'a> CheckedProgramBuilder<'a> {
         self.declaration_by_id
             .get(&id)
             .and_then(|index| self.declarations.get(*index))
+            .filter(|declaration| declaration.id == id)
+    }
+
+    fn declaration_mut(&mut self, id: DeclId) -> Option<&mut CheckedDeclaration> {
+        let index = self.declaration_by_id.get(&id).copied()?;
+        self.declarations
+            .get_mut(index)
+            .filter(|declaration| declaration.id == id)
+    }
+
+    fn scope(&self, id: LexicalScopeId) -> Option<&CheckedScope> {
+        self.scopes
+            .get(id.0 as usize)
+            .filter(|scope| scope.id == id)
     }
 
     fn signature_by_declaration(&self, id: DeclId) -> Option<&CheckedCallableSignature> {
@@ -2850,56 +3816,19 @@ impl<'a> CheckedProgramBuilder<'a> {
         }
     }
 
-    fn register_field_projection_signatures(&mut self, expr_type_table: &ExprTypeTable) {
-        let flow_types = expr_type_table
-            .entries
-            .iter()
-            .map(|entry| (entry.expr_id, entry.flow_type.clone()))
-            .collect::<BTreeMap<_, _>>();
+    fn register_field_projection_signatures(&mut self) {
         let projections = self
             .program
             .expressions
             .iter()
             .filter_map(|expr| {
-                let AstExprKind::Pipe {
-                    input, op, args, ..
-                } = &expr.kind
-                else {
+                let AstExprKind::Pipe { op, args, .. } = &expr.kind else {
                     return None;
                 };
-                (op.starts_with("Field/") && args.is_empty()).then(|| {
-                    (
-                        op.clone(),
-                        flow_types
-                            .get(input)
-                            .cloned()
-                            .unwrap_or_else(unknown_flow_type),
-                        flow_types
-                            .get(&expr.id)
-                            .cloned()
-                            .unwrap_or_else(unknown_flow_type),
-                    )
-                })
+                (op.starts_with("Field/") && args.is_empty()).then(|| op.clone())
             })
-            .fold(
-                BTreeMap::<String, (FlowType, FlowType)>::new(),
-                |mut projections, (function, input, result)| {
-                    projections
-                        .entry(function)
-                        .and_modify(|(existing_input, existing_result)| {
-                            existing_input.mode = merge_flow_modes(existing_input.mode, input.mode);
-                            existing_input.ty =
-                                merge_canonical_row_type(&existing_input.ty, &input.ty);
-                            existing_result.mode =
-                                merge_flow_modes(existing_result.mode, result.mode);
-                            existing_result.ty =
-                                merge_canonical_row_type(&existing_result.ty, &result.ty);
-                        })
-                        .or_insert((input, result));
-                    projections
-                },
-            );
-        for (function, (input, result)) in projections {
+            .collect::<BTreeSet<_>>();
+        for function in projections {
             self.register_authoritative_signature(
                 &function,
                 CheckedCallableKind::Builtin,
@@ -2907,11 +3836,11 @@ impl<'a> CheckedProgramBuilder<'a> {
                     parameters: vec![AuthoritativeParameter {
                         name: "input".to_owned(),
                         kind: CheckedParameterKind::Value,
-                        flow_type: input,
+                        flow_type: unknown_flow_type(),
                         requirement: CheckedParameterRequirement::Required,
                     }],
                     call_contexts: Vec::new(),
-                    result,
+                    result: unknown_flow_type(),
                     effect: CheckedEffectSummary::default(),
                     contextual_builtin: None,
                 },
@@ -3699,114 +4628,7 @@ impl<'a> CheckedProgramBuilder<'a> {
         }
     }
 
-    fn apply_inferred_types(
-        &mut self,
-        expr_type_table: &ExprTypeTable,
-        function_type_table: &FunctionTypeTable,
-        named_value_type_table: &NamedValueTypeTable,
-        external_types: &ExternalTypeEnvironment,
-    ) {
-        let mut scheme_derived_expressions = self
-            .expression_owner
-            .keys()
-            .copied()
-            .chain(self.calls.iter().map(|call| call.expression.0 as usize))
-            .chain(
-                self.program
-                    .expressions
-                    .iter()
-                    .filter(|expression| matches!(expression.kind, AstExprKind::Source))
-                    .map(|expression| expression.id),
-            )
-            .collect::<BTreeSet<_>>();
-        let mut scheme_derived_declarations = self
-            .declarations
-            .iter()
-            .filter(|declaration| {
-                matches!(
-                    declaration.kind,
-                    CheckedDeclarationKind::ValueParameter
-                        | CheckedDeclarationKind::OutParameter
-                        | CheckedDeclarationKind::FreshOut
-                        | CheckedDeclarationKind::PatternBinding
-                )
-            })
-            .map(|declaration| declaration.id)
-            .collect::<BTreeSet<_>>();
-        scheme_derived_declarations.extend(self.calls.iter().flat_map(|call| {
-            call.entries.iter().filter_map(|entry| match entry {
-                CheckedCallEntry::FreshOut { output, .. } => Some(*output),
-                CheckedCallEntry::ForwardOut { target, .. } => Some(*target),
-                CheckedCallEntry::Input { .. } => None,
-            })
-        }));
-        loop {
-            let mut changed = false;
-            let derived_declarations = self
-                .declarations
-                .iter()
-                .filter_map(|declaration| {
-                    declaration.value.and_then(|value| {
-                        scheme_derived_expressions
-                            .contains(&(value.0 as usize))
-                            .then_some(declaration.id)
-                    })
-                })
-                .collect::<Vec<_>>();
-            for declaration in derived_declarations {
-                changed |= scheme_derived_declarations.insert(declaration);
-            }
-
-            let derived_expressions = self
-                .program
-                .expressions
-                .iter()
-                .filter(|expression| !scheme_derived_expressions.contains(&expression.id))
-                .filter(|expression| {
-                    let has_derived_child = direct_expression_children(expression)
-                        .iter()
-                        .any(|child| scheme_derived_expressions.contains(child));
-                    let reads_derived_declaration = checked_read_path_parts(expression)
-                        .and_then(|parts| {
-                            let scope_id = self
-                                .expression_scopes
-                                .get(&expression.id)
-                                .copied()
-                                .unwrap_or(LexicalScopeId(0));
-                            self.resolve_checked_read_path(expression.id, scope_id, &parts)
-                        })
-                        .is_some_and(|(target, _)| scheme_derived_declarations.contains(&target));
-                    has_derived_child || reads_derived_declaration
-                })
-                .map(|expression| expression.id)
-                .collect::<Vec<_>>();
-            for expression in derived_expressions {
-                changed |= scheme_derived_expressions.insert(expression);
-            }
-            if !changed {
-                break;
-            }
-        }
-        self.authoritative_expr_types = expr_type_table
-            .entries
-            .iter()
-            .filter(|entry| {
-                type_is_recursively_closed(&entry.flow_type.ty)
-                    && !scheme_derived_expressions.contains(&entry.expr_id)
-            })
-            .map(|entry| entry.expr_id)
-            .collect();
-        self.syntax_expr_types = expr_type_table
-            .entries
-            .iter()
-            .map(|entry| (entry.expr_id, entry.flow_type.clone()))
-            .collect();
-        self.inferred_expr_types = self
-            .syntax_expr_types
-            .iter()
-            .map(|(expression, flow_type)| (*expression, flow_type.clone()))
-            .collect();
-
+    fn apply_inferred_types(&mut self, external_types: &ExternalTypeEnvironment) {
         for (expression, flow_type) in checked_source_expression_flow_types(
             &self.program.ast.statements,
             &self.program.expressions,
@@ -3832,22 +4654,6 @@ impl<'a> CheckedProgramBuilder<'a> {
                 for (parameter, argument) in signature.parameters.iter_mut().zip(&external.args) {
                     parameter.flow_type = argument.flow_type.clone();
                 }
-            } else if let Some(function) = function_type_table
-                .entries
-                .iter()
-                .find(|function| function.name == signature.name)
-            {
-                signature.result = function.result.clone();
-                for parameter in &mut signature.parameters {
-                    if let Some(inferred) = function
-                        .parameters
-                        .iter()
-                        .find(|candidate| candidate.name == parameter.name)
-                    {
-                        parameter.flow_type = inferred.flow_type.clone();
-                    }
-                }
-                signature.effect = function.effect;
             }
         }
 
@@ -3932,11 +4738,6 @@ impl<'a> CheckedProgramBuilder<'a> {
                 )
             })
             .collect::<BTreeMap<_, _>>();
-        let named_types = named_value_type_table
-            .entries
-            .iter()
-            .map(|entry| (entry.path.as_str(), &entry.flow_type))
-            .collect::<BTreeMap<_, _>>();
         for declaration in &mut self.declarations {
             if let Some(flow_type) = parameter_types
                 .get(&declaration.id)
@@ -3947,8 +4748,6 @@ impl<'a> CheckedProgramBuilder<'a> {
                 && let Some(flow_type) = self.inferred_expr_types.get(&(value.0 as usize))
             {
                 declaration.flow_type = flow_type.clone();
-            } else if let Some(flow_type) = named_types.get(declaration.name.as_str()) {
-                declaration.flow_type = (*flow_type).clone();
             }
         }
         let call_results = self
@@ -3972,48 +4771,11 @@ impl<'a> CheckedProgramBuilder<'a> {
         }
     }
 
-    fn infer_contextual_callable_schemes(&mut self) -> BTreeSet<DeclId> {
-        let trace = std::env::var_os("BOON_TYPECHECK_TRACE").is_some();
-        let projected_started = Instant::now();
-        self.infer_user_parameter_schemes();
-        if trace {
-            eprintln!(
-                "boon_typecheck checked_program.infer_contextual_callable_schemes.parameters: {:.3}ms",
-                typecheck_elapsed_ms(projected_started)
-            );
-        }
-        let pass_started = Instant::now();
-        self.infer_context_schemes();
-        if trace {
-            eprintln!(
-                "boon_typecheck checked_program.infer_contextual_callable_schemes.context: {:.3}ms",
-                typecheck_elapsed_ms(pass_started)
-            );
-        }
-        let structural_started = Instant::now();
-        self.infer_structural_user_result_schemes();
-        if trace {
-            eprintln!(
-                "boon_typecheck checked_program.infer_contextual_callable_schemes.structural: {:.3}ms",
-                typecheck_elapsed_ms(structural_started)
-            );
+    fn initialize_checked_scheme_type_var_allocator(&mut self) {
+        if self.next_checked_scheme_type_var.is_some() {
+            return;
         }
 
-        // Stabilize call-local result types before propagating requirements
-        // through user wrappers. Contextual operations such as List/find can
-        // reveal a broader tagged payload only after their call is
-        // instantiated; propagating from the pre-instantiation fallback would
-        // freeze every upstream wrapper to that one fallback variant.
-        let call_instantiation_started = Instant::now();
-        self.infer_checked_types();
-        if trace {
-            eprintln!(
-                "boon_typecheck checked_program.infer_contextual_callable_schemes.calls: {:.3}ms",
-                typecheck_elapsed_ms(call_instantiation_started)
-            );
-        }
-
-        let propagation_started = Instant::now();
         let mut existing_vars = BTreeSet::new();
         for signature in &self.signatures {
             for parameter in &signature.parameters {
@@ -4034,57 +4796,85 @@ impl<'a> CheckedProgramBuilder<'a> {
         for flow_type in self.inferred_expr_types.values() {
             collect_type_vars(&flow_type.ty, &mut existing_vars);
         }
-        let mut next_var = existing_vars
-            .iter()
-            .map(|variable| variable.0)
-            .max()
-            .unwrap_or(CONTEXTUAL_RESULT_VAR.0)
-            .saturating_add(1);
-        let mut call_scheme_vars = BTreeMap::<(CheckedCallId, TypeVar), TypeVar>::new();
-        let calls = self.calls.clone();
-        let mut calls_by_owner = BTreeMap::<DeclId, Vec<usize>>::new();
-        for (call_index, call) in calls.iter().enumerate() {
-            if let Some(owner) = call.owner_callable {
-                calls_by_owner.entry(owner).or_default().push(call_index);
-            }
+        existing_vars.extend(self.wrapper_call_scheme_vars.values().copied());
+        self.next_checked_scheme_type_var = Some(
+            existing_vars
+                .iter()
+                .map(|variable| variable.0)
+                .max()
+                .unwrap_or(CONTEXTUAL_RESULT_VAR.0)
+                .saturating_add(1),
+        );
+    }
+
+    fn prepare_contextual_callable_schemes(&mut self) {
+        let trace = std::env::var_os("BOON_TYPECHECK_TRACE").is_some();
+        self.initialize_checked_scheme_type_var_allocator();
+        let projected_started = Instant::now();
+        self.infer_user_parameter_schemes();
+        if trace {
+            eprintln!(
+                "boon_typecheck checked_program.infer_contextual_callable_schemes.parameters: {:.3}ms",
+                typecheck_elapsed_ms(projected_started)
+            );
         }
-        let signature_index_by_decl = self
-            .signatures
-            .iter()
-            .enumerate()
-            .map(|(index, signature)| (signature.decl_id, index))
-            .collect::<BTreeMap<_, _>>();
-        let user_owner_indices = self
-            .signatures
-            .iter()
-            .enumerate()
-            .filter_map(|(index, signature)| {
-                (signature.kind == CheckedCallableKind::User).then_some(index)
-            })
-            .collect::<BTreeSet<_>>();
-        let mut callers_by_callee = BTreeMap::<DeclId, BTreeSet<usize>>::new();
-        for call in &calls {
-            let Some(owner) = call
-                .owner_callable
-                .and_then(|owner| signature_index_by_decl.get(&owner))
-                .copied()
-                .filter(|owner| user_owner_indices.contains(owner))
-            else {
-                continue;
-            };
-            callers_by_callee
-                .entry(call.callable)
-                .or_default()
-                .insert(owner);
+        let pass_started = Instant::now();
+        self.infer_context_schemes();
+        if trace {
+            eprintln!(
+                "boon_typecheck checked_program.infer_contextual_callable_schemes.context: {:.3}ms",
+                typecheck_elapsed_ms(pass_started)
+            );
         }
+        let structural_started = Instant::now();
+        // Structural result discovery performs many overlapping post-order
+        // expression reads. Give that scheme-construction phase a memoized
+        // scratch view rather than recomputing every subtree once per
+        // containing statement.
+        self.enable_checked_flow_inference_cache();
+        self.infer_structural_user_result_schemes();
+        if trace {
+            eprintln!(
+                "boon_typecheck checked_program.infer_contextual_callable_schemes.structural: {:.3}ms",
+                typecheck_elapsed_ms(structural_started)
+            );
+        }
+        // Wrapper contracts are a transfer over the already-built call graph
+        // and callable schemes. Seed them before the expression solver so its
+        // first fixed point observes those contracts. The existing
+        // post-quiescence hook remains as an exact audit/fallback: with stable
+        // per-call alpha renaming it reports no changes unless expression
+        // solving genuinely refined an input scheme.
+        self.propagate_contextual_user_wrapper_schemes();
+        // The scratch cache above was populated while callable schemes were
+        // intentionally changing. Start the production solver cache only now,
+        // against the stable scheme snapshot; carrying scratch answers across
+        // this ownership boundary made their dense values appear quiescent
+        // even when a final declaration projection had refined.
+        self.enable_checked_flow_inference_cache();
+    }
+
+    fn propagate_contextual_user_wrapper_schemes(&mut self) -> BTreeSet<DeclId> {
+        let trace = std::env::var_os("BOON_TYPECHECK_TRACE").is_some();
+        let propagation_started = Instant::now();
+        let mut next_var = self
+            .next_checked_scheme_type_var
+            .expect("checked scheme type-variable allocator initialized");
+        let mut call_scheme_vars = std::mem::take(&mut self.wrapper_call_scheme_vars);
+        let dependencies = Arc::clone(
+            self.checked_type_inference_dependencies
+                .as_ref()
+                .expect("checked inference dependencies initialized"),
+        );
 
         // Propagation is monotone along the callee-to-caller graph. A global
         // round used to recompute every user callable even when only one
         // downstream signature changed, making deep wrapper chains quadratic.
         // Seed every owner once, then revisit only callers whose callee
         // contract actually changed.
-        let mut pending = user_owner_indices.clone();
-        let maximum_visits = user_owner_indices
+        let mut pending = dependencies.wrapper_user_signature_indices.clone();
+        let maximum_visits = dependencies
+            .wrapper_user_signature_indices
             .len()
             .saturating_mul(self.signatures.len().saturating_add(1));
         let mut visit_count = 0usize;
@@ -4107,9 +4897,17 @@ impl<'a> CheckedProgramBuilder<'a> {
             let mut parameter_updates = BTreeMap::<DeclId, FlowType>::new();
             let mut direct_result = None;
 
-            for call_index in calls_by_owner.get(&owner.decl_id).into_iter().flatten() {
-                let call = &calls[*call_index];
-                let Some(callee) = signature_index_by_decl
+            for call_index in dependencies
+                .wrapper_calls_by_owner
+                .get(owner.decl_id.0 as usize)
+                .into_iter()
+                .flatten()
+            {
+                let Some(call) = self.calls.get(*call_index) else {
+                    continue;
+                };
+                let Some(callee) = self
+                    .signature_by_decl
                     .get(&call.callable)
                     .and_then(|index| self.signatures.get(*index))
                 else {
@@ -4236,36 +5034,46 @@ impl<'a> CheckedProgramBuilder<'a> {
                 }
             }
 
-            let mut owner_changed = false;
+            let mut changed_parameters = Vec::new();
             for parameter in &mut self.signatures[owner_index].parameters {
                 if let Some(flow_type) = parameter_updates.get(&parameter.decl_id)
                     && parameter.flow_type != *flow_type
                 {
                     parameter.flow_type = flow_type.clone();
-                    owner_changed = true;
+                    changed_parameters.push(parameter.decl_id);
                     parameter_change_count += 1;
                     changed_declarations.insert(parameter.decl_id);
                 }
             }
+            let mut result_changed = false;
             if let Some(result) = direct_result
-                && self.signatures[owner_index].result != result
+                && self.set_checked_signature_result(owner_index, result)
             {
-                self.signatures[owner_index].result = result;
-                owner_changed = true;
+                result_changed = true;
                 result_change_count += 1;
             }
-            if !owner_changed {
+            if changed_parameters.is_empty() && !result_changed {
                 continue;
+            }
+            if changed_parameters.is_empty() {
+                let callable_type = self.checked_callable_declaration_flow_type(owner_index);
+                self.set_declaration_flow_type(owner.decl_id, callable_type);
+            } else {
+                let published = self
+                    .publish_checked_signature_parameter_changes(owner_index, &changed_parameters);
+                debug_assert_eq!(published, Some(owner.decl_id));
             }
             changed_owner_count += 1;
             changed_declarations.insert(owner.decl_id);
-            if let Some(callers) = callers_by_callee.get(&owner.decl_id) {
+            if let Some(callers) = dependencies
+                .wrapper_callers_by_callee
+                .get(owner.decl_id.0 as usize)
+            {
                 pending.extend(callers.iter().copied());
             }
         }
-        if changed_owner_count > 0 {
-            self.sync_signature_declaration_types();
-        }
+        self.wrapper_call_scheme_vars = call_scheme_vars;
+        self.next_checked_scheme_type_var = Some(next_var);
         if trace {
             eprintln!(
                 "boon_typecheck checked_program.infer_contextual_callable_schemes.propagation_worklist \
@@ -4283,42 +5091,42 @@ impl<'a> CheckedProgramBuilder<'a> {
     }
 
     fn infer_user_parameter_schemes(&mut self) {
-        let mut requirements = function_param_requirements(self.program);
-        merge_external_function_param_requirements(
-            &mut requirements,
-            &self.local_function_requirements,
-        );
         let pattern_domains = self.pattern_selector_parameter_domains();
-        let mut actual_variant_domains = BTreeMap::<DeclId, Type>::new();
+        let mut actual_variant_candidates = BTreeMap::<DeclId, Vec<Type>>::new();
         let pattern_selector_parameters = self.syntax_discriminant_parameters.clone();
-        let pattern_actuals = self
-            .calls
-            .iter()
-            .flat_map(|call| &call.entries)
-            .filter_map(|entry| match entry {
-                CheckedCallEntry::Input { formal, value, .. }
-                    if pattern_selector_parameters.contains(formal) =>
-                {
-                    Some((*formal, *value))
-                }
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        self.begin_checked_flow_inference_epoch();
+        // Selector actuals have heavily overlapping expression subtrees. Build
+        // one scratch cache for this phase and read the already-indexed reverse
+        // parameter relation rather than scanning every call entry again.
+        self.enable_checked_flow_inference_cache();
+        let dependencies = Arc::clone(
+            self.checked_type_inference_dependencies
+                .as_ref()
+                .expect("checked inference dependencies initialized"),
+        );
+        let mut pattern_actuals = Vec::new();
+        for formal in &pattern_selector_parameters {
+            if let Some(actuals) = dependencies.actuals_by_parameter.get(formal) {
+                pattern_actuals.extend(actuals.iter().copied().map(|value| (*formal, value)));
+            }
+        }
         for (formal, value) in pattern_actuals {
-            let actual = self
-                .infer_checked_expr_flow(value.0 as usize, &mut BTreeSet::new())
-                .ty;
+            let actual = self.infer_checked_expr_flow_root(value.0 as usize).ty;
             if !type_is_variant_domain(&actual) {
                 continue;
             }
-            actual_variant_domains
+            actual_variant_candidates
                 .entry(formal)
-                .and_modify(|existing| {
-                    *existing = canonical_union_type(vec![existing.clone(), actual.clone()]);
-                })
-                .or_insert(actual);
+                .or_default()
+                .push(actual);
         }
+        // Canonicalization sorts and structurally merges the complete domain.
+        // Re-canonicalizing a growing union after every call site repeatedly
+        // formatted and copied all prior members, turning high-fanout selector
+        // parameters into quadratic setup work.
+        let mut actual_variant_domains = actual_variant_candidates
+            .into_iter()
+            .map(|(formal, candidates)| (formal, canonical_union_type(candidates)))
+            .collect::<BTreeMap<_, _>>();
         for (formal, pattern_domain) in pattern_domains {
             actual_variant_domains
                 .entry(formal)
@@ -4336,19 +5144,9 @@ impl<'a> CheckedProgramBuilder<'a> {
             .map(|(index, signature)| (index, signature.name.clone()))
             .collect::<Vec<_>>();
 
-        let mut existing_vars = BTreeSet::new();
-        for signature in &self.signatures {
-            for parameter in &signature.parameters {
-                collect_type_vars(&parameter.flow_type.ty, &mut existing_vars);
-            }
-            collect_type_vars(&signature.result.ty, &mut existing_vars);
-        }
-        let mut next_var = existing_vars
-            .iter()
-            .map(|var| var.0)
-            .max()
-            .unwrap_or(CONTEXTUAL_RESULT_VAR.0)
-            .saturating_add(1);
+        let mut next_var = self
+            .next_checked_scheme_type_var
+            .expect("checked scheme type-variable allocator initialized");
         for (signature_index, name) in user_signatures {
             for parameter in &mut self.signatures[signature_index].parameters {
                 let inferred_variant_domain = actual_variant_domains
@@ -4361,7 +5159,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                             .filter(type_is_variant_domain)
                     });
                 let seed = inferred_variant_domain.unwrap_or_else(|| {
-                    requirements
+                    self.function_param_requirements
                         .get(&name)
                         .and_then(|parameters| parameters.get(&parameter.name))
                         .cloned()
@@ -4370,9 +5168,14 @@ impl<'a> CheckedProgramBuilder<'a> {
                 parameter.flow_type =
                     continuous_flow_type(freshen_checked_scheme_type(&seed, &mut next_var));
             }
-            self.signatures[signature_index].result = unknown_flow_type();
+            self.set_checked_signature_result(signature_index, unknown_flow_type());
         }
+        self.next_checked_scheme_type_var = Some(next_var);
         self.sync_signature_declaration_types();
+        // Parameter/signature/declaration schemes changed after the scratch
+        // reads above. Reset at that exact ownership boundary so context
+        // inference cannot observe a cached answer from the old schemes.
+        self.enable_checked_flow_inference_cache();
     }
 
     fn infer_context_schemes(&mut self) {
@@ -4405,19 +5208,9 @@ impl<'a> CheckedProgramBuilder<'a> {
             }
         }
 
-        let mut existing_vars = BTreeSet::new();
-        for signature in &self.signatures {
-            for parameter in &signature.parameters {
-                collect_type_vars(&parameter.flow_type.ty, &mut existing_vars);
-            }
-            collect_type_vars(&signature.result.ty, &mut existing_vars);
-        }
-        let mut next_var = existing_vars
-            .iter()
-            .map(|variable| variable.0)
-            .max()
-            .unwrap_or(CONTEXTUAL_RESULT_VAR.0)
-            .saturating_add(1);
+        let mut next_var = self
+            .next_checked_scheme_type_var
+            .expect("checked scheme type-variable allocator initialized");
         let leaf_vars_by_path = reads_by_owner
             .iter()
             .flat_map(|(owner, reads)| {
@@ -4456,23 +5249,101 @@ impl<'a> CheckedProgramBuilder<'a> {
             .iter()
             .map(|callable| (*callable, None))
             .collect::<BTreeMap<_, Option<FlowType>>>();
+        let roots_by_owner = reads_by_owner
+            .keys()
+            .map(|owner| (*owner, self.owned_expression_roots(*owner)))
+            .collect::<BTreeMap<_, _>>();
+        let mut inherited_calls_by_owner = BTreeMap::<DeclId, Vec<usize>>::new();
+        let mut dependents_by_callee = BTreeMap::<DeclId, BTreeSet<DeclId>>::new();
+        let mut callees_by_owner = BTreeMap::<DeclId, BTreeSet<DeclId>>::new();
+        for (call_index, call) in self.calls.iter().enumerate() {
+            let Some(owner) = call.owner_callable else {
+                continue;
+            };
+            let Some(callee) = self.signature_by_declaration(call.callable) else {
+                continue;
+            };
+            if callee.kind != CheckedCallableKind::User {
+                continue;
+            }
+            // Inherited calls merge the callee requirement directly. An
+            // explicit PASS is consumed while traversing the owner's syntax.
+            // Both forms make the owner depend on the callee requirement.
+            dependents_by_callee
+                .entry(callee.decl_id)
+                .or_default()
+                .insert(owner);
+            callees_by_owner
+                .entry(owner)
+                .or_default()
+                .insert(callee.decl_id);
+            if !matches!(call.context_binding, CheckedContextBinding::Explicit { .. }) {
+                inherited_calls_by_owner
+                    .entry(owner)
+                    .or_default()
+                    .push(call_index);
+            }
+        }
         let iteration_limit = user_callables
             .len()
             .saturating_add(self.calls.len())
             .saturating_add(leaf_vars.len())
             .saturating_add(2);
-        let mut converged = false;
+        let maximum_visits = iteration_limit.saturating_mul(user_callables.len().max(1));
+        // Evaluate callees before their owners. The prior DeclId-ordered set
+        // routinely evaluated an owner before a later-ID callee and then
+        // rescanned the owner's complete body for each downstream change.
+        // A deterministic dependency postorder gives every acyclic component
+        // its final inputs on its first visit. Back edges are deliberately
+        // skipped during this ordering pass; the same exact dependent queue
+        // below iterates only recursive components to their fixed point.
+        fn dependency_postorder(
+            owner: DeclId,
+            callees_by_owner: &BTreeMap<DeclId, BTreeSet<DeclId>>,
+            visited: &mut BTreeSet<DeclId>,
+            active: &mut BTreeSet<DeclId>,
+            order: &mut Vec<DeclId>,
+        ) {
+            if visited.contains(&owner) || !active.insert(owner) {
+                return;
+            }
+            for callee in callees_by_owner.get(&owner).into_iter().flatten() {
+                dependency_postorder(*callee, callees_by_owner, visited, active, order);
+            }
+            active.remove(&owner);
+            if visited.insert(owner) {
+                order.push(owner);
+            }
+        }
+        let mut initial_order = Vec::with_capacity(user_callables.len());
+        let mut ordered = BTreeSet::new();
+        let mut active = BTreeSet::new();
+        for callable in &user_callables {
+            dependency_postorder(
+                *callable,
+                &callees_by_owner,
+                &mut ordered,
+                &mut active,
+                &mut initial_order,
+            );
+        }
+        let mut pending = VecDeque::from(initial_order);
+        let mut queued = user_callables.iter().copied().collect::<BTreeSet<_>>();
+        let mut visits = 0usize;
+        let mut changes = 0usize;
 
-        for _ in 0..iteration_limit {
-            let mut next = user_callables
-                .iter()
-                .map(|callable| (*callable, None))
-                .collect::<BTreeMap<_, Option<FlowType>>>();
+        while let Some(owner) = pending.pop_front() {
+            queued.remove(&owner);
+            if visits >= maximum_visits {
+                if queued.insert(owner) {
+                    pending.push_front(owner);
+                }
+                break;
+            }
+            visits += 1;
+            let mut next_requirement = None;
 
-            for (owner, reads) in &reads_by_owner {
-                let target = next
-                    .get_mut(owner)
-                    .expect("PASSED owner is a user callable");
+            if let Some(reads) = reads_by_owner.get(&owner) {
                 for (expression, projection) in reads {
                     let leaf = Type::Var(
                         *leaf_vars
@@ -4480,47 +5351,36 @@ impl<'a> CheckedProgramBuilder<'a> {
                             .expect("PASSED read owns a stable scheme variable"),
                     );
                     merge_checked_context_requirement(
-                        target,
+                        &mut next_requirement,
                         continuous_flow_type(forwarded_parameter_requirement(projection, leaf)),
                     );
                 }
 
                 let mut active = BTreeSet::new();
-                for root in self.owned_expression_roots(*owner) {
+                for root in roots_by_owner.get(&owner).into_iter().flatten().copied() {
                     self.collect_passed_requirement_constraints(
-                        *owner,
+                        owner,
                         root,
                         None,
                         &requirements,
                         &leaf_vars,
                         &mut call_scheme_vars,
                         &mut next_var,
-                        target,
+                        &mut next_requirement,
                         &mut active,
                     );
                 }
             }
 
-            for call in &self.calls {
-                if matches!(call.context_binding, CheckedContextBinding::Explicit { .. }) {
-                    continue;
-                }
-                let Some(owner) = call.owner_callable else {
-                    continue;
-                };
+            for call_index in inherited_calls_by_owner.get(&owner).into_iter().flatten() {
+                let call = &self.calls[*call_index];
                 let Some(callee) = self.signature_by_declaration(call.callable) else {
                     continue;
                 };
-                if callee.kind != CheckedCallableKind::User {
-                    continue;
-                }
                 let Some(requirement) = requirements.get(&callee.decl_id).and_then(Option::as_ref)
                 else {
                     continue;
                 };
-                let target = next
-                    .get_mut(&owner)
-                    .expect("user-call owner has a requirement slot");
                 let scheme = FlowType {
                     mode: requirement.mode,
                     ty: instantiate_checked_type_scheme_for_call(
@@ -4530,15 +5390,28 @@ impl<'a> CheckedProgramBuilder<'a> {
                         &mut next_var,
                     ),
                 };
-                merge_checked_context_requirement(target, scheme);
+                merge_checked_context_requirement(&mut next_requirement, scheme);
             }
 
-            if next == requirements {
-                requirements = next;
-                converged = true;
-                break;
+            if requirements.get(&owner) == Some(&next_requirement) {
+                continue;
             }
-            requirements = next;
+            requirements.insert(owner, next_requirement);
+            changes += 1;
+            if let Some(dependents) = dependents_by_callee.get(&owner) {
+                for dependent in dependents {
+                    if queued.insert(*dependent) {
+                        pending.push_back(*dependent);
+                    }
+                }
+            }
+        }
+
+        let converged = pending.is_empty();
+        if std::env::var_os("BOON_TYPECHECK_TRACE").is_some() {
+            eprintln!(
+                "boon_typecheck checked_program.infer_context_schemes.worklist visits={visits} changes={changes} maximum_visits={maximum_visits} exhausted={converged}"
+            );
         }
 
         if !converged {
@@ -4579,7 +5452,7 @@ impl<'a> CheckedProgramBuilder<'a> {
         for (expression, flow_type) in lexical_passed_types {
             self.set_inferred_expr_flow(expression, flow_type);
         }
-        self.begin_checked_flow_inference_epoch();
+        self.next_checked_scheme_type_var = Some(next_var);
     }
 
     fn install_context_formals(
@@ -4890,7 +5763,7 @@ impl<'a> CheckedProgramBuilder<'a> {
             AstExprKind::MapLiteral { entries } => {
                 let expected_entry = expected.as_ref().and_then(|expected| match expected {
                     Type::Map { key, value } => {
-                        Some(Type::Object(ObjectShape::from_ordered_fields(
+                        Some(Type::object(ObjectShape::from_ordered_fields(
                             [
                                 ("key".to_owned(), key.as_ref().clone()),
                                 ("value".to_owned(), value.as_ref().clone()),
@@ -5010,11 +5883,39 @@ impl<'a> CheckedProgramBuilder<'a> {
     }
 
     fn infer_structural_user_result_schemes(&mut self) {
-        self.begin_checked_flow_inference_epoch();
-        let roots = self.program.ast.statements.clone();
+        let mut plans = Vec::new();
+        self.collect_structural_statement_plans(&self.program.ast.statements, &mut plans);
         let mut values = BTreeMap::new();
-        for statement in &roots {
-            self.infer_structural_statement_value(statement, &mut values);
+        for plan in plans {
+            let child_value = plan
+                .children
+                .iter()
+                .rev()
+                .find_map(|child| values.get(child).cloned().flatten());
+            let expression_value = plan.value.map(|expression| {
+                let flow_type = self.infer_checked_expr_flow_root(expression.0 as usize);
+                self.set_inferred_expr_flow(expression.0 as usize, flow_type.clone());
+                let structural_record = self
+                    .program
+                    .expressions
+                    .get(expression.0 as usize)
+                    .is_some_and(|expression| matches!(expression.kind, AstExprKind::Object(_)));
+                InferredStructuralValue {
+                    flow_type,
+                    structural_record,
+                }
+            });
+            let value = if plan.is_function {
+                child_value
+            } else {
+                expression_value.or(child_value)
+            };
+            if let Some(value) = &value
+                && let Some(declaration) = self.statement_declarations.get(&plan.statement).copied()
+            {
+                self.set_declaration_flow_type(declaration, value.flow_type.clone());
+            }
+            values.insert(plan.statement, value);
         }
 
         let user_bodies = self
@@ -5041,68 +5942,41 @@ impl<'a> CheckedProgramBuilder<'a> {
             {
                 continue;
             }
-            self.signatures[signature_index].result = result.flow_type;
+            self.set_checked_signature_result(signature_index, result.flow_type);
         }
         self.sync_signature_declaration_types();
     }
 
-    fn infer_structural_statement_value(
-        &mut self,
-        statement: &AstStatement,
-        values: &mut BTreeMap<usize, Option<InferredStructuralValue>>,
-    ) -> Option<InferredStructuralValue> {
-        if let Some(value) = values.get(&statement.id) {
-            return value.clone();
-        }
-        let child_values = statement
-            .children
-            .iter()
-            .map(|child| self.infer_structural_statement_value(child, values))
-            .collect::<Vec<_>>();
-        let expression_value = self
-            .statement_declarations
-            .get(&statement.id)
-            .and_then(|declaration| {
-                self.declaration(*declaration)
-                    .and_then(|declaration| declaration.value)
-            })
-            .or_else(|| {
-                canonical_statement_value_expression(
-                    &statement.children,
-                    statement,
-                    &self.program.expressions,
-                )
-                .or(statement.expr)
-                .map(|expression| CheckedExprId(expression as u32))
-            })
-            .map(|expression| {
-                let flow_type =
-                    self.infer_checked_expr_flow(expression.0 as usize, &mut BTreeSet::new());
-                self.set_inferred_expr_flow(expression.0 as usize, flow_type.clone());
-                let structural_record = self
-                    .program
-                    .expressions
-                    .get(expression.0 as usize)
-                    .is_some_and(|expression| matches!(expression.kind, AstExprKind::Object(_)));
-                InferredStructuralValue {
-                    flow_type,
-                    structural_record,
-                }
+    fn collect_structural_statement_plans(
+        &self,
+        statements: &[AstStatement],
+        plans: &mut Vec<StructuralStatementPlan>,
+    ) {
+        for statement in statements {
+            self.collect_structural_statement_plans(&statement.children, plans);
+            let value = self
+                .statement_declarations
+                .get(&statement.id)
+                .and_then(|declaration| {
+                    self.declaration(*declaration)
+                        .and_then(|declaration| declaration.value)
+                })
+                .or_else(|| {
+                    canonical_statement_value_expression(
+                        &statement.children,
+                        statement,
+                        &self.program.expressions,
+                    )
+                    .or(statement.expr)
+                    .map(|expression| CheckedExprId(expression as u32))
+                });
+            plans.push(StructuralStatementPlan {
+                statement: statement.id,
+                is_function: matches!(statement.kind, AstStatementKind::Function { .. }),
+                value,
+                children: statement.children.iter().map(|child| child.id).collect(),
             });
-
-        let value = if matches!(statement.kind, AstStatementKind::Function { .. }) {
-            child_values.into_iter().rev().flatten().next()
-        } else {
-            expression_value.or_else(|| child_values.into_iter().rev().flatten().next())
-        };
-
-        if let Some(value) = &value
-            && let Some(declaration) = self.statement_declarations.get(&statement.id).copied()
-        {
-            self.set_declaration_flow_type(declaration, value.flow_type.clone());
         }
-        values.insert(statement.id, value.clone());
-        value
     }
 
     fn direct_read_declaration_with_projection(
@@ -5111,12 +5985,101 @@ impl<'a> CheckedProgramBuilder<'a> {
     ) -> Option<(DeclId, Vec<String>)> {
         let expr_id = expression.0 as usize;
         let parts = checked_read_path_parts(self.program.expressions.get(expr_id)?)?;
+        if let Some(plan) = self
+            .checked_type_inference_dependencies
+            .as_ref()
+            .and_then(|dependencies| dependencies.read_inference_plans.get(&expr_id))
+            .filter(|plan| plan.source_parts.as_ref() == parts.as_slice())
+        {
+            return plan
+                .path_target
+                .map(|target| (target, plan.path_projection.to_vec()));
+        }
         let scope_id = self
             .expression_scopes
             .get(&expr_id)
             .copied()
             .unwrap_or(LexicalScopeId(0));
         self.resolve_checked_read_path(expr_id, scope_id, &parts)
+    }
+
+    fn checked_read_path_inference_lookup<'dependencies>(
+        &mut self,
+        dependencies: &'dependencies CheckedTypeInferenceDependencies,
+        expr_id: usize,
+        parts: &[String],
+    ) -> CheckedReadPathInferenceLookup<'dependencies> {
+        let Some(plan) = dependencies.read_inference_plans.get(&expr_id) else {
+            self.checked_flow_inference_cache.stats.indexed_read_missing = self
+                .checked_flow_inference_cache
+                .stats
+                .indexed_read_missing
+                .saturating_add(1);
+            return CheckedReadPathInferenceLookup::Missing;
+        };
+        // Projected-expression traversal can append a path that was not part
+        // of the parser expression. Reject that derived path and preserve the
+        // existing resolver as the exact fallback; treating the suffix as a
+        // structural projection would skip nested declaration scopes.
+        if plan.source_parts.as_ref() != parts {
+            self.checked_flow_inference_cache
+                .stats
+                .indexed_read_rejected = self
+                .checked_flow_inference_cache
+                .stats
+                .indexed_read_rejected
+                .saturating_add(1);
+            return CheckedReadPathInferenceLookup::Rejected;
+        }
+        self.checked_flow_inference_cache.stats.indexed_read_hits = self
+            .checked_flow_inference_cache
+            .stats
+            .indexed_read_hits
+            .saturating_add(1);
+        plan.path_target.map_or(
+            CheckedReadPathInferenceLookup::Unresolved {
+                canonical_path: &plan.canonical_path,
+            },
+            |target| CheckedReadPathInferenceLookup::Resolved {
+                target,
+                projection: &plan.path_projection,
+            },
+        )
+    }
+
+    fn checked_read_root_inference_lookup(
+        &mut self,
+        dependencies: &CheckedTypeInferenceDependencies,
+        expr_id: usize,
+        parts: &[String],
+    ) -> CheckedReadRootInferenceLookup {
+        let Some(plan) = dependencies.read_inference_plans.get(&expr_id) else {
+            self.checked_flow_inference_cache.stats.indexed_read_missing = self
+                .checked_flow_inference_cache
+                .stats
+                .indexed_read_missing
+                .saturating_add(1);
+            return CheckedReadRootInferenceLookup::Missing;
+        };
+        if plan.source_parts.as_ref() != parts {
+            self.checked_flow_inference_cache
+                .stats
+                .indexed_read_rejected = self
+                .checked_flow_inference_cache
+                .stats
+                .indexed_read_rejected
+                .saturating_add(1);
+            return CheckedReadRootInferenceLookup::Rejected;
+        }
+        self.checked_flow_inference_cache.stats.indexed_read_hits = self
+            .checked_flow_inference_cache
+            .stats
+            .indexed_read_hits
+            .saturating_add(1);
+        plan.root_target.map_or(
+            CheckedReadRootInferenceLookup::Unresolved,
+            CheckedReadRootInferenceLookup::Resolved,
+        )
     }
 
     fn forwarded_owner_parameter_with_path(
@@ -5308,7 +6271,7 @@ impl<'a> CheckedProgramBuilder<'a> {
             }
         }
 
-        let mut domains = BTreeMap::<DeclId, Type>::new();
+        let mut domain_candidates = BTreeMap::<DeclId, Vec<Type>>::new();
         for ((parameter, _), (has_catch_all, variants)) in selectors {
             // A catch-all arm accepts variants beyond the named arms, so its
             // syntax is not a closed selector domain. Actual call types remain
@@ -5316,16 +6279,15 @@ impl<'a> CheckedProgramBuilder<'a> {
             if has_catch_all || variants.is_empty() {
                 continue;
             }
-            let pattern_domain = Type::VariantSet(variants);
-            domains
+            domain_candidates
                 .entry(parameter)
-                .and_modify(|existing| {
-                    *existing =
-                        canonical_union_type(vec![existing.clone(), pattern_domain.clone()]);
-                })
-                .or_insert(pattern_domain);
+                .or_default()
+                .push(Type::VariantSet(variants));
         }
-        domains
+        domain_candidates
+            .into_iter()
+            .map(|(parameter, candidates)| (parameter, canonical_union_type(candidates)))
+            .collect()
     }
 
     fn pattern_selector_parameters(&self) -> BTreeSet<DeclId> {
@@ -5371,53 +6333,113 @@ impl<'a> CheckedProgramBuilder<'a> {
                 )
             })
             .collect::<BTreeMap<_, _>>();
-        for declaration in &mut self.declarations {
-            if let Some(flow_type) = parameter_types
-                .get(&declaration.id)
-                .or_else(|| callable_types.get(&declaration.id))
-            {
-                declaration.flow_type = flow_type.clone();
-            }
+        let updates = self
+            .declarations
+            .iter()
+            .filter_map(|declaration| {
+                parameter_types
+                    .get(&declaration.id)
+                    .or_else(|| callable_types.get(&declaration.id))
+                    .map(|flow_type| (declaration.id, flow_type.clone()))
+            })
+            .collect::<Vec<_>>();
+        for (declaration, flow_type) in updates {
+            self.set_declaration_flow_type(declaration, flow_type);
         }
     }
 
-    fn infer_checked_types(&mut self) {
-        self.infer_checked_types_with_seed(None);
+    fn infer_checked_types_with_contextual_wrapper_propagation(&mut self) {
+        self.infer_checked_types_with_seed(
+            None,
+            None,
+            CheckedTypeInferenceQuiescenceHook::PropagateContextualUserWrappers,
+        );
     }
 
-    fn infer_checked_types_after_scheme_changes(&mut self, changed: &BTreeSet<DeclId>) {
-        self.infer_checked_types_with_seed(Some(changed));
+    fn infer_checked_types_after_flush_changes(
+        &mut self,
+        changed_declarations: &BTreeSet<DeclId>,
+        changed_expressions: &BTreeSet<usize>,
+    ) {
+        self.infer_checked_types_with_seed(
+            Some(changed_declarations),
+            Some(changed_expressions),
+            CheckedTypeInferenceQuiescenceHook::None,
+        );
     }
 
-    fn infer_checked_types_with_seed(&mut self, changed: Option<&BTreeSet<DeclId>>) {
+    fn enqueue_checked_scheme_changes(
+        &self,
+        changed: &BTreeSet<DeclId>,
+        dependencies: &CheckedTypeInferenceDependencies,
+        pending: &mut CheckedTypeInferencePending,
+        stats: &mut CheckedTypeInferenceWorkStats,
+    ) {
+        for declaration in changed {
+            pending.declarations.insert(*declaration);
+            if self
+                .signature_by_decl
+                .get(declaration)
+                .and_then(|index| self.signatures.get(*index))
+                .is_some_and(|signature| {
+                    signature.kind == CheckedCallableKind::User
+                        && signature.result_expression.is_some()
+                })
+            {
+                pending.callables.insert(*declaration);
+            }
+            Self::enqueue_checked_declaration_dependents(
+                *declaration,
+                dependencies,
+                pending,
+                stats,
+                None,
+            );
+        }
+    }
+
+    fn infer_checked_types_with_seed(
+        &mut self,
+        changed: Option<&BTreeSet<DeclId>>,
+        changed_expressions: Option<&BTreeSet<usize>>,
+        quiescence_hook: CheckedTypeInferenceQuiescenceHook,
+    ) {
         let trace = std::env::var_os("BOON_TYPECHECK_TRACE").is_some();
-        let dependencies = self.checked_type_inference_dependencies();
+        let cache_stats_before = self.checked_flow_inference_cache.stats;
+        if self.checked_type_inference_dependencies.is_none() {
+            self.checked_type_inference_dependencies =
+                Some(Arc::new(self.build_checked_type_inference_dependencies()));
+        }
+        let dependencies = Arc::clone(
+            self.checked_type_inference_dependencies
+                .as_ref()
+                .expect("checked inference dependencies initialized"),
+        );
+        let mut stats = CheckedTypeInferenceWorkStats::default();
         let mut pending = if let Some(changed) = changed {
             let mut pending = CheckedTypeInferencePending {
                 selector_parameters: true,
                 pattern_bindings: true,
                 ..CheckedTypeInferencePending::default()
             };
-            for declaration in changed {
-                if self
-                    .signature_by_decl
-                    .get(declaration)
-                    .and_then(|index| self.signatures.get(*index))
-                    .is_some_and(|signature| {
-                        signature.kind == CheckedCallableKind::User
-                            && signature.result_expression.is_some()
-                    })
-                {
-                    pending.callables.insert(*declaration);
-                }
-                Self::enqueue_checked_declaration_dependents(
-                    *declaration,
+            self.enqueue_checked_scheme_changes(changed, &dependencies, &mut pending, &mut stats);
+            for expression in changed_expressions.into_iter().flatten() {
+                pending.expressions.insert(*expression);
+                // A FLUSH boundary can change the declaration/callable view
+                // of an expression without changing its stored ordinary flow
+                // type. Seed those non-expression consumers explicitly rather
+                // than waiting for `set_inferred_expr_flow` to observe a
+                // difference that intentionally is not stored there.
+                Self::enqueue_checked_expression_dependents(
+                    *expression,
                     &dependencies,
                     &mut pending,
+                    &mut stats,
                 );
             }
             pending
         } else {
+            stats.call_seed_enqueues = self.calls.len();
             CheckedTypeInferencePending {
                 expressions: self
                     .program
@@ -5441,295 +6463,895 @@ impl<'a> CheckedProgramBuilder<'a> {
                 pattern_bindings: true,
             }
         };
-        let mut stats = CheckedTypeInferenceWorkStats::default();
-        let maximum_rounds = 64usize;
+        self.enqueue_checked_flow_publications(&mut pending, &mut stats);
+        // A propagation round advances at least one edge in the indexed
+        // dependency graph. A source-independent constant rejects valid deep
+        // wrapper/call chains once their diameter crosses that constant, so
+        // derive the fail-closed bound from the finite snapshot topology.
+        // Ordinary programs still stop as soon as the pending sets are empty.
+        let inference_node_count = self
+            .program
+            .expressions
+            .len()
+            .saturating_add(self.declarations.len())
+            .saturating_add(self.signatures.len())
+            .saturating_add(self.calls.len())
+            .saturating_add(2);
+        let maximum_rounds = inference_node_count.saturating_mul(2).max(64);
+        let mut wrapper_hook_pending = matches!(
+            quiescence_hook,
+            CheckedTypeInferenceQuiescenceHook::PropagateContextualUserWrappers
+        );
+        let mut phase_rounds = 0usize;
+        let mut pre_hook_rounds = 0usize;
+        let mut wrapper_changed_declarations = 0usize;
 
-        while pending.any() && stats.rounds < maximum_rounds {
-            stats.rounds += 1;
+        loop {
+            while pending.any() && phase_rounds < maximum_rounds {
+                // Mutations from the preceding round are visible as one exact
+                // cache transition. Keeping a round snapshot stable also makes
+                // expression evaluation independent of incidental ID order.
+                self.flush_checked_flow_invalidations();
+                phase_rounds += 1;
+                stats.rounds += 1;
 
-            let expressions = std::mem::take(&mut pending.expressions);
-            if !expressions.is_empty() {
-                self.begin_checked_flow_inference_epoch();
-            }
-            stats.expression_visits += expressions.len();
-            let mut changed_expressions = Vec::new();
-            for expression in expressions {
-                let flow_type = self.infer_checked_expr_flow(expression, &mut BTreeSet::new());
-                if matches!(flow_type.ty, Type::Unknown | Type::UnresolvedShape { .. }) {
-                    continue;
+                let expressions = pending.expressions.drain_sorted();
+                let expressions_started = trace.then(Instant::now);
+                stats.expression_visits += expressions.len();
+                let mut propagated_expressions = Vec::new();
+                for expression in expressions {
+                    let flow_type = self.infer_checked_expr_flow_root(expression);
+                    if matches!(flow_type.ty, Type::Unknown | Type::UnresolvedShape { .. }) {
+                        continue;
+                    }
+                    if self.set_inferred_expr_flow(expression, flow_type) {
+                        propagated_expressions.push(expression);
+                    }
                 }
-                if self.set_inferred_expr_flow(expression, flow_type) {
-                    changed_expressions.push(expression);
-                }
-            }
-            for expression in changed_expressions {
-                Self::enqueue_checked_expression_dependents(
-                    expression,
-                    &dependencies,
-                    &mut pending,
-                );
-            }
-
-            let declarations = std::mem::take(&mut pending.declarations);
-            stats.declaration_visits += declarations.len();
-            for declaration in declarations {
-                let Some(value) = self
-                    .declaration(declaration)
-                    .and_then(|declaration| declaration.value)
-                else {
-                    continue;
-                };
-                let Some(flow_type) = self.inferred_expr_types.get(&(value.0 as usize)).cloned()
-                else {
-                    continue;
-                };
-                let flow_type = self.flush_boundary_flow_type(value.0 as usize, flow_type);
-                if matches!(flow_type.ty, Type::Unknown | Type::UnresolvedShape { .. }) {
-                    continue;
-                }
-                if self.set_declaration_flow_type(declaration, flow_type) {
-                    Self::enqueue_checked_declaration_dependents(
-                        declaration,
-                        &dependencies,
-                        &mut pending,
-                    );
-                }
-            }
-
-            let callables = std::mem::take(&mut pending.callables);
-            stats.callable_visits += callables.len();
-            for callable in callables {
-                let Some(index) = self.signature_by_decl.get(&callable).copied() else {
-                    continue;
-                };
-                let Some(result_expression) = self
-                    .signatures
-                    .get(index)
-                    .filter(|signature| signature.kind == CheckedCallableKind::User)
-                    .and_then(|signature| signature.result_expression)
-                else {
-                    continue;
-                };
-                let Some(result) = self
-                    .inferred_expr_types
-                    .get(&(result_expression.0 as usize))
-                    .cloned()
-                else {
-                    continue;
-                };
-                let result = self.flush_boundary_flow_type(result_expression.0 as usize, result);
-                if matches!(result.ty, Type::Unknown | Type::UnresolvedShape { .. })
-                    || self.signatures[index].result == result
-                {
-                    continue;
-                }
-                self.signatures[index].result = result;
-                let declaration_type = self.checked_callable_declaration_flow_type(index);
-                if self.set_declaration_flow_type(callable, declaration_type) {
-                    Self::enqueue_checked_declaration_dependents(
-                        callable,
-                        &dependencies,
-                        &mut pending,
-                    );
-                }
-                if let Some(calls) = dependencies.calls_by_callee.get(&callable) {
-                    pending.calls.extend(calls.iter().copied());
-                }
-            }
-
-            let calls = std::mem::take(&mut pending.calls);
-            if !calls.is_empty() {
-                self.begin_checked_flow_inference_epoch();
-            }
-            stats.call_visits += calls.len();
-            for call_id in calls {
-                let Some(call) = self.call_by_checked_id(call_id).cloned() else {
-                    continue;
-                };
-                let before_expression = self
-                    .inferred_expr_types
-                    .get(&(call.expression.0 as usize))
-                    .cloned();
-                let output_declarations = call
-                    .entries
-                    .iter()
-                    .filter_map(|entry| match entry {
-                        CheckedCallEntry::FreshOut { output, .. } => Some(*output),
-                        CheckedCallEntry::ForwardOut { target, .. } => Some(*target),
-                        CheckedCallEntry::Input { .. } => None,
-                    })
-                    .collect::<BTreeSet<_>>();
-                let before_outputs = output_declarations
-                    .iter()
-                    .filter_map(|declaration| {
-                        self.declaration(*declaration)
-                            .map(|definition| (*declaration, definition.flow_type.clone()))
-                    })
-                    .collect::<BTreeMap<_, _>>();
-                if !self.instantiate_checked_call(call_id) {
-                    continue;
-                }
-                let after_expression = self
-                    .inferred_expr_types
-                    .get(&(call.expression.0 as usize))
-                    .cloned();
-                if before_expression != after_expression {
+                for expression in propagated_expressions {
                     Self::enqueue_checked_expression_dependents(
-                        call.expression.0 as usize,
+                        expression,
                         &dependencies,
                         &mut pending,
+                        &mut stats,
                     );
                 }
-                for declaration in output_declarations {
-                    let after = self
+                stats.expression_ms += expressions_started.map(typecheck_elapsed_ms).unwrap_or(0.0);
+                self.flush_checked_flow_invalidations();
+
+                let declarations = pending.declarations.drain_sorted();
+                let declarations_started = trace.then(Instant::now);
+                stats.declaration_visits += declarations.len();
+                for declaration in declarations {
+                    let Some(value) = self
                         .declaration(declaration)
-                        .map(|definition| definition.flow_type.clone());
-                    if before_outputs.get(&declaration) != after.as_ref() {
+                        .and_then(|declaration| declaration.value)
+                    else {
+                        continue;
+                    };
+                    let Some(flow_type) =
+                        self.inferred_expr_types.get(&(value.0 as usize)).cloned()
+                    else {
+                        continue;
+                    };
+                    let flow_type = self.flush_boundary_flow_type(value.0 as usize, flow_type);
+                    if matches!(flow_type.ty, Type::Unknown | Type::UnresolvedShape { .. }) {
+                        continue;
+                    }
+                    if self.set_declaration_flow_type(declaration, flow_type) {
                         Self::enqueue_checked_declaration_dependents(
                             declaration,
                             &dependencies,
                             &mut pending,
+                            &mut stats,
+                            None,
                         );
                     }
                 }
-                // Call-local substitutions can stabilize one step after the
-                // externally visible result or OUT types. Revisit only this
-                // call once more; a stable revisit does not enqueue itself.
-                pending.calls.insert(call_id);
-            }
+                stats.declaration_ms += declarations_started
+                    .map(typecheck_elapsed_ms)
+                    .unwrap_or(0.0);
+                self.flush_checked_flow_invalidations();
 
-            if std::mem::take(&mut pending.selector_parameters) {
-                stats.selector_visits += 1;
-                let before = self.checked_selector_parameter_state();
-                self.begin_checked_flow_inference_epoch();
-                if self.refresh_pattern_selector_parameter_types() {
-                    let after = self.checked_selector_parameter_state();
-                    for (formal, (owner, flow_type)) in after {
-                        if before
-                            .get(&formal)
-                            .is_some_and(|before| before.0 == owner && before.1 == flow_type)
-                        {
-                            continue;
+                let callables = pending.callables.drain_sorted();
+                let callables_started = trace.then(Instant::now);
+                stats.callable_visits += callables.len();
+                for callable in callables {
+                    let Some(index) = self.signature_by_decl.get(&callable).copied() else {
+                        continue;
+                    };
+                    let Some(result_expression) = self
+                        .signatures
+                        .get(index)
+                        .filter(|signature| signature.kind == CheckedCallableKind::User)
+                        .and_then(|signature| signature.result_expression)
+                    else {
+                        continue;
+                    };
+                    let Some(result) = self
+                        .inferred_expr_types
+                        .get(&(result_expression.0 as usize))
+                        .cloned()
+                    else {
+                        continue;
+                    };
+                    let result =
+                        self.flush_boundary_flow_type(result_expression.0 as usize, result);
+                    if matches!(result.ty, Type::Unknown | Type::UnresolvedShape { .. })
+                        || self.signatures[index].result == result
+                    {
+                        continue;
+                    }
+                    self.set_checked_signature_result(index, result);
+                    let declaration_type = self.checked_callable_declaration_flow_type(index);
+                    if self.set_declaration_flow_type(callable, declaration_type) {
+                        Self::enqueue_checked_declaration_dependents(
+                            callable,
+                            &dependencies,
+                            &mut pending,
+                            &mut stats,
+                            None,
+                        );
+                    }
+                    if let Some(calls) = dependencies.calls_by_callee.get(&callable) {
+                        for call in calls {
+                            Self::enqueue_checked_call(
+                                *call,
+                                CheckedCallEnqueueCause::Callee,
+                                &mut pending,
+                                &mut stats,
+                            );
                         }
+                    }
+                }
+                stats.callable_ms += callables_started.map(typecheck_elapsed_ms).unwrap_or(0.0);
+                self.flush_checked_flow_invalidations();
+
+                let calls = pending.calls.drain_sorted();
+                let calls_started = trace.then(Instant::now);
+                stats.call_visits += calls.len();
+                for call_id in calls {
+                    let changes = self.instantiate_checked_call(call_id);
+                    if !changes.any {
+                        stats.call_noop_visits += 1;
+                        continue;
+                    }
+                    stats.call_changed_visits += 1;
+                    if let Some(expression) = changes.expression {
+                        Self::enqueue_checked_expression_dependents(
+                            expression,
+                            &dependencies,
+                            &mut pending,
+                            &mut stats,
+                        );
+                    }
+                    for declaration in changes.outputs {
+                        Self::enqueue_checked_declaration_dependents(
+                            declaration,
+                            &dependencies,
+                            &mut pending,
+                            &mut stats,
+                            Some(call_id),
+                        );
+                    }
+                    if changes.needs_output_scope_revisit {
+                        Self::enqueue_checked_call(
+                            call_id,
+                            CheckedCallEnqueueCause::OutputScope,
+                            &mut pending,
+                            &mut stats,
+                        );
+                    }
+                }
+                stats.call_ms += calls_started.map(typecheck_elapsed_ms).unwrap_or(0.0);
+                self.flush_checked_flow_invalidations();
+
+                if std::mem::take(&mut pending.selector_parameters) {
+                    let selector_started = trace.then(Instant::now);
+                    stats.selector_visits += 1;
+                    for (formal, owner) in self.refresh_pattern_selector_parameter_types() {
                         Self::enqueue_checked_declaration_dependents(
                             formal,
                             &dependencies,
                             &mut pending,
+                            &mut stats,
+                            None,
                         );
                         Self::enqueue_checked_declaration_dependents(
                             owner,
                             &dependencies,
                             &mut pending,
+                            &mut stats,
+                            None,
                         );
                         if let Some(calls) = dependencies.calls_by_callee.get(&owner) {
-                            pending.calls.extend(calls.iter().copied());
+                            for call in calls {
+                                Self::enqueue_checked_call(
+                                    *call,
+                                    CheckedCallEnqueueCause::Selector,
+                                    &mut pending,
+                                    &mut stats,
+                                );
+                            }
                         }
                     }
+                    stats.selector_ms += selector_started.map(typecheck_elapsed_ms).unwrap_or(0.0);
                 }
+                self.flush_checked_flow_invalidations();
+
+                if std::mem::take(&mut pending.pattern_bindings) {
+                    let pattern_started = trace.then(Instant::now);
+                    stats.pattern_visits += 1;
+                    for declaration in self.refresh_pattern_binding_types() {
+                        Self::enqueue_checked_declaration_dependents(
+                            declaration,
+                            &dependencies,
+                            &mut pending,
+                            &mut stats,
+                            None,
+                        );
+                    }
+                    stats.pattern_ms += pattern_started.map(typecheck_elapsed_ms).unwrap_or(0.0);
+                }
+                // Recursive reads performed by any lane above are cache
+                // computations, not publications. Queue every refined child
+                // before testing quiescence so the next stable round updates
+                // its dense value and all indexed consumers.
+                self.enqueue_checked_flow_publications(&mut pending, &mut stats);
             }
 
-            if std::mem::take(&mut pending.pattern_bindings) {
-                stats.pattern_visits += 1;
-                let pattern_declarations = self
-                    .pattern_declarations
-                    .values()
-                    .copied()
-                    .collect::<BTreeSet<_>>();
-                let before = pattern_declarations
-                    .iter()
-                    .filter_map(|declaration| {
-                        self.declaration(*declaration)
-                            .map(|definition| (*declaration, definition.flow_type.clone()))
-                    })
-                    .collect::<BTreeMap<_, _>>();
-                self.begin_checked_flow_inference_epoch();
-                if self.refresh_pattern_binding_types() {
-                    for declaration in pattern_declarations {
-                        let after = self
-                            .declaration(declaration)
-                            .map(|definition| definition.flow_type.clone());
-                        if before.get(&declaration) != after.as_ref() {
-                            Self::enqueue_checked_declaration_dependents(
-                                declaration,
-                                &dependencies,
-                                &mut pending,
-                            );
-                        }
-                    }
+            // A wrapper contract must observe stable call-local results. Run
+            // propagation only after the full initial worklist is quiescent,
+            // then feed its exact mutations back into this same persistent
+            // solver/cache instance.
+            self.flush_checked_flow_invalidations();
+            if pending.any() {
+                break;
+            }
+            if wrapper_hook_pending {
+                wrapper_hook_pending = false;
+                pre_hook_rounds = stats.rounds;
+                let changed = self.propagate_contextual_user_wrapper_schemes();
+                wrapper_changed_declarations = changed.len();
+                if !changed.is_empty() {
+                    pending.selector_parameters = true;
+                    pending.pattern_bindings = true;
+                    self.enqueue_checked_scheme_changes(
+                        &changed,
+                        &dependencies,
+                        &mut pending,
+                        &mut stats,
+                    );
+                }
+                self.enqueue_checked_flow_publications(&mut pending, &mut stats);
+                if pending.any() {
+                    phase_rounds = 0;
+                    continue;
                 }
             }
+            break;
         }
 
-        let worklist_exhausted = !pending.any();
-        let audit_started = trace.then(Instant::now);
-        let audit = worklist_exhausted.then(|| self.advance_checked_type_inference());
-        let audit_clean = audit.is_some_and(|changes| !changes.any());
+        // Leave no stale entries for validation or a later seeded solve, even
+        // when this invocation exhausted its topology-derived round bound.
+        self.flush_checked_flow_invalidations();
+
+        let worklist_exhausted = !pending.any() && !wrapper_hook_pending;
+        // The indexed worklist is the production solver. Typecheck's own test
+        // build retains a clean full-sweep oracle, but production compilation
+        // must not pay or fall back to another whole-program fixed point.
+        let cache_stats = self
+            .checked_flow_inference_cache
+            .stats
+            .since(cache_stats_before);
+        let audit_started = (trace && cfg!(test)).then(Instant::now);
+        let audit = (worklist_exhausted && cfg!(test)).then(|| {
+            // The oracle must not share persistent memoized answers with the
+            // worklist it audits. Recompute from a clean cache, then restore
+            // the production cache when the full sweep confirms quiescence.
+            let production_cache = std::mem::replace(
+                &mut self.checked_flow_inference_cache,
+                CheckedFlowInferenceCache::with_len(self.program.expressions.len()),
+            );
+            let production_publications =
+                std::mem::take(&mut self.checked_flow_pending_expression_publications);
+            let audit_before = (
+                self.inferred_expr_types.clone(),
+                self.declarations
+                    .iter()
+                    .map(|declaration| (declaration.id, declaration.flow_type.clone()))
+                    .collect::<BTreeMap<_, _>>(),
+                self.signatures
+                    .iter()
+                    .map(|signature| {
+                        (
+                            signature.decl_id,
+                            (
+                                signature.result.clone(),
+                                signature
+                                    .parameters
+                                    .iter()
+                                    .map(|parameter| {
+                                        (parameter.decl_id, parameter.flow_type.clone())
+                                    })
+                                    .collect::<Vec<_>>(),
+                            ),
+                        )
+                    })
+                    .collect::<BTreeMap<_, _>>(),
+                self.calls
+                    .iter()
+                    .map(|call| {
+                        (
+                            call.id,
+                            (
+                                call.result.clone(),
+                                call.type_substitutions.clone(),
+                                call.contextual_substitutions.clone(),
+                            ),
+                        )
+                    })
+                    .collect::<BTreeMap<_, _>>(),
+            );
+            let observed_changes = self.advance_checked_type_inference();
+            let (expressions, declarations, signatures, calls) = &audit_before;
+            let expression_changed = expressions != &self.inferred_expr_types;
+            let declaration_changed = self
+                .declarations
+                .iter()
+                .any(|declaration| declarations.get(&declaration.id) != Some(&declaration.flow_type));
+            let callable_changed = self.signatures.iter().any(|signature| {
+                signatures.get(&signature.decl_id)
+                    != Some(&(
+                        signature.result.clone(),
+                        signature
+                            .parameters
+                            .iter()
+                            .map(|parameter| (parameter.decl_id, parameter.flow_type.clone()))
+                            .collect::<Vec<_>>(),
+                    ))
+            });
+            let call_changed = self.calls.iter().any(|call| {
+                calls.get(&call.id)
+                    != Some(&(
+                        call.result.clone(),
+                        call.type_substitutions.clone(),
+                        call.contextual_substitutions.clone(),
+                    ))
+            });
+            let changes = CheckedTypeInferenceChanges {
+                callable: callable_changed,
+                declaration: declaration_changed,
+                call: call_changed,
+                selector: observed_changes.selector && (callable_changed || declaration_changed),
+                pattern: observed_changes.pattern && declaration_changed,
+                expression: expression_changed,
+            };
+            if trace && changes.any() {
+                fn compact_type(ty: &Type) -> String {
+                    match ty {
+                        Type::Text => "Text".to_owned(),
+                        Type::Number => "Number".to_owned(),
+                        Type::Bytes(bytes) => format!("Bytes({bytes:?})"),
+                        Type::Absent => "Absent".to_owned(),
+                        Type::VariantSet(variants) => format!("Variants({})", variants.len()),
+                        Type::Object(shape) => format!("Object({})", shape.fields.len()),
+                        Type::RenderContract => "RenderContract".to_owned(),
+                        Type::List(_) => "List".to_owned(),
+                        Type::Function { args, .. } => format!("Function({})", args.len()),
+                        Type::UnresolvedShape { .. } => "UnresolvedShape".to_owned(),
+                        Type::Var(variable) => format!("Var({})", variable.0),
+                        Type::Unknown => "Unknown".to_owned(),
+                        Type::Union(types) => format!("Union({})", types.len()),
+                        Type::Map { .. } => "Map".to_owned(),
+                        Type::Set(_) => "Set".to_owned(),
+                        Type::Bits { width } => format!("Bits({width})"),
+                    }
+                }
+                fn expression_kind(kind: &AstExprKind) -> &'static str {
+                    match kind {
+                        AstExprKind::Identifier(_) => "Identifier",
+                        AstExprKind::Path(_) => "Path",
+                        AstExprKind::Drain { .. } => "Drain",
+                        AstExprKind::StringLiteral(_) => "StringLiteral",
+                        AstExprKind::TextLiteral(_) => "TextLiteral",
+                        AstExprKind::TextTemplate { .. } => "TextTemplate",
+                        AstExprKind::Number(_) => "Number",
+                        AstExprKind::ByteLiteral { .. } => "ByteLiteral",
+                        AstExprKind::Tag(_) => "Tag",
+                        AstExprKind::TaggedObject { .. } => "TaggedObject",
+                        AstExprKind::Flush { .. } => "Flush",
+                        AstExprKind::Source => "Source",
+                        AstExprKind::Call { .. } => "Call",
+                        AstExprKind::Pipe { .. } => "Pipe",
+                        AstExprKind::Draining { .. } => "Draining",
+                        AstExprKind::Hold { .. } => "Hold",
+                        AstExprKind::Latest { .. } => "Latest",
+                        AstExprKind::When { .. } => "When",
+                        AstExprKind::Then { .. } => "Then",
+                        AstExprKind::Infix { .. } => "Infix",
+                        AstExprKind::MatchArm { .. } => "MatchArm",
+                        AstExprKind::Block { .. } => "Block",
+                        AstExprKind::Object(_) => "Object",
+                        AstExprKind::ListLiteral { .. } => "ListLiteral",
+                        AstExprKind::BytesLiteral { .. } => "BytesLiteral",
+                        AstExprKind::Delimiter => "Delimiter",
+                        AstExprKind::Unknown(_) => "Unknown",
+                        AstExprKind::Arrow { .. } => "Arrow",
+                        AstExprKind::MapEntry { .. } => "MapEntry",
+                        AstExprKind::MapLiteral { .. } => "MapLiteral",
+                        AstExprKind::SetLiteral { .. } => "SetLiteral",
+                        AstExprKind::BitsLiteral { .. } => "BitsLiteral",
+                    }
+                }
+                let changed_expression_ids = (0..self.program.expressions.len())
+                    .filter(|expression| {
+                        expressions.get(expression) != self.inferred_expr_types.get(expression)
+                    })
+                    .take(16)
+                    .collect::<Vec<_>>();
+                let changed_expressions = changed_expression_ids
+                    .iter()
+                    .map(|expression| {
+                        let syntax = self.program.expressions.get(*expression);
+                        let before = expressions.get(expression);
+                        let after = self.inferred_expr_types.get(expression);
+                        (
+                            *expression,
+                            syntax.map_or(0, |syntax| syntax.line),
+                            self.expression_owner.get(expression).cloned(),
+                            syntax.and_then(ast_callable_name).map(str::to_owned).or_else(|| {
+                                syntax
+                                    .and_then(checked_read_path_parts)
+                                    .map(|parts| canonical_checked_path(&parts))
+                            }),
+                            before.map(|flow| (flow.mode, compact_type(&flow.ty))),
+                            after.map(|flow| (flow.mode, compact_type(&flow.ty))),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let changed_expression_graph = changed_expression_ids
+                    .iter()
+                    .map(|expression| {
+                        let syntax = self.program.expressions.get(*expression);
+                        let children = syntax
+                            .map(direct_expression_children)
+                            .unwrap_or_default();
+                        let parents = dependencies
+                            .expression_parents
+                            .get(*expression)
+                            .cloned()
+                            .unwrap_or_default();
+                        let dependents = dependencies
+                            .flow_cache_dependents
+                            .get(*expression)
+                            .cloned()
+                            .unwrap_or_default();
+                        (
+                            *expression,
+                            syntax.map(|syntax| expression_kind(&syntax.kind)),
+                            (
+                                children.len(),
+                                children.into_iter().take(8).collect::<Vec<_>>(),
+                            ),
+                            (
+                                parents.len(),
+                                parents.into_iter().take(8).collect::<Vec<_>>(),
+                            ),
+                            (
+                                dependents.len(),
+                                dependents.into_iter().take(8).collect::<Vec<_>>(),
+                            ),
+                            self.direct_read_declaration_with_projection(CheckedExprId(
+                                *expression as u32,
+                            )),
+                            self.call_for_expression(CheckedExprId(*expression as u32))
+                                .map(|call| call.id),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let changed_declarations = self
+                    .declarations
+                    .iter()
+                    .filter(|declaration| {
+                        declarations.get(&declaration.id) != Some(&declaration.flow_type)
+                    })
+                    .take(16)
+                    .map(|declaration| {
+                        (
+                            declaration.id,
+                            declaration.name.clone(),
+                            declarations
+                                .get(&declaration.id)
+                                .map(|flow| (flow.mode, compact_type(&flow.ty))),
+                            (
+                                declaration.flow_type.mode,
+                                compact_type(&declaration.flow_type.ty),
+                            ),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                let changed_signatures = self
+                    .signatures
+                    .iter()
+                    .filter(|signature| {
+                        signatures.get(&signature.decl_id)
+                            != Some(&(
+                                signature.result.clone(),
+                                signature
+                                    .parameters
+                                    .iter()
+                                    .map(|parameter| {
+                                        (parameter.decl_id, parameter.flow_type.clone())
+                                    })
+                                    .collect::<Vec<_>>(),
+                            ))
+                    })
+                    .take(16)
+                    .map(|signature| (signature.decl_id, signature.name.clone()))
+                    .collect::<Vec<_>>();
+                let changed_calls = self
+                    .calls
+                    .iter()
+                    .filter(|call| {
+                        calls.get(&call.id)
+                            != Some(&(
+                                call.result.clone(),
+                                call.type_substitutions.clone(),
+                                call.contextual_substitutions.clone(),
+                            ))
+                    })
+                    .take(16)
+                    .map(|call| (call.id, call.function.clone(), call.expression))
+                    .collect::<Vec<_>>();
+                eprintln!(
+                    "boon_typecheck checked_program.infer_checked_types.audit_changes expressions={changed_expressions:?} graph={changed_expression_graph:?} declarations={changed_declarations:?} signatures={changed_signatures:?} calls={changed_calls:?}"
+                );
+            }
+            if changes.any() {
+                drop(production_cache);
+            } else {
+                self.checked_flow_inference_cache = production_cache;
+            }
+            self.checked_flow_pending_expression_publications = production_publications;
+            changes
+        });
+        let audit_clean = audit.is_none_or(|changes| !changes.any());
         if trace {
+            let post_hook_rounds = matches!(
+                quiescence_hook,
+                CheckedTypeInferenceQuiescenceHook::PropagateContextualUserWrappers
+            )
+            .then(|| stats.rounds.saturating_sub(pre_hook_rounds))
+            .unwrap_or(0);
             eprintln!(
-                "boon_typecheck checked_program.infer_checked_types.worklist seed={} rounds={} expression_visits={} declaration_visits={} callable_visits={} call_visits={} selector_visits={} pattern_visits={} exhausted={} audit={audit:?} audit_clean={} audit_ms={:.3}",
+                "boon_typecheck checked_program.infer_checked_types.worklist seed={} quiescence_hook={quiescence_hook:?} rounds={} pre_hook_rounds={} post_hook_rounds={} wrapper_changed_declarations={} expression_visits={} declaration_visits={} callable_visits={} call_visits={} call_changed_visits={} call_noop_visits={} call_seed_enqueues={} call_input_enqueues={} call_output_enqueues={} call_callee_enqueues={} call_selector_enqueues={} call_output_scope_enqueues={} call_output_origin_skips={} selector_visits={} pattern_visits={} expression_ms={:.3} declaration_ms={:.3} callable_ms={:.3} call_ms={:.3} selector_ms={:.3} pattern_ms={:.3} cache_hits={} cache_misses={} cache_invalidations={} cache_reverse_invalidation_traversals={} cache_full_resets_total={} cache_rejected_invalid_ids={} indexed_read_hits={} indexed_read_missing={} indexed_read_rejected={} indexed_out_hits={} indexed_out_missing={} exhausted={} audit={audit:?} audit_clean={} audit_ms={:.3}",
                 if changed.is_some() {
                     "scheme_changes"
                 } else {
                     "full_program"
                 },
                 stats.rounds,
+                pre_hook_rounds,
+                post_hook_rounds,
+                wrapper_changed_declarations,
                 stats.expression_visits,
                 stats.declaration_visits,
                 stats.callable_visits,
                 stats.call_visits,
+                stats.call_changed_visits,
+                stats.call_noop_visits,
+                stats.call_seed_enqueues,
+                stats.call_input_enqueues,
+                stats.call_output_enqueues,
+                stats.call_callee_enqueues,
+                stats.call_selector_enqueues,
+                stats.call_output_scope_enqueues,
+                stats.call_output_origin_skips,
                 stats.selector_visits,
                 stats.pattern_visits,
+                stats.expression_ms,
+                stats.declaration_ms,
+                stats.callable_ms,
+                stats.call_ms,
+                stats.selector_ms,
+                stats.pattern_ms,
+                cache_stats.hits,
+                cache_stats.misses,
+                cache_stats.invalidations,
+                cache_stats.reverse_invalidation_traversals,
+                self.checked_flow_inference_cache.stats.full_resets,
+                cache_stats.rejected_invalid_ids,
+                cache_stats.indexed_read_hits,
+                cache_stats.indexed_read_missing,
+                cache_stats.indexed_read_rejected,
+                cache_stats.indexed_out_hits,
+                cache_stats.indexed_out_missing,
                 worklist_exhausted,
                 audit_clean,
                 audit_started.map(typecheck_elapsed_ms).unwrap_or(0.0),
             );
         }
-        if audit_clean {
+        if worklist_exhausted && audit_clean {
             return;
         }
-        if trace {
-            eprintln!(
-                "boon_typecheck checked_program.infer_checked_types.worklist fallback=full_sweeps"
-            );
-        }
-        self.infer_checked_types_full_sweeps();
+        self.diagnostics.push(diagnostic_at_line(
+            1,
+            if worklist_exhausted {
+                "internal indexed type inference diverged from its test oracle".to_owned()
+            } else {
+                "indexed type inference did not converge within its topology-derived work bound"
+                    .to_owned()
+            },
+        ));
     }
 
-    fn checked_type_inference_dependencies(&self) -> CheckedTypeInferenceDependencies {
+    fn build_checked_call_inference_plan(
+        &self,
+        call_index: usize,
+        context_formal_indices: &BTreeMap<ContextFormalId, usize>,
+    ) -> Option<CheckedCallInferencePlan> {
+        let call = self.calls.get(call_index)?;
+        let signature_index = self.signature_by_decl.get(&call.callable).copied()?;
+        let signature = self.signatures.get(signature_index)?;
+        let mut entries = Vec::with_capacity(call.entries.len());
+        let mut parent_inputs = Vec::new();
+        let mut output_scope_inputs = Vec::new();
+        let mut outputs = Vec::new();
+
+        for entry in &call.entries {
+            let formal = match entry {
+                CheckedCallEntry::Input { formal, .. }
+                | CheckedCallEntry::FreshOut { formal, .. }
+                | CheckedCallEntry::ForwardOut { formal, .. } => *formal,
+            };
+            let parameter_index = self
+                .parameter_location_by_decl
+                .get(&(formal.0 as usize))
+                .copied()
+                .filter(|location| location.signature == signature_index)
+                .and_then(|location| {
+                    signature
+                        .parameters
+                        .get(location.parameter)
+                        .filter(|parameter| parameter.decl_id == formal)
+                        .map(|_| location.parameter)
+                });
+            let entry_index = entries.len();
+            match entry {
+                CheckedCallEntry::Input {
+                    value,
+                    evaluation_scope,
+                    ..
+                } => {
+                    entries.push(CheckedCallInferenceEntryPlan::Input {
+                        formal,
+                        value: *value,
+                        parameter_index,
+                    });
+                    match evaluation_scope {
+                        CheckedEvaluationScope::Parent => parent_inputs.push(entry_index),
+                        CheckedEvaluationScope::Output { .. } => {
+                            output_scope_inputs.push(entry_index);
+                        }
+                    }
+                }
+                CheckedCallEntry::FreshOut { output, .. } => {
+                    entries.push(CheckedCallInferenceEntryPlan::Output {
+                        formal,
+                        output: *output,
+                        forwarded: false,
+                        parameter_index,
+                    });
+                    outputs.push(entry_index);
+                }
+                CheckedCallEntry::ForwardOut { target, .. } => {
+                    entries.push(CheckedCallInferenceEntryPlan::Output {
+                        formal,
+                        output: *target,
+                        forwarded: true,
+                        parameter_index,
+                    });
+                    outputs.push(entry_index);
+                }
+            }
+        }
+
+        let mode = if signature.name == "List/map" {
+            checked_call_entry_input(&call.entries, "new").map_or(
+                CheckedCallModeInferencePlan::Fixed,
+                CheckedCallModeInferencePlan::Input,
+            )
+        } else if signature.name == "List/latest" {
+            checked_call_entry_input(&call.entries, "list").map_or(
+                CheckedCallModeInferencePlan::Fixed,
+                CheckedCallModeInferencePlan::Input,
+            )
+        } else {
+            match signature.kind {
+                CheckedCallableKind::External => CheckedCallModeInferencePlan::External(
+                    call.entries
+                        .iter()
+                        .filter_map(|entry| match entry {
+                            CheckedCallEntry::Input { value, .. } => Some(*value),
+                            CheckedCallEntry::FreshOut { .. }
+                            | CheckedCallEntry::ForwardOut { .. } => None,
+                        })
+                        .collect(),
+                ),
+                CheckedCallableKind::User => signature.result_expression.map_or(
+                    CheckedCallModeInferencePlan::Fixed,
+                    CheckedCallModeInferencePlan::User,
+                ),
+                CheckedCallableKind::Builtin => CheckedCallModeInferencePlan::Fixed,
+            }
+        };
+        let context_formal_index = signature
+            .context_formal
+            .and_then(|formal| context_formal_indices.get(&formal).copied());
+        let (explicit_context_input, inherited_context_formal_index) = match call.context_binding {
+            CheckedContextBinding::Explicit { value, .. } => (Some(value), None),
+            CheckedContextBinding::Inherited { formal } => {
+                (None, context_formal_indices.get(&formal).copied())
+            }
+            CheckedContextBinding::None => (None, None),
+        };
+
+        Some(CheckedCallInferencePlan {
+            call_id: call.id,
+            call_index,
+            signature_index,
+            call_expression: call.expression,
+            callable: call.callable,
+            owner_callable: call.owner_callable,
+            entries: entries.into_boxed_slice(),
+            parent_inputs: parent_inputs.into_boxed_slice(),
+            output_scope_inputs: output_scope_inputs.into_boxed_slice(),
+            outputs: outputs.into_boxed_slice(),
+            context_formal: signature.context_formal,
+            context_formal_index,
+            explicit_context_input,
+            inherited_context_formal_index,
+            dependency_catch_cycle: signature.name == "Dependency/catch_cycle",
+            has_syntax_discriminant: signature.kind == CheckedCallableKind::User
+                && self.checked_call_has_syntax_discriminant(&call.entries),
+            is_user_callable: signature.kind == CheckedCallableKind::User,
+            result_expression: signature.result_expression,
+            mode,
+        })
+    }
+
+    fn build_checked_read_inference_plan(
+        &self,
+        expression: &AstExpr,
+    ) -> Option<CheckedReadInferencePlan> {
+        let source_parts = checked_read_path_parts(expression)?;
+        if source_parts.first().is_some_and(|part| part == "PASSED") {
+            return None;
+        }
+        let scope = self
+            .expression_scopes
+            .get(&expression.id)
+            .copied()
+            .unwrap_or(LexicalScopeId(0));
+        let root_target = source_parts
+            .first()
+            .and_then(|name| self.resolve_checked_read_name(expression.id, scope, name));
+        let (path_target, path_projection) = self
+            .resolve_checked_read_path(expression.id, scope, &source_parts)
+            .map_or((None, Vec::new()), |(target, projection)| {
+                (Some(target), projection)
+            });
+        Some(CheckedReadInferencePlan {
+            canonical_path: source_parts.join(".").into_boxed_str(),
+            source_parts: source_parts.into_boxed_slice(),
+            root_target,
+            path_target,
+            path_projection: path_projection.into_boxed_slice(),
+        })
+    }
+
+    fn build_checked_type_inference_dependencies(&self) -> CheckedTypeInferenceDependencies {
         let expression_count = self.program.expressions.len();
+        let context_formal_indices = self
+            .context_formals
+            .iter()
+            .enumerate()
+            .map(|(index, formal)| (formal.id, index))
+            .collect::<BTreeMap<_, _>>();
+        let mut call_inference_plans = DenseIndexTable::with_len(self.next_call_id as usize);
+        for call_index in 0..self.calls.len() {
+            let Some(plan) =
+                self.build_checked_call_inference_plan(call_index, &context_formal_indices)
+            else {
+                continue;
+            };
+            call_inference_plans.insert_if_in_bounds(plan.call_id.0 as usize, plan);
+        }
+        let mut pattern_binding_sites = self
+            .pattern_declarations
+            .iter()
+            .filter_map(|((arm_expression, name), declaration)| {
+                Some(CheckedPatternBindingSite {
+                    arm_expression: *arm_expression,
+                    name: name.clone(),
+                    declaration: *declaration,
+                    selector_expression: self.pattern_selectors.get(arm_expression).copied()?,
+                })
+            })
+            .collect::<Vec<_>>();
+        pattern_binding_sites.sort_by_key(|site| site.declaration);
         let mut dependencies = CheckedTypeInferenceDependencies {
+            call_inference_plans,
+            read_inference_plans: DenseIndexTable::with_len(expression_count),
+            hold_updates_by_expression: DenseIndexTable::with_len(expression_count),
             expression_parents: vec![Vec::new(); expression_count],
             declarations_by_value: vec![Vec::new(); expression_count],
             callables_by_result: vec![Vec::new(); expression_count],
             calls_by_input: vec![Vec::new(); expression_count],
             parameters_by_actual: vec![Vec::new(); expression_count],
+            actuals_by_parameter: BTreeMap::new(),
             declaration_readers: BTreeMap::new(),
             calls_by_output: BTreeMap::new(),
             calls_by_callee: BTreeMap::new(),
+            outputs_by_formal: vec![Vec::new(); self.next_decl_id as usize],
+            contextual_list_inputs_by_output: vec![Vec::new(); self.next_decl_id as usize],
+            wrapper_calls_by_owner: vec![Vec::new(); self.next_decl_id as usize],
+            wrapper_callers_by_callee: vec![Vec::new(); self.next_decl_id as usize],
+            wrapper_user_signature_indices: self
+                .signatures
+                .iter()
+                .enumerate()
+                .filter_map(|(index, signature)| {
+                    (signature.kind == CheckedCallableKind::User).then_some(index)
+                })
+                .collect(),
             selector_actuals: BTreeSet::new(),
             pattern_selectors: self.pattern_selectors.values().copied().collect(),
+            pattern_binding_sites,
             pattern_dependents_by_selector: vec![Vec::new(); expression_count],
+            flow_cache_dependents: vec![Vec::new(); expression_count],
+            flow_cache_declaration_readers: BTreeMap::new(),
+            flow_cache_declaration_dependents: BTreeMap::new(),
+            signature_expression_readers: BTreeMap::new(),
         };
         for expression in &self.program.expressions {
             let mut children = direct_expression_children(expression);
             if matches!(&expression.kind, AstExprKind::Hold { .. }) {
-                children.extend(hold_update_exprs_for_expr(
+                let updates = hold_update_exprs_for_expr(
                     &self.program.ast.statements,
                     expression.id,
                     &self.program.expressions,
-                ));
+                );
+                children.extend(updates.iter().copied());
+                dependencies
+                    .hold_updates_by_expression
+                    .insert_if_in_bounds(expression.id, updates.into_boxed_slice());
             }
             for child in children {
                 if let Some(parents) = dependencies.expression_parents.get_mut(child) {
                     parents.push(expression.id);
                 }
             }
-            if let Some((declaration, _)) =
-                self.direct_read_declaration_with_projection(CheckedExprId(expression.id as u32))
+            if let Some(plan) = self.build_checked_read_inference_plan(expression) {
+                if let Some(declaration) = plan.path_target {
+                    dependencies
+                        .declaration_readers
+                        .entry(declaration)
+                        .or_default()
+                        .push(expression.id);
+                }
+                dependencies
+                    .read_inference_plans
+                    .insert_if_in_bounds(expression.id, plan);
+            }
+            if let Some(callable) = ast_callable_name(expression)
+                .and_then(|name| self.signature(name))
+                .map(|signature| signature.decl_id)
             {
                 dependencies
-                    .declaration_readers
-                    .entry(declaration)
+                    .signature_expression_readers
+                    .entry(callable)
                     .or_default()
                     .push(expression.id);
             }
@@ -5770,12 +7392,65 @@ impl<'a> CheckedProgramBuilder<'a> {
                 callables.push(signature.decl_id);
             }
         }
-        for call in &self.calls {
+        for (call_index, call) in self.calls.iter().enumerate() {
+            let mut first_output_formal_by_output = BTreeMap::new();
+            for entry in &call.entries {
+                match entry {
+                    CheckedCallEntry::FreshOut { formal, output, .. }
+                    | CheckedCallEntry::ForwardOut {
+                        formal,
+                        target: output,
+                        ..
+                    } => {
+                        first_output_formal_by_output
+                            .entry(*output)
+                            .or_insert(*formal);
+                    }
+                    CheckedCallEntry::Input { .. } => {}
+                }
+            }
+            let contextual_row_input = self
+                .signature_by_declaration(call.callable)
+                .and_then(|signature| signature.contextual_operation)
+                .and_then(checked_contextual_operation_formals)
+                .and_then(|(list_formal, row_formal, _)| {
+                    call.entries.iter().find_map(|entry| match entry {
+                        CheckedCallEntry::Input { formal, value, .. } if *formal == list_formal => {
+                            Some((row_formal, *value))
+                        }
+                        _ => None,
+                    })
+                });
             dependencies
                 .calls_by_callee
                 .entry(call.callable)
                 .or_default()
                 .push(call.id);
+            dependencies
+                .signature_expression_readers
+                .entry(call.callable)
+                .or_default()
+                .push(call.expression.0 as usize);
+            if let Some(owner) = call.owner_callable
+                && let Some(owner_index) = self.signature_by_decl.get(&owner).copied()
+                && self
+                    .signatures
+                    .get(owner_index)
+                    .is_some_and(|signature| signature.kind == CheckedCallableKind::User)
+            {
+                if let Some(calls) = dependencies
+                    .wrapper_calls_by_owner
+                    .get_mut(owner.0 as usize)
+                {
+                    calls.push(call_index);
+                }
+                if let Some(callers) = dependencies
+                    .wrapper_callers_by_callee
+                    .get_mut(call.callable.0 as usize)
+                {
+                    callers.push(owner_index);
+                }
+            }
             for entry in &call.entries {
                 match entry {
                     CheckedCallEntry::Input { formal, value, .. } => {
@@ -5787,20 +7462,43 @@ impl<'a> CheckedProgramBuilder<'a> {
                         {
                             parameters.push(*formal);
                         }
+                        dependencies
+                            .actuals_by_parameter
+                            .entry(*formal)
+                            .or_default()
+                            .push(*value);
                         if self.syntax_discriminant_parameters.contains(formal) {
                             dependencies.selector_actuals.insert(value.0 as usize);
                         }
                     }
-                    CheckedCallEntry::FreshOut { output, .. } => dependencies
-                        .calls_by_output
-                        .entry(*output)
-                        .or_default()
-                        .push(call.id),
-                    CheckedCallEntry::ForwardOut { target, .. } => dependencies
-                        .calls_by_output
-                        .entry(*target)
-                        .or_default()
-                        .push(call.id),
+                    CheckedCallEntry::FreshOut { formal, output, .. }
+                    | CheckedCallEntry::ForwardOut {
+                        formal,
+                        target: output,
+                        ..
+                    } => {
+                        dependencies
+                            .calls_by_output
+                            .entry(*output)
+                            .or_default()
+                            .push(call.id);
+                        if let Some(outputs) =
+                            dependencies.outputs_by_formal.get_mut(formal.0 as usize)
+                        {
+                            outputs.push(*output);
+                        }
+                    }
+                }
+            }
+            if let Some((row_formal, input)) = contextual_row_input {
+                for (output, formal) in &first_output_formal_by_output {
+                    if *formal == row_formal
+                        && let Some(inputs) = dependencies
+                            .contextual_list_inputs_by_output
+                            .get_mut(output.0 as usize)
+                    {
+                        inputs.push(input);
+                    }
                 }
             }
             if let CheckedContextBinding::Explicit { value, .. } = call.context_binding
@@ -5808,6 +7506,14 @@ impl<'a> CheckedProgramBuilder<'a> {
             {
                 calls.push(call.id);
             }
+        }
+        for calls in &mut dependencies.wrapper_calls_by_owner {
+            calls.sort_unstable();
+            calls.dedup();
+        }
+        for callers in &mut dependencies.wrapper_callers_by_callee {
+            callers.sort_unstable();
+            callers.dedup();
         }
         for values in &mut dependencies.expression_parents {
             values.sort();
@@ -5829,6 +7535,10 @@ impl<'a> CheckedProgramBuilder<'a> {
             values.sort();
             values.dedup();
         }
+        for values in dependencies.actuals_by_parameter.values_mut() {
+            values.sort();
+            values.dedup();
+        }
         for values in &mut dependencies.pattern_dependents_by_selector {
             values.sort();
             values.dedup();
@@ -5845,18 +7555,397 @@ impl<'a> CheckedProgramBuilder<'a> {
             values.sort();
             values.dedup();
         }
+        for values in &mut dependencies.outputs_by_formal {
+            values.sort();
+            values.dedup();
+        }
+        for values in &mut dependencies.contextual_list_inputs_by_output {
+            values.sort();
+            values.dedup();
+        }
+        for values in dependencies.signature_expression_readers.values_mut() {
+            values.sort();
+            values.dedup();
+        }
+        dependencies.flow_cache_declaration_readers = dependencies.declaration_readers.clone();
+
+        // Build the complete immediate expression-flow reverse relation used
+        // by persistent memoization. Solver scheduling retains its more
+        // granular declaration/call queues above; cache invalidation must also
+        // cover flow-mode reads that intentionally bypass an intermediate
+        // declaration update.
+        let mut flow_edges = dependencies
+            .expression_parents
+            .iter()
+            .enumerate()
+            .flat_map(|(child, parents)| parents.iter().map(move |parent| (child, *parent)))
+            .collect::<Vec<_>>();
+        for (value, declarations) in dependencies.declarations_by_value.iter().enumerate() {
+            for declaration in declarations {
+                flow_edges.extend(
+                    dependencies
+                        .declaration_readers
+                        .get(declaration)
+                        .into_iter()
+                        .flatten()
+                        .map(|reader| (value, *reader)),
+                );
+            }
+        }
+        for (actual, parameters) in dependencies.parameters_by_actual.iter().enumerate() {
+            for parameter in parameters {
+                flow_edges.extend(
+                    dependencies
+                        .declaration_readers
+                        .get(parameter)
+                        .into_iter()
+                        .flatten()
+                        .map(|reader| (actual, *reader)),
+                );
+            }
+        }
+        for (selector, dependents) in dependencies
+            .pattern_dependents_by_selector
+            .iter()
+            .enumerate()
+        {
+            flow_edges.extend(dependents.iter().map(|dependent| (selector, *dependent)));
+        }
+        // A projected read of an OUT formal follows every concrete output
+        // occurrence through `checked_out_projection_flow_mode`. Encode that
+        // non-syntactic lane from the same exact adjacency consumed at run
+        // time, rather than scanning calls a second time here.
+        for (formal, outputs) in dependencies.outputs_by_formal.iter().enumerate() {
+            let formal = DeclId(formal as u32);
+            for output in outputs {
+                dependencies
+                    .flow_cache_declaration_dependents
+                    .entry(*output)
+                    .or_default()
+                    .push(formal);
+            }
+        }
+
+        // Only contextual row outputs inspect a call input directly while
+        // inferring a projected mode. Keep this edge exact instead of forming
+        // the all-inputs x all-output-readers cross product that the old
+        // whole-epoch invalidation happened to conceal.
+        for (output, list_inputs) in dependencies
+            .contextual_list_inputs_by_output
+            .iter()
+            .enumerate()
+        {
+            let output = DeclId(output as u32);
+            for list_input in list_inputs {
+                flow_edges.extend(
+                    dependencies
+                        .declaration_readers
+                        .get(&output)
+                        .into_iter()
+                        .flatten()
+                        .map(|reader| (list_input.0 as usize, *reader)),
+                );
+            }
+        }
+        for call in &self.calls {
+            let inputs = call
+                .entries
+                .iter()
+                .filter_map(|entry| match entry {
+                    CheckedCallEntry::Input { value, .. } => Some(value.0 as usize),
+                    CheckedCallEntry::FreshOut { .. } | CheckedCallEntry::ForwardOut { .. } => None,
+                })
+                .chain(
+                    call.context_binding
+                        .explicit()
+                        .map(|(value, _)| value.0 as usize),
+                );
+            for input in inputs {
+                flow_edges.push((input, call.expression.0 as usize));
+            }
+        }
+        for signature in &self.signatures {
+            let Some(result) = signature.result_expression else {
+                continue;
+            };
+            for call in dependencies
+                .calls_by_callee
+                .get(&signature.decl_id)
+                .into_iter()
+                .flatten()
+                .filter_map(|call| self.call_by_checked_id(*call))
+            {
+                flow_edges.push((result.0 as usize, call.expression.0 as usize));
+            }
+        }
+        for expression in &self.program.expressions {
+            let Some(plan) = dependencies.read_inference_plans.get(&expression.id) else {
+                continue;
+            };
+            if plan.path_target.is_some() {
+                continue;
+            }
+            let path = canonical_checked_path(&plan.source_parts);
+            if let Some(value) = declaration_expr_for_path(&self.named_value_expressions, &path) {
+                flow_edges.push((value, expression.id));
+            }
+        }
+        for (source, dependent) in flow_edges {
+            if let Some(dependents) = dependencies.flow_cache_dependents.get_mut(source) {
+                dependents.push(dependent);
+            }
+        }
+        for dependents in &mut dependencies.flow_cache_dependents {
+            dependents.sort_unstable();
+            dependents.dedup();
+        }
+        for dependents in dependencies.flow_cache_declaration_dependents.values_mut() {
+            dependents.sort();
+            dependents.dedup();
+        }
         dependencies
+    }
+
+    fn enable_checked_flow_inference_cache(&mut self) {
+        if self.checked_type_inference_dependencies.is_none() {
+            self.checked_type_inference_dependencies =
+                Some(Arc::new(self.build_checked_type_inference_dependencies()));
+        }
+        // This is the one permitted broad boundary: the cache begins against
+        // a complete immutable topology and external environment. All later
+        // mutations use reverse dependency invalidation below.
+        self.checked_flow_inference_cache.reset_for_new_topology();
+        self.checked_flow_declaration_invalidation_seen =
+            DenseGenerationSet::with_len(self.next_decl_id as usize);
+        self.checked_flow_pending_expression_invalidations = PendingIdSet::default();
+        self.checked_flow_pending_declaration_invalidations = PendingIdSet::default();
+        self.checked_flow_pending_signature_invalidations = PendingIdSet::default();
+        self.checked_flow_pending_expression_publications = PendingIdSet::default();
+        self.checked_flow_inference_cache_enabled = true;
+    }
+
+    fn invalidate_checked_flow_expressions(&mut self, roots: impl IntoIterator<Item = usize>) {
+        if !self.checked_flow_inference_cache_enabled {
+            return;
+        }
+        self.checked_flow_pending_expression_invalidations
+            .extend(roots);
+    }
+
+    /// Publish an expression value that was just computed from the current
+    /// checked topology. The root cache entry is already current (or can be
+    /// replaced directly with the published value); only expressions that
+    /// read it are stale. Invalidating the root as well made every successful
+    /// solver write immediately discard its own memoized result and then walk
+    /// the complete reverse closure a second time.
+    fn publish_checked_flow_expression(&mut self, expression: usize, flow_type: FlowType) {
+        if !self.checked_flow_inference_cache_enabled {
+            return;
+        }
+        if !self
+            .checked_flow_inference_cache
+            .insert(expression, flow_type)
+        {
+            return;
+        }
+        let Some(dependencies) = self.checked_type_inference_dependencies.as_ref() else {
+            // Preserve the existing fail-closed path: an enabled cache without
+            // its reverse index is reset and disabled at the next boundary.
+            self.checked_flow_pending_expression_invalidations
+                .insert(expression);
+            return;
+        };
+        if let Some(dependents) = dependencies.flow_cache_dependents.get(expression) {
+            self.checked_flow_pending_expression_invalidations
+                .extend(dependents.iter().copied());
+        }
+    }
+
+    /// Move recursively recomputed cache values onto the stable worklist.
+    ///
+    /// Inference is recursive for compact post-order reads, but publication is
+    /// deliberately iterative. Keeping this as a journal avoids mutating the
+    /// dense checked graph from inside recursion and preserves deterministic
+    /// solver ordering. Values that were already published by their root are
+    /// filtered here, so each genuine cache/dense divergence is queued once.
+    fn enqueue_checked_flow_publications(
+        &mut self,
+        pending: &mut CheckedTypeInferencePending,
+        stats: &mut CheckedTypeInferenceWorkStats,
+    ) {
+        let dependencies = self.checked_type_inference_dependencies.as_ref().cloned();
+        for expression in self
+            .checked_flow_pending_expression_publications
+            .drain_sorted()
+        {
+            let cached = self.checked_flow_inference_cache.entries.get(&expression);
+            if expression >= self.program.expressions.len() {
+                continue;
+            }
+            if cached.is_none_or(|cached| self.inferred_expr_types.get(&expression) != Some(cached))
+            {
+                pending.expressions.insert(expression);
+            } else if let Some(dependencies) = dependencies.as_ref() {
+                // The dense value is already current, but another cache reader
+                // may still hold an answer computed before this node was
+                // invalidated. Invalidate and schedule those direct readers;
+                // scheduling without invalidation would merely return their
+                // stale cache entries on the next round.
+                if let Some(readers) = dependencies.flow_cache_dependents.get(expression) {
+                    self.checked_flow_pending_expression_invalidations
+                        .extend(readers.iter().copied());
+                }
+                Self::enqueue_checked_expression_dependents(
+                    expression,
+                    dependencies,
+                    pending,
+                    stats,
+                );
+            }
+        }
+    }
+
+    /// Apply every mutation since the previous solver boundary to its direct
+    /// cache readers. Transitive invalidation is deliberately value-driven:
+    /// a reader publishes and dirties its own readers only when its inferred
+    /// value actually changes. Eagerly walking the complete reverse closure
+    /// discarded stable intermediate results and made fanout graphs behave
+    /// like repeated whole-program sweeps.
+    fn flush_checked_flow_invalidations(&mut self) {
+        self.flush_checked_flow_invalidations_impl();
+    }
+
+    fn flush_checked_flow_invalidations_impl(&mut self) {
+        if !self.checked_flow_inference_cache_enabled {
+            return;
+        }
+        if self
+            .checked_flow_pending_expression_invalidations
+            .is_empty()
+            && self
+                .checked_flow_pending_declaration_invalidations
+                .is_empty()
+            && self.checked_flow_pending_signature_invalidations.is_empty()
+        {
+            return;
+        }
+        let Some(dependencies) = self.checked_type_inference_dependencies.as_ref().cloned() else {
+            // A cache without its immutable reverse index can never answer
+            // soundly. Drop and disable it before consuming any dirty roots so
+            // subsequent reads recompute instead of publishing stale types.
+            self.checked_flow_inference_cache.reset_for_new_topology();
+            self.checked_flow_pending_expression_invalidations = PendingIdSet::default();
+            self.checked_flow_pending_declaration_invalidations = PendingIdSet::default();
+            self.checked_flow_pending_signature_invalidations = PendingIdSet::default();
+            self.checked_flow_pending_expression_publications = PendingIdSet::default();
+            self.checked_flow_inference_cache_enabled = false;
+            self.diagnostics.push(diagnostic_at_line(
+                1,
+                "internal checked-flow cache lost its dependency index".to_owned(),
+            ));
+            return;
+        };
+        let declarations = self
+            .checked_flow_pending_declaration_invalidations
+            .drain_sorted();
+        let mut roots = self
+            .checked_flow_pending_expression_invalidations
+            .drain_sorted();
+        for callable in self
+            .checked_flow_pending_signature_invalidations
+            .drain_sorted()
+        {
+            roots.extend(
+                dependencies
+                    .signature_expression_readers
+                    .get(&callable)
+                    .into_iter()
+                    .flatten()
+                    .copied(),
+            );
+        }
+        if !declarations.is_empty() {
+            let mut declaration_seen = std::mem::replace(
+                &mut self.checked_flow_declaration_invalidation_seen,
+                DenseGenerationSet::with_len(0),
+            );
+            roots.extend(checked_flow_declarations_invalidation_roots(
+                &dependencies.flow_cache_declaration_readers,
+                &dependencies.flow_cache_declaration_dependents,
+                declarations,
+                &mut declaration_seen,
+            ));
+            self.checked_flow_declaration_invalidation_seen = declaration_seen;
+        }
+        roots.sort_unstable();
+        roots.dedup();
+        for expression in roots {
+            self.checked_flow_inference_cache.invalidate(expression);
+        }
+    }
+
+    fn invalidate_checked_flow_declaration(&mut self, declaration: DeclId) {
+        if !self.checked_flow_inference_cache_enabled {
+            return;
+        }
+        self.checked_flow_pending_declaration_invalidations
+            .insert(declaration);
+    }
+
+    fn invalidate_checked_flow_signature(&mut self, callable: DeclId) {
+        if !self.checked_flow_inference_cache_enabled {
+            return;
+        }
+        self.checked_flow_pending_signature_invalidations
+            .insert(callable);
+    }
+
+    fn set_checked_signature_result(&mut self, signature_index: usize, result: FlowType) -> bool {
+        let Some(signature) = self.signatures.get_mut(signature_index) else {
+            return false;
+        };
+        if signature.result == result {
+            return false;
+        }
+        signature.result = result;
+        let callable = signature.decl_id;
+        self.invalidate_checked_flow_signature(callable);
+        true
+    }
+
+    fn enqueue_checked_call(
+        call: CheckedCallId,
+        cause: CheckedCallEnqueueCause,
+        pending: &mut CheckedTypeInferencePending,
+        stats: &mut CheckedTypeInferenceWorkStats,
+    ) {
+        if !pending.calls.insert(call) {
+            return;
+        }
+        match cause {
+            CheckedCallEnqueueCause::Input => stats.call_input_enqueues += 1,
+            CheckedCallEnqueueCause::Output => stats.call_output_enqueues += 1,
+            CheckedCallEnqueueCause::Callee => stats.call_callee_enqueues += 1,
+            CheckedCallEnqueueCause::Selector => stats.call_selector_enqueues += 1,
+            CheckedCallEnqueueCause::OutputScope => stats.call_output_scope_enqueues += 1,
+        }
     }
 
     fn enqueue_checked_expression_dependents(
         expression: usize,
         dependencies: &CheckedTypeInferenceDependencies,
         pending: &mut CheckedTypeInferencePending,
+        stats: &mut CheckedTypeInferenceWorkStats,
     ) {
+        // The cache graph is the complete direct expression dependency graph;
+        // it also contains resolved named reads and call-result edges that are
+        // not syntax parents. Schedule those exact readers alongside the
+        // non-expression consumers below.
+        if let Some(readers) = dependencies.flow_cache_dependents.get(expression) {
+            pending.expressions.extend(readers.iter().copied());
+        }
         if let Some(parents) = dependencies.expression_parents.get(expression) {
-            for parent in parents {
-                Self::enqueue_checked_expression_with_ancestors(*parent, dependencies, pending);
-            }
+            pending.expressions.extend(parents.iter().copied());
         }
         if let Some(declarations) = dependencies.declarations_by_value.get(expression) {
             pending.declarations.extend(declarations.iter().copied());
@@ -5865,11 +7954,19 @@ impl<'a> CheckedProgramBuilder<'a> {
             pending.callables.extend(callables.iter().copied());
         }
         if let Some(calls) = dependencies.calls_by_input.get(expression) {
-            pending.calls.extend(calls.iter().copied());
+            for call in calls {
+                Self::enqueue_checked_call(*call, CheckedCallEnqueueCause::Input, pending, stats);
+            }
         }
         if let Some(parameters) = dependencies.parameters_by_actual.get(expression) {
             for parameter in parameters {
-                Self::enqueue_checked_declaration_dependents(*parameter, dependencies, pending);
+                Self::enqueue_checked_declaration_dependents(
+                    *parameter,
+                    dependencies,
+                    pending,
+                    stats,
+                    None,
+                );
             }
         }
         if dependencies.selector_actuals.contains(&expression) {
@@ -5879,25 +7976,7 @@ impl<'a> CheckedProgramBuilder<'a> {
             pending.pattern_bindings = true;
         }
         if let Some(dependents) = dependencies.pattern_dependents_by_selector.get(expression) {
-            for dependent in dependents {
-                Self::enqueue_checked_expression_with_ancestors(*dependent, dependencies, pending);
-            }
-        }
-    }
-
-    fn enqueue_checked_expression_with_ancestors(
-        expression: usize,
-        dependencies: &CheckedTypeInferenceDependencies,
-        pending: &mut CheckedTypeInferencePending,
-    ) {
-        let mut frontier = vec![expression];
-        while let Some(expression) = frontier.pop() {
-            if !pending.expressions.insert(expression) {
-                continue;
-            }
-            if let Some(parents) = dependencies.expression_parents.get(expression) {
-                frontier.extend(parents.iter().copied());
-            }
+            pending.expressions.extend(dependents.iter().copied());
         }
     }
 
@@ -5905,17 +7984,31 @@ impl<'a> CheckedProgramBuilder<'a> {
         declaration: DeclId,
         dependencies: &CheckedTypeInferenceDependencies,
         pending: &mut CheckedTypeInferencePending,
+        stats: &mut CheckedTypeInferenceWorkStats,
+        excluded_output_call: Option<CheckedCallId>,
     ) {
+        if let Some(readers) = dependencies
+            .flow_cache_declaration_readers
+            .get(&declaration)
+        {
+            pending.expressions.extend(readers.iter().copied());
+        }
         if let Some(readers) = dependencies.declaration_readers.get(&declaration) {
-            for reader in readers {
-                Self::enqueue_checked_expression_with_ancestors(*reader, dependencies, pending);
-            }
+            pending.expressions.extend(readers.iter().copied());
         }
         if let Some(calls) = dependencies.calls_by_output.get(&declaration) {
-            pending.calls.extend(calls.iter().copied());
+            for call in calls {
+                if excluded_output_call == Some(*call) {
+                    stats.call_output_origin_skips += 1;
+                    continue;
+                }
+                Self::enqueue_checked_call(*call, CheckedCallEnqueueCause::Output, pending, stats);
+            }
         }
         if let Some(calls) = dependencies.calls_by_callee.get(&declaration) {
-            pending.calls.extend(calls.iter().copied());
+            for call in calls {
+                Self::enqueue_checked_call(*call, CheckedCallEnqueueCause::Callee, pending, stats);
+            }
         }
     }
 
@@ -5935,174 +8028,60 @@ impl<'a> CheckedProgramBuilder<'a> {
         }
     }
 
-    fn checked_selector_parameter_state(&self) -> BTreeMap<DeclId, (DeclId, FlowType)> {
-        let mut state = BTreeMap::new();
-        for signature in &self.signatures {
-            for parameter in &signature.parameters {
-                if self
-                    .syntax_discriminant_parameters
-                    .contains(&parameter.decl_id)
-                {
-                    state.insert(
-                        parameter.decl_id,
-                        (signature.decl_id, parameter.flow_type.clone()),
-                    );
-                }
-            }
+    fn publish_checked_signature_parameter_changes(
+        &mut self,
+        signature_index: usize,
+        changed_parameters: &[DeclId],
+    ) -> Option<DeclId> {
+        if changed_parameters.is_empty() {
+            return None;
         }
-        state
-    }
+        let signature = self.signatures.get(signature_index)?;
+        let callable = signature.decl_id;
+        let parameter_updates = changed_parameters
+            .iter()
+            .filter_map(|formal| {
+                let location = self.parameter_location_by_decl.get(&(formal.0 as usize))?;
+                if location.signature != signature_index {
+                    return None;
+                }
+                let parameter = signature.parameters.get(location.parameter)?;
+                (parameter.decl_id == *formal).then(|| (*formal, parameter.flow_type.clone()))
+            })
+            .collect::<Vec<_>>();
+        let callable_type = self.checked_callable_declaration_flow_type(signature_index);
 
-    fn infer_checked_types_full_sweeps(&mut self) {
-        let trace = std::env::var_os("BOON_TYPECHECK_TRACE").is_some();
-        let iteration_limit = self
-            .calls
-            .len()
-            .saturating_add(self.signatures.len())
-            .saturating_add(4);
-        let mut final_boundary_unchanged = false;
-        for iteration in 0..iteration_limit {
-            // The boundary snapshot is only used to distinguish harmless
-            // internal churn from real non-convergence at the hard limit.
-            // Cloning the complete type state on every ordinary iteration was
-            // pure overhead for every fixed point that terminates normally.
-            let final_iteration = iteration.saturating_add(1) == iteration_limit;
-            let boundary = final_iteration.then(|| {
-                (
-                    self.declarations
-                        .iter()
-                        .map(|declaration| declaration.flow_type.clone())
-                        .collect::<Vec<_>>(),
-                    self.signatures
-                        .iter()
-                        .map(|signature| signature.result.clone())
-                        .collect::<Vec<_>>(),
-                    self.calls
-                        .iter()
-                        .map(|call| {
-                            (
-                                call.result.clone(),
-                                call.type_substitutions.clone(),
-                                call.contextual_substitutions.clone(),
-                            )
-                        })
-                        .collect::<Vec<_>>(),
-                    self.inferred_expr_types.clone(),
-                )
-            });
-            let iteration_started = trace.then(Instant::now);
-            let changes = self.advance_checked_type_inference();
-            if let Some(iteration_started) = iteration_started {
-                eprintln!(
-                    "boon_typecheck checked_program.infer_checked_types iteration={} changes={changes:?} elapsed_ms={:.3}",
-                    iteration + 1,
-                    typecheck_elapsed_ms(iteration_started)
-                );
-            }
-            if !changes.any() {
-                if trace {
-                    eprintln!(
-                        "boon_typecheck checked_program.infer_checked_types iterations={} convergence=no_changes",
-                        iteration + 1
-                    );
-                }
-                return;
-            }
-            final_boundary_unchanged = boundary.is_some_and(
-                |(
-                    boundary_declarations,
-                    boundary_signatures,
-                    boundary_calls,
-                    boundary_expressions,
-                )| {
-                    boundary_declarations
-                        == self
-                            .declarations
-                            .iter()
-                            .map(|declaration| declaration.flow_type.clone())
-                            .collect::<Vec<_>>()
-                        && boundary_signatures
-                            == self
-                                .signatures
-                                .iter()
-                                .map(|signature| signature.result.clone())
-                                .collect::<Vec<_>>()
-                        && boundary_calls
-                            == self
-                                .calls
-                                .iter()
-                                .map(|call| {
-                                    (
-                                        call.result.clone(),
-                                        call.type_substitutions.clone(),
-                                        call.contextual_substitutions.clone(),
-                                    )
-                                })
-                                .collect::<Vec<_>>()
-                        && boundary_expressions == self.inferred_expr_types
-                },
-            );
+        // Parameter schemes are read through the callable signature as well as
+        // their declaration. In particular an OUT parameter is absent from the
+        // serialized Function arguments, so declaration equality cannot stand
+        // in for invalidating every call-expression reader of the signature.
+        self.invalidate_checked_flow_signature(callable);
+        for (formal, flow_type) in parameter_updates {
+            self.set_declaration_flow_type(formal, flow_type);
         }
-        if final_boundary_unchanged {
-            // A deterministic epoch that reports internal rewrites while
-            // preserving the complete externally consumed inference state is
-            // a fixed point, not a user-visible non-convergence.
-            if trace {
-                eprintln!(
-                    "boon_typecheck checked_program.infer_checked_types iterations={iteration_limit} convergence=stable_boundary"
-                );
-            }
-            return;
-        }
-        self.diagnostics.push(TypeDiagnostic {
-            severity: DiagnosticSeverity::Error,
-            line: 0,
-            start: 0,
-            end: 0,
-            message: "checked contextual type inference did not converge".to_owned(),
-        });
+        self.set_declaration_flow_type(callable, callable_type);
+        Some(callable)
     }
 
     fn advance_checked_type_inference(&mut self) -> CheckedTypeInferenceChanges {
-        self.begin_checked_flow_inference_epoch();
         let mut callable = self.refresh_checked_callable_result_types();
-        if callable {
-            self.begin_checked_flow_inference_epoch();
-        }
         let mut declaration = self.refresh_checked_declaration_types();
-        if declaration {
-            self.begin_checked_flow_inference_epoch();
-        }
         let (propagated_callable, mut call) = self.refresh_checked_calls_and_callers();
         callable |= propagated_callable;
-        if call {
-            self.begin_checked_flow_inference_epoch();
-        }
-        let selector = self.refresh_pattern_selector_parameter_types();
-        if selector {
-            self.begin_checked_flow_inference_epoch();
-        }
-        let pattern = self.refresh_pattern_binding_types();
-        if pattern {
-            self.begin_checked_flow_inference_epoch();
-        }
+        let selector = !self.refresh_pattern_selector_parameter_types().is_empty();
+        let pattern = !self.refresh_pattern_binding_types().is_empty();
         let mut expression = self.refresh_checked_expression_types();
         if expression {
             // Complete the reverse half of the fixed-point sweep while the
             // changed expressions are hot. This moves new value types through
             // their declarations and call sites in the same global epoch
             // instead of waiting for the next full callable/selector scan.
-            self.begin_checked_flow_inference_epoch();
             let trailing_declaration = self.refresh_checked_declaration_types();
             declaration |= trailing_declaration;
-            if trailing_declaration {
-                self.begin_checked_flow_inference_epoch();
-            }
             let (trailing_callable, trailing_call) = self.refresh_checked_calls_and_callers();
             callable |= trailing_callable;
             call |= trailing_call;
             if trailing_call {
-                self.begin_checked_flow_inference_epoch();
                 expression |= self.refresh_checked_expression_types();
             }
         }
@@ -6121,7 +8100,8 @@ impl<'a> CheckedProgramBuilder<'a> {
         let mut changed_call_owners = BTreeSet::new();
         let call_ids = self.calls.iter().map(|call| call.id).collect::<Vec<_>>();
         for call_id in call_ids {
-            if self.instantiate_checked_call(call_id) {
+            let changes = self.instantiate_checked_call(call_id);
+            if changes.any {
                 call = true;
                 if let Some(owner) = self
                     .call_by_checked_id(call_id)
@@ -6151,12 +8131,10 @@ impl<'a> CheckedProgramBuilder<'a> {
     /// call updates immediately and queues only affected callers.
     fn propagate_changed_user_callers(&mut self, mut pending: BTreeSet<DeclId>) -> (bool, bool) {
         let trace = std::env::var_os("BOON_TYPECHECK_TRACE").is_some();
-        let calls_by_callee = self.calls.iter().fold(
-            BTreeMap::<DeclId, Vec<CheckedCallId>>::new(),
-            |mut index, call| {
-                index.entry(call.callable).or_default().push(call.id);
-                index
-            },
+        let dependencies = Arc::clone(
+            self.checked_type_inference_dependencies
+                .as_ref()
+                .expect("checked inference dependencies initialized"),
         );
         let maximum_visits = self
             .signatures
@@ -6181,25 +8159,23 @@ impl<'a> CheckedProgramBuilder<'a> {
             else {
                 continue;
             };
-            self.begin_checked_flow_inference_epoch();
-            let result =
-                self.infer_checked_expr_flow(result_expression.0 as usize, &mut BTreeSet::new());
+            let result = self.infer_checked_expr_flow_root(result_expression.0 as usize);
             let result = self.flush_boundary_flow_type(result_expression.0 as usize, result);
             if matches!(result.ty, Type::Unknown | Type::UnresolvedShape { .. })
                 || self.signatures[signature_index].result == result
             {
                 continue;
             }
-            self.signatures[signature_index].result = result;
+            self.set_checked_signature_result(signature_index, result);
             callable_changed = true;
-            self.begin_checked_flow_inference_epoch();
-            for call_id in calls_by_callee
+            for call_id in dependencies
+                .calls_by_callee
                 .get(&callable)
                 .into_iter()
                 .flatten()
                 .copied()
             {
-                if !self.instantiate_checked_call(call_id) {
+                if !self.instantiate_checked_call(call_id).any {
                     continue;
                 }
                 call_changed = true;
@@ -6222,40 +8198,38 @@ impl<'a> CheckedProgramBuilder<'a> {
         (callable_changed, call_changed)
     }
 
-    fn refresh_pattern_selector_parameter_types(&mut self) -> bool {
+    fn refresh_pattern_selector_parameter_types(&mut self) -> Vec<(DeclId, DeclId)> {
         let pattern_domains = self.pattern_selector_parameter_domains();
-        let mut domains = BTreeMap::<DeclId, Type>::new();
         let selector_parameters = self.syntax_discriminant_parameters.clone();
         if selector_parameters.is_empty() {
-            return false;
+            return Vec::new();
         }
-        let actuals = self
-            .calls
-            .iter()
-            .flat_map(|call| &call.entries)
-            .filter_map(|entry| match entry {
-                CheckedCallEntry::Input { formal, value, .. }
-                    if selector_parameters.contains(formal) =>
-                {
-                    Some((*formal, *value))
+        let dependencies = Arc::clone(
+            self.checked_type_inference_dependencies
+                .as_ref()
+                .expect("checked inference dependencies initialized"),
+        );
+        let mut actual_variant_candidates = BTreeMap::<DeclId, Vec<Type>>::new();
+        for formal in &selector_parameters {
+            for value in dependencies
+                .actuals_by_parameter
+                .get(formal)
+                .into_iter()
+                .flatten()
+            {
+                let actual = self.infer_checked_expr_flow_root(value.0 as usize).ty;
+                if type_is_variant_domain(&actual) {
+                    actual_variant_candidates
+                        .entry(*formal)
+                        .or_default()
+                        .push(actual);
                 }
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        for (formal, value) in actuals {
-            let actual = self
-                .infer_checked_expr_flow(value.0 as usize, &mut BTreeSet::new())
-                .ty;
-            if !type_is_variant_domain(&actual) {
-                continue;
             }
-            domains
-                .entry(formal)
-                .and_modify(|existing| {
-                    *existing = canonical_union_type(vec![existing.clone(), actual.clone()]);
-                })
-                .or_insert(actual);
         }
+        let mut domains = actual_variant_candidates
+            .into_iter()
+            .map(|(formal, candidates)| (formal, canonical_union_type(candidates)))
+            .collect::<BTreeMap<_, _>>();
         for (formal, pattern_domain) in pattern_domains {
             domains
                 .entry(formal)
@@ -6266,28 +8240,48 @@ impl<'a> CheckedProgramBuilder<'a> {
                 .or_insert(pattern_domain);
         }
 
-        let mut changed = false;
-        for signature in &mut self.signatures {
-            for parameter in &mut signature.parameters {
-                let Some(actual) = domains.get(&parameter.decl_id) else {
-                    continue;
-                };
-                let merged = if type_is_variant_domain(&parameter.flow_type.ty) {
-                    canonical_union_type(vec![parameter.flow_type.ty.clone(), actual.clone()])
-                } else if is_value_placeholder_type(&parameter.flow_type.ty) {
-                    actual.clone()
-                } else {
-                    continue;
-                };
-                if parameter.flow_type.ty != merged {
-                    parameter.flow_type.ty = merged;
-                    changed = true;
-                }
+        let mut changed_by_signature = BTreeMap::<usize, Vec<DeclId>>::new();
+        for (formal, actual) in domains {
+            let Some(location) = self
+                .parameter_location_by_decl
+                .get(&(formal.0 as usize))
+                .copied()
+            else {
+                continue;
+            };
+            let Some(parameter) = self
+                .signatures
+                .get_mut(location.signature)
+                .and_then(|signature| signature.parameters.get_mut(location.parameter))
+                .filter(|parameter| parameter.decl_id == formal)
+            else {
+                continue;
+            };
+            let merged = if type_is_variant_domain(&parameter.flow_type.ty) {
+                canonical_union_type(vec![parameter.flow_type.ty.clone(), actual])
+            } else if is_value_placeholder_type(&parameter.flow_type.ty) {
+                actual
+            } else {
+                continue;
+            };
+            if parameter.flow_type.ty != merged {
+                parameter.flow_type.ty = merged;
+                changed_by_signature
+                    .entry(location.signature)
+                    .or_default()
+                    .push(formal);
             }
         }
-        if changed {
-            self.sync_signature_declaration_types();
+
+        let mut changed = Vec::new();
+        for (signature, formals) in changed_by_signature {
+            let Some(owner) = self.publish_checked_signature_parameter_changes(signature, &formals)
+            else {
+                continue;
+            };
+            changed.extend(formals.into_iter().map(|formal| (formal, owner)));
         }
+        changed.sort_unstable();
         changed
     }
 
@@ -6395,9 +8389,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                 .iter()
                 .map(|substitution| (substitution.variable, substitution.value.clone()))
                 .collect::<BTreeMap<_, _>>();
-            let actual = self
-                .infer_checked_expr_flow(value.0 as usize, &mut BTreeSet::new())
-                .ty;
+            let actual = self.infer_checked_expr_flow_root(value.0 as usize).ty;
             let expected = substitute_checked_type(&formal.scheme.flow_type.ty, &substitutions);
             if type_is_assignable_to(&actual, &expected) {
                 continue;
@@ -6455,9 +8447,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                 else {
                     continue;
                 };
-                let actual = self
-                    .infer_checked_expr_flow(value.0 as usize, &mut BTreeSet::new())
-                    .ty;
+                let actual = self.infer_checked_expr_flow_root(value.0 as usize).ty;
                 let expected = substitute_checked_type(&parameter.flow_type.ty, &substitutions);
                 if type_is_assignable_to(&actual, &expected) {
                     continue;
@@ -6487,14 +8477,6 @@ impl<'a> CheckedProgramBuilder<'a> {
         }
     }
 
-    fn begin_checked_flow_inference_epoch(&mut self) {
-        self.checked_flow_inference_epoch = self.checked_flow_inference_epoch.wrapping_add(1);
-        if self.checked_flow_inference_epoch == 0 {
-            self.checked_flow_inference_cache.clear();
-            self.checked_flow_inference_epoch = 1;
-        }
-    }
-
     fn flush_boundary_flow_type(&self, expression: usize, mut flow_type: FlowType) -> FlowType {
         let Some(flush_type) = self.expression_flush_types.get(&expression) else {
             return flow_type;
@@ -6511,7 +8493,8 @@ impl<'a> CheckedProgramBuilder<'a> {
             infer_checked_expression_flush_types(self.program, &self.inferred_expr_types);
         self.expression_flush_types = inferred.types;
         self.diagnostics.extend(inferred.diagnostics);
-        self.invalidate_flush_boundary_authoritative_types();
+        let (changed_expressions, changed_declarations) =
+            self.invalidate_flush_boundary_authoritative_types();
 
         for expression in &self.program.expressions {
             let AstExprKind::Hold { initial, .. } = expression.kind else {
@@ -6527,14 +8510,23 @@ impl<'a> CheckedProgramBuilder<'a> {
             }
         }
 
-        self.begin_checked_flow_inference_epoch();
-        // The main worklist has already converged. Installing FLUSH metadata
-        // only removes stale authoritative shortcuts; the bounded full audit
-        // is cheaper here than reseeding every inference entity.
-        self.infer_checked_types_full_sweeps();
+        for expression in &changed_expressions {
+            self.invalidate_checked_flow_expressions([*expression]);
+        }
+        for declaration in &changed_declarations {
+            self.invalidate_checked_flow_declaration(*declaration);
+        }
+        if !changed_declarations.is_empty() || !changed_expressions.is_empty() {
+            self.infer_checked_types_after_flush_changes(
+                &changed_declarations,
+                &changed_expressions,
+            );
+        }
     }
 
-    fn invalidate_flush_boundary_authoritative_types(&mut self) {
+    fn invalidate_flush_boundary_authoritative_types(
+        &mut self,
+    ) -> (BTreeSet<usize>, BTreeSet<DeclId>) {
         let mut derived_expressions = self
             .expression_flush_types
             .keys()
@@ -6599,8 +8591,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                 break;
             }
         }
-        self.authoritative_expr_types
-            .retain(|expression| !derived_expressions.contains(expression));
+        (derived_expressions, derived_declarations)
     }
 
     fn refresh_checked_callable_result_types(&mut self) -> bool {
@@ -6617,13 +8608,20 @@ impl<'a> CheckedProgramBuilder<'a> {
             .collect::<Vec<_>>();
         let mut changed = false;
         for (index, expression) in callables {
-            let result = self.infer_checked_expr_flow(expression.0 as usize, &mut BTreeSet::new());
+            let result = self.infer_checked_expr_flow_root(expression.0 as usize);
             let result = self.flush_boundary_flow_type(expression.0 as usize, result);
             if matches!(result.ty, Type::Unknown | Type::UnresolvedShape { .. }) {
                 continue;
             }
             if self.signatures[index].result != result {
-                self.signatures[index].result = result;
+                if std::env::var_os("BOON_TYPECHECK_TRACE").is_some() {
+                    eprintln!(
+                        "boon_typecheck checked_program.refresh_callable changed={} result={}",
+                        self.signatures[index].name,
+                        boon_facing_type_compact_label(&result.ty),
+                    );
+                }
+                self.set_checked_signature_result(index, result);
                 changed = true;
             }
         }
@@ -6641,70 +8639,461 @@ impl<'a> CheckedProgramBuilder<'a> {
             .collect::<Vec<_>>();
         let mut changed = false;
         for (declaration, value) in values {
-            let flow_type = self.infer_checked_expr_flow(value.0 as usize, &mut BTreeSet::new());
+            let flow_type = self.infer_checked_expr_flow_root(value.0 as usize);
             let flow_type = self.flush_boundary_flow_type(value.0 as usize, flow_type);
             if matches!(flow_type.ty, Type::Unknown | Type::UnresolvedShape { .. }) {
                 continue;
             }
-            if let Some(index) = self.declaration_by_id.get(&declaration).copied()
-                && let Some(target) = self.declarations.get_mut(index)
-                && target.flow_type != flow_type
-            {
-                target.flow_type = flow_type;
-                changed = true;
-            }
+            changed |= self.set_declaration_flow_type(declaration, flow_type);
         }
         changed
     }
 
-    fn instantiate_checked_call(&mut self, call_id: CheckedCallId) -> bool {
-        let Some((
-            call_expression,
-            call_callable,
-            call_owner_callable,
-            call_entries,
-            call_context_binding,
-            call_result,
-        )) = self.call_by_checked_id(call_id).map(|call| {
-            (
-                call.expression,
-                call.callable,
-                call.owner_callable,
-                call.entries.clone(),
-                call.context_binding,
-                call.result.clone(),
+    /// Evaluate one user-call result under its concrete checked argument
+    /// types when a tagged syntax discriminant selects a narrower branch than
+    /// the callable's occurrence-independent principal result scheme.
+    ///
+    /// This is a call-local overlay over the checked graph, not a second
+    /// program-wide inference owner. It follows only the selected user-call
+    /// chain and reads all non-local facts from the indexed checked tables.
+    fn infer_checked_syntax_call_result(&mut self, call_id: CheckedCallId) -> Option<Type> {
+        self.infer_checked_overlay_call_type(call_id, &BTreeMap::new(), &mut BTreeSet::new())
+    }
+
+    fn infer_checked_overlay_call_type(
+        &mut self,
+        call_id: CheckedCallId,
+        caller_bindings: &BTreeMap<DeclId, Type>,
+        active_callables: &mut BTreeSet<DeclId>,
+    ) -> Option<Type> {
+        let dependencies = self.checked_type_inference_dependencies.as_ref().cloned()?;
+        let plan = dependencies
+            .call_inference_plans
+            .get(&(call_id.0 as usize))
+            .filter(|plan| plan.call_id == call_id)?;
+        let call_result = self
+            .calls
+            .get(plan.call_index)
+            .filter(|call| call.id == call_id)?
+            .result
+            .ty
+            .clone();
+        if !plan.is_user_callable {
+            return Some(call_result);
+        }
+        if !active_callables.insert(plan.callable) {
+            return None;
+        }
+        let result = (|| {
+            let mut bindings = BTreeMap::new();
+            for entry in &plan.entries {
+                match *entry {
+                    CheckedCallInferenceEntryPlan::Input { formal, value, .. } => {
+                        let ty = self.infer_checked_overlay_expr_type(
+                            value.0 as usize,
+                            caller_bindings,
+                            active_callables,
+                        )?;
+                        bindings.insert(formal, ty);
+                    }
+                    CheckedCallInferenceEntryPlan::Output {
+                        formal,
+                        output,
+                        forwarded,
+                        ..
+                    } => {
+                        let ty = forwarded
+                            .then(|| caller_bindings.get(&output).cloned())
+                            .flatten()
+                            .or_else(|| {
+                                self.declaration(output)
+                                    .map(|declaration| declaration.flow_type.ty.clone())
+                            });
+                        if let Some(ty) = ty {
+                            bindings.insert(formal, ty);
+                        }
+                    }
+                }
+            }
+            plan.result_expression.and_then(|result| {
+                self.infer_checked_overlay_expr_type(result.0 as usize, &bindings, active_callables)
+            })
+        })();
+        active_callables.remove(&plan.callable);
+        result
+    }
+
+    fn infer_checked_overlay_expr_type(
+        &mut self,
+        expr_id: usize,
+        bindings: &BTreeMap<DeclId, Type>,
+        active_callables: &mut BTreeSet<DeclId>,
+    ) -> Option<Type> {
+        let program = self.program;
+        let expression = program.expressions.get(expr_id)?;
+        let fallback = self
+            .inferred_expr_types
+            .get(&expr_id)
+            .map(|flow| flow.ty.clone())
+            .unwrap_or(Type::Unknown);
+        let read_type = |builder: &Self, expression: CheckedExprId| {
+            let (target, projection) =
+                builder.direct_read_declaration_with_projection(expression)?;
+            let base = bindings.get(&target).cloned().or_else(|| {
+                builder
+                    .declaration(target)
+                    .map(|declaration| declaration.flow_type.ty.clone())
+            })?;
+            let projected = if projection.is_empty() {
+                base
+            } else {
+                type_for_nested_path(&base, &projection)?
+            };
+            Some(
+                builder
+                    .narrowed_checked_read_type(
+                        expression.0 as usize,
+                        target,
+                        &projection,
+                        &projected,
+                    )
+                    .unwrap_or(projected),
             )
-        })
-        else {
-            return false;
         };
-        let Some(signature) = self.signature_by_declaration(call_callable).cloned() else {
-            return false;
+        let ty = match &expression.kind {
+            AstExprKind::StringLiteral(_)
+            | AstExprKind::TextLiteral(_)
+            | AstExprKind::TextTemplate { .. } => Type::Text,
+            AstExprKind::Number(_) => Type::Number,
+            AstExprKind::BitsLiteral { width, .. } => Type::Bits { width: *width },
+            AstExprKind::ByteLiteral { .. } => Type::Bytes(BytesType::Fixed(1)),
+            AstExprKind::BytesLiteral { size, .. } => Type::Bytes(match size {
+                BytesSizeSyntax::Fixed(size) => BytesType::Fixed(*size),
+                BytesSizeSyntax::Dynamic | BytesSizeSyntax::Infer => BytesType::Dynamic,
+            }),
+            AstExprKind::Tag(tag) if tag == "SKIP" => Type::Absent,
+            AstExprKind::Tag(tag) => Type::VariantSet(vec![Variant::Tag(tag.clone())]),
+            AstExprKind::Flush { .. } => Type::Absent,
+            AstExprKind::TaggedObject { tag, fields } => Type::VariantSet(vec![Variant::Tagged {
+                tag: tag.clone(),
+                fields: ObjectShape::from_ordered_fields(
+                    fields.iter().filter(|field| !field.spread).map(|field| {
+                        (
+                            field.name.clone(),
+                            self.infer_checked_overlay_expr_type(
+                                field.value,
+                                bindings,
+                                active_callables,
+                            )
+                            .unwrap_or(Type::Unknown),
+                        )
+                    }),
+                    false,
+                ),
+            }]),
+            AstExprKind::Object(fields) => Type::object(ObjectShape::from_ordered_fields(
+                fields.iter().filter(|field| !field.spread).map(|field| {
+                    (
+                        field.name.clone(),
+                        self.infer_checked_overlay_expr_type(
+                            field.value,
+                            bindings,
+                            active_callables,
+                        )
+                        .unwrap_or(Type::Unknown),
+                    )
+                }),
+                false,
+            )),
+            AstExprKind::ListLiteral { items, .. } => Type::List(Box::new(
+                items
+                    .iter()
+                    .filter_map(|item| {
+                        self.infer_checked_overlay_expr_type(*item, bindings, active_callables)
+                    })
+                    .reduce(|existing, extra| widen_structural_type(&existing, &extra))
+                    .or_else(|| match fallback {
+                        Type::List(ref item) => Some((**item).clone()),
+                        _ => None,
+                    })
+                    .unwrap_or(Type::Unknown),
+            )),
+            AstExprKind::SetLiteral { items } => Type::Set(Box::new(
+                items
+                    .iter()
+                    .filter_map(|item| {
+                        self.infer_checked_overlay_expr_type(*item, bindings, active_callables)
+                    })
+                    .reduce(|existing, extra| widen_structural_type(&existing, &extra))
+                    .unwrap_or(Type::Unknown),
+            )),
+            AstExprKind::MapEntry { key, value } => Type::object(ObjectShape::from_ordered_fields(
+                [
+                    (
+                        "key".to_owned(),
+                        self.infer_checked_overlay_expr_type(*key, bindings, active_callables)
+                            .unwrap_or(Type::Unknown),
+                    ),
+                    (
+                        "value".to_owned(),
+                        self.infer_checked_overlay_expr_type(*value, bindings, active_callables)
+                            .unwrap_or(Type::Unknown),
+                    ),
+                ],
+                false,
+            )),
+            AstExprKind::MapLiteral { entries } => {
+                let mut key = None;
+                let mut value = None;
+                for entry in entries {
+                    let Some(Type::Object(shape)) =
+                        self.infer_checked_overlay_expr_type(*entry, bindings, active_callables)
+                    else {
+                        continue;
+                    };
+                    if let Some(next) = shape.fields.get("key") {
+                        key = Some(key.map_or_else(
+                            || next.clone(),
+                            |existing| widen_structural_type(&existing, next),
+                        ));
+                    }
+                    if let Some(next) = shape.fields.get("value") {
+                        value = Some(value.map_or_else(
+                            || next.clone(),
+                            |existing| widen_structural_type(&existing, next),
+                        ));
+                    }
+                }
+                Type::Map {
+                    key: Box::new(key.unwrap_or(Type::Unknown)),
+                    value: Box::new(value.unwrap_or(Type::Unknown)),
+                }
+            }
+            AstExprKind::Identifier(_) | AstExprKind::Path(_) | AstExprKind::Drain { .. } => {
+                read_type(self, CheckedExprId(expr_id as u32)).unwrap_or(fallback)
+            }
+            AstExprKind::Arrow { output, .. } => output
+                .and_then(|output| {
+                    self.infer_checked_overlay_expr_type(output, bindings, active_callables)
+                })
+                .unwrap_or(Type::Unknown),
+            AstExprKind::When { input, .. } => self
+                .infer_checked_overlay_when_type(expression, *input, bindings, active_callables)
+                .unwrap_or(fallback),
+            AstExprKind::Pipe { input, op, .. } if op == "WHILE" => self
+                .infer_checked_overlay_when_type(expression, *input, bindings, active_callables)
+                .unwrap_or(fallback),
+            AstExprKind::Call { .. } | AstExprKind::Pipe { .. } => {
+                if let AstExprKind::Pipe { input, op, .. } = &expression.kind
+                    && let Some(field) = op.strip_prefix("Field/")
+                {
+                    self.exact_pipeline_input(expression, *input)
+                        .and_then(|input| {
+                            self.infer_checked_overlay_expr_type(input, bindings, active_callables)
+                        })
+                        .and_then(|input| type_for_nested_path(&input, &[field.to_owned()]))
+                        .unwrap_or(Type::Unknown)
+                } else if let Some((call_id, call_result)) = self
+                    .call_for_expression(CheckedExprId(expr_id as u32))
+                    .map(|call| (call.id, call.result.ty.clone()))
+                {
+                    let is_user = self
+                        .checked_type_inference_dependencies
+                        .as_ref()
+                        .and_then(|dependencies| {
+                            dependencies.call_inference_plans.get(&(call_id.0 as usize))
+                        })
+                        .is_some_and(|plan| plan.call_id == call_id && plan.is_user_callable);
+                    if is_user {
+                        self.infer_checked_overlay_call_type(call_id, bindings, active_callables)
+                            .unwrap_or(call_result)
+                    } else {
+                        call_result
+                    }
+                } else {
+                    fallback
+                }
+            }
+            AstExprKind::Infix { op, .. } => {
+                if infix_returns_bool(op) {
+                    true_false_type()
+                } else {
+                    Type::Number
+                }
+            }
+            AstExprKind::MatchArm { output, .. } => output
+                .and_then(|output| {
+                    self.infer_checked_overlay_expr_type(output, bindings, active_callables)
+                })
+                .unwrap_or(Type::Absent),
+            AstExprKind::Block { result, .. } => result
+                .and_then(|result| {
+                    self.infer_checked_overlay_expr_type(result, bindings, active_callables)
+                })
+                .unwrap_or(Type::Absent),
+            AstExprKind::Then { input, output } => output
+                .or_else(|| self.exact_pipeline_input(expression, *input))
+                .and_then(|output| {
+                    self.infer_checked_overlay_expr_type(output, bindings, active_callables)
+                })
+                .unwrap_or(Type::Unknown),
+            AstExprKind::Hold { initial, .. } => self
+                .exact_pipeline_input(expression, *initial)
+                .and_then(|initial| {
+                    self.infer_checked_overlay_expr_type(initial, bindings, active_callables)
+                })
+                .unwrap_or(fallback),
+            AstExprKind::Draining { input } => self
+                .exact_pipeline_input(expression, *input)
+                .and_then(|input| {
+                    self.infer_checked_overlay_expr_type(input, bindings, active_callables)
+                })
+                .unwrap_or(Type::Unknown),
+            AstExprKind::Latest { branches } => branches
+                .iter()
+                .filter_map(|branch| {
+                    self.infer_checked_overlay_expr_type(*branch, bindings, active_callables)
+                })
+                .filter(|branch| !matches!(branch, Type::Absent))
+                .reduce(|existing, branch| widen_structural_type(&existing, &branch))
+                .unwrap_or(fallback),
+            AstExprKind::Source | AstExprKind::Delimiter | AstExprKind::Unknown(_) => fallback,
+        };
+        Some(ty)
+    }
+
+    fn infer_checked_overlay_when_type(
+        &mut self,
+        expression: &AstExpr,
+        raw_input: usize,
+        bindings: &BTreeMap<DeclId, Type>,
+        active_callables: &mut BTreeSet<DeclId>,
+    ) -> Option<Type> {
+        let selector = self.exact_pipeline_input(expression, raw_input)?;
+        let selector_type =
+            self.infer_checked_overlay_expr_type(selector, bindings, active_callables)?;
+        let mut result = None;
+        for arm in reachable_static_when_arms(
+            expression.id,
+            &self.program.expressions,
+            Some(&selector_type),
+        ) {
+            let arm_selector = arm.selector_type.as_ref().unwrap_or(&selector_type);
+            let mut arm_bindings = bindings.clone();
+            for (name, ty) in pattern_payload_bindings(arm_selector, &arm.pattern) {
+                if let Some(declaration) = self
+                    .pattern_declarations
+                    .get(&(arm.expression, name))
+                    .copied()
+                {
+                    arm_bindings.insert(declaration, ty);
+                }
+            }
+            if let AstMatchPattern::Binding { name } = &arm.pattern
+                && let Some(declaration) = self
+                    .pattern_declarations
+                    .get(&(arm.expression, name.clone()))
+                    .copied()
+            {
+                arm_bindings.insert(declaration, arm_selector.clone());
+            }
+            let Some(arm_type) =
+                self.infer_checked_overlay_expr_type(arm.output, &arm_bindings, active_callables)
+            else {
+                continue;
+            };
+            if matches!(arm_type, Type::Absent) {
+                continue;
+            }
+            result = Some(match result {
+                Some(existing) => widen_structural_type(&existing, &arm_type),
+                None => arm_type,
+            });
+        }
+        result
+    }
+
+    fn snapshot_checked_call_inference(
+        &self,
+        plan: &CheckedCallInferencePlan,
+    ) -> Option<CheckedCallInferenceSnapshot> {
+        let call = self
+            .calls
+            .get(plan.call_index)
+            .filter(|call| call.id == plan.call_id && call.callable == plan.callable)?;
+        let signature = self
+            .signatures
+            .get(plan.signature_index)
+            .filter(|signature| signature.decl_id == plan.callable)?;
+        let parameter_flow_types = plan
+            .entries
+            .iter()
+            .map(|entry| {
+                let entry = *entry;
+                let parameter_index = entry.parameter_index()?;
+                signature
+                    .parameters
+                    .get(parameter_index)
+                    .filter(|parameter| parameter.decl_id == entry.formal())
+                    .map(|parameter| parameter.flow_type.clone())
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let context_formal = plan.context_formal_index.and_then(|index| {
+            self.context_formals
+                .get(index)
+                .filter(|formal| plan.context_formal == Some(formal.id))
+                .map(|formal| formal.scheme.flow_type.clone())
+        });
+        let inherited_context = plan.inherited_context_formal_index.and_then(|index| {
+            self.context_formals
+                .get(index)
+                .map(|formal| formal.scheme.flow_type.clone())
+        });
+        Some(CheckedCallInferenceSnapshot {
+            call_result: call.result.clone(),
+            signature_result: signature.result.clone(),
+            parameter_flow_types,
+            context_formal,
+            inherited_context,
+        })
+    }
+
+    fn instantiate_checked_call(
+        &mut self,
+        call_id: CheckedCallId,
+    ) -> CheckedCallInstantiationChanges {
+        let Some(dependencies) = self.checked_type_inference_dependencies.as_ref().cloned() else {
+            return CheckedCallInstantiationChanges::default();
+        };
+        let Some(plan) = dependencies
+            .call_inference_plans
+            .get(&(call_id.0 as usize))
+            .filter(|plan| plan.call_id == call_id)
+        else {
+            return CheckedCallInstantiationChanges::default();
+        };
+        let Some(snapshot) = self.snapshot_checked_call_inference(plan) else {
+            return CheckedCallInstantiationChanges::default();
         };
         let mut substitutions = BTreeMap::<TypeVar, Type>::new();
         let mut dependency_catch_inputs = Vec::new();
 
-        for entry in &call_entries {
-            let CheckedCallEntry::Input {
-                formal,
-                value,
-                evaluation_scope: CheckedEvaluationScope::Parent,
-                ..
-            } = entry
+        for entry_index in plan.parent_inputs.iter().copied() {
+            let Some(CheckedCallInferenceEntryPlan::Input { value, .. }) =
+                plan.entries.get(entry_index).copied()
             else {
                 continue;
             };
-            let Some(parameter) = signature
-                .parameters
-                .iter()
-                .find(|parameter| parameter.decl_id == *formal)
+            let Some(parameter) = snapshot
+                .parameter_flow_types
+                .get(entry_index)
+                .and_then(Option::as_ref)
             else {
                 continue;
             };
-            let actual = self
-                .infer_checked_expr_flow(value.0 as usize, &mut BTreeSet::new())
-                .ty;
-            if signature.name == "Dependency/catch_cycle"
+            let actual = self.infer_checked_expr_flow_root(value.0 as usize).ty;
+            if plan.dependency_catch_cycle
                 && !matches!(
                     &actual,
                     Type::Unknown | Type::UnresolvedShape { .. } | Type::Absent
@@ -6712,51 +9101,43 @@ impl<'a> CheckedProgramBuilder<'a> {
             {
                 dependency_catch_inputs.push(actual.clone());
             }
-            unify_checked_type_pattern(&parameter.flow_type.ty, &actual, &mut substitutions);
+            unify_checked_type_pattern(&parameter.ty, &actual, &mut substitutions);
         }
-        if signature.name == "Dependency/catch_cycle"
-            && let Type::Var(result_variable) = signature.result.ty
+        if plan.dependency_catch_cycle
+            && let Type::Var(result_variable) = &snapshot.signature_result.ty
             && !dependency_catch_inputs.is_empty()
         {
             substitutions.insert(
-                result_variable,
+                *result_variable,
                 canonical_union_type(dependency_catch_inputs),
             );
         }
-        let context_formal = signature
-            .context_formal
-            .and_then(|formal| self.context_formal(formal).cloned());
-        if let Some(formal) = context_formal.as_ref() {
-            let actual = match call_context_binding {
-                CheckedContextBinding::Explicit { value, .. } => Some(
-                    self.infer_checked_expr_flow(value.0 as usize, &mut BTreeSet::new())
-                        .ty,
-                ),
-                CheckedContextBinding::Inherited { formal } => self
-                    .context_formal(formal)
-                    .map(|formal| formal.scheme.flow_type.ty.clone()),
-                CheckedContextBinding::None => None,
+        if let Some(formal) = snapshot.context_formal.as_ref() {
+            let actual = if let Some(value) = plan.explicit_context_input {
+                Some(self.infer_checked_expr_flow_root(value.0 as usize).ty)
+            } else {
+                snapshot
+                    .inherited_context
+                    .as_ref()
+                    .map(|flow_type| flow_type.ty.clone())
             };
             if let Some(actual) = actual {
-                unify_checked_type_pattern(
-                    &formal.scheme.flow_type.ty,
-                    &actual,
-                    &mut substitutions,
-                );
+                unify_checked_type_pattern(&formal.ty, &actual, &mut substitutions);
             }
         }
 
-        let mut changed = false;
-        for entry in &call_entries {
-            let (formal, output) = match entry {
-                CheckedCallEntry::FreshOut { formal, output, .. } => (*formal, *output),
-                CheckedCallEntry::ForwardOut { formal, target, .. } => (*formal, *target),
-                CheckedCallEntry::Input { .. } => continue,
+        let mut changes = CheckedCallInstantiationChanges::default();
+        let mut output_changed = false;
+        for entry_index in plan.outputs.iter().copied() {
+            let Some(CheckedCallInferenceEntryPlan::Output { output, .. }) =
+                plan.entries.get(entry_index).copied()
+            else {
+                continue;
             };
-            let Some(parameter) = signature
-                .parameters
-                .iter()
-                .find(|parameter| parameter.decl_id == formal)
+            let Some(parameter) = snapshot
+                .parameter_flow_types
+                .get(entry_index)
+                .and_then(Option::as_ref)
             else {
                 continue;
             };
@@ -6764,62 +9145,65 @@ impl<'a> CheckedProgramBuilder<'a> {
                 .declaration(output)
                 .map(|declaration| declaration.flow_type.ty.clone())
             {
-                unify_checked_type_pattern(&parameter.flow_type.ty, &existing, &mut substitutions);
+                unify_checked_type_pattern(&parameter.ty, &existing, &mut substitutions);
             }
             let flow_type = FlowType {
-                mode: parameter.flow_type.mode,
-                ty: substitute_checked_type(&parameter.flow_type.ty, &substitutions),
+                mode: parameter.mode,
+                ty: substitute_checked_type(&parameter.ty, &substitutions),
             };
-            changed |= self.set_declaration_flow_type(output, flow_type);
+            if self.set_declaration_flow_type(output, flow_type) {
+                changes.any = true;
+                changes.outputs.push(output);
+                output_changed = true;
+            }
         }
 
-        for entry in &call_entries {
-            let CheckedCallEntry::Input {
-                formal,
-                value,
-                evaluation_scope: CheckedEvaluationScope::Output { .. },
-                ..
-            } = entry
+        for entry_index in plan.output_scope_inputs.iter().copied() {
+            let Some(CheckedCallInferenceEntryPlan::Input { value, .. }) =
+                plan.entries.get(entry_index).copied()
             else {
                 continue;
             };
-            let Some(parameter) = signature
-                .parameters
-                .iter()
-                .find(|parameter| parameter.decl_id == *formal)
+            let Some(parameter) = snapshot
+                .parameter_flow_types
+                .get(entry_index)
+                .and_then(Option::as_ref)
             else {
                 continue;
             };
-            let actual = self
-                .infer_checked_expr_flow(value.0 as usize, &mut BTreeSet::new())
-                .ty;
-            unify_checked_type_pattern(&parameter.flow_type.ty, &actual, &mut substitutions);
+            let actual = self.infer_checked_expr_flow_root(value.0 as usize).ty;
+            unify_checked_type_pattern(&parameter.ty, &actual, &mut substitutions);
         }
 
-        for entry in &call_entries {
-            let (formal, output) = match entry {
-                CheckedCallEntry::FreshOut { formal, output, .. } => (*formal, *output),
-                CheckedCallEntry::ForwardOut { formal, target, .. } => (*formal, *target),
-                CheckedCallEntry::Input { .. } => continue,
-            };
-            let Some(parameter) = signature
-                .parameters
-                .iter()
-                .find(|parameter| parameter.decl_id == formal)
+        for entry_index in plan.outputs.iter().copied() {
+            let Some(CheckedCallInferenceEntryPlan::Output { output, .. }) =
+                plan.entries.get(entry_index).copied()
             else {
                 continue;
             };
-            changed |= self.set_declaration_flow_type(
+            let Some(parameter) = snapshot
+                .parameter_flow_types
+                .get(entry_index)
+                .and_then(Option::as_ref)
+            else {
+                continue;
+            };
+            if self.set_declaration_flow_type(
                 output,
                 FlowType {
-                    mode: parameter.flow_type.mode,
-                    ty: substitute_checked_type(&parameter.flow_type.ty, &substitutions),
+                    mode: parameter.mode,
+                    ty: substitute_checked_type(&parameter.ty, &substitutions),
                 },
-            );
+            ) {
+                changes.any = true;
+                changes.outputs.push(output);
+                output_changed = true;
+            }
         }
+        changes.needs_output_scope_revisit = output_changed && !plan.output_scope_inputs.is_empty();
 
         let mut result_instantiation = substitutions.clone();
-        if type_is_recursively_closed(&call_result.ty) {
+        if type_is_recursively_closed(&snapshot.call_result.ty) {
             // Some result variables are determined by call-local syntax rather
             // than a value parameter (for example, the width argument to
             // `Bits/slice`). Seed only result variables that argument
@@ -6829,8 +9213,8 @@ impl<'a> CheckedProgramBuilder<'a> {
             // specialize the callable body to one unrelated call site.
             let mut result_substitutions = BTreeMap::new();
             unify_checked_type_pattern(
-                &signature.result.ty,
-                &call_result.ty,
+                &snapshot.signature_result.ty,
+                &snapshot.call_result.ty,
                 &mut result_substitutions,
             );
             for (variable, value) in result_substitutions {
@@ -6838,25 +9222,12 @@ impl<'a> CheckedProgramBuilder<'a> {
             }
         }
         let instantiated_result =
-            substitute_checked_type(&signature.result.ty, &result_instantiation);
-        let syntax_discriminated_result = (signature.kind == CheckedCallableKind::User
-            && self.checked_call_has_syntax_discriminant(&call_entries))
-        .then(|| {
-            self.syntax_expr_types
-                .get(&(call_expression.0 as usize))
-                .map(|flow_type| flow_type.ty.clone())
-        })
-        .flatten()
-        .filter(type_is_recursively_closed);
-        let authoritative_result = self
-            .authoritative_expr_types
-            .contains(&(call_expression.0 as usize))
-            .then(|| {
-                self.inferred_expr_types
-                    .get(&(call_expression.0 as usize))
-                    .map(|flow_type| flow_type.ty.clone())
-            })
-            .flatten();
+            substitute_checked_type(&snapshot.signature_result.ty, &result_instantiation);
+        let syntax_discriminated_result = plan
+            .has_syntax_discriminant
+            .then(|| self.infer_checked_syntax_call_result(call_id))
+            .flatten()
+            .filter(type_is_recursively_closed);
         // A root call expression is a concrete instantiation site. The
         // syntax-wide scheme remains open inside its callable, but the exact
         // structural result inferred at this occurrence must not be widened
@@ -6865,9 +9236,9 @@ impl<'a> CheckedProgramBuilder<'a> {
         // Calls owned by another callable deliberately do not use this path:
         // their expression is shared by every outer instantiation and must
         // remain generic.
-        let concrete_root_result = call_owner_callable
-            .is_none()
-            .then(|| specialize_checked_call_result(&instantiated_result, &call_result.ty));
+        let concrete_root_result = plan.owner_callable.is_none().then(|| {
+            specialize_checked_call_result(&instantiated_result, &snapshot.call_result.ty)
+        });
         // A syntactically fixed outer Tag selects a stable callable branch even
         // when the principal result scheme has to summarize heterogeneous arm
         // results (for example, an object material versus a list of lights).
@@ -6878,15 +9249,12 @@ impl<'a> CheckedProgramBuilder<'a> {
             syntax
         } else if let Some(concrete) = concrete_root_result {
             concrete
-        } else if type_is_recursively_closed(&instantiated_result) {
-            authoritative_result.unwrap_or(instantiated_result)
-        } else if !type_is_recursively_closed(&call_result.ty) {
-            authoritative_result.unwrap_or(instantiated_result)
         } else {
             instantiated_result
         };
         let result = FlowType {
-            mode: self.instantiate_checked_call_result_mode(&signature, &call_entries),
+            mode: self
+                .compute_checked_call_result_mode_from_plan(plan, snapshot.signature_result.mode),
             ty: result_type,
         };
         let type_substitutions = substitutions
@@ -6897,44 +9265,49 @@ impl<'a> CheckedProgramBuilder<'a> {
             })
             .collect::<Vec<_>>();
         let mut context_variables = BTreeSet::new();
-        if let Some(formal) = context_formal.as_ref() {
-            collect_type_vars(&formal.scheme.flow_type.ty, &mut context_variables);
+        if let Some(formal) = snapshot.context_formal.as_ref() {
+            collect_type_vars(&formal.ty, &mut context_variables);
         }
-        let contextual_substitutions = context_formal
-            .as_ref()
+        let contextual_substitutions = plan
+            .context_formal
+            .zip(snapshot.context_formal.as_ref())
             .into_iter()
-            .flat_map(|formal| {
+            .flat_map(|(formal, _)| {
                 type_substitutions
                     .iter()
                     .filter(|substitution| context_variables.contains(&substitution.variable))
-                    .map(|substitution| CheckedContextTypeSubstitution {
-                        formal: formal.id,
+                    .map(move |substitution| CheckedContextTypeSubstitution {
+                        formal,
                         variable: substitution.variable,
                         value: substitution.value.clone(),
                     })
             })
             .collect::<Vec<_>>();
         if let Some(target) = self
-            .call_by_id
-            .get(&call_id)
-            .copied()
-            .and_then(|index| self.calls.get_mut(index))
+            .calls
+            .get_mut(plan.call_index)
+            .filter(|target| target.id == call_id)
         {
             if target.result != result {
                 target.result = result.clone();
-                changed = true;
+                changes.any = true;
             }
             if target.type_substitutions != type_substitutions {
                 target.type_substitutions = type_substitutions;
-                changed = true;
+                changes.any = true;
             }
             if target.contextual_substitutions != contextual_substitutions {
                 target.contextual_substitutions = contextual_substitutions;
-                changed = true;
+                changes.any = true;
             }
         }
-        changed |= self.set_inferred_expr_flow(call_expression.0 as usize, result);
-        changed
+        if self.set_inferred_expr_flow(plan.call_expression.0 as usize, result) {
+            changes.any = true;
+            changes.expression = Some(plan.call_expression.0 as usize);
+        }
+        changes.outputs.sort_unstable();
+        changes.outputs.dedup();
+        changes
     }
 
     fn checked_call_has_syntax_discriminant(&self, entries: &[CheckedCallEntry]) -> bool {
@@ -6985,9 +9358,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                 else {
                     continue;
                 };
-                let actual = self
-                    .infer_checked_expr_flow(value.0 as usize, &mut BTreeSet::new())
-                    .ty;
+                let actual = self.infer_checked_expr_flow_root(value.0 as usize).ty;
                 unify_checked_type_pattern(&parameter.flow_type.ty, &actual, &mut substitutions);
                 let expected = substitute_checked_type(&parameter.flow_type.ty, &substitutions);
                 if !type_is_assignable_to(&actual, &expected) {
@@ -7005,62 +9376,50 @@ impl<'a> CheckedProgramBuilder<'a> {
         }
     }
 
-    fn instantiate_checked_call_result_mode(
+    fn compute_checked_call_result_mode_from_plan(
         &mut self,
-        signature: &CheckedCallableSignature,
-        entries: &[CheckedCallEntry],
+        plan: &CheckedCallInferencePlan,
+        fallback: FlowMode,
     ) -> FlowMode {
-        if signature.name == "List/map"
-            && let Some(new) = checked_call_entry_input(entries, "new")
-        {
-            return self
-                .infer_checked_expr_flow(new.0 as usize, &mut BTreeSet::new())
-                .mode;
+        match &plan.mode {
+            CheckedCallModeInferencePlan::Input(value) => {
+                self.infer_checked_expr_flow_root(value.0 as usize).mode
+            }
+            CheckedCallModeInferencePlan::External(inputs) => {
+                let mut active = BTreeSet::new();
+                inputs.iter().fold(fallback, |mode, value| {
+                    let argument_mode = self
+                        .infer_instantiated_expr_mode(*value, &BTreeMap::new(), &mut active)
+                        .unwrap_or(FlowMode::Continuous);
+                    merge_flow_modes(mode, argument_mode)
+                })
+            }
+            CheckedCallModeInferencePlan::Fixed => fallback,
+            CheckedCallModeInferencePlan::User(result) => {
+                let mut active = BTreeSet::new();
+                let bindings = self.instantiate_checked_flow_bindings_from_plan(
+                    &plan.entries,
+                    &BTreeMap::new(),
+                    &mut active,
+                );
+                self.infer_instantiated_expr_mode(*result, &bindings, &mut active)
+                    .unwrap_or(fallback)
+            }
         }
-        if signature.name == "List/latest"
-            && let Some(list) = checked_call_entry_input(entries, "list")
-        {
-            return self
-                .infer_checked_expr_flow(list.0 as usize, &mut BTreeSet::new())
-                .mode;
-        }
-        if signature.kind == CheckedCallableKind::External {
-            let mut active = BTreeSet::new();
-            return entries.iter().fold(signature.result.mode, |mode, entry| {
-                let CheckedCallEntry::Input { value, .. } = entry else {
-                    return mode;
-                };
-                let argument_mode = self
-                    .infer_instantiated_expr_mode(*value, &BTreeMap::new(), &mut active)
-                    .unwrap_or(FlowMode::Continuous);
-                merge_flow_modes(mode, argument_mode)
-            });
-        }
-        if signature.kind != CheckedCallableKind::User {
-            return signature.result.mode;
-        }
-        let Some(result) = signature.result_expression else {
-            return signature.result.mode;
-        };
-        let mut active = BTreeSet::new();
-        let bindings =
-            self.instantiate_checked_flow_bindings(entries, &BTreeMap::new(), &mut active);
-        self.infer_instantiated_expr_mode(result, &bindings, &mut active)
-            .unwrap_or(signature.result.mode)
     }
 
-    fn instantiate_checked_flow_bindings(
+    fn instantiate_checked_flow_bindings_from_plan(
         &mut self,
-        entries: &[CheckedCallEntry],
+        entries: &[CheckedCallInferenceEntryPlan],
         parent: &BTreeMap<DeclId, FlowMode>,
         active: &mut BTreeSet<CheckedExprId>,
     ) -> BTreeMap<DeclId, FlowMode> {
         entries
             .iter()
-            .filter_map(|entry| match entry {
-                CheckedCallEntry::Input { formal, value, .. } => Some((
-                    *formal,
-                    self.infer_instantiated_expr_mode(*value, parent, active)
+            .filter_map(|entry| match *entry {
+                CheckedCallInferenceEntryPlan::Input { formal, value, .. } => Some((
+                    formal,
+                    self.infer_instantiated_expr_mode(value, parent, active)
                         .unwrap_or_else(|| {
                             self.inferred_expr_types
                                 .get(&(value.0 as usize))
@@ -7068,12 +9427,9 @@ impl<'a> CheckedProgramBuilder<'a> {
                                 .unwrap_or(FlowMode::Continuous)
                         }),
                 )),
-                CheckedCallEntry::FreshOut { formal, output, .. } => self
-                    .declaration(*output)
-                    .map(|declaration| (*formal, declaration.flow_type.mode)),
-                CheckedCallEntry::ForwardOut { formal, target, .. } => self
-                    .declaration(*target)
-                    .map(|declaration| (*formal, declaration.flow_type.mode)),
+                CheckedCallInferenceEntryPlan::Output { formal, output, .. } => self
+                    .declaration(output)
+                    .map(|declaration| (formal, declaration.flow_type.mode)),
             })
             .collect()
     }
@@ -7090,7 +9446,8 @@ impl<'a> CheckedProgramBuilder<'a> {
                 .get(&(expression.0 as usize))
                 .map(|flow| flow.mode);
         }
-        let expr = self.program.expressions.get(expression.0 as usize)?.clone();
+        let program = self.program;
+        let expr = program.expressions.get(expression.0 as usize)?;
         let mode = match &expr.kind {
             AstExprKind::Source | AstExprKind::Then { .. } => FlowMode::PresentOrAbsent,
             AstExprKind::Flush { .. } => FlowMode::Continuous,
@@ -7127,13 +9484,13 @@ impl<'a> CheckedProgramBuilder<'a> {
                 .unwrap_or(FlowMode::Continuous)
             }
             AstExprKind::When { input, .. } => self
-                .exact_pipeline_input(&expr, *input)
+                .exact_pipeline_input(expr, *input)
                 .and_then(|input| {
                     self.infer_instantiated_expr_mode(CheckedExprId(input as u32), bindings, active)
                 })
                 .unwrap_or(FlowMode::Continuous),
             AstExprKind::Draining { input } => self
-                .exact_pipeline_input(&expr, *input)
+                .exact_pipeline_input(expr, *input)
                 .and_then(|input| {
                     self.infer_instantiated_expr_mode(CheckedExprId(input as u32), bindings, active)
                 })
@@ -7157,17 +9514,35 @@ impl<'a> CheckedProgramBuilder<'a> {
                 })
                 .unwrap_or(FlowMode::Absent),
             AstExprKind::Call { .. } | AstExprKind::Pipe { .. } => {
-                if let Some(call) = self.call_for_expression(expression).cloned()
-                    && let Some(signature) = self.signature_by_declaration(call.callable).cloned()
-                    && signature.kind == CheckedCallableKind::User
-                    && let Some(result) = signature.result_expression
-                {
-                    let nested =
-                        self.instantiate_checked_flow_bindings(&call.entries, bindings, active);
+                let call_id = self.call_for_expression(expression).map(|call| call.id);
+                let dependencies = self.checked_type_inference_dependencies.as_ref().cloned();
+                let user_call = call_id.and_then(|call_id| {
+                    let plan = dependencies
+                        .as_ref()?
+                        .call_inference_plans
+                        .get(&(call_id.0 as usize))?;
+                    if plan.call_id != call_id || !plan.is_user_callable {
+                        return None;
+                    }
+                    let result = plan.result_expression?;
+                    let fallback = self
+                        .signatures
+                        .get(plan.signature_index)
+                        .filter(|signature| signature.decl_id == plan.callable)?
+                        .result
+                        .mode;
+                    Some((plan, result, fallback))
+                });
+                if let Some((plan, result, fallback)) = user_call {
+                    let nested = self.instantiate_checked_flow_bindings_from_plan(
+                        &plan.entries,
+                        bindings,
+                        active,
+                    );
                     self.infer_instantiated_expr_mode(result, &nested, active)
-                        .unwrap_or(signature.result.mode)
+                        .unwrap_or(fallback)
                 } else {
-                    self.infer_instantiated_builtin_call_mode(&expr, bindings, active)
+                    self.infer_instantiated_builtin_call_mode(expr, bindings, active)
                 }
             }
             AstExprKind::StringLiteral(_)
@@ -7255,37 +9630,65 @@ impl<'a> CheckedProgramBuilder<'a> {
         bindings: &BTreeMap<DeclId, FlowMode>,
         active: &mut BTreeSet<CheckedExprId>,
     ) -> Option<FlowMode> {
-        let scope = self
-            .expression_scopes
-            .get(&(expression.0 as usize))
-            .copied()
-            .unwrap_or(LexicalScopeId(0));
-        let Some((target, projection)) =
-            self.resolve_checked_read_path(expression.0 as usize, scope, parts)
-        else {
-            let path = parts.join(".");
-            return self
-                .exact_named_value_mode(&path)
-                .or_else(|| flow_binding_mode(&self.named_value_modes, &path))
-                .or_else(|| flow_binding_mode(&self.flow_bindings, &path));
+        let expr_id = expression.0 as usize;
+        let dependencies = self.checked_type_inference_dependencies.as_ref().cloned();
+        let indexed = if let Some(dependencies) = dependencies.as_ref() {
+            self.checked_read_path_inference_lookup(dependencies, expr_id, parts)
+        } else {
+            self.checked_flow_inference_cache.stats.indexed_read_missing = self
+                .checked_flow_inference_cache
+                .stats
+                .indexed_read_missing
+                .saturating_add(1);
+            CheckedReadPathInferenceLookup::Missing
+        };
+        let (target, projection) = match indexed {
+            CheckedReadPathInferenceLookup::Resolved { target, projection } => {
+                (target, Cow::Borrowed(projection))
+            }
+            CheckedReadPathInferenceLookup::Unresolved { canonical_path } => {
+                return self
+                    .exact_named_value_mode(canonical_path)
+                    .or_else(|| flow_binding_mode(&self.named_value_modes, canonical_path))
+                    .or_else(|| flow_binding_mode(&self.flow_bindings, canonical_path));
+            }
+            CheckedReadPathInferenceLookup::Missing | CheckedReadPathInferenceLookup::Rejected => {
+                let scope = self
+                    .expression_scopes
+                    .get(&expr_id)
+                    .copied()
+                    .unwrap_or(LexicalScopeId(0));
+                let Some((target, projection)) =
+                    self.resolve_checked_read_path(expr_id, scope, parts)
+                else {
+                    let path = parts.join(".");
+                    return self
+                        .exact_named_value_mode(&path)
+                        .or_else(|| flow_binding_mode(&self.named_value_modes, &path))
+                        .or_else(|| flow_binding_mode(&self.flow_bindings, &path));
+                };
+                (target, Cow::Owned(projection))
+            }
         };
         if let Some(mode) = bindings.get(&target) {
             return Some(*mode);
         }
-        let declaration = self.declaration(target).cloned()?;
+        let (declaration_value, declaration_mode) = self
+            .declaration(target)
+            .map(|declaration| (declaration.value, declaration.flow_type.mode))?;
         if projection.is_empty()
-            && let Some(value) = declaration.value
+            && let Some(value) = declaration_value
         {
             return self.infer_instantiated_expr_mode(value, bindings, active);
         }
         if !projection.is_empty()
-            && let Some(value) = declaration.value
+            && let Some(value) = declaration_value
             && let Some(mode) =
                 self.infer_instantiated_projection_mode(value, &projection, bindings, active)
         {
             return Some(mode);
         }
-        Some(declaration.flow_type.mode)
+        Some(declaration_mode)
     }
 
     fn infer_instantiated_projection_mode(
@@ -7347,36 +9750,40 @@ impl<'a> CheckedProgramBuilder<'a> {
         }
     }
 
-    fn refresh_pattern_binding_types(&mut self) -> bool {
-        let bindings = self.pattern_declarations.clone();
-        let selectors = self.pattern_selectors.clone();
-        let mut changed = false;
-        for ((arm_expr_id, name), declaration) in bindings {
-            let Some(selector_expr_id) = selectors.get(&arm_expr_id).copied() else {
-                continue;
-            };
+    fn refresh_pattern_binding_types(&mut self) -> Vec<DeclId> {
+        let dependencies = Arc::clone(
+            self.checked_type_inference_dependencies
+                .as_ref()
+                .expect("checked inference dependencies initialized"),
+        );
+        let mut changed = Vec::new();
+        for site in &dependencies.pattern_binding_sites {
             let selector = self
-                .infer_checked_expr_flow(selector_expr_id, &mut BTreeSet::new())
+                .infer_checked_expr_flow_root(site.selector_expression)
                 .ty;
             let Some(AstExpr {
                 kind: AstExprKind::MatchArm { pattern, .. },
                 ..
-            }) = self.program.expressions.get(arm_expr_id)
+            }) = self.program.expressions.get(site.arm_expression)
             else {
                 continue;
             };
             let ty = if let Some(Variant::Tag(tag)) = pattern_variant(pattern) {
-                let Some(ty) = tagged_variant_field_type(&selector, &tag, &name) else {
+                let Some(ty) = tagged_variant_field_type(&selector, &tag, &site.name) else {
                     continue;
                 };
                 ty
-            } else if pattern_variable_names(pattern).as_slice() == [name.as_str()] {
+            } else if pattern_variable_names(pattern).as_slice() == [site.name.as_str()] {
                 selector
             } else {
                 continue;
             };
-            changed |= self.set_declaration_flow_type(declaration, continuous_flow_type(ty));
+            if self.set_declaration_flow_type(site.declaration, continuous_flow_type(ty)) {
+                changed.push(site.declaration);
+            }
         }
+        changed.sort_unstable();
+        changed.dedup();
         changed
     }
 
@@ -7389,7 +9796,7 @@ impl<'a> CheckedProgramBuilder<'a> {
             .collect::<Vec<_>>();
         let mut changed = false;
         for expr_id in expression_ids {
-            let flow_type = self.infer_checked_expr_flow(expr_id, &mut BTreeSet::new());
+            let flow_type = self.infer_checked_expr_flow_root(expr_id);
             if matches!(flow_type.ty, Type::Unknown | Type::UnresolvedShape { .. }) {
                 continue;
             }
@@ -7398,293 +9805,362 @@ impl<'a> CheckedProgramBuilder<'a> {
         changed
     }
 
-    fn validate_checked_type_projections(&mut self) {
-        self.validate_checked_projections = true;
-        self.begin_checked_flow_inference_epoch();
-        let expression_ids = self
-            .program
-            .expressions
-            .iter()
-            .map(|expression| expression.id)
-            .collect::<Vec<_>>();
-        for expression in expression_ids {
-            self.infer_checked_expr_flow(expression, &mut BTreeSet::new());
+    fn rebuild_projection_sites(&mut self) {
+        let mut sites = Vec::new();
+        for expression in &self.program.expressions {
+            if let Some(parts) = checked_read_path_parts(expression)
+                && parts.len() > 1
+                && parts.first().is_some_and(|root| root != "PASSED")
+            {
+                let scope = self
+                    .expression_scopes
+                    .get(&expression.id)
+                    .copied()
+                    .unwrap_or(LexicalScopeId(0));
+                if let Some(declaration) =
+                    self.resolve_checked_read_name(expression.id, scope, &parts[0])
+                {
+                    sites.push(CheckedProjectionSite {
+                        expression: expression.id,
+                        base: CheckedProjectionBase::Declaration(declaration),
+                        fields: parts.into_iter().skip(1).collect(),
+                    });
+                }
+            }
+            if let AstExprKind::Pipe { input, op, .. } = &expression.kind
+                && let Some(field) = op.strip_prefix("Field/")
+                && let Some(input) = self.exact_pipeline_input(expression, *input)
+            {
+                sites.push(CheckedProjectionSite {
+                    expression: expression.id,
+                    base: CheckedProjectionBase::Expression(input),
+                    fields: vec![field.to_owned()].into_boxed_slice(),
+                });
+            }
         }
-        self.validate_checked_projections = false;
+        sites.sort_by_key(|site| site.expression);
+        self.projection_sites = sites;
+    }
+
+    fn validate_checked_type_projections(&mut self) {
+        // Projection diagnostics depend only on the final type at each
+        // resolved projection base. The old validator discarded the
+        // persistent cache and re-inferred every expression solely to revisit
+        // the two syntax forms below. Keep those sites indexed instead and
+        // read the quiescent solver tables directly.
+        self.flush_checked_flow_invalidations();
+        let sites = std::mem::take(&mut self.projection_sites);
+        for site in &sites {
+            let base = match site.base {
+                CheckedProjectionBase::Declaration(declaration) => self
+                    .declaration(declaration)
+                    .map(|declaration| declaration.flow_type.ty.clone())
+                    .unwrap_or(Type::Unknown),
+                CheckedProjectionBase::Expression(expression) => self
+                    .inferred_expr_types
+                    .get(&expression)
+                    .map(|flow_type| flow_type.ty.clone())
+                    .unwrap_or(Type::Unknown),
+            };
+            self.project_checked_type(site.expression, base, &site.fields, true);
+        }
+        self.projection_sites = sites;
+    }
+
+    fn infer_checked_expr_flow_root(&mut self, expr_id: usize) -> FlowType {
+        let mut active = std::mem::replace(
+            &mut self.checked_flow_recursion,
+            DenseRecursionGuard::with_len(0),
+        );
+        active.begin_root();
+        let flow_type = self.infer_checked_expr_flow(expr_id, &mut active);
+        debug_assert_eq!(active.len(), 0);
+        self.checked_flow_recursion = active;
+        flow_type
     }
 
     fn infer_checked_expr_flow(
         &mut self,
         expr_id: usize,
-        active: &mut BTreeSet<usize>,
+        active: &mut DenseRecursionGuard,
     ) -> FlowType {
-        if let Some((_, flow_type)) = self
-            .checked_flow_inference_cache
-            .get(&expr_id)
-            .filter(|(epoch, _)| *epoch == self.checked_flow_inference_epoch)
+        if self.checked_flow_inference_cache_enabled
+            && let Some(flow_type) = self.checked_flow_inference_cache.get_cloned(expr_id)
         {
-            return flow_type.clone();
+            return flow_type;
         }
         let fallback = self
             .inferred_expr_types
             .get(&expr_id)
             .cloned()
             .unwrap_or_else(unknown_flow_type);
-        let authoritative_type = self.authoritative_expr_types.contains(&expr_id);
         if !active.insert(expr_id) {
             return fallback;
         }
-        let Some(expr) = self.program.expressions.get(expr_id).cloned() else {
+        // `self.program` is an external immutable arena reference. Copy that
+        // reference locally so recursive mutable inference can borrow syntax
+        // in place instead of cloning a full `AstExpr` and then its kind on
+        // every cache miss.
+        let program = self.program;
+        let Some(expr) = program.expressions.get(expr_id) else {
             active.remove(&expr_id);
             return fallback;
         };
-        let ty = if authoritative_type {
-            fallback.ty.clone()
-        } else {
-            match expr.kind.clone() {
-                AstExprKind::StringLiteral(_)
-                | AstExprKind::TextLiteral(_)
-                | AstExprKind::TextTemplate { .. } => Type::Text,
-                AstExprKind::Number(_) => Type::Number,
-                AstExprKind::BitsLiteral { width, .. } => Type::Bits { width },
-                AstExprKind::ByteLiteral { .. } => Type::Bytes(BytesType::Fixed(1)),
-                AstExprKind::BytesLiteral { size, .. } => Type::Bytes(match size {
-                    BytesSizeSyntax::Fixed(size) => BytesType::Fixed(size),
-                    BytesSizeSyntax::Dynamic | BytesSizeSyntax::Infer => BytesType::Dynamic,
-                }),
-                AstExprKind::Tag(tag) if tag == "SKIP" => Type::Absent,
-                AstExprKind::Flush { payload } => {
-                    if let Some(payload) = payload {
-                        self.infer_checked_expr_flow(payload, active);
-                    }
-                    Type::Absent
+        let ty = match &expr.kind {
+            AstExprKind::StringLiteral(_)
+            | AstExprKind::TextLiteral(_)
+            | AstExprKind::TextTemplate { .. } => Type::Text,
+            AstExprKind::Number(_) => Type::Number,
+            AstExprKind::BitsLiteral { width, .. } => Type::Bits { width: *width },
+            AstExprKind::ByteLiteral { .. } => Type::Bytes(BytesType::Fixed(1)),
+            AstExprKind::BytesLiteral { size, .. } => Type::Bytes(match size {
+                BytesSizeSyntax::Fixed(size) => BytesType::Fixed(*size),
+                BytesSizeSyntax::Dynamic | BytesSizeSyntax::Infer => BytesType::Dynamic,
+            }),
+            AstExprKind::Tag(tag) if tag == "SKIP" => Type::Absent,
+            AstExprKind::Flush { payload } => {
+                if let Some(payload) = payload {
+                    self.infer_checked_expr_flow(*payload, active);
                 }
-                AstExprKind::Tag(tag) => Type::VariantSet(vec![Variant::Tag(tag)]),
-                AstExprKind::TaggedObject { tag, fields } => {
-                    Type::VariantSet(vec![Variant::Tagged {
-                        tag,
-                        fields: ObjectShape::from_ordered_fields(
-                            fields
-                                .into_iter()
-                                .filter(|field| !field.spread)
-                                .map(|field| {
-                                    let field_flow =
-                                        self.infer_checked_expr_flow(field.value, active);
-                                    (
-                                        field.name,
-                                        self.flush_boundary_flow_type(field.value, field_flow).ty,
-                                    )
-                                }),
-                            false,
-                        ),
-                    }])
-                }
-                AstExprKind::Object(fields) => Type::Object(ObjectShape::from_ordered_fields(
-                    fields
-                        .into_iter()
-                        .filter(|field| !field.spread)
-                        .map(|field| {
-                            let field_flow = self.infer_checked_expr_flow(field.value, active);
-                            (
-                                field.name,
-                                self.flush_boundary_flow_type(field.value, field_flow).ty,
-                            )
-                        }),
-                    false,
-                )),
-                AstExprKind::ListLiteral { items, .. } => {
-                    let fallback_item = match &fallback.ty {
-                        Type::List(item) => Some((**item).clone()),
-                        _ => None,
-                    };
-                    Type::List(Box::new(
-                        items
-                            .into_iter()
-                            .map(|item| self.infer_checked_expr_flow(item, active).ty)
-                            .reduce(|existing, extra| widen_structural_type(&existing, &extra))
-                            .or(fallback_item)
-                            .unwrap_or_else(open_object_type),
-                    ))
-                }
-                AstExprKind::SetLiteral { items } => {
-                    let fallback_item = match &fallback.ty {
-                        Type::Set(item) => Some((**item).clone()),
-                        _ => None,
-                    };
-                    Type::Set(Box::new(
-                        items
-                            .into_iter()
-                            .map(|item| self.infer_checked_expr_flow(item, active).ty)
-                            .reduce(|existing, extra| widen_structural_type(&existing, &extra))
-                            .or(fallback_item)
-                            .unwrap_or(Type::Unknown),
-                    ))
-                }
-                AstExprKind::MapEntry { key, value } => {
-                    Type::Object(ObjectShape::from_ordered_fields(
-                        [
-                            (
-                                "key".to_owned(),
-                                self.infer_checked_expr_flow(key, active).ty,
-                            ),
-                            (
-                                "value".to_owned(),
-                                self.infer_checked_expr_flow(value, active).ty,
-                            ),
-                        ],
-                        false,
-                    ))
-                }
-                AstExprKind::MapLiteral { entries } => {
-                    let mut key_type: Option<Type> = None;
-                    let mut value_type: Option<Type> = None;
-                    for entry in entries {
-                        let Type::Object(shape) = self.infer_checked_expr_flow(entry, active).ty
-                        else {
-                            continue;
-                        };
-                        if let Some(key) = shape.fields.get("key") {
-                            key_type = Some(key_type.map_or_else(
-                                || key.clone(),
-                                |existing| widen_structural_type(&existing, key),
-                            ));
-                        }
-                        if let Some(value) = shape.fields.get("value") {
-                            value_type = Some(value_type.map_or_else(
-                                || value.clone(),
-                                |existing| widen_structural_type(&existing, value),
-                            ));
-                        }
-                    }
-                    Type::Map {
-                        key: Box::new(key_type.unwrap_or(Type::Unknown)),
-                        value: Box::new(value_type.unwrap_or(Type::Unknown)),
-                    }
-                }
-                AstExprKind::Arrow { output, .. } => output
-                    .map(|output| self.infer_checked_expr_flow(output, active).ty)
-                    .unwrap_or(Type::Unknown),
-                AstExprKind::Identifier(name) => {
-                    self.checked_read_type(expr_id, &[name], active, fallback.ty.clone())
-                }
-                AstExprKind::Path(parts) => {
-                    self.checked_read_type(expr_id, &parts, active, fallback.ty.clone())
-                }
-                AstExprKind::Drain { path } => self.checked_read_type(
-                    expr_id,
-                    &drain_path_parts(&path),
-                    active,
-                    fallback.ty.clone(),
-                ),
-                AstExprKind::Pipe {
-                    input, op, arms, ..
-                } if op == "WHILE" => {
-                    if let Some(selector) = self.exact_pipeline_input(&expr, input) {
-                        self.infer_checked_expr_flow(selector, active);
-                        arms.into_iter()
-                            .map(|arm| self.infer_checked_expr_flow(arm, active).ty)
-                            .reduce(|existing, extra| widen_structural_type(&existing, &extra))
-                            .unwrap_or(fallback.ty.clone())
-                    } else {
-                        Type::Unknown
-                    }
-                }
-                AstExprKind::Call { .. } | AstExprKind::Pipe { .. } => {
-                    let function = ast_callable_name(&expr).unwrap_or_default();
-                    if let AstExprKind::Pipe { input, op, .. } = &expr.kind
-                        && let Some(field) = op.strip_prefix("Field/")
-                    {
-                        self.exact_pipeline_input(&expr, *input)
-                            .map_or(Type::Unknown, |input| {
-                                let base = self.infer_checked_expr_flow(input, active).ty;
-                                self.project_checked_type(expr_id, base, &[field.to_owned()])
-                            })
-                    } else {
-                        self.call_for_expression(CheckedExprId(expr_id as u32))
-                            .map(|call| call.result.ty.clone())
-                            .or_else(|| {
-                                self.signature(function)
-                                    .map(|signature| signature.result.ty.clone())
-                            })
-                            .unwrap_or(fallback.ty.clone())
-                    }
-                }
-                AstExprKind::Infix { left, op, right } => {
-                    self.infer_checked_expr_flow(left, active);
-                    self.infer_checked_expr_flow(right, active);
-                    if infix_returns_bool(&op) {
-                        true_false_type()
-                    } else {
-                        Type::Number
-                    }
-                }
-                AstExprKind::MatchArm { output, .. } => output
-                    .map(|output| self.infer_checked_expr_flow(output, active).ty)
-                    .unwrap_or(Type::Absent),
-                AstExprKind::When { input, arms } => {
-                    if let Some(selector) = self.exact_pipeline_input(&expr, input) {
-                        self.infer_checked_expr_flow(selector, active);
-                        arms.into_iter()
-                            .map(|arm| self.infer_checked_expr_flow(arm, active).ty)
-                            .reduce(|existing, extra| widen_structural_type(&existing, &extra))
-                            .unwrap_or(fallback.ty.clone())
-                    } else {
-                        Type::Unknown
-                    }
-                }
-                AstExprKind::Block { result, .. } => result
-                    .map(|result| {
-                        let result_flow = self.infer_checked_expr_flow(result, active);
-                        self.flush_boundary_flow_type(result, result_flow).ty
-                    })
-                    .unwrap_or(Type::Absent),
-                AstExprKind::Then { input, output } => output
-                    .map(|output| self.infer_checked_expr_flow(output, active).ty)
-                    .or_else(|| {
-                        self.exact_pipeline_input(&expr, input)
-                            .map(|input| self.infer_checked_expr_flow(input, active).ty)
-                    })
-                    .unwrap_or(Type::Unknown),
-                AstExprKind::Hold { initial, .. } => {
-                    if let Some(initial) = self.exact_pipeline_input(&expr, initial) {
-                        let mut ty = self.infer_checked_expr_flow(initial, active).ty;
-                        for update in hold_update_exprs_for_expr(
-                            &self.program.ast.statements,
-                            expr_id,
-                            &self.program.expressions,
-                        ) {
-                            let update = self.infer_checked_expr_flow(update, active).ty;
-                            if !matches!(update, Type::Absent) {
-                                ty = widen_checked_hold_type(&ty, &update);
-                            }
-                        }
-                        ty
-                    } else {
-                        Type::Unknown
-                    }
-                }
-                AstExprKind::Draining { input } => self
-                    .exact_pipeline_input(&expr, input)
-                    .map(|input| self.infer_checked_expr_flow(input, active).ty)
-                    .unwrap_or(Type::Unknown),
-                AstExprKind::Latest { branches } => branches
-                    .into_iter()
-                    .map(|branch| self.infer_checked_expr_flow(branch, active).ty)
-                    .filter(|branch| !matches!(branch, Type::Absent))
-                    .reduce(|existing, branch| widen_structural_type(&existing, &branch))
-                    .unwrap_or(fallback.ty.clone()),
-                AstExprKind::Source => fallback.ty.clone(),
-                AstExprKind::Delimiter => fallback.ty.clone(),
-                AstExprKind::Unknown(_) => fallback.ty.clone(),
+                Type::Absent
             }
+            AstExprKind::Tag(tag) => Type::VariantSet(vec![Variant::Tag(tag.clone())]),
+            AstExprKind::TaggedObject { tag, fields } => Type::VariantSet(vec![Variant::Tagged {
+                tag: tag.clone(),
+                fields: ObjectShape::from_ordered_fields(
+                    fields.iter().filter(|field| !field.spread).map(|field| {
+                        let field_flow = self.infer_checked_expr_flow(field.value, active);
+                        (
+                            field.name.clone(),
+                            self.flush_boundary_flow_type(field.value, field_flow).ty,
+                        )
+                    }),
+                    false,
+                ),
+            }]),
+            AstExprKind::Object(fields) => Type::object(ObjectShape::from_ordered_fields(
+                fields.iter().filter(|field| !field.spread).map(|field| {
+                    let field_flow = self.infer_checked_expr_flow(field.value, active);
+                    (
+                        field.name.clone(),
+                        self.flush_boundary_flow_type(field.value, field_flow).ty,
+                    )
+                }),
+                false,
+            )),
+            AstExprKind::ListLiteral { items, .. } => {
+                let fallback_item = match &fallback.ty {
+                    Type::List(item) => Some((**item).clone()),
+                    _ => None,
+                };
+                Type::List(Box::new(
+                    items
+                        .iter()
+                        .map(|item| self.infer_checked_expr_flow(*item, active).ty)
+                        .reduce(|existing, extra| widen_structural_type(&existing, &extra))
+                        .or(fallback_item)
+                        .unwrap_or_else(open_object_type),
+                ))
+            }
+            AstExprKind::SetLiteral { items } => {
+                let fallback_item = match &fallback.ty {
+                    Type::Set(item) => Some((**item).clone()),
+                    _ => None,
+                };
+                Type::Set(Box::new(
+                    items
+                        .iter()
+                        .map(|item| self.infer_checked_expr_flow(*item, active).ty)
+                        .reduce(|existing, extra| widen_structural_type(&existing, &extra))
+                        .or(fallback_item)
+                        .unwrap_or(Type::Unknown),
+                ))
+            }
+            AstExprKind::MapEntry { key, value } => Type::object(ObjectShape::from_ordered_fields(
+                [
+                    (
+                        "key".to_owned(),
+                        self.infer_checked_expr_flow(*key, active).ty,
+                    ),
+                    (
+                        "value".to_owned(),
+                        self.infer_checked_expr_flow(*value, active).ty,
+                    ),
+                ],
+                false,
+            )),
+            AstExprKind::MapLiteral { entries } => {
+                let mut key_type: Option<Type> = None;
+                let mut value_type: Option<Type> = None;
+                for entry in entries {
+                    let Type::Object(shape) = self.infer_checked_expr_flow(*entry, active).ty
+                    else {
+                        continue;
+                    };
+                    if let Some(key) = shape.fields.get("key") {
+                        key_type = Some(key_type.map_or_else(
+                            || key.clone(),
+                            |existing| widen_structural_type(&existing, key),
+                        ));
+                    }
+                    if let Some(value) = shape.fields.get("value") {
+                        value_type = Some(value_type.map_or_else(
+                            || value.clone(),
+                            |existing| widen_structural_type(&existing, value),
+                        ));
+                    }
+                }
+                Type::Map {
+                    key: Box::new(key_type.unwrap_or(Type::Unknown)),
+                    value: Box::new(value_type.unwrap_or(Type::Unknown)),
+                }
+            }
+            AstExprKind::Arrow { output, .. } => output
+                .map(|output| self.infer_checked_expr_flow(output, active).ty)
+                .unwrap_or(Type::Unknown),
+            AstExprKind::Identifier(name) => self.checked_read_type(
+                expr_id,
+                std::slice::from_ref(name),
+                active,
+                fallback.ty.clone(),
+            ),
+            AstExprKind::Path(parts) => {
+                self.checked_read_type(expr_id, parts, active, fallback.ty.clone())
+            }
+            AstExprKind::Drain { path } => self.checked_read_type(
+                expr_id,
+                &drain_path_parts(path),
+                active,
+                fallback.ty.clone(),
+            ),
+            AstExprKind::Pipe {
+                input, op, arms, ..
+            } if op == "WHILE" => {
+                if let Some(selector) = self.exact_pipeline_input(expr, *input) {
+                    self.infer_checked_expr_flow(selector, active);
+                    arms.iter()
+                        .map(|arm| self.infer_checked_expr_flow(*arm, active).ty)
+                        .reduce(|existing, extra| widen_structural_type(&existing, &extra))
+                        .unwrap_or(fallback.ty.clone())
+                } else {
+                    Type::Unknown
+                }
+            }
+            AstExprKind::Call { .. } | AstExprKind::Pipe { .. } => {
+                let function = ast_callable_name(expr).unwrap_or_default();
+                if let AstExprKind::Pipe { input, op, .. } = &expr.kind
+                    && let Some(field) = op.strip_prefix("Field/")
+                {
+                    self.exact_pipeline_input(expr, *input)
+                        .map_or(Type::Unknown, |input| {
+                            let base = self.infer_checked_expr_flow(input, active).ty;
+                            self.project_checked_type(expr_id, base, &[field.to_owned()], false)
+                        })
+                } else {
+                    self.call_for_expression(CheckedExprId(expr_id as u32))
+                        .map(|call| call.result.ty.clone())
+                        .or_else(|| {
+                            self.signature(function)
+                                .map(|signature| signature.result.ty.clone())
+                        })
+                        .unwrap_or(fallback.ty.clone())
+                }
+            }
+            AstExprKind::Infix { left, op, right } => {
+                self.infer_checked_expr_flow(*left, active);
+                self.infer_checked_expr_flow(*right, active);
+                if infix_returns_bool(op) {
+                    true_false_type()
+                } else {
+                    Type::Number
+                }
+            }
+            AstExprKind::MatchArm { output, .. } => output
+                .map(|output| self.infer_checked_expr_flow(output, active).ty)
+                .unwrap_or(Type::Absent),
+            AstExprKind::When { input, arms } => {
+                if let Some(selector) = self.exact_pipeline_input(expr, *input) {
+                    self.infer_checked_expr_flow(selector, active);
+                    arms.iter()
+                        .map(|arm| self.infer_checked_expr_flow(*arm, active).ty)
+                        .reduce(|existing, extra| widen_structural_type(&existing, &extra))
+                        .unwrap_or(fallback.ty.clone())
+                } else {
+                    Type::Unknown
+                }
+            }
+            AstExprKind::Block { result, .. } => result
+                .map(|result| {
+                    let result_flow = self.infer_checked_expr_flow(result, active);
+                    self.flush_boundary_flow_type(result, result_flow).ty
+                })
+                .unwrap_or(Type::Absent),
+            AstExprKind::Then { input, output } => output
+                .map(|output| self.infer_checked_expr_flow(output, active).ty)
+                .or_else(|| {
+                    self.exact_pipeline_input(expr, *input)
+                        .map(|input| self.infer_checked_expr_flow(input, active).ty)
+                })
+                .unwrap_or(Type::Unknown),
+            AstExprKind::Hold { initial, .. } => {
+                if let Some(initial) = self.exact_pipeline_input(expr, *initial) {
+                    let mut ty = self.infer_checked_expr_flow(initial, active).ty;
+                    let dependencies = self.checked_type_inference_dependencies.as_ref().cloned();
+                    let fallback_updates;
+                    let updates = if let Some(updates) =
+                        dependencies.as_ref().and_then(|dependencies| {
+                            dependencies.hold_updates_by_expression.get(&expr_id)
+                        }) {
+                        updates.as_ref()
+                    } else {
+                        fallback_updates = hold_update_exprs_for_expr(
+                            &program.ast.statements,
+                            expr_id,
+                            &program.expressions,
+                        );
+                        fallback_updates.as_slice()
+                    };
+                    for update in updates.iter().copied() {
+                        let update = self.infer_checked_expr_flow(update, active).ty;
+                        if !matches!(update, Type::Absent) {
+                            ty = widen_checked_hold_type(&ty, &update);
+                        }
+                    }
+                    ty
+                } else {
+                    Type::Unknown
+                }
+            }
+            AstExprKind::Draining { input } => self
+                .exact_pipeline_input(expr, *input)
+                .map(|input| self.infer_checked_expr_flow(input, active).ty)
+                .unwrap_or(Type::Unknown),
+            AstExprKind::Latest { branches } => branches
+                .iter()
+                .map(|branch| self.infer_checked_expr_flow(*branch, active).ty)
+                .filter(|branch| !matches!(branch, Type::Absent))
+                .reduce(|existing, branch| widen_structural_type(&existing, &branch))
+                .unwrap_or(fallback.ty.clone()),
+            AstExprKind::Source => fallback.ty.clone(),
+            AstExprKind::Delimiter => fallback.ty.clone(),
+            AstExprKind::Unknown(_) => fallback.ty.clone(),
         };
-        let mode = self.infer_checked_expr_mode(expr_id, &expr, active, fallback.mode);
+        let mode = self.infer_checked_expr_mode(expr_id, expr, active, fallback.mode);
         active.remove(&expr_id);
         let flow_type = FlowType { mode, ty };
-        self.checked_flow_inference_cache.insert(
-            expr_id,
-            (self.checked_flow_inference_epoch, flow_type.clone()),
-        );
+        if self.checked_flow_inference_cache_enabled {
+            let dense_differs = self.inferred_expr_types.get(&expr_id) != Some(&flow_type);
+            let (inserted, previous) = self
+                .checked_flow_inference_cache
+                .insert_recomputed(expr_id, flow_type.clone());
+            let cached_value_changed = previous
+                .as_ref()
+                .is_some_and(|previous| previous != &flow_type);
+            if inserted && (dense_differs || cached_value_changed) {
+                self.checked_flow_pending_expression_publications
+                    .insert(expr_id);
+            }
+        }
         flow_type
     }
 
@@ -7692,7 +10168,7 @@ impl<'a> CheckedProgramBuilder<'a> {
         &mut self,
         expr_id: usize,
         expr: &AstExpr,
-        active: &mut BTreeSet<usize>,
+        active: &mut DenseRecursionGuard,
         fallback: FlowMode,
     ) -> FlowMode {
         match &expr.kind {
@@ -7726,6 +10202,10 @@ impl<'a> CheckedProgramBuilder<'a> {
                 .map(|selector| self.infer_checked_expr_flow(selector, active).mode)
                 .unwrap_or(fallback),
             AstExprKind::Pipe { op, .. } if op == "WHILE" => FlowMode::Continuous,
+            AstExprKind::Pipe { input, op, .. } if op.starts_with("Field/") => self
+                .exact_pipeline_input(expr, *input)
+                .map(|input| self.infer_checked_expr_flow(input, active).mode)
+                .unwrap_or(fallback),
             AstExprKind::Draining { input } => self
                 .exact_pipeline_input(expr, *input)
                 .map(|input| self.infer_checked_expr_flow(input, active).mode)
@@ -7747,39 +10227,82 @@ impl<'a> CheckedProgramBuilder<'a> {
         &mut self,
         expr_id: usize,
         parts: &[String],
-        active: &mut BTreeSet<usize>,
+        active: &mut DenseRecursionGuard,
     ) -> Option<FlowMode> {
         if parts.first().is_some_and(|part| part == "PASSED") {
             return self
                 .checked_passed_flow_type(expr_id, &parts[1..])
                 .map(|flow_type| flow_type.mode);
         }
-        let scope_id = self
-            .expression_scopes
-            .get(&expr_id)
-            .copied()
-            .unwrap_or(LexicalScopeId(0));
-        let Some((target, projection)) = self.resolve_checked_read_path(expr_id, scope_id, parts)
-        else {
-            let path = parts.join(".");
-            return self
-                .exact_named_value_mode(&path)
-                .or_else(|| flow_binding_mode(&self.named_value_modes, &path))
-                .or_else(|| flow_binding_mode(&self.flow_bindings, &path));
+        let dependencies = self.checked_type_inference_dependencies.as_ref().cloned();
+        let indexed = if let Some(dependencies) = dependencies.as_ref() {
+            self.checked_read_path_inference_lookup(dependencies, expr_id, parts)
+        } else {
+            self.checked_flow_inference_cache.stats.indexed_read_missing = self
+                .checked_flow_inference_cache
+                .stats
+                .indexed_read_missing
+                .saturating_add(1);
+            CheckedReadPathInferenceLookup::Missing
         };
-        let declaration = self.declaration(target).cloned()?;
-        if declaration.kind == CheckedDeclarationKind::ValueParameter {
-            let actuals = self
-                .calls
-                .iter()
-                .flat_map(|call| &call.entries)
-                .filter_map(|entry| match entry {
-                    CheckedCallEntry::Input { formal, value, .. } if *formal == target => {
-                        Some(*value)
-                    }
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
+        let (target, projection) = match indexed {
+            CheckedReadPathInferenceLookup::Resolved { target, projection } => {
+                (target, Cow::Borrowed(projection))
+            }
+            CheckedReadPathInferenceLookup::Unresolved { canonical_path } => {
+                return self
+                    .exact_named_value_mode(canonical_path)
+                    .or_else(|| flow_binding_mode(&self.named_value_modes, canonical_path))
+                    .or_else(|| flow_binding_mode(&self.flow_bindings, canonical_path));
+            }
+            CheckedReadPathInferenceLookup::Missing | CheckedReadPathInferenceLookup::Rejected => {
+                let scope_id = self
+                    .expression_scopes
+                    .get(&expr_id)
+                    .copied()
+                    .unwrap_or(LexicalScopeId(0));
+                let Some((target, projection)) =
+                    self.resolve_checked_read_path(expr_id, scope_id, parts)
+                else {
+                    let path = parts.join(".");
+                    return self
+                        .exact_named_value_mode(&path)
+                        .or_else(|| flow_binding_mode(&self.named_value_modes, &path))
+                        .or_else(|| flow_binding_mode(&self.flow_bindings, &path));
+                };
+                (target, Cow::Owned(projection))
+            }
+        };
+        let (declaration_kind, declaration_value, declaration_mode) =
+            self.declaration(target).map(|declaration| {
+                (
+                    declaration.kind,
+                    declaration.value,
+                    declaration.flow_type.mode,
+                )
+            })?;
+        if declaration_kind == CheckedDeclarationKind::ValueParameter {
+            // The inference worklist owns this exact reverse-call index. Clone
+            // its Arc, not the call graph, so recursive inference can mutably
+            // use `self` without retaining a borrow into the builder.
+            let actuals = dependencies
+                .as_ref()
+                .and_then(|dependencies| dependencies.actuals_by_parameter.get(&target))
+                .cloned()
+                .unwrap_or_else(|| {
+                    // Outside the indexed solver (principally diagnostic
+                    // construction), preserve the exact fail-closed behavior.
+                    self.calls
+                        .iter()
+                        .flat_map(|call| &call.entries)
+                        .filter_map(|entry| match entry {
+                            CheckedCallEntry::Input { formal, value, .. } if *formal == target => {
+                                Some(*value)
+                            }
+                            _ => None,
+                        })
+                        .collect()
+                });
             let modes = actuals
                 .into_iter()
                 .filter_map(|actual| {
@@ -7796,7 +10319,7 @@ impl<'a> CheckedProgramBuilder<'a> {
         }
         if !projection.is_empty()
             && matches!(
-                declaration.kind,
+                declaration_kind,
                 CheckedDeclarationKind::FreshOut | CheckedDeclarationKind::OutParameter
             )
             && let Some(mode) = self.checked_out_projection_flow_mode(
@@ -7809,24 +10332,24 @@ impl<'a> CheckedProgramBuilder<'a> {
             return Some(mode);
         }
         if !projection.is_empty()
-            && let Some(value) = declaration.value
+            && let Some(value) = declaration_value
             && let Some(mode) = self.checked_projected_value_flow_mode(value, &projection, active)
         {
             return Some(mode);
         }
         if projection.is_empty()
-            && let Some(value) = declaration.value
+            && let Some(value) = declaration_value
         {
             return Some(self.infer_checked_expr_flow(value.0 as usize, active).mode);
         }
-        Some(declaration.flow_type.mode)
+        Some(declaration_mode)
     }
 
     fn checked_projected_expression_flow_mode(
         &mut self,
         root: CheckedExprId,
         projection: &[String],
-        active: &mut BTreeSet<usize>,
+        active: &mut DenseRecursionGuard,
     ) -> Option<FlowMode> {
         if let Some(mode) = self.checked_projected_value_flow_mode(root, projection, active) {
             return Some(mode);
@@ -7917,44 +10440,38 @@ impl<'a> CheckedProgramBuilder<'a> {
         &mut self,
         target: DeclId,
         projection: &[String],
-        active: &mut BTreeSet<usize>,
+        active: &mut DenseRecursionGuard,
         visited_outputs: &mut BTreeSet<DeclId>,
     ) -> Option<FlowMode> {
         if !visited_outputs.insert(target) {
             return None;
         }
 
-        let contextual_list_inputs = self
-            .calls
-            .iter()
-            .filter_map(|call| {
-                let output_formal = call.entries.iter().find_map(|entry| match entry {
-                    CheckedCallEntry::FreshOut { formal, output, .. } if *output == target => {
-                        Some(*formal)
-                    }
-                    CheckedCallEntry::ForwardOut {
-                        formal,
-                        target: output,
-                        ..
-                    } if *output == target => Some(*formal),
-                    _ => None,
-                })?;
-                let signature = self.signature_by_declaration(call.callable)?;
-                let (list_formal, row_formal, _) =
-                    checked_contextual_operation_formals(signature.contextual_operation?)?;
-                if output_formal != row_formal {
-                    return None;
-                }
-                call.entries.iter().find_map(|entry| match entry {
-                    CheckedCallEntry::Input { formal, value, .. } if *formal == list_formal => {
-                        Some(*value)
-                    }
-                    _ => None,
-                })
-            })
-            .collect::<Vec<_>>();
+        let dependencies = self.checked_type_inference_dependencies.as_ref().cloned();
+        let indexed = dependencies.as_ref().and_then(|dependencies| {
+            Some((
+                dependencies
+                    .contextual_list_inputs_by_output
+                    .get(target.0 as usize)?,
+                dependencies.outputs_by_formal.get(target.0 as usize)?,
+            ))
+        });
+        let Some((contextual_list_inputs, forwarded_outputs)) = indexed else {
+            self.checked_flow_inference_cache.stats.indexed_out_missing = self
+                .checked_flow_inference_cache
+                .stats
+                .indexed_out_missing
+                .saturating_add(1);
+            return None;
+        };
+        self.checked_flow_inference_cache.stats.indexed_out_hits = self
+            .checked_flow_inference_cache
+            .stats
+            .indexed_out_hits
+            .saturating_add(1);
         let mut modes = contextual_list_inputs
-            .into_iter()
+            .iter()
+            .copied()
             .filter_map(|list| {
                 self.checked_list_item_projection_flow_mode(
                     list,
@@ -7964,24 +10481,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                 )
             })
             .collect::<Vec<_>>();
-
-        let forwarded_outputs = self
-            .calls
-            .iter()
-            .flat_map(|call| &call.entries)
-            .filter_map(|entry| match entry {
-                CheckedCallEntry::FreshOut { formal, output, .. } if *formal == target => {
-                    Some(*output)
-                }
-                CheckedCallEntry::ForwardOut {
-                    formal,
-                    target: output,
-                    ..
-                } if *formal == target => Some(*output),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        modes.extend(forwarded_outputs.into_iter().filter_map(|output| {
+        modes.extend(forwarded_outputs.iter().copied().filter_map(|output| {
             self.checked_out_projection_flow_mode(output, projection, active, visited_outputs)
         }));
         modes.into_iter().reduce(merge_flow_modes)
@@ -7991,7 +10491,7 @@ impl<'a> CheckedProgramBuilder<'a> {
         &mut self,
         root: CheckedExprId,
         projection: &[String],
-        active: &mut BTreeSet<usize>,
+        active: &mut DenseRecursionGuard,
         visited: &mut BTreeSet<usize>,
     ) -> Option<FlowMode> {
         if !visited.insert(root.0 as usize) {
@@ -8097,16 +10597,37 @@ impl<'a> CheckedProgramBuilder<'a> {
         root: CheckedExprId,
         parts: &[String],
         projection: &[String],
-        active: &mut BTreeSet<usize>,
+        active: &mut DenseRecursionGuard,
         visited: &mut BTreeSet<usize>,
     ) -> Option<FlowMode> {
-        let scope_id = self
-            .expression_scopes
-            .get(&(root.0 as usize))
-            .copied()
-            .unwrap_or(LexicalScopeId(0));
-        let (target, remaining) =
-            self.resolve_checked_read_path(root.0 as usize, scope_id, parts)?;
+        let expr_id = root.0 as usize;
+        let dependencies = self.checked_type_inference_dependencies.as_ref().cloned();
+        let indexed = if let Some(dependencies) = dependencies.as_ref() {
+            self.checked_read_path_inference_lookup(dependencies, expr_id, parts)
+        } else {
+            self.checked_flow_inference_cache.stats.indexed_read_missing = self
+                .checked_flow_inference_cache
+                .stats
+                .indexed_read_missing
+                .saturating_add(1);
+            CheckedReadPathInferenceLookup::Missing
+        };
+        let (target, remaining) = match indexed {
+            CheckedReadPathInferenceLookup::Resolved { target, projection } => {
+                (target, Cow::Borrowed(projection))
+            }
+            CheckedReadPathInferenceLookup::Unresolved { .. } => return None,
+            CheckedReadPathInferenceLookup::Missing | CheckedReadPathInferenceLookup::Rejected => {
+                let scope_id = self
+                    .expression_scopes
+                    .get(&expr_id)
+                    .copied()
+                    .unwrap_or(LexicalScopeId(0));
+                let (target, projection) =
+                    self.resolve_checked_read_path(expr_id, scope_id, parts)?;
+                (target, Cow::Owned(projection))
+            }
+        };
         let mut value = self.declaration(target)?.value?;
         if !remaining.is_empty() {
             let (projected, consumed) = self.checked_projected_value_prefix(value, &remaining)?;
@@ -8122,7 +10643,7 @@ impl<'a> CheckedProgramBuilder<'a> {
         &mut self,
         root: CheckedExprId,
         projection: &[String],
-        active: &mut BTreeSet<usize>,
+        active: &mut DenseRecursionGuard,
     ) -> Option<FlowMode> {
         let (projected, consumed) = self.checked_projected_value_prefix(root, projection)?;
         let mode = self
@@ -8169,7 +10690,7 @@ impl<'a> CheckedProgramBuilder<'a> {
         &mut self,
         expr_id: usize,
         parts: &[String],
-        _active: &mut BTreeSet<usize>,
+        _active: &mut DenseRecursionGuard,
         fallback: Type,
     ) -> Type {
         let Some(name) = parts.first() else {
@@ -8181,20 +10702,39 @@ impl<'a> CheckedProgramBuilder<'a> {
                 .map(|flow_type| flow_type.ty)
                 .unwrap_or(fallback);
         }
-        let scope_id = self
-            .expression_scopes
-            .get(&expr_id)
-            .copied()
-            .unwrap_or(LexicalScopeId(0));
-        let Some(declaration_id) = self.resolve_checked_read_name(expr_id, scope_id, name) else {
-            return fallback;
+        let dependencies = self.checked_type_inference_dependencies.as_ref().cloned();
+        let indexed = if let Some(dependencies) = dependencies.as_ref() {
+            self.checked_read_root_inference_lookup(dependencies, expr_id, parts)
+        } else {
+            self.checked_flow_inference_cache.stats.indexed_read_missing = self
+                .checked_flow_inference_cache
+                .stats
+                .indexed_read_missing
+                .saturating_add(1);
+            CheckedReadRootInferenceLookup::Missing
+        };
+        let declaration_id = match indexed {
+            CheckedReadRootInferenceLookup::Resolved(declaration) => declaration,
+            CheckedReadRootInferenceLookup::Unresolved => return fallback,
+            CheckedReadRootInferenceLookup::Missing | CheckedReadRootInferenceLookup::Rejected => {
+                let scope_id = self
+                    .expression_scopes
+                    .get(&expr_id)
+                    .copied()
+                    .unwrap_or(LexicalScopeId(0));
+                let Some(declaration) = self.resolve_checked_read_name(expr_id, scope_id, name)
+                else {
+                    return fallback;
+                };
+                declaration
+            }
         };
         let base = self
             .declaration(declaration_id)
             .map(|declaration| declaration.flow_type.ty.clone())
             .unwrap_or(Type::Unknown);
         let projection = &parts[1..];
-        let projected = self.project_checked_type(expr_id, base, projection);
+        let projected = self.project_checked_type(expr_id, base, projection, false);
         self.narrowed_checked_read_type(expr_id, declaration_id, projection, &projected)
             .unwrap_or(projected)
     }
@@ -8261,7 +10801,13 @@ impl<'a> CheckedProgramBuilder<'a> {
         })
     }
 
-    fn project_checked_type(&mut self, expr_id: usize, mut ty: Type, fields: &[String]) -> Type {
+    fn project_checked_type(
+        &mut self,
+        expr_id: usize,
+        mut ty: Type,
+        fields: &[String],
+        emit_invalid_projection: bool,
+    ) -> Type {
         for field in fields {
             ty = match ty {
                 Type::Object(shape) => match shape.fields.get(field).cloned() {
@@ -8277,7 +10823,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                 | Type::List(_)
                 | Type::Map { .. }
                 | Type::Set(_)) => {
-                    if self.validate_checked_projections {
+                    if emit_invalid_projection {
                         self.contextual_type_diagnostic(
                             expr_id,
                             format!(
@@ -8318,6 +10864,7 @@ impl<'a> CheckedProgramBuilder<'a> {
             return false;
         }
         target.flow_type = flow_type;
+        self.invalidate_checked_flow_declaration(declaration);
         true
     }
 
@@ -8325,7 +10872,8 @@ impl<'a> CheckedProgramBuilder<'a> {
         match self.inferred_expr_types.get(&expr_id) {
             Some(existing) if existing == &flow_type => false,
             _ => {
-                self.inferred_expr_types.insert(expr_id, flow_type);
+                self.inferred_expr_types.insert(expr_id, flow_type.clone());
+                self.publish_checked_flow_expression(expr_id, flow_type);
                 true
             }
         }
@@ -8712,7 +11260,7 @@ impl<'a> CheckedProgramBuilder<'a> {
         let ty = match &statement.kind {
             AstStatementKind::Source {
                 event: Some(event), ..
-            } => Type::Object(ObjectShape::from_ordered_fields(
+            } => Type::object(ObjectShape::from_ordered_fields(
                 [(event.clone(), payload)],
                 false,
             )),
@@ -9008,7 +11556,7 @@ impl<'a> CheckedProgramBuilder<'a> {
 
         let mut expression_roots = Vec::new();
         roots(statements, &mut expression_roots);
-        let mut visited = BTreeSet::new();
+        let mut visited = DenseFlagSet::with_len(self.program.expressions.len());
         for expr_id in expression_roots {
             self.predeclare_pattern_expr(expr_id, &mut visited);
         }
@@ -9017,13 +11565,14 @@ impl<'a> CheckedProgramBuilder<'a> {
         }
     }
 
-    fn predeclare_pattern_expr(&mut self, expr_id: usize, visited: &mut BTreeSet<usize>) {
+    fn predeclare_pattern_expr(&mut self, expr_id: usize, visited: &mut DenseFlagSet) {
         if !visited.insert(expr_id) {
             return;
         }
-        let Some(expr) = self.program.expressions.get(expr_id).cloned() else {
+        let Some(expr) = self.program.expressions.get(expr_id) else {
             return;
         };
+        let linked_input = expr.linked_input;
         let selector = match &expr.kind {
             AstExprKind::When { input, arms } => Some((*input, arms.clone())),
             AstExprKind::Pipe {
@@ -9031,8 +11580,9 @@ impl<'a> CheckedProgramBuilder<'a> {
             } if op == "WHILE" => Some((*input, arms.clone())),
             _ => None,
         };
+        let children = direct_expression_children(expr);
         if let Some((raw_selector, arms)) = selector {
-            let Some(selector) = self.exact_pipeline_input(&expr, raw_selector) else {
+            let Some(selector) = self.exact_pipeline_input_parts(linked_input, raw_selector) else {
                 return;
             };
             let parent = self
@@ -9044,7 +11594,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                 self.predeclare_pattern_arm(arm, selector, expr_id, parent);
             }
         }
-        for child in direct_expression_children(&expr) {
+        for child in children {
             self.predeclare_pattern_expr(child, visited);
         }
     }
@@ -9056,36 +11606,47 @@ impl<'a> CheckedProgramBuilder<'a> {
         pattern_parent: usize,
         parent: LexicalScopeId,
     ) {
-        let Some(AstExpr {
-            kind: AstExprKind::MatchArm { pattern, output },
-            ..
-        }) = self.program.expressions.get(expr_id).cloned()
+        let Some((pattern_names, output, span)) =
+            self.program
+                .expressions
+                .get(expr_id)
+                .and_then(|expression| {
+                    let AstExprKind::MatchArm { pattern, output } = &expression.kind else {
+                        return None;
+                    };
+                    Some((
+                        pattern_variable_names(pattern),
+                        *output,
+                        checked_expr_span(expression),
+                    ))
+                })
         else {
             return;
         };
-        let statement = exact_expression_statement(&self.program.ast.statements, expr_id).cloned();
+        let statement = self
+            .exact_statement_by_root_expression
+            .get(&expr_id)
+            .copied();
         let arm_scope = self.allocate_scope();
         self.scopes.push(CheckedScope {
             id: arm_scope,
             parent: Some(parent),
             owner: None,
             kind: CheckedScopeKind::Block,
-            span: checked_expr_span(
-                self.program
-                    .expressions
-                    .get(expr_id)
-                    .expect("pattern expression exists"),
-            ),
+            span,
         });
         self.expression_scopes.insert(expr_id, arm_scope);
-        if let Some(statement) = &statement {
-            self.statement_scopes.insert(statement.id, arm_scope);
+        if let Some(statement) = statement {
+            self.statement_scopes.insert(statement, arm_scope);
         }
-        let body_scope = statement
-            .as_ref()
-            .and_then(|statement| self.statement_body_scopes.get(&statement.id).copied());
+        let body_scope =
+            statement.and_then(|statement| self.statement_body_scopes.get(&statement).copied());
         if let Some(body_scope) = body_scope {
-            if let Some(scope) = self.scopes.iter_mut().find(|scope| scope.id == body_scope) {
+            if let Some(scope) = self
+                .scopes
+                .get_mut(body_scope.0 as usize)
+                .filter(|scope| scope.id == body_scope)
+            {
                 scope.parent = Some(arm_scope);
             }
         } else if let Some(output) = output {
@@ -9095,7 +11656,7 @@ impl<'a> CheckedProgramBuilder<'a> {
         self.pattern_parents.insert(expr_id, pattern_parent);
         self.pattern_arms_by_scope.insert(arm_scope, expr_id);
 
-        for name in pattern_variable_names(&pattern) {
+        for name in pattern_names {
             let declaration = self.allocate_decl();
             self.scope_declarations
                 .insert((arm_scope, name.clone()), declaration);
@@ -9109,22 +11670,12 @@ impl<'a> CheckedProgramBuilder<'a> {
                 flow_type: unknown_flow_type(),
                 value: None,
                 body_scope: None,
-                span: checked_expr_span(
-                    self.program
-                        .expressions
-                        .get(expr_id)
-                        .expect("pattern expression exists"),
-                ),
+                span,
             });
             self.occurrences.push(SemanticOccurrence {
                 target: declaration,
                 kind: SemanticOccurrenceKind::Declaration,
-                span: checked_expr_span(
-                    self.program
-                        .expressions
-                        .get(expr_id)
-                        .expect("pattern expression exists"),
-                ),
+                span,
             });
         }
     }
@@ -9153,17 +11704,12 @@ impl<'a> CheckedProgramBuilder<'a> {
 
     fn lower_checked_tree(
         &mut self,
-        render_slots: &RenderSlotTable,
+        render_slot_statements: &BTreeSet<usize>,
     ) -> (Vec<CheckedStatement>, Vec<CheckedExpression>) {
-        let render_slot_statements = render_slots
-            .slots
-            .iter()
-            .map(|slot| slot.slot_statement_id)
-            .collect::<BTreeSet<_>>();
         let mut statements = Vec::new();
         self.lower_checked_statements(
             &self.program.ast.statements,
-            &render_slot_statements,
+            render_slot_statements,
             &mut statements,
         );
         statements.sort_by_key(|statement| statement.id);
@@ -9335,6 +11881,20 @@ impl<'a> CheckedProgramBuilder<'a> {
                     .map(|value| (declaration.id, (value, declaration.flow_type.clone())))
             })
             .collect::<BTreeMap<_, _>>();
+        let callables_by_id = self
+            .signatures
+            .iter()
+            .map(|callable| (callable.decl_id, callable))
+            .collect::<BTreeMap<_, _>>();
+        let calls_by_id = self
+            .calls
+            .iter()
+            .map(|call| (call.id, call))
+            .collect::<BTreeMap<_, _>>();
+        let containing_statements = containing_expression_statement_index(
+            &self.program.ast.statements,
+            &self.program.expressions,
+        );
         let builtin_source_call_expressions = self
             .calls
             .iter()
@@ -9409,10 +11969,10 @@ impl<'a> CheckedProgramBuilder<'a> {
                 path: CheckedSemanticPath {
                     anchor: declaration,
                     projection: checked_declaration_resource_projection(
-                        &self.signatures,
+                        &callables_by_id,
                         &declaration_values,
                         expressions,
-                        &self.calls,
+                        &calls_by_id,
                         declaration,
                         checked_expression.id,
                     )
@@ -9469,10 +12029,10 @@ impl<'a> CheckedProgramBuilder<'a> {
                 continue;
             };
             let projection = checked_declaration_resource_projection(
-                &self.signatures,
+                &callables_by_id,
                 &declaration_values,
                 expressions,
-                &self.calls,
+                &calls_by_id,
                 declaration,
                 expression.id,
             )
@@ -9499,16 +12059,19 @@ impl<'a> CheckedProgramBuilder<'a> {
             sources.push(source);
         }
 
-        for expression in expressions.iter_mut() {
-            let CheckedExpressionKind::Read {
-                target,
-                projection,
-                source,
-            } = &mut expression.kind
-            else {
-                continue;
-            };
-            *source = exact_checked_source_read(*target, projection, &sources);
+        {
+            let source_paths = CheckedSourcePathIndex::new(&sources);
+            for expression in expressions.iter_mut() {
+                let CheckedExpressionKind::Read {
+                    target,
+                    projection,
+                    source,
+                } = &mut expression.kind
+                else {
+                    continue;
+                };
+                *source = source_paths.exact_read(*target, projection);
+            }
         }
         refine_checked_source_payload_types(&mut sources, expressions);
 
@@ -9516,13 +12079,8 @@ impl<'a> CheckedProgramBuilder<'a> {
             statements,
             expressions,
             &declaration_statements,
-            &self.calls,
+            &calls_by_id,
         );
-        let calls_by_id = self
-            .calls
-            .iter()
-            .map(|call| (call.id, call))
-            .collect::<BTreeMap<_, _>>();
         let mut states = Vec::<CheckedState>::new();
         for expression in expressions.iter() {
             let state = match &expression.kind {
@@ -9587,10 +12145,10 @@ impl<'a> CheckedProgramBuilder<'a> {
                 continue;
             };
             let mut projection = checked_declaration_resource_projection(
-                &self.signatures,
+                &callables_by_id,
                 &declaration_values,
                 expressions,
-                &self.calls,
+                &calls_by_id,
                 declaration,
                 expression.id,
             )
@@ -9701,18 +12259,16 @@ impl<'a> CheckedProgramBuilder<'a> {
             };
             let declaration_authority =
                 declaration_values.get(&declaration).and_then(|(root, _)| {
-                    checked_inline_list_authority_root(expressions, &self.calls, *root)
+                    checked_inline_list_authority_root(expressions, &calls_by_id, *root)
                 }) == Some(expression.id);
             let Some(statement) = declaration_authority
                 .then(|| declaration_statements.get(&declaration).copied())
                 .flatten()
                 .or_else(|| {
-                    containing_expression_statement(
-                        &self.program.ast.statements,
-                        expression.id.0 as usize,
-                        &self.program.expressions,
-                    )
-                    .map(|statement| CheckedStatementId(statement.id as u32))
+                    containing_statements
+                        .get(expression.id.0 as usize)
+                        .copied()
+                        .flatten()
                 })
                 .or_else(|| declaration_statements.get(&declaration).copied())
             else {
@@ -9752,10 +12308,10 @@ impl<'a> CheckedProgramBuilder<'a> {
                 })
                 .unwrap_or_else(|| item_type.as_ref().clone());
             let mut projection = checked_declaration_resource_projection(
-                &self.signatures,
+                &callables_by_id,
                 &declaration_values,
                 expressions,
-                &self.calls,
+                &calls_by_id,
                 declaration,
                 expression.id,
             )
@@ -9905,45 +12461,79 @@ impl<'a> CheckedProgramBuilder<'a> {
             .iter()
             .map(|statement| (statement.id, statement.value))
             .collect::<BTreeMap<_, _>>();
-        let roots = self.program.ast.statements.clone();
-        for statement in &roots {
-            self.finalize_structured_statement_value(statement, &statement_values, expressions);
+        enum FinalizeAction {
+            Function {
+                name: String,
+                value: CheckedExprId,
+            },
+            Declaration {
+                statement: usize,
+                value: CheckedExprId,
+            },
+        }
+        fn collect_actions(
+            statements: &[AstStatement],
+            statement_values: &BTreeMap<CheckedStatementId, Option<CheckedExprId>>,
+            actions: &mut Vec<FinalizeAction>,
+        ) {
+            for statement in statements {
+                collect_actions(&statement.children, statement_values, actions);
+                let Some(value) = statement_values
+                    .get(&CheckedStatementId(statement.id as u32))
+                    .copied()
+                    .flatten()
+                else {
+                    continue;
+                };
+                match &statement.kind {
+                    AstStatementKind::Function { name, .. } => {
+                        actions.push(FinalizeAction::Function {
+                            name: name.clone(),
+                            value,
+                        });
+                    }
+                    _ => actions.push(FinalizeAction::Declaration {
+                        statement: statement.id,
+                        value,
+                    }),
+                }
+            }
+        }
+
+        let mut actions = Vec::new();
+        collect_actions(
+            &self.program.ast.statements,
+            &statement_values,
+            &mut actions,
+        );
+        for action in actions {
+            match action {
+                FinalizeAction::Function { name, value } => {
+                    self.set_function_result(&name, value, expressions);
+                }
+                FinalizeAction::Declaration { statement, value } => {
+                    self.finalize_structured_declaration_value(statement, value, expressions);
+                }
+            }
         }
     }
 
-    fn finalize_structured_statement_value(
+    fn finalize_structured_declaration_value(
         &mut self,
-        statement: &AstStatement,
-        statement_values: &BTreeMap<CheckedStatementId, Option<CheckedExprId>>,
+        statement: usize,
+        value: CheckedExprId,
         expressions: &mut [CheckedExpression],
     ) {
-        for child in &statement.children {
-            self.finalize_structured_statement_value(child, statement_values, expressions);
-        }
-        let Some(value) = statement_values
-            .get(&CheckedStatementId(statement.id as u32))
-            .copied()
-            .flatten()
-        else {
+        let Some(declaration) = self.statement_declarations.get(&statement).copied() else {
             return;
         };
-        if let AstStatementKind::Function { name, .. } = &statement.kind {
-            self.set_function_result(name, value, expressions);
-            return;
-        }
-        let Some(declaration) =
-            self.statement_declarations
-                .get(&statement.id)
-                .and_then(|declaration| {
-                    self.declarations
-                        .iter_mut()
-                        .find(|candidate| candidate.id == *declaration)
-                })
-        else {
+        let Some(declaration_index) = self.declaration_by_id.get(&declaration).copied() else {
             return;
         };
-        declaration.value = Some(value);
-        if let Some(expression) = expressions.iter().find(|expression| expression.id == value) {
+        if let Some(expression) = expressions
+            .get(value.0 as usize)
+            .filter(|expression| expression.id == value)
+        {
             let mut flow_type = expression.flow_type.clone();
             if let Some(flush_type) = &expression.flush_type {
                 flow_type.ty = canonical_union_type(vec![flow_type.ty, flush_type.clone()]);
@@ -9951,7 +12541,12 @@ impl<'a> CheckedProgramBuilder<'a> {
                     flow_type.mode = FlowMode::Continuous;
                 }
             }
-            declaration.flow_type = flow_type;
+            if let Some(declaration) = self.declarations.get_mut(declaration_index) {
+                declaration.value = Some(value);
+                declaration.flow_type = flow_type;
+            }
+        } else if let Some(declaration) = self.declarations.get_mut(declaration_index) {
+            declaration.value = Some(value);
         }
     }
 
@@ -9966,8 +12561,8 @@ impl<'a> CheckedProgramBuilder<'a> {
         };
         self.signatures[signature_index].result_expression = Some(result);
         let Some(expression_type) = expressions
-            .iter()
-            .find(|expression| expression.id == result)
+            .get(result.0 as usize)
+            .filter(|expression| expression.id == result)
             .map(|expression| expression.flow_type.clone())
         else {
             return;
@@ -9978,29 +12573,41 @@ impl<'a> CheckedProgramBuilder<'a> {
         let callable = self.signatures[signature_index].decl_id;
         let result_type = self.signatures[signature_index].result.clone();
         if let Some(expression) = expressions
-            .iter_mut()
-            .find(|expression| expression.id == result)
+            .get_mut(result.0 as usize)
+            .filter(|expression| expression.id == result)
         {
             expression.flow_type = result_type.clone();
         }
-        if let Some(declaration) = self
-            .declarations
-            .iter_mut()
-            .find(|declaration| declaration.id == callable)
+        if let Some(declaration) = self.declaration_mut(callable)
             && let Type::Function { result, .. } = &mut declaration.flow_type.ty
         {
             **result = result_type.clone();
         }
         if !checked_signature_is_generic(&self.signatures[signature_index]) {
-            let mut call_results = BTreeMap::new();
-            for call in self
-                .calls
-                .iter_mut()
-                .filter(|call| call.callable == callable)
-            {
-                let occurrence = expressions
-                    .iter()
-                    .find(|expression| expression.id == call.expression)
+            let indexed_calls = self
+                .checked_type_inference_dependencies
+                .as_ref()
+                .and_then(|dependencies| dependencies.calls_by_callee.get(&callable))
+                .cloned()
+                .unwrap_or_else(|| {
+                    self.calls
+                        .iter()
+                        .filter(|call| call.callable == callable)
+                        .map(|call| call.id)
+                        .collect()
+                });
+            for call_id in indexed_calls {
+                let Some(call_index) = self.call_by_id.get(&call_id).copied() else {
+                    continue;
+                };
+                let Some(call) = self.calls.get_mut(call_index) else {
+                    continue;
+                };
+                let occurrence_expression = expressions
+                    .get_mut(call.expression.0 as usize)
+                    .filter(|expression| expression.id == call.expression);
+                let occurrence = occurrence_expression
+                    .as_deref()
                     .map(|expression| expression.flow_type.clone())
                     .unwrap_or_else(|| call.result.clone());
                 let occurrence_result = FlowType {
@@ -10012,11 +12619,8 @@ impl<'a> CheckedProgramBuilder<'a> {
                     ty: specialize_checked_call_result(&result_type.ty, &occurrence.ty),
                 };
                 call.result = occurrence_result.clone();
-                call_results.insert(call.expression, occurrence_result);
-            }
-            for expression in expressions.iter_mut() {
-                if let Some(result) = call_results.get(&expression.id) {
-                    expression.flow_type = result.clone();
+                if let Some(expression) = occurrence_expression {
+                    expression.flow_type = occurrence_result;
                 }
             }
         }
@@ -10713,9 +13317,7 @@ impl<'a> CheckedProgramBuilder<'a> {
         let mut target = self.resolve_checked_read_name(expr_id, scope_id, parts.first()?)?;
         for (index, part) in parts.iter().enumerate().skip(1) {
             let Some(body_scope) = self
-                .declarations
-                .iter()
-                .find(|declaration| declaration.id == target)
+                .declaration(target)
                 .and_then(|declaration| declaration.body_scope)
             else {
                 return Some((target, parts[index..].to_vec()));
@@ -10770,23 +13372,14 @@ impl<'a> CheckedProgramBuilder<'a> {
 
     fn declaration_is_inside_call_context(&self, declaration: DeclId, context: DeclId) -> bool {
         let Some(declaration_scope) = self
-            .declarations
-            .iter()
-            .find(|candidate| candidate.id == declaration)
+            .declaration(declaration)
             .map(|declaration| declaration.scope_id)
         else {
             return false;
         };
         let Some(context_parent) = self
-            .declarations
-            .iter()
-            .find(|candidate| candidate.id == context)
-            .and_then(|context| {
-                self.scopes
-                    .iter()
-                    .find(|scope| scope.id == context.scope_id)
-                    .and_then(|scope| scope.parent)
-            })
+            .declaration(context)
+            .and_then(|context| self.scope(context.scope_id).and_then(|scope| scope.parent))
         else {
             return false;
         };
@@ -10800,12 +13393,7 @@ impl<'a> CheckedProgramBuilder<'a> {
             if scope == ancestor {
                 return true;
             }
-            let Some(parent) = self
-                .scopes
-                .iter()
-                .find(|candidate| candidate.id == scope)
-                .and_then(|scope| scope.parent)
-            else {
+            let Some(parent) = self.scope(scope).and_then(|scope| scope.parent) else {
                 return false;
             };
             scope = parent;
@@ -10816,17 +13404,14 @@ impl<'a> CheckedProgramBuilder<'a> {
     fn resolve_name(&self, mut scope_id: LexicalScopeId, name: &str) -> Option<DeclId> {
         loop {
             if let Some(declaration) = self
-                .scope_declarations
-                .get(&(scope_id, name.to_owned()))
+                .scope_declarations_by_scope
+                .get(scope_id.0 as usize)
+                .and_then(|names| names.get(name))
                 .copied()
             {
                 return Some(declaration);
             }
-            scope_id = self
-                .scopes
-                .iter()
-                .find(|scope| scope.id == scope_id)
-                .and_then(|scope| scope.parent)?;
+            scope_id = self.scope(scope_id).and_then(|scope| scope.parent)?;
         }
     }
 
@@ -12006,33 +14591,30 @@ fn checked_declaration_canonical_path(
 
 fn validate_structural_lowering_metadata(
     program: &CheckedProgram,
+    lookup: &CheckedProgramLookup<'_>,
     source_payloads: &[SourcePayloadShapeEntry],
     functions: &FunctionTypeTable,
     named_values: &NamedValueTypeTable,
     outputs: &[OutputRootTypeEntry],
     host_ports: &HostPortTable,
 ) -> Result<(), String> {
-    validate_source_payload_shape_table(program, source_payloads)?;
+    validate_source_payload_shape_table(program, lookup, source_payloads)?;
 
-    let user_callables = program
-        .callables
-        .iter()
-        .filter(|callable| callable.kind == CheckedCallableKind::User)
-        .collect::<Vec<_>>();
-    if functions.entries.len() != user_callables.len() {
+    let user_callable_count = lookup.user_callables.values().map(Vec::len).sum::<usize>();
+    if functions.entries.len() != user_callable_count {
         return Err(format!(
             "function type metadata has {} entries for {} checked user callables",
             functions.entries.len(),
-            user_callables.len()
+            user_callable_count
         ));
     }
     for entry in &functions.entries {
-        let matches = user_callables
-            .iter()
-            .filter(|callable| callable.decl_id == entry.callable)
-            .copied()
-            .collect::<Vec<_>>();
-        let [callable] = matches.as_slice() else {
+        let matches = lookup
+            .user_callables
+            .get(&entry.callable)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let [callable] = matches else {
             return Err(format!(
                 "function type identity {} resolves to {} checked user callables",
                 entry.callable.0,
@@ -12119,12 +14701,7 @@ fn validate_structural_lowering_metadata(
         for origin in &entry.origins {
             let declaration = origin
                 .declaration
-                .and_then(|id| {
-                    program
-                        .declarations
-                        .iter()
-                        .find(|declaration| declaration.id == id)
-                })
+                .and_then(|id| lookup.declarations.get(&id).copied())
                 .ok_or_else(|| {
                     format!(
                         "named-value type `{}` has a missing declaration origin",
@@ -12132,17 +14709,13 @@ fn validate_structural_lowering_metadata(
                     )
                 })?;
             if let Some(statement) = origin.statement {
-                let statement = program
-                    .statements
-                    .iter()
-                    .find(|candidate| candidate.id == statement)
-                    .ok_or_else(|| {
-                        format!(
-                            "named-value type `{}` references a missing statement origin",
-                            entry.path
-                        )
-                    })?;
-                if checked_named_value_statement_declaration(program, statement)
+                let statement = lookup.statement(statement).ok_or_else(|| {
+                    format!(
+                        "named-value type `{}` references a missing statement origin",
+                        entry.path
+                    )
+                })?;
+                if checked_named_value_statement_declaration(lookup, statement)
                     != Some(declaration.id)
                 {
                     return Err(format!(
@@ -12152,16 +14725,12 @@ fn validate_structural_lowering_metadata(
                 }
             }
             if let Some(value) = origin.value {
-                let expression = program
-                    .expressions
-                    .iter()
-                    .find(|expression| expression.id == value)
-                    .ok_or_else(|| {
-                        format!(
-                            "named-value type `{}` references missing expression {}",
-                            entry.path, value.0
-                        )
-                    })?;
+                let expression = lookup.expressions.get(&value).copied().ok_or_else(|| {
+                    format!(
+                        "named-value type `{}` references missing expression {}",
+                        entry.path, value.0
+                    )
+                })?;
                 if expression.declaration != Some(declaration.id) {
                     return Err(format!(
                         "named-value type `{}` expression {} origin {:?} differs from declaration {}",
@@ -12170,9 +14739,8 @@ fn validate_structural_lowering_metadata(
                 }
             }
             if let Some(source) = origin.source
-                && !program.sources.iter().any(|candidate| {
-                    candidate.id == source
-                        && candidate.declaration == declaration.id
+                && !lookup.sources.get(&source).is_some_and(|candidate| {
+                    candidate.declaration == declaration.id
                         && Some(candidate.expression) == origin.value
                 })
             {
@@ -12182,9 +14750,8 @@ fn validate_structural_lowering_metadata(
                 ));
             }
             if let Some(state) = origin.state
-                && !program.states.iter().any(|candidate| {
-                    candidate.id == state
-                        && candidate.declaration == declaration.id
+                && !lookup.states.get(&state).is_some_and(|candidate| {
+                    candidate.declaration == declaration.id
                         && Some(candidate.expression) == origin.value
                 })
             {
@@ -12194,9 +14761,8 @@ fn validate_structural_lowering_metadata(
                 ));
             }
             if let Some(list) = origin.list
-                && !program.lists.iter().any(|candidate| {
-                    candidate.id == list
-                        && candidate.declaration == declaration.id
+                && !lookup.lists.get(&list).is_some_and(|candidate| {
+                    candidate.declaration == declaration.id
                         && Some(candidate.producer) == origin.value
                 })
             {
@@ -12205,7 +14771,7 @@ fn validate_structural_lowering_metadata(
                     entry.path, list.0
                 ));
             }
-            let flow = checked_named_value_origin_flow_type(program, origin).ok_or_else(|| {
+            let flow = checked_named_value_origin_flow_type(lookup, origin).ok_or_else(|| {
                 format!(
                     "named-value type `{}` cannot resolve its exact checked origin",
                     entry.path
@@ -12229,16 +14795,12 @@ fn validate_structural_lowering_metadata(
     }
 
     for output in outputs {
-        let statement = program
-            .statements
-            .iter()
-            .find(|statement| statement.id == output.statement)
-            .ok_or_else(|| {
-                format!(
-                    "output `{}` references missing checked statement {}",
-                    output.name, output.statement.0
-                )
-            })?;
+        let statement = lookup.statement(output.statement).ok_or_else(|| {
+            format!(
+                "output `{}` references missing checked statement {}",
+                output.name, output.statement.0
+            )
+        })?;
         if checked_statement_declaration(&statement.kind) != Some(output.declaration)
             || statement.value != output.value
         {
@@ -12248,16 +14810,12 @@ fn validate_structural_lowering_metadata(
             ));
         }
         if let Some(value) = output.value {
-            let expression = program
-                .expressions
-                .iter()
-                .find(|expression| expression.id == value)
-                .ok_or_else(|| {
-                    format!(
-                        "output `{}` references missing checked expression {}",
-                        output.name, value.0
-                    )
-                })?;
+            let expression = lookup.expressions.get(&value).copied().ok_or_else(|| {
+                format!(
+                    "output `{}` references missing checked expression {}",
+                    output.name, value.0
+                )
+            })?;
             if expression.flow_type.ty != output.ty {
                 return Err(format!(
                     "output `{}` type differs from its checked expression",
@@ -12268,10 +14826,10 @@ fn validate_structural_lowering_metadata(
     }
 
     let validate_source = |binding: &CheckedHostSourcePortBinding| -> Result<(), String> {
-        let source = program
+        let source = lookup
             .sources
-            .iter()
-            .find(|source| source.id == binding.source)
+            .get(&binding.source)
+            .copied()
             .ok_or_else(|| {
                 format!(
                     "host port references missing checked source {}",
@@ -12326,6 +14884,7 @@ fn validate_structural_lowering_metadata(
 
 fn validate_source_payload_shape_table(
     program: &CheckedProgram,
+    lookup: &CheckedProgramLookup<'_>,
     entries: &[SourcePayloadShapeEntry],
 ) -> Result<(), String> {
     let expected_sources = program
@@ -12364,16 +14923,12 @@ fn validate_source_payload_shape_table(
 
         for source_id in &entry.checked_sources {
             covered_sources.push(*source_id);
-            let source = program
-                .sources
-                .iter()
-                .find(|source| source.id == *source_id)
-                .ok_or_else(|| {
-                    format!(
-                        "source payload shape `{}` references missing checked source {}",
-                        entry.diagnostic_path, source_id.0
-                    )
-                })?;
+            let source = lookup.sources.get(source_id).copied().ok_or_else(|| {
+                format!(
+                    "source payload shape `{}` references missing checked source {}",
+                    entry.diagnostic_path, source_id.0
+                )
+            })?;
             let diagnostic_path = program.semantic_path(&source.path).ok_or_else(|| {
                 format!(
                     "checked source {} has no canonical diagnostic path",
@@ -12437,10 +14992,160 @@ fn validate_source_payload_shape_table(
     Ok(())
 }
 
+/// Exact checked-program indexes shared by diagnostic projections and their
+/// structural validator. All of these relations were previously rediscovered
+/// with linear scans for every named value origin.
+struct CheckedProgramLookup<'a> {
+    statements: BTreeMap<CheckedStatementId, Vec<&'a CheckedStatement>>,
+    expressions: BTreeMap<CheckedExprId, &'a CheckedExpression>,
+    declarations: BTreeMap<DeclId, &'a CheckedDeclaration>,
+    scopes: BTreeMap<LexicalScopeId, &'a CheckedScope>,
+    sources: BTreeMap<CheckedSourceId, &'a CheckedSource>,
+    states: BTreeMap<CheckedStateId, &'a CheckedState>,
+    lists: BTreeMap<CheckedListId, &'a CheckedList>,
+    user_callables: BTreeMap<DeclId, Vec<&'a CheckedCallableSignature>>,
+    sources_by_declaration_value: BTreeMap<(DeclId, CheckedExprId), Vec<&'a CheckedSource>>,
+    states_by_declaration_value: BTreeMap<(DeclId, CheckedExprId), Vec<&'a CheckedState>>,
+    lists_by_declaration_value: BTreeMap<(DeclId, CheckedExprId), Vec<&'a CheckedList>>,
+    statements_exposing_flush: BTreeSet<CheckedStatementId>,
+}
+
+impl<'a> CheckedProgramLookup<'a> {
+    fn new(program: &'a CheckedProgram) -> Self {
+        let mut statements = BTreeMap::<CheckedStatementId, Vec<&CheckedStatement>>::new();
+        for statement in &program.statements {
+            statements.entry(statement.id).or_default().push(statement);
+        }
+        let expressions = program
+            .expressions
+            .iter()
+            .map(|expression| (expression.id, expression))
+            .collect::<BTreeMap<_, _>>();
+        let declarations = program
+            .declarations
+            .iter()
+            .map(|declaration| (declaration.id, declaration))
+            .collect::<BTreeMap<_, _>>();
+        let scopes = program
+            .scopes
+            .iter()
+            .map(|scope| (scope.id, scope))
+            .collect::<BTreeMap<_, _>>();
+        let sources = program
+            .sources
+            .iter()
+            .map(|source| (source.id, source))
+            .collect::<BTreeMap<_, _>>();
+        let states = program
+            .states
+            .iter()
+            .map(|state| (state.id, state))
+            .collect::<BTreeMap<_, _>>();
+        let lists = program
+            .lists
+            .iter()
+            .map(|list| (list.id, list))
+            .collect::<BTreeMap<_, _>>();
+        let mut user_callables = BTreeMap::<DeclId, Vec<&CheckedCallableSignature>>::new();
+        for callable in program
+            .callables
+            .iter()
+            .filter(|callable| callable.kind == CheckedCallableKind::User)
+        {
+            user_callables
+                .entry(callable.decl_id)
+                .or_default()
+                .push(callable);
+        }
+        let mut sources_by_declaration_value =
+            BTreeMap::<(DeclId, CheckedExprId), Vec<&CheckedSource>>::new();
+        for source in &program.sources {
+            sources_by_declaration_value
+                .entry((source.declaration, source.expression))
+                .or_default()
+                .push(source);
+        }
+        let mut states_by_declaration_value =
+            BTreeMap::<(DeclId, CheckedExprId), Vec<&CheckedState>>::new();
+        for state in &program.states {
+            states_by_declaration_value
+                .entry((state.declaration, state.expression))
+                .or_default()
+                .push(state);
+        }
+        let mut lists_by_declaration_value =
+            BTreeMap::<(DeclId, CheckedExprId), Vec<&CheckedList>>::new();
+        for list in &program.lists {
+            lists_by_declaration_value
+                .entry((list.declaration, list.producer))
+                .or_default()
+                .push(list);
+        }
+
+        // A statement exposes a FLUSH boundary exactly when its own value or
+        // any transitively reachable child does. Reverse propagation computes
+        // that monotone reachability once and remains exact even if malformed
+        // checked input contains a statement cycle.
+        let mut parents = BTreeMap::<CheckedStatementId, Vec<CheckedStatementId>>::new();
+        let mut pending = Vec::new();
+        for (id, candidates) in &statements {
+            let Some(statement) = candidates.first().copied() else {
+                continue;
+            };
+            if statement
+                .value
+                .and_then(|value| expressions.get(&value).copied())
+                .is_some_and(|expression| expression.flush_type.is_some())
+            {
+                pending.push(*id);
+            }
+            for child in &statement.children {
+                parents.entry(*child).or_default().push(*id);
+            }
+        }
+        let mut statements_exposing_flush = BTreeSet::new();
+        while let Some(statement) = pending.pop() {
+            if !statements_exposing_flush.insert(statement) {
+                continue;
+            }
+            pending.extend(parents.get(&statement).into_iter().flatten().copied());
+        }
+
+        Self {
+            statements,
+            expressions,
+            declarations,
+            scopes,
+            sources,
+            states,
+            lists,
+            user_callables,
+            sources_by_declaration_value,
+            states_by_declaration_value,
+            lists_by_declaration_value,
+            statements_exposing_flush,
+        }
+    }
+
+    fn statement(&self, id: CheckedStatementId) -> Option<&'a CheckedStatement> {
+        self.statements
+            .get(&id)
+            .and_then(|candidates| candidates.first().copied())
+    }
+
+    fn unique_statement(&self, id: CheckedStatementId) -> Option<&'a CheckedStatement> {
+        let candidates = self.statements.get(&id)?;
+        let [statement] = candidates.as_slice() else {
+            return None;
+        };
+        Some(*statement)
+    }
+}
+
 fn refresh_named_value_types_from_checked_program(
     table: &mut NamedValueTypeTable,
     syntax_sites: &BTreeMap<String, Vec<usize>>,
-    program: &CheckedProgram,
+    lookup: &CheckedProgramLookup<'_>,
 ) -> Result<(), String> {
     let provisional_entries = std::mem::take(&mut table.entries);
     let mut refreshed = Vec::new();
@@ -12458,12 +15163,12 @@ fn refresh_named_value_types_from_checked_program(
             ));
         }
         for site in sites {
-            let matches = program
-                .statements
-                .iter()
-                .filter(|statement| statement.id.0 as usize == *site)
-                .collect::<Vec<_>>();
-            let [statement] = matches.as_slice() else {
+            let matches = u32::try_from(*site)
+                .ok()
+                .and_then(|site| lookup.statements.get(&CheckedStatementId(site)))
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let [statement] = matches else {
                 return Err(format!(
                     "named-value type `{}` parser statement {} resolves to {} checked statements",
                     provisional.path,
@@ -12471,11 +15176,11 @@ fn refresh_named_value_types_from_checked_program(
                     matches.len()
                 ));
             };
-            let origins = checked_named_value_origins_for_statement(program, statement)?;
+            let origins = checked_named_value_origins_for_statement(lookup, statement)?;
             let flows = origins
                 .iter()
                 .map(|origin| {
-                    checked_named_value_origin_flow_type(program, origin).ok_or_else(|| {
+                    checked_named_value_origin_flow_type(lookup, origin).ok_or_else(|| {
                         format!(
                             "named-value type `{}` cannot resolve exact checked origin {:?}",
                             provisional.path, origin
@@ -12512,17 +15217,13 @@ fn refresh_named_value_types_from_checked_program(
         }
     }
 
-    let own_modes = refreshed
-        .iter()
-        .map(|entry| (entry.path.clone(), entry.flow_type.mode))
-        .collect::<Vec<_>>();
+    let mut modes = FlowModeIndex::default();
+    for entry in &refreshed {
+        modes.insert(entry.path.clone(), entry.flow_type.mode);
+    }
     for entry in &mut refreshed {
-        let descendant_prefix = format!("{}.", entry.path);
-        entry.flow_type.mode = own_modes
-            .iter()
-            .filter(|(path, _)| path == &entry.path || path.starts_with(&descendant_prefix))
-            .map(|(_, mode)| *mode)
-            .reduce(merge_flow_modes)
+        entry.flow_type.mode = modes
+            .subtree_mode(&entry.path)
             .unwrap_or(entry.flow_type.mode);
     }
     refreshed.sort_by(|left, right| {
@@ -12541,11 +15242,11 @@ fn refresh_named_value_types_from_checked_program(
 }
 
 fn checked_named_value_origins_for_statement(
-    program: &CheckedProgram,
+    lookup: &CheckedProgramLookup<'_>,
     statement: &CheckedStatement,
 ) -> Result<Vec<NamedValueTypeOrigin>, String> {
     let declaration =
-        checked_named_value_statement_declaration(program, statement).ok_or_else(|| {
+        checked_named_value_statement_declaration(lookup, statement).ok_or_else(|| {
             format!(
                 "named-value checked statement {} has no structural declaration",
                 statement.id.0
@@ -12553,10 +15254,11 @@ fn checked_named_value_origins_for_statement(
         })?;
     let mut origins = Vec::new();
     if let Some(value) = statement.value {
-        for source in program
-            .sources
-            .iter()
-            .filter(|source| source.declaration == declaration && source.expression == value)
+        for source in lookup
+            .sources_by_declaration_value
+            .get(&(declaration, value))
+            .into_iter()
+            .flatten()
         {
             origins.push(NamedValueTypeOrigin {
                 declaration: Some(declaration),
@@ -12568,10 +15270,11 @@ fn checked_named_value_origins_for_statement(
                 projection: Vec::new(),
             });
         }
-        for state in program
-            .states
-            .iter()
-            .filter(|state| state.declaration == declaration && state.expression == value)
+        for state in lookup
+            .states_by_declaration_value
+            .get(&(declaration, value))
+            .into_iter()
+            .flatten()
         {
             origins.push(NamedValueTypeOrigin {
                 declaration: Some(declaration),
@@ -12583,10 +15286,11 @@ fn checked_named_value_origins_for_statement(
                 projection: Vec::new(),
             });
         }
-        for list in program
-            .lists
-            .iter()
-            .filter(|list| list.declaration == declaration && list.producer == value)
+        for list in lookup
+            .lists_by_declaration_value
+            .get(&(declaration, value))
+            .into_iter()
+            .flatten()
         {
             origins.push(NamedValueTypeOrigin {
                 declaration: Some(declaration),
@@ -12616,16 +15320,15 @@ fn checked_named_value_origins_for_statement(
 }
 
 fn checked_named_value_statement_declaration(
-    program: &CheckedProgram,
+    lookup: &CheckedProgramLookup<'_>,
     statement: &CheckedStatement,
 ) -> Option<DeclId> {
     checked_statement_declaration(&statement.kind)
         .or_else(|| {
             statement.value.and_then(|value| {
-                program
+                lookup
                     .expressions
-                    .iter()
-                    .find(|expression| expression.id == value)
+                    .get(&value)
                     .and_then(|expression| expression.declaration)
             })
         })
@@ -12636,7 +15339,7 @@ fn checked_named_value_statement_declaration(
                 if !visited.insert(current) {
                     break;
                 }
-                let scope = program.scopes.iter().find(|scope| scope.id == current)?;
+                let scope = lookup.scopes.get(&current).copied()?;
                 if scope.owner.is_some() {
                     return scope.owner;
                 }
@@ -12647,57 +15350,23 @@ fn checked_named_value_statement_declaration(
 }
 
 fn checked_named_value_origin_exposes_flush_boundary(
-    program: &CheckedProgram,
+    lookup: &CheckedProgramLookup<'_>,
     origin: &NamedValueTypeOrigin,
 ) -> bool {
-    fn visit(
-        program: &CheckedProgram,
-        statement: CheckedStatementId,
-        visited: &mut BTreeSet<CheckedStatementId>,
-    ) -> bool {
-        if !visited.insert(statement) {
-            return false;
-        }
-        let Some(statement) = program
-            .statements
-            .iter()
-            .find(|candidate| candidate.id == statement)
-        else {
-            return false;
-        };
-        if statement.value.is_some_and(|value| {
-            program
-                .expressions
-                .iter()
-                .find(|candidate| candidate.id == value)
-                .is_some_and(|expression| expression.flush_type.is_some())
-        }) {
-            return true;
-        }
-        statement
-            .children
-            .iter()
-            .any(|child| visit(program, *child, visited))
-    }
-
     origin
         .statement
-        .is_some_and(|statement| visit(program, statement, &mut BTreeSet::new()))
+        .is_some_and(|statement| lookup.statements_exposing_flush.contains(&statement))
 }
 
 fn checked_named_value_origin_flow_type(
-    program: &CheckedProgram,
+    lookup: &CheckedProgramLookup<'_>,
     origin: &NamedValueTypeOrigin,
 ) -> Option<FlowType> {
     let mut flow = if let Some(source) = origin.source {
-        let source = program
-            .sources
-            .iter()
-            .find(|candidate| candidate.id == source)?;
-        let mode = program
+        let source = lookup.sources.get(&source).copied()?;
+        let mode = lookup
             .expressions
-            .iter()
-            .find(|expression| expression.id == source.expression)
+            .get(&source.expression)
             .map_or(FlowMode::PresentOrAbsent, |expression| {
                 expression.flow_type.mode
             });
@@ -12706,37 +15375,21 @@ fn checked_named_value_origin_flow_type(
             ty: source.payload_type.clone(),
         }
     } else if let Some(state) = origin.state {
-        program
-            .states
-            .iter()
-            .find(|candidate| candidate.id == state)?
-            .flow_type
-            .clone()
+        lookup.states.get(&state).copied()?.flow_type.clone()
     } else if let Some(list) = origin.list {
-        let list = program
-            .lists
-            .iter()
-            .find(|candidate| candidate.id == list)?;
-        program
+        let list = lookup.lists.get(&list).copied()?;
+        lookup
             .expressions
-            .iter()
-            .find(|expression| expression.id == list.producer)?
+            .get(&list.producer)
+            .copied()?
             .flow_type
             .clone()
     } else if let Some(value) = origin.value {
-        let expression = program
-            .expressions
-            .iter()
-            .find(|expression| expression.id == value)?;
-        let mut flow = if checked_named_value_origin_exposes_flush_boundary(program, origin) {
+        let expression = lookup.expressions.get(&value).copied()?;
+        let mut flow = if checked_named_value_origin_exposes_flush_boundary(lookup, origin) {
             origin
                 .declaration
-                .and_then(|declaration| {
-                    program
-                        .declarations
-                        .iter()
-                        .find(|candidate| candidate.id == declaration)
-                })
+                .and_then(|declaration| lookup.declarations.get(&declaration).copied())
                 .map_or_else(
                     || expression.flow_type.clone(),
                     |declaration| declaration.flow_type.clone(),
@@ -12752,10 +15405,10 @@ fn checked_named_value_origin_flow_type(
         }
         flow
     } else {
-        program
+        lookup
             .declarations
-            .iter()
-            .find(|declaration| Some(declaration.id) == origin.declaration)?
+            .get(&origin.declaration?)
+            .copied()?
             .flow_type
             .clone()
     };
@@ -12954,7 +15607,7 @@ fn merge_principal_context_type(
                     fields.insert(field.clone(), incoming_type.clone());
                 }
             }
-            Ok(Type::Object(ObjectShape {
+            Ok(Type::object(ObjectShape {
                 fields,
                 field_order: object_field_order_for_widened_shapes(current, incoming),
                 open: current.open || incoming.open,
@@ -13057,7 +15710,7 @@ fn alpha_normalize_context_type(
             *next_var = next_var.saturating_add(1);
             normalized
         })),
-        Type::Object(shape) => Type::Object(ObjectShape {
+        Type::Object(shape) => Type::object(ObjectShape {
             fields: shape
                 .fields
                 .iter()
@@ -13111,7 +15764,8 @@ fn alpha_normalize_context_type(
                                 .collect(),
                             field_order: fields.field_order.clone(),
                             open: fields.open,
-                        },
+                        }
+                        .into(),
                     },
                 })
                 .collect(),
@@ -13158,7 +15812,7 @@ fn pass_scheme_type_with_fallback(ty: &Type, fallback: &Type) -> Type {
     match ty {
         Type::Unknown | Type::UnresolvedShape { .. } => fallback.clone(),
         Type::Object(shape) if shape.open && shape.fields.is_empty() => fallback.clone(),
-        Type::Object(shape) => Type::Object(ObjectShape {
+        Type::Object(shape) => Type::object(ObjectShape {
             fields: shape
                 .fields
                 .iter()
@@ -13200,7 +15854,8 @@ fn pass_scheme_type_with_fallback(ty: &Type, fallback: &Type) -> Type {
                                 .collect(),
                             field_order: fields.field_order.clone(),
                             open: fields.open,
-                        },
+                        }
+                        .into(),
                     },
                 })
                 .collect(),
@@ -13235,7 +15890,7 @@ fn freshen_checked_scheme_type(ty: &Type, next_var: &mut u32) -> Type {
         Type::Object(shape) if shape.open && shape.fields.is_empty() => {
             fresh_checked_scheme_var(next_var)
         }
-        Type::Object(shape) => Type::Object(ObjectShape {
+        Type::Object(shape) => Type::object(ObjectShape {
             fields: shape
                 .fields
                 .iter()
@@ -13277,7 +15932,8 @@ fn freshen_checked_scheme_type(ty: &Type, next_var: &mut u32) -> Type {
                                 .collect(),
                             field_order: fields.field_order.clone(),
                             open: fields.open,
-                        },
+                        }
+                        .into(),
                     },
                 })
                 .collect(),
@@ -13303,6 +15959,14 @@ fn instantiate_checked_type_scheme_for_call(
     call_vars: &mut BTreeMap<(CheckedCallId, TypeVar), TypeVar>,
     next_var: &mut u32,
 ) -> Type {
+    // Most call-site types are already closed. Preserve their shared object
+    // and tagged payload shapes instead of walking and rebuilding the entire
+    // tree merely to discover that there is no scheme variable to freshen.
+    // Recursive calls use the same guard, so closed siblings of a generic
+    // field retain their allocation when the containing shape is rebuilt.
+    if !checked_type_contains_var(ty) {
+        return ty.clone();
+    }
     match ty {
         Type::Var(variable) => {
             Type::Var(*call_vars.entry((call, *variable)).or_insert_with(|| {
@@ -13337,7 +16001,7 @@ fn instantiate_checked_type_scheme_for_call(
                 ty: instantiate_checked_type_scheme_for_call(&result.ty, call, call_vars, next_var),
             }),
         },
-        Type::Object(shape) => Type::Object(ObjectShape {
+        Type::Object(shape) => Type::object(ObjectShape {
             fields: shape
                 .fields
                 .iter()
@@ -13373,7 +16037,8 @@ fn instantiate_checked_type_scheme_for_call(
                                 .collect(),
                             field_order: fields.field_order.clone(),
                             open: fields.open,
-                        },
+                        }
+                        .into(),
                     },
                 })
                 .collect(),
@@ -13542,6 +16207,51 @@ impl CheckedTypeSubstitutionLookup for [CheckedTypeSubstitution] {
     }
 }
 
+fn checked_type_has_applicable_substitution(
+    ty: &Type,
+    substitutions: &(impl CheckedTypeSubstitutionLookup + ?Sized),
+) -> bool {
+    match ty {
+        Type::Var(variable) => substitutions
+            .replacement(*variable)
+            .is_some_and(|replacement| replacement != ty),
+        Type::List(item) | Type::Set(item) => {
+            checked_type_has_applicable_substitution(item, substitutions)
+        }
+        Type::Map { key, value } => {
+            checked_type_has_applicable_substitution(key, substitutions)
+                || checked_type_has_applicable_substitution(value, substitutions)
+        }
+        Type::Function { args, result } => {
+            args.iter()
+                .any(|argument| checked_type_has_applicable_substitution(argument, substitutions))
+                || checked_type_has_applicable_substitution(&result.ty, substitutions)
+        }
+        Type::Object(shape) => shape
+            .fields
+            .values()
+            .any(|field| checked_type_has_applicable_substitution(field, substitutions)),
+        Type::VariantSet(variants) => variants.iter().any(|variant| match variant {
+            Variant::Tag(_) => false,
+            Variant::Tagged { fields, .. } => fields
+                .fields
+                .values()
+                .any(|field| checked_type_has_applicable_substitution(field, substitutions)),
+        }),
+        Type::Union(members) => members
+            .iter()
+            .any(|member| checked_type_has_applicable_substitution(member, substitutions)),
+        Type::Text
+        | Type::Number
+        | Type::Bytes(_)
+        | Type::Bits { .. }
+        | Type::Absent
+        | Type::RenderContract
+        | Type::UnresolvedShape { .. }
+        | Type::Unknown => false,
+    }
+}
+
 fn substitute_checked_type_from_lookup(
     ty: &Type,
     substitutions: &(impl CheckedTypeSubstitutionLookup + ?Sized),
@@ -13554,6 +16264,13 @@ fn substitute_checked_type_inner(
     substitutions: &(impl CheckedTypeSubstitutionLookup + ?Sized),
     active: &mut BTreeSet<TypeVar>,
 ) -> Type {
+    // Substitution maps are often sparse. Reuse an unchanged subtree as-is;
+    // for Object and tagged payload nodes this keeps the existing Arc shape.
+    // Testing applicability rather than merely looking for any TypeVar also
+    // preserves sharing for generic variables outside this substitution map.
+    if !checked_type_has_applicable_substitution(ty, substitutions) {
+        return ty.clone();
+    }
     match ty {
         Type::Var(var) => {
             let Some(replacement) = substitutions
@@ -13593,7 +16310,7 @@ fn substitute_checked_type_inner(
                 ty: substitute_checked_type_inner(&result.ty, substitutions, active),
             }),
         },
-        Type::Object(shape) => Type::Object(ObjectShape {
+        Type::Object(shape) => Type::object(ObjectShape {
             fields: shape
                 .fields
                 .iter()
@@ -13627,7 +16344,8 @@ fn substitute_checked_type_inner(
                                 .collect(),
                             field_order: fields.field_order.clone(),
                             open: fields.open,
-                        },
+                        }
+                        .into(),
                     },
                 })
                 .collect(),
@@ -14343,7 +17061,7 @@ fn effect_schema_type_to_type(value_type: &boon_effect_schema::ValueType) -> Typ
             Type::List(Box::new(effect_schema_type_to_type(item)))
         }
         boon_effect_schema::ValueType::Record { fields, open } => {
-            Type::Object(ObjectShape::from_ordered_fields(
+            Type::object(ObjectShape::from_ordered_fields(
                 fields.iter().map(|field| {
                     (
                         field.name.to_owned(),
@@ -14769,8 +17487,25 @@ pub fn check_profiled(program: &ParsedProgram) -> (TypeCheckReport, TypeCheckPro
 }
 
 pub fn check_program_profiled(program: &ParsedProgram) -> (CheckOutput, TypeCheckProfile) {
-    let (mut checker, init_profile) = Checker::new_profiled(program);
-    checker.finish_program_profiled(true, init_profile)
+    let (checker, init_profile) = Checker::new_profiled(program);
+    checker.finish_program_profiled(CheckOutputOwnership::ReportOwned, init_profile)
+}
+
+/// Typecheck for an interactive editor while retaining a single owned copy of
+/// successful lowering metadata in the returned [`CheckedProgram`].
+pub fn check_editor_program_profiled(program: &ParsedProgram) -> (CheckOutput, TypeCheckProfile) {
+    let (checker, init_profile) = Checker::new_profiled(program);
+    checker.finish_program_profiled(CheckOutputOwnership::EditorOwned, init_profile)
+}
+
+/// Complete diagnostics for the compiler service without eagerly building
+/// the editor inspector-hint sidecar. Successful lowering tables remain owned
+/// by the checked artifact so a verified request can consume the same check.
+pub fn check_diagnostics_program_profiled(
+    program: &ParsedProgram,
+) -> (CheckOutput, TypeCheckProfile) {
+    let (checker, init_profile) = Checker::new_profiled(program);
+    checker.finish_program_profiled(CheckOutputOwnership::DiagnosticsOwned, init_profile)
 }
 
 pub fn check_profiled_with_external_types(
@@ -14785,9 +17520,29 @@ pub fn check_program_profiled_with_external_types(
     program: &ParsedProgram,
     external_types: &ExternalTypeEnvironment,
 ) -> (CheckOutput, TypeCheckProfile) {
-    let (mut checker, init_profile) =
+    let (checker, init_profile) =
         Checker::new_profiled_with_external_types(program, external_types);
-    checker.finish_program_profiled(true, init_profile)
+    checker.finish_program_profiled(CheckOutputOwnership::ReportOwned, init_profile)
+}
+
+/// External-environment variant of [`check_editor_program_profiled`].
+pub fn check_editor_program_profiled_with_external_types(
+    program: &ParsedProgram,
+    external_types: &ExternalTypeEnvironment,
+) -> (CheckOutput, TypeCheckProfile) {
+    let (checker, init_profile) =
+        Checker::new_profiled_with_external_types(program, external_types);
+    checker.finish_program_profiled(CheckOutputOwnership::EditorOwned, init_profile)
+}
+
+/// External-environment variant of [`check_diagnostics_program_profiled`].
+pub fn check_diagnostics_program_profiled_with_external_types(
+    program: &ParsedProgram,
+    external_types: &ExternalTypeEnvironment,
+) -> (CheckOutput, TypeCheckProfile) {
+    let (checker, init_profile) =
+        Checker::new_profiled_with_external_types(program, external_types);
+    checker.finish_program_profiled(CheckOutputOwnership::DiagnosticsOwned, init_profile)
 }
 
 pub fn check_runtime_profiled(program: &ParsedProgram) -> (TypeCheckReport, TypeCheckProfile) {
@@ -14796,8 +17551,8 @@ pub fn check_runtime_profiled(program: &ParsedProgram) -> (TypeCheckReport, Type
 }
 
 pub fn check_runtime_program_profiled(program: &ParsedProgram) -> (CheckOutput, TypeCheckProfile) {
-    let (mut checker, init_profile) = Checker::new_profiled(program);
-    checker.finish_program_profiled(false, init_profile)
+    let (checker, init_profile) = Checker::new_profiled(program);
+    checker.finish_program_profiled(CheckOutputOwnership::RuntimeOwned, init_profile)
 }
 
 pub fn check_runtime_profiled_with_external_types(
@@ -14813,9 +17568,67 @@ pub fn check_runtime_program_profiled_with_external_types(
     program: &ParsedProgram,
     external_types: &ExternalTypeEnvironment,
 ) -> (CheckOutput, TypeCheckProfile) {
-    let (mut checker, init_profile) =
+    let (checker, init_profile) =
         Checker::new_profiled_with_external_types(program, external_types);
-    checker.finish_program_profiled(false, init_profile)
+    checker.finish_program_profiled(CheckOutputOwnership::RuntimeOwned, init_profile)
+}
+
+/// Materialize the editor-only type-hint sidecar from an already completed
+/// check. Compiler-service diagnostics deliberately defer this global
+/// presentation projection; editor clients may request it without parsing or
+/// solving the program a second time.
+pub fn project_type_hints(program: &ParsedProgram, output: &CheckOutput) -> TypeHintTable {
+    if !output.report.type_hint_table.entries.is_empty() {
+        return output.report.type_hint_table.clone();
+    }
+
+    let (expr_type_table, function_type_table, render_slot_table, source_payload_shape_table) =
+        if let Some(checked) = output.program.as_ref() {
+            let metadata = &checked.lowering_metadata;
+            (
+                &metadata.expr_type_table,
+                &metadata.function_type_table,
+                &metadata.render_slot_table,
+                &metadata.source_payload_shape_table,
+            )
+        } else {
+            (
+                &output.report.expr_type_table,
+                &output.report.function_type_table,
+                &output.report.render_slot_table,
+                &output.report.source_payload_shape_table,
+            )
+        };
+
+    let payloads_by_path = source_payload_shape_table
+        .iter()
+        .map(|entry| (entry.diagnostic_path.as_str(), entry))
+        .collect::<BTreeMap<_, _>>();
+    let syntax_payloads = syntax_source_sites(program)
+        .into_iter()
+        .filter_map(|source| {
+            let payload = payloads_by_path.get(source.path.as_str())?;
+            Some(SourcePayloadSyntaxShapeEntry {
+                statement: source.statement,
+                source_path: source.path,
+                payload_type: payload.payload_type.clone(),
+                fields: payload.fields.clone(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let source_payload_types = source_payload_shape_table
+        .iter()
+        .map(|entry| (entry.diagnostic_path.clone(), entry.payload_type.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let bindings = name_bindings(program, &source_payload_types);
+    type_hint_table(
+        program,
+        expr_type_table,
+        function_type_table,
+        render_slot_table,
+        &syntax_payloads,
+        &bindings,
+    )
 }
 
 fn role_for_namespace(namespace: &str) -> Option<ProgramRole> {
@@ -15169,20 +17982,32 @@ struct Checker<'a> {
     function_arg_call_sites: BTreeMap<String, BTreeMap<String, Vec<usize>>>,
     function_arg_display_type_cache: RefCell<BTreeMap<(String, String), Type>>,
     function_return_type_cache: RefCell<BTreeMap<String, Option<Type>>>,
-    function_call_return_type_cache: Vec<FunctionCallReturnTypeCacheEntry>,
-    object_bindings: BTreeMap<String, ObjectShape>,
+    function_call_return_type_cache: RefCell<BTreeMap<String, HashMap<Vec<Type>, Option<Type>>>>,
+    #[cfg(test)]
+    function_call_return_type_cache_misses: Cell<usize>,
+    object_bindings: BTreeMap<String, SharedObjectShape>,
     name_bindings: BTreeMap<String, Type>,
-    declaration_exprs: BTreeMap<String, usize>,
+    declaration_exprs: DeclarationExprIndex,
     local_name_bindings: Vec<BTreeMap<String, Type>>,
-    flow_bindings: BTreeMap<String, FlowMode>,
+    flow_bindings: FlowModeIndex,
     function_param_requirements: BTreeMap<String, BTreeMap<String, Type>>,
-    expr_type_vars: BTreeMap<usize, TypeVar>,
+    expr_type_vars: DenseIndexTable<TypeVar>,
     builtin_symbol_exprs: BTreeSet<usize>,
-    visited: BTreeSet<usize>,
-    expr_type_in_progress: BTreeSet<usize>,
     expr_type_cache: Vec<Option<FlowType>>,
+    checked_diagnostic_replay: bool,
+    diagnostic_replayed: DenseFlagSet,
+    diagnostic_ensure_requests: usize,
+    diagnostic_lookup_hits: usize,
+    diagnostic_lookup_misses: usize,
+    checked_flow_install_count: usize,
+    checked_flow_duplicate_ids: usize,
+    checked_flow_out_of_range_ids: usize,
+    checked_flow_missing_parser_ids: usize,
+    #[cfg(test)]
+    flow_mode_expression_visits: Cell<usize>,
     expr_type_table: ExprTypeTable,
     function_type_table: FunctionTypeTable,
+    checked_function_parameters: BTreeMap<String, Vec<FunctionTypeParameterEntry>>,
     collect_type_hints: bool,
     render_slot_table: RenderSlotTable,
     deferred_style_constraints: Vec<DeferredStyleConstraint>,
@@ -15202,13 +18027,6 @@ struct DeferredStyleConstraint {
     expression: CheckedExprId,
     field_name: String,
     expectation: DeferredStyleExpectation,
-}
-
-#[derive(Clone, Debug)]
-struct FunctionCallReturnTypeCacheEntry {
-    function: String,
-    argument_types: Vec<Type>,
-    result: Option<Type>,
 }
 
 trait StaticBindingLookup {
@@ -15365,20 +18183,32 @@ impl<'a> Checker<'a> {
             function_arg_call_sites,
             function_arg_display_type_cache: RefCell::new(BTreeMap::new()),
             function_return_type_cache: RefCell::new(BTreeMap::new()),
-            function_call_return_type_cache: Vec::new(),
+            function_call_return_type_cache: RefCell::new(BTreeMap::new()),
+            #[cfg(test)]
+            function_call_return_type_cache_misses: Cell::new(0),
             object_bindings,
             name_bindings,
             declaration_exprs: declaration_expression_index(program),
             local_name_bindings: Vec::new(),
             flow_bindings,
             function_param_requirements,
-            expr_type_vars: BTreeMap::new(),
+            expr_type_vars: DenseIndexTable::with_len(program.expressions.len()),
             builtin_symbol_exprs,
-            visited: BTreeSet::new(),
-            expr_type_in_progress: BTreeSet::new(),
             expr_type_cache: vec![None; program.expressions.len()],
+            checked_diagnostic_replay: false,
+            diagnostic_replayed: DenseFlagSet::with_len(program.expressions.len()),
+            diagnostic_ensure_requests: 0,
+            diagnostic_lookup_hits: 0,
+            diagnostic_lookup_misses: 0,
+            checked_flow_install_count: 0,
+            checked_flow_duplicate_ids: 0,
+            checked_flow_out_of_range_ids: 0,
+            checked_flow_missing_parser_ids: 0,
+            #[cfg(test)]
+            flow_mode_expression_visits: Cell::new(0),
             expr_type_table: ExprTypeTable::default(),
             function_type_table: FunctionTypeTable::default(),
+            checked_function_parameters: BTreeMap::new(),
             collect_type_hints: true,
             render_slot_table: RenderSlotTable::default(),
             deferred_style_constraints: Vec::new(),
@@ -15451,9 +18281,145 @@ impl<'a> Checker<'a> {
         }
     }
 
+    fn build_checked_program_first(&mut self) -> CheckedProgramBuildOutput {
+        let render_slot_statements = render_slot_statement_ids(self.program);
+        let builtins = std::mem::replace(
+            &mut self.builtins,
+            BuiltinSignatureRegistry {
+                entries: BTreeMap::new(),
+            },
+        );
+        let render_contracts = std::mem::replace(
+            &mut self.render_contracts,
+            RenderContractRegistry {
+                active_root: "document",
+                roots: BTreeMap::new(),
+            },
+        );
+        let mut output = CheckedProgramBuilder::build(
+            self.program,
+            OwnedCheckedConstruction {
+                external_types: std::mem::take(&mut self.external_types),
+                render_slot_statements,
+                source_payload_shape_table: std::mem::take(&mut self.source_payload_shape_table),
+                flow_bindings: std::mem::take(&mut self.flow_bindings),
+                expression_owner: std::mem::take(&mut self.expression_owner),
+                named_value_expressions: std::mem::take(&mut self.declaration_exprs),
+                function_param_requirements: std::mem::take(&mut self.function_param_requirements),
+                builtins,
+                render_contracts,
+            },
+        );
+        let replay_inputs = output
+            .diagnostic_replay_inputs
+            .take()
+            .expect("checked construction must return diagnostic replay inputs");
+        self.source_payload_shape_table = replay_inputs.source_payload_shape_table;
+        self.declaration_exprs = replay_inputs.named_value_expressions;
+        self.builtins = replay_inputs.builtins;
+        self.render_contracts = replay_inputs.render_contracts;
+
+        // The authoritative CheckedProgram must retain its external environment
+        // while the legacy diagnostic replay still reads it from Checker.
+        // This is the one unavoidable transitional deep clone in this handoff.
+        self.external_types = output.program.external_types.clone();
+        output
+    }
+
+    /// Populate the compatibility diagnostic walker from the authoritative
+    /// checked database. `ensure_expr` therefore becomes a dense lookup on
+    /// this path and cannot start the superseded provisional inference solve.
+    fn install_checked_diagnostic_lookups(&mut self, program: &CheckedProgram) {
+        self.expr_type_cache.fill(None);
+        self.checked_flow_install_count = 0;
+        self.checked_flow_duplicate_ids = 0;
+        self.checked_flow_out_of_range_ids = 0;
+        let mut installed = DenseFlagSet::with_len(self.program.expressions.len());
+        for expression in &program.expressions {
+            self.checked_flow_install_count = self.checked_flow_install_count.saturating_add(1);
+            let index = expression.id.0 as usize;
+            let Some(slot) = self.expr_type_cache.get_mut(index) else {
+                self.checked_flow_out_of_range_ids =
+                    self.checked_flow_out_of_range_ids.saturating_add(1);
+                continue;
+            };
+            if !installed.insert(index) {
+                self.checked_flow_duplicate_ids = self.checked_flow_duplicate_ids.saturating_add(1);
+                continue;
+            }
+            *slot = Some(expression.flow_type.clone());
+        }
+        self.checked_flow_missing_parser_ids = self
+            .program
+            .expressions
+            .len()
+            .saturating_sub(installed.len());
+        if self.checked_flow_duplicate_ids > 0
+            || self.checked_flow_out_of_range_ids > 0
+            || self.checked_flow_missing_parser_ids > 0
+        {
+            self.diagnostics.push(diagnostic_at_line(
+                1,
+                format!(
+                    "internal checked diagnostic database is incomplete: installed={} duplicates={} out_of_range={} missing={}",
+                    self.checked_flow_install_count,
+                    self.checked_flow_duplicate_ids,
+                    self.checked_flow_out_of_range_ids,
+                    self.checked_flow_missing_parser_ids,
+                ),
+            ));
+        }
+        self.function_arg_display_type_cache.borrow_mut().clear();
+        self.function_return_type_cache.borrow_mut().clear();
+        self.function_call_return_type_cache.borrow_mut().clear();
+        self.function_type_table.entries = program
+            .callables
+            .iter()
+            .filter(|signature| signature.kind == CheckedCallableKind::User)
+            .map(|signature| FunctionTypeEntry {
+                callable: signature.decl_id,
+                name: signature.name.clone(),
+                parameters: signature
+                    .parameters
+                    .iter()
+                    .map(|parameter| FunctionTypeParameterEntry {
+                        formal: parameter.decl_id,
+                        ordinal: parameter.ordinal,
+                        name: parameter.name.clone(),
+                        flow_type: parameter.flow_type.clone(),
+                    })
+                    .collect(),
+                result: signature.result.clone(),
+                effect: signature.effect,
+            })
+            .collect();
+        self.function_type_table
+            .entries
+            .sort_by_key(|entry| entry.callable);
+        self.checked_function_parameters = self
+            .function_type_table
+            .entries
+            .iter()
+            .map(|entry| (entry.name.clone(), entry.parameters.clone()))
+            .collect();
+        self.checked_diagnostic_replay = true;
+        self.diagnostic_replayed = DenseFlagSet::with_len(self.program.expressions.len());
+        self.diagnostic_ensure_requests = 0;
+        self.diagnostic_lookup_hits = 0;
+        self.diagnostic_lookup_misses = 0;
+    }
+
     fn finish_program_profiled(
-        &mut self,
-        include_type_hints: bool,
+        self,
+        output_ownership: CheckOutputOwnership,
+        init_profile: CheckerInitProfile,
+    ) -> (CheckOutput, TypeCheckProfile) {
+        self.finish_program_profiled_impl(output_ownership, init_profile)
+    }
+
+    fn finish_program_profiled_impl(
+        mut self,
+        output_ownership: CheckOutputOwnership,
         init_profile: CheckerInitProfile,
     ) -> (CheckOutput, TypeCheckProfile) {
         let trace_typecheck = std::env::var_os("BOON_TYPECHECK_TRACE").is_some();
@@ -15462,7 +18428,24 @@ impl<'a> Checker<'a> {
                 eprintln!("boon_typecheck {phase}: {elapsed_ms:.3}ms");
             }
         };
+        if trace_typecheck {
+            eprintln!(
+                "boon_typecheck checker_init: {:.3}ms source_paths={:.3} source_payload_shapes={:.3} source_payload_types={:.3} function_index={:.3} object_bindings={:.3} function_param_requirements={:.3} name_bindings={:.3} flow_bindings={:.3} render_contracts={:.3} static_list_bindings={:.3}",
+                init_profile.checker_init_ms,
+                init_profile.source_paths_ms,
+                init_profile.source_payload_shape_table_ms,
+                init_profile.source_payload_types_ms,
+                init_profile.function_index_ms,
+                init_profile.object_bindings_ms,
+                init_profile.function_param_requirements_ms,
+                init_profile.name_bindings_ms,
+                init_profile.flow_bindings_ms,
+                init_profile.render_contracts_ms,
+                init_profile.refresh_static_list_bindings_ms,
+            );
+        }
         let total_started = Instant::now();
+        let include_type_hints = output_ownership.includes_type_hints();
         self.collect_type_hints = include_type_hints;
         self.check_byte_literal_contexts();
         let recursive_functions_started = Instant::now();
@@ -15472,6 +18455,15 @@ impl<'a> Checker<'a> {
         self.check_recursive_functions();
         let recursive_functions_ms = typecheck_elapsed_ms(recursive_functions_started);
         trace_phase("recursive_functions", recursive_functions_ms);
+
+        if trace_typecheck {
+            eprintln!("boon_typecheck checked_program:start");
+        }
+        let checked_program_build_started = Instant::now();
+        let build_output = self.build_checked_program_first();
+        let checked_program_build_ms = typecheck_elapsed_ms(checked_program_build_started);
+        self.install_checked_diagnostic_lookups(&build_output.program);
+
         let check_statements_started = Instant::now();
         if trace_typecheck {
             eprintln!("boon_typecheck check_statements:start");
@@ -15480,21 +18472,69 @@ impl<'a> Checker<'a> {
             self.check_statement(statement, false);
         }
         self.check_host_effect_calls();
+        let accounted_diagnostic_lookups = self
+            .diagnostic_lookup_hits
+            .saturating_add(self.diagnostic_lookup_misses);
+        if accounted_diagnostic_lookups != self.diagnostic_ensure_requests {
+            self.diagnostics.push(diagnostic_at_line(
+                1,
+                format!(
+                    "internal checked diagnostic replay lookup accounting mismatch: requests={} hits={} misses={}",
+                    self.diagnostic_ensure_requests,
+                    self.diagnostic_lookup_hits,
+                    self.diagnostic_lookup_misses,
+                ),
+            ));
+        }
+        if self.diagnostic_lookup_misses > 0 {
+            self.diagnostics.push(diagnostic_at_line(
+                1,
+                format!(
+                    "internal checked diagnostic replay missed {} expression flow(s)",
+                    self.diagnostic_lookup_misses
+                ),
+            ));
+        }
         let check_statements_ms = typecheck_elapsed_ms(check_statements_started);
         trace_phase("check_statements", check_statements_ms);
+        if trace_typecheck {
+            eprintln!(
+                "boon_typecheck diagnostic_replay installed={} duplicate_ids={} out_of_range_ids={} missing_parser_ids={} requests={} hits={} misses={} expressions={}",
+                self.checked_flow_install_count,
+                self.checked_flow_duplicate_ids,
+                self.checked_flow_out_of_range_ids,
+                self.checked_flow_missing_parser_ids,
+                self.diagnostic_ensure_requests,
+                self.diagnostic_lookup_hits,
+                self.diagnostic_lookup_misses,
+                self.diagnostic_replayed.len(),
+            );
+        }
         let ensure_all_expressions_started = Instant::now();
         if trace_typecheck {
             eprintln!("boon_typecheck ensure_all_expressions:start");
         }
-        // Runtime compilation omits editor-only type hints, but it still
-        // produces a complete CheckedProgram. Every parser expression must
-        // therefore enter the authoritative typecheck before lowering
-        // metadata records checked-expression coverage.
-        for expr in &self.program.expressions {
-            self.ensure_expr(expr.id);
-        }
+        // The checked builder populated every lowered expression before this
+        // compatibility diagnostic walk. Missing arena-only syntax remains
+        // absent; `ensure_expr` may visit only those non-executable nodes.
+        let expressions_cached_before_coverage = self
+            .expr_type_cache
+            .iter()
+            .filter(|entry| entry.is_some())
+            .count();
         let ensure_all_expressions_ms = typecheck_elapsed_ms(ensure_all_expressions_started);
         trace_phase("ensure_all_expressions", ensure_all_expressions_ms);
+        if trace_typecheck {
+            eprintln!(
+                "boon_typecheck ensure_all_expressions.checked_lookup cached={} arena_only={} total={}",
+                expressions_cached_before_coverage,
+                self.program
+                    .expressions
+                    .len()
+                    .saturating_sub(expressions_cached_before_coverage),
+                self.program.expressions.len(),
+            );
+        }
         let report_counts_started = Instant::now();
         if trace_typecheck {
             eprintln!("boon_typecheck report_counts:start");
@@ -15507,79 +18547,33 @@ impl<'a> Checker<'a> {
             .flat_map(|slot| &slot.diagnostics)
             .filter(|diagnostic| diagnostic.severity == DiagnosticSeverity::Error)
             .count();
-        let unresolved_type_variable_count = self.unresolved_type_variable_count();
-        let source_payload_syntax_table = self.source_payload_shape_table.clone();
         let report_counts_ms = typecheck_elapsed_ms(report_counts_started);
         trace_phase("report_counts", report_counts_ms);
-        let type_hint_table_started = Instant::now();
-        if trace_typecheck {
-            eprintln!("boon_typecheck type_hint_table:start");
-        }
-        let mut type_hint_table = if include_type_hints {
-            type_hint_table(
-                self.program,
-                &self.expr_type_table,
-                &self.function_type_table,
-                &self.render_slot_table,
-                &source_payload_syntax_table,
-                &self.name_bindings,
-            )
-        } else {
-            TypeHintTable::default()
-        };
-        let type_hint_table_ms = typecheck_elapsed_ms(type_hint_table_started);
-        trace_phase("type_hint_table", type_hint_table_ms);
-        if trace_typecheck {
-            eprintln!("boon_typecheck resolved_constant_table:start");
-        }
-        let resolved_constant_table_started = Instant::now();
-        let resolved_constant_table = resolved_constant_table(self.program);
-        trace_phase(
-            "resolved_constant_table",
-            typecheck_elapsed_ms(resolved_constant_table_started),
-        );
+        // The authoritative expression/function tables are rebuilt from the
+        // completed CheckedProgram below. Constructing hints from the
+        // provisional tables here duplicated the entire expensive editor hint
+        // projection and immediately discarded it.
+        let mut type_hint_table = TypeHintTable::default();
+        let mut type_hint_table_ms = 0.0;
         if trace_typecheck {
             eprintln!("boon_typecheck named_value_type_table:start");
         }
         let named_value_type_table_started = Instant::now();
         let (mut named_value_type_table, named_value_syntax_sites) = self.named_value_type_table();
-        self.function_type_table
-            .entries
-            .sort_by(|left, right| left.name.cmp(&right.name));
         trace_phase(
             "named_value_type_table",
             typecheck_elapsed_ms(named_value_type_table_started),
         );
-        if trace_typecheck {
-            eprintln!("boon_typecheck checked_program:start");
-        }
-        let checked_program_started = Instant::now();
-        let checked_program_build_started = Instant::now();
-        let (checked_program, call_diagnostics, exact_pipeline_inputs_valid) =
-            CheckedProgramBuilder::build(
-                self.program,
-                CheckedProgramBuildInputs {
-                    external_types: &self.external_types,
-                    expr_type_table: &self.expr_type_table,
-                    function_type_table: &self.function_type_table,
-                    named_value_type_table: &named_value_type_table,
-                    render_slot_table: &self.render_slot_table,
-                    source_payload_shape_table: &source_payload_syntax_table,
-                    flow_bindings: &self.flow_bindings,
-                    builtins: &self.builtins,
-                    render_contracts: &self.render_contracts,
-                },
-            );
-        trace_phase(
-            "checked_program.build",
-            typecheck_elapsed_ms(checked_program_build_started),
-        );
-        let reconcile_functions_started = Instant::now();
-        self.reconcile_function_type_table(&checked_program);
-        trace_phase(
-            "checked_program.reconcile_function_types",
-            typecheck_elapsed_ms(reconcile_functions_started),
-        );
+        let external_allow_unresolved = self.external_types.allow_unresolved;
+        let source_payload_syntax_table = std::mem::take(&mut self.source_payload_shape_table);
+        let checked_program_post_started = Instant::now();
+        let CheckedProgramBuildOutput {
+            program: checked_program,
+            diagnostics: call_diagnostics,
+            exact_pipeline_inputs_valid,
+            diagnostic_replay_inputs: _,
+        } = build_output;
+        trace_phase("checked_program.build", checked_program_build_ms);
         let host_ports_started = Instant::now();
         if let Err(error) =
             validate_checked_host_port_source_payload_types(&checked_program, &self.host_port_table)
@@ -15620,11 +18614,17 @@ impl<'a> Checker<'a> {
             "checked_program.source_payload_shapes",
             typecheck_elapsed_ms(payload_shape_started),
         );
+        let lookup_started = Instant::now();
+        let checked_program_lookup = CheckedProgramLookup::new(&checked_program);
+        trace_phase(
+            "checked_program.build_projection_indexes",
+            typecheck_elapsed_ms(lookup_started),
+        );
         let refresh_named_values_started = Instant::now();
         if let Err(error) = refresh_named_value_types_from_checked_program(
             &mut named_value_type_table,
             &named_value_syntax_sites,
-            &checked_program,
+            &checked_program_lookup,
         ) {
             self.diagnostics.push(diagnostic_at_line(1, error));
         }
@@ -15634,13 +18634,13 @@ impl<'a> Checker<'a> {
         );
         trace_phase(
             "checked_program",
-            typecheck_elapsed_ms(checked_program_started),
+            checked_program_build_ms + typecheck_elapsed_ms(checked_program_post_started),
         );
         if trace_typecheck {
             eprintln!("boon_typecheck output_roots:start");
         }
         let output_roots_started = Instant::now();
-        let output_root_types = self.check_output_roots(&checked_program);
+        let output_root_types = self.check_output_roots(&checked_program_lookup);
         self.check_host_port_outputs(&output_root_types);
         let host_port_table = match resolve_checked_host_port_table(
             &self.host_port_table,
@@ -15655,6 +18655,7 @@ impl<'a> Checker<'a> {
         };
         if let Err(error) = validate_structural_lowering_metadata(
             &checked_program,
+            &checked_program_lookup,
             &source_payload_shape_table,
             &self.function_type_table,
             &named_value_type_table,
@@ -15740,7 +18741,15 @@ impl<'a> Checker<'a> {
             .iter()
             .filter(|entry| matches!(entry.flow_type.ty, Type::Unknown))
             .count();
+        let unresolved_type_variable_count = {
+            let mut variables = BTreeSet::new();
+            for entry in &self.expr_type_table.entries {
+                collect_type_vars(&entry.flow_type.ty, &mut variables);
+            }
+            variables.len()
+        };
         if include_type_hints {
+            let type_hint_table_started = Instant::now();
             type_hint_table = crate::type_hint_table(
                 self.program,
                 &self.expr_type_table,
@@ -15749,7 +18758,9 @@ impl<'a> Checker<'a> {
                 &source_payload_syntax_table,
                 &self.name_bindings,
             );
+            type_hint_table_ms = typecheck_elapsed_ms(type_hint_table_started);
         }
+        trace_phase("type_hint_table", type_hint_table_ms);
         for slot in &mut self.render_slot_table.slots {
             if let Some(statement) = checked_program
                 .statements
@@ -15767,24 +18778,72 @@ impl<'a> Checker<'a> {
         if trace_typecheck {
             eprintln!("boon_typecheck assemble_report:start");
         }
-        let report = TypeCheckReport {
+        let diagnostics_have_errors = self
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.severity == DiagnosticSeverity::Error);
+        let report_has_errors = diagnostics_have_errors || render_slot_failure_count > 0;
+        let program_is_available =
+            exact_pipeline_inputs_valid && (!report_has_errors || external_allow_unresolved);
+        let runtime_owned_success = output_ownership == CheckOutputOwnership::RuntimeOwned
+            && program_is_available
+            && !report_has_errors;
+        let transfer_lowering_success = output_ownership.transfers_lowering_tables()
+            && program_is_available
+            && !report_has_errors;
+        let resolved_constant_table = if runtime_owned_success {
+            // Constant previews are editor/report data and are not consumed by
+            // lowering. Avoid constructing them on the successful cold path.
+            ResolvedConstantTable::default()
+        } else {
+            let resolved_constant_table_started = Instant::now();
+            if trace_typecheck {
+                eprintln!("boon_typecheck resolved_constant_table:start");
+            }
+            let table = resolved_constant_table(self.program);
+            trace_phase(
+                "resolved_constant_table",
+                typecheck_elapsed_ms(resolved_constant_table_started),
+            );
+            table
+        };
+        let builtin_signature_coverage = if runtime_owned_success {
+            Vec::new()
+        } else {
+            builtin_signature_coverage(self.program)
+        };
+        let source_payload_shape_coverage = if runtime_owned_success {
+            Vec::new()
+        } else {
+            source_payload_shape_table
+                .iter()
+                .map(|source| source.diagnostic_path.clone())
+                .collect()
+        };
+        let constraints = if runtime_owned_success {
+            drop(std::mem::take(&mut self.constraints));
+            Vec::new()
+        } else {
+            std::mem::take(&mut self.constraints)
+        };
+        let mut report = TypeCheckReport {
             expression_count: self.program.expressions.len(),
-            checked_expression_count: self.visited.len(),
+            checked_expression_count: checked_program.expressions.len(),
             unresolved_type_variable_count,
             dynamic_fallback_count: unknown_type_count + unresolved_type_variable_count,
             render_slot_count,
             render_slot_failure_count,
-            builtin_signature_coverage: builtin_signature_coverage(self.program),
-            source_payload_shape_coverage: source_payload_shape_table
-                .iter()
-                .map(|source| source.diagnostic_path.clone())
-                .collect(),
+            builtin_signature_coverage,
+            source_payload_shape_coverage,
             source_payload_shape_table,
             host_port_table,
             full_document_typecheck_coverage: document_root(self.program).is_none_or(|root| {
-                statement_expr_ids(root)
-                    .into_iter()
-                    .all(|expr_id| self.visited.contains(&expr_id))
+                statement_expr_ids(root).into_iter().all(|expr_id| {
+                    checked_program
+                        .expressions
+                        .get(expr_id)
+                        .is_some_and(|expression| expression.id.0 as usize == expr_id)
+                })
             }),
             output_root_types,
             expr_type_table: std::mem::take(&mut self.expr_type_table),
@@ -15793,40 +18852,70 @@ impl<'a> Checker<'a> {
             type_hint_table,
             resolved_constant_table,
             render_slot_table: std::mem::take(&mut self.render_slot_table),
-            constraints: std::mem::take(&mut self.constraints),
+            constraints,
             diagnostics: std::mem::take(&mut self.diagnostics),
         };
-        let program = (exact_pipeline_inputs_valid
-            && (!report.has_errors() || self.external_types.allow_unresolved))
-            .then(|| {
-                let mut checked_program = checked_program;
-                checked_program.fields.external_types = self.external_types.clone();
-                checked_program.fields.lowering_metadata = CheckedProgramLoweringMetadata {
-                    source_units: self
-                        .program
-                        .files
-                        .iter()
-                        .map(|file| CheckedSourceUnitMetadata {
-                            path: file.path.clone(),
-                            module: file.module.clone(),
-                            start_line: file.start_line,
-                            line_count: file.source.lines().count().max(1),
-                        })
-                        .collect(),
-                    original_source_expression_count: report.expression_count,
-                    source_payload_shape_table: report.source_payload_shape_table.clone(),
-                    host_port_table: report.host_port_table.clone(),
-                    output_root_types: report.output_root_types.clone(),
-                    expr_type_table: report.expr_type_table.clone(),
-                    function_type_table: report.function_type_table.clone(),
-                    named_value_type_table: report.named_value_type_table.clone(),
-                    render_slot_table: report.render_slot_table.clone(),
-                    checked_expression_count: report.checked_expression_count,
-                    dynamic_fallback_count: report.dynamic_fallback_count,
-                    diagnostics: report.diagnostics.clone(),
-                };
-                checked_program
-            });
+        let program = program_is_available.then(|| {
+            let mut checked_program = checked_program;
+            let mut lowering_metadata = CheckedProgramLoweringMetadata {
+                source_units: self
+                    .program
+                    .files
+                    .iter()
+                    .map(|file| CheckedSourceUnitMetadata {
+                        path: file.path.clone(),
+                        module: file.module.clone(),
+                        start_line: file.start_line,
+                        line_count: file.source.lines().count().max(1),
+                    })
+                    .collect(),
+                original_source_expression_count: report.expression_count,
+                source_payload_shape_table: Vec::new(),
+                host_port_table: HostPortTable::default(),
+                output_root_types: Vec::new(),
+                expr_type_table: ExprTypeTable::default(),
+                function_type_table: FunctionTypeTable::default(),
+                named_value_type_table: NamedValueTypeTable::default(),
+                render_slot_table: RenderSlotTable::default(),
+                checked_expression_count: report.checked_expression_count,
+                dynamic_fallback_count: report.dynamic_fallback_count,
+                diagnostics: report.diagnostics.clone(),
+            };
+            if transfer_lowering_success {
+                lowering_metadata.source_payload_shape_table =
+                    std::mem::take(&mut report.source_payload_shape_table);
+                lowering_metadata.host_port_table = std::mem::take(&mut report.host_port_table);
+                lowering_metadata.output_root_types = std::mem::take(&mut report.output_root_types);
+                lowering_metadata.expr_type_table = std::mem::take(&mut report.expr_type_table);
+                lowering_metadata.render_slot_table = std::mem::take(&mut report.render_slot_table);
+
+                // Provisional distributed checks consume these two
+                // interface projections from the report while converging.
+                // Settled runtime checks transfer them like every other
+                // lowering table and retain only one owned copy.
+                if external_allow_unresolved {
+                    lowering_metadata.function_type_table = report.function_type_table.clone();
+                    lowering_metadata.named_value_type_table =
+                        report.named_value_type_table.clone();
+                } else {
+                    lowering_metadata.function_type_table =
+                        std::mem::take(&mut report.function_type_table);
+                    lowering_metadata.named_value_type_table =
+                        std::mem::take(&mut report.named_value_type_table);
+                }
+            } else {
+                lowering_metadata.source_payload_shape_table =
+                    report.source_payload_shape_table.clone();
+                lowering_metadata.host_port_table = report.host_port_table.clone();
+                lowering_metadata.output_root_types = report.output_root_types.clone();
+                lowering_metadata.expr_type_table = report.expr_type_table.clone();
+                lowering_metadata.function_type_table = report.function_type_table.clone();
+                lowering_metadata.named_value_type_table = report.named_value_type_table.clone();
+                lowering_metadata.render_slot_table = report.render_slot_table.clone();
+            }
+            checked_program.fields.lowering_metadata = lowering_metadata;
+            checked_program
+        });
         let assemble_report_ms = typecheck_elapsed_ms(assemble_report_started);
         trace_phase("assemble_report", assemble_report_ms);
         (
@@ -15854,71 +18943,6 @@ impl<'a> Checker<'a> {
         )
     }
 
-    fn reconcile_function_type_table(&mut self, checked_program: &CheckedProgram) {
-        for signature in checked_program
-            .callables
-            .iter()
-            .filter(|signature| signature.kind == CheckedCallableKind::User)
-        {
-            let matches = self
-                .function_type_table
-                .entries
-                .iter()
-                .enumerate()
-                .filter_map(|(index, entry)| (entry.name == signature.name).then_some(index))
-                .collect::<Vec<_>>();
-            let [index] = matches.as_slice() else {
-                let line = signature
-                    .body
-                    .and_then(|body| {
-                        checked_program
-                            .statements
-                            .iter()
-                            .find(|statement| statement.id == body)
-                    })
-                    .map_or(1, |statement| statement.span.line);
-                self.diagnostics.push(diagnostic_at_line(
-                    line,
-                    format!(
-                        "function `{}` resolves to {} inferred function-type entries",
-                        signature.name,
-                        matches.len()
-                    ),
-                ));
-                continue;
-            };
-            let entry = &mut self.function_type_table.entries[*index];
-            entry.callable = signature.decl_id;
-            entry.parameters = signature
-                .parameters
-                .iter()
-                .map(|parameter| FunctionTypeParameterEntry {
-                    formal: parameter.decl_id,
-                    ordinal: parameter.ordinal,
-                    name: parameter.name.clone(),
-                    flow_type: parameter.flow_type.clone(),
-                })
-                .collect();
-            entry.result = signature.result.clone();
-            entry.effect = signature.effect;
-        }
-        self.function_type_table
-            .entries
-            .sort_by_key(|entry| entry.callable);
-        if self.function_type_table.entries.iter().any(|entry| {
-            entry.callable == DeclId(u32::MAX)
-                || entry
-                    .parameters
-                    .iter()
-                    .any(|parameter| parameter.formal == DeclId(u32::MAX))
-        }) {
-            self.diagnostics.push(diagnostic_at_line(
-                1,
-                "function type metadata contains unresolved structural identities".to_owned(),
-            ));
-        }
-    }
-
     fn check_statement(&mut self, statement: &AstStatement, in_document: bool) {
         if std::env::var_os("BOON_TYPECHECK_STATEMENT_TRACE").is_some() {
             eprintln!(
@@ -15931,23 +18955,26 @@ impl<'a> Checker<'a> {
         }
         let function_signature =
             if let AstStatementKind::Function { name, parameters } = &statement.kind {
-                let parameters = parameters
-                    .iter()
-                    .enumerate()
-                    .map(|(ordinal, parameter)| FunctionTypeParameterEntry {
-                        // The checked builder allocates structural declaration
-                        // identities after this inference pass. This private
-                        // in-flight sentinel is replaced before a report or
-                        // CheckedProgram is assembled.
-                        formal: DeclId(u32::MAX),
-                        ordinal,
-                        name: parameter.name.clone(),
-                        flow_type: FlowType {
-                            mode: FlowMode::Continuous,
-                            ty: self.function_arg_display_type(name, &parameter.name),
-                        },
-                    })
-                    .collect::<Vec<_>>();
+                let parameters = if self.checked_diagnostic_replay {
+                    self.checked_function_parameters
+                        .get(name)
+                        .cloned()
+                        .unwrap_or_default()
+                } else {
+                    parameters
+                        .iter()
+                        .enumerate()
+                        .map(|(ordinal, parameter)| FunctionTypeParameterEntry {
+                            formal: DeclId(u32::MAX),
+                            ordinal,
+                            name: parameter.name.clone(),
+                            flow_type: FlowType {
+                                mode: FlowMode::Continuous,
+                                ty: self.function_arg_display_type(name, &parameter.name),
+                            },
+                        })
+                        .collect::<Vec<_>>()
+                };
                 Some((name.clone(), parameters))
             } else {
                 None
@@ -16081,7 +19108,9 @@ impl<'a> Checker<'a> {
         if has_function_bindings {
             self.local_name_bindings.pop();
         }
-        if let Some((name, parameters)) = function_signature {
+        if let Some((name, parameters)) = function_signature
+            && !self.checked_diagnostic_replay
+        {
             let checked_result =
                 canonical_block_value_expression(&statement.children, &self.program.expressions)
                     .and_then(|expression| self.expr_type_cache.get(expression))
@@ -16102,7 +19131,10 @@ impl<'a> Checker<'a> {
         }
     }
 
-    fn check_output_roots(&mut self, checked: &CheckedProgram) -> Vec<OutputRootTypeEntry> {
+    fn check_output_roots(
+        &mut self,
+        lookup: &CheckedProgramLookup<'_>,
+    ) -> Vec<OutputRootTypeEntry> {
         let containers = self
             .program
             .ast
@@ -16178,11 +19210,7 @@ impl<'a> Checker<'a> {
                 continue;
             };
             let statement_id = CheckedStatementId(raw_statement);
-            let Some(checked_statement) = checked
-                .statements
-                .iter()
-                .find(|statement| statement.id == statement_id)
-            else {
+            let Some(checked_statement) = lookup.unique_statement(statement_id) else {
                 self.diagnostics.push(diagnostic_for_statement(
                     Some(child),
                     format!("output root `{name}` has no exact checked statement"),
@@ -16213,12 +19241,7 @@ impl<'a> Checker<'a> {
             };
             let ty = checked_statement
                 .value
-                .and_then(|value| {
-                    checked
-                        .expressions
-                        .iter()
-                        .find(|expression| expression.id == value)
-                })
+                .and_then(|value| lookup.expressions.get(&value).copied())
                 .map(|expression| {
                     expression.flush_type.as_ref().map_or_else(
                         || expression.flow_type.ty.clone(),
@@ -16260,40 +19283,15 @@ impl<'a> Checker<'a> {
             &mut Vec::new(),
             &mut syntax_sites,
         );
-        let mut inferred_types = BTreeMap::new();
-        collect_inferred_named_value_types(
-            &self.program.ast.statements,
-            &self.program.expressions,
-            &self.expr_type_cache,
-            &mut Vec::new(),
-            &mut inferred_types,
-        );
+        // The checked-program refresh below consumes only these canonical
+        // parser paths and replaces every provisional flow and origin.
         let entries = syntax_sites
             .keys()
             .cloned()
-            .map(|path| {
-                let descendant_prefix = format!("{path}.");
-                let mode = self
-                    .flow_bindings
-                    .iter()
-                    .filter(|(candidate, _)| {
-                        candidate.as_str() == path || candidate.starts_with(&descendant_prefix)
-                    })
-                    .map(|(_, mode)| *mode)
-                    .reduce(merge_flow_modes)
-                    .unwrap_or(FlowMode::Continuous);
-                NamedValueTypeEntry {
-                    flow_type: FlowType {
-                        mode,
-                        ty: inferred_types
-                            .get(&path)
-                            .cloned()
-                            .or_else(|| self.name_bindings.get(&path).cloned())
-                            .unwrap_or(Type::Unknown),
-                    },
-                    path,
-                    origins: Vec::new(),
-                }
+            .map(|path| NamedValueTypeEntry {
+                flow_type: unknown_flow_type(),
+                path,
+                origins: Vec::new(),
             })
             .collect();
         (
@@ -16427,7 +19425,7 @@ impl<'a> Checker<'a> {
         FlowType {
             mode: FlowMode::Continuous,
             ty: inferred.unwrap_or_else(|| {
-                if self.program.functions.iter().any(|name| name == function) {
+                if self.function_statements.contains_key(function) {
                     open_object_type()
                 } else {
                     Type::Unknown
@@ -16596,55 +19594,30 @@ impl<'a> Checker<'a> {
     }
 
     fn ensure_expr(&mut self, expr_id: usize) -> FlowType {
+        if self.checked_diagnostic_replay {
+            self.diagnostic_ensure_requests = self.diagnostic_ensure_requests.saturating_add(1);
+        }
         if let Some(existing) = self
             .expr_type_cache
             .get(expr_id)
             .and_then(|entry| entry.as_ref())
             .cloned()
         {
+            if self.checked_diagnostic_replay {
+                self.diagnostic_lookup_hits = self.diagnostic_lookup_hits.saturating_add(1);
+            }
+            if self.checked_diagnostic_replay && self.diagnostic_replayed.insert(expr_id) {
+                let program = self.program;
+                if let Some(expression) = program.expressions.get(expr_id) {
+                    self.replay_checked_expr_diagnostics(expression);
+                }
+            }
             return existing;
         }
-        let expr_var = self.expr_type_var_key(expr_id);
-        if self.expr_type_in_progress.contains(&expr_id) {
-            return FlowType {
-                mode: FlowMode::Continuous,
-                ty: Type::Var(expr_var),
-            };
+        if self.checked_diagnostic_replay {
+            self.diagnostic_lookup_misses = self.diagnostic_lookup_misses.saturating_add(1);
         }
-        self.expr_type_in_progress.insert(expr_id);
-        self.visited.insert(expr_id);
-        let flow_type = self
-            .program
-            .expressions
-            .get(expr_id)
-            .map(|expr| self.infer_expr(expr))
-            .unwrap_or(FlowType {
-                mode: FlowMode::Continuous,
-                ty: Type::Var(expr_var),
-            });
-        self.expr_type_in_progress.remove(&expr_id);
-        self.constraints.push(Constraint::Equal {
-            left: Type::Var(expr_var),
-            right: flow_type.ty.clone(),
-        });
-        if !matches!(flow_type.ty, Type::Var(var) if var == expr_var)
-            && self.vars.bind(expr_var, flow_type.ty.clone()).is_err()
-        {
-            self.diagnostics.push(
-                self.diagnostic_for_expr(
-                    expr_id,
-                    "incompatible inferred expression types".to_owned(),
-                ),
-            );
-        }
-        self.expr_type_table.entries.push(ExprTypeEntry {
-            expr_id,
-            flow_type: flow_type.clone(),
-        });
-        if let Some(slot) = self.expr_type_cache.get_mut(expr_id) {
-            *slot = Some(flow_type.clone());
-        }
-        flow_type
+        unknown_flow_type()
     }
 
     fn infer_delimiter_type(&mut self, expr_id: usize) -> Type {
@@ -16680,12 +19653,339 @@ impl<'a> Checker<'a> {
         if fields.is_empty() {
             return Type::List(Box::new(open_object_type()));
         }
-        Type::Object(ObjectShape::from_ordered_fields(
+        Type::object(ObjectShape::from_ordered_fields(
             fields
                 .into_iter()
                 .map(|(name, value)| (name, self.ensure_expr(value).ty)),
             false,
         ))
+    }
+
+    fn replay_builtin_call_diagnostics(
+        &mut self,
+        expression: &AstExpr,
+        function: &str,
+        piped_input: Option<usize>,
+        args: &[AstCallArg],
+    ) {
+        self.check_bytes_builtin_arguments(expression.id, function, args, piped_input);
+        self.check_text_to_number_arguments(expression.id, function, args, piped_input.is_some());
+        self.check_number_to_text_arguments(expression.id, function, args, piped_input.is_some());
+        self.check_number_round_arguments(function, args);
+        self.check_one_based_arguments(expression.id, function, args);
+        self.check_stream_builtin_arguments(function, piped_input, args);
+        self.check_bits_builtin_arguments(expression.id, function, piped_input, args);
+        self.check_builtin_call_compatibility(expression.id, function, piped_input, args);
+
+        let input_flow = piped_input.map(|input| self.ensure_expr(input));
+        if self.render_contracts.is_render_constructor(function) {
+            self.check_style_args(args);
+            self.check_render_constructor_call_args(
+                expression.id,
+                function,
+                input_flow.as_ref(),
+                args,
+            );
+        }
+        if matches!(function, "Bool/not" | "Bool/toggle") {
+            let actual = input_flow.or_else(|| args.first().map(|arg| self.ensure_expr(arg.value)));
+            if let Some(actual) = actual.as_ref() {
+                self.check_true_false_input(expression, function, actual);
+            }
+        } else if matches!(function, "Bool/and" | "Bool/or") {
+            if let Some(actual) = input_flow.as_ref() {
+                self.check_true_false_input(expression, function, actual);
+            }
+            for arg in args {
+                let actual = self.ensure_expr(arg.value);
+                self.check_true_false_input(expression, function, &actual);
+            }
+        }
+    }
+
+    /// Replay only user-facing diagnostic obligations against authoritative
+    /// checked flows. This deliberately does not compute or publish a type,
+    /// call a user-body return solver, or recompute expression flow modes.
+    fn replay_checked_expr_diagnostics(&mut self, expression: &AstExpr) {
+        match &expression.kind {
+            AstExprKind::StringLiteral(_)
+            | AstExprKind::TextLiteral(_)
+            | AstExprKind::TextTemplate { .. }
+            | AstExprKind::Number(_)
+            | AstExprKind::BitsLiteral { .. }
+            | AstExprKind::ByteLiteral { .. }
+            | AstExprKind::Tag(_)
+            | AstExprKind::Source => {}
+            AstExprKind::BytesLiteral { size, items } => {
+                let _ = self.infer_bytes_literal(expression, size, items);
+            }
+            AstExprKind::Flush { payload } => {
+                if let Some(payload) = payload {
+                    self.ensure_expr(*payload);
+                }
+            }
+            AstExprKind::TaggedObject { tag, fields } => {
+                let shape = ObjectShape::from_ordered_fields(
+                    fields
+                        .iter()
+                        .filter(|field| !field.spread)
+                        .map(|field| (field.name.clone(), self.ensure_expr(field.value).ty)),
+                    false,
+                );
+                self.check_tagged_object_contract(expression, tag, fields, &shape);
+            }
+            AstExprKind::Object(fields) => {
+                let _ = self.infer_record_shape(fields);
+            }
+            AstExprKind::Drain { path } => {
+                let _ = self.type_for_path(expression.id, &drain_path_parts(path));
+            }
+            AstExprKind::ListLiteral { items, .. } => {
+                for item in items {
+                    self.ensure_expr(*item);
+                }
+            }
+            AstExprKind::MapEntry { key, value } => {
+                let key_type = self.ensure_expr(*key).ty;
+                self.ensure_expr(*value);
+                if !type_is_map_key_safe(&key_type) && key_type != Type::Unknown {
+                    self.diagnostics.push(self.diagnostic_for_expr(
+                        expression.id,
+                        format!(
+                            "MAP keys must be closed canonical NUMBER, TEXT, BYTES, BITS, Tag, or object data; found {key_type:?}"
+                        ),
+                    ));
+                }
+            }
+            AstExprKind::MapLiteral { entries } => {
+                let mut static_keys = BTreeMap::<DataValue, usize>::new();
+                for entry in entries {
+                    if let Some(AstExpr {
+                        kind: AstExprKind::MapEntry { key, .. },
+                        ..
+                    }) = self.program.expressions.get(*entry)
+                        && let Some(key_value) = static_key_value(self.program, *key)
+                        && let Some(first) = static_keys.insert(key_value, *key)
+                    {
+                        self.diagnostics.push(self.diagnostic_for_expr(
+                            *key,
+                            format!(
+                                "MAP literal contains a statically duplicate key; first equal key is expression {first}"
+                            ),
+                        ));
+                    }
+                    self.ensure_expr(*entry);
+                }
+            }
+            AstExprKind::SetLiteral { items } => {
+                let item_type = items
+                    .iter()
+                    .map(|item| self.ensure_expr(*item).ty)
+                    .reduce(|existing, extra| widen_structural_type(&existing, &extra))
+                    .unwrap_or(Type::Unknown);
+                if !type_is_map_key_safe(&item_type) && item_type != Type::Unknown {
+                    self.diagnostics.push(self.diagnostic_for_expr(
+                        expression.id,
+                        format!(
+                            "SET items must be closed canonical NUMBER, TEXT, BYTES, BITS, Tag, or object data; found {item_type:?}"
+                        ),
+                    ));
+                }
+            }
+            AstExprKind::Call { function, args, .. } => {
+                for arg in args {
+                    self.ensure_expr(arg.value);
+                }
+                if external_function_role(function).is_some() {
+                    let _ = self.check_external_function_call(expression.id, function, None, args);
+                } else {
+                    self.replay_builtin_call_diagnostics(expression, function, None, args);
+                }
+            }
+            AstExprKind::Pipe {
+                input, op, args, ..
+            } => {
+                let input = pipeline_source_expr_id(
+                    &self.program.ast.statements,
+                    expression.id,
+                    *input,
+                    &self.program.expressions,
+                );
+                let input_flow = self.ensure_expr(input);
+                for arg in args {
+                    if contextual_body_parameter_name(op).is_some()
+                        && (arg.is_bare_binding()
+                            || arg.named_name() == contextual_body_parameter_name(op))
+                    {
+                        continue;
+                    }
+                    self.ensure_expr(arg.value);
+                }
+                if external_function_role(op).is_some() {
+                    let _ = self.check_external_function_call(expression.id, op, Some(input), args);
+                    return;
+                }
+                self.replay_builtin_call_diagnostics(expression, op, Some(input), args);
+                if op == "List/map"
+                    && let Some(new_expression) = list_map_result_expr_id(
+                        &self.program.ast.statements,
+                        &self.program.expressions,
+                        args,
+                    )
+                {
+                    let item_type = self.ensure_expr(new_expression).ty;
+                    if type_contains_absence(&item_type) {
+                        self.diagnostics.push(self.diagnostic_for_expr(
+                            new_expression,
+                            "`SKIP` cannot be used as a `List/map` item".to_owned(),
+                        ));
+                    }
+                }
+                if op == "WHILE" && !matches!(input_flow.mode, FlowMode::Continuous) {
+                    self.constraints.push(Constraint::FlowCompatible {
+                        actual: input_flow.clone(),
+                        expected: FlowType {
+                            mode: FlowMode::Continuous,
+                            ty: input_flow.ty.clone(),
+                        },
+                    });
+                    self.diagnostics.push(self.diagnostic_for_expr(
+                        input,
+                        "`WHILE` requires a continuous selector".to_owned(),
+                    ));
+                }
+            }
+            AstExprKind::Draining { input } => {
+                let input = pipeline_source_expr_id(
+                    &self.program.ast.statements,
+                    expression.id,
+                    *input,
+                    &self.program.expressions,
+                );
+                self.ensure_expr(input);
+            }
+            AstExprKind::Hold { initial, .. } => {
+                let initial = pipeline_source_expr_id(
+                    &self.program.ast.statements,
+                    expression.id,
+                    *initial,
+                    &self.program.expressions,
+                );
+                let _ = self.hold_result_type(expression.id, initial);
+            }
+            AstExprKind::Latest { branches } => {
+                for branch in branches {
+                    self.ensure_expr(*branch);
+                }
+            }
+            AstExprKind::When { input, .. } => {
+                if self.expr_id_is_bytes_source_payload_path(*input) {
+                    self.diagnostics.push(self.diagnostic_for_expr(
+                        *input,
+                        "BYTES source payload guards are not supported in v1; use `THEN` to route the BYTES payload or convert it explicitly before matching".to_owned(),
+                    ));
+                }
+                let _ = self.when_result_type(expression.id);
+            }
+            AstExprKind::Then { input, output } => {
+                self.ensure_expr(*input);
+                if let Some(output) = output {
+                    self.ensure_expr(*output);
+                }
+            }
+            AstExprKind::Infix { left, right, op } => {
+                let left_flow = self.ensure_expr(*left);
+                let right_flow = self.ensure_expr(*right);
+                if infix_requires_number_operands(op) {
+                    for (operand, actual) in [(*left, &left_flow.ty), (*right, &right_flow.ty)] {
+                        self.constraints.push(Constraint::Assignable {
+                            actual: actual.clone(),
+                            expected: Type::Number,
+                        });
+                        if !type_is_assignable_to(actual, &Type::Number) {
+                            self.diagnostics.push(self.diagnostic_for_expr(
+                                operand,
+                                format!(
+                                    "operator `{op}` operand has incompatible type\nexpected: NUMBER\nfound: {}",
+                                    boon_facing_type_label(actual)
+                                ),
+                            ));
+                        }
+                    }
+                }
+            }
+            AstExprKind::MatchArm { output, .. } => {
+                if let Some(output) = output {
+                    self.ensure_expr(*output);
+                }
+            }
+            AstExprKind::Block { bindings, result } => {
+                for binding in bindings {
+                    self.ensure_expr(binding.value);
+                }
+                if let Some(result) = result {
+                    self.ensure_expr(*result);
+                }
+            }
+            AstExprKind::Identifier(value) => {
+                if self.builtin_symbol_exprs.contains(&expression.id) {
+                    return;
+                }
+                if self.is_known_function(value) {
+                    self.diagnostics.push(self.diagnostic_for_expr(
+                        expression.id,
+                        format!("function `{value}` must be called with parentheses: `{value}()`"),
+                    ));
+                } else if self
+                    .local_name_bindings
+                    .iter()
+                    .rev()
+                    .any(|bindings| bindings.contains_key(value))
+                    || self.name_bindings.contains_key(value)
+                {
+                    return;
+                } else if let Some(declaration) =
+                    declaration_expr_for_path(&self.declaration_exprs, value)
+                {
+                    self.ensure_expr(declaration);
+                } else {
+                    self.diagnostics.push(self.diagnostic_for_expr(
+                        expression.id,
+                        format!("unknown identifier `{value}`"),
+                    ));
+                }
+            }
+            AstExprKind::Delimiter => {
+                let _ = self.infer_delimiter_type(expression.id);
+            }
+            AstExprKind::Unknown(tokens)
+                if tokens.len() == 1 && self.is_known_function(&tokens[0]) =>
+            {
+                let function = &tokens[0];
+                self.diagnostics.push(self.diagnostic_for_expr(
+                    expression.id,
+                    format!(
+                        "function `{function}` must be called with parentheses: `{function}()`"
+                    ),
+                ));
+            }
+            AstExprKind::Unknown(tokens) if unknown_tokens_are_quoted_text(tokens) => {}
+            AstExprKind::Unknown(tokens) => {
+                self.diagnostics.push(self.diagnostic_for_expr(
+                    expression.id,
+                    format!("could not infer expression `{}`", tokens.join(" ")),
+                ));
+            }
+            AstExprKind::Path(parts) => {
+                let _ = self.type_for_path(expression.id, parts);
+            }
+            AstExprKind::Arrow { .. } => {
+                self.diagnostics.push(self.diagnostic_for_expr(
+                    expression.id,
+                    "unconsumed `=>` expression reached type checking".to_owned(),
+                ));
+            }
+        }
     }
 
     fn infer_expr(&mut self, expr: &AstExpr) -> FlowType {
@@ -16716,12 +20016,9 @@ impl<'a> Checker<'a> {
                     false,
                 );
                 self.check_tagged_object_contract(expr, tag, fields, &shape);
-                Type::VariantSet(vec![Variant::Tagged {
-                    tag: tag.clone(),
-                    fields: shape,
-                }])
+                Type::VariantSet(vec![Variant::tagged(tag.clone(), shape)])
             }
-            AstExprKind::Object(fields) => Type::Object(self.infer_record_shape(fields)),
+            AstExprKind::Object(fields) => Type::object(self.infer_record_shape(fields)),
             AstExprKind::Drain { path } => self.type_for_path(expr.id, &drain_path_parts(path)),
             AstExprKind::ListLiteral { items, .. } => {
                 let item_type = items
@@ -16750,7 +20047,7 @@ impl<'a> Checker<'a> {
                         ),
                     ));
                 }
-                Type::Object(ObjectShape::from_ordered_fields(
+                Type::object(ObjectShape::from_ordered_fields(
                     [("key".to_owned(), key), ("value".to_owned(), value)],
                     false,
                 ))
@@ -17161,10 +20458,7 @@ impl<'a> Checker<'a> {
     }
 
     fn is_known_function(&self, name: &str) -> bool {
-        self.program
-            .functions
-            .iter()
-            .any(|function| function == name)
+        self.function_statements.contains_key(name)
             || self.external_types.functions.contains_key(name)
             || !matches!(
                 self.builtins.type_for_call(name, &self.render_contracts),
@@ -18560,7 +21854,7 @@ impl<'a> Checker<'a> {
         if !matches!(ty, Type::Unknown) {
             return ty;
         }
-        if self.program.functions.iter().any(|name| name == function) {
+        if self.function_statements.contains_key(function) {
             self.user_function_return_type(function, &mut BTreeSet::new())
                 .filter(is_specific_type)
                 .unwrap_or_else(open_object_type)
@@ -18599,46 +21893,68 @@ impl<'a> Checker<'a> {
         pipe_input: Option<usize>,
         args: &[AstCallArg],
     ) -> Option<Type> {
-        let parameters = self.function_args_by_name.get(function)?.clone();
-        let statement = self.function_statements.get(function).copied()?;
-        let mut arguments = Vec::new();
-        for parameter in parameters
+        let argument_expressions = {
+            let parameters = self.function_args_by_name.get(function)?;
+            parameters
+                .iter()
+                .filter(|parameter| parameter.kind == AstParameterKind::Value)
+                .map(|parameter| {
+                    function_call_argument_expr(parameters, &parameter.name, pipe_input, args)
+                })
+                .collect::<Option<Vec<_>>>()?
+        };
+        let argument_types = argument_expressions
+            .into_iter()
+            .map(|expression| self.ensure_expr(expression).ty)
+            .collect::<Vec<_>>();
+        self.cached_user_function_return_type_for_argument_types(
+            function,
+            argument_types,
+            &mut BTreeSet::from([function.to_owned()]),
+        )
+    }
+
+    fn cached_user_function_return_type_for_argument_types(
+        &self,
+        function: &str,
+        argument_types: Vec<Type>,
+        active_functions: &mut BTreeSet<String>,
+    ) -> Option<Type> {
+        let cached = self
+            .function_call_return_type_cache
+            .borrow()
+            .get(function)
+            .and_then(|by_arguments| by_arguments.get(argument_types.as_slice()))
+            .cloned();
+        if let Some(result) = cached {
+            return result;
+        }
+        let parameters = self.function_args_by_name.get(function)?;
+        let value_parameters = parameters
             .iter()
             .filter(|parameter| parameter.kind == AstParameterKind::Value)
-        {
-            let expr_id =
-                function_call_argument_expr(&parameters, &parameter.name, pipe_input, args)?;
-            arguments.push((parameter.name.clone(), self.ensure_expr(expr_id).ty));
-        }
-        let argument_types = arguments
-            .iter()
-            .map(|(_, ty)| ty.clone())
             .collect::<Vec<_>>();
-        if let Some(cached) = self
-            .function_call_return_type_cache
-            .iter()
-            .find(|cached| cached.function == function && cached.argument_types == argument_types)
-        {
-            return cached.result.clone();
+        if value_parameters.len() != argument_types.len() {
+            return None;
         }
-        let result = {
-            let mut bindings = self.user_function_static_bindings(function);
-            for (name, ty) in arguments {
-                bindings.insert(name, ty);
-            }
-            let mut active_functions = BTreeSet::from([function.to_owned()]);
-            self.function_body_return_type_with_bindings(
-                statement,
-                &mut active_functions,
-                &bindings,
-            )
-        };
+        let statement = self.function_statements.get(function).copied()?;
+        let mut bindings = self.user_function_static_bindings(function);
+        for (parameter, argument_type) in value_parameters.into_iter().zip(&argument_types) {
+            bindings.insert(parameter.name.clone(), argument_type.clone());
+        }
+        #[cfg(test)]
+        self.function_call_return_type_cache_misses.set(
+            self.function_call_return_type_cache_misses
+                .get()
+                .saturating_add(1),
+        );
+        let result =
+            self.function_body_return_type_with_bindings(statement, active_functions, &bindings);
         self.function_call_return_type_cache
-            .push(FunctionCallReturnTypeCacheEntry {
-                function: function.to_owned(),
-                argument_types,
-                result: result.clone(),
-            });
+            .borrow_mut()
+            .entry(function.to_owned())
+            .or_default()
+            .insert(argument_types, result.clone());
         result
     }
 
@@ -18996,10 +22312,15 @@ impl<'a> Checker<'a> {
     }
 
     fn expr_type_var_key(&mut self, expr_id: usize) -> TypeVar {
-        *self
-            .expr_type_vars
-            .entry(expr_id)
-            .or_insert_with(|| self.vars.new_var())
+        if let Some(variable) = self.expr_type_vars.get(&expr_id) {
+            return *variable;
+        }
+        let variable = self.vars.new_var();
+        // Parser expression IDs are dense and snapshot-bounded. An invalid ID
+        // still receives an unresolved variable so checking fails closed, but
+        // it cannot grow the dense table or affect valid-expression coverage.
+        self.expr_type_vars.insert_if_in_bounds(expr_id, variable);
+        variable
     }
 
     fn infer_contextual_body_type(
@@ -19274,7 +22595,7 @@ impl<'a> Checker<'a> {
                         })
                 }
             }
-            AstExprKind::Object(fields) => Some(Type::Object(
+            AstExprKind::Object(fields) => Some(Type::object(
                 self.static_record_shape(fields, active_functions),
             )),
             AstExprKind::TaggedObject { tag, fields } => {
@@ -19684,7 +23005,7 @@ impl<'a> Checker<'a> {
                 &mut field_order,
             );
             if !fields.is_empty() {
-                return Some(Type::Object(ObjectShape {
+                return Some(Type::object(ObjectShape {
                     fields,
                     field_order,
                     open: false,
@@ -19696,7 +23017,13 @@ impl<'a> Checker<'a> {
 
     fn user_function_static_bindings(&self, function: &str) -> StaticBindingOverlay<'_> {
         let mut bindings = StaticBindingOverlay::new(&self.name_bindings);
-        if let Some(parameters) = self.function_args_by_name.get(function) {
+        if self.checked_diagnostic_replay {
+            if let Some(parameters) = self.checked_function_parameters.get(function) {
+                for parameter in parameters {
+                    bindings.insert(parameter.name.clone(), parameter.flow_type.ty.clone());
+                }
+            }
+        } else if let Some(parameters) = self.function_args_by_name.get(function) {
             for parameter in parameters {
                 bindings.insert(
                     parameter.name.clone(),
@@ -19799,7 +23126,7 @@ impl<'a> Checker<'a> {
                     &mut fields,
                     &mut field_order,
                 );
-                (!fields.is_empty()).then_some(Type::Object(ObjectShape {
+                (!fields.is_empty()).then_some(Type::object(ObjectShape {
                     fields,
                     field_order,
                     open: false,
@@ -19929,7 +23256,7 @@ impl<'a> Checker<'a> {
                         &mut fields,
                         &mut field_order,
                     );
-                    (!fields.is_empty()).then_some(Type::Object(ObjectShape {
+                    (!fields.is_empty()).then_some(Type::object(ObjectShape {
                         fields,
                         field_order,
                         open: false,
@@ -20055,22 +23382,32 @@ impl<'a> Checker<'a> {
             ),
             _ => return None,
         };
-        let parameters = self.function_args_by_name.get(function)?;
-        let statement = self.function_statements.get(function).copied()?;
         if !active_functions.insert(function.to_owned()) {
             return None;
         }
-        let mut bindings = self.user_function_static_bindings(function);
-        for parameter in parameters
-            .iter()
-            .filter(|parameter| parameter.kind == AstParameterKind::Value)
-        {
-            let Some(argument) =
-                function_call_argument_expr(parameters, &parameter.name, pipe_input, arguments)
-            else {
-                active_functions.remove(function);
-                return None;
-            };
+        let argument_expressions =
+            self.function_args_by_name
+                .get(function)
+                .and_then(|parameters| {
+                    parameters
+                        .iter()
+                        .filter(|parameter| parameter.kind == AstParameterKind::Value)
+                        .map(|parameter| {
+                            function_call_argument_expr(
+                                parameters,
+                                &parameter.name,
+                                pipe_input,
+                                arguments,
+                            )
+                        })
+                        .collect::<Option<Vec<_>>>()
+                });
+        let Some(argument_expressions) = argument_expressions else {
+            active_functions.remove(function);
+            return None;
+        };
+        let mut argument_types = Vec::with_capacity(argument_expressions.len());
+        for argument in argument_expressions {
             let Some(argument_type) = self.static_expr_type_for_pipeline_expr(
                 argument,
                 active_functions,
@@ -20079,10 +23416,13 @@ impl<'a> Checker<'a> {
                 active_functions.remove(function);
                 return None;
             };
-            bindings.insert(parameter.name.clone(), argument_type);
+            argument_types.push(argument_type);
         }
-        let result =
-            self.function_body_return_type_with_bindings(statement, active_functions, &bindings);
+        let result = self.cached_user_function_return_type_for_argument_types(
+            function,
+            argument_types,
+            active_functions,
+        );
         active_functions.remove(function);
         result
     }
@@ -20229,18 +23569,10 @@ impl<'a> Checker<'a> {
             && statement_contains_render_context_syntax(statement, &self.program.expressions)
     }
 
-    fn unresolved_type_variable_count(&mut self) -> usize {
-        let mut vars = BTreeSet::new();
-        for entry in &self.expr_type_table.entries {
-            collect_type_vars(&entry.flow_type.ty, &mut vars);
-        }
-        vars.into_iter()
-            .map(|var| self.vars.root(var))
-            .collect::<BTreeSet<_>>()
-            .len()
-    }
-
     fn flow_mode_for_expr(&self, expr: &AstExpr) -> FlowMode {
+        #[cfg(test)]
+        self.flow_mode_expression_visits
+            .set(self.flow_mode_expression_visits.get().saturating_add(1));
         match &expr.kind {
             AstExprKind::Source => FlowMode::PresentOrAbsent,
             AstExprKind::Then { .. } => FlowMode::PresentOrAbsent,
@@ -20346,6 +23678,19 @@ impl<'a> Checker<'a> {
     }
 
     fn flow_mode_for_expr_id(&self, expr_id: usize) -> FlowMode {
+        // `infer_expr` ensures children before it computes the parent's mode.
+        // Reuse that completed child mode instead of recursively walking the
+        // already-checked prefix of every linked pipeline. The recursive
+        // fallback remains necessary for topology references that have not
+        // entered provisional inference yet.
+        if let Some(mode) = self
+            .expr_type_cache
+            .get(expr_id)
+            .and_then(|entry| entry.as_ref())
+            .map(|flow_type| flow_type.mode)
+        {
+            return mode;
+        }
         self.program
             .expressions
             .get(expr_id)
@@ -21842,6 +25187,17 @@ fn pipeline_source_expr_id(
     {
         return input_expr_id;
     }
+    // Parser normalization seals the lexical predecessor for placeholder
+    // continuations. Reuse that edge instead of recursively searching the
+    // statement tree for every read; malformed hand-built arenas retain the
+    // structural fallback below.
+    if let Some(linked_input) = expressions
+        .get(marker_expr_id)
+        .and_then(|expression| expression.linked_input)
+        .filter(|linked_input| expressions.get(*linked_input).is_some())
+    {
+        return linked_input;
+    }
     previous_pipeline_expr_id(statements, marker_expr_id, expressions).unwrap_or(input_expr_id)
 }
 
@@ -21960,7 +25316,8 @@ fn pattern_domain_variant(pattern: &AstMatchPattern) -> Option<Variant> {
                     .collect(),
                 field_order: fields.clone(),
                 open: false,
-            },
+            }
+            .into(),
         }),
         _ => None,
     }
@@ -22088,6 +25445,46 @@ fn statement_field(statement: &AstStatement) -> Option<String> {
         } => Some(name.clone()),
         _ => None,
     }
+}
+
+fn render_slot_statement_ids(program: &ParsedProgram) -> BTreeSet<usize> {
+    fn collect(
+        statements: &[AstStatement],
+        expressions: &[AstExpr],
+        in_render_context: bool,
+        slots: &mut BTreeSet<usize>,
+    ) {
+        for statement in statements {
+            let field = statement_field(statement);
+            let next_in_render_context = in_render_context
+                || matches!(field.as_deref(), Some("document" | "scene"))
+                || (matches!(statement.kind, AstStatementKind::Function { .. })
+                    && statement_contains_render_context_syntax(statement, expressions));
+            if next_in_render_context
+                && matches!(
+                    field.as_deref(),
+                    Some("root" | "child" | "items" | "children")
+                )
+            {
+                slots.insert(statement.id);
+            }
+            collect(
+                &statement.children,
+                expressions,
+                next_in_render_context,
+                slots,
+            );
+        }
+    }
+
+    let mut slots = BTreeSet::new();
+    collect(
+        &program.ast.statements,
+        &program.expressions,
+        false,
+        &mut slots,
+    );
+    slots
 }
 
 fn statement_output_name(statement: &AstStatement) -> Option<String> {
@@ -23387,7 +26784,7 @@ impl Default for BuiltinSignatureRegistry {
         );
         register(
             "List/chunk",
-            Type::List(Box::new(Type::Object(ObjectShape::from_ordered_fields(
+            Type::List(Box::new(Type::object(ObjectShape::from_ordered_fields(
                 [
                     ("label".to_owned(), Type::Text),
                     (
@@ -23428,7 +26825,7 @@ impl Default for BuiltinSignatureRegistry {
                 required_parameter("map", map_type()),
                 required_parameter(
                     "entry",
-                    Type::Object(ObjectShape::from_ordered_fields(
+                    Type::object(ObjectShape::from_ordered_fields(
                         [
                             ("key".to_owned(), map_key_type()),
                             ("value".to_owned(), map_value_type()),
@@ -23505,7 +26902,7 @@ impl Default for BuiltinSignatureRegistry {
             vec![required_parameter("route", Type::Text)],
             None,
         );
-        let directional_light = Type::Object(ObjectShape::from_ordered_fields(
+        let directional_light = Type::object(ObjectShape::from_ordered_fields(
             [
                 ("azimuth".to_owned(), Type::Number),
                 ("altitude".to_owned(), Type::Number),
@@ -23527,7 +26924,7 @@ impl Default for BuiltinSignatureRegistry {
             ],
             None,
         );
-        let ambient_light = Type::Object(ObjectShape::from_ordered_fields(
+        let ambient_light = Type::object(ObjectShape::from_ordered_fields(
             [
                 ("intensity".to_owned(), Type::Number),
                 ("color".to_owned(), Type::Unknown),
@@ -23543,7 +26940,7 @@ impl Default for BuiltinSignatureRegistry {
             ],
             None,
         );
-        let spot_light = Type::Object(ObjectShape::from_ordered_fields(
+        let spot_light = Type::object(ObjectShape::from_ordered_fields(
             [
                 ("target".to_owned(), Type::Unknown),
                 ("color".to_owned(), Type::Unknown),
@@ -23856,7 +27253,7 @@ impl RenderContractRegistry {
             .map(|contract| contract.kind_type(&lookup_fields))
             .unwrap_or_else(|| Type::VariantSet(vec![Variant::Tag("Renderable".to_owned())]));
         ordered_fields.push(("kind".to_owned(), kind));
-        Type::Object(ObjectShape::from_ordered_fields(ordered_fields, false))
+        Type::object(ObjectShape::from_ordered_fields(ordered_fields, false))
     }
 
     fn is_renderable_object_type(&self, ty: &Type) -> bool {
@@ -23925,7 +27322,7 @@ fn render_constructor_call_contexts(function: &str) -> Vec<AuthoritativeCallCont
     if !is_registered_element_constructor(function) {
         return Vec::new();
     }
-    let state = Type::Object(ObjectShape::from_ordered_fields(
+    let state = Type::object(ObjectShape::from_ordered_fields(
         [
             ("hovered".to_owned(), true_false_type()),
             ("focused".to_owned(), true_false_type()),
@@ -24641,7 +28038,19 @@ fn validate_deferred_style_constraints(
                 continue;
             };
             let ty = substitute_checked_type(&expression.flow_type.ty, substitutions);
+            if style_type_requires_instantiation(&ty) {
+                continue;
+            }
             if !accepts(constraint.expectation, &ty) {
+                if std::env::var_os("BOON_TYPECHECK_TRACE").is_some() {
+                    eprintln!(
+                        "boon_typecheck diagnostic_replay.style owner={owner:?} expression={} base={} substituted={} substitutions={}",
+                        constraint.expression.0,
+                        boon_facing_type_compact_label(&expression.flow_type.ty),
+                        boon_facing_type_compact_label(&ty),
+                        substitutions.len(),
+                    );
+                }
                 diagnostics.push(diagnostic(expression, constraint, &ty));
             }
         }
@@ -25137,7 +28546,7 @@ fn hold_update_exprs_for_expr(
 
 fn checked_inline_list_authority_root(
     expressions: &[CheckedExpression],
-    calls: &[CheckedCall],
+    calls: &BTreeMap<CheckedCallId, &CheckedCall>,
     root: CheckedExprId,
 ) -> Option<CheckedExprId> {
     let mut current = root;
@@ -25147,7 +28556,7 @@ fn checked_inline_list_authority_root(
         current = match &expression.kind {
             CheckedExpressionKind::List { .. } => return Some(current),
             CheckedExpressionKind::Call { call } => {
-                let call = calls.iter().find(|candidate| candidate.id == *call)?;
+                let call = calls.get(call).copied()?;
                 if call.function == "List/range" {
                     return Some(current);
                 }
@@ -25327,6 +28736,26 @@ fn exact_expression_statement(
     None
 }
 
+fn exact_statement_by_root_expression(
+    statements: &[AstStatement],
+    expression_count: usize,
+) -> DenseIndexTable<usize> {
+    fn index(statements: &[AstStatement], output: &mut DenseIndexTable<usize>) {
+        for statement in statements {
+            if let Some(expr_id) = statement.expr
+                && output.get(&expr_id).is_none()
+            {
+                output.insert_if_in_bounds(expr_id, statement.id);
+            }
+            index(&statement.children, output);
+        }
+    }
+
+    let mut output = DenseIndexTable::with_len(expression_count);
+    index(statements, &mut output);
+    output
+}
+
 fn structured_delimiter_statement<'a>(
     statements: &'a [AstStatement],
     expressions: &[AstExpr],
@@ -25415,6 +28844,91 @@ fn containing_expression_statement<'a>(
         }
     }
     None
+}
+
+/// Builds the exact child-statement-first containment relation once. This
+/// follows the deliberately limited expression edge set used by
+/// `expr_contains_expr_id`; it must not be replaced with the broader parser
+/// arena child relation because that would change list ownership.
+fn containing_expression_statement_index(
+    statements: &[AstStatement],
+    expressions: &[AstExpr],
+) -> Vec<Option<CheckedStatementId>> {
+    fn expression_children(expr: &AstExpr) -> Vec<usize> {
+        match &expr.kind {
+            AstExprKind::Call { args, .. } => args.iter().map(|arg| arg.value).collect(),
+            AstExprKind::Pipe { input, args, .. } => std::iter::once(*input)
+                .chain(args.iter().map(|arg| arg.value))
+                .collect(),
+            AstExprKind::Hold { initial, .. }
+            | AstExprKind::When { input: initial, .. }
+            | AstExprKind::Draining { input: initial } => vec![*initial],
+            AstExprKind::Then { input, output } => std::iter::once(*input)
+                .chain(output.iter().copied())
+                .collect(),
+            AstExprKind::MatchArm { output, .. } => output.iter().copied().collect(),
+            AstExprKind::Infix { left, right, .. } => vec![*left, *right],
+            AstExprKind::Object(fields) | AstExprKind::TaggedObject { fields, .. } => {
+                fields.iter().map(|field| field.value).collect()
+            }
+            AstExprKind::StringLiteral(_)
+            | AstExprKind::TextLiteral(_)
+            | AstExprKind::TextTemplate { .. }
+            | AstExprKind::Number(_)
+            | AstExprKind::BitsLiteral { .. }
+            | AstExprKind::ByteLiteral { .. }
+            | AstExprKind::BytesLiteral { .. }
+            | AstExprKind::Tag(_)
+            | AstExprKind::Source
+            | AstExprKind::Latest { .. }
+            | AstExprKind::Block { .. }
+            | AstExprKind::Flush { .. }
+            | AstExprKind::Arrow { .. }
+            | AstExprKind::ListLiteral { .. }
+            | AstExprKind::MapEntry { .. }
+            | AstExprKind::MapLiteral { .. }
+            | AstExprKind::SetLiteral { .. }
+            | AstExprKind::Identifier(_)
+            | AstExprKind::Path(_)
+            | AstExprKind::Drain { .. }
+            | AstExprKind::Delimiter
+            | AstExprKind::Unknown(_) => Vec::new(),
+        }
+    }
+
+    fn visit_statements(
+        statements: &[AstStatement],
+        expressions: &[AstExpr],
+        owners: &mut [Option<CheckedStatementId>],
+    ) {
+        for statement in statements {
+            visit_statements(&statement.children, expressions, owners);
+            let (Some(root), Ok(raw_statement)) = (statement.expr, u32::try_from(statement.id))
+            else {
+                continue;
+            };
+            let statement_id = CheckedStatementId(raw_statement);
+            let mut pending = vec![root];
+            let mut visited = BTreeSet::new();
+            while let Some(expression) = pending.pop() {
+                if !visited.insert(expression) {
+                    continue;
+                }
+                if let Some(owner) = owners.get_mut(expression) {
+                    owner.get_or_insert(statement_id);
+                }
+                let Some(expression) = expressions.get(expression) else {
+                    continue;
+                };
+                let children = expression_children(expression);
+                pending.extend(children.into_iter().rev());
+            }
+        }
+    }
+
+    let mut owners = vec![None; expressions.len()];
+    visit_statements(statements, expressions, &mut owners);
+    owners
 }
 
 fn statement_pipeline_final_expr_id_containing_expr(
@@ -25703,6 +29217,36 @@ fn canonical_statement_value_expression(
         .or_else(|| direct_statement_value_expr_id(statement, expressions))
 }
 
+fn canonical_statement_value_expression_at_known_index(
+    statements: &[AstStatement],
+    statement_index: usize,
+    expressions: &[AstExpr],
+) -> Option<usize> {
+    // This is the matched branch of
+    // `statement_pipeline_final_expr_id_containing_expr`: the caller already
+    // knows the root statement's sibling index, so no forest search is needed.
+    let statement = statements.get(statement_index)?;
+    let pipeline_value = statement.expr.and_then(|statement_expr_id| {
+        statement_pipeline_final_expr_id(statement, expressions).or_else(|| {
+            let mut continuations = Vec::new();
+            collect_pipe_continuation_expr_ids(statement, expressions, &mut continuations);
+            collect_following_sibling_pipe_continuation_expr_ids(
+                &statements[statement_index + 1..],
+                expressions,
+                &mut continuations,
+            );
+            let continuation_value = continuations.last().copied();
+            let mut expr_ids = Vec::with_capacity(continuations.len().saturating_add(1));
+            expr_ids.push(statement_expr_id);
+            expr_ids.extend(continuations);
+            expression_sequence_is_pipeline(&expr_ids, expressions)
+                .then(|| *expr_ids.last().unwrap())
+                .or(continuation_value)
+        })
+    });
+    pipeline_value.or_else(|| direct_statement_value_expr_id(statement, expressions))
+}
+
 fn canonical_checked_statement_value_expression(
     statement: &AstStatement,
     expressions: &[AstExpr],
@@ -25729,13 +29273,15 @@ fn canonical_block_value_expression(
     expressions: &[AstExpr],
 ) -> Option<usize> {
     let mut result = None;
-    for statement in statements {
+    for (statement_index, statement) in statements.iter().enumerate() {
         if statement_is_source_pipe_continuation(statement, expressions) && result.is_some() {
             continue;
         }
-        if let Some(expression) =
-            canonical_statement_value_expression(statements, statement, expressions)
-        {
+        if let Some(expression) = canonical_statement_value_expression_at_known_index(
+            statements,
+            statement_index,
+            expressions,
+        ) {
             result = Some(expression);
         }
     }
@@ -25760,7 +29306,7 @@ fn collect_pipe_continuation_expr_ids(
     }
 }
 
-fn object_bindings(program: &ParsedProgram) -> BTreeMap<String, ObjectShape> {
+fn object_bindings(program: &ParsedProgram) -> BTreeMap<String, SharedObjectShape> {
     let mut bindings = BTreeMap::new();
     collect_object_bindings(
         &program.ast.statements,
@@ -25775,7 +29321,7 @@ fn collect_object_bindings(
     statements: &[AstStatement],
     expressions: &[AstExpr],
     scope: &mut Vec<String>,
-    bindings: &mut BTreeMap<String, ObjectShape>,
+    bindings: &mut BTreeMap<String, SharedObjectShape>,
 ) {
     for statement in statements {
         match &statement.kind {
@@ -25785,11 +29331,12 @@ fn collect_object_bindings(
                 if let Some(expr_id) = statement.expr
                     && let Some(shape) = object_shape_for_expr(expr_id, expressions)
                 {
-                    bindings.insert(path.clone(), shape);
+                    bindings.insert(path.clone(), shape.into());
                 } else if direct_statement_value_expr_id(statement, expressions).is_none()
                     && !statement.children.is_empty()
                 {
-                    let shape = object_shape_for_statement(statement, expressions);
+                    let shape =
+                        SharedObjectShape::new(object_shape_for_statement(statement, expressions));
                     bindings.insert(name.clone(), shape.clone());
                     bindings.insert(path.clone(), shape);
                 }
@@ -26333,7 +29880,7 @@ fn simple_expr_type(expr: &AstExpr, expressions: &[AstExpr]) -> Type {
         }
         AstExprKind::Tag(value) if value == "SKIP" => Type::Absent,
         AstExprKind::Tag(value) => Type::VariantSet(vec![Variant::Tag(value.clone())]),
-        AstExprKind::Object(fields) => Type::Object(simple_record_shape(fields, expressions)),
+        AstExprKind::Object(fields) => Type::object(simple_record_shape(fields, expressions)),
         AstExprKind::ListLiteral { items, .. } => {
             static_list_literal_type(items, expressions, |item| {
                 Some(simple_expr_type(item, expressions))
@@ -26394,7 +29941,7 @@ fn simple_expr_type(expr: &AstExpr, expressions: &[AstExpr]) -> Type {
         AstExprKind::Call { function, .. } | AstExprKind::Pipe { op: function, .. }
             if function == "List/chunk" =>
         {
-            Type::List(Box::new(Type::Object(ObjectShape::from_ordered_fields(
+            Type::List(Box::new(Type::object(ObjectShape::from_ordered_fields(
                 [
                     ("label".to_owned(), Type::Text),
                     ("items".to_owned(), Type::List(Box::new(open_object_type()))),
@@ -26958,7 +30505,7 @@ fn object_type_for_path_requirement(parts: &[String], leaf_type: Option<Type>) -
     } else {
         object_type_for_path_requirement(rest, leaf_type)
     };
-    Type::Object(ObjectShape::from_ordered_fields(
+    Type::object(ObjectShape::from_ordered_fields(
         [(field.clone(), field_type)],
         true,
     ))
@@ -27658,7 +31205,7 @@ fn static_expr_type_from_bindings(
         return Some(signature.result_type);
     }
     match &expr.kind {
-        AstExprKind::Object(fields) => Some(Type::Object(ObjectShape::from_ordered_fields(
+        AstExprKind::Object(fields) => Some(Type::object(ObjectShape::from_ordered_fields(
             fields.iter().filter(|field| !field.spread).map(|field| {
                 (
                     field.name.clone(),
@@ -27902,7 +31449,7 @@ fn static_expr_type_with_external_types(
                 .get(function)
                 .map(|signature| signature.result.ty.clone())
         }
-        AstExprKind::Object(fields) => Some(Type::Object(ObjectShape::from_ordered_fields(
+        AstExprKind::Object(fields) => Some(Type::object(ObjectShape::from_ordered_fields(
             fields.iter().filter(|field| !field.spread).map(|field| {
                 (
                     field.name.clone(),
@@ -27967,12 +31514,11 @@ fn static_expr_type_with_external_types(
 fn flow_bindings(
     program: &ParsedProgram,
     external_types: &ExternalTypeEnvironment,
-) -> BTreeMap<String, FlowMode> {
-    let mut bindings = external_types
-        .values
-        .iter()
-        .map(|(path, flow_type)| (path.clone(), flow_type.mode))
-        .collect();
+) -> FlowModeIndex {
+    let mut bindings = FlowModeIndex::default();
+    for (path, flow_type) in &external_types.values {
+        bindings.insert(path.clone(), flow_type.mode);
+    }
     collect_flow_bindings(
         &program.ast.statements,
         &program.expressions,
@@ -28034,7 +31580,7 @@ fn collect_canonical_named_value_sites(
     }
 }
 
-fn declaration_expression_index(program: &ParsedProgram) -> BTreeMap<String, usize> {
+fn declaration_expression_index(program: &ParsedProgram) -> DeclarationExprIndex {
     let mut declarations = BTreeMap::new();
     collect_declaration_expressions(
         &program.ast.statements,
@@ -28042,7 +31588,7 @@ fn declaration_expression_index(program: &ParsedProgram) -> BTreeMap<String, usi
         &mut Vec::new(),
         &mut declarations,
     );
-    declarations
+    DeclarationExprIndex::from_exact(declarations)
 }
 
 fn collect_declaration_expressions(
@@ -28109,16 +31655,8 @@ fn collect_declaration_expressions(
     }
 }
 
-fn declaration_expr_for_path(declarations: &BTreeMap<String, usize>, path: &str) -> Option<usize> {
-    declarations.get(path).copied().or_else(|| {
-        let suffix = format!(".{path}");
-        let mut matches = declarations
-            .iter()
-            .filter(|(candidate, _)| candidate.ends_with(&suffix))
-            .map(|(_, expr_id)| *expr_id);
-        let first = matches.next()?;
-        matches.next().is_none().then_some(first)
-    })
+fn declaration_expr_for_path(declarations: &DeclarationExprIndex, path: &str) -> Option<usize> {
+    declarations.resolve(path)
 }
 
 fn collect_inferred_named_value_types(
@@ -28205,7 +31743,7 @@ fn collect_flow_bindings(
     statements: &[AstStatement],
     expressions: &[AstExpr],
     scope: &mut Vec<String>,
-    bindings: &mut BTreeMap<String, FlowMode>,
+    bindings: &mut FlowModeIndex,
 ) {
     for statement in statements {
         match &statement.kind {
@@ -28250,29 +31788,19 @@ fn collect_flow_bindings(
     }
 }
 
-fn insert_flow_binding(bindings: &mut BTreeMap<String, FlowMode>, path: String, mode: FlowMode) {
-    bindings
-        .entry(path)
-        .and_modify(|existing| *existing = merge_flow_modes(*existing, mode))
-        .or_insert(mode);
+fn insert_flow_binding(bindings: &mut FlowModeIndex, path: String, mode: FlowMode) {
+    bindings.insert(path, mode);
 }
 
-fn flow_binding_mode(bindings: &BTreeMap<String, FlowMode>, path: &str) -> Option<FlowMode> {
-    bindings.get(path).copied().or_else(|| {
-        let suffix = format!(".{path}");
-        bindings
-            .iter()
-            .filter(|(candidate, _)| candidate.ends_with(&suffix))
-            .map(|(_, mode)| *mode)
-            .reduce(merge_flow_modes)
-    })
+fn flow_binding_mode(bindings: &FlowModeIndex, path: &str) -> Option<FlowMode> {
+    bindings.resolve(path)
 }
 
 fn simple_statement_flow_mode(
     statement: &AstStatement,
     expr: &AstExpr,
     expressions: &[AstExpr],
-    bindings: &BTreeMap<String, FlowMode>,
+    bindings: &FlowModeIndex,
 ) -> FlowMode {
     let AstExprKind::Latest { branches } = &expr.kind else {
         return simple_flow_mode_with_bindings(expr, expressions, bindings);
@@ -28296,7 +31824,7 @@ fn simple_statement_flow_mode(
 fn simple_flow_mode_with_bindings(
     expr: &AstExpr,
     expressions: &[AstExpr],
-    bindings: &BTreeMap<String, FlowMode>,
+    bindings: &FlowModeIndex,
 ) -> FlowMode {
     match &expr.kind {
         AstExprKind::Identifier(path) => {
@@ -28381,7 +31909,7 @@ fn collect_name_bindings(
                 let ty = statement_value_type_from_bindings(statement, expressions, bindings)
                     .or_else(|| simple_statement_value_type(statement, expressions))
                     .unwrap_or_else(|| {
-                        Type::Object(object_shape_for_statement(statement, expressions))
+                        Type::object(object_shape_for_statement(statement, expressions))
                     });
                 insert_simple_binding_preserving_renderable(bindings, name, ty.clone());
                 if path != *name {
@@ -28498,7 +32026,7 @@ fn list_item_type_from_list_type(ty: &Type) -> Option<Type> {
 
 fn forwarded_parameter_requirement(projection: &[String], required: Type) -> Type {
     projection.iter().rev().fold(required, |child, field| {
-        Type::Object(ObjectShape::from_ordered_fields(
+        Type::object(ObjectShape::from_ordered_fields(
             [(field.clone(), child)],
             true,
         ))
@@ -28512,7 +32040,7 @@ fn forwarded_parameter_requirement_for_path(
     path.iter()
         .rev()
         .fold(required, |child, segment| match segment {
-            ForwardedParameterPathSegment::Field(field) => Type::Object(
+            ForwardedParameterPathSegment::Field(field) => Type::object(
                 ObjectShape::from_ordered_fields([(field.clone(), child)], true),
             ),
             ForwardedParameterPathSegment::ListItem => Type::List(Box::new(child)),
@@ -28554,7 +32082,7 @@ fn merge_forwarded_parameter_type(caller: &Type, required: &Type) -> Type {
                     })
                     .or_insert_with(|| required_ty.clone());
             }
-            Type::Object(ObjectShape {
+            Type::object(ObjectShape {
                 fields,
                 field_order: object_field_order_for_widened_shapes(caller, required),
                 open: caller.open || required.open,
@@ -28617,7 +32145,7 @@ pub fn specialize_checked_call_result(instantiated: &Type, occurrence: &Type) ->
                     fields.insert(name.clone(), occurrence_type.clone());
                 }
             }
-            Type::Object(ObjectShape {
+            Type::object(ObjectShape {
                 fields,
                 field_order: object_field_order_for_widened_shapes(instantiated, occurrence),
                 // These are two descriptions of the same concrete
@@ -28700,7 +32228,7 @@ fn merge_canonical_row_type(canonical: &Type, extra: &Type) -> Type {
                     })
                     .or_insert_with(|| extra_ty.clone());
             }
-            Type::Object(ObjectShape {
+            Type::object(ObjectShape {
                 fields,
                 field_order: object_field_order_for_widened_shapes(canonical_shape, extra_shape),
                 open: canonical_shape.open || extra_shape.open,
@@ -28811,7 +32339,7 @@ fn widen_structural_type(left: &Type, right: &Type) -> Type {
                     .and_modify(|existing| *existing = widen_structural_type(existing, ty))
                     .or_insert_with(|| ty.clone());
             }
-            Type::Object(ObjectShape {
+            Type::object(ObjectShape {
                 fields,
                 field_order: object_field_order_for_widened_shapes(left, right),
                 open: left.open || right.open,
@@ -29245,31 +32773,45 @@ fn exact_duration_milliseconds(value: &ExactNumber, scale: u64) -> Option<u64> {
         .ok()
 }
 
-fn exact_checked_source_read(
-    target: DeclId,
-    projection: &[String],
-    sources: &[CheckedSource],
-) -> Option<CheckedSourceRead> {
-    let mut matches = sources
-        .iter()
-        .filter(|source| source.path.anchor == target)
-        .filter_map(|source| {
+/// Longest-prefix source lookup indexed once per checked program. The old
+/// helper filtered, allocated, and sorted the entire source table for every
+/// read and every provenance traversal.
+struct CheckedSourcePathIndex<'a> {
+    by_anchor: BTreeMap<DeclId, Vec<&'a CheckedSource>>,
+}
+
+impl<'a> CheckedSourcePathIndex<'a> {
+    fn new(sources: &'a [CheckedSource]) -> Self {
+        let mut by_anchor = BTreeMap::<DeclId, Vec<&CheckedSource>>::new();
+        for source in sources {
+            by_anchor
+                .entry(source.path.anchor)
+                .or_default()
+                .push(source);
+        }
+        for candidates in by_anchor.values_mut() {
+            candidates.sort_by_key(|source| std::cmp::Reverse(source.path.projection.len()));
+        }
+        Self { by_anchor }
+    }
+
+    fn exact_read(&self, target: DeclId, projection: &[String]) -> Option<CheckedSourceRead> {
+        let mut matches = self.by_anchor.get(&target)?.iter().filter_map(|source| {
             projection
                 .strip_prefix(source.path.projection.as_slice())
-                .map(|payload| (source, payload))
+                .map(|payload| (*source, payload))
+        });
+        let (source, payload) = matches.next()?;
+        if matches.next().is_some_and(|(candidate, _)| {
+            candidate.path.projection.len() == source.path.projection.len()
+        }) {
+            return None;
+        }
+        Some(CheckedSourceRead {
+            source: source.id,
+            payload_projection: canonical_checked_source_payload_projection(payload),
         })
-        .collect::<Vec<_>>();
-    matches.sort_by_key(|(source, _)| std::cmp::Reverse(source.path.projection.len()));
-    let (source, payload) = matches.first().copied()?;
-    if matches.get(1).is_some_and(|(candidate, _)| {
-        candidate.path.projection.len() == source.path.projection.len()
-    }) {
-        return None;
     }
-    Some(CheckedSourceRead {
-        source: source.id,
-        payload_projection: canonical_checked_source_payload_projection(payload),
-    })
 }
 
 fn canonical_checked_source_payload_projection(projection: &[String]) -> Vec<String> {
@@ -29323,7 +32865,7 @@ fn refine_checked_source_payload_types(
 
     for source in sources {
         let mut shape = match &source.payload_type {
-            Type::Object(shape) => shape.clone(),
+            Type::Object(shape) => shape.as_ref().clone(),
             _ => ObjectShape {
                 fields: BTreeMap::new(),
                 field_order: Vec::new(),
@@ -29333,7 +32875,7 @@ fn refine_checked_source_payload_types(
         for (path, ty) in requirements.remove(&source.id).unwrap_or_default() {
             insert_source_payload_requirement_path(&mut shape, &path, &ty);
         }
-        source.payload_type = Type::Object(shape);
+        source.payload_type = Type::object(shape);
     }
 }
 
@@ -29344,7 +32886,7 @@ fn checked_resource_projection_requirements(
     expressions: &[CheckedExpression],
     sources: &[CheckedSource],
 ) -> Vec<CheckedResourceProjectionRequirement> {
-    let resolver =
+    let mut resolver =
         CheckedSourceProvenanceResolver::new(declarations, callables, calls, expressions, sources);
     expressions
         .iter()
@@ -29401,7 +32943,7 @@ fn refine_checked_source_payload_types_from_requirements(
     }
     for source in sources {
         let mut shape = match &source.payload_type {
-            Type::Object(shape) => shape.clone(),
+            Type::Object(shape) => shape.as_ref().clone(),
             _ => ObjectShape {
                 fields: BTreeMap::new(),
                 field_order: Vec::new(),
@@ -29411,7 +32953,7 @@ fn refine_checked_source_payload_types_from_requirements(
         for (path, ty) in payloads.remove(&source.id).unwrap_or_default() {
             insert_source_payload_requirement_path(&mut shape, &path, &ty);
         }
-        source.payload_type = Type::Object(shape);
+        source.payload_type = Type::object(shape);
     }
 }
 
@@ -29428,8 +32970,12 @@ struct CheckedSourceProvenanceResolver<'a> {
     callables: BTreeMap<DeclId, &'a CheckedCallableSignature>,
     calls: BTreeMap<CheckedCallId, &'a CheckedCall>,
     expressions: BTreeMap<CheckedExprId, &'a CheckedExpression>,
-    sources: &'a [CheckedSource],
+    source_paths: CheckedSourcePathIndex<'a>,
     source_expressions: BTreeMap<CheckedExprId, Vec<CheckedSourceId>>,
+    actual_inputs_by_formal: BTreeMap<DeclId, Vec<CheckedExprId>>,
+    contextual_lists_by_output: BTreeMap<DeclId, Vec<CheckedExprId>>,
+    forwarded_outputs_by_formal: BTreeMap<DeclId, Vec<DeclId>>,
+    declaration_cache: BTreeMap<(DeclId, Vec<String>), Vec<CheckedSourceRead>>,
 }
 
 impl<'a> CheckedSourceProvenanceResolver<'a> {
@@ -29440,6 +32986,10 @@ impl<'a> CheckedSourceProvenanceResolver<'a> {
         expressions: &'a [CheckedExpression],
         sources: &'a [CheckedSource],
     ) -> Self {
+        let callable_index = callables
+            .iter()
+            .map(|callable| (callable.decl_id, callable))
+            .collect::<BTreeMap<_, _>>();
         let mut source_expressions = BTreeMap::<CheckedExprId, Vec<CheckedSourceId>>::new();
         for source in sources {
             source_expressions
@@ -29447,33 +32997,106 @@ impl<'a> CheckedSourceProvenanceResolver<'a> {
                 .or_default()
                 .push(source.id);
         }
+        let mut actual_inputs_by_formal = BTreeMap::<DeclId, Vec<CheckedExprId>>::new();
+        let mut contextual_lists_by_output = BTreeMap::<DeclId, Vec<CheckedExprId>>::new();
+        let mut forwarded_outputs_by_formal = BTreeMap::<DeclId, Vec<DeclId>>::new();
+        for call in calls {
+            let mut indexed_input_formals = BTreeSet::new();
+            for entry in &call.entries {
+                match entry {
+                    CheckedCallEntry::Input { formal, value, .. } => {
+                        // `checked_call_formal_input` has always selected the
+                        // first input for a formal within one call. Preserve
+                        // that fail-closed malformed-call behavior exactly.
+                        if indexed_input_formals.insert(*formal) {
+                            actual_inputs_by_formal
+                                .entry(*formal)
+                                .or_default()
+                                .push(*value);
+                        }
+                    }
+                    CheckedCallEntry::FreshOut { formal, output, .. }
+                    | CheckedCallEntry::ForwardOut {
+                        formal,
+                        target: output,
+                        ..
+                    } => {
+                        forwarded_outputs_by_formal
+                            .entry(*formal)
+                            .or_default()
+                            .push(*output);
+                    }
+                }
+            }
+            let Some(operation) = callable_index
+                .get(&call.callable)
+                .and_then(|callable| callable.contextual_operation)
+            else {
+                continue;
+            };
+            let Some((list_formal, row_formal, _)) =
+                checked_contextual_operation_formals(operation)
+            else {
+                continue;
+            };
+            let Some(list) = checked_call_formal_input(call, list_formal) else {
+                continue;
+            };
+            for entry in &call.entries {
+                let output = match entry {
+                    CheckedCallEntry::FreshOut { formal, output, .. } if *formal == row_formal => {
+                        Some(*output)
+                    }
+                    CheckedCallEntry::ForwardOut {
+                        formal,
+                        target: output,
+                        ..
+                    } if *formal == row_formal => Some(*output),
+                    _ => None,
+                };
+                if let Some(output) = output {
+                    contextual_lists_by_output
+                        .entry(output)
+                        .or_default()
+                        .push(list);
+                }
+            }
+        }
         Self {
             declarations: declarations
                 .iter()
                 .map(|declaration| (declaration.id, declaration))
                 .collect(),
-            callables: callables
-                .iter()
-                .map(|callable| (callable.decl_id, callable))
-                .collect(),
+            callables: callable_index,
             calls: calls.iter().map(|call| (call.id, call)).collect(),
             expressions: expressions
                 .iter()
                 .map(|expression| (expression.id, expression))
                 .collect(),
-            sources,
+            source_paths: CheckedSourcePathIndex::new(sources),
             source_expressions,
+            actual_inputs_by_formal,
+            contextual_lists_by_output,
+            forwarded_outputs_by_formal,
+            declaration_cache: BTreeMap::new(),
         }
     }
 
     fn sources_for_declaration(
-        &self,
+        &mut self,
         target: DeclId,
         projection: &[String],
     ) -> Vec<CheckedSourceRead> {
-        self.declaration_sources(target, projection, &mut BTreeSet::new())
+        let key = (target, projection.to_vec());
+        if let Some(cached) = self.declaration_cache.get(&key) {
+            return cached.clone();
+        }
+        let resolved = self
+            .declaration_sources(target, projection, &mut BTreeSet::new())
             .into_iter()
-            .collect()
+            .collect::<Vec<_>>();
+        self.declaration_cache.insert(key, resolved.clone());
+        resolved
     }
 
     fn declaration_sources(
@@ -29487,7 +33110,7 @@ impl<'a> CheckedSourceProvenanceResolver<'a> {
             return BTreeSet::new();
         }
         let mut resolved = BTreeSet::new();
-        if let Some(source) = exact_checked_source_read(target, projection, self.sources) {
+        if let Some(source) = self.source_paths.exact_read(target, projection) {
             resolved.insert(source);
         }
         let Some(declaration) = self.declarations.get(&target).copied() else {
@@ -29495,10 +33118,13 @@ impl<'a> CheckedSourceProvenanceResolver<'a> {
             return resolved;
         };
         if declaration.kind == CheckedDeclarationKind::ValueParameter {
-            for call in self.calls.values() {
-                if let Some(actual) = checked_call_formal_input(call, target) {
-                    resolved.extend(self.expression_sources(actual, projection, visiting));
-                }
+            for actual in self
+                .actual_inputs_by_formal
+                .get(&target)
+                .into_iter()
+                .flatten()
+            {
+                resolved.extend(self.expression_sources(*actual, projection, visiting));
             }
         }
         if matches!(
@@ -29679,11 +33305,13 @@ impl<'a> CheckedSourceProvenanceResolver<'a> {
                     && let Some(declaration) = self.declarations.get(target).copied()
                 {
                     if declaration.kind == CheckedDeclarationKind::ValueParameter {
-                        for call in self.calls.values() {
-                            if let Some(actual) = checked_call_formal_input(call, *target) {
-                                resolved
-                                    .extend(self.list_item_sources(actual, projection, visiting));
-                            }
+                        for actual in self
+                            .actual_inputs_by_formal
+                            .get(target)
+                            .into_iter()
+                            .flatten()
+                        {
+                            resolved.extend(self.list_item_sources(*actual, projection, visiting));
                         }
                     }
                     if let Some(value) = declaration.value {
@@ -29800,49 +33428,21 @@ impl<'a> CheckedSourceProvenanceResolver<'a> {
             return BTreeSet::new();
         }
         let mut resolved = BTreeSet::new();
-        for call in self.calls.values().copied() {
-            let Some(callable) = self.callables.get(&call.callable).copied() else {
-                continue;
-            };
-            for entry in &call.entries {
-                let formal = match entry {
-                    CheckedCallEntry::FreshOut { formal, output, .. } if *output == target => {
-                        Some(*formal)
-                    }
-                    CheckedCallEntry::ForwardOut {
-                        formal,
-                        target: output,
-                        ..
-                    } if *output == target => Some(*formal),
-                    _ => None,
-                };
-                let Some(formal) = formal else {
-                    continue;
-                };
-                if let Some(operation) = callable.contextual_operation
-                    && let Some((list, row, _)) = checked_contextual_operation_formals(operation)
-                    && formal == row
-                    && let Some(list) = checked_call_formal_input(call, list)
-                {
-                    resolved.extend(self.list_item_sources(list, projection, visiting));
-                }
-            }
-            for entry in &call.entries {
-                let output = match entry {
-                    CheckedCallEntry::FreshOut { formal, output, .. } if *formal == target => {
-                        Some(*output)
-                    }
-                    CheckedCallEntry::ForwardOut {
-                        formal,
-                        target: output,
-                        ..
-                    } if *formal == target => Some(*output),
-                    _ => None,
-                };
-                if let Some(output) = output {
-                    resolved.extend(self.output_sources(output, projection, visiting));
-                }
-            }
+        for list in self
+            .contextual_lists_by_output
+            .get(&target)
+            .into_iter()
+            .flatten()
+        {
+            resolved.extend(self.list_item_sources(*list, projection, visiting));
+        }
+        for output in self
+            .forwarded_outputs_by_formal
+            .get(&target)
+            .into_iter()
+            .flatten()
+        {
+            resolved.extend(self.output_sources(*output, projection, visiting));
         }
         visiting.remove(&key);
         resolved
@@ -29919,7 +33519,7 @@ fn validate_checked_host_port_source_payload_types(
         let Some(fields) = host_payloads.get(&path) else {
             continue;
         };
-        let contract = Type::Object(ObjectShape::from_ordered_fields(
+        let contract = Type::object(ObjectShape::from_ordered_fields(
             fields.iter().map(|(name, ty)| (name.clone(), ty.clone())),
             false,
         ));
@@ -29960,6 +33560,14 @@ fn checked_call_result_paths(
                 .map(|value| (declaration.id, (value, declaration.flow_type.clone())))
         })
         .collect::<BTreeMap<_, _>>();
+    let callables_by_id = callables
+        .iter()
+        .map(|callable| (callable.decl_id, callable))
+        .collect::<BTreeMap<_, _>>();
+    let calls_by_id = calls
+        .iter()
+        .map(|call| (call.id, call))
+        .collect::<BTreeMap<_, _>>();
     let mut paths = calls
         .iter()
         .filter_map(|call| {
@@ -29968,10 +33576,10 @@ fn checked_call_result_paths(
                 .filter(|expression| expression.id == call.expression)?;
             let anchor = expression.declaration?;
             checked_declaration_resource_projection(
-                callables,
+                &callables_by_id,
                 &declaration_values,
                 expressions,
-                calls,
+                &calls_by_id,
                 anchor,
                 call.expression,
             )
@@ -29986,10 +33594,10 @@ fn checked_call_result_paths(
 }
 
 fn checked_declaration_resource_projection(
-    callables: &[CheckedCallableSignature],
+    callables: &BTreeMap<DeclId, &CheckedCallableSignature>,
     declaration_values: &BTreeMap<DeclId, (CheckedExprId, FlowType)>,
     expressions: &[CheckedExpression],
-    calls: &[CheckedCall],
+    calls: &BTreeMap<CheckedCallId, &CheckedCall>,
     declaration: DeclId,
     target: CheckedExprId,
 ) -> Option<Vec<String>> {
@@ -29998,8 +33606,7 @@ fn checked_declaration_resource_projection(
         .map(|(root, _)| *root)
         .or_else(|| {
             callables
-                .iter()
-                .find(|callable| callable.decl_id == declaration)
+                .get(&declaration)
                 .and_then(|callable| callable.result_expression)
         })?;
     checked_projection_to_expression(expressions, calls, root, target)
@@ -30007,13 +33614,13 @@ fn checked_declaration_resource_projection(
 
 fn checked_projection_to_expression(
     expressions: &[CheckedExpression],
-    calls: &[CheckedCall],
+    calls: &BTreeMap<CheckedCallId, &CheckedCall>,
     root: CheckedExprId,
     target: CheckedExprId,
 ) -> Option<Vec<String>> {
     fn visit(
         expressions: &[CheckedExpression],
-        calls: &[CheckedCall],
+        calls: &BTreeMap<CheckedCallId, &CheckedCall>,
         current: CheckedExprId,
         target: CheckedExprId,
         visiting: &mut BTreeSet<CheckedExprId>,
@@ -30037,8 +33644,7 @@ fn checked_projection_to_expression(
                 Some(projection)
             }),
             CheckedExpressionKind::Call { call } => calls
-                .iter()
-                .find(|candidate| candidate.id == *call)
+                .get(call)
                 .into_iter()
                 .flat_map(|call| &call.entries)
                 .find_map(|entry| match entry {
@@ -30106,15 +33712,11 @@ fn checked_hold_update_mergers(
     statements: &[CheckedStatement],
     expressions: &[CheckedExpression],
     declaration_statements: &BTreeMap<DeclId, CheckedStatementId>,
-    checked_calls: &[CheckedCall],
+    calls: &BTreeMap<CheckedCallId, &CheckedCall>,
 ) -> BTreeSet<CheckedExprId> {
     let statement_by_id = statements
         .iter()
         .map(|statement| (statement.id, statement))
-        .collect::<BTreeMap<_, _>>();
-    let calls = checked_calls
-        .iter()
-        .map(|call| (call.id, call))
         .collect::<BTreeMap<_, _>>();
     let mut roots = Vec::new();
     for expression in expressions
@@ -30158,7 +33760,7 @@ fn checked_hold_update_mergers(
         if matches!(expression.kind, CheckedExpressionKind::Latest { .. }) {
             mergers.insert(expression.id);
         }
-        pending.extend(checked_expression_children(&expression.kind, &calls));
+        pending.extend(checked_expression_children(&expression.kind, calls));
     }
     mergers
 }
@@ -31033,7 +34635,7 @@ fn source_payload_shape_table(
                 .into_iter()
                 .map(|(name, ty)| SourcePayloadShapeField { name, ty })
                 .collect::<Vec<_>>();
-            let payload_type = Type::Object(ObjectShape::from_ordered_fields(
+            let payload_type = Type::object(ObjectShape::from_ordered_fields(
                 fields
                     .iter()
                     .map(|field| (field.name.clone(), field.ty.clone())),
@@ -31492,7 +35094,7 @@ fn contextual_binding_row_type(requirements: &BTreeMap<Vec<String>, Type>) -> Ty
     for (path, ty) in requirements {
         insert_source_payload_requirement_path(&mut shape, path, ty);
     }
-    Type::Object(shape)
+    Type::object(shape)
 }
 
 fn insert_source_payload_requirement_path(shape: &mut ObjectShape, path: &[String], ty: &Type) {
@@ -31513,14 +35115,14 @@ fn insert_source_payload_requirement_path(shape: &mut ObjectShape, path: &[Strin
         return;
     }
     let entry = shape.fields.entry(field.clone()).or_insert_with(|| {
-        Type::Object(ObjectShape {
+        Type::object(ObjectShape {
             fields: BTreeMap::new(),
             field_order: Vec::new(),
             open: false,
         })
     });
     if !matches!(entry, Type::Object(_)) {
-        *entry = Type::Object(ObjectShape {
+        *entry = Type::object(ObjectShape {
             fields: BTreeMap::new(),
             field_order: Vec::new(),
             open: false,
@@ -31529,7 +35131,9 @@ fn insert_source_payload_requirement_path(shape: &mut ObjectShape, path: &[Strin
     let Type::Object(child) = entry else {
         unreachable!("source payload path is a structural object")
     };
-    insert_source_payload_requirement_path(child, rest, ty);
+    let mut child = child.as_ref().clone();
+    insert_source_payload_requirement_path(&mut child, rest, ty);
+    *entry = Type::object(child);
 }
 
 fn merge_source_payload_structural_requirement(left: &Type, right: &Type) -> Type {
@@ -31547,7 +35151,7 @@ fn merge_source_payload_structural_requirement(left: &Type, right: &Type) -> Typ
                     })
                     .or_insert_with(|| ty.clone());
             }
-            Type::Object(ObjectShape {
+            Type::object(ObjectShape {
                 fields,
                 field_order: object_field_order_for_widened_shapes(left, right),
                 open: left.open || right.open,
@@ -31562,7 +35166,7 @@ fn source_payload_list_field_origins(
     expr_id: usize,
     program: &ParsedProgram,
     source_lookup: &SourcePayloadPathLookup,
-    declarations: &BTreeMap<String, usize>,
+    declarations: &DeclarationExprIndex,
     visited: &mut BTreeSet<usize>,
 ) -> Vec<(String, String)> {
     if !visited.insert(expr_id) {
@@ -31739,7 +35343,7 @@ fn http_request_payload_fields() -> BTreeMap<String, Type> {
 }
 
 fn named_text_pairs_type() -> Type {
-    Type::List(Box::new(Type::Object(ObjectShape::from_ordered_fields(
+    Type::List(Box::new(Type::object(ObjectShape::from_ordered_fields(
         [
             ("name".to_owned(), Type::Text),
             ("value".to_owned(), Type::Text),
@@ -31756,11 +35360,13 @@ fn type_hint_table(
     source_payload_shape_table: &[SourcePayloadSyntaxShapeEntry],
     name_bindings: &BTreeMap<String, Type>,
 ) -> TypeHintTable {
-    let expr_types = expr_type_table
-        .entries
-        .iter()
-        .map(|entry| (entry.expr_id, entry.flow_type.ty.clone()))
-        .collect::<BTreeMap<_, _>>();
+    let source_index = TypeHintSourceIndex::new(&program.source);
+    let expr_types = TypeHintExprIndex::new(expr_type_table, program.expressions.len());
+    let metadata = TypeHintMetadataIndex::new(
+        &program.ast.statements,
+        function_type_table,
+        source_payload_shape_table,
+    );
     let mut entries = Vec::new();
     for expr in &program.expressions {
         let Some(ty) = expr_types.get(&expr.id) else {
@@ -31772,6 +35378,7 @@ fn type_hint_table(
         let category = type_hint_category_for_expr(&expr.kind);
         entries.push(type_hint_entry_for_range(
             program,
+            &source_index,
             Some(expr.id),
             expr.line,
             expr.start,
@@ -31779,24 +35386,26 @@ fn type_hint_table(
             category,
             ty,
         ));
-        collect_call_argument_type_hints(program, expr, &expr_types, &mut entries);
+        collect_call_argument_type_hints(program, &source_index, expr, &expr_types, &mut entries);
     }
+    let mut statement_hint_types = BTreeMap::new();
     collect_statement_type_hints(
         program,
+        &source_index,
         &program.ast.statements,
         &expr_types,
-        function_type_table,
-        source_payload_shape_table,
+        &metadata,
         name_bindings,
+        &mut statement_hint_types,
         &mut entries,
     );
     for slot in &render_slot_table.slots {
-        let Some(statement) = statement_by_id(&program.ast.statements, slot.slot_statement_id)
-        else {
+        let Some(statement) = metadata.statements.get(&slot.slot_statement_id).copied() else {
             continue;
         };
         entries.push(type_hint_entry_for_range(
             program,
+            &source_index,
             slot.value_expr_id,
             statement.line,
             statement.start,
@@ -31816,8 +35425,150 @@ fn type_hint_table(
     TypeHintTable { entries }
 }
 
+/// Borrowed dense projection over the already-owned expression table. Hint
+/// generation used to deep-clone every checked type into a second BTreeMap
+/// before emitting its first hint.
+struct TypeHintExprIndex<'a> {
+    entries: Vec<Option<&'a Type>>,
+}
+
+impl<'a> TypeHintExprIndex<'a> {
+    fn new(table: &'a ExprTypeTable, expression_count: usize) -> Self {
+        let mut entries = vec![None; expression_count];
+        for entry in &table.entries {
+            if let Some(slot) = entries.get_mut(entry.expr_id) {
+                *slot = Some(&entry.flow_type.ty);
+            }
+        }
+        Self { entries }
+    }
+
+    fn get(&self, expression: &usize) -> Option<&'a Type> {
+        self.entries.get(*expression).copied().flatten()
+    }
+}
+
+struct TypeHintMetadataIndex<'a> {
+    statements: BTreeMap<usize, &'a AstStatement>,
+    functions: BTreeMap<&'a str, &'a FunctionTypeEntry>,
+    source_payloads: BTreeMap<usize, &'a SourcePayloadSyntaxShapeEntry>,
+}
+
+impl<'a> TypeHintMetadataIndex<'a> {
+    fn new(
+        statements: &'a [AstStatement],
+        functions: &'a FunctionTypeTable,
+        source_payloads: &'a [SourcePayloadSyntaxShapeEntry],
+    ) -> Self {
+        fn index_statements<'a>(
+            statements: &'a [AstStatement],
+            index: &mut BTreeMap<usize, &'a AstStatement>,
+        ) {
+            for statement in statements {
+                index.entry(statement.id).or_insert(statement);
+                index_statements(&statement.children, index);
+            }
+        }
+        let mut statement_index = BTreeMap::new();
+        index_statements(statements, &mut statement_index);
+        let mut function_index = BTreeMap::new();
+        for function in &functions.entries {
+            function_index
+                .entry(function.name.as_str())
+                .or_insert(function);
+        }
+        let mut source_index = BTreeMap::new();
+        for source in source_payloads {
+            source_index.entry(source.statement).or_insert(source);
+        }
+        Self {
+            statements: statement_index,
+            functions: function_index,
+            source_payloads: source_index,
+        }
+    }
+
+    fn source_payload_type(&self, statement: usize) -> Option<Type> {
+        self.source_payloads
+            .get(&statement)
+            .map(|entry| entry.payload_type.clone())
+    }
+
+    fn source_statement_value_type(&self, statement: &AstStatement) -> Type {
+        let payload = self
+            .source_payload_type(statement.id)
+            .unwrap_or_else(exact_empty_object_type);
+        match &statement.kind {
+            AstStatementKind::Source {
+                event: Some(event), ..
+            } => Type::object(ObjectShape::from_ordered_fields(
+                [(event.clone(), payload)],
+                false,
+            )),
+            _ => payload,
+        }
+    }
+}
+
+/// One immutable source index shared by the entire editor-hint projection.
+/// Hint construction used to rescan from byte zero for every entry, making a
+/// large file's otherwise linear projection quadratic in its line count.
+struct TypeHintSourceIndex<'a> {
+    source: &'a str,
+    line_starts: Vec<usize>,
+}
+
+impl<'a> TypeHintSourceIndex<'a> {
+    fn new(source: &'a str) -> Self {
+        let mut line_starts = Vec::with_capacity(source.lines().count().saturating_add(1));
+        line_starts.push(0);
+        for (index, byte) in source.bytes().enumerate() {
+            if byte == b'\n' {
+                line_starts.push(index + 1);
+            }
+        }
+        Self {
+            source,
+            line_starts,
+        }
+    }
+
+    fn line_with_start(&self, line: usize) -> Option<(usize, &'a str)> {
+        let index = line.max(1).saturating_sub(1);
+        let start = *self.line_starts.get(index)?;
+        let end = self
+            .line_starts
+            .get(index + 1)
+            .copied()
+            .unwrap_or(self.source.len());
+        self.source.get(start..end).map(|text| (start, text))
+    }
+
+    fn line_for_byte(&self, byte: usize) -> usize {
+        let byte = byte.min(self.source.len());
+        self.line_starts
+            .partition_point(|start| *start <= byte)
+            .max(1)
+    }
+
+    fn byte_column(&self, line: usize, byte: usize) -> usize {
+        let line_start = self
+            .line_starts
+            .get(line.max(1).saturating_sub(1))
+            .copied()
+            .unwrap_or(0);
+        self.source
+            .get(line_start..byte.min(self.source.len()))
+            .unwrap_or_default()
+            .chars()
+            .count()
+            .saturating_add(1)
+    }
+}
+
 fn type_hint_entry_for_range(
     program: &ParsedProgram,
+    source_index: &TypeHintSourceIndex<'_>,
     expr_id: Option<usize>,
     line: usize,
     start: usize,
@@ -31827,6 +35578,7 @@ fn type_hint_entry_for_range(
 ) -> TypeHintEntry {
     type_hint_entry_for_labels(
         program,
+        source_index,
         expr_id,
         line,
         start,
@@ -31840,7 +35592,8 @@ fn type_hint_entry_for_range(
 
 #[allow(clippy::too_many_arguments)]
 fn type_hint_entry_for_labels(
-    program: &ParsedProgram,
+    _program: &ParsedProgram,
+    source_index: &TypeHintSourceIndex<'_>,
     expr_id: Option<usize>,
     line: usize,
     start: usize,
@@ -31855,7 +35608,7 @@ fn type_hint_entry_for_labels(
         line,
         start,
         end,
-        anchor_column: byte_column_for_line(&program.source, line, end),
+        anchor_column: source_index.byte_column(line, end),
         category: category.to_owned(),
         compact_label,
         detail_label,
@@ -31865,8 +35618,9 @@ fn type_hint_entry_for_labels(
 
 fn collect_call_argument_type_hints(
     program: &ParsedProgram,
+    source_index: &TypeHintSourceIndex<'_>,
     expr: &AstExpr,
-    expr_types: &BTreeMap<usize, Type>,
+    expr_types: &TypeHintExprIndex<'_>,
     entries: &mut Vec<TypeHintEntry>,
 ) {
     let args = match &expr.kind {
@@ -31874,7 +35628,7 @@ fn collect_call_argument_type_hints(
         _ => return,
     };
     for arg in args {
-        let Some((line, start, end)) = call_arg_name_range(program, arg) else {
+        let Some((line, start, end)) = call_arg_name_range(source_index, arg) else {
             continue;
         };
         let Some(ty) = expr_types.get(&arg.value) else {
@@ -31882,6 +35636,7 @@ fn collect_call_argument_type_hints(
         };
         entries.push(type_hint_entry_for_range(
             program,
+            source_index,
             Some(arg.value),
             line,
             start,
@@ -31919,11 +35674,12 @@ fn type_hint_category_for_expr(kind: &AstExprKind) -> &'static str {
 
 fn collect_statement_type_hints(
     program: &ParsedProgram,
+    source_index: &TypeHintSourceIndex<'_>,
     statements: &[AstStatement],
-    expr_types: &BTreeMap<usize, Type>,
-    function_type_table: &FunctionTypeTable,
-    source_payload_shape_table: &[SourcePayloadSyntaxShapeEntry],
+    expr_types: &TypeHintExprIndex<'_>,
+    metadata: &TypeHintMetadataIndex<'_>,
     name_bindings: &BTreeMap<String, Type>,
+    statement_hint_types: &mut BTreeMap<usize, Type>,
     entries: &mut Vec<TypeHintEntry>,
 ) {
     for statement in statements {
@@ -31934,11 +35690,13 @@ fn collect_statement_type_hints(
                     program,
                     statement,
                     expr_types,
-                    source_payload_shape_table,
+                    metadata,
                     name_bindings,
+                    statement_hint_types,
                 );
                 entries.push(type_hint_entry_for_range(
                     program,
+                    source_index,
                     value_expr,
                     statement.line,
                     statement.start,
@@ -31953,6 +35711,7 @@ fn collect_statement_type_hints(
                     .unwrap_or_else(|| simple_list_statement_type(statement, &program.expressions));
                 entries.push(type_hint_entry_for_range(
                     program,
+                    source_index,
                     statement.expr,
                     statement.line,
                     statement.start,
@@ -31962,11 +35721,12 @@ fn collect_statement_type_hints(
                 ));
             }
             AstStatementKind::Source { .. } => {
-                let source_path =
-                    source_payload_type_for_statement(statement, source_payload_shape_table)
-                        .unwrap_or_else(exact_empty_object_type);
+                let source_path = metadata
+                    .source_payload_type(statement.id)
+                    .unwrap_or_else(exact_empty_object_type);
                 entries.push(type_hint_entry_for_range(
                     program,
+                    source_index,
                     statement.expr,
                     statement.line,
                     statement.start,
@@ -31976,15 +35736,12 @@ fn collect_statement_type_hints(
                 ));
             }
             AstStatementKind::Function { name, parameters } => {
-                if let Some(function) = function_type_table
-                    .entries
-                    .iter()
-                    .find(|entry| entry.name == *name)
-                {
-                    if let Some((start, end)) = function_name_range(program, statement, name) {
+                if let Some(function) = metadata.functions.get(name.as_str()).copied() {
+                    if let Some((start, end)) = function_name_range(source_index, statement, name) {
                         if let Some(compact_label) = function_signature_compact_label(function) {
                             entries.push(type_hint_entry_for_labels(
                                 program,
+                                source_index,
                                 statement.expr,
                                 statement.line,
                                 start,
@@ -31997,6 +35754,7 @@ fn collect_statement_type_hints(
                         }
                         entries.push(type_hint_entry_for_range(
                             program,
+                            source_index,
                             statement.expr,
                             statement.line,
                             start,
@@ -32010,6 +35768,7 @@ fn collect_statement_type_hints(
                         if let Some(Some((start, end))) = arg_ranges.get(index) {
                             entries.push(type_hint_entry_for_range(
                                 program,
+                                source_index,
                                 statement.expr,
                                 statement.line,
                                 *start,
@@ -32025,11 +35784,12 @@ fn collect_statement_type_hints(
         }
         collect_statement_type_hints(
             program,
+            source_index,
             &statement.children,
             expr_types,
-            function_type_table,
-            source_payload_shape_table,
+            metadata,
             name_bindings,
+            statement_hint_types,
             entries,
         );
     }
@@ -32038,10 +35798,14 @@ fn collect_statement_type_hints(
 fn statement_hint_type(
     program: &ParsedProgram,
     statement: &AstStatement,
-    expr_types: &BTreeMap<usize, Type>,
-    source_payload_shape_table: &[SourcePayloadSyntaxShapeEntry],
+    expr_types: &TypeHintExprIndex<'_>,
+    metadata: &TypeHintMetadataIndex<'_>,
     name_bindings: &BTreeMap<String, Type>,
+    cache: &mut BTreeMap<usize, Type>,
 ) -> Type {
+    if let Some(ty) = cache.get(&statement.id) {
+        return ty.clone();
+    }
     let value_expr = direct_statement_value_expr_id(statement, &program.expressions);
     if !statement.children.is_empty() {
         let mut fields = BTreeMap::new();
@@ -32051,41 +35815,40 @@ fn statement_hint_type(
                 continue;
             };
             let ty = match &child.kind {
-                AstStatementKind::Source { .. } => {
-                    source_statement_value_type(child, source_payload_shape_table)
+                AstStatementKind::Source { .. } => metadata.source_statement_value_type(child),
+                _ => {
+                    statement_hint_type(program, child, expr_types, metadata, name_bindings, cache)
                 }
-                _ => statement_hint_type(
-                    program,
-                    child,
-                    expr_types,
-                    source_payload_shape_table,
-                    name_bindings,
-                ),
             };
             insert_ordered_shape_field(&mut fields, &mut field_order, field, ty);
         }
         if !fields.is_empty() {
-            return Type::Object(ObjectShape {
+            let ty = Type::object(ObjectShape {
                 fields,
                 field_order,
                 open: false,
             });
+            cache.insert(statement.id, ty.clone());
+            return ty;
         }
     }
-    if let Some(ty) = value_expr
+    let ty = if let Some(ty) = value_expr
         .and_then(|expr_id| expr_types.get(&expr_id).cloned())
         .filter(is_specific_type)
         .or_else(|| statement_pipeline_hint_type(program, statement, expr_types, name_bindings))
         .or_else(|| best_statement_expr_type(statement, expr_types))
     {
-        return ty;
-    }
-    statement_field(statement)
-        .and_then(|field| name_bindings.get(&field).cloned())
-        .or_else(|| value_expr.and_then(|expr_id| expr_types.get(&expr_id).cloned()))
-        .unwrap_or_else(|| {
-            Type::Object(object_shape_for_statement(statement, &program.expressions))
-        })
+        ty
+    } else {
+        statement_field(statement)
+            .and_then(|field| name_bindings.get(&field).cloned())
+            .or_else(|| value_expr.and_then(|expr_id| expr_types.get(&expr_id).cloned()))
+            .unwrap_or_else(|| {
+                Type::object(object_shape_for_statement(statement, &program.expressions))
+            })
+    };
+    cache.insert(statement.id, ty.clone());
+    ty
 }
 
 fn checked_source_expression_flow_types(
@@ -32169,7 +35932,7 @@ fn source_statement_value_type(
     match &statement.kind {
         AstStatementKind::Source {
             event: Some(event), ..
-        } => Type::Object(ObjectShape::from_ordered_fields(
+        } => Type::object(ObjectShape::from_ordered_fields(
             [(event.clone(), payload)],
             false,
         )),
@@ -32188,7 +35951,7 @@ fn is_specific_type(ty: &Type) -> bool {
 
 fn best_statement_expr_type(
     statement: &AstStatement,
-    expr_types: &BTreeMap<usize, Type>,
+    expr_types: &TypeHintExprIndex<'_>,
 ) -> Option<Type> {
     statement_expr_ids(statement)
         .into_iter()
@@ -32200,7 +35963,7 @@ fn best_statement_expr_type(
 fn statement_pipeline_hint_type(
     program: &ParsedProgram,
     statement: &AstStatement,
-    expr_types: &BTreeMap<usize, Type>,
+    expr_types: &TypeHintExprIndex<'_>,
     name_bindings: &BTreeMap<String, Type>,
 ) -> Option<Type> {
     let expr_ids = statement_expression_child_expr_ids(statement);
@@ -32293,7 +36056,7 @@ fn statement_expression_child_expr_ids(statement: &AstStatement) -> Vec<usize> {
 fn hint_type_for_expr_id(
     program: &ParsedProgram,
     expr_id: usize,
-    expr_types: &BTreeMap<usize, Type>,
+    expr_types: &TypeHintExprIndex<'_>,
     name_bindings: &BTreeMap<String, Type>,
 ) -> Option<Type> {
     expr_types
@@ -32387,11 +36150,11 @@ fn signature_type_compact_label(ty: &Type) -> String {
 }
 
 fn function_name_range(
-    program: &ParsedProgram,
+    source_index: &TypeHintSourceIndex<'_>,
     statement: &AstStatement,
     name: &str,
 ) -> Option<(usize, usize)> {
-    let (line_start, line_text) = source_line_with_start(&program.source, statement.line)?;
+    let (line_start, line_text) = source_index.line_with_start(statement.line)?;
     let keyword = line_text.find("FUNCTION")?;
     let name_search_start = keyword + "FUNCTION".len();
     let name_offset = line_text.get(name_search_start..)?.find(name)?;
@@ -32406,42 +36169,19 @@ fn function_arg_ranges(parameters: &[AstParameter]) -> Vec<Option<(usize, usize)
         .collect()
 }
 
-fn statement_by_id(statements: &[AstStatement], id: usize) -> Option<&AstStatement> {
-    for statement in statements {
-        if statement.id == id {
-            return Some(statement);
-        }
-        if let Some(found) = statement_by_id(&statement.children, id) {
-            return Some(found);
-        }
-    }
-    None
-}
-
-fn call_arg_name_range(program: &ParsedProgram, arg: &AstCallArg) -> Option<(usize, usize, usize)> {
+fn call_arg_name_range(
+    source_index: &TypeHintSourceIndex<'_>,
+    arg: &AstCallArg,
+) -> Option<(usize, usize, usize)> {
     let name = arg.named_name()?;
-    let line = line_for_byte(&program.source, arg.start);
-    let (line_start, line_text) = source_line_with_start(&program.source, line)?;
+    let line = source_index.line_for_byte(arg.start);
+    let (line_start, line_text) = source_index.line_with_start(line)?;
     let search_start = arg.start.saturating_sub(line_start).min(line_text.len());
     let search_end = arg.end.saturating_sub(line_start).min(line_text.len());
     let range_text = line_text.get(search_start..search_end)?;
     let name_offset = range_text.find(name)?;
     let start = line_start + search_start + name_offset;
     Some((line, start, start + name.len()))
-}
-
-fn source_line_with_start(source: &str, line: usize) -> Option<(usize, &str)> {
-    let start = source
-        .split_inclusive('\n')
-        .take(line.saturating_sub(1))
-        .map(str::len)
-        .sum::<usize>();
-    if start > source.len() {
-        return None;
-    }
-    let rest = source.get(start..)?;
-    let len = rest.find('\n').map(|index| index + 1).unwrap_or(rest.len());
-    Some((start, &rest[..len]))
 }
 
 fn line_for_byte(source: &str, byte: usize) -> usize {
@@ -32455,20 +36195,6 @@ fn line_for_byte(source: &str, byte: usize) -> usize {
         line += 1;
     }
     line
-}
-
-fn byte_column_for_line(source: &str, line: usize, byte: usize) -> usize {
-    let line_start = source
-        .split_inclusive('\n')
-        .take(line.saturating_sub(1))
-        .map(str::len)
-        .sum::<usize>();
-    source
-        .get(line_start..byte.min(source.len()))
-        .unwrap_or_default()
-        .chars()
-        .count()
-        .saturating_add(1)
 }
 
 fn collect_payload_pattern_fields(
@@ -32577,7 +36303,8 @@ fn source_payload_tag_selector_type(
                                 .collect(),
                             field_order: fields.clone(),
                             open: false,
-                        },
+                        }
+                        .into(),
                     }
                 });
             }
@@ -33145,11 +36872,11 @@ fn expr_is_skip(expr: &AstExpr) -> bool {
 }
 
 fn open_object_type() -> Type {
-    Type::Object(ObjectShape::new(BTreeMap::new(), true))
+    Type::object(ObjectShape::new(BTreeMap::new(), true))
 }
 
 fn embedded_program_source_units_type() -> Type {
-    Type::List(Box::new(Type::Object(ObjectShape::from_ordered_fields(
+    Type::List(Box::new(Type::object(ObjectShape::from_ordered_fields(
         [
             ("path".to_owned(), Type::Text),
             ("source".to_owned(), Type::Text),
@@ -33159,7 +36886,7 @@ fn embedded_program_source_units_type() -> Type {
 }
 
 fn exact_empty_object_type() -> Type {
-    Type::Object(ObjectShape::new(BTreeMap::new(), false))
+    Type::object(ObjectShape::new(BTreeMap::new(), false))
 }
 
 fn unresolved_shape(reason: impl Into<String>) -> Type {
@@ -33169,14 +36896,7 @@ fn unresolved_shape(reason: impl Into<String>) -> Type {
 }
 
 fn is_open_object_type(ty: &Type) -> bool {
-    matches!(
-        ty,
-        Type::Object(ObjectShape {
-            fields,
-            open: true,
-            ..
-        }) if fields.is_empty()
-    )
+    matches!(ty, Type::Object(shape) if shape.open && shape.fields.is_empty())
 }
 
 fn collect_type_vars(ty: &Type, vars: &mut BTreeSet<TypeVar>) {

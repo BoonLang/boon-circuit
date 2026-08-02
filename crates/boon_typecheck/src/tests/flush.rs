@@ -3,10 +3,8 @@ fn closed_tag(name: &str) -> Type {
 }
 
 fn closed_record(fields: impl IntoIterator<Item = (&'static str, Type)>) -> Type {
-    Type::Object(ObjectShape::from_ordered_fields(
-        fields
-            .into_iter()
-            .map(|(name, ty)| (name.to_owned(), ty)),
+    Type::object(ObjectShape::from_ordered_fields(
+        fields.into_iter().map(|(name, ty)| (name.to_owned(), ty)),
         false,
     ))
 }
@@ -100,11 +98,8 @@ fn resolved_structural_assignability_preserves_authority_and_narrowing() {
         Variant::Tag("True".to_owned()),
     ]);
     let false_only = closed_tag("False");
-    let authority = closed_record([
-        ("completed", truth.clone()),
-        ("title", Type::Text),
-    ]);
-    let narrower = Type::Object(ObjectShape::from_ordered_fields(
+    let authority = closed_record([("completed", truth.clone()), ("title", Type::Text)]);
+    let narrower = Type::object(ObjectShape::from_ordered_fields(
         [
             ("completed".to_owned(), false_only.clone()),
             ("title".to_owned(), Type::Text),
@@ -118,7 +113,7 @@ fn resolved_structural_assignability_preserves_authority_and_narrowing() {
     assert!(resolved_type_is_assignable_to(&narrower, &authority));
     assert!(!resolved_type_is_assignable_to(&authority, &narrower));
     assert!(!resolved_type_is_assignable_to(
-        &Type::Object(ObjectShape::from_ordered_fields([], true)),
+        &Type::object(ObjectShape::from_ordered_fields([], true)),
         &authority,
     ));
 }

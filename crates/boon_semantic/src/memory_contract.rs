@@ -3136,7 +3136,7 @@ mod tests {
     }
 
     fn record_coverage_fixture() -> (Vec<SemanticMemoryV1>, DrainUse, DrainUse) {
-        let record_type = Type::Object(boon_typecheck::ObjectShape {
+        let record_type = Type::object(boon_typecheck::ObjectShape {
             fields: BTreeMap::from([
                 ("density".to_owned(), Type::Number),
                 ("theme".to_owned(), Type::Number),

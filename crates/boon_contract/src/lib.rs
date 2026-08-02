@@ -5,6 +5,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
+use std::io::{self, Write};
 use std::str::FromStr;
 
 pub const SOURCE_BUNDLE_DIGEST_V1_DOMAIN: &[u8] = b"boon.source-bundle.v1\0";
@@ -31,6 +32,95 @@ pub fn canonical_serde_hash_v1<T: Serialize + ?Sized>(
     value: &T,
 ) -> Result<[u8; 32], CanonicalEncodingError> {
     canonical_serde_hash_v1_with_buffer(domain, value, &mut Vec::new())
+}
+
+/// Canonically hashes a potentially large value without materializing its
+/// encoded CBOR payload.
+///
+/// The V1 digest commits the encoded byte length before the bytes themselves,
+/// so a deterministic counting pass is followed by a hashing pass. Both use
+/// the same `ciborium` serializer as [`canonical_serde_hash_v1`], preserving
+/// the exact digest contract while bounding auxiliary memory.
+pub fn canonical_serde_hash_v1_streaming<T: Serialize + ?Sized>(
+    domain: &[u8],
+    value: &T,
+) -> Result<[u8; 32], CanonicalEncodingError> {
+    canonical_serde_hashes_v1_streaming([domain], value).map(|[digest]| digest)
+}
+
+/// Streaming counterpart to [`canonical_serde_hashes_v1_with_buffer`].
+/// Serialization is counted once and streamed once regardless of domain count.
+pub fn canonical_serde_hashes_v1_streaming<const N: usize, T: Serialize + ?Sized>(
+    domains: [&[u8]; N],
+    value: &T,
+) -> Result<[[u8; 32]; N], CanonicalEncodingError> {
+    let mut counter = CanonicalLengthWriter::default();
+    ciborium::ser::into_writer(value, &mut counter)
+        .map_err(|error| CanonicalEncodingError::new(error.to_string()))?;
+
+    let mut hashers = domains.map(|domain| {
+        let mut hasher = Sha256::new();
+        hasher.update(domain);
+        hasher.update(counter.length.to_be_bytes());
+        hasher
+    });
+    let mut writer = CanonicalHashesWriter {
+        hashers: &mut hashers,
+        length: 0,
+    };
+    ciborium::ser::into_writer(value, &mut writer)
+        .map_err(|error| CanonicalEncodingError::new(error.to_string()))?;
+    if writer.length != counter.length {
+        return Err(CanonicalEncodingError::new(
+            "canonical streaming serialization changed length between passes",
+        ));
+    }
+    Ok(hashers.map(|hasher| hasher.finalize().into()))
+}
+
+#[derive(Default)]
+struct CanonicalLengthWriter {
+    length: u64,
+}
+
+impl Write for CanonicalLengthWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let length = u64::try_from(bytes.len())
+            .map_err(|_| io::Error::other("canonical payload chunk exceeds u64"))?;
+        self.length = self
+            .length
+            .checked_add(length)
+            .ok_or_else(|| io::Error::other("canonical payload exceeds u64"))?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+struct CanonicalHashesWriter<'a, const N: usize> {
+    hashers: &'a mut [Sha256; N],
+    length: u64,
+}
+
+impl<const N: usize> Write for CanonicalHashesWriter<'_, N> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let length = u64::try_from(bytes.len())
+            .map_err(|_| io::Error::other("canonical payload chunk exceeds u64"))?;
+        self.length = self
+            .length
+            .checked_add(length)
+            .ok_or_else(|| io::Error::other("canonical payload exceeds u64"))?;
+        for hasher in self.hashers.iter_mut() {
+            hasher.update(bytes);
+        }
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Canonically hashes `value` while reusing caller-owned encoding storage.
@@ -516,12 +606,23 @@ mod tests {
             canonical_serde_hash_v1_with_buffer(b"first-domain\0", &value, &mut scratch).unwrap(),
             "caller-owned encoding storage must not change canonical hashes"
         );
+        assert_eq!(
+            canonical_serde_hash_v1(b"first-domain\0", &value).unwrap(),
+            canonical_serde_hash_v1_streaming(b"first-domain\0", &value).unwrap(),
+            "streaming canonical hashing must preserve exact V1 bytes"
+        );
         let [first_domain, second_domain] = canonical_serde_hashes_v1_with_buffer(
             [b"first-domain\0", b"second-domain\0"],
             &value,
             &mut scratch,
         )
         .unwrap();
+        assert_eq!(
+            [first_domain, second_domain],
+            canonical_serde_hashes_v1_streaming([b"first-domain\0", b"second-domain\0"], &value,)
+                .unwrap(),
+            "multi-domain streaming must preserve exact V1 bytes"
+        );
         assert_eq!(
             first_domain,
             canonical_serde_hash_v1(b"first-domain\0", &value).unwrap()

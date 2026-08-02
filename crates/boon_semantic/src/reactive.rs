@@ -606,6 +606,20 @@ pub(crate) fn build_semantic_reactive_graph_from_validated_inputs(
     out_net: &ResolvedOutGraph,
     external_event_identities: &[CheckedExternalDeclarationIdentityV1],
 ) -> Result<SemanticReactiveGraphV1, SemanticReactiveError> {
+    let trace_reactive = std::env::var_os("BOON_SEMANTIC_TRACE").is_some();
+    macro_rules! reactive_phase {
+        ($name:literal, $expression:expr) => {{
+            let started = trace_reactive.then(std::time::Instant::now);
+            let result = $expression;
+            if let Some(started) = started {
+                eprintln!(
+                    concat!("boon_semantic reactive ", $name, " elapsed_ms={:.3}"),
+                    started.elapsed().as_secs_f64() * 1000.0,
+                );
+            }
+            result
+        }};
+    }
     let external_event_identities = external_event_identities
         .iter()
         .copied()
@@ -640,9 +654,15 @@ pub(crate) fn build_semantic_reactive_graph_from_validated_inputs(
             )));
         }
     }
-    let graph =
-        ReactiveBuilder::new(execution, resources, out_net, external_event_identities)?.build()?;
-    validate_semantic_reactive_shape(&graph, execution, resources)?;
+    let builder = reactive_phase!(
+        "index_inputs",
+        ReactiveBuilder::new(execution, resources, out_net, external_event_identities)
+    )?;
+    let graph = reactive_phase!("derive_graph", builder.build())?;
+    reactive_phase!(
+        "validate_shape",
+        validate_semantic_reactive_shape(&graph, execution, resources)
+    )?;
     Ok(graph)
 }
 
@@ -765,6 +785,214 @@ struct RawPulseTransition {
     output: SemanticExprId,
     start_then: Option<SemanticExprId>,
     start_expression: Option<SemanticExprId>,
+}
+
+/// Dense reverse edges for the two reachability relations used by reactive
+/// ownership. Structural reachability follows only normalized expression
+/// children. Value reachability additionally follows canonical/local reads and
+/// producer-function parameter inputs to their exact semantic producers.
+///
+/// Building these edges once avoids restarting a graph walk for every
+/// (runtime root, host effect) and (state arm, host effect) pair.
+struct ReactiveReachabilityIndex {
+    structural_parents: Vec<Vec<SemanticExprId>>,
+    value_parents: Vec<Vec<SemanticExprId>>,
+}
+
+struct DenseExpressionSet {
+    members: Vec<bool>,
+}
+
+impl DenseExpressionSet {
+    fn contains(&self, expression: SemanticExprId) -> bool {
+        self.members
+            .get(expression.as_usize())
+            .copied()
+            .unwrap_or(false)
+    }
+}
+
+impl ReactiveReachabilityIndex {
+    fn build(
+        builder: &ReactiveBuilder<'_>,
+        bindings: &[SemanticBindingV1],
+        reads: &[SemanticReadBindingV1],
+    ) -> Result<Self, SemanticReactiveError> {
+        let expression_count = builder.execution.expressions.len();
+        let mut structural_parents = vec![Vec::new(); expression_count];
+        let mut value_parents = vec![Vec::new(); expression_count];
+        let mut reads_by_expression = vec![None; expression_count];
+        for read in reads {
+            let slot = reads_by_expression
+                .get_mut(read.expression.as_usize())
+                .ok_or_else(|| {
+                    SemanticReactiveError::new(format!(
+                        "semantic reachability read {} references out-of-range expression {}",
+                        read.id, read.expression
+                    ))
+                })?;
+            if slot.replace(read).is_some() {
+                return Err(SemanticReactiveError::new(format!(
+                    "semantic reachability expression {} has multiple read identities",
+                    read.expression
+                )));
+            }
+        }
+
+        for (index, expression) in builder.execution.expressions.iter().enumerate() {
+            if expression.id.as_usize() != index {
+                return Err(SemanticReactiveError::new(format!(
+                    "semantic reachability expected dense expression {index}, found {}",
+                    expression.id
+                )));
+            }
+            let structural_children =
+                semantic_expression_children(&expression.kind, builder.execution)?;
+            Self::insert_reverse_edges(
+                builder.execution,
+                &mut structural_parents,
+                expression.id,
+                structural_children.iter().copied(),
+                "structural",
+            )?;
+
+            match &expression.kind {
+                SemanticExpressionKind::CanonicalRead { target, .. } => {
+                    let binding = match reads_by_expression[index].map(|read| &read.target) {
+                        Some(
+                            SemanticReadTargetV1::Binding { binding, .. }
+                            | SemanticReadTargetV1::SourcePayload { binding, .. }
+                            | SemanticReadTargetV1::StateProjection { binding, .. },
+                        ) => bindings
+                            .get(binding.as_usize())
+                            .filter(|candidate| candidate.id == *binding)
+                            .ok_or_else(|| {
+                                SemanticReactiveError::new(format!(
+                                    "semantic reachability read {} references missing binding {binding}",
+                                    expression.id
+                                ))
+                            })?,
+                        Some(other) => {
+                            return Err(SemanticReactiveError::new(format!(
+                                "semantic canonical read {} has non-binding target {other:?}",
+                                expression.id
+                            )));
+                        }
+                        None => builder.resolve_decl_binding(*target, expression, bindings)?,
+                    };
+                    Self::insert_reverse_edges(
+                        builder.execution,
+                        &mut value_parents,
+                        expression.id,
+                        std::iter::once(binding.producer),
+                        "value",
+                    )?;
+                }
+                SemanticExpressionKind::LocalRead { binding, .. } => {
+                    let (_, producer) =
+                        builder.local_values.get(binding).copied().ok_or_else(|| {
+                            SemanticReactiveError::new(format!(
+                                "semantic reachability local read {} references missing binding {binding}",
+                                expression.id
+                            ))
+                        })?;
+                    Self::insert_reverse_edges(
+                        builder.execution,
+                        &mut value_parents,
+                        expression.id,
+                        std::iter::once(producer),
+                        "value",
+                    )?;
+                }
+                SemanticExpressionKind::FunctionParameter { .. } => {
+                    if let Some(inputs) = builder.parameter_inputs.get(&expression.id) {
+                        Self::insert_reverse_edges(
+                            builder.execution,
+                            &mut value_parents,
+                            expression.id,
+                            inputs.iter().copied(),
+                            "value",
+                        )?;
+                    } else {
+                        // Shared ordinary callable definitions retain parameter
+                        // expressions for diagnostics, but are not concrete
+                        // producer-function instances and therefore have no
+                        // value edge until a contextual occurrence exists.
+                    }
+                }
+                _ => Self::insert_reverse_edges(
+                    builder.execution,
+                    &mut value_parents,
+                    expression.id,
+                    structural_children.into_iter(),
+                    "value",
+                )?,
+            }
+        }
+        for parents in structural_parents.iter_mut().chain(&mut value_parents) {
+            parents.sort_unstable();
+            parents.dedup();
+        }
+        Ok(Self {
+            structural_parents,
+            value_parents,
+        })
+    }
+
+    fn insert_reverse_edges(
+        execution: &SemanticExecutionGraphV1,
+        parents: &mut [Vec<SemanticExprId>],
+        expression: SemanticExprId,
+        children: impl IntoIterator<Item = SemanticExprId>,
+        relation: &str,
+    ) -> Result<(), SemanticReactiveError> {
+        for child in children {
+            execution.expression(child).map_err(|error| {
+                SemanticReactiveError::new(format!(
+                    "semantic {relation} reachability expression {expression} references invalid child {child}: {error}"
+                ))
+            })?;
+            parents[child.as_usize()].push(expression);
+        }
+        Ok(())
+    }
+
+    fn structural_roots_reaching(
+        &self,
+        target: SemanticExprId,
+    ) -> Result<DenseExpressionSet, SemanticReactiveError> {
+        Self::roots_reaching(&self.structural_parents, target, "structural")
+    }
+
+    fn value_roots_reaching(
+        &self,
+        target: SemanticExprId,
+    ) -> Result<DenseExpressionSet, SemanticReactiveError> {
+        Self::roots_reaching(&self.value_parents, target, "value")
+    }
+
+    fn roots_reaching(
+        parents: &[Vec<SemanticExprId>],
+        target: SemanticExprId,
+        relation: &str,
+    ) -> Result<DenseExpressionSet, SemanticReactiveError> {
+        if target.as_usize() >= parents.len() {
+            return Err(SemanticReactiveError::new(format!(
+                "semantic {relation} reachability target {target} is out of range"
+            )));
+        }
+        let mut members = vec![false; parents.len()];
+        let mut pending = vec![target];
+        while let Some(expression) = pending.pop() {
+            let member = &mut members[expression.as_usize()];
+            if *member {
+                continue;
+            }
+            *member = true;
+            pending.extend(parents[expression.as_usize()].iter().copied());
+        }
+        Ok(DenseExpressionSet { members })
+    }
 }
 
 fn semantic_pulse_batch_digest_v1(
@@ -1305,12 +1533,33 @@ impl<'a> ReactiveBuilder<'a> {
     }
 
     fn build(self) -> Result<SemanticReactiveGraphV1, SemanticReactiveError> {
-        let producer_instances = self.build_producer_instances()?;
-        let fields = self.build_fields()?;
-        let bindings = self.build_bindings(&fields)?;
-        let reads = self.build_reads(&bindings)?;
-        let mut raw_pulse_batches = self.build_raw_pulse_batches()?;
-        let (activations, activation_ids) = self.build_activation_sites()?;
+        let trace_reactive = std::env::var_os("BOON_SEMANTIC_TRACE").is_some();
+        macro_rules! reactive_phase {
+            ($name:literal, $expression:expr) => {{
+                let started = trace_reactive.then(std::time::Instant::now);
+                let result = $expression;
+                if let Some(started) = started {
+                    eprintln!(
+                        concat!("boon_semantic reactive ", $name, " elapsed_ms={:.3}"),
+                        started.elapsed().as_secs_f64() * 1000.0,
+                    );
+                }
+                result
+            }};
+        }
+        let producer_instances =
+            reactive_phase!("producer_instances", self.build_producer_instances())?;
+        let fields = reactive_phase!("fields", self.build_fields())?;
+        let bindings = reactive_phase!("bindings", self.build_bindings(&fields))?;
+        let reads = reactive_phase!("reads", self.build_reads(&bindings))?;
+        let reachability = reactive_phase!(
+            "reachability_index",
+            ReactiveReachabilityIndex::build(&self, &bindings, &reads)
+        )?;
+        let mut raw_pulse_batches =
+            reactive_phase!("raw_pulse_batches", self.build_raw_pulse_batches())?;
+        let (activations, activation_ids) =
+            reactive_phase!("activation_sites", self.build_activation_sites())?;
         let pulse_by_expression = raw_pulse_batches
             .iter()
             .map(|batch| (batch.call_expression, batch.id))
@@ -1329,52 +1578,75 @@ impl<'a> ReactiveBuilder<'a> {
             .flat_map(|batch| [batch.enclosing_then, batch.start_then])
             .flatten()
             .collect::<BTreeSet<_>>();
-        let mut triggers = TriggerResolver::new(
-            self.execution,
-            self.resources,
-            self.out_net,
-            &bindings,
-            &self.local_values,
-            &self.parameter_inputs,
-            &pulse_by_expression,
-            &pulse_states,
-            &pulse_activation_expressions,
-            &self.external_event_identities,
+        let mut triggers = reactive_phase!(
+            "trigger_index",
+            TriggerResolver::new(
+                self.execution,
+                self.resources,
+                self.out_net,
+                &bindings,
+                &self.local_values,
+                &self.parameter_inputs,
+                &pulse_by_expression,
+                &pulse_states,
+                &pulse_activation_expressions,
+                &self.external_event_identities,
+            )
         )?;
 
         let mut raw_pulse_starts = BTreeMap::<SemanticPulseBatchId, Vec<RawTriggerArm>>::new();
-        for batch in &raw_pulse_batches {
-            let start_expression = match (batch.start_expression, batch.enclosing_then) {
-                (Some(start_expression), _) => start_expression,
-                (None, Some(then_expression)) => activations
-                    .iter()
-                    .find(|activation| activation.then_expression == then_expression)
-                    .map(|activation| activation.input_expression)
-                    .ok_or_else(|| {
-                        SemanticReactiveError::new(format!(
-                            "semantic pulse batch {} lost activation input {}",
-                            batch.id, then_expression
-                        ))
-                    })?,
-                (None, None) => batch.count_expression,
-            };
-            raw_pulse_starts.insert(
-                batch.id,
-                triggers.trigger_arms_for_expression(start_expression)?,
-            );
-        }
+        reactive_phase!("pulse_starts", {
+            for batch in &raw_pulse_batches {
+                let start_expression = match (batch.start_expression, batch.enclosing_then) {
+                    (Some(start_expression), _) => start_expression,
+                    (None, Some(then_expression)) => activations
+                        .iter()
+                        .find(|activation| activation.then_expression == then_expression)
+                        .map(|activation| activation.input_expression)
+                        .ok_or_else(|| {
+                            SemanticReactiveError::new(format!(
+                                "semantic pulse batch {} lost activation input {}",
+                                batch.id, then_expression
+                            ))
+                        })?,
+                    (None, None) => batch.count_expression,
+                };
+                raw_pulse_starts.insert(
+                    batch.id,
+                    triggers.trigger_arms_for_expression(start_expression)?,
+                );
+            }
+            Ok::<(), SemanticReactiveError>(())
+        })?;
 
-        let raw_state_arms = self.build_state_update_arms(&mut triggers)?;
-        let mut raw_mutations = self.build_list_mutations(&bindings, &reads, &mut triggers)?;
-        self.bind_pulse_list_mutations(&raw_pulse_batches, &mut raw_mutations, &mut triggers)?;
-        let mut raw_derived = self.build_raw_derived_values(&fields, &bindings, &mut triggers)?;
-        self.bind_pulse_emission_derived_values(
-            &mut raw_pulse_batches,
-            &mut raw_derived,
-            &mut triggers,
+        let raw_state_arms = reactive_phase!(
+            "state_update_arms",
+            self.build_state_update_arms(&mut triggers)
         )?;
-        let raw_call_invocations =
-            self.build_call_invocation_schedules(&bindings, &mut triggers)?;
+        let mut raw_mutations = reactive_phase!(
+            "list_mutations",
+            self.build_list_mutations(&bindings, &reads, &mut triggers)
+        )?;
+        reactive_phase!(
+            "bind_pulse_list_mutations",
+            self.bind_pulse_list_mutations(&raw_pulse_batches, &mut raw_mutations, &mut triggers,)
+        )?;
+        let mut raw_derived = reactive_phase!(
+            "derived_values",
+            self.build_raw_derived_values(&fields, &bindings, &mut triggers)
+        )?;
+        reactive_phase!(
+            "bind_pulse_derived_values",
+            self.bind_pulse_emission_derived_values(
+                &mut raw_pulse_batches,
+                &mut raw_derived,
+                &mut triggers,
+            )
+        )?;
+        let raw_call_invocations = reactive_phase!(
+            "call_invocations",
+            self.build_call_invocation_schedules(&bindings, &mut triggers)
+        )?;
 
         let trigger_keys = raw_state_arms
             .iter()
@@ -1532,36 +1804,53 @@ impl<'a> ReactiveBuilder<'a> {
             })
             .collect::<Result<Vec<_>, SemanticReactiveError>>()?;
 
-        let dependencies =
-            self.build_dependencies(&state_update_arms, &trigger_arms, &pulse_states)?;
-        let possible_causes = self.build_possible_causes(&state_update_arms, &trigger_arms)?;
-        let host_effect_schedules = self.build_host_effect_schedules(
-            &fields,
-            &bindings,
-            &derived_values,
-            &state_update_arms,
-            &trigger_arms,
+        let dependencies = reactive_phase!(
+            "dependencies",
+            self.build_dependencies(&state_update_arms, &trigger_arms, &pulse_states)
         )?;
-        let dependency_uses = self.build_dependency_uses(&bindings, &reads, &mut triggers)?;
-        let output_values = self.build_output_values(&fields)?;
-        let view_captures = self.build_view_captures(
-            &output_values,
-            &fields,
-            &bindings,
-            &reads,
-            &mut triggers,
-            &pulse_states,
+        let possible_causes = reactive_phase!(
+            "possible_causes",
+            self.build_possible_causes(&state_update_arms, &trigger_arms)
         )?;
-        let migration_inputs = self.build_migration_inputs()?;
-        let pulse_batches = self.finish_pulse_batches(
-            raw_pulse_batches,
-            &activation_ids,
-            &pulse_starts,
-            &trigger_arms,
-            &state_update_arms,
-            &list_mutations,
-            &derived_values,
-            &host_effect_schedules,
+        let host_effect_schedules = reactive_phase!(
+            "host_effect_schedules",
+            self.build_host_effect_schedules(
+                &fields,
+                &derived_values,
+                &state_update_arms,
+                &trigger_arms,
+                &reachability,
+            )
+        )?;
+        let dependency_uses = reactive_phase!(
+            "dependency_uses",
+            self.build_dependency_uses(&bindings, &reads, &mut triggers)
+        )?;
+        let output_values = reactive_phase!("output_values", self.build_output_values(&fields))?;
+        let view_captures = reactive_phase!(
+            "view_captures",
+            self.build_view_captures(
+                &output_values,
+                &fields,
+                &bindings,
+                &reads,
+                &mut triggers,
+                &pulse_states,
+            )
+        )?;
+        let migration_inputs = reactive_phase!("migration_inputs", self.build_migration_inputs())?;
+        let pulse_batches = reactive_phase!(
+            "finish_pulse_batches",
+            self.finish_pulse_batches(
+                raw_pulse_batches,
+                &activation_ids,
+                &pulse_starts,
+                &trigger_arms,
+                &state_update_arms,
+                &list_mutations,
+                &derived_values,
+                &host_effect_schedules,
+            )
         )?;
 
         Ok(SemanticReactiveGraphV1 {
@@ -3263,10 +3552,10 @@ impl<'a> ReactiveBuilder<'a> {
     fn build_host_effect_schedules(
         &self,
         fields: &[SemanticFieldV1],
-        bindings: &[SemanticBindingV1],
         derived_values: &[SemanticDerivedValueV1],
         state_arms: &[SemanticStateUpdateArmV1],
         triggers: &[SemanticTriggerOwnedArmV1],
+        reachability: &ReactiveReachabilityIndex,
     ) -> Result<Vec<SemanticHostEffectScheduleV1>, SemanticReactiveError> {
         let mut schedules = Vec::new();
         let runtime_roots = self
@@ -3297,24 +3586,20 @@ impl<'a> ReactiveBuilder<'a> {
             if !boon_typecheck::is_typed_host_effect(function) {
                 continue;
             }
-            let mut runtime_reachable = false;
-            for root in &runtime_roots {
-                if self.expression_value_reaches(*root, expression.id, bindings)? {
-                    runtime_reachable = true;
-                    break;
-                }
-            }
-            if !runtime_reachable {
+            let value_roots = reachability.value_roots_reaching(expression.id)?;
+            if !runtime_roots.iter().any(|root| value_roots.contains(*root)) {
                 continue;
             }
-            let mut transient_results = Vec::new();
-            for derived in derived_values.iter().filter(|derived| {
-                derived.state_backing.is_none() && !derived.trigger_arms.is_empty()
-            }) {
-                if self.expression_reaches(derived.producer, expression.id)? {
-                    transient_results.push(derived.id);
-                }
-            }
+            let structural_roots = reachability.structural_roots_reaching(expression.id)?;
+            let transient_results = derived_values
+                .iter()
+                .filter(|derived| {
+                    derived.state_backing.is_none()
+                        && !derived.trigger_arms.is_empty()
+                        && structural_roots.contains(derived.producer)
+                })
+                .map(|derived| derived.id)
+                .collect::<Vec<_>>();
             let transient_result = match transient_results.as_slice() {
                 [derived] => {
                     let derived = derived_values
@@ -3359,11 +3644,7 @@ impl<'a> ReactiveBuilder<'a> {
             let mut candidates = Vec::new();
             for arm in state_arms {
                 let trigger = require_trigger(triggers, arm.trigger)?;
-                let reaches = self.expression_value_reaches(
-                    trigger.output_expression,
-                    expression.id,
-                    bindings,
-                )?;
+                let reaches = value_roots.contains(trigger.output_expression);
                 candidates.push((
                     arm.id,
                     arm.state,
@@ -3771,56 +4052,6 @@ impl<'a> ReactiveBuilder<'a> {
         target: SemanticExprId,
     ) -> Result<bool, SemanticReactiveError> {
         Ok(self.reachable_expressions(root)?.contains(&target))
-    }
-
-    fn expression_value_reaches(
-        &self,
-        root: SemanticExprId,
-        target: SemanticExprId,
-        bindings: &[SemanticBindingV1],
-    ) -> Result<bool, SemanticReactiveError> {
-        let mut pending = vec![root];
-        let mut visited = BTreeSet::new();
-        while let Some(id) = pending.pop() {
-            if !visited.insert(id) {
-                continue;
-            }
-            if id == target {
-                return Ok(true);
-            }
-            let expression = self.execution.expression(id)?;
-            match &expression.kind {
-                SemanticExpressionKind::CanonicalRead {
-                    target: declaration,
-                    ..
-                } => {
-                    let binding = self.resolve_decl_binding(*declaration, expression, bindings)?;
-                    pending.push(binding.producer);
-                }
-                SemanticExpressionKind::LocalRead { binding, .. } => {
-                    let (_, producer) =
-                        self.local_values.get(binding).copied().ok_or_else(|| {
-                            SemanticReactiveError::new(format!(
-                                "semantic value reachability read {id} references missing local binding {binding}"
-                            ))
-                        })?;
-                    pending.push(producer);
-                }
-                SemanticExpressionKind::FunctionParameter { parameter, .. } => {
-                    let inputs = self.parameter_inputs.get(&id).ok_or_else(|| {
-                        SemanticReactiveError::new(format!(
-                            "semantic value reachability parameter expression {id} ({parameter:?}) has no exact producer inputs"
-                        ))
-                    })?;
-                    pending.extend(inputs.iter().copied());
-                }
-                _ => pending.extend(semantic_expression_children(
-                    &expression.kind,
-                    self.execution,
-                )?),
-            }
-        }
-        Ok(false)
     }
 }
 

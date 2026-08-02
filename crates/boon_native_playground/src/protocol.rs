@@ -6,16 +6,17 @@ use std::time::Duration;
 
 use bincode::Options;
 use boon_plan::ProgramRole;
+use boon_typecheck::TypeDisplayNode;
 use serde::{Deserialize, Serialize};
 
-pub use boon_editor::language::SourceUnit;
+pub use boon_editor::language::{LanguageProjectSnapshot, SourceUnit};
 pub use boon_runtime::{
     ApplicationIdentity, MigrationScenario, MigrationSequence, MigrationTestDriver,
     ScenarioExpectation, ScenarioFieldMatch,
 };
 
 const MAGIC: [u8; 4] = *b"BNIP";
-const VERSION: u16 = 15;
+const VERSION: u16 = 16;
 const HEADER_BYTES: usize = MAGIC.len() + 2 + 1;
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const MAX_STRING_BYTES: usize = 8 * 1024 * 1024;
@@ -36,7 +37,13 @@ pub const MAX_PERSISTENCE_OUTBOX_SAMPLES: usize = 16;
 pub const MAX_PERSISTENCE_STATUS_BYTES: usize = 4 * 1024;
 pub const MAX_PERSISTENCE_ARTIFACT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_AUTHORITY_PATH_BYTES: usize = 1024;
-const LAST_MESSAGE_TAG: u8 = 26;
+const MAX_LANGUAGE_HINTS: usize = 262_144;
+const MAX_LANGUAGE_SEMANTICS: usize = 262_144;
+const MAX_LANGUAGE_DIAGNOSTICS: usize = 65_536;
+const MAX_LANGUAGE_TYPE_DISPLAY_NODES: usize = 65_536;
+const MAX_LANGUAGE_TYPE_DISPLAY_CHILDREN: usize = 4_096;
+const MAX_LANGUAGE_TYPE_DISPLAY_DEPTH: usize = 128;
+const LAST_MESSAGE_TAG: u8 = 27;
 pub const VERIFY_BOUNDED_WINDOWS_ENV: &str = "BOON_VERIFY_BOUNDED_WINDOWS";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -146,6 +153,349 @@ mod migration_scenario_wire {
             return Err(de::Error::custom("migration scenario exceeds byte limit"));
         }
         toml::from_str(&encoded).map_err(de::Error::custom)
+    }
+}
+
+// `TypeDisplayNode` intentionally uses an internally tagged serde shape for
+// human-readable reports. Bincode cannot decode internally tagged enums, so
+// the native IPC boundary projects only that nested tree to an equivalent
+// externally tagged wire enum. The public message still owns the editor DTO,
+// and the conversion preserves every field without a JSON/TOML side encoding.
+mod language_snapshot_wire {
+    use boon_contract::SourceBundleDigestV1;
+    use boon_editor::language::{
+        InspectorHint, LanguageFileIndex, LanguageProjectSnapshot, SemanticDiagnostic, SemanticItem,
+    };
+    use boon_typecheck::{TypeDisplayField, TypeDisplayFunctionArg, TypeDisplayNode};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    #[derive(Serialize)]
+    struct SnapshotRef<'a> {
+        revision: u64,
+        entrypoint: &'a str,
+        source_bundle_digest_v1: SourceBundleDigestV1,
+        files: Vec<FileRef<'a>>,
+        semantics: &'a [SemanticItem],
+        diagnostics: &'a [SemanticDiagnostic],
+        inline_out_hints: bool,
+    }
+
+    #[derive(Serialize)]
+    struct FileRef<'a> {
+        path: &'a str,
+        inspector_hints: Vec<HintRef<'a>>,
+    }
+
+    #[derive(Serialize)]
+    struct HintRef<'a> {
+        line: usize,
+        start: usize,
+        end: usize,
+        anchor_column: usize,
+        category: &'a str,
+        compact_label: &'a str,
+        detail_label: &'a str,
+        display_tree: DisplayNodeRef<'a>,
+    }
+
+    // Variant and field order must remain identical to `DisplayNodeOwned`.
+    // The protocol roundtrip fixture covers every variant.
+    #[derive(Serialize)]
+    enum DisplayNodeRef<'a> {
+        Scalar {
+            label: &'a str,
+        },
+        Object {
+            fields: Vec<DisplayFieldRef<'a>>,
+            open: bool,
+        },
+        TaggedObject {
+            tag: &'a str,
+            fields: Vec<DisplayFieldRef<'a>>,
+            open: bool,
+        },
+        List {
+            item: Box<DisplayNodeRef<'a>>,
+        },
+        Union {
+            variants: Vec<DisplayNodeRef<'a>>,
+        },
+        Function {
+            name: Option<&'a str>,
+            args: Vec<DisplayFunctionArgRef<'a>>,
+            result: Box<DisplayNodeRef<'a>>,
+        },
+        Map {
+            key: Box<DisplayNodeRef<'a>>,
+            value: Box<DisplayNodeRef<'a>>,
+        },
+        Set {
+            item: Box<DisplayNodeRef<'a>>,
+        },
+        Bits {
+            width: u32,
+        },
+    }
+
+    #[derive(Serialize)]
+    struct DisplayFieldRef<'a> {
+        name: &'a str,
+        ty: DisplayNodeRef<'a>,
+    }
+
+    #[derive(Serialize)]
+    struct DisplayFunctionArgRef<'a> {
+        name: Option<&'a str>,
+        ty: DisplayNodeRef<'a>,
+    }
+
+    #[derive(Deserialize)]
+    struct SnapshotOwned {
+        revision: u64,
+        entrypoint: String,
+        source_bundle_digest_v1: SourceBundleDigestV1,
+        files: Vec<FileOwned>,
+        semantics: Vec<SemanticItem>,
+        diagnostics: Vec<SemanticDiagnostic>,
+        inline_out_hints: bool,
+    }
+
+    #[derive(Deserialize)]
+    struct FileOwned {
+        path: String,
+        inspector_hints: Vec<HintOwned>,
+    }
+
+    #[derive(Deserialize)]
+    struct HintOwned {
+        line: usize,
+        start: usize,
+        end: usize,
+        anchor_column: usize,
+        category: String,
+        compact_label: String,
+        detail_label: String,
+        display_tree: DisplayNodeOwned,
+    }
+
+    #[derive(Deserialize)]
+    enum DisplayNodeOwned {
+        Scalar {
+            label: String,
+        },
+        Object {
+            fields: Vec<DisplayFieldOwned>,
+            open: bool,
+        },
+        TaggedObject {
+            tag: String,
+            fields: Vec<DisplayFieldOwned>,
+            open: bool,
+        },
+        List {
+            item: Box<DisplayNodeOwned>,
+        },
+        Union {
+            variants: Vec<DisplayNodeOwned>,
+        },
+        Function {
+            name: Option<String>,
+            args: Vec<DisplayFunctionArgOwned>,
+            result: Box<DisplayNodeOwned>,
+        },
+        Map {
+            key: Box<DisplayNodeOwned>,
+            value: Box<DisplayNodeOwned>,
+        },
+        Set {
+            item: Box<DisplayNodeOwned>,
+        },
+        Bits {
+            width: u32,
+        },
+    }
+
+    #[derive(Deserialize)]
+    struct DisplayFieldOwned {
+        name: String,
+        ty: DisplayNodeOwned,
+    }
+
+    #[derive(Deserialize)]
+    struct DisplayFunctionArgOwned {
+        name: Option<String>,
+        ty: DisplayNodeOwned,
+    }
+
+    pub fn serialize<S>(
+        snapshot: &LanguageProjectSnapshot,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        SnapshotRef {
+            revision: snapshot.revision,
+            entrypoint: &snapshot.entrypoint,
+            source_bundle_digest_v1: snapshot.source_bundle_digest_v1,
+            files: snapshot
+                .files
+                .iter()
+                .map(|file| FileRef {
+                    path: &file.path,
+                    inspector_hints: file
+                        .inspector_hints
+                        .iter()
+                        .map(|hint| HintRef {
+                            line: hint.line,
+                            start: hint.start,
+                            end: hint.end,
+                            anchor_column: hint.anchor_column,
+                            category: &hint.category,
+                            compact_label: &hint.compact_label,
+                            detail_label: &hint.detail_label,
+                            display_tree: display_node_ref(&hint.display_tree),
+                        })
+                        .collect(),
+                })
+                .collect(),
+            semantics: &snapshot.semantics,
+            diagnostics: &snapshot.diagnostics,
+            inline_out_hints: snapshot.inline_out_hints,
+        }
+        .serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<LanguageProjectSnapshot, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let snapshot = SnapshotOwned::deserialize(deserializer)?;
+        Ok(LanguageProjectSnapshot {
+            revision: snapshot.revision,
+            entrypoint: snapshot.entrypoint,
+            source_bundle_digest_v1: snapshot.source_bundle_digest_v1,
+            files: snapshot
+                .files
+                .into_iter()
+                .map(|file| LanguageFileIndex {
+                    path: file.path,
+                    inspector_hints: file
+                        .inspector_hints
+                        .into_iter()
+                        .map(|hint| InspectorHint {
+                            line: hint.line,
+                            start: hint.start,
+                            end: hint.end,
+                            anchor_column: hint.anchor_column,
+                            category: hint.category,
+                            compact_label: hint.compact_label,
+                            detail_label: hint.detail_label,
+                            display_tree: display_node_owned(hint.display_tree),
+                        })
+                        .collect(),
+                })
+                .collect(),
+            semantics: snapshot.semantics,
+            diagnostics: snapshot.diagnostics,
+            inline_out_hints: snapshot.inline_out_hints,
+        })
+    }
+
+    fn display_node_ref(node: &TypeDisplayNode) -> DisplayNodeRef<'_> {
+        match node {
+            TypeDisplayNode::Scalar { label } => DisplayNodeRef::Scalar { label },
+            TypeDisplayNode::Object { fields, open } => DisplayNodeRef::Object {
+                fields: fields.iter().map(display_field_ref).collect(),
+                open: *open,
+            },
+            TypeDisplayNode::TaggedObject { tag, fields, open } => DisplayNodeRef::TaggedObject {
+                tag,
+                fields: fields.iter().map(display_field_ref).collect(),
+                open: *open,
+            },
+            TypeDisplayNode::List { item } => DisplayNodeRef::List {
+                item: Box::new(display_node_ref(item)),
+            },
+            TypeDisplayNode::Union { variants } => DisplayNodeRef::Union {
+                variants: variants.iter().map(display_node_ref).collect(),
+            },
+            TypeDisplayNode::Function { name, args, result } => DisplayNodeRef::Function {
+                name: name.as_deref(),
+                args: args.iter().map(display_function_arg_ref).collect(),
+                result: Box::new(display_node_ref(result)),
+            },
+            TypeDisplayNode::Map { key, value } => DisplayNodeRef::Map {
+                key: Box::new(display_node_ref(key)),
+                value: Box::new(display_node_ref(value)),
+            },
+            TypeDisplayNode::Set { item } => DisplayNodeRef::Set {
+                item: Box::new(display_node_ref(item)),
+            },
+            TypeDisplayNode::Bits { width } => DisplayNodeRef::Bits { width: *width },
+        }
+    }
+
+    fn display_field_ref(field: &TypeDisplayField) -> DisplayFieldRef<'_> {
+        DisplayFieldRef {
+            name: &field.name,
+            ty: display_node_ref(&field.ty),
+        }
+    }
+
+    fn display_function_arg_ref(arg: &TypeDisplayFunctionArg) -> DisplayFunctionArgRef<'_> {
+        DisplayFunctionArgRef {
+            name: arg.name.as_deref(),
+            ty: display_node_ref(&arg.ty),
+        }
+    }
+
+    fn display_node_owned(node: DisplayNodeOwned) -> TypeDisplayNode {
+        match node {
+            DisplayNodeOwned::Scalar { label } => TypeDisplayNode::Scalar { label },
+            DisplayNodeOwned::Object { fields, open } => TypeDisplayNode::Object {
+                fields: fields.into_iter().map(display_field_owned).collect(),
+                open,
+            },
+            DisplayNodeOwned::TaggedObject { tag, fields, open } => TypeDisplayNode::TaggedObject {
+                tag,
+                fields: fields.into_iter().map(display_field_owned).collect(),
+                open,
+            },
+            DisplayNodeOwned::List { item } => TypeDisplayNode::List {
+                item: Box::new(display_node_owned(*item)),
+            },
+            DisplayNodeOwned::Union { variants } => TypeDisplayNode::Union {
+                variants: variants.into_iter().map(display_node_owned).collect(),
+            },
+            DisplayNodeOwned::Function { name, args, result } => TypeDisplayNode::Function {
+                name,
+                args: args.into_iter().map(display_function_arg_owned).collect(),
+                result: Box::new(display_node_owned(*result)),
+            },
+            DisplayNodeOwned::Map { key, value } => TypeDisplayNode::Map {
+                key: Box::new(display_node_owned(*key)),
+                value: Box::new(display_node_owned(*value)),
+            },
+            DisplayNodeOwned::Set { item } => TypeDisplayNode::Set {
+                item: Box::new(display_node_owned(*item)),
+            },
+            DisplayNodeOwned::Bits { width } => TypeDisplayNode::Bits { width },
+        }
+    }
+
+    fn display_field_owned(field: DisplayFieldOwned) -> TypeDisplayField {
+        TypeDisplayField {
+            name: field.name,
+            ty: display_node_owned(field.ty),
+        }
+    }
+
+    fn display_function_arg_owned(arg: DisplayFunctionArgOwned) -> TypeDisplayFunctionArg {
+        TypeDisplayFunctionArg {
+            name: arg.name,
+            ty: display_node_owned(arg.ty),
+        }
     }
 }
 
@@ -797,6 +1147,10 @@ pub enum Message {
         revision: u64,
         artifact: CanonicalStateArtifact,
     },
+    PreviewLanguageSnapshot {
+        #[serde(with = "language_snapshot_wire")]
+        snapshot: LanguageProjectSnapshot,
+    },
     Shutdown,
 }
 
@@ -829,6 +1183,7 @@ impl Message {
             Self::PreviewPersistenceCommand { .. } => 24,
             Self::PreviewPersistenceSnapshot(_) => 25,
             Self::PreviewPersistenceArtifact { .. } => 26,
+            Self::PreviewLanguageSnapshot { .. } => 27,
         }
     }
 
@@ -929,6 +1284,7 @@ impl Message {
             | Self::PreviewPersistenceCommand { command, .. } => command.validate(),
             Self::PreviewPersistenceSnapshot(snapshot) => snapshot.validate(),
             Self::PreviewPersistenceArtifact { artifact, .. } => artifact.validate(),
+            Self::PreviewLanguageSnapshot { snapshot } => validate_language_snapshot(snapshot),
         }
     }
 }
@@ -948,6 +1304,205 @@ fn validate_source_units(
     check_limit(limit_name, units.len(), MAX_SOURCE_UNITS)?;
     for unit in units {
         validate_strings([unit.path.as_str(), unit.source.as_str()])?;
+    }
+    Ok(())
+}
+
+fn validate_language_snapshot(snapshot: &LanguageProjectSnapshot) -> Result<(), ProtocolError> {
+    if snapshot.files.is_empty() {
+        return Err(ProtocolError::InvalidLanguageSnapshot(
+            "language snapshot has no source files".to_owned(),
+        ));
+    }
+    check_limit(
+        "language source file count",
+        snapshot.files.len(),
+        MAX_SOURCE_UNITS,
+    )?;
+    validate_string(&snapshot.entrypoint)?;
+    let entrypoint = boon_contract::normalize_source_path(&snapshot.entrypoint)
+        .map_err(|error| ProtocolError::InvalidLanguageSnapshot(error.to_string()))?;
+    if entrypoint != snapshot.entrypoint {
+        return Err(ProtocolError::InvalidLanguageSnapshot(
+            "language snapshot entrypoint is not canonical".to_owned(),
+        ));
+    }
+
+    let mut paths = std::collections::BTreeSet::new();
+    let mut hint_count = 0usize;
+    for file in &snapshot.files {
+        validate_string(&file.path)?;
+        let path = boon_contract::normalize_source_path(&file.path)
+            .map_err(|error| ProtocolError::InvalidLanguageSnapshot(error.to_string()))?;
+        if path != file.path {
+            return Err(ProtocolError::InvalidLanguageSnapshot(format!(
+                "language source path `{}` is not canonical",
+                file.path
+            )));
+        }
+        if !paths.insert(file.path.as_str()) {
+            return Err(ProtocolError::InvalidLanguageSnapshot(format!(
+                "language source path `{}` is duplicated",
+                file.path
+            )));
+        }
+        hint_count = hint_count.checked_add(file.inspector_hints.len()).ok_or(
+            ProtocolError::LimitExceeded("language hint count", usize::MAX),
+        )?;
+        check_limit("language hint count", hint_count, MAX_LANGUAGE_HINTS)?;
+        for hint in &file.inspector_hints {
+            if hint.start > hint.end {
+                return Err(ProtocolError::InvalidLanguageSnapshot(format!(
+                    "language hint in `{}` has an inverted byte span",
+                    file.path
+                )));
+            }
+            validate_strings([
+                hint.category.as_str(),
+                hint.compact_label.as_str(),
+                hint.detail_label.as_str(),
+            ])?;
+            validate_type_display_node(&hint.display_tree)?;
+        }
+    }
+    if !paths.contains(snapshot.entrypoint.as_str()) {
+        return Err(ProtocolError::InvalidLanguageSnapshot(format!(
+            "language entrypoint `{}` is absent from its file index",
+            snapshot.entrypoint
+        )));
+    }
+
+    check_limit(
+        "language semantic item count",
+        snapshot.semantics.len(),
+        MAX_LANGUAGE_SEMANTICS,
+    )?;
+    for item in &snapshot.semantics {
+        validate_language_location("semantic item", &item.location, snapshot)?;
+        validate_strings([
+            item.name.as_str(),
+            item.label.as_str(),
+            item.detail.as_str(),
+        ])?;
+    }
+    check_limit(
+        "language diagnostic count",
+        snapshot.diagnostics.len(),
+        MAX_LANGUAGE_DIAGNOSTICS,
+    )?;
+    for diagnostic in &snapshot.diagnostics {
+        validate_language_location("diagnostic", &diagnostic.location, snapshot)?;
+        validate_string(&diagnostic.message)?;
+    }
+    Ok(())
+}
+
+fn validate_language_location(
+    kind: &str,
+    location: &boon_editor::language::SourceLocation,
+    snapshot: &LanguageProjectSnapshot,
+) -> Result<(), ProtocolError> {
+    let Some(file) = snapshot.files.get(location.file_index) else {
+        return Err(ProtocolError::InvalidLanguageSnapshot(format!(
+            "{kind} references missing file index {}",
+            location.file_index
+        )));
+    };
+    if location.path != file.path {
+        return Err(ProtocolError::InvalidLanguageSnapshot(format!(
+            "{kind} path `{}` does not match file index {} (`{}`)",
+            location.path, location.file_index, file.path
+        )));
+    }
+    if location.start > location.end {
+        return Err(ProtocolError::InvalidLanguageSnapshot(format!(
+            "{kind} in `{}` has an inverted byte span",
+            location.path
+        )));
+    }
+    Ok(())
+}
+
+fn validate_type_display_node(root: &TypeDisplayNode) -> Result<(), ProtocolError> {
+    let mut stack = vec![(root, 0usize)];
+    let mut node_count = 0usize;
+    while let Some((node, depth)) = stack.pop() {
+        if depth > MAX_LANGUAGE_TYPE_DISPLAY_DEPTH {
+            return Err(ProtocolError::InvalidLanguageSnapshot(
+                "language type display tree exceeds its depth limit".to_owned(),
+            ));
+        }
+        node_count = node_count
+            .checked_add(1)
+            .ok_or(ProtocolError::LimitExceeded(
+                "language type display node count",
+                usize::MAX,
+            ))?;
+        check_limit(
+            "language type display node count",
+            node_count,
+            MAX_LANGUAGE_TYPE_DISPLAY_NODES,
+        )?;
+        let child_depth = depth.saturating_add(1);
+        match node {
+            TypeDisplayNode::Scalar { label } => validate_string(label)?,
+            TypeDisplayNode::Object { fields, .. } => {
+                check_limit(
+                    "language type display child count",
+                    fields.len(),
+                    MAX_LANGUAGE_TYPE_DISPLAY_CHILDREN,
+                )?;
+                for field in fields {
+                    validate_string(&field.name)?;
+                    stack.push((&field.ty, child_depth));
+                }
+            }
+            TypeDisplayNode::TaggedObject { tag, fields, .. } => {
+                validate_string(tag)?;
+                check_limit(
+                    "language type display child count",
+                    fields.len(),
+                    MAX_LANGUAGE_TYPE_DISPLAY_CHILDREN,
+                )?;
+                for field in fields {
+                    validate_string(&field.name)?;
+                    stack.push((&field.ty, child_depth));
+                }
+            }
+            TypeDisplayNode::List { item } | TypeDisplayNode::Set { item } => {
+                stack.push((item.as_ref(), child_depth));
+            }
+            TypeDisplayNode::Union { variants } => {
+                check_limit(
+                    "language type display child count",
+                    variants.len(),
+                    MAX_LANGUAGE_TYPE_DISPLAY_CHILDREN,
+                )?;
+                stack.extend(variants.iter().map(|variant| (variant, child_depth)));
+            }
+            TypeDisplayNode::Function { name, args, result } => {
+                if let Some(name) = name {
+                    validate_string(name)?;
+                }
+                check_limit(
+                    "language type display child count",
+                    args.len(),
+                    MAX_LANGUAGE_TYPE_DISPLAY_CHILDREN,
+                )?;
+                for arg in args {
+                    if let Some(name) = &arg.name {
+                        validate_string(name)?;
+                    }
+                    stack.push((&arg.ty, child_depth));
+                }
+                stack.push((result.as_ref(), child_depth));
+            }
+            TypeDisplayNode::Map { key, value } => {
+                stack.push((key.as_ref(), child_depth));
+                stack.push((value.as_ref(), child_depth));
+            }
+            TypeDisplayNode::Bits { .. } => {}
+        }
     }
     Ok(())
 }
@@ -1136,6 +1691,7 @@ pub enum ProtocolError {
     InvalidPayload(bincode::Error),
     InvalidMigration(String),
     InvalidPersistence(String),
+    InvalidLanguageSnapshot(String),
     LimitExceeded(&'static str, usize),
     TrailingBytes(usize),
 }
@@ -1160,6 +1716,9 @@ impl fmt::Display for ProtocolError {
             }
             Self::InvalidPersistence(message) => {
                 write!(f, "IPC persistence data is invalid: {message}")
+            }
+            Self::InvalidLanguageSnapshot(message) => {
+                write!(f, "IPC language snapshot is invalid: {message}")
             }
             Self::LimitExceeded(name, value) => {
                 write!(f, "IPC {name} exceeds its limit: {value}")
@@ -1293,6 +1852,12 @@ pub fn read_message(reader: &mut impl Read) -> Result<Option<Message>, ProtocolE
 #[cfg(test)]
 mod tests {
     use super::*;
+    use boon_contract::{SourceBundleDigestV1, SourceBundleUnit};
+    use boon_editor::language::{
+        InspectorHint, LanguageFileIndex, SemanticDiagnostic, SemanticItem, SemanticKind,
+        SourceLocation,
+    };
+    use boon_typecheck::{DeclId, DiagnosticSeverity, TypeDisplayField, TypeDisplayFunctionArg};
 
     fn application() -> ApplicationIdentity {
         ApplicationIdentity::new(
@@ -1313,6 +1878,110 @@ mod tests {
                 source: "view: Text[text: value]\n".to_owned(),
             },
         ]
+    }
+
+    fn language_snapshot() -> LanguageProjectSnapshot {
+        let source_units = units();
+        LanguageProjectSnapshot {
+            revision: 19,
+            entrypoint: "examples/main.bn".to_owned(),
+            source_bundle_digest_v1: SourceBundleDigestV1::new(
+                "examples/main.bn",
+                source_units
+                    .iter()
+                    .map(|unit| SourceBundleUnit::new(&unit.path, &unit.source)),
+            )
+            .unwrap(),
+            files: vec![
+                LanguageFileIndex {
+                    path: "examples/main.bn".to_owned(),
+                    inspector_hints: vec![InspectorHint {
+                        line: 0,
+                        start: 0,
+                        end: 5,
+                        anchor_column: 5,
+                        category: "definition".to_owned(),
+                        compact_label: "Number".to_owned(),
+                        detail_label: "Number".to_owned(),
+                        display_tree: language_display_tree(),
+                    }],
+                },
+                LanguageFileIndex {
+                    path: "examples/view.bn".to_owned(),
+                    inspector_hints: Vec::new(),
+                },
+            ],
+            semantics: vec![SemanticItem {
+                target: DeclId(7),
+                kind: SemanticKind::Declaration,
+                location: SourceLocation {
+                    file_index: 0,
+                    path: "examples/main.bn".to_owned(),
+                    line: 0,
+                    start: 0,
+                    end: 5,
+                },
+                name: "value".to_owned(),
+                label: "value value".to_owned(),
+                detail: "Declares value value".to_owned(),
+                out_related: false,
+            }],
+            diagnostics: vec![SemanticDiagnostic {
+                severity: DiagnosticSeverity::Warning,
+                location: SourceLocation {
+                    file_index: 1,
+                    path: "examples/view.bn".to_owned(),
+                    line: 0,
+                    start: 0,
+                    end: 4,
+                },
+                message: "example warning".to_owned(),
+            }],
+            inline_out_hints: false,
+        }
+    }
+
+    fn language_display_tree() -> TypeDisplayNode {
+        let scalar = || TypeDisplayNode::Scalar {
+            label: "Number".to_owned(),
+        };
+        TypeDisplayNode::Union {
+            variants: vec![
+                scalar(),
+                TypeDisplayNode::Object {
+                    fields: vec![TypeDisplayField {
+                        name: "width".to_owned(),
+                        ty: TypeDisplayNode::Bits { width: 32 },
+                    }],
+                    open: false,
+                },
+                TypeDisplayNode::TaggedObject {
+                    tag: "Some".to_owned(),
+                    fields: vec![TypeDisplayField {
+                        name: "value".to_owned(),
+                        ty: TypeDisplayNode::List {
+                            item: Box::new(scalar()),
+                        },
+                    }],
+                    open: true,
+                },
+                TypeDisplayNode::Function {
+                    name: Some("map".to_owned()),
+                    args: vec![TypeDisplayFunctionArg {
+                        name: Some("items".to_owned()),
+                        ty: TypeDisplayNode::Set {
+                            item: Box::new(scalar()),
+                        },
+                    }],
+                    result: Box::new(TypeDisplayNode::Map {
+                        key: Box::new(scalar()),
+                        value: Box::new(TypeDisplayNode::Union {
+                            variants: vec![scalar()],
+                        }),
+                    }),
+                },
+            ],
+        }
     }
 
     fn program_sources() -> Vec<ProgramSource> {
@@ -1531,6 +2200,9 @@ mod tests {
             passed: true,
             message: "counter scenario passed".to_owned(),
         });
+        roundtrip(Message::PreviewLanguageSnapshot {
+            snapshot: language_snapshot(),
+        });
         roundtrip(Message::DevMigrationCommand {
             request_id: 17,
             revision: 19,
@@ -1556,6 +2228,33 @@ mod tests {
             deleted_memory_count: 0,
             message: "candidate settled without mutation".to_owned(),
         }));
+    }
+
+    #[test]
+    fn language_snapshot_validation_rejects_noncanonical_and_mismatched_locations() {
+        let mut noncanonical = language_snapshot();
+        noncanonical.entrypoint = "./examples/main.bn".to_owned();
+        assert!(matches!(
+            write_message(
+                &mut Vec::new(),
+                &Message::PreviewLanguageSnapshot {
+                    snapshot: noncanonical,
+                },
+            ),
+            Err(ProtocolError::InvalidLanguageSnapshot(_))
+        ));
+
+        let mut mismatched = language_snapshot();
+        mismatched.semantics[0].location.path = "examples/view.bn".to_owned();
+        assert!(matches!(
+            write_message(
+                &mut Vec::new(),
+                &Message::PreviewLanguageSnapshot {
+                    snapshot: mismatched,
+                },
+            ),
+            Err(ProtocolError::InvalidLanguageSnapshot(_))
+        ));
     }
 
     #[test]

@@ -1,19 +1,47 @@
 use crate::protocol::ProgramSource;
+use boon_editor::language::{LanguageProjectSnapshot, project_checked_language};
 use boon_plan::ProgramRole;
 use boon_program_runtime::{
-    DistributedProgramBundle, ProgramCompileRequest, compile_distributed_program_bundle,
+    DistributedProgramBundle, DistributedProgramBundleWithClientProjection, ProgramCompileRequest,
+    compile_distributed_program_bundle_with_client_projection,
 };
 use boon_runtime::{ProgramCapabilityProfile, RuntimeResult, RuntimeSourceUnit};
 
+#[derive(Debug)]
+pub(crate) struct CompiledDistributedProgram {
+    pub bundle: DistributedProgramBundle,
+    pub client_projection: LanguageProjectSnapshot,
+}
+
 pub(crate) fn compile_distributed_program(
     mut sources: Vec<ProgramSource>,
-) -> RuntimeResult<DistributedProgramBundle> {
+    language_revision: u64,
+) -> RuntimeResult<CompiledDistributedProgram> {
     sources.sort_by_key(|source| role_rank(source.role));
+    let client_units = sources
+        .iter()
+        .find(|source| source.role == ProgramRole::Client)
+        .map(|source| source.units.clone())
+        .ok_or_else(|| boon_plan::PlanError::new("distributed source has no Client role"))?;
     let requests = sources
         .into_iter()
         .map(program_compile_request)
         .collect::<Vec<_>>();
-    compile_distributed_program_bundle(&requests).map_err(Into::into)
+    let DistributedProgramBundleWithClientProjection {
+        bundle,
+        client_projection,
+    } = compile_distributed_program_bundle_with_client_projection(&requests)?;
+    let client_projection = project_checked_language(
+        language_revision,
+        &client_units,
+        &client_projection.parsed,
+        &client_projection.output,
+    )
+    .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
+    Ok(CompiledDistributedProgram {
+        bundle,
+        client_projection,
+    })
 }
 
 fn program_compile_request(source: ProgramSource) -> ProgramCompileRequest {
@@ -139,9 +167,18 @@ mod tests {
     }
 
     #[test]
-    fn unrelated_distributed_program_compiles_role_owned_artifacts() {
-        let bundle = compile_distributed_program(distributed_fixture_sources())
-            .expect("compile distributed fixture");
+    fn distributed_compile_preserves_role_artifacts_and_client_projection_identity() {
+        let sources = distributed_fixture_sources();
+        let client_units = sources
+            .iter()
+            .find(|source| source.role == ProgramRole::Client)
+            .expect("client source")
+            .units
+            .clone();
+        let CompiledDistributedProgram {
+            bundle,
+            client_projection,
+        } = compile_distributed_program(sources, 41).expect("compile distributed fixture");
         assert_eq!(bundle.artifacts().len(), 3);
         let client = bundle.artifact(ProgramRole::Client).expect("client");
         let session = bundle.artifact(ProgramRole::Session).expect("session");
@@ -175,6 +212,44 @@ mod tests {
         );
         assert_ne!(client.plan_digest(), session.plan_digest());
         assert_ne!(session.plan_digest(), server.plan_digest());
+        assert_eq!(client_projection.revision, 41);
+        assert_eq!(client_projection.entrypoint, CLIENT_PATH);
+        assert_eq!(
+            client_projection.source_bundle_digest_v1,
+            client.source_bundle_digest_v1()
+        );
+        assert!(client_projection.matches_source_units(&client_units));
+        assert_eq!(
+            client_projection
+                .files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+            [SHARED_PATH, CLIENT_PATH]
+        );
+        assert!(client_projection.diagnostics.is_empty());
+        assert!(
+            client_projection
+                .files
+                .iter()
+                .any(|file| !file.inspector_hints.is_empty())
+        );
+        assert!(!client_projection.semantics.is_empty());
+        assert!(client_projection.semantics.iter().all(|item| {
+            matches!(item.location.path.as_str(), SHARED_PATH | CLIENT_PATH)
+                && item.location.path != SESSION_PATH
+                && item.location.path != SERVER_PATH
+        }));
+        let client_file = client_projection
+            .files
+            .iter()
+            .position(|file| file.path == CLIENT_PATH)
+            .expect("Client projection entry file");
+        let materialized = client_projection
+            .materialize_file(client_file, &client_units[client_file])
+            .expect("materialize Client source from local bytes");
+        assert_eq!(materialized.path, CLIENT_PATH);
+        assert!(!materialized.lines.is_empty());
 
         let wire_hash = client
             .plan()
@@ -204,8 +279,9 @@ mod tests {
 
     #[test]
     fn distributed_fixture_uses_runtime_content_artifacts_for_all_roles() {
-        let bundle = compile_distributed_program(distributed_fixture_sources())
-            .expect("compile distributed fixture");
+        let bundle = compile_distributed_program(distributed_fixture_sources(), 1)
+            .expect("compile distributed fixture")
+            .bundle;
         for (role, profile) in [
             (ProgramRole::Client, ProgramCapabilityProfile::PublicClient),
             (
@@ -241,7 +317,7 @@ mod tests {
                 source: CLIENT_SOURCE.to_owned(),
             },
         ];
-        let error = compile_distributed_program(sources).expect_err("role mismatch");
+        let error = compile_distributed_program(sources, 1).expect_err("role mismatch");
         assert!(
             error
                 .to_string()
@@ -256,7 +332,7 @@ mod tests {
         for source in &mut sources {
             source.application.state_namespace = "shared-state".to_owned();
         }
-        let error = compile_distributed_program(sources).expect_err("shared namespace");
+        let error = compile_distributed_program(sources, 1).expect_err("shared namespace");
         assert!(
             error
                 .to_string()

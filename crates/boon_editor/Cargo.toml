@@ -10,7 +10,6 @@ boon_contract.workspace = true
 boon_document_model.workspace = true
 boon_parser.workspace = true
 boon_typecheck.workspace = true
-futures.workspace = true
 ropey.workspace = true
 serde.workspace = true
 unicode-segmentation.workspace = true

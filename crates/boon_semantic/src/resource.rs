@@ -6181,7 +6181,7 @@ kept: mapped |> List/retain(item, if: True)
     #[test]
     fn lineage_projection_matches_record_scalar_and_new_list_value_semantics() {
         let list_type = Type::List(Box::new(Type::Unknown));
-        let object_type = Type::Object(boon_typecheck::ObjectShape {
+        let object_type = Type::object(boon_typecheck::ObjectShape {
             fields: BTreeMap::new(),
             field_order: Vec::new(),
             open: false,
@@ -6371,13 +6371,13 @@ kept: mapped |> List/retain(item, if: True)
 
     #[test]
     fn projected_host_result_list_does_not_inherit_unrelated_argument_rows() {
-        let row_type = Type::Object(boon_typecheck::ObjectShape {
+        let row_type = Type::object(boon_typecheck::ObjectShape {
             fields: BTreeMap::new(),
             field_order: Vec::new(),
             open: false,
         });
         let list_type = Type::List(Box::new(row_type.clone()));
-        let host_result_type = Type::Object(boon_typecheck::ObjectShape {
+        let host_result_type = Type::object(boon_typecheck::ObjectShape {
             fields: BTreeMap::from([("rows".to_owned(), list_type.clone())]),
             field_order: vec!["rows".to_owned()],
             open: false,
@@ -6593,7 +6593,7 @@ kept: mapped |> List/retain(item, if: True)
 
     #[test]
     fn storage_scope_resolution_handles_drain_locals_and_only_chunk_items_projection() {
-        let row_type = Type::Object(boon_typecheck::ObjectShape {
+        let row_type = Type::object(boon_typecheck::ObjectShape {
             fields: BTreeMap::new(),
             field_order: Vec::new(),
             open: false,
@@ -7415,7 +7415,7 @@ chunks: rows |> List/chunk(size: 2)
             checked_expr_id: boon_typecheck::CheckedExprId(0),
             flow_type: FlowType {
                 mode: boon_typecheck::FlowMode::Continuous,
-                ty: Type::List(Box::new(Type::Object(boon_typecheck::ObjectShape {
+                ty: Type::List(Box::new(Type::object(boon_typecheck::ObjectShape {
                     fields: BTreeMap::new(),
                     field_order: Vec::new(),
                     open: false,

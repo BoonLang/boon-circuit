@@ -1,16 +1,13 @@
 use std::collections::BTreeMap;
-use std::sync::{Arc, Condvar, Mutex};
-use std::thread::{self, JoinHandle};
-use std::time::Duration;
 
+use boon_contract::{CanonicalSourceBundleV1, SourceBundleDigestV1, SourceBundleUnit};
 use boon_document_model::{StyleEditorTypeHint, StyleRichTextSpan};
-use boon_parser::{AstToken, AstTokenKind, lex_source, parse_project};
+use boon_parser::{AstToken, AstTokenKind, ParseError, ParsedProgram, lex_source};
 use boon_typecheck::{
-    CheckedCallEntry, CheckedContextBinding, CheckedDeclarationKind, CheckedProgram, CheckedSpan,
-    DeclId, DiagnosticSeverity, SemanticOccurrenceKind as CheckedSemanticOccurrenceKind,
-    TypeDisplayNode,
+    CheckOutput, CheckedCallEntry, CheckedContextBinding, CheckedDeclarationKind, CheckedProgram,
+    CheckedSpan, DeclId, DiagnosticSeverity,
+    SemanticOccurrenceKind as CheckedSemanticOccurrenceKind, TypeDisplayNode,
 };
-use futures::channel::mpsc;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -19,13 +16,12 @@ pub struct SourceUnit {
     pub source: String,
 }
 
-const ANALYSIS_QUIET: Duration = Duration::from_millis(90);
-
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct InspectorHint {
     pub line: usize,
     pub start: usize,
     pub end: usize,
+    pub anchor_column: usize,
     pub category: String,
     pub compact_label: String,
     pub detail_label: String,
@@ -38,7 +34,7 @@ pub struct LineDecorations {
     pub type_hints: Vec<StyleEditorTypeHint>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub enum SemanticKind {
     Declaration,
     Reference,
@@ -48,7 +44,7 @@ pub enum SemanticKind {
     Pass,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SourceLocation {
     pub file_index: usize,
     pub path: String,
@@ -57,7 +53,7 @@ pub struct SourceLocation {
     pub end: usize,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SemanticItem {
     pub target: DeclId,
     pub kind: SemanticKind,
@@ -68,7 +64,7 @@ pub struct SemanticItem {
     pub out_related: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SemanticDiagnostic {
     pub severity: DiagnosticSeverity,
     pub location: SourceLocation,
@@ -85,6 +81,88 @@ pub struct LanguageSnapshot {
     pub semantics: Vec<SemanticItem>,
     pub diagnostics: Vec<SemanticDiagnostic>,
     pub inline_out_hints: bool,
+}
+
+/// Compact, compiler-produced language data for one source file.
+///
+/// Source text and painted lines deliberately stay in the dev process. The
+/// compiler service sends only checked hints and project-wide semantic data;
+/// [`LanguageProjectSnapshot::materialize_file`] lexes and paints the selected
+/// local source file without parsing or typechecking the project again.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct LanguageFileIndex {
+    /// Canonical UTF-8 project-relative path at this dev-facing file index.
+    pub path: String,
+    pub inspector_hints: Vec<InspectorHint>,
+}
+
+/// Serializable editor projection of one exact compiler source revision.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct LanguageProjectSnapshot {
+    pub revision: u64,
+    pub entrypoint: String,
+    pub source_bundle_digest_v1: SourceBundleDigestV1,
+    /// Files are ordered exactly like the dev-owned [`SourceUnit`] slice.
+    pub files: Vec<LanguageFileIndex>,
+    /// All project occurrences are retained so navigation can cross files.
+    pub semantics: Vec<SemanticItem>,
+    pub diagnostics: Vec<SemanticDiagnostic>,
+    pub inline_out_hints: bool,
+}
+
+impl LanguageProjectSnapshot {
+    /// Proves that the dev-owned bytes are the exact compiler snapshot from
+    /// which this projection was produced.
+    pub fn matches_source_units(&self, units: &[SourceUnit]) -> bool {
+        canonical_source_bundle(&self.entrypoint, units).is_ok_and(|bundle| {
+            bundle.digest() == self.source_bundle_digest_v1
+                && bundle.units().len() == self.files.len()
+                && self.files.iter().enumerate().all(|(dev_index, file)| {
+                    units
+                        .get(dev_index)
+                        .and_then(|unit| boon_contract::normalize_source_path(&unit.path).ok())
+                        .is_some_and(|path| path == file.path)
+                })
+        })
+    }
+
+    /// Materializes the existing active-file `LanguageSnapshot` API using only
+    /// a local lexical pass over that file. Callers should first use
+    /// [`Self::matches_source_units`] when accepting a new IPC snapshot; file
+    /// switches on the already accepted revision need only this path check.
+    pub fn materialize_file(
+        &self,
+        file_index: usize,
+        unit: &SourceUnit,
+    ) -> Option<LanguageSnapshot> {
+        let file = self.files.get(file_index)?;
+        let unit_path = boon_contract::normalize_source_path(&unit.path).ok()?;
+        if unit_path != file.path {
+            return None;
+        }
+        let tokens = lex_source(&file.path, &unit.source).unwrap_or_default();
+        let active_semantics = self
+            .semantics
+            .iter()
+            .filter(|item| item.location.file_index == file_index)
+            .collect::<Vec<_>>();
+        let mut lines = syntax_lines(&unit.source, &tokens, &active_semantics);
+        for hint in &file.inspector_hints {
+            if let Some(decorations) = lines.get_mut(hint.line) {
+                decorations.type_hints.push(style_type_hint(hint));
+            }
+        }
+        Some(LanguageSnapshot {
+            revision: self.revision,
+            file_index,
+            path: file.path.clone(),
+            lines,
+            inspector_hints: file.inspector_hints.clone(),
+            semantics: self.semantics.clone(),
+            diagnostics: self.diagnostics.clone(),
+            inline_out_hints: self.inline_out_hints,
+        })
+    }
 }
 
 impl LanguageSnapshot {
@@ -187,245 +265,193 @@ impl LanguageSnapshot {
     }
 }
 
-#[derive(Clone)]
-struct AnalysisJob {
+/// Projects editor data from the exact parsed/typechecked artifact owned by the
+/// compiler service. This function never parses, lexes, or typechecks source.
+pub fn project_checked_language(
     revision: u64,
-    file_index: usize,
-    units: Vec<SourceUnit>,
-}
-
-#[derive(Default)]
-struct WorkerState {
-    generation: u64,
-    pending: Option<AnalysisJob>,
-    stop: bool,
-}
-
-pub struct LanguageWorker {
-    state: Arc<(Mutex<WorkerState>, Condvar)>,
-    output: Option<mpsc::UnboundedReceiver<LanguageSnapshot>>,
-    thread: Option<JoinHandle<()>>,
-}
-
-impl LanguageWorker {
-    pub fn new() -> Self {
-        let state = Arc::new((Mutex::new(WorkerState::default()), Condvar::new()));
-        let worker_state = Arc::clone(&state);
-        let (output_tx, output) = mpsc::unbounded();
-        let thread = thread::Builder::new()
-            .name("boon-dev-language".to_owned())
-            .spawn(move || worker_loop(&worker_state, &output_tx))
-            .expect("spawn Boon language worker");
-        Self {
-            state,
-            output: Some(output),
-            thread: Some(thread),
-        }
+    units: &[SourceUnit],
+    program: &ParsedProgram,
+    output: &CheckOutput,
+) -> Result<LanguageProjectSnapshot, String> {
+    let bundle = canonical_source_bundle(&program.path, units)?;
+    if bundle.digest() != program.source_bundle_digest_v1 {
+        return Err(format!(
+            "language projection source digest {} differs from parsed digest {}",
+            bundle.digest(),
+            program.source_bundle_digest_v1
+        ));
     }
-
-    pub fn submit(&self, revision: u64, file_index: usize, units: Vec<SourceUnit>) {
-        let (lock, wake) = &*self.state;
-        let mut state = lock.lock().expect("language worker state");
-        state.generation = state.generation.saturating_add(1);
-        state.pending = Some(AnalysisJob {
-            revision,
-            file_index,
-            units,
-        });
-        wake.notify_one();
-    }
-
-    pub fn take_output(&mut self) -> mpsc::UnboundedReceiver<LanguageSnapshot> {
-        self.output.take().expect("language output already taken")
-    }
-}
-
-impl Drop for LanguageWorker {
-    fn drop(&mut self) {
-        let (lock, wake) = &*self.state;
-        lock.lock().expect("language worker state").stop = true;
-        wake.notify_one();
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
-}
-
-fn worker_loop(
-    shared: &Arc<(Mutex<WorkerState>, Condvar)>,
-    output: &mpsc::UnboundedSender<LanguageSnapshot>,
-) {
-    let (lock, wake) = &**shared;
-    loop {
-        let mut state = lock.lock().expect("language worker state");
-        while state.pending.is_none() && !state.stop {
-            state = wake.wait(state).expect("language worker wait");
-        }
-        if state.stop {
-            return;
-        }
-        let mut generation = state.generation;
-        loop {
-            let (next, timeout) = wake
-                .wait_timeout(state, ANALYSIS_QUIET)
-                .expect("language worker debounce");
-            state = next;
-            if state.stop {
-                return;
-            }
-            if state.generation == generation && timeout.timed_out() {
-                break;
-            }
-            generation = state.generation;
-        }
-        let Some(job) = state.pending.take() else {
-            continue;
-        };
-        drop(state);
-        if output.unbounded_send(analyze(job)).is_err() {
-            return;
-        }
-    }
-}
-
-fn analyze(job: AnalysisJob) -> LanguageSnapshot {
-    let active = job.units.get(job.file_index);
-    let path = active.map_or_else(|| "RUN.bn".to_owned(), |unit| unit.path.clone());
-    let source = active.map_or("", |unit| unit.source.as_str());
-    let tokens = lex_source(&path, source).unwrap_or_default();
-    let mut inspector_hints = Vec::new();
-    let mut line_type_hints = Vec::new();
+    let canonical_to_dev_file = canonical_to_dev_file_mapping(program, units)?;
+    let mut files = units
+        .iter()
+        .map(|unit| {
+            Ok(LanguageFileIndex {
+                path: boon_contract::normalize_source_path(&unit.path)
+                    .map_err(|error| error.to_string())?,
+                inspector_hints: Vec::new(),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     let mut semantics = Vec::new();
     let mut diagnostics = Vec::new();
 
-    match parse_project(
-        &path,
-        job.units
-            .iter()
-            .map(|unit| (unit.path.clone(), unit.source.clone())),
-    ) {
-        Ok(program) => {
-            let project_tokens = program
-                .files
-                .iter()
-                .map(|file| lex_source(&file.path, &file.source).unwrap_or_default())
-                .collect::<Vec<_>>();
-            let canonical_to_job_file = program
-                .files
-                .iter()
-                .map(|file| {
-                    job.units.iter().position(|unit| {
-                        boon_contract::normalize_source_path(&unit.path)
-                            .is_ok_and(|path| path == file.path)
-                    })
-                })
-                .collect::<Vec<_>>();
-            let output = boon_typecheck::check_program(&program);
-            if let Some(checked) = output.program.as_ref() {
-                semantics = semantic_items(&program, checked, &project_tokens);
-                for item in &mut semantics {
-                    remap_source_location(&mut item.location, &canonical_to_job_file);
-                }
-            }
-            if let Some(file) = program.files.iter().find(|file| file.path == program.path) {
-                let file_start = byte_offset_for_line(&program.source, file.start_line);
-                let file_end = file_start.saturating_add(file.source.len());
-                for hint in output.report.type_hint_table.entries {
-                    if hint.start < file_start || hint.start > file_end {
-                        continue;
-                    }
-                    let local_line = hint.line.saturating_sub(file.start_line);
-                    let local_start = hint.start.saturating_sub(file_start);
-                    let local_end = hint.end.saturating_sub(file_start).min(file.source.len());
-                    line_type_hints.push((
-                        local_line,
-                        StyleEditorTypeHint {
-                            line: local_line,
-                            start: local_start,
-                            end: local_end,
-                            anchor_column: hint.anchor_column,
-                            category: hint.category.clone(),
-                            compact_label: hint.compact_label.clone(),
-                            detail_label: hint.detail_label.clone(),
-                        },
-                    ));
-                    inspector_hints.push(InspectorHint {
-                        line: local_line,
-                        start: local_start,
-                        end: local_end,
-                        category: hint.category,
-                        compact_label: hint.compact_label,
-                        detail_label: hint.detail_label,
-                        display_tree: hint.display_tree,
-                    });
-                }
-            }
-            diagnostics.extend(
-                output
-                    .report
-                    .diagnostics
-                    .into_iter()
-                    .filter_map(|diagnostic| {
-                        source_location_for_span(
-                            &program,
-                            CheckedSpan {
-                                line: diagnostic.line,
-                                start: diagnostic.start,
-                                end: diagnostic.end,
-                            },
-                        )
-                        .map(|mut location| {
-                            remap_source_location(&mut location, &canonical_to_job_file);
-                            SemanticDiagnostic {
-                                severity: diagnostic.severity,
-                                location,
-                                message: diagnostic.message,
-                            }
-                        })
-                    }),
-            );
-        }
-        Err(error) => diagnostics.push(parse_diagnostic(&job.units, job.file_index, error)),
-    }
-
-    let active_semantics = semantics
-        .iter()
-        .filter(|item| item.location.file_index == job.file_index)
-        .collect::<Vec<_>>();
-    let mut lines = syntax_lines(source, &tokens, &active_semantics);
-    for (line, hint) in line_type_hints {
-        if let Some(decorations) = lines.get_mut(line) {
-            decorations.type_hints.push(hint);
+    if let Some(checked) = output.program.as_ref() {
+        semantics = semantic_items(program, checked);
+        for item in &mut semantics {
+            remap_source_location(&mut item.location, &canonical_to_dev_file);
         }
     }
+    // Diagnostics requests intentionally omit this global presentation
+    // sidecar. Materialize it here from the already-checked tables, without a
+    // second parse or type solve, only when an editor projection is requested.
+    let type_hints = boon_typecheck::project_type_hints(program, output);
+    for hint in &type_hints.entries {
+        let Some(mut location) = source_location_for_span(
+            program,
+            CheckedSpan {
+                line: hint.line,
+                start: hint.start,
+                end: hint.end,
+            },
+        ) else {
+            continue;
+        };
+        remap_source_location(&mut location, &canonical_to_dev_file);
+        let Some(file) = files.get_mut(location.file_index) else {
+            continue;
+        };
+        file.inspector_hints.push(InspectorHint {
+            line: location.line,
+            start: location.start,
+            end: location.end,
+            anchor_column: hint.anchor_column,
+            category: hint.category.clone(),
+            compact_label: hint.compact_label.clone(),
+            detail_label: hint.detail_label.clone(),
+            display_tree: hint.display_tree.clone(),
+        });
+    }
+    diagnostics.extend(output.report.diagnostics.iter().filter_map(|diagnostic| {
+        source_location_for_span(
+            program,
+            CheckedSpan {
+                line: diagnostic.line,
+                start: diagnostic.start,
+                end: diagnostic.end,
+            },
+        )
+        .map(|mut location| {
+            remap_source_location(&mut location, &canonical_to_dev_file);
+            SemanticDiagnostic {
+                severity: diagnostic.severity,
+                location,
+                message: diagnostic.message.clone(),
+            }
+        })
+    }));
 
-    LanguageSnapshot {
-        revision: job.revision,
-        file_index: job.file_index,
-        path,
-        lines,
-        inspector_hints,
+    Ok(LanguageProjectSnapshot {
+        revision,
+        entrypoint: bundle.entrypoint().to_owned(),
+        source_bundle_digest_v1: bundle.digest(),
+        files,
         semantics,
         diagnostics,
         inline_out_hints: false,
-    }
+    })
 }
 
-fn remap_source_location(location: &mut SourceLocation, canonical_to_job_file: &[Option<usize>]) {
-    if let Some(file_index) = canonical_to_job_file
-        .get(location.file_index)
-        .copied()
-        .flatten()
-    {
+/// Produces lexical editor data and the exact parser failure without invoking a
+/// parser or typechecker. The active file is lexed later by
+/// [`LanguageProjectSnapshot::materialize_file`].
+pub fn project_parse_error_language(
+    revision: u64,
+    entrypoint: &str,
+    units: &[SourceUnit],
+    error: &ParseError,
+) -> Result<LanguageProjectSnapshot, String> {
+    let bundle = canonical_source_bundle(entrypoint, units)?;
+    let files = units
+        .iter()
+        .map(|unit| {
+            Ok(LanguageFileIndex {
+                path: boon_contract::normalize_source_path(&unit.path)
+                    .map_err(|error| error.to_string())?,
+                inspector_hints: Vec::new(),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let fallback_file = units
+        .iter()
+        .position(|unit| {
+            boon_contract::normalize_source_path(&unit.path)
+                .is_ok_and(|path| path == bundle.entrypoint())
+        })
+        .unwrap_or(0);
+    Ok(LanguageProjectSnapshot {
+        revision,
+        entrypoint: bundle.entrypoint().to_owned(),
+        source_bundle_digest_v1: bundle.digest(),
+        files,
+        semantics: Vec::new(),
+        diagnostics: vec![parse_diagnostic(units, fallback_file, error)],
+        inline_out_hints: false,
+    })
+}
+
+fn canonical_source_bundle<'a>(
+    entrypoint: &str,
+    units: &'a [SourceUnit],
+) -> Result<CanonicalSourceBundleV1<'a>, String> {
+    CanonicalSourceBundleV1::new(
+        entrypoint,
+        units
+            .iter()
+            .map(|unit| SourceBundleUnit::new(&unit.path, &unit.source)),
+    )
+    .map_err(|error| format!("invalid language source bundle: {error}"))
+}
+
+fn canonical_to_dev_file_mapping(
+    program: &ParsedProgram,
+    units: &[SourceUnit],
+) -> Result<Vec<usize>, String> {
+    if program.files.len() != units.len() {
+        return Err(format!(
+            "parsed language file count {} differs from dev source count {}",
+            program.files.len(),
+            units.len()
+        ));
+    }
+    let mut dev_by_path = BTreeMap::new();
+    for (dev_index, unit) in units.iter().enumerate() {
+        let path =
+            boon_contract::normalize_source_path(&unit.path).map_err(|error| error.to_string())?;
+        if dev_by_path.insert(path.clone(), dev_index).is_some() {
+            return Err(format!("duplicate normalized dev source path `{path}`"));
+        }
+    }
+    program
+        .files
+        .iter()
+        .map(|file| {
+            dev_by_path.get(&file.path).copied().ok_or_else(|| {
+                format!(
+                    "parsed source path `{}` is absent from the dev source snapshot",
+                    file.path
+                )
+            })
+        })
+        .collect()
+}
+
+fn remap_source_location(location: &mut SourceLocation, canonical_to_dev_file: &[usize]) {
+    if let Some(file_index) = canonical_to_dev_file.get(location.file_index).copied() {
         location.file_index = file_index;
     }
 }
 
-fn semantic_items(
-    program: &boon_parser::ParsedProgram,
-    checked: &CheckedProgram,
-    tokens_by_file: &[Vec<AstToken>],
-) -> Vec<SemanticItem> {
+fn semantic_items(program: &ParsedProgram, checked: &CheckedProgram) -> Vec<SemanticItem> {
     let declarations = checked
         .declarations
         .iter()
@@ -450,10 +476,8 @@ fn semantic_items(
                         .map(|name| (*name).to_owned())
                 })
                 .unwrap_or_else(|| format!("declaration {}", occurrence.target.0));
-            let mut location = source_location_for_span(program, occurrence.span)?;
-            if let Some(tokens) = tokens_by_file.get(location.file_index) {
-                refine_semantic_location(&mut location, tokens, kind, &name);
-            }
+            let span = refine_semantic_span(occurrence.span, &program.ast.tokens, kind, &name);
+            let location = source_location_for_span(program, span)?;
             let declaration_kind = declaration.map(|declaration| declaration.kind);
             let out_related = matches!(
                 declaration_kind,
@@ -684,10 +708,7 @@ fn semantic_description(
     }
 }
 
-fn source_location_for_span(
-    program: &boon_parser::ParsedProgram,
-    span: CheckedSpan,
-) -> Option<SourceLocation> {
+fn source_location_for_span(program: &ParsedProgram, span: CheckedSpan) -> Option<SourceLocation> {
     let by_line = program
         .files
         .iter()
@@ -733,42 +754,46 @@ fn source_location_for_span(
     })
 }
 
-fn refine_semantic_location(
-    location: &mut SourceLocation,
+fn refine_semantic_span(
+    mut span: CheckedSpan,
     tokens: &[AstToken],
     kind: SemanticKind,
     name: &str,
-) {
+) -> CheckedSpan {
     let expected = match kind {
         SemanticKind::Pass => "PASS",
         SemanticKind::Declaration
         | SemanticKind::Call
         | SemanticKind::FreshOut
         | SemanticKind::ForwardOut => name,
-        SemanticKind::Reference => return,
+        SemanticKind::Reference => return span,
     };
     let short_expected = expected.rsplit('/').next().unwrap_or(expected);
-    // The checked occurrence owns identity and meaning. Lexing only narrows its
-    // compiler-provided range to the token painted by the editor.
+    // The checked occurrence owns identity and meaning. Parser-owned tokens
+    // only narrow its compiler-provided global range to the painted token; no
+    // project-wide editor re-lex is necessary.
     if let Some(token) = tokens.iter().find(|token| {
-        token.start >= location.start
-            && token.end <= location.end
+        token.start >= span.start
+            && token.end <= span.end
             && (token.lexeme == expected || token.lexeme == short_expected)
     }) {
-        location.start = token.start;
-        location.end = token.end;
-        location.line = token.line.saturating_sub(1);
+        span.start = token.start;
+        span.end = token.end;
+        span.line = token.line;
     }
+    span
 }
 
 fn parse_diagnostic(
     units: &[SourceUnit],
     active_file: usize,
-    error: boon_parser::ParseError,
+    error: &ParseError,
 ) -> SemanticDiagnostic {
     let file_index = units
         .iter()
-        .position(|unit| unit.path == error.path)
+        .position(|unit| {
+            boon_contract::normalize_source_path(&unit.path).is_ok_and(|path| path == error.path)
+        })
         .unwrap_or_else(|| active_file.min(units.len().saturating_sub(1)));
     let unit = units.get(file_index);
     let path = unit.map_or_else(|| error.path.clone(), |unit| unit.path.clone());
@@ -787,7 +812,19 @@ fn parse_diagnostic(
             start,
             end: start,
         },
-        message: error.message,
+        message: error.message.clone(),
+    }
+}
+
+fn style_type_hint(hint: &InspectorHint) -> StyleEditorTypeHint {
+    StyleEditorTypeHint {
+        line: hint.line,
+        start: hint.start,
+        end: hint.end,
+        anchor_column: hint.anchor_column,
+        category: hint.category.clone(),
+        compact_label: hint.compact_label.clone(),
+        detail_label: hint.detail_label.clone(),
     }
 }
 
@@ -1011,15 +1048,26 @@ fn byte_offset_for_line(source: &str, line: usize) -> usize {
 mod tests {
     use super::*;
 
+    fn project(revision: u64, entrypoint: &str, units: &[SourceUnit]) -> LanguageProjectSnapshot {
+        let parsed = boon_parser::parse_project(
+            entrypoint,
+            units
+                .iter()
+                .map(|unit| (unit.path.clone(), unit.source.clone())),
+        )
+        .unwrap();
+        let output = boon_typecheck::check_program(&parsed);
+        project_checked_language(revision, units, &parsed, &output).unwrap()
+    }
+
     fn snapshot(source: &str) -> LanguageSnapshot {
-        analyze(AnalysisJob {
-            revision: 7,
-            file_index: 0,
-            units: vec![SourceUnit {
-                path: "RUN.bn".to_owned(),
-                source: source.to_owned(),
-            }],
-        })
+        let units = vec![SourceUnit {
+            path: "RUN.bn".to_owned(),
+            source: source.to_owned(),
+        }];
+        let project = project(7, "RUN.bn", &units);
+        assert!(project.matches_source_units(&units));
+        project.materialize_file(0, &units[0]).unwrap()
     }
 
     #[test]
@@ -1188,11 +1236,8 @@ result: wrapper(PASS: [store: [count: 1]])
                 source: "FUNCTION double(value) {\n    value * 2\n}\n".to_owned(),
             },
         ];
-        let snapshot = analyze(AnalysisJob {
-            revision: 9,
-            file_index: 0,
-            units,
-        });
+        let project = project(9, "RUN.bn", &units);
+        let snapshot = project.materialize_file(0, &units[0]).unwrap();
         assert!(
             snapshot.diagnostics.is_empty(),
             "{:#?}",
@@ -1209,6 +1254,132 @@ result: wrapper(PASS: [store: [count: 1]])
         assert_eq!(definition.location.file_index, 1);
         assert_eq!(definition.location.path, "Math.bn");
         assert_eq!(definition.name, "Math/double");
+    }
+
+    #[test]
+    fn compact_project_snapshot_preserves_dev_order_and_materializes_each_file() {
+        // Canonical source order is Math.bn, RUN.bn, deliberately unlike the
+        // dev-owned tab order below.
+        let units = vec![
+            SourceUnit {
+                path: "RUN.bn".to_owned(),
+                source: "result: Math/double(value: 21)\n".to_owned(),
+            },
+            SourceUnit {
+                path: "Math.bn".to_owned(),
+                source: "FUNCTION double(value) {\n    value * 2\n}\n".to_owned(),
+            },
+        ];
+        let project = project(11, "RUN.bn", &units);
+        assert_eq!(
+            project
+                .files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+            ["RUN.bn", "Math.bn"]
+        );
+        assert!(project.matches_source_units(&units));
+        assert!(
+            project
+                .files
+                .iter()
+                .any(|file| !file.inspector_hints.is_empty()),
+            "report-owned checked projection should retain editor type hints"
+        );
+
+        let run = project.materialize_file(0, &units[0]).unwrap();
+        let math = project.materialize_file(1, &units[1]).unwrap();
+        assert_eq!(run.path, "RUN.bn");
+        assert_eq!(math.path, "Math.bn");
+        assert!(
+            run.semantics
+                .iter()
+                .any(|item| { item.kind == SemanticKind::Call && item.location.file_index == 0 })
+        );
+        assert!(math.semantics.iter().any(|item| {
+            item.kind == SemanticKind::Declaration && item.location.file_index == 1
+        }));
+        for snapshot in [&run, &math] {
+            for hint in &snapshot.inspector_hints {
+                let painted_hint = snapshot.lines[hint.line]
+                    .type_hints
+                    .iter()
+                    .find(|candidate| {
+                        candidate.start == hint.start
+                            && candidate.end == hint.end
+                            && candidate.anchor_column == hint.anchor_column
+                    });
+                assert!(
+                    painted_hint.is_some(),
+                    "materialized hint missing: {hint:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn source_digest_rejects_changed_bytes_and_dev_order() {
+        let units = vec![
+            SourceUnit {
+                path: "RUN.bn".to_owned(),
+                source: "result: value\n".to_owned(),
+            },
+            SourceUnit {
+                path: "Value.bn".to_owned(),
+                source: "value: 1\n".to_owned(),
+            },
+        ];
+        let project = project(12, "RUN.bn", &units);
+        assert!(project.matches_source_units(&units));
+
+        let mut changed = units.clone();
+        changed[1].source = "value: 2\n".to_owned();
+        assert!(!project.matches_source_units(&changed));
+
+        let parsed = boon_parser::parse_project(
+            "RUN.bn",
+            units
+                .iter()
+                .map(|unit| (unit.path.clone(), unit.source.clone())),
+        )
+        .unwrap();
+        let output = boon_typecheck::check_program(&parsed);
+        let error = project_checked_language(12, &changed, &parsed, &output).unwrap_err();
+        assert!(error.contains("source digest"), "{error}");
+
+        let mut reordered = units.clone();
+        reordered.swap(0, 1);
+        assert!(!project.matches_source_units(&reordered));
+        assert!(project.materialize_file(0, &units[1]).is_none());
+    }
+
+    #[test]
+    fn parse_error_projection_materializes_lexical_lines_without_rechecking() {
+        let units = vec![SourceUnit {
+            path: "RUN.bn".to_owned(),
+            source: "value: [\n".to_owned(),
+        }];
+        let error = boon_parser::parse_project(
+            "RUN.bn",
+            units
+                .iter()
+                .map(|unit| (unit.path.clone(), unit.source.clone())),
+        )
+        .unwrap_err();
+        let project = project_parse_error_language(13, "RUN.bn", &units, &error).unwrap();
+        assert!(project.matches_source_units(&units));
+        assert!(project.semantics.is_empty());
+        assert!(project.files[0].inspector_hints.is_empty());
+
+        let snapshot = project.materialize_file(0, &units[0]).unwrap();
+        assert_eq!(snapshot.revision, 13);
+        assert_eq!(snapshot.path, "RUN.bn");
+        assert!(!snapshot.lines.is_empty());
+        assert!(snapshot.lines.iter().any(|line| !line.spans.is_empty()));
+        assert_eq!(snapshot.diagnostics.len(), 1);
+        assert_eq!(snapshot.diagnostics[0].location.path, "RUN.bn");
+        assert_eq!(snapshot.diagnostics[0].message, error.message);
     }
 
     #[test]

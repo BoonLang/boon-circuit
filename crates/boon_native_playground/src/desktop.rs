@@ -286,6 +286,7 @@ impl DesktopSupervisor {
             }),
             (Role::Preview, message @ Message::PreviewStats(_))
             | (Role::Preview, message @ Message::PreviewStatus { .. })
+            | (Role::Preview, message @ Message::PreviewLanguageSnapshot { .. })
             | (Role::Preview, message @ Message::PreviewRuntimeChanged { .. })
             | (Role::Preview, message @ Message::PreviewTestResult { .. })
             | (Role::Preview, message @ Message::PreviewInspectResult { .. })

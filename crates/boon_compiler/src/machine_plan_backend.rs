@@ -13858,6 +13858,20 @@ impl<'a> ExecutableRowLowerer<'a> {
         &self,
         expression: ir::ExecutableExprId,
     ) -> bool {
+        let mut visiting = BTreeSet::new();
+        self.executable_projection_is_structural_resource(expression, &[], &mut visiting)
+    }
+
+    fn executable_projection_is_structural_resource(
+        &self,
+        expression: ir::ExecutableExprId,
+        inherited_projection: &[String],
+        visiting: &mut BTreeSet<(ir::ExecutableExprId, Vec<String>)>,
+    ) -> bool {
+        let key = (expression, inherited_projection.to_vec());
+        if !visiting.insert(key.clone()) {
+            return false;
+        }
         let Some(expression) = self
             .program
             .executable
@@ -13865,29 +13879,58 @@ impl<'a> ExecutableRowLowerer<'a> {
             .get(expression.as_usize())
             .filter(|candidate| candidate.id == expression)
         else {
+            visiting.remove(&key);
             return false;
         };
-        let ir::ExecutableExpressionKind::MaterializationLocal {
-            owner,
-            local,
-            projection,
-            ..
-        } = &expression.kind
-        else {
-            return false;
-        };
-        self.materialization_local_member(*owner, *local, projection)
-            .is_some_and(|(target, _)| match target {
-                ir::ErasedLocalMemberTarget::Sources(_) => true,
-                ir::ErasedLocalMemberTarget::Field(field) => self
-                    .program
-                    .scope_index
-                    .fields
+        let structural = match &expression.kind {
+            ir::ExecutableExpressionKind::MaterializationLocal {
+                owner,
+                local,
+                projection,
+                ..
+            } => {
+                let mut projection = projection.clone();
+                projection.extend_from_slice(inherited_projection);
+                self.materialization_local_member(*owner, *local, &projection)
+                    .is_some_and(|(target, _)| match target {
+                        ir::ErasedLocalMemberTarget::Sources(_) => true,
+                        ir::ErasedLocalMemberTarget::Field(field) => self
+                            .program
+                            .scope_index
+                            .fields
+                            .iter()
+                            .find(|candidate| candidate.id == field)
+                            .is_some_and(|field| field.resource_only),
+                        ir::ErasedLocalMemberTarget::State(_) => false,
+                    })
+            }
+            ir::ExecutableExpressionKind::FunctionParameter {
+                parameter,
+                projection,
+            } => {
+                let mut projection = projection.clone();
+                projection.extend_from_slice(inherited_projection);
+                self.function_parameter_bindings
                     .iter()
-                    .find(|candidate| candidate.id == field)
-                    .is_some_and(|field| field.resource_only),
-                ir::ErasedLocalMemberTarget::State(_) => false,
-            })
+                    .rev()
+                    .find_map(|bindings| bindings.get(parameter))
+                    .is_some_and(|binding| {
+                        self.executable_projection_is_structural_resource(
+                            binding.expression,
+                            &projection,
+                            visiting,
+                        )
+                    })
+            }
+            ir::ExecutableExpressionKind::Project { input, fields } => {
+                let mut projection = fields.clone();
+                projection.extend_from_slice(inherited_projection);
+                self.executable_projection_is_structural_resource(*input, &projection, visiting)
+            }
+            _ => false,
+        };
+        visiting.remove(&key);
+        structural
     }
 
     fn lower_list_page(
@@ -15961,6 +16004,15 @@ document: Document/new(
     #[test]
     fn producer_ownership_and_source_routes_separate_resources_from_scalars() {
         let compiled = compiled_resource_rows();
+        assert!(
+            compiled
+                .ir
+                .executable
+                .ordinary_functions
+                .iter()
+                .any(|function| function.name == "forward_row"),
+            "resource projection forwarding must retain the shared ordinary callable body"
+        );
         let resource = compiled
             .ir
             .scope_index

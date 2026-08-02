@@ -1,4 +1,6 @@
 mod architecture;
+mod compiler_interactions;
+mod compiler_performance;
 mod dependency_classifier;
 mod fjordpulse_traceability;
 mod gates;
@@ -128,6 +130,30 @@ fn run_standalone(workspace: &Path, args: &[String]) -> ToolResult<Option<Report
             )
             .map(Some)
         }
+        "verify-compiler-performance" => {
+            let (check_existing, report, setup_samples, scored_samples) =
+                parse_compiler_performance_options(&args[1..])?;
+            compiler_performance::run(
+                workspace,
+                check_existing,
+                report.map(|path| resolve_path(workspace, path)),
+                setup_samples,
+                scored_samples,
+            )
+            .map(Some)
+        }
+        "verify-compiler-interactions" => {
+            let (check_existing, report, setup_samples, scored_samples) =
+                parse_compiler_performance_options(&args[1..])?;
+            compiler_interactions::run(
+                workspace,
+                check_existing,
+                report.map(|path| resolve_path(workspace, path)),
+                setup_samples,
+                scored_samples,
+            )
+            .map(Some)
+        }
         "packed-site-inventory" => {
             packed_site_inventory::run_cli(workspace, &args[1..])
                 .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
@@ -230,6 +256,48 @@ fn parse_verify_options(
     Ok(())
 }
 
+fn parse_compiler_performance_options(
+    args: &[String],
+) -> Result<(bool, Option<PathBuf>, Option<usize>, Option<usize>), String> {
+    let mut check_existing = false;
+    let mut report = None;
+    let mut setup_samples = None;
+    let mut scored_samples = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--check-existing" if !check_existing => {
+                check_existing = true;
+                index += 1;
+            }
+            "--report" if report.is_none() => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--report requires a path".to_owned())?;
+                report = Some(PathBuf::from(value));
+                index += 2;
+            }
+            "--setup-samples" if setup_samples.is_none() => {
+                setup_samples = Some(parse_sample_count(args, index, "--setup-samples")?);
+                index += 2;
+            }
+            "--scored-samples" if scored_samples.is_none() => {
+                scored_samples = Some(parse_sample_count(args, index, "--scored-samples")?);
+                index += 2;
+            }
+            option => return Err(format!("unsupported or duplicate option {option}")),
+        }
+    }
+    Ok((check_existing, report, setup_samples, scored_samples))
+}
+
+fn parse_sample_count(args: &[String], index: usize, option: &str) -> Result<usize, String> {
+    args.get(index + 1)
+        .ok_or_else(|| format!("{option} requires a count"))?
+        .parse::<usize>()
+        .map_err(|error| format!("invalid {option} count: {error}"))
+}
+
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -253,6 +321,12 @@ fn print_help(manifest: &HandoffManifest) {
     println!("  verify-language-surface");
     println!("  verify-phase0 [--report <path>]");
     println!("  verify-packed-baseline [--check-existing] [--report <path>]");
+    println!(
+        "  verify-compiler-performance [--check-existing] [--report <path>] [--setup-samples N] [--scored-samples N]"
+    );
+    println!(
+        "  verify-compiler-interactions [--check-existing] [--report <path>] [--setup-samples N] [--scored-samples N]"
+    );
     for gate in &manifest.gates {
         println!("  {}", gate.verifier.as_str());
     }

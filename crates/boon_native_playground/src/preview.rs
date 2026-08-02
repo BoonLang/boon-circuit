@@ -1495,6 +1495,18 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                 if outcome.job_id != desired_compile_job || outcome.revision < desired_revision {
                     continue;
                 }
+                let job_id = outcome.job_id;
+                let revision = outcome.revision;
+                if let Some(snapshot) = outcome.language {
+                    if snapshot.revision != revision {
+                        return Err(format!(
+                            "compiler language snapshot revision {} does not match compile outcome revision {revision}",
+                            snapshot.revision
+                        )
+                        .into());
+                    }
+                    output.send(Message::PreviewLanguageSnapshot { snapshot })?;
+                }
                 let request = match outcome.result {
                     Ok(compiled_preview) => {
                         let test = compiled_preview.intent == PreviewIntent::Test;
@@ -1510,11 +1522,7 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                             Arc::clone(&package_assets),
                         )
                     }
-                    Err(error) => RuntimeReadinessRequest::compile_failed(
-                        outcome.job_id,
-                        outcome.revision,
-                        error,
-                    ),
+                    Err(error) => RuntimeReadinessRequest::compile_failed(job_id, revision, error),
                 };
                 readiness.replace(request);
             }
@@ -1948,15 +1956,17 @@ pub async fn run(mut host: NativeSurfaceHost, writer: Connection) -> NativeRoleR
                                 message: error.clone(),
                             },
                         );
-                        show_error(
-                            &observer,
-                            &mut view,
-                            &mut product,
-                            &mut host,
-                            &mut columns,
-                            &error,
-                        )
-                        .await?;
+                        if runtime.is_none() {
+                            show_error(
+                                &observer,
+                                &mut view,
+                                &mut product,
+                                &mut host,
+                                &mut columns,
+                                &error,
+                            )
+                            .await?;
+                        }
                         output.send(Message::PreviewStatus {
                             revision: outcome.revision,
                             ok: false,

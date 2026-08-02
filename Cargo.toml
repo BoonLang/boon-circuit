@@ -101,7 +101,6 @@ toml_edit = "0.25"
 web-time = "1.1.0"
 sha2 = "0.10"
 wellen = "0.18.5"
-chumsky = "0.9"
 ena = "0.14"
 bytemuck = { version = "1.25", features = ["derive"] }
 encase = "0.12"
@@ -197,14 +196,26 @@ debug = 1
 opt-level = 2
 debug = 1
 
-# Large-source integration tests exercise the real compiler. Keep the two
-# graph-building stages representative of the interactive dev compiler rather
-# than running their known debug-mode hot loops at opt-level 0.
+# Dev-package overrides also apply while Cargo builds tests. Override the two
+# largest compiler crates back to level 0 explicitly so focused correctness
+# tests do not spend minutes optimizing and linking them. Compiler latency and
+# scaling acceptance uses the prebuilt release CLI and is never inferred from a
+# debug test harness.
 [profile.test.package.boon_semantic]
-opt-level = 2
+opt-level = 0
+debug = 1
 
 [profile.test.package.boon_typecheck]
-opt-level = 2
+opt-level = 0
+debug = 1
+
+[profile.test.package.boon_compiler]
+opt-level = 0
+debug = 1
+
+[profile.test.package.boon_native_playground]
+opt-level = 0
+debug = 1
 
 [profile.dev.package.ciborium]
 opt-level = 2

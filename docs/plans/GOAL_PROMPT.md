@@ -9,6 +9,7 @@ objective from the current HEAD.
 Read AGENTS.md and these contracts completely before editing:
 
 - docs/plans/steps.md
+- docs/plans/BOON_COMPILER_PERFORMANCE_PLAN.md
 - docs/plans/BOON_CIRCUIT_SIMPLIFICATION_AND_NATIVE_RECOVERY_PLAN.md
 - docs/plans/BOON_LANGUAGE_FOUNDATIONS_PLAN.md
 - docs/plans/BOON_OUT_PARAMETERS_AND_ORDER_INDEPENDENT_BINDINGS_PLAN.md
@@ -47,6 +48,14 @@ Goal replacement rule:
 
 Authority and conflict rules:
 
+- `BOON_COMPILER_PERFORMANCE_PLAN.md` owns compiler execution architecture and
+  performance: source-unit snapshots, the owned compiler database and
+  `CompilerSession`, dependency-indexed invalidation, cancellation, immutable
+  compiler-artifact reuse, phase profiles, scaling fixtures, and cold, warm,
+  cancellation, and RSS budgets. It may replace internal compiler
+  representations, but it does not own public language semantics, proof or
+  evidence soundness, runtime persistence identity, native presentation
+  semantics, or the mandatory verified artifact spine.
 - `BOON_LANGUAGE_FOUNDATIONS_PLAN.md` owns the target public value algebra,
   Tags-only truth, private absence/fault channels, exact `NUMBER`, one-based
   positions, `BITS[N]`, `LIST`/`SET`/`MAP` authorities, matching, `FLUSH`,
@@ -165,16 +174,26 @@ Current checkpoints to preserve and audit rather than redo:
   selector-dependent arm-scope invalidation; the dense nearest-pattern-arm
   index replaces a quadratic forwarding query, reducing contextual owner
   propagation from about 1.34 seconds to 18 ms and the traced typecheck from
-  5.79 to 4.59 seconds; two final-source runs before that final indexed query
-  measured 0.07/0.07, 2.09/2.12, and 25.79/25.20 seconds respectively, and the
-  later Counter, TodoMVC, and NovyWave plans remain byte-identical;
-- the next compiler-performance blockers are the roughly 1.75-second
-  pre-scheme call/type worklist and, more importantly, the roughly 11.56-second
-  semantic elaboration/contextual expansion phase. Retain shared semantic
+  5.79 to 4.59 seconds. Dense reverse semantic reachability now replaces one
+  DFS per runtime-root/effect and state-arm/effect pair, reducing NovyWave host-
+  effect scheduling from about 1.51 seconds to 5.7 ms and the complete reactive
+  phase from about 1.87 seconds to 0.35 seconds. Ordinary-callable eligibility
+  analyzes each body once and propagates rejection through a reverse dependency
+  worklist instead of repeating whole-body fixed-point scans. A post-reboot
+  debug measurement completes Counter in 0.09 seconds, physical TodoMVC in 2.02
+  seconds, and NovyWave in 20.68 seconds at 1,000,416 KiB peak RSS; their exact
+  plan SHA-256 values remain `dc1fe51b659d1746a0b0b4ae2dcba21d50a9426499eb2bde28dbed988e6cfb08`,
+  `c9a12cd0a1bcf748a20e3a072afa09d0f923c2c9dbd664f2343d343494404f96`,
+  and `4d3c284a9240cdc68c70aff7f30c570367e285cc1e8f823585900829bafd8ff7`;
+- the next compiler-performance blockers are the roughly 4.84-second cold
+  typecheck, 2.84 seconds of contextual materialization/execution expansion,
+  and 3.81-second whole-program dependency proof. Retain more shared semantic
   callable definitions, invalidate only affected contextual instances, and
   keep proof/debug-artifact generation outside the interactive critical path
-  before resuming production recovery; do not return to tactical type-cache
-  invalidation or another manifest collection tweak;
+  before resuming production recovery. Cold improvements do not replace the
+  required persistent compiler session or its warm-edit/switch gates; do not
+  return to tactical type-cache invalidation or another manifest collection
+  tweak;
 - FjordPulse currently has no basis for weakening the 108-story/340-scenario
   acceptance inventory. Only its two explicitly deferred backup/restore
   automation scenarios may retain that final status.
@@ -199,33 +218,19 @@ Execution strategy:
   binaries directly for repeated Boon fixtures. Do not pay a Cargo graph scan
   and test-harness relink for every example or every unchanged focused check.
 - Treat compiler timeouts and graph explosions as architecture failures, not as
-  requests for larger timeouts. A representative source compile that exceeds
-  120 seconds, or growth caused by eagerly retaining statically unreachable
-  branches or repeatedly cloning ordinary callable bodies, blocks the next
-  production slice until the owning compiler representation is fixed and a
-  focused scaling regression proves the correction.
-- The 120-second rule is only an emergency ceiling. Ratchet development-loop
-  budgets at every accepted compiler checkpoint: two consecutive runs more
-  than 25 percent slower or larger than the recorded checkpoint block the next
-  slice even below 120 seconds. The current debug time ceilings on the reference
-  machine are 0.20 seconds for Counter, 3.5 seconds for physical TodoMVC, and 28
-  seconds for NovyWave. Their peak-RSS ceilings are respectively 48 MiB, 180
-  MiB, and 1.1 GiB. These ceilings may move only downward unless a changed
-  represented workload is documented with before/after evidence.
-- Those cold `dump-plan` ceilings are emergency regression bounds, not
-  interactive usability targets. Before production recovery resumes, the
-  playground/editor must use a persistent compiler session with dependency-
-  indexed invalidation and stable identities. A warm affected-source edit must
-  publish its complete diagnostic generation within 16.7 ms p95. Switching an
-  already loaded example source bundle must not block rendering for more than
-  16.7 ms and must publish the complete checked preview or diagnostics within
-  100 ms p95. Cancel stale generations and retain the last good preview.
-- Parsing, typechecking, and affected semantic invalidation are on the
-  interactive critical path. Whole-graph proof, handoff reports, and large
-  debug JSON serialization run only for explicit build/handoff work or from a
-  valid content-addressed cache. Measure cold checked, cold semantic, warm edit,
-  example switch, proof, and serialization independently; never use fast UI
-  scheduling to conceal unchanged compiler graph explosion.
+  requests for larger timeouts. The former 120-second rule and debug fixture
+  ceilings are historical emergency bounds, not acceptance targets.
+  `BOON_COMPILER_PERFORMANCE_PLAN.md` is the sole numeric authority: both its
+  fresh-process and empty-session cache-disabled cold gates must pass before
+  persistent state or caches may satisfy any warm gate. Budgets may only
+  tighten unless a changed represented workload is documented with exact
+  before/after evidence.
+- Parsing, typechecking, semantic invalidation, exact callable-dependency
+  sealing, and verification required for an executable preview are on the
+  interactive path defined by the compiler-performance plan. Flattened proof
+  and debug graphs, handoff reports, and large serialization are not. Never use
+  fast UI scheduling, an incomplete diagnostic profile, or an artifact cache to
+  conceal unchanged cold compiler graph explosion.
 - After the same blocker class appears twice, stop tactical patching and change
   the owning parser, compiler, proof, runtime, currentness, document, renderer,
   host, persistence, physical-layout, or verifier architecture.
@@ -244,6 +249,21 @@ Execution strategy:
   not dump large report bodies into the conversation.
 - Add no Python source, scripts, invocations, or generated Python artifacts.
 - Do not commit or push unless the user explicitly requests it.
+
+Blocking compiler-performance prerequisite:
+
+- Complete `BOON_COMPILER_PERFORMANCE_PLAN.md` before resuming the remaining
+  simplification/native-recovery closure or any later production phase.
+- Pass the fresh-process and empty-`CompilerSession` no-cache gates first, then
+  the warm edit, loaded switch, cancellation, invalidation-locality, scaling,
+  deterministic-artifact, and RSS gates. Persistent compiler state is the
+  second layer, never a substitute for the cold result.
+- Every request that emits an executable artifact still seals exact semantic
+  dependencies and crosses `boon_verify`. A diagnostics-only request may stop
+  after a complete `CheckedProgram`, publishes no runnable artifact, and is
+  generation-labeled until the corresponding verified result exists.
+- Compiler changes make earlier native reports stale. Refresh native handoff
+  evidence only after this prerequisite and its native timing cutover pass.
 
 Phase 0: reconcile contracts, inventory current state, and freeze evidence
 

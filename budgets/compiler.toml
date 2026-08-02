@@ -1,0 +1,123 @@
+format_version = 1
+owner_plan = "docs/plans/BOON_COMPILER_PERFORMANCE_PLAN.md"
+report = "target/reports/compiler-performance/compiler-performance.json"
+
+[protocol]
+build_profile = "release"
+target_profile = "software_default"
+setup_samples = 3
+scored_samples = 30
+compiler_threads = 1
+compiler_caches = "disabled"
+cold_modes = ["fresh-process", "empty-session"]
+os_page_cache = "natural"
+sample_process_isolation = "one-process-per-observation"
+peak_rss_unit = "KiB"
+peak_rss_scope = "process-high-water-through-compiler-artifact"
+
+[[fixtures]]
+id = "counter"
+source = "examples/counter.bn"
+package_source_lines = 140
+compiler_input_source_lines = 140
+checked_diagnostics_p95_ms = 10.0
+verified_machine_plan_p95_ms = 50.0
+peak_rss_mib_max = 32
+machine_plan_sha256 = "dc1fe51b659d1746a0b0b4ae2dcba21d50a9426499eb2bde28dbed988e6cfb08"
+
+[[fixtures]]
+id = "todo-mvc-physical"
+source = "examples/todo_mvc_physical/RUN.bn"
+package_source_lines = 3576
+compiler_input_source_lines = 3576
+checked_diagnostics_p95_ms = 75.0
+verified_machine_plan_p95_ms = 300.0
+peak_rss_mib_max = 128
+machine_plan_sha256 = "c9a12cd0a1bcf748a20e3a072afa09d0f923c2c9dbd664f2343d343494404f96"
+
+[[fixtures]]
+id = "novywave"
+source = "examples/novywave/RUN.bn"
+package_source_lines = 11994
+compiler_input_source_lines = 11923
+checked_diagnostics_p95_ms = 250.0
+verified_machine_plan_p95_ms = 1000.0
+peak_rss_mib_max = 384
+machine_plan_sha256 = "4d3c284a9240cdc68c70aff7f30c570367e285cc1e8f823585900829bafd8ff7"
+
+[warm]
+report = "target/reports/compiler-performance/compiler-interactions.json"
+source = "examples/todo_mvc_physical/RUN.bn"
+switch_source = "examples/counter.bn"
+edit_unit = "examples/todo_mvc_physical/RUN.bn"
+edit_from = "TEXT { Walk the dog }"
+edit_to = "TEXT { Walk the dogs }"
+checked_diagnostics_p95_ms = 16.7
+checked_diagnostics_p99_ms = 25.0
+checked_diagnostics_max_ms = 33.4
+verified_preview_p95_ms = 100.0
+verified_preview_max_ms = 200.0
+loaded_bundle_lookup_max_ms = 1.0
+switch_ack_p95_ms = 16.7
+switch_present_p95_ms = 100.0
+switch_present_max_ms = 200.0
+cancellation_max_ms = 8.0
+
+[scaling]
+maximum_doubling_ratio = 2.2
+dimensions = [
+  "call-depth",
+  "call-site-count",
+  "contextual-call-site-count",
+  "static-branch-count",
+  "source-unit-count",
+  "dependency-cone-size",
+]
+
+[[scaling.workloads]]
+id = "call-depth"
+intent = "diagnostics"
+owning_work_counter = "checked-calls"
+baseline_size = 0
+base_size = 32
+doubled_size = 64
+
+[[scaling.workloads]]
+id = "call-site-count"
+intent = "diagnostics"
+owning_work_counter = "checked-calls"
+baseline_size = 0
+base_size = 32
+doubled_size = 64
+
+[[scaling.workloads]]
+id = "contextual-call-site-count"
+intent = "verified"
+owning_work_counter = "semantic-graph-nodes"
+baseline_size = 0
+base_size = 32
+doubled_size = 64
+
+[[scaling.workloads]]
+id = "static-branch-count"
+intent = "verified"
+owning_work_counter = "semantic-graph-nodes"
+baseline_size = 0
+base_size = 32
+doubled_size = 64
+
+[[scaling.workloads]]
+id = "source-unit-count"
+intent = "diagnostics"
+owning_work_counter = "parsed-expressions"
+baseline_size = 0
+base_size = 32
+doubled_size = 64
+
+[[scaling.workloads]]
+id = "dependency-cone-size"
+intent = "verified"
+owning_work_counter = "dependency-scc-components"
+baseline_size = 0
+base_size = 32
+doubled_size = 64

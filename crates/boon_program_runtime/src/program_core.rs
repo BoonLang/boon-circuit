@@ -1,10 +1,8 @@
-use boon_runtime::{
-    ApplicationIdentity, DocumentFrame, DocumentPatch, LiveRuntime, MachineTemplate,
-    ProgramCapabilityProfile, RowId, RuntimeSourceUnit, SessionOptions, SourcePayload,
-};
 use boon_compiler::{
-    COMPILER_ID, CompileProfile, CompileRequest, CompilerSourceUnit, DistributedCompilerProgram,
-    compile_distributed_runtime_source_programs, compile_machine_plan,
+    COMPILER_ID, CompileProfile, CompileRequest, CompilerSourceUnit,
+    DistributedClientProjectionSource, DistributedCompilerProgram,
+    compile_distributed_runtime_source_programs,
+    compile_distributed_runtime_source_programs_with_client_projection, compile_machine_plan,
     diagnose_runtime_source_units,
 };
 use boon_contract::{CanonicalSourceBundleV1, SourceBundleDigestV1, SourceBundleUnit};
@@ -19,6 +17,10 @@ use boon_persistence::{
 use boon_plan::{
     DocumentConstructor, EffectBarrier, EffectReplay, MachinePlan, OutputContractKind, ProgramRole,
     SourceRouteToken, TargetProfile,
+};
+use boon_runtime::{
+    ApplicationIdentity, DocumentFrame, DocumentPatch, LiveRuntime, MachineTemplate,
+    ProgramCapabilityProfile, RowId, RuntimeSourceUnit, SessionOptions, SourcePayload,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -109,6 +111,15 @@ pub struct ProgramCompileRequest {
     pub units: Vec<RuntimeSourceUnit>,
     pub application: ApplicationIdentity,
     pub capability_profile: ProgramCapabilityProfile,
+}
+
+/// Atomic distributed runtime bundle plus the exact settled Client compiler
+/// artifacts needed by an outer editor/presentation crate. This layer remains
+/// neutral and does not depend on `boon_editor`.
+#[derive(Debug)]
+pub struct DistributedProgramBundleWithClientProjection {
+    pub bundle: DistributedProgramBundle,
+    pub client_projection: DistributedClientProjectionSource,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -530,7 +541,32 @@ pub fn compile_distributed_program_bundle(
     for request in requests {
         validate_request(request)?;
     }
-    compile_validated_distributed_program_bundle(requests)
+    compile_validated_distributed_program_bundle(requests, false).map(|(bundle, _)| bundle)
+}
+
+pub fn compile_distributed_program_bundle_with_client_projection(
+    requests: &[ProgramCompileRequest],
+) -> Result<DistributedProgramBundleWithClientProjection, ProgramDiagnostic> {
+    for request in requests {
+        validate_request(request)?;
+    }
+    let revision = requests
+        .iter()
+        .map(|request| request.revision)
+        .max()
+        .unwrap_or(0);
+    let (bundle, client_projection) = compile_validated_distributed_program_bundle(requests, true)?;
+    let client_projection = client_projection.ok_or_else(|| {
+        ProgramDiagnostic::new(
+            revision,
+            ProgramDiagnosticPhase::Artifact,
+            "joint compiler omitted the requested Client projection source",
+        )
+    })?;
+    Ok(DistributedProgramBundleWithClientProjection {
+        bundle,
+        client_projection,
+    })
 }
 
 pub fn compile_trusted_package_distributed_program_bundle(
@@ -543,12 +579,19 @@ pub fn compile_trusted_package_distributed_program_bundle(
             MAX_TRUSTED_PACKAGE_SOURCE_BYTES,
         )?;
     }
-    compile_validated_distributed_program_bundle(requests)
+    compile_validated_distributed_program_bundle(requests, false).map(|(bundle, _)| bundle)
 }
 
 fn compile_validated_distributed_program_bundle(
     requests: &[ProgramCompileRequest],
-) -> Result<DistributedProgramBundle, ProgramDiagnostic> {
+    retain_client_projection: bool,
+) -> Result<
+    (
+        DistributedProgramBundle,
+        Option<DistributedClientProjectionSource>,
+    ),
+    ProgramDiagnostic,
+> {
     let revision = requests
         .iter()
         .map(|request| request.revision)
@@ -578,15 +621,23 @@ fn compile_validated_distributed_program_bundle(
             migration_predecessors: Vec::new(),
         })
         .collect::<Vec<_>>();
-    let compiled = compile_distributed_runtime_source_programs(
-        &compiler_programs,
-        TargetProfile::SoftwareBounded,
-    )
+    let compiled = if retain_client_projection {
+        compile_distributed_runtime_source_programs_with_client_projection(
+            &compiler_programs,
+            TargetProfile::SoftwareBounded,
+        )
+    } else {
+        compile_distributed_runtime_source_programs(
+            &compiler_programs,
+            TargetProfile::SoftwareBounded,
+        )
+    }
     .map_err(|error| {
         ProgramDiagnostic::new(revision, ProgramDiagnosticPhase::Compile, error.to_string())
     })?;
+    let (compiled_programs, client_projection) = compiled.into_parts();
     let mut artifacts = Vec::with_capacity(requests.len());
-    for (role, compiled) in compiled.into_programs() {
+    for (role, compiled) in compiled_programs {
         let request_index = requests
             .iter()
             .position(|request| request.role == role)
@@ -603,13 +654,14 @@ fn compile_validated_distributed_program_bundle(
         let request = &requests[request_index];
         artifacts.push(artifact_from_compiled(request, compiled)?);
     }
-    DistributedProgramBundle::new(artifacts).map_err(|error| {
+    let bundle = DistributedProgramBundle::new(artifacts).map_err(|error| {
         ProgramDiagnostic::new(
             revision,
             ProgramDiagnosticPhase::Artifact,
             error.to_string(),
         )
-    })
+    })?;
+    Ok((bundle, client_projection))
 }
 
 fn canonical_source_bundle(
@@ -846,11 +898,17 @@ impl ProgramSession {
         })
     }
 
-    pub fn root_value_current(&mut self, name: &str) -> boon_runtime::RuntimeResult<boon_runtime::Value> {
+    pub fn root_value_current(
+        &mut self,
+        name: &str,
+    ) -> boon_runtime::RuntimeResult<boon_runtime::Value> {
         self.runtime.root_value_current(name)
     }
 
-    pub fn output_value_current(&mut self, name: &str) -> boon_runtime::RuntimeResult<boon_runtime::Value> {
+    pub fn output_value_current(
+        &mut self,
+        name: &str,
+    ) -> boon_runtime::RuntimeResult<boon_runtime::Value> {
         self.runtime.output_value_current(name)
     }
 
@@ -1071,7 +1129,10 @@ impl boon_runtime::DistributedServerMachine for ProgramSession {
     fn current_call_instances(
         &mut self,
         call_site_id: boon_plan::RemoteCallSiteId,
-    ) -> Result<Vec<boon_runtime::DistributedCurrentCallInstance>, boon_runtime::DistributedRuntimeError> {
+    ) -> Result<
+        Vec<boon_runtime::DistributedCurrentCallInstance>,
+        boon_runtime::DistributedRuntimeError,
+    > {
         self.runtime
             .distributed_call_instances_current(call_site_id)
             .map_err(distributed_machine_error)
@@ -1094,7 +1155,10 @@ impl boon_runtime::DistributedServerMachine for ProgramSession {
         export_id: boon_plan::ExportId,
         demand_revision: u64,
         arguments: BTreeMap<boon_plan::DistributedArgumentId, boon_runtime::Value>,
-    ) -> Result<(boon_runtime::Value, Option<boon_runtime::RuntimeTurn>), boon_runtime::DistributedRuntimeError> {
+    ) -> Result<
+        (boon_runtime::Value, Option<boon_runtime::RuntimeTurn>),
+        boon_runtime::DistributedRuntimeError,
+    > {
         self.runtime
             .evaluate_distributed_function_instance_unsettled(
                 call_site_id,
@@ -1228,7 +1292,8 @@ impl boon_runtime::DistributedServerMachine for ProgramSession {
     fn drop_producer_origin(
         &mut self,
         origin: boon_runtime::SessionOrigin,
-    ) -> Result<Vec<boon_runtime::TransientEffectCallId>, boon_runtime::DistributedRuntimeError> {
+    ) -> Result<Vec<boon_runtime::TransientEffectCallId>, boon_runtime::DistributedRuntimeError>
+    {
         let origin = boon_runtime::MachineOrigin::new(origin.slot(), origin.generation())
             .map_err(distributed_machine_error)?;
         self.runtime

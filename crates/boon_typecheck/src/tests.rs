@@ -10,6 +10,57 @@ fn found_payload_type(ty: &Type) -> Option<&Type> {
     })
 }
 
+fn first_json_difference(
+    path: &mut String,
+    left: &serde_json::Value,
+    right: &serde_json::Value,
+) -> Option<(String, serde_json::Value, serde_json::Value)> {
+    match (left, right) {
+        (serde_json::Value::Array(left), serde_json::Value::Array(right)) => {
+            for (index, (left, right)) in left.iter().zip(right).enumerate() {
+                let previous_len = path.len();
+                path.push_str(&format!("[{index}]"));
+                if let Some(difference) = first_json_difference(path, left, right) {
+                    return Some(difference);
+                }
+                path.truncate(previous_len);
+            }
+            (left.len() != right.len()).then(|| {
+                (
+                    format!("{path}.length"),
+                    left.len().into(),
+                    right.len().into(),
+                )
+            })
+        }
+        (serde_json::Value::Object(left), serde_json::Value::Object(right)) => {
+            let mut keys = left.keys().chain(right.keys()).collect::<Vec<_>>();
+            keys.sort_unstable();
+            keys.dedup();
+            for key in keys {
+                let previous_len = path.len();
+                path.push('.');
+                path.push_str(key);
+                let difference = match (left.get(key), right.get(key)) {
+                    (Some(left), Some(right)) => first_json_difference(path, left, right),
+                    (left, right) => Some((
+                        path.clone(),
+                        left.cloned().unwrap_or(serde_json::Value::Null),
+                        right.cloned().unwrap_or(serde_json::Value::Null),
+                    )),
+                };
+                if difference.is_some() {
+                    return difference;
+                }
+                path.truncate(previous_len);
+            }
+            None
+        }
+        _ if left == right => None,
+        _ => Some((path.clone(), left.clone(), right.clone())),
+    }
+}
+
 // Typecheck tests are grouped by language surface while staying in this module for private helper access.
 include!("tests/reactive_collections.rs");
 include!("tests/flush.rs");
@@ -154,6 +205,16 @@ state:
                 ordered, oracle,
                 "ordered projection diverged for {path} in {ownership:?}"
             );
+            if ownership == CheckOutputOwnership::DiagnosticsOwned {
+                let (lean_checker, lean_profile) = Checker::new_diagnostics_profiled(&parsed);
+                let lean = lean_checker
+                    .finish_program_profiled(CheckOutputOwnership::DiagnosticsOwned, lean_profile)
+                    .0;
+                assert_eq!(
+                    ordered, lean,
+                    "checked-only diagnostic initialization diverged for {path}"
+                );
+            }
         }
     }
 }
@@ -166,6 +227,17 @@ fn ordered_checked_diagnostic_projection_matches_product_examples() {
         checker.checked_diagnostic_projection_mode = mode;
         checker
             .finish_program_profiled(CheckOutputOwnership::ReportOwned, profile)
+            .0
+    }
+
+    fn project_diagnostics(parsed: &ParsedProgram, legacy_bindings: bool) -> CheckOutput {
+        let (checker, profile) = if legacy_bindings {
+            Checker::new_profiled(parsed)
+        } else {
+            Checker::new_diagnostics_profiled(parsed)
+        };
+        checker
+            .finish_program_profiled(CheckOutputOwnership::DiagnosticsOwned, profile)
             .0
     }
 
@@ -285,6 +357,20 @@ fn ordered_checked_diagnostic_projection_matches_product_examples() {
                     .expect("unequal projections have a serialized difference");
             panic!(
                 "ordered projection diverged for {name} at {path}: ordered={ordered_value} oracle={oracle_value}"
+            );
+        }
+        let eager = project_diagnostics(&parsed, true);
+        let lean = project_diagnostics(&parsed, false);
+        if eager != lean {
+            let eager_json = serde_json::to_value((&eager.program, &eager.report))
+                .expect("eager diagnostics serialize");
+            let lean_json = serde_json::to_value((&lean.program, &lean.report))
+                .expect("checked-only diagnostics serialize");
+            let (path, eager_value, lean_value) =
+                first_json_difference(&mut "$".to_owned(), &eager_json, &lean_json)
+                    .expect("unequal diagnostics have a serialized difference");
+            panic!(
+                "checked-only diagnostic initialization diverged for {name} at {path}: eager={eager_value} checked_only={lean_value}"
             );
         }
     }
@@ -919,17 +1005,15 @@ fn checked_flow_cache_reuses_unaffected_entries_and_invalidates_only_reverse_clo
 
 #[test]
 fn checked_flow_declaration_invalidation_follows_forwarded_outputs_without_cycles() {
-    let readers = BTreeMap::from([
-        (DeclId(2), vec![7]),
-        (DeclId(3), vec![9]),
-        (DeclId(4), vec![11, 7]),
-    ]);
-    let dependents = BTreeMap::from([
-        (DeclId(1), vec![DeclId(2)]),
-        (DeclId(2), vec![DeclId(3)]),
-        (DeclId(3), vec![DeclId(4)]),
-        (DeclId(4), vec![DeclId(2)]),
-    ]);
+    let mut readers = vec![Vec::new(); 6];
+    readers[2] = vec![7];
+    readers[3] = vec![9];
+    readers[4] = vec![11, 7];
+    let mut dependents = vec![Vec::new(); 6];
+    dependents[1] = vec![DeclId(2)];
+    dependents[2] = vec![DeclId(3)];
+    dependents[3] = vec![DeclId(4)];
+    dependents[4] = vec![DeclId(2)];
     let mut seen = DenseGenerationSet::with_len(5);
 
     assert_eq!(

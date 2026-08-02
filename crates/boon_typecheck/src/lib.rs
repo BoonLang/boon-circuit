@@ -1802,39 +1802,39 @@ struct CheckedProgramBuilder<'a> {
     named_value_expressions: DeclarationExprIndex,
     signatures: Vec<CheckedCallableSignature>,
     context_formals: Vec<CheckedContextFormal>,
-    signature_by_name: BTreeMap<String, usize>,
-    signature_by_decl: BTreeMap<DeclId, usize>,
+    signature_by_name: HashMap<String, usize>,
+    signature_by_decl: DenseIndexTable<usize>,
     parameter_location_by_decl: DenseIndexTable<CheckedParameterLocation>,
-    expression_owner: BTreeMap<usize, String>,
-    expressions_by_owner: BTreeMap<String, Vec<usize>>,
+    expression_owner: DenseIndexTable<String>,
+    expressions_by_owner: HashMap<String, Vec<usize>>,
     next_decl_id: u32,
     next_scope_id: u32,
     next_call_id: u32,
-    visited_exprs: BTreeSet<usize>,
+    visited_exprs: DenseFlagSet,
     calls: Vec<CheckedCall>,
-    call_by_id: BTreeMap<CheckedCallId, usize>,
-    call_by_expression: BTreeMap<CheckedExprId, usize>,
+    call_by_id: DenseIndexTable<usize>,
+    call_by_expression: DenseIndexTable<usize>,
     scopes: Vec<CheckedScope>,
     declarations: Vec<CheckedDeclaration>,
-    declaration_by_id: BTreeMap<DeclId, usize>,
+    declaration_by_id: DenseIndexTable<usize>,
     occurrences: Vec<SemanticOccurrence>,
-    statement_declarations: BTreeMap<usize, DeclId>,
-    statement_scopes: BTreeMap<usize, LexicalScopeId>,
-    statement_body_scopes: BTreeMap<usize, LexicalScopeId>,
+    statement_declarations: DenseIndexTable<DeclId>,
+    statement_scopes: DenseIndexTable<LexicalScopeId>,
+    statement_body_scopes: DenseIndexTable<LexicalScopeId>,
     exact_statement_by_root_expression: DenseIndexTable<usize>,
-    expression_scopes: BTreeMap<usize, LexicalScopeId>,
-    expression_declarations: BTreeMap<usize, DeclId>,
-    expression_call_contexts: BTreeMap<(usize, String), DeclId>,
-    scope_declarations: BTreeMap<(LexicalScopeId, String), DeclId>,
+    expression_scopes: DenseIndexTable<LexicalScopeId>,
+    expression_declarations: DenseIndexTable<DeclId>,
+    expression_call_contexts: HashMap<(usize, String), DeclId>,
+    scope_declarations: HashMap<(LexicalScopeId, String), DeclId>,
     /// Dense exact-name lookup used by read lowering. The canonical ordered
     /// map above remains the serialized/deterministic construction index;
     /// this projection removes a fresh `String` allocation at every parent
     /// scope visited by `resolve_name`.
-    scope_declarations_by_scope: Vec<BTreeMap<String, DeclId>>,
-    pattern_declarations: BTreeMap<(usize, String), DeclId>,
-    pattern_selectors: BTreeMap<usize, usize>,
-    pattern_parents: BTreeMap<usize, usize>,
-    pattern_arms_by_scope: BTreeMap<LexicalScopeId, usize>,
+    scope_declarations_by_scope: Vec<HashMap<String, DeclId>>,
+    pattern_declarations: HashMap<(usize, String), DeclId>,
+    pattern_selectors: DenseIndexTable<usize>,
+    pattern_parents: DenseIndexTable<usize>,
+    pattern_arms_by_scope: DenseIndexTable<usize>,
     nearest_pattern_arm_by_scope: Vec<Option<usize>>,
     syntax_discriminant_parameters: BTreeSet<DeclId>,
     /// Exact selector paths read by user-callable static branches. Unlike
@@ -1872,7 +1872,7 @@ struct CheckedProgramBuilder<'a> {
     next_checked_scheme_type_var: Option<u32>,
     projection_sites: Vec<CheckedProjectionSite>,
     source_payload_shape_table: Vec<SourcePayloadSyntaxShapeEntry>,
-    exact_number_literals: BTreeMap<usize, ExactNumber>,
+    exact_number_literals: DenseIndexTable<ExactNumber>,
     work_counters: TypeCheckWorkCounters,
     diagnostics: Vec<TypeDiagnostic>,
 }
@@ -2209,8 +2209,8 @@ fn invalidate_checked_flow_cache_reverse_closure(
 
 #[cfg(test)]
 fn checked_flow_declaration_invalidation_roots(
-    readers: &BTreeMap<DeclId, Vec<usize>>,
-    dependents: &BTreeMap<DeclId, Vec<DeclId>>,
+    readers: &[Vec<usize>],
+    dependents: &[Vec<DeclId>],
     declaration: DeclId,
     seen: &mut DenseGenerationSet,
 ) -> Vec<usize> {
@@ -2218,8 +2218,8 @@ fn checked_flow_declaration_invalidation_roots(
 }
 
 fn checked_flow_declarations_invalidation_roots(
-    readers: &BTreeMap<DeclId, Vec<usize>>,
-    dependents: &BTreeMap<DeclId, Vec<DeclId>>,
+    readers: &[Vec<usize>],
+    dependents: &[Vec<DeclId>],
     declarations: impl IntoIterator<Item = DeclId>,
     seen: &mut DenseGenerationSet,
 ) -> Vec<usize> {
@@ -2230,8 +2230,20 @@ fn checked_flow_declarations_invalidation_roots(
         if !seen.insert(declaration.0 as usize) {
             continue;
         }
-        roots.extend(readers.get(&declaration).into_iter().flatten().copied());
-        declarations.extend(dependents.get(&declaration).into_iter().flatten().copied());
+        roots.extend(
+            readers
+                .get(declaration.0 as usize)
+                .into_iter()
+                .flatten()
+                .copied(),
+        );
+        declarations.extend(
+            dependents
+                .get(declaration.0 as usize)
+                .into_iter()
+                .flatten()
+                .copied(),
+        );
     }
     roots.sort_unstable();
     roots.dedup();
@@ -2290,6 +2302,13 @@ impl<T> DenseIndexTable<T> {
         self.entries.iter().filter_map(Option::as_ref)
     }
 
+    fn iter(&self) -> impl Iterator<Item = (usize, &T)> {
+        self.entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, value)| value.as_ref().map(|value| (index, value)))
+    }
+
     fn clear(&mut self) {
         self.entries.fill_with(|| None);
     }
@@ -2315,7 +2334,7 @@ struct OwnedCheckedConstruction {
     render_slot_statements: BTreeSet<usize>,
     source_payload_shape_table: Vec<SourcePayloadSyntaxShapeEntry>,
     flow_bindings: FlowModeIndex,
-    expression_owner: BTreeMap<usize, String>,
+    expression_owner: DenseIndexTable<String>,
     named_value_expressions: DeclarationExprIndex,
     function_param_requirements: BTreeMap<String, BTreeMap<String, Type>>,
     builtins: BuiltinSignatureRegistry,
@@ -2331,11 +2350,20 @@ struct CheckedDiagnosticReplayInputs {
     hold_updates_by_expression: DenseIndexTable<Box<[usize]>>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct CheckedExpressionCoverage {
+    install_attempts: usize,
+    duplicate_ids: usize,
+    out_of_range_ids: usize,
+    missing_parser_ids: usize,
+}
+
 struct CheckedProgramBuildOutput {
     program: Arc<CheckedProgram>,
     diagnostics: Vec<TypeDiagnostic>,
     exact_pipeline_inputs_valid: bool,
     work_counters: TypeCheckWorkCounters,
+    expression_coverage: CheckedExpressionCoverage,
     diagnostic_replay_inputs: Option<CheckedDiagnosticReplayInputs>,
 }
 
@@ -2720,10 +2748,10 @@ struct CheckedTypeInferenceDependencies {
     /// supplied to one formal declaration. Flow inference reads this lane on
     /// parameter cache misses, so it must not rediscover the same relation by
     /// scanning every call in the program.
-    actuals_by_parameter: BTreeMap<DeclId, Vec<CheckedExprId>>,
-    declaration_readers: BTreeMap<DeclId, Vec<usize>>,
-    calls_by_output: BTreeMap<DeclId, Vec<CheckedCallId>>,
-    calls_by_callee: BTreeMap<DeclId, Vec<CheckedCallId>>,
+    actuals_by_parameter: Vec<Vec<CheckedExprId>>,
+    declaration_readers: Vec<Vec<usize>>,
+    calls_by_output: Vec<Vec<CheckedCallId>>,
+    calls_by_callee: Vec<Vec<CheckedCallId>>,
     /// Every concrete OUT declaration supplied for an OUT formal, keyed by
     /// `DeclId.0`. This is the recursive projected-OUT lane.
     outputs_by_formal: Vec<Vec<DeclId>>,
@@ -2749,12 +2777,12 @@ struct CheckedTypeInferenceDependencies {
     /// syntax parents with read, call-output, contextual, and pattern lanes.
     flow_cache_dependents: Vec<Vec<usize>>,
     /// Expressions whose cached flow directly reads a declaration.
-    flow_cache_declaration_readers: BTreeMap<DeclId, Vec<usize>>,
+    flow_cache_declaration_readers: Vec<Vec<usize>>,
     /// Declaration-level reverse edges for forwarded OUT formals. They remain
     /// separate from expression edges so long forwarding chains do not require
     /// a precomputed quadratic transitive closure.
-    flow_cache_declaration_dependents: BTreeMap<DeclId, Vec<DeclId>>,
-    signature_expression_readers: BTreeMap<DeclId, Vec<usize>>,
+    flow_cache_declaration_dependents: Vec<Vec<DeclId>>,
+    signature_expression_readers: Vec<Vec<usize>>,
 }
 
 #[derive(Default)]
@@ -3021,9 +3049,9 @@ impl<'a> CheckedProgramBuilder<'a> {
                 program.expressions.len(),
             );
             let expressions_by_owner = expression_owner.iter().fold(
-                BTreeMap::<String, Vec<usize>>::new(),
+                HashMap::<String, Vec<usize>>::new(),
                 |mut owners, (expression, owner)| {
-                    owners.entry(owner.clone()).or_default().push(*expression);
+                    owners.entry(owner.clone()).or_default().push(expression);
                     owners
                 },
             );
@@ -3042,18 +3070,18 @@ impl<'a> CheckedProgramBuilder<'a> {
                 named_value_expressions,
                 signatures: Vec::new(),
                 context_formals: Vec::new(),
-                signature_by_name: BTreeMap::new(),
-                signature_by_decl: BTreeMap::new(),
+                signature_by_name: HashMap::new(),
+                signature_by_decl: DenseIndexTable::default(),
                 parameter_location_by_decl: DenseIndexTable::with_len(0),
                 expression_owner,
                 expressions_by_owner,
                 next_decl_id: 1,
                 next_scope_id: 1,
                 next_call_id: 0,
-                visited_exprs: BTreeSet::new(),
+                visited_exprs: DenseFlagSet::with_len(program.expressions.len()),
                 calls: Vec::new(),
-                call_by_id: BTreeMap::new(),
-                call_by_expression: BTreeMap::new(),
+                call_by_id: DenseIndexTable::default(),
+                call_by_expression: DenseIndexTable::with_len(program.expressions.len()),
                 scopes: vec![CheckedScope {
                     id: LexicalScopeId(0),
                     parent: None,
@@ -3062,21 +3090,21 @@ impl<'a> CheckedProgramBuilder<'a> {
                     span: CheckedSpan::default(),
                 }],
                 declarations: Vec::new(),
-                declaration_by_id: BTreeMap::new(),
+                declaration_by_id: DenseIndexTable::default(),
                 occurrences: Vec::new(),
-                statement_declarations: BTreeMap::new(),
-                statement_scopes: BTreeMap::new(),
-                statement_body_scopes: BTreeMap::new(),
+                statement_declarations: DenseIndexTable::default(),
+                statement_scopes: DenseIndexTable::default(),
+                statement_body_scopes: DenseIndexTable::default(),
                 exact_statement_by_root_expression,
-                expression_scopes: BTreeMap::new(),
-                expression_declarations: BTreeMap::new(),
-                expression_call_contexts: BTreeMap::new(),
-                scope_declarations: BTreeMap::new(),
+                expression_scopes: DenseIndexTable::with_len(program.expressions.len()),
+                expression_declarations: DenseIndexTable::with_len(program.expressions.len()),
+                expression_call_contexts: HashMap::new(),
+                scope_declarations: HashMap::new(),
                 scope_declarations_by_scope: Vec::new(),
-                pattern_declarations: BTreeMap::new(),
-                pattern_selectors: BTreeMap::new(),
-                pattern_parents: BTreeMap::new(),
-                pattern_arms_by_scope: BTreeMap::new(),
+                pattern_declarations: HashMap::new(),
+                pattern_selectors: DenseIndexTable::with_len(program.expressions.len()),
+                pattern_parents: DenseIndexTable::with_len(program.expressions.len()),
+                pattern_arms_by_scope: DenseIndexTable::default(),
                 nearest_pattern_arm_by_scope: Vec::new(),
                 syntax_discriminant_parameters: BTreeSet::new(),
                 syntax_discriminant_parameter_paths: BTreeMap::new(),
@@ -3097,7 +3125,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                 next_checked_scheme_type_var: None,
                 projection_sites: Vec::new(),
                 source_payload_shape_table,
-                exact_number_literals: BTreeMap::new(),
+                exact_number_literals: DenseIndexTable::with_len(program.expressions.len()),
                 work_counters: TypeCheckWorkCounters::default(),
                 diagnostics: Vec::new(),
             }
@@ -3208,7 +3236,7 @@ impl<'a> CheckedProgramBuilder<'a> {
             "validate_user_results",
             builder.validate_user_callable_results()
         );
-        checked_program_phase!("validate_expression_roots", {
+        let expression_coverage = checked_program_phase!("validate_expression_roots", {
             builder.validate_checked_expression_roots(&statements, &expressions)
         });
         let pattern_bindings = checked_program_phase!(
@@ -3287,6 +3315,7 @@ impl<'a> CheckedProgramBuilder<'a> {
             diagnostics: builder.diagnostics,
             exact_pipeline_inputs_valid,
             work_counters,
+            expression_coverage,
             diagnostic_replay_inputs: Some(CheckedDiagnosticReplayInputs {
                 source_payload_shape_table: builder.source_payload_shape_table,
                 named_value_expressions: builder.named_value_expressions,
@@ -3529,7 +3558,7 @@ impl<'a> CheckedProgramBuilder<'a> {
             .signatures
             .iter()
             .enumerate()
-            .map(|(index, signature)| (signature.decl_id, index))
+            .map(|(index, signature)| (signature.decl_id.0 as usize, index))
             .collect();
         self.parameter_location_by_decl = DenseIndexTable::with_len(self.next_decl_id as usize);
         for (signature_index, signature) in self.signatures.iter().enumerate() {
@@ -3548,9 +3577,9 @@ impl<'a> CheckedProgramBuilder<'a> {
             .declarations
             .iter()
             .enumerate()
-            .map(|(index, declaration)| (declaration.id, index))
+            .map(|(index, declaration)| (declaration.id.0 as usize, index))
             .collect();
-        self.scope_declarations_by_scope = vec![BTreeMap::new(); self.scopes.len()];
+        self.scope_declarations_by_scope = vec![HashMap::new(); self.scopes.len()];
         for ((scope, name), declaration) in &self.scope_declarations {
             let valid_scope = self
                 .scopes
@@ -3716,7 +3745,11 @@ impl<'a> CheckedProgramBuilder<'a> {
                 if !visited.insert(current) {
                     break None;
                 }
-                if let Some(arm) = self.pattern_arms_by_scope.get(&current).copied() {
+                if let Some(arm) = self
+                    .pattern_arms_by_scope
+                    .get(&(current.0 as usize))
+                    .copied()
+                {
                     break Some(arm);
                 }
                 let Some(parent) = self
@@ -3743,25 +3776,25 @@ impl<'a> CheckedProgramBuilder<'a> {
             .calls
             .iter()
             .enumerate()
-            .map(|(index, call)| (call.id, index))
+            .map(|(index, call)| (call.id.0 as usize, index))
             .collect();
         self.call_by_expression = self
             .calls
             .iter()
             .enumerate()
-            .map(|(index, call)| (call.expression, index))
+            .map(|(index, call)| (call.expression.0 as usize, index))
             .collect();
     }
 
     fn declaration(&self, id: DeclId) -> Option<&CheckedDeclaration> {
         self.declaration_by_id
-            .get(&id)
+            .get(&(id.0 as usize))
             .and_then(|index| self.declarations.get(*index))
             .filter(|declaration| declaration.id == id)
     }
 
     fn declaration_mut(&mut self, id: DeclId) -> Option<&mut CheckedDeclaration> {
-        let index = self.declaration_by_id.get(&id).copied()?;
+        let index = self.declaration_by_id.get(&(id.0 as usize)).copied()?;
         self.declarations
             .get_mut(index)
             .filter(|declaration| declaration.id == id)
@@ -3775,7 +3808,7 @@ impl<'a> CheckedProgramBuilder<'a> {
 
     fn signature_by_declaration(&self, id: DeclId) -> Option<&CheckedCallableSignature> {
         self.signature_by_decl
-            .get(&id)
+            .get(&(id.0 as usize))
             .and_then(|index| self.signatures.get(*index))
     }
 
@@ -3785,13 +3818,13 @@ impl<'a> CheckedProgramBuilder<'a> {
 
     fn call_by_checked_id(&self, id: CheckedCallId) -> Option<&CheckedCall> {
         self.call_by_id
-            .get(&id)
+            .get(&(id.0 as usize))
             .and_then(|index| self.calls.get(*index))
     }
 
     fn call_for_expression(&self, expression: CheckedExprId) -> Option<&CheckedCall> {
         self.call_by_expression
-            .get(&expression)
+            .get(&(expression.0 as usize))
             .and_then(|index| self.calls.get(*index))
     }
 
@@ -5065,7 +5098,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                 };
                 let Some(callee) = self
                     .signature_by_decl
-                    .get(&call.callable)
+                    .get(&(call.callable.0 as usize))
                     .and_then(|index| self.signatures.get(*index))
                 else {
                     continue;
@@ -5268,7 +5301,10 @@ impl<'a> CheckedProgramBuilder<'a> {
         let pattern_domains = dependencies.pattern_selector_domains.clone();
         let mut pattern_actuals = Vec::new();
         for formal in &pattern_selector_parameters {
-            if let Some(actuals) = dependencies.actuals_by_parameter.get(formal) {
+            if let Some(actuals) = dependencies
+                .actuals_by_parameter
+                .get(formal.0 as usize)
+            {
                 pattern_actuals.extend(actuals.iter().copied().map(|value| (*formal, value)));
             }
         }
@@ -6409,7 +6445,7 @@ impl<'a> CheckedProgramBuilder<'a> {
 
     fn pattern_selector_parameter_domains(&self) -> BTreeMap<DeclId, Type> {
         let mut selectors = BTreeMap::<(DeclId, usize), (bool, Vec<Variant>)>::new();
-        for (arm, selector) in &self.pattern_selectors {
+        for (arm, selector) in self.pattern_selectors.iter() {
             let Some((parameter, projection)) =
                 self.direct_read_declaration_with_projection(CheckedExprId(*selector as u32))
             else {
@@ -6421,7 +6457,7 @@ impl<'a> CheckedProgramBuilder<'a> {
             let Some(AstExpr {
                 kind: AstExprKind::MatchArm { pattern, .. },
                 ..
-            }) = self.program.expressions.get(*arm)
+            }) = self.program.expressions.get(arm)
             else {
                 continue;
             };
@@ -6544,7 +6580,7 @@ impl<'a> CheckedProgramBuilder<'a> {
             pending.declarations.insert(*declaration);
             if self
                 .signature_by_decl
-                .get(declaration)
+                .get(&(declaration.0 as usize))
                 .and_then(|index| self.signatures.get(*index))
                 .is_some_and(|signature| {
                     signature.kind == CheckedCallableKind::User
@@ -6724,7 +6760,11 @@ impl<'a> CheckedProgramBuilder<'a> {
                 let callables_started = trace.then(Instant::now);
                 stats.callable_visits += callables.len();
                 for callable in callables {
-                    let Some(index) = self.signature_by_decl.get(&callable).copied() else {
+                    let Some(index) = self
+                        .signature_by_decl
+                        .get(&(callable.0 as usize))
+                        .copied()
+                    else {
                         continue;
                     };
                     let Some(result_expression) = self
@@ -6760,7 +6800,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                             None,
                         );
                     }
-                    if let Some(calls) = dependencies.calls_by_callee.get(&callable) {
+                    if let Some(calls) = dependencies.calls_by_callee.get(callable.0 as usize) {
                         for call in calls {
                             Self::enqueue_checked_call(
                                 *call,
@@ -6834,7 +6874,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                             &mut stats,
                             None,
                         );
-                        if let Some(calls) = dependencies.calls_by_callee.get(&owner) {
+                        if let Some(calls) = dependencies.calls_by_callee.get(owner.0 as usize) {
                             for call in calls {
                                 Self::enqueue_checked_call(
                                     *call,
@@ -7272,7 +7312,10 @@ impl<'a> CheckedProgramBuilder<'a> {
         context_formal_indices: &BTreeMap<ContextFormalId, usize>,
     ) -> Option<CheckedCallInferencePlan> {
         let call = self.calls.get(call_index)?;
-        let signature_index = self.signature_by_decl.get(&call.callable).copied()?;
+        let signature_index = self
+            .signature_by_decl
+            .get(&(call.callable.0 as usize))
+            .copied()?;
         let signature = self.signatures.get(signature_index)?;
         let mut entries = Vec::with_capacity(call.entries.len());
         let mut parent_inputs = Vec::new();
@@ -7480,10 +7523,10 @@ impl<'a> CheckedProgramBuilder<'a> {
             callables_by_result: vec![Vec::new(); expression_count],
             calls_by_input: vec![Vec::new(); expression_count],
             parameters_by_actual: vec![Vec::new(); expression_count],
-            actuals_by_parameter: BTreeMap::new(),
-            declaration_readers: BTreeMap::new(),
-            calls_by_output: BTreeMap::new(),
-            calls_by_callee: BTreeMap::new(),
+            actuals_by_parameter: vec![Vec::new(); self.next_decl_id as usize],
+            declaration_readers: vec![Vec::new(); self.next_decl_id as usize],
+            calls_by_output: vec![Vec::new(); self.next_decl_id as usize],
+            calls_by_callee: vec![Vec::new(); self.next_decl_id as usize],
             outputs_by_formal: vec![Vec::new(); self.next_decl_id as usize],
             contextual_list_inputs_by_output: vec![Vec::new(); self.next_decl_id as usize],
             wrapper_calls_by_owner: vec![Vec::new(); self.next_decl_id as usize],
@@ -7503,9 +7546,9 @@ impl<'a> CheckedProgramBuilder<'a> {
             pattern_binding_sites,
             pattern_dependents_by_selector: vec![Vec::new(); expression_count],
             flow_cache_dependents: vec![Vec::new(); expression_count],
-            flow_cache_declaration_readers: BTreeMap::new(),
-            flow_cache_declaration_dependents: BTreeMap::new(),
-            signature_expression_readers: BTreeMap::new(),
+            flow_cache_declaration_readers: vec![Vec::new(); self.next_decl_id as usize],
+            flow_cache_declaration_dependents: vec![Vec::new(); self.next_decl_id as usize],
+            signature_expression_readers: vec![Vec::new(); self.next_decl_id as usize],
         };
         for expression in &self.program.expressions {
             let mut children = direct_expression_children(expression);
@@ -7527,11 +7570,12 @@ impl<'a> CheckedProgramBuilder<'a> {
             }
             if let Some(plan) = self.build_checked_read_inference_plan(expression) {
                 if let Some(declaration) = plan.path_target {
-                    dependencies
+                    if let Some(readers) = dependencies
                         .declaration_readers
-                        .entry(declaration)
-                        .or_default()
-                        .push(expression.id);
+                        .get_mut(declaration.0 as usize)
+                    {
+                        readers.push(expression.id);
+                    }
                 }
                 dependencies
                     .read_inference_plans
@@ -7541,11 +7585,12 @@ impl<'a> CheckedProgramBuilder<'a> {
                 .and_then(|name| self.signature(name))
                 .map(|signature| signature.decl_id)
             {
-                dependencies
+                if let Some(readers) = dependencies
                     .signature_expression_readers
-                    .entry(callable)
-                    .or_default()
-                    .push(expression.id);
+                    .get_mut(callable.0 as usize)
+                {
+                    readers.push(expression.id);
+                }
             }
             if let Some(arm) = self
                 .expression_scopes
@@ -7561,12 +7606,12 @@ impl<'a> CheckedProgramBuilder<'a> {
                 dependents.push(expression.id);
             }
         }
-        for (arm, selector) in &self.pattern_selectors {
+        for (arm, selector) in self.pattern_selectors.iter() {
             if let Some(dependents) = dependencies
                 .pattern_dependents_by_selector
                 .get_mut(*selector)
             {
-                dependents.push(*arm);
+                dependents.push(arm);
             }
         }
         for declaration in &self.declarations {
@@ -7613,18 +7658,23 @@ impl<'a> CheckedProgramBuilder<'a> {
                         _ => None,
                     })
                 });
-            dependencies
+            if let Some(calls) = dependencies
                 .calls_by_callee
-                .entry(call.callable)
-                .or_default()
-                .push(call.id);
-            dependencies
+                .get_mut(call.callable.0 as usize)
+            {
+                calls.push(call.id);
+            }
+            if let Some(readers) = dependencies
                 .signature_expression_readers
-                .entry(call.callable)
-                .or_default()
-                .push(call.expression.0 as usize);
+                .get_mut(call.callable.0 as usize)
+            {
+                readers.push(call.expression.0 as usize);
+            }
             if let Some(owner) = call.owner_callable
-                && let Some(owner_index) = self.signature_by_decl.get(&owner).copied()
+                && let Some(owner_index) = self
+                    .signature_by_decl
+                    .get(&(owner.0 as usize))
+                    .copied()
                 && self
                     .signatures
                     .get(owner_index)
@@ -7654,11 +7704,12 @@ impl<'a> CheckedProgramBuilder<'a> {
                         {
                             parameters.push(*formal);
                         }
-                        dependencies
+                        if let Some(actuals) = dependencies
                             .actuals_by_parameter
-                            .entry(*formal)
-                            .or_default()
-                            .push(*value);
+                            .get_mut(formal.0 as usize)
+                        {
+                            actuals.push(*value);
+                        }
                         if self.syntax_discriminant_parameters.contains(formal) {
                             if let Some(parameters) = dependencies
                                 .selector_parameters_by_actual
@@ -7674,11 +7725,12 @@ impl<'a> CheckedProgramBuilder<'a> {
                         target: output,
                         ..
                     } => {
-                        dependencies
+                        if let Some(calls) = dependencies
                             .calls_by_output
-                            .entry(*output)
-                            .or_default()
-                            .push(call.id);
+                            .get_mut(output.0 as usize)
+                        {
+                            calls.push(call.id);
+                        }
                         if let Some(outputs) =
                             dependencies.outputs_by_formal.get_mut(formal.0 as usize)
                         {
@@ -7736,7 +7788,7 @@ impl<'a> CheckedProgramBuilder<'a> {
             values.sort();
             values.dedup();
         }
-        for values in dependencies.actuals_by_parameter.values_mut() {
+        for values in &mut dependencies.actuals_by_parameter {
             values.sort();
             values.dedup();
         }
@@ -7744,15 +7796,15 @@ impl<'a> CheckedProgramBuilder<'a> {
             values.sort();
             values.dedup();
         }
-        for values in dependencies.declaration_readers.values_mut() {
+        for values in &mut dependencies.declaration_readers {
             values.sort();
             values.dedup();
         }
-        for values in dependencies.calls_by_output.values_mut() {
+        for values in &mut dependencies.calls_by_output {
             values.sort();
             values.dedup();
         }
-        for values in dependencies.calls_by_callee.values_mut() {
+        for values in &mut dependencies.calls_by_callee {
             values.sort();
             values.dedup();
         }
@@ -7764,7 +7816,7 @@ impl<'a> CheckedProgramBuilder<'a> {
             values.sort();
             values.dedup();
         }
-        for values in dependencies.signature_expression_readers.values_mut() {
+        for values in &mut dependencies.signature_expression_readers {
             values.sort();
             values.dedup();
         }
@@ -7786,7 +7838,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                 flow_edges.extend(
                     dependencies
                         .declaration_readers
-                        .get(declaration)
+                        .get(declaration.0 as usize)
                         .into_iter()
                         .flatten()
                         .map(|reader| (value, *reader)),
@@ -7798,7 +7850,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                 flow_edges.extend(
                     dependencies
                         .declaration_readers
-                        .get(parameter)
+                        .get(parameter.0 as usize)
                         .into_iter()
                         .flatten()
                         .map(|reader| (actual, *reader)),
@@ -7819,11 +7871,12 @@ impl<'a> CheckedProgramBuilder<'a> {
         for (formal, outputs) in dependencies.outputs_by_formal.iter().enumerate() {
             let formal = DeclId(formal as u32);
             for output in outputs {
-                dependencies
+                if let Some(dependents) = dependencies
                     .flow_cache_declaration_dependents
-                    .entry(*output)
-                    .or_default()
-                    .push(formal);
+                    .get_mut(output.0 as usize)
+                {
+                    dependents.push(formal);
+                }
             }
         }
 
@@ -7841,7 +7894,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                 flow_edges.extend(
                     dependencies
                         .declaration_readers
-                        .get(&output)
+                        .get(output.0 as usize)
                         .into_iter()
                         .flatten()
                         .map(|reader| (list_input.0 as usize, *reader)),
@@ -7871,7 +7924,7 @@ impl<'a> CheckedProgramBuilder<'a> {
             };
             for call in dependencies
                 .calls_by_callee
-                .get(&signature.decl_id)
+                .get(signature.decl_id.0 as usize)
                 .into_iter()
                 .flatten()
                 .filter_map(|call| self.call_by_checked_id(*call))
@@ -7900,7 +7953,7 @@ impl<'a> CheckedProgramBuilder<'a> {
             dependents.sort_unstable();
             dependents.dedup();
         }
-        for dependents in dependencies.flow_cache_declaration_dependents.values_mut() {
+        for dependents in &mut dependencies.flow_cache_declaration_dependents {
             dependents.sort();
             dependents.dedup();
         }
@@ -8059,7 +8112,7 @@ impl<'a> CheckedProgramBuilder<'a> {
             roots.extend(
                 dependencies
                     .signature_expression_readers
-                    .get(&callable)
+                    .get(callable.0 as usize)
                     .into_iter()
                     .flatten()
                     .copied(),
@@ -8192,14 +8245,14 @@ impl<'a> CheckedProgramBuilder<'a> {
     ) {
         if let Some(readers) = dependencies
             .flow_cache_declaration_readers
-            .get(&declaration)
+            .get(declaration.0 as usize)
         {
             pending.expressions.extend(readers.iter().copied());
         }
-        if let Some(readers) = dependencies.declaration_readers.get(&declaration) {
+        if let Some(readers) = dependencies.declaration_readers.get(declaration.0 as usize) {
             pending.expressions.extend(readers.iter().copied());
         }
-        if let Some(calls) = dependencies.calls_by_output.get(&declaration) {
+        if let Some(calls) = dependencies.calls_by_output.get(declaration.0 as usize) {
             for call in calls {
                 if excluded_output_call == Some(*call) {
                     stats.call_output_origin_skips += 1;
@@ -8208,7 +8261,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                 Self::enqueue_checked_call(*call, CheckedCallEnqueueCause::Output, pending, stats);
             }
         }
-        if let Some(calls) = dependencies.calls_by_callee.get(&declaration) {
+        if let Some(calls) = dependencies.calls_by_callee.get(declaration.0 as usize) {
             for call in calls {
                 Self::enqueue_checked_call(*call, CheckedCallEnqueueCause::Callee, pending, stats);
             }
@@ -8358,7 +8411,11 @@ impl<'a> CheckedProgramBuilder<'a> {
                 break;
             }
             visits += 1;
-            let Some(signature_index) = self.signature_by_decl.get(&callable).copied() else {
+            let Some(signature_index) = self
+                .signature_by_decl
+                .get(&(callable.0 as usize))
+                .copied()
+            else {
                 continue;
             };
             let Some(result_expression) = self
@@ -8380,7 +8437,7 @@ impl<'a> CheckedProgramBuilder<'a> {
             callable_changed = true;
             for call_id in dependencies
                 .calls_by_callee
-                .get(&callable)
+                .get(callable.0 as usize)
                 .into_iter()
                 .flatten()
                 .copied()
@@ -8425,7 +8482,7 @@ impl<'a> CheckedProgramBuilder<'a> {
             let mut candidates = Vec::new();
             for value in dependencies
                 .actuals_by_parameter
-                .get(formal)
+                .get(formal.0 as usize)
                 .into_iter()
                 .flatten()
             {
@@ -10539,7 +10596,9 @@ impl<'a> CheckedProgramBuilder<'a> {
             // use `self` without retaining a borrow into the builder.
             let actuals = dependencies
                 .as_ref()
-                .and_then(|dependencies| dependencies.actuals_by_parameter.get(&target))
+                .and_then(|dependencies| {
+                    dependencies.actuals_by_parameter.get(target.0 as usize)
+                })
                 .cloned()
                 .unwrap_or_else(|| {
                     // Outside the indexed solver (principally diagnostic
@@ -11106,7 +11165,11 @@ impl<'a> CheckedProgramBuilder<'a> {
     }
 
     fn set_declaration_flow_type(&mut self, declaration: DeclId, flow_type: FlowType) -> bool {
-        let Some(index) = self.declaration_by_id.get(&declaration).copied() else {
+        let Some(index) = self
+            .declaration_by_id
+            .get(&(declaration.0 as usize))
+            .copied()
+        else {
             return false;
         };
         let Some(target) = self.declarations.get_mut(index) else {
@@ -11906,7 +11969,8 @@ impl<'a> CheckedProgramBuilder<'a> {
         }
         self.pattern_selectors.insert(expr_id, selector);
         self.pattern_parents.insert(expr_id, pattern_parent);
-        self.pattern_arms_by_scope.insert(arm_scope, expr_id);
+        self.pattern_arms_by_scope
+            .insert(arm_scope.0 as usize, expr_id);
 
         for name in pattern_names {
             let declaration = self.allocate_decl();
@@ -12779,7 +12843,11 @@ impl<'a> CheckedProgramBuilder<'a> {
         let Some(declaration) = self.statement_declarations.get(&statement).copied() else {
             return;
         };
-        let Some(declaration_index) = self.declaration_by_id.get(&declaration).copied() else {
+        let Some(declaration_index) = self
+            .declaration_by_id
+            .get(&(declaration.0 as usize))
+            .copied()
+        else {
             return;
         };
         if let Some(expression) = expressions
@@ -12839,7 +12907,9 @@ impl<'a> CheckedProgramBuilder<'a> {
             let indexed_calls = self
                 .checked_type_inference_dependencies
                 .as_ref()
-                .and_then(|dependencies| dependencies.calls_by_callee.get(&callable))
+                .and_then(|dependencies| {
+                    dependencies.calls_by_callee.get(callable.0 as usize)
+                })
                 .cloned()
                 .unwrap_or_else(|| {
                     self.calls
@@ -12849,7 +12919,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                         .collect()
                 });
             for call_id in indexed_calls {
-                let Some(call_index) = self.call_by_id.get(&call_id).copied() else {
+                let Some(call_index) = self.call_by_id.get(&(call_id.0 as usize)).copied() else {
                     continue;
                 };
                 let Some(call) = self.calls.get_mut(call_index) else {
@@ -12882,13 +12952,28 @@ impl<'a> CheckedProgramBuilder<'a> {
         &mut self,
         statements: &[CheckedStatement],
         expressions: &[CheckedExpression],
-    ) {
-        let expression_by_id = expressions
-            .iter()
-            .enumerate()
-            .map(|(index, expression)| (expression.id, index))
-            .collect::<BTreeMap<_, _>>();
-        let roots = self
+    ) -> CheckedExpressionCoverage {
+        let parser_expression_count = self.program.expressions.len();
+        let mut expression_by_id = DenseIndexTable::with_len(parser_expression_count);
+        let mut installed = DenseFlagSet::with_len(parser_expression_count);
+        let mut coverage = CheckedExpressionCoverage {
+            install_attempts: expressions.len(),
+            ..CheckedExpressionCoverage::default()
+        };
+        for (index, expression) in expressions.iter().enumerate() {
+            let expression_id = expression.id.0 as usize;
+            if expression_id >= parser_expression_count {
+                coverage.out_of_range_ids = coverage.out_of_range_ids.saturating_add(1);
+                continue;
+            }
+            if !installed.insert(expression_id) {
+                coverage.duplicate_ids = coverage.duplicate_ids.saturating_add(1);
+            }
+            expression_by_id.insert_if_in_bounds(expression_id, index);
+        }
+        coverage.missing_parser_ids = parser_expression_count.saturating_sub(installed.len());
+
+        let mut roots = self
             .declarations
             .iter()
             .filter_map(|declaration| declaration.value)
@@ -12899,22 +12984,27 @@ impl<'a> CheckedProgramBuilder<'a> {
                     .filter(|signature| signature.kind == CheckedCallableKind::User)
                     .filter_map(|signature| signature.result_expression),
             )
-            .collect::<BTreeSet<_>>();
+            .collect::<Vec<_>>();
+        roots.sort_unstable();
+        roots.dedup();
         let mut reported_missing = BTreeSet::new();
-        let mut reported_cycles = BTreeSet::new();
-        let mut visited = BTreeSet::new();
+        let mut reported_cycles = DenseFlagSet::with_len(parser_expression_count);
+        let mut visited = DenseFlagSet::with_len(parser_expression_count);
+        let mut visiting = DenseFlagSet::with_len(parser_expression_count);
+        let mut path = Vec::new();
         for root in roots {
             self.validate_checked_expression_root(
                 root,
                 expressions,
                 &expression_by_id,
-                &mut BTreeSet::new(),
-                &mut Vec::new(),
+                &mut visiting,
+                &mut path,
                 &mut visited,
                 &mut reported_missing,
                 &mut reported_cycles,
             );
         }
+        coverage
     }
 
     fn validate_user_callable_results(&mut self) {
@@ -12949,14 +13039,15 @@ impl<'a> CheckedProgramBuilder<'a> {
         &mut self,
         expression: CheckedExprId,
         expressions: &[CheckedExpression],
-        expression_by_id: &BTreeMap<CheckedExprId, usize>,
-        visiting: &mut BTreeSet<CheckedExprId>,
+        expression_by_id: &DenseIndexTable<usize>,
+        visiting: &mut DenseFlagSet,
         path: &mut Vec<CheckedExprId>,
-        visited: &mut BTreeSet<CheckedExprId>,
+        visited: &mut DenseFlagSet,
         reported_missing: &mut BTreeSet<CheckedExprId>,
-        reported_cycles: &mut BTreeSet<CheckedExprId>,
+        reported_cycles: &mut DenseFlagSet,
     ) {
-        if !expression_by_id.contains_key(&expression) {
+        let expression_index = expression.0 as usize;
+        if expression_by_id.get(&expression_index).is_none() {
             if reported_missing.insert(expression) {
                 self.diagnostics.push(TypeDiagnostic {
                     severity: DiagnosticSeverity::Error,
@@ -12971,11 +13062,11 @@ impl<'a> CheckedProgramBuilder<'a> {
             }
             return;
         }
-        if visited.contains(&expression) {
+        if visited.contains(&expression_index) {
             return;
         }
-        if !visiting.insert(expression) {
-            if reported_cycles.insert(expression) {
+        if !visiting.insert(expression_index) {
+            if reported_cycles.insert(expression_index) {
                 let cycle = path
                     .iter()
                     .position(|candidate| *candidate == expression)
@@ -12992,7 +13083,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                     .into_iter()
                     .map(|expression_id| {
                         expression_by_id
-                            .get(&expression_id)
+                            .get(&(expression_id.0 as usize))
                             .and_then(|index| expressions.get(*index))
                             .map_or_else(
                                 || expression_id.0.to_string(),
@@ -13007,7 +13098,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                     .collect::<Vec<_>>()
                     .join(" -> ");
                 let span = expression_by_id
-                    .get(&expression)
+                    .get(&expression_index)
                     .and_then(|index| expressions.get(*index))
                     .map_or(CheckedSpan::default(), |candidate| candidate.span);
                 self.diagnostics.push(TypeDiagnostic {
@@ -13038,21 +13129,21 @@ impl<'a> CheckedProgramBuilder<'a> {
             );
         }
         path.pop();
-        visiting.remove(&expression);
-        visited.insert(expression);
+        visiting.remove(&expression_index);
+        visited.insert(expression_index);
     }
 
     fn checked_expression_dependencies(
         &self,
         expression: CheckedExprId,
         expressions: &[CheckedExpression],
-        expression_by_id: &BTreeMap<CheckedExprId, usize>,
-    ) -> Vec<CheckedExprId> {
+        expression_by_id: &DenseIndexTable<usize>,
+    ) -> SmallVec<[CheckedExprId; 4]> {
         let Some(expression) = expression_by_id
-            .get(&expression)
+            .get(&(expression.0 as usize))
             .and_then(|index| expressions.get(*index))
         else {
-            return Vec::new();
+            return SmallVec::new();
         };
         match &expression.kind {
             CheckedExpressionKind::Read { target, .. } => self
@@ -13068,7 +13159,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                     }
                     declaration
                         .value
-                        .and_then(|value| expression_by_id.get(&value))
+                        .and_then(|value| expression_by_id.get(&(value.0 as usize)))
                         .and_then(|index| expressions.get(*index))
                         .is_some_and(|value| {
                             !value.effect.writes_state
@@ -13088,7 +13179,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                 .collect(),
             CheckedExpressionKind::Call { call } => {
                 let Some(call) = self.call_by_checked_id(*call) else {
-                    return Vec::new();
+                    return SmallVec::new();
                 };
                 call.entries
                     .iter()
@@ -13115,9 +13206,9 @@ impl<'a> CheckedProgramBuilder<'a> {
             }
             CheckedExpressionKind::List { items, .. }
             | CheckedExpressionKind::Bytes { items, .. }
-            | CheckedExpressionKind::Set { items } => items.clone(),
-            CheckedExpressionKind::Map { entries } => entries.clone(),
-            CheckedExpressionKind::MapEntry { key, value } => vec![*key, *value],
+            | CheckedExpressionKind::Set { items } => items.iter().copied().collect(),
+            CheckedExpressionKind::Map { entries } => entries.iter().copied().collect(),
+            CheckedExpressionKind::MapEntry { key, value } => [*key, *value].into_iter().collect(),
             CheckedExpressionKind::TextTemplate { segments } => segments
                 .iter()
                 .filter_map(|segment| match segment {
@@ -13129,14 +13220,16 @@ impl<'a> CheckedProgramBuilder<'a> {
             | CheckedExpressionKind::While { input, arms } => std::iter::once(*input)
                 .chain(arms.iter().copied())
                 .collect(),
-            CheckedExpressionKind::Draining { input } => vec![*input],
-            CheckedExpressionKind::Flush { payload } => vec![*payload],
-            CheckedExpressionKind::Hold { initial, .. } => vec![*initial],
-            CheckedExpressionKind::Latest { branches } => branches.clone(),
+            CheckedExpressionKind::Draining { input } => std::iter::once(*input).collect(),
+            CheckedExpressionKind::Flush { payload } => std::iter::once(*payload).collect(),
+            CheckedExpressionKind::Hold { initial, .. } => std::iter::once(*initial).collect(),
+            CheckedExpressionKind::Latest { branches } => branches.iter().copied().collect(),
             CheckedExpressionKind::Then { input, output } => {
                 std::iter::once(*input).chain(*output).collect()
             }
-            CheckedExpressionKind::Infix { left, right, .. } => vec![*left, *right],
+            CheckedExpressionKind::Infix { left, right, .. } => {
+                [*left, *right].into_iter().collect()
+            }
             CheckedExpressionKind::MatchArm { output, .. } => output.iter().copied().collect(),
             CheckedExpressionKind::Block { bindings, result } => bindings
                 .iter()
@@ -13154,14 +13247,13 @@ impl<'a> CheckedProgramBuilder<'a> {
             | CheckedExpressionKind::Tag { .. }
             | CheckedExpressionKind::Source
             | CheckedExpressionKind::Delimiter
-            | CheckedExpressionKind::Invalid { .. } => Vec::new(),
+            | CheckedExpressionKind::Invalid { .. } => SmallVec::new(),
         }
     }
 
     fn scope_is_function_local(&self, mut scope_id: LexicalScopeId) -> bool {
-        let mut visited = BTreeSet::new();
-        while visited.insert(scope_id) {
-            let Some(scope) = self.scopes.iter().find(|scope| scope.id == scope_id) else {
+        for _ in 0..=self.scopes.len() {
+            let Some(scope) = self.scope(scope_id) else {
                 return false;
             };
             if scope.kind == CheckedScopeKind::Function {
@@ -13182,9 +13274,8 @@ impl<'a> CheckedProgramBuilder<'a> {
         else {
             return false;
         };
-        let mut visited = BTreeSet::new();
-        while visited.insert(scope_id) {
-            let Some(scope) = self.scopes.iter().find(|scope| scope.id == scope_id) else {
+        for _ in 0..=self.scopes.len() {
+            let Some(scope) = self.scope(scope_id) else {
                 return false;
             };
             if let Some(owner) = scope.owner
@@ -16933,12 +17024,12 @@ fn expression_single_name(program: &ParsedProgram, expr_id: usize) -> Option<Str
     }
 }
 
-fn expression_owner_functions(program: &ParsedProgram) -> BTreeMap<usize, String> {
+fn expression_owner_functions(program: &ParsedProgram) -> DenseIndexTable<String> {
     fn collect(
         statements: &[AstStatement],
         expressions: &[AstExpr],
         owner: Option<&str>,
-        output: &mut BTreeMap<usize, String>,
+        output: &mut DenseIndexTable<String>,
     ) {
         for statement in statements {
             let next_owner = match &statement.kind {
@@ -16948,13 +17039,15 @@ fn expression_owner_functions(program: &ParsedProgram) -> BTreeMap<usize, String
             if let (Some(expr_id), Some(owner)) = (statement.expr, next_owner) {
                 let mut ids = BTreeSet::new();
                 collect_expression_tree_ids(expr_id, expressions, &mut ids);
-                output.extend(ids.into_iter().map(|expr_id| (expr_id, owner.to_owned())));
+                for expr_id in ids {
+                    output.insert(expr_id, owner.to_owned());
+                }
             }
             collect(&statement.children, expressions, next_owner, output);
         }
     }
 
-    let mut output = BTreeMap::new();
+    let mut output = DenseIndexTable::with_len(program.expressions.len());
     collect(
         &program.ast.statements,
         &program.expressions,
@@ -17844,7 +17937,7 @@ pub fn check_editor_program_profiled(program: &ParsedProgram) -> (CheckOutput, T
 pub fn check_diagnostics_program_profiled(
     program: &ParsedProgram,
 ) -> (CheckOutput, TypeCheckProfile) {
-    let (checker, init_profile) = Checker::new_profiled(program);
+    let (checker, init_profile) = Checker::new_diagnostics_profiled(program);
     checker.finish_program_profiled(CheckOutputOwnership::DiagnosticsOwned, init_profile)
 }
 
@@ -17881,7 +17974,7 @@ pub fn check_diagnostics_program_profiled_with_external_types(
     external_types: &ExternalTypeEnvironment,
 ) -> (CheckOutput, TypeCheckProfile) {
     let (checker, init_profile) =
-        Checker::new_profiled_with_external_types(program, external_types);
+        Checker::new_diagnostics_profiled_with_external_types(program, external_types);
     checker.finish_program_profiled(CheckOutputOwnership::DiagnosticsOwned, init_profile)
 }
 
@@ -18520,7 +18613,7 @@ struct Checker<'a> {
     host_port_table: HostPortSyntaxTable,
     function_statements: BTreeMap<String, &'a AstStatement>,
     function_call_graph: BTreeMap<String, BTreeSet<String>>,
-    expression_owner: BTreeMap<usize, String>,
+    expression_owner: DenseIndexTable<String>,
     function_args_by_name: BTreeMap<String, Vec<AstParameter>>,
     function_arg_call_sites: BTreeMap<String, BTreeMap<String, Vec<usize>>>,
     function_arg_display_type_cache: RefCell<BTreeMap<(String, String), Type>>,
@@ -18712,9 +18805,32 @@ impl<'a> Checker<'a> {
         Self::new_profiled_with_external_types(program, &ExternalTypeEnvironment::default())
     }
 
+    fn new_diagnostics_profiled(program: &'a ParsedProgram) -> (Self, CheckerInitProfile) {
+        Self::new_profiled_with_external_types_and_legacy_bindings(
+            program,
+            &ExternalTypeEnvironment::default(),
+            false,
+        )
+    }
+
     fn new_profiled_with_external_types(
         program: &'a ParsedProgram,
         external_types: &ExternalTypeEnvironment,
+    ) -> (Self, CheckerInitProfile) {
+        Self::new_profiled_with_external_types_and_legacy_bindings(program, external_types, true)
+    }
+
+    fn new_diagnostics_profiled_with_external_types(
+        program: &'a ParsedProgram,
+        external_types: &ExternalTypeEnvironment,
+    ) -> (Self, CheckerInitProfile) {
+        Self::new_profiled_with_external_types_and_legacy_bindings(program, external_types, false)
+    }
+
+    fn new_profiled_with_external_types_and_legacy_bindings(
+        program: &'a ParsedProgram,
+        external_types: &ExternalTypeEnvironment,
+        initialize_legacy_bindings: bool,
     ) -> (Self, CheckerInitProfile) {
         let checker_init_started = Instant::now();
         let source_paths_started = Instant::now();
@@ -18750,8 +18866,12 @@ impl<'a> Checker<'a> {
         let function_arg_call_sites = function_arg_call_site_index(program, &function_args_by_name);
         let function_index_ms = typecheck_elapsed_ms(function_index_started);
         let object_bindings_started = Instant::now();
-        let object_bindings = object_bindings(program);
-        let object_bindings_ms = typecheck_elapsed_ms(object_bindings_started);
+        let object_bindings = initialize_legacy_bindings
+            .then(|| object_bindings(program))
+            .unwrap_or_default();
+        let object_bindings_ms = initialize_legacy_bindings
+            .then(|| typecheck_elapsed_ms(object_bindings_started))
+            .unwrap_or(0.0);
         let function_param_requirements_started = Instant::now();
         let mut function_param_requirements = function_param_requirements(program);
         merge_external_function_param_requirements(
@@ -18761,18 +18881,23 @@ impl<'a> Checker<'a> {
         let function_param_requirements_ms =
             typecheck_elapsed_ms(function_param_requirements_started);
         let name_bindings_started = Instant::now();
-        let mut name_bindings = name_bindings(program, &source_payload_types);
-        for (path, flow_type) in &external_types.values {
-            name_bindings.insert(path.clone(), flow_type.ty.clone());
+        let mut legacy_name_bindings = BTreeMap::new();
+        if initialize_legacy_bindings {
+            legacy_name_bindings = name_bindings(program, &source_payload_types);
+            for (path, flow_type) in &external_types.values {
+                legacy_name_bindings.insert(path.clone(), flow_type.ty.clone());
+            }
+            refresh_external_declaration_bindings(
+                &program.ast.statements,
+                &program.expressions,
+                external_types,
+                &mut Vec::new(),
+                &mut legacy_name_bindings,
+            );
         }
-        refresh_external_declaration_bindings(
-            &program.ast.statements,
-            &program.expressions,
-            external_types,
-            &mut Vec::new(),
-            &mut name_bindings,
-        );
-        let name_bindings_ms = typecheck_elapsed_ms(name_bindings_started);
+        let name_bindings_ms = initialize_legacy_bindings
+            .then(|| typecheck_elapsed_ms(name_bindings_started))
+            .unwrap_or(0.0);
         let flow_bindings_started = Instant::now();
         let flow_bindings = flow_bindings(program, external_types);
         let flow_bindings_ms = typecheck_elapsed_ms(flow_bindings_started);
@@ -18822,7 +18947,7 @@ impl<'a> Checker<'a> {
             #[cfg(test)]
             function_call_return_type_cache_misses: Cell::new(0),
             object_bindings,
-            name_bindings,
+            name_bindings: legacy_name_bindings,
             declaration_exprs: declaration_expression_index(program),
             local_name_bindings: Vec::new(),
             flow_bindings,
@@ -18859,8 +18984,12 @@ impl<'a> Checker<'a> {
                 .collect(),
         };
         let refresh_started = Instant::now();
-        checker.refresh_static_list_bindings();
-        let refresh_static_list_bindings_ms = typecheck_elapsed_ms(refresh_started);
+        if initialize_legacy_bindings {
+            checker.refresh_static_list_bindings();
+        }
+        let refresh_static_list_bindings_ms = initialize_legacy_bindings
+            .then(|| typecheck_elapsed_ms(refresh_started))
+            .unwrap_or(0.0);
         let init_profile = CheckerInitProfile {
             checker_init_ms: typecheck_elapsed_ms(checker_init_started),
             source_paths_ms,
@@ -18974,7 +19103,11 @@ impl<'a> Checker<'a> {
     /// Populate the compatibility diagnostic walker from the authoritative
     /// checked database. `ensure_expr` therefore becomes a dense lookup on
     /// this path and cannot start the superseded provisional inference solve.
-    fn install_checked_diagnostic_lookups(&mut self, program: &Arc<CheckedProgram>) {
+    fn install_checked_diagnostic_lookups(
+        &mut self,
+        program: &Arc<CheckedProgram>,
+        coverage: CheckedExpressionCoverage,
+    ) {
         self.expr_type_cache.fill(None);
         self.checked_program_for_diagnostics = Some(Arc::clone(program));
         self.checked_statement_values = program
@@ -18986,27 +19119,10 @@ impl<'a> Checker<'a> {
                     .map(|value| (statement.id.0 as usize, value))
             })
             .collect();
-        self.checked_flow_install_count = 0;
-        self.checked_flow_duplicate_ids = 0;
-        self.checked_flow_out_of_range_ids = 0;
-        let mut installed = DenseFlagSet::with_len(self.program.expressions.len());
-        for expression in &program.expressions {
-            self.checked_flow_install_count = self.checked_flow_install_count.saturating_add(1);
-            let index = expression.id.0 as usize;
-            if index >= self.program.expressions.len() {
-                self.checked_flow_out_of_range_ids =
-                    self.checked_flow_out_of_range_ids.saturating_add(1);
-                continue;
-            }
-            if !installed.insert(index) {
-                self.checked_flow_duplicate_ids = self.checked_flow_duplicate_ids.saturating_add(1);
-            }
-        }
-        self.checked_flow_missing_parser_ids = self
-            .program
-            .expressions
-            .len()
-            .saturating_sub(installed.len());
+        self.checked_flow_install_count = coverage.install_attempts;
+        self.checked_flow_duplicate_ids = coverage.duplicate_ids;
+        self.checked_flow_out_of_range_ids = coverage.out_of_range_ids;
+        self.checked_flow_missing_parser_ids = coverage.missing_parser_ids;
         if self.checked_flow_duplicate_ids > 0
             || self.checked_flow_out_of_range_ids > 0
             || self.checked_flow_missing_parser_ids > 0
@@ -19055,6 +19171,42 @@ impl<'a> Checker<'a> {
             .iter()
             .map(|entry| (entry.name.clone(), entry.parameters.clone()))
             .collect();
+        if self.name_bindings.is_empty() {
+            // The checked-only diagnostics path deliberately skips the legacy
+            // whole-program static binding solve during checker construction.
+            // Rehydrate only the exact/suffix names that diagnostic scopes
+            // actually query, using the finalized checked flow table as their
+            // single type owner.
+            for (path, expression) in &self.declaration_exprs.exact {
+                if let Some(flow_type) = program
+                    .expressions
+                    .get(*expression)
+                    .filter(|entry| entry.id.0 as usize == *expression)
+                    .map(|entry| entry.flow_type.ty.clone())
+                {
+                    self.name_bindings.insert(path.clone(), flow_type);
+                }
+            }
+            for (suffix, expression) in &self.declaration_exprs.unique_suffix {
+                let Some(expression) = expression else {
+                    continue;
+                };
+                if let Some(flow_type) = program
+                    .expressions
+                    .get(*expression)
+                    .filter(|entry| entry.id.0 as usize == *expression)
+                    .map(|entry| entry.flow_type.ty.clone())
+                {
+                    self.name_bindings.insert(suffix.clone(), flow_type);
+                }
+            }
+            self.name_bindings.extend(
+                self.external_types
+                    .values
+                    .iter()
+                    .map(|(path, flow_type)| (path.clone(), flow_type.ty.clone())),
+            );
+        }
         self.checked_diagnostic_replay = true;
         self.checked_diagnostic_projection_active = false;
         self.diagnostic_replayed = DenseFlagSet::with_len(self.program.expressions.len());
@@ -19116,7 +19268,15 @@ impl<'a> Checker<'a> {
         let checked_program_build_started = Instant::now();
         let build_output = self.build_checked_program_first();
         let checked_program_build_ms = typecheck_elapsed_ms(checked_program_build_started);
-        self.install_checked_diagnostic_lookups(&build_output.program);
+        let checked_diagnostic_install_started = Instant::now();
+        self.install_checked_diagnostic_lookups(
+            &build_output.program,
+            build_output.expression_coverage,
+        );
+        trace_phase(
+            "checked_program.install_diagnostic_lookups",
+            typecheck_elapsed_ms(checked_diagnostic_install_started),
+        );
 
         let check_statements_started = Instant::now();
         if trace_typecheck {
@@ -19235,6 +19395,7 @@ impl<'a> Checker<'a> {
             diagnostics: call_diagnostics,
             exact_pipeline_inputs_valid,
             mut work_counters,
+            expression_coverage: _,
             diagnostic_replay_inputs: _,
         } = build_output;
         trace_phase("checked_program.build", checked_program_build_ms);
@@ -20176,7 +20337,7 @@ impl<'a> Checker<'a> {
             // same-name global value to a parameter before the owning body is checked.
             // Checked call-site types become available after lexical evaluation; until
             // then the declared structural requirement is the authoritative fallback.
-            if self.expression_owner.contains_key(arg_expr_id) {
+            if self.expression_owner.get(arg_expr_id).is_some() {
                 continue;
             }
             let Some(arg_expr) = self.program.expressions.get(*arg_expr_id) else {
@@ -23181,6 +23342,35 @@ impl<'a> Checker<'a> {
                     return self.expr_type_var(expr_id);
                 }
             }
+        }
+        if self.checked_diagnostic_replay
+            && let Some(program) = self.checked_program_for_diagnostics.as_ref()
+            && let Some(expression) = program
+                .expressions
+                .get(expr_id)
+                .filter(|expression| expression.id.0 as usize == expr_id)
+            && let Some((target, projection)) = match &expression.kind {
+                CheckedExpressionKind::Read {
+                    target, projection, ..
+                }
+                | CheckedExpressionKind::Drain { target, projection } => {
+                    Some((*target, projection.as_slice()))
+                }
+                _ => None,
+            }
+            && let Some(base) = program
+                .declarations
+                .iter()
+                .find(|declaration| declaration.id == target)
+                .map(|declaration| &declaration.flow_type.ty)
+            && let Some(projected) = type_for_nested_path(base, projection)
+        {
+            // Checked lexical resolution owns block/function/pattern scopes.
+            // The legacy global name map flattened those scopes merely so its
+            // recursive diagnostic walker could rediscover them. Read the
+            // exact checked target instead of rebuilding that whole-project
+            // approximation on the diagnostics-only path.
+            return projected;
         }
         if let Some(ty) = self
             .local_name_bindings

@@ -23,7 +23,8 @@ document, renderer, native host, or verifier code may branch on a fixture name.
 ## Ownership
 
 ```text
-boon_parser              syntax
+boon_syntax              syntax vocabulary, AST DTOs, and feature registry
+boon_parser              parsing, validation, formatting, and ParsedProgram issuance
 boon_typecheck           types and render contracts
 boon_ir                  typed semantic graph
 boon_plan                MachinePlan v2 and typed DocumentPlan

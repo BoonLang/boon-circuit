@@ -7,7 +7,7 @@ use std::process::{Command, Stdio};
 pub const MANIFEST_RELATIVE_PATH: &str = "examples/language_feature_coverage.toml";
 
 const FORMAT_VERSION: u32 = 1;
-const REGISTRY_OWNER: &str = "boon_parser";
+const REGISTRY_OWNER: &str = "boon_syntax";
 const REGISTRY_PROTOCOL: &str = "boon-language-feature-registry-v1";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -73,7 +73,7 @@ impl FeatureBuilder {
     }
 }
 
-/// Verify the committed language-surface manifest against the parser-owned
+/// Verify the committed language-surface manifest against the syntax-owned
 /// registry and the parser's current behavior.
 ///
 /// This module is intentionally independent of the xtask command dispatcher so
@@ -83,12 +83,12 @@ pub fn run(workspace: &Path) -> Result<(), String> {
     let source = fs::read_to_string(&manifest_path)
         .map_err(|error| format!("failed to read {}: {error}", manifest_path.display()))?;
     let manifest = parse_manifest(&source)?;
-    let registry = load_parser_registry(workspace)?;
+    let registry = load_syntax_registry(workspace)?;
     validate_contract(workspace, &manifest, &registry)?;
     verify_fixture_parsing(workspace, &manifest)?;
     let pattern_corpus_count = verify_match_pattern_corpus(workspace)?;
     println!(
-        "verified {} parser-owned language feature(s) from {} and {} Boon match-pattern source(s)",
+        "verified {} syntax-owned language feature(s) from {} and {} Boon match-pattern source(s)",
         manifest.features.len(),
         MANIFEST_RELATIVE_PATH,
         pattern_corpus_count,
@@ -234,16 +234,16 @@ fn validate_manifest_shape(manifest: &Manifest) -> Result<(), String> {
     Ok(())
 }
 
-fn load_parser_registry(workspace: &Path) -> Result<Vec<RegistryFeature>, String> {
+fn load_syntax_registry(workspace: &Path) -> Result<Vec<RegistryFeature>, String> {
     let output = parser_probe_command(workspace)
         .arg("registry")
         .output()
         .map_err(|error| format!("failed to run parser language-surface probe: {error}"))?;
     if !output.status.success() {
-        return Err(command_failure("parser registry probe", &output));
+        return Err(command_failure("syntax registry probe", &output));
     }
     let stdout = String::from_utf8(output.stdout)
-        .map_err(|_| "parser registry probe emitted non-UTF-8 output".to_owned())?;
+        .map_err(|_| "syntax registry probe emitted non-UTF-8 output".to_owned())?;
     parse_registry_output(&stdout)
 }
 
@@ -251,7 +251,7 @@ fn parse_registry_output(source: &str) -> Result<Vec<RegistryFeature>, String> {
     let mut lines = source.lines();
     if lines.next() != Some(REGISTRY_PROTOCOL) {
         return Err(format!(
-            "parser registry probe did not emit `{REGISTRY_PROTOCOL}`"
+            "syntax registry probe did not emit `{REGISTRY_PROTOCOL}`"
         ));
     }
     let mut features = Vec::new();
@@ -259,7 +259,7 @@ fn parse_registry_output(source: &str) -> Result<Vec<RegistryFeature>, String> {
         let fields = line.split('\t').collect::<Vec<_>>();
         let [id, stage, parser_expectation] = fields.as_slice() else {
             return Err(format!(
-                "parser registry row {} is not id, stage, expectation",
+                "syntax registry row {} is not id, stage, expectation",
                 index + 1
             ));
         };
@@ -270,12 +270,12 @@ fn parse_registry_output(source: &str) -> Result<Vec<RegistryFeature>, String> {
         });
     }
     if features.is_empty() {
-        return Err("parser language feature registry is empty".to_owned());
+        return Err("syntax language feature registry is empty".to_owned());
     }
     for pair in features.windows(2) {
         if pair[0].id >= pair[1].id {
             return Err(format!(
-                "parser registry feature `{}` must sort before unique feature `{}`",
+                "syntax registry feature `{}` must sort before unique feature `{}`",
                 pair[0].id, pair[1].id
             ));
         }
@@ -290,7 +290,7 @@ fn validate_contract(
 ) -> Result<(), String> {
     if manifest.features.len() != registry.len() {
         return Err(format!(
-            "manifest has {} feature(s), parser registry has {}; coverage must be one-to-one",
+            "manifest has {} feature(s), syntax registry has {}; coverage must be one-to-one",
             manifest.features.len(),
             registry.len()
         ));
@@ -307,7 +307,7 @@ fn validate_contract(
             registry_feature.parser_expectation.as_str(),
         ) {
             return Err(format!(
-                "manifest feature ({}, {}, {}) differs from parser registry feature ({}, {}, {})",
+                "manifest feature ({}, {}, {}) differs from syntax registry feature ({}, {}, {})",
                 manifest_feature.id,
                 manifest_feature.stage,
                 manifest_feature.parser_expectation,
@@ -504,7 +504,7 @@ mod tests {
     static NEXT_TEMP: AtomicUsize = AtomicUsize::new(0);
 
     fn manifest_source(features: &str) -> String {
-        format!("format_version = 1\nregistry_owner = \"boon_parser\"\n\n{features}")
+        format!("format_version = 1\nregistry_owner = \"boon_syntax\"\n\n{features}")
     }
 
     fn temp_workspace() -> std::path::PathBuf {

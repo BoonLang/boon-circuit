@@ -10,7 +10,10 @@ only; linked plans remain authoritative for their own semantics and acceptance.
    relying on persistent sessions or immutable artifact reuse. Preserve the
    mandatory verified-artifact spine, complete diagnostics, proof soundness,
    persistence identities, and current language semantics. Use one Cargo build
-   or test suite at a time; invoke prebuilt binaries for repeated measurements.
+   or test suite at a time, normally with two build jobs on the reference
+   machine; invoke prebuilt binaries for repeated measurements. Use the
+   performance plan's measured flag-day crate boundaries instead of overlapping
+   Cargo producers or cosmetic file-only splits.
 
 2. Finish the active
    `BOON_CIRCUIT_SIMPLIFICATION_AND_NATIVE_RECOVERY_PLAN.md` exit before adding

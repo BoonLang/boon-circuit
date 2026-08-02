@@ -11,6 +11,7 @@ boon_data.workspace = true
 boon_document_model.workspace = true
 boon_effect_schema.workspace = true
 boon_parser.workspace = true
+boon_syntax.workspace = true
 ena.workspace = true
 serde.workspace = true
 

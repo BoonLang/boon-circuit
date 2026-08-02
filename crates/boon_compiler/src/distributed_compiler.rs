@@ -1044,10 +1044,10 @@ fn lower_parsed_role(
 }
 
 fn program_role_for_namespace(namespace: &str) -> Option<ProgramRole> {
-    Some(match boon_parser::program_role_root(namespace)? {
-        boon_parser::ProgramRoleRoot::Client => ProgramRole::Client,
-        boon_parser::ProgramRoleRoot::Session => ProgramRole::Session,
-        boon_parser::ProgramRoleRoot::Server => ProgramRole::Server,
+    Some(match boon_syntax::program_role_root(namespace)? {
+        boon_syntax::ProgramRoleRoot::Client => ProgramRole::Client,
+        boon_syntax::ProgramRoleRoot::Session => ProgramRole::Session,
+        boon_syntax::ProgramRoleRoot::Server => ProgramRole::Server,
     })
 }
 

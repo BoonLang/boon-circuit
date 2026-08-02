@@ -4,10 +4,11 @@ use boon_data::{
     Value as DataValue,
 };
 pub use boon_document_model::ProgramRole;
-use boon_parser::{
+use boon_parser::ParsedProgram;
+use boon_syntax::{
     AstCallArg, AstCallArgKind, AstDrainPath, AstExpr, AstExprKind, AstMatchPattern, AstParameter,
     AstParameterKind, AstPassContext, AstRecordField, AstStatement, AstStatementKind,
-    AstTextSegment, BytesSizeSyntax, ParsedProgram,
+    AstTextSegment, BytesSizeSyntax,
 };
 use ena::unify::{EqUnifyValue, InPlaceUnificationTable, UnifyKey};
 use serde::{Deserialize, Serialize};
@@ -16543,7 +16544,7 @@ fn merge_checked_effects(
 }
 
 fn canonical_checked_path(parts: &[String]) -> String {
-    boon_parser::canonical_value_path(parts)
+    boon_syntax::canonical_value_path(parts)
 }
 
 fn output_cycle_nodes(edges: &[(DeclId, DeclId)]) -> BTreeSet<DeclId> {
@@ -17632,10 +17633,10 @@ pub fn project_type_hints(program: &ParsedProgram, output: &CheckOutput) -> Type
 }
 
 fn role_for_namespace(namespace: &str) -> Option<ProgramRole> {
-    Some(match boon_parser::program_role_root(namespace)? {
-        boon_parser::ProgramRoleRoot::Client => ProgramRole::Client,
-        boon_parser::ProgramRoleRoot::Session => ProgramRole::Session,
-        boon_parser::ProgramRoleRoot::Server => ProgramRole::Server,
+    Some(match boon_syntax::program_role_root(namespace)? {
+        boon_syntax::ProgramRoleRoot::Client => ProgramRole::Client,
+        boon_syntax::ProgramRoleRoot::Session => ProgramRole::Session,
+        boon_syntax::ProgramRoleRoot::Server => ProgramRole::Server,
     })
 }
 
@@ -17645,7 +17646,7 @@ fn external_value_role(parts: &[String]) -> Option<ProgramRole> {
 
 fn external_value_path(parts: &[String]) -> Option<String> {
     external_value_role(parts)?;
-    (parts.len() > 1).then(|| boon_parser::canonical_value_path(parts))
+    (parts.len() > 1).then(|| boon_syntax::canonical_value_path(parts))
 }
 
 fn external_value_uses_store_root(parts: &[String]) -> bool {
@@ -32537,7 +32538,7 @@ fn type_from_longest_binding_prefix(
     parts: &[String],
 ) -> Option<Type> {
     for prefix_len in (1..=parts.len()).rev() {
-        let prefix = boon_parser::canonical_value_path(&parts[..prefix_len]);
+        let prefix = boon_syntax::canonical_value_path(&parts[..prefix_len]);
         let Some(base) = bindings.static_binding(&prefix) else {
             continue;
         };

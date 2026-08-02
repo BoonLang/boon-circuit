@@ -12,6 +12,7 @@ boon_ir.workspace = true
 boon_parser.workspace = true
 boon_plan.workspace = true
 boon_semantic.workspace = true
+boon_syntax.workspace = true
 boon_typecheck.workspace = true
 boon_verify.workspace = true
 serde.workspace = true

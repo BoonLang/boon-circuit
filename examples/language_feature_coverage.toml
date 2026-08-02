@@ -1,5 +1,5 @@
 format_version = 1
-registry_owner = "boon_parser"
+registry_owner = "boon_syntax"
 
 # `stage` describes delivery, while `parser_expectation` describes only today's
 # grammar. Planned features may reuse accepted syntax without claiming their

@@ -1,4 +1,5 @@
-use boon_parser::{LANGUAGE_FEATURE_REGISTRY, parse_ast, parse_source};
+use boon_parser::{parse_ast, parse_source};
+use boon_syntax::LANGUAGE_FEATURE_REGISTRY;
 use std::fs;
 use std::io::{self, BufRead};
 

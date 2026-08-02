@@ -52,7 +52,7 @@ The following table records code, not planning aspirations.
 
 | Area | Current evidence | Reconciliation |
 | --- | --- | --- |
-| Parser surface | `crates/boon_parser/src/lib.rs` has a canonical feature registry; exact `Number`, `BITS`, `MAP`, `SET`, structured OUT/PASS, and `FLUSH` are accepted; `WHERE` is still planned and rejected | reuse the final surface; do not create console syntax as a parser shortcut |
+| Syntax and parser surface | `crates/boon_syntax/src/lib.rs` owns the canonical feature registry and AST DTOs; `crates/boon_parser/src/lib.rs` owns parsing, validation, formatting, and opaque `ParsedProgram` issuance; exact `Number`, `BITS`, `MAP`, `SET`, structured OUT/PASS, and `FLUSH` are accepted; `WHERE` is still planned and rejected | reuse the final surface; do not create console syntax as a parser shortcut |
 | Data algebra | `crates/boon_data/src/lib.rs` has only `Number`, `Text`, `Bytes`, `List`, `Object`, `Tag`, `Map`, `Set`, and `Bits`; `number.rs` owns exact rational `ExactNumber` | app eligibility may prove fixed whole-number representation but cannot invent alternate Number semantics |
 | Checked artifact | `crates/boon_typecheck/src/lib.rs` owns opaque `CheckedProgram`, typed call/context tables, host-port metadata, BITS/MAP/SET types, and diagnostics | extend typed target/console eligibility in this owner |
 | Semantic artifact | `crates/boon_semantic/src/lib.rs` owns opaque `SemanticProgram`; `lowering_contract.rs` binds typed HTTP/WebSocket host ports | add target-neutral `ConsolePort` here; do not overload HTTP/WebSocket |

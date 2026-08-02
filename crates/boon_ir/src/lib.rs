@@ -2002,10 +2002,10 @@ fn distributed_function_role(function: &str) -> Option<boon_typecheck::ProgramRo
 }
 
 fn distributed_role(namespace: &str) -> Option<boon_typecheck::ProgramRole> {
-    Some(match boon_parser::program_role_root(namespace)? {
-        boon_parser::ProgramRoleRoot::Client => boon_typecheck::ProgramRole::Client,
-        boon_parser::ProgramRoleRoot::Session => boon_typecheck::ProgramRole::Session,
-        boon_parser::ProgramRoleRoot::Server => boon_typecheck::ProgramRole::Server,
+    Some(match boon_syntax::program_role_root(namespace)? {
+        boon_syntax::ProgramRoleRoot::Client => boon_typecheck::ProgramRole::Client,
+        boon_syntax::ProgramRoleRoot::Session => boon_typecheck::ProgramRole::Session,
+        boon_syntax::ProgramRoleRoot::Server => boon_typecheck::ProgramRole::Server,
     })
 }
 

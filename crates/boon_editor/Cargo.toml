@@ -9,6 +9,7 @@ rust-version.workspace = true
 boon_contract.workspace = true
 boon_document_model.workspace = true
 boon_parser.workspace = true
+boon_syntax.workspace = true
 boon_typecheck.workspace = true
 ropey.workspace = true
 serde.workspace = true

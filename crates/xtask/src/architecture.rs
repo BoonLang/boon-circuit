@@ -669,6 +669,7 @@ fn verified_semantic_compiler_spine(workspace: &Path) -> Result<String, String> 
     let verify = read_text(&workspace.join("crates/boon_verify/src/lib.rs"))?;
     let ir = read_text(&workspace.join("crates/boon_ir/src/lib.rs"))?;
     let parser = read_text(&workspace.join("crates/boon_parser/src/lib.rs"))?;
+    let syntax = read_text(&workspace.join("crates/boon_syntax/src/lib.rs"))?;
     let typecheck = read_text(&workspace.join("crates/boon_typecheck/src/lib.rs"))?;
     let compiler = read_text(&workspace.join("crates/boon_compiler/src/lib.rs"))?;
     let distributed =
@@ -681,7 +682,7 @@ fn verified_semantic_compiler_spine(workspace: &Path) -> Result<String, String> 
     verify_opaque_artifact(&verify, "ContractVerifiedProgram", false)?;
     verify_opaque_artifact(&ir, "ErasedProgram", true)?;
     verify_required_direct_field(
-        &parser,
+        &syntax,
         "ParsedProgramFields",
         "source_bundle_digest_v1",
         "SourceBundleDigestV1",
@@ -1552,6 +1553,7 @@ fn no_example_specific_engine_branches(workspace: &Path) -> Result<String, Strin
     names.dedup();
 
     let prefixes = [
+        "crates/boon_syntax/",
         "crates/boon_parser/",
         "crates/boon_compiler/",
         "crates/boon_typecheck/",

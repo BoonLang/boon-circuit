@@ -1906,8 +1906,9 @@ ParsedProgram
 
 The boundaries and owners are fixed:
 
-- `boon_parser` produces `ParsedProgram` and owns only syntax, source spans,
-  and lossless source structure.
+- `boon_syntax` owns syntax vocabulary, AST/source DTOs, source spans, and the
+  canonical language-feature registry. `boon_parser` owns parsing, validation,
+  formatting, tracing, and opaque `ParsedProgram` issuance.
 - `boon_typecheck` produces `CheckedProgram` with resolved declarations,
   structural types, flow types, and typed calls.
 - `boon_semantic` produces `SemanticProgram` by expanding contextual
@@ -2356,7 +2357,7 @@ passthrough/no-op behavior.
   `ParsedProgram -> CheckedProgram -> SemanticProgram ->
   ContractVerifiedProgram -> ErasedProgram` ownership boundary and inventory
   every compiler/runtime/backend entry point that bypasses it.
-- Add the parser-owned feature registry design.
+- Add the syntax-owned feature registry design.
 - Add `examples/language_feature_coverage.toml` and its verifier skeleton.
 - Record current parser/type/value/schema fingerprints.
 - Inventory all zero-based, `NaN`, public Bool, binary64, and pattern uses.

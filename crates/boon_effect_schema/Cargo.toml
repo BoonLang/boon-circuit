@@ -6,4 +6,4 @@ license.workspace = true
 rust-version.workspace = true
 
 [dev-dependencies]
-boon_parser = { path = "../boon_parser" }
+boon_syntax.workspace = true

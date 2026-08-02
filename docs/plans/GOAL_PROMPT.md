@@ -212,8 +212,12 @@ Execution strategy:
   relevant milestone.
 - Keep compiler development feedback practical. Use focused debug-profile
   checks while fixing semantics and correctness; reserve release builds and
-  end-to-end performance reports for completed milestone candidates. Never run
-  multiple Cargo builds or test suites concurrently on the reference machine.
+  end-to-end performance reports for completed milestone candidates. Run only
+  one Cargo invocation at a time, normally with two build jobs on the reference
+  machine; never overlap independent Cargo builds or test suites. Split crates
+  only at the performance plan's stable ownership and dependency-invalidation
+  boundaries, with an atomic no-compatibility cutover and unchanged artifact
+  proof boundaries.
 - After one required Rust build, invoke the built `boon_cli` and focused test
   binaries directly for repeated Boon fixtures. Do not pay a Cargo graph scan
   and test-harness relink for every example or every unchanged focused check.

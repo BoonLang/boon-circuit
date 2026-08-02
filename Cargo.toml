@@ -6,6 +6,7 @@ members = [
     "crates/boon_wire",
     "crates/boon_effect_schema",
     "crates/boon_example_manifest",
+    "crates/boon_syntax",
     "crates/boon_parser",
     "crates/boon_typecheck",
     "crates/boon_semantic",
@@ -55,6 +56,7 @@ boon_data = { path = "crates/boon_data" }
 boon_wire = { path = "crates/boon_wire" }
 boon_effect_schema = { path = "crates/boon_effect_schema" }
 boon_example_manifest = { path = "crates/boon_example_manifest" }
+boon_syntax = { path = "crates/boon_syntax" }
 boon_parser = { path = "crates/boon_parser" }
 boon_typecheck = { path = "crates/boon_typecheck" }
 boon_semantic = { path = "crates/boon_semantic" }

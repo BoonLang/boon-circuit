@@ -683,6 +683,7 @@ dependencies = [
  "boon_parser",
  "boon_plan",
  "boon_semantic",
+ "boon_syntax",
  "boon_typecheck",
  "boon_verify",
  "serde",
@@ -758,6 +759,7 @@ dependencies = [
  "boon_contract",
  "boon_document_model",
  "boon_parser",
+ "boon_syntax",
  "boon_typecheck",
  "ropey",
  "serde",
@@ -768,7 +770,7 @@ dependencies = [
 name = "boon_effect_schema"
 version = "0.1.0"
 dependencies = [
- "boon_parser",
+ "boon_syntax",
 ]
 
 [[package]]
@@ -851,6 +853,7 @@ dependencies = [
  "boon_data",
  "boon_parser",
  "boon_semantic",
+ "boon_syntax",
  "boon_typecheck",
  "boon_verify",
  "serde",
@@ -941,6 +944,7 @@ name = "boon_parser"
 version = "0.1.0"
 dependencies = [
  "boon_contract",
+ "boon_syntax",
  "serde",
  "serde_json",
 ]
@@ -1099,6 +1103,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "boon_syntax"
+version = "0.1.0"
+dependencies = [
+ "boon_contract",
+ "serde",
+]
+
+[[package]]
 name = "boon_typecheck"
 version = "0.1.0"
 dependencies = [
@@ -1107,6 +1119,7 @@ dependencies = [
  "boon_document_model",
  "boon_effect_schema",
  "boon_parser",
+ "boon_syntax",
  "ena",
  "serde",
  "serde_json",

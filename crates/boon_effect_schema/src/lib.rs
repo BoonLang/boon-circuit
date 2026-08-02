@@ -1321,7 +1321,7 @@ mod tests {
                 .split_once('/')
                 .expect("host effect operations use a standard-root namespace");
             assert!(
-                boon_parser::is_reserved_standard_root(root),
+                boon_syntax::is_reserved_standard_root(root),
                 "host effect namespace `{root}` is absent from STANDARD_ROOTS"
             );
             assert!(

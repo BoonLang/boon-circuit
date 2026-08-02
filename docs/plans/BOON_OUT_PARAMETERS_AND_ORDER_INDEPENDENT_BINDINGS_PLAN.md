@@ -948,7 +948,7 @@ layout frame rebuild, full host reconciliation, or full render-scene rebuild.
 
 The implementation starts from concrete duplicated paths that exist today:
 
-- `boon_parser::AstCallArg` stores only an optional name and expression, so it
+- `boon_syntax::AstCallArg` stores only an optional name and expression, so it
   must be replaced or complemented by structured bare/named/PASS call entries
   and structured function parameters.
 - `boon_typecheck::ListMapBinding`, render-slot template fields, and parser

@@ -175,6 +175,39 @@ gate.
   only for a request that asks for them and must not remain reachable from the
   normal executable artifact.
 
+### Rust Build And Crate Boundaries
+
+Rust build latency is development infrastructure, not a substitute for the
+measured Boon compiler latency. Use one Cargo invocation at a time with two
+build jobs on the reference machine. A third job may be adopted only after a
+measured dependency-boundary change shows a benefit without renewed memory or
+I/O pressure; do not run independent Cargo producers concurrently.
+
+Split crates at stable ownership and dependency-invalidation boundaries, not
+merely because a source file is large:
+
+1. complete independent source-unit parsing and project assembly before moving
+   the stable AST, syntax DTOs, language registry, and canonical vocabulary to
+   `boon_syntax`;
+2. move the complete immutable checked graph and its pure operations to
+   `boon_checked` so semantic, verification, and IR consumers do not depend on
+   solver implementation;
+3. isolate the large `MachinePlan` backend from compiler-session orchestration;
+4. split semantic passes only after the checked boundary removes cycles and
+   fresh timings identify independently owned components.
+
+Each move is a flag-day cutover: update production consumers atomically and
+delete the old definitions without aliases, blanket re-exports, duplicate DTOs,
+feature-selected owners, or fallback paths. `ParsedProgram` and
+`CheckedProgram` remain safely unforgeable proof-bearing products. A crate
+boundary must not expose a safe constructor that lets a parser snapshot,
+checked DTO, semantic core, or unverified program enter the executable spine.
+
+Development profiles and focused debug tests remain directional tools. The
+acceptance producer remains the revision-identified `release` binary required
+by the budget manifest; a faster Rust profile cannot be relabeled as cold
+compiler evidence.
+
 ### Semantic Construction And Proof Boundary
 
 The public executable spine remains:
@@ -296,11 +329,15 @@ cache-enabled evidence, and reproduces the current fixture artifacts.
 ### Phase 1: Cold Parse And Type Core
 
 1. Introduce independent unit parsing and stable source/declaration identities.
-2. Replace borrowed checker state and duplicate checked construction with the
+2. Move the stabilized syntax data boundary to `boon_syntax` without retaining
+   parser compatibility exports.
+3. Replace borrowed checker state and duplicate checked construction with the
    owned checked database.
-3. Introduce compact interned terms, dense tables, dependency indexes, and one
+4. Move the immutable checked-program model to `boon_checked` while keeping
+   safe construction exclusive to successful checking.
+5. Introduce compact interned terms, dense tables, dependency indexes, and one
    bounded solver/worklist path.
-4. Delete superseded global sweeps, deep copies, parser semantic side channels,
+6. Delete superseded global sweeps, deep copies, parser semantic side channels,
    and backend name rediscovery as their replacements land.
 
 Exit: both cold checked-diagnostics gates and their RSS/scaling gates pass with
@@ -319,9 +356,11 @@ closures and negative proof cases pass, and no unsealed artifact is executable.
 
 ### Phase 3: Backend, Hash, And Memory Closure
 
-1. Lower directly from compact verified tables.
-2. Stream hashes and serialization and detach optional debug/report data.
-3. Remove old recursive/duplicated representations after parity is proven.
+1. Isolate the large machine-plan backend from compiler service/session
+   orchestration without weakening its verified input boundary.
+2. Lower directly from compact verified tables.
+3. Stream hashes and serialization and detach optional debug/report data.
+4. Remove old recursive/duplicated representations after parity is proven.
 
 Exit: both cold verified-runnable time and RSS gates pass for all fixtures, and
 their plan hashes remain unchanged.

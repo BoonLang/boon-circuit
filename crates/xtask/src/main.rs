@@ -1,6 +1,7 @@
 mod architecture;
 mod compiler_interactions;
 mod compiler_performance;
+mod compiler_work_sample;
 mod dependency_classifier;
 mod fjordpulse_traceability;
 mod gates;

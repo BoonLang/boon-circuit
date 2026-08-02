@@ -1,6 +1,9 @@
 use boon_example_manifest::{ExampleEntry, ExampleManifest};
 use boon_ir::{ErasedProgram, verify_hidden_identity, verify_static_schedule};
-use boon_parser::{ParsedProgram, parse_project, parse_source};
+use boon_parser::{
+    ParseError, ParseProfile, ParseWorkCounters, ParsedProgram, parse_project,
+    parse_project_profiled, parse_source_profiled,
+};
 pub use boon_plan::{
     ApplicationIdentity, MachinePlan, MigrationPredecessorBinding, PlanError, ProgramRole,
     TargetProfile,
@@ -149,6 +152,8 @@ pub struct CheckedDiagnosticsProfile {
     pub source_unit_count: usize,
     pub expression_count: usize,
     pub diagnostic_count: usize,
+    pub parse_work: ParseWorkCounters,
+    pub typecheck_work: boon_typecheck::TypeCheckWorkCounters,
     pub parse_ms: f64,
     pub typecheck_ms: f64,
     pub total_ms: f64,
@@ -247,6 +252,8 @@ pub struct CompileProfile {
     pub checked_call_count: usize,
     pub graph_node_count: usize,
     pub cancellation_checkpoint_count: usize,
+    pub parse_work: ParseWorkCounters,
+    pub typecheck_work: boon_typecheck::TypeCheckWorkCounters,
     pub parse_ms: f64,
     pub typecheck_ms: f64,
     pub semantic_ms: f64,
@@ -469,10 +476,11 @@ pub fn compile_machine_plan(
 ) -> CompilerResult<CompiledMachinePlanFromSource> {
     let total_started = Instant::now();
     let parse_started = Instant::now();
-    let parsed = parse_compile_source(request.source)?;
+    let (parsed, parse_work) = parse_compile_source(request.source)?;
     let parse_ms = elapsed_ms(parse_started);
     compile_parsed_to_machine_plan(
         parsed,
+        parse_work,
         parse_ms,
         total_started,
         request.target_profile,
@@ -534,36 +542,33 @@ fn check_source_with_ownership(
 ) -> CompilerResult<CheckedSourceFromSource> {
     let total_started = Instant::now();
     let parse_started = Instant::now();
-    let parsed = parse_compile_source(request.source)?;
+    let (parsed, parse_work) = parse_compile_source(request.source)?;
     let parse_ms = elapsed_ms(parse_started);
     let source_unit_count = parsed.files.len();
     let expression_count = parsed.expressions.len();
     let external_types = boon_typecheck::ExternalTypeEnvironment::empty(request.program_role);
     let typecheck_started = Instant::now();
-    let output = match ownership {
+    let (output, typecheck_profile) = match ownership {
         CheckedSourceOwnership::Report => {
-            boon_typecheck::check_program_profiled_with_external_types(&parsed, &external_types).0
+            boon_typecheck::check_program_profiled_with_external_types(&parsed, &external_types)
         }
         CheckedSourceOwnership::Editor => {
             boon_typecheck::check_editor_program_profiled_with_external_types(
                 &parsed,
                 &external_types,
             )
-            .0
         }
         CheckedSourceOwnership::Diagnostics => {
             boon_typecheck::check_diagnostics_program_profiled_with_external_types(
                 &parsed,
                 &external_types,
             )
-            .0
         }
         CheckedSourceOwnership::Runtime => {
             boon_typecheck::check_runtime_program_profiled_with_external_types(
                 &parsed,
                 &external_types,
             )
-            .0
         }
     };
     let typecheck_ms = elapsed_ms(typecheck_started);
@@ -582,6 +587,8 @@ fn check_source_with_ownership(
             source_unit_count,
             expression_count,
             diagnostic_count,
+            parse_work,
+            typecheck_work: typecheck_profile.work_counters,
             parse_ms,
             typecheck_ms,
             total_ms: elapsed_ms(total_started),
@@ -589,24 +596,30 @@ fn check_source_with_ownership(
     })
 }
 
-fn parse_compile_source(source: CompileSource<'_>) -> CompilerResult<ParsedProgram> {
-    let parsed = match source {
-        CompileSource::Path(source_path) => parse_source_path_or_manifest_project(source_path)?,
+fn parse_compile_source(
+    source: CompileSource<'_>,
+) -> CompilerResult<(ParsedProgram, ParseWorkCounters)> {
+    let (parsed, profile) = match source {
+        CompileSource::Path(source_path) => {
+            let (entrypoint, units) = compiler_source_project_for_path(source_path)?;
+            parse_source_units_profiled(&entrypoint, &units)
+        }
         CompileSource::Text {
             source_label,
             source_text,
-        } => parse_source(source_label.to_owned(), source_text.to_owned())?,
+        } => parse_source_profiled(source_label.to_owned(), source_text.to_owned()),
         CompileSource::Units {
             source_label,
             units,
-        } => parse_source_units(source_label, units)?,
+        } => parse_source_units_profiled(source_label, units),
     };
-    Ok(parsed)
+    Ok((parsed?, profile.work_counters))
 }
 
 #[allow(clippy::too_many_arguments)]
 fn compile_parsed_to_machine_plan(
     parsed: ParsedProgram,
+    parse_work: ParseWorkCounters,
     parse_ms: f64,
     total_started: Instant,
     target_profile: TargetProfile,
@@ -617,11 +630,11 @@ fn compile_parsed_to_machine_plan(
 ) -> CompilerResult<CompiledMachinePlanFromSource> {
     let external_types = boon_typecheck::ExternalTypeEnvironment::empty(program_role);
     let typecheck_started = Instant::now();
-    let check_output = boon_typecheck::check_runtime_program_profiled_with_external_types(
-        &parsed,
-        &external_types,
-    )
-    .0;
+    let (check_output, typecheck_profile) =
+        boon_typecheck::check_runtime_program_profiled_with_external_types(
+            &parsed,
+            &external_types,
+        );
     let typecheck_ms = elapsed_ms(typecheck_started);
     if std::env::var_os("BOON_COMPILER_LOWER_TRACE").is_some() {
         eprintln!("boon_compiler lower typecheck: {:.3}ms", typecheck_ms);
@@ -633,6 +646,8 @@ fn compile_parsed_to_machine_plan(
         checked,
         source_unit_count,
         parsed_expression_count,
+        parse_work,
+        typecheck_profile.work_counters,
         parse_ms,
         typecheck_ms,
         elapsed_ms(total_started),
@@ -676,6 +691,8 @@ pub(crate) fn finish_checked_machine_plan_with_cancellation(
         checked,
         profile.source_unit_count,
         profile.expression_count,
+        profile.parse_work,
+        profile.typecheck_work,
         profile.parse_ms,
         profile.typecheck_ms,
         profile.total_ms,
@@ -693,6 +710,8 @@ fn finish_checked_program_to_machine_plan(
     checked: boon_typecheck::CheckedProgram,
     source_unit_count: usize,
     parsed_expression_count: usize,
+    parse_work: ParseWorkCounters,
+    typecheck_work: boon_typecheck::TypeCheckWorkCounters,
     parse_ms: f64,
     typecheck_ms: f64,
     elapsed_before_finish_ms: f64,
@@ -748,6 +767,8 @@ fn finish_checked_program_to_machine_plan(
         checked_call_count,
         graph_node_count: ir.graph_node_count,
         cancellation_checkpoint_count: cancellation.checkpoints,
+        parse_work,
+        typecheck_work,
         parse_ms,
         typecheck_ms,
         semantic_ms: semantic_profile.semantic_ms,
@@ -818,6 +839,18 @@ fn parse_source_units(
             .iter()
             .map(|unit| (unit.path.clone(), unit.source.clone())),
     )?)
+}
+
+fn parse_source_units_profiled(
+    source_label: &str,
+    units: &[CompilerSourceUnit],
+) -> (Result<ParsedProgram, ParseError>, ParseProfile) {
+    parse_project_profiled(
+        source_label.to_owned(),
+        units
+            .iter()
+            .map(|unit| (unit.path.clone(), unit.source.clone())),
+    )
 }
 
 pub fn compiler_source_units_for_path(path: &Path) -> CompilerResult<Vec<CompilerSourceUnit>> {
@@ -896,11 +929,6 @@ fn compiler_source_units_for_files(files: Vec<PathBuf>) -> CompilerResult<Vec<Co
             })
         })
         .collect()
-}
-
-fn parse_source_path_or_manifest_project(source_path: &Path) -> CompilerResult<ParsedProgram> {
-    let (entrypoint, units) = compiler_source_project_for_path(source_path)?;
-    parse_source_units(&entrypoint, &units)
 }
 
 fn compiler_logical_source_paths(files: &[PathBuf]) -> CompilerResult<Vec<String>> {

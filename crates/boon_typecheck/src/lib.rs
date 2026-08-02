@@ -1865,6 +1865,7 @@ struct CheckedProgramBuilder<'a> {
     projection_sites: Vec<CheckedProjectionSite>,
     source_payload_shape_table: Vec<SourcePayloadSyntaxShapeEntry>,
     exact_number_literals: BTreeMap<usize, ExactNumber>,
+    work_counters: TypeCheckWorkCounters,
     diagnostics: Vec<TypeDiagnostic>,
 }
 
@@ -2324,6 +2325,7 @@ struct CheckedProgramBuildOutput {
     program: CheckedProgram,
     diagnostics: Vec<TypeDiagnostic>,
     exact_pipeline_inputs_valid: bool,
+    work_counters: TypeCheckWorkCounters,
     diagnostic_replay_inputs: Option<CheckedDiagnosticReplayInputs>,
 }
 
@@ -3033,6 +3035,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                 projection_sites: Vec::new(),
                 source_payload_shape_table,
                 exact_number_literals: BTreeMap::new(),
+                work_counters: TypeCheckWorkCounters::default(),
                 diagnostics: Vec::new(),
             }
         });
@@ -3207,10 +3210,13 @@ impl<'a> CheckedProgramBuilder<'a> {
             checked_program_phase!("derive_order_chains", derive_checked_order_chains(&checked));
         checked.fields.order_chains = order_chains;
         builder.diagnostics.extend(order_diagnostics);
+        let mut work_counters = builder.work_counters;
+        work_counters.record_flow_cache(builder.checked_flow_inference_cache.stats);
         CheckedProgramBuildOutput {
             program: checked,
             diagnostics: builder.diagnostics,
             exact_pipeline_inputs_valid,
+            work_counters,
             diagnostic_replay_inputs: Some(CheckedDiagnosticReplayInputs {
                 source_payload_shape_table: builder.source_payload_shape_table,
                 named_value_expressions: builder.named_value_expressions,
@@ -5075,6 +5081,12 @@ impl<'a> CheckedProgramBuilder<'a> {
         }
         self.wrapper_call_scheme_vars = call_scheme_vars;
         self.next_checked_scheme_type_var = Some(next_var);
+        self.work_counters.record_wrapper_scheme_worklist(
+            visit_count,
+            changed_owner_count,
+            parameter_change_count,
+            result_change_count,
+        );
         if trace {
             eprintln!(
                 "boon_typecheck checked_program.infer_contextual_callable_schemes.propagation_worklist \
@@ -5409,6 +5421,8 @@ impl<'a> CheckedProgramBuilder<'a> {
         }
 
         let converged = pending.is_empty();
+        self.work_counters
+            .record_context_scheme_worklist(visits, changes);
         if std::env::var_os("BOON_TYPECHECK_TRACE").is_some() {
             eprintln!(
                 "boon_typecheck checked_program.infer_context_schemes.worklist visits={visits} changes={changes} maximum_visits={maximum_visits} exhausted={converged}"
@@ -7073,6 +7087,14 @@ impl<'a> CheckedProgramBuilder<'a> {
                 audit_started.map(typecheck_elapsed_ms).unwrap_or(0.0),
             );
         }
+        debug_assert_eq!(
+            stats
+                .call_changed_visits
+                .saturating_add(stats.call_noop_visits),
+            stats.call_visits,
+            "every checked inference call visit must be classified"
+        );
+        self.work_counters.record_inference(&stats);
         if worklist_exhausted && audit_clean {
             return;
         }
@@ -17928,8 +17950,207 @@ fn external_type_environment_diagnostics(
     diagnostics
 }
 
+/// Deterministic, timer-free work performed by one complete typecheck request.
+///
+/// These counters are incremented at the owning worklist, cache, or diagnostic
+/// lookup. They deliberately do not infer work from the size of the resulting
+/// checked program or report. Consequently they can be compared across runs
+/// and used by scaling gates without depending on wall-clock noise.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TypeCheckWorkCounters {
+    pub inference_invocations: u64,
+    pub inference_rounds: u64,
+    pub inference_expression_visits: u64,
+    pub inference_declaration_visits: u64,
+    pub inference_callable_visits: u64,
+    pub inference_call_visits: u64,
+    pub inference_call_changed_visits: u64,
+    pub inference_call_noop_visits: u64,
+    pub inference_call_seed_enqueues: u64,
+    pub inference_call_input_enqueues: u64,
+    pub inference_call_output_enqueues: u64,
+    pub inference_call_callee_enqueues: u64,
+    pub inference_call_selector_enqueues: u64,
+    pub inference_call_output_scope_enqueues: u64,
+    pub inference_call_output_origin_skips: u64,
+    pub inference_selector_visits: u64,
+    pub inference_pattern_visits: u64,
+    pub context_scheme_worklist_invocations: u64,
+    pub context_scheme_worklist_visits: u64,
+    pub context_scheme_worklist_changes: u64,
+    pub wrapper_scheme_worklist_invocations: u64,
+    pub wrapper_scheme_worklist_visits: u64,
+    pub wrapper_scheme_changed_owners: u64,
+    pub wrapper_scheme_parameter_changes: u64,
+    pub wrapper_scheme_result_changes: u64,
+    pub checked_flow_cache_hits: u64,
+    pub checked_flow_cache_misses: u64,
+    pub checked_flow_cache_invalidations: u64,
+    pub checked_flow_cache_reverse_invalidation_traversals: u64,
+    pub checked_flow_cache_full_resets: u64,
+    pub checked_flow_cache_rejected_invalid_ids: u64,
+    pub checked_flow_indexed_read_hits: u64,
+    pub checked_flow_indexed_read_missing: u64,
+    pub checked_flow_indexed_read_rejected: u64,
+    pub checked_flow_indexed_out_hits: u64,
+    pub checked_flow_indexed_out_missing: u64,
+    /// Checked expressions considered while installing the diagnostic lookup.
+    /// This is an attempt counter: duplicate and out-of-range IDs remain
+    /// classified separately below and are not silently subtracted.
+    pub diagnostic_flow_install_attempts: u64,
+    pub diagnostic_flow_duplicate_ids: u64,
+    pub diagnostic_flow_out_of_range_ids: u64,
+    pub diagnostic_flow_missing_parser_ids: u64,
+    /// Every diagnostic `ensure_expr` lookup after checked replay is enabled.
+    /// Repeated requests for one expression are counted repeatedly.
+    pub diagnostic_replay_requests: u64,
+    pub diagnostic_replay_hits: u64,
+    pub diagnostic_replay_misses: u64,
+    /// Distinct expression IDs whose checked diagnostics were replayed.
+    pub diagnostic_replay_unique_expressions: u64,
+}
+
+impl TypeCheckWorkCounters {
+    /// Every inference call visit is classified exactly once as changed or a
+    /// no-op. A false result identifies instrumentation drift or saturation.
+    #[must_use]
+    pub fn inference_call_visits_are_fully_classified(&self) -> bool {
+        self.inference_call_changed_visits
+            .checked_add(self.inference_call_noop_visits)
+            == Some(self.inference_call_visits)
+    }
+
+    /// A replay request increments before lookup and then takes exactly one
+    /// hit or miss branch. Unique-expression replay is intentionally separate
+    /// because multiple diagnostics may request the same expression.
+    #[must_use]
+    pub fn diagnostic_replay_is_fully_accounted(&self) -> bool {
+        self.diagnostic_replay_hits
+            .checked_add(self.diagnostic_replay_misses)
+            == Some(self.diagnostic_replay_requests)
+    }
+
+    fn add_usize(counter: &mut u64, value: usize) {
+        *counter = counter.saturating_add(value as u64);
+    }
+
+    fn record_inference(&mut self, stats: &CheckedTypeInferenceWorkStats) {
+        self.inference_invocations = self.inference_invocations.saturating_add(1);
+        Self::add_usize(&mut self.inference_rounds, stats.rounds);
+        Self::add_usize(
+            &mut self.inference_expression_visits,
+            stats.expression_visits,
+        );
+        Self::add_usize(
+            &mut self.inference_declaration_visits,
+            stats.declaration_visits,
+        );
+        Self::add_usize(&mut self.inference_callable_visits, stats.callable_visits);
+        Self::add_usize(&mut self.inference_call_visits, stats.call_visits);
+        Self::add_usize(
+            &mut self.inference_call_changed_visits,
+            stats.call_changed_visits,
+        );
+        Self::add_usize(&mut self.inference_call_noop_visits, stats.call_noop_visits);
+        Self::add_usize(
+            &mut self.inference_call_seed_enqueues,
+            stats.call_seed_enqueues,
+        );
+        Self::add_usize(
+            &mut self.inference_call_input_enqueues,
+            stats.call_input_enqueues,
+        );
+        Self::add_usize(
+            &mut self.inference_call_output_enqueues,
+            stats.call_output_enqueues,
+        );
+        Self::add_usize(
+            &mut self.inference_call_callee_enqueues,
+            stats.call_callee_enqueues,
+        );
+        Self::add_usize(
+            &mut self.inference_call_selector_enqueues,
+            stats.call_selector_enqueues,
+        );
+        Self::add_usize(
+            &mut self.inference_call_output_scope_enqueues,
+            stats.call_output_scope_enqueues,
+        );
+        Self::add_usize(
+            &mut self.inference_call_output_origin_skips,
+            stats.call_output_origin_skips,
+        );
+        Self::add_usize(&mut self.inference_selector_visits, stats.selector_visits);
+        Self::add_usize(&mut self.inference_pattern_visits, stats.pattern_visits);
+    }
+
+    fn record_context_scheme_worklist(&mut self, visits: usize, changes: usize) {
+        self.context_scheme_worklist_invocations =
+            self.context_scheme_worklist_invocations.saturating_add(1);
+        Self::add_usize(&mut self.context_scheme_worklist_visits, visits);
+        Self::add_usize(&mut self.context_scheme_worklist_changes, changes);
+    }
+
+    fn record_wrapper_scheme_worklist(
+        &mut self,
+        visits: usize,
+        changed_owners: usize,
+        parameter_changes: usize,
+        result_changes: usize,
+    ) {
+        self.wrapper_scheme_worklist_invocations =
+            self.wrapper_scheme_worklist_invocations.saturating_add(1);
+        Self::add_usize(&mut self.wrapper_scheme_worklist_visits, visits);
+        Self::add_usize(&mut self.wrapper_scheme_changed_owners, changed_owners);
+        Self::add_usize(
+            &mut self.wrapper_scheme_parameter_changes,
+            parameter_changes,
+        );
+        Self::add_usize(&mut self.wrapper_scheme_result_changes, result_changes);
+    }
+
+    fn record_flow_cache(&mut self, stats: CheckedFlowInferenceCacheStats) {
+        self.checked_flow_cache_hits = stats.hits;
+        self.checked_flow_cache_misses = stats.misses;
+        self.checked_flow_cache_invalidations = stats.invalidations;
+        self.checked_flow_cache_reverse_invalidation_traversals =
+            stats.reverse_invalidation_traversals;
+        self.checked_flow_cache_full_resets = stats.full_resets;
+        self.checked_flow_cache_rejected_invalid_ids = stats.rejected_invalid_ids;
+        self.checked_flow_indexed_read_hits = stats.indexed_read_hits;
+        self.checked_flow_indexed_read_missing = stats.indexed_read_missing;
+        self.checked_flow_indexed_read_rejected = stats.indexed_read_rejected;
+        self.checked_flow_indexed_out_hits = stats.indexed_out_hits;
+        self.checked_flow_indexed_out_missing = stats.indexed_out_missing;
+    }
+
+    fn record_diagnostic_replay(
+        &mut self,
+        install_attempts: usize,
+        duplicate_ids: usize,
+        out_of_range_ids: usize,
+        missing_parser_ids: usize,
+        requests: usize,
+        hits: usize,
+        misses: usize,
+        unique_expressions: usize,
+    ) {
+        self.diagnostic_flow_install_attempts = install_attempts as u64;
+        self.diagnostic_flow_duplicate_ids = duplicate_ids as u64;
+        self.diagnostic_flow_out_of_range_ids = out_of_range_ids as u64;
+        self.diagnostic_flow_missing_parser_ids = missing_parser_ids as u64;
+        self.diagnostic_replay_requests = requests as u64;
+        self.diagnostic_replay_hits = hits as u64;
+        self.diagnostic_replay_misses = misses as u64;
+        self.diagnostic_replay_unique_expressions = unique_expressions as u64;
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TypeCheckProfile {
+    #[serde(default)]
+    pub work_counters: TypeCheckWorkCounters,
     pub checker_init_ms: f64,
     pub source_paths_ms: f64,
     pub source_payload_shape_table_ms: f64,
@@ -18572,6 +18793,7 @@ impl<'a> Checker<'a> {
             program: checked_program,
             diagnostics: call_diagnostics,
             exact_pipeline_inputs_valid,
+            mut work_counters,
             diagnostic_replay_inputs: _,
         } = build_output;
         trace_phase("checked_program.build", checked_program_build_ms);
@@ -18919,9 +19141,28 @@ impl<'a> Checker<'a> {
         });
         let assemble_report_ms = typecheck_elapsed_ms(assemble_report_started);
         trace_phase("assemble_report", assemble_report_ms);
+        work_counters.record_diagnostic_replay(
+            self.checked_flow_install_count,
+            self.checked_flow_duplicate_ids,
+            self.checked_flow_out_of_range_ids,
+            self.checked_flow_missing_parser_ids,
+            self.diagnostic_ensure_requests,
+            self.diagnostic_lookup_hits,
+            self.diagnostic_lookup_misses,
+            self.diagnostic_replayed.len(),
+        );
+        debug_assert!(
+            work_counters.diagnostic_replay_is_fully_accounted(),
+            "every checked diagnostic replay request must be a hit or miss"
+        );
+        debug_assert!(
+            work_counters.inference_call_visits_are_fully_classified(),
+            "every checked inference call visit must be changed or a no-op"
+        );
         (
             CheckOutput { program, report },
             TypeCheckProfile {
+                work_counters,
                 checker_init_ms: init_profile.checker_init_ms,
                 source_paths_ms: init_profile.source_paths_ms,
                 source_payload_shape_table_ms: init_profile.source_payload_shape_table_ms,

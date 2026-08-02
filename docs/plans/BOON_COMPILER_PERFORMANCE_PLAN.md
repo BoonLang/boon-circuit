@@ -326,6 +326,35 @@ never mixed into cold results.
 Exit: the report exposes all named phases and identities, rejects stale or
 cache-enabled evidence, and reproduces the current fixture artifacts.
 
+Current implementation checkpoint (2026-08-02):
+
+- `boon_parser` exposes deterministic profiled entrypoints whose counters
+  measure attempted/parsed units, inspected bytes/tokens/symbols, statement and
+  expression visits, rebasing, and validation work on both success and failure.
+- `boon_typecheck::TypeCheckProfile` carries timer-free inference,
+  scheme-worklist, cache/index, and diagnostic-replay counters with exact
+  changed-plus-no-op and hit-plus-miss accounting invariants.
+- The compiler preserves both complete counter sets through monolithic and
+  staged compilation. Producer schema v3 and report schemas v4/v2 carry the
+  counters without relabeling artifact cardinalities as work.
+- Call-depth/call-site scaling is owned by actual inference call visits and
+  source-unit scaling by actual parser unit attempts. Contextual/static and
+  dependency-cone scaling retain their current owners until semantic/proof work
+  counters land in their owning phases.
+- Performance and interaction collection consume one explicitly prebuilt
+  two-job release producer. They no longer launch nested Cargo builds, and fail
+  when the producer is missing or older than a Rust/workspace build input.
+- Directional evidence from the directly invoked debug producer measured Counter at
+  about 15 ms and NovyWave diagnostics at about 744 ms (about 332 ms parse and
+  412 ms typecheck). This is diagnostic evidence, not release acceptance. It
+  identifies repeated whole-program parser validation/assembly as the first
+  measured optimization target.
+
+Phase 0 remains open until session build/reuse and in-flight cancellation work
+are counted, the producer is cryptographically cross-bound to the source
+identity rather than only guarded by build-input freshness, and current release
+cold/warm/scaling reports pass from one unchanged revision.
+
 ### Phase 1: Cold Parse And Type Core
 
 1. Introduce independent unit parsing and stable source/declaration identities.

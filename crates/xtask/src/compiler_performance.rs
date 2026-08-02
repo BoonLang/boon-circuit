@@ -1,23 +1,23 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
-use std::ffi::OsString;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
+use crate::compiler_work_sample::{WorkSample, require_current_prebuilt_producer};
 use crate::report_v2::{
     ExpectedIdentity, ReportStatus, ToolResult, current_identity, sha256_bytes, sha256_file,
     unix_time_ms,
 };
 
-const REPORT_FORMAT_VERSION: u16 = 3;
-const PRODUCER_FORMAT_VERSION: u16 = 2;
-const BUDGET_FORMAT_VERSION: u16 = 1;
-const REPORT_CONTRACT: &str = "boon-compiler-performance-v3";
+const REPORT_FORMAT_VERSION: u16 = 4;
+const PRODUCER_FORMAT_VERSION: u16 = 3;
+const BUDGET_FORMAT_VERSION: u16 = 2;
+const REPORT_CONTRACT: &str = "boon-compiler-performance-v4";
 const DEFAULT_BUDGET: &str = "budgets/compiler.toml";
 const PRODUCER_PATH: &str = "target/release/boon_cli";
 const MAX_BUDGET_BYTES: u64 = 64 * 1024;
-const MAX_REPORT_BYTES: u64 = 512 * 1024;
+const MAX_REPORT_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_SAMPLE_OUTPUT_BYTES: usize = 512 * 1024;
 const MAX_SAMPLE_COUNT: usize = 128;
 
@@ -301,17 +301,6 @@ struct AllocationSample {
     deallocated_bytes: u64,
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-struct WorkSample {
-    source_units: usize,
-    parsed_expressions: usize,
-    checked_expressions: usize,
-    checked_calls: usize,
-    semantic_graph_nodes: usize,
-    cancellation_checkpoints: usize,
-}
-
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct PhaseSample {
@@ -407,6 +396,13 @@ struct WorkSummary {
     checked_calls: CountSummary,
     semantic_graph_nodes: CountSummary,
     cancellation_checkpoints: CountSummary,
+    parse_source_units_attempted: CountSummary,
+    parse_expression_visits: CountSummary,
+    parse_validation_visits: CountSummary,
+    typecheck_inference_expression_visits: CountSummary,
+    typecheck_inference_call_visits: CountSummary,
+    typecheck_diagnostic_replay_requests: CountSummary,
+    typecheck_diagnostic_replay_misses: CountSummary,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]
@@ -504,15 +500,8 @@ fn collect(
     setup_samples: usize,
     scored_samples: usize,
 ) -> ToolResult<()> {
-    build_producer(workspace)?;
     let producer_path = workspace.join(PRODUCER_PATH);
-    if !producer_path.is_file() {
-        return Err(format!(
-            "release compiler sample producer is missing at {}",
-            producer_path.display()
-        )
-        .into());
-    }
+    require_current_prebuilt_producer(workspace, &producer_path)?;
     let before = current_identity(workspace)?;
     let producer_digest = sha256_file(&producer_path)?;
     let mut fixtures = Vec::with_capacity(budget.fixtures.len());
@@ -579,28 +568,6 @@ fn collect(
         scored_samples,
     )?;
     write_report(report_path, &report)
-}
-
-fn build_producer(workspace: &Path) -> ToolResult<()> {
-    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
-    let status = Command::new(cargo)
-        .current_dir(workspace)
-        .args([
-            "build",
-            "--locked",
-            "--release",
-            "--jobs",
-            "1",
-            "-p",
-            "boon_cli",
-            "--bin",
-            "boon_cli",
-        ])
-        .status()?;
-    if !status.success() {
-        return Err(format!("release compiler sample producer build failed with {status}").into());
-    }
-    Ok(())
 }
 
 fn collect_fixture(
@@ -865,6 +832,9 @@ fn validate_sample_shape(sample: &Sample, intent: SampleIntent) -> ToolResult<()
     }
     if sample.allocations.allocation_calls == 0 || sample.allocations.allocated_bytes == 0 {
         return Err("compiler sample allocation counters are unavailable or zero".into());
+    }
+    if !sample.work.has_complete_frontend_work() {
+        return Err("compiler sample frontend work counters are incomplete or inconsistent".into());
     }
     validate_sha256(
         &sample.source_bundle_digest_v1,
@@ -1298,6 +1268,7 @@ fn validate_report(
         return Err("compiler performance report budget identity is stale".into());
     }
     let producer_path = workspace.join(PRODUCER_PATH);
+    require_current_prebuilt_producer(workspace, &producer_path)?;
     let producer_digest = sha256_file(&producer_path)?;
     let expected_producer = ProducerIdentity {
         path: PRODUCER_PATH.to_owned(),
@@ -1634,6 +1605,9 @@ fn summarize_work(samples: &[Sample]) -> WorkSummary {
                 .collect(),
         )
     };
+    let u64_values = |field: fn(&WorkSample) -> u64| {
+        summarize_counts(samples.iter().map(|sample| field(&sample.work)).collect())
+    };
     WorkSummary {
         source_units: values(|work| work.source_units),
         parsed_expressions: values(|work| work.parsed_expressions),
@@ -1641,6 +1615,19 @@ fn summarize_work(samples: &[Sample]) -> WorkSummary {
         checked_calls: values(|work| work.checked_calls),
         semantic_graph_nodes: values(|work| work.semantic_graph_nodes),
         cancellation_checkpoints: values(|work| work.cancellation_checkpoints),
+        parse_source_units_attempted: values(|work| work.parse.source_units_attempted),
+        parse_expression_visits: values(|work| work.parse.expression_visits),
+        parse_validation_visits: values(|work| work.parse.validation_visits),
+        typecheck_inference_expression_visits: u64_values(|work| {
+            work.typecheck.inference_expression_visits
+        }),
+        typecheck_inference_call_visits: u64_values(|work| work.typecheck.inference_call_visits),
+        typecheck_diagnostic_replay_requests: u64_values(|work| {
+            work.typecheck.diagnostic_replay_requests
+        }),
+        typecheck_diagnostic_replay_misses: u64_values(|work| {
+            work.typecheck.diagnostic_replay_misses
+        }),
     }
 }
 
@@ -1937,11 +1924,11 @@ fn validate_scaling_budget(scaling: &ScalingBudget) -> ToolResult<()> {
             return Err(format!("invalid scaling workload `{}`", workload.id).into());
         }
         let expected = match workload.id.as_str() {
-            "call-depth" | "call-site-count" => ("diagnostics", "checked-calls"),
+            "call-depth" | "call-site-count" => ("diagnostics", "typecheck-inference-call-visits"),
             "contextual-call-site-count" | "static-branch-count" => {
                 ("verified", "semantic-graph-nodes")
             }
-            "source-unit-count" => ("diagnostics", "parsed-expressions"),
+            "source-unit-count" => ("diagnostics", "parse-source-units-attempted"),
             "dependency-cone-size" => ("verified", "dependency-scc-components"),
             other => return Err(format!("unsupported scaling workload `{other}`").into()),
         };

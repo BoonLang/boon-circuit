@@ -33,6 +33,8 @@ fn staged_check_and_finish_match_monolithic_compilation() {
     ))
     .unwrap();
     assert!(!checked.output.report.has_errors());
+    let staged_parse_work = checked.profile.parse_work;
+    let staged_typecheck_work = checked.profile.typecheck_work;
     let staged = finish_checked_machine_plan(
         checked,
         CheckedCompileRequest::new(
@@ -45,6 +47,13 @@ fn staged_check_and_finish_match_monolithic_compilation() {
 
     assert_eq!(staged.ir, monolithic.ir);
     assert_eq!(staged.plan, monolithic.plan);
+    assert_eq!(staged.profile.parse_work, staged_parse_work);
+    assert_eq!(staged.profile.typecheck_work, staged_typecheck_work);
+    assert_eq!(staged.profile.parse_work, monolithic.profile.parse_work);
+    assert_eq!(
+        staged.profile.typecheck_work,
+        monolithic.profile.typecheck_work
+    );
     assert!(staged.profile.typecheck_ms >= 0.0);
     assert!(staged.profile.semantic_ms >= 0.0);
     assert!(staged.profile.contract_verify_ms >= 0.0);

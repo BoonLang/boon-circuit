@@ -1,4 +1,4 @@
-format_version = 1
+format_version = 2
 owner_plan = "docs/plans/BOON_COMPILER_PERFORMANCE_PLAN.md"
 report = "target/reports/compiler-performance/compiler-performance.json"
 
@@ -77,7 +77,7 @@ dimensions = [
 [[scaling.workloads]]
 id = "call-depth"
 intent = "diagnostics"
-owning_work_counter = "checked-calls"
+owning_work_counter = "typecheck-inference-call-visits"
 baseline_size = 0
 base_size = 32
 doubled_size = 64
@@ -85,7 +85,7 @@ doubled_size = 64
 [[scaling.workloads]]
 id = "call-site-count"
 intent = "diagnostics"
-owning_work_counter = "checked-calls"
+owning_work_counter = "typecheck-inference-call-visits"
 baseline_size = 0
 base_size = 32
 doubled_size = 64
@@ -109,7 +109,7 @@ doubled_size = 64
 [[scaling.workloads]]
 id = "source-unit-count"
 intent = "diagnostics"
-owning_work_counter = "parsed-expressions"
+owning_work_counter = "parse-source-units-attempted"
 baseline_size = 0
 base_size = 32
 doubled_size = 64

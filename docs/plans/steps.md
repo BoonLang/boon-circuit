@@ -14,6 +14,10 @@ only; linked plans remain authoritative for their own semantics and acceptance.
    machine; invoke prebuilt binaries for repeated measurements. Use the
    performance plan's measured flag-day crate boundaries instead of overlapping
    Cargo producers or cosmetic file-only splits.
+   Treat artifact sizes only as cardinality evidence: parser inspection,
+   typechecker worklist/cache/replay, semantic/proof traversal, and backend work
+   counters own scaling gates. Build the release producer explicitly once;
+   performance verifiers must never start a nested Cargo build.
 
 2. Finish the active
    `BOON_CIRCUIT_SIMPLIFICATION_AND_NATIVE_RECOVERY_PLAN.md` exit before adding

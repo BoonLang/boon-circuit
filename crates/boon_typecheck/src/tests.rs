@@ -539,6 +539,44 @@ explicit_value: explicit(store: [count: 2])
 }
 
 #[test]
+fn profiled_typecheck_work_counters_are_deterministic_and_fully_accounted() {
+    let parsed = boon_parser::parse_source(
+        "profiled-work-counters.bn",
+        r#"
+FUNCTION leaf() {
+    PASSED.store.count
+}
+
+FUNCTION wrapper() {
+    leaf()
+}
+
+value: wrapper(PASS: [store: [count: 1]])
+"#,
+    )
+    .expect("profiled work-counter fixture parses");
+    let run = || check_diagnostics_program_profiled(&parsed).1.work_counters;
+
+    let baseline = run();
+    let repeated = run();
+    assert_eq!(repeated, baseline, "timer-free work must be repeatable");
+    assert!(baseline.inference_invocations > 0);
+    assert!(baseline.inference_rounds > 0);
+    assert!(baseline.inference_call_visits > 0);
+    assert!(baseline.context_scheme_worklist_invocations > 0);
+    assert!(baseline.wrapper_scheme_worklist_invocations > 0);
+    assert!(
+        baseline
+            .checked_flow_cache_hits
+            .saturating_add(baseline.checked_flow_cache_misses)
+            > 0
+    );
+    assert!(baseline.diagnostic_replay_requests > 0);
+    assert!(baseline.inference_call_visits_are_fully_classified());
+    assert!(baseline.diagnostic_replay_is_fully_accounted());
+}
+
+#[test]
 fn nested_user_function_body_cache_reuses_equal_argument_shapes() {
     let parsed = boon_parser::parse_source(
         "nested-call-cache.bn",
@@ -1083,12 +1121,12 @@ fn novywave_checked_builder_is_seed_free_and_deterministic() {
     let parsed = boon_parser::parse_project("RUN.bn", units).expect("NovyWave project parses");
     let run = || {
         let (checker, init_profile) = Checker::new_profiled(&parsed);
-        checker
-            .finish_program_profiled(CheckOutputOwnership::DiagnosticsOwned, init_profile)
-            .0
+        let (output, profile) =
+            checker.finish_program_profiled(CheckOutputOwnership::DiagnosticsOwned, init_profile);
+        (output, profile.work_counters)
     };
-    let baseline = run();
-    let repeated = run();
+    let (baseline, baseline_work) = run();
+    let (repeated, repeated_work) = run();
     assert!(
         !baseline.report.has_errors(),
         "seed-free NovyWave diagnostics: {:#?}",
@@ -1102,6 +1140,15 @@ fn novywave_checked_builder_is_seed_free_and_deterministic() {
         repeated, baseline,
         "seed-free checked output must be stable"
     );
+    assert_eq!(
+        repeated_work, baseline_work,
+        "NovyWave timer-free typecheck work must be stable"
+    );
+    assert!(baseline_work.inference_rounds > 0);
+    assert!(baseline_work.inference_expression_visits > 0);
+    assert!(baseline_work.diagnostic_replay_requests > 0);
+    assert!(baseline_work.inference_call_visits_are_fully_classified());
+    assert!(baseline_work.diagnostic_replay_is_fully_accounted());
 }
 
 #[test]

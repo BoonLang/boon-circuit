@@ -1,19 +1,19 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
-use std::ffi::OsString;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output};
 
+use crate::compiler_work_sample::{WorkSample, require_current_prebuilt_producer};
 use crate::report_v2::{
     ExpectedIdentity, ReportStatus, ToolResult, current_identity, sha256_bytes, sha256_file,
     unix_time_ms,
 };
 
-const FORMAT_VERSION: u16 = 1;
-const PRODUCER_FORMAT_VERSION: u16 = 2;
-const BUDGET_FORMAT_VERSION: u16 = 1;
-const REPORT_CONTRACT: &str = "boon-compiler-interactions-v1";
+const FORMAT_VERSION: u16 = 2;
+const PRODUCER_FORMAT_VERSION: u16 = 3;
+const BUDGET_FORMAT_VERSION: u16 = 2;
+const REPORT_CONTRACT: &str = "boon-compiler-interactions-v2";
 const DEFAULT_BUDGET: &str = "budgets/compiler.toml";
 const PRODUCER_PATH: &str = "target/release/boon_cli";
 const MAX_BUDGET_BYTES: u64 = 64 * 1024;
@@ -220,7 +220,9 @@ struct ScalingPoint {
     elapsed_ms: MillisSummary,
     allocation_calls: CountSummary,
     allocated_bytes: CountSummary,
+    parse_source_units_attempted: CountSummary,
     parsed_expressions: CountSummary,
+    typecheck_inference_call_visits: CountSummary,
     checked_calls: CountSummary,
     semantic_graph_nodes: CountSummary,
     dependency_scc: Option<SccTraceEvidence>,
@@ -388,17 +390,6 @@ struct AllocationSample {
     deallocated_bytes: u64,
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-struct WorkSample {
-    source_units: usize,
-    parsed_expressions: usize,
-    checked_expressions: usize,
-    checked_calls: usize,
-    semantic_graph_nodes: usize,
-    cancellation_checkpoints: usize,
-}
-
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct PhaseSample {
@@ -497,15 +488,8 @@ fn collect(
     setup_samples: usize,
     scored_samples: usize,
 ) -> ToolResult<()> {
-    build_producer(workspace)?;
     let producer_path = workspace.join(PRODUCER_PATH);
-    if !producer_path.is_file() {
-        return Err(format!(
-            "compiler interaction producer is missing at {}",
-            producer_path.display()
-        )
-        .into());
-    }
+    require_current_prebuilt_producer(workspace, &producer_path)?;
     let before = current_identity(workspace)?;
     let producer_digest = sha256_file(&producer_path)?.as_str().to_owned();
     let warm_batch = run_warm_batch(
@@ -573,30 +557,6 @@ fn collect(
         scored_samples,
     )?;
     write_report(report_path, &report)
-}
-
-fn build_producer(workspace: &Path) -> ToolResult<()> {
-    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
-    let status = Command::new(cargo)
-        .current_dir(workspace)
-        .args([
-            "build",
-            "--locked",
-            "--release",
-            "--jobs",
-            "1",
-            "-p",
-            "boon_cli",
-            "--bin",
-            "boon_cli",
-        ])
-        .status()?;
-    if !status.success() {
-        return Err(
-            format!("release compiler interaction producer build failed with {status}").into(),
-        );
-    }
-    Ok(())
 }
 
 fn run_warm_batch(
@@ -936,6 +896,18 @@ fn scaling_point(
             .map(|sample| sample.work.checked_calls as u64)
             .collect(),
     );
+    let typecheck_inference_call_visits = summarize_counts(
+        scored_samples
+            .iter()
+            .map(|sample| sample.work.typecheck.inference_call_visits)
+            .collect(),
+    );
+    let parse_source_units_attempted = summarize_counts(
+        scored_samples
+            .iter()
+            .map(|sample| sample.work.parse.source_units_attempted as u64)
+            .collect(),
+    );
     let parsed_expressions = summarize_counts(
         scored_samples
             .iter()
@@ -955,7 +927,9 @@ fn scaling_point(
         elapsed_ms,
         allocation_calls,
         allocated_bytes,
+        parse_source_units_attempted,
         parsed_expressions,
+        typecheck_inference_call_visits,
         checked_calls,
         semantic_graph_nodes,
         dependency_scc: trace,
@@ -1032,8 +1006,8 @@ fn scaling_report(
 
 fn owning_work(point: &ScalingPoint, counter: &str) -> ToolResult<u64> {
     match counter {
-        "checked-calls" => Ok(point.checked_calls.p95),
-        "parsed-expressions" => Ok(point.parsed_expressions.p95),
+        "typecheck-inference-call-visits" => Ok(point.typecheck_inference_call_visits.p95),
+        "parse-source-units-attempted" => Ok(point.parse_source_units_attempted.p95),
         "semantic-graph-nodes" => Ok(point.semantic_graph_nodes.p95),
         "dependency-scc-components" => point
             .dependency_scc
@@ -1136,7 +1110,9 @@ fn validate_warm_batch(
             || sample.diagnostics_work.source_units == 0
             || sample.diagnostics_work.parsed_expressions == 0
             || sample.diagnostics_work.checked_expressions == 0
+            || !sample.diagnostics_work.has_complete_frontend_work()
             || sample.diagnostics_work.semantic_graph_nodes != 0
+            || !sample.preview_work.has_complete_frontend_work()
             || sample.preview_work.semantic_graph_nodes == 0
             || sample
                 .diagnostics_phase
@@ -1294,6 +1270,7 @@ fn validate_scaling_sample(
         || sample.work.source_units == 0
         || sample.work.parsed_expressions == 0
         || sample.work.checked_expressions == 0
+        || !sample.work.has_complete_frontend_work()
         || sample
             .phase
             .values()
@@ -1464,11 +1441,13 @@ fn validate_budget(workspace: &Path, budget: &BudgetManifest) -> ToolResult<()> 
             .into());
         }
         let expected = match workload.id.as_str() {
-            "call-depth" | "call-site-count" => (SampleIntent::Diagnostics, "checked-calls"),
+            "call-depth" | "call-site-count" => {
+                (SampleIntent::Diagnostics, "typecheck-inference-call-visits")
+            }
             "contextual-call-site-count" | "static-branch-count" => {
                 (SampleIntent::Verified, "semantic-graph-nodes")
             }
-            "source-unit-count" => (SampleIntent::Diagnostics, "parsed-expressions"),
+            "source-unit-count" => (SampleIntent::Diagnostics, "parse-source-units-attempted"),
             "dependency-cone-size" => (SampleIntent::Verified, "dependency-scc-components"),
             other => return Err(format!("unsupported scaling workload `{other}`").into()),
         };
@@ -1531,6 +1510,7 @@ fn validate_report(
         return Err("compiler interaction report budget identity is stale".into());
     }
     let producer_path = workspace.join(PRODUCER_PATH);
+    require_current_prebuilt_producer(workspace, &producer_path)?;
     let expected_producer = ProducerIdentity {
         path: PRODUCER_PATH.to_owned(),
         sha256: sha256_file(&producer_path)?.as_str().to_owned(),

@@ -56,6 +56,11 @@ Authority and conflict rules:
   representations, but it does not own public language semantics, proof or
   evidence soundness, runtime persistence identity, native presentation
   semantics, or the mandatory verified artifact spine.
+- Compiler scaling evidence uses actual parser inspections and
+  typechecker/semantic/proof/backend work, never final AST/call/graph sizes as
+  substitutes. Build one current two-job release producer explicitly and invoke
+  it directly for repeated samples; the performance verifiers must reject a
+  missing or stale producer and must not launch Cargo themselves.
 - `BOON_LANGUAGE_FOUNDATIONS_PLAN.md` owns the target public value algebra,
   Tags-only truth, private absence/fault channels, exact `NUMBER`, one-based
   positions, `BITS[N]`, `LIST`/`SET`/`MAP` authorities, matching, `FLUSH`,

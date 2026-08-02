@@ -14,7 +14,7 @@ use crate::{
     CompilerAllocationCounters, compiler_allocation_counters, reset_compiler_allocation_counters,
 };
 
-const FORMAT_VERSION: u16 = 2;
+const FORMAT_VERSION: u16 = 3;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -206,6 +206,67 @@ impl From<CompilerAllocationCounters> for AllocationSample {
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize)]
+struct ParserWorkSample {
+    source_units_attempted: usize,
+    source_units_parsed: usize,
+    source_bytes_inspected: usize,
+    token_inspections: usize,
+    symbol_inspections: usize,
+    statement_visits: usize,
+    expression_visits: usize,
+    nodes_rebased: usize,
+    validation_visits: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+struct TypeCheckWorkSample {
+    inference_invocations: u64,
+    inference_rounds: u64,
+    inference_expression_visits: u64,
+    inference_declaration_visits: u64,
+    inference_callable_visits: u64,
+    inference_call_visits: u64,
+    inference_call_changed_visits: u64,
+    inference_call_noop_visits: u64,
+    inference_call_seed_enqueues: u64,
+    inference_call_input_enqueues: u64,
+    inference_call_output_enqueues: u64,
+    inference_call_callee_enqueues: u64,
+    inference_call_selector_enqueues: u64,
+    inference_call_output_scope_enqueues: u64,
+    inference_call_output_origin_skips: u64,
+    inference_selector_visits: u64,
+    inference_pattern_visits: u64,
+    context_scheme_worklist_invocations: u64,
+    context_scheme_worklist_visits: u64,
+    context_scheme_worklist_changes: u64,
+    wrapper_scheme_worklist_invocations: u64,
+    wrapper_scheme_worklist_visits: u64,
+    wrapper_scheme_changed_owners: u64,
+    wrapper_scheme_parameter_changes: u64,
+    wrapper_scheme_result_changes: u64,
+    checked_flow_cache_hits: u64,
+    checked_flow_cache_misses: u64,
+    checked_flow_cache_invalidations: u64,
+    checked_flow_cache_reverse_invalidation_traversals: u64,
+    checked_flow_cache_full_resets: u64,
+    checked_flow_cache_rejected_invalid_ids: u64,
+    checked_flow_indexed_read_hits: u64,
+    checked_flow_indexed_read_missing: u64,
+    checked_flow_indexed_read_rejected: u64,
+    checked_flow_indexed_out_hits: u64,
+    checked_flow_indexed_out_missing: u64,
+    diagnostic_flow_install_attempts: u64,
+    diagnostic_flow_duplicate_ids: u64,
+    diagnostic_flow_out_of_range_ids: u64,
+    diagnostic_flow_missing_parser_ids: u64,
+    diagnostic_replay_requests: u64,
+    diagnostic_replay_hits: u64,
+    diagnostic_replay_misses: u64,
+    diagnostic_replay_unique_expressions: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize)]
 struct WorkSample {
     source_units: usize,
     parsed_expressions: usize,
@@ -213,6 +274,78 @@ struct WorkSample {
     checked_calls: usize,
     semantic_graph_nodes: usize,
     cancellation_checkpoints: usize,
+    parse: ParserWorkSample,
+    typecheck: TypeCheckWorkSample,
+}
+
+macro_rules! parser_work_sample {
+    ($work:expr) => {{
+        let work = $work;
+        ParserWorkSample {
+            source_units_attempted: work.source_units_attempted,
+            source_units_parsed: work.source_units_parsed,
+            source_bytes_inspected: work.source_bytes_inspected,
+            token_inspections: work.token_inspections,
+            symbol_inspections: work.symbol_inspections,
+            statement_visits: work.statement_visits,
+            expression_visits: work.expression_visits,
+            nodes_rebased: work.nodes_rebased,
+            validation_visits: work.validation_visits,
+        }
+    }};
+}
+
+macro_rules! typecheck_work_sample {
+    ($work:expr) => {{
+        let work = $work;
+        TypeCheckWorkSample {
+            inference_invocations: work.inference_invocations,
+            inference_rounds: work.inference_rounds,
+            inference_expression_visits: work.inference_expression_visits,
+            inference_declaration_visits: work.inference_declaration_visits,
+            inference_callable_visits: work.inference_callable_visits,
+            inference_call_visits: work.inference_call_visits,
+            inference_call_changed_visits: work.inference_call_changed_visits,
+            inference_call_noop_visits: work.inference_call_noop_visits,
+            inference_call_seed_enqueues: work.inference_call_seed_enqueues,
+            inference_call_input_enqueues: work.inference_call_input_enqueues,
+            inference_call_output_enqueues: work.inference_call_output_enqueues,
+            inference_call_callee_enqueues: work.inference_call_callee_enqueues,
+            inference_call_selector_enqueues: work.inference_call_selector_enqueues,
+            inference_call_output_scope_enqueues: work.inference_call_output_scope_enqueues,
+            inference_call_output_origin_skips: work.inference_call_output_origin_skips,
+            inference_selector_visits: work.inference_selector_visits,
+            inference_pattern_visits: work.inference_pattern_visits,
+            context_scheme_worklist_invocations: work.context_scheme_worklist_invocations,
+            context_scheme_worklist_visits: work.context_scheme_worklist_visits,
+            context_scheme_worklist_changes: work.context_scheme_worklist_changes,
+            wrapper_scheme_worklist_invocations: work.wrapper_scheme_worklist_invocations,
+            wrapper_scheme_worklist_visits: work.wrapper_scheme_worklist_visits,
+            wrapper_scheme_changed_owners: work.wrapper_scheme_changed_owners,
+            wrapper_scheme_parameter_changes: work.wrapper_scheme_parameter_changes,
+            wrapper_scheme_result_changes: work.wrapper_scheme_result_changes,
+            checked_flow_cache_hits: work.checked_flow_cache_hits,
+            checked_flow_cache_misses: work.checked_flow_cache_misses,
+            checked_flow_cache_invalidations: work.checked_flow_cache_invalidations,
+            checked_flow_cache_reverse_invalidation_traversals: work
+                .checked_flow_cache_reverse_invalidation_traversals,
+            checked_flow_cache_full_resets: work.checked_flow_cache_full_resets,
+            checked_flow_cache_rejected_invalid_ids: work.checked_flow_cache_rejected_invalid_ids,
+            checked_flow_indexed_read_hits: work.checked_flow_indexed_read_hits,
+            checked_flow_indexed_read_missing: work.checked_flow_indexed_read_missing,
+            checked_flow_indexed_read_rejected: work.checked_flow_indexed_read_rejected,
+            checked_flow_indexed_out_hits: work.checked_flow_indexed_out_hits,
+            checked_flow_indexed_out_missing: work.checked_flow_indexed_out_missing,
+            diagnostic_flow_install_attempts: work.diagnostic_flow_install_attempts,
+            diagnostic_flow_duplicate_ids: work.diagnostic_flow_duplicate_ids,
+            diagnostic_flow_out_of_range_ids: work.diagnostic_flow_out_of_range_ids,
+            diagnostic_flow_missing_parser_ids: work.diagnostic_flow_missing_parser_ids,
+            diagnostic_replay_requests: work.diagnostic_replay_requests,
+            diagnostic_replay_hits: work.diagnostic_replay_hits,
+            diagnostic_replay_misses: work.diagnostic_replay_misses,
+            diagnostic_replay_unique_expressions: work.diagnostic_replay_unique_expressions,
+        }
+    }};
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize)]
@@ -903,6 +1036,8 @@ fn checked_work_and_phase(
             parsed_expressions: checked.profile.expression_count,
             checked_expressions: checked.output.report.checked_expression_count,
             checked_calls: program.calls.len(),
+            parse: parser_work_sample!(checked.profile.parse_work),
+            typecheck: typecheck_work_sample!(checked.profile.typecheck_work),
             ..WorkSample::default()
         },
         PhaseSample {
@@ -924,6 +1059,8 @@ fn compiled_work_and_phase(
             checked_calls: compiled.profile.checked_call_count,
             semantic_graph_nodes: compiled.profile.graph_node_count,
             cancellation_checkpoints: compiled.profile.cancellation_checkpoint_count,
+            parse: parser_work_sample!(compiled.profile.parse_work),
+            typecheck: typecheck_work_sample!(compiled.profile.typecheck_work),
         },
         PhaseSample {
             parse_ms: compiled.profile.parse_ms,
@@ -1011,13 +1148,7 @@ fn diagnostics_sample(source: &Path) -> Result<Sample, Box<dyn std::error::Error
         ),
         plan_sha256: None,
         allocations,
-        work: WorkSample {
-            source_units: checked.profile.source_unit_count,
-            parsed_expressions: checked.profile.expression_count,
-            checked_expressions: checked.output.report.checked_expression_count,
-            checked_calls: program.calls.len(),
-            ..WorkSample::default()
-        },
+        work: checked_work_and_phase(&checked)?.0,
         phase: PhaseSample {
             parse_ms: checked.profile.parse_ms,
             typecheck_ms: checked.profile.typecheck_ms,
@@ -1080,13 +1211,7 @@ fn session_diagnostics_sample(source: &Path) -> Result<Sample, Box<dyn std::erro
         ),
         plan_sha256: None,
         allocations,
-        work: WorkSample {
-            source_units: checked.profile.source_unit_count,
-            parsed_expressions: checked.profile.expression_count,
-            checked_expressions: checked.output.report.checked_expression_count,
-            checked_calls: program.calls.len(),
-            ..WorkSample::default()
-        },
+        work: checked_work_and_phase(checked)?.0,
         phase: PhaseSample {
             parse_ms: checked.profile.parse_ms,
             typecheck_ms: checked.profile.typecheck_ms,
@@ -1187,14 +1312,7 @@ fn compiled_sample(
         full_document_typecheck_coverage: None,
         plan_sha256: Some(plan_sha256),
         allocations,
-        work: WorkSample {
-            source_units: compiled.profile.source_unit_count,
-            parsed_expressions: compiled.profile.expression_count,
-            checked_expressions: compiled.profile.checked_expression_count,
-            checked_calls: compiled.profile.checked_call_count,
-            semantic_graph_nodes: compiled.profile.graph_node_count,
-            cancellation_checkpoints: compiled.profile.cancellation_checkpoint_count,
-        },
+        work: compiled_work_and_phase(compiled).0,
         phase: PhaseSample {
             parse_ms: compiled.profile.parse_ms,
             typecheck_ms: compiled.profile.typecheck_ms,

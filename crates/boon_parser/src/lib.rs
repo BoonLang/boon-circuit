@@ -219,6 +219,18 @@ impl ParseWorkRecorder {
     }
 
     #[inline]
+    fn batch(&self) -> ParseWorkBatch<'_> {
+        ParseWorkBatch {
+            work: self,
+            token_inspections: 0,
+            symbol_inspections: 0,
+            statement_visits: 0,
+            expression_visits: 0,
+            validation_visits: 0,
+        }
+    }
+
+    #[inline]
     fn add(&self, counter: &Cell<usize>, count: usize) {
         if self.enabled {
             counter.set(counter.get().saturating_add(count));
@@ -265,11 +277,6 @@ impl ParseWorkRecorder {
         self.add(&self.nodes_rebased, 1);
     }
 
-    #[inline]
-    fn validation(&self) {
-        self.add(&self.validation_visits, 1);
-    }
-
     fn finish(&self) -> ParseProfile {
         ParseProfile {
             work_counters: ParseWorkCounters {
@@ -284,6 +291,61 @@ impl ParseWorkRecorder {
                 validation_visits: self.validation_visits.get(),
             },
         }
+    }
+}
+
+/// Function-local parser work that is merged into the shared recorder once.
+///
+/// Validation functions return at the first malformed construct, so a drop
+/// guard is intentional: every early `?`/`return` flushes exactly the visits
+/// completed before the diagnostic without paying one interior-mutable update
+/// for every node in a large valid project.
+struct ParseWorkBatch<'a> {
+    work: &'a ParseWorkRecorder,
+    token_inspections: usize,
+    symbol_inspections: usize,
+    statement_visits: usize,
+    expression_visits: usize,
+    validation_visits: usize,
+}
+
+impl ParseWorkBatch<'_> {
+    #[inline]
+    fn tokens(&mut self, count: usize) {
+        self.token_inspections = self.token_inspections.saturating_add(count);
+    }
+
+    #[inline]
+    fn symbols(&mut self, count: usize) {
+        self.symbol_inspections = self.symbol_inspections.saturating_add(count);
+    }
+
+    #[inline]
+    fn statement(&mut self) {
+        self.statement_visits = self.statement_visits.saturating_add(1);
+    }
+
+    #[inline]
+    fn expression(&mut self) {
+        self.expression_visits = self.expression_visits.saturating_add(1);
+    }
+
+    #[inline]
+    fn validation(&mut self) {
+        self.validation_visits = self.validation_visits.saturating_add(1);
+    }
+}
+
+impl Drop for ParseWorkBatch<'_> {
+    fn drop(&mut self) {
+        self.work.tokens(self.token_inspections);
+        self.work.symbols(self.symbol_inspections);
+        self.work
+            .add(&self.work.statement_visits, self.statement_visits);
+        self.work
+            .add(&self.work.expression_visits, self.expression_visits);
+        self.work
+            .add(&self.work.validation_visits, self.validation_visits);
     }
 }
 
@@ -325,12 +387,13 @@ impl ValidationIndex {
         scope: ValidationIndexScope,
     ) -> Self {
         let document_lines = document_line_mask_with_work(ast, work);
+        let mut work_batch = work.batch();
         let mut text_literal_spans = ast
             .expressions
             .iter()
             .filter_map(|expression| {
-                work.expression();
-                work.validation();
+                work_batch.expression();
+                work_batch.validation();
                 matches!(expression.kind, AstExprKind::TextLiteral(_))
                     .then_some((expression.start, expression.end))
             })
@@ -344,7 +407,7 @@ impl ValidationIndex {
                 .iter()
                 .enumerate()
                 .find_map(|(item_id, item)| {
-                    work.validation();
+                    work_batch.validation();
                     (!document_lines.get(item.line).copied().unwrap_or(false)).then_some(item_id)
                 })
                 .into_iter()
@@ -372,8 +435,8 @@ impl ValidationIndex {
         let mut semantic_token_line_ranges = vec![(usize::MAX, usize::MAX); maximum_line + 1];
         let mut drain_token_ids = Vec::new();
         for (token_id, token) in ast.tokens.iter().enumerate() {
-            work.tokens(1);
-            work.validation();
+            work_batch.tokens(1);
+            work_batch.validation();
             if !matches!(token.kind, AstTokenKind::Comment | AstTokenKind::String)
                 && !document_lines.get(token.line).copied().unwrap_or(false)
             {
@@ -397,11 +460,11 @@ impl ValidationIndex {
 
         let mut list_sites = Vec::new();
         for (line_id, line) in ast.lines.iter().enumerate() {
-            work.validation();
+            work_batch.validation();
             if line.symbols.is_empty() || document_lines.get(line.line).copied().unwrap_or(false) {
                 continue;
             }
-            work.symbols(line.symbols.len());
+            work_batch.symbols(line.symbols.len());
             if let Some(list_index) = line.symbols.iter().position(|lexeme| lexeme == "LIST") {
                 list_sites.push((line_id, list_index));
             }
@@ -411,11 +474,11 @@ impl ValidationIndex {
         let mut bits_sites = Vec::new();
         let mut bytes_sites = Vec::new();
         for (item_id, item) in ast.items.iter().enumerate() {
-            work.validation();
+            work_batch.validation();
             if !document_lines.get(item.line).copied().unwrap_or(false) {
                 semantic_item_ids.push(item_id);
             }
-            work.symbols(item.symbols.len());
+            work_batch.symbols(item.symbols.len());
             for (symbol_index, symbol) in item.symbols.iter().enumerate() {
                 match symbol.as_str() {
                     "BITS" => bits_sites.push((item_id, symbol_index)),
@@ -500,12 +563,13 @@ impl ValidationIndex {
         start: usize,
         work: &ParseWorkRecorder,
     ) -> Option<&'a AstToken> {
+        let mut work_batch = work.batch();
         let mut left = 0usize;
         let mut right = ast.tokens.len();
         while left < right {
             let middle = left + (right - left) / 2;
-            work.tokens(1);
-            work.validation();
+            work_batch.tokens(1);
+            work_batch.validation();
             if ast.tokens[middle].start < start {
                 left = middle + 1;
             } else {
@@ -517,7 +581,7 @@ impl ValidationIndex {
 }
 
 fn document_line_mask_with_work(ast: &AstProgram, work: &ParseWorkRecorder) -> Vec<bool> {
-    fn mark(statement: &AstStatement, lines: &mut [bool], work: &ParseWorkRecorder) {
+    fn mark(statement: &AstStatement, lines: &mut [bool], work: &mut ParseWorkBatch<'_>) {
         work.statement();
         work.validation();
         if let Some(line) = lines.get_mut(statement.line) {
@@ -528,9 +592,10 @@ fn document_line_mask_with_work(ast: &AstProgram, work: &ParseWorkRecorder) -> V
         }
     }
 
+    let mut work_batch = work.batch();
     let Some(document) = ast.statements.iter().find(|statement| {
-        work.statement();
-        work.validation();
+        work_batch.statement();
+        work_batch.validation();
         matches!(
             &statement.kind,
             AstStatementKind::Field { name } if name == "document"
@@ -544,7 +609,7 @@ fn document_line_mask_with_work(ast: &AstProgram, work: &ParseWorkRecorder) -> V
         .map_or(document.line, |token| token.line)
         .max(document.line);
     let mut lines = vec![false; maximum_line.saturating_add(1)];
-    mark(document, &mut lines, work);
+    mark(document, &mut lines, &mut work_batch);
     lines
 }
 
@@ -2426,9 +2491,10 @@ fn validate_pipeline_inputs(
     expressions: &[AstExpr],
     work: &ParseWorkRecorder,
 ) -> Result<(), ParseError> {
+    let mut work_batch = work.batch();
     for expression in expressions {
-        work.expression();
-        work.validation();
+        work_batch.expression();
+        work_batch.validation();
         let input = match &expression.kind {
             AstExprKind::Pipe { input, .. }
             | AstExprKind::Then { input, .. }
@@ -5096,9 +5162,10 @@ fn validate_source_syntax_with_work(
     work: &ParseWorkRecorder,
 ) -> Result<(), ParseError> {
     let example_source = path.contains("/examples/") || path.starts_with("examples/");
+    let mut work_batch = work.batch();
     for token in &ast.tokens {
-        work.tokens(1);
-        work.validation();
+        work_batch.tokens(1);
+        work_batch.validation();
         if matches!(token.kind, AstTokenKind::String | AstTokenKind::Comment)
             || containing_source_span(&validation_index.text_literal_spans, token.start, token.end)
                 .is_some()
@@ -5154,10 +5221,10 @@ fn validate_source_syntax_with_work(
         }
     }
     for item in &ast.items {
-        work.validation();
-        work.symbols(item.symbols.len());
+        work_batch.validation();
+        work_batch.symbols(item.symbols.len());
         for (index, window) in item.symbols.windows(2).enumerate() {
-            work.symbols(window.len());
+            work_batch.symbols(window.len());
             if matches!(window, [pipe, op] if pipe == "|>" && op == "LINK") {
                 return Err(error(
                     path,
@@ -5227,16 +5294,17 @@ fn validate_match_patterns(
     ast: &AstProgram,
     work: &ParseWorkRecorder,
 ) -> Result<(), ParseError> {
+    let mut work_batch = work.batch();
     for expression in &ast.expressions {
-        work.expression();
-        work.validation();
+        work_batch.expression();
+        work_batch.validation();
         if matches!(expression.kind, AstExprKind::Arrow { .. }) {
             let column = ast
                 .tokens
                 .iter()
                 .find(|token| {
-                    work.tokens(1);
-                    work.validation();
+                    work_batch.tokens(1);
+                    work_batch.validation();
                     token.line == expression.line && token.start >= expression.start
                 })
                 .map_or(1, |token| token.column);
@@ -5258,8 +5326,8 @@ fn validate_match_patterns(
             .tokens
             .iter()
             .find(|token| {
-                work.tokens(1);
-                work.validation();
+                work_batch.tokens(1);
+                work_batch.validation();
                 token.line == expression.line && token.start >= expression.start
             })
             .map_or(1, |token| token.column);
@@ -5273,9 +5341,10 @@ fn validate_function_parameter_syntax(
     ast: &AstProgram,
     work: &ParseWorkRecorder,
 ) -> Result<(), ParseError> {
+    let mut work_batch = work.batch();
     for item in &ast.items {
-        work.validation();
-        work.symbols(item.symbols.len());
+        work_batch.validation();
+        work_batch.symbols(item.symbols.len());
         if item.function.is_none() {
             continue;
         }
@@ -5333,9 +5402,10 @@ fn validate_call_entry_syntax(
     ast: &AstProgram,
     work: &ParseWorkRecorder,
 ) -> Result<(), ParseError> {
+    let mut work_batch = work.batch();
     for expr in &ast.expressions {
-        work.expression();
-        work.validation();
+        work_batch.expression();
+        work_batch.validation();
         let (function, args, pass) = match &expr.kind {
             AstExprKind::Call {
                 function,
@@ -5420,9 +5490,10 @@ fn validate_reserved_standard_namespaces(
     statements: &[AstStatement],
     work: &ParseWorkRecorder,
 ) -> Result<(), ParseError> {
+    let mut work_batch = work.batch();
     for statement in statements {
-        work.statement();
-        work.validation();
+        work_batch.statement();
+        work_batch.validation();
         if let AstStatementKind::Field { name } = &statement.kind
             && is_reserved_standard_root(name)
         {
@@ -5436,13 +5507,13 @@ fn validate_reserved_standard_namespaces(
             ));
         }
     }
-    validate_reserved_standard_function_names(path, statements, work)
+    validate_reserved_standard_function_names(path, statements, &mut work_batch)
 }
 
 fn validate_reserved_standard_function_names(
     path: &str,
     statements: &[AstStatement],
-    work: &ParseWorkRecorder,
+    work: &mut ParseWorkBatch<'_>,
 ) -> Result<(), ParseError> {
     for statement in statements {
         work.statement();
@@ -5472,9 +5543,10 @@ fn validate_role_qualified_value_syntax(
     tokens: &[AstToken],
     work: &ParseWorkRecorder,
 ) -> Result<(), ParseError> {
+    let mut work_batch = work.batch();
     for window in tokens.windows(2) {
-        work.tokens(window.len());
-        work.validation();
+        work_batch.tokens(window.len());
+        work_batch.validation();
         let [role, separator] = window else {
             continue;
         };
@@ -5503,11 +5575,12 @@ fn validate_drain_syntax(
     work: &ParseWorkRecorder,
 ) -> Result<(), ParseError> {
     let tokens = validation_index.drain_tokens(ast).collect::<Vec<_>>();
+    let mut work_batch = work.batch();
 
     let mut index = 0usize;
     while let Some(token) = tokens.get(index) {
-        work.tokens(1);
-        work.validation();
+        work_batch.tokens(1);
+        work_batch.validation();
         if token.lexeme != "DRAIN" {
             index += 1;
             continue;
@@ -5531,8 +5604,8 @@ fn validate_drain_syntax(
         let body = tokens[index + 2..close]
             .iter()
             .map(|token| {
-                work.tokens(1);
-                work.validation();
+                work_batch.tokens(1);
+                work_batch.validation();
                 token.lexeme.clone()
             })
             .collect::<Vec<_>>();
@@ -5549,8 +5622,8 @@ fn validate_drain_syntax(
 
     let depths = semantic_token_depths(&tokens, work);
     for (index, token) in tokens.iter().enumerate() {
-        work.tokens(1);
-        work.validation();
+        work_batch.tokens(1);
+        work_batch.validation();
         if token.lexeme != "DRAINING" {
             continue;
         }
@@ -5584,10 +5657,11 @@ fn matching_semantic_brace(
     open: usize,
     work: &ParseWorkRecorder,
 ) -> Option<usize> {
+    let mut work_batch = work.batch();
     let mut depth = 0usize;
     for (index, token) in tokens.iter().enumerate().skip(open) {
-        work.tokens(1);
-        work.validation();
+        work_batch.tokens(1);
+        work_batch.validation();
         match token.lexeme.as_str() {
             "{" => depth += 1,
             "}" => {
@@ -5603,12 +5677,13 @@ fn matching_semantic_brace(
 }
 
 fn semantic_token_depths(tokens: &[&AstToken], work: &ParseWorkRecorder) -> Vec<i32> {
+    let mut work_batch = work.batch();
     let mut depth = 0i32;
     tokens
         .iter()
         .map(|token| {
-            work.tokens(1);
-            work.validation();
+            work_batch.tokens(1);
+            work_batch.validation();
             let current = depth;
             match token.lexeme.as_str() {
                 "[" | "{" | "(" => depth += 1,
@@ -5665,9 +5740,10 @@ fn validate_bytes_syntax(
     validation_index: &ValidationIndex,
     work: &ParseWorkRecorder,
 ) -> Result<(), ParseError> {
+    let mut work_batch = work.batch();
     for window in ast.tokens.windows(2) {
-        work.tokens(window.len());
-        work.validation();
+        work_batch.tokens(window.len());
+        work_batch.validation();
         let [base_token, suffix_token] = window else {
             continue;
         };
@@ -5714,7 +5790,7 @@ fn validate_bytes_syntax(
         let Some(item) = ast.items.get(*item_id) else {
             continue;
         };
-        work.validation();
+        work_batch.validation();
         validate_bytes_site_syntax(
             path,
             item,
@@ -5744,11 +5820,12 @@ fn validate_bits_syntax(
     validation_index: &ValidationIndex,
     work: &ParseWorkRecorder,
 ) -> Result<(), ParseError> {
+    let mut work_batch = work.batch();
     for (item_id, bits_index) in &validation_index.bits_sites {
         let Some(item) = ast.items.get(*item_id) else {
             continue;
         };
-        work.validation();
+        work_batch.validation();
         let token_start = item
             .symbol_spans
             .get(*bits_index)
@@ -5764,7 +5841,7 @@ fn validate_bits_syntax(
             continue;
         }
         let literal = bits_literal_tokens_at(&item.symbols, *bits_index);
-        work.symbols(literal.len());
+        work_batch.symbols(literal.len());
         let (_, radix, digits, base_index, suffix_index) = parse_bits_literal_tokens(literal)
             .map_err(|message| error(path, item.line, item.indent + 1, message.as_str()))?;
         let base_span = item
@@ -5910,18 +5987,19 @@ fn text_literal_token_spans_with_work(
     tokens: &[AstToken],
     work: &ParseWorkRecorder,
 ) -> Vec<(usize, usize)> {
+    let mut work_batch = work.batch();
     let mut spans = Vec::new();
     let mut index = 0usize;
     while index + 1 < tokens.len() {
-        work.tokens(2);
-        work.validation();
+        work_batch.tokens(2);
+        work_batch.validation();
         if tokens[index].lexeme == "TEXT" && tokens[index + 1].lexeme == "{" {
             let start = tokens[index].start;
             let mut depth = 0i32;
             let mut cursor = index + 1;
             while cursor < tokens.len() {
-                work.tokens(1);
-                work.validation();
+                work_batch.tokens(1);
+                work_batch.validation();
                 match tokens[cursor].lexeme.as_str() {
                     "{" => depth += 1,
                     "}" => {
@@ -6011,13 +6089,17 @@ fn text_literal_body_line_ranges_with_work(
 }
 
 fn statement_has_field(statement: &AstStatement, needle: &str, work: &ParseWorkRecorder) -> bool {
-    work.statement();
-    work.validation();
-    matches!(&statement.kind, AstStatementKind::Field { name } if name == needle)
-        || statement
-            .children
-            .iter()
-            .any(|child| statement_has_field(child, needle, work))
+    fn contains(statement: &AstStatement, needle: &str, work: &mut ParseWorkBatch<'_>) -> bool {
+        work.statement();
+        work.validation();
+        matches!(&statement.kind, AstStatementKind::Field { name } if name == needle)
+            || statement
+                .children
+                .iter()
+                .any(|child| contains(child, needle, work))
+    }
+
+    contains(statement, needle, &mut work.batch())
 }
 
 fn validate_source_unit_boundary_with_work(
@@ -6028,9 +6110,10 @@ fn validate_source_unit_boundary_with_work(
     work: &ParseWorkRecorder,
 ) -> Result<(), ParseError> {
     validate_balanced_brackets_with_work(path, ast, work)?;
+    let mut work_batch = work.batch();
     if let Some(item) = validation_index.semantic_items(ast).next() {
-        work.symbols(item.symbols.len());
-        work.validation();
+        work_batch.symbols(item.symbols.len());
+        work_batch.validation();
         let indentation = source
             .lines()
             .nth(item.line.saturating_sub(1))
@@ -6049,8 +6132,8 @@ fn validate_source_unit_boundary_with_work(
     }
 
     for token in &ast.tokens {
-        work.tokens(1);
-        work.validation();
+        work_batch.tokens(1);
+        work_batch.validation();
         if token.kind != AstTokenKind::Unknown
             || token.lexeme != "\""
             || containing_source_span(&validation_index.text_literal_spans, token.start, token.end)
@@ -6081,10 +6164,11 @@ fn validate_balanced_brackets_with_work(
     ast: &AstProgram,
     work: &ParseWorkRecorder,
 ) -> Result<(), ParseError> {
+    let mut work_batch = work.batch();
     let mut stack = Vec::new();
     for token in &ast.tokens {
-        work.tokens(1);
-        work.validation();
+        work_batch.tokens(1);
+        work_batch.validation();
         if matches!(
             token.kind,
             AstTokenKind::Comment | AstTokenKind::String | AstTokenKind::Newline
@@ -6128,11 +6212,12 @@ fn validate_list_capacities_with_work(
     validation_index: &ValidationIndex,
     work: &ParseWorkRecorder,
 ) -> Result<(), ParseError> {
+    let mut work_batch = work.batch();
     for (line_id, list_index) in &validation_index.list_sites {
         let Some(line) = ast.lines.get(*line_id) else {
             continue;
         };
-        work.validation();
+        work_batch.validation();
         if line.symbols.get(*list_index + 1).map(String::as_str) != Some("[") {
             continue;
         }
@@ -6185,9 +6270,10 @@ fn validate_no_reducer_style_update_with_work(
     validation_index: &ValidationIndex,
     work: &ParseWorkRecorder,
 ) -> Result<(), ParseError> {
+    let mut work_batch = work.batch();
     if validation_index.semantic_items(ast).any(|item| {
-        work.symbols(item.symbols.len());
-        work.validation();
+        work_batch.symbols(item.symbols.len());
+        work_batch.validation();
         reducer_update_signature(item)
     }) {
         return Err(ParseError {
@@ -6198,13 +6284,13 @@ fn validate_no_reducer_style_update_with_work(
         });
     }
     let has_event_source_when = validation_index.semantic_items(ast).any(|item| {
-        work.symbols(item.symbols.len());
-        work.validation();
+        work_batch.symbols(item.symbols.len());
+        work_batch.validation();
         item.contains_sequence(&["event", ".", "source", "|>", "WHEN"])
     });
     let has_state_pipe = validation_index.semantic_items(ast).any(|item| {
-        work.symbols(item.symbols.len());
-        work.validation();
+        work_batch.symbols(item.symbols.len());
+        work_batch.validation();
         item.contains_sequence(&["state", "|>"])
     });
     if has_event_source_when && has_state_pipe {
@@ -6230,9 +6316,10 @@ fn validate_no_hidden_identity_leak_with_work(
     validation_index: &ValidationIndex,
     work: &ParseWorkRecorder,
 ) -> Result<(), ParseError> {
+    let mut work_batch = work.batch();
     for token in validation_index.semantic_tokens(ast) {
-        work.tokens(1);
-        work.validation();
+        work_batch.tokens(1);
+        work_batch.validation();
         if let Some(needle) = hidden_runtime_identity_token(&token.lexeme) {
             return Err(ParseError {
                 path: path.to_owned(),
@@ -6243,8 +6330,8 @@ fn validate_no_hidden_identity_leak_with_work(
         }
     }
     for item in validation_index.semantic_items(ast) {
-        work.symbols(item.symbols.len());
-        work.validation();
+        work_batch.symbols(item.symbols.len());
+        work_batch.validation();
         if item.field.as_deref() == Some("alive") {
             return Err(ParseError {
                 path: path.to_owned(),
@@ -6764,6 +6851,28 @@ document:
         assert_eq!(failed_profile.work_counters.source_units_attempted, 1);
         assert_eq!(failed_profile.work_counters.source_units_parsed, 0);
         assert!(failed_profile.work_counters.source_bytes_inspected > 0);
+    }
+
+    #[test]
+    fn validation_work_batch_flushes_exact_visits_on_scope_exit() {
+        let work = ParseWorkRecorder::enabled();
+        {
+            let mut batch = work.batch();
+            batch.tokens(7);
+            batch.symbols(11);
+            batch.statement();
+            batch.statement();
+            batch.expression();
+            batch.validation();
+            batch.validation();
+            batch.validation();
+        }
+        let counters = work.finish().work_counters;
+        assert_eq!(counters.token_inspections, 7);
+        assert_eq!(counters.symbol_inspections, 11);
+        assert_eq!(counters.statement_visits, 2);
+        assert_eq!(counters.expression_visits, 1);
+        assert_eq!(counters.validation_visits, 3);
     }
 
     #[test]

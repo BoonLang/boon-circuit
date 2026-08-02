@@ -2328,11 +2328,11 @@ struct CheckedDiagnosticReplayInputs {
     builtins: BuiltinSignatureRegistry,
     render_contracts: RenderContractRegistry,
     render_slot_statements: BTreeSet<usize>,
-    inference_dependencies: Arc<CheckedTypeInferenceDependencies>,
+    hold_updates_by_expression: DenseIndexTable<Box<[usize]>>,
 }
 
 struct CheckedProgramBuildOutput {
-    program: CheckedProgram,
+    program: Arc<CheckedProgram>,
     diagnostics: Vec<TypeDiagnostic>,
     exact_pipeline_inputs_valid: bool,
     work_counters: TypeCheckWorkCounters,
@@ -3273,16 +3273,17 @@ impl<'a> CheckedProgramBuilder<'a> {
             checked_program_phase!("derive_order_chains", derive_checked_order_chains(&checked));
         checked.fields.order_chains = order_chains;
         builder.diagnostics.extend(order_diagnostics);
-        let inference_dependencies = Arc::clone(
+        let inference_dependencies = Arc::try_unwrap(
             builder
                 .checked_type_inference_dependencies
-                .as_ref()
+                .take()
                 .expect("checked inference dependencies initialized"),
-        );
+        )
+        .unwrap_or_else(|_| panic!("checked construction retained an inference-index borrower"));
         let mut work_counters = builder.work_counters;
         work_counters.record_flow_cache(builder.checked_flow_inference_cache.stats);
         CheckedProgramBuildOutput {
-            program: checked,
+            program: Arc::new(checked),
             diagnostics: builder.diagnostics,
             exact_pipeline_inputs_valid,
             work_counters,
@@ -3292,7 +3293,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                 builtins,
                 render_contracts,
                 render_slot_statements,
-                inference_dependencies,
+                hold_updates_by_expression: inference_dependencies.hold_updates_by_expression,
             }),
         }
     }
@@ -18512,7 +18513,7 @@ struct Checker<'a> {
     render_context_function_statements: BTreeSet<usize>,
     render_slot_statements: BTreeSet<usize>,
     structured_delimiter_fields: DenseIndexTable<Box<[(String, usize)]>>,
-    diagnostic_inference_dependencies: Option<Arc<CheckedTypeInferenceDependencies>>,
+    diagnostic_hold_updates: DenseIndexTable<Box<[usize]>>,
     source_payload_lookup: SourcePayloadPathLookup,
     source_payload_shape_table: Vec<SourcePayloadSyntaxShapeEntry>,
     source_payload_types: BTreeMap<String, Type>,
@@ -18536,8 +18537,12 @@ struct Checker<'a> {
     expr_type_vars: DenseIndexTable<TypeVar>,
     builtin_symbol_exprs: BTreeSet<usize>,
     expr_type_cache: Vec<Option<FlowType>>,
+    checked_program_for_diagnostics: Option<Arc<CheckedProgram>>,
     checked_statement_values: DenseIndexTable<CheckedExprId>,
     checked_diagnostic_replay: bool,
+    checked_diagnostic_projection_active: bool,
+    #[cfg(test)]
+    checked_diagnostic_projection_mode: CheckedDiagnosticProjectionMode,
     diagnostic_replayed: DenseFlagSet,
     diagnostic_ensure_requests: usize,
     diagnostic_lookup_hits: usize,
@@ -18556,6 +18561,89 @@ struct Checker<'a> {
     deferred_style_constraints: Vec<DeferredStyleConstraint>,
     constraints: Vec<Constraint>,
     diagnostics: Vec<TypeDiagnostic>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CheckedDiagnosticProjectionMode {
+    Ordered,
+    RecursiveOracle,
+}
+
+#[derive(Clone)]
+struct CheckedDiagnosticWhenSelector {
+    path: Option<String>,
+    ty: Type,
+}
+
+struct CheckedDiagnosticStatementContext {
+    next_in_document: bool,
+    has_function_bindings: bool,
+    when_selector: Option<Arc<CheckedDiagnosticWhenSelector>>,
+}
+
+#[derive(Default)]
+struct CheckedDiagnosticChildCleanup {
+    payload_bindings_pushed: bool,
+    saved_narrowed_bindings: Vec<(String, Option<Type>)>,
+}
+
+#[derive(Clone)]
+struct CheckedDiagnosticWhenProjection {
+    path: Option<String>,
+    ty: Option<Type>,
+}
+
+/// Explicit continuations for projecting legacy-compatible diagnostics from
+/// finalized checked flows. An expression is marked only when `Enter` runs;
+/// every leaf check is therefore ordered at the same point as the former
+/// recursive `ensure_expr` call rather than after a precomputed closure.
+enum CheckedDiagnosticExpressionTask {
+    Enter(usize),
+    ReplayLeaf(usize),
+    CheckBytesItem {
+        expression: usize,
+        item: usize,
+    },
+    FinishBytesLiteral(usize),
+    CheckRecordField {
+        expression: usize,
+        field: usize,
+        duplicate: bool,
+    },
+    CheckMapDuplicate {
+        key: usize,
+        first: usize,
+    },
+    CheckWhenBytesGuard {
+        input: usize,
+    },
+    EnterWhenArm {
+        projection: Arc<CheckedDiagnosticWhenProjection>,
+        arm: ReachableStaticWhenArm,
+    },
+    EnterHoldUpdate {
+        expression: usize,
+        name: Arc<String>,
+        accumulator: Type,
+    },
+    FinishScope(CheckedDiagnosticChildCleanup),
+    MissingHoldUpdates(usize),
+    ExternalCall(usize),
+    BuiltinComplete(usize),
+    BuiltinContextualHead(usize),
+    BuiltinArgument {
+        expression: usize,
+        argument: usize,
+    },
+    BuiltinTail(usize),
+    CheckListMapItem {
+        expression: usize,
+    },
+    CheckWhileInput {
+        expression: usize,
+        input: usize,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -18718,7 +18806,7 @@ impl<'a> Checker<'a> {
             render_context_function_statements: BTreeSet::new(),
             render_slot_statements: BTreeSet::new(),
             structured_delimiter_fields: DenseIndexTable::with_len(program.expressions.len()),
-            diagnostic_inference_dependencies: None,
+            diagnostic_hold_updates: DenseIndexTable::with_len(program.expressions.len()),
             source_payload_lookup,
             source_payload_shape_table,
             source_payload_types,
@@ -18742,8 +18830,12 @@ impl<'a> Checker<'a> {
             expr_type_vars: DenseIndexTable::with_len(program.expressions.len()),
             builtin_symbol_exprs,
             expr_type_cache: vec![None; program.expressions.len()],
+            checked_program_for_diagnostics: None,
             checked_statement_values: DenseIndexTable::default(),
             checked_diagnostic_replay: false,
+            checked_diagnostic_projection_active: false,
+            #[cfg(test)]
+            checked_diagnostic_projection_mode: CheckedDiagnosticProjectionMode::Ordered,
             diagnostic_replayed: DenseFlagSet::with_len(program.expressions.len()),
             diagnostic_ensure_requests: 0,
             diagnostic_lookup_hits: 0,
@@ -18870,7 +18962,7 @@ impl<'a> Checker<'a> {
         self.builtins = replay_inputs.builtins;
         self.render_contracts = replay_inputs.render_contracts;
         self.render_slot_statements = replay_inputs.render_slot_statements;
-        self.diagnostic_inference_dependencies = Some(replay_inputs.inference_dependencies);
+        self.diagnostic_hold_updates = replay_inputs.hold_updates_by_expression;
 
         // The authoritative CheckedProgram must retain its external environment
         // while the legacy diagnostic replay still reads it from Checker.
@@ -18882,8 +18974,9 @@ impl<'a> Checker<'a> {
     /// Populate the compatibility diagnostic walker from the authoritative
     /// checked database. `ensure_expr` therefore becomes a dense lookup on
     /// this path and cannot start the superseded provisional inference solve.
-    fn install_checked_diagnostic_lookups(&mut self, program: &CheckedProgram) {
+    fn install_checked_diagnostic_lookups(&mut self, program: &Arc<CheckedProgram>) {
         self.expr_type_cache.fill(None);
+        self.checked_program_for_diagnostics = Some(Arc::clone(program));
         self.checked_statement_values = program
             .statements
             .iter()
@@ -18900,16 +18993,14 @@ impl<'a> Checker<'a> {
         for expression in &program.expressions {
             self.checked_flow_install_count = self.checked_flow_install_count.saturating_add(1);
             let index = expression.id.0 as usize;
-            let Some(slot) = self.expr_type_cache.get_mut(index) else {
+            if index >= self.program.expressions.len() {
                 self.checked_flow_out_of_range_ids =
                     self.checked_flow_out_of_range_ids.saturating_add(1);
                 continue;
-            };
+            }
             if !installed.insert(index) {
                 self.checked_flow_duplicate_ids = self.checked_flow_duplicate_ids.saturating_add(1);
-                continue;
             }
-            *slot = Some(expression.flow_type.clone());
         }
         self.checked_flow_missing_parser_ids = self
             .program
@@ -18965,6 +19056,7 @@ impl<'a> Checker<'a> {
             .map(|entry| (entry.name.clone(), entry.parameters.clone()))
             .collect();
         self.checked_diagnostic_replay = true;
+        self.checked_diagnostic_projection_active = false;
         self.diagnostic_replayed = DenseFlagSet::with_len(self.program.expressions.len());
         self.diagnostic_ensure_requests = 0;
         self.diagnostic_lookup_hits = 0;
@@ -19030,9 +19122,19 @@ impl<'a> Checker<'a> {
         if trace_typecheck {
             eprintln!("boon_typecheck check_statements:start");
         }
-        for statement in &self.program.ast.statements {
-            self.check_statement(statement, false);
+        #[cfg(test)]
+        if self.checked_diagnostic_projection_mode
+            == CheckedDiagnosticProjectionMode::RecursiveOracle
+        {
+            let program = self.program;
+            for statement in &program.ast.statements {
+                self.check_statement(statement, false);
+            }
+        } else {
+            self.project_checked_statement_diagnostics();
         }
+        #[cfg(not(test))]
+        self.project_checked_statement_diagnostics();
         self.check_host_effect_calls();
         let accounted_diagnostic_lookups = self
             .diagnostic_lookup_hits
@@ -19079,11 +19181,10 @@ impl<'a> Checker<'a> {
         // The checked builder populated every lowered expression before this
         // compatibility diagnostic walk. Missing arena-only syntax remains
         // absent; `ensure_expr` may visit only those non-executable nodes.
-        let expressions_cached_before_coverage = self
-            .expr_type_cache
-            .iter()
-            .filter(|entry| entry.is_some())
-            .count();
+        let expressions_cached_before_coverage = self.checked_flow_install_count.saturating_sub(
+            self.checked_flow_duplicate_ids
+                .saturating_add(self.checked_flow_out_of_range_ids),
+        );
         let ensure_all_expressions_ms = typecheck_elapsed_ms(ensure_all_expressions_started);
         trace_phase("ensure_all_expressions", ensure_all_expressions_ms);
         if trace_typecheck {
@@ -19380,6 +19481,9 @@ impl<'a> Checker<'a> {
         } else {
             std::mem::take(&mut self.constraints)
         };
+        self.checked_program_for_diagnostics = None;
+        let checked_program = Arc::try_unwrap(checked_program)
+            .expect("diagnostic projection must release the finalized checked graph");
         let mut report = TypeCheckReport {
             expression_count: self.program.expressions.len(),
             checked_expression_count: checked_program.expressions.len(),
@@ -19516,7 +19620,11 @@ impl<'a> Checker<'a> {
         )
     }
 
-    fn check_statement(&mut self, statement: &AstStatement, in_document: bool) {
+    fn begin_checked_diagnostic_statement(
+        &mut self,
+        statement: &AstStatement,
+        in_document: bool,
+    ) -> CheckedDiagnosticStatementContext {
         if std::env::var_os("BOON_TYPECHECK_STATEMENT_TRACE").is_some() {
             eprintln!(
                 "boon_typecheck statement kind={:?} expr={:?} line={} children={}",
@@ -19526,32 +19634,15 @@ impl<'a> Checker<'a> {
                 statement.children.len()
             );
         }
-        let function_signature =
-            if let AstStatementKind::Function { name, parameters } = &statement.kind {
-                let parameters = if self.checked_diagnostic_replay {
-                    self.checked_function_parameters
-                        .get(name)
-                        .cloned()
-                        .unwrap_or_default()
-                } else {
-                    parameters
-                        .iter()
-                        .enumerate()
-                        .map(|(ordinal, parameter)| FunctionTypeParameterEntry {
-                            formal: DeclId(u32::MAX),
-                            ordinal,
-                            name: parameter.name.clone(),
-                            flow_type: FlowType {
-                                mode: FlowMode::Continuous,
-                                ty: self.function_arg_display_type(name, &parameter.name),
-                            },
-                        })
-                        .collect::<Vec<_>>()
-                };
-                Some((name.clone(), parameters))
-            } else {
-                None
-            };
+        let function_parameters = match &statement.kind {
+            AstStatementKind::Function { name, .. } => Some(
+                self.checked_function_parameters
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_default(),
+            ),
+            _ => None,
+        };
         let next_in_document = in_document
             || statement_field(statement).as_deref() == Some("document")
             || statement_field(statement).as_deref() == Some("scene")
@@ -19582,9 +19673,9 @@ impl<'a> Checker<'a> {
         if self.render_slot_statements.contains(&statement.id) {
             self.check_render_slot(statement);
         }
-        let has_function_bindings = function_signature
+        let has_function_bindings = function_parameters
             .as_ref()
-            .map(|(_, parameters)| {
+            .map(|parameters| {
                 self.local_name_bindings.push(
                     parameters
                         .iter()
@@ -19609,95 +19700,167 @@ impl<'a> Checker<'a> {
                 })
             })
             .map(|(_, selector_expr_id)| {
-                (
-                    pattern_selector_path(self.program.expressions.get(selector_expr_id)),
-                    self.ensure_expr(selector_expr_id).ty,
-                )
+                Arc::new(CheckedDiagnosticWhenSelector {
+                    path: pattern_selector_path(self.program.expressions.get(selector_expr_id)),
+                    ty: self.ensure_expr(selector_expr_id).ty,
+                })
             });
-        for child in &statement.children {
-            let narrowed_bindings =
-                when_selector
-                    .as_ref()
-                    .and_then(|(selector_path, selector_ty)| {
-                        let pattern = child
-                            .expr
-                            .and_then(|expr_id| self.program.expressions.get(expr_id))
-                            .and_then(|expr| match &expr.kind {
-                                AstExprKind::MatchArm { pattern, .. } => Some(pattern),
-                                _ => None,
-                            })?;
-                        let narrowed = narrowed_pattern_binding(selector_ty, pattern)?;
-                        let path = selector_path.as_ref()?;
-                        let mut bindings = vec![(path.clone(), narrowed.clone())];
-                        if let Some(name) = path.rsplit('.').next()
-                            && name != path
-                        {
-                            bindings.push((name.to_owned(), narrowed));
-                        }
-                        Some(bindings)
-                    });
-            let payload_bindings = when_selector.as_ref().and_then(|(_, selector_ty)| {
-                let pattern = child
-                    .expr
-                    .and_then(|expr_id| self.program.expressions.get(expr_id))
-                    .and_then(|expr| match &expr.kind {
-                        AstExprKind::MatchArm { pattern, .. } => Some(pattern),
-                        _ => None,
-                    })?;
-                let bindings = pattern_payload_bindings(selector_ty, pattern);
-                (!bindings.is_empty()).then_some(bindings)
-            });
-            let saved_arm_bindings = narrowed_bindings.as_ref().map(|bindings| {
-                bindings
-                    .iter()
-                    .map(|(name, ty)| {
-                        (
-                            name.clone(),
-                            self.name_bindings.insert(name.clone(), ty.clone()),
-                        )
-                    })
-                    .collect::<Vec<_>>()
-            });
-            if let Some(payload_bindings) = payload_bindings.as_ref() {
-                self.local_name_bindings.push(payload_bindings.clone());
+        CheckedDiagnosticStatementContext {
+            next_in_document,
+            has_function_bindings,
+            when_selector,
+        }
+    }
+
+    fn begin_checked_diagnostic_child_scope(
+        &mut self,
+        child: &AstStatement,
+        when_selector: Option<&CheckedDiagnosticWhenSelector>,
+    ) -> CheckedDiagnosticChildCleanup {
+        let narrowed_bindings = when_selector.and_then(|selector| {
+            let pattern = child
+                .expr
+                .and_then(|expr_id| self.program.expressions.get(expr_id))
+                .and_then(|expr| match &expr.kind {
+                    AstExprKind::MatchArm { pattern, .. } => Some(pattern),
+                    _ => None,
+                })?;
+            let narrowed = narrowed_pattern_binding(&selector.ty, pattern)?;
+            let path = selector.path.as_ref()?;
+            let mut bindings = vec![(path.clone(), narrowed.clone())];
+            if let Some(name) = path.rsplit('.').next()
+                && name != path
+            {
+                bindings.push((name.to_owned(), narrowed));
             }
-            self.check_statement(child, next_in_document);
-            if payload_bindings.is_some() {
-                self.local_name_bindings.pop();
+            Some(bindings)
+        });
+        let payload_bindings = when_selector.and_then(|selector| {
+            let pattern = child
+                .expr
+                .and_then(|expr_id| self.program.expressions.get(expr_id))
+                .and_then(|expr| match &expr.kind {
+                    AstExprKind::MatchArm { pattern, .. } => Some(pattern),
+                    _ => None,
+                })?;
+            let bindings = pattern_payload_bindings(&selector.ty, pattern);
+            (!bindings.is_empty()).then_some(bindings)
+        });
+        let saved_narrowed_bindings = narrowed_bindings
+            .into_iter()
+            .flatten()
+            .map(|(name, ty)| {
+                let previous = self.name_bindings.insert(name.clone(), ty);
+                (name, previous)
+            })
+            .collect();
+        let payload_bindings_pushed = payload_bindings.is_some();
+        if let Some(payload_bindings) = payload_bindings {
+            self.local_name_bindings.push(payload_bindings);
+        }
+        CheckedDiagnosticChildCleanup {
+            payload_bindings_pushed,
+            saved_narrowed_bindings,
+        }
+    }
+
+    fn finish_checked_diagnostic_child_scope(&mut self, cleanup: CheckedDiagnosticChildCleanup) {
+        if cleanup.payload_bindings_pushed {
+            self.local_name_bindings.pop();
+        }
+        for (name, previous) in cleanup.saved_narrowed_bindings {
+            if let Some(previous) = previous {
+                self.name_bindings.insert(name, previous);
+            } else {
+                self.name_bindings.remove(&name);
             }
-            if let Some(saved_arm_bindings) = saved_arm_bindings {
-                for (name, previous) in saved_arm_bindings {
-                    if let Some(previous) = previous {
-                        self.name_bindings.insert(name, previous);
-                    } else {
-                        self.name_bindings.remove(&name);
+        }
+    }
+
+    /// Production statement projection uses an explicit task stack. The
+    /// recursive walker below is compiled only for exact parity tests.
+    fn project_checked_statement_diagnostics(&mut self) {
+        enum Task<'a> {
+            Enter {
+                statement: &'a AstStatement,
+                in_document: bool,
+            },
+            EnterChild {
+                statement: &'a AstStatement,
+                in_document: bool,
+                when_selector: Option<Arc<CheckedDiagnosticWhenSelector>>,
+            },
+            FinishChild(CheckedDiagnosticChildCleanup),
+            FinishFunction,
+        }
+
+        let program = self.program;
+        let mut tasks = program
+            .ast
+            .statements
+            .iter()
+            .rev()
+            .map(|statement| Task::Enter {
+                statement,
+                in_document: false,
+            })
+            .collect::<Vec<_>>();
+        while let Some(task) = tasks.pop() {
+            match task {
+                Task::Enter {
+                    statement,
+                    in_document,
+                } => {
+                    let context = self.begin_checked_diagnostic_statement(statement, in_document);
+                    if context.has_function_bindings {
+                        tasks.push(Task::FinishFunction);
                     }
+                    tasks.extend(
+                        statement
+                            .children
+                            .iter()
+                            .rev()
+                            .map(|child| Task::EnterChild {
+                                statement: child,
+                                in_document: context.next_in_document,
+                                when_selector: context.when_selector.clone(),
+                            }),
+                    );
+                }
+                Task::EnterChild {
+                    statement,
+                    in_document,
+                    when_selector,
+                } => {
+                    let cleanup = self
+                        .begin_checked_diagnostic_child_scope(statement, when_selector.as_deref());
+                    tasks.push(Task::FinishChild(cleanup));
+                    tasks.push(Task::Enter {
+                        statement,
+                        in_document,
+                    });
+                }
+                Task::FinishChild(cleanup) => {
+                    self.finish_checked_diagnostic_child_scope(cleanup);
+                }
+                Task::FinishFunction => {
+                    self.local_name_bindings.pop();
                 }
             }
         }
-        if has_function_bindings {
-            self.local_name_bindings.pop();
+    }
+
+    #[cfg(test)]
+    fn check_statement(&mut self, statement: &AstStatement, in_document: bool) {
+        let context = self.begin_checked_diagnostic_statement(statement, in_document);
+        for child in &statement.children {
+            let cleanup =
+                self.begin_checked_diagnostic_child_scope(child, context.when_selector.as_deref());
+            self.check_statement(child, context.next_in_document);
+            self.finish_checked_diagnostic_child_scope(cleanup);
         }
-        if let Some((name, parameters)) = function_signature
-            && !self.checked_diagnostic_replay
-        {
-            let checked_result =
-                canonical_block_value_expression(&statement.children, &self.program.expressions)
-                    .and_then(|expression| self.expr_type_cache.get(expression))
-                    .and_then(|flow| flow.as_ref())
-                    .filter(|flow| !matches!(flow.ty, Type::Unknown))
-                    .map(|flow| FlowType {
-                        mode: FlowMode::Continuous,
-                        ty: flow.ty.clone(),
-                    });
-            let result = checked_result.unwrap_or_else(|| self.function_type_hint_result(&name));
-            self.function_type_table.entries.push(FunctionTypeEntry {
-                callable: DeclId(u32::MAX),
-                name: name.clone(),
-                parameters,
-                result,
-                effect: CheckedEffectSummary::default(),
-            });
+        if context.has_function_bindings {
+            self.local_name_bindings.pop();
         }
     }
 
@@ -20163,19 +20326,49 @@ impl<'a> Checker<'a> {
     }
 
     fn ensure_expr(&mut self, expr_id: usize) -> FlowType {
+        #[cfg(test)]
+        let use_recursive_oracle = self.checked_diagnostic_projection_mode
+            == CheckedDiagnosticProjectionMode::RecursiveOracle;
+        #[cfg(not(test))]
+        let use_recursive_oracle = false;
         if self.checked_diagnostic_replay {
             self.diagnostic_ensure_requests = self.diagnostic_ensure_requests.saturating_add(1);
+            if !use_recursive_oracle
+                && !self.checked_diagnostic_projection_active
+                && !self.diagnostic_replayed.contains(&expr_id)
+            {
+                self.project_checked_expression_diagnostics(expr_id);
+            }
         }
-        if let Some(existing) = self
-            .expr_type_cache
-            .get(expr_id)
-            .and_then(|entry| entry.as_ref())
-            .cloned()
-        {
+        let existing = self
+            .checked_diagnostic_replay
+            .then(|| {
+                self.checked_program_for_diagnostics
+                    .as_ref()
+                    .and_then(|program| program.expressions.get(expr_id))
+                    .filter(|expression| expression.id.0 as usize == expr_id)
+                    .map(|expression| expression.flow_type.clone())
+            })
+            .flatten()
+            .or_else(|| {
+                (!self.checked_diagnostic_replay)
+                    .then(|| {
+                        self.expr_type_cache
+                            .get(expr_id)
+                            .and_then(|entry| entry.as_ref())
+                            .cloned()
+                    })
+                    .flatten()
+            });
+        if let Some(existing) = existing {
             if self.checked_diagnostic_replay {
                 self.diagnostic_lookup_hits = self.diagnostic_lookup_hits.saturating_add(1);
             }
-            if self.checked_diagnostic_replay && self.diagnostic_replayed.insert(expr_id) {
+            #[cfg(test)]
+            if self.checked_diagnostic_replay
+                && use_recursive_oracle
+                && self.diagnostic_replayed.insert(expr_id)
+            {
                 let program = self.program;
                 if let Some(expression) = program.expressions.get(expr_id) {
                     self.replay_checked_expr_diagnostics(expression);
@@ -20187,6 +20380,821 @@ impl<'a> Checker<'a> {
             self.diagnostic_lookup_misses = self.diagnostic_lookup_misses.saturating_add(1);
         }
         unknown_flow_type()
+    }
+
+    fn finalized_checked_flow(&self, expression: usize) -> Option<&FlowType> {
+        self.checked_program_for_diagnostics
+            .as_ref()?
+            .expressions
+            .get(expression)
+            .filter(|checked| checked.id.0 as usize == expression)
+            .map(|checked| &checked.flow_type)
+    }
+
+    /// Execute deterministic diagnostic continuations without recursive
+    /// `ensure_expr` dispatch. Unlike a dependency postorder, continuations
+    /// preserve checks that occur before, between, and after child reads.
+    fn project_checked_expression_diagnostics(&mut self, root: usize) {
+        let mut tasks = vec![CheckedDiagnosticExpressionTask::Enter(root)];
+        self.checked_diagnostic_projection_active = true;
+        while let Some(task) = tasks.pop() {
+            match task {
+                CheckedDiagnosticExpressionTask::Enter(expression) => {
+                    if !self.diagnostic_replayed.insert(expression)
+                        || self.program.expressions.get(expression).is_none()
+                    {
+                        continue;
+                    }
+                    let sequence = self.checked_diagnostic_expression_sequence(expression);
+                    tasks.extend(sequence.into_iter().rev());
+                }
+                CheckedDiagnosticExpressionTask::ReplayLeaf(expression) => {
+                    let program = self.program;
+                    if let Some(expression) = program.expressions.get(expression) {
+                        self.replay_checked_expr_diagnostics(expression);
+                    }
+                }
+                CheckedDiagnosticExpressionTask::CheckBytesItem { expression, item } => {
+                    self.check_projected_bytes_item(expression, item);
+                }
+                CheckedDiagnosticExpressionTask::FinishBytesLiteral(expression) => {
+                    self.finish_projected_bytes_literal(expression);
+                }
+                CheckedDiagnosticExpressionTask::CheckRecordField {
+                    expression,
+                    field,
+                    duplicate,
+                } => self.check_projected_record_field(expression, field, duplicate),
+                CheckedDiagnosticExpressionTask::CheckMapDuplicate { key, first } => {
+                    self.diagnostics.push(self.diagnostic_for_expr(
+                        key,
+                        format!(
+                            "MAP literal contains a statically duplicate key; first equal key is expression {first}"
+                        ),
+                    ));
+                }
+                CheckedDiagnosticExpressionTask::CheckWhenBytesGuard { input } => {
+                    if self.expr_id_is_bytes_source_payload_path(input) {
+                        self.diagnostics.push(self.diagnostic_for_expr(
+                            input,
+                            "BYTES source payload guards are not supported in v1; use `THEN` to route the BYTES payload or convert it explicitly before matching".to_owned(),
+                        ));
+                    }
+                }
+                CheckedDiagnosticExpressionTask::EnterWhenArm { projection, arm } => {
+                    let narrowed = arm
+                        .selector_type
+                        .as_ref()
+                        .and_then(|selector_type| {
+                            narrowed_pattern_binding(selector_type, &arm.pattern)
+                        })
+                        .or_else(|| arm.catch_all.then(|| arm.selector_type.clone()).flatten())
+                        .or_else(|| {
+                            projection.ty.as_ref().and_then(|selector_type| {
+                                narrowed_pattern_binding(selector_type, &arm.pattern)
+                            })
+                        });
+                    let payload_bindings = projection
+                        .ty
+                        .as_ref()
+                        .map(|selector_type| pattern_payload_bindings(selector_type, &arm.pattern))
+                        .unwrap_or_default();
+                    let mut binding_keys = projection
+                        .path
+                        .as_ref()
+                        .map(|path| {
+                            let mut keys = vec![path.clone()];
+                            if let Some(name) = path.rsplit('.').next()
+                                && name != path
+                            {
+                                keys.push(name.to_owned());
+                            }
+                            keys
+                        })
+                        .unwrap_or_default();
+                    let saved_narrowed_bindings = narrowed
+                        .into_iter()
+                        .flat_map(|narrowed| {
+                            binding_keys
+                                .drain(..)
+                                .map(|key| {
+                                    let previous =
+                                        self.name_bindings.insert(key.clone(), narrowed.clone());
+                                    (key, previous)
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .collect();
+                    let payload_bindings_pushed = !payload_bindings.is_empty();
+                    if payload_bindings_pushed {
+                        self.local_name_bindings.push(payload_bindings);
+                    }
+                    tasks.push(CheckedDiagnosticExpressionTask::FinishScope(
+                        CheckedDiagnosticChildCleanup {
+                            payload_bindings_pushed,
+                            saved_narrowed_bindings,
+                        },
+                    ));
+                    tasks.push(CheckedDiagnosticExpressionTask::Enter(arm.output));
+                }
+                CheckedDiagnosticExpressionTask::EnterHoldUpdate {
+                    expression,
+                    name,
+                    accumulator,
+                } => {
+                    self.local_name_bindings
+                        .push(BTreeMap::from([(name.as_ref().clone(), accumulator)]));
+                    tasks.push(CheckedDiagnosticExpressionTask::FinishScope(
+                        CheckedDiagnosticChildCleanup {
+                            payload_bindings_pushed: true,
+                            saved_narrowed_bindings: Vec::new(),
+                        },
+                    ));
+                    tasks.push(CheckedDiagnosticExpressionTask::Enter(expression));
+                }
+                CheckedDiagnosticExpressionTask::FinishScope(cleanup) => {
+                    self.finish_checked_diagnostic_child_scope(cleanup);
+                }
+                CheckedDiagnosticExpressionTask::MissingHoldUpdates(expression) => {
+                    self.diagnostics.push(self.diagnostic_for_expr(
+                        expression,
+                        "internal checked diagnostic projection is missing HOLD update ownership"
+                            .to_owned(),
+                    ));
+                }
+                CheckedDiagnosticExpressionTask::ExternalCall(expression) => {
+                    self.project_external_call_diagnostics(expression);
+                }
+                CheckedDiagnosticExpressionTask::BuiltinComplete(expression) => {
+                    self.project_builtin_complete_diagnostics(expression);
+                }
+                CheckedDiagnosticExpressionTask::BuiltinContextualHead(expression) => {
+                    self.project_builtin_contextual_head_diagnostics(expression);
+                }
+                CheckedDiagnosticExpressionTask::BuiltinArgument {
+                    expression,
+                    argument,
+                } => self.project_builtin_argument(expression, argument),
+                CheckedDiagnosticExpressionTask::BuiltinTail(expression) => {
+                    self.project_builtin_tail_diagnostics(expression);
+                }
+                CheckedDiagnosticExpressionTask::CheckListMapItem { expression } => {
+                    let item_type = self.ensure_expr(expression).ty;
+                    if type_contains_absence(&item_type) {
+                        self.diagnostics.push(self.diagnostic_for_expr(
+                            expression,
+                            "`SKIP` cannot be used as a `List/map` item".to_owned(),
+                        ));
+                    }
+                }
+                CheckedDiagnosticExpressionTask::CheckWhileInput { expression, input } => {
+                    let input_flow = self.ensure_expr(input);
+                    if !matches!(input_flow.mode, FlowMode::Continuous) {
+                        self.constraints.push(Constraint::FlowCompatible {
+                            actual: input_flow.clone(),
+                            expected: FlowType {
+                                mode: FlowMode::Continuous,
+                                ty: input_flow.ty.clone(),
+                            },
+                        });
+                        self.diagnostics.push(self.diagnostic_for_expr(
+                            input,
+                            "`WHILE` requires a continuous selector".to_owned(),
+                        ));
+                    }
+                    let _ = expression;
+                }
+            }
+        }
+        self.checked_diagnostic_projection_active = false;
+    }
+
+    fn checked_diagnostic_expression_sequence(
+        &self,
+        expression_id: usize,
+    ) -> SmallVec<[CheckedDiagnosticExpressionTask; 12]> {
+        let mut sequence = SmallVec::new();
+        let Some(expression) = self.program.expressions.get(expression_id) else {
+            return sequence;
+        };
+        match &expression.kind {
+            AstExprKind::BytesLiteral { items, .. } => {
+                for item in items {
+                    sequence.push(CheckedDiagnosticExpressionTask::Enter(*item));
+                    sequence.push(CheckedDiagnosticExpressionTask::CheckBytesItem {
+                        expression: expression_id,
+                        item: *item,
+                    });
+                }
+                sequence.push(CheckedDiagnosticExpressionTask::FinishBytesLiteral(
+                    expression_id,
+                ));
+            }
+            AstExprKind::Object(fields) => {
+                let mut explicit_fields = BTreeSet::new();
+                for (field_index, field) in fields.iter().enumerate() {
+                    let duplicate = !field.spread && !explicit_fields.insert(field.name.clone());
+                    sequence.push(CheckedDiagnosticExpressionTask::Enter(field.value));
+                    sequence.push(CheckedDiagnosticExpressionTask::CheckRecordField {
+                        expression: expression_id,
+                        field: field_index,
+                        duplicate,
+                    });
+                }
+            }
+            AstExprKind::MapLiteral { entries } => {
+                let mut static_keys = BTreeMap::<DataValue, usize>::new();
+                for entry in entries {
+                    if let Some(AstExpr {
+                        kind: AstExprKind::MapEntry { key, .. },
+                        ..
+                    }) = self.program.expressions.get(*entry)
+                        && let Some(key_value) = static_key_value(self.program, *key)
+                        && let Some(first) = static_keys.insert(key_value, *key)
+                    {
+                        sequence.push(CheckedDiagnosticExpressionTask::CheckMapDuplicate {
+                            key: *key,
+                            first,
+                        });
+                    }
+                    sequence.push(CheckedDiagnosticExpressionTask::Enter(*entry));
+                }
+            }
+            AstExprKind::Call { function, args, .. } => {
+                sequence.extend(
+                    args.iter()
+                        .map(|argument| CheckedDiagnosticExpressionTask::Enter(argument.value)),
+                );
+                if external_function_role(function).is_some() {
+                    sequence.push(CheckedDiagnosticExpressionTask::ExternalCall(expression_id));
+                } else {
+                    sequence.push(CheckedDiagnosticExpressionTask::BuiltinComplete(
+                        expression_id,
+                    ));
+                }
+            }
+            AstExprKind::Pipe {
+                input, op, args, ..
+            } => {
+                let input = pipeline_source_expr_id(
+                    &self.program.ast.statements,
+                    expression.id,
+                    *input,
+                    &self.program.expressions,
+                );
+                sequence.push(CheckedDiagnosticExpressionTask::Enter(input));
+                for argument in args {
+                    if contextual_body_parameter_name(op).is_some()
+                        && (argument.is_bare_binding()
+                            || argument.named_name() == contextual_body_parameter_name(op))
+                    {
+                        continue;
+                    }
+                    sequence.push(CheckedDiagnosticExpressionTask::Enter(argument.value));
+                }
+                if external_function_role(op).is_some() {
+                    sequence.push(CheckedDiagnosticExpressionTask::ExternalCall(expression_id));
+                } else if contextual_body_parameter_name(op).is_some() {
+                    self.schedule_projected_contextual_builtin_diagnostics(
+                        expression_id,
+                        op,
+                        args,
+                        &mut sequence,
+                    );
+                } else {
+                    sequence.push(CheckedDiagnosticExpressionTask::BuiltinComplete(
+                        expression_id,
+                    ));
+                }
+                if external_function_role(op).is_none() {
+                    if op == "List/map"
+                        && let Some(mapped) = list_map_result_expr_id(
+                            &self.program.ast.statements,
+                            &self.program.expressions,
+                            args,
+                        )
+                    {
+                        sequence.push(CheckedDiagnosticExpressionTask::Enter(mapped));
+                        sequence.push(CheckedDiagnosticExpressionTask::CheckListMapItem {
+                            expression: mapped,
+                        });
+                    }
+                    if op == "WHILE" {
+                        sequence.push(CheckedDiagnosticExpressionTask::CheckWhileInput {
+                            expression: expression_id,
+                            input,
+                        });
+                    }
+                }
+            }
+            AstExprKind::Hold { initial, name } => {
+                let initial = pipeline_source_expr_id(
+                    &self.program.ast.statements,
+                    expression.id,
+                    *initial,
+                    &self.program.expressions,
+                );
+                sequence.push(CheckedDiagnosticExpressionTask::Enter(initial));
+                let Some(updates) = self.diagnostic_hold_updates.get(&expression.id) else {
+                    sequence.push(CheckedDiagnosticExpressionTask::MissingHoldUpdates(
+                        expression_id,
+                    ));
+                    return sequence;
+                };
+                let mut accumulator = self
+                    .finalized_checked_flow(initial)
+                    .map(|flow| flow.ty.clone())
+                    .unwrap_or(Type::Unknown);
+                let name = Arc::new(name.clone());
+                for update in updates.iter().copied() {
+                    sequence.push(CheckedDiagnosticExpressionTask::EnterHoldUpdate {
+                        expression: update,
+                        name: Arc::clone(&name),
+                        accumulator: accumulator.clone(),
+                    });
+                    if let Some(update_type) = self
+                        .finalized_checked_flow(update)
+                        .map(|flow| &flow.ty)
+                        .filter(|ty| !matches!(ty, Type::Absent))
+                    {
+                        accumulator = widen_hold_type(&accumulator, update_type);
+                    }
+                }
+            }
+            AstExprKind::When { input, .. } => {
+                sequence
+                    .push(CheckedDiagnosticExpressionTask::CheckWhenBytesGuard { input: *input });
+                let selector = pattern_selector_expr_id(expression_id, &self.program.expressions)
+                    .map(|input| {
+                        pipeline_source_expr_id(
+                            &self.program.ast.statements,
+                            expression_id,
+                            input,
+                            &self.program.expressions,
+                        )
+                    });
+                if let Some(selector) = selector {
+                    sequence.push(CheckedDiagnosticExpressionTask::Enter(selector));
+                    let selector_type = self
+                        .finalized_checked_flow(selector)
+                        .map(|flow| flow.ty.clone());
+                    let projection = Arc::new(CheckedDiagnosticWhenProjection {
+                        path: pattern_selector_path(self.program.expressions.get(selector)),
+                        ty: selector_type.clone(),
+                    });
+                    sequence.extend(
+                        reachable_static_when_arms(
+                            expression_id,
+                            &self.program.expressions,
+                            selector_type.as_ref(),
+                        )
+                        .into_iter()
+                        .map(|arm| {
+                            CheckedDiagnosticExpressionTask::EnterWhenArm {
+                                projection: Arc::clone(&projection),
+                                arm,
+                            }
+                        }),
+                    );
+                }
+            }
+            AstExprKind::Flush { payload } => {
+                sequence.extend(
+                    payload
+                        .iter()
+                        .copied()
+                        .map(CheckedDiagnosticExpressionTask::Enter),
+                );
+                sequence.push(CheckedDiagnosticExpressionTask::ReplayLeaf(expression_id));
+            }
+            AstExprKind::TaggedObject { fields, .. } => {
+                sequence.extend(
+                    fields
+                        .iter()
+                        .filter(|field| !field.spread)
+                        .map(|field| CheckedDiagnosticExpressionTask::Enter(field.value)),
+                );
+                sequence.push(CheckedDiagnosticExpressionTask::ReplayLeaf(expression_id));
+            }
+            AstExprKind::ListLiteral { items, .. } | AstExprKind::SetLiteral { items } => {
+                sequence.extend(
+                    items
+                        .iter()
+                        .copied()
+                        .map(CheckedDiagnosticExpressionTask::Enter),
+                );
+                sequence.push(CheckedDiagnosticExpressionTask::ReplayLeaf(expression_id));
+            }
+            AstExprKind::MapEntry { key, value } => {
+                sequence.push(CheckedDiagnosticExpressionTask::Enter(*key));
+                sequence.push(CheckedDiagnosticExpressionTask::Enter(*value));
+                sequence.push(CheckedDiagnosticExpressionTask::ReplayLeaf(expression_id));
+            }
+            AstExprKind::Draining { input } => {
+                sequence.push(CheckedDiagnosticExpressionTask::Enter(
+                    pipeline_source_expr_id(
+                        &self.program.ast.statements,
+                        expression.id,
+                        *input,
+                        &self.program.expressions,
+                    ),
+                ));
+                sequence.push(CheckedDiagnosticExpressionTask::ReplayLeaf(expression_id));
+            }
+            AstExprKind::Latest { branches } => {
+                sequence.extend(
+                    branches
+                        .iter()
+                        .copied()
+                        .map(CheckedDiagnosticExpressionTask::Enter),
+                );
+                sequence.push(CheckedDiagnosticExpressionTask::ReplayLeaf(expression_id));
+            }
+            AstExprKind::Then { input, output } => {
+                sequence.push(CheckedDiagnosticExpressionTask::Enter(*input));
+                sequence.extend(
+                    output
+                        .iter()
+                        .copied()
+                        .map(CheckedDiagnosticExpressionTask::Enter),
+                );
+                sequence.push(CheckedDiagnosticExpressionTask::ReplayLeaf(expression_id));
+            }
+            AstExprKind::Infix { left, right, .. } => {
+                sequence.push(CheckedDiagnosticExpressionTask::Enter(*left));
+                sequence.push(CheckedDiagnosticExpressionTask::Enter(*right));
+                sequence.push(CheckedDiagnosticExpressionTask::ReplayLeaf(expression_id));
+            }
+            AstExprKind::MatchArm { output, .. } => {
+                sequence.extend(
+                    output
+                        .iter()
+                        .copied()
+                        .map(CheckedDiagnosticExpressionTask::Enter),
+                );
+                sequence.push(CheckedDiagnosticExpressionTask::ReplayLeaf(expression_id));
+            }
+            AstExprKind::Block { bindings, result } => {
+                sequence.extend(
+                    bindings
+                        .iter()
+                        .map(|binding| CheckedDiagnosticExpressionTask::Enter(binding.value)),
+                );
+                sequence.extend(
+                    result
+                        .iter()
+                        .copied()
+                        .map(CheckedDiagnosticExpressionTask::Enter),
+                );
+                sequence.push(CheckedDiagnosticExpressionTask::ReplayLeaf(expression_id));
+            }
+            AstExprKind::Delimiter => {
+                sequence.extend(
+                    self.structured_delimiter_fields
+                        .get(&expression.id)
+                        .into_iter()
+                        .flatten()
+                        .map(|(_, value)| CheckedDiagnosticExpressionTask::Enter(*value)),
+                );
+                sequence.push(CheckedDiagnosticExpressionTask::ReplayLeaf(expression_id));
+            }
+            AstExprKind::Identifier(value) => {
+                if !self.builtin_symbol_exprs.contains(&expression.id)
+                    && !self.is_known_function(value)
+                    && !self
+                        .local_name_bindings
+                        .iter()
+                        .rev()
+                        .any(|bindings| bindings.contains_key(value))
+                    && !self.name_bindings.contains_key(value)
+                    && let Some(declaration) =
+                        declaration_expr_for_path(&self.declaration_exprs, value)
+                {
+                    sequence.push(CheckedDiagnosticExpressionTask::Enter(declaration));
+                }
+                sequence.push(CheckedDiagnosticExpressionTask::ReplayLeaf(expression_id));
+            }
+            AstExprKind::Drain { path } => {
+                let parts = drain_path_parts(path);
+                if let Some(declaration) = self.projected_path_dependency(&parts) {
+                    sequence.push(CheckedDiagnosticExpressionTask::Enter(declaration));
+                }
+                sequence.push(CheckedDiagnosticExpressionTask::ReplayLeaf(expression_id));
+            }
+            AstExprKind::Path(parts) => {
+                if let Some(declaration) = self.projected_path_dependency(parts) {
+                    sequence.push(CheckedDiagnosticExpressionTask::Enter(declaration));
+                }
+                sequence.push(CheckedDiagnosticExpressionTask::ReplayLeaf(expression_id));
+            }
+            AstExprKind::StringLiteral(_)
+            | AstExprKind::TextLiteral(_)
+            | AstExprKind::TextTemplate { .. }
+            | AstExprKind::Number(_)
+            | AstExprKind::BitsLiteral { .. }
+            | AstExprKind::ByteLiteral { .. }
+            | AstExprKind::Tag(_)
+            | AstExprKind::Source
+            | AstExprKind::Unknown(_)
+            | AstExprKind::Arrow { .. } => {
+                sequence.push(CheckedDiagnosticExpressionTask::ReplayLeaf(expression_id));
+            }
+        }
+        sequence
+    }
+
+    fn schedule_projected_contextual_builtin_diagnostics(
+        &self,
+        expression: usize,
+        function: &str,
+        arguments: &[AstCallArg],
+        sequence: &mut SmallVec<[CheckedDiagnosticExpressionTask; 12]>,
+    ) {
+        sequence.push(CheckedDiagnosticExpressionTask::BuiltinContextualHead(
+            expression,
+        ));
+        let ordinary_compatibility = session_info_intrinsic_type(function).is_none()
+            && host_effect_signature(function).is_none();
+        if ordinary_compatibility {
+            let body_parameter = contextual_body_parameter_name(function);
+            for (argument_index, argument) in arguments.iter().enumerate() {
+                let name = argument.named_name();
+                let reads_flow = !(is_registered_render_constructor(function)
+                    && name
+                        .is_some_and(|name| !render_arg_should_validate_directly(function, name)))
+                    && ((function == "Bool/toggle" && name == Some("when"))
+                        || builtin_argument_custom_expected_label(function, name, true).is_some()
+                        || builtin_argument_expected_type(function, name, true).is_some());
+                if !reads_flow {
+                    continue;
+                }
+                if argument.is_bare_binding() || name == body_parameter {
+                    sequence.push(CheckedDiagnosticExpressionTask::Enter(argument.value));
+                }
+                sequence.push(CheckedDiagnosticExpressionTask::BuiltinArgument {
+                    expression,
+                    argument: argument_index,
+                });
+            }
+        }
+        sequence.push(CheckedDiagnosticExpressionTask::BuiltinTail(expression));
+    }
+
+    fn projected_path_dependency(&self, parts: &[String]) -> Option<usize> {
+        if external_value_role(parts).is_some()
+            || parts.join(".") == "element.hovered"
+            || self.source_payload_lookup.access_for_parts(parts).is_some()
+            || self
+                .local_name_bindings
+                .iter()
+                .rev()
+                .any(|bindings| type_from_longest_binding_prefix(bindings, parts).is_some())
+        {
+            return None;
+        }
+        declaration_expr_for_path(&self.declaration_exprs, &parts.join("."))
+    }
+
+    fn check_projected_bytes_item(&mut self, expression: usize, item: usize) {
+        let Some(AstExpr {
+            kind: AstExprKind::BytesLiteral { size, .. },
+            ..
+        }) = self.program.expressions.get(expression)
+        else {
+            return;
+        };
+        let item_type = self.ensure_expr(item).ty;
+        match item_type {
+            Type::Bytes(BytesType::Fixed(_)) => {}
+            Type::Bytes(BytesType::Dynamic) => {
+                if !matches!(size, BytesSizeSyntax::Dynamic) {
+                    self.diagnostics.push(self.diagnostic_for_expr(
+                        item,
+                        "fixed BYTES constructors cannot contain dynamic BYTES".to_owned(),
+                    ));
+                }
+            }
+            Type::Unknown | Type::Var(_) | Type::UnresolvedShape { .. } => {}
+            other => self.diagnostics.push(self.diagnostic_for_expr(
+                item,
+                format!(
+                    "BYTES constructor items must be byte literals or BYTES values, found {}; use Text/to_bytes for explicit TEXT/BYTES conversion",
+                    boon_facing_type_label(&other)
+                ),
+            )),
+        }
+    }
+
+    fn finish_projected_bytes_literal(&mut self, expression: usize) {
+        let Some(AstExpr {
+            kind: AstExprKind::BytesLiteral { size, items },
+            ..
+        }) = self.program.expressions.get(expression)
+        else {
+            return;
+        };
+        let mut known_len = 0usize;
+        let mut all_fixed = true;
+        for item in items {
+            match self
+                .finalized_checked_flow(*item)
+                .map(|flow| &flow.ty)
+                .unwrap_or(&Type::Unknown)
+            {
+                Type::Bytes(BytesType::Fixed(len)) => known_len += len,
+                Type::Bytes(BytesType::Dynamic)
+                | Type::Unknown
+                | Type::Var(_)
+                | Type::UnresolvedShape { .. } => all_fixed = false,
+                _ => all_fixed = false,
+            }
+        }
+        match size {
+            BytesSizeSyntax::Dynamic => {}
+            BytesSizeSyntax::Infer if !all_fixed => {
+                self.diagnostics.push(
+                    self.diagnostic_for_expr(
+                        expression,
+                        "BYTES[__] length cannot be inferred from dynamic or unknown content"
+                            .to_owned(),
+                    ),
+                );
+            }
+            BytesSizeSyntax::Fixed(expected)
+                if !items.is_empty() && all_fixed && known_len != *expected =>
+            {
+                self.diagnostics.push(self.diagnostic_for_expr(
+                    expression,
+                    format!(
+                        "BYTES[{expected}] contains {known_len} byte(s); fixed BYTES length must match exactly"
+                    ),
+                ));
+            }
+            BytesSizeSyntax::Infer | BytesSizeSyntax::Fixed(_) => {}
+        }
+    }
+
+    fn check_projected_record_field(
+        &mut self,
+        expression: usize,
+        field_index: usize,
+        duplicate: bool,
+    ) {
+        let Some(AstExpr {
+            kind: AstExprKind::Object(fields),
+            ..
+        }) = self.program.expressions.get(expression)
+        else {
+            return;
+        };
+        let Some(field) = fields.get(field_index) else {
+            return;
+        };
+        let value = field.value;
+        let spread = field.spread;
+        let name = field.name.clone();
+        let ty = self.ensure_expr(value).ty;
+        if spread {
+            if !matches!(
+                ty,
+                Type::Object(_) | Type::Unknown | Type::UnresolvedShape { .. } | Type::Var(_)
+            ) && !matches!(
+                &ty,
+                Type::VariantSet(variants)
+                    if variants.iter().any(
+                        |variant| matches!(variant, Variant::Tag(tag) if tag == "UNPLUGGED")
+                    )
+            ) {
+                self.diagnostics.push(
+                    self.diagnostic_for_expr(
+                        value,
+                        "record spread expects a record value".to_owned(),
+                    ),
+                );
+            }
+        } else if duplicate {
+            self.diagnostics.push(
+                self.diagnostic_for_expr(
+                    value,
+                    format!("duplicate explicit record field `{name}`"),
+                ),
+            );
+        }
+    }
+
+    fn project_external_call_diagnostics(&mut self, expression: usize) {
+        let program = self.program;
+        let Some(syntax) = program.expressions.get(expression) else {
+            return;
+        };
+        match &syntax.kind {
+            AstExprKind::Call { function, args, .. } => {
+                let _ = self.check_external_function_call(expression, function, None, args);
+            }
+            AstExprKind::Pipe {
+                input, op, args, ..
+            } => {
+                let input = pipeline_source_expr_id(
+                    &program.ast.statements,
+                    expression,
+                    *input,
+                    &program.expressions,
+                );
+                let _ = self.check_external_function_call(expression, op, Some(input), args);
+            }
+            _ => {}
+        }
+    }
+
+    fn project_builtin_complete_diagnostics(&mut self, expression: usize) {
+        let program = self.program;
+        let Some(syntax) = program.expressions.get(expression) else {
+            return;
+        };
+        match &syntax.kind {
+            AstExprKind::Call { function, args, .. } => {
+                self.replay_builtin_call_diagnostics(syntax, function, None, args);
+            }
+            AstExprKind::Pipe {
+                input, op, args, ..
+            } => {
+                let input = pipeline_source_expr_id(
+                    &program.ast.statements,
+                    expression,
+                    *input,
+                    &program.expressions,
+                );
+                self.replay_builtin_call_diagnostics(syntax, op, Some(input), args);
+            }
+            _ => {}
+        }
+    }
+
+    fn project_builtin_contextual_head_diagnostics(&mut self, expression: usize) {
+        let program = self.program;
+        let Some(syntax) = program.expressions.get(expression) else {
+            return;
+        };
+        let AstExprKind::Pipe {
+            input, op, args, ..
+        } = &syntax.kind
+        else {
+            return;
+        };
+        let input = pipeline_source_expr_id(
+            &program.ast.statements,
+            expression,
+            *input,
+            &program.expressions,
+        );
+        self.replay_builtin_call_prefix_diagnostics(expression, op, Some(input), args);
+        if self.check_builtin_call_compatibility_head(expression, op, Some(input), args) {
+            self.check_builtin_pipe_input_compatibility(op, Some(input));
+        }
+    }
+
+    fn project_builtin_argument(&mut self, expression: usize, argument: usize) {
+        let program = self.program;
+        let Some(syntax) = program.expressions.get(expression) else {
+            return;
+        };
+        match &syntax.kind {
+            AstExprKind::Call { function, args, .. } => {
+                if let Some(argument) = args.get(argument) {
+                    self.check_builtin_argument_compatibility(function, argument, false);
+                }
+            }
+            AstExprKind::Pipe { op, args, .. } => {
+                if let Some(argument) = args.get(argument) {
+                    self.check_builtin_argument_compatibility(op, argument, true);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn project_builtin_tail_diagnostics(&mut self, expression: usize) {
+        let program = self.program;
+        let Some(syntax) = program.expressions.get(expression) else {
+            return;
+        };
+        match &syntax.kind {
+            AstExprKind::Call { function, args, .. } => {
+                self.replay_builtin_call_tail_diagnostics(syntax, function, None, args);
+            }
+            AstExprKind::Pipe {
+                input, op, args, ..
+            } => {
+                let input = pipeline_source_expr_id(
+                    &program.ast.statements,
+                    expression,
+                    *input,
+                    &program.expressions,
+                );
+                self.replay_builtin_call_tail_diagnostics(syntax, op, Some(input), args);
+            }
+            _ => {}
+        }
     }
 
     fn infer_delimiter_type(&mut self, expr_id: usize) -> Type {
@@ -20213,15 +21221,34 @@ impl<'a> Checker<'a> {
         piped_input: Option<usize>,
         args: &[AstCallArg],
     ) {
-        self.check_bytes_builtin_arguments(expression.id, function, args, piped_input);
-        self.check_text_to_number_arguments(expression.id, function, args, piped_input.is_some());
-        self.check_number_to_text_arguments(expression.id, function, args, piped_input.is_some());
-        self.check_number_round_arguments(function, args);
-        self.check_one_based_arguments(expression.id, function, args);
-        self.check_stream_builtin_arguments(function, piped_input, args);
-        self.check_bits_builtin_arguments(expression.id, function, piped_input, args);
+        self.replay_builtin_call_prefix_diagnostics(expression.id, function, piped_input, args);
         self.check_builtin_call_compatibility(expression.id, function, piped_input, args);
+        self.replay_builtin_call_tail_diagnostics(expression, function, piped_input, args);
+    }
 
+    fn replay_builtin_call_prefix_diagnostics(
+        &mut self,
+        expression: usize,
+        function: &str,
+        piped_input: Option<usize>,
+        args: &[AstCallArg],
+    ) {
+        self.check_bytes_builtin_arguments(expression, function, args, piped_input);
+        self.check_text_to_number_arguments(expression, function, args, piped_input.is_some());
+        self.check_number_to_text_arguments(expression, function, args, piped_input.is_some());
+        self.check_number_round_arguments(function, args);
+        self.check_one_based_arguments(expression, function, args);
+        self.check_stream_builtin_arguments(function, piped_input, args);
+        self.check_bits_builtin_arguments(expression, function, piped_input, args);
+    }
+
+    fn replay_builtin_call_tail_diagnostics(
+        &mut self,
+        expression: &AstExpr,
+        function: &str,
+        piped_input: Option<usize>,
+        args: &[AstCallArg],
+    ) {
         let input_flow = piped_input.map(|input| self.ensure_expr(input));
         if self.render_contracts.is_render_constructor(function) {
             self.check_style_args(args);
@@ -22999,12 +24026,7 @@ impl<'a> Checker<'a> {
                 AstExprKind::Hold { name, .. } => Some(name.clone()),
                 _ => None,
             });
-        let Some(updates) = self
-            .diagnostic_inference_dependencies
-            .as_ref()
-            .and_then(|dependencies| dependencies.hold_updates_by_expression.get(&expr_id))
-            .cloned()
-        else {
+        let Some(updates) = self.diagnostic_hold_updates.get(&expr_id).cloned() else {
             self.diagnostics.push(
                 self.diagnostic_for_expr(
                     expr_id,
@@ -24438,6 +25460,26 @@ impl<'a> Checker<'a> {
         pipe_input: Option<usize>,
         call_args: &[AstCallArg],
     ) {
+        if !self.check_builtin_call_compatibility_head(expr_id, function, pipe_input, call_args) {
+            return;
+        }
+        self.check_builtin_pipe_input_compatibility(function, pipe_input);
+        let piped = pipe_input.is_some();
+        for arg in call_args {
+            self.check_builtin_argument_compatibility(function, arg, piped);
+        }
+    }
+
+    /// Emit the portion of builtin compatibility diagnostics that precedes
+    /// the first checked-flow read. The boolean tells the ordered diagnostic
+    /// projector whether ordinary input and argument checks follow.
+    fn check_builtin_call_compatibility_head(
+        &mut self,
+        expr_id: usize,
+        function: &str,
+        pipe_input: Option<usize>,
+        call_args: &[AstCallArg],
+    ) -> bool {
         if session_info_intrinsic_type(function).is_some() {
             if !session_info_intrinsic_allowed(function, self.external_types.current_role) {
                 self.diagnostics.push(self.diagnostic_for_expr(
@@ -24457,16 +25499,23 @@ impl<'a> Checker<'a> {
                     format!("`{function}` does not accept arguments"),
                 ));
             }
-            return;
+            return false;
         }
         if host_effect_signature(function).is_some() {
-            return;
+            return false;
         }
 
         if function == "List/page" {
             self.check_page_literal_size(call_args);
         }
+        true
+    }
 
+    fn check_builtin_pipe_input_compatibility(
+        &mut self,
+        function: &str,
+        pipe_input: Option<usize>,
+    ) {
         if let Some(input_expr_id) = pipe_input
             && !self.expr_id_is_pipe_placeholder(input_expr_id)
         {
@@ -24498,69 +25547,72 @@ impl<'a> Checker<'a> {
                 }
             }
         }
+    }
 
-        let piped = pipe_input.is_some();
-        for arg in call_args {
-            let arg_name = arg.named_name();
-            if is_registered_render_constructor(function)
-                && arg_name.is_some_and(|name| !render_arg_should_validate_directly(function, name))
-            {
-                continue;
-            }
-            if function == "Bool/toggle" && arg_name == Some("when") {
-                let actual_flow = self.ensure_expr(arg.value);
-                self.constraints.push(Constraint::FlowCompatible {
-                    actual: actual_flow.clone(),
-                    expected: FlowType {
-                        mode: FlowMode::PresentOrAbsent,
-                        ty: actual_flow.ty.clone(),
-                    },
-                });
-                if !bool_toggle_when_accepts_flow(
-                    &actual_flow,
-                    self.expr_id_is_event_payload_path(arg.value)
-                        || self.expr_id_is_pipe_placeholder(arg.value),
-                ) {
-                    self.diagnostics.push(self.diagnostic_for_expr(
-                        arg.value,
-                        format!(
-                            "`{function}` argument `when` requires a tick-present-or-absent value\nexpected: SOURCE pulse\nfound: {}",
-                            boon_facing_type_label(&actual_flow.ty)
-                        ),
-                    ));
-                }
-                continue;
-            }
-
-            if let Some(expected_label) =
-                builtin_argument_custom_expected_label(function, arg_name, piped)
-            {
-                let actual = self.ensure_expr(arg.value).ty;
-                if !builtin_argument_custom_accepts(function, arg_name, &actual, piped) {
-                    let arg_label = arg.named_name().unwrap_or("argument");
-                    self.diagnostics.push(self.diagnostic_for_expr(
-                        arg.value,
-                        format!(
-                            "`{function}` argument `{arg_label}` has incompatible type\nexpected: {expected_label}\nfound: {}",
-                            boon_facing_type_label(&actual)
-                        ),
-                    ));
-                }
-                continue;
-            }
-
-            let Some(expected) = builtin_argument_expected_type(function, arg.named_name(), piped)
-            else {
-                continue;
-            };
-            let actual = self.ensure_expr(arg.value).ty;
-            self.constraints.push(Constraint::Assignable {
-                actual: actual.clone(),
-                expected: expected.clone(),
+    fn check_builtin_argument_compatibility(
+        &mut self,
+        function: &str,
+        arg: &AstCallArg,
+        piped: bool,
+    ) {
+        let arg_name = arg.named_name();
+        if is_registered_render_constructor(function)
+            && arg_name.is_some_and(|name| !render_arg_should_validate_directly(function, name))
+        {
+            return;
+        }
+        if function == "Bool/toggle" && arg_name == Some("when") {
+            let actual_flow = self.ensure_expr(arg.value);
+            self.constraints.push(Constraint::FlowCompatible {
+                actual: actual_flow.clone(),
+                expected: FlowType {
+                    mode: FlowMode::PresentOrAbsent,
+                    ty: actual_flow.ty.clone(),
+                },
             });
-            if type_is_assignable_to(&actual, &expected) {
-                continue;
+            if !bool_toggle_when_accepts_flow(
+                &actual_flow,
+                self.expr_id_is_event_payload_path(arg.value)
+                    || self.expr_id_is_pipe_placeholder(arg.value),
+            ) {
+                self.diagnostics.push(self.diagnostic_for_expr(
+                    arg.value,
+                    format!(
+                        "`{function}` argument `when` requires a tick-present-or-absent value\nexpected: SOURCE pulse\nfound: {}",
+                        boon_facing_type_label(&actual_flow.ty)
+                    ),
+                ));
             }
+            return;
+        }
+
+        if let Some(expected_label) =
+            builtin_argument_custom_expected_label(function, arg_name, piped)
+        {
+            let actual = self.ensure_expr(arg.value).ty;
+            if !builtin_argument_custom_accepts(function, arg_name, &actual, piped) {
+                let arg_label = arg.named_name().unwrap_or("argument");
+                self.diagnostics.push(self.diagnostic_for_expr(
+                    arg.value,
+                    format!(
+                        "`{function}` argument `{arg_label}` has incompatible type\nexpected: {expected_label}\nfound: {}",
+                        boon_facing_type_label(&actual)
+                    ),
+                ));
+            }
+            return;
+        }
+
+        let Some(expected) = builtin_argument_expected_type(function, arg.named_name(), piped)
+        else {
+            return;
+        };
+        let actual = self.ensure_expr(arg.value).ty;
+        self.constraints.push(Constraint::Assignable {
+            actual: actual.clone(),
+            expected: expected.clone(),
+        });
+        if !type_is_assignable_to(&actual, &expected) {
             let arg_label = arg.named_name().unwrap_or("argument");
             self.diagnostics.push(self.diagnostic_for_expr(
                 arg.value,

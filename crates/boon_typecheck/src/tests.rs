@@ -83,6 +83,214 @@ fn dense_flag_set_tracks_membership_and_rejects_invalid_ids() {
 }
 
 #[test]
+fn ordered_checked_diagnostic_projection_matches_recursive_oracle() {
+    fn project(
+        parsed: &ParsedProgram,
+        ownership: CheckOutputOwnership,
+        mode: CheckedDiagnosticProjectionMode,
+    ) -> CheckOutput {
+        let (mut checker, profile) = Checker::new_profiled(parsed);
+        checker.checked_diagnostic_projection_mode = mode;
+        checker.finish_program_profiled(ownership, profile).0
+    }
+
+    let fixtures = [
+        (
+            "projection-duplicate-map.bn",
+            r#"
+users: MAP {
+    1 => TEXT { first }
+    1.0 => TEXT { second }
+}
+"#,
+        ),
+        (
+            "projection-deferred-style.bn",
+            r#"
+FUNCTION sized_box(width) {
+    Element/container(
+        element: []
+        style: [width: width]
+        child: Element/label(
+            element: []
+            style: []
+            label: TEXT { child }
+        )
+    )
+}
+
+document: Document/new(root: sized_box(width: TEXT { invalid }))
+"#,
+        ),
+        (
+            "projection-mixed-errors.bn",
+            r#"
+items: LIST { 1 2 }
+bad_number: TEXT { no } + 1
+bad_set: SET { items }
+state:
+    [items: items]
+    |> HOLD state {}
+"#,
+        ),
+    ];
+    let ownerships = [
+        CheckOutputOwnership::ReportOwned,
+        CheckOutputOwnership::EditorOwned,
+        CheckOutputOwnership::DiagnosticsOwned,
+        CheckOutputOwnership::RuntimeOwned,
+    ];
+
+    for (path, source) in fixtures {
+        let parsed = boon_parser::parse_source(path, source).expect("projection fixture parses");
+        for ownership in ownerships {
+            let ordered = project(&parsed, ownership, CheckedDiagnosticProjectionMode::Ordered);
+            let oracle = project(
+                &parsed,
+                ownership,
+                CheckedDiagnosticProjectionMode::RecursiveOracle,
+            );
+            assert_eq!(
+                ordered, oracle,
+                "ordered projection diverged for {path} in {ownership:?}"
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "product-scale checked diagnostic projection parity gate"]
+fn ordered_checked_diagnostic_projection_matches_product_examples() {
+    fn project(parsed: &ParsedProgram, mode: CheckedDiagnosticProjectionMode) -> CheckOutput {
+        let (mut checker, profile) = Checker::new_profiled(parsed);
+        checker.checked_diagnostic_projection_mode = mode;
+        checker
+            .finish_program_profiled(CheckOutputOwnership::ReportOwned, profile)
+            .0
+    }
+
+    fn project_units(root: &std::path::Path) -> Vec<(String, String)> {
+        fn collect(
+            root: &std::path::Path,
+            path: &std::path::Path,
+            output: &mut Vec<(String, String)>,
+        ) {
+            for entry in std::fs::read_dir(path).expect("example directory is readable") {
+                let entry = entry.expect("example directory entry is readable");
+                let path = entry.path();
+                if path.is_dir() {
+                    collect(root, &path, output);
+                    continue;
+                }
+                if path.extension().and_then(|extension| extension.to_str()) != Some("bn")
+                    || path.file_name().and_then(|name| name.to_str()) == Some("BUILD.bn")
+                {
+                    continue;
+                }
+                let relative = path
+                    .strip_prefix(root)
+                    .expect("example unit remains under its root")
+                    .to_string_lossy()
+                    .replace(std::path::MAIN_SEPARATOR, "/");
+                output.push((
+                    relative,
+                    std::fs::read_to_string(&path).expect("example unit is readable"),
+                ));
+            }
+        }
+
+        let mut output = Vec::new();
+        collect(root, root, &mut output);
+        output.sort_by(|left, right| left.0.cmp(&right.0));
+        output
+    }
+
+    let examples = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples");
+    let counter = boon_parser::parse_source(
+        "counter.bn",
+        &std::fs::read_to_string(examples.join("counter.bn")).expect("Counter source is readable"),
+    )
+    .expect("Counter parses");
+    let todo =
+        boon_parser::parse_project("RUN.bn", project_units(&examples.join("todo_mvc_physical")))
+            .expect("physical TodoMVC parses");
+    let novywave = boon_parser::parse_project("RUN.bn", project_units(&examples.join("novywave")))
+        .expect("NovyWave parses");
+
+    for (name, parsed) in [
+        ("Counter", counter),
+        ("physical TodoMVC", todo),
+        ("NovyWave", novywave),
+    ] {
+        let ordered = project(&parsed, CheckedDiagnosticProjectionMode::Ordered);
+        let oracle = project(&parsed, CheckedDiagnosticProjectionMode::RecursiveOracle);
+        if ordered != oracle {
+            fn first_difference(
+                path: &mut String,
+                left: &serde_json::Value,
+                right: &serde_json::Value,
+            ) -> Option<(String, serde_json::Value, serde_json::Value)> {
+                match (left, right) {
+                    (serde_json::Value::Array(left), serde_json::Value::Array(right)) => {
+                        for (index, (left, right)) in left.iter().zip(right).enumerate() {
+                            let previous_len = path.len();
+                            path.push_str(&format!("[{index}]"));
+                            if let Some(difference) = first_difference(path, left, right) {
+                                return Some(difference);
+                            }
+                            path.truncate(previous_len);
+                        }
+                        (left.len() != right.len()).then(|| {
+                            (
+                                format!("{path}.length"),
+                                left.len().into(),
+                                right.len().into(),
+                            )
+                        })
+                    }
+                    (serde_json::Value::Object(left), serde_json::Value::Object(right)) => {
+                        let mut keys = left.keys().chain(right.keys()).collect::<Vec<_>>();
+                        keys.sort_unstable();
+                        keys.dedup();
+                        for key in keys {
+                            let previous_len = path.len();
+                            path.push('.');
+                            path.push_str(key);
+                            let difference = match (left.get(key), right.get(key)) {
+                                (Some(left), Some(right)) => first_difference(path, left, right),
+                                (left, right) => Some((
+                                    path.clone(),
+                                    left.cloned().unwrap_or(serde_json::Value::Null),
+                                    right.cloned().unwrap_or(serde_json::Value::Null),
+                                )),
+                            };
+                            if difference.is_some() {
+                                return difference;
+                            }
+                            path.truncate(previous_len);
+                        }
+                        None
+                    }
+                    _ if left == right => None,
+                    _ => Some((path.clone(), left.clone(), right.clone())),
+                }
+            }
+
+            let ordered_json = serde_json::to_value((&ordered.program, &ordered.report))
+                .expect("ordered projection serializes");
+            let oracle_json = serde_json::to_value((&oracle.program, &oracle.report))
+                .expect("recursive projection serializes");
+            let (path, ordered_value, oracle_value) =
+                first_difference(&mut "$".to_owned(), &ordered_json, &oracle_json)
+                    .expect("unequal projections have a serialized difference");
+            panic!(
+                "ordered projection diverged for {name} at {path}: ordered={ordered_value} oracle={oracle_value}"
+            );
+        }
+    }
+}
+
+#[test]
 fn dense_index_table_bounded_insert_does_not_expand_for_invalid_expression_ids() {
     let mut table = DenseIndexTable::with_len(2);
     assert!(table.insert_if_in_bounds(1, TypeVar(7)));

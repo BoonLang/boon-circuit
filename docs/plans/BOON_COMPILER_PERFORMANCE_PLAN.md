@@ -59,6 +59,15 @@ or compiler daemon state may be reused by either cold mode. Incremental state
 and content-addressed artifacts are a second optimization layer; they cannot
 be used to satisfy a cold gate.
 
+A `/goal` run does not reach a performance stopping point by reconciling
+documentation, adding counters, extracting a crate, producing a directional
+sample, committing a checkpoint, or passing a focused correctness test. Those
+are implementation steps. While any required report is missing or red, the
+next action is the highest-impact measured compiler change or the smallest
+harness change that makes that blocker measurable. After an authorized phase
+checkpoint, continue directly with the next failing gate. Do not wait for a
+second `/goal resume` instruction and do not enter a later plan.
+
 The default and measured compiler is single-threaded. Parallel compilation is
 permitted only after the single-threaded cold targets pass and only when it
 improves a separately measured workload without increasing interactive
@@ -87,13 +96,28 @@ the 3.81-second blocker; manifest discovery inside semantic construction is.
 The editor currently pays avoidable latency in addition to those compiler
 costs: a fixed 90 ms debounce precedes a whole-project parse/check/editor-
 semantics pass, and preview publication performs another whole-project
-`compile_machine_plan` pass. Parsing concatenates source units into one global
-program, checker-owned caches die with each borrowed checker, and an in-flight
-compile cannot be canceled.
+`compile_machine_plan` pass. The landed parser now parses source units
+independently, but cold project assembly still constructs and repeatedly
+validates one global program. Checker-owned caches die with each borrowed
+checker, and an in-flight compile cannot be canceled.
 
 These observations choose the first architectural work. They do not authorize
 fixture-specific shortcuts, reduced diagnostics, skipped verification, longer
 timeouts, or altered plan semantics.
+
+The current structured-counter checkpoint adds a narrower directional
+measurement of complete checked diagnostics. The directly invoked debug
+producer measured Counter at about 14.9 ms and NovyWave at 744.1 ms: about
+332.4 ms of parsing and 411.7 ms of typechecking, with 76,412 KiB peak RSS.
+A separate parser trace measured about 153.8 ms in raw unit parsing and 126.5
+ms in canonical project validation. The NovyWave parse observed 73,571 tokens
+but 1,060,559 validation visits; the typechecker performed 35 inference rounds
+and 24,218 diagnostic-replay requests. These are not release acceptance
+numbers, but they identify repeated project validation/assembly and recursive
+checked-diagnostic projection as the first frontend hypotheses to confirm with
+one current release producer before a large rewrite. The 20.68-second full-plan
+baseline remains the relevant evidence for later semantic, proof, and backend
+work; the two scopes must never be presented as the same measurement.
 
 ## Performance Contract
 
@@ -183,6 +207,34 @@ build jobs on the reference machine. A third job may be adopted only after a
 measured dependency-boundary change shows a benefit without renewed memory or
 I/O pressure; do not run independent Cargo producers concurrently.
 
+Keep the existing profile intent unless an A/B measurement justifies a change:
+selected hot compiler crates use optimized dev builds with line tables, focused
+test harnesses favor quick unoptimized correctness builds, and acceptance uses
+the ordinary `release` producer. `boon_parser` currently remains at the default
+unoptimized dev level even though parser latency is part of every interactive
+compile. Perform one bounded A/B of a package-local dev `opt-level = 2` with
+line tables; record its Rust rebuild cost and direct debug Counter/NovyWave
+latency, and keep it only if it improves the development loop. This setting
+cannot satisfy or weaken the release cold gates. Do not add LTO,
+one-codegen-unit builds,
+`target-cpu=native`, global `RUSTFLAGS`, disabled correctness checks, or a
+custom profile merely to improve a reported number. A proposed profile change
+must report Rust build wall time and peak RSS as development-loop evidence,
+then report Boon latency, RSS, diagnostics, work counters, and artifact hashes
+from the same source before and after. Keep it only when the combined tradeoff
+is useful; never relabel a custom or debug producer as release acceptance.
+
+The normal build discipline is:
+
+- use `cargo check` or the smallest focused debug test for a correctness edit;
+- pass `--jobs 2` to the one active Cargo build/test on the reference machine;
+- build `boon_cli` in release once per coherent milestone candidate, then run
+  `target/release/boon_cli` directly for every repeated fixture sample;
+- build `xtask` only when its source or report contract changed, then invoke
+  the prebuilt `target/debug/xtask` directly; and
+- inspect active Cargo/rustc processes before a long build and do not start a
+  second producer while one is alive.
+
 Split crates at stable ownership and dependency-invalidation boundaries, not
 merely because a source file is large:
 
@@ -202,6 +254,24 @@ feature-selected owners, or fallback paths. `ParsedProgram` and
 `CheckedProgram` remain safely unforgeable proof-bearing products. A crate
 boundary must not expose a safe constructor that lets a parser snapshot,
 checked DTO, semantic core, or unverified program enter the executable spine.
+
+Every proposed crate split must publish its intended dependency graph before
+editing and pass four gates after cutover:
+
+1. the moved API has one semantic owner and introduces no dependency cycle or
+   reverse dependency on its former implementation crate;
+2. touching a common parser, solver, session, or backend implementation file
+   rebuilds a strictly smaller relevant crate set, measured once before and
+   once after with the same Cargo state;
+3. focused behavior, diagnostic parity, proof-boundary, and artifact-hash tests
+   remain unchanged; and
+4. the split is followed by the measured runtime optimization it enables.
+
+If it only moves files, increases the affected dependency graph, or fails to
+enable an ownership/invalidation change, use modules instead of another crate.
+A successful split improves Rust organization and rebuild isolation; it is not
+itself evidence that Boon source compiles faster and is never a reason for the
+performance goal to pause.
 
 Development profiles and focused debug tests remain directional tools. The
 acceptance producer remains the revision-identified `release` binary required
@@ -309,6 +379,95 @@ A missing, malformed, stale, partially written, or mismatched entry is rejected
 closed and recomputed. Cache-hit measurements are reported separately and
 never mixed into cold results.
 
+## Optimization Loop And Harness Ladder
+
+Repeat this loop until the plan's Clear End Condition passes:
+
+1. Measure the same revision and producer. Record source digest, binary hash,
+   intent, fixture, total/phase time, RSS, work counters, diagnostics digest,
+   and artifact hash. Never optimize from wall time alone.
+2. Select the dominant failing owner. State the repeated work or allocation,
+   the generic architectural change, the correctness invariants, and the work
+   counter expected to fall. Do not start several unrelated micro-optimizations
+   in one measurement batch.
+3. Implement one coherent owner-level slice. Hot-loop instrumentation must use
+   allocation-free local/batched counters merged at phase boundaries rather
+   than a shared `Cell`, lock, map lookup, or timer on every node visit.
+4. Run the smallest unit/integration tests that cover the changed owner plus a
+   deterministic malformed-source or negative-proof oracle where applicable.
+   A broad workspace suite is a milestone check, not an edit-loop command.
+5. Invoke the already-built producer directly for Counter and NovyWave, and
+   add physical TodoMVC when the changed owner affects its path. Compare
+   diagnostics and artifact hashes as well as time, RSS, and work.
+6. Keep the change only when it preserves semantics and either materially
+   reduces the targeted work/time/RSS or establishes a required measured
+   ownership boundary. If the targeted counter does not fall, reassess the
+   architecture instead of stacking another local patch on the same theory.
+7. Before claiming a numbered phase exit, give one fresh-context read-only
+   subagent the phase contract, live revision, exact diff/checkpoint range, and
+   report paths. It must try to disprove completion and return an evidence-
+   backed pass/fail checklist. Close every finding before the exit claim.
+8. If a coherent checkpoint is authorized, commit its exact scope, then begin
+   the next failing gate in the same goal run.
+
+Use three harness levels so verification cost stays proportional to confidence:
+
+- **Edit loop:** one direct debug or existing release sample per relevant
+  intent/fixture, plus focused correctness tests. It is directional only and
+  never produces acceptance evidence.
+- **Milestone preflight:** build the current release `boon_cli` once with
+  `cargo build --locked --release --jobs 2 -p boon_cli --bin boon_cli`, then run
+  the xtask collectors with a small explicitly non-acceptance sample count.
+  Fix failures before spending time on 30-sample reports.
+- **Acceptance:** from one clean unchanged revision and current producer, run
+  the manifest protocol of three setup plus 30 scored observations for all
+  fixtures and both cold modes, followed by the complete interaction/scaling
+  collector and `--check-existing` validation. Do this only for a candidate
+  that passed preflight.
+
+The concrete collector sequence is:
+
+```bash
+# Only when xtask itself changed or target/debug/xtask is missing.
+cargo build --locked --jobs 2 -p xtask
+
+# One release producer build for the coherent candidate.
+cargo build --locked --release --jobs 2 -p boon_cli --bin boon_cli
+
+# Fast cold preflight during Phases 1-3.
+target/debug/xtask verify-compiler-performance \
+  --report target/reports/compiler-performance/preflight-cold.json \
+  --setup-samples 1 --scored-samples 5
+
+# Add the interaction preflight when Phase 4 session/cancellation work exists.
+target/debug/xtask verify-compiler-interactions \
+  --report target/reports/compiler-performance/preflight-interactions.json \
+  --setup-samples 1 --scored-samples 5
+
+# Run each full collector only after its corresponding preflight passes.
+target/debug/xtask verify-compiler-performance
+target/debug/xtask verify-compiler-interactions
+target/debug/xtask verify-compiler-performance --check-existing
+target/debug/xtask verify-compiler-interactions --check-existing
+
+# Phase 6 adds this manifest-backed closure after the three reviews exist.
+target/debug/xtask verify-compiler-performance-closure --check-existing
+```
+
+Run each Cargo or collector command sequentially. During cold Phases 1-3, the
+interaction collector's explicit missing session/native evidence remains red
+and does not block work on the cold owner; do not repeatedly run it before its
+implementation phase. A failing relevant preflight report is useful blocker
+evidence and must not overwrite the default acceptance report. The one-sample
+edit loop may call `boon_cli compiler-sample` directly; it does not call either
+collector and does not claim a percentile.
+
+The collectors must remain orchestration-only: they may start direct producer
+processes, but they must never invoke Cargo. An unavailable sampling profiler
+does not block work; deterministic phase timers, work/allocation counters, and
+targeted trace modes must be sufficient to choose an owner. External profilers
+are corroborating evidence when available, not an excuse to stop.
+
 ## Implementation Order
 
 ### Phase 0: Documentation And Measurement Contract
@@ -344,22 +503,80 @@ Current implementation checkpoint (2026-08-02):
 - Performance and interaction collection consume one explicitly prebuilt
   two-job release producer. They no longer launch nested Cargo builds, and fail
   when the producer is missing or older than a Rust/workspace build input.
-- Directional evidence from the directly invoked debug producer measured Counter at
-  about 15 ms and NovyWave diagnostics at about 744 ms (about 332 ms parse and
-  412 ms typecheck). This is diagnostic evidence, not release acceptance. It
-  identifies repeated whole-program parser validation/assembly as the first
-  measured optimization target.
+- Directional evidence from the directly invoked debug producer measured
+  Counter at about 15 ms and NovyWave diagnostics at about 744 ms (about 332 ms
+  parse and 412 ms typecheck). This is diagnostic evidence, not release
+  acceptance. It identifies repeated whole-program parser
+  validation/assembly as the first measured optimization target.
 
-Phase 0 remains open until session build/reuse and in-flight cancellation work
-are counted, the producer is cryptographically cross-bound to the source
-identity rather than only guarded by build-input freshness, and current release
-cold/warm/scaling reports pass from one unchanged revision.
+Phase 0 is a rolling measurement contract, not permission to postpone measured
+optimization until session code exists. The existing cold producer and exact
+frontend counters are sufficient to begin the current Phase 1 tranche. Add
+semantic/proof/backend counters with their owning phases and add session reuse,
+in-flight cancellation, and supersession counters when those mechanisms exist.
+Until then, their explicit missing-evidence fields remain red. The producer
+still requires cryptographic source-to-binary cross-binding rather than only
+build-input freshness, and current release reports remain required before the
+corresponding exits; those gaps do not justify another documentation-only or
+counter-only loop before changing the measured parser/typechecker owners.
+
+### Current Resumption Point: Phase 1 Frontend Tranche
+
+At the structured-counter checkpoint, perform this tranche before general
+compiler-service work or any later repository plan:
+
+1. Build one current two-job release producer and run bounded direct samples
+   for Counter and NovyWave diagnostics plus NovyWave verified output in both
+   cold modes. Record phase/work/RSS and parity without running the full
+   percentile protocol. Use this optimized baseline to confirm or replace the
+   debug-profile hypothesis before changing a large owner.
+2. Run the one-time `boon_parser` dev `opt-level = 2` A/B described above and
+   inspect one Cargo timing for the frontend edit path. If full `boon_cli`
+   relinking, rather than the changed frontend crate, dominates iteration, add
+   one thin development-only frontend probe that calls the exact shared source-
+   bundle/parser/typechecker entrypoints and emits the same work schema. It may
+   not copy compiler logic, become a second compiler, or satisfy acceptance;
+   keep it only when the measured rebuild/iteration loop improves.
+3. If the release profile confirms the measured parser owner, replace repeated
+   parser-wide lookup scans with one non-diagnostic validation index built
+   without changing error order. Provide direct token-start lookup, per-line
+   semantic-token ranges, literal/text spans, and the other indexes justified
+   by measured validators. Preserve the existing validator sequence and
+   malformed-source diagnostics.
+4. Make project assembly reserve once, move/append unit-owned tables where
+   ownership permits, and rebase each dense identity/span exactly once. Keep
+   independent source units and the opaque `ParsedProgram` boundary; do not
+   reintroduce concatenated-source parsing.
+5. Batch parser work counters so measurement does not dominate the million-
+   visit debug path. Prove counter totals and profiled/unprofiled result parity.
+6. Replace recursive production diagnostic replay with deterministic projection
+   from the finalized checked graph and ordered obligations. Retain the old
+   recursive path only as a test oracle until unsorted diagnostics, constraints,
+   render slots, deferred styles, and deferred-style diagnostics match exactly,
+   then delete it from production.
+7. Establish the owned checked database and extract the stable immutable
+   checked boundary to `boon_checked` using the crate-split gates above. The
+   semantic, verification, and IR crates must depend on the checked product,
+   not on solver implementation details; no forgeable executable bypass or
+   compatibility re-export may remain.
+8. Reprofile after every owner-level slice and continue Phase 1 until Counter,
+   physical TodoMVC, and NovyWave pass both cache-disabled cold diagnostics
+   modes and their RSS/scaling gates. A crate checkpoint or a parser-only win
+   does not permit moving to semantic work while this exit is red.
+
+Once diagnostics pass, use the same loop for semantic component retention,
+single manifest sealing, verified lowering, streaming/hash memory, and backend
+isolation until the full verified-plan gates pass. Only then implement and
+measure persistent session reuse, warm invalidation, switching, and bounded
+cancellation.
 
 ### Phase 1: Cold Parse And Type Core
 
-1. Introduce independent unit parsing and stable source/declaration identities.
-2. Move the stabilized syntax data boundary to `boon_syntax` without retaining
-   parser compatibility exports.
+1. Preserve the landed independent-unit parser and finish stable source-unit,
+   source-revision, and declaration identities without restoring concatenated
+   parsing.
+2. Preserve the landed `boon_syntax` flag-day boundary and keep it free of
+   parser implementation dependencies or compatibility exports.
 3. Replace borrowed checker state and duplicate checked construction with the
    owned checked database.
 4. Move the immutable checked-program model to `boon_checked` while keeping
@@ -426,6 +643,16 @@ duplicate compiler owners and compatibility paths, and then refresh every
 downstream report invalidated by compiler changes. Old native, Wasm, proof,
 packed, or product evidence is not relabeled as current.
 
+Add a manifest-backed `verify-compiler-performance-closure` xtask command that
+cross-checks the cold report, interaction/scaling report, three adversarial
+review sidecars, budget identity, producer/source/worktree identities, and
+their status without running Cargo or regenerating evidence. It fails closed on
+any missing, stale, mismatched, malformed, or non-passing input.
+
+After the reports pass, run the independent adversarial closure below. A review
+finding reopens the owning phase. Any corrective tracked edit makes affected
+compiler and downstream reports stale, so rerun them before repeating review.
+
 ## Measurement And Verification Protocol
 
 - Build the optimized compiler once. Cargo/Rust build time is not compiler
@@ -459,6 +686,61 @@ packed, or product evidence is not relabeled as current.
 - Compare fresh-process and empty-database results byte-for-byte and compare
   incremental results against a clean full compile of the same revision.
 
+## Independent Adversarial Closure
+
+Performance completion requires three fresh-context, read-only subagent reviews
+with disjoint charters. Give each reviewer the current contracts, live `HEAD`,
+budget manifest, report paths, and relevant source/tests, but not an implementer
+summary that presupposes success:
+
+1. **Implementation-completeness reviewer:** map every numbered non-optional
+   implementation item, optimization, crate boundary, deletion, and harness
+   obligation in this plan to live code and focused evidence. It must identify
+   silent omissions, aliases/fallbacks, duplicated owners, cosmetic crate
+   splits, planned indexes or reuse that are declared but not used, and old hot
+   paths still reachable in production. An item may be marked unnecessary only
+   when this plan explicitly makes it conditional and the reviewer cites the
+   passing evidence that satisfies that condition.
+2. **Measurement-integrity reviewer:** independently validate budget/report
+   schemas, sample counts and ordering, cold cache state, compiler thread count,
+   process isolation, producer/source/worktree/binary hashes, RSS scope,
+   percentiles, deterministic diagnostics/artifacts, scaling-counter ownership,
+   cancellation evidence, and `--check-existing` behavior. It must look for
+   stale producers, warmed state, nested builds, concurrent samples, debug or
+   custom profiles mislabeled as release, fixture shortcuts, and report fields
+   derived from cardinalities instead of measured work.
+3. **Semantic-and-architecture reviewer:** try to prove that speed came from
+   skipped diagnostics, weakened verification, changed artifacts, fixture-
+   specific branches, extra compiler concurrency, hidden caches, incomplete
+   invalidation, stale publication, or a bypass around the verified artifact
+   spine. It also checks that crate boundaries reduce the measured rebuild set
+   or establish their claimed ownership/invalidation seam without exposing a
+   forgeable executable product.
+
+The primary agent coordinates all execution. Review subagents may inspect the
+tree and existing reports concurrently, but they must not start Cargo, compiler
+producers, collectors, or other resource-heavy commands independently. The
+primary runs any requested command sequentially with the plan's two-job Cargo
+limit and returns the exact output/report identity to all reviewers.
+
+Each reviewer returns a machine-checkable checklist or bounded Markdown table
+with `pass`, `fail`, or `not-applicable`, exact file/report references, and no
+unsupported human-observation claims. All three must pass independently. A
+majority vote, an implementer rebuttal without evidence, a passing time number
+with missing implementation, or implemented architecture with failing time/RSS
+does not close the plan. After all findings are fixed and all stale evidence is
+regenerated, rerun the three reviews against the final unchanged revision.
+
+Persist the final checklists as three bounded JSON sidecars under
+`target/reports/compiler-performance/`. Each sidecar records its charter,
+status, live revision, worktree fingerprint, reviewed producer/report hashes,
+every checklist item, findings, and cited evidence paths. Extend the final
+performance aggregate and `--check-existing` validation to require all three
+passing, mutually distinct charters and reject missing, stale, malformed, or
+pre-fix review sidecars. Machine-checking identity and completeness does not
+turn a reviewer assertion into evidence; every pass still needs its cited live
+code, test, counter, or report support.
+
 ## Clear End Condition
 
 This plan is complete only when all of the following are true on one unchanged
@@ -484,7 +766,12 @@ revision:
   deleted;
 - downstream evidence invalidated by the compiler change is rerun rather than
   declared current by documentation.
+- all three independent adversarial reviewers pass every applicable checklist
+  item against that same unchanged revision, and every finding from an earlier
+  review is closed with regenerated affected evidence.
 
 Passing only a smoke test, increasing a timeout, warming a cache, running more
 compilers concurrently, publishing partial diagnostics, skipping proof work,
 or preserving the old path behind a fallback does not satisfy this plan.
+Neither does ending a `/goal` run after an intermediate commit while any item
+above is missing or failing.

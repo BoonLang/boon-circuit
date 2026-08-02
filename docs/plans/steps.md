@@ -3,6 +3,15 @@
 `GOAL_PROMPT.md` is the complete execution contract. This file fixes sequencing
 only; linked plans remain authoritative for their own semantics and acceptance.
 
+Before advancing past any numbered step, assign at least one fresh-context,
+read-only adversarial subagent to map that step and every completed linked-plan
+item to live implementation and current evidence, actively looking for omitted
+work, compatibility paths, stale reports, weakened acceptance, or a false exit
+claim. A finding reopens the owning work and any corrective edit invalidates
+affected evidence. Review agents do not run Cargo or heavy verifiers
+independently; the primary agent serializes those commands. Step 1 has the
+stronger three-reviewer performance closure defined below.
+
 1. Complete `BOON_COMPILER_PERFORMANCE_PLAN.md` before the remaining active
    recovery exit or any later production phase. Publish and reconcile its
    documentation first, then make both cache-disabled cold modes pass their
@@ -18,6 +27,42 @@ only; linked plans remain authoritative for their own semantics and acceptance.
    typechecker worklist/cache/replay, semantic/proof traversal, and backend work
    counters own scaling gates. Build the release producer explicitly once;
    performance verifiers must never start a nested Cargo build.
+
+   Preserve the landed independent-unit parser, `boon_syntax` cutover, and
+   structured work counters. The first incomplete implementation tranche is
+   one bounded current-release baseline and the measured frontend path: the
+   one-time parser dev-profile A/B, indexed parser validation/assembly, batched
+   hot counters, deterministic non-recursive checked-diagnostic projection,
+   the owned checked database, and the `boon_checked` boundary. Confirm the
+   dominant release owner before a large rewrite, reprofile after each owner-
+   level slice, and keep working until Counter, physical TodoMVC, and NovyWave
+   pass both cold diagnostics modes. Then close semantic sealing, proof,
+   backend, hashing, and memory until both verified-plan modes pass; only
+   afterward may persistent-session warm work satisfy its separate gates.
+
+   Use the performance plan's edit-loop, milestone-preflight, and full-
+   acceptance harness levels. Focused debug tests and direct one-sample producer
+   runs are the normal edit loop; one current two-job release build feeds
+   repeated direct samples; three-setup/30-scored reports run only for a
+   candidate that passed preflight. Do not change LTO, codegen units, target CPU,
+   compiler threads, timeouts, or profiles without before/after build-cost and
+   Boon-runtime evidence. A crate split must reduce a measured rebuild set or
+   establish a required ownership/invalidation boundary, preserve artifact and
+   diagnostic parity, and immediately enable the next optimization.
+
+   Documentation, instrumentation, a crate split, a focused test pass, or an
+   authorized checkpoint commit is not this step's exit. After each checkpoint,
+   continue with the next red or missing performance gate in the same goal run.
+   Do not start step 2 until the performance plan's complete cold, warm,
+   cancellation, invalidation, scaling, determinism, RSS, and native timing
+   Clear End Condition passes from current evidence. Then run its three fresh-
+   context adversarial subagent reviews for implementation completeness,
+   measurement integrity, and semantic/architectural soundness. Review agents
+   are read-only and the primary agent serializes every Cargo/producer command.
+   Any finding reopens the owning performance phase; after fixes, regenerate
+   stale reports and repeat all three reviews. The manifest-backed compiler-
+   performance closure must validate both performance reports and all three
+   current review sidecars before starting step 2.
 
 2. Finish the active
    `BOON_CIRCUIT_SIMPLIFICATION_AND_NATIVE_RECOVERY_PLAN.md` exit before adding

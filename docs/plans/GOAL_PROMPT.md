@@ -6,6 +6,13 @@ runtime, BoonConsole with the first Boon-designed RV32I processor and exact
 interpreted app.wasm parity, mature web-application stack, and example portfolio
 objective from the current HEAD.
 
+The first and only active implementation objective at goal start is the full
+`BOON_COMPILER_PERFORMANCE_PLAN.md` Clear End Condition. Execute that plan's
+internal phases before the unified phases later in this prompt. Do not begin or
+resume simplification/native recovery, language foundations, formal, packed,
+console, product, portfolio, or game implementation while any required
+compiler-performance report is missing or red.
+
 Read AGENTS.md and these contracts completely before editing:
 
 - docs/plans/steps.md
@@ -34,6 +41,13 @@ Read AGENTS.md and these contracts completely before editing:
 
 Goal replacement rule:
 
+- Resolve and record the actual `git rev-parse HEAD` when this new goal starts.
+  Paste this fenced prompt as the new objective; do not replace it with a
+  bootstrap sentence pinned to a historical commit hash. If the product stores
+  a long pasted objective in an attachment, that attachment must contain this
+  complete current prompt rather than an older hash reference. Later authorized
+  checkpoint commits advance the same live goal and do not require another
+  `/goal resume`.
 - This prompt replaces the pre-foundations unified product goal. Do not resume
   an agent goal that captured the older prompt. Preserve its compatible commits,
   retire that paused goal, and start a fresh goal from this file.
@@ -168,6 +182,19 @@ Current checkpoints to preserve and audit rather than redo:
   are stale and cannot prove the final revision;
 - Cells previously met interaction budgets, but every semantic/compiler/runtime
   cut must preserve and freshly prove them;
+- commits 8e065e4, db5e11c, and 5a6993b establish the compiler-performance
+  contract and harness foundations, independent source-unit parsing, the
+  `boon_syntax` flag-day boundary, exact parser/typechecker work counters, and
+  prebuilt-producer report propagation. Preserve these checkpoints; do not
+  repeat their documentation or compatibility work;
+- the current direct debug diagnostics sample is about 14.9 ms for Counter and
+  744.1 ms for NovyWave, with NovyWave split between about 332.4 ms parsing and
+  411.7 ms typechecking at 76,412 KiB peak RSS. Parser tracing attributes about
+  126.5 ms to canonical validation and observes 1,060,559 validation visits for
+  73,571 tokens. This is directional evidence, not release acceptance, and it
+  makes a bounded current-release confirmation followed by indexed validation/
+  assembly plus deterministic non-recursive checked-diagnostic projection the
+  first implementation tranche;
 - the current compiler-throughput checkpoint keeps Counter, physical TodoMVC,
   and NovyWave `MachinePlan` output deterministic while replacing copied OUT
   type environments with active-path overlays, retaining canonical-root-reading
@@ -190,15 +217,15 @@ Current checkpoints to preserve and audit rather than redo:
   plan SHA-256 values remain `dc1fe51b659d1746a0b0b4ae2dcba21d50a9426499eb2bde28dbed988e6cfb08`,
   `c9a12cd0a1bcf748a20e3a072afa09d0f923c2c9dbd664f2343d343494404f96`,
   and `4d3c284a9240cdc68c70aff7f30c570367e285cc1e8f823585900829bafd8ff7`;
-- the next compiler-performance blockers are the roughly 4.84-second cold
-  typecheck, 2.84 seconds of contextual materialization/execution expansion,
-  and 3.81-second whole-program dependency proof. Retain more shared semantic
-  callable definitions, invalidate only affected contextual instances, and
-  keep proof/debug-artifact generation outside the interactive critical path
-  before resuming production recovery. Cold improvements do not replace the
-  required persistent compiler session or its warm-edit/switch gates; do not
-  return to tactical type-cache invalidation or another manifest collection
-  tweak;
+- after the current diagnostics tranche passes, the full-plan blockers remain
+  the historically measured 2.84 seconds of contextual materialization/
+  execution expansion and 3.81-second whole-program dependency proof, plus
+  backend/hash/memory closure. Retain more shared semantic callable definitions,
+  invalidate only affected contextual instances, and keep optional flattened
+  proof/debug sidecars outside the interactive path. Cold improvements do not
+  replace the required persistent compiler session or its warm-edit/switch/
+  cancellation gates; do not return to tactical type-cache invalidation or
+  another manifest-only tweak after the same owner fails twice;
 - FjordPulse currently has no basis for weakening the 108-story/340-scenario
   acceptance inventory. Only its two explicitly deferred backup/restore
   automation scenarios may retain that final status.
@@ -206,6 +233,10 @@ Current checkpoints to preserve and audit rather than redo:
 Execution strategy:
 
 - Work in the exact order in `steps.md` and the phases below.
+- Execute all internal phases of `BOON_COMPILER_PERFORMANCE_PLAN.md` before
+  entering unified Phase 0 below. The similar phase numbers belong to different
+  plans; unified Phase 0 is not an alternate documentation task that can bypass
+  the blocking performance prerequisite.
 - Work in large coherent ownership slices. Temporary compile breakage is
   acceptable inside a flag-day slice; do not preserve two execution worlds to
   keep an intermediate tree green.
@@ -223,9 +254,22 @@ Execution strategy:
   only at the performance plan's stable ownership and dependency-invalidation
   boundaries, with an atomic no-compatibility cutover and unchanged artifact
   proof boundaries.
+- Preserve the current dev/test profile intent. Do not add LTO, one-codegen-unit
+  builds, `target-cpu=native`, global `RUSTFLAGS`, extra compiler threads, or a
+  custom acceptance profile without a same-source A/B report covering Rust
+  build wall/RSS and Boon latency/RSS/work/artifact identity. A crate split must
+  measurably shrink an affected rebuild set or establish a required ownership
+  and invalidation boundary; a file-only move is not an optimization.
 - After one required Rust build, invoke the built `boon_cli` and focused test
   binaries directly for repeated Boon fixtures. Do not pay a Cargo graph scan
   and test-harness relink for every example or every unchanged focused check.
+- Follow the performance plan's measurement loop: select one dominant owner
+  from phase time plus real work counters, state the invariant and expected
+  counter reduction, implement one coherent change, run focused correctness
+  oracles, and directly remeasure Counter and NovyWave before choosing the next
+  owner. Use small explicitly non-acceptance preflight samples before the full
+  three-setup/30-scored protocol. If the expected work does not fall, reassess
+  the architecture rather than accumulating local patches.
 - Treat compiler timeouts and graph explosions as architecture failures, not as
   requests for larger timeouts. The former 120-second rule and debug fixture
   ceilings are historical emergency bounds, not acceptance targets.
@@ -245,6 +289,18 @@ Execution strategy:
   host, persistence, physical-layout, or verifier architecture.
 - Use subagents for disjoint compiler, proof, packed runtime, distributed,
   streaming, product, hardware, and adversarial-review boundaries.
+- Before advancing past any unified phase or numbered `steps.md` exit, assign at
+  least one fresh-context read-only adversarial subagent to map every applicable
+  plan item to live implementation and current evidence and to seek omissions,
+  compatibility paths, stale reports, or weakened acceptance. Any finding
+  reopens the owning work; rerun affected evidence after fixes.
+- Before every compiler-performance phase-exit claim, use a fresh-context
+  read-only subagent to try to disprove it. Before leaving the complete
+  performance prerequisite, run the performance plan's three disjoint final
+  reviewers for implementation completeness, measurement integrity, and
+  semantic/architectural soundness. Subagents may inspect concurrently but may
+  not launch Cargo, producers, collectors, or other heavy commands; the primary
+  agent serializes those commands and shares their exact evidence.
 - Delete superseded syntax, aliases, codecs, plans, tests, runtime paths,
   representations, and compatibility fallbacks once replacements compile. Do
   not rename, quarantine, feature-gate, or retain them as a second path.
@@ -258,11 +314,27 @@ Execution strategy:
   not dump large report bodies into the conversation.
 - Add no Python source, scripts, invocations, or generated Python artifacts.
 - Do not commit or push unless the user explicitly requests it.
+- If checkpoint commits are authorized for the goal invocation, a successful
+  commit is persistence only: immediately continue with the next red or missing
+  gate. Do not end, pause, or report the compiler-performance prerequisite as
+  complete because documentation, instrumentation, a crate boundary, a focused
+  test, or a directional benchmark landed.
 
 Blocking compiler-performance prerequisite:
 
 - Complete `BOON_COMPILER_PERFORMANCE_PLAN.md` before resuming the remaining
   simplification/native-recovery closure or any later production phase.
+- Begin from its documented current tranche: indexed parser validation and
+  one-pass assembly/rebasing, batched hot counters, deterministic non-recursive
+  checked-diagnostic projection, the owned checked database, and the measured
+  `boon_checked` flag-day boundary. First build one current two-job release
+  producer and take the bounded direct baseline required by the plan so a debug-
+  profile artifact does not choose a large rewrite; also perform its one-time
+  parser dev-profile A/B. Continue frontend work until both cold diagnostics
+  modes pass for Counter, physical TodoMVC, and NovyWave; then continue through
+  semantic/proof/backend time and RSS until both verified-plan modes pass. Do
+  not substitute a crate split or a fast parser subphase for the complete
+  diagnostics or verified-plan gate.
 - Pass the fresh-process and empty-`CompilerSession` no-cache gates first, then
   the warm edit, loaded switch, cancellation, invalidation-locality, scaling,
   deterministic-artifact, and RSS gates. Persistent compiler state is the
@@ -273,6 +345,20 @@ Blocking compiler-performance prerequisite:
   generation-labeled until the corresponding verified result exists.
 - Compiler changes make earlier native reports stale. Refresh native handoff
   evidence only after this prerequisite and its native timing cutover pass.
+- Missing or failing performance evidence is executable work for the active
+  goal, not a reason to yield a completion response. Continue through measured
+  optimization slices and authorized checkpoints until every performance-plan
+  Clear End Condition is green or a genuine external blocker satisfies the
+  goal system's blocked-state rules.
+- Passing numeric reports is necessary but not sufficient. The three final
+  adversarial performance reviewers must also confirm that every applicable
+  planned optimization/deletion/boundary is implemented and used, no shortcut
+  or duplicate hot path remains, report provenance is current, and all cold,
+  warm, scaling, cancellation, determinism, RSS, and native timing requirements
+  pass. Any finding reopens its owning phase; fixes invalidate affected reports,
+  which must be regenerated before all three reviews repeat. Do not begin step
+  2 until the manifest-backed compiler-performance closure validates both
+  performance reports and all three current review sidecars.
 
 Phase 0: reconcile contracts, inventory current state, and freeze evidence
 

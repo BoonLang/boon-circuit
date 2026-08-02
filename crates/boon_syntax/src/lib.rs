@@ -462,7 +462,7 @@ pub struct AstProgram {
 /// that may be shared by another view.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SharedAstExpressions {
-    expressions: Arc<[AstExpr]>,
+    expressions: Arc<Vec<AstExpr>>,
 }
 
 impl SharedAstExpressions {
@@ -474,14 +474,14 @@ impl SharedAstExpressions {
     /// artifact. This is not part of the supported syntax DTO surface.
     #[doc(hidden)]
     pub fn __parser_make_mut(&mut self) -> &mut [AstExpr] {
-        Arc::make_mut(&mut self.expressions)
+        Arc::make_mut(&mut self.expressions).as_mut_slice()
     }
 }
 
 impl From<Vec<AstExpr>> for SharedAstExpressions {
     fn from(expressions: Vec<AstExpr>) -> Self {
         Self {
-            expressions: expressions.into(),
+            expressions: Arc::new(expressions),
         }
     }
 }
@@ -514,7 +514,9 @@ impl IntoIterator for SharedAstExpressions {
     type IntoIter = std::vec::IntoIter<AstExpr>;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.iter().cloned().collect::<Vec<_>>().into_iter()
+        Arc::try_unwrap(self.expressions)
+            .unwrap_or_else(|shared| shared.as_ref().clone())
+            .into_iter()
     }
 }
 

@@ -218,10 +218,13 @@ Current checkpoints to preserve and audit rather than redo:
   3,848, no-op visits from 1,964 to 752, and directional release samples are
   229.97/228.51 ms fresh/empty with 1,929,058 fresh allocations / 219,061,685
   bytes. The complete 80-test suite, full-sweep audit, and exact digest pass.
-  The remaining 35 rounds are still open. Finish the duplicate checker/builder
-  owner, measured interning and the larger contextual/user-call worklist
-  reduction, scaling/parity proof, and adversarial review, then regenerate the
-  full protocol after the final edit;
+  Recursive flow inference then retains one immutable parsed-program owner per
+  root instead of cloning/dropping it on every cache miss. Work and allocation
+  counts remain exact; a three-sample directional release batch has
+  227.33/227.73 ms fresh/empty medians. The remaining 35 rounds are still open.
+  Finish the duplicate checker/builder owner, measured interning and the larger
+  contextual/user-call worklist reduction, scaling/parity proof, and
+  adversarial review, then regenerate the full protocol after the final edit;
 - the current compiler-throughput checkpoint keeps Counter, physical TodoMVC,
   and NovyWave `MachinePlan` output deterministic while replacing copied OUT
   type environments with active-path overlays, retaining canonical-root-reading

@@ -8768,7 +8768,12 @@ impl CheckedProgramBuilder {
             DenseRecursionGuard::with_len(0),
         );
         active.begin_root();
-        let flow_type = self.infer_checked_expr_flow(expr_id, &mut active);
+        // Keep one immutable arena owner alive for the complete recursive walk.
+        // Passing its borrow through projection/read helpers avoids one atomic
+        // Arc clone and drop on every cache miss while still allowing mutable
+        // inference state to advance independently.
+        let program = self.program.clone();
+        let flow_type = self.infer_checked_expr_flow(expr_id, &program, &mut active);
         debug_assert_eq!(active.len(), 0);
         self.checked_flow_recursion = active;
         flow_type
@@ -8777,6 +8782,7 @@ impl CheckedProgramBuilder {
     fn infer_checked_expr_flow(
         &mut self,
         expr_id: usize,
+        program: &ParsedProgram,
         active: &mut DenseRecursionGuard,
     ) -> FlowType {
         if self.checked_flow_inference_cache_enabled
@@ -8792,11 +8798,6 @@ impl CheckedProgramBuilder {
         if !active.insert(expr_id) {
             return fallback;
         }
-        // `self.program` is an external immutable arena reference. Copy that
-        // reference locally so recursive mutable inference can borrow syntax
-        // in place instead of cloning a full `AstExpr` and then its kind on
-        // every cache miss.
-        let program = self.program.clone();
         let Some(expr) = program.expressions.get(expr_id) else {
             active.remove(&expr_id);
             return fallback;
@@ -8815,7 +8816,7 @@ impl CheckedProgramBuilder {
             AstExprKind::Tag(tag) if tag == "SKIP" => Type::Absent,
             AstExprKind::Flush { payload } => {
                 if let Some(payload) = payload {
-                    self.infer_checked_expr_flow(*payload, active);
+                    self.infer_checked_expr_flow(*payload, program, active);
                 }
                 Type::Absent
             }
@@ -8825,7 +8826,8 @@ impl CheckedProgramBuilder {
                     tag: tag.clone(),
                     fields: ObjectShape::from_ordered_fields(
                         fields.iter().filter(|field| !field.spread).map(|field| {
-                            let field_flow = self.infer_checked_expr_flow(field.value, active);
+                            let field_flow =
+                                self.infer_checked_expr_flow(field.value, program, active);
                             (
                                 field.name.clone(),
                                 self.flush_boundary_flow_type(field.value, field_flow).ty,
@@ -8838,7 +8840,7 @@ impl CheckedProgramBuilder {
             ),
             AstExprKind::Object(fields) => Type::object(ObjectShape::from_ordered_fields(
                 fields.iter().filter(|field| !field.spread).map(|field| {
-                    let field_flow = self.infer_checked_expr_flow(field.value, active);
+                    let field_flow = self.infer_checked_expr_flow(field.value, program, active);
                     (
                         field.name.clone(),
                         self.flush_boundary_flow_type(field.value, field_flow).ty,
@@ -8854,7 +8856,7 @@ impl CheckedProgramBuilder {
                 Type::List(Type::shared(
                     items
                         .iter()
-                        .map(|item| self.infer_checked_expr_flow(*item, active).ty)
+                        .map(|item| self.infer_checked_expr_flow(*item, program, active).ty)
                         .reduce(|existing, extra| widen_structural_type(&existing, &extra))
                         .or(fallback_item)
                         .unwrap_or_else(open_object_type),
@@ -8868,7 +8870,7 @@ impl CheckedProgramBuilder {
                 Type::Set(Type::shared(
                     items
                         .iter()
-                        .map(|item| self.infer_checked_expr_flow(*item, active).ty)
+                        .map(|item| self.infer_checked_expr_flow(*item, program, active).ty)
                         .reduce(|existing, extra| widen_structural_type(&existing, &extra))
                         .or(fallback_item)
                         .unwrap_or(Type::Unknown),
@@ -8878,11 +8880,11 @@ impl CheckedProgramBuilder {
                 [
                     (
                         "key".to_owned(),
-                        self.infer_checked_expr_flow(*key, active).ty,
+                        self.infer_checked_expr_flow(*key, program, active).ty,
                     ),
                     (
                         "value".to_owned(),
-                        self.infer_checked_expr_flow(*value, active).ty,
+                        self.infer_checked_expr_flow(*value, program, active).ty,
                     ),
                 ],
                 false,
@@ -8891,7 +8893,8 @@ impl CheckedProgramBuilder {
                 let mut key_type: Option<Type> = None;
                 let mut value_type: Option<Type> = None;
                 for entry in entries {
-                    let Type::Object(shape) = self.infer_checked_expr_flow(*entry, active).ty
+                    let Type::Object(shape) =
+                        self.infer_checked_expr_flow(*entry, program, active).ty
                     else {
                         continue;
                     };
@@ -8914,7 +8917,7 @@ impl CheckedProgramBuilder {
                 }
             }
             AstExprKind::Arrow { output, .. } => output
-                .map(|output| self.infer_checked_expr_flow(output, active).ty)
+                .map(|output| self.infer_checked_expr_flow(output, program, active).ty)
                 .unwrap_or(Type::Unknown),
             AstExprKind::Identifier(name) => self.checked_read_type(
                 expr_id,
@@ -8935,9 +8938,9 @@ impl CheckedProgramBuilder {
                 input, op, arms, ..
             } if op == "WHILE" => {
                 if let Some(selector) = self.exact_pipeline_input(expr, *input) {
-                    self.infer_checked_expr_flow(selector, active);
+                    self.infer_checked_expr_flow(selector, program, active);
                     arms.iter()
-                        .map(|arm| self.infer_checked_expr_flow(*arm, active).ty)
+                        .map(|arm| self.infer_checked_expr_flow(*arm, program, active).ty)
                         .reduce(|existing, extra| widen_structural_type(&existing, &extra))
                         .unwrap_or(fallback.ty.clone())
                 } else {
@@ -8951,7 +8954,7 @@ impl CheckedProgramBuilder {
                 {
                     self.exact_pipeline_input(expr, *input)
                         .map_or(Type::Unknown, |input| {
-                            let base = self.infer_checked_expr_flow(input, active).ty;
+                            let base = self.infer_checked_expr_flow(input, program, active).ty;
                             self.project_checked_type(expr_id, base, &[field.to_owned()], false)
                         })
                 } else {
@@ -8965,8 +8968,8 @@ impl CheckedProgramBuilder {
                 }
             }
             AstExprKind::Infix { left, op, right } => {
-                self.infer_checked_expr_flow(*left, active);
-                self.infer_checked_expr_flow(*right, active);
+                self.infer_checked_expr_flow(*left, program, active);
+                self.infer_checked_expr_flow(*right, program, active);
                 if infix_returns_bool(op) {
                     true_false_type()
                 } else {
@@ -8974,13 +8977,13 @@ impl CheckedProgramBuilder {
                 }
             }
             AstExprKind::MatchArm { output, .. } => output
-                .map(|output| self.infer_checked_expr_flow(output, active).ty)
+                .map(|output| self.infer_checked_expr_flow(output, program, active).ty)
                 .unwrap_or(Type::Absent),
             AstExprKind::When { input, arms } => {
                 if let Some(selector) = self.exact_pipeline_input(expr, *input) {
-                    self.infer_checked_expr_flow(selector, active);
+                    self.infer_checked_expr_flow(selector, program, active);
                     arms.iter()
-                        .map(|arm| self.infer_checked_expr_flow(*arm, active).ty)
+                        .map(|arm| self.infer_checked_expr_flow(*arm, program, active).ty)
                         .reduce(|existing, extra| widen_structural_type(&existing, &extra))
                         .unwrap_or(fallback.ty.clone())
                 } else {
@@ -8989,20 +8992,20 @@ impl CheckedProgramBuilder {
             }
             AstExprKind::Block { result, .. } => result
                 .map(|result| {
-                    let result_flow = self.infer_checked_expr_flow(result, active);
+                    let result_flow = self.infer_checked_expr_flow(result, program, active);
                     self.flush_boundary_flow_type(result, result_flow).ty
                 })
                 .unwrap_or(Type::Absent),
             AstExprKind::Then { input, output } => output
-                .map(|output| self.infer_checked_expr_flow(output, active).ty)
+                .map(|output| self.infer_checked_expr_flow(output, program, active).ty)
                 .or_else(|| {
                     self.exact_pipeline_input(expr, *input)
-                        .map(|input| self.infer_checked_expr_flow(input, active).ty)
+                        .map(|input| self.infer_checked_expr_flow(input, program, active).ty)
                 })
                 .unwrap_or(Type::Unknown),
             AstExprKind::Hold { initial, .. } => {
                 if let Some(initial) = self.exact_pipeline_input(expr, *initial) {
-                    let mut ty = self.infer_checked_expr_flow(initial, active).ty;
+                    let mut ty = self.infer_checked_expr_flow(initial, program, active).ty;
                     let dependencies = self.checked_type_inference_dependencies.as_ref().cloned();
                     let fallback_updates;
                     let updates = if let Some(updates) =
@@ -9019,7 +9022,7 @@ impl CheckedProgramBuilder {
                         fallback_updates.as_slice()
                     };
                     for update in updates.iter().copied() {
-                        let update = self.infer_checked_expr_flow(update, active).ty;
+                        let update = self.infer_checked_expr_flow(update, program, active).ty;
                         if !matches!(update, Type::Absent) {
                             ty = widen_checked_hold_type(&ty, &update);
                         }
@@ -9031,11 +9034,11 @@ impl CheckedProgramBuilder {
             }
             AstExprKind::Draining { input } => self
                 .exact_pipeline_input(expr, *input)
-                .map(|input| self.infer_checked_expr_flow(input, active).ty)
+                .map(|input| self.infer_checked_expr_flow(input, program, active).ty)
                 .unwrap_or(Type::Unknown),
             AstExprKind::Latest { branches } => branches
                 .iter()
-                .map(|branch| self.infer_checked_expr_flow(*branch, active).ty)
+                .map(|branch| self.infer_checked_expr_flow(*branch, program, active).ty)
                 .filter(|branch| !matches!(branch, Type::Absent))
                 .reduce(|existing, branch| widen_structural_type(&existing, &branch))
                 .unwrap_or(fallback.ty.clone()),
@@ -9043,7 +9046,7 @@ impl CheckedProgramBuilder {
             AstExprKind::Delimiter => fallback.ty.clone(),
             AstExprKind::Unknown(_) => fallback.ty.clone(),
         };
-        let mode = self.infer_checked_expr_mode(expr_id, expr, active, fallback.mode);
+        let mode = self.infer_checked_expr_mode(expr_id, expr, program, active, fallback.mode);
         active.remove(&expr_id);
         let flow_type = FlowType { mode, ty };
         if self.checked_flow_inference_cache_enabled {
@@ -9066,6 +9069,7 @@ impl CheckedProgramBuilder {
         &mut self,
         expr_id: usize,
         expr: &AstExpr,
+        program: &ParsedProgram,
         active: &mut DenseRecursionGuard,
         fallback: FlowMode,
     ) -> FlowMode {
@@ -9074,10 +9078,10 @@ impl CheckedProgramBuilder {
             AstExprKind::Flush { .. } => FlowMode::Continuous,
             AstExprKind::Tag(tag) if tag == "SKIP" => FlowMode::Absent,
             AstExprKind::Identifier(name) => self
-                .checked_read_flow_mode(expr_id, std::slice::from_ref(name), active)
+                .checked_read_flow_mode(expr_id, std::slice::from_ref(name), program, active)
                 .unwrap_or(fallback),
             AstExprKind::Path(parts) => self
-                .checked_read_flow_mode(expr_id, parts, active)
+                .checked_read_flow_mode(expr_id, parts, program, active)
                 .or_else(|| {
                     external_value_path(parts)
                         .and_then(|path| self.external_value_modes.get(&path))
@@ -9085,35 +9089,35 @@ impl CheckedProgramBuilder {
                 })
                 .unwrap_or(fallback),
             AstExprKind::Drain { path } => self
-                .checked_read_flow_mode(expr_id, &drain_path_parts(path), active)
+                .checked_read_flow_mode(expr_id, &drain_path_parts(path), program, active)
                 .unwrap_or(fallback),
             AstExprKind::Hold { .. } => FlowMode::Continuous,
             AstExprKind::Latest { branches } => latest_flow_mode(
                 branches
                     .iter()
                     .copied()
-                    .map(|branch| self.infer_checked_expr_flow(branch, active).mode),
+                    .map(|branch| self.infer_checked_expr_flow(branch, program, active).mode),
             )
             .unwrap_or(fallback),
             AstExprKind::When { input, .. } => self
                 .exact_pipeline_input(expr, *input)
-                .map(|selector| self.infer_checked_expr_flow(selector, active).mode)
+                .map(|selector| self.infer_checked_expr_flow(selector, program, active).mode)
                 .unwrap_or(fallback),
             AstExprKind::Pipe { op, .. } if op == "WHILE" => FlowMode::Continuous,
             AstExprKind::Pipe { input, op, .. } if op.starts_with("Field/") => self
                 .exact_pipeline_input(expr, *input)
-                .map(|input| self.infer_checked_expr_flow(input, active).mode)
+                .map(|input| self.infer_checked_expr_flow(input, program, active).mode)
                 .unwrap_or(fallback),
             AstExprKind::Draining { input } => self
                 .exact_pipeline_input(expr, *input)
-                .map(|input| self.infer_checked_expr_flow(input, active).mode)
+                .map(|input| self.infer_checked_expr_flow(input, program, active).mode)
                 .unwrap_or(fallback),
             AstExprKind::MatchArm { output, .. } => output
-                .map(|output| self.infer_checked_expr_flow(output, active).mode)
+                .map(|output| self.infer_checked_expr_flow(output, program, active).mode)
                 .unwrap_or(FlowMode::Absent),
             AstExprKind::Block { result, .. } => result
                 .map(|result| {
-                    let result_flow = self.infer_checked_expr_flow(result, active);
+                    let result_flow = self.infer_checked_expr_flow(result, program, active);
                     self.flush_boundary_flow_type(result, result_flow).mode
                 })
                 .unwrap_or(FlowMode::Absent),
@@ -9125,6 +9129,7 @@ impl CheckedProgramBuilder {
         &mut self,
         expr_id: usize,
         parts: &[String],
+        program: &ParsedProgram,
         active: &mut DenseRecursionGuard,
     ) -> Option<FlowMode> {
         if parts.first().is_some_and(|part| part == "PASSED") {
@@ -9205,9 +9210,17 @@ impl CheckedProgramBuilder {
                 .into_iter()
                 .filter_map(|actual| {
                     if projection.is_empty() {
-                        Some(self.infer_checked_expr_flow(actual.0 as usize, active).mode)
+                        Some(
+                            self.infer_checked_expr_flow(actual.0 as usize, program, active)
+                                .mode,
+                        )
                     } else {
-                        self.checked_projected_expression_flow_mode(actual, &projection, active)
+                        self.checked_projected_expression_flow_mode(
+                            actual,
+                            &projection,
+                            program,
+                            active,
+                        )
                     }
                 })
                 .collect::<Vec<_>>();
@@ -9223,6 +9236,7 @@ impl CheckedProgramBuilder {
             && let Some(mode) = self.checked_out_projection_flow_mode(
                 target,
                 &projection,
+                program,
                 active,
                 &mut BTreeSet::new(),
             )
@@ -9231,14 +9245,18 @@ impl CheckedProgramBuilder {
         }
         if !projection.is_empty()
             && let Some(value) = declaration_value
-            && let Some(mode) = self.checked_projected_value_flow_mode(value, &projection, active)
+            && let Some(mode) =
+                self.checked_projected_value_flow_mode(value, &projection, program, active)
         {
             return Some(mode);
         }
         if projection.is_empty()
             && let Some(value) = declaration_value
         {
-            return Some(self.infer_checked_expr_flow(value.0 as usize, active).mode);
+            return Some(
+                self.infer_checked_expr_flow(value.0 as usize, program, active)
+                    .mode,
+            );
         }
         Some(declaration_mode)
     }
@@ -9247,9 +9265,12 @@ impl CheckedProgramBuilder {
         &mut self,
         root: CheckedExprId,
         projection: &[String],
+        program: &ParsedProgram,
         active: &mut DenseRecursionGuard,
     ) -> Option<FlowMode> {
-        if let Some(mode) = self.checked_projected_value_flow_mode(root, projection, active) {
+        if let Some(mode) =
+            self.checked_projected_value_flow_mode(root, projection, program, active)
+        {
             return Some(mode);
         }
         if let Some(result) = self
@@ -9258,40 +9279,45 @@ impl CheckedProgramBuilder {
             .and_then(|signature| signature.result_expression)
             && result != root
         {
-            return self.checked_projected_expression_flow_mode(result, projection, active);
+            return self
+                .checked_projected_expression_flow_mode(result, projection, program, active);
         }
-        let expression = self.program.expressions.get(root.0 as usize)?.clone();
+        let expression = program.expressions.get(root.0 as usize)?.clone();
         match expression.kind {
             AstExprKind::Identifier(name) => {
                 let mut parts = vec![name];
                 parts.extend(projection.iter().cloned());
-                self.checked_read_flow_mode(root.0 as usize, &parts, active)
+                self.checked_read_flow_mode(root.0 as usize, &parts, program, active)
             }
             AstExprKind::Path(mut parts) => {
                 parts.extend(projection.iter().cloned());
-                self.checked_read_flow_mode(root.0 as usize, &parts, active)
+                self.checked_read_flow_mode(root.0 as usize, &parts, program, active)
             }
             AstExprKind::When { .. } => {
-                let outputs = when_arms(root.0 as usize, &self.program.expressions)
+                let outputs = when_arms(root.0 as usize, &program.expressions)
                     .into_iter()
                     .map(|(_, output)| CheckedExprId(output as u32))
                     .collect::<Vec<_>>();
                 outputs
                     .into_iter()
                     .filter_map(|output| {
-                        self.checked_projected_expression_flow_mode(output, projection, active)
+                        self.checked_projected_expression_flow_mode(
+                            output, projection, program, active,
+                        )
                     })
                     .reduce(merge_flow_modes)
             }
             AstExprKind::Pipe { ref op, .. } if op == "WHILE" => {
-                let outputs = when_arms(root.0 as usize, &self.program.expressions)
+                let outputs = when_arms(root.0 as usize, &program.expressions)
                     .into_iter()
                     .map(|(_, output)| CheckedExprId(output as u32))
                     .collect::<Vec<_>>();
                 outputs
                     .into_iter()
                     .filter_map(|output| {
-                        self.checked_projected_expression_flow_mode(output, projection, active)
+                        self.checked_projected_expression_flow_mode(
+                            output, projection, program, active,
+                        )
                     })
                     .reduce(merge_flow_modes)
             }
@@ -9300,18 +9326,22 @@ impl CheckedProgramBuilder {
                     .into_iter()
                     .map(|branch| CheckedExprId(branch as u32))
                     .filter_map(|branch| {
-                        self.checked_projected_expression_flow_mode(branch, projection, active)
+                        self.checked_projected_expression_flow_mode(
+                            branch, projection, program, active,
+                        )
                     }),
             ),
             AstExprKind::Then { input, output } => self.checked_projected_expression_flow_mode(
                 CheckedExprId(output.unwrap_or(input) as u32),
                 projection,
+                program,
                 active,
             ),
             AstExprKind::Hold { initial, .. } | AstExprKind::Draining { input: initial } => self
                 .checked_projected_expression_flow_mode(
                     CheckedExprId(initial as u32),
                     projection,
+                    program,
                     active,
                 ),
             AstExprKind::Block {
@@ -9320,6 +9350,7 @@ impl CheckedProgramBuilder {
             } => self.checked_projected_expression_flow_mode(
                 CheckedExprId(result as u32),
                 projection,
+                program,
                 active,
             ),
             AstExprKind::MatchArm {
@@ -9328,6 +9359,7 @@ impl CheckedProgramBuilder {
             } => self.checked_projected_expression_flow_mode(
                 CheckedExprId(output as u32),
                 projection,
+                program,
                 active,
             ),
             _ => None,
@@ -9338,6 +9370,7 @@ impl CheckedProgramBuilder {
         &mut self,
         target: DeclId,
         projection: &[String],
+        program: &ParsedProgram,
         active: &mut DenseRecursionGuard,
         visited_outputs: &mut BTreeSet<DeclId>,
     ) -> Option<FlowMode> {
@@ -9374,13 +9407,20 @@ impl CheckedProgramBuilder {
                 self.checked_list_item_projection_flow_mode(
                     list,
                     projection,
+                    program,
                     active,
                     &mut BTreeSet::new(),
                 )
             })
             .collect::<Vec<_>>();
         modes.extend(forwarded_outputs.iter().copied().filter_map(|output| {
-            self.checked_out_projection_flow_mode(output, projection, active, visited_outputs)
+            self.checked_out_projection_flow_mode(
+                output,
+                projection,
+                program,
+                active,
+                visited_outputs,
+            )
         }));
         modes.into_iter().reduce(merge_flow_modes)
     }
@@ -9389,13 +9429,14 @@ impl CheckedProgramBuilder {
         &mut self,
         root: CheckedExprId,
         projection: &[String],
+        program: &ParsedProgram,
         active: &mut DenseRecursionGuard,
         visited: &mut BTreeSet<usize>,
     ) -> Option<FlowMode> {
         if !visited.insert(root.0 as usize) {
             return None;
         }
-        let expression = self.program.expressions.get(root.0 as usize)?.clone();
+        let expression = program.expressions.get(root.0 as usize)?.clone();
         match expression.kind {
             AstExprKind::ListLiteral { items, .. } => items
                 .into_iter()
@@ -9403,6 +9444,7 @@ impl CheckedProgramBuilder {
                     self.checked_projected_expression_flow_mode(
                         CheckedExprId(item as u32),
                         projection,
+                        program,
                         active,
                     )
                 })
@@ -9427,6 +9469,7 @@ impl CheckedProgramBuilder {
                         .checked_projected_expression_flow_mode(
                             actual(body_formal)?,
                             projection,
+                            program,
                             active,
                         ),
                     CheckedContextualOperation::Filter { .. }
@@ -9437,6 +9480,7 @@ impl CheckedProgramBuilder {
                         .checked_list_item_projection_flow_mode(
                             actual(list_formal)?,
                             projection,
+                            program,
                             active,
                             visited,
                         ),
@@ -9449,17 +9493,20 @@ impl CheckedProgramBuilder {
                 root,
                 &[name],
                 projection,
+                program,
                 active,
                 visited,
             ),
-            AstExprKind::Path(parts) => self
-                .checked_list_item_projection_from_read(root, &parts, projection, active, visited),
+            AstExprKind::Path(parts) => self.checked_list_item_projection_from_read(
+                root, &parts, projection, program, active, visited,
+            ),
             AstExprKind::Block {
                 result: Some(result),
                 ..
             } => self.checked_list_item_projection_flow_mode(
                 CheckedExprId(result as u32),
                 projection,
+                program,
                 active,
                 visited,
             ),
@@ -9468,6 +9515,7 @@ impl CheckedProgramBuilder {
                     self.checked_list_item_projection_flow_mode(
                         CheckedExprId(branch as u32),
                         projection,
+                        program,
                         active,
                         visited,
                     )
@@ -9476,6 +9524,7 @@ impl CheckedProgramBuilder {
             AstExprKind::Then { input, output } => self.checked_list_item_projection_flow_mode(
                 CheckedExprId(output.unwrap_or(input) as u32),
                 projection,
+                program,
                 active,
                 visited,
             ),
@@ -9483,6 +9532,7 @@ impl CheckedProgramBuilder {
                 .checked_list_item_projection_flow_mode(
                     CheckedExprId(initial as u32),
                     projection,
+                    program,
                     active,
                     visited,
                 ),
@@ -9495,6 +9545,7 @@ impl CheckedProgramBuilder {
         root: CheckedExprId,
         parts: &[String],
         projection: &[String],
+        program: &ParsedProgram,
         active: &mut DenseRecursionGuard,
         visited: &mut BTreeSet<usize>,
     ) -> Option<FlowMode> {
@@ -9528,24 +9579,27 @@ impl CheckedProgramBuilder {
         };
         let mut value = self.declaration(target)?.value?;
         if !remaining.is_empty() {
-            let (projected, consumed) = self.checked_projected_value_prefix(value, &remaining)?;
+            let (projected, consumed) =
+                self.checked_projected_value_prefix(value, &remaining, program)?;
             if consumed != remaining.len() {
                 return None;
             }
             value = projected;
         }
-        self.checked_list_item_projection_flow_mode(value, projection, active, visited)
+        self.checked_list_item_projection_flow_mode(value, projection, program, active, visited)
     }
 
     fn checked_projected_value_flow_mode(
         &mut self,
         root: CheckedExprId,
         projection: &[String],
+        program: &ParsedProgram,
         active: &mut DenseRecursionGuard,
     ) -> Option<FlowMode> {
-        let (projected, consumed) = self.checked_projected_value_prefix(root, projection)?;
+        let (projected, consumed) =
+            self.checked_projected_value_prefix(root, projection, program)?;
         let mode = self
-            .infer_checked_expr_flow(projected.0 as usize, active)
+            .infer_checked_expr_flow(projected.0 as usize, program, active)
             .mode;
         (consumed == projection.len()
             || matches!(mode, FlowMode::TickPresent | FlowMode::PresentOrAbsent))
@@ -9556,12 +9610,13 @@ impl CheckedProgramBuilder {
         &self,
         root: CheckedExprId,
         projection: &[String],
+        program: &ParsedProgram,
     ) -> Option<(CheckedExprId, usize)> {
         let mut current = root.0 as usize;
         let mut offset = 0;
         let mut visited = BTreeSet::new();
         while visited.insert(current) {
-            let expression = self.program.expressions.get(current)?;
+            let expression = program.expressions.get(current)?;
             match &expression.kind {
                 AstExprKind::Object(fields) | AstExprKind::TaggedObject { fields, .. } => {
                     let name = projection.get(offset)?;

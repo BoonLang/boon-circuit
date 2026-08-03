@@ -389,6 +389,14 @@ Current cold-diagnostics candidate evidence:
   1,929,058 allocations / 219,061,685 bytes, 3,328 calls / 205,560 bytes below
   checkpoint `69614c2`. This is not percentile acceptance: the remaining 35
   rounds and contextual/user-call owner remain open.
+- Recursive checked-flow inference now clones the immutable parsed-program
+  owner once per root and borrows that snapshot through read and projection
+  recursion, instead of performing an atomic shared-owner clone/drop on every
+  cache miss. Solver work, allocation counts, the exact digest, and the complete
+  80-test suite remain unchanged. A three-sample alternating release edit-loop
+  batch has 227.33/227.73 ms fresh/empty medians and 171.50/172.32 ms typecheck
+  medians. This small directional win is not percentile acceptance and does not
+  close the remaining construction, interning, or contextual/user-call owners.
 - Item 7 is still incomplete: the lifetime-free checker and builder remain two
   construction owners. Fuse checked construction into one owned database,
   then complete measured compact/name interning and worklist reductions,

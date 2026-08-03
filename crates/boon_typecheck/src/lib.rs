@@ -124,7 +124,11 @@ fn checked_intrinsic_v1(kind: CheckedCallableKind, name: &str) -> Option<Checked
     }
 }
 
-struct CheckedProgramBuilder {
+/// Single owned database for checked construction and its exact diagnostic
+/// projections. Checked lowering and compatibility-shaped reporting operate
+/// in sequence on this value; whole-project construction tables are never
+/// handed to a second owner.
+struct CheckedProgramDatabase {
     program: ParsedProgram,
     role: ProgramRole,
     external_value_modes: BTreeMap<String, FlowMode>,
@@ -132,7 +136,6 @@ struct CheckedProgramBuilder {
     function_param_requirements: BTreeMap<String, BTreeMap<String, Type>>,
     flow_bindings: FlowModeIndex,
     named_value_modes: FlowModeIndex,
-    named_value_expressions: DeclarationExprIndex,
     signatures: Vec<CheckedCallableSignature>,
     context_formals: Vec<CheckedContextFormal>,
     signature_by_name: HashMap<String, usize>,
@@ -225,6 +228,57 @@ struct CheckedProgramBuilder {
     exact_number_literals: DenseIndexTable<ExactNumber>,
     work_counters: TypeCheckWorkCounters,
     diagnostics: Vec<TypeDiagnostic>,
+    external_types: ExternalTypeEnvironment,
+    vars: TypeVarStore,
+    builtins: BuiltinSignatureRegistry,
+    render_contracts: RenderContractRegistry,
+    render_context_function_statements: BTreeSet<usize>,
+    render_slot_statements: BTreeSet<usize>,
+    diagnostic_hold_updates: DenseIndexTable<Box<[usize]>>,
+    source_payload_lookup: SourcePayloadPathLookup,
+    source_payload_types: BTreeMap<String, Type>,
+    host_port_table: HostPortSyntaxTable,
+    function_statements: FunctionStatementIndex,
+    function_call_graph: BTreeMap<String, BTreeSet<String>>,
+    function_args_by_name: BTreeMap<String, Vec<AstParameter>>,
+    function_arg_call_sites: BTreeMap<String, BTreeMap<String, Vec<usize>>>,
+    function_arg_display_type_cache: RefCell<BTreeMap<(String, String), Type>>,
+    function_return_type_cache: RefCell<BTreeMap<String, Option<Type>>>,
+    function_call_return_type_cache: RefCell<BTreeMap<String, HashMap<Vec<Type>, Option<Type>>>>,
+    #[cfg(test)]
+    function_call_return_type_cache_misses: Cell<usize>,
+    object_bindings: BTreeMap<String, SharedObjectShape>,
+    name_bindings: BTreeMap<String, Type>,
+    declaration_exprs: DeclarationExprIndex,
+    local_name_bindings: Vec<BTreeMap<String, Type>>,
+    expr_type_vars: DenseIndexTable<TypeVar>,
+    builtin_symbol_exprs: BTreeSet<usize>,
+    expr_type_cache: Vec<Option<FlowType>>,
+    checked_program_for_diagnostics: Option<Arc<CheckedProgram>>,
+    checked_statement_values: DenseIndexTable<CheckedExprId>,
+    checked_diagnostic_replay: bool,
+    checked_diagnostic_projection_active: bool,
+    checked_diagnostic_tasks: Vec<CheckedDiagnosticExpressionTask>,
+    checked_diagnostic_sequence: SmallVec<[CheckedDiagnosticExpressionTask; 12]>,
+    #[cfg(test)]
+    checked_diagnostic_projection_mode: CheckedDiagnosticProjectionMode,
+    diagnostic_replayed: DenseFlagSet,
+    diagnostic_ensure_requests: usize,
+    diagnostic_lookup_hits: usize,
+    diagnostic_lookup_misses: usize,
+    checked_flow_install_count: usize,
+    checked_flow_duplicate_ids: usize,
+    checked_flow_out_of_range_ids: usize,
+    checked_flow_missing_parser_ids: usize,
+    #[cfg(test)]
+    flow_mode_expression_visits: Cell<usize>,
+    expr_type_table: ExprTypeTable,
+    function_type_table: FunctionTypeTable,
+    checked_function_parameters: BTreeMap<String, Vec<FunctionTypeParameterEntry>>,
+    collect_type_hints: bool,
+    render_slot_table: RenderSlotTable,
+    deferred_style_constraints: Vec<DeferredStyleConstraint>,
+    constraints: Vec<Constraint>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -674,34 +728,6 @@ impl<T> FromIterator<(usize, T)> for DenseIndexTable<T> {
     }
 }
 
-/// Syntax and environment inputs for authoritative checked construction.
-///
-/// Provisional checker type tables deliberately do not cross this boundary.
-/// The checked builder owns the only structural type database; legacy report
-/// projections remain outside until diagnostic replay replaces their owner.
-struct OwnedCheckedConstruction {
-    external_types: ExternalTypeEnvironment,
-    render_slot_statements: BTreeSet<usize>,
-    source_payload_shape_table: Vec<SourcePayloadSyntaxShapeEntry>,
-    flow_bindings: FlowModeIndex,
-    expression_owner: DenseIndexTable<String>,
-    structured_delimiter_fields: DenseIndexTable<Box<[(String, usize)]>>,
-    named_value_expressions: DeclarationExprIndex,
-    function_param_requirements: BTreeMap<String, BTreeMap<String, Type>>,
-    builtins: BuiltinSignatureRegistry,
-    render_contracts: RenderContractRegistry,
-}
-
-struct CheckedDiagnosticReplayInputs {
-    source_payload_shape_table: Vec<SourcePayloadSyntaxShapeEntry>,
-    named_value_expressions: DeclarationExprIndex,
-    builtins: BuiltinSignatureRegistry,
-    render_contracts: RenderContractRegistry,
-    render_slot_statements: BTreeSet<usize>,
-    structured_delimiter_fields: DenseIndexTable<Box<[(String, usize)]>>,
-    hold_updates_by_expression: DenseIndexTable<Box<[usize]>>,
-}
-
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct CheckedExpressionCoverage {
     install_attempts: usize,
@@ -716,7 +742,6 @@ struct CheckedProgramBuildOutput {
     exact_pipeline_inputs_valid: bool,
     work_counters: TypeCheckWorkCounters,
     expression_coverage: CheckedExpressionCoverage,
-    diagnostic_replay_inputs: Option<CheckedDiagnosticReplayInputs>,
 }
 
 fn proper_dotted_suffixes(path: &str) -> impl Iterator<Item = &str> {
@@ -1397,23 +1422,8 @@ fn checked_contextual_operation_formals(
     })
 }
 
-impl CheckedProgramBuilder {
-    fn build(
-        program: &ParsedProgram,
-        inputs: OwnedCheckedConstruction,
-    ) -> CheckedProgramBuildOutput {
-        let OwnedCheckedConstruction {
-            external_types,
-            render_slot_statements,
-            source_payload_shape_table,
-            flow_bindings,
-            expression_owner,
-            structured_delimiter_fields,
-            named_value_expressions,
-            function_param_requirements,
-            builtins,
-            render_contracts,
-        } = inputs;
+impl CheckedProgramDatabase {
+    fn build_checked_program_first(&mut self) -> CheckedProgramBuildOutput {
         let trace_checked_program = typecheck_trace_enabled();
         macro_rules! checked_program_phase {
             ($name:literal, $body:expr) => {{
@@ -1432,155 +1442,173 @@ impl CheckedProgramBuilder {
                 result
             }};
         }
-        let transferred_source_shape_count = source_payload_shape_table.len();
-        let mut builder = checked_program_phase!("initialize_builder", {
-            let exact_statement_by_root_expression = exact_statement_by_root_expression(
-                &program.ast.statements,
-                program.expressions.len(),
-            );
-            Self {
-                program: program.clone(),
-                role: external_types.current_role,
-                external_value_modes: external_types
+        let program = self.program.clone();
+        let diagnostic_prefix = std::mem::take(&mut self.diagnostics);
+        let transferred_source_shape_count = self.source_payload_shape_table.len();
+        let (external_types, render_slot_statements, builtins, render_contracts) =
+            checked_program_phase!("initialize_database", {
+                let render_context = render_context_syntax_index(&program);
+                self.render_context_function_statements = render_context.function_statements;
+                let render_slot_statements = render_context.render_slot_statements;
+                self.structured_delimiter_fields = structured_delimiter_field_index(&program);
+                let exact_statement_by_root_expression = exact_statement_by_root_expression(
+                    &program.ast.statements,
+                    program.expressions.len(),
+                );
+                self.role = self.external_types.current_role;
+                self.external_value_modes = self
+                    .external_types
                     .values
                     .iter()
                     .map(|(path, value)| (path.clone(), value.mode))
-                    .collect(),
-                external_identities: external_types.external_identities.clone(),
-                function_param_requirements,
-                flow_bindings,
-                named_value_modes: FlowModeIndex::default(),
-                named_value_expressions,
-                signatures: Vec::new(),
-                context_formals: Vec::new(),
-                signature_by_name: HashMap::new(),
-                signature_by_decl: DenseIndexTable::default(),
-                parameter_location_by_decl: DenseIndexTable::with_len(0),
-                expression_owner,
-                expression_owner_signatures: DenseIndexTable::with_len(program.expressions.len()),
-                expressions_by_signature: Vec::new(),
-                expression_roots_by_signature: Vec::new(),
-                next_decl_id: 1,
-                next_scope_id: 1,
-                next_call_id: 0,
-                visited_exprs: DenseFlagSet::with_len(program.expressions.len()),
-                calls: Vec::new(),
-                call_by_id: DenseIndexTable::default(),
-                call_by_expression: DenseIndexTable::with_len(program.expressions.len()),
-                scopes: vec![CheckedScope {
+                    .collect();
+                self.external_identities = self.external_types.external_identities.clone();
+                self.named_value_modes = FlowModeIndex::default();
+                self.signatures.clear();
+                self.context_formals.clear();
+                self.signature_by_name.clear();
+                self.signature_by_decl.clear();
+                self.parameter_location_by_decl = DenseIndexTable::with_len(0);
+                self.expression_owner_signatures =
+                    DenseIndexTable::with_len(program.expressions.len());
+                self.expressions_by_signature.clear();
+                self.expression_roots_by_signature.clear();
+                self.next_decl_id = 1;
+                self.next_scope_id = 1;
+                self.next_call_id = 0;
+                self.visited_exprs = DenseFlagSet::with_len(program.expressions.len());
+                self.calls.clear();
+                self.call_by_id.clear();
+                self.call_by_expression = DenseIndexTable::with_len(program.expressions.len());
+                self.scopes.clear();
+                self.scopes.push(CheckedScope {
                     id: LexicalScopeId(0),
                     parent: None,
                     owner: None,
                     kind: CheckedScopeKind::Root,
                     span: CheckedSpan::default(),
-                }],
-                declarations: Vec::new(),
-                declaration_by_id: DenseIndexTable::default(),
-                occurrences: Vec::new(),
-                statement_declarations: DenseIndexTable::default(),
-                statement_scopes: DenseIndexTable::default(),
-                statement_body_scopes: DenseIndexTable::default(),
-                exact_statement_by_root_expression,
-                expression_scopes: DenseIndexTable::with_len(program.expressions.len()),
-                expression_declarations: DenseIndexTable::with_len(program.expressions.len()),
-                expression_call_contexts: HashMap::new(),
-                scope_declarations: HashMap::new(),
-                scope_declarations_by_scope: Vec::new(),
-                pattern_declarations: HashMap::new(),
-                pattern_selectors: DenseIndexTable::with_len(program.expressions.len()),
-                pattern_parents: DenseIndexTable::with_len(program.expressions.len()),
-                pattern_arms_by_scope: DenseIndexTable::default(),
-                nearest_pattern_arm_by_scope: Vec::new(),
-                structured_delimiter_fields,
-                syntax_discriminant_parameters: BTreeSet::new(),
-                syntax_discriminant_parameter_paths: BTreeMap::new(),
-                inferred_expr_types: DenseIndexTable::with_len(program.expressions.len()),
-                // Allocated exactly once when the flush pass owns its final
-                // dense result; no earlier construction phase reads it.
-                expression_flush_types: DenseIndexTable::default(),
-                checked_flow_inference_cache: CheckedFlowInferenceCache::with_len(
-                    program.expressions.len(),
-                ),
-                checked_flow_inference_cache_enabled: false,
-                checked_flow_recursion: DenseRecursionGuard::with_len(program.expressions.len()),
-                checked_flow_declaration_invalidation_seen: DenseGenerationSet::with_len(0),
-                checked_flow_pending_expression_invalidations: PendingIdSet::default(),
-                checked_flow_pending_declaration_invalidations: PendingIdSet::default(),
-                checked_flow_pending_signature_invalidations: PendingIdSet::default(),
-                dirty_signature_declarations: PendingIdSet::default(),
-                checked_flow_pending_expression_publications: PendingIdSet::default(),
-                checked_type_inference_dependencies: None,
-                wrapper_call_scheme_vars: BTreeMap::new(),
-                next_checked_scheme_type_var: None,
-                projection_sites: Vec::new(),
-                source_payload_shape_table,
-                exact_number_literals: DenseIndexTable::with_len(program.expressions.len()),
-                work_counters: TypeCheckWorkCounters::default(),
-                diagnostics: Vec::new(),
-            }
-        });
+                });
+                self.declarations.clear();
+                self.declaration_by_id.clear();
+                self.occurrences.clear();
+                self.statement_declarations.clear();
+                self.statement_scopes.clear();
+                self.statement_body_scopes.clear();
+                self.exact_statement_by_root_expression = exact_statement_by_root_expression;
+                self.expression_scopes = DenseIndexTable::with_len(program.expressions.len());
+                self.expression_declarations = DenseIndexTable::with_len(program.expressions.len());
+                self.expression_call_contexts.clear();
+                self.scope_declarations.clear();
+                self.scope_declarations_by_scope.clear();
+                self.pattern_declarations.clear();
+                self.pattern_selectors = DenseIndexTable::with_len(program.expressions.len());
+                self.pattern_parents = DenseIndexTable::with_len(program.expressions.len());
+                self.pattern_arms_by_scope.clear();
+                self.nearest_pattern_arm_by_scope.clear();
+                self.syntax_discriminant_parameters.clear();
+                self.syntax_discriminant_parameter_paths.clear();
+                self.inferred_expr_types = DenseIndexTable::with_len(program.expressions.len());
+                // Allocated exactly once when the flush pass owns its final dense
+                // result; no earlier construction phase reads it.
+                self.expression_flush_types.clear();
+                self.checked_flow_inference_cache =
+                    CheckedFlowInferenceCache::with_len(program.expressions.len());
+                self.checked_flow_inference_cache_enabled = false;
+                self.checked_flow_recursion =
+                    DenseRecursionGuard::with_len(program.expressions.len());
+                self.checked_flow_declaration_invalidation_seen = DenseGenerationSet::with_len(0);
+                self.checked_flow_pending_expression_invalidations = PendingIdSet::default();
+                self.checked_flow_pending_declaration_invalidations = PendingIdSet::default();
+                self.checked_flow_pending_signature_invalidations = PendingIdSet::default();
+                self.dirty_signature_declarations = PendingIdSet::default();
+                self.checked_flow_pending_expression_publications = PendingIdSet::default();
+                self.checked_type_inference_dependencies = None;
+                self.wrapper_call_scheme_vars.clear();
+                self.next_checked_scheme_type_var = None;
+                self.projection_sites.clear();
+                self.exact_number_literals = DenseIndexTable::with_len(program.expressions.len());
+                self.work_counters = TypeCheckWorkCounters::default();
+
+                let external_types = std::mem::take(&mut self.external_types);
+                let builtins = std::mem::replace(
+                    &mut self.builtins,
+                    BuiltinSignatureRegistry {
+                        entries: BTreeMap::new(),
+                    },
+                );
+                let render_contracts = std::mem::replace(
+                    &mut self.render_contracts,
+                    RenderContractRegistry {
+                        active_root: "document",
+                        roots: BTreeMap::new(),
+                    },
+                );
+                (
+                    external_types,
+                    render_slot_statements,
+                    builtins,
+                    render_contracts,
+                )
+            });
         let exact_pipeline_inputs_valid = checked_program_phase!(
             "validate_exact_pipeline_inputs",
-            builder.validate_exact_pipeline_inputs()
+            self.validate_exact_pipeline_inputs()
         );
         checked_program_phase!(
             "validate_exact_number_literals",
-            builder.validate_exact_number_literals()
+            self.validate_exact_number_literals()
         );
-        checked_program_phase!("validate_bits_literals", builder.validate_bits_literals());
+        checked_program_phase!("validate_bits_literals", self.validate_bits_literals());
         checked_program_phase!(
             "collect_user_signatures",
-            builder.collect_user_signatures(&program.ast.statements)
+            self.collect_user_signatures(&program.ast.statements)
         );
         checked_program_phase!("register_signatures", {
-            builder.register_builtin_signatures(&builtins);
-            builder.register_stream_signatures(&builtins);
-            builder.register_field_projection_signatures();
-            builder.register_session_info_intrinsics();
-            builder.register_render_signatures(&render_contracts);
-            builder.register_host_effect_signatures();
-            builder.register_external_signatures(&external_types);
+            self.register_builtin_signatures(&builtins);
+            self.register_stream_signatures(&builtins);
+            self.register_field_projection_signatures();
+            self.register_session_info_intrinsics();
+            self.register_render_signatures(&render_contracts);
+            self.register_host_effect_signatures();
+            self.register_external_signatures(&external_types);
         });
         checked_program_phase!(
             "index_expression_owners",
-            builder.rebuild_expression_owner_indexes()
+            self.rebuild_expression_owner_indexes()
         );
         checked_program_phase!("predeclare", {
-            builder.predeclare_statement_tree(&program.ast.statements, LexicalScopeId(0));
-            builder.register_output_root_declarations();
-            builder.predeclare_pattern_bindings(&program.ast.statements);
+            self.predeclare_statement_tree(&program.ast.statements, LexicalScopeId(0));
+            self.register_output_root_declarations();
+            self.predeclare_pattern_bindings(&program.ast.statements);
         });
 
         checked_program_phase!("visit_expressions", {
             let child_exprs = expression_child_ids(&program.expressions);
             for expr in &program.expressions {
                 if !child_exprs.contains(&expr.id) {
-                    builder.visit_expr(program, expr.id, BTreeMap::new());
+                    self.visit_expr(&program, expr.id, BTreeMap::new());
                 }
             }
             for expr in &program.expressions {
-                builder.visit_expr(program, expr.id, BTreeMap::new());
+                self.visit_expr(&program, expr.id, BTreeMap::new());
             }
         });
-        checked_program_phase!("index_semantics", builder.rebuild_semantic_indexes());
+        checked_program_phase!("index_semantics", self.rebuild_semantic_indexes());
         checked_program_phase!(
             "validate_callable_coverage",
-            builder.validate_callable_coverage()
+            self.validate_callable_coverage()
         );
         checked_program_phase!(
             "infer_contextual_scope_effects",
-            builder.infer_contextual_scope_effects()
+            self.infer_contextual_scope_effects()
         );
-        checked_program_phase!(
-            "index_checked_projections",
-            builder.rebuild_projection_sites()
-        );
+        checked_program_phase!("index_checked_projections", self.rebuild_projection_sites());
         checked_program_phase!(
             "validate_output_producers",
-            builder.validate_output_producers()
+            self.validate_output_producers()
         );
         checked_program_phase!("apply_inferred_types", {
-            builder.apply_inferred_types(&external_types)
+            self.apply_inferred_types(&external_types)
         });
         if trace_checked_program {
             eprintln!(
@@ -1590,71 +1618,69 @@ impl CheckedProgramBuilder {
         }
         checked_program_phase!(
             "infer_contextual_callable_schemes",
-            builder.prepare_contextual_callable_schemes()
+            self.prepare_contextual_callable_schemes()
         );
         checked_program_phase!(
             "infer_checked_types",
-            builder.infer_checked_types_with_contextual_wrapper_propagation()
+            self.infer_checked_types_with_contextual_wrapper_propagation()
         );
         checked_program_phase!(
             "install_flush_control_contract",
-            builder.install_flush_control_contract()
+            self.install_flush_control_contract()
         );
         checked_program_phase!(
             "validate_checked_projections",
-            builder.validate_checked_type_projections()
+            self.validate_checked_type_projections()
         );
         checked_program_phase!(
             "validate_contextual_call_arguments",
-            builder.validate_contextual_call_arguments()
+            self.validate_contextual_call_arguments()
         );
-        checked_program_phase!("validate_pass_calls", builder.validate_pass_calls());
+        checked_program_phase!("validate_pass_calls", self.validate_pass_calls());
         checked_program_phase!(
             "validate_user_call_arguments",
-            builder.validate_user_call_arguments()
+            self.validate_user_call_arguments()
         );
         checked_program_phase!("sort_calls", {
-            builder.calls.sort_by_key(|call| call.expression);
-            builder.rebuild_call_indexes();
+            self.calls.sort_by_key(|call| call.expression);
+            self.rebuild_call_indexes();
         });
         let (mut statements, mut expressions) = checked_program_phase!(
             "lower_checked_tree",
-            builder.lower_checked_tree(&render_slot_statements)
+            self.lower_checked_tree(&render_slot_statements)
         );
         checked_program_phase!(
             "reconcile_call_occurrence_results",
-            builder.reconcile_call_occurrence_results(&expressions)
+            self.reconcile_call_occurrence_results(&expressions)
         );
         checked_program_phase!(
             "validate_user_results",
-            builder.validate_user_callable_results()
+            self.validate_user_callable_results()
         );
         let expression_coverage = checked_program_phase!("validate_expression_roots", {
-            builder.validate_checked_expression_roots(&statements, &expressions)
+            self.validate_checked_expression_roots(&statements, &expressions)
         });
-        let pattern_bindings = checked_program_phase!(
-            "checked_pattern_bindings",
-            builder.checked_pattern_bindings()
-        );
+        let pattern_bindings =
+            checked_program_phase!("checked_pattern_bindings", self.checked_pattern_bindings());
         let (mut sources, states, lists) = checked_program_phase!(
             "derive_checked_resources",
-            builder.derive_checked_resources(&mut statements, &mut expressions)
+            self.derive_checked_resources(&mut statements, &mut expressions)
         );
         let call_result_paths = checked_program_phase!(
             "checked_call_result_paths",
             checked_call_result_paths(
-                &builder.declarations,
-                &builder.signatures,
+                &self.declarations,
+                &self.signatures,
                 &expressions,
-                &builder.calls,
+                &self.calls,
             )
         );
         let resource_projection_requirements = checked_program_phase!(
             "resolve_checked_resource_projections",
             checked_resource_projection_requirements(
-                &builder.declarations,
-                &builder.signatures,
-                &builder.calls,
+                &self.declarations,
+                &self.signatures,
+                &self.calls,
                 &expressions,
                 &sources,
             )
@@ -1666,18 +1692,18 @@ impl CheckedProgramBuilder {
             )
         });
         let mut checked_fields = CheckedProgramFields {
-            source_bundle_digest_v1: builder.program.source_bundle_digest_v1,
-            role: builder.role,
+            source_bundle_digest_v1: self.program.source_bundle_digest_v1,
+            role: self.role,
             external_types,
             lowering_metadata: CheckedProgramLoweringMetadata::default(),
             root_scope: LexicalScopeId(0),
-            scopes: builder.scopes,
-            declarations: builder.declarations,
+            scopes: std::mem::take(&mut self.scopes),
+            declarations: std::mem::take(&mut self.declarations),
             statements,
             expressions,
-            callables: builder.signatures,
-            context_formals: builder.context_formals,
-            calls: builder.calls,
+            callables: std::mem::take(&mut self.signatures),
+            context_formals: std::mem::take(&mut self.context_formals),
+            calls: std::mem::take(&mut self.calls),
             call_result_paths,
             order_chains: Vec::new(),
             pattern_bindings,
@@ -1685,14 +1711,14 @@ impl CheckedProgramBuilder {
             sources,
             states,
             lists,
-            occurrences: builder.occurrences,
+            occurrences: std::mem::take(&mut self.occurrences),
         };
         let (order_chains, order_diagnostics) = checked_program_phase!(
             "derive_order_chains",
             derive_checked_order_chains(&checked_fields)
         );
         checked_fields.order_chains = order_chains;
-        builder.diagnostics.extend(order_diagnostics);
+        self.diagnostics.extend(order_diagnostics);
         let checked = checked_program_phase!(
             "assemble_checked_program",
             // SAFETY: all construction and order analysis above operated on
@@ -1700,29 +1726,31 @@ impl CheckedProgramBuilder {
             unsafe { CheckedProgram::from_typechecker_fields_unchecked(checked_fields) }
         );
         let inference_dependencies = Arc::try_unwrap(
-            builder
-                .checked_type_inference_dependencies
+            self.checked_type_inference_dependencies
                 .take()
                 .expect("checked inference dependencies initialized"),
         )
         .unwrap_or_else(|_| panic!("checked construction retained an inference-index borrower"));
-        let mut work_counters = builder.work_counters;
-        work_counters.record_flow_cache(builder.checked_flow_inference_cache.stats);
+        let mut work_counters = std::mem::take(&mut self.work_counters);
+        work_counters.record_flow_cache(self.checked_flow_inference_cache.stats);
+        let program = Arc::new(checked);
+        self.builtins = builtins;
+        self.render_contracts = render_contracts;
+        self.render_slot_statements = render_slot_statements;
+        self.diagnostic_hold_updates = inference_dependencies.hold_updates_by_expression;
+        // Construction-only indexes are dropped at the checked seal. The
+        // diagnostic projector reads the finalized graph instead of retaining
+        // a second whole-project inference owner.
+        self.flow_bindings = FlowModeIndex::default();
+        self.expression_owner = DenseIndexTable::default();
+        self.function_param_requirements.clear();
+        let diagnostics = std::mem::replace(&mut self.diagnostics, diagnostic_prefix);
         CheckedProgramBuildOutput {
-            program: Arc::new(checked),
-            diagnostics: builder.diagnostics,
+            program,
+            diagnostics,
             exact_pipeline_inputs_valid,
             work_counters,
             expression_coverage,
-            diagnostic_replay_inputs: Some(CheckedDiagnosticReplayInputs {
-                source_payload_shape_table: builder.source_payload_shape_table,
-                named_value_expressions: builder.named_value_expressions,
-                builtins,
-                render_contracts,
-                render_slot_statements,
-                structured_delimiter_fields: builder.structured_delimiter_fields,
-                hold_updates_by_expression: inference_dependencies.hold_updates_by_expression,
-            }),
         }
     }
 
@@ -6626,7 +6654,7 @@ impl CheckedProgramBuilder {
                 let Some(path) = plan.canonical_path.as_deref() else {
                     continue;
                 };
-                if let Some(value) = declaration_expr_for_path(&self.named_value_expressions, path)
+                if let Some(value) = declaration_expr_for_path(&self.declaration_exprs, path)
                     && let Some(dependents) = flow_cache_dependents.get_mut(value)
                 {
                     dependents.push(expression.id);
@@ -9014,7 +9042,7 @@ impl CheckedProgramBuilder {
     }
 
     fn exact_named_value_mode(&self, path: &str) -> Option<FlowMode> {
-        declaration_expr_for_path(&self.named_value_expressions, path)
+        declaration_expr_for_path(&self.declaration_exprs, path)
             .and_then(|expression| self.inferred_expr_types.get(&expression))
             .map(|flow_type| flow_type.mode)
     }
@@ -11907,7 +11935,7 @@ impl CheckedProgramBuilder {
                                 external_identity: None,
                             } => {
                                 let declaration = declaration_expr_for_path(
-                                    &self.named_value_expressions,
+                                    &self.declaration_exprs,
                                     canonical_path,
                                 )
                                 .and_then(|value| {
@@ -12951,7 +12979,7 @@ impl CheckedProgramBuilder {
                 // the checked program instead of lowering the same read as an
                 // ambient external that semantic expansion must rediscover
                 // from a call-site scope.
-                let expression = declaration_expr_for_path(&self.named_value_expressions, name)?;
+                let expression = declaration_expr_for_path(&self.declaration_exprs, name)?;
                 self.expression_declarations.get(&expression).copied()?
             }
         };
@@ -17042,14 +17070,14 @@ pub fn check_profiled(program: &ParsedProgram) -> (TypeCheckReport, TypeCheckPro
 }
 
 pub fn check_program_profiled(program: &ParsedProgram) -> (CheckOutput, TypeCheckProfile) {
-    let (checker, init_profile) = Checker::new_profiled(program);
+    let (checker, init_profile) = CheckedProgramDatabase::new_profiled(program);
     checker.finish_program_profiled(CheckOutputOwnership::ReportOwned, init_profile)
 }
 
 /// Typecheck for an interactive editor while retaining a single owned copy of
 /// successful lowering metadata in the returned [`CheckedProgram`].
 pub fn check_editor_program_profiled(program: &ParsedProgram) -> (CheckOutput, TypeCheckProfile) {
-    let (checker, init_profile) = Checker::new_profiled(program);
+    let (checker, init_profile) = CheckedProgramDatabase::new_profiled(program);
     checker.finish_program_profiled(CheckOutputOwnership::EditorOwned, init_profile)
 }
 
@@ -17059,7 +17087,7 @@ pub fn check_editor_program_profiled(program: &ParsedProgram) -> (CheckOutput, T
 pub fn check_diagnostics_program_profiled(
     program: &ParsedProgram,
 ) -> (CheckOutput, TypeCheckProfile) {
-    let (checker, init_profile) = Checker::new_diagnostics_profiled(program);
+    let (checker, init_profile) = CheckedProgramDatabase::new_diagnostics_profiled(program);
     checker.finish_program_profiled(CheckOutputOwnership::DiagnosticsOwned, init_profile)
 }
 
@@ -17076,7 +17104,7 @@ pub fn check_program_profiled_with_external_types(
     external_types: &ExternalTypeEnvironment,
 ) -> (CheckOutput, TypeCheckProfile) {
     let (checker, init_profile) =
-        Checker::new_profiled_with_external_types(program, external_types);
+        CheckedProgramDatabase::new_profiled_with_external_types(program, external_types);
     checker.finish_program_profiled(CheckOutputOwnership::ReportOwned, init_profile)
 }
 
@@ -17086,7 +17114,7 @@ pub fn check_editor_program_profiled_with_external_types(
     external_types: &ExternalTypeEnvironment,
 ) -> (CheckOutput, TypeCheckProfile) {
     let (checker, init_profile) =
-        Checker::new_profiled_with_external_types(program, external_types);
+        CheckedProgramDatabase::new_profiled_with_external_types(program, external_types);
     checker.finish_program_profiled(CheckOutputOwnership::EditorOwned, init_profile)
 }
 
@@ -17096,7 +17124,10 @@ pub fn check_diagnostics_program_profiled_with_external_types(
     external_types: &ExternalTypeEnvironment,
 ) -> (CheckOutput, TypeCheckProfile) {
     let (checker, init_profile) =
-        Checker::new_diagnostics_profiled_with_external_types(program, external_types);
+        CheckedProgramDatabase::new_diagnostics_profiled_with_external_types(
+            program,
+            external_types,
+        );
     checker.finish_program_profiled(CheckOutputOwnership::DiagnosticsOwned, init_profile)
 }
 
@@ -17106,7 +17137,7 @@ pub fn check_runtime_profiled(program: &ParsedProgram) -> (TypeCheckReport, Type
 }
 
 pub fn check_runtime_program_profiled(program: &ParsedProgram) -> (CheckOutput, TypeCheckProfile) {
-    let (checker, init_profile) = Checker::new_profiled(program);
+    let (checker, init_profile) = CheckedProgramDatabase::new_profiled(program);
     checker.finish_program_profiled(CheckOutputOwnership::RuntimeOwned, init_profile)
 }
 
@@ -17124,7 +17155,7 @@ pub fn check_runtime_program_profiled_with_external_types(
     external_types: &ExternalTypeEnvironment,
 ) -> (CheckOutput, TypeCheckProfile) {
     let (checker, init_profile) =
-        Checker::new_profiled_with_external_types(program, external_types);
+        CheckedProgramDatabase::new_profiled_with_external_types(program, external_types);
     checker.finish_program_profiled(CheckOutputOwnership::RuntimeOwned, init_profile)
 }
 
@@ -17705,7 +17736,7 @@ pub struct TypeCheckProfile {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct CheckerInitProfile {
+struct CheckedDatabaseInitProfile {
     checker_init_ms: f64,
     source_paths_ms: f64,
     source_payload_shape_table_ms: f64,
@@ -17717,67 +17748,6 @@ struct CheckerInitProfile {
     flow_bindings_ms: f64,
     render_contracts_ms: f64,
     refresh_static_list_bindings_ms: f64,
-}
-
-struct Checker {
-    program: ParsedProgram,
-    external_types: ExternalTypeEnvironment,
-    vars: TypeVarStore,
-    builtins: BuiltinSignatureRegistry,
-    render_contracts: RenderContractRegistry,
-    render_context_function_statements: BTreeSet<usize>,
-    render_slot_statements: BTreeSet<usize>,
-    structured_delimiter_fields: DenseIndexTable<Box<[(String, usize)]>>,
-    diagnostic_hold_updates: DenseIndexTable<Box<[usize]>>,
-    source_payload_lookup: SourcePayloadPathLookup,
-    source_payload_shape_table: Vec<SourcePayloadSyntaxShapeEntry>,
-    source_payload_types: BTreeMap<String, Type>,
-    host_port_table: HostPortSyntaxTable,
-    function_statements: FunctionStatementIndex,
-    function_call_graph: BTreeMap<String, BTreeSet<String>>,
-    expression_owner: DenseIndexTable<String>,
-    function_args_by_name: BTreeMap<String, Vec<AstParameter>>,
-    function_arg_call_sites: BTreeMap<String, BTreeMap<String, Vec<usize>>>,
-    function_arg_display_type_cache: RefCell<BTreeMap<(String, String), Type>>,
-    function_return_type_cache: RefCell<BTreeMap<String, Option<Type>>>,
-    function_call_return_type_cache: RefCell<BTreeMap<String, HashMap<Vec<Type>, Option<Type>>>>,
-    #[cfg(test)]
-    function_call_return_type_cache_misses: Cell<usize>,
-    object_bindings: BTreeMap<String, SharedObjectShape>,
-    name_bindings: BTreeMap<String, Type>,
-    declaration_exprs: DeclarationExprIndex,
-    local_name_bindings: Vec<BTreeMap<String, Type>>,
-    flow_bindings: FlowModeIndex,
-    function_param_requirements: BTreeMap<String, BTreeMap<String, Type>>,
-    expr_type_vars: DenseIndexTable<TypeVar>,
-    builtin_symbol_exprs: BTreeSet<usize>,
-    expr_type_cache: Vec<Option<FlowType>>,
-    checked_program_for_diagnostics: Option<Arc<CheckedProgram>>,
-    checked_statement_values: DenseIndexTable<CheckedExprId>,
-    checked_diagnostic_replay: bool,
-    checked_diagnostic_projection_active: bool,
-    checked_diagnostic_tasks: Vec<CheckedDiagnosticExpressionTask>,
-    checked_diagnostic_sequence: SmallVec<[CheckedDiagnosticExpressionTask; 12]>,
-    #[cfg(test)]
-    checked_diagnostic_projection_mode: CheckedDiagnosticProjectionMode,
-    diagnostic_replayed: DenseFlagSet,
-    diagnostic_ensure_requests: usize,
-    diagnostic_lookup_hits: usize,
-    diagnostic_lookup_misses: usize,
-    checked_flow_install_count: usize,
-    checked_flow_duplicate_ids: usize,
-    checked_flow_out_of_range_ids: usize,
-    checked_flow_missing_parser_ids: usize,
-    #[cfg(test)]
-    flow_mode_expression_visits: Cell<usize>,
-    expr_type_table: ExprTypeTable,
-    function_type_table: FunctionTypeTable,
-    checked_function_parameters: BTreeMap<String, Vec<FunctionTypeParameterEntry>>,
-    collect_type_hints: bool,
-    render_slot_table: RenderSlotTable,
-    deferred_style_constraints: Vec<DeferredStyleConstraint>,
-    constraints: Vec<Constraint>,
-    diagnostics: Vec<TypeDiagnostic>,
 }
 
 #[cfg(test)]
@@ -17924,12 +17894,12 @@ impl StaticBindingLookup for StaticBindingOverlay<'_> {
     }
 }
 
-impl Checker {
-    fn new_profiled(program: &ParsedProgram) -> (Self, CheckerInitProfile) {
+impl CheckedProgramDatabase {
+    fn new_profiled(program: &ParsedProgram) -> (Self, CheckedDatabaseInitProfile) {
         Self::new_profiled_with_external_types(program, &ExternalTypeEnvironment::default())
     }
 
-    fn new_diagnostics_profiled(program: &ParsedProgram) -> (Self, CheckerInitProfile) {
+    fn new_diagnostics_profiled(program: &ParsedProgram) -> (Self, CheckedDatabaseInitProfile) {
         Self::new_profiled_with_external_types_and_legacy_bindings(
             program,
             &ExternalTypeEnvironment::default(),
@@ -17940,14 +17910,14 @@ impl Checker {
     fn new_profiled_with_external_types(
         program: &ParsedProgram,
         external_types: &ExternalTypeEnvironment,
-    ) -> (Self, CheckerInitProfile) {
+    ) -> (Self, CheckedDatabaseInitProfile) {
         Self::new_profiled_with_external_types_and_legacy_bindings(program, external_types, true)
     }
 
     fn new_diagnostics_profiled_with_external_types(
         program: &ParsedProgram,
         external_types: &ExternalTypeEnvironment,
-    ) -> (Self, CheckerInitProfile) {
+    ) -> (Self, CheckedDatabaseInitProfile) {
         Self::new_profiled_with_external_types_and_legacy_bindings(program, external_types, false)
     }
 
@@ -17955,7 +17925,7 @@ impl Checker {
         program: &ParsedProgram,
         external_types: &ExternalTypeEnvironment,
         initialize_legacy_bindings: bool,
-    ) -> (Self, CheckerInitProfile) {
+    ) -> (Self, CheckedDatabaseInitProfile) {
         let checker_init_started = Instant::now();
         let source_paths_started = Instant::now();
         let source_sites = syntax_source_sites(program);
@@ -18048,6 +18018,62 @@ impl Checker {
             .collect();
         let mut checker = Self {
             program: program.clone(),
+            role: external_types.current_role,
+            external_value_modes: BTreeMap::new(),
+            external_identities: BTreeMap::new(),
+            named_value_modes: FlowModeIndex::default(),
+            signatures: Vec::new(),
+            context_formals: Vec::new(),
+            signature_by_name: HashMap::new(),
+            signature_by_decl: DenseIndexTable::default(),
+            parameter_location_by_decl: DenseIndexTable::default(),
+            expression_owner_signatures: DenseIndexTable::default(),
+            expressions_by_signature: Vec::new(),
+            expression_roots_by_signature: Vec::new(),
+            next_decl_id: 1,
+            next_scope_id: 1,
+            next_call_id: 0,
+            visited_exprs: DenseFlagSet::with_len(0),
+            calls: Vec::new(),
+            call_by_id: DenseIndexTable::default(),
+            call_by_expression: DenseIndexTable::default(),
+            scopes: Vec::new(),
+            declarations: Vec::new(),
+            declaration_by_id: DenseIndexTable::default(),
+            occurrences: Vec::new(),
+            statement_declarations: DenseIndexTable::default(),
+            statement_scopes: DenseIndexTable::default(),
+            statement_body_scopes: DenseIndexTable::default(),
+            exact_statement_by_root_expression: DenseIndexTable::default(),
+            expression_scopes: DenseIndexTable::default(),
+            expression_declarations: DenseIndexTable::default(),
+            expression_call_contexts: HashMap::new(),
+            scope_declarations: HashMap::new(),
+            scope_declarations_by_scope: Vec::new(),
+            pattern_declarations: HashMap::new(),
+            pattern_selectors: DenseIndexTable::default(),
+            pattern_parents: DenseIndexTable::default(),
+            pattern_arms_by_scope: DenseIndexTable::default(),
+            nearest_pattern_arm_by_scope: Vec::new(),
+            syntax_discriminant_parameters: BTreeSet::new(),
+            syntax_discriminant_parameter_paths: BTreeMap::new(),
+            inferred_expr_types: DenseIndexTable::default(),
+            expression_flush_types: DenseIndexTable::default(),
+            checked_flow_inference_cache: CheckedFlowInferenceCache::with_len(0),
+            checked_flow_inference_cache_enabled: false,
+            checked_flow_recursion: DenseRecursionGuard::with_len(0),
+            checked_flow_declaration_invalidation_seen: DenseGenerationSet::with_len(0),
+            checked_flow_pending_expression_invalidations: PendingIdSet::default(),
+            checked_flow_pending_declaration_invalidations: PendingIdSet::default(),
+            checked_flow_pending_signature_invalidations: PendingIdSet::default(),
+            dirty_signature_declarations: PendingIdSet::default(),
+            checked_flow_pending_expression_publications: PendingIdSet::default(),
+            checked_type_inference_dependencies: None,
+            wrapper_call_scheme_vars: BTreeMap::new(),
+            next_checked_scheme_type_var: None,
+            projection_sites: Vec::new(),
+            exact_number_literals: DenseIndexTable::default(),
+            work_counters: TypeCheckWorkCounters::default(),
             external_types: external_types.clone(),
             vars: TypeVarStore::with_reserved_vars(BUILTIN_TYPE_VAR_COUNT),
             builtins: BuiltinSignatureRegistry::default(),
@@ -18116,7 +18142,7 @@ impl Checker {
         let refresh_static_list_bindings_ms = initialize_legacy_bindings
             .then(|| typecheck_elapsed_ms(refresh_started))
             .unwrap_or(0.0);
-        let init_profile = CheckerInitProfile {
+        let init_profile = CheckedDatabaseInitProfile {
             checker_init_ms: typecheck_elapsed_ms(checker_init_started),
             source_paths_ms,
             source_payload_shape_table_ms,
@@ -18174,58 +18200,6 @@ impl Checker {
             }
             self.collect_static_list_binding_updates(&statement.children, scope, updates);
         }
-    }
-
-    fn build_checked_program_first(&mut self) -> CheckedProgramBuildOutput {
-        let render_context = render_context_syntax_index(&self.program);
-        self.render_context_function_statements = render_context.function_statements;
-        let render_slot_statements = render_context.render_slot_statements;
-        self.structured_delimiter_fields = structured_delimiter_field_index(&self.program);
-        let builtins = std::mem::replace(
-            &mut self.builtins,
-            BuiltinSignatureRegistry {
-                entries: BTreeMap::new(),
-            },
-        );
-        let render_contracts = std::mem::replace(
-            &mut self.render_contracts,
-            RenderContractRegistry {
-                active_root: "document",
-                roots: BTreeMap::new(),
-            },
-        );
-        let mut output = CheckedProgramBuilder::build(
-            &self.program,
-            OwnedCheckedConstruction {
-                external_types: std::mem::take(&mut self.external_types),
-                render_slot_statements,
-                source_payload_shape_table: std::mem::take(&mut self.source_payload_shape_table),
-                flow_bindings: std::mem::take(&mut self.flow_bindings),
-                expression_owner: std::mem::take(&mut self.expression_owner),
-                structured_delimiter_fields: std::mem::take(&mut self.structured_delimiter_fields),
-                named_value_expressions: std::mem::take(&mut self.declaration_exprs),
-                function_param_requirements: std::mem::take(&mut self.function_param_requirements),
-                builtins,
-                render_contracts,
-            },
-        );
-        let replay_inputs = output
-            .diagnostic_replay_inputs
-            .take()
-            .expect("checked construction must return diagnostic replay inputs");
-        self.source_payload_shape_table = replay_inputs.source_payload_shape_table;
-        self.declaration_exprs = replay_inputs.named_value_expressions;
-        self.builtins = replay_inputs.builtins;
-        self.render_contracts = replay_inputs.render_contracts;
-        self.render_slot_statements = replay_inputs.render_slot_statements;
-        self.structured_delimiter_fields = replay_inputs.structured_delimiter_fields;
-        self.diagnostic_hold_updates = replay_inputs.hold_updates_by_expression;
-
-        // The authoritative CheckedProgram must retain its external environment
-        // while the legacy diagnostic replay still reads it from Checker.
-        // This is the one unavoidable transitional deep clone in this handoff.
-        self.external_types = output.program.external_types.clone();
-        output
     }
 
     /// Populate the compatibility diagnostic walker from the authoritative
@@ -18329,7 +18303,8 @@ impl Checker {
                 }
             }
             self.name_bindings.extend(
-                self.external_types
+                program
+                    .external_types
                     .values
                     .iter()
                     .map(|(path, flow_type)| (path.clone(), flow_type.ty.clone())),
@@ -18345,10 +18320,17 @@ impl Checker {
         self.diagnostic_lookup_misses = 0;
     }
 
+    fn active_external_types(&self) -> &ExternalTypeEnvironment {
+        self.checked_program_for_diagnostics
+            .as_ref()
+            .map(|program| &program.external_types)
+            .unwrap_or(&self.external_types)
+    }
+
     fn finish_program_profiled(
         self,
         output_ownership: CheckOutputOwnership,
-        init_profile: CheckerInitProfile,
+        init_profile: CheckedDatabaseInitProfile,
     ) -> (CheckOutput, TypeCheckProfile) {
         self.finish_program_profiled_impl(output_ownership, init_profile)
     }
@@ -18356,7 +18338,7 @@ impl Checker {
     fn finish_program_profiled_impl(
         mut self,
         output_ownership: CheckOutputOwnership,
-        init_profile: CheckerInitProfile,
+        init_profile: CheckedDatabaseInitProfile,
     ) -> (CheckOutput, TypeCheckProfile) {
         let trace_typecheck = typecheck_trace_enabled();
         let trace_phase = |phase: &str, elapsed_ms: f64| {
@@ -18527,7 +18509,7 @@ impl Checker {
             "named_value_type_table",
             typecheck_elapsed_ms(named_value_type_table_started),
         );
-        let external_allow_unresolved = self.external_types.allow_unresolved;
+        let external_allow_unresolved = self.active_external_types().allow_unresolved;
         let source_payload_syntax_table = std::mem::take(&mut self.source_payload_shape_table);
         let checked_program_post_started = Instant::now();
         let CheckedProgramBuildOutput {
@@ -18536,7 +18518,6 @@ impl Checker {
             exact_pipeline_inputs_valid,
             mut work_counters,
             expression_coverage: _,
-            diagnostic_replay_inputs: _,
         } = build_output;
         trace_phase("checked_program.build", checked_program_build_ms);
         let host_ports_started = Instant::now();
@@ -19454,36 +19435,6 @@ impl Checker {
                     .filter(type_has_known_user_shape)
             })
             .reduce(|existing, extra| merge_canonical_row_type(&existing, &extra))
-    }
-
-    fn function_type_hint_result(&self, function: &str) -> FlowType {
-        let builtin = self
-            .builtins
-            .type_for_call(function, &self.render_contracts);
-        if !matches!(builtin, Type::Unknown) {
-            return FlowType {
-                mode: FlowMode::Continuous,
-                ty: builtin,
-            };
-        }
-        let cached = self
-            .function_return_type_cache
-            .borrow()
-            .get(function)
-            .cloned()
-            .flatten();
-        let inferred =
-            cached.or_else(|| self.user_function_return_type(function, &mut BTreeSet::new()));
-        FlowType {
-            mode: FlowMode::Continuous,
-            ty: inferred.unwrap_or_else(|| {
-                if self.function_statements.contains_key(function) {
-                    open_object_type()
-                } else {
-                    Type::Unknown
-                }
-            }),
-        }
     }
 
     fn function_arg_call_site_type(&self, function: &str, arg: &str) -> Option<Type> {
@@ -20919,478 +20870,9 @@ impl Checker {
         }
     }
 
-    fn infer_expr(&mut self, expr: &AstExpr) -> FlowType {
-        let ty = match &expr.kind {
-            AstExprKind::StringLiteral(_)
-            | AstExprKind::TextLiteral(_)
-            | AstExprKind::TextTemplate { .. } => Type::Text,
-            AstExprKind::Number(_) => Type::Number,
-            AstExprKind::BitsLiteral { width, .. } => Type::Bits { width: *width },
-            AstExprKind::ByteLiteral { .. } => Type::Bytes(BytesType::Fixed(1)),
-            AstExprKind::BytesLiteral { size, items } => {
-                self.infer_bytes_literal(expr, size, items)
-            }
-            AstExprKind::Tag(tag) if tag == "SKIP" => Type::Absent,
-            AstExprKind::Flush { payload } => {
-                if let Some(payload) = payload {
-                    self.ensure_expr(*payload);
-                }
-                Type::Absent
-            }
-            AstExprKind::Tag(tag) => Type::VariantSet(vec![Variant::Tag(tag.clone())].into()),
-            AstExprKind::TaggedObject { tag, fields } => {
-                let shape = ObjectShape::from_ordered_fields(
-                    fields
-                        .iter()
-                        .filter(|field| !field.spread)
-                        .map(|field| (field.name.clone(), self.ensure_expr(field.value).ty)),
-                    false,
-                );
-                self.check_tagged_object_contract(expr, tag, fields, &shape);
-                Type::VariantSet(vec![Variant::tagged(tag.clone(), shape)].into())
-            }
-            AstExprKind::Object(fields) => Type::object(self.infer_record_shape(fields)),
-            AstExprKind::Drain { path } => self.type_for_path(expr.id, &drain_path_parts(path)),
-            AstExprKind::ListLiteral { items, .. } => {
-                let item_type = items
-                    .iter()
-                    .map(|item| self.ensure_expr(*item).ty)
-                    .reduce(|existing, extra| widen_structural_type(&existing, &extra));
-                item_type
-                    .map(|item| Type::List(Type::shared(item)))
-                    .or_else(|| {
-                        exact_expression_statement(&self.program.ast.statements, expr.id).and_then(
-                            |statement| {
-                                self.static_list_statement_type(statement, &mut BTreeSet::new())
-                            },
-                        )
-                    })
-                    .unwrap_or_else(|| Type::List(Type::shared(open_object_type())))
-            }
-            AstExprKind::MapEntry { key, value } => {
-                let key = self.ensure_expr(*key).ty;
-                let value = self.ensure_expr(*value).ty;
-                if !type_is_map_key_safe(&key) && key != Type::Unknown {
-                    self.diagnostics.push(self.diagnostic_for_expr(
-                        expr.id,
-                        format!(
-                            "MAP keys must be closed canonical NUMBER, TEXT, BYTES, BITS, Tag, or object data; found {key:?}"
-                        ),
-                    ));
-                }
-                Type::object(ObjectShape::from_ordered_fields(
-                    [("key".to_owned(), key), ("value".to_owned(), value)],
-                    false,
-                ))
-            }
-            AstExprKind::MapLiteral { entries } => {
-                let mut key_type: Option<Type> = None;
-                let mut value_type: Option<Type> = None;
-                let mut static_keys = BTreeMap::<DataValue, usize>::new();
-                for entry in entries {
-                    if let Some(AstExpr {
-                        kind: AstExprKind::MapEntry { key, .. },
-                        ..
-                    }) = self.program.expressions.get(*entry)
-                        && let Some(key_value) = static_key_value(&self.program, *key)
-                        && let Some(first) = static_keys.insert(key_value, *key)
-                    {
-                        self.diagnostics.push(self.diagnostic_for_expr(
-                            *key,
-                            format!(
-                                "MAP literal contains a statically duplicate key; first equal key is expression {first}"
-                            ),
-                        ));
-                    }
-                    let Type::Object(shape) = self.ensure_expr(*entry).ty else {
-                        continue;
-                    };
-                    if let Some(key) = shape.fields.get("key") {
-                        key_type = Some(key_type.map_or_else(
-                            || key.clone(),
-                            |existing| widen_structural_type(&existing, key),
-                        ));
-                    }
-                    if let Some(value) = shape.fields.get("value") {
-                        value_type = Some(value_type.map_or_else(
-                            || value.clone(),
-                            |existing| widen_structural_type(&existing, value),
-                        ));
-                    }
-                }
-                Type::Map {
-                    key: Box::new(key_type.unwrap_or(Type::Unknown)),
-                    value: Box::new(value_type.unwrap_or(Type::Unknown)),
-                }
-            }
-            AstExprKind::SetLiteral { items } => {
-                let item_type = items
-                    .iter()
-                    .map(|item| self.ensure_expr(*item).ty)
-                    .reduce(|existing, extra| widen_structural_type(&existing, &extra))
-                    .unwrap_or(Type::Unknown);
-                if !type_is_map_key_safe(&item_type) && item_type != Type::Unknown {
-                    self.diagnostics.push(self.diagnostic_for_expr(
-                        expr.id,
-                        format!(
-                            "SET items must be closed canonical NUMBER, TEXT, BYTES, BITS, Tag, or object data; found {item_type:?}"
-                        ),
-                    ));
-                }
-                Type::Set(Type::shared(item_type))
-            }
-            AstExprKind::Call { function, args, .. }
-                if external_function_role(function).is_some() =>
-            {
-                self.check_external_function_call(expr.id, function, None, args)
-            }
-            AstExprKind::Call { function, args, .. } => {
-                for arg in args {
-                    self.ensure_expr(arg.value);
-                }
-                self.check_bytes_builtin_arguments(expr.id, function, args, None);
-                self.check_text_to_number_arguments(expr.id, function, args, false);
-                self.check_number_to_text_arguments(expr.id, function, args, false);
-                self.check_number_round_arguments(function, args);
-                self.check_one_based_arguments(expr.id, function, args);
-                self.check_stream_builtin_arguments(function, None, args);
-                self.check_bits_builtin_arguments(expr.id, function, None, args);
-                self.check_builtin_call_compatibility(expr.id, function, None, args);
-                if self.render_contracts.is_render_constructor(function) {
-                    self.check_style_args(args);
-                    self.check_render_constructor_call_args(expr.id, function, None, args);
-                }
-                if function == "Bool/not" || function == "Bool/toggle" {
-                    let input_flow = args
-                        .first()
-                        .map(|arg| self.ensure_expr(arg.value))
-                        .unwrap_or(FlowType {
-                            mode: FlowMode::Continuous,
-                            ty: Type::Unknown,
-                        });
-                    self.check_true_false_input(expr, function, &input_flow);
-                    true_false_type()
-                } else if matches!(function.as_str(), "Bool/and" | "Bool/or") {
-                    for arg in args {
-                        let arg_flow = self.ensure_expr(arg.value);
-                        self.check_true_false_input(expr, function, &arg_flow);
-                    }
-                    true_false_type()
-                } else if self.render_contracts.is_render_constructor(function) {
-                    self.render_constructor_type_for_args(function, None, args)
-                } else if let Some(ty) = self.contextual_bits_result_type(function, None, args) {
-                    ty
-                } else if let Some(ty) = self.contextual_bytes_result_type(function, None, args) {
-                    ty
-                } else if let Some(ty) = self.typed_list_result_type(function, None, args) {
-                    ty
-                } else if let Some(ty) = self.typed_map_set_result_type(function, None, args) {
-                    ty
-                } else {
-                    self.type_for_call_expr(expr.id, function, None, args)
-                }
-            }
-            AstExprKind::Pipe {
-                input, op, args, ..
-            } if external_function_role(op).is_some() => {
-                let input = pipeline_source_expr_id(
-                    &self.program.ast.statements,
-                    expr.id,
-                    *input,
-                    &self.program.expressions,
-                );
-                self.check_external_function_call(expr.id, op, Some(input), args)
-            }
-            AstExprKind::Pipe {
-                input, op, args, ..
-            } => {
-                let input_expr_id = pipeline_source_expr_id(
-                    &self.program.ast.statements,
-                    expr.id,
-                    *input,
-                    &self.program.expressions,
-                );
-                let input_flow = self.ensure_expr(input_expr_id);
-                let contextual_body_type = contextual_body_parameter_name(op)
-                    .and_then(|body| self.infer_contextual_body_type(&input_flow.ty, args, body));
-                for arg in args {
-                    if contextual_body_parameter_name(op).is_some()
-                        && (arg.is_bare_binding()
-                            || arg.named_name() == contextual_body_parameter_name(op))
-                    {
-                        continue;
-                    }
-                    self.ensure_expr(arg.value);
-                }
-                self.check_bytes_builtin_arguments(expr.id, op, args, Some(input_expr_id));
-                self.check_text_to_number_arguments(expr.id, op, args, true);
-                self.check_number_to_text_arguments(expr.id, op, args, true);
-                self.check_number_round_arguments(op, args);
-                self.check_one_based_arguments(expr.id, op, args);
-                self.check_stream_builtin_arguments(op, Some(input_expr_id), args);
-                self.check_bits_builtin_arguments(expr.id, op, Some(input_expr_id), args);
-                self.check_builtin_call_compatibility(expr.id, op, Some(input_expr_id), args);
-                if self.render_contracts.is_render_constructor(op) {
-                    self.check_style_args(args);
-                    self.check_render_constructor_call_args(expr.id, op, Some(&input_flow), args);
-                }
-                if let Some(field) = op.strip_prefix("Field/") {
-                    match &input_flow.ty {
-                        Type::Object(shape) => {
-                            shape.fields.get(field).cloned().unwrap_or(Type::Unknown)
-                        }
-                        Type::Unknown => Type::Unknown,
-                        _ => Type::Unknown,
-                    }
-                } else if op == "List/map" {
-                    if let (Some(new_expr_id), Some(item_type)) = (
-                        list_map_result_expr_id(
-                            &self.program.ast.statements,
-                            &self.program.expressions,
-                            args,
-                        ),
-                        contextual_body_type.as_ref(),
-                    ) && type_contains_absence(item_type)
-                    {
-                        self.diagnostics.push(self.diagnostic_for_expr(
-                            new_expr_id,
-                            "`SKIP` cannot be used as a `List/map` item".to_owned(),
-                        ));
-                    }
-                    let item_type = contextual_body_type.unwrap_or_else(open_object_type);
-                    Type::List(Type::shared(item_type))
-                } else if matches!(op.as_str(), "List/every" | "List/any" | "List/is_not_empty") {
-                    true_false_type()
-                } else if op == "List/latest" {
-                    list_item_type_from_list_type(&input_flow.ty).unwrap_or_else(open_object_type)
-                } else if op == "SOURCE"
-                    || matches!(
-                        op.as_str(),
-                        "List/filter"
-                            | "List/retain"
-                            | "List/remove"
-                            | "List/sort_by"
-                            | "List/then_by"
-                            | "List/take"
-                    )
-                {
-                    input_flow.ty
-                } else if op == "List/page" {
-                    page_result_type(
-                        list_item_type_from_list_type(&input_flow.ty)
-                            .unwrap_or_else(open_object_type),
-                    )
-                } else if op == "List/append" {
-                    let append_item = args
-                        .iter()
-                        .find(|arg| arg.named_name() == Some("item"))
-                        .map(|arg| self.ensure_expr(arg.value).ty);
-                    match (input_flow.ty, append_item) {
-                        (Type::List(input_item), Some(item_ty)) => {
-                            Type::List(Type::shared(widen_structural_type(&input_item, &item_ty)))
-                        }
-                        (input_ty, _) => input_ty,
-                    }
-                } else if op == "Stream/pulses" {
-                    tag_type("Pulse")
-                } else if op == "Stream/skip" {
-                    input_flow.ty
-                } else if op == "WHILE" {
-                    if !matches!(input_flow.mode, FlowMode::Continuous) {
-                        self.constraints.push(Constraint::FlowCompatible {
-                            actual: input_flow.clone(),
-                            expected: FlowType {
-                                mode: FlowMode::Continuous,
-                                ty: input_flow.ty.clone(),
-                            },
-                        });
-                        self.diagnostics.push(self.diagnostic_for_expr(
-                            input_expr_id,
-                            "`WHILE` requires a continuous selector".to_owned(),
-                        ));
-                    }
-                    self.when_result_type(expr.id).unwrap_or_else(|| {
-                        self.type_for_call_expr(expr.id, op, Some(input_expr_id), args)
-                    })
-                } else if self.render_contracts.is_render_constructor(op) {
-                    self.render_constructor_type_for_args(op, Some(&input_flow), args)
-                } else if op == "Bool/not" || op == "Bool/toggle" {
-                    self.check_true_false_input(expr, op, &input_flow);
-                    true_false_type()
-                } else if matches!(op.as_str(), "Bool/and" | "Bool/or") {
-                    self.check_true_false_input(expr, op, &input_flow);
-                    for arg in args {
-                        let arg_flow = self.ensure_expr(arg.value);
-                        self.check_true_false_input(expr, op, &arg_flow);
-                    }
-                    true_false_type()
-                } else if let Some(ty) =
-                    self.contextual_bits_result_type(op, Some(input_expr_id), args)
-                {
-                    ty
-                } else if let Some(ty) =
-                    self.contextual_bytes_result_type(op, Some(input_expr_id), args)
-                {
-                    ty
-                } else if let Some(ty) = self.typed_list_result_type(op, Some(input_expr_id), args)
-                {
-                    ty
-                } else if let Some(ty) =
-                    self.typed_map_set_result_type(op, Some(input_expr_id), args)
-                {
-                    ty
-                } else {
-                    self.type_for_call_expr(expr.id, op, Some(input_expr_id), args)
-                }
-            }
-            AstExprKind::Draining { input } => {
-                let input = pipeline_source_expr_id(
-                    &self.program.ast.statements,
-                    expr.id,
-                    *input,
-                    &self.program.expressions,
-                );
-                self.ensure_expr(input).ty
-            }
-            AstExprKind::Hold { initial, .. } => {
-                let initial = pipeline_source_expr_id(
-                    &self.program.ast.statements,
-                    expr.id,
-                    *initial,
-                    &self.program.expressions,
-                );
-                self.hold_result_type(expr.id, initial)
-            }
-            AstExprKind::Latest { branches } => self
-                .latest_result_type(branches)
-                .unwrap_or_else(exact_empty_object_type),
-            AstExprKind::When { input, .. } => {
-                if self.expr_id_is_bytes_source_payload_path(*input) {
-                    self.diagnostics.push(self.diagnostic_for_expr(
-                        *input,
-                        "BYTES source payload guards are not supported in v1; use `THEN` to route the BYTES payload or convert it explicitly before matching".to_owned(),
-                    ));
-                }
-                self.when_result_type(expr.id)
-                    .unwrap_or_else(|| self.ensure_expr(*input).ty)
-            }
-            AstExprKind::Then { input, output } => {
-                let input_flow = self.ensure_expr(*input);
-                output
-                    .map(|output| self.ensure_expr(output).ty)
-                    .unwrap_or(input_flow.ty)
-            }
-            AstExprKind::Infix { left, right, op } => {
-                let left_flow = self.ensure_expr(*left);
-                let right_flow = self.ensure_expr(*right);
-                if infix_requires_number_operands(op) {
-                    for (operand, actual) in [(*left, &left_flow.ty), (*right, &right_flow.ty)] {
-                        self.constraints.push(Constraint::Assignable {
-                            actual: actual.clone(),
-                            expected: Type::Number,
-                        });
-                        if !type_is_assignable_to(actual, &Type::Number) {
-                            self.diagnostics.push(self.diagnostic_for_expr(
-                                operand,
-                                format!(
-                                    "operator `{op}` operand has incompatible type\nexpected: NUMBER\nfound: {}",
-                                    boon_facing_type_label(actual)
-                                ),
-                            ));
-                        }
-                    }
-                }
-                if infix_returns_bool(op) {
-                    true_false_type()
-                } else {
-                    Type::Number
-                }
-            }
-            AstExprKind::MatchArm { output, .. } => output
-                .map(|output| self.ensure_expr(output).ty)
-                .unwrap_or_else(|| Type::Absent),
-            AstExprKind::Block { bindings, result } => {
-                for binding in bindings {
-                    self.ensure_expr(binding.value);
-                }
-                result
-                    .map(|result| self.ensure_expr(result).ty)
-                    .unwrap_or(Type::Absent)
-            }
-            AstExprKind::Source => exact_empty_object_type(),
-            AstExprKind::Identifier(value) => {
-                if self.builtin_symbol_exprs.contains(&expr.id) {
-                    Type::Unknown
-                } else if self.is_known_function(value) {
-                    self.diagnostics.push(self.diagnostic_for_expr(
-                        expr.id,
-                        format!("function `{value}` must be called with parentheses: `{value}()`"),
-                    ));
-                    self.expr_type_var(expr.id)
-                } else if let Some(ty) = self
-                    .local_name_bindings
-                    .iter()
-                    .rev()
-                    .find_map(|bindings| bindings.get(value))
-                {
-                    ty.clone()
-                } else if let Some(declaration_expr_id) =
-                    declaration_expr_for_path(&self.declaration_exprs, value)
-                {
-                    let declared = self.ensure_expr(declaration_expr_id).ty;
-                    if is_specific_type(&declared) {
-                        declared
-                    } else {
-                        self.name_bindings.get(value).cloned().unwrap_or(declared)
-                    }
-                } else if let Some(ty) = self.name_bindings.get(value) {
-                    ty.clone()
-                } else {
-                    self.diagnostics.push(
-                        self.diagnostic_for_expr(expr.id, format!("unknown identifier `{value}`")),
-                    );
-                    self.expr_type_var(expr.id)
-                }
-            }
-            AstExprKind::Delimiter => self.infer_delimiter_type(expr.id),
-            AstExprKind::Unknown(tokens)
-                if tokens.len() == 1 && self.is_known_function(&tokens[0]) =>
-            {
-                let function = &tokens[0];
-                self.diagnostics.push(self.diagnostic_for_expr(
-                    expr.id,
-                    format!(
-                        "function `{function}` must be called with parentheses: `{function}()`"
-                    ),
-                ));
-                self.expr_type_var(expr.id)
-            }
-            AstExprKind::Unknown(tokens) if unknown_tokens_are_quoted_text(tokens) => Type::Text,
-            AstExprKind::Unknown(tokens) => {
-                self.diagnostics.push(self.diagnostic_for_expr(
-                    expr.id,
-                    format!("could not infer expression `{}`", tokens.join(" ")),
-                ));
-                self.expr_type_var(expr.id)
-            }
-            AstExprKind::Path(parts) => self.type_for_path(expr.id, parts),
-            AstExprKind::Arrow { .. } => {
-                self.diagnostics.push(self.diagnostic_for_expr(
-                    expr.id,
-                    "unconsumed `=>` expression reached type checking".to_owned(),
-                ));
-                Type::Unknown
-            }
-        };
-        FlowType {
-            mode: self.flow_mode_for_expr(expr),
-            ty,
-        }
-    }
-
     fn is_known_function(&self, name: &str) -> bool {
         self.function_statements.contains_key(name)
-            || self.external_types.functions.contains_key(name)
+            || self.active_external_types().functions.contains_key(name)
             || !matches!(
                 self.builtins.type_for_call(name, &self.render_contracts),
                 Type::Unknown
@@ -22507,10 +21989,10 @@ impl Checker {
             if !self.check_external_role_access(expr_id, producer, &path) {
                 return self.expr_type_var(expr_id);
             }
-            if let Some(flow_type) = self.external_types.values.get(&path) {
+            if let Some(flow_type) = self.active_external_types().values.get(&path) {
                 return flow_type.ty.clone();
             }
-            if !self.external_types.allow_unresolved {
+            if !self.active_external_types().allow_unresolved {
                 self.diagnostics.push(self.diagnostic_for_expr(
                     expr_id,
                     format!("unknown qualified external value `{path}`"),
@@ -22627,7 +22109,7 @@ impl Checker {
         producer: ProgramRole,
         reference: &str,
     ) -> bool {
-        let current = self.external_types.current_role;
+        let current = self.active_external_types().current_role;
         if current == producer {
             self.diagnostics.push(self.diagnostic_for_expr(
                 expr_id,
@@ -22664,14 +22146,19 @@ impl Checker {
         if !self.check_external_role_access(expr_id, producer, function) {
             return self.expr_type_var(expr_id);
         }
-        let Some(signature) = self.external_types.functions.get(function).cloned() else {
+        let Some(signature) = self
+            .active_external_types()
+            .functions
+            .get(function)
+            .cloned()
+        else {
             for argument in call_args {
                 self.ensure_expr(argument.value);
             }
             if let Some(input) = pipe_input {
                 self.ensure_expr(input);
             }
-            if !self.external_types.allow_unresolved {
+            if !self.active_external_types().allow_unresolved {
                 self.diagnostics.push(self.diagnostic_for_expr(
                     expr_id,
                     format!("unknown qualified external function `{function}`"),
@@ -22811,76 +22298,6 @@ impl Checker {
         type_from_longest_binding_prefix(&self.name_bindings, parts)
     }
 
-    fn type_for_call(&self, function: &str) -> Type {
-        if let Some(signature) = self.external_types.functions.get(function) {
-            return signature.result.ty.clone();
-        }
-        let ty = self
-            .builtins
-            .type_for_call(function, &self.render_contracts);
-        if !matches!(ty, Type::Unknown) {
-            return ty;
-        }
-        if self.function_statements.contains_key(function) {
-            self.user_function_return_type(function, &mut BTreeSet::new())
-                .filter(is_specific_type)
-                .unwrap_or_else(open_object_type)
-        } else {
-            Type::Unknown
-        }
-    }
-
-    fn type_for_call_expr(
-        &mut self,
-        expr_id: usize,
-        function: &str,
-        pipe_input: Option<usize>,
-        args: &[AstCallArg],
-    ) -> Type {
-        if let Some(ty) = self
-            .user_function_return_type_for_call(function, pipe_input, args)
-            .filter(is_specific_type)
-        {
-            return ty;
-        }
-        let ty = self.type_for_call(function);
-        if !matches!(ty, Type::Unknown) {
-            return ty;
-        }
-        self.diagnostics.push(self.diagnostic_for_expr(
-            expr_id,
-            format!("unknown function or operator `{function}`"),
-        ));
-        self.expr_type_var(expr_id)
-    }
-
-    fn user_function_return_type_for_call(
-        &mut self,
-        function: &str,
-        pipe_input: Option<usize>,
-        args: &[AstCallArg],
-    ) -> Option<Type> {
-        let argument_expressions = {
-            let parameters = self.function_args_by_name.get(function)?;
-            parameters
-                .iter()
-                .filter(|parameter| parameter.kind == AstParameterKind::Value)
-                .map(|parameter| {
-                    function_call_argument_expr(parameters, &parameter.name, pipe_input, args)
-                })
-                .collect::<Option<Vec<_>>>()?
-        };
-        let argument_types = argument_expressions
-            .into_iter()
-            .map(|expression| self.ensure_expr(expression).ty)
-            .collect::<Vec<_>>();
-        self.cached_user_function_return_type_for_argument_types(
-            function,
-            argument_types,
-            &mut BTreeSet::from([function.to_owned()]),
-        )
-    }
-
     fn cached_user_function_return_type_for_argument_types(
         &self,
         function: &str,
@@ -22925,223 +22342,6 @@ impl Checker {
         result
     }
 
-    fn contextual_bytes_result_type(
-        &mut self,
-        function: &str,
-        piped_input: Option<usize>,
-        args: &[AstCallArg],
-    ) -> Option<Type> {
-        match function {
-            "Bytes/get" => Some(found_or_not_found_type(Type::Bytes(BytesType::Fixed(1)))),
-            "Bytes/set" | "Bytes/write_unsigned" | "Bytes/write_signed" => Some(
-                self.bytes_input_type(piped_input, args)
-                    .unwrap_or(Type::Bytes(BytesType::Dynamic)),
-            ),
-            "Bytes/slice" | "Bytes/take" => Some(Type::Bytes(
-                self.static_bytes_count(args)
-                    .map(BytesType::Fixed)
-                    .unwrap_or(BytesType::Dynamic),
-            )),
-            "Bytes/drop" => Some(Type::Bytes(
-                match (
-                    self.bytes_input_type(piped_input, args),
-                    self.static_bytes_count(args),
-                ) {
-                    (Some(Type::Bytes(BytesType::Fixed(len))), Some(count)) if count <= len => {
-                        BytesType::Fixed(len - count)
-                    }
-                    _ => BytesType::Dynamic,
-                },
-            )),
-            "Bytes/concat" => Some(Type::Bytes(
-                match (
-                    self.bytes_pair_left_type(piped_input, args),
-                    self.bytes_pair_right_type(args),
-                ) {
-                    (
-                        Some(Type::Bytes(BytesType::Fixed(left))),
-                        Some(Type::Bytes(BytesType::Fixed(right))),
-                    ) => left
-                        .checked_add(right)
-                        .map(BytesType::Fixed)
-                        .unwrap_or(BytesType::Dynamic),
-                    _ => BytesType::Dynamic,
-                },
-            )),
-            "Bytes/zeros" => Some(Type::Bytes(
-                self.static_bytes_count(args)
-                    .map(BytesType::Fixed)
-                    .unwrap_or(BytesType::Dynamic),
-            )),
-            "Text/to_bytes" => Some(Type::Bytes(
-                self.static_text_to_bytes_len(piped_input, args)
-                    .map(BytesType::Fixed)
-                    .unwrap_or(BytesType::Dynamic),
-            )),
-            "Bytes/from_hex" => Some(Type::Bytes(
-                self.static_text_input(piped_input, args)
-                    .and_then(|(_, text)| static_hex_decoded_len(&text))
-                    .map(BytesType::Fixed)
-                    .unwrap_or(BytesType::Dynamic),
-            )),
-            "Bytes/from_base64" => Some(Type::Bytes(
-                self.static_text_input(piped_input, args)
-                    .and_then(|(_, text)| static_base64_decoded_len(&text))
-                    .map(BytesType::Fixed)
-                    .unwrap_or(BytesType::Dynamic),
-            )),
-            _ => None,
-        }
-    }
-
-    fn contextual_bits_result_type(
-        &mut self,
-        function: &str,
-        piped_input: Option<usize>,
-        args: &[AstCallArg],
-    ) -> Option<Type> {
-        let exact_bits = |ty: Option<Type>| match ty {
-            Some(Type::Bits { width }) => Some(width),
-            _ => None,
-        };
-
-        match function {
-            "Bits/width" | "Bits/to_number" => Some(Type::Number),
-            "Bits/get" => Some(true_false_type()),
-            "Bits/compare" => Some(bits_comparison_type()),
-            "Bits/set"
-            | "Bits/set_slice"
-            | "Bits/and"
-            | "Bits/or"
-            | "Bits/xor"
-            | "Bits/not"
-            | "Bits/shift_left"
-            | "Bits/shift_right"
-            | "Bits/shift_right_arithmetic"
-            | "Bits/rotate_left"
-            | "Bits/rotate_right"
-            | "Bits/add_or_wrap"
-            | "Bits/subtract_or_wrap" => self.bits_input_type(piped_input, args),
-            "Bits/slice" => self
-                .static_bits_width_arg(args, "count")
-                .map(|width| Type::Bits { width }),
-            "Bits/concat" => exact_bits(self.bits_input_type(piped_input, args))
-                .zip(exact_bits(self.bits_named_arg_type(args, "with")))
-                .and_then(|(left, right)| left.checked_add(right))
-                .filter(|width| *width <= MAX_BITS_WIDTH)
-                .map(|width| Type::Bits { width }),
-            "Bits/zero_extend" | "Bits/sign_extend" | "Bits/truncate" | "Bytes/to_bits" => self
-                .static_bits_width_arg(args, "width")
-                .map(|width| Type::Bits { width }),
-            "Bits/add_widening" => exact_bits(self.bits_input_type(piped_input, args))
-                .and_then(|width| width.checked_add(1))
-                .filter(|width| *width <= MAX_BITS_WIDTH)
-                .map(|width| Type::Bits { width }),
-            "Bits/try_add" => self.bits_input_type(piped_input, args).map(bits_added_type),
-            "Bits/try_subtract" => self
-                .bits_input_type(piped_input, args)
-                .map(bits_subtracted_type),
-            "Number/to_bits" => self
-                .static_bits_width_arg(args, "width")
-                .map(|width| bits_converted_type(Type::Bits { width })),
-            "Bits/to_bytes" => exact_bits(self.bits_input_type(piped_input, args)).map(|width| {
-                Type::Bytes(BytesType::Fixed(
-                    usize::try_from(width / 8).unwrap_or(usize::MAX),
-                ))
-            }),
-            _ => None,
-        }
-    }
-
-    fn bits_input_type(&mut self, piped_input: Option<usize>, args: &[AstCallArg]) -> Option<Type> {
-        piped_input
-            .or_else(|| named_arg_expr(args, "bits"))
-            .map(|expr_id| self.ensure_expr(expr_id).ty)
-    }
-
-    fn bits_named_arg_type(&mut self, args: &[AstCallArg], name: &str) -> Option<Type> {
-        named_arg_expr(args, name).map(|expr_id| self.ensure_expr(expr_id).ty)
-    }
-
-    fn static_bits_width_arg(&self, args: &[AstCallArg], name: &str) -> Option<u32> {
-        named_arg_expr(args, name)
-            .and_then(|expr_id| self.static_integer_literal(expr_id))
-            .and_then(|width| u32::try_from(width).ok())
-            .filter(|width| (1..=MAX_BITS_WIDTH).contains(width))
-    }
-
-    fn typed_list_result_type(
-        &mut self,
-        function: &str,
-        piped_input: Option<usize>,
-        args: &[AstCallArg],
-    ) -> Option<Type> {
-        let list = piped_input
-            .or_else(|| named_arg_expr(args, "list"))
-            .map(|expr_id| self.ensure_expr(expr_id).ty)?;
-        match function {
-            "List/filter" | "List/retain" | "List/remove" | "List/sort_by" | "List/then_by"
-            | "List/take" => Some(list),
-            "List/get" => Some(found_or_not_found_type(
-                list_item_type_from_list_type(&list)
-                    .filter(|item| !matches!(item, Type::Absent))
-                    .unwrap_or_else(open_object_type),
-            )),
-            "List/page" => Some(page_result_type(
-                list_item_type_from_list_type(&list)
-                    .filter(|item| !matches!(item, Type::Absent))
-                    .unwrap_or_else(open_object_type),
-            )),
-            _ => None,
-        }
-    }
-
-    fn typed_map_set_result_type(
-        &mut self,
-        function: &str,
-        piped_input: Option<usize>,
-        args: &[AstCallArg],
-    ) -> Option<Type> {
-        match function {
-            "Map/upsert" | "Map/remove" | "Map/get" => {
-                let map = piped_input
-                    .or_else(|| named_arg_expr(args, "map"))
-                    .map(|expr_id| self.ensure_expr(expr_id).ty)?;
-                match function {
-                    "Map/upsert" | "Map/remove" => Some(map),
-                    "Map/get" => Some(found_or_not_found_type(match map {
-                        Type::Map { value, .. } => *value,
-                        _ => Type::Unknown,
-                    })),
-                    _ => unreachable!(),
-                }
-            }
-            "Set/add" | "Set/remove" | "Set/contains" => {
-                let set = piped_input
-                    .or_else(|| named_arg_expr(args, "set"))
-                    .map(|expr_id| self.ensure_expr(expr_id).ty)?;
-                if function == "Set/contains" {
-                    Some(true_false_type())
-                } else {
-                    Some(set)
-                }
-            }
-            _ => None,
-        }
-    }
-
-    fn bytes_input_type(
-        &mut self,
-        piped_input: Option<usize>,
-        args: &[AstCallArg],
-    ) -> Option<Type> {
-        if let Some(input) = piped_input {
-            return Some(self.ensure_expr(input).ty);
-        }
-        self.named_arg_expr_for_names(args, &["input", "left"])
-            .map(|expr_id| self.ensure_expr(expr_id).ty)
-    }
-
     fn bytes_named_input_type(
         &mut self,
         piped_input: Option<usize>,
@@ -23154,48 +22354,6 @@ impl Checker {
             .iter()
             .find_map(|name| named_arg_expr(args, name))
             .map(|expr_id| self.ensure_expr(expr_id).ty)
-    }
-
-    fn bytes_pair_left_type(
-        &mut self,
-        piped_input: Option<usize>,
-        args: &[AstCallArg],
-    ) -> Option<Type> {
-        if let Some(input) = piped_input {
-            return Some(self.ensure_expr(input).ty);
-        }
-        self.named_arg_expr_for_names(args, &["left", "input"])
-            .map(|expr_id| self.ensure_expr(expr_id).ty)
-    }
-
-    fn bytes_pair_right_type(&mut self, args: &[AstCallArg]) -> Option<Type> {
-        self.named_arg_expr_for_names(args, &["right", "with"])
-            .map(|expr_id| self.ensure_expr(expr_id).ty)
-    }
-
-    fn named_arg_expr_for_names(&self, args: &[AstCallArg], names: &[&str]) -> Option<usize> {
-        args.iter()
-            .find(|arg| arg.named_name().is_some_and(|name| names.contains(&name)))
-            .map(|arg| arg.value)
-    }
-
-    fn static_bytes_count(&self, args: &[AstCallArg]) -> Option<usize> {
-        ["count", "byte_count"].iter().find_map(|name| {
-            named_arg_expr(args, name).and_then(|expr_id| self.static_usize_literal(expr_id))
-        })
-    }
-
-    fn static_text_to_bytes_len(
-        &self,
-        piped_input: Option<usize>,
-        args: &[AstCallArg],
-    ) -> Option<usize> {
-        let (_, text) = self.static_text_input(piped_input, args)?;
-        match self.static_encoding_arg(args)?.as_str() {
-            "Utf8" => Some(text.len()),
-            "Ascii" if text.is_ascii() => Some(text.len()),
-            _ => None,
-        }
     }
 
     fn static_text_input(
@@ -23243,35 +22401,8 @@ impl Checker {
         })
     }
 
-    fn static_usize_literal(&self, expr_id: usize) -> Option<usize> {
-        let value = static_integer_expr(&self.program, expr_id)?;
-        usize::try_from(value).ok()
-    }
-
     fn static_integer_literal(&self, expr_id: usize) -> Option<i128> {
         static_integer_expr(&self.program, expr_id)
-    }
-
-    fn render_constructor_type_for_args(
-        &mut self,
-        function: &str,
-        input_flow: Option<&FlowType>,
-        args: &[AstCallArg],
-    ) -> Type {
-        let mut fields = Vec::new();
-        if let Some(input_flow) = input_flow
-            && !matches!(input_flow.ty, Type::Unknown)
-        {
-            fields.push(("input".to_owned(), input_flow.ty.clone()));
-        }
-        for arg in args {
-            let Some(name) = arg.named_name() else {
-                continue;
-            };
-            let ty = self.ensure_expr(arg.value).ty;
-            fields.push((name.to_owned(), ty));
-        }
-        self.render_contracts.constructor_shape(function, fields)
     }
 
     fn expr_type_var(&mut self, expr_id: usize) -> Type {
@@ -23288,31 +22419,6 @@ impl Checker {
         // it cannot grow the dense table or affect valid-expression coverage.
         self.expr_type_vars.insert_if_in_bounds(expr_id, variable);
         variable
-    }
-
-    fn infer_contextual_body_type(
-        &mut self,
-        input_type: &Type,
-        args: &[AstCallArg],
-        body_parameter: &str,
-    ) -> Option<Type> {
-        let body_expr_id = named_arg_expr(args, body_parameter)?;
-        let Some(binding_name) = args
-            .iter()
-            .find(|arg| arg.is_bare_binding())
-            .and_then(|arg| self.program.expressions.get(arg.value))
-            .and_then(expr_single_name)
-            .map(str::to_owned)
-        else {
-            return Some(self.ensure_expr(body_expr_id).ty);
-        };
-        let input_item_type =
-            list_item_type_from_list_type(input_type).unwrap_or_else(open_object_type);
-        self.local_name_bindings
-            .push(BTreeMap::from([(binding_name, input_item_type)]));
-        let body_type = self.ensure_expr(body_expr_id).ty;
-        self.local_name_bindings.pop();
-        Some(body_type)
     }
 
     fn when_result_type(&mut self, expr_id: usize) -> Option<Type> {
@@ -23396,21 +22502,6 @@ impl Checker {
         result
     }
 
-    fn latest_result_type(&mut self, branch_expr_ids: &[usize]) -> Option<Type> {
-        let mut result: Option<Type> = None;
-        for branch_expr_id in branch_expr_ids.iter().copied() {
-            let branch_type = self.ensure_expr(branch_expr_id).ty;
-            if matches!(branch_type, Type::Absent) {
-                continue;
-            }
-            result = Some(match result {
-                Some(existing) => widen_structural_type(&existing, &branch_type),
-                None => branch_type,
-            });
-        }
-        result
-    }
-
     fn hold_result_type(&mut self, expr_id: usize, initial: usize) -> Type {
         let mut ty = self.ensure_expr(initial).ty;
         let hold_name = self
@@ -23459,7 +22550,7 @@ impl Checker {
     ) -> Option<Type> {
         match &expr.kind {
             AstExprKind::Call { function, args, .. } => {
-                if let Some(signature) = self.external_types.functions.get(function) {
+                if let Some(signature) = self.active_external_types().functions.get(function) {
                     return Some(signature.result.ty.clone());
                 }
                 if self.render_contracts.is_render_constructor(function) {
@@ -24534,135 +23625,6 @@ impl Checker {
         )))
     }
 
-    fn flow_mode_for_expr(&self, expr: &AstExpr) -> FlowMode {
-        #[cfg(test)]
-        self.flow_mode_expression_visits
-            .set(self.flow_mode_expression_visits.get().saturating_add(1));
-        match &expr.kind {
-            AstExprKind::Source => FlowMode::PresentOrAbsent,
-            AstExprKind::Then { .. } => FlowMode::PresentOrAbsent,
-            AstExprKind::Identifier(value) => {
-                if let Some(mode) = flow_binding_mode(&self.flow_bindings, value) {
-                    mode
-                } else if !self
-                    .source_payload_lookup
-                    .source_paths_for_parts(std::slice::from_ref(value))
-                    .is_empty()
-                {
-                    FlowMode::PresentOrAbsent
-                } else {
-                    FlowMode::Continuous
-                }
-            }
-            AstExprKind::Path(parts) => {
-                let path = external_value_path(parts).unwrap_or_else(|| parts.join("."));
-                if let Some(flow_type) = self.external_types.values.get(&path) {
-                    flow_type.mode
-                } else if let Some(mode) = flow_binding_mode(&self.flow_bindings, &path) {
-                    mode
-                } else if path == "element.hovered" || path.ends_with(".element.hovered") {
-                    FlowMode::Continuous
-                } else if !self
-                    .source_payload_lookup
-                    .source_paths_for_parts(parts)
-                    .is_empty()
-                    || path_is_event_payload_parts(parts)
-                {
-                    FlowMode::PresentOrAbsent
-                } else {
-                    FlowMode::Continuous
-                }
-            }
-            AstExprKind::Drain { path } => {
-                let parts = drain_path_parts(path);
-                let path = parts.join(".");
-                flow_binding_mode(&self.flow_bindings, &path).unwrap_or(FlowMode::Continuous)
-            }
-            AstExprKind::Tag(tag) if tag == "SKIP" => FlowMode::Absent,
-            AstExprKind::Call { function, args, .. }
-                if self.external_types.functions.contains_key(function) =>
-            {
-                args.iter()
-                    .map(|arg| self.flow_mode_for_expr_id(arg.value))
-                    .fold(
-                        self.external_types.functions[function].result.mode,
-                        merge_flow_modes,
-                    )
-            }
-            AstExprKind::Call { function, .. }
-                if matches!(function.as_str(), "Stream/pulses" | "Stream/skip") =>
-            {
-                FlowMode::PresentOrAbsent
-            }
-            AstExprKind::Call { args, .. } => args
-                .iter()
-                .map(|arg| self.flow_mode_for_expr_id(arg.value))
-                .fold(FlowMode::Continuous, merge_flow_modes),
-            AstExprKind::Pipe {
-                input, op, args, ..
-            } => {
-                let input = pipeline_source_expr_id(
-                    &self.program.ast.statements,
-                    expr.id,
-                    *input,
-                    &self.program.expressions,
-                );
-                if op == "WHILE" {
-                    FlowMode::Continuous
-                } else if matches!(op.as_str(), "Stream/pulses" | "Stream/skip") {
-                    FlowMode::PresentOrAbsent
-                } else if matches!(op.as_str(), "List/map" | "WHEN") {
-                    self.flow_mode_for_expr_id(input)
-                } else {
-                    args.iter()
-                        .map(|arg| self.flow_mode_for_expr_id(arg.value))
-                        .chain(std::iter::once(self.flow_mode_for_expr_id(input)))
-                        .fold(FlowMode::Continuous, merge_flow_modes)
-                }
-            }
-            AstExprKind::When { input, .. } => self.flow_mode_for_expr_id(*input),
-            AstExprKind::Draining { input } => self.flow_mode_for_expr_id(pipeline_source_expr_id(
-                &self.program.ast.statements,
-                expr.id,
-                *input,
-                &self.program.expressions,
-            )),
-            AstExprKind::Hold { .. } => FlowMode::Continuous,
-            AstExprKind::MatchArm { output, .. }
-                if output.is_none_or(|output| {
-                    self.program
-                        .expressions
-                        .get(output)
-                        .is_some_and(expr_is_skip)
-                }) =>
-            {
-                FlowMode::Absent
-            }
-            _ => FlowMode::Continuous,
-        }
-    }
-
-    fn flow_mode_for_expr_id(&self, expr_id: usize) -> FlowMode {
-        // `infer_expr` ensures children before it computes the parent's mode.
-        // Reuse that completed child mode instead of recursively walking the
-        // already-checked prefix of every linked pipeline. The recursive
-        // fallback remains necessary for topology references that have not
-        // entered provisional inference yet.
-        if let Some(mode) = self
-            .expr_type_cache
-            .get(expr_id)
-            .and_then(|entry| entry.as_ref())
-            .map(|flow_type| flow_type.mode)
-        {
-            return mode;
-        }
-        self.program
-            .expressions
-            .get(expr_id)
-            .map(|expr| self.flow_mode_for_expr(expr))
-            .unwrap_or(FlowMode::Continuous)
-    }
-
     fn expr_id_is_event_payload_path(&self, expr_id: usize) -> bool {
         matches!(
             self.program.expressions.get(expr_id).map(|expr| &expr.kind),
@@ -24872,10 +23834,14 @@ impl Checker {
         call_args: &[AstCallArg],
     ) -> bool {
         if session_info_intrinsic_type(function).is_some() {
-            if !session_info_intrinsic_allowed(function, self.external_types.current_role) {
+            if !session_info_intrinsic_allowed(function, self.active_external_types().current_role)
+            {
                 self.diagnostics.push(self.diagnostic_for_expr(
                     expr_id,
-                    session_info_role_diagnostic(function, self.external_types.current_role),
+                    session_info_role_diagnostic(
+                        function,
+                        self.active_external_types().current_role,
+                    ),
                 ));
             }
             if let Some(input_expr_id) = pipe_input {
@@ -29833,42 +28799,6 @@ fn structured_delimiter_field_index(
     output
 }
 
-#[cfg(test)]
-fn structured_delimiter_statement<'a>(
-    statements: &'a [AstStatement],
-    expressions: &[AstExpr],
-    delimiter: usize,
-) -> Option<&'a AstStatement> {
-    for statement in statements {
-        if let Some(found) =
-            structured_delimiter_statement(&statement.children, expressions, delimiter)
-        {
-            return Some(found);
-        }
-        let owns_delimiter = statement.expr == Some(delimiter)
-            || statement
-                .expr
-                .and_then(|expression| expressions.get(expression))
-                .is_some_and(|expression| {
-                    direct_expression_children(expression).contains(&delimiter)
-                });
-        if owns_delimiter
-            && statement.children.iter().any(|child| {
-                matches!(
-                    child.kind,
-                    AstStatementKind::Field { .. }
-                        | AstStatementKind::Source { field: Some(_), .. }
-                        | AstStatementKind::Hold { field: Some(_), .. }
-                        | AstStatementKind::List { field: Some(_), .. }
-                )
-            })
-        {
-            return Some(statement);
-        }
-    }
-    None
-}
-
 fn named_call_argument_exprs(
     program: &ParsedProgram,
     call_expr_id: usize,
@@ -32744,86 +31674,6 @@ fn collect_declaration_expressions(
 
 fn declaration_expr_for_path(declarations: &DeclarationExprIndex, path: &str) -> Option<usize> {
     declarations.resolve(path)
-}
-
-fn collect_inferred_named_value_types(
-    statements: &[AstStatement],
-    expressions: &[AstExpr],
-    expr_type_cache: &[Option<FlowType>],
-    scope: &mut Vec<String>,
-    types: &mut BTreeMap<String, Type>,
-) {
-    for statement in statements {
-        match &statement.kind {
-            AstStatementKind::Function { .. } => continue,
-            AstStatementKind::Field { name } if matches!(name.as_str(), "document" | "scene") => {
-                continue;
-            }
-            AstStatementKind::Field { name } => {
-                let path = scoped_path(scope, name);
-                if let Some(ty) = inferred_statement_type(statement, expressions, expr_type_cache) {
-                    types.insert(path, ty);
-                }
-                scope.push(name.clone());
-                collect_inferred_named_value_types(
-                    &statement.children,
-                    expressions,
-                    expr_type_cache,
-                    scope,
-                    types,
-                );
-                scope.pop();
-                continue;
-            }
-            AstStatementKind::Hold { field, name, .. } => {
-                if let Some(name) = field.as_ref().or(name.as_ref())
-                    && let Some(ty) =
-                        inferred_statement_type(statement, expressions, expr_type_cache)
-                {
-                    let path = if scope.last() == Some(name) {
-                        scope.join(".")
-                    } else {
-                        scoped_path(scope, name)
-                    };
-                    types.insert(path, ty);
-                }
-            }
-            AstStatementKind::List {
-                field: Some(name), ..
-            }
-            | AstStatementKind::Source {
-                field: Some(name), ..
-            } => {
-                if let Some(ty) = inferred_statement_type(statement, expressions, expr_type_cache) {
-                    types.insert(scoped_path(scope, name), ty);
-                }
-            }
-            AstStatementKind::Block
-            | AstStatementKind::List { field: None, .. }
-            | AstStatementKind::Source { field: None, .. }
-            | AstStatementKind::Spread
-            | AstStatementKind::Expression => {}
-        }
-        collect_inferred_named_value_types(
-            &statement.children,
-            expressions,
-            expr_type_cache,
-            scope,
-            types,
-        );
-    }
-}
-
-fn inferred_statement_type(
-    statement: &AstStatement,
-    expressions: &[AstExpr],
-    expr_type_cache: &[Option<FlowType>],
-) -> Option<Type> {
-    statement_pipeline_final_expr_id(statement, expressions)
-        .or_else(|| direct_statement_value_expr_id(statement, expressions))
-        .and_then(|expr_id| expr_type_cache.get(expr_id))
-        .and_then(Option::as_ref)
-        .map(|flow| flow.ty.clone())
 }
 
 fn collect_flow_bindings(
@@ -37857,10 +36707,6 @@ fn type_contains_absence(ty: &Type) -> bool {
         | Type::Unknown
         | Type::UnresolvedShape { .. } => false,
     }
-}
-
-fn expr_is_skip(expr: &AstExpr) -> bool {
-    matches!(&expr.kind, AstExprKind::Tag(tag) if tag == "SKIP")
 }
 
 fn open_object_type() -> Type {

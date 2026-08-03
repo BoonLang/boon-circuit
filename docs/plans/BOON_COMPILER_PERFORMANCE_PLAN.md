@@ -512,11 +512,27 @@ Current cold-diagnostics candidate evidence:
   rebuild still takes 1m35s, independently confirming that the later measured
   crate/relink boundary remains open. This is another directional owner-level
   result, not fresh percentile or Phase 1 acceptance evidence.
-- Item 7 is still incomplete: the lifetime-free checker and builder remain two
-  construction owners. Fuse checked construction into one owned database,
-  then complete measured compact/name interning and worklist reductions,
-  scaling/parity evidence, and the fresh adversarial review. Regenerate the
-  full cold protocol after the final Phase 1 edit.
+- Item 7's owned construction is now complete inside `boon_typecheck`:
+  `CheckedProgramDatabase` directly owns checked construction, exact ordered
+  diagnostic projection, and final report assembly. The separate `Checker`,
+  `CheckedProgramBuilder`, owned-input bundle, replay-input bundle, repeated
+  named-value table owner, and post-seal external-environment deep clone are
+  deleted. Compiler-proven unreachable recursive inference/report helpers are
+  also deleted rather than retained as a second latent engine; the complete
+  source diff is net 1,153 lines smaller and production plus test-target checks
+  have no dead-code warnings. The fixed 35.4 MB tuple oracle, exact digest,
+  clean audit, all 78 ordinary tests, and both product-scale ignored gates pass
+  with every work counter unchanged. Fresh/empty allocation work is
+  1,732,728/1,732,734 calls and 210,213,846/210,278,443 bytes, exactly one call
+  and 48 bytes below the preceding checkpoint in each mode. Six alternating-
+  pair release medians are 213.89/212.96 ms total and 158.70/157.43 ms
+  typecheck. This is an ownership/deletion result rather than a new percentile
+  claim. The locked release rebuild remains 1m35s even after the source cut,
+  confirming that the later measured crate/downstream-relink boundary remains
+  open. Next complete measured compact/name interning and dominant contextual-
+  scheme/inference worklist reductions, then scaling/parity evidence and the
+  fresh adversarial review. Regenerate the full cold protocol after the final
+  Phase 1 edit.
 
 Development profiles and focused debug tests remain directional tools. The
 acceptance producer remains the revision-identified `release` binary required
@@ -809,16 +825,18 @@ compiler-service work or any later repository plan:
    modes and their RSS/scaling gates. A crate checkpoint or a parser-only win
    does not permit moving to semantic work while this exit is red.
 
-Current resumption after the first passing cold-diagnostics candidate: finish
-item 7's owned database inside `boon_typecheck` rather than performing another
-crate move. The parsed snapshot and both construction owners are now
-lifetime-free; next remove the duplicate checker/builder construction owner.
-Then complete the measured compact/name interning and reduce the dominant
+Current resumption after the first passing cold-diagnostics candidate: item 7's
+single owned `CheckedProgramDatabase` is complete inside `boon_typecheck`; do
+not recreate a checker/builder handoff or a latent recursive production engine.
+Next complete measured compact/name interning and reduce the dominant
 contextual-scheme/inference worklists before the Phase 1 scaling,
-malformed-source/parity, and fresh adversarial checks. Reprofile every
-owner-level slice and rerun the complete three-setup/30-scored cold protocol
-after the final Phase 1 edit; checkpoint `677d09d`'s narrow empty-session result
-cannot be reused across these source changes.
+malformed-source/parity, and fresh adversarial checks. Use the unchanged 1m35s
+release rebuild after the net source deletion as evidence when evaluating the
+next ownership/dependency crate boundary, but accept a split only under the
+measured split gates above. Reprofile every owner-level slice and rerun the
+complete three-setup/30-scored cold protocol after the final Phase 1 edit;
+checkpoint `677d09d`'s narrow empty-session result cannot be reused across
+these source changes.
 
 Once diagnostics pass, use the same loop for semantic component retention,
 single manifest sealing, verified lowering, streaming/hash memory, and backend

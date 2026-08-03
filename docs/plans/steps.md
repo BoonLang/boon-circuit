@@ -100,11 +100,21 @@ stronger three-reviewer performance closure defined below.
    all 80 tests pass. Fresh/empty allocation work falls to
    1,732,729/1,732,735 calls and 210,213,894/210,278,491 bytes; six-pair release
    medians are 214.35/212.82 ms total and 158.87/158.18 ms typecheck. This is
-   directional rather than Phase 1 acceptance. The first tranche still includes
-   fusing the duplicate checker/builder into one owned database, remaining
-   interning, scaling/parity evidence, and the fresh Phase 1 adversarial review.
-   Reprofile after each owner-level slice and regenerate the complete cold
-   protocol after the final edit. Then close
+   directional rather than Phase 1 acceptance. Checked construction, ordered
+   diagnostics, and report assembly are now fused into one
+   `CheckedProgramDatabase`; the two prior owners and transfer bundles, the
+   post-seal external-environment clone, and compiler-proven dead recursive
+   inference/report helpers are deleted. The source diff is net 1,153 lines
+   smaller. The fixed tuple oracle, exact digest, clean audit, all 78 ordinary
+   tests, and both product gates pass with unchanged work. Fresh/empty
+   allocation work is 1,732,728/1,732,734 calls and
+   210,213,846/210,278,443 bytes; six-pair medians are 213.89/212.96 ms total
+   and 158.70/157.43 ms typecheck. The unchanged 1m35s release rebuild keeps the
+   measured crate/downstream-relink boundary open. The first tranche still
+   includes remaining compact/name interning, dominant contextual/inference
+   worklist reduction, scaling/parity evidence, and the fresh Phase 1
+   adversarial review. Reprofile after each owner-level slice and regenerate
+   the complete cold protocol after the final edit. Then close
    semantic sealing, proof, backend, hashing, and memory until both verified-
    plan modes pass; only afterward may persistent-session warm work satisfy its
    separate gates.

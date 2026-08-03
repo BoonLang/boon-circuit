@@ -273,10 +273,20 @@ Current checkpoints to preserve and audit rather than redo:
   tests pass. Fresh/empty allocation work falls to 1,732,729/1,732,735 calls and
   210,213,894/210,278,491 bytes. Six-pair release medians are 214.35/212.82 ms
   total and 158.87/158.18 ms typecheck. This remains directional, not Phase 1
-  acceptance. Continue with the one-owned-database checker/builder fusion,
-  remaining measured interning/worklist owners, scaling/parity proof, and fresh
-  adversarial review before regenerating the full protocol after the final
-  edit;
+  acceptance. The subsequent owned-database slice fuses checked construction,
+  ordered diagnostic projection, and report assembly into one
+  `CheckedProgramDatabase`; it deletes `Checker`, `CheckedProgramBuilder`, both
+  transfer bundles, the duplicate named-value owner, the post-seal external
+  environment clone, and compiler-proven dead recursive inference/report
+  helpers. The source diff is net 1,153 lines smaller. The fixed tuple oracle,
+  exact digest, clean audit, all 78 ordinary tests, and both product-scale gates
+  pass with unchanged work. Fresh/empty allocation work is
+  1,732,728/1,732,734 calls and 210,213,846/210,278,443 bytes; six-pair release
+  medians are 213.89/212.96 ms total and 158.70/157.43 ms typecheck. The release
+  rebuild remains 1m35s, so the later measured crate/downstream-relink boundary
+  remains open. Continue with remaining measured compact/name interning and
+  contextual-scheme/inference worklist owners, scaling/parity proof, and fresh
+  adversarial review before regenerating the full protocol after the final edit;
 - the current compiler-throughput checkpoint keeps Counter, physical TodoMVC,
   and NovyWave `MachinePlan` output deterministic while replacing copied OUT
   type environments with active-path overlays, retaining canonical-root-reading

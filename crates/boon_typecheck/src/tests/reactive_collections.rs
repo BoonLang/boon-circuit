@@ -499,7 +499,7 @@ result: make() |> consume()
     )
     .unwrap();
     {
-        let (checker, _) = Checker::new_profiled(&parsed);
+        let (checker, _) = CheckedProgramDatabase::new_profiled(&parsed);
         let statement = checker
             .function_statement("make")
             .expect("make function statement");

@@ -164,7 +164,7 @@ fn ordered_checked_diagnostic_projection_matches_recursive_oracle() {
         ownership: CheckOutputOwnership,
         mode: CheckedDiagnosticProjectionMode,
     ) -> CheckOutput {
-        let (mut checker, profile) = Checker::new_profiled(parsed);
+        let (mut checker, profile) = CheckedProgramDatabase::new_profiled(parsed);
         checker.checked_diagnostic_projection_mode = mode;
         checker.finish_program_profiled(ownership, profile).0
     }
@@ -241,7 +241,8 @@ bad_pipe: 1 |> identity(wrong: 2)
                 "ordered projection diverged for {path} in {ownership:?}"
             );
             if ownership == CheckOutputOwnership::DiagnosticsOwned {
-                let (lean_checker, lean_profile) = Checker::new_diagnostics_profiled(&parsed);
+                let (lean_checker, lean_profile) =
+                    CheckedProgramDatabase::new_diagnostics_profiled(&parsed);
                 let lean = lean_checker
                     .finish_program_profiled(CheckOutputOwnership::DiagnosticsOwned, lean_profile)
                     .0;
@@ -258,7 +259,7 @@ bad_pipe: 1 |> identity(wrong: 2)
 #[ignore = "product-scale checked diagnostic projection parity gate"]
 fn ordered_checked_diagnostic_projection_matches_product_examples() {
     fn project(parsed: &ParsedProgram, mode: CheckedDiagnosticProjectionMode) -> CheckOutput {
-        let (mut checker, profile) = Checker::new_profiled(parsed);
+        let (mut checker, profile) = CheckedProgramDatabase::new_profiled(parsed);
         checker.checked_diagnostic_projection_mode = mode;
         checker
             .finish_program_profiled(CheckOutputOwnership::ReportOwned, profile)
@@ -267,9 +268,9 @@ fn ordered_checked_diagnostic_projection_matches_product_examples() {
 
     fn project_diagnostics(parsed: &ParsedProgram, legacy_bindings: bool) -> CheckOutput {
         let (checker, profile) = if legacy_bindings {
-            Checker::new_profiled(parsed)
+            CheckedProgramDatabase::new_profiled(parsed)
         } else {
-            Checker::new_diagnostics_profiled(parsed)
+            CheckedProgramDatabase::new_diagnostics_profiled(parsed)
         };
         checker
             .finish_program_profiled(CheckOutputOwnership::DiagnosticsOwned, profile)
@@ -702,7 +703,7 @@ fn provisional_flow_mode_visits_for_pipeline(pipe_count: usize) -> (usize, usize
     let parsed = boon_parser::parse_source("flow-mode-linear.bn", &source)
         .expect("generated boolean pipeline parses");
     let expression_count = parsed.expressions.len();
-    let (mut checker, _) = Checker::new_profiled(&parsed);
+    let (mut checker, _) = CheckedProgramDatabase::new_profiled(&parsed);
     for statement in &parsed.ast.statements {
         checker.check_statement(&parsed, statement, false);
     }
@@ -936,7 +937,7 @@ FUNCTION second(item) {
         .collect::<Vec<_>>();
     assert_eq!(identity_calls.len(), 2);
 
-    let (checker, _) = Checker::new_profiled(&parsed);
+    let (checker, _) = CheckedProgramDatabase::new_profiled(&parsed);
     checker.function_call_return_type_cache_misses.set(0);
     let equal_shape = || {
         Type::object(ObjectShape {
@@ -1516,8 +1517,8 @@ FUNCTION lane_row(row) {
 }
 
 #[test]
-#[ignore = "large NovyWave checked-builder determinism gate"]
-fn novywave_checked_builder_is_seed_free_and_deterministic() {
+#[ignore = "large NovyWave checked-database determinism gate"]
+fn novywave_checked_database_is_seed_free_and_deterministic() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/novywave");
     let units = [
         "hold.bn",
@@ -1539,7 +1540,7 @@ fn novywave_checked_builder_is_seed_free_and_deterministic() {
     .collect::<Vec<_>>();
     let parsed = boon_parser::parse_project("RUN.bn", units).expect("NovyWave project parses");
     let run = || {
-        let (checker, init_profile) = Checker::new_profiled(&parsed);
+        let (checker, init_profile) = CheckedProgramDatabase::new_profiled(&parsed);
         let (output, profile) =
             checker.finish_program_profiled(CheckOutputOwnership::DiagnosticsOwned, init_profile);
         (output, profile.work_counters)

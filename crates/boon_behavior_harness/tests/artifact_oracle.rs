@@ -1,6 +1,6 @@
 #![cfg(feature = "test-flat-oracle")]
 
-use boon_behavior_harness::{BehaviorAsset, BehaviorHarness};
+use boon_behavior_harness::{BehaviorAsset, BehaviorEffectTranscript, BehaviorHarness};
 use boon_compiler::{CompileRequest, CompilerSourceUnit, compile_artifact_oracle_pair};
 use boon_document::{
     DocumentFrame, DocumentNodeId, DocumentNodeKind, EmbeddedProgramDescriptor,
@@ -16,14 +16,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 struct BehaviorFrame {
     root: BehaviorNode,
     focus: Option<Vec<usize>>,
     scroll_roots: Vec<(Vec<usize>, ScrollState)>,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 struct BehaviorNode {
     kind: DocumentNodeKind,
     text: Option<TextValue>,
@@ -43,14 +43,34 @@ struct OracleRuntime {
     plan: Arc<boon_plan::MachinePlan>,
 }
 
+#[derive(Clone, Debug)]
+struct OracleObservation {
+    behavior: BehaviorFrame,
+    semantic: boon_persistence::RestoreImage,
+    store_epoch: u64,
+    turn_trace: Vec<boon_behavior_harness::BehaviorTurnTrace>,
+}
+
 impl OracleRuntime {
-    fn new(plan: boon_plan::MachinePlan, assets: &[BehaviorAsset]) -> Result<Self, String> {
+    fn new_recording(
+        plan: boon_plan::MachinePlan,
+        assets: &[BehaviorAsset],
+    ) -> Result<Self, String> {
         let plan = Arc::new(plan);
         let harness = BehaviorHarness::new(
             Arc::clone(&plan),
             assets,
             workspace_root().join("target/boon-behavior-harness"),
         )?;
+        Ok(Self { harness, plan })
+    }
+
+    fn new_replaying(
+        plan: boon_plan::MachinePlan,
+        transcript: BehaviorEffectTranscript,
+    ) -> Result<Self, String> {
+        let plan = Arc::new(plan);
+        let harness = BehaviorHarness::replay(Arc::clone(&plan), transcript)?;
         Ok(Self { harness, plan })
     }
 
@@ -64,6 +84,18 @@ impl OracleRuntime {
 
     fn behavior(&self) -> BehaviorFrame {
         behavior_frame(self.harness.frame())
+    }
+
+    fn observation(&self) -> Result<OracleObservation, String> {
+        let mut semantic = self.harness.semantic_value_image()?;
+        let store_epoch = semantic.epoch;
+        semantic.epoch = 0;
+        Ok(OracleObservation {
+            behavior: self.behavior(),
+            semantic,
+            store_epoch,
+            turn_trace: self.harness.turn_trace().to_vec(),
+        })
     }
 
     fn diagnostic_roots(&mut self) -> Vec<(String, String)> {
@@ -84,6 +116,41 @@ impl OracleRuntime {
         })
         .collect()
     }
+}
+
+fn assert_matches_observation(
+    expected: &OracleObservation,
+    runtime: &OracleRuntime,
+) -> Result<(), String> {
+    let actual = runtime.observation()?;
+    if expected.behavior != actual.behavior {
+        return Err(format!(
+            "document frame differs: {}",
+            first_behavior_difference(&expected.behavior, &actual.behavior)
+        ));
+    }
+    if expected.semantic != actual.semantic {
+        return Err(format!(
+            "semantic image differs after normalizing only store-local epoch {}/{}: {}",
+            expected.store_epoch,
+            actual.store_epoch,
+            first_restore_difference(&runtime.plan, &expected.semantic, &actual.semantic),
+        ));
+    }
+    if expected.turn_trace != actual.turn_trace {
+        let index = expected
+            .turn_trace
+            .iter()
+            .zip(&actual.turn_trace)
+            .position(|(left, right)| left != right)
+            .unwrap_or_else(|| expected.turn_trace.len().min(actual.turn_trace.len()));
+        return Err(format!(
+            "runtime turn trace differs at index {index}: expected={:?} actual={:?}",
+            expected.turn_trace.get(index),
+            actual.turn_trace.get(index),
+        ));
+    }
+    Ok(())
 }
 
 fn assert_same_behavior(left: &OracleRuntime, right: &OracleRuntime) -> Result<(), String> {
@@ -411,6 +478,63 @@ fn behavior_frame(frame: &DocumentFrame) -> BehaviorFrame {
 }
 
 #[test]
+fn retained_and_flat_share_one_real_host_effect_transcript() -> Result<(), String> {
+    let source = r#"
+store: [
+    fire: SOURCE
+    random:
+        NotRequested |> HOLD random {
+            fire |> THEN { Random/bytes(byte_count: 8) }
+        }
+]
+
+document: Document/new(
+    root: Element/label(
+        element: [events: [press: store.fire]]
+        label: TEXT { Generate }
+    )
+)
+"#;
+    let pair = compile_artifact_oracle_pair(CompileRequest::source_text(
+        "effect-transcript-oracle.bn",
+        source,
+        TargetProfile::SoftwareBounded,
+        ProgramRole::Client,
+        ApplicationIdentity::new("dev.boon.effect-transcript", "test", "local"),
+    ))
+    .map_err(|error| error.to_string())?;
+    let step = ScenarioStep {
+        id: "generate".to_owned(),
+        user_action_kind: Some("click".to_owned()),
+        user_action_text: Some("Generate".to_owned()),
+        user_action_key: None,
+        source_event: Some(boon_runtime::ScenarioSourceEvent {
+            source: "store.fire".to_owned(),
+            target_list: None,
+            target_key: None,
+            target_generation: None,
+            target_text: Some("Generate".to_owned()),
+            target_occurrence: None,
+            payload: boon_runtime::SourcePayload::default(),
+        }),
+        expectations: Vec::new(),
+    };
+
+    let mut retained = OracleRuntime::new_recording(pair.retained, &[])?;
+    retained.dispatch_step(&step)?;
+    let expected = retained.observation()?;
+    let transcript = retained.harness.recorded_effect_transcript()?;
+    if transcript.is_empty() {
+        return Err("real-host effect transcript unexpectedly contains no events".to_owned());
+    }
+
+    let mut flat = OracleRuntime::new_replaying(pair.flat_specialized, transcript)?;
+    flat.dispatch_step(&step)?;
+    flat.harness.assert_effect_replay_consumed()?;
+    assert_matches_observation(&expected, &flat)
+}
+
+#[test]
 #[ignore = "full real-host NovyWave artifact oracle; run explicitly with the optimized test profile"]
 fn retained_novywave_matches_flat_real_host_scenario_and_restart() -> Result<(), String> {
     let example = load_novywave()?;
@@ -438,30 +562,41 @@ fn retained_novywave_matches_flat_real_host_scenario_and_restart() -> Result<(),
 
     let retained_plan = pair.retained.clone();
     let flat_plan = pair.flat_specialized.clone();
-    let mut retained = OracleRuntime::new(pair.retained, &example.assets)?;
-    let mut flat = OracleRuntime::new(pair.flat_specialized, &example.assets)?;
-    assert_same_behavior(&retained, &flat)?;
+    let mut retained = OracleRuntime::new_recording(pair.retained, &example.assets)?;
+    let mut observations = vec![retained.observation()?];
     for step in &example.scenario.steps {
         retained.dispatch_step(step)?;
-        flat.dispatch_step(step)?;
-        assert_same_behavior(&retained, &flat)
-            .map_err(|error| format!("step `{}`: {error}", step.id))?;
         let retained_assertion = retained.assert_step(step);
-        let flat_assertion = flat.assert_step(step);
-        if retained_assertion.is_err() || flat_assertion.is_err() {
+        if let Err(error) = retained_assertion {
             let retained_roots = retained.diagnostic_roots();
+            return Err(format!(
+                "step `{}` retained authored scenario mismatch: {error}; roots={retained_roots:?}",
+                step.id,
+            ));
+        }
+        observations.push(retained.observation()?);
+    }
+    retained.harness.settle()?;
+    let scenario_transcript = retained.harness.recorded_effect_transcript()?;
+
+    let mut flat =
+        OracleRuntime::new_replaying(pair.flat_specialized, scenario_transcript.clone())?;
+    assert_matches_observation(&observations[0], &flat)?;
+    for (step, expected) in example.scenario.steps.iter().zip(&observations[1..]) {
+        flat.dispatch_step(step)?;
+        assert_matches_observation(expected, &flat)
+            .map_err(|error| format!("step `{}`: {error}", step.id))?;
+        if let Err(error) = flat.assert_step(step) {
             let flat_roots = flat.diagnostic_roots();
             return Err(format!(
-                "step `{}` authored scenario mismatch: retained={:?} roots={retained_roots:?}; flat={:?} roots={flat_roots:?}",
+                "step `{}` flat replay authored scenario mismatch: {error}; roots={flat_roots:?}",
                 step.id,
-                retained_assertion.err(),
-                flat_assertion.err(),
             ));
         }
     }
-
-    retained.harness.settle()?;
     flat.harness.settle()?;
+    flat.harness.assert_effect_replay_consumed()?;
+    assert_same_behavior(&retained, &flat)?;
     let retained_artifact = retained.harness.export_state_artifact()?;
     let flat_artifact = flat.harness.export_state_artifact()?;
     let retained_transfer = boon_persistence::decode_application_transfer(
@@ -520,36 +655,51 @@ fn retained_novywave_matches_flat_real_host_scenario_and_restart() -> Result<(),
         return Err("corrupt NovyWave import changed live semantic state".to_owned());
     }
 
-    flat.harness
+    let mut activated_retained =
+        OracleRuntime::new_recording(retained_plan.clone(), &example.assets)?;
+    activated_retained
+        .harness
         .activate_state_artifact(&retained_artifact)
-        .map_err(|error| format!("activate retained artifact in live flat runtime: {error}"))?;
-    assert_same_behavior(&retained, &flat)
-        .map_err(|error| format!("cross-activate retained artifact into flat runtime: {error}"))?;
+        .map_err(|error| format!("activate retained artifact in retained runtime: {error}"))?;
+    let activation_transcript = activated_retained.harness.recorded_effect_transcript()?;
+    let mut activated_flat =
+        OracleRuntime::new_replaying(flat_plan.clone(), activation_transcript.clone())?;
+    activated_flat
+        .harness
+        .activate_state_artifact(&retained_artifact)
+        .map_err(|error| format!("activate retained artifact after flat restart: {error}"))?;
+    activated_flat.harness.assert_effect_replay_consumed()?;
+    assert_same_behavior(&retained, &activated_retained)
+        .map_err(|error| format!("retained artifact restart changed behavior: {error}"))?;
+    assert_same_behavior(&activated_retained, &activated_flat)
+        .map_err(|error| format!("flat restart from retained artifact: {error}"))?;
 
-    let migrated = flat.harness.export_state_artifact()?;
-    let mut restarted_retained = OracleRuntime::new(retained_plan, &example.assets)?;
+    let migrated = activated_flat.harness.export_state_artifact()?;
+    let mut restarted_retained = OracleRuntime::new_recording(retained_plan, &example.assets)?;
     restarted_retained
         .harness
         .activate_state_artifact(&migrated)
         .map_err(|error| format!("activate migrated artifact after retained restart: {error}"))?;
-    assert_same_behavior(&flat, &restarted_retained)
-        .map_err(|error| format!("retained restart from migrated artifact: {error}"))?;
-
-    let mut restarted_flat = OracleRuntime::new(flat_plan, &example.assets)?;
+    let restart_transcript = restarted_retained.harness.recorded_effect_transcript()?;
+    let mut restarted_flat = OracleRuntime::new_replaying(flat_plan, restart_transcript.clone())?;
     restarted_flat
         .harness
-        .activate_state_artifact(&retained_artifact)
-        .map_err(|error| format!("activate retained artifact after flat restart: {error}"))?;
-    assert_same_behavior(&retained, &restarted_flat)
-        .map_err(|error| format!("flat restart from retained artifact: {error}"))?;
+        .activate_state_artifact(&migrated)
+        .map_err(|error| format!("activate migrated artifact after flat restart: {error}"))?;
+    restarted_flat.harness.assert_effect_replay_consumed()?;
+    assert_same_behavior(&restarted_retained, &restarted_flat)
+        .map_err(|error| format!("retained/flat restart from migrated artifact: {error}"))?;
 
     eprintln!(
-        "novywave behavior artifact oracle: steps={} stable_contract={} retained_plan={} flat_plan={} state_artifact_bytes={}",
+        "novywave behavior artifact oracle: steps={} stable_contract={} retained_plan={} flat_plan={} state_artifact_bytes={} scenario_effect_events={} activation_effect_events={} restart_effect_events={}",
         example.scenario.steps.len(),
         retained_contract,
         retained_hash,
         flat_hash,
         retained_artifact.len(),
+        scenario_transcript.event_count(),
+        activation_transcript.event_count(),
+        restart_transcript.event_count(),
     );
     Ok(())
 }

@@ -426,6 +426,13 @@ pub struct ResetApplicationBatch {
     pub next_epoch: u64,
     pub source_schema_hash: [u8; 32],
     pub default_image: RestoreImage,
+    /// Exact authority work emitted while constructing the replacement from
+    /// its defaults. Reset and activation are one durable transaction.
+    pub through_turn_sequence: u64,
+    #[serde(default)]
+    pub authority_changes: Vec<DurableChange>,
+    #[serde(default)]
+    pub outbox_changes: Vec<DurableOutboxChange>,
     pub checksum: [u8; 32],
 }
 
@@ -453,6 +460,11 @@ pub struct ActivationBatch {
     pub target_schema_hash: [u8; 32],
     pub through_turn_sequence: u64,
     pub authority_changes: Vec<DurableChange>,
+    /// Host-effect outbox work emitted by the runtime activation itself. This
+    /// is committed atomically with schema/authority replacement so the new
+    /// runtime can never become visible without its startup effects.
+    #[serde(default)]
+    pub outbox_changes: Vec<DurableOutboxChange>,
     pub completed_migration_edges: Vec<MigrationEdgeId>,
     pub deleted_memory: Vec<MemoryId>,
     #[serde(default)]
@@ -468,6 +480,11 @@ impl ActivationBatch {
     pub fn seal(mut self) -> Self {
         self.checksum = activation_checksum(&self);
         self
+    }
+
+    pub fn with_outbox_changes(mut self, outbox_changes: Vec<DurableOutboxChange>) -> Self {
+        self.outbox_changes = outbox_changes;
+        self.seal()
     }
 
     pub fn between(current: &RestoreImage, candidate: &RestoreImage) -> Result<Self, StoreError> {
@@ -585,6 +602,7 @@ impl ActivationBatch {
             target_schema_hash: candidate.schema_hash,
             through_turn_sequence: candidate.through_turn_sequence,
             authority_changes,
+            outbox_changes: Vec::new(),
             completed_migration_edges,
             deleted_memory,
             target_content_artifact_manifest: candidate.content_artifact_manifest.clone(),
@@ -2171,9 +2189,16 @@ fn apply_reset_to_image(
         return Err(StoreError::SchemaMismatch);
     }
 
+    if batch.through_turn_sequence < current.through_turn_sequence {
+        return Err(StoreError::NonContiguousTurn);
+    }
+
     let mut reset = batch.default_image.clone();
+    apply_changes(&mut reset, &batch.authority_changes)?;
+    apply_durable_outbox_changes(&mut reset.outbox, &batch.outbox_changes)?;
+    validate_outbox(&reset.outbox)?;
     reset.epoch = batch.next_epoch;
-    reset.through_turn_sequence = current.through_turn_sequence;
+    reset.through_turn_sequence = batch.through_turn_sequence;
     let ack = ResetApplicationAck {
         epoch: reset.epoch,
         schema_version: reset.schema_version,
@@ -2205,6 +2230,8 @@ fn apply_activation_to_image(
 
     let mut candidate = current;
     apply_changes(&mut candidate, &batch.authority_changes)?;
+    apply_durable_outbox_changes(&mut candidate.outbox, &batch.outbox_changes)?;
+    validate_outbox(&candidate.outbox)?;
     for memory in &batch.deleted_memory {
         candidate.scalars.remove(memory);
         candidate.lists.remove(memory);
@@ -2764,6 +2791,13 @@ fn validate_reset(batch: &ResetApplicationBatch) -> Result<(), StoreError> {
             "start-over target schema version must be positive".to_owned(),
         ));
     }
+    if batch.through_turn_sequence < batch.default_image.through_turn_sequence {
+        return Err(StoreError::NonContiguousTurn);
+    }
+    let mut activated_default = batch.default_image.clone();
+    apply_changes(&mut activated_default, &batch.authority_changes)?;
+    apply_durable_outbox_changes(&mut activated_default.outbox, &batch.outbox_changes)?;
+    validate_outbox(&activated_default.outbox)?;
     Ok(())
 }
 
@@ -2893,7 +2927,7 @@ fn checkpoint_checksum(batch: &CheckpointBatch) -> [u8; 32] {
 
 fn reset_checksum(batch: &ResetApplicationBatch) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(b"boon.persistence.reset.v1");
+    hasher.update(b"boon.persistence.reset.v2");
     hash_application(&mut hasher, &batch.application);
     hasher.update(batch.expected_base_epoch.to_be_bytes());
     hasher.update(batch.next_epoch.to_be_bytes());
@@ -2904,12 +2938,15 @@ fn reset_checksum(batch: &ResetApplicationBatch) -> [u8; 32] {
     hasher.update(batch.default_image.epoch.to_be_bytes());
     hasher.update(batch.default_image.through_turn_sequence.to_be_bytes());
     hash_content_artifact_manifest(&mut hasher, &batch.default_image.content_artifact_manifest);
+    hasher.update(batch.through_turn_sequence.to_be_bytes());
+    hash_changes(&mut hasher, &batch.authority_changes);
+    hash_outbox_changes(&mut hasher, &batch.outbox_changes);
     hasher.finalize().into()
 }
 
 fn activation_checksum(batch: &ActivationBatch) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(b"boon.persistence.activation.v3");
+    hasher.update(b"boon.persistence.activation.v4");
     hash_application(&mut hasher, &batch.application);
     hasher.update(batch.expected_base_epoch.to_be_bytes());
     hasher.update(batch.next_epoch.to_be_bytes());
@@ -2918,6 +2955,7 @@ fn activation_checksum(batch: &ActivationBatch) -> [u8; 32] {
     hasher.update(batch.target_schema_hash);
     hasher.update(batch.through_turn_sequence.to_be_bytes());
     hash_changes(&mut hasher, &batch.authority_changes);
+    hash_outbox_changes(&mut hasher, &batch.outbox_changes);
     for edge in &batch.completed_migration_edges {
         hasher.update(edge.as_bytes());
     }
@@ -3913,6 +3951,9 @@ mod tests {
             next_epoch: 1,
             source_schema_hash: [1; 32],
             default_image: RestoreImage::empty(application(), 1, [1; 32]),
+            through_turn_sequence: 0,
+            authority_changes: Vec::new(),
+            outbox_changes: Vec::new(),
             checksum: [0; 32],
         }
         .seal();
@@ -4215,6 +4256,7 @@ mod tests {
             target_schema_hash: [2; 32],
             through_turn_sequence: 1,
             authority_changes: Vec::new(),
+            outbox_changes: Vec::new(),
             completed_migration_edges: Vec::new(),
             deleted_memory: Vec::new(),
             target_content_artifact_manifest: target_manifest.clone(),
@@ -4265,6 +4307,7 @@ mod tests {
             target_schema_hash: [3; 32],
             through_turn_sequence: 1,
             authority_changes: Vec::new(),
+            outbox_changes: Vec::new(),
             completed_migration_edges: Vec::new(),
             deleted_memory: Vec::new(),
             target_content_artifact_manifest: ContentArtifactManifest {
@@ -4519,6 +4562,7 @@ mod tests {
                     value: number(7),
                 },
             }],
+            outbox_changes: Vec::new(),
             completed_migration_edges: Vec::new(),
             deleted_memory: vec![memory("count")],
             target_content_artifact_manifest: ContentArtifactManifest::default(),
@@ -4565,6 +4609,7 @@ mod tests {
                     value: number(3),
                 },
             }],
+            outbox_changes: Vec::new(),
             completed_migration_edges: Vec::new(),
             deleted_memory: vec![old_memory],
             target_content_artifact_manifest: ContentArtifactManifest::default(),
@@ -4806,7 +4851,7 @@ mod tests {
     }
 
     #[test]
-    fn reset_application_clears_every_durable_domain_and_preserves_monotonicity() {
+    fn reset_application_atomically_replaces_authority_and_startup_outbox() {
         let mut driver = seeded_driver();
         let current = driver.applications.get_mut(&application()).unwrap();
         current.epoch = 4;
@@ -4818,19 +4863,31 @@ mod tests {
                 value: number(7),
             },
         );
-        let item = pending_outbox(7, 9);
-        current.outbox.insert(item.item_id, item);
+        let old_item = pending_outbox(7, 9);
+        let old_item_id = old_item.item_id;
+        current.outbox.insert(old_item_id, old_item);
         current
             .completed_migration_edges
             .insert(MigrationEdgeId([9; 32]));
 
         let default_image = RestoreImage::empty(application(), 2, [2; 32]);
+        let new_item = pending_outbox(8, 10);
+        let new_item_id = new_item.item_id;
         let batch = ResetApplicationBatch {
             application: application(),
             expected_base_epoch: 4,
             next_epoch: 5,
             source_schema_hash: [1; 32],
             default_image,
+            through_turn_sequence: 10,
+            authority_changes: vec![DurableChange::SetScalar {
+                memory_id: memory("fresh_count"),
+                value: StoredScalar {
+                    touched: true,
+                    value: number(1),
+                },
+            }],
+            outbox_changes: vec![DurableOutboxChange::Enqueue { item: new_item }],
             checksum: [0; 32],
         }
         .seal();
@@ -4839,18 +4896,27 @@ mod tests {
             PersistenceResult::ApplicationReset(Ok(ResetApplicationAck {
                 epoch: 5,
                 schema_version: 2,
-                through_turn_sequence: 9,
+                through_turn_sequence: 10,
                 ..
             }))
         ));
         let reset = driver.image(&application()).unwrap();
-        assert!(reset.scalars.is_empty());
+        assert!(!reset.scalars.contains_key(&memory("count")));
+        assert_eq!(reset.scalars[&memory("fresh_count")].value, number(1));
         assert!(reset.lists.is_empty());
         assert!(reset.completed_migration_edges.is_empty());
-        assert!(reset.outbox.is_empty());
+        assert!(!reset.outbox.contains_key(&old_item_id));
+        assert_eq!(
+            reset
+                .outbox
+                .get(&new_item_id)
+                .unwrap()
+                .created_turn_sequence,
+            10
+        );
         assert_eq!(reset.schema_hash, [2; 32]);
         assert_eq!(reset.epoch, 5);
-        assert_eq!(reset.through_turn_sequence, 9);
+        assert_eq!(reset.through_turn_sequence, 10);
         assert!(matches!(
             driver.execute(PersistenceCommand::ResetApplication(batch)),
             PersistenceResult::ApplicationReset(Err(StoreError::StaleEpoch))

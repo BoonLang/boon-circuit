@@ -735,7 +735,7 @@ impl ProgramSession {
     pub fn start(artifact: ProgramArtifact) -> Result<Self, ProgramDiagnostic> {
         let limits = program_limits(artifact.capability_profile());
         let id = artifact.session_id();
-        let runtime = LiveRuntime::from_machine_template(
+        let activation = LiveRuntime::from_machine_template(
             artifact.machine_template(),
             SessionOptions {
                 program_revision: artifact.revision(),
@@ -750,6 +750,24 @@ impl ProgramSession {
                 error.to_string(),
             )
         })?;
+        let (runtime, initial_turn, base_turn_sequence) = activation.into_parts();
+        if initial_turn.sequence != base_turn_sequence
+            || !initial_turn.deltas.is_empty()
+            || !initial_turn.authority_deltas.is_empty()
+            || !initial_turn.durable_changes.is_empty()
+            || !initial_turn.outbox_changes.is_empty()
+            || !initial_turn.transient_effects.is_empty()
+            || !initial_turn.cancelled_transient_effects.is_empty()
+            || !initial_turn.transient_effect_credit_grants.is_empty()
+            || !initial_turn.distributed_invocations.is_empty()
+        {
+            return Err(ProgramDiagnostic::new(
+                artifact.revision(),
+                ProgramDiagnosticPhase::Start,
+                "embedded program startup produced host work before the program host activation handoff"
+                    .to_owned(),
+            ));
+        }
         Ok(Self {
             id,
             artifact,

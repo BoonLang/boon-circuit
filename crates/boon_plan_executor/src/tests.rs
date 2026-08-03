@@ -603,7 +603,7 @@ fn root_value_comparison_tracks_both_state_inputs() {
         indexed: false,
         unresolved_executable_ref_count: 0,
     };
-    let mut session = MachineInstance::new(
+    let mut session = MachineInstance::new_quiescent(
         plan(
             RootOutputDemand::All,
             row_expressions,
@@ -656,7 +656,7 @@ fn phase_elapsed_metrics_are_scoped_to_source_and_boundary_work() {
         indexed: false,
         unresolved_executable_ref_count: 0,
     };
-    let mut session = MachineInstance::new(
+    let mut session = MachineInstance::new_quiescent(
         plan(
             RootOutputDemand::All,
             row_expressions,
@@ -692,7 +692,7 @@ fn phase_elapsed_metrics_are_scoped_to_source_and_boundary_work() {
 fn fully_qualified_state_lookup_wins_over_an_unrelated_field_local_name() {
     let mut row_expressions = PlanRowExpressionArena::new();
     let expression = row_constant(&mut row_expressions, PlanConstantId(1));
-    let mut session = MachineInstance::new(
+    let mut session = MachineInstance::new_quiescent(
         plan(
             RootOutputDemand::All,
             row_expressions,
@@ -763,9 +763,11 @@ fn authority_restore_preserves_touched_value_equal_to_old_default() {
         )
     };
 
-    let untouched = MachineInstance::new(make_plan(0), SessionOptions::default()).unwrap();
+    let untouched =
+        MachineInstance::new_quiescent(make_plan(0), SessionOptions::default()).unwrap();
     let semantic_default = untouched.semantic_value_image().unwrap();
-    let mut original = MachineInstance::new(make_plan(0), SessionOptions::default()).unwrap();
+    let mut original =
+        MachineInstance::new_quiescent(make_plan(0), SessionOptions::default()).unwrap();
     let turn = original.apply(event(&original, 1, 0, None)).unwrap();
     assert!(turn.deltas.is_empty());
     assert_eq!(
@@ -790,7 +792,7 @@ fn authority_restore_preserves_touched_value_equal_to_old_default() {
         .unwrap()
         .restore_durable(durable)
         .unwrap()
-        .build()
+        .build_quiescent()
         .unwrap();
     assert_eq!(
         restored.authority_snapshot().unwrap().states[&StateId(0)].value,
@@ -820,7 +822,7 @@ fn failed_turn_rolls_back_authority_and_touch_provenance() {
         Vec::new(),
         Vec::new(),
     );
-    let mut session = MachineInstance::new(machine, SessionOptions::default()).unwrap();
+    let mut session = MachineInstance::new_quiescent(machine, SessionOptions::default()).unwrap();
     let before = session.authority_snapshot().unwrap();
 
     assert!(session.apply(event(&session, 1, 0, None)).is_err());
@@ -846,7 +848,7 @@ fn unsettled_turn_can_rollback_authority_sequence_and_durable_delta() {
         Vec::new(),
         Vec::new(),
     );
-    let mut session = MachineInstance::new(machine, SessionOptions::default()).unwrap();
+    let mut session = MachineInstance::new_quiescent(machine, SessionOptions::default()).unwrap();
     let before = session.authority_snapshot().unwrap();
 
     let turn = session.apply(event(&session, 1, 0, None)).unwrap();
@@ -903,7 +905,7 @@ fn contextual_any_evaluates_typed_local_projections() {
         source,
         body,
     );
-    let session = MachineInstance::new(
+    let session = MachineInstance::new_quiescent(
         plan(
             RootOutputDemand::All,
             row_expressions,
@@ -1005,7 +1007,7 @@ fn contextual_collection_operations_cover_map_filter_retain_every_any_and_find()
         vec![ValueRef::List(ListId(0))],
         Some(expression),
     ));
-    let session = MachineInstance::new(
+    let session = MachineInstance::new_quiescent(
         plan(
             RootOutputDemand::All,
             row_expressions,
@@ -1110,7 +1112,7 @@ fn nested_contextual_collections_disambiguate_same_local_id_by_owner() {
         outer_source,
         inner,
     );
-    let session = MachineInstance::new(
+    let session = MachineInstance::new_quiescent(
         plan(
             RootOutputDemand::All,
             row_expressions,
@@ -1503,7 +1505,8 @@ fn dynamic_row_dependencies_invalidate_consumers_across_lists() {
         0,
         10,
     ));
-    let mut session = MachineInstance::new(machine_plan, SessionOptions::default()).unwrap();
+    let mut session =
+        MachineInstance::new_quiescent(machine_plan, SessionOptions::default()).unwrap();
 
     assert!(matches!(
         session.snapshot().unwrap().fields[&FieldId(30)],
@@ -1554,7 +1557,7 @@ fn mapped_range_initializes_range_columns() {
         range: Some(PlanRangeInitializer { from: 3, to: 4 }),
         initial_rows: Vec::new(),
     };
-    let session = MachineInstance::new(
+    let session = MachineInstance::new_quiescent(
         plan(
             RootOutputDemand::Selected(Vec::new()),
             PlanRowExpressionArena::new(),
@@ -1708,7 +1711,7 @@ fn unscoped_source_updates_every_row_owned_by_indexed_state() {
         indexed: true,
         unresolved_executable_ref_count: 0,
     };
-    let mut session = MachineInstance::new(
+    let mut session = MachineInstance::new_quiescent(
         plan(
             RootOutputDemand::Selected(Vec::new()),
             row_expressions,
@@ -1864,7 +1867,7 @@ fn machine_build_task_slices_full_authority_restore_and_runtime_rebuild() {
     let synchronous = MachineInstanceBuilder::new(machine.clone(), SessionOptions::default())
         .unwrap()
         .restore(authority.clone())
-        .build()
+        .build_quiescent()
         .unwrap();
     let durable_machine = machine.clone();
     let mut task = MachineInstanceBuilder::new(machine, SessionOptions::default())
@@ -1880,7 +1883,9 @@ fn machine_build_task_slices_full_authority_restore_and_runtime_rebuild() {
                 MachineBuildPhase::RuntimeState => rebuild_polls += 1,
                 _ => {}
             },
-            MachineBuildPoll::Ready(session) => break session,
+            MachineBuildPoll::Ready(activation) => {
+                break activation.into_quiescent_machine().unwrap();
+            }
         }
     };
     assert!(
@@ -1915,7 +1920,9 @@ fn machine_build_task_slices_full_authority_restore_and_runtime_rebuild() {
                 MachineBuildPhase::RestoreAuthority => authority_polls += 1,
                 _ => {}
             },
-            MachineBuildPoll::Ready(session) => break session,
+            MachineBuildPoll::Ready(activation) => {
+                break activation.into_quiescent_machine().unwrap();
+            }
         }
     };
     assert!(
@@ -1992,7 +1999,7 @@ fn list_map_records_preserve_source_row_identity() {
         body,
     );
     let map = derived(0, 0, vec![ValueRef::List(ListId(0))], Some(expression));
-    let session = MachineInstance::new(
+    let session = MachineInstance::new_quiescent(
         plan(
             RootOutputDemand::All,
             row_expressions,
@@ -2034,7 +2041,7 @@ fn selected_demand_stays_current_without_eager_unrequested_work() {
     );
     let unsupported_unrequested = derived(1, 1, Vec::new(), None);
     let update = const_update(&mut row_expressions, 2, 0, 0, 1);
-    let mut session = MachineInstance::new(
+    let mut session = MachineInstance::new_quiescent(
         plan(
             RootOutputDemand::Selected(vec![FieldId(0)]),
             row_expressions,
@@ -2151,7 +2158,7 @@ fn state_backed_deep_dependency_plan(depth: usize) -> MachinePlan {
 #[test]
 fn default_stack_state_backed_dependency_chain_survives_dirty_and_redemand() {
     const DEPTH: usize = 4_096;
-    let mut session = MachineInstance::new(
+    let mut session = MachineInstance::new_quiescent(
         state_backed_deep_dependency_plan(DEPTH),
         SessionOptions::default(),
     )
@@ -2287,7 +2294,8 @@ fn default_stack_deep_acyclic_chunk_length_and_window_chain_is_iterative() {
     const DEPTH: usize = 1_024;
     let deepest = ListId(DEPTH);
     let mut session =
-        MachineInstance::new(deep_chunk_chain_plan(DEPTH), SessionOptions::default()).unwrap();
+        MachineInstance::new_quiescent(deep_chunk_chain_plan(DEPTH), SessionOptions::default())
+            .unwrap();
 
     assert_eq!(session.list_logical_len_current(deepest).unwrap(), 1);
     assert!(
@@ -2344,7 +2352,7 @@ fn cyclic_chunk_plan() -> MachinePlan {
 #[test]
 fn default_stack_worklist_failures_clean_currentness_for_retry() {
     const DEPTH: usize = 512;
-    let mut budgeted = MachineInstance::new(
+    let mut budgeted = MachineInstance::new_quiescent(
         deep_acyclic_dependency_plan(DEPTH),
         SessionOptions {
             max_work_units_per_transaction: Some(32),
@@ -2362,7 +2370,8 @@ fn default_stack_worklist_failures_clean_currentness_for_retry() {
         assert_eq!(budgeted.root_value_current("chain.0").unwrap(), number(7));
     }
 
-    let mut cyclic = MachineInstance::new(cyclic_chunk_plan(), SessionOptions::default()).unwrap();
+    let mut cyclic =
+        MachineInstance::new_quiescent(cyclic_chunk_plan(), SessionOptions::default()).unwrap();
     for entry in [ListId(0), ListId(1), ListId(0)] {
         assert_eq!(
             cyclic.list_logical_len_current(entry),
@@ -2396,9 +2405,9 @@ fn deterministic_work_budget_bounds_startup_without_affecting_unbounded_sessions
         )
     };
 
-    MachineInstance::new(make_plan(), SessionOptions::default())
+    MachineInstance::new_quiescent(make_plan(), SessionOptions::default())
         .expect("trusted sessions remain unbounded by default");
-    let error = MachineInstance::new(
+    let error = MachineInstance::new_quiescent(
         make_plan(),
         SessionOptions {
             max_work_units_per_transaction: Some(0),
@@ -2434,7 +2443,7 @@ fn source_turn_work_budget_rolls_back_authority_and_current_outputs() {
     };
     let source_value = row_field(&mut row_expressions, ValueRef::State(StateId(0)));
     let current_value = row_field(&mut row_expressions, ValueRef::State(StateId(1)));
-    let mut session = MachineInstance::new(
+    let mut session = MachineInstance::new_quiescent(
         plan(
             RootOutputDemand::Selected(vec![FieldId(1)]),
             row_expressions,
@@ -2518,7 +2527,7 @@ fn materializing_a_row_field_does_not_invalidate_list_structure_consumers() {
         indexed: true,
         unresolved_executable_ref_count: 0,
     };
-    let mut session = MachineInstance::new(
+    let mut session = MachineInstance::new_quiescent(
         plan(
             RootOutputDemand::Selected(vec![FieldId(0)]),
             row_expressions,
@@ -2579,7 +2588,7 @@ fn source_transform_captures_event_before_later_demand() {
         indexed: false,
         unresolved_executable_ref_count: 0,
     };
-    let mut session = MachineInstance::new(
+    let mut session = MachineInstance::new_quiescent(
         plan(
             RootOutputDemand::Selected(Vec::new()),
             row_expressions,
@@ -2667,7 +2676,7 @@ fn source_transform_keeps_precommit_state_for_the_event_turn() {
             constant_id: PlanConstantId(0),
         },
     };
-    let mut session = MachineInstance::new(
+    let mut session = MachineInstance::new_quiescent(
         plan(
             RootOutputDemand::All,
             row_expressions,
@@ -2706,7 +2715,7 @@ fn reverse_dependencies_recompute_every_dependent_once() {
     let left = row_field(&mut row_expressions, ValueRef::State(StateId(0)));
     let right = row_field(&mut row_expressions, ValueRef::State(StateId(0)));
     let update = const_update(&mut row_expressions, 2, 0, 0, 1);
-    let mut session = MachineInstance::new(
+    let mut session = MachineInstance::new_quiescent(
         plan(
             RootOutputDemand::All,
             row_expressions,
@@ -2756,7 +2765,7 @@ fn same_turn_recompute_does_not_suppress_later_invalidation() {
     };
     let first_update = const_update(&mut row_expressions, 2, 0, 0, 1);
     let second_update = const_update(&mut row_expressions, 4, 0, 0, 2);
-    let mut session = MachineInstance::new(
+    let mut session = MachineInstance::new_quiescent(
         plan(
             RootOutputDemand::All,
             row_expressions,
@@ -2806,7 +2815,7 @@ fn recursive_derived_reentry_returns_typed_cycle_error() {
         vec![ValueRef::Field(FieldId(0))],
         Some(right_expression),
     );
-    let error = MachineInstance::new(
+    let error = MachineInstance::new_quiescent(
         plan(
             RootOutputDemand::Selected(vec![FieldId(0)]),
             row_expressions,
@@ -2956,7 +2965,7 @@ fn explicit_dependency_cycle_boundary_returns_application_tag_and_recovers() {
         indexed: true,
         unresolved_executable_ref_count: 0,
     };
-    let mut session = MachineInstance::new(
+    let mut session = MachineInstance::new_quiescent(
         plan(
             RootOutputDemand::Selected(Vec::new()),
             row_expressions,
@@ -3086,7 +3095,7 @@ fn remove_then_append_allocates_a_new_row_identity() {
         indexed: true,
         unresolved_executable_ref_count: 0,
     };
-    let mut session = MachineInstance::new(
+    let mut session = MachineInstance::new_quiescent(
         plan(
             RootOutputDemand::Selected(Vec::new()),
             row_expressions,
@@ -3188,7 +3197,8 @@ fn authority_restore_preserves_an_explicitly_emptied_list_and_allocator() {
         vec![(ListId(0), "items")],
         vec![(FieldId(0), "items.value")],
     );
-    let mut session = MachineInstance::new(machine.clone(), SessionOptions::default()).unwrap();
+    let mut session =
+        MachineInstance::new_quiescent(machine.clone(), SessionOptions::default()).unwrap();
     let original = session.list_rows(ListId(0))[0];
     session
         .apply(event(&session, 1, 0, Some(original)))
@@ -3207,7 +3217,7 @@ fn authority_restore_preserves_an_explicitly_emptied_list_and_allocator() {
         .unwrap()
         .restore_durable(durable)
         .unwrap()
-        .build()
+        .build_quiescent()
         .unwrap();
     assert!(restored.list_rows(ListId(0)).is_empty());
     assert_eq!(
@@ -3303,7 +3313,8 @@ fn indexed_override_does_not_materialize_the_whole_default_list() {
         vec![(ListId(0), "cells")],
         vec![(FieldId(0), "cells.formula")],
     );
-    let mut session = MachineInstance::new(machine.clone(), SessionOptions::default()).unwrap();
+    let mut session =
+        MachineInstance::new_quiescent(machine.clone(), SessionOptions::default()).unwrap();
     let selected = session.list_rows(ListId(0))[1];
     let turn = session
         .apply(event(&session, 1, 0, Some(selected)))
@@ -3325,7 +3336,7 @@ fn indexed_override_does_not_materialize_the_whole_default_list() {
         .unwrap()
         .restore_durable(durable)
         .unwrap()
-        .build()
+        .build_quiescent()
         .unwrap();
     let snapshot = restored.snapshot().unwrap();
     assert_eq!(snapshot.lists[&ListId(0)].len(), 2);
@@ -3403,7 +3414,8 @@ fn activation_restored_root_state_is_available_to_indexed_default_reconstruction
         vec![(ListId(0), "rows")],
         vec![(FieldId(0), "rows.value")],
     );
-    let mut session = MachineInstance::new(machine.clone(), SessionOptions::default()).unwrap();
+    let mut session =
+        MachineInstance::new_quiescent(machine.clone(), SessionOptions::default()).unwrap();
     session.apply(event(&session, 1, 0, None)).unwrap();
     let durable = session
         .durable_restore_image(1, Default::default())
@@ -3412,7 +3424,7 @@ fn activation_restored_root_state_is_available_to_indexed_default_reconstruction
         .unwrap()
         .restore_durable(durable)
         .unwrap()
-        .build()
+        .build_quiescent()
         .unwrap();
     let Value::List(rows) = restored
         .inspect_list_field_current(ListId(0), FieldId(0), 1)
@@ -3553,7 +3565,8 @@ fn activation_derived_default_is_reconstructed_before_sparse_row_override() {
         vec![(FieldId(0), "rows.id"), (FieldId(1), "rows.value")],
     );
     set_list_activation_mode(&mut machine, ListId(0), ListActivationMode::DerivedDefault);
-    let mut session = MachineInstance::new(machine.clone(), SessionOptions::default()).unwrap();
+    let mut session =
+        MachineInstance::new_quiescent(machine.clone(), SessionOptions::default()).unwrap();
     let rows = session.list_rows_current(ListId(0)).unwrap();
     assert_eq!(rows.len(), 1);
     session.apply(event(&session, 1, 0, Some(rows[0]))).unwrap();
@@ -3568,7 +3581,7 @@ fn activation_derived_default_is_reconstructed_before_sparse_row_override() {
         .unwrap()
         .restore_durable(durable)
         .unwrap()
-        .build()
+        .build_quiescent()
         .unwrap();
     let snapshot = restored.snapshot().unwrap();
     assert_eq!(snapshot.lists[&ListId(0)].len(), 1);
@@ -3663,7 +3676,8 @@ fn activation_materialized_authority_stays_durable_even_with_a_list_computation(
         ListId(0),
         ListActivationMode::MaterializedAuthority,
     );
-    let mut session = MachineInstance::new(machine.clone(), SessionOptions::default()).unwrap();
+    let mut session =
+        MachineInstance::new_quiescent(machine.clone(), SessionOptions::default()).unwrap();
     let turn = session.apply(event(&session, 1, 0, None)).unwrap();
     assert!(matches!(
         turn.durable_changes.as_slice(),
@@ -3679,14 +3693,14 @@ fn activation_materialized_authority_stays_durable_even_with_a_list_computation(
         .unwrap()
         .restore_durable(durable)
         .unwrap()
-        .build()
+        .build_quiescent()
         .unwrap();
     assert_eq!(restored.list_rows(ListId(0)).len(), 1);
 }
 
 #[test]
 fn non_monotonic_source_sequences_are_rejected() {
-    let mut session = MachineInstance::new(
+    let mut session = MachineInstance::new_quiescent(
         plan(
             RootOutputDemand::Selected(Vec::new()),
             PlanRowExpressionArena::new(),
@@ -3760,7 +3774,7 @@ fn flush_is_private_until_the_named_root_boundary() {
             .any(|(_, node)| { matches!(node, PlanRowExpressionNode::FlushBoundary { .. }) })
     );
 
-    let mut session = MachineInstance::new(
+    let mut session = MachineInstance::new_quiescent(
         plan(
             RootOutputDemand::All,
             row_expressions,
@@ -3821,7 +3835,7 @@ fn flushing_state_update_preserves_prior_state_and_later_activation_recovers() {
         unresolved_executable_ref_count: 0,
     };
     let exposed_result = derived(2, 0, vec![ValueRef::State(StateId(0))], Some(exposed));
-    let mut session = MachineInstance::new(
+    let mut session = MachineInstance::new_quiescent(
         plan(
             RootOutputDemand::All,
             row_expressions,
@@ -3949,7 +3963,7 @@ fn collection_flush_uses_first_semantic_position_and_bypasses_downstream_work() 
             input: downstream_count,
         },
     );
-    let mut session = MachineInstance::new(
+    let mut session = MachineInstance::new_quiescent(
         plan(
             RootOutputDemand::All,
             row_expressions,
@@ -4076,7 +4090,7 @@ fn flushed_state_chain_suppresses_dispatch_without_cancelling_prior_effect() {
     machine.effects.push(contract);
     machine.capability_summary = derive_capability_summary(&machine);
 
-    let mut session = MachineInstance::new(machine, SessionOptions::default()).unwrap();
+    let mut session = MachineInstance::new_quiescent(machine, SessionOptions::default()).unwrap();
     let dispatched = session.apply(event(&session, 1, 1, None)).unwrap();
     assert_eq!(dispatched.transient_effects.len(), 1);
     assert_eq!(session.pending_transient_effect_count(), 1);
@@ -4171,7 +4185,7 @@ fn flushed_state_chain_discards_staged_list_mutation() {
         range: None,
         initial_rows: Vec::new(),
     };
-    let mut session = MachineInstance::new(
+    let mut session = MachineInstance::new_quiescent(
         plan(
             RootOutputDemand::All,
             row_expressions,
@@ -4399,7 +4413,7 @@ fn current_detached_capture_rows(session: &mut MachineInstance) -> Vec<RowSnapsh
 
 #[test]
 fn detached_state_captures_retain_distinct_source_row_values() {
-    let mut session = MachineInstance::new(
+    let mut session = MachineInstance::new_quiescent(
         detached_capture_materialization_plan(DetachedCaptureDeclaration::TargetCapture),
         SessionOptions::default(),
     )
@@ -4417,7 +4431,7 @@ fn detached_state_captures_retain_distinct_source_row_values() {
 
 #[test]
 fn detached_state_capture_is_published_before_indexed_state_initialization() {
-    let mut session = MachineInstance::new(
+    let mut session = MachineInstance::new_quiescent(
         detached_capture_materialization_plan(DetachedCaptureDeclaration::TargetCapture),
         SessionOptions::default(),
     )
@@ -4481,7 +4495,7 @@ fn detached_state_captures_do_not_escape_spread_materialization_or_facades() {
             indexed_access: None,
         },
     );
-    let session = MachineInstance::new(
+    let session = MachineInstance::new_quiescent(
         plan(
             RootOutputDemand::All,
             row_expressions,
@@ -4533,7 +4547,7 @@ fn detached_state_capture_field_identity_fails_closed() {
         ),
         ("non-Capture field", DetachedCaptureDeclaration::TargetValue),
     ] {
-        let error = match MachineInstance::new(
+        let error = match MachineInstance::new_quiescent(
             detached_capture_materialization_plan(declaration),
             SessionOptions::default(),
         ) {

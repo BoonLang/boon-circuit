@@ -1,5 +1,5 @@
 use boon_persistence::{
-    ActivationAck, BarrierAck, BarrierRequest, BrowserPersistenceEnqueueError,
+    ActivationAck, ActivationBatch, BarrierAck, BarrierRequest, BrowserPersistenceEnqueueError,
     BrowserPersistenceOperation, BrowserStorageStatus, CheckpointBatch, CommitAck, CompactAck,
     CompactRequest, InspectRequest, MigrationError, MigrationPreview, PersistenceCommand,
     PersistenceInspectorSnapshot, PersistenceResult, ResetApplicationAck, ResetApplicationBatch,
@@ -8,8 +8,8 @@ use boon_persistence::{
 };
 use boon_plan::{MachinePlan, SourceRouteToken};
 use boon_runtime::{
-    DocumentPatch, LiveRuntime, LiveRuntimeBuildPoll, MachineTemplate, RuntimeTurn, SessionOptions,
-    SourceEvent, SourcePayload, TurnMetrics, Value,
+    DocumentPatch, LiveRuntime, LiveRuntimeBuildPoll, MachineTemplate, RuntimeActivation,
+    RuntimeTurn, SessionOptions, SourceEvent, SourcePayload, TurnMetrics, Value,
 };
 use gloo_timers::future::TimeoutFuture;
 use std::collections::{BTreeSet, VecDeque};
@@ -126,19 +126,19 @@ pub struct WebDurablyAcknowledgedTurn {
 pub struct WebPersistenceStartup {
     pub restore_image: RestoreImage,
     pub initialized: bool,
-    pub mount: RuntimeTurn,
+    pub initial_turn: RuntimeTurn,
     pub build: WebRuntimeBuildStats,
 }
 
 pub struct WebPlanActivation {
-    pub mount: RuntimeTurn,
+    pub initial_turn: RuntimeTurn,
     pub acknowledgement: Option<ActivationAck>,
     pub migration: Option<MigrationPreview>,
     pub build: WebRuntimeBuildStats,
 }
 
 pub struct WebPlanReset {
-    pub mount: RuntimeTurn,
+    pub initial_turn: RuntimeTurn,
     pub acknowledgement: ResetApplicationAck,
     pub build: WebRuntimeBuildStats,
 }
@@ -251,13 +251,15 @@ impl WebPersistentRuntime {
         let template = MachineTemplate::new_shared(Arc::clone(&plan)).map_err(runtime_error)?;
         let loaded = load_image(&mut persistence, &plan.application.identity).await?;
 
-        let (runtime, restore_image, initialized, build) = match loaded {
+        let (runtime, initial_turn, restore_image, initialized, build) = match loaded {
             None => {
-                let (default_runtime, build) =
+                let (activation, build) =
                     build_live_runtime(&template, options.clone(), None).await?;
-                let initial_image = default_runtime
+                let mut initial_image = activation
+                    .runtime()
                     .durable_restore_image(0, BTreeSet::new())
                     .map_err(runtime_error)?;
+                initial_image.through_turn_sequence = activation.base_turn_sequence();
                 let acknowledgement =
                     initialize_image(&mut persistence, initial_image.clone()).await?;
                 ensure_commit_ack(
@@ -266,7 +268,15 @@ impl WebPersistentRuntime {
                     initial_image.through_turn_sequence,
                     "Initialize",
                 )?;
-                (default_runtime, initial_image, true, build)
+                let (runtime, mut initial_turn) =
+                    split_runtime_activation(activation, &initial_image)?;
+                let persistence_started = std::time::Instant::now();
+                let restore_image =
+                    commit_runtime_activation(&mut persistence, &initial_image, &initial_turn)
+                        .await?;
+                initial_turn.phase_timings.persistence_enqueue_us =
+                    duration_us(persistence_started.elapsed());
+                (runtime, initial_turn, restore_image, true, build)
             }
             Some(stored) => {
                 if stored.application != plan.application.identity {
@@ -275,34 +285,57 @@ impl WebPersistentRuntime {
                 if stored.schema_version == plan.persistence.schema_version
                     && stored.schema_hash == plan.persistence.schema_hash
                 {
-                    let (runtime, build) =
+                    let (activation, build) =
                         build_live_runtime(&template, options.clone(), Some(stored.clone()))
                             .await?;
-                    (runtime, stored, false, build)
+                    let (runtime, mut initial_turn) =
+                        split_runtime_activation(activation, &stored)?;
+                    let persistence_started = std::time::Instant::now();
+                    let restore_image =
+                        commit_runtime_activation(&mut persistence, &stored, &initial_turn).await?;
+                    initial_turn.phase_timings.persistence_enqueue_us =
+                        duration_us(persistence_started.elapsed());
+                    (runtime, initial_turn, restore_image, false, build)
                 } else {
                     let staged =
                         stage_migration(&stored, &plan).map_err(WebPersistenceError::Migration)?;
-                    let (runtime, build) = build_live_runtime(
+                    let (activation, build) = build_live_runtime(
                         &template,
                         options.clone(),
                         Some(staged.candidate.clone()),
                     )
                     .await?;
-                    let acknowledgement =
-                        activate_batch(&mut persistence, staged.activation).await?;
+                    let (runtime, mut initial_turn) =
+                        split_runtime_activation(activation, &stored)?;
+                    let mut activated_image = runtime
+                        .durable_restore_image(
+                            stored.epoch,
+                            staged.candidate.completed_migration_edges.clone(),
+                        )
+                        .map_err(runtime_error)?;
+                    activated_image.outbox = stored.outbox.clone();
+                    activated_image.content_artifact_manifest =
+                        staged.candidate.content_artifact_manifest.clone();
+                    let batch = ActivationBatch::between(&stored, &activated_image)
+                        .map_err(WebPersistenceError::Store)?
+                        .with_outbox_changes(initial_turn.outbox_changes.clone());
+                    let persistence_started = std::time::Instant::now();
+                    let acknowledgement = activate_batch(&mut persistence, batch).await?;
                     ensure_activation_ack(
                         &acknowledgement,
-                        staged.candidate.schema_version,
-                        staged.candidate.schema_hash,
-                        staged.candidate.through_turn_sequence,
+                        activated_image.schema_version,
+                        activated_image.schema_hash,
+                        activated_image.through_turn_sequence,
                     )?;
-                    let mut restored = staged.candidate;
-                    restored.epoch = acknowledgement.epoch;
-                    (runtime, restored, false, build)
+                    initial_turn.phase_timings.persistence_enqueue_us =
+                        duration_us(persistence_started.elapsed());
+                    let restored = load_image(&mut persistence, &stored.application)
+                        .await?
+                        .ok_or(WebPersistenceError::MissingDurableState)?;
+                    (runtime, initial_turn, restored, false, build)
                 }
             }
         };
-        let mount = runtime.mount();
         let durable = DurableCursor::from_image(&restore_image);
         let admitted = durable.clone();
         Ok((
@@ -323,7 +356,7 @@ impl WebPersistentRuntime {
             WebPersistenceStartup {
                 restore_image,
                 initialized,
-                mount,
+                initial_turn,
                 build,
             },
         ))
@@ -638,30 +671,34 @@ impl WebPersistentRuntime {
         options: SessionOptions,
     ) -> Result<WebPlanActivation, WebPersistenceError> {
         let current = self.load_durable_image().await?;
-        let (restore, activation, migration) = if current.schema_version
-            == plan.persistence.schema_version
+        let (restore, migration) = if current.schema_version == plan.persistence.schema_version
             && current.schema_hash == plan.persistence.schema_hash
         {
-            (current.clone(), None, None)
+            (current.clone(), None)
         } else {
             let staged =
                 stage_migration(&current, &plan).map_err(WebPersistenceError::Migration)?;
-            (
-                staged.candidate,
-                Some(staged.activation),
-                Some(staged.preview),
-            )
+            (staged.candidate, Some(staged.preview))
         };
         let template = MachineTemplate::new_shared(Arc::clone(&plan)).map_err(runtime_error)?;
-        let (candidate, build) =
+        let (activation, build) =
             build_live_runtime(&template, options.clone(), Some(restore.clone())).await?;
-        let mount = candidate.mount();
-        let acknowledgement = match activation {
-            Some(batch) => {
+        let (candidate, mut initial_turn) = split_runtime_activation(activation, &current)?;
+        let persistence_started = std::time::Instant::now();
+        let (acknowledgement, durable_image) = if migration.is_some() {
+            let mut candidate_image = candidate
+                .durable_restore_image(current.epoch, restore.completed_migration_edges.clone())
+                .map_err(runtime_error)?;
+            candidate_image.outbox = current.outbox.clone();
+            candidate_image.content_artifact_manifest = restore.content_artifact_manifest.clone();
+            let batch = ActivationBatch::between(&current, &candidate_image)
+                .map_err(WebPersistenceError::Store)?
+                .with_outbox_changes(initial_turn.outbox_changes.clone());
+            let acknowledgement = {
                 let operation =
                     self.admit_control("Activate", PersistenceCommand::Activate(batch))?;
                 let result = self.complete_control(&operation).await?;
-                let acknowledgement = match result {
+                match result {
                     PersistenceResult::Activated(Ok(acknowledgement)) => acknowledgement,
                     PersistenceResult::Activated(Err(error)) => {
                         let error = WebPersistenceError::Store(error);
@@ -673,31 +710,37 @@ impl WebPersistentRuntime {
                         self.record_durability_failure(&error);
                         return Err(error);
                     }
-                };
-                if let Err(error) = ensure_activation_ack(
-                    &acknowledgement,
-                    restore.schema_version,
-                    restore.schema_hash,
-                    restore.through_turn_sequence,
-                ) {
-                    self.require_reopen("Activate", &error);
-                    return Err(error);
                 }
-                Some(acknowledgement)
+            };
+            if let Err(error) = ensure_activation_ack(
+                &acknowledgement,
+                candidate_image.schema_version,
+                candidate_image.schema_hash,
+                candidate_image.through_turn_sequence,
+            ) {
+                self.require_reopen("Activate", &error);
+                return Err(error);
             }
-            None => None,
+            let durable_image = load_image(&mut self.persistence, &current.application)
+                .await?
+                .ok_or(WebPersistenceError::MissingDurableState)?;
+            (Some(acknowledgement), durable_image)
+        } else {
+            let durable_image = self
+                .commit_runtime_activation_control(&current, &initial_turn)
+                .await?;
+            (None, durable_image)
         };
+        initial_turn.phase_timings.persistence_enqueue_us =
+            duration_us(persistence_started.elapsed());
         self.runtime = candidate;
         self.plan = plan;
         self.template = template;
         self.options = options;
-        self.durable = DurableCursor::from_image(&restore);
-        if let Some(acknowledgement) = &acknowledgement {
-            self.durable.epoch = acknowledgement.epoch;
-        }
+        self.durable = DurableCursor::from_image(&durable_image);
         self.admitted = self.durable.clone();
         Ok(WebPlanActivation {
-            mount,
+            initial_turn,
             acknowledgement,
             migration,
             build,
@@ -707,11 +750,15 @@ impl WebPersistentRuntime {
     /// Commits current-plan defaults before replacing the published runtime.
     pub async fn start_over(&mut self) -> Result<WebPlanReset, WebPersistenceError> {
         let current = self.load_durable_image().await?;
-        let (defaults, default_build) =
+        let (defaults_activation, default_build) =
             build_live_runtime(&self.template, self.options.clone(), None).await?;
-        let default_image = defaults
+        let default_image = defaults_activation
+            .runtime()
             .durable_restore_image(0, BTreeSet::new())
             .map_err(runtime_error)?;
+        // This first private build exists only to derive the clean default
+        // image. The rebased candidate below owns the observable activation.
+        let (_defaults, _private_initial_turn, _) = defaults_activation.into_parts();
         let next_epoch = current
             .epoch
             .checked_add(1)
@@ -719,18 +766,23 @@ impl WebPersistentRuntime {
         let mut candidate_image = default_image.clone();
         candidate_image.epoch = next_epoch;
         candidate_image.through_turn_sequence = current.through_turn_sequence;
-        let (candidate, candidate_build) =
+        let (candidate_activation, candidate_build) =
             build_live_runtime(&self.template, self.options.clone(), Some(candidate_image)).await?;
-        let mount = candidate.mount();
+        let (candidate, mut initial_turn) =
+            split_runtime_activation(candidate_activation, &current)?;
         let batch = ResetApplicationBatch {
             application: current.application.clone(),
             expected_base_epoch: current.epoch,
             next_epoch,
             source_schema_hash: current.schema_hash,
             default_image,
+            through_turn_sequence: initial_turn.sequence,
+            authority_changes: initial_turn.durable_changes.clone(),
+            outbox_changes: initial_turn.outbox_changes.clone(),
             checksum: [0; 32],
         }
         .seal();
+        let persistence_started = std::time::Instant::now();
         let operation = self.admit_control(
             "ResetApplication",
             PersistenceCommand::ResetApplication(batch),
@@ -752,7 +804,7 @@ impl WebPersistentRuntime {
         if acknowledgement.epoch != next_epoch
             || acknowledgement.schema_version != self.plan.persistence.schema_version
             || acknowledgement.schema_hash != self.plan.persistence.schema_hash
-            || acknowledgement.through_turn_sequence != current.through_turn_sequence
+            || acknowledgement.through_turn_sequence != initial_turn.sequence
         {
             let error = WebPersistenceError::Protocol(
                 "ResetApplication returned an inconsistent acknowledgement".to_owned(),
@@ -760,17 +812,16 @@ impl WebPersistentRuntime {
             self.require_reopen("ResetApplication", &error);
             return Err(error);
         }
+        initial_turn.phase_timings.persistence_enqueue_us =
+            duration_us(persistence_started.elapsed());
+        let durable_image = load_image(&mut self.persistence, &current.application)
+            .await?
+            .ok_or(WebPersistenceError::MissingDurableState)?;
         self.runtime = candidate;
-        self.durable = DurableCursor {
-            application: current.application,
-            schema_version: acknowledgement.schema_version,
-            schema_hash: acknowledgement.schema_hash,
-            epoch: acknowledgement.epoch,
-            through_turn_sequence: acknowledgement.through_turn_sequence,
-        };
+        self.durable = DurableCursor::from_image(&durable_image);
         self.admitted = self.durable.clone();
         Ok(WebPlanReset {
-            mount,
+            initial_turn,
             acknowledgement,
             build: default_build.merge(candidate_build),
         })
@@ -840,6 +891,46 @@ impl WebPersistentRuntime {
             checksum: [0; 32],
         }
         .seal())
+    }
+
+    async fn commit_runtime_activation_control(
+        &mut self,
+        base: &RestoreImage,
+        turn: &RuntimeTurn,
+    ) -> Result<RestoreImage, WebPersistenceError> {
+        let Some(batch) = activation_checkpoint(base, turn)? else {
+            return Ok(base.clone());
+        };
+        let expected_epoch = batch.next_epoch;
+        let expected_turn_sequence = batch.last_turn_sequence;
+        let operation =
+            self.admit_control("CommitActivation", PersistenceCommand::Commit(batch))?;
+        let result = self.complete_control(&operation).await?;
+        let acknowledgement = match result {
+            PersistenceResult::Committed(Ok(acknowledgement)) => acknowledgement,
+            PersistenceResult::Committed(Err(error)) => {
+                let error = WebPersistenceError::Store(error);
+                self.record_durability_failure(&error);
+                return Err(error);
+            }
+            other => {
+                let error = unexpected_result("CommitActivation", &other);
+                self.record_durability_failure(&error);
+                return Err(error);
+            }
+        };
+        if let Err(error) = ensure_commit_ack(
+            &acknowledgement,
+            expected_epoch,
+            expected_turn_sequence,
+            "CommitActivation",
+        ) {
+            self.require_reopen("CommitActivation", &error);
+            return Err(error);
+        }
+        load_image(&mut self.persistence, &base.application)
+            .await?
+            .ok_or(WebPersistenceError::MissingDurableState)
     }
 
     fn rollback_admission(
@@ -1040,11 +1131,103 @@ fn ensure_activation_ack(
     }
 }
 
+fn split_runtime_activation(
+    activation: RuntimeActivation,
+    base: &RestoreImage,
+) -> Result<(LiveRuntime, RuntimeTurn), WebPersistenceError> {
+    let (runtime, initial_turn, base_turn_sequence) = activation.into_parts();
+    if base_turn_sequence != base.through_turn_sequence {
+        return Err(WebPersistenceError::Runtime(format!(
+            "runtime activation base turn {base_turn_sequence} does not match durable turn {}",
+            base.through_turn_sequence
+        )));
+    }
+    let next = base_turn_sequence.checked_add(1);
+    if initial_turn.sequence != base_turn_sequence && Some(initial_turn.sequence) != next {
+        return Err(WebPersistenceError::Runtime(format!(
+            "runtime activation turn {} is not contiguous after base {base_turn_sequence}",
+            initial_turn.sequence
+        )));
+    }
+    Ok((runtime, initial_turn))
+}
+
+fn activation_checkpoint(
+    base: &RestoreImage,
+    turn: &RuntimeTurn,
+) -> Result<Option<CheckpointBatch>, WebPersistenceError> {
+    if turn.sequence == base.through_turn_sequence {
+        if !turn.durable_changes.is_empty() || !turn.outbox_changes.is_empty() {
+            return Err(WebPersistenceError::Protocol(
+                "runtime activation emitted durable work without advancing its turn".to_owned(),
+            ));
+        }
+        return Ok(None);
+    }
+    let expected_turn = base
+        .through_turn_sequence
+        .checked_add(1)
+        .ok_or_else(|| WebPersistenceError::Runtime("durable turn overflow".to_owned()))?;
+    if turn.sequence != expected_turn {
+        return Err(WebPersistenceError::Store(StoreError::NonContiguousTurn));
+    }
+    let next_epoch = base
+        .epoch
+        .checked_add(1)
+        .ok_or_else(|| WebPersistenceError::Runtime("durable epoch overflow".to_owned()))?;
+    Ok(Some(
+        CheckpointBatch {
+            application: base.application.clone(),
+            schema_hash: base.schema_hash,
+            base_epoch: base.epoch,
+            next_epoch,
+            first_turn_sequence: turn.sequence,
+            last_turn_sequence: turn.sequence,
+            changes: turn.durable_changes.clone(),
+            outbox_changes: turn.outbox_changes.clone(),
+            content_artifact_changes: Vec::new(),
+            checksum: [0; 32],
+        }
+        .seal(),
+    ))
+}
+
+async fn commit_runtime_activation(
+    persistence: &mut RexieDriver,
+    base: &RestoreImage,
+    turn: &RuntimeTurn,
+) -> Result<RestoreImage, WebPersistenceError> {
+    let Some(batch) = activation_checkpoint(base, turn)? else {
+        return Ok(base.clone());
+    };
+    let expected_epoch = batch.next_epoch;
+    let expected_turn_sequence = batch.last_turn_sequence;
+    let result = persistence.execute(PersistenceCommand::Commit(batch)).await;
+    let acknowledgement = match result {
+        PersistenceResult::Committed(Ok(acknowledgement)) => acknowledgement,
+        PersistenceResult::Committed(Err(error)) => return Err(WebPersistenceError::Store(error)),
+        other => return Err(unexpected_result("CommitActivation", &other)),
+    };
+    ensure_commit_ack(
+        &acknowledgement,
+        expected_epoch,
+        expected_turn_sequence,
+        "CommitActivation",
+    )?;
+    load_image(persistence, &base.application)
+        .await?
+        .ok_or(WebPersistenceError::MissingDurableState)
+}
+
+fn duration_us(duration: std::time::Duration) -> u64 {
+    duration.as_micros().try_into().unwrap_or(u64::MAX)
+}
+
 async fn build_live_runtime(
     template: &MachineTemplate,
     options: SessionOptions,
     restore: Option<RestoreImage>,
-) -> Result<(LiveRuntime, WebRuntimeBuildStats), WebPersistenceError> {
+) -> Result<(RuntimeActivation, WebRuntimeBuildStats), WebPersistenceError> {
     let mut task =
         LiveRuntime::begin_machine_template_build_with_restore(template, options, restore)
             .map_err(runtime_error)?;

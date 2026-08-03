@@ -2,7 +2,8 @@ use async_trait::async_trait;
 use boon_distributed_runtime::{DistributedClientRuntime, DistributedQueueLimits};
 use boon_plan::ProgramRole;
 use boon_program_runtime::{
-    DistributedProgramBundle, ProgramCompileRequest, compile_distributed_program_bundle,
+    DistributedProgramBundle, ProgramArtifact, ProgramCompileRequest,
+    compile_distributed_program_bundle,
 };
 use boon_runtime::{
     ApplicationIdentity, ProgramCapabilityProfile, RuntimeSourceUnit, SourcePayload,
@@ -24,6 +25,24 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 
 type ClientSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
+
+fn start_headless_client(artifact: &ProgramArtifact) -> DistributedClientRuntime {
+    let (runtime, initial_turn) =
+        DistributedClientRuntime::start(artifact, DistributedQueueLimits::default())
+            .unwrap()
+            .into_parts();
+    assert!(initial_turn.deltas.is_empty());
+    assert!(initial_turn.authority_deltas.is_empty());
+    assert!(initial_turn.durable_changes.is_empty());
+    assert!(initial_turn.outbox_changes.is_empty());
+    assert!(initial_turn.transient_effects.is_empty());
+    assert!(initial_turn.cancelled_transient_effects.is_empty());
+    assert!(initial_turn.transient_effect_credit_grants.is_empty());
+    assert!(initial_turn.distributed_invocations.is_empty());
+    // These transport tests intentionally omit a document host.
+    let _document_patches = initial_turn.document_patches;
+    runtime
+}
 
 const CLIENT_SOURCE: &str = r#"
 store: [
@@ -343,20 +362,12 @@ async fn real_reserved_transport_is_scoped_lossless_and_resumable() {
             .await
             .expect("fresh second Session should be accepted");
 
-    let mut first_client = DistributedClientRuntime::start(
-        bundle.artifact(ProgramRole::Client).unwrap(),
-        DistributedQueueLimits::default(),
-    )
-    .unwrap();
+    let mut first_client = start_headless_client(bundle.artifact(ProgramRole::Client).unwrap());
     first_client
         .bind(first_session_id, first_generation, first_applied_client)
         .unwrap();
     first_client.mark_current().unwrap();
-    let mut second_client = DistributedClientRuntime::start(
-        bundle.artifact(ProgramRole::Client).unwrap(),
-        DistributedQueueLimits::default(),
-    )
-    .unwrap();
+    let mut second_client = start_headless_client(bundle.artifact(ProgramRole::Client).unwrap());
     second_client
         .bind(second_session_id, second_generation, second_applied_client)
         .unwrap();
@@ -506,20 +517,12 @@ async fn hostile_transport_lifecycle_is_fail_closed_and_connection_local() {
             .await
             .expect("second healthy Session should be accepted");
 
-    let mut stale_client = DistributedClientRuntime::start(
-        bundle.artifact(ProgramRole::Client).unwrap(),
-        DistributedQueueLimits::default(),
-    )
-    .unwrap();
+    let mut stale_client = start_headless_client(bundle.artifact(ProgramRole::Client).unwrap());
     stale_client
         .bind(stale_session_id, stale_generation, stale_applied_client)
         .unwrap();
     stale_client.mark_current().unwrap();
-    let mut healthy_client = DistributedClientRuntime::start(
-        bundle.artifact(ProgramRole::Client).unwrap(),
-        DistributedQueueLimits::default(),
-    )
-    .unwrap();
+    let mut healthy_client = start_headless_client(bundle.artifact(ProgramRole::Client).unwrap());
     healthy_client
         .bind(
             healthy_session_id,
@@ -644,11 +647,7 @@ async fn distributed_host_failure_closes_the_stalled_session_transport() {
         handshake(&mut socket, identity, None, 0)
             .await
             .expect("effect Session should be accepted");
-    let mut client = DistributedClientRuntime::start(
-        bundle.artifact(ProgramRole::Client).unwrap(),
-        DistributedQueueLimits::default(),
-    )
-    .unwrap();
+    let mut client = start_headless_client(bundle.artifact(ProgramRole::Client).unwrap());
     client
         .bind(session_id, generation, applied_client_through)
         .unwrap();

@@ -217,7 +217,6 @@ pub(crate) struct RuntimeStartupEvidence {
 struct PersistentMountRequest<'a> {
     runtime: PersistentRuntime,
     turn: RuntimeTurn,
-    host_started: Option<RuntimeTurn>,
     startup: PersistentRuntimeStartup,
     host_identity_mode: HostIdentityMode,
     host_identity_generation: u64,
@@ -355,7 +354,7 @@ impl RuntimeView {
         plan: Arc<MachinePlan>,
         assets: &[AssetBlob],
     ) -> ViewResult<Self> {
-        let (mut runtime, startup) = PersistentRuntime::from_shared_machine_plan(
+        let (runtime, startup) = PersistentRuntime::from_shared_machine_plan(
             plan,
             SessionOptions::default(),
             InMemoryDriver::default(),
@@ -363,23 +362,18 @@ impl RuntimeView {
         )
         .map_err(|error| error.to_string())?;
         let host_identity_generation = 1;
-        let host_started = dispatch_host_lifecycle_started(
-            &mut runtime,
-            HostIdentityMode::Deterministic,
-            host_identity_generation,
-            1,
-        )?;
-        let mount = runtime.runtime().mount();
-        Self::mount_persistent(PersistentMountRequest {
+        let initial_turn = startup.initial_turn.clone();
+        let mut view = Self::mount_persistent(PersistentMountRequest {
             runtime,
-            turn: mount,
-            host_started,
+            turn: initial_turn,
             startup,
             host_identity_mode: HostIdentityMode::Deterministic,
             host_identity_generation,
             content_root: transient_content_root(&repository_root().join("target/boon-transient")),
             assets,
-        })
+        })?;
+        view.dispatch_host_lifecycle_started()?;
+        Ok(view)
     }
 
     pub fn open_distributed_with_assets(
@@ -596,7 +590,7 @@ impl RuntimeView {
                 database_path.display()
             )
         })?;
-        let (mut runtime, startup) = PersistentRuntime::from_shared_machine_plan(
+        let (runtime, startup) = PersistentRuntime::from_shared_machine_plan(
             plan,
             SessionOptions::default(),
             driver,
@@ -604,43 +598,32 @@ impl RuntimeView {
         )
         .map_err(|error| error.to_string())?;
         let host_identity_generation = 1;
-        let host_started = dispatch_host_lifecycle_started(
-            &mut runtime,
-            host_identity_mode,
-            host_identity_generation,
-            1,
-        )?;
-        let mount = runtime.runtime().mount();
-        Self::mount_persistent(PersistentMountRequest {
+        let initial_turn = startup.initial_turn.clone();
+        let mut view = Self::mount_persistent(PersistentMountRequest {
             runtime,
-            turn: mount,
-            host_started,
+            turn: initial_turn,
             startup,
             host_identity_mode,
             host_identity_generation,
             content_root,
             assets,
-        })
+        })?;
+        view.dispatch_host_lifecycle_started()?;
+        Ok(view)
     }
 
     fn mount_persistent(request: PersistentMountRequest<'_>) -> ViewResult<Self> {
         let PersistentMountRequest {
             mut runtime,
             turn,
-            host_started,
             startup,
             host_identity_mode,
             host_identity_generation,
             content_root,
             assets,
         } = request;
-        let source_sequence = source_sequence_after_turn(
-            source_sequence_after_turn(0, turn.source_sequence),
-            host_started.as_ref().and_then(|turn| turn.source_sequence),
-        );
-        let runtime_turn_sequence = host_started
-            .as_ref()
-            .map_or(turn.sequence, |turn| turn.sequence);
+        let source_sequence = source_sequence_after_turn(0, turn.source_sequence);
+        let runtime_turn_sequence = turn.sequence;
         let mut transient_host = LocalTransientHost::new(
             content_root,
             assets.iter().map(|asset| PackageAsset {
@@ -650,9 +633,6 @@ impl RuntimeView {
             }),
             transient_effect_ids(runtime.runtime().machine_plan()),
         )?;
-        if let Some(host_started) = &host_started {
-            transient_host.route_turn(host_started)?;
-        }
         transient_host.route_turn(&turn)?;
         if turn.document_patch_status != DocumentPatchStatus::Complete {
             return Err("MachinePlan did not produce complete typed document bindings".to_owned());
@@ -721,9 +701,7 @@ impl RuntimeView {
             persistence_status,
             persistence_inspector,
             persistence_inspector_error,
-            next_persistence_poll: host_started
-                .as_ref()
-                .map(|_| Instant::now() + PERSISTENCE_ACK_POLL_INTERVAL),
+            next_persistence_poll: None,
             runtime_turn_sequence,
             hovered: None,
             pressed: None,
@@ -740,8 +718,7 @@ impl RuntimeView {
             event_dispatches: None,
             pending_external_url: None,
             last_primary_click: None,
-            last_runtime_phase: host_started
-                .map_or_else(RuntimePhaseTimings::default, |turn| turn.phase_timings),
+            last_runtime_phase: turn.phase_timings,
             scheduled_sources,
             effect_worker,
             transient_host,
@@ -841,7 +818,7 @@ impl RuntimeView {
             })?;
         let acknowledgement = activation.acknowledgement;
         let migration = activation.migration;
-        self.install_replacement_runtime(activation.mount, false)
+        self.install_replacement_runtime(activation.initial_turn, false)
             .map_err(RuntimePlanPublishError::Failed)?;
         let target_schema_version = self.persistence_schema_version;
         let durable_epoch = acknowledgement
@@ -874,7 +851,7 @@ impl RuntimeView {
             .map_err(|error| error.to_string())?;
         let durable_epoch = reset.acknowledgement.epoch;
         let through_turn_sequence = reset.acknowledgement.through_turn_sequence;
-        self.install_replacement_runtime(reset.mount, true)?;
+        self.install_replacement_runtime(reset.initial_turn, true)?;
         Ok(RuntimePlanChange {
             target_schema_version,
             durable_epoch,
@@ -1383,7 +1360,7 @@ impl RuntimeView {
             .map_err(|error| error.to_string())?;
         let epoch = activation.acknowledgement.epoch;
         let preview = activation.preview;
-        self.install_replacement_runtime(activation.mount, false)?;
+        self.install_replacement_runtime(activation.initial_turn, false)?;
         Ok((preview, epoch))
     }
 
@@ -1398,7 +1375,7 @@ impl RuntimeView {
             .ok_or_else(|| "clear authority did not produce a durable activation".to_owned())?;
         let epoch = acknowledgement.epoch;
         let turn = acknowledgement.through_turn_sequence;
-        self.install_replacement_runtime(activation.mount, false)?;
+        self.install_replacement_runtime(activation.initial_turn, false)?;
         Ok((epoch, turn))
     }
 
@@ -2959,34 +2936,6 @@ impl RuntimeView {
         self.dispatch_root_source(HOST_LIFECYCLE_STARTED_SOURCE, payload)?;
         Ok(())
     }
-}
-
-fn dispatch_host_lifecycle_started(
-    runtime: &mut PersistentRuntime,
-    mode: HostIdentityMode,
-    generation: u64,
-    sequence: u64,
-) -> ViewResult<Option<RuntimeTurn>> {
-    if !has_host_lifecycle_started_source(runtime.runtime()) {
-        return Ok(None);
-    }
-    let event = runtime
-        .runtime()
-        .source_event_for_path(
-            sequence,
-            HOST_LIFECYCLE_STARTED_SOURCE,
-            &[],
-            host_lifecycle_started_payload(mode, generation),
-        )
-        .map_err(|error| error.to_string())?;
-    runtime
-        .dispatch(event)
-        .map(Some)
-        .map_err(|error| error.to_string())
-}
-
-fn has_host_lifecycle_started_source(runtime: &LiveRuntime) -> bool {
-    has_host_lifecycle_started_source_plan(runtime.machine_plan())
 }
 
 fn has_host_lifecycle_started_source_plan(plan: &MachinePlan) -> bool {

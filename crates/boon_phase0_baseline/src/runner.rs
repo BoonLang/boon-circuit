@@ -101,8 +101,9 @@ fn measure_fixture(
     let startup_live_start = live_requested_bytes();
     let startup_interval = AllocationInterval::begin().map_err(str::to_owned)?;
     let startup_started = Instant::now();
-    let mut session = MachineInstance::new_shared(Arc::clone(&plan), SessionOptions::default())
-        .map_err(|error| format!("fixture {} startup: {error}", definition.id))?;
+    let mut session =
+        MachineInstance::new_shared_quiescent(Arc::clone(&plan), SessionOptions::default())
+            .map_err(|error| format!("fixture {} startup: {error}", definition.id))?;
     let startup_elapsed_ns = duration_ns(startup_started.elapsed());
     let startup_work = WorkEvidence::from(session.startup_metrics());
     let startup_allocator = startup_interval.finish();

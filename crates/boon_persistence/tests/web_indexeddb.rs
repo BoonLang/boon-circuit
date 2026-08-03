@@ -544,12 +544,32 @@ async fn sparse_transactions_match_in_memory_and_abort_atomically() {
     .await;
 
     let default_image = RestoreImage::empty(app.clone(), 4, [0x44; 32]);
+    let reset_outbox_item = DurableOutboxItem::pending(
+        invocation,
+        effect,
+        StoredValue::Text("reset-key".to_owned()),
+        number(9),
+        DurableOwner::default(),
+        None,
+        5,
+    );
     let reset = ResetApplicationBatch {
         application: app.clone(),
         expected_base_epoch: 5,
         next_epoch: 6,
         source_schema_hash: [0x33; 32],
         default_image,
+        through_turn_sequence: 5,
+        authority_changes: vec![DurableChange::SetScalar {
+            memory_id: scalar_memory,
+            value: StoredScalar {
+                touched: true,
+                value: StoredValue::Text("reset-activation".to_owned()),
+            },
+        }],
+        outbox_changes: vec![DurableOutboxChange::Enqueue {
+            item: reset_outbox_item,
+        }],
         checksum: [0; 32],
     }
     .seal();
@@ -646,6 +666,9 @@ async fn cancelled_mutating_control_remains_tracked_and_can_be_resumed() {
         next_epoch: 1,
         source_schema_hash: schema_hash,
         default_image: RestoreImage::empty(application(), 1, schema_hash),
+        through_turn_sequence: 0,
+        authority_changes: Vec::new(),
+        outbox_changes: Vec::new(),
         checksum: [0; 32],
     }
     .seal();

@@ -28,8 +28,8 @@ pub use boon_plan_executor::{
     SessionPrincipal, Snapshot, SourceEvent, SourcePayload, TransientEffectCallId,
     TransientEffectCreditGrant, TransientEffectInvocation, TurnMetrics, Value, ValueTarget,
 };
+use boon_plan_executor::{MachineActivation, MachineBuildTask, MachineInstance, Turn};
 pub use boon_plan_executor::{MachineBuildPhase, MachineBuildProgress};
-use boon_plan_executor::{MachineBuildTask, MachineInstance, Turn};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -118,12 +118,47 @@ pub struct LiveRuntime {
     source_ids_by_path: BTreeMap<String, SourceId>,
 }
 
+/// Exact runtime produced by construction, including the one initial turn
+/// that a host must observe before it may dispatch new input.
+#[must_use = "runtime activation must be consumed so its initial turn reaches the host"]
+pub struct RuntimeActivation {
+    runtime: LiveRuntime,
+    initial_turn: RuntimeTurn,
+    base_turn_sequence: u64,
+}
+
+impl RuntimeActivation {
+    pub fn runtime(&self) -> &LiveRuntime {
+        &self.runtime
+    }
+
+    pub fn runtime_mut(&mut self) -> &mut LiveRuntime {
+        &mut self.runtime
+    }
+
+    pub fn initial_turn(&self) -> &RuntimeTurn {
+        &self.initial_turn
+    }
+
+    pub const fn base_turn_sequence(&self) -> u64 {
+        self.base_turn_sequence
+    }
+
+    pub fn requires_authority_commit(&self) -> bool {
+        self.initial_turn.sequence != self.base_turn_sequence
+    }
+
+    pub fn into_parts(self) -> (LiveRuntime, RuntimeTurn, u64) {
+        (self.runtime, self.initial_turn, self.base_turn_sequence)
+    }
+}
+
 // Boxing `Ready` would change this public incremental-build API and add an
 // allocation to the successful runtime startup path.
 #[allow(clippy::large_enum_variant)]
 pub enum LiveRuntimeBuildPoll {
     Pending(MachineBuildProgress),
-    Ready(LiveRuntime),
+    Ready(RuntimeActivation),
 }
 
 pub struct LiveRuntimeBuildTask {
@@ -138,18 +173,60 @@ impl LiveRuntimeBuildTask {
             boon_plan_executor::MachineBuildPoll::Pending(progress) => {
                 Ok(LiveRuntimeBuildPoll::Pending(progress))
             }
-            boon_plan_executor::MachineBuildPoll::Ready(mut session) => {
-                let document = document::DocumentRuntime::new(&mut session)?;
-                Ok(LiveRuntimeBuildPoll::Ready(LiveRuntime {
-                    session,
-                    document,
-                    pending_document_rollback: None,
-                    source_inventory: std::mem::take(&mut self.source_inventory),
-                    source_ids_by_path: std::mem::take(&mut self.source_ids_by_path),
-                }))
-            }
+            boon_plan_executor::MachineBuildPoll::Ready(activation) => Ok(
+                LiveRuntimeBuildPoll::Ready(runtime_activation_from_machine(
+                    activation,
+                    std::mem::take(&mut self.source_inventory),
+                    std::mem::take(&mut self.source_ids_by_path),
+                )?),
+            ),
         }
     }
+}
+
+fn runtime_activation_from_machine(
+    activation: MachineActivation,
+    source_inventory: SourceInventory,
+    source_ids_by_path: BTreeMap<String, SourceId>,
+) -> RuntimeResult<RuntimeActivation> {
+    let (mut session, initial_turn, base_turn_sequence) = activation.into_parts();
+    let document = document::DocumentRuntime::new(&mut session)?;
+    let document_patches = document
+        .as_ref()
+        .map(document::DocumentRuntime::mount_patches)
+        .unwrap_or_default();
+    let materialization = document
+        .as_ref()
+        .map(document::DocumentRuntime::stats)
+        .unwrap_or_default();
+    let runtime = LiveRuntime {
+        session,
+        document,
+        pending_document_rollback: None,
+        source_inventory,
+        source_ids_by_path,
+    };
+    Ok(RuntimeActivation {
+        runtime,
+        initial_turn: RuntimeTurn {
+            sequence: initial_turn.sequence,
+            source_sequence: initial_turn.source_sequence,
+            deltas: initial_turn.deltas,
+            authority_deltas: initial_turn.authority_deltas,
+            durable_changes: initial_turn.durable_changes,
+            outbox_changes: initial_turn.outbox_changes,
+            transient_effects: initial_turn.transient_effects,
+            cancelled_transient_effects: initial_turn.cancelled_transient_effects,
+            transient_effect_credit_grants: initial_turn.transient_effect_credit_grants,
+            distributed_invocations: initial_turn.distributed_invocations,
+            document_patches,
+            document_patch_status: DocumentPatchStatus::Complete,
+            metrics: initial_turn.metrics,
+            materialization,
+            phase_timings: RuntimePhaseTimings::default(),
+        },
+        base_turn_sequence,
+    })
 }
 
 #[derive(Clone)]
@@ -239,7 +316,7 @@ impl LiveRuntime {
         self.pending_document_rollback.is_some()
     }
 
-    pub fn from_source(source_label: &str, source: &str) -> RuntimeResult<Self> {
+    pub fn from_source(source_label: &str, source: &str) -> RuntimeResult<RuntimeActivation> {
         Self::from_source_with_identity(
             source_label,
             source,
@@ -251,7 +328,7 @@ impl LiveRuntime {
         source_label: &str,
         source: &str,
         application: ApplicationIdentity,
-    ) -> RuntimeResult<Self> {
+    ) -> RuntimeResult<RuntimeActivation> {
         Self::from_source_for_role_with_identity(
             source_label,
             source,
@@ -265,7 +342,7 @@ impl LiveRuntime {
         source: &str,
         role: ProgramRole,
         application: ApplicationIdentity,
-    ) -> RuntimeResult<Self> {
+    ) -> RuntimeResult<RuntimeActivation> {
         Ok(Self::from_source_profiled_for_role_with_identity(
             source_label,
             source,
@@ -278,7 +355,7 @@ impl LiveRuntime {
     pub fn from_source_profiled(
         source_label: &str,
         source: &str,
-    ) -> RuntimeResult<(Self, RuntimeLoadProfile)> {
+    ) -> RuntimeResult<(RuntimeActivation, RuntimeLoadProfile)> {
         Self::from_source_profiled_with_identity(
             source_label,
             source,
@@ -290,7 +367,7 @@ impl LiveRuntime {
         source_label: &str,
         source: &str,
         application: ApplicationIdentity,
-    ) -> RuntimeResult<(Self, RuntimeLoadProfile)> {
+    ) -> RuntimeResult<(RuntimeActivation, RuntimeLoadProfile)> {
         Self::from_source_profiled_for_role_with_identity(
             source_label,
             source,
@@ -304,7 +381,7 @@ impl LiveRuntime {
         source: &str,
         role: ProgramRole,
         application: ApplicationIdentity,
-    ) -> RuntimeResult<(Self, RuntimeLoadProfile)> {
+    ) -> RuntimeResult<(RuntimeActivation, RuntimeLoadProfile)> {
         let source_bundle = CanonicalSourceBundleV1::new(
             source_label,
             [SourceBundleUnit::new(source_label, source)],
@@ -334,7 +411,10 @@ impl LiveRuntime {
         ))
     }
 
-    pub fn from_project(source_label: &str, units: &[RuntimeSourceUnit]) -> RuntimeResult<Self> {
+    pub fn from_project(
+        source_label: &str,
+        units: &[RuntimeSourceUnit],
+    ) -> RuntimeResult<RuntimeActivation> {
         Self::from_project_with_identity(
             source_label,
             units,
@@ -346,7 +426,7 @@ impl LiveRuntime {
         source_label: &str,
         units: &[RuntimeSourceUnit],
         application: ApplicationIdentity,
-    ) -> RuntimeResult<Self> {
+    ) -> RuntimeResult<RuntimeActivation> {
         Self::from_project_for_role_with_identity(
             source_label,
             units,
@@ -360,7 +440,7 @@ impl LiveRuntime {
         units: &[RuntimeSourceUnit],
         role: ProgramRole,
         application: ApplicationIdentity,
-    ) -> RuntimeResult<Self> {
+    ) -> RuntimeResult<RuntimeActivation> {
         Ok(Self::from_project_profiled_for_role_with_identity(
             source_label,
             units,
@@ -373,7 +453,7 @@ impl LiveRuntime {
     pub fn from_project_profiled(
         source_label: &str,
         units: &[RuntimeSourceUnit],
-    ) -> RuntimeResult<(Self, RuntimeLoadProfile)> {
+    ) -> RuntimeResult<(RuntimeActivation, RuntimeLoadProfile)> {
         Self::from_project_profiled_with_identity(
             source_label,
             units,
@@ -385,7 +465,7 @@ impl LiveRuntime {
         source_label: &str,
         units: &[RuntimeSourceUnit],
         application: ApplicationIdentity,
-    ) -> RuntimeResult<(Self, RuntimeLoadProfile)> {
+    ) -> RuntimeResult<(RuntimeActivation, RuntimeLoadProfile)> {
         Self::from_project_profiled_for_role_with_identity(
             source_label,
             units,
@@ -399,7 +479,7 @@ impl LiveRuntime {
         units: &[RuntimeSourceUnit],
         role: ProgramRole,
         application: ApplicationIdentity,
-    ) -> RuntimeResult<(Self, RuntimeLoadProfile)> {
+    ) -> RuntimeResult<(RuntimeActivation, RuntimeLoadProfile)> {
         let source_bundle = CanonicalSourceBundleV1::new(
             source_label,
             units
@@ -439,7 +519,10 @@ impl LiveRuntime {
         ))
     }
 
-    pub fn from_machine_plan(plan: MachinePlan, options: SessionOptions) -> RuntimeResult<Self> {
+    pub fn from_machine_plan(
+        plan: MachinePlan,
+        options: SessionOptions,
+    ) -> RuntimeResult<RuntimeActivation> {
         Self::from_machine_plan_with_restore(plan, options, None)
     }
 
@@ -447,14 +530,14 @@ impl LiveRuntime {
         plan: MachinePlan,
         options: SessionOptions,
         restore: Option<RestoreImage>,
-    ) -> RuntimeResult<Self> {
+    ) -> RuntimeResult<RuntimeActivation> {
         Self::from_shared_machine_plan_with_restore(Arc::new(plan), options, restore)
     }
 
     pub fn from_shared_machine_plan(
         plan: Arc<MachinePlan>,
         options: SessionOptions,
-    ) -> RuntimeResult<Self> {
+    ) -> RuntimeResult<RuntimeActivation> {
         Self::from_shared_machine_plan_with_restore(plan, options, None)
     }
 
@@ -462,7 +545,7 @@ impl LiveRuntime {
         plan: Arc<MachinePlan>,
         options: SessionOptions,
         restore: Option<RestoreImage>,
-    ) -> RuntimeResult<Self> {
+    ) -> RuntimeResult<RuntimeActivation> {
         let template = MachineTemplate::new_shared(plan)?;
         Self::from_machine_template_with_restore(&template, options, restore)
     }
@@ -470,7 +553,7 @@ impl LiveRuntime {
     pub fn from_machine_template(
         template: &MachineTemplate,
         options: SessionOptions,
-    ) -> RuntimeResult<Self> {
+    ) -> RuntimeResult<RuntimeActivation> {
         Self::from_machine_template_with_restore(template, options, None)
     }
 
@@ -478,7 +561,7 @@ impl LiveRuntime {
         template: &MachineTemplate,
         options: SessionOptions,
         restore: Option<RestoreImage>,
-    ) -> RuntimeResult<Self> {
+    ) -> RuntimeResult<RuntimeActivation> {
         let mut task = Self::begin_machine_template_build_with_restore(template, options, restore)?;
         loop {
             match task.poll(usize::MAX)? {
@@ -523,7 +606,7 @@ impl LiveRuntime {
         template: &MachineTemplate,
         options: SessionOptions,
         recovery: MachineRecoveryImage,
-    ) -> RuntimeResult<Self> {
+    ) -> RuntimeResult<RuntimeActivation> {
         let plan = template.shared_plan();
         let source_inventory = source_inventory(&plan);
         let source_ids_by_path = source_inventory
@@ -531,50 +614,15 @@ impl LiveRuntime {
             .iter()
             .map(|source| (source.path.clone(), source.id))
             .collect();
-        let mut session = template
+        let activation = template
             .instantiate(options)?
             .restore_recovery(recovery)?
             .build()?;
-        let document = document::DocumentRuntime::new(&mut session)?;
-        Ok(Self {
-            session,
-            document,
-            pending_document_rollback: None,
-            source_inventory,
-            source_ids_by_path,
-        })
+        runtime_activation_from_machine(activation, source_inventory, source_ids_by_path)
     }
 
-    fn from_cached_plan(cached: CachedPlan) -> RuntimeResult<Self> {
+    fn from_cached_plan(cached: CachedPlan) -> RuntimeResult<RuntimeActivation> {
         Self::from_shared_machine_plan(cached.plan, SessionOptions::default())
-    }
-
-    pub fn mount(&self) -> RuntimeTurn {
-        RuntimeTurn {
-            sequence: 0,
-            source_sequence: None,
-            deltas: Vec::new(),
-            authority_deltas: Vec::new(),
-            durable_changes: Vec::new(),
-            outbox_changes: Vec::new(),
-            transient_effects: Vec::new(),
-            cancelled_transient_effects: Vec::new(),
-            transient_effect_credit_grants: Vec::new(),
-            distributed_invocations: Vec::new(),
-            document_patches: self
-                .document
-                .as_ref()
-                .map(document::DocumentRuntime::mount_patches)
-                .unwrap_or_default(),
-            document_patch_status: DocumentPatchStatus::Complete,
-            metrics: TurnMetrics::default(),
-            materialization: self
-                .document
-                .as_ref()
-                .map(document::DocumentRuntime::stats)
-                .unwrap_or_default(),
-            phase_timings: RuntimePhaseTimings::default(),
-        }
     }
 
     pub fn dispatch(&mut self, event: SourceEvent) -> RuntimeResult<RuntimeTurn> {

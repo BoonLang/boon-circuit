@@ -522,6 +522,9 @@ impl SparseTransactionPlan {
         if !batch.completed_migration_edges.is_empty() {
             plan.stores.insert(MIGRATIONS);
         }
+        if !batch.outbox_changes.is_empty() {
+            plan.stores.insert(OUTBOX);
+        }
         plan
     }
 
@@ -2089,10 +2092,20 @@ fn command_admission_cost(command: &PersistenceCommand) -> BrowserPersistenceAdm
                         .saturating_add(artifact.bytes.len()),
                 );
             }
+            cost.add(checkpoint_components_admission_cost(
+                &[],
+                &batch.outbox_changes,
+                &[],
+            ));
         }
         PersistenceCommand::ResetApplication(batch) => {
             cost.add_payload(application_identity_bytes(&batch.application) + 96);
             cost.add(restore_image_admission_cost(&batch.default_image));
+            cost.add(checkpoint_components_admission_cost(
+                &batch.authority_changes,
+                &batch.outbox_changes,
+                &[],
+            ));
         }
         PersistenceCommand::Barrier(request) => {
             cost.add_payload(application_identity_bytes(&request.application) + 16);
@@ -2759,6 +2772,16 @@ impl IndexedDbBackend {
         {
             return abort_with(transaction, error).await;
         }
+        if let Err(error) = apply_sparse_outbox_changes(
+            &transaction,
+            &batch.application,
+            &batch.outbox_changes,
+            self.limits,
+        )
+        .await
+        {
+            return abort_with(transaction, error).await;
+        }
         for memory in &batch.deleted_memory {
             if let Err(error) =
                 delete_memory_sparse(&transaction, &batch.application, *memory, self.limits).await
@@ -2849,6 +2872,9 @@ impl IndexedDbBackend {
         if current.schema_hash != batch.source_schema_hash {
             return abort_with(transaction, StoreError::SchemaMismatch).await;
         }
+        if batch.through_turn_sequence < current.through_turn_sequence {
+            return abort_with(transaction, StoreError::NonContiguousTurn).await;
+        }
         let prefix = application_storage_key(&batch.application);
         for store in [
             SLOTS,
@@ -2872,12 +2898,33 @@ impl IndexedDbBackend {
             }
         }
 
+        if let Err(error) = apply_sparse_changes(
+            &transaction,
+            &batch.application,
+            &batch.authority_changes,
+            self.limits,
+        )
+        .await
+        {
+            return abort_with(transaction, error).await;
+        }
+        if let Err(error) = apply_sparse_outbox_changes(
+            &transaction,
+            &batch.application,
+            &batch.outbox_changes,
+            self.limits,
+        )
+        .await
+        {
+            return abort_with(transaction, error).await;
+        }
+
         let reset_record = CheckpointRecord {
             kind: CheckpointKind::Reset,
             base_epoch: batch.expected_base_epoch,
             next_epoch: batch.next_epoch,
             first_turn_sequence: current.through_turn_sequence,
-            last_turn_sequence: current.through_turn_sequence,
+            last_turn_sequence: batch.through_turn_sequence,
             schema_hash: batch.default_image.schema_hash,
             checksum: batch.checksum,
         };
@@ -2894,7 +2941,7 @@ impl IndexedDbBackend {
             schema_version: batch.default_image.schema_version,
             schema_hash: batch.default_image.schema_hash,
             epoch: batch.next_epoch,
-            through_turn_sequence: current.through_turn_sequence,
+            through_turn_sequence: batch.through_turn_sequence,
             clean_shutdown: false,
             initialization_checksum: match restore_checksum(&batch.default_image) {
                 Ok(checksum) => checksum,
@@ -7042,6 +7089,7 @@ mod tests {
             target_schema_hash: [2; 32],
             through_turn_sequence: 8,
             authority_changes: Vec::new(),
+            outbox_changes: Vec::new(),
             completed_migration_edges: vec![MigrationEdgeId([0x51; 32])],
             deleted_memory: vec![memory],
             target_content_artifact_manifest: ContentArtifactManifest::default(),

@@ -121,7 +121,8 @@ async fn start_boon_app_inner(config_bytes: Uint8Array) -> WebHostResult<ActiveB
             BrowserAppStartupPoll::Ready(startup) => break startup,
         }
     };
-    let (config, identity, runtime, effect_contracts) = startup.into_distributed_parts();
+    let (config, identity, runtime, initial_turn, effect_contracts) =
+        startup.into_distributed_parts();
     let authoritative_frame =
         runtime
             .document_frame()
@@ -194,7 +195,7 @@ async fn start_boon_app_inner(config_bytes: Uint8Array) -> WebHostResult<ActiveB
         protocols: Vec::new(),
     };
     let event_wake: Rc<dyn Fn()> = Rc::new(schedule_browser_network_pump);
-    let effects = BrowserClientEffectHost::open(
+    let mut effects = BrowserClientEffectHost::open(
         &config.package_id,
         &config.client_capability_profile,
         &effect_contracts,
@@ -202,6 +203,7 @@ async fn start_boon_app_inner(config_bytes: Uint8Array) -> WebHostResult<ActiveB
         Rc::clone(&event_wake),
     )
     .await?;
+    effects.route_turns(std::slice::from_ref(&initial_turn))?;
     let session = BrowserDistributedSessionSocket::connect_with_event_wake(
         capabilities,
         request,

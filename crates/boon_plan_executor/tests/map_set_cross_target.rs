@@ -127,7 +127,7 @@ document: Document/new(
     let selected = field_id(&plan, "store.selected");
     let roles = field_id(&plan, "store.roles");
     let has_editor = field_id(&plan, "store.has_editor");
-    let mut session = MachineInstance::new(plan, SessionOptions::default()).unwrap();
+    let mut session = MachineInstance::new_quiescent(plan, SessionOptions::default()).unwrap();
 
     assert_eq!(
         session.root_value_current("store.users").unwrap(),
@@ -302,7 +302,7 @@ document: Document/new(
     let updates = source_id(&plan, "store.updates");
     let left_users = field_id(&plan, "store.left_users");
     let right_users = field_id(&plan, "store.right_users");
-    let mut session = MachineInstance::new(plan, SessionOptions::default()).unwrap();
+    let mut session = MachineInstance::new_quiescent(plan, SessionOptions::default()).unwrap();
 
     session.root_value_current("store.left_users").unwrap();
     session.root_value_current("store.right_users").unwrap();

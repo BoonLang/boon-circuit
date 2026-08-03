@@ -56,7 +56,7 @@ fn compile_for_role(
 }
 
 fn machine(compiled: CompiledMachinePlanFromSource) -> Result<MachineInstance, String> {
-    MachineInstance::new_shared(Arc::new(compiled.plan), SessionOptions::default())
+    MachineInstance::new_shared_quiescent(Arc::new(compiled.plan), SessionOptions::default())
         .map_err(|error| error.to_string())
 }
 
@@ -335,7 +335,7 @@ pub fn effect_cancellation_rejects_late_publication() -> Result<(), String> {
 pub fn stale_route_is_rejected_before_current_route_executes() -> Result<(), String> {
     let compiled = compile("stale_routing_current.bn", TargetProfile::SoftwareDefault)?;
     let plan = Arc::new(compiled.plan);
-    let mut old = MachineInstance::new_shared(
+    let mut old = MachineInstance::new_shared_quiescent(
         Arc::clone(&plan),
         SessionOptions {
             program_revision: 1,
@@ -343,7 +343,7 @@ pub fn stale_route_is_rejected_before_current_route_executes() -> Result<(), Str
         },
     )
     .map_err(|error| error.to_string())?;
-    let mut current = MachineInstance::new_shared(
+    let mut current = MachineInstance::new_shared_quiescent(
         Arc::clone(&plan),
         SessionOptions {
             program_revision: 2,

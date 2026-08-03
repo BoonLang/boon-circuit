@@ -5,7 +5,7 @@ use boon_distributed_runtime::{
     DistributedClientStartupTask,
 };
 use boon_plan::EffectContract;
-use boon_runtime::MachineBuildProgress;
+use boon_runtime::{MachineBuildProgress, RuntimeTurn};
 
 /// A verified public Client artifact mounted into the distributed Client
 /// endpoint. The browser adapter must move these parts into the resumable
@@ -14,6 +14,7 @@ pub struct BrowserAppStartup {
     config: BrowserAppConfig,
     identity: DistributedSessionIdentity,
     runtime: DistributedClientRuntime,
+    initial_turn: RuntimeTurn,
     effect_contracts: Vec<EffectContract>,
 }
 
@@ -35,11 +36,13 @@ impl BrowserAppStartupTask {
             DistributedClientStartupPoll::Pending(progress) => {
                 Ok(BrowserAppStartupPoll::Pending(progress))
             }
-            DistributedClientStartupPoll::Ready(runtime) => {
+            DistributedClientStartupPoll::Ready(activation) => {
+                let (runtime, initial_turn) = activation.into_parts();
                 Ok(BrowserAppStartupPoll::Ready(BrowserAppStartup {
                     config: self.config.take().ok_or_else(completed_startup_error)?,
                     identity: self.identity.take().ok_or_else(completed_startup_error)?,
                     runtime,
+                    initial_turn,
                     effect_contracts: self
                         .effect_contracts
                         .take()
@@ -115,12 +118,14 @@ impl BrowserAppStartup {
         BrowserAppConfig,
         DistributedSessionIdentity,
         DistributedClientRuntime,
+        RuntimeTurn,
         Vec<EffectContract>,
     ) {
         (
             self.config,
             self.identity,
             self.runtime,
+            self.initial_turn,
             self.effect_contracts,
         )
     }

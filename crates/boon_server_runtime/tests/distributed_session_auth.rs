@@ -4,8 +4,8 @@ use boon_program_runtime::{
     DistributedProgramBundle, ProgramCompileRequest, compile_distributed_program_bundle,
 };
 use boon_runtime::{
-    ApplicationIdentity, ProgramCapabilityProfile, RuntimeSourceUnit, SessionPrincipal,
-    SourcePayload, Value,
+    ApplicationIdentity, ProgramCapabilityProfile, RuntimeSourceUnit, RuntimeTurn,
+    SessionPrincipal, SourcePayload, Value,
 };
 use boon_server_host::{
     DISTRIBUTED_SESSION_TRANSPORT_PATH, DistributedSessionOpen, ServerConfig, bind,
@@ -28,6 +28,20 @@ use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 
 type ClientSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
+
+fn consume_headless_client_activation(turn: RuntimeTurn) {
+    assert!(turn.deltas.is_empty());
+    assert!(turn.authority_deltas.is_empty());
+    assert!(turn.durable_changes.is_empty());
+    assert!(turn.outbox_changes.is_empty());
+    assert!(turn.transient_effects.is_empty());
+    assert!(turn.cancelled_transient_effects.is_empty());
+    assert!(turn.transient_effect_credit_grants.is_empty());
+    assert!(turn.distributed_invocations.is_empty());
+    // This transport-isolation test intentionally has no document host. The
+    // initial document patches are nevertheless consumed at this boundary.
+    let _document_patches = turn.document_patches;
+}
 
 const CLIENT: &str = r#"
 store: [
@@ -391,20 +405,24 @@ async fn production_transport_isolates_concurrent_authenticated_users() {
     let (_bob_token, bob_session_id, bob_generation, bob_applied_client) =
         commit_with_binding(&mut bob_socket, bob_offer).await;
 
-    let mut alice_client = DistributedClientRuntime::start(
+    let (mut alice_client, alice_initial_turn) = DistributedClientRuntime::start(
         bundle.artifact(ProgramRole::Client).unwrap(),
         DistributedQueueLimits::default(),
     )
-    .unwrap();
+    .unwrap()
+    .into_parts();
+    consume_headless_client_activation(alice_initial_turn);
     alice_client
         .bind(alice_session_id, alice_generation, alice_applied_client)
         .unwrap();
     alice_client.mark_current().unwrap();
-    let mut bob_client = DistributedClientRuntime::start(
+    let (mut bob_client, bob_initial_turn) = DistributedClientRuntime::start(
         bundle.artifact(ProgramRole::Client).unwrap(),
         DistributedQueueLimits::default(),
     )
-    .unwrap();
+    .unwrap()
+    .into_parts();
+    consume_headless_client_activation(bob_initial_turn);
     bob_client
         .bind(bob_session_id, bob_generation, bob_applied_client)
         .unwrap();

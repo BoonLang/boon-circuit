@@ -60,7 +60,8 @@ fn universal_foundation_values_have_one_native_and_wasm_trace() {
     .unwrap();
     let expected: Vec<ExpectedRoot> =
         serde_json::from_str(include_str!("../testdata/foundations_vertical.json")).unwrap();
-    let mut machine = MachineInstance::new(compiled.plan, SessionOptions::default()).unwrap();
+    let mut machine =
+        MachineInstance::new_quiescent(compiled.plan, SessionOptions::default()).unwrap();
 
     for expected in expected {
         let path = expected.path.clone();
@@ -95,7 +96,8 @@ fn typed_views_have_one_native_and_wasm_trace() {
         ProgramRole::Server,
     )
     .unwrap();
-    let mut machine = MachineInstance::new(compiled.plan, SessionOptions::default()).unwrap();
+    let mut machine =
+        MachineInstance::new_quiescent(compiled.plan, SessionOptions::default()).unwrap();
 
     assert_eq!(
         machine.root_value_current("selected").unwrap(),
@@ -123,7 +125,8 @@ fn scoped_reactive_rows_have_one_native_and_wasm_trace() {
         ProgramRole::Server,
     )
     .unwrap();
-    let mut machine = MachineInstance::new(compiled.plan, SessionOptions::default()).unwrap();
+    let mut machine =
+        MachineInstance::new_quiescent(compiled.plan, SessionOptions::default()).unwrap();
     let rows = row_ids(machine.root_value_current("store.rows").unwrap());
     let selected_row = rows[1];
     let route = machine

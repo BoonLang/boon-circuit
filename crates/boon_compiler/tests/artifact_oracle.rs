@@ -51,7 +51,7 @@ fn novywave_source() -> PathBuf {
 fn start(
     plan: MachinePlan,
 ) -> Result<(MachineInstance, DocumentRuntime), Box<dyn std::error::Error>> {
-    let mut session = MachineInstance::new(plan, SessionOptions::default())?;
+    let mut session = MachineInstance::new_quiescent(plan, SessionOptions::default())?;
     let document = DocumentRuntime::new(&mut session)?.expect("document runtime");
     Ok((session, document))
 }

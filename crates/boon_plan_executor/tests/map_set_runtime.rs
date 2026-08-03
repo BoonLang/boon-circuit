@@ -150,7 +150,8 @@ document: Document/new(
     .unwrap();
     assert!(compiled.plan.persistence.collections.is_empty());
     assert!(compiled.plan.persistence.lists.is_empty());
-    let mut session = MachineInstance::new(compiled.plan, SessionOptions::default()).unwrap();
+    let mut session =
+        MachineInstance::new_quiescent(compiled.plan, SessionOptions::default()).unwrap();
 
     let (selected_user, selected_metrics) = session
         .root_value_current_with_metrics("store.selected_user")
@@ -286,7 +287,8 @@ document: Document/new(
     )
     .unwrap();
     assert!(compiled.plan.persistence.lists.is_empty());
-    let mut session = MachineInstance::new(compiled.plan, SessionOptions::default()).unwrap();
+    let mut session =
+        MachineInstance::new_quiescent(compiled.plan, SessionOptions::default()).unwrap();
 
     let error = session
         .root_value_current("store.selected")
@@ -323,7 +325,8 @@ document: Document/new(
         TargetProfile::SoftwareBounded,
     )
     .unwrap();
-    let mut session = MachineInstance::new(compiled.plan, SessionOptions::default()).unwrap();
+    let mut session =
+        MachineInstance::new_quiescent(compiled.plan, SessionOptions::default()).unwrap();
 
     assert_eq!(
         session.root_value_current("store.updated_left").unwrap(),
@@ -382,7 +385,8 @@ document: Document/new(
             "store.orders.@authority:entry:0/value/field:lines",
         ]
     );
-    let mut session = MachineInstance::new(compiled.plan, SessionOptions::default()).unwrap();
+    let mut session =
+        MachineInstance::new_quiescent(compiled.plan, SessionOptions::default()).unwrap();
     let value = session.root_value_current("store.orders").unwrap();
     let authority = session.authority_snapshot().unwrap();
     assert_eq!(
@@ -456,7 +460,8 @@ document: Document/new(
     let plan = compiled.plan;
     let remove = source_id(&plan, "store.remove");
     let rows = list_id(&plan, "store.rows");
-    let mut session = MachineInstance::new(plan.clone(), SessionOptions::default()).unwrap();
+    let mut session =
+        MachineInstance::new_quiescent(plan.clone(), SessionOptions::default()).unwrap();
     session.root_value_current("store.observed_lines").unwrap();
     let Value::List(initial_rows) = session.list_value_current(rows).unwrap() else {
         panic!("nested LIST fixture did not publish a list");
@@ -570,7 +575,7 @@ document: Document/new(
         .unwrap()
         .restore_durable(durable_image)
         .unwrap()
-        .build()
+        .build_quiescent()
         .unwrap();
     assert_eq!(
         restored.list_value_current(rows).unwrap(),
@@ -621,7 +626,8 @@ document: Document/new(
     let add = source_id(&plan, "store.add");
     let remove = source_id(&plan, "store.remove");
     let rows = list_id(&plan, "store.rows");
-    let mut session = MachineInstance::new(plan.clone(), SessionOptions::default()).unwrap();
+    let mut session =
+        MachineInstance::new_quiescent(plan.clone(), SessionOptions::default()).unwrap();
     let initial = session.semantic_value_image().unwrap();
     let application = initial.application.clone();
     let schema_hash = initial.schema_hash;
@@ -773,7 +779,7 @@ document: Document/new(
         .unwrap()
         .restore_durable(durable)
         .unwrap()
-        .build()
+        .build_quiescent()
         .unwrap();
     assert_eq!(restored.list_row_snapshots(rows).unwrap().len(), 2);
     assert_eq!(restored.authority_snapshot().unwrap().maps.len(), 2);
@@ -818,7 +824,8 @@ document: Document/new(
     let actions = source_id(&plan, "store.actions");
     let removed = field_id(&plan, "store.removed");
     let reinserted = field_id(&plan, "store.reinserted");
-    let mut session = MachineInstance::new(plan.clone(), SessionOptions::default()).unwrap();
+    let mut session =
+        MachineInstance::new_quiescent(plan.clone(), SessionOptions::default()).unwrap();
     session.root_value_current("store.orders").unwrap();
     let initial = session.authority_snapshot().unwrap();
     let initial_durable = session.semantic_value_image().unwrap();
@@ -934,7 +941,7 @@ document: Document/new(
     let mut restored = MachineInstanceBuilder::new(plan.clone(), SessionOptions::default())
         .unwrap()
         .restore(reinserted_snapshot)
-        .build()
+        .build_quiescent()
         .unwrap();
     assert_eq!(
         restored.root_value_current("store.orders").unwrap(),
@@ -950,7 +957,7 @@ document: Document/new(
         .unwrap()
         .restore_durable(durable_image)
         .unwrap()
-        .build()
+        .build_quiescent()
         .unwrap();
     assert_eq!(
         durable_restored.root_value_current("store.orders").unwrap(),
@@ -1006,7 +1013,8 @@ document: Document/new(
     let selected_a = field_id(&plan, "store.selected_a");
     let selected_b = field_id(&plan, "store.selected_b");
     let only_initial_entry = field_id(&plan, "store.only_initial_entry");
-    let mut session = MachineInstance::new(plan.clone(), SessionOptions::default()).unwrap();
+    let mut session =
+        MachineInstance::new_quiescent(plan.clone(), SessionOptions::default()).unwrap();
 
     assert_eq!(
         session.root_value_current("store.selected_a").unwrap(),
@@ -1115,7 +1123,7 @@ document: Document/new(
     let mut restored = MachineInstanceBuilder::new(plan, SessionOptions::default())
         .unwrap()
         .restore(authority)
-        .build()
+        .build_quiescent()
         .unwrap();
     assert_eq!(
         restored.root_value_current("store.users").unwrap(),
@@ -1179,7 +1187,7 @@ document: Document/new(
     let change = source_id(&plan, "store.updates");
     let left_users = field_id(&plan, "store.left_users");
     let right_users = field_id(&plan, "store.right_users");
-    let mut session = MachineInstance::new(plan, SessionOptions::default()).unwrap();
+    let mut session = MachineInstance::new_quiescent(plan, SessionOptions::default()).unwrap();
 
     session.root_value_current("store.left_users").unwrap();
     session.root_value_current("store.right_users").unwrap();

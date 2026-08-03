@@ -930,7 +930,8 @@ fn initialize_client(
             "distributed bundle has no Client artifact".to_owned(),
         ))
     })?;
-    let mut client = DistributedClientRuntime::start(artifact, config.client_queue_limits)?;
+    let (mut client, initial_turn) =
+        DistributedClientRuntime::start(artifact, config.client_queue_limits)?.into_parts();
     let hello = encode_session_control_frame(&SessionControlFrame::ClientHello(ClientHello::new(
         identity.graph_id,
         identity.graph_revision,
@@ -971,6 +972,10 @@ fn initialize_client(
     validate_ready(&ready, session_id, generation, applied_client_through)?;
 
     let mut pending_turns = VecDeque::new();
+    pending_turns.push_back(PendingTurn {
+        owner: TransientEffectOwner::Client,
+        turn: initial_turn,
+    });
     pending_turns.extend(
         client
             .bind(session_id, generation, applied_client_through)?

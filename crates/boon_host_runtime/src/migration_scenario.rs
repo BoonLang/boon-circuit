@@ -17,7 +17,10 @@ use boon_plan::{
     ApplicationIdentity, ExactNumber, MachinePlan, MemoryId, MigrationPredecessorBinding,
     ProgramRole, TargetProfile,
 };
-use boon_runtime::{LiveRuntime, RowId, SessionOptions, Snapshot, SourcePayload, Value};
+use boon_runtime::{
+    LiveRuntime, RowId, RuntimeActivation, RuntimeTurn, SessionOptions, Snapshot, SourcePayload,
+    Value,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -190,7 +193,7 @@ impl PersistenceDriver for SharedInMemoryDriver {
 
 struct PreparedPreview {
     stage: String,
-    candidate: LiveRuntime,
+    candidate: RuntimeActivation,
     staged: StagedMigration,
 }
 
@@ -549,6 +552,7 @@ impl MigrationScenarioRunner {
             deterministic_worker_config(),
         )
         .map_err(|error| ActionError::new("start_failed", error.to_string()))?;
+        ensure_migration_turn_quiescent(&startup.initial_turn)?;
         let next_sequence = startup
             .restore_image
             .through_turn_sequence
@@ -722,6 +726,7 @@ impl MigrationScenarioRunner {
             deterministic_worker_config(),
         )
         .map_err(|error| ActionError::new("restart_failed", error.to_string()))?;
+        ensure_migration_turn_quiescent(&startup.initial_turn)?;
         namespace.next_sequence = startup
             .restore_image
             .through_turn_sequence
@@ -760,7 +765,6 @@ impl MigrationScenarioRunner {
             Some(staged.candidate.clone()),
         )
         .map_err(|error| ActionError::new("candidate_settle_failed", error.to_string()))?;
-        let _ = candidate.mount();
         namespace.preview = Some(PreparedPreview {
             stage: stage.to_owned(),
             candidate,
@@ -794,7 +798,7 @@ impl MigrationScenarioRunner {
         }
         let migration_preview = if let Some(preview) = preview {
             let completed_edges = preview.staged.candidate.completed_migration_edges.clone();
-            namespace
+            let (initial_turn, _) = namespace
                 .runtime
                 .as_mut()
                 .ok_or_else(|| {
@@ -809,6 +813,7 @@ impl MigrationScenarioRunner {
                     };
                     ActionError::new(code, error.to_string())
                 })?;
+            ensure_migration_turn_quiescent(&initial_turn)?;
             Some(preview.staged.preview)
         } else {
             namespace
@@ -1091,7 +1096,7 @@ impl MigrationScenarioRunner {
                         )
                     })?;
                 let plan = namespace.compiled.plan(stage)?;
-                let mut runtime = LiveRuntime::from_shared_machine_plan_with_restore(
+                let activation = LiveRuntime::from_shared_machine_plan_with_restore(
                     Arc::clone(&plan),
                     SessionOptions::default(),
                     Some(durable.clone()),
@@ -1099,6 +1104,7 @@ impl MigrationScenarioRunner {
                 .map_err(|error| {
                     ActionError::new("durable_value_restore_failed", error.to_string())
                 })?;
+                let mut runtime = into_migration_runtime(activation)?;
                 let value = runtime
                     .inspect_value_current(path, 100_000)
                     .map_err(|error| {
@@ -1262,7 +1268,7 @@ impl MigrationScenarioRunner {
                         )
                     })?;
                 let plan = namespace.compiled.plan(stage)?;
-                let runtime = LiveRuntime::from_shared_machine_plan_with_restore(
+                let activation = LiveRuntime::from_shared_machine_plan_with_restore(
                     Arc::clone(&plan),
                     SessionOptions::default(),
                     Some(durable.clone()),
@@ -1270,6 +1276,7 @@ impl MigrationScenarioRunner {
                 .map_err(|error| {
                     ActionError::new("durable_list_restore_failed", error.to_string())
                 })?;
+                let runtime = into_migration_runtime(activation)?;
                 let snapshot = runtime.snapshot().map_err(|error| {
                     ActionError::new("durable_list_read_failed", error.to_string())
                 })?;
@@ -1802,6 +1809,30 @@ fn fault_name(point: MigrationFaultPoint) -> &'static str {
         MigrationFaultPoint::DuringActivationCommit => "during_activation_commit",
         MigrationFaultPoint::AfterActivationCommit => "after_activation_commit",
     }
+}
+
+fn ensure_migration_turn_quiescent(turn: &RuntimeTurn) -> Result<(), ActionError> {
+    if !turn.deltas.is_empty()
+        || !turn.authority_deltas.is_empty()
+        || !turn.durable_changes.is_empty()
+        || !turn.outbox_changes.is_empty()
+        || !turn.transient_effects.is_empty()
+        || !turn.cancelled_transient_effects.is_empty()
+        || !turn.transient_effect_credit_grants.is_empty()
+        || !turn.distributed_invocations.is_empty()
+    {
+        return Err(ActionError::new(
+            "unsupported_startup_host_work",
+            "migration scenario has no effect host for a non-quiescent runtime activation",
+        ));
+    }
+    Ok(())
+}
+
+fn into_migration_runtime(activation: RuntimeActivation) -> Result<LiveRuntime, ActionError> {
+    let (runtime, initial_turn, _) = activation.into_parts();
+    ensure_migration_turn_quiescent(&initial_turn)?;
+    Ok(runtime)
 }
 
 fn fault_error(point: MigrationFaultPoint) -> ActionError {

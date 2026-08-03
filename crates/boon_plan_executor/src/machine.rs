@@ -1477,6 +1477,65 @@ pub struct Turn {
     pub metrics: TurnMetrics,
 }
 
+/// Exact result of constructing a machine.
+///
+/// Construction may execute startup pulses that schedule host work. Keeping
+/// the initial turn beside the machine makes that work impossible to replace
+/// with a synthetic empty mount or silently lose at the build boundary.
+#[must_use = "machine activation must be consumed so its initial turn reaches the host"]
+pub struct MachineActivation {
+    machine: MachineInstance,
+    initial_turn: Turn,
+    base_turn_sequence: u64,
+}
+
+impl MachineActivation {
+    pub fn machine(&self) -> &MachineInstance {
+        &self.machine
+    }
+
+    pub fn machine_mut(&mut self) -> &mut MachineInstance {
+        &mut self.machine
+    }
+
+    pub fn initial_turn(&self) -> &Turn {
+        &self.initial_turn
+    }
+
+    pub const fn base_turn_sequence(&self) -> u64 {
+        self.base_turn_sequence
+    }
+
+    pub fn requires_authority_commit(&self) -> bool {
+        self.initial_turn.sequence != self.base_turn_sequence
+    }
+
+    pub fn into_parts(self) -> (MachineInstance, Turn, u64) {
+        (self.machine, self.initial_turn, self.base_turn_sequence)
+    }
+
+    /// Extracts a machine only when construction produced no host-facing
+    /// activation work. Low-level executor tests and tools use this boundary
+    /// deliberately; product hosts must consume `into_parts` instead.
+    pub fn into_quiescent_machine(self) -> Result<MachineInstance, Error> {
+        if self.requires_authority_commit()
+            || !self.initial_turn.deltas.is_empty()
+            || !self.initial_turn.authority_deltas.is_empty()
+            || !self.initial_turn.durable_changes.is_empty()
+            || !self.initial_turn.outbox_changes.is_empty()
+            || !self.initial_turn.transient_effects.is_empty()
+            || !self.initial_turn.cancelled_transient_effects.is_empty()
+            || !self.initial_turn.transient_effect_credit_grants.is_empty()
+            || !self.initial_turn.distributed_invocations.is_empty()
+        {
+            return Err(Error::Evaluation(
+                "machine activation contains host work and cannot be discarded".to_owned(),
+            ));
+        }
+        Ok(self.machine)
+    }
+}
+
 impl fmt::Debug for Turn {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -6834,6 +6893,26 @@ fn authority_delta_is_producer_local(
     }
 }
 
+fn delta_is_producer_local(
+    delta: &Delta,
+    ownership: &boon_plan::ProducerFunctionOwnershipPlan,
+) -> bool {
+    match delta {
+        Delta::SetValue { target, .. } | Delta::ClearValue { target } => match target {
+            ValueTarget::State(state) => ownership.states.contains(state),
+            ValueTarget::Field(field) => ownership.fields.contains(field),
+            ValueTarget::RowField { row, field } => {
+                ownership.lists.contains(&row.list) || ownership.fields.contains(field)
+            }
+        },
+        Delta::InsertRow { row } => ownership.lists.contains(&row.id.list),
+        Delta::RemoveRow { row }
+        | Delta::BindSource { row, .. }
+        | Delta::UnbindSource { row, .. } => ownership.lists.contains(&row.list),
+        Delta::SetDistributedImport { .. } | Delta::ClearDistributedImport { .. } => false,
+    }
+}
+
 fn instantiate_plan_owner(
     plan: &PlanOwner,
     trigger: &ActiveTrigger,
@@ -9500,7 +9579,7 @@ pub struct MachineBuildProgress {
 #[allow(clippy::large_enum_variant)]
 pub enum MachineBuildPoll {
     Pending(MachineBuildProgress),
-    Ready(MachineInstance),
+    Ready(MachineActivation),
 }
 
 #[derive(Default)]
@@ -10067,7 +10146,7 @@ impl MachineInstanceBuilder {
         }
     }
 
-    pub fn build(self) -> Result<MachineInstance, Error> {
+    pub fn build(self) -> Result<MachineActivation, Error> {
         let mut task = self.into_build_task();
         loop {
             match task.poll(usize::MAX)? {
@@ -10075,6 +10154,10 @@ impl MachineInstanceBuilder {
                 MachineBuildPoll::Ready(session) => return Ok(session),
             }
         }
+    }
+
+    pub fn build_quiescent(self) -> Result<MachineInstance, Error> {
+        self.build()?.into_quiescent_machine()
     }
 }
 
@@ -10383,11 +10466,55 @@ impl MachineBuildTask {
                     ));
                 }
                 MachineBuildState::Complete => {
-                    self.work.finish_metrics();
                     let mut session = self.session.take().expect("active machine build");
+                    session.strip_unleased_producer_resources(&mut self.work);
+                    session.commit_transient_effects(&mut self.work)?;
+                    let durable_changes = session.durable_changes(&self.work.authority_deltas)?;
+                    let (deltas, authority_deltas) = session.take_report_deltas(&mut self.work)?;
+                    self.work.finish_metrics();
+                    let base_turn_sequence = session.turn_sequence;
+                    let carries_activation_work = !deltas.is_empty()
+                        || !authority_deltas.is_empty()
+                        || !durable_changes.is_empty()
+                        || !self.work.outbox_changes.is_empty()
+                        || !self.work.transient_effects.is_empty()
+                        || !self.work.cancelled_transient_effects.is_empty()
+                        || !self.work.transient_effect_credit_grants.is_empty()
+                        || !self.work.distributed_invocations.is_empty();
+                    let sequence = if carries_activation_work {
+                        base_turn_sequence.checked_add(1).ok_or_else(|| {
+                            Error::Evaluation("activation turn sequence overflow".to_owned())
+                        })?
+                    } else {
+                        base_turn_sequence
+                    };
+                    session.turn_sequence = sequence;
                     session.startup_metrics = self.work.metrics.clone();
-                    session.strip_unleased_producer_resources();
-                    return Ok(MachineBuildPoll::Ready(session));
+                    let initial_turn = Turn {
+                        sequence,
+                        source_sequence: None,
+                        deltas,
+                        authority_deltas,
+                        durable_changes,
+                        outbox_changes: std::mem::take(&mut self.work.outbox_changes),
+                        transient_effects: std::mem::take(&mut self.work.transient_effects),
+                        cancelled_transient_effects: std::mem::take(
+                            &mut self.work.cancelled_transient_effects,
+                        ),
+                        transient_effect_credit_grants: std::mem::take(
+                            &mut self.work.transient_effect_credit_grants,
+                        ),
+                        distributed_invocations: std::mem::take(
+                            &mut self.work.distributed_invocations,
+                        ),
+                        metrics: std::mem::take(&mut self.work.metrics),
+                    };
+                    self.work.settle();
+                    return Ok(MachineBuildPoll::Ready(MachineActivation {
+                        machine: session,
+                        initial_turn,
+                        base_turn_sequence,
+                    }));
                 }
             }
             if remaining == 0 {
@@ -11605,7 +11732,7 @@ impl MachineInstance {
         Work::with_limit(self.options.max_work_units_per_transaction)
     }
 
-    fn strip_unleased_producer_resources(&mut self) {
+    fn strip_unleased_producer_resources(&mut self, work: &mut Work) {
         let ownerships = self
             .metadata
             .producer_function_instances
@@ -11613,6 +11740,22 @@ impl MachineInstance {
             .map(|instance| instance.ownership.clone())
             .collect::<Vec<_>>();
         for ownership in ownerships {
+            work.deltas
+                .retain(|delta| !delta_is_producer_local(delta, &ownership));
+            work.authority_deltas
+                .retain(|delta| !authority_delta_is_producer_local(delta, &ownership));
+            work.transient_effects
+                .retain(|effect| !ownership.effects.contains(&effect.invocation_id));
+            work.distributed_invocations.retain(|invocation| {
+                !self
+                    .plan
+                    .distributed_endpoint
+                    .as_ref()
+                    .into_iter()
+                    .flat_map(|endpoint| &endpoint.endpoint.remote_call_sites)
+                    .find(|call| call.call_site_id == invocation.call_site_id)
+                    .is_some_and(|call| ownership.static_owners.contains(&call.owner.static_owner))
+            });
             self.clear_owned_dynamic_dependencies(&ownership);
             self.remove_owned_resources(&ownership);
         }
@@ -12156,12 +12299,26 @@ impl MachineInstance {
         Ok(turn)
     }
 
-    pub fn new(plan: MachinePlan, options: SessionOptions) -> Result<Self, Error> {
+    pub fn new(plan: MachinePlan, options: SessionOptions) -> Result<MachineActivation, Error> {
         MachineInstanceBuilder::new(plan, options)?.build()
     }
 
-    pub fn new_shared(plan: Arc<MachinePlan>, options: SessionOptions) -> Result<Self, Error> {
+    pub fn new_shared(
+        plan: Arc<MachinePlan>,
+        options: SessionOptions,
+    ) -> Result<MachineActivation, Error> {
         MachineInstanceBuilder::new_shared(plan, options)?.build()
+    }
+
+    pub fn new_quiescent(plan: MachinePlan, options: SessionOptions) -> Result<Self, Error> {
+        Self::new(plan, options)?.into_quiescent_machine()
+    }
+
+    pub fn new_shared_quiescent(
+        plan: Arc<MachinePlan>,
+        options: SessionOptions,
+    ) -> Result<Self, Error> {
+        Self::new_shared(plan, options)?.into_quiescent_machine()
     }
 
     pub fn set_transient_effect_scope(&mut self, scope: u64) {
@@ -36587,6 +36744,88 @@ mod ownership_tests {
     }
 
     #[test]
+    fn unleased_producer_staging_is_pruned_before_activation_commit() {
+        let compiled = compile_test_source(
+            "producer-activation-pruning-internal.bn",
+            r#"
+store: [
+    advance: SOURCE
+    count:
+        0 |> HOLD count {
+            advance |> THEN { count + 1 }
+        }
+]
+"#,
+            TargetProfile::SoftwareDefault,
+            ProgramRole::Server,
+        )
+        .expect("producer pruning fixture compiles");
+        let mut session =
+            MachineInstance::new_quiescent(compiled.plan, SessionOptions::default()).unwrap();
+        let state = *session
+            .root_states
+            .keys()
+            .next()
+            .expect("fixture has one root state");
+        let invocation_id = EffectInvocationId([7; 32]);
+        let ownership = boon_plan::ProducerFunctionOwnershipPlan::new(
+            vec![PlanStaticOwnerId(1)],
+            Vec::new(),
+            vec![state],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![invocation_id],
+        );
+        Arc::make_mut(&mut session.metadata)
+            .producer_function_instances
+            .insert(
+                RemoteCallSiteId([8; 32]),
+                ProducerFunctionInstancePlan {
+                    call_site_id: RemoteCallSiteId([8; 32]),
+                    function_export_id: ExportId([9; 32]),
+                    owner: PlanOwner::root(),
+                    mode: DistributedCallMode::Current,
+                    invocation_source: None,
+                    ownership,
+                    arguments: Vec::new(),
+                    result: ValueRef::State(state),
+                    result_type: DataTypePlan::Number,
+                },
+            );
+
+        let mut work = session.fresh_work();
+        work.deltas.push(Delta::SetValue {
+            target: ValueTarget::State(state),
+            value: Value::integer(2).unwrap(),
+        });
+        work.authority_deltas.push(AuthorityDelta::SetRoot {
+            state,
+            value: Value::integer(2).unwrap(),
+        });
+        work.transient_effects.push(TransientEffectInvocation {
+            call_id: TransientEffectCallId::from_host_parts(1, 1),
+            invocation_id,
+            effect_id: boon_plan::EffectId([6; 32]),
+            trigger_sequence: 0,
+            authority_turn_sequence: 1,
+            owner: OwnerInstanceRoute::root(),
+            target: None,
+            intent: Value::Record(BTreeMap::new()),
+            delivery: boon_plan::EffectDeliveryCardinality::Single,
+        });
+
+        session.strip_unleased_producer_resources(&mut work);
+        session.commit_transient_effects(&mut work).unwrap();
+
+        assert!(work.deltas.is_empty());
+        assert!(work.authority_deltas.is_empty());
+        assert!(work.transient_effects.is_empty());
+        assert_eq!(session.pending_transient_effect_count(), 0);
+        assert!(!session.root_states.contains_key(&state));
+    }
+
+    #[test]
     fn runtime_turn_diagnostics_do_not_expose_distributed_payloads() {
         const SENTINEL: &str = "turn-secret-82be7a";
         let invocation = DistributedInvocation {
@@ -37163,7 +37402,8 @@ outputs: [
                 .iter()
                 .all(|index| index.source_list == source)
         );
-        let mut session = MachineInstance::new(compiled.plan, SessionOptions::default()).unwrap();
+        let mut session =
+            MachineInstance::new_quiescent(compiled.plan, SessionOptions::default()).unwrap();
         let changed = session
             .list_row_ids(source)
             .into_iter()
@@ -37253,7 +37493,7 @@ rows:
         )
         .expect("range/map row-local state fixture compiles");
 
-        let mut session = MachineInstance::new(compiled.plan, SessionOptions::default())
+        let mut session = MachineInstance::new_quiescent(compiled.plan, SessionOptions::default())
             .expect("row-local state initializes from the constructor value");
         let Value::List(rows) = session.root_value_current("rows").unwrap() else {
             panic!("range/map fixture did not publish a row list");
@@ -37332,7 +37572,8 @@ store: [
             .take(3)
             .collect::<Vec<_>>();
         assert_eq!(list_ids.len(), 3);
-        let mut session = MachineInstance::new(plan.clone(), SessionOptions::default()).unwrap();
+        let mut session =
+            MachineInstance::new_quiescent(plan.clone(), SessionOptions::default()).unwrap();
         let mut work = session.fresh_work();
         work.begin_turn(None, 0);
         let parent = session
@@ -37436,7 +37677,8 @@ store: [
             captures: BTreeMap::new(),
         };
 
-        let mut session = MachineInstance::new(plan.clone(), SessionOptions::default()).unwrap();
+        let mut session =
+            MachineInstance::new_quiescent(plan.clone(), SessionOptions::default()).unwrap();
         let mut work = session.fresh_work();
         work.begin_turn(None, 0);
         let parent_a = session
@@ -37564,7 +37806,7 @@ store: [
             .unwrap()
             .restore_durable(durable)
             .unwrap()
-            .build()
+            .build_quiescent()
             .unwrap();
         let restored_owner_a = restored.row_owner_ancestry(parent_a).unwrap();
         let restored_owner_b = restored.row_owner_ancestry(parent_b).unwrap();
@@ -37607,7 +37849,7 @@ store: [
                 _ => None,
             })
             .expect("compiled append mutation");
-        let mut session = MachineInstance::new(plan, SessionOptions::default()).unwrap();
+        let mut session = MachineInstance::new_quiescent(plan, SessionOptions::default()).unwrap();
         let mut work = session.fresh_work();
         work.begin_turn(None, 1);
         let mutation = |ordinal| PendingListMutation::Append {

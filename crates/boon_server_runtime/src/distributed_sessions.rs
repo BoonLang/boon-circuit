@@ -964,12 +964,13 @@ impl DistributedSessionRegistry {
         let slot_epoch = self.next_slot_epoch(slot_id)?;
         let origin = SessionOrigin::new(slot_id, slot_epoch)?;
         let execution_scope = self.take_execution_scope()?;
-        let mut runtime = self.session_template.instantiate(
+        let activation = self.session_template.instantiate(
             session_id,
             next_transport_generation,
             principal.clone(),
             self.config.session_queue_limits,
         )?;
+        let (mut runtime, initial_turn) = activation.into_parts();
         let current_update = runtime.mark_current()?;
         server.attach_origin(origin, principal.clone(), execution_scope)?;
 
@@ -995,6 +996,7 @@ impl DistributedSessionRegistry {
         );
 
         let initialization = (|| {
+            self.pending_session_turns.push_back((origin, initial_turn));
             self.record_session_update(origin, current_update);
             let server_update =
                 server.set_origin_status(origin, SessionConnectionStatus::Current)?;

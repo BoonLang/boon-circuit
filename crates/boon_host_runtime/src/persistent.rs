@@ -27,8 +27,8 @@ use boon_program_runtime::{
 };
 use boon_runtime::{
     DistributedCurrentCallInstance, DistributedImportUpdate, DocumentPatch, LiveRuntime,
-    RuntimeTurn, SessionContext, SessionOptions, SourceEvent, SourcePayload, TransientEffectCallId,
-    Value,
+    RuntimeActivation, RuntimeTurn, SessionContext, SessionOptions, SourceEvent, SourcePayload,
+    TransientEffectCallId, Value,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
@@ -51,10 +51,7 @@ impl fmt::Display for PersistentRuntimeStartError {
             Self::Persistence(error) => write!(formatter, "{error}"),
             Self::Migration(error) => write!(formatter, "persistence migration failed: {error}"),
             Self::Activation(error) => {
-                write!(
-                    formatter,
-                    "persistence migration activation failed: {error}"
-                )
+                write!(formatter, "persistence runtime activation failed: {error}")
             }
         }
     }
@@ -344,14 +341,15 @@ pub enum PersistentRuntimeStartupDisposition {
     Migrated(boon_persistence::MigrationPreview),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PersistentRuntimeStartup {
     pub restore_image: RestoreImage,
     pub disposition: PersistentRuntimeStartupDisposition,
+    pub initial_turn: RuntimeTurn,
 }
 
 pub struct PersistentPlanActivation {
-    pub mount: RuntimeTurn,
+    pub initial_turn: RuntimeTurn,
     pub acknowledgement: Option<ActivationAck>,
     pub migration: Option<boon_persistence::MigrationPreview>,
 }
@@ -371,8 +369,8 @@ pub struct PersistentPlanBuildRequest {
 /// It is safe to discard when a newer source or authority revision wins.
 pub struct PreparedPersistentPlanActivation {
     base: RestoreImage,
-    candidate: LiveRuntime,
-    replacement_effect_work: EffectWorkIndex,
+    candidate: RuntimeActivation,
+    completed_migration_edges: BTreeSet<boon_plan::MigrationEdgeId>,
     activation: Option<ActivationBatch>,
     migration: Option<boon_persistence::MigrationPreview>,
     rebuild_derived_us: u64,
@@ -388,7 +386,7 @@ impl PersistentPlanBuildRequest {
             activation,
             migration,
         } = self;
-        let replacement_effect_work = EffectWorkIndex::from_items(restore.outbox.clone());
+        let completed_migration_edges = restore.completed_migration_edges.clone();
         let rebuild_started = Instant::now();
         let candidate =
             LiveRuntime::from_shared_machine_plan_with_restore(plan, options, Some(restore))
@@ -396,7 +394,7 @@ impl PersistentPlanBuildRequest {
         Ok(PreparedPersistentPlanActivation {
             base,
             candidate,
-            replacement_effect_work,
+            completed_migration_edges,
             activation,
             migration,
             rebuild_derived_us: duration_us(rebuild_started.elapsed()),
@@ -412,7 +410,7 @@ pub struct PersistentPlanPreview {
 }
 
 pub struct PersistentPlanReset {
-    pub mount: RuntimeTurn,
+    pub initial_turn: RuntimeTurn,
     pub acknowledgement: ResetApplicationAck,
 }
 
@@ -427,13 +425,13 @@ pub struct PersistentStateArtifactPreview {
 }
 
 pub struct PersistentStateArtifactActivation {
-    pub mount: RuntimeTurn,
+    pub initial_turn: RuntimeTurn,
     pub acknowledgement: ActivationAck,
     pub preview: PersistentStateArtifactPreview,
 }
 
 type PreparedStateArtifact = (
-    LiveRuntime,
+    RuntimeActivation,
     PersistentStateArtifactPreview,
     BTreeSet<boon_plan::MigrationEdgeId>,
     ContentArtifactManifest,
@@ -718,14 +716,13 @@ impl PersistentRuntime {
         #[allow(clippy::large_enum_variant)]
         enum ResolvedRuntimeStartup {
             Ready {
-                runtime: LiveRuntime,
+                runtime: RuntimeActivation,
                 disposition: PersistentRuntimeStartupDisposition,
                 rebuild_derived_us: u64,
             },
             Migration {
-                runtime: LiveRuntime,
+                runtime: RuntimeActivation,
                 candidate: RestoreImage,
-                activation: ActivationBatch,
                 preview: boon_persistence::MigrationPreview,
                 rebuild_derived_us: u64,
             },
@@ -744,11 +741,13 @@ impl PersistentRuntime {
                             options.clone(),
                         )
                         .map_err(|error| PersistentRuntimeStartError::Runtime(error.to_string()))?;
-                        let initial_image = runtime
+                        let mut initial_image = runtime
+                            .runtime()
                             .durable_restore_image(0, BTreeSet::new())
                             .map_err(|error| {
                                 PersistentRuntimeStartError::Runtime(error.to_string())
                             })?;
+                        initial_image.through_turn_sequence = runtime.base_turn_sequence();
                         Ok(PersistenceStartupResolution::Initialize {
                             initial_image,
                             value: ResolvedRuntimeStartup::Ready {
@@ -791,7 +790,6 @@ impl PersistentRuntime {
                             value: ResolvedRuntimeStartup::Migration {
                                 runtime,
                                 candidate: staged.candidate,
-                                activation: staged.activation,
                                 preview: staged.preview,
                                 rebuild_derived_us: duration_us(rebuild_started.elapsed()),
                             },
@@ -807,41 +805,97 @@ impl PersistentRuntime {
             }
             Err(PersistenceResolvedStartError::Resolver(error)) => return Err(error),
         };
-        let (runtime, disposition, last_rebuild_derived_us) = match resolved {
-            ResolvedRuntimeStartup::Ready {
-                runtime,
-                disposition,
-                rebuild_derived_us,
-            } => (runtime, disposition, rebuild_derived_us),
-            ResolvedRuntimeStartup::Migration {
-                runtime,
-                mut candidate,
-                activation,
-                preview,
-                rebuild_derived_us,
-            } => {
-                let acknowledgement = match persistence.activate(activation) {
-                    Ok(acknowledgement) => acknowledgement,
-                    Err(error) => {
-                        let _ = persistence.shutdown();
-                        return Err(PersistentRuntimeStartError::Activation(error));
-                    }
-                };
-                candidate.epoch = acknowledgement.epoch;
-                startup.restore_image = candidate;
-                (
+        let (runtime_activation, disposition, last_rebuild_derived_us, migration_candidate) =
+            match resolved {
+                ResolvedRuntimeStartup::Ready {
+                    runtime,
+                    disposition,
+                    rebuild_derived_us,
+                } => (runtime, disposition, rebuild_derived_us, None),
+                ResolvedRuntimeStartup::Migration {
+                    runtime,
+                    candidate,
+                    preview,
+                    rebuild_derived_us,
+                } => (
                     runtime,
                     PersistentRuntimeStartupDisposition::Migrated(preview),
                     rebuild_derived_us,
-                )
-            }
-        };
+                    Some(candidate),
+                ),
+            };
 
+        let (runtime, mut initial_turn, base_turn_sequence) = runtime_activation.into_parts();
+        if base_turn_sequence != startup.restore_image.through_turn_sequence {
+            let _ = persistence.shutdown();
+            return Err(PersistentRuntimeStartError::Runtime(format!(
+                "runtime activation base turn {base_turn_sequence} does not match durable turn {}",
+                startup.restore_image.through_turn_sequence
+            )));
+        }
+        let expected_activation_sequence = base_turn_sequence.checked_add(1);
+        if initial_turn.sequence != base_turn_sequence
+            && Some(initial_turn.sequence) != expected_activation_sequence
+        {
+            let _ = persistence.shutdown();
+            return Err(PersistentRuntimeStartError::Runtime(format!(
+                "runtime activation turn {} is not contiguous after base {base_turn_sequence}",
+                initial_turn.sequence
+            )));
+        }
+
+        let persistence_started = Instant::now();
+        if let Some(mut candidate) = migration_candidate {
+            let mut activated_image = runtime
+                .durable_restore_image(
+                    startup.restore_image.epoch,
+                    candidate.completed_migration_edges.clone(),
+                )
+                .map_err(|error| PersistentRuntimeStartError::Runtime(error.to_string()))?;
+            activated_image.outbox = startup.restore_image.outbox.clone();
+            activated_image.content_artifact_manifest = candidate.content_artifact_manifest.clone();
+            let batch = ActivationBatch::between(&startup.restore_image, &activated_image)
+                .map_err(|error| PersistentRuntimeStartError::Runtime(error.to_string()))?
+                .with_outbox_changes(initial_turn.outbox_changes.clone());
+            if let Err(error) = persistence.activate(batch) {
+                let _ = persistence.shutdown();
+                return Err(PersistentRuntimeStartError::Activation(error));
+            }
+            candidate = persistence
+                .load()
+                .map_err(PersistentRuntimeStartError::Activation)?
+                .ok_or_else(|| {
+                    PersistentRuntimeStartError::Runtime(
+                        "persistence activation lost its durable image".to_owned(),
+                    )
+                })?;
+            startup.restore_image = candidate;
+        } else if initial_turn.sequence != base_turn_sequence {
+            let authority =
+                AuthorityTurn::new(initial_turn.sequence, initial_turn.durable_changes.clone())
+                    .with_outbox_changes(initial_turn.outbox_changes.clone());
+            if let Err(error) = persistence.commit_immediate(authority) {
+                let _ = persistence.shutdown();
+                return Err(PersistentRuntimeStartError::Activation(error));
+            }
+            startup.restore_image = persistence
+                .load()
+                .map_err(PersistentRuntimeStartError::Activation)?
+                .ok_or_else(|| {
+                    PersistentRuntimeStartError::Runtime(
+                        "startup activation lost its durable image".to_owned(),
+                    )
+                })?;
+        }
+        initial_turn.phase_timings.persistence_enqueue_us =
+            duration_us(persistence_started.elapsed());
+
+        let effect_work = EffectWorkIndex::from_items(startup.restore_image.outbox.clone());
         let startup = PersistentRuntimeStartup {
             restore_image: startup.restore_image,
             disposition,
+            initial_turn,
         };
-        let effect_work = EffectWorkIndex::from_items(startup.restore_image.outbox.clone());
 
         Ok((
             Self {
@@ -1776,15 +1830,14 @@ impl PersistentRuntime {
             rebuild_derived_us,
         ) = self.prepare_state_artifact(artifact, options)?;
         self.last_rebuild_derived_us = rebuild_derived_us;
-        let mount = candidate.mount();
-        let acknowledgement = self.activate_settled_candidate_with_artifacts(
+        let (initial_turn, acknowledgement) = self.activate_settled_candidate_with_artifacts(
             candidate,
             completed_migration_edges,
             Some(content_artifact_manifest),
             content_artifacts,
         )?;
         Ok(PersistentStateArtifactActivation {
-            mount,
+            initial_turn,
             acknowledgement,
             preview,
         })
@@ -1859,11 +1912,10 @@ impl PersistentRuntime {
         )
         .map_err(|error| PersistentActivationError::Runtime(error.to_string()))?;
         self.last_rebuild_derived_us = duration_us(rebuild_started.elapsed());
-        let mount = candidate.mount();
-        let acknowledgement =
+        let (initial_turn, acknowledgement) =
             self.activate_settled_candidate(candidate, completed_migration_edges)?;
         Ok(PersistentPlanActivation {
-            mount,
+            initial_turn,
             acknowledgement: Some(acknowledgement),
             migration: None,
         })
@@ -1925,6 +1977,7 @@ impl PersistentRuntime {
         .map_err(|error| PersistentActivationError::Runtime(error.to_string()))?;
         let rebuild_derived_us = duration_us(rebuild_started.elapsed());
         let document_node_count = candidate
+            .runtime()
             .primary_retained_output_frame()
             .map_or(0, |frame| frame.nodes.len());
         let preview = PersistentStateArtifactPreview {
@@ -2390,9 +2443,9 @@ impl PersistentRuntime {
     /// ownership. A failed backend activation leaves the old runtime active.
     pub fn activate_settled_candidate(
         &mut self,
-        candidate: LiveRuntime,
+        candidate: RuntimeActivation,
         completed_migration_edges: BTreeSet<boon_plan::MigrationEdgeId>,
-    ) -> Result<ActivationAck, PersistentActivationError> {
+    ) -> Result<(RuntimeTurn, ActivationAck), PersistentActivationError> {
         self.activate_settled_candidate_with_artifacts(
             candidate,
             completed_migration_edges,
@@ -2403,31 +2456,48 @@ impl PersistentRuntime {
 
     fn activate_settled_candidate_with_artifacts(
         &mut self,
-        candidate: LiveRuntime,
+        candidate: RuntimeActivation,
         completed_migration_edges: BTreeSet<boon_plan::MigrationEdgeId>,
         target_content_artifact_manifest: Option<ContentArtifactManifest>,
         content_artifacts: BTreeMap<ContentArtifactId, ContentArtifact>,
-    ) -> Result<ActivationAck, PersistentActivationError> {
+    ) -> Result<(RuntimeTurn, ActivationAck), PersistentActivationError> {
         let current = self
             .persistence
             .load()
             .map_err(PersistentActivationError::Persistence)?
             .ok_or(PersistentActivationError::MissingDurableState)?;
+        if candidate.base_turn_sequence() != current.through_turn_sequence {
+            return Err(PersistentActivationError::Runtime(format!(
+                "candidate activation base turn {} does not match durable turn {}",
+                candidate.base_turn_sequence(),
+                current.through_turn_sequence
+            )));
+        }
+        let (candidate, mut initial_turn, _) = candidate.into_parts();
         let mut candidate_image = candidate
             .durable_restore_image(current.epoch, completed_migration_edges)
             .map_err(|error| PersistentActivationError::Runtime(error.to_string()))?;
         candidate_image.outbox = current.outbox.clone();
         candidate_image.content_artifact_manifest = target_content_artifact_manifest
             .unwrap_or_else(|| current.content_artifact_manifest.clone());
-        let next_effect_work = EffectWorkIndex::from_items(candidate_image.outbox.clone());
         let mut batch = ActivationBatch::between(&current, &candidate_image)
-            .map_err(|error| PersistentActivationError::Runtime(error.to_string()))?;
+            .map_err(|error| PersistentActivationError::Runtime(error.to_string()))?
+            .with_outbox_changes(initial_turn.outbox_changes.clone());
         batch.content_artifacts = content_artifacts;
         batch = batch.seal();
+        let persistence_started = Instant::now();
         let acknowledgement = self
             .persistence
             .activate(batch)
             .map_err(PersistentActivationError::Persistence)?;
+        initial_turn.phase_timings.persistence_enqueue_us =
+            duration_us(persistence_started.elapsed());
+        let durable = self
+            .persistence
+            .load()
+            .map_err(PersistentActivationError::Persistence)?
+            .ok_or(PersistentActivationError::MissingDurableState)?;
+        let next_effect_work = EffectWorkIndex::from_items(durable.outbox);
         self.runtime = candidate;
         self.program_artifacts = ProgramArtifactLanes::default();
         self.effect_work = next_effect_work.clone();
@@ -2435,7 +2505,7 @@ impl PersistentRuntime {
         self.pending_effect_durability.clear();
         self.ready_effect_actions.clear();
         self.generation = self.generation.saturating_add(1);
-        Ok(acknowledgement)
+        Ok((initial_turn, acknowledgement))
     }
 
     /// Captures an acknowledged authority image for an independently built
@@ -2506,27 +2576,56 @@ impl PersistentRuntime {
 
         let PreparedPersistentPlanActivation {
             candidate,
-            replacement_effect_work,
+            completed_migration_edges,
             activation,
             migration,
             rebuild_derived_us,
             ..
         } = prepared;
-        let mount = candidate.mount();
-        let acknowledgement = activation
-            .map(|batch| self.persistence.activate(batch))
-            .transpose()
-            .map_err(PersistentActivationError::Persistence)?;
-        self.runtime = candidate;
-        self.program_artifacts = ProgramArtifactLanes::default();
-        self.effect_work = replacement_effect_work.clone();
-        self.durable_effect_work = replacement_effect_work;
-        self.pending_effect_durability.clear();
-        self.ready_effect_actions.clear();
+        let (initial_turn, acknowledgement) = if activation.is_some() {
+            let (initial_turn, acknowledgement) =
+                self.activate_settled_candidate(candidate, completed_migration_edges)?;
+            (initial_turn, Some(acknowledgement))
+        } else {
+            let (candidate, mut initial_turn, base_turn_sequence) = candidate.into_parts();
+            if base_turn_sequence != current.through_turn_sequence {
+                return Err(PersistentActivationError::Runtime(format!(
+                    "prepared activation base turn {base_turn_sequence} does not match durable turn {}",
+                    current.through_turn_sequence
+                )));
+            }
+            if initial_turn.sequence != base_turn_sequence {
+                let persistence_started = Instant::now();
+                self.persistence
+                    .commit_immediate(
+                        AuthorityTurn::new(
+                            initial_turn.sequence,
+                            initial_turn.durable_changes.clone(),
+                        )
+                        .with_outbox_changes(initial_turn.outbox_changes.clone()),
+                    )
+                    .map_err(PersistentActivationError::Persistence)?;
+                initial_turn.phase_timings.persistence_enqueue_us =
+                    duration_us(persistence_started.elapsed());
+            }
+            let durable = self
+                .persistence
+                .load()
+                .map_err(PersistentActivationError::Persistence)?
+                .ok_or(PersistentActivationError::MissingDurableState)?;
+            let effect_work = EffectWorkIndex::from_items(durable.outbox);
+            self.runtime = candidate;
+            self.program_artifacts = ProgramArtifactLanes::default();
+            self.effect_work = effect_work.clone();
+            self.durable_effect_work = effect_work;
+            self.pending_effect_durability.clear();
+            self.ready_effect_actions.clear();
+            self.generation = self.generation.saturating_add(1);
+            (initial_turn, None)
+        };
         self.last_rebuild_derived_us = rebuild_derived_us;
-        self.generation = self.generation.saturating_add(1);
         Ok(PersistentPlanActivation {
-            mount,
+            initial_turn,
             acknowledgement,
             migration,
         })
@@ -2578,6 +2677,7 @@ impl PersistentRuntime {
             target_schema_version: plan.persistence.schema_version,
             target_schema_hash: plan.persistence.schema_hash,
             document_node_count: candidate
+                .runtime()
                 .primary_retained_output_frame()
                 .map_or(0, |frame| frame.nodes.len()),
         })
@@ -2606,6 +2706,7 @@ impl PersistentRuntime {
         let defaults = LiveRuntime::from_shared_machine_plan(Arc::clone(&plan), options.clone())
             .map_err(|error| PersistentActivationError::Runtime(error.to_string()))?;
         let default_image = defaults
+            .runtime()
             .durable_restore_image(0, BTreeSet::new())
             .map_err(|error| PersistentActivationError::Runtime(error.to_string()))?;
         let next_epoch = current.epoch.checked_add(1).ok_or_else(|| {
@@ -2624,30 +2725,56 @@ impl PersistentRuntime {
         )
         .map_err(|error| PersistentActivationError::Runtime(error.to_string()))?;
         let rebuild_derived_us = duration_us(rebuild_started.elapsed());
-        let mount = candidate.mount();
+        let (candidate, mut initial_turn, base_turn_sequence) = candidate.into_parts();
+        if base_turn_sequence != current.through_turn_sequence {
+            return Err(PersistentActivationError::Runtime(format!(
+                "start-over activation base turn {base_turn_sequence} does not match durable turn {}",
+                current.through_turn_sequence
+            )));
+        }
+        if initial_turn.sequence != base_turn_sequence
+            && initial_turn.sequence != base_turn_sequence.saturating_add(1)
+        {
+            return Err(PersistentActivationError::Runtime(format!(
+                "start-over activation turn {} is not contiguous with base turn {base_turn_sequence}",
+                initial_turn.sequence
+            )));
+        }
         let batch = ResetApplicationBatch {
             application: current.application.clone(),
             expected_base_epoch: current.epoch,
             next_epoch,
             source_schema_hash: current.schema_hash,
             default_image,
+            through_turn_sequence: initial_turn.sequence,
+            authority_changes: initial_turn.durable_changes.clone(),
+            outbox_changes: initial_turn.outbox_changes.clone(),
             checksum: [0; 32],
         }
         .seal();
+        let persistence_started = Instant::now();
         let acknowledgement = self
             .persistence
             .reset_application(batch)
             .map_err(PersistentActivationError::Persistence)?;
+        initial_turn.phase_timings.persistence_enqueue_us =
+            duration_us(persistence_started.elapsed());
+        let durable = self
+            .persistence
+            .load()
+            .map_err(PersistentActivationError::Persistence)?
+            .ok_or(PersistentActivationError::MissingDurableState)?;
+        let effect_work = EffectWorkIndex::from_items(durable.outbox);
         self.runtime = candidate;
         self.program_artifacts = ProgramArtifactLanes::default();
-        self.effect_work = EffectWorkIndex::default();
-        self.durable_effect_work = EffectWorkIndex::default();
+        self.effect_work = effect_work.clone();
+        self.durable_effect_work = effect_work;
         self.pending_effect_durability.clear();
         self.ready_effect_actions.clear();
         self.last_rebuild_derived_us = rebuild_derived_us;
         self.generation = self.generation.saturating_add(1);
         Ok(PersistentPlanReset {
-            mount,
+            initial_turn,
             acknowledgement,
         })
     }

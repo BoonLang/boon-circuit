@@ -149,9 +149,11 @@ fn run_scenario(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     reject_unknown_options(args, &["--scenario"])?;
 
     let units = source_units_for_path(Path::new(source))?;
-    let mut runtime = LiveRuntime::from_project(source, &units)?;
+    let activation = LiveRuntime::from_project(source, &units)?;
+    let (mut runtime, initial_turn, _) = activation.into_parts();
     let scenario = parse_scenario(Path::new(&scenario))?;
-    let turns = runtime.run_scenario(&scenario)?;
+    let mut turns = vec![initial_turn];
+    turns.extend(runtime.run_scenario(&scenario)?);
     let snapshot = runtime.snapshot()?;
     println!(
         "pass: {} turn(s), {} state value(s), {} derived field value(s), {} list(s)",

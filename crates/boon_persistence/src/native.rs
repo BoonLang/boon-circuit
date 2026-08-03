@@ -684,6 +684,9 @@ impl RedbDriver {
             if current.schema_hash != batch.source_schema_hash {
                 return Err(StoreError::SchemaMismatch);
             }
+            if batch.through_turn_sequence < current.through_turn_sequence {
+                return Err(StoreError::NonContiguousTurn);
+            }
 
             delete_prefix(&mut transaction.open_table(SLOTS).map_err(backend)?, &app)?;
             delete_prefix(&mut transaction.open_table(LISTS).map_err(backend)?, &app)?;
@@ -712,6 +715,43 @@ impl RedbDriver {
                 &mut transaction.open_table(ARTIFACT_OWNERS).map_err(backend)?,
                 &app,
             )?;
+
+            if !batch.authority_changes.is_empty() {
+                let mut slots = transaction.open_table(SLOTS).map_err(backend)?;
+                let mut lists = transaction.open_table(LISTS).map_err(backend)?;
+                let mut rows = transaction.open_table(ROWS).map_err(backend)?;
+                let mut maps = transaction.open_table(MAPS).map_err(backend)?;
+                let mut map_entries = transaction.open_table(MAP_ENTRIES).map_err(backend)?;
+                let mut sets = transaction.open_table(SETS).map_err(backend)?;
+                let mut set_items = transaction.open_table(SET_ITEMS).map_err(backend)?;
+                let mut blob_table = transaction.open_table(BLOBS).map_err(backend)?;
+                let empty_blobs = BTreeMap::new();
+                let mut candidate_blobs = BTreeMap::new();
+                apply_changes(
+                    &mut slots,
+                    &mut lists,
+                    &mut rows,
+                    &mut maps,
+                    &mut map_entries,
+                    &mut sets,
+                    &mut set_items,
+                    &app,
+                    &batch.authority_changes,
+                    self.limits,
+                    &mut candidate_blobs,
+                )?;
+                sync_blobs(&mut blob_table, &app, &empty_blobs, &candidate_blobs)?;
+            }
+
+            if !batch.outbox_changes.is_empty() {
+                let mut outbox = transaction.open_table(OUTBOX).map_err(backend)?;
+                let empty_outbox = BTreeMap::new();
+                let mut candidate_outbox = BTreeMap::new();
+                super::apply_durable_outbox_changes(&mut candidate_outbox, &batch.outbox_changes)?;
+                super::validate_outbox(&candidate_outbox)?;
+                replace_outbox(&mut outbox, &app, &empty_outbox, &candidate_outbox)?;
+            }
+
             let mut checkpoints = transaction.open_table(CHECKPOINTS).map_err(backend)?;
             delete_prefix(&mut checkpoints, &app)?;
             record_checkpoint(
@@ -722,7 +762,7 @@ impl RedbDriver {
                     base_epoch: batch.expected_base_epoch,
                     next_epoch: batch.next_epoch,
                     first_turn_sequence: current.through_turn_sequence,
-                    last_turn_sequence: current.through_turn_sequence,
+                    last_turn_sequence: batch.through_turn_sequence,
                     schema_hash: batch.default_image.schema_hash,
                     checksum: batch.checksum,
                 },
@@ -733,7 +773,7 @@ impl RedbDriver {
                 schema_version: batch.default_image.schema_version,
                 schema_hash: batch.default_image.schema_hash,
                 epoch: batch.next_epoch,
-                through_turn_sequence: current.through_turn_sequence,
+                through_turn_sequence: batch.through_turn_sequence,
                 clean_shutdown: false,
                 initialization_checksum: restore_checksum(&batch.default_image)?,
             };
@@ -854,6 +894,17 @@ impl RedbDriver {
                 )?;
             }
             sync_blobs(&mut blob_table, &app, &current_blobs, &candidate_blobs)?;
+
+            if !batch.outbox_changes.is_empty() {
+                let mut outbox = transaction.open_table(OUTBOX).map_err(backend)?;
+                let mut decoded_bytes = 0;
+                let current_outbox =
+                    load_outbox_table(&outbox, &app, self.limits, &mut decoded_bytes)?;
+                let mut candidate_outbox = current_outbox.clone();
+                super::apply_durable_outbox_changes(&mut candidate_outbox, &batch.outbox_changes)?;
+                super::validate_outbox(&candidate_outbox)?;
+                replace_outbox(&mut outbox, &app, &current_outbox, &candidate_outbox)?;
+            }
 
             let mut migrations = transaction.open_table(MIGRATIONS).map_err(backend)?;
             for edge in &batch.completed_migration_edges {
@@ -3725,6 +3776,9 @@ mod tests {
             next_epoch: 1,
             source_schema_hash: [4; 32],
             default_image: RestoreImage::empty(app.clone(), 1, [4; 32]),
+            through_turn_sequence: 0,
+            authority_changes: Vec::new(),
+            outbox_changes: Vec::new(),
             checksum: [0; 32],
         }
         .seal();
@@ -4162,6 +4216,7 @@ mod tests {
                         value: number(7),
                     },
                 }],
+                outbox_changes: Vec::new(),
                 completed_migration_edges: vec![edge],
                 deleted_memory: vec![old],
                 target_content_artifact_manifest: ContentArtifactManifest {
@@ -4543,6 +4598,9 @@ mod tests {
             next_epoch: 2,
             source_schema_hash: [11; 32],
             default_image: RestoreImage::empty(app.clone(), 2, [12; 32]),
+            through_turn_sequence: 1,
+            authority_changes: Vec::new(),
+            outbox_changes: Vec::new(),
             checksum: [0; 32],
         }
         .seal();
@@ -4580,5 +4638,84 @@ mod tests {
             count_prefix(&checkpoints, &application_key(&app)).unwrap(),
             1
         );
+    }
+
+    #[test]
+    fn activation_persists_startup_outbox_in_the_schema_transaction() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.redb");
+        let app = application();
+        let current = RestoreImage::empty(app.clone(), 1, [21; 32]);
+        let mut driver = RedbDriver::open(&path).unwrap();
+        initialize(&mut driver, current.clone());
+        let mut candidate = current.clone();
+        candidate.schema_version = 2;
+        candidate.schema_hash = [22; 32];
+        candidate.through_turn_sequence = 1;
+        let item = pending_outbox(1);
+        let item_id = item.item_id;
+        let batch = ActivationBatch::between(&current, &candidate)
+            .unwrap()
+            .with_outbox_changes(vec![super::super::DurableOutboxChange::Enqueue { item }]);
+        assert!(matches!(
+            driver.execute(PersistenceCommand::Activate(batch)),
+            PersistenceResult::Activated(Ok(ActivationAck {
+                epoch: 1,
+                through_turn_sequence: 1,
+                ..
+            }))
+        ));
+        let activated = load(&mut driver, app);
+        assert_eq!(
+            activated
+                .outbox
+                .get(&item_id)
+                .unwrap()
+                .created_turn_sequence,
+            1
+        );
+    }
+
+    #[test]
+    fn reset_persists_default_activation_in_the_reset_transaction() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.redb");
+        let app = application();
+        let mut driver = RedbDriver::open(&path).unwrap();
+        initialize(&mut driver, RestoreImage::empty(app.clone(), 1, [31; 32]));
+        let item = pending_outbox(1);
+        let item_id = item.item_id;
+        let batch = ResetApplicationBatch {
+            application: app.clone(),
+            expected_base_epoch: 0,
+            next_epoch: 1,
+            source_schema_hash: [31; 32],
+            default_image: RestoreImage::empty(app.clone(), 2, [32; 32]),
+            through_turn_sequence: 1,
+            authority_changes: vec![DurableChange::SetScalar {
+                memory_id: scalar("fresh"),
+                value: StoredScalar {
+                    touched: true,
+                    value: number(3),
+                },
+            }],
+            outbox_changes: vec![super::super::DurableOutboxChange::Enqueue { item }],
+            checksum: [0; 32],
+        }
+        .seal();
+        assert!(matches!(
+            driver.execute(PersistenceCommand::ResetApplication(batch)),
+            PersistenceResult::ApplicationReset(Ok(ResetApplicationAck {
+                epoch: 1,
+                through_turn_sequence: 1,
+                ..
+            }))
+        ));
+        drop(driver);
+
+        let mut reopened = RedbDriver::open(&path).unwrap();
+        let reset = load(&mut reopened, app);
+        assert_eq!(reset.scalars[&scalar("fresh")].value, number(3));
+        assert_eq!(reset.outbox.get(&item_id).unwrap().created_turn_sequence, 1);
     }
 }

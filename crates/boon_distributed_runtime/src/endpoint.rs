@@ -52,12 +52,17 @@ pub(super) struct EndpointRuntime {
     protocol: EndpointProtocolState,
 }
 
+pub(super) struct EndpointActivation {
+    pub(super) endpoint: EndpointRuntime,
+    pub(super) initial_turn: RuntimeTurn,
+}
+
 // Keeping the ready runtime inline avoids an allocation on every endpoint
 // startup and preserves the enclosing startup poll representation.
 #[allow(clippy::large_enum_variant)]
 pub(super) enum EndpointBuildPoll {
     Pending(MachineBuildProgress),
-    Ready(EndpointRuntime),
+    Ready(EndpointActivation),
 }
 
 pub(super) struct EndpointBuildTask {
@@ -74,16 +79,22 @@ impl EndpointBuildTask {
     ) -> Result<EndpointBuildPoll, DistributedRuntimeError> {
         match self.machine.poll(max_steps).map_err(runtime_error)? {
             LiveRuntimeBuildPoll::Pending(progress) => Ok(EndpointBuildPoll::Pending(progress)),
-            LiveRuntimeBuildPoll::Ready(runtime) => Ok(EndpointBuildPoll::Ready(EndpointRuntime {
-                role: self.role,
-                contract: self.contract.clone(),
-                wire_schema: self.wire_schema.clone(),
-                machine: EndpointMachine {
-                    runtime,
-                    next_source_sequence: 1,
-                },
-                protocol: EndpointProtocolState::default(),
-            })),
+            LiveRuntimeBuildPoll::Ready(activation) => {
+                let (runtime, initial_turn, _) = activation.into_parts();
+                Ok(EndpointBuildPoll::Ready(EndpointActivation {
+                    endpoint: EndpointRuntime {
+                        role: self.role,
+                        contract: self.contract.clone(),
+                        wire_schema: self.wire_schema.clone(),
+                        machine: EndpointMachine {
+                            runtime,
+                            next_source_sequence: 1,
+                        },
+                        protocol: EndpointProtocolState::default(),
+                    },
+                    initial_turn,
+                }))
+            }
         }
     }
 }
@@ -366,7 +377,7 @@ impl EndpointRuntime {
         contract: DistributedEndpointContractPlan,
         wire_schema: DistributedWireSchemaPlan,
         options: SessionOptions,
-    ) -> Result<Self, DistributedRuntimeError> {
+    ) -> Result<EndpointActivation, DistributedRuntimeError> {
         let mut task = Self::begin_start(template, contract, wire_schema, options)?;
         loop {
             match task.poll(usize::MAX)? {

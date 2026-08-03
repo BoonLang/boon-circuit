@@ -11,13 +11,14 @@ mod session;
 
 pub use boon_runtime::DistributedRuntimeError;
 pub use client::{
-    DistributedClientRuntime, DistributedClientStartupPoll, DistributedClientStartupTask,
-    DistributedClientUpdate,
+    DistributedClientActivation, DistributedClientRuntime, DistributedClientStartupPoll,
+    DistributedClientStartupTask, DistributedClientUpdate,
 };
 pub use client_session::ClientSessionQueueLimits;
 pub use message::{DistributedMessage, DistributedMessagePayload, DistributedQueueLimits};
 pub use session::{
-    DistributedSessionRuntime, DistributedSessionTemplate, DistributedSessionUpdate,
+    DistributedSessionActivation, DistributedSessionRuntime, DistributedSessionTemplate,
+    DistributedSessionUpdate,
 };
 
 use boon_plan::{DistributedEventExportPlan, SourcePayloadField};

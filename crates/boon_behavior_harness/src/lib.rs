@@ -14,7 +14,8 @@ use boon_local_host::{LocalTransientCompletion, LocalTransientHost, PackageAsset
 use boon_persistence::{InMemoryDriver, PersistenceWorkerConfig, RestoreImage};
 use boon_plan::{EffectReplay, ExactNumber, MachinePlan, SourceRouteToken};
 use boon_runtime::{
-    RuntimeTurn, ScenarioSourceEvent, ScenarioStep, SessionOptions, SourcePayload, Value,
+    RuntimeTurn, ScenarioSourceEvent, ScenarioStep, SessionOptions, SourcePayload,
+    TransientEffectCallId, TransientEffectInvocation, Value,
 };
 use std::collections::BTreeMap;
 use std::ops::Range;
@@ -56,6 +57,498 @@ pub struct BehaviorTurnTrace {
     pub transient_effects: Vec<String>,
 }
 
+/// Exact external causality observed from one real transient host execution.
+/// Call IDs remain launch-local and are replaced by transcript-local logical
+/// IDs, so an independently built runtime can replay the same host results.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct BehaviorEffectTranscript {
+    events: Vec<BehaviorEffectTranscriptEvent>,
+}
+
+impl BehaviorEffectTranscript {
+    pub fn event_count(&self) -> usize {
+        self.events.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum BehaviorEffectTranscriptEvent {
+    Route(RecordedEffectRoute),
+    Completion(RecordedEffectCompletion),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RecordedEffectRoute {
+    turn_sequence: u64,
+    source_sequence: Option<u64>,
+    cancellations: Vec<u64>,
+    credits: Vec<(u64, u32)>,
+    invocations: Vec<RecordedEffectInvocation>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RecordedEffectInvocation {
+    logical_call: u64,
+    invocation: TransientEffectInvocation,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RecordedEffectCompletion {
+    logical_call: u64,
+    kind: RecordedEffectCompletionKind,
+    outcome: Value,
+    terminal: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecordedEffectCompletionKind {
+    Single,
+    Stream { result_sequence: u64 },
+}
+
+enum BehaviorTransientCompletion {
+    Single {
+        call_id: TransientEffectCallId,
+        outcome: Value,
+    },
+    Stream {
+        call_id: TransientEffectCallId,
+        result_sequence: u64,
+        outcome: Value,
+    },
+}
+
+enum BehaviorTransientHost {
+    Record {
+        host: LocalTransientHost,
+        transcript: BehaviorEffectTranscript,
+        call_to_logical: BTreeMap<TransientEffectCallId, u64>,
+        next_logical_call: u64,
+    },
+    Replay {
+        transcript: BehaviorEffectTranscript,
+        cursor: usize,
+        call_to_logical: BTreeMap<TransientEffectCallId, u64>,
+        logical_to_call: BTreeMap<u64, TransientEffectCallId>,
+    },
+}
+
+impl BehaviorTransientHost {
+    fn record(host: LocalTransientHost) -> Self {
+        Self::Record {
+            host,
+            transcript: BehaviorEffectTranscript::default(),
+            call_to_logical: BTreeMap::new(),
+            next_logical_call: 1,
+        }
+    }
+
+    fn replay(transcript: BehaviorEffectTranscript) -> Self {
+        Self::Replay {
+            transcript,
+            cursor: 0,
+            call_to_logical: BTreeMap::new(),
+            logical_to_call: BTreeMap::new(),
+        }
+    }
+
+    fn route_turn(&mut self, turn: &RuntimeTurn) -> Result<(), String> {
+        match self {
+            Self::Record {
+                host,
+                transcript,
+                call_to_logical,
+                next_logical_call,
+            } => {
+                let mut next_calls = call_to_logical.clone();
+                let mut next_logical = *next_logical_call;
+                let cancellations = turn
+                    .cancelled_transient_effects
+                    .iter()
+                    .map(|call| {
+                        next_calls.remove(call).ok_or_else(|| {
+                            format!("effect transcript saw cancellation for unknown call {call}")
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let credits = turn
+                    .transient_effect_credit_grants
+                    .iter()
+                    .map(|grant| {
+                        next_calls
+                            .get(&grant.call_id)
+                            .copied()
+                            .map(|logical| (logical, grant.credits))
+                            .ok_or_else(|| {
+                                format!(
+                                    "effect transcript saw credit for unknown call {}",
+                                    grant.call_id
+                                )
+                            })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let mut invocations = Vec::with_capacity(turn.transient_effects.len());
+                for invocation in &turn.transient_effects {
+                    if next_calls.contains_key(&invocation.call_id) {
+                        return Err(format!(
+                            "effect transcript saw repeated active call {}",
+                            invocation.call_id
+                        ));
+                    }
+                    let logical_call = next_logical;
+                    next_logical = next_logical.checked_add(1).ok_or_else(|| {
+                        "effect transcript logical call identity overflow".to_owned()
+                    })?;
+                    next_calls.insert(invocation.call_id, logical_call);
+                    invocations.push(RecordedEffectInvocation {
+                        logical_call,
+                        invocation: normalize_invocation(invocation, logical_call),
+                    });
+                }
+                host.route_turn(turn)?;
+                *call_to_logical = next_calls;
+                *next_logical_call = next_logical;
+                if !cancellations.is_empty() || !credits.is_empty() || !invocations.is_empty() {
+                    transcript.events.push(BehaviorEffectTranscriptEvent::Route(
+                        RecordedEffectRoute {
+                            turn_sequence: turn.sequence,
+                            source_sequence: turn.source_sequence,
+                            cancellations,
+                            credits,
+                            invocations,
+                        },
+                    ));
+                }
+                Ok(())
+            }
+            Self::Replay {
+                transcript,
+                cursor,
+                call_to_logical,
+                logical_to_call,
+            } => {
+                if turn.cancelled_transient_effects.is_empty()
+                    && turn.transient_effect_credit_grants.is_empty()
+                    && turn.transient_effects.is_empty()
+                {
+                    return Ok(());
+                }
+                let expected = match transcript.events.get(*cursor) {
+                    Some(BehaviorEffectTranscriptEvent::Route(route)) => route.clone(),
+                    Some(BehaviorEffectTranscriptEvent::Completion(completion)) => {
+                        return Err(format!(
+                            "effect replay expected completion for logical call {} before runtime turn {}",
+                            completion.logical_call, turn.sequence
+                        ));
+                    }
+                    None => {
+                        return Err(format!(
+                            "effect replay produced unexpected runtime turn {} after transcript end",
+                            turn.sequence
+                        ));
+                    }
+                };
+                if expected.turn_sequence != turn.sequence
+                    || expected.source_sequence != turn.source_sequence
+                {
+                    return Err(format!(
+                        "effect replay turn identity differs: expected {}/{:?}, got {}/{:?}",
+                        expected.turn_sequence,
+                        expected.source_sequence,
+                        turn.sequence,
+                        turn.source_sequence,
+                    ));
+                }
+
+                let mut next_calls = call_to_logical.clone();
+                let mut next_logical_calls = logical_to_call.clone();
+                let cancellations = turn
+                    .cancelled_transient_effects
+                    .iter()
+                    .map(|call| {
+                        let logical = next_calls.remove(call).ok_or_else(|| {
+                            format!("effect replay cancelled unknown call {call}")
+                        })?;
+                        next_logical_calls.remove(&logical);
+                        Ok(logical)
+                    })
+                    .collect::<Result<Vec<_>, String>>()?;
+                let credits = turn
+                    .transient_effect_credit_grants
+                    .iter()
+                    .map(|grant| {
+                        next_calls
+                            .get(&grant.call_id)
+                            .copied()
+                            .map(|logical| (logical, grant.credits))
+                            .ok_or_else(|| {
+                                format!("effect replay credited unknown call {}", grant.call_id)
+                            })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                if turn.transient_effects.len() != expected.invocations.len() {
+                    return Err(format!(
+                        "effect replay invocation count differs at turn {}: expected {}, got {}",
+                        turn.sequence,
+                        expected.invocations.len(),
+                        turn.transient_effects.len(),
+                    ));
+                }
+                let mut invocations = Vec::with_capacity(turn.transient_effects.len());
+                for (invocation, expected_invocation) in
+                    turn.transient_effects.iter().zip(&expected.invocations)
+                {
+                    let normalized =
+                        normalize_invocation(invocation, expected_invocation.logical_call);
+                    invocations.push(RecordedEffectInvocation {
+                        logical_call: expected_invocation.logical_call,
+                        invocation: normalized,
+                    });
+                    if next_calls
+                        .insert(invocation.call_id, expected_invocation.logical_call)
+                        .is_some()
+                        || next_logical_calls
+                            .insert(expected_invocation.logical_call, invocation.call_id)
+                            .is_some()
+                    {
+                        return Err(format!(
+                            "effect replay repeated logical call {}",
+                            expected_invocation.logical_call
+                        ));
+                    }
+                }
+                let actual = RecordedEffectRoute {
+                    turn_sequence: turn.sequence,
+                    source_sequence: turn.source_sequence,
+                    cancellations,
+                    credits,
+                    invocations,
+                };
+                if actual != expected {
+                    return Err(format!(
+                        "effect replay route differs at turn {}: expected {expected:?}, got {actual:?}",
+                        turn.sequence
+                    ));
+                }
+                *call_to_logical = next_calls;
+                *logical_to_call = next_logical_calls;
+                *cursor += 1;
+                Ok(())
+            }
+        }
+    }
+
+    fn try_completion(&mut self) -> Result<Option<BehaviorTransientCompletion>, String> {
+        match self {
+            Self::Record {
+                host,
+                transcript,
+                call_to_logical,
+                ..
+            } => {
+                let Some(completion) = host.try_completion()? else {
+                    return Ok(None);
+                };
+                let (call_id, kind, outcome, terminal) = match completion {
+                    LocalTransientCompletion::Single { call_id, outcome } => {
+                        (call_id, RecordedEffectCompletionKind::Single, outcome, true)
+                    }
+                    LocalTransientCompletion::File(event) => {
+                        let terminal = event.is_terminal();
+                        let kind = if event.is_stream() {
+                            RecordedEffectCompletionKind::Stream {
+                                result_sequence: event.result_sequence,
+                            }
+                        } else {
+                            RecordedEffectCompletionKind::Single
+                        };
+                        (event.call_id, kind, event.outcome, terminal)
+                    }
+                };
+                let logical_call = call_to_logical
+                    .get(&call_id)
+                    .copied()
+                    .ok_or_else(|| format!("effect transcript completed unknown call {call_id}"))?;
+                if terminal {
+                    call_to_logical.remove(&call_id);
+                }
+                transcript
+                    .events
+                    .push(BehaviorEffectTranscriptEvent::Completion(
+                        RecordedEffectCompletion {
+                            logical_call,
+                            kind,
+                            outcome: outcome.clone(),
+                            terminal,
+                        },
+                    ));
+                Ok(Some(match kind {
+                    RecordedEffectCompletionKind::Single => {
+                        BehaviorTransientCompletion::Single { call_id, outcome }
+                    }
+                    RecordedEffectCompletionKind::Stream { result_sequence } => {
+                        BehaviorTransientCompletion::Stream {
+                            call_id,
+                            result_sequence,
+                            outcome,
+                        }
+                    }
+                }))
+            }
+            Self::Replay {
+                transcript,
+                cursor,
+                call_to_logical,
+                logical_to_call,
+            } => {
+                let Some(BehaviorEffectTranscriptEvent::Completion(completion)) =
+                    transcript.events.get(*cursor)
+                else {
+                    return Ok(None);
+                };
+                let completion = completion.clone();
+                let call_id = logical_to_call
+                    .get(&completion.logical_call)
+                    .copied()
+                    .ok_or_else(|| {
+                        format!(
+                            "effect replay transcript completed inactive logical call {}",
+                            completion.logical_call
+                        )
+                    })?;
+                if completion.terminal {
+                    logical_to_call.remove(&completion.logical_call);
+                    call_to_logical.remove(&call_id);
+                }
+                *cursor += 1;
+                Ok(Some(match completion.kind {
+                    RecordedEffectCompletionKind::Single => BehaviorTransientCompletion::Single {
+                        call_id,
+                        outcome: completion.outcome,
+                    },
+                    RecordedEffectCompletionKind::Stream { result_sequence } => {
+                        BehaviorTransientCompletion::Stream {
+                            call_id,
+                            result_sequence,
+                            outcome: completion.outcome,
+                        }
+                    }
+                }))
+            }
+        }
+    }
+
+    fn has_work(&self) -> bool {
+        match self {
+            Self::Record { host, .. } => host.has_work(),
+            Self::Replay {
+                call_to_logical, ..
+            } => !call_to_logical.is_empty(),
+        }
+    }
+
+    fn recorded_transcript(&self) -> Result<BehaviorEffectTranscript, String> {
+        match self {
+            Self::Record { transcript, .. } => Ok(transcript.clone()),
+            Self::Replay { .. } => {
+                Err("effect transcript is unavailable from a replay host".to_owned())
+            }
+        }
+    }
+
+    fn assert_replay_consumed(&self) -> Result<(), String> {
+        match self {
+            Self::Record { .. } => Err("behavior host is recording, not replaying".to_owned()),
+            Self::Replay {
+                transcript,
+                cursor,
+                call_to_logical,
+                ..
+            } if *cursor == transcript.events.len() && call_to_logical.is_empty() => Ok(()),
+            Self::Replay {
+                transcript,
+                cursor,
+                call_to_logical,
+                ..
+            } => Err(format!(
+                "effect replay stopped at event {cursor}/{} with {} active logical calls",
+                transcript.events.len(),
+                call_to_logical.len(),
+            )),
+        }
+    }
+
+    fn replay_stall(&self) -> Option<String> {
+        let Self::Replay {
+            transcript,
+            cursor,
+            call_to_logical,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        if call_to_logical.is_empty() {
+            return None;
+        }
+        match transcript.events.get(*cursor) {
+            Some(BehaviorEffectTranscriptEvent::Completion(_)) => None,
+            Some(BehaviorEffectTranscriptEvent::Route(route)) => Some(format!(
+                "effect replay still has {} active calls but next expects runtime turn {}",
+                call_to_logical.len(),
+                route.turn_sequence,
+            )),
+            None => Some(format!(
+                "effect replay exhausted its transcript with {} active calls",
+                call_to_logical.len(),
+            )),
+        }
+    }
+}
+
+fn normalize_invocation(
+    invocation: &TransientEffectInvocation,
+    logical_call: u64,
+) -> TransientEffectInvocation {
+    let mut normalized = invocation.clone();
+    normalized.call_id = TransientEffectCallId::from_host_parts(0, logical_call);
+    normalized
+}
+
+fn behavior_turn_trace(turn: &RuntimeTurn) -> BehaviorTurnTrace {
+    BehaviorTurnTrace {
+        sequence: turn.sequence,
+        source_sequence: turn.source_sequence,
+        durable_change_count: turn.durable_changes.len(),
+        transient_effect_count: turn.transient_effects.len(),
+        cancelled_transient_effect_count: turn.cancelled_transient_effects.len(),
+        document_patch_count: turn.document_patches.len(),
+        durable_changes: turn
+            .durable_changes
+            .iter()
+            .map(durable_change_trace)
+            .collect(),
+        transient_effects: turn
+            .transient_effects
+            .iter()
+            .map(|effect| {
+                format!(
+                    "effect={:?} invocation={:?} target={:?} trigger={} authority_turn={}",
+                    effect.effect_id,
+                    effect.invocation_id,
+                    effect.target,
+                    effect.trigger_sequence,
+                    effect.authority_turn_sequence,
+                )
+            })
+            .collect(),
+    }
+}
+
 impl BehaviorAsset {
     pub fn new(url: impl Into<String>, media_type: impl Into<String>, bytes: Vec<u8>) -> Self {
         Self {
@@ -73,7 +566,7 @@ impl BehaviorAsset {
 /// authored action must resolve to a visible typed route in the retained frame.
 pub struct BehaviorHarness {
     runtime: PersistentRuntime,
-    transient_host: LocalTransientHost,
+    transient_host: BehaviorTransientHost,
     effect_worker: HostEffectWorker,
     view: RetainedView,
     columns: ApproximateTextColumnMeasurer,
@@ -106,17 +599,8 @@ impl BehaviorHarness {
         viewport: Viewport,
     ) -> Result<Self, String> {
         validate_plan(&plan)?;
-        let (runtime, _) = PersistentRuntime::from_shared_machine_plan(
-            Arc::clone(&plan),
-            SessionOptions::default(),
-            InMemoryDriver::default(),
-            PersistenceWorkerConfig::default(),
-        )
-        .map_err(|error| error.to_string())?;
-        let mount = runtime.runtime().mount();
-        let sequence = mount.source_sequence.unwrap_or(0);
         let content_root = isolated_content_root(content_root.as_ref());
-        let mut transient_host = LocalTransientHost::new(
+        let host = LocalTransientHost::new(
             content_root,
             assets.iter().map(|asset| PackageAsset {
                 url: &asset.url,
@@ -125,7 +609,40 @@ impl BehaviorHarness {
             }),
             transient_effect_ids(&plan),
         )?;
-        transient_host.route_turn(&mount)?;
+        Self::mount(plan, BehaviorTransientHost::record(host), viewport)
+    }
+
+    pub fn replay(
+        plan: Arc<MachinePlan>,
+        transcript: BehaviorEffectTranscript,
+    ) -> Result<Self, String> {
+        Self::replay_with_viewport(plan, transcript, DEFAULT_BEHAVIOR_VIEWPORT)
+    }
+
+    pub fn replay_with_viewport(
+        plan: Arc<MachinePlan>,
+        transcript: BehaviorEffectTranscript,
+        viewport: Viewport,
+    ) -> Result<Self, String> {
+        validate_plan(&plan)?;
+        Self::mount(plan, BehaviorTransientHost::replay(transcript), viewport)
+    }
+
+    fn mount(
+        plan: Arc<MachinePlan>,
+        mut transient_host: BehaviorTransientHost,
+        viewport: Viewport,
+    ) -> Result<Self, String> {
+        let (runtime, startup) = PersistentRuntime::from_shared_machine_plan(
+            Arc::clone(&plan),
+            SessionOptions::default(),
+            InMemoryDriver::default(),
+            PersistenceWorkerConfig::default(),
+        )
+        .map_err(|error| error.to_string())?;
+        let initial_turn = startup.initial_turn;
+        let sequence = initial_turn.source_sequence.unwrap_or(0);
+        transient_host.route_turn(&initial_turn)?;
         let frame = runtime
             .runtime()
             .primary_retained_output_frame()
@@ -153,7 +670,7 @@ impl BehaviorHarness {
             scenario_trigger_turn: None,
             settle_timeout: DEFAULT_SETTLE_TIMEOUT,
             host_identity_generation: 1,
-            turn_trace: Vec::new(),
+            turn_trace: vec![behavior_turn_trace(&initial_turn)],
         };
         harness.sync_layout_demands()?;
         harness.dispatch_host_lifecycle_started()?;
@@ -238,21 +755,17 @@ impl BehaviorHarness {
                     break;
                 };
                 let turn = match completion {
-                    LocalTransientCompletion::Single { call_id, outcome } => self
+                    BehaviorTransientCompletion::Single { call_id, outcome } => self
                         .runtime
                         .complete_transient_effect(call_id, outcome)
                         .map_err(|error| error.to_string())?,
-                    LocalTransientCompletion::File(event) if event.is_stream() => self
+                    BehaviorTransientCompletion::Stream {
+                        call_id,
+                        result_sequence,
+                        outcome,
+                    } => self
                         .runtime
-                        .deliver_transient_effect_result(
-                            event.call_id,
-                            event.result_sequence,
-                            event.outcome,
-                        )
-                        .map_err(|error| error.to_string())?,
-                    LocalTransientCompletion::File(event) => self
-                        .runtime
-                        .complete_transient_effect(event.call_id, event.outcome)
+                        .deliver_transient_effect_result(call_id, result_sequence, outcome)
                         .map_err(|error| error.to_string())?,
                 };
                 self.finish_turn(turn)?;
@@ -273,6 +786,9 @@ impl BehaviorHarness {
             {
                 return Ok(());
             }
+            if let Some(stall) = self.transient_host.replay_stall() {
+                return Err(stall);
+            }
             if !progressed {
                 thread::sleep(Duration::from_millis(1));
             }
@@ -285,6 +801,14 @@ impl BehaviorHarness {
 
     pub fn turn_trace(&self) -> &[BehaviorTurnTrace] {
         &self.turn_trace
+    }
+
+    pub fn recorded_effect_transcript(&self) -> Result<BehaviorEffectTranscript, String> {
+        self.transient_host.recorded_transcript()
+    }
+
+    pub fn assert_effect_replay_consumed(&self) -> Result<(), String> {
+        self.transient_host.assert_replay_consumed()
     }
 
     pub fn export_state_artifact(&self) -> Result<Vec<u8>, String> {
@@ -311,8 +835,13 @@ impl BehaviorHarness {
             .activate_state_artifact(artifact, SessionOptions::default())
             .map_err(|error| error.to_string())?;
         let preview = activation.preview;
-        self.transient_host.route_turn(&activation.mount)?;
-        self.sequence = activation.mount.source_sequence.unwrap_or(self.sequence);
+        self.transient_host.route_turn(&activation.initial_turn)?;
+        self.turn_trace
+            .push(behavior_turn_trace(&activation.initial_turn));
+        self.sequence = activation
+            .initial_turn
+            .source_sequence
+            .unwrap_or(self.sequence);
         self.materialization_overscan.clear();
         self.hovered = None;
         self.pressed = None;
@@ -480,33 +1009,7 @@ impl BehaviorHarness {
     }
 
     fn finish_turn(&mut self, turn: RuntimeTurn) -> Result<(), String> {
-        self.turn_trace.push(BehaviorTurnTrace {
-            sequence: turn.sequence,
-            source_sequence: turn.source_sequence,
-            durable_change_count: turn.durable_changes.len(),
-            transient_effect_count: turn.transient_effects.len(),
-            cancelled_transient_effect_count: turn.cancelled_transient_effects.len(),
-            document_patch_count: turn.document_patches.len(),
-            durable_changes: turn
-                .durable_changes
-                .iter()
-                .map(durable_change_trace)
-                .collect(),
-            transient_effects: turn
-                .transient_effects
-                .iter()
-                .map(|effect| {
-                    format!(
-                        "effect={:?} invocation={:?} target={:?} trigger={} authority_turn={}",
-                        effect.effect_id,
-                        effect.invocation_id,
-                        effect.target,
-                        effect.trigger_sequence,
-                        effect.authority_turn_sequence,
-                    )
-                })
-                .collect(),
-        });
+        self.turn_trace.push(behavior_turn_trace(&turn));
         self.transient_host.route_turn(&turn)?;
         self.sequence = turn.source_sequence.unwrap_or(self.sequence);
         self.view

@@ -30,6 +30,18 @@ pub struct DistributedSessionRuntime {
     owned_transient_effects: BTreeSet<TransientEffectCallId>,
 }
 
+#[must_use = "distributed session activation must deliver its initial turn to the host"]
+pub struct DistributedSessionActivation {
+    pub runtime: DistributedSessionRuntime,
+    pub initial_turn: RuntimeTurn,
+}
+
+impl DistributedSessionActivation {
+    pub fn into_parts(self) -> (DistributedSessionRuntime, RuntimeTurn) {
+        (self.runtime, self.initial_turn)
+    }
+}
+
 #[derive(Clone)]
 struct LeasedClientFrame {
     bytes: Vec<u8>,
@@ -87,11 +99,11 @@ impl DistributedSessionTemplate {
         generation: u64,
         principal: SessionPrincipal,
         queue_limits: DistributedQueueLimits,
-    ) -> Result<DistributedSessionRuntime, DistributedRuntimeError> {
+    ) -> Result<DistributedSessionActivation, DistributedRuntimeError> {
         if generation == 0 {
             return Err(DistributedRuntimeError::StaleTransportGeneration);
         }
-        let endpoint = EndpointRuntime::start(
+        let activation = EndpointRuntime::start(
             &self.machine,
             self.contract.clone(),
             self.wire_schema.clone(),
@@ -103,25 +115,28 @@ impl DistributedSessionTemplate {
                 ..SessionOptions::default()
             },
         )?;
-        Ok(DistributedSessionRuntime {
-            endpoint,
-            wire_schema: self.wire_schema.clone(),
-            link: ClientSessionLink::new(
-                self.graph.graph_id.0,
-                self.wire_schema_hash,
-                self.graph.revision,
-                session_id,
-                generation,
-            ),
-            connected: false,
-            principal,
-            inbound_client_frames: VecDeque::new(),
-            inbound_client_bytes: 0,
-            inbound_limits: queue_limits,
-            outbound_client: OutboundClientSessionQueue::new(queue_limits)?,
-            leased_client_frame: None,
-            outbound_server: TypedMessageQueue::new(queue_limits)?,
-            owned_transient_effects: BTreeSet::new(),
+        Ok(DistributedSessionActivation {
+            runtime: DistributedSessionRuntime {
+                endpoint: activation.endpoint,
+                wire_schema: self.wire_schema.clone(),
+                link: ClientSessionLink::new(
+                    self.graph.graph_id.0,
+                    self.wire_schema_hash,
+                    self.graph.revision,
+                    session_id,
+                    generation,
+                ),
+                connected: false,
+                principal,
+                inbound_client_frames: VecDeque::new(),
+                inbound_client_bytes: 0,
+                inbound_limits: queue_limits,
+                outbound_client: OutboundClientSessionQueue::new(queue_limits)?,
+                leased_client_frame: None,
+                outbound_server: TypedMessageQueue::new(queue_limits)?,
+                owned_transient_effects: BTreeSet::new(),
+            },
+            initial_turn: activation.initial_turn,
         })
     }
 }

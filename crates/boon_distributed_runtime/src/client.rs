@@ -31,12 +31,24 @@ pub struct DistributedClientRuntime {
     owned_transient_effects: BTreeSet<TransientEffectCallId>,
 }
 
+#[must_use = "distributed client activation must deliver its initial turn to the host"]
+pub struct DistributedClientActivation {
+    pub runtime: DistributedClientRuntime,
+    pub initial_turn: RuntimeTurn,
+}
+
+impl DistributedClientActivation {
+    pub fn into_parts(self) -> (DistributedClientRuntime, RuntimeTurn) {
+        (self.runtime, self.initial_turn)
+    }
+}
+
 // Boxing `Ready` would change this public incremental-startup API and add an
 // allocation to the successful startup path.
 #[allow(clippy::large_enum_variant)]
 pub enum DistributedClientStartupPoll {
     Pending(MachineBuildProgress),
-    Ready(DistributedClientRuntime),
+    Ready(DistributedClientActivation),
 }
 
 pub struct DistributedClientStartupTask {
@@ -56,17 +68,20 @@ impl DistributedClientStartupTask {
             EndpointBuildPoll::Pending(progress) => {
                 Ok(DistributedClientStartupPoll::Pending(progress))
             }
-            EndpointBuildPoll::Ready(endpoint) => Ok(DistributedClientStartupPoll::Ready(
-                DistributedClientRuntime {
-                    endpoint,
-                    graph: self.graph.clone(),
-                    wire_schema: self.wire_schema.clone(),
-                    wire_schema_hash: self.wire_schema_hash,
-                    link: None,
-                    connected: false,
-                    outbound: self.outbound.clone(),
-                    leased_session_frame: None,
-                    owned_transient_effects: BTreeSet::new(),
+            EndpointBuildPoll::Ready(activation) => Ok(DistributedClientStartupPoll::Ready(
+                DistributedClientActivation {
+                    runtime: DistributedClientRuntime {
+                        endpoint: activation.endpoint,
+                        graph: self.graph.clone(),
+                        wire_schema: self.wire_schema.clone(),
+                        wire_schema_hash: self.wire_schema_hash,
+                        link: None,
+                        connected: false,
+                        outbound: self.outbound.clone(),
+                        leased_session_frame: None,
+                        owned_transient_effects: BTreeSet::new(),
+                    },
+                    initial_turn: activation.initial_turn,
                 },
             )),
         }
@@ -97,7 +112,7 @@ impl DistributedClientRuntime {
     pub fn start(
         artifact: &ProgramArtifact,
         queue_limits: ClientSessionQueueLimits,
-    ) -> Result<Self, DistributedRuntimeError> {
+    ) -> Result<DistributedClientActivation, DistributedRuntimeError> {
         let mut task = Self::begin_start(artifact, queue_limits)?;
         loop {
             match task.poll(usize::MAX)? {

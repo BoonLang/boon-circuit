@@ -17,6 +17,7 @@ Read AGENTS.md and these contracts completely before editing:
 
 - docs/plans/steps.md
 - docs/plans/BOON_COMPILER_PERFORMANCE_PLAN.md
+- docs/plans/BOON_COMPILER_ARCHITECTURE_REFACTOR_PLAN.md
 - docs/plans/BOON_CIRCUIT_SIMPLIFICATION_AND_NATIVE_RECOVERY_PLAN.md
 - docs/plans/BOON_LANGUAGE_FOUNDATIONS_PLAN.md
 - docs/plans/BOON_OUT_PARAMETERS_AND_ORDER_INDEPENDENT_BINDINGS_PLAN.md
@@ -70,6 +71,13 @@ Authority and conflict rules:
   representations, but it does not own public language semantics, proof or
   evidence soundness, runtime persistence identity, native presentation
   semantics, or the mandatory verified artifact spine.
+- `BOON_COMPILER_ARCHITECTURE_REFACTOR_PLAN.md` is subordinate to those budgets
+  and owns the current post-`968c56a` implementation sequence: activation-turn
+  handoff and deterministic effect replay, construction-time owner proof seals,
+  one sealed semantic database, demand-collected plan instances, one plan
+  builder seal, revisioned compiler currentness, and measured dependency
+  inversion. Its intermediate directional exits never replace the performance
+  plan's complete scored Clear End Condition.
 - Compiler scaling evidence uses actual parser inspections and
   typechecker/semantic/proof/backend work, never final AST/call/graph sizes as
   substitutes. Build one current two-job release producer explicitly and invoke
@@ -370,13 +378,15 @@ Current checkpoints to preserve and audit rather than redo:
   until that proof passes. A trace assigns 2,368.00 ms to the dependency
   manifest, which still creates 159,612 records and a
   160,276-node/512,204-edge proof graph from only 16,417 execution expressions;
-  after oracle repair, add demand-driven retained plan instances and compact
-  direct proof construction/sealing rather than more typechecker-container
-  work. Then share sealed semantic row fingerprints across consumers and split
-  the compiler-loading facade out of `boon_runtime` only at a measured rebuild
-  seam. Follow the complete ranked architecture tranches in the performance
-  plan and do not relabel this checkpoint as Phase 1 closure. The first
-  non-default `test-flat-oracle` slice now parses/checks once and lowers both
+  after oracle repair, emit proof receipts during semantic construction, fold
+  owner-local and exact projection roots, and close dependencies on their
+  compact summary graph rather than merely repacking or coarsening the entity
+  inventory. Then add demand-driven retained plan instances, share sealed
+  semantic row fingerprints across consumers, and split the compiler-loading
+  facade out of `boon_runtime` only at a measured rebuild seam. Follow the
+  complete ranked architecture tranches in the performance plan and do not
+  relabel this checkpoint as Phase 1 closure. The first non-default
+  `test-flat-oracle` slice now parses/checks once and lowers both
   representations without adding a production fallback. Counter and a focused
   four-state width fixture pass stable-contract and multi-turn document/
   snapshot differential tests. An explicit optimized NovyWave preflight passes
@@ -387,44 +397,49 @@ Current checkpoints to preserve and audit rather than redo:
   invariants remain exact. Budget V2 stays red until the V3 provenance report,
   real-host NovyWave behavior scenario, migration/restart matrix, and negative
   cases are complete;
-- resume the performance goal from clean local checkpoint `37f874e`. The
-  compiler now emits one canonical list-dataflow/activation contract with
-  stable semantic list identities and type fingerprints; persistence prunes
-  pure `store.variable_rows` and stores derived durable overlays; executor
-  activation restores authority, reconstructs effect-free row domains
-  topologically, initializes defaults, applies overlays only after rows exist,
-  and then rebuilds indexes/currentness/demand. Focused activation tests and the
-  current optimized retained-vs-flat NovyWave oracle pass in 16.90 seconds.
-  Preserve that generic engine contract and do not add row-handle durability,
-  projection-specific activation, or a production flat fallback. The bounded
-  V3 provenance report, complete migration/restart/negative matrix, and budget
-  cross-binding are still open;
-- prioritize the checkpoint-level architecture cuts over further micro-
-  optimization. First extract the real-host retained-document behavior oracle
-  from the native GPU/editor/window shell into a product-faithful headless
-  harness owning retained hit testing, authored typed actions, real local host
-  effects, persistent activation, replacement, migration, and restart. The
-  starting native normal workspace closure is 37 crates; focused test bodies
-  take about 0.1--0.2 seconds after linking, but observed dependency-bottom
-  build/relink work takes 38--109 seconds and the first optimized feature build
-  took 3m10s. Prove the same NovyWave trace/artifacts without an example-name or
-  direct-event shortcut, publish before/after closure and rebuild evidence, and
-  then finish V3. Native WGPU evidence remains separate. No compatibility re-
-  export, cosmetic file split, or smaller Rust rebuild may be counted as a Boon
-  latency win;
-- after the narrow oracle boundary, replace full-plan fingerprint cloning with
-  a seal-once builder, then implement demand-collected plan instances, the
-  packed proof summary, and one sealed semantic database with shared
-  fingerprints. `CompilerSession::apply_updates` currently drops its one whole-
-  project checked result for any changed unit; replace that with stable
-  component implementation/public-semantic fingerprints, exact reverse
-  dependency cones, unchanged-result backdating, and `changed_at`/
-  `verified_at` currentness. Current-revision diagnostics and verified
-  publication remain fail-closed, and incremental results must match a clean
-  full compile. The live graph audit also finds 31 normal transitive dependents
-  of `boon_document_model` and 16 of `boon_compiler`; move cross-layer IDs and
-  invert runtime/compiler edges only when before/after measurement proves the
-  ownership and rebuild cut;
+- resume the performance goal from clean local checkpoint `968c56a` and follow
+  `BOON_COMPILER_ARCHITECTURE_REFACTOR_PLAN.md`. The canonical list-dataflow,
+  sparse durable-overlay lifecycle, product-faithful `boon_behavior_harness`,
+  real local host, and retained document hit testing are landed. The headless
+  harness now has a 28-crate normal forward closure versus native playground's
+  38. Preserve the generic engine contract and do not add row-handle
+  durability, projection-specific activation, example shortcuts, or a
+  production flat fallback;
+- repair the two generic blockers exposed by the extracted full-host oracle
+  before accepting an artifact migration. Machine construction currently
+  stages then drops startup transient effects and `LiveRuntime::mount`
+  fabricates an empty-effect mount; replace both with one activation product
+  carrying the exact initial turn for construction, restore, migration,
+  replacement, and restart. Execute the real host once, map stable logical
+  effect calls, and replay exactly the same completion order into the second
+  retained/flat candidate. Compare exact turns and revisions; normalize only
+  the store-local epoch. Then finish the V3 provenance, migration/restart, and
+  negative matrix. Native WGPU evidence remains separate;
+- prioritize the owner-sealed semantic architecture over further micro-
+  optimization. A current directional release trace still spends 2,350.35 ms
+  building 159,652 rich dependency records, 208,982 coverage rows, and a
+  160,316-node/512,314-edge proof graph for only 663 callable owners plus the
+  program root. Emit canonical row fingerprints and exact references during
+  semantic construction, prove exact single coverage with dense bitsets, fold
+  owner-local Merkle roots plus narrow projection roots, and run SCC closure on
+  that summary graph. The owner count is an aggregation opportunity, not
+  permission to broaden exact dependency cones; keep compact typed row regions
+  where parity proves they remain necessary. Keep exhaustive V3 derivation
+  test-only until adversarial mutation, omission, cycle, and cone-precision
+  parity authorizes a flag-day V4 proof; production must then allocate no
+  exhaustive dependency or coverage inventory;
+- next unify the rich semantic graphs into one sealed database with shared row
+  fingerprints and demand-collected plan instances, deleting each superseded
+  production owner. Replace full-plan clone/rewrite/compact/hash finalization
+  with one `MachinePlanBuilder` seal. Promote independent parsed units and the
+  existing owned checked database into the persistent compiler service with
+  stable owner/local identities, implementation/public-semantic fingerprints,
+  exact reverse cones, unchanged-result backdating, `changed_at`/
+  `verified_at`, cancellation, and clean-full parity. Move cross-layer IDs and
+  invert compiler/runtime, migration-harness, effect-adapter, and content-store
+  dependencies only when before/after closure and rebuild measurement proves
+  the cut. No compatibility re-export, cosmetic file split, or smaller Rust
+  rebuild may be counted as a Boon latency win;
 - the current compiler-throughput checkpoint keeps Counter, physical TodoMVC,
   and NovyWave `MachinePlan` output deterministic while replacing copied OUT
   type environments with active-path overlays, retaining canonical-root-reading
@@ -469,7 +484,8 @@ Execution strategy:
 - Execute all internal phases of `BOON_COMPILER_PERFORMANCE_PLAN.md` before
   entering unified Phase 0 below. The similar phase numbers belong to different
   plans; unified Phase 0 is not an alternate documentation task that can bypass
-  the blocking performance prerequisite.
+  the blocking performance prerequisite. Within that prerequisite, use
+  `BOON_COMPILER_ARCHITECTURE_REFACTOR_PLAN.md` as the current refactor order.
 - Work in large coherent ownership slices. Temporary compile breakage is
   acceptable inside a flag-day slice; do not preserve two execution worlds to
   keep an intermediate tree green.
@@ -557,17 +573,16 @@ Blocking compiler-performance prerequisite:
 
 - Complete `BOON_COMPILER_PERFORMANCE_PLAN.md` before resuming the remaining
   simplification/native-recovery closure or any later production phase.
-- Begin from its documented current tranche: indexed parser validation and
-  one-pass assembly/rebasing, batched hot counters, deterministic non-recursive
-  checked-diagnostic projection, the owned checked database, and the measured
-  `boon_checked` flag-day boundary. First build one current two-job release
-  producer and take the bounded direct baseline required by the plan so a debug-
-  profile artifact does not choose a large rewrite; also perform its one-time
-  parser dev-profile A/B. Continue frontend work until both cold diagnostics
-  modes pass for Counter, physical TodoMVC, and NovyWave; then continue through
-  semantic/proof/backend time and RSS until both verified-plan modes pass. Do
-  not substitute a crate split or a fast parser subphase for the complete
-  diagnostics or verified-plan gate.
+- Begin from checkpoint `968c56a` and the refactor plan's current tranche:
+  exact activation-turn handoff, one recorded/replayed real-host effect
+  transcript, construction-time owner proof seals, one sealed semantic
+  database, demand-collected plan instances, and one plan builder seal. The
+  package-local dev profile choices are already present; do not repeat a stale
+  parser-profile task. Use focused correctness and bounded direct release
+  preflight while changing each owner, then regenerate the full current two-job
+  release protocol at milestone candidates. Do not substitute a crate split,
+  a packed version of the exhaustive entity graph, or a fast subphase for the
+  complete diagnostics or verified-plan gate.
 - Pass the fresh-process and empty-`CompilerSession` no-cache gates first, then
   the warm edit, loaded switch, cancellation, invalidation-locality, scaling,
   deterministic-artifact, and RSS gates. Persistent compiler state is the

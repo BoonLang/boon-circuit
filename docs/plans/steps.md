@@ -27,6 +27,9 @@ stronger three-reviewer performance closure defined below.
    typechecker worklist/cache/replay, semantic/proof traversal, and backend work
    counters own scaling gates. Build the release producer explicitly once;
    performance verifiers must never start a nested Cargo build.
+   Execute the current architectural tranches in
+   `BOON_COMPILER_ARCHITECTURE_REFACTOR_PLAN.md`; that file is subordinate to
+   the performance budgets and does not create an earlier exit.
 
    Preserve the landed independent-unit parser, `boon_syntax`/`boon_checked`
    cutovers, structured work counters, indexed parser validation/assembly, and
@@ -183,11 +186,14 @@ stronger three-reviewer performance closure defined below.
    differential oracle, stable-contract checks, plan/migration/restart and
    negative tests, and recorded V3 oracle migration first. Then lower
    definition-plus-overlay instances directly and replace the remaining
-   2,368.00 ms manifest path—159,612 records and a
-   160,276-node/512,204-edge graph, including about 1,007 ms of digest work—with
-   the packed proof summary. Share sealed row fingerprints across later
-   consumers and measure the runtime/compiler loading crate seam before any
-   further small typechecker-container edits.
+   post-hoc manifest path with construction-time row receipts, owner-local and
+   projection Merkle roots, and a compact exact summary graph. The historical
+   2,368.00 ms trace built 159,612 records and a
+   160,276-node/512,204-edge graph; a directional existing-release trace taken
+   after `968c56a` is still 2,350.35 ms for 159,652 records and a
+   160,316-node/512,314-edge graph. Share the resulting sealed row
+   fingerprints across later consumers and measure the runtime/compiler
+   loading crate seam before any further small typechecker-container edits.
 
    The first feature-gated flat-oracle slice is implemented without a
    production mode switch. Counter and the focused four-state persistence
@@ -200,46 +206,50 @@ stronger three-reviewer performance closure defined below.
    red until V3 records source/old/new identities, the real-host NovyWave
    behavior trace, migration/restart evidence, and focused negative cases.
 
-   Resume from clean local checkpoint `37f874e`. The canonical list-dataflow
-   and activation contract is now emitted by the compiler and consumed by the
-   executor: it separates complete structural authority, reconstructable
-   derived domains, and durable indexed overlays; prunes pure
-   `store.variable_rows`; reconstructs topologically before applying sparse
-   overlays; and carries stable semantic identities and type fingerprints for
-   every runtime list. Focused activation tests and the current optimized
-   retained-vs-flat NovyWave oracle pass (16.90 seconds), but the bounded V3
-   provenance report, complete migration/restart/negative matrix, and budget
-   cross-binding remain open. Preserve this generic contract and do not add row-
-   handle serialization, projection-only activation, or a production flat
-   fallback.
+   Resume from clean local checkpoint `968c56a` and follow
+   `BOON_COMPILER_ARCHITECTURE_REFACTOR_PLAN.md`. The canonical list-dataflow,
+   sparse durable-overlay lifecycle, `boon_behavior_harness`, real local host,
+   and retained document hit testing are landed. The headless harness has a
+   28-crate normal forward closure versus native playground's 38, but its
+   full-host restart path exposes two generic blockers: machine construction
+   drops startup transient effects, and independently scheduled hosts produce
+   different completion/revision order.
 
-   The checkpoint-level boundary audit now takes priority over more small
-   container edits. First extract the real-host retained-document behavior
-   oracle from the native GPU/editor/window shell. Its normal workspace closure
-   is currently 37 crates; focused bodies run in about 0.1--0.2 seconds after
-   linking, while observed dependency-bottom build/relink work takes 38--109
-   seconds and the first optimized feature build took 3m10s. The narrow harness
-   must preserve retained hit testing, authored typed actions, real local host
-   effects, activation, artifact replacement, migration, and restart without
-   example-name shortcuts. Re-run the same NovyWave trace there, measure the
-   dependency/rebuild cut, then complete V3. Native WGPU evidence stays
-   independent.
+   First replace machine/runtime construction plus synthetic empty `mount`
+   with one activation product carrying the exact initial turn. Then execute
+   the real host once and replay the same logical effect-completion transcript
+   into the second retained/flat candidate so exact turns, revisions,
+   persistence, migration, and restart can be compared without normalizing
+   causality. Finish the bounded oracle provenance and negative matrix on this
+   route. Preserve the generic list contract and do not add row-handle
+   serialization, projection-specific activation, example shortcuts, or a
+   production flat fallback.
 
-   Next replace full-`MachinePlan` fingerprint cloning with one seal/compact/
-   fingerprint boundary, then continue demand-driven plan instances, the packed
-   proof summary, and one sealed semantic database with shared fingerprints.
-   Replace `CompilerSession::apply_updates` whole-project checked-result
-   eviction with stable per-component implementation/public-semantic
-   fingerprints, exact reverse dependency cones, unchanged-result backdating,
-   and `changed_at`/`verified_at` currentness. Complete current-revision
-   diagnostics and verified publication remain fail-closed and every
-   incremental result must match a clean full compile. Move stable cross-layer
-   execution IDs out of `boon_document_model` (current normal transitive closure
-   31 crates, predicted 19) and invert runtime/compiler edges only when measured
-   closures prove the cut. Every split needs a before/after dependency closure
-   and rebuild time, no compatibility export, and unchanged diagnostics/
-   artifacts. Keep Rust rebuild speed and Boon compile latency as separate
-   measured gates.
+   The next compiler tranche is the architectural proof cut, not another
+   packed container. During semantic construction, assign every executable row
+   exactly once to a callable/program owner, compute its canonical row
+   fingerprint, and record exact row/owner references. Fold owner-local Merkle
+   roots plus stable narrow projection roots and run dependency SCC closure on
+   that summary graph instead of automatically making every rich field record
+   a node. The current 664 owners are an aggregation starting point, not
+   permission to broaden exact dependency cones; compact typed row-level
+   regions remain only where parity proves they are necessary. Keep the
+   exhaustive V3 inventory test-only as an independent materializer until
+   mutation, omission, cycle, cone-precision, stable-contract, and behavior
+   evidence authorizes a flag-day V4 proof. Production then allocates no
+   exhaustive dependency or coverage records.
+
+   Continue by unifying the rich semantic graphs into one sealed database with
+   shared row fingerprints and demand-collected plan instances, deleting each
+   superseded production owner as parity lands. Replace full-`MachinePlan`
+   clone/rewrite/compact/hash finalization with one builder seal. Only then
+   promote independent parsed units and the existing owned checked database
+   into the revisioned compiler service with stable owner/local identities,
+   public/implementation fingerprints, exact cones, backdating,
+   `changed_at`/`verified_at`, cancellation, and clean-full parity. Pull crate
+   splits and runtime/compiler dependency inversion only when measured closure
+   and rebuild evidence proves the ownership cut. Keep Rust rebuild speed and
+   Boon compile latency as separate gates.
 
    Use the performance plan's edit-loop, milestone-preflight, and full-
    acceptance harness levels. Focused debug tests and direct one-sample producer

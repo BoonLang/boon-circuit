@@ -701,50 +701,52 @@ verifier, and exact persistence comparison in 14.82 seconds. It is preflight,
 not oracle migration: the V3 provenance record, real-host NovyWave interaction
 trace, migration/restart evidence, and negative matrix remain blocking, and no
 flat production fallback exists.
-Resume that work from clean local checkpoint `37f874e`. The compiler now emits
+Resume that work from clean local checkpoint `968c56a` and the architecture
+sequence in `BOON_COMPILER_ARCHITECTURE_REFACTOR_PLAN.md`. The compiler emits
 one canonical list-dataflow and activation contract with stable semantic list
 identities/type fingerprints, minimal durable-owner closure, reconstructable
-derived domains, sparse durable overlays, and topological activation; the
-executor consumes that order rather than rediscovering authority. Pure
-`store.variable_rows` is absent from persistence. Focused compiler/executor
-tests and the current optimized retained-vs-flat NovyWave oracle pass in 16.90
-seconds. This closes the original activation defect, but not the bounded V3
-provenance report, complete migration/restart/negative matrix, or budget cross-
-binding. Row handles, projection-only activation exceptions, and a production
+derived domains, sparse durable overlays, and topological activation. The
+product-faithful `boon_behavior_harness`, real local host, and retained document
+hit testing are now outside the native shell; the headless normal forward
+closure is 28 workspace crates versus native playground's 38. Row handles,
+projection-only activation exceptions, example shortcuts, and a production
 flat fallback remain prohibited.
-The whole-system audit now pulls a product-faithful headless behavior harness
-ahead of further V3 iteration: the oracle's native shell has a 37-workspace-
-crate normal closure, observed dependency-bottom rebuild/relink work of 38--109
-seconds, and a first optimized feature build of 3m10s even though focused test
-bodies take about 0.1--0.2 seconds. Extract retained hit/action routing, real
-local host effects, persistent activation, replacement, migration, and restart
-without example-specific shortcuts; prove the same NovyWave trace/artifacts and
-measure the closure/rebuild cut. Native WGPU evidence remains separate.
-After that boundary, replace full-plan fingerprint cloning with one immutable
-seal/compact/fingerprint boundary, then continue demand-collected instances,
-packed proof summary, and shared sealed semantic fingerprints. The current
-`CompilerSession::apply_updates` whole-project checked-result eviction is also
-an architecture blocker: replace it with stable component implementation/public
-fingerprints, exact dependency cones, unchanged-result backdating, and explicit
-`changed_at`/`verified_at` currentness while keeping complete diagnostics,
-verification, clean-full parity, cancellation, and publication fail-closed.
-Measured compiler/runtime dependency inversion and cross-layer ID ownership are
-performance-enabling refactors only when their before/after closures prove the
-cut; none relaxes this recovery plan's native GPU evidence or behavior
-requirements.
-The traced NovyWave cold path is now about 4.84 seconds of typechecking, 2.84
-seconds of contextual materialization/execution expansion, 3.81 seconds of
-whole-program dependency proof, and 9.51 seconds for semantic elaboration in
-total. The next performance slice must retain more shared semantic callable
-definitions, collect concrete instances from definition-plus-overlay keys,
-replace the expanded manifest/proof inventory with a packed summary index, and
-share sealed semantic fingerprints before separating interactive diagnostics/
-preview compilation from explicit proof and debug-artifact generation. A
-measured compiler-loading/runtime crate seam may support that work, but a crate
-split is not a Boon speed result. Do not return to tactical type-cache
-invalidation or another manifest collection tweak. Phase 1 still requires the
-remaining focused semantic, IR, and compiler regression matrix plus a clean,
-revision-identified remeasurement at the next user-authorized checkpoint.
+
+The extracted full-host restart path exposes two remaining generic activation
+defects. Machine construction stages startup transient effects in non-emitting
+work and then drops them, while `LiveRuntime::mount` fabricates an empty-effect
+mount. Independently running retained and flat hosts also complete effects in
+different orders, so their otherwise equivalent values acquire different exact
+revisions. Replace construction/mount with one activation product carrying the
+initial turn, and drive both candidates from one recorded/replayed real-host
+completion transcript. Then finish the bounded provenance,
+migration/restart, and negative matrix with exact turns and revisions,
+normalizing only the store-local epoch. Native WGPU evidence remains separate.
+
+The next speed tranche is a proof architecture replacement, not another
+manifest container tweak. A current directional release trace spends 2,350.35
+ms building 159,652 dependency records, 208,982 coverage rows, and a
+160,316-node/512,314-edge proof graph even though there are only 663 callable
+owners plus the program root. Emit canonical row fingerprints and exact
+references during semantic construction, prove exact single coverage, fold
+owner-local Merkle roots plus narrow projection roots, and run SCC closure on
+that summary graph. Owner aggregation must not broaden exact dependency cones;
+compact typed row regions remain where parity proves they are necessary. Retain
+the exhaustive V3 derivation as a test-only adversarial materializer until a
+controlled flag-day V4 proof migration passes. Production must then allocate
+no exhaustive dependency/coverage inventory.
+
+After that cut, unify the rich semantic graphs into one sealed database with
+shared fingerprints and demand-collected plan instances, and replace full-plan
+clone/rewrite/compact/hash finalization with one builder seal. Promote parsed
+units and the owned checked database into a revisioned compiler service with
+stable owner/local identities, public/implementation fingerprints, exact
+cones, backdating, `changed_at`/`verified_at`, cancellation, and clean-full
+parity. Measured compiler/runtime dependency inversion and cross-layer ID
+ownership are performance-enabling refactors only when their before/after
+closures prove the cut; none relaxes this recovery plan's native GPU evidence
+or behavior requirements. Do not return to tactical type-cache invalidation or
+another manifest collection tweak while these larger owners remain.
 
 Cold `dump-plan` throughput is not the interactive acceptance target. Before
 production recovery resumes, the playground/editor path must own a persistent

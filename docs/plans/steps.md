@@ -231,16 +231,31 @@ stronger three-reviewer performance closure defined below.
    behavior evidence authorizes a flag-day V4 proof. Production then allocates
    no exhaustive dependency or coverage records.
 
+   The first V4 projection-proof slice is now implemented but is not this
+   tranche's exit. It moves V3 to the test oracle and reduces the production
+   proof graph from 159,617 nodes/506,915 edges to 14,518 nodes/43,714 edges.
+   A directional optimized NovyWave sample improves from 4,581.206 ms and
+   317,316 KiB to 3,977.806 ms and 247,092 KiB; manifest time improves from
+   2,321.269 to 1,807.287 ms. The residual manifest still post-processes the
+   checked, execution, and lowering graphs. The active next cut is therefore
+   construction-time row/projection receipt emission in those builders, with
+   the same receipts becoming proof and revision-currentness authority and the
+   post-hoc inventory walks deleted. Reprofile semantic demand after that
+   ownership cut. Do not spend another tranche on receipt-hash micro-tuning.
+
    Expand the same database through the rich semantic domains. Carry each
    ordinary executable body once through `MachinePlan` and represent call-
    specific parameter/type/PASSED/owner/resource/effect/render context with
    compact invocation frames rather than recompiling every exact call. Runtime
    executes verified plan functions and never a semantic AST interpreter or
    flat fallback. Replace full-`MachinePlan` clone/rewrite/compact/hash
-   finalization with one builder seal. Normal in-memory publication does not
-   retain full construction IR/semantic products or pretty JSON; explicit
+   finalization with one builder seal returning a non-forgeable
+   `SealedMachinePlan`. Normal in-memory publication does not retain full
+   construction IR/semantic products or pretty JSON and does not rehash or
+   reverify the same trusted plan at every handoff; explicit
    debug/serialized-artifact intents and bounded pre-seal distributed linking
-   own those products, and acceptance format migration remains controlled.
+   own those products, while deserialized/untrusted plans still verify once and
+   acceptance format migration remains controlled.
    Retain the same request graph across revisions for exact cones, backdating,
    `changed_at`/`verified_at`, cancellation, and clean-full parity. Pull crate
    splits and runtime/compiler dependency inversion only when measured closure

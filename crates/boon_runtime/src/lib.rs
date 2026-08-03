@@ -1,7 +1,7 @@
 use boon_compiler::{
-    CompileProfile, CompileRequest, CompiledMachinePlanFromSource, CompilerSourceUnit,
-    compile_machine_plan, compiler_source_text_for_path, compiler_source_units_for_manifest_source,
-    compiler_source_units_for_path,
+    CompileProfile, CompileRequest, CompiledSealedMachinePlanFromSource, CompilerSourceUnit,
+    compile_sealed_machine_plan, compiler_source_text_for_path,
+    compiler_source_units_for_manifest_source, compiler_source_units_for_path,
 };
 use boon_contract::{CanonicalSourceBundleV1, SourceBundleDigestV1, SourceBundleUnit};
 use boon_document::runtime as document;
@@ -231,7 +231,7 @@ fn runtime_activation_from_machine(
 
 #[derive(Clone)]
 struct CachedPlan {
-    plan: Arc<MachinePlan>,
+    template: MachineTemplate,
     compile: CompileProfile,
 }
 
@@ -249,7 +249,7 @@ fn plan_cache() -> &'static Mutex<BTreeMap<RuntimePlanCacheKey, CachedPlan>> {
 
 fn cached_plan(
     key: RuntimePlanCacheKey,
-    compile: impl FnOnce() -> RuntimeResult<CompiledMachinePlanFromSource>,
+    compile: impl FnOnce() -> RuntimeResult<CompiledSealedMachinePlanFromSource>,
 ) -> RuntimeResult<(CachedPlan, bool)> {
     if let Ok(cache) = plan_cache().lock()
         && let Some(cached) = cache.get(&key).cloned()
@@ -258,8 +258,9 @@ fn cached_plan(
     }
 
     let compiled = compile()?;
+    let template = MachineTemplate::new_sealed(&compiled.plan)?;
     let cached = CachedPlan {
-        plan: Arc::new(compiled.plan),
+        template,
         compile: compiled.profile,
     };
     if let Ok(mut cache) = plan_cache().lock() {
@@ -393,7 +394,7 @@ impl LiveRuntime {
         };
         let entrypoint = source_bundle.entrypoint().to_owned();
         let (cached, cache_hit) = cached_plan(key, || {
-            compile_machine_plan(CompileRequest::source_text(
+            compile_sealed_machine_plan(CompileRequest::source_text(
                 &entrypoint,
                 source,
                 TargetProfile::SoftwareDefault,
@@ -501,7 +502,7 @@ impl LiveRuntime {
             })
             .collect::<Vec<_>>();
         let (cached, cache_hit) = cached_plan(key, || {
-            compile_machine_plan(CompileRequest::source_units(
+            compile_sealed_machine_plan(CompileRequest::source_units(
                 &entrypoint,
                 &compiler_units,
                 TargetProfile::SoftwareDefault,
@@ -622,7 +623,7 @@ impl LiveRuntime {
     }
 
     fn from_cached_plan(cached: CachedPlan) -> RuntimeResult<RuntimeActivation> {
-        Self::from_shared_machine_plan(cached.plan, SessionOptions::default())
+        Self::from_machine_template(&cached.template, SessionOptions::default())
     }
 
     pub fn dispatch(&mut self, event: SourceEvent) -> RuntimeResult<RuntimeTurn> {

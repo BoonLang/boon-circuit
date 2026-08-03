@@ -1,9 +1,9 @@
 use boon_compiler::{
     CancellationToken, CheckedCompileRequest, CompileIntent, CompilerCheckRequest, CompilerProject,
     CompilerSession, UnitUpdate, check_diagnostics_source, check_runtime_source,
-    compiler_source_project_for_path, finish_checked_machine_plan,
+    compiler_source_project_for_path, finish_checked_sealed_machine_plan,
 };
-use boon_plan::{ApplicationIdentity, ProgramRole, TargetProfile, verify_plan};
+use boon_plan::{ApplicationIdentity, ProgramRole, TargetProfile};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::io::{self, Write};
@@ -530,10 +530,11 @@ fn warm_session_sample(args: &[String]) -> Result<(), Box<dyn std::error::Error>
             &CancellationToken::new(),
         )?;
         plan_sha256(
-            &result
+            result
                 .compiled()
                 .ok_or("initial switch request returned no compiled plan")?
-                .plan,
+                .plan
+                .plan(),
         )?
     };
 
@@ -612,8 +613,13 @@ fn warm_session_sample(args: &[String]) -> Result<(), Box<dyn std::error::Error>
                 .compiled()
                 .ok_or("warm preview request returned no compiled plan")?;
             let (work, phase) = compiled_work_and_phase(compiled);
-            let source_digest = compiled.ir.source_bundle_digest_v1().to_string();
-            (source_digest, plan_sha256(&compiled.plan)?, work, phase)
+            let source_digest = compiled.source_bundle_digest_v1.to_string();
+            (
+                source_digest,
+                plan_sha256(compiled.plan.plan())?,
+                work,
+                phase,
+            )
         };
         drop(preview_result);
         let published_revision = session
@@ -674,7 +680,7 @@ fn warm_session_sample(args: &[String]) -> Result<(), Box<dyn std::error::Error>
         let loaded_bundle_lookup_ms = duration_ms(lookup_started.elapsed());
         let acknowledgement_ms = duration_ms(switch_started.elapsed());
         let allocations = compiler_allocation_counters();
-        let selected_plan_sha256 = plan_sha256(&compiled.plan)?;
+        let selected_plan_sha256 = plan_sha256(compiled.plan.plan())?;
         switches.push(LoadedSwitchSample {
             sequence,
             scored: sequence >= setup_samples,
@@ -893,8 +899,8 @@ fn synthetic_scaling_sample(args: &[String]) -> Result<(), Box<dyn std::error::E
             let compiled = result
                 .compiled()
                 .ok_or("synthetic verified request returned no plan")?;
-            let source_digest = compiled.ir.source_bundle_digest_v1().to_string();
-            let plan_hash = plan_sha256(&compiled.plan)?;
+            let source_digest = compiled.source_bundle_digest_v1.to_string();
+            let plan_hash = plan_sha256(compiled.plan.plan())?;
             let (work, phase) = compiled_work_and_phase(compiled);
             (source_digest, Some(plan_hash), work, phase)
         }
@@ -1049,7 +1055,7 @@ fn checked_work_and_phase(
 }
 
 fn compiled_work_and_phase(
-    compiled: &boon_compiler::CompiledMachinePlanFromSource,
+    compiled: &boon_compiler::CompiledSealedMachinePlanFromSource,
 ) -> (WorkSample, PhaseSample) {
     (
         WorkSample {
@@ -1070,17 +1076,18 @@ fn compiled_work_and_phase(
             ir_lower_ms: compiled.profile.ir_lower_ms,
             ir_validation_ms: compiled.profile.verify_ms,
             backend_ms: compiled.profile.compile_ms,
+            plan_validation_ms: compiled.profile.plan_validation_ms,
             ..PhaseSample::default()
         },
     )
 }
 
 fn compiled_identity(
-    compiled: &boon_compiler::CompiledMachinePlanFromSource,
+    compiled: &boon_compiler::CompiledSealedMachinePlanFromSource,
 ) -> Result<(String, String), Box<dyn std::error::Error>> {
     Ok((
-        compiled.ir.source_bundle_digest_v1().to_string(),
-        plan_sha256(&compiled.plan)?,
+        compiled.source_bundle_digest_v1.to_string(),
+        plan_sha256(compiled.plan.plan())?,
     ))
 }
 
@@ -1228,7 +1235,7 @@ fn verified_sample(source: &Path) -> Result<Sample, Box<dyn std::error::Error>> 
         source,
         ProgramRole::Client,
     ))?;
-    let compiled = finish_checked_machine_plan(
+    let compiled = finish_checked_sealed_machine_plan(
         checked,
         CheckedCompileRequest::new(
             TargetProfile::SoftwareDefault,
@@ -1280,7 +1287,7 @@ fn session_verified_sample(source: &Path) -> Result<Sample, Box<dyn std::error::
 }
 
 fn compiled_sample(
-    compiled: &boon_compiler::CompiledMachinePlanFromSource,
+    compiled: &boon_compiler::CompiledSealedMachinePlanFromSource,
     elapsed_ms: f64,
     allocations: AllocationSample,
     observation_started_unix_us: u64,
@@ -1289,15 +1296,14 @@ fn compiled_sample(
     // below can allocate a second representation of the plan.
     let compiler_peak_rss_kib = peak_rss_kib();
     let compiler_artifact_ready_unix_us = unix_time_us()?;
-    let plan_validation_started = Instant::now();
-    let validation = verify_plan(&compiled.plan)?;
-    let plan_validation_ms = duration_ms(plan_validation_started.elapsed());
+    let plan_validation_ms = compiled.profile.plan_validation_ms;
+    let validation = compiled.plan.verification();
     if validation.status != "pass" {
         return Err("compiled performance fixture failed MachinePlan validation".into());
     }
     let serialization_started = Instant::now();
     let mut plan_hasher = Sha256Writer::default();
-    serde_json::to_writer_pretty(&mut plan_hasher, &compiled.plan)?;
+    serde_json::to_writer_pretty(&mut plan_hasher, compiled.plan.plan())?;
     let serialization_ms = duration_ms(serialization_started.elapsed());
     let plan_sha256 = hex_digest(plan_hasher.finish());
     Ok(Sample {
@@ -1306,7 +1312,7 @@ fn compiled_sample(
         compiler_artifact_ready_unix_us,
         elapsed_ms,
         peak_rss_kib: compiler_peak_rss_kib,
-        source_bundle_digest_v1: compiled.ir.source_bundle_digest_v1().to_string(),
+        source_bundle_digest_v1: compiled.source_bundle_digest_v1.to_string(),
         checked_result_sha256: None,
         diagnostic_count: 0,
         full_document_typecheck_coverage: None,

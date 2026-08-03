@@ -168,6 +168,117 @@ If instrumentation shows that work belongs to a different envelope, move it
 without double counting and keep the 1,000 ms total. Do not improve a stage by
 silently charging its work to another stage.
 
+### Post-Checkpoint Whole-Pipeline Research (`76b93af`)
+
+A bounded direct release trace after the documentation checkpoint, over the
+unchanged `32bcf40` production code, completed in 4,401.51 ms at 317,860 KiB
+peak RSS. Parse plus typecheck used 55.81 + 156.58 ms, while semantic
+elaboration used 3,733.87 ms and its post-hoc dependency manifest alone used
+2,329.43 ms. The manifest constructed 159,652 dependency records, 208,982
+coverage rows, and a 160,316-node/512,314-edge graph for 664 callable/root
+owners. Contract verification itself used only 0.06 ms. The bottleneck is
+therefore representation and proof amplification after checking, not authored
+proof execution or a generally slow frontend.
+
+The same trace found a second multiplicative boundary after semantic sealing.
+The retained execution graph had 16,421 expressions, but document lowering
+published 33,916 expressions, 2,320 ordinary-call scopes, and 13,279 cache
+scopes because `compile_user_call` recompiles a retained function root for each
+argument/overlay context. Backend construction, the separate public plan
+validation, and scored serialization then used 402.41, 100.60, and 89.52 ms.
+Those are structural ownership passes, not candidates for another collection
+micro-tune.
+
+A source-level audit of the normal program-host route exposes work not fully
+represented by that direct producer sample:
+
+- `CompiledMachinePlanFromSource` retains the complete `ErasedProgram` beside
+  the complete `MachinePlan`, although the ordinary host needs only the source
+  digest from the IR;
+- artifact encoding computes a plan digest, clones the plan into an owned
+  serialization DTO, and serializes it; artifact construction then computes
+  the plan digest again;
+- `MachineTemplate::new_shared` runs the public plan verifier, whose report
+  computes the plan digest again, before constructing executor metadata.
+
+The trusted in-process path must consequently publish a non-forgeable
+`SealedMachinePlan` containing the immutable shared plan, its canonical digest,
+its successful verification receipt, and the minimal source/semantic/
+verification provenance needed by the host. Explicit output intent owns the
+remaining products:
+
+```text
+Diagnostics        -> complete checked diagnostics, no executable artifact
+VerifiedPreview    -> SealedMachinePlan, no retained semantic/IR/debug tree
+SerializedArtifact -> same seal plus one streamed canonical artifact image
+DebugIr            -> explicit ErasedProgram materialization
+DebugPlan          -> explicit human-readable plan projection
+DistributedLink    -> construction IR only until the joint link seals
+```
+
+Deserialized or otherwise untrusted plans still pass the complete public
+verifier exactly once. A trusted token cannot be constructed by bypassing the
+builder/verifier, and executor metadata is derived once per seal rather than
+once per consumer. This boundary removes duplicate lifetime and publication
+work; it does not weaken the mandatory
+`SemanticProgram -> ContractVerifiedProgram -> ErasedProgram -> MachinePlan`
+construction spine.
+
+The ranked architectural opportunities are now:
+
+| Rank | Refactor | Work owner that must disappear | Primary acceptance effect |
+| ---: | --- | --- | --- |
+| 1 | one owner/projection `CompilationDb` with construction-time row receipts | production V3 exhaustive record/coverage allocation, entity-level proof graph, and a future second warm dependency graph | remove the dominant 2.33-second proof rescan while preserving exact proof and invalidation cones |
+| 2 | demand-collected retained plan functions plus compact invocation frames | per-call ordinary-body recompilation, call cache scopes, and unreachable plan definitions | reduce semantic-to-plan expansion, backend time, plan bytes, and runtime metadata |
+| 3 | one `MachinePlanBuilder` seal and one `SealedMachinePlan` publication token | full-plan fingerprint clone, repeated compaction/validation/hash passes, retained IR in preview, owned serialization clone, and repeated trusted verification | reduce backend/publication time and peak live bytes without weakening untrusted-plan checks |
+| 4 | retain the same database across revisions | whole-project `CompilerSession` invalidation and clean rebuild of unaffected owner/projection results | meet warm diagnostic, verified-edit, cancellation, and latest-generation gates |
+| 5 | dependency inversion and measured crate splits at the new ownership seams | runtime-to-compiler convenience dependencies and broad Rust rebuild/relink closures | shorten implementation feedback without counting Rust build speed as Boon latency |
+
+Ranks are dependency order, not five independent patch queues. The first
+vertical slice must cross ranks 1--3 for the program root and one ordinary
+callable, prove V3 materializer and runtime parity, and delete its old owners.
+Otherwise a database facade, retained-function side table, or sealed-plan
+wrapper would merely coexist with the same hot path. Bounded parallel owner
+evaluation and lower-level container tuning remain later options only after a
+fresh trace shows the structural multipliers have gone.
+
+### First V4 Projection-Proof Slice (2026-08-03)
+
+The first flag-day production proof cut replaces the V3 entity inventory with
+stable owner/projection receipts and an exact compact projection graph. V3 is
+now a test-only exhaustive oracle. Its independent materializer reconstructs
+every V4 row receipt, projection receipt, graph edge, SCC digest, and owner
+implementation digest from the V3 inventory. The production graph falls from
+159,617 nodes/506,915 edges to 14,518 nodes/43,714 edges. A normal downstream
+compiler/runtime/CLI check and all 19 focused dependency-manifest tests pass.
+
+One directional optimized NovyWave sample, not the scored p95 protocol, falls
+from the immediately preceding sealed-plan sample's 4,581.206 ms and
+317,316 KiB peak RSS to 3,977.806 ms and 247,092 KiB. The manifest itself falls
+from 2,321.269 to 1,807.287 ms. The compact proof therefore saves about 603 ms
+and 70 MiB while reducing graph nodes and edges by roughly elevenfold. It is a
+real architectural cut, but it remains far outside both the 1,000 ms total gate
+and the 350 ms semantic/proof envelope.
+
+The residual profile is the important result: checked inventory still uses
+367.057 ms, execution inventory 471.067 ms, lowering inventory 269.516 ms, and
+final projection-receipt folding 516.468 ms. Production no longer retains rich
+V3 rows, but it still walks already-built rich graphs after construction to
+rediscover proof facts. Do not spend the next tranche polishing receipt hash
+containers. Move row/projection receipt emission into checked, execution, and
+lowering construction, make those receipts the shared proof/currentness
+authority, and delete each corresponding post-hoc inventory walk. Then measure
+whether exhaustive semantic demand itself must shrink. This V4 slice is not
+the planned `CompilationDb`, construction-time receipt, or warm-currentness
+exit.
+
+The same checkpoint introduces a non-forgeable `SealedMachinePlan` for the
+trusted in-process route. It carries the immutable plan, canonical digest, and
+successful verification receipt so normal runtime and artifact handoffs do not
+clone, rehash, or reverify the same plan. Deserialized plans still use the full
+public verifier. This closes the duplicate publication boundary but does not
+make backend expansion or the end-to-end performance gate green.
+
 ## Architectural Decisions
 
 ### 1. Activation Is A First-Class Output, Not An Empty Mount
@@ -331,15 +442,18 @@ serializes through distinct traversals. Replace this with one
 - compact unreachable construction rows before publication, without cloning a
   completed plan;
 - perform local invariants while inserting and one final cross-table seal;
-- return an immutable `MachinePlan` plus its already computed canonical digest.
+- return a non-forgeable `SealedMachinePlan` containing an immutable shared
+  `MachinePlan`, its already computed canonical digest, successful verification
+  receipt, and minimal provenance.
 
 The runtime consumes only sealed plan functions/frames and existing typed
 kernels; it must not regain a semantic AST interpreter or production flat
 fallback. The public verifier remains mandatory, but repeated validation of the
-same immutable payload at adjacent ownership handoffs is removed. JSON/debug
-output streams from the sealed plan and is not required for an in-memory
-preview. Compiler-internal distributed linking may retain construction IR only
-until the link seals, then drops it.
+same immutable payload at adjacent trusted ownership handoffs is removed.
+Deserialized/untrusted plans always verify once before receiving a seal.
+JSON/debug output streams from the sealed plan and is not required for an
+in-memory preview. Compiler-internal distributed linking may retain
+construction IR only until the link seals, then drops it.
 The scored producer continues to include whatever serialization the manifest
 declares, so no work is hidden from the gate.
 
@@ -457,11 +571,12 @@ compiler latency.
    V3 to V4 only with the complete controlled proof evidence. No second warm
    dependency graph is allowed.
 4. Complete demand-collected retained plan functions/frames and replace backend
-   clone/rewrite/compact/hash passes with one `MachinePlan` builder seal. Normal
-   in-memory publication does not retain construction IR/semantic products or
-   pretty JSON; explicit debug/serialized-artifact intents and bounded pre-seal
-   distributed linking own them. Acceptance format migration remains controlled
-   and scored.
+   clone/rewrite/compact/hash passes with one `MachinePlan` builder seal. Return
+   one non-forgeable `SealedMachinePlan`; normal in-memory publication neither
+   retains construction IR/semantic products nor repeats plan verification or
+   hashing. Explicit debug/serialized-artifact intents and bounded pre-seal
+   distributed linking own those products. Deserialization verifies once, and
+   acceptance format migration remains controlled and scored.
 5. Reprofile the complete cold path. Return to a local optimization only when
    the new trace proves it is now the largest remaining owner.
 6. Retain the same source/check/semantic request graph across revisions and

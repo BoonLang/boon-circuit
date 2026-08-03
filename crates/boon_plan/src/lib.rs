@@ -3,6 +3,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
+use std::sync::Arc;
 
 mod binary;
 mod document;
@@ -9954,6 +9955,77 @@ pub struct PlanCheck {
     pub id: String,
     pub pass: bool,
     pub detail: String,
+}
+
+/// Immutable proof that one exact [`MachinePlan`] passed the public verifier.
+///
+/// The plan is shared read-only and the constructor is private to this crate,
+/// so trusted in-process consumers can carry one verification result across
+/// compiler, artifact, and executor handoffs without making the verifier an
+/// optional convention. Plans received from serialized or otherwise untrusted
+/// input must enter through [`seal_machine_plan`] or
+/// [`seal_shared_machine_plan`] before they can obtain this token.
+#[derive(Clone)]
+pub struct SealedMachinePlan {
+    plan: Arc<MachinePlan>,
+    verification: Arc<PlanVerification>,
+}
+
+impl SealedMachinePlan {
+    pub fn plan(&self) -> &MachinePlan {
+        &self.plan
+    }
+
+    pub fn shared_plan(&self) -> Arc<MachinePlan> {
+        Arc::clone(&self.plan)
+    }
+
+    pub fn into_shared_plan(self) -> Arc<MachinePlan> {
+        self.plan
+    }
+
+    pub fn verification(&self) -> &PlanVerification {
+        &self.verification
+    }
+
+    pub fn plan_hash(&self) -> &str {
+        &self.verification.plan_hash
+    }
+}
+
+impl fmt::Debug for SealedMachinePlan {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SealedMachinePlan")
+            .field("plan_hash", &self.plan_hash())
+            .field("plan_version", &self.verification.plan_version)
+            .finish_non_exhaustive()
+    }
+}
+
+pub fn seal_machine_plan(plan: MachinePlan) -> Result<SealedMachinePlan, PlanError> {
+    seal_shared_machine_plan(Arc::new(plan))
+}
+
+pub fn seal_shared_machine_plan(plan: Arc<MachinePlan>) -> Result<SealedMachinePlan, PlanError> {
+    let verification = verify_plan(&plan)?;
+    if verification.status != "pass" {
+        let failures = verification
+            .checks
+            .iter()
+            .filter(|check| !check.pass)
+            .map(|check| format!("{}: {}", check.id, check.detail))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(PlanError::new(format!(
+            "MachinePlan verification returned {}: {failures}",
+            verification.status
+        )));
+    }
+    Ok(SealedMachinePlan {
+        plan,
+        verification: Arc::new(verification),
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

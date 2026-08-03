@@ -1,9 +1,9 @@
 use boon_compiler::{
-    COMPILER_ID, CompileProfile, CompileRequest, CompilerSourceUnit,
-    DistributedClientProjectionSource, DistributedCompilerProgram,
+    COMPILER_ID, CompileProfile, CompileRequest, CompiledSealedMachinePlanFromSource,
+    CompilerSourceUnit, DistributedClientProjectionSource, DistributedCompilerProgram,
     compile_distributed_runtime_source_programs,
-    compile_distributed_runtime_source_programs_with_client_projection, compile_machine_plan,
-    diagnose_runtime_source_units,
+    compile_distributed_runtime_source_programs_with_client_projection,
+    compile_sealed_machine_plan, diagnose_runtime_source_units,
 };
 use boon_contract::{CanonicalSourceBundleV1, SourceBundleDigestV1, SourceBundleUnit};
 use boon_document_model::{
@@ -16,7 +16,7 @@ use boon_persistence::{
 };
 use boon_plan::{
     DocumentConstructor, EffectBarrier, EffectReplay, MachinePlan, OutputContractKind, ProgramRole,
-    SourceRouteToken, TargetProfile,
+    SealedMachinePlan, SourceRouteToken, TargetProfile,
 };
 use boon_runtime::{
     ApplicationIdentity, DocumentFrame, DocumentPatch, LiveRuntime, MachineTemplate,
@@ -328,27 +328,32 @@ struct StoredProgramArtifact {
     plan: MachinePlan,
 }
 
+#[derive(Serialize)]
+struct StoredProgramArtifactRef<'a> {
+    format: u32,
+    source_bundle_digest_v1: SourceBundleDigestV1,
+    compiler_id: &'a str,
+    target_profile: TargetProfile,
+    capability_profile: ProgramCapabilityProfile,
+    plan_digest: &'a str,
+    plan: &'a MachinePlan,
+}
+
 fn encode_program_artifact(
     revision: u64,
     source_bundle_digest_v1: SourceBundleDigestV1,
     capability_profile: ProgramCapabilityProfile,
-    plan: &MachinePlan,
+    sealed: &SealedMachinePlan,
 ) -> Result<ContentArtifact, ProgramDiagnostic> {
-    let plan_digest = boon_plan::plan_sha256(plan).map_err(|error| {
-        ProgramDiagnostic::new(
-            revision,
-            ProgramDiagnosticPhase::Artifact,
-            error.to_string(),
-        )
-    })?;
-    let stored = StoredProgramArtifact {
+    let plan = sealed.plan();
+    let stored = StoredProgramArtifactRef {
         format: PROGRAM_ARTIFACT_FORMAT,
         source_bundle_digest_v1,
-        compiler_id: COMPILER_ID.to_owned(),
+        compiler_id: COMPILER_ID,
         target_profile: plan.target_profile,
         capability_profile,
-        plan_digest,
-        plan: plan.clone(),
+        plan_digest: sealed.plan_hash(),
+        plan,
     };
     let mut bytes = Vec::new();
     ciborium::ser::into_writer(&stored, &mut bytes).map_err(|error| {
@@ -438,29 +443,29 @@ fn decode_program_artifact(
             "program artifact capability profile differs from the requested profile",
         ));
     }
-    let actual_plan_digest = boon_plan::plan_sha256(&stored.plan).map_err(|error| {
+    let sealed = boon_plan::seal_machine_plan(stored.plan).map_err(|error| {
         ProgramDiagnostic::new(
             revision,
             ProgramDiagnosticPhase::Artifact,
             error.to_string(),
         )
     })?;
-    if stored.plan_digest != actual_plan_digest {
+    if stored.plan_digest != sealed.plan_hash() {
         return Err(ProgramDiagnostic::new(
             revision,
             ProgramDiagnosticPhase::Artifact,
             "program artifact plan digest does not match its compiled plan",
         ));
     }
-    validate_plan(revision, expected_capability, &stored.plan)?;
-    let plan = Arc::new(stored.plan);
-    let template = MachineTemplate::new_shared(Arc::clone(&plan)).map_err(|error| {
+    validate_plan(revision, expected_capability, sealed.plan())?;
+    let template = MachineTemplate::new_sealed(&sealed).map_err(|error| {
         ProgramDiagnostic::new(
             revision,
             ProgramDiagnosticPhase::Artifact,
             error.to_string(),
         )
     })?;
+    let plan = sealed.shared_plan();
     Ok(ProgramArtifact {
         id: artifact.id,
         revision,
@@ -509,7 +514,7 @@ fn compile_validated_program_artifact(
             source: unit.source().to_owned(),
         })
         .collect::<Vec<_>>();
-    let compiled = compile_machine_plan(CompileRequest::source_units(
+    let compiled = compile_sealed_machine_plan(CompileRequest::source_units(
         source_bundle.entrypoint(),
         &units,
         TargetProfile::SoftwareBounded,
@@ -652,6 +657,9 @@ fn compile_validated_distributed_program_bundle(
                 )
             })?;
         let request = &requests[request_index];
+        let compiled = compiled.seal().map_err(|error| {
+            ProgramDiagnostic::new(revision, ProgramDiagnosticPhase::Artifact, error.to_string())
+        })?;
         artifacts.push(artifact_from_compiled(request, compiled)?);
     }
     let bundle = DistributedProgramBundle::new(artifacts).map_err(|error| {
@@ -685,32 +693,30 @@ fn canonical_source_bundle(
 
 fn artifact_from_compiled(
     request: &ProgramCompileRequest,
-    compiled: boon_compiler::CompiledMachinePlanFromSource,
+    compiled: CompiledSealedMachinePlanFromSource,
 ) -> Result<ProgramArtifact, ProgramDiagnostic> {
-    let source_bundle_digest_v1 = compiled.ir.source_bundle_digest_v1();
-    validate_plan(request.revision, request.capability_profile, &compiled.plan)?;
+    let source_bundle_digest_v1 = compiled.source_bundle_digest_v1;
+    validate_plan(
+        request.revision,
+        request.capability_profile,
+        compiled.plan.plan(),
+    )?;
     let content = encode_program_artifact(
         request.revision,
         source_bundle_digest_v1,
         request.capability_profile,
         &compiled.plan,
     )?;
-    let plan_digest = boon_plan::plan_sha256(&compiled.plan).map_err(|error| {
-        ProgramDiagnostic::new(
-            request.revision,
-            ProgramDiagnosticPhase::Artifact,
-            error.to_string(),
-        )
-    })?;
+    let plan_digest = compiled.plan.plan_hash().to_owned();
     let compile_profile = compiled.profile;
-    let plan = Arc::new(compiled.plan);
-    let template = MachineTemplate::new_shared(Arc::clone(&plan)).map_err(|error| {
+    let template = MachineTemplate::new_sealed(&compiled.plan).map_err(|error| {
         ProgramDiagnostic::new(
             request.revision,
             ProgramDiagnosticPhase::Artifact,
             error.to_string(),
         )
     })?;
+    let plan = compiled.plan.shared_plan();
     Ok(ProgramArtifact {
         id: content.id,
         revision: request.revision,
@@ -1338,4 +1344,63 @@ pub struct ProgramSessionDispatch {
     pub source_sequence: u64,
     pub source_path: String,
     pub runtime_turn: boon_runtime::RuntimeTurn,
+}
+
+#[cfg(test)]
+mod sealed_artifact_tests {
+    use super::*;
+
+    fn request() -> ProgramCompileRequest {
+        ProgramCompileRequest {
+            revision: 7,
+            role: ProgramRole::Server,
+            entry_path: "RUN.bn".to_owned(),
+            units: vec![RuntimeSourceUnit {
+                path: "RUN.bn".to_owned(),
+                source: "value: 1".to_owned(),
+            }],
+            application: ApplicationIdentity::compiler_default(),
+            capability_profile: ProgramCapabilityProfile::TrustedServer,
+        }
+    }
+
+    #[test]
+    fn sealed_compiler_artifact_round_trips_without_rehashing_its_trusted_handoff() {
+        let request = request();
+        let first = compile_program_artifact(&request).unwrap();
+        let second = compile_program_artifact(&request).unwrap();
+
+        assert_eq!(first.plan_digest(), boon_plan::plan_sha256(first.plan()).unwrap());
+        assert_eq!(first.to_content_artifact(), second.to_content_artifact());
+
+        let decoded = ProgramArtifact::from_content_artifact(
+            request.revision,
+            request.capability_profile,
+            first.to_content_artifact(),
+        )
+        .unwrap();
+        assert_eq!(decoded.plan_digest(), first.plan_digest());
+        assert_eq!(decoded.plan().as_ref(), first.plan().as_ref());
+    }
+
+    #[test]
+    fn untrusted_artifact_must_match_the_digest_from_its_verifier_seal() {
+        let request = request();
+        let artifact = compile_program_artifact(&request).unwrap();
+        let content = artifact.to_content_artifact();
+        let mut stored: StoredProgramArtifact =
+            ciborium::de::from_reader(Cursor::new(content.bytes.as_slice())).unwrap();
+        stored.plan_digest = "00".repeat(32);
+        let mut bytes = Vec::new();
+        ciborium::ser::into_writer(&stored, &mut bytes).unwrap();
+        let tampered = ContentArtifact::new(PROGRAM_ARTIFACT_MEDIA_TYPE, bytes).unwrap();
+
+        let error = ProgramArtifact::from_content_artifact(
+            request.revision,
+            request.capability_profile,
+            tampered,
+        )
+        .unwrap_err();
+        assert!(error.message.contains("plan digest does not match"));
+    }
 }

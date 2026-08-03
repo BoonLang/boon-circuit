@@ -2,7 +2,7 @@ use boon_compiler::{
     CancellationToken, CompileIntent, CompileRequest, CompilerProject, CompilerSession,
     compile_machine_plan, compiler_source_project_for_path,
 };
-use boon_plan::{ApplicationIdentity, ProgramRole, TargetProfile, verify_plan};
+use boon_plan::{ApplicationIdentity, ProgramRole, TargetProfile};
 use boon_runtime::{LiveRuntime, parse_scenario, source_units_for_path};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -188,7 +188,7 @@ fn check_source(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let compiled = result
         .compiled()
         .ok_or("verified check produced no compiled artifact")?;
-    let verification = verify_plan(&compiled.plan)?;
+    let verification = compiled.plan.verification();
     if verification.status != "pass" {
         let failed = verification
             .checks
@@ -203,11 +203,10 @@ fn check_source(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         )
         .into());
     }
+    let plan = compiled.plan.plan();
     println!(
         "pass: MachinePlan {}.{}, {} operation(s)",
-        compiled.plan.version.major,
-        compiled.plan.version.minor,
-        compiled.plan.capability_summary.operation_count
+        plan.version.major, plan.version.minor, plan.capability_summary.operation_count
     );
     Ok(())
 }

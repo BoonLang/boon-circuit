@@ -34,8 +34,9 @@ use boon_plan::{
     PlanRowSelectPattern, PlanStateLifetime, PlanStaticOwnerId, PlanTransientCollection,
     PlanTransientCollectionKind, PlanTransientCollectionResult, PlanTransientCollectionStep,
     PlanValueListAuthority, ProducerFunctionInstancePlan, RemoteCallSiteId, RemoteCallSitePlan,
-    RootOutputDemand, ScalarInitializerPlan, ScalarStorageSlot, ScopeId, SourceId,
-    SourcePayloadField, SourceRoute, SourceRouteToken, StateId, ValueRef, verify_plan,
+    RootOutputDemand, ScalarInitializerPlan, ScalarStorageSlot, ScopeId, SealedMachinePlan,
+    SourceId, SourcePayloadField, SourceRoute, SourceRouteToken, StateId, ValueRef,
+    seal_shared_machine_plan,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -9511,26 +9512,17 @@ impl MachineTemplate {
     }
 
     pub fn new_shared(plan: Arc<MachinePlan>) -> Result<Self, Error> {
-        if plan.version.major != boon_plan::PLAN_MAJOR_VERSION {
-            return Err(Error::InvalidPlan(format!(
-                "plan major version {} is not supported",
-                plan.version.major
-            )));
-        }
-        let verification = verify_plan(&plan)
+        let sealed = seal_shared_machine_plan(plan)
             .map_err(|error| Error::InvalidPlan(format!("plan verification failed: {error}")))?;
-        if verification.status != "pass" {
-            let failures = verification
-                .checks
-                .iter()
-                .filter(|check| !check.pass)
-                .map(|check| format!("{}: {}", check.id, check.detail))
-                .collect::<Vec<_>>()
-                .join("; ");
-            return Err(Error::InvalidPlan(format!(
-                "plan verification rejected runtime readiness: {failures}"
-            )));
-        }
+        Self::new_sealed(&sealed)
+    }
+
+    /// Constructs executor metadata from a plan that already crossed the
+    /// public verifier in this process. The sealed token is immutable and
+    /// non-forgeable outside `boon_plan`, so this does not introduce a second
+    /// unchecked runtime entrypoint.
+    pub fn new_sealed(sealed: &SealedMachinePlan) -> Result<Self, Error> {
+        let plan = sealed.shared_plan();
         let metadata = Arc::new(Metadata::new(&plan)?);
         Ok(Self { plan, metadata })
     }

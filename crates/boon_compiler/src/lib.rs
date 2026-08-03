@@ -6,7 +6,7 @@ use boon_parser::{
 };
 pub use boon_plan::{
     ApplicationIdentity, MachinePlan, MigrationPredecessorBinding, PlanError, ProgramRole,
-    TargetProfile,
+    SealedMachinePlan, TargetProfile,
 };
 use serde::de::DeserializeOwned;
 use std::fs;
@@ -262,6 +262,7 @@ pub struct CompileProfile {
     pub lower_ms: f64,
     pub verify_ms: f64,
     pub compile_ms: f64,
+    pub plan_validation_ms: f64,
     pub total_ms: f64,
 }
 
@@ -270,6 +271,42 @@ pub struct CompiledMachinePlanFromSource {
     pub ir: ErasedProgram,
     pub plan: MachinePlan,
     pub profile: CompileProfile,
+}
+
+/// Normal verified publication product.
+///
+/// Unlike the explicit compiler/debug product above, this artifact does not
+/// retain construction IR beside the runnable plan. Its immutable plan token
+/// carries the one successful public plan verification across trusted host and
+/// executor handoffs.
+#[derive(Clone, Debug)]
+pub struct CompiledSealedMachinePlanFromSource {
+    pub source_bundle_digest_v1: boon_contract::SourceBundleDigestV1,
+    pub semantic_program_digest: boon_semantic::SemanticProgramDigestV1,
+    pub verification_manifest_digest: boon_verify::VerificationManifestDigestV1,
+    pub plan: SealedMachinePlan,
+    pub profile: CompileProfile,
+}
+
+impl CompiledMachinePlanFromSource {
+    pub fn seal(self) -> CompilerResult<CompiledSealedMachinePlanFromSource> {
+        let seal_started = Instant::now();
+        let source_bundle_digest_v1 = self.ir.source_bundle_digest_v1();
+        let semantic_program_digest = self.ir.semantic_program_digest();
+        let verification_manifest_digest = self.ir.verification_manifest_digest();
+        let plan = boon_plan::seal_machine_plan(self.plan)?;
+        let seal_ms = elapsed_ms(seal_started);
+        let mut profile = self.profile;
+        profile.plan_validation_ms = seal_ms;
+        profile.total_ms += seal_ms;
+        Ok(CompiledSealedMachinePlanFromSource {
+            source_bundle_digest_v1,
+            semantic_program_digest,
+            verification_manifest_digest,
+            plan,
+            profile,
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -489,6 +526,14 @@ pub fn compile_machine_plan(
         request.schema_version,
         request.migration_predecessors,
     )
+}
+
+/// Compiles the normal preview/runtime artifact and drops construction IR
+/// before returning it to the host.
+pub fn compile_sealed_machine_plan(
+    request: CompileRequest<'_>,
+) -> CompilerResult<CompiledSealedMachinePlanFromSource> {
+    compile_machine_plan(request)?.seal()
 }
 
 /// Retained and occurrence-specialized plans produced from one checked graph.
@@ -768,6 +813,13 @@ pub fn finish_checked_machine_plan(
     finish_checked_machine_plan_with_cancellation(checked_source, request, None)
 }
 
+pub fn finish_checked_sealed_machine_plan(
+    checked_source: CheckedSourceFromSource,
+    request: CheckedCompileRequest<'_>,
+) -> CompilerResult<CompiledSealedMachinePlanFromSource> {
+    finish_checked_machine_plan(checked_source, request)?.seal()
+}
+
 pub(crate) fn finish_checked_machine_plan_with_cancellation(
     checked_source: CheckedSourceFromSource,
     request: CheckedCompileRequest<'_>,
@@ -878,6 +930,7 @@ fn finish_checked_program_to_machine_plan(
         lower_ms,
         verify_ms,
         compile_ms,
+        plan_validation_ms: 0.0,
         total_ms: elapsed_before_finish_ms + elapsed_ms(finish_started),
     };
     Ok(CompiledMachinePlanFromSource { ir, plan, profile })

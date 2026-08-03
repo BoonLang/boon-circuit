@@ -240,6 +240,26 @@ fn plan_row_expression_arena_serde_and_plan_hash_are_deterministic() {
 }
 
 #[test]
+fn sealed_machine_plan_binds_one_immutable_plan_and_verification() {
+    let mut plan = empty_plan();
+    plan.program_role = ProgramRole::Server;
+    let expected_hash = plan_sha256(&plan).unwrap();
+    let sealed = seal_machine_plan(plan).unwrap();
+
+    assert_eq!(sealed.plan_hash(), expected_hash);
+    assert_eq!(sealed.verification().status, "pass");
+    assert_eq!(sealed.shared_plan().as_ref(), sealed.plan());
+}
+
+#[test]
+fn sealed_machine_plan_rejects_a_failed_public_verification() {
+    let mut plan = empty_plan();
+    plan.version.major = PLAN_MAJOR_VERSION + 1;
+    let error = seal_machine_plan(plan).unwrap_err();
+    assert!(error.to_string().contains("plan-version-supported"));
+}
+
+#[test]
 fn structural_row_expression_hash_ignores_arena_offsets() {
     let mut first = PlanRowExpressionArena::new();
     let first_source = first.builder().value(ValueRef::State(StateId(3))).unwrap();

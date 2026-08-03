@@ -423,6 +423,20 @@ Current checkpoints to preserve and audit rather than redo:
   omission, cycle, cone-precision, and retained/flat parity authorizes a
   flag-day V4 proof; production must then allocate no exhaustive dependency or
   coverage inventory;
+- preserve the first production V4 projection-proof result, but do not mistake
+  it for the database or performance exit. A directional optimized NovyWave
+  sample improves from the preceding sealed-plan sample's 4,581.206 ms and
+  317,316 KiB to 3,977.806 ms and 247,092 KiB; manifest time improves from
+  2,321.269 to 1,807.287 ms, and the exact production graph falls from
+  159,617 nodes/506,915 edges to 14,518 nodes/43,714 edges. Exhaustive V3 is
+  test-only with independent V4 materializer parity. The remaining manifest
+  still rescans completed checked, execution, and lowering graphs, so `/goal`
+  must next move row/projection receipt emission into those builders, share the
+  receipts with proof and revision currentness, and delete the corresponding
+  inventory walks. Reprofile and reduce unnecessary semantic demand after that
+  ownership cut. Do not stop at this improvement and do not return to receipt-
+  hashing or container micro-tuning while the 1,000 ms total and 350 ms
+  semantic/proof gates remain red;
 - expand that vertical cut through the rich semantic domains, deleting each
   superseded production owner. Carry ordinary executable bodies once through
   `MachinePlan` with compact parameter/type/PASSED/owner/resource/effect/render
@@ -578,7 +592,12 @@ Blocking compiler-performance prerequisite:
   finish the full real-host oracle on the landed exact activation/effect
   boundary; build one owner/projection `CompilationDb` shared by cold proof and
   later warm currentness; carry retained ordinary functions and compact
-  invocation frames through the plan; and use one plan builder seal. The
+  invocation frames through the plan; and use one plan builder seal returning
+  a non-forgeable `SealedMachinePlan`. Explicit diagnostics, verified-preview,
+  serialized-artifact, debug-IR/debug-plan, and distributed-link intents own
+  their products. The ordinary trusted preview must not retain complete IR or
+  repeat plan hashing/verification at each handoff; deserialized/untrusted plans
+  still verify once. The
   package-local dev profile choices are already present; do not repeat a stale
   parser-profile task. Use focused correctness and bounded direct release
   preflight while changing each owner, then regenerate the full current two-job

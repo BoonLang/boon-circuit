@@ -1,5 +1,5 @@
 use crate::{
-    CheckedCompileRequest, CheckedSourceFromSource, CompiledMachinePlanFromSource,
+    CheckedCompileRequest, CheckedSourceFromSource, CompiledSealedMachinePlanFromSource,
     CompilerCheckRequest, CompilerResult, CompilerSourceUnit, check_diagnostics_source,
     check_runtime_source, finish_checked_machine_plan_with_cancellation,
 };
@@ -105,7 +105,7 @@ pub enum CompilerSessionResult<'a> {
     Diagnostics(&'a CheckedSourceFromSource),
     Verified {
         intent: CompileIntent,
-        compiled: &'a CompiledMachinePlanFromSource,
+        compiled: &'a CompiledSealedMachinePlanFromSource,
     },
 }
 
@@ -117,7 +117,7 @@ impl CompilerSessionResult<'_> {
         }
     }
 
-    pub fn compiled(&self) -> Option<&CompiledMachinePlanFromSource> {
+    pub fn compiled(&self) -> Option<&CompiledSealedMachinePlanFromSource> {
         match self {
             Self::Diagnostics(_) => None,
             Self::Verified { compiled, .. } => Some(compiled),
@@ -135,7 +135,7 @@ struct ProjectState {
     source: CompilerProject,
     revision: Revision,
     checked: Option<CheckedSourceFromSource>,
-    compiled: Option<(Revision, CompiledMachinePlanFromSource)>,
+    compiled: Option<(Revision, CompiledSealedMachinePlanFromSource)>,
 }
 
 impl CompilerSession {
@@ -252,7 +252,7 @@ impl CompilerSession {
     pub fn last_verified(
         &self,
         project: ProjectId,
-    ) -> CompilerResult<Option<(Revision, &CompiledMachinePlanFromSource)>> {
+    ) -> CompilerResult<Option<(Revision, &CompiledSealedMachinePlanFromSource)>> {
         let state = self
             .projects
             .get(&project)
@@ -340,7 +340,8 @@ impl CompilerSession {
                     &state.source.migration_predecessors,
                 ),
                 Some(cancellation),
-            )?;
+            )?
+            .seal()?;
             if cancellation.is_canceled() {
                 return Err(canceled_error());
             }
@@ -423,6 +424,7 @@ mod tests {
             .compiled()
             .unwrap()
             .plan
+            .plan()
             .clone();
         let second_plan = session
             .request(project, revision, CompileIntent::VerifiedPreview, &token)
@@ -430,6 +432,7 @@ mod tests {
             .compiled()
             .unwrap()
             .plan
+            .plan()
             .clone();
         assert_eq!(first_plan, second_plan);
     }
@@ -530,6 +533,7 @@ mod tests {
             .compiled()
             .unwrap()
             .plan
+            .plan()
             .clone();
 
         let invalid_revision = session
@@ -551,7 +555,7 @@ mod tests {
             .unwrap()
             .expect("last verified artifact remains available");
         assert_eq!(retained_revision, first_revision);
-        assert_eq!(retained.plan, first_plan);
+        assert_eq!(retained.plan.plan(), &first_plan);
     }
 
     #[test]

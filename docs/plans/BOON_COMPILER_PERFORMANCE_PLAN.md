@@ -676,6 +676,21 @@ Current cold-diagnostics candidate evidence:
   is about 409.57 ms, including about 75.25 ms for document construction. The
   next measured owner is therefore compact direct proof construction/sealing,
   not another typechecker container micro-edit.
+- The first production V4 projection-proof slice confirms the structural
+  opportunity without closing it. V3 rich records and coverage are now
+  test-only; an independent V3 materializer reconstructs all V4 row/projection
+  receipts, exact edges, SCCs, and owner digests. One directional optimized
+  NovyWave sample falls from the preceding sealed-plan sample's 4,581.206 ms
+  and 317,316 KiB to 3,977.806 ms and 247,092 KiB. Manifest time falls from
+  2,321.269 to 1,807.287 ms, and its graph falls from 159,617 nodes/506,915
+  edges to 14,518 nodes/43,714 edges. These are single-sample architectural
+  measurements, not percentile acceptance. The remaining manifest still
+  rescans completed checked, execution, and lowering graphs for about
+  367.057, 471.067, and 269.516 ms, then spends 516.468 ms folding projection
+  receipts. The next tranche must emit and seal shared receipts during those
+  graph builders and delete the corresponding inventory passes; do not resume
+  row-hash/container tuning. After that cut, profile and reduce unnecessary
+  semantic demand rather than merely making exhaustive demand cheaper.
 - The current artifact-oracle gate is red and blocks phase exit, but restoring
   the budgeted NovyWave hash would be a correctness regression. Fresh and empty
   modes deterministically emit
@@ -985,6 +1000,7 @@ implementation.
 | durable list ownership | the inspected NovyWave plan has 24 persistent list schemas and 252 persisted row fields; 21 schemas have no generated structural-authority fields, while `selected_signal_defaults` mixes two durable `HOLD` fields with 20 computed/host-backed authority fields; the serialized plan snapshot is about 64 MB | compute the minimal durable-owner closure; separate stable row-domain identity and sparse indexed overlays from computed view fields; omit pure derived views from persistence and emit ordered activation steps | before/after list/field/plan/artifact bytes and activation work, exact migration/restart parity, negative tests for missing origins and cyclic activation dependencies |
 | list topology ownership | derived materializations, `ListProjection`/`List/chunk`, storage initializer shape, mutations, indexes, and executor reconstruction scans independently describe overlapping row domains; the real-host oracle tried to persist nested mapped rows in pure `store.variable_rows` | one canonical list-dataflow table with row-identity, replayability, authority, overlay, and dependency columns; all specialized operators lower from it | every list has exactly one topology row, no executor rediscovery, pure-view absence from persistence, projection/map/filter/chunk activation tests, NovyWave restart parity |
 | plan sealing | typed-list fingerprint refresh clones the complete `MachinePlan` before a separate rewrite, compaction, and validation sequence; in the stale 64,029,143-byte JSON snapshot the compact document component is about 26.9 MB while persistence is about 243 KB | one mutable builder followed by one immutable seal: reachable postorder, shared fingerprints, compaction, and validation without a full-plan clone | peak live bytes, finalization time, expression visits, fingerprint parity, exact stable contract and behavior oracle |
+| artifact publication | the normal compiler result retains `ErasedProgram` beside `MachinePlan` although the host uses only its source digest; program artifact construction hashes the plan during encoding, clones it into an owned serialization DTO, hashes it again, and `MachineTemplate` verification hashes it again | explicit diagnostics/preview/serialized/debug/link intents and one non-forgeable `SealedMachinePlan` carrying the shared immutable plan, canonical digest, verification receipt, executor metadata input, and minimal provenance; untrusted deserialization still verifies once | before/after retained bytes, plan clones, hash/verification/serialization passes, exact artifact bytes/digests, forged/deserialized-plan rejection, unchanged runtime behavior |
 | product behavior harness | `boon_behavior_harness`, `boon_local_host`, and retained document hit testing are outside the native shell; `32bcf40` routes startup effects and records/replays deterministic host outcomes, while full NovyWave closure remains incomplete | finish the single recorded/replayed real-host scenario and its migration/restart/provenance/negative matrix | exact startup effects and turn revisions, identical authored trace/artifacts, complete migration/restart/negative matrix, and no example-name or render shortcut |
 
 The target representation lifetime is:
@@ -994,7 +1010,7 @@ one CompilationDb at revision zero and later revisions
   -> complete checked-diagnostic requests
   -> stable owner/projection semantic rows + proof/currentness receipts
   -> demand-collected retained plan definitions + compact invocation frames
-  -> one sealed and verified MachinePlan image
+  -> one non-forgeable SealedMachinePlan image + explicit output projections
 ```
 
 Construction-only adjacency, cloned proof subjects, diagnostic DTO trees, and
@@ -1318,11 +1334,14 @@ project invalidation, and rebuild fan-out dominate.
    and frames. Runtime executes verified plan functions; no semantic AST
    interpreter or flat fallback is permitted.
 6. Replace full-plan clone/rewrite/compact/hash finalization with one
-   `MachinePlanBuilder` seal that consumes only reachable verified instances.
-   Normal in-memory publication does not retain complete IR/semantic products
-   or pretty JSON; explicit debug or serialized-artifact intents may materialize
-   them, and distributed linking may retain construction IR only until its link
-   seals. Any acceptance serialization migration remains controlled and scored.
+   `MachinePlanBuilder` seal that consumes only reachable verified instances
+   and returns one non-forgeable `SealedMachinePlan`. Normal in-memory
+   publication does not retain complete IR/semantic products or pretty JSON and
+   does not repeat verification/hashing at each trusted handoff; explicit debug
+   or serialized-artifact intents may materialize them, distributed linking may
+   retain construction IR only until its link seals, and deserialized/untrusted
+   plans still run the complete verifier once. Any acceptance serialization
+   migration remains controlled and scored.
    Reprofile the complete cold path after each owner-level cut and keep the
    non-overlapping 250/350/300/100 ms frontend, semantic+proof, backend+seal,
    and publication envelopes honest.

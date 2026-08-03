@@ -2550,6 +2550,7 @@ fn link_lowered_roles(
                     lower_ms: program.lower_ms,
                     verify_ms: program.verify_ms,
                     compile_ms,
+                    plan_validation_ms: 0.0,
                     total_ms: program.parse_ms + program.lower_ms + program.verify_ms + compile_ms,
                 },
             },

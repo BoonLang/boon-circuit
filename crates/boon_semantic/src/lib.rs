@@ -626,7 +626,7 @@ pub struct SemanticProgram {
     scope_storage_graph: SemanticScopeStorageGraphV1,
     memory_graph: SemanticMemoryGraphV1,
     canonical_core: program_core::CanonicalProgramCoreV1,
-    dependency_manifest: CallableDependencyManifestV3,
+    dependency_manifest: CallableDependencyManifestV4,
     digest: SemanticProgramDigestV1,
 }
 
@@ -775,7 +775,7 @@ impl SemanticProgram {
         self.digest
     }
 
-    pub const fn dependency_manifest(&self) -> &CallableDependencyManifestV3 {
+    pub const fn dependency_manifest(&self) -> &CallableDependencyManifestV4 {
         &self.dependency_manifest
     }
 

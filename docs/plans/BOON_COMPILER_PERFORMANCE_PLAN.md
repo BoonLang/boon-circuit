@@ -478,6 +478,25 @@ Current cold-diagnostics candidate evidence:
   ordered call maps before pruning the worklist, and checked inference still
   takes 35 rounds. The next contextual slice must move that dependency cone to
   a compact indexed owner rather than polishing the now-cheap no-op visits.
+- Expression ownership is now projected once after signature registration into
+  dense signature ordinals plus compact per-signature expression/root slices.
+  This replaces the initialization-time HashMap that cloned and hashed an owner
+  `String` for every owned expression, repeated name resolution in calls,
+  PASSED inference, effects, and lowering, and per-owner BTree root discovery.
+  PASSED projections borrow the immutable AST; leaf variables, requirements,
+  recursion/queue membership, and formal lookup use dense or sorted indexes,
+  while call-child deduplication stays inline for ordinary arities. The complete
+  80-test suite, legacy owner/root oracle used during the cutover, fixed
+  pre-change tuple oracle, and exact checked digest pass. Fresh NovyWave
+  allocation work falls to 1,758,855 calls / 211,969,403 bytes and empty-session
+  to 1,758,861 / 212,034,000, another 28,778 calls / 645,435 bytes below the
+  contextual-cone checkpoint in each mode. A six-pair release batch has
+  216.62/217.17 ms fresh/empty medians and 161.95/162.37 ms typecheck medians.
+  A release trace attributes 0.72 ms to the new owner index and reduces context
+  setup/work from about 10.52 to 8.22 ms (0.52 reads, 0.35 graph, 5.31 worklist,
+  1.86 install); the checked builder is directionally 117.37 ms versus 123.45
+  ms. The still-open dominant owners are about 9.08 ms of parameter schemes,
+  5.17 ms of structural schemes, and 43.23 ms/35 rounds of checked inference.
 - Item 7 is still incomplete: the lifetime-free checker and builder remain two
   construction owners. Fuse checked construction into one owned database,
   then complete measured compact/name interning and worklist reductions,

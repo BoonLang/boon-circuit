@@ -256,9 +256,17 @@ Current checkpoints to preserve and audit rather than redo:
   164.18/164.53 ms typecheck medians, with one slow outlier per mode; this
   remains directional. The context phase is still about 10.52 ms because it
   builds complete ordered call maps before pruning, and the 35 inference rounds
-  remain. Move the context cone into a compact indexed owner, then finish the
-  duplicate checker/builder owner, measured interning, larger contextual/user-
-  call worklist reduction, scaling/parity proof, and adversarial review before
+  remain. The compact-owner cutover now projects immutable expression owners
+  once into dense signature ordinals and per-signature expression/root slices,
+  borrows PASSED paths, and uses dense leaf/requirement/recursion/worklist state.
+  The legacy owner/root oracle, fixed tuple oracle, exact digest, and full suite
+  pass. Fresh/empty allocation work falls to 1,758,855/1,758,861 calls and
+  211,969,403/212,034,000 bytes. Six-pair medians are 216.62/217.17 ms total and
+  161.95/162.37 ms typecheck. The traced context phase falls to 8.22 ms and the
+  checked builder is directionally 117.37 ms. Parameter schemes remain about
+  9.08 ms, structural schemes 5.17 ms, and checked inference 43.23 ms/35 rounds.
+  Optimize those measured owners, then finish the duplicate checker/builder
+  owner, remaining interning, scaling/parity proof, and adversarial review before
   regenerating the full protocol after the final edit;
 - the current compiler-throughput checkpoint keeps Counter, physical TodoMVC,
   and NovyWave `MachinePlan` output deterministic while replacing copied OUT

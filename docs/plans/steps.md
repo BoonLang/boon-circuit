@@ -83,11 +83,20 @@ stronger three-reviewer performance closure defined below.
    164.18/164.53 ms typecheck medians, with one slow outlier per mode. The
    context phase remains about 10.52 ms because it builds complete ordered call
    maps before pruning, and the 35 rounds remain. Move that cone into a compact
-   indexed owner. The remaining first tranche also includes fusing the duplicate
-   checker/builder into one owned database, measured compact/name interning, the
-   larger contextual/user-call worklist reduction, scaling/parity evidence, and
-   the fresh Phase 1 adversarial review. Reprofile after each owner-level slice
-   and regenerate the complete cold protocol after the final edit. Then close
+   indexed owner. That cutover now projects immutable expression owners once to
+   dense signature ordinals and per-signature expression/root slices, borrows
+   PASSED paths, and uses dense leaf/requirement/recursion/worklist state. The
+   legacy owner/root oracle, fixed tuple oracle, exact digest, and full suite
+   pass. Fresh/empty allocation work is 1,758,855/1,758,861 calls and
+   211,969,403/212,034,000 bytes. Six-pair medians are 216.62/217.17 ms total and
+   161.95/162.37 ms typecheck; traced context work falls to 8.22 ms and the
+   checked builder is directionally 117.37 ms. The remaining measured owners are
+   about 9.08 ms of parameter schemes, 5.17 ms of structural schemes, and 43.23
+   ms/35 rounds of checked inference. The first tranche also includes fusing the
+   duplicate checker/builder into one owned database, remaining interning,
+   scaling/parity evidence, and the fresh Phase 1 adversarial review. Reprofile
+   after each owner-level slice and regenerate the complete cold protocol after
+   the final edit. Then close
    semantic sealing, proof, backend, hashing, and memory until both verified-
    plan modes pass; only afterward may persistent-session warm work satisfy its
    separate gates.

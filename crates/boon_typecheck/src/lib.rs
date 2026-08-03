@@ -139,7 +139,12 @@ struct CheckedProgramBuilder {
     signature_by_decl: DenseIndexTable<usize>,
     parameter_location_by_decl: DenseIndexTable<CheckedParameterLocation>,
     expression_owner: DenseIndexTable<String>,
-    expressions_by_owner: HashMap<String, Vec<usize>>,
+    /// Dense callable ownership projected once after signature registration.
+    /// The parser-owned name table remains available for diagnostics, while
+    /// construction and inference avoid repeated string hashing.
+    expression_owner_signatures: DenseIndexTable<u32>,
+    expressions_by_signature: Vec<Box<[usize]>>,
+    expression_roots_by_signature: Vec<Box<[usize]>>,
     next_decl_id: u32,
     next_scope_id: u32,
     next_call_id: u32,
@@ -1422,13 +1427,6 @@ impl CheckedProgramBuilder {
                 &program.ast.statements,
                 program.expressions.len(),
             );
-            let expressions_by_owner = expression_owner.iter().fold(
-                HashMap::<String, Vec<usize>>::new(),
-                |mut owners, (expression, owner)| {
-                    owners.entry(owner.clone()).or_default().push(expression);
-                    owners
-                },
-            );
             Self {
                 program: program.clone(),
                 role: external_types.current_role,
@@ -1448,7 +1446,9 @@ impl CheckedProgramBuilder {
                 signature_by_decl: DenseIndexTable::default(),
                 parameter_location_by_decl: DenseIndexTable::with_len(0),
                 expression_owner,
-                expressions_by_owner,
+                expression_owner_signatures: DenseIndexTable::with_len(program.expressions.len()),
+                expressions_by_signature: Vec::new(),
+                expression_roots_by_signature: Vec::new(),
                 next_decl_id: 1,
                 next_scope_id: 1,
                 next_call_id: 0,
@@ -1530,6 +1530,10 @@ impl CheckedProgramBuilder {
             builder.register_host_effect_signatures();
             builder.register_external_signatures(&external_types);
         });
+        checked_program_phase!(
+            "index_expression_owners",
+            builder.rebuild_expression_owner_indexes()
+        );
         checked_program_phase!("predeclare", {
             builder.predeclare_statement_tree(&program.ast.statements, LexicalScopeId(0));
             builder.register_output_root_declarations();
@@ -2197,7 +2201,10 @@ impl CheckedProgramBuilder {
     }
 
     fn context_formal(&self, id: ContextFormalId) -> Option<&CheckedContextFormal> {
-        self.context_formals.iter().find(|formal| formal.id == id)
+        self.context_formals
+            .binary_search_by_key(&id, |formal| formal.id)
+            .ok()
+            .and_then(|index| self.context_formals.get(index))
     }
 
     fn call_by_checked_id(&self, id: CheckedCallId) -> Option<&CheckedCall> {
@@ -2744,6 +2751,57 @@ impl CheckedProgramBuilder {
         }
     }
 
+    fn rebuild_expression_owner_indexes(&mut self) {
+        let expression_count = self.program.expressions.len();
+        let mut owner_signatures = DenseIndexTable::with_len(expression_count);
+        let mut expressions_by_signature = (0..self.signatures.len())
+            .map(|_| Vec::new())
+            .collect::<Vec<_>>();
+
+        for (expression, owner) in self.expression_owner.iter() {
+            let Some(signature_index) = self.signature_by_name.get(owner).copied() else {
+                continue;
+            };
+            if self.signatures.get(signature_index).is_none() {
+                continue;
+            }
+            owner_signatures.insert(expression, signature_index as u32);
+            expressions_by_signature[signature_index].push(expression);
+        }
+
+        let mut nested_expressions = DenseFlagSet::with_len(expression_count);
+        for (expression, owner) in owner_signatures.iter() {
+            let Some(expression) = self.program.expressions.get(expression) else {
+                continue;
+            };
+            for child in direct_expression_children(expression) {
+                if owner_signatures.get(&child) == Some(owner) {
+                    nested_expressions.insert(child);
+                }
+            }
+        }
+        let mut roots_by_signature = (0..self.signatures.len())
+            .map(|_| Vec::new())
+            .collect::<Vec<_>>();
+        for (signature_index, expressions) in expressions_by_signature.iter().enumerate() {
+            for expression in expressions.iter().copied() {
+                if !nested_expressions.contains(&expression) {
+                    roots_by_signature[signature_index].push(expression);
+                }
+            }
+        }
+
+        self.expression_owner_signatures = owner_signatures;
+        self.expressions_by_signature = expressions_by_signature
+            .into_iter()
+            .map(Vec::into_boxed_slice)
+            .collect();
+        self.expression_roots_by_signature = roots_by_signature
+            .into_iter()
+            .map(Vec::into_boxed_slice)
+            .collect();
+    }
+
     fn visit_expr(
         &mut self,
         program: &ParsedProgram,
@@ -2753,8 +2811,8 @@ impl CheckedProgramBuilder {
         if !self.visited_exprs.insert(expr_id) {
             return;
         }
-        if let Some(owner) = self.expression_owner.get(&expr_id)
-            && let Some(signature) = self.signature(owner)
+        if let Some(owner) = self.expression_owner_signatures.get(&expr_id)
+            && let Some(signature) = self.signatures.get(*owner as usize)
         {
             for parameter in signature
                 .parameters
@@ -3104,9 +3162,9 @@ impl CheckedProgramBuilder {
                 expression: CheckedExprId(expr.id as u32),
                 callable: signature.decl_id,
                 owner_callable: self
-                    .expression_owner
+                    .expression_owner_signatures
                     .get(&expr.id)
-                    .and_then(|owner| self.signature(owner))
+                    .and_then(|owner| self.signatures.get(*owner as usize))
                     .map(|owner| owner.decl_id),
                 function: signature.name.clone(),
                 intrinsic: signature.intrinsic,
@@ -3249,14 +3307,15 @@ impl CheckedProgramBuilder {
             .collect::<BTreeMap<_, _>>();
         loop {
             let mut next = callable_effects.clone();
-            for signature in self
+            for (signature_index, signature) in self
                 .signatures
                 .iter()
-                .filter(|signature| signature.kind == CheckedCallableKind::User)
+                .enumerate()
+                .filter(|(_, signature)| signature.kind == CheckedCallableKind::User)
             {
                 let effect = self
-                    .expressions_by_owner
-                    .get(&signature.name)
+                    .expressions_by_signature
+                    .get(signature_index)
                     .into_iter()
                     .flatten()
                     .filter_map(|expr_id| self.program.expressions.get(*expr_id))
@@ -3810,27 +3869,25 @@ impl CheckedProgramBuilder {
     }
 
     fn infer_context_schemes(&mut self) {
+        let trace = typecheck_trace_enabled();
+        let reads_started = trace.then(Instant::now);
         let passed_reads = self
             .program
             .expressions
             .iter()
-            .filter_map(|expression| {
-                checked_passed_projection(expression).map(|projection| (expression.id, projection))
-            })
+            .filter(|expression| checked_passed_projection(expression).is_some())
+            .map(|expression| expression.id)
             .collect::<Vec<_>>();
-        let mut reads_by_owner = BTreeMap::<DeclId, Vec<(usize, Vec<String>)>>::new();
-        for (expression, projection) in passed_reads {
+        let mut reads_by_owner = BTreeMap::<DeclId, Vec<usize>>::new();
+        for expression in passed_reads {
             let owner = self
-                .expression_owner
+                .expression_owner_signatures
                 .get(&expression)
-                .and_then(|name| self.signature(name))
+                .and_then(|owner| self.signatures.get(*owner as usize))
                 .filter(|signature| signature.kind == CheckedCallableKind::User)
                 .map(|signature| signature.decl_id);
             if let Some(owner) = owner {
-                reads_by_owner
-                    .entry(owner)
-                    .or_default()
-                    .push((expression, projection));
+                reads_by_owner.entry(owner).or_default().push(expression);
             } else {
                 self.contextual_type_diagnostic(
                     expression,
@@ -3842,44 +3899,61 @@ impl CheckedProgramBuilder {
         let mut next_var = self
             .next_checked_scheme_type_var
             .expect("checked scheme type-variable allocator initialized");
-        let leaf_vars_by_path = reads_by_owner
-            .iter()
-            .flat_map(|(owner, reads)| {
-                reads
-                    .iter()
-                    .map(move |(_, projection)| (*owner, projection.clone()))
-            })
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .map(|key| {
-                let variable = TypeVar(next_var);
-                next_var = next_var.saturating_add(1);
-                (key, variable)
-            })
-            .collect::<BTreeMap<_, _>>();
-        let leaf_vars = reads_by_owner
-            .iter()
-            .flat_map(|(owner, reads)| {
-                reads.iter().map(|(expression, projection)| {
-                    (
-                        *expression,
-                        leaf_vars_by_path[&(*owner, projection.clone())],
-                    )
+        let mut leaf_vars_by_owner = BTreeMap::new();
+        for (owner, reads) in &reads_by_owner {
+            let paths = reads
+                .iter()
+                .filter_map(|expression| {
+                    self.program
+                        .expressions
+                        .get(*expression)
+                        .and_then(checked_passed_projection)
+                        .map(|projection| projection.to_vec().into_boxed_slice())
                 })
-            })
-            .collect::<BTreeMap<_, _>>();
+                .collect::<BTreeSet<_>>();
+            let variables = paths
+                .into_iter()
+                .map(|path| {
+                    let variable = TypeVar(next_var);
+                    next_var = next_var.saturating_add(1);
+                    (path, variable)
+                })
+                .collect::<BTreeMap<_, _>>();
+            leaf_vars_by_owner.insert(*owner, variables);
+        }
+        let mut leaf_vars = DenseIndexTable::with_len(self.program.expressions.len());
+        for (owner, reads) in &reads_by_owner {
+            let variables = &leaf_vars_by_owner[owner];
+            for expression in reads {
+                let projection = self
+                    .program
+                    .expressions
+                    .get(*expression)
+                    .and_then(checked_passed_projection)
+                    .expect("indexed PASSED read keeps its projection");
+                let variable = *variables
+                    .get(projection)
+                    .expect("PASSED projection owns a stable scheme variable");
+                leaf_vars.insert(*expression, variable);
+            }
+        }
         let mut call_scheme_vars = BTreeMap::<(CheckedCallId, TypeVar), TypeVar>::new();
+        if let Some(started) = reads_started {
+            eprintln!(
+                "boon_typecheck checked_program.infer_context_schemes.reads: {:.3}ms owners={} reads={}",
+                typecheck_elapsed_ms(started),
+                reads_by_owner.len(),
+                leaf_vars.values().count(),
+            );
+        }
 
+        let graph_started = trace.then(Instant::now);
         let user_callables = self
             .signatures
             .iter()
             .filter(|signature| signature.kind == CheckedCallableKind::User)
             .map(|signature| signature.decl_id)
             .collect::<Vec<_>>();
-        let roots_by_owner = reads_by_owner
-            .keys()
-            .map(|owner| (*owner, self.owned_expression_roots(*owner)))
-            .collect::<BTreeMap<_, _>>();
         let mut inherited_calls_by_owner = BTreeMap::<DeclId, Vec<usize>>::new();
         let mut dependents_by_callee = BTreeMap::<DeclId, BTreeSet<DeclId>>::new();
         let mut callees_by_owner = BTreeMap::<DeclId, BTreeSet<DeclId>>::new();
@@ -3937,14 +4011,21 @@ impl CheckedProgramBuilder {
         for callees in callees_by_owner.values_mut() {
             callees.retain(|callee| contextual_callables.contains(callee));
         }
-        let mut requirements = user_callables
-            .iter()
-            .map(|callable| (*callable, None))
-            .collect::<BTreeMap<_, Option<FlowType>>>();
+        let mut requirements = DenseIndexTable::with_len(self.next_decl_id as usize);
+        for callable in &user_callables {
+            requirements.insert(callable.0 as usize, None);
+        }
+        if let Some(started) = graph_started {
+            eprintln!(
+                "boon_typecheck checked_program.infer_context_schemes.graph: {:.3}ms contextual_callables={}",
+                typecheck_elapsed_ms(started),
+                user_callables.len(),
+            );
+        }
         let iteration_limit = user_callables
             .len()
             .saturating_add(self.calls.len())
-            .saturating_add(leaf_vars.len())
+            .saturating_add(leaf_vars.values().count())
             .saturating_add(2);
         let maximum_visits = iteration_limit.saturating_mul(user_callables.len().max(1));
         // Evaluate callees before their owners. The prior DeclId-ordered set
@@ -3957,24 +4038,26 @@ impl CheckedProgramBuilder {
         fn dependency_postorder(
             owner: DeclId,
             callees_by_owner: &BTreeMap<DeclId, BTreeSet<DeclId>>,
-            visited: &mut BTreeSet<DeclId>,
-            active: &mut BTreeSet<DeclId>,
+            visited: &mut DenseFlagSet,
+            active: &mut DenseFlagSet,
             order: &mut Vec<DeclId>,
         ) {
-            if visited.contains(&owner) || !active.insert(owner) {
+            let owner_index = owner.0 as usize;
+            if visited.contains(&owner_index) || !active.insert(owner_index) {
                 return;
             }
             for callee in callees_by_owner.get(&owner).into_iter().flatten() {
                 dependency_postorder(*callee, callees_by_owner, visited, active, order);
             }
-            active.remove(&owner);
-            if visited.insert(owner) {
+            active.remove(&owner_index);
+            if visited.insert(owner_index) {
                 order.push(owner);
             }
         }
+        let worklist_started = trace.then(Instant::now);
         let mut initial_order = Vec::with_capacity(user_callables.len());
-        let mut ordered = BTreeSet::new();
-        let mut active = BTreeSet::new();
+        let mut ordered = DenseFlagSet::with_len(self.next_decl_id as usize);
+        let mut active = DenseFlagSet::with_len(self.next_decl_id as usize);
         for callable in &user_callables {
             dependency_postorder(
                 *callable,
@@ -3985,14 +4068,19 @@ impl CheckedProgramBuilder {
             );
         }
         let mut pending = VecDeque::from(initial_order);
-        let mut queued = user_callables.iter().copied().collect::<BTreeSet<_>>();
+        let mut queued = DenseFlagSet::with_len(self.next_decl_id as usize);
+        for callable in &user_callables {
+            queued.insert(callable.0 as usize);
+        }
         let mut visits = 0usize;
         let mut changes = 0usize;
+        let mut constraint_recursion =
+            DenseRecursionGuard::with_len(self.program.expressions.len());
 
         while let Some(owner) = pending.pop_front() {
-            queued.remove(&owner);
+            queued.remove(&(owner.0 as usize));
             if visits >= maximum_visits {
-                if queued.insert(owner) {
+                if queued.insert(owner.0 as usize) {
                     pending.push_front(owner);
                 }
                 break;
@@ -4001,7 +4089,13 @@ impl CheckedProgramBuilder {
             let mut next_requirement = None;
 
             if let Some(reads) = reads_by_owner.get(&owner) {
-                for (expression, projection) in reads {
+                for expression in reads {
+                    let projection = self
+                        .program
+                        .expressions
+                        .get(*expression)
+                        .and_then(checked_passed_projection)
+                        .expect("indexed PASSED read keeps its projection");
                     let leaf = Type::Var(
                         *leaf_vars
                             .get(expression)
@@ -4013,8 +4107,12 @@ impl CheckedProgramBuilder {
                     );
                 }
 
-                let mut active = BTreeSet::new();
-                for root in roots_by_owner.get(&owner).into_iter().flatten().copied() {
+                constraint_recursion.begin_root();
+                let roots = self
+                    .signature_by_decl
+                    .get(&(owner.0 as usize))
+                    .and_then(|signature| self.expression_roots_by_signature.get(*signature));
+                for root in roots.into_iter().flatten().copied() {
                     self.collect_passed_requirement_constraints(
                         owner,
                         root,
@@ -4024,7 +4122,7 @@ impl CheckedProgramBuilder {
                         &mut call_scheme_vars,
                         &mut next_var,
                         &mut next_requirement,
-                        &mut active,
+                        &mut constraint_recursion,
                     );
                 }
             }
@@ -4034,7 +4132,9 @@ impl CheckedProgramBuilder {
                 let Some(callee) = self.signature_by_declaration(call.callable) else {
                     continue;
                 };
-                let Some(requirement) = requirements.get(&callee.decl_id).and_then(Option::as_ref)
+                let Some(requirement) = requirements
+                    .get(&(callee.decl_id.0 as usize))
+                    .and_then(Option::as_ref)
                 else {
                     continue;
                 };
@@ -4050,14 +4150,14 @@ impl CheckedProgramBuilder {
                 merge_checked_context_requirement(&mut next_requirement, scheme);
             }
 
-            if requirements.get(&owner) == Some(&next_requirement) {
+            if requirements.get(&(owner.0 as usize)) == Some(&next_requirement) {
                 continue;
             }
-            requirements.insert(owner, next_requirement);
+            requirements.insert(owner.0 as usize, next_requirement);
             changes += 1;
             if let Some(dependents) = dependents_by_callee.get(&owner) {
                 for dependent in dependents {
-                    if queued.insert(*dependent) {
+                    if queued.insert(dependent.0 as usize) {
                         pending.push_back(*dependent);
                     }
                 }
@@ -4067,9 +4167,10 @@ impl CheckedProgramBuilder {
         let converged = pending.is_empty();
         self.work_counters
             .record_context_scheme_worklist(visits, changes);
-        if typecheck_trace_enabled() {
+        if trace {
             eprintln!(
-                "boon_typecheck checked_program.infer_context_schemes.worklist visits={visits} changes={changes} maximum_visits={maximum_visits} exhausted={converged}"
+                "boon_typecheck checked_program.infer_context_schemes.worklist: {:.3}ms visits={visits} changes={changes} maximum_visits={maximum_visits} exhausted={converged}",
+                worklist_started.map(typecheck_elapsed_ms).unwrap_or(0.0),
             );
         }
 
@@ -4083,40 +4184,56 @@ impl CheckedProgramBuilder {
             });
         }
 
+        let install_started = trace.then(Instant::now);
         self.install_context_formals(&mut requirements, &mut next_var);
 
-        let lexical_passed_types = reads_by_owner
-            .into_iter()
-            .flat_map(|(owner, reads)| {
-                let requirement = self
-                    .signature_by_declaration(owner)
-                    .and_then(|signature| signature.context_formal)
-                    .and_then(|formal| self.context_formal(formal))
-                    .map(|formal| formal.scheme.flow_type.clone());
-                reads
-                    .into_iter()
-                    .filter_map(move |(expression, projection)| {
-                        let scheme = requirement.as_ref()?;
-                        let ty = type_for_nested_path(&scheme.ty, &projection)?;
-                        Some((
-                            expression,
-                            FlowType {
-                                mode: scheme.mode,
-                                ty,
-                            },
-                        ))
-                    })
-            })
-            .collect::<Vec<_>>();
+        let mut lexical_passed_types = Vec::new();
+        for (owner, reads) in reads_by_owner {
+            let requirement = self
+                .signature_by_declaration(owner)
+                .and_then(|signature| signature.context_formal)
+                .and_then(|formal| self.context_formal(formal))
+                .map(|formal| formal.scheme.flow_type.clone());
+            let Some(scheme) = requirement else {
+                continue;
+            };
+            for expression in reads {
+                let Some(projection) = self
+                    .program
+                    .expressions
+                    .get(expression)
+                    .and_then(checked_passed_projection)
+                else {
+                    continue;
+                };
+                let Some(ty) = type_for_nested_path(&scheme.ty, projection) else {
+                    continue;
+                };
+                lexical_passed_types.push((
+                    expression,
+                    FlowType {
+                        mode: scheme.mode,
+                        ty,
+                    },
+                ));
+            }
+        }
         for (expression, flow_type) in lexical_passed_types {
             self.set_inferred_expr_flow(expression, flow_type);
         }
         self.next_checked_scheme_type_var = Some(next_var);
+        if let Some(started) = install_started {
+            eprintln!(
+                "boon_typecheck checked_program.infer_context_schemes.install: {:.3}ms formals={}",
+                typecheck_elapsed_ms(started),
+                self.context_formals.len(),
+            );
+        }
     }
 
     fn install_context_formals(
         &mut self,
-        requirements: &mut BTreeMap<DeclId, Option<FlowType>>,
+        requirements: &mut DenseIndexTable<Option<FlowType>>,
         next_var: &mut u32,
     ) {
         self.context_formals.clear();
@@ -4132,7 +4249,7 @@ impl CheckedProgramBuilder {
             .map(|(index, signature)| (index, signature.decl_id))
             .collect::<Vec<_>>();
         for (signature_index, callable) in user_callables {
-            let Some(flow_type) = requirements.remove(&callable).flatten() else {
+            let Some(flow_type) = requirements.take(callable.0 as usize).flatten() else {
                 continue;
             };
             if let Some(reason) = context_scheme_conflict_reason(&flow_type.ty) {
@@ -4169,47 +4286,27 @@ impl CheckedProgramBuilder {
         }
         self.context_formals.sort_by_key(|formal| formal.id);
 
-        let formals_by_callable = self
-            .context_formals
-            .iter()
-            .map(|formal| (formal.callable, formal.id))
-            .collect::<BTreeMap<_, _>>();
+        let mut formals_by_callable = DenseIndexTable::with_len(self.next_decl_id as usize);
+        for formal in &self.context_formals {
+            formals_by_callable.insert(formal.callable.0 as usize, formal.id);
+        }
         for call in &mut self.calls {
             if !matches!(call.context_binding, CheckedContextBinding::None) {
                 continue;
             }
-            if !formals_by_callable.contains_key(&call.callable) {
+            if formals_by_callable
+                .get(&(call.callable.0 as usize))
+                .is_none()
+            {
                 continue;
             }
             if let Some(formal) = call
                 .owner_callable
-                .and_then(|owner| formals_by_callable.get(&owner).copied())
+                .and_then(|owner| formals_by_callable.get(&(owner.0 as usize)).copied())
             {
                 call.context_binding = CheckedContextBinding::Inherited { formal };
             }
         }
-    }
-
-    fn owned_expression_roots(&self, owner: DeclId) -> Vec<usize> {
-        let Some(signature) = self.signature_by_declaration(owner) else {
-            return Vec::new();
-        };
-        let owned = self
-            .expressions_by_owner
-            .get(&signature.name)
-            .cloned()
-            .unwrap_or_default();
-        let owned_set = owned.iter().copied().collect::<BTreeSet<_>>();
-        let children = owned
-            .iter()
-            .filter_map(|expression| self.program.expressions.get(*expression))
-            .flat_map(direct_expression_children)
-            .filter(|child| owned_set.contains(child))
-            .collect::<BTreeSet<_>>();
-        owned
-            .into_iter()
-            .filter(|expression| !children.contains(expression))
-            .collect()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4218,21 +4315,21 @@ impl CheckedProgramBuilder {
         owner: DeclId,
         expression: usize,
         expected: Option<Type>,
-        requirements: &BTreeMap<DeclId, Option<FlowType>>,
-        leaf_vars: &BTreeMap<usize, TypeVar>,
+        requirements: &DenseIndexTable<Option<FlowType>>,
+        leaf_vars: &DenseIndexTable<TypeVar>,
         call_scheme_vars: &mut BTreeMap<(CheckedCallId, TypeVar), TypeVar>,
         next_var: &mut u32,
         target: &mut Option<FlowType>,
-        active: &mut BTreeSet<usize>,
+        active: &mut DenseRecursionGuard,
     ) {
         if !active.insert(expression) {
             return;
         }
         let owned_by_callable = self
-            .expression_owner
+            .expression_owner_signatures
             .get(&expression)
-            .and_then(|name| self.signature(name))
-            .is_some_and(|signature| signature.decl_id == owner);
+            .and_then(|candidate| self.signatures.get(*candidate as usize))
+            .is_some_and(|candidate| candidate.decl_id == owner);
         if !owned_by_callable {
             active.remove(&expression);
             return;
@@ -4252,7 +4349,7 @@ impl CheckedProgramBuilder {
                 .unwrap_or(leaf);
             merge_checked_context_requirement(
                 target,
-                continuous_flow_type(forwarded_parameter_requirement(&projection, expected)),
+                continuous_flow_type(forwarded_parameter_requirement(projection, expected)),
             );
             active.remove(&expression);
             return;
@@ -4261,7 +4358,7 @@ impl CheckedProgramBuilder {
         if let Some(call) = self.call_for_expression(CheckedExprId(expression as u32))
             && let Some(signature) = self.signature_by_declaration(call.callable)
         {
-            let mut handled = BTreeSet::new();
+            let mut handled = SmallVec::<[usize; 8]>::new();
             for entry in &call.entries {
                 let CheckedCallEntry::Input { formal, value, .. } = entry else {
                     continue;
@@ -4278,7 +4375,9 @@ impl CheckedProgramBuilder {
                             next_var,
                         )
                     });
-                handled.insert(value.0 as usize);
+                if !handled.contains(&(value.0 as usize)) {
+                    handled.push(value.0 as usize);
+                }
                 self.collect_passed_requirement_constraints(
                     owner,
                     value.0 as usize,
@@ -4292,11 +4391,13 @@ impl CheckedProgramBuilder {
                 );
             }
             if let CheckedContextBinding::Explicit { value, .. } = call.context_binding {
-                handled.insert(value.0 as usize);
+                if !handled.contains(&(value.0 as usize)) {
+                    handled.push(value.0 as usize);
+                }
                 let expected = (signature.kind == CheckedCallableKind::User)
                     .then(|| {
                         requirements
-                            .get(&signature.decl_id)
+                            .get(&(signature.decl_id.0 as usize))
                             .and_then(Option::as_ref)
                             .map(|requirement| {
                                 instantiate_checked_type_scheme_for_call(
@@ -4321,7 +4422,8 @@ impl CheckedProgramBuilder {
                 );
             }
             for child in direct_expression_children(expr) {
-                if handled.insert(child) {
+                if !handled.contains(&child) {
+                    handled.push(child);
                     self.collect_passed_requirement_constraints(
                         owner,
                         child,
@@ -4342,7 +4444,7 @@ impl CheckedProgramBuilder {
         let mut recurse = |child: usize,
                            expected: Option<Type>,
                            target: &mut Option<FlowType>,
-                           active: &mut BTreeSet<usize>| {
+                           active: &mut DenseRecursionGuard| {
             self.collect_passed_requirement_constraints(
                 owner,
                 child,
@@ -10061,9 +10163,10 @@ impl CheckedProgramBuilder {
     }
 
     fn checked_passed_flow_type(&self, expr_id: usize, projection: &[String]) -> Option<FlowType> {
-        let owner = self.expression_owner.get(&expr_id)?;
+        let owner = self.expression_owner_signatures.get(&expr_id)?;
         let formal = self
-            .signature(owner)?
+            .signatures
+            .get(*owner as usize)?
             .context_formal
             .and_then(|formal| self.context_formal(formal))?;
         Some(FlowType {
@@ -11068,9 +11171,9 @@ impl CheckedProgramBuilder {
                     .get(&expr.id)
                     .copied()
                     .or_else(|| {
-                        self.expression_owner
+                        self.expression_owner_signatures
                             .get(&expr.id)
-                            .and_then(|owner| self.signature(owner))
+                            .and_then(|owner| self.signatures.get(*owner as usize))
                             .map(|owner| owner.scope_id)
                     })
                     .unwrap_or(LexicalScopeId(0));
@@ -12666,9 +12769,9 @@ impl CheckedProgramBuilder {
     }
 
     fn context_formal_for_expression(&self, expression: usize) -> Option<ContextFormalId> {
-        self.expression_owner
+        self.expression_owner_signatures
             .get(&expression)
-            .and_then(|owner| self.signature(owner))
+            .and_then(|owner| self.signatures.get(*owner as usize))
             .and_then(|signature| signature.context_formal)
     }
 
@@ -15010,12 +15113,17 @@ fn checked_read_path_matches_parts(expression: Option<&AstExpr>, parts: &[String
     }
 }
 
-fn checked_passed_projection(expression: &AstExpr) -> Option<Vec<String>> {
-    let parts = checked_read_path_parts(expression)?;
-    parts
-        .first()
-        .is_some_and(|part| part == "PASSED")
-        .then(|| parts.into_iter().skip(1).collect())
+fn checked_passed_projection(expression: &AstExpr) -> Option<&[String]> {
+    match &expression.kind {
+        AstExprKind::Identifier(name) if name == "PASSED" => Some(&[]),
+        AstExprKind::Path(parts) if parts.first().is_some_and(|part| part == "PASSED") => {
+            Some(&parts[1..])
+        }
+        AstExprKind::Drain {
+            path: AstDrainPath::Passed { fields },
+        } => Some(fields),
+        _ => None,
+    }
 }
 
 fn merge_checked_context_requirement(requirement: &mut Option<FlowType>, incoming: FlowType) {

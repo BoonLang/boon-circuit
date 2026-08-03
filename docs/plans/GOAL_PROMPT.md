@@ -72,12 +72,13 @@ Authority and conflict rules:
   evidence soundness, runtime persistence identity, native presentation
   semantics, or the mandatory verified artifact spine.
 - `BOON_COMPILER_ARCHITECTURE_REFACTOR_PLAN.md` is subordinate to those budgets
-  and owns the current post-`968c56a` implementation sequence: activation-turn
-  handoff and deterministic effect replay, construction-time owner proof seals,
-  one sealed semantic database, demand-collected plan instances, one plan
-  builder seal, revisioned compiler currentness, and measured dependency
-  inversion. Its intermediate directional exits never replace the performance
-  plan's complete scored Clear End Condition.
+  and owns the current post-`32bcf40` implementation sequence: finish the full
+  oracle on the landed exact activation/effect boundary; introduce one typed
+  `CompilationDb` for cold construction, proof receipts, and later revision
+  currentness; retain ordinary executable definitions plus compact invocation
+  frames through `MachinePlan`; seal the plan once; and pull only measured
+  dependency inversions. Its intermediate directional exits never replace the
+  performance plan's complete scored Clear End Condition.
 - Compiler scaling evidence uses actual parser inspections and
   typechecker/semantic/proof/backend work, never final AST/call/graph sizes as
   substitutes. Build one current two-job release producer explicitly and invoke
@@ -397,46 +398,46 @@ Current checkpoints to preserve and audit rather than redo:
   invariants remain exact. Budget V2 stays red until the V3 provenance report,
   real-host NovyWave behavior scenario, migration/restart matrix, and negative
   cases are complete;
-- resume the performance goal from clean local checkpoint `968c56a` and follow
+- resume the performance goal from clean local checkpoint `32bcf40` and follow
   `BOON_COMPILER_ARCHITECTURE_REFACTOR_PLAN.md`. The canonical list-dataflow,
   sparse durable-overlay lifecycle, product-faithful `boon_behavior_harness`,
-  real local host, and retained document hit testing are landed. The headless
-  harness now has a 28-crate normal forward closure versus native playground's
-  38. Preserve the generic engine contract and do not add row-handle
-  durability, projection-specific activation, example shortcuts, or a
-  production flat fallback;
-- repair the two generic blockers exposed by the extracted full-host oracle
-  before accepting an artifact migration. Machine construction currently
-  stages then drops startup transient effects and `LiveRuntime::mount`
-  fabricates an empty-effect mount; replace both with one activation product
-  carrying the exact initial turn for construction, restore, migration,
-  replacement, and restart. Execute the real host once, map stable logical
-  effect calls, and replay exactly the same completion order into the second
-  retained/flat candidate. Compare exact turns and revisions; normalize only
-  the store-local epoch. Then finish the V3 provenance, migration/restart, and
-  negative matrix. Native WGPU evidence remains separate;
-- prioritize the owner-sealed semantic architecture over further micro-
+  real local host, retained document hit testing, exact activation-turn
+  handoff, atomic reset/activation persistence, deterministic effect transcript,
+  and pre-commit pruning of unleased producer work are landed. The headless
+  harness has a 28-crate normal forward closure versus native playground's 38.
+  Finish the complete real-host NovyWave migration/restart/provenance/negative
+  matrix on this route. Preserve the generic engine contract and do not add
+  row-handle durability, projection-specific activation, example shortcuts, a
+  second mount/replay authority, or a production flat fallback;
+- prioritize one owner/projection compilation database over further micro-
   optimization. A current directional release trace still spends 2,350.35 ms
   building 159,652 rich dependency records, 208,982 coverage rows, and a
   160,316-node/512,314-edge proof graph for only 663 callable owners plus the
-  program root. Emit canonical row fingerprints and exact references during
-  semantic construction, prove exact single coverage with dense bitsets, fold
-  owner-local Merkle roots plus narrow projection roots, and run SCC closure on
-  that summary graph. The owner count is an aggregation opportunity, not
-  permission to broaden exact dependency cones; keep compact typed row regions
-  where parity proves they remain necessary. Keep exhaustive V3 derivation
-  test-only until adversarial mutation, omission, cycle, and cone-precision
-  parity authorizes a flag-day V4 proof; production must then allocate no
-  exhaustive dependency or coverage inventory;
-- next unify the rich semantic graphs into one sealed database with shared row
-  fingerprints and demand-collected plan instances, deleting each superseded
-  production owner. Replace full-plan clone/rewrite/compact/hash finalization
-  with one `MachinePlanBuilder` seal. Promote independent parsed units and the
-  existing owned checked database into the persistent compiler service with
-  stable owner/local identities, implementation/public-semantic fingerprints,
-  exact reverse cones, unchanged-result backdating, `changed_at`/
-  `verified_at`, cancellation, and clean-full parity. Move cross-layer IDs and
-  invert compiler/runtime, migration-harness, effect-adapter, and content-store
+  program root. Implement a minimal `CompilationDb` vertical slice in which a
+  stable owner/projection or definition/invocation-overlay request owns dense
+  semantic row receipts, an exact dependency span, input/result fingerprints,
+  `changed_at`, `verified_at`, and work counters. Use that same request graph
+  for cold construction, owner/projection proof roots, and later warm
+  currentness/backdating; do not build a separate proof index and incremental
+  graph. Keep exhaustive V3 derivation test-only until adversarial mutation,
+  omission, cycle, cone-precision, and retained/flat parity authorizes a
+  flag-day V4 proof; production must then allocate no exhaustive dependency or
+  coverage inventory;
+- expand that vertical cut through the rich semantic domains, deleting each
+  superseded production owner. Carry ordinary executable bodies once through
+  `MachinePlan` with compact parameter/type/PASSED/owner/resource/effect/render
+  invocation frames instead of recompiling each exact call in the backend.
+  Runtime executes verified plan functions, never a semantic AST interpreter
+  or flat fallback. Replace full-plan clone/rewrite/compact/hash finalization
+  with one `MachinePlanBuilder` seal. Normal in-memory publication does not
+  retain complete IR/semantic products or pretty JSON; explicit debug or
+  serialized-artifact intents may materialize them, distributed linking may
+  retain construction IR only until its link seals, and any acceptance format
+  migration remains controlled and scored.
+  Retain the same `CompilationDb` across revisions with exact reverse cones,
+  unchanged-result backdating, cancellation, and clean-full parity. Move
+  cross-layer IDs and invert compiler/runtime, migration-harness,
+  effect-adapter, and content-store
   dependencies only when before/after closure and rebuild measurement proves
   the cut. No compatibility re-export, cosmetic file split, or smaller Rust
   rebuild may be counted as a Boon latency win;
@@ -573,10 +574,11 @@ Blocking compiler-performance prerequisite:
 
 - Complete `BOON_COMPILER_PERFORMANCE_PLAN.md` before resuming the remaining
   simplification/native-recovery closure or any later production phase.
-- Begin from checkpoint `968c56a` and the refactor plan's current tranche:
-  exact activation-turn handoff, one recorded/replayed real-host effect
-  transcript, construction-time owner proof seals, one sealed semantic
-  database, demand-collected plan instances, and one plan builder seal. The
+- Begin from checkpoint `32bcf40` and the refactor plan's current tranche:
+  finish the full real-host oracle on the landed exact activation/effect
+  boundary; build one owner/projection `CompilationDb` shared by cold proof and
+  later warm currentness; carry retained ordinary functions and compact
+  invocation frames through the plan; and use one plan builder seal. The
   package-local dev profile choices are already present; do not repeat a stale
   parser-profile task. Use focused correctness and bounded direct release
   preflight while changing each owner, then regenerate the full current two-job

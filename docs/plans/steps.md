@@ -206,46 +206,42 @@ stronger three-reviewer performance closure defined below.
    red until V3 records source/old/new identities, the real-host NovyWave
    behavior trace, migration/restart evidence, and focused negative cases.
 
-   Resume from clean local checkpoint `968c56a` and follow
+   Resume from clean local checkpoint `32bcf40` and follow
    `BOON_COMPILER_ARCHITECTURE_REFACTOR_PLAN.md`. The canonical list-dataflow,
    sparse durable-overlay lifecycle, `boon_behavior_harness`, real local host,
-   and retained document hit testing are landed. The headless harness has a
-   28-crate normal forward closure versus native playground's 38, but its
-   full-host restart path exposes two generic blockers: machine construction
-   drops startup transient effects, and independently scheduled hosts produce
-   different completion/revision order.
+   retained document hit testing, exact activation-turn handoff, atomic reset/
+   activation persistence, deterministic effect transcript, and pre-commit
+   pruning of unleased producer work are landed. The headless harness has a
+   28-crate normal forward closure versus native playground's 38. Finish the
+   complete real-host NovyWave migration/restart/provenance/negative matrix on
+   this route. Preserve the generic list contract and do not add row-handle
+   serialization, projection-specific activation, example shortcuts, a second
+   mount/replay authority, or a production flat fallback.
 
-   First replace machine/runtime construction plus synthetic empty `mount`
-   with one activation product carrying the exact initial turn. Then execute
-   the real host once and replay the same logical effect-completion transcript
-   into the second retained/flat candidate so exact turns, revisions,
-   persistence, migration, and restart can be compared without normalizing
-   causality. Finish the bounded oracle provenance and negative matrix on this
-   route. Preserve the generic list contract and do not add row-handle
-   serialization, projection-specific activation, example shortcuts, or a
-   production flat fallback.
+   The next compiler tranche is one typed `CompilationDb`, not another packed
+   proof container followed later by a separate incremental graph. Begin with
+   a vertical program-root plus representative ordinary-callable slice. Stable
+   owner/projection or definition/invocation-overlay requests own dense
+   semantic row receipts, compact exact dependency spans, input/result
+   fingerprints, `changed_at`, `verified_at`, and work counters. Drive that
+   slice through checking, semantics, test-only V3 materialization, demand
+   collection, plan, verifier, and runtime, and delete every superseded
+   production owner for the slice. Keep the exhaustive V3 inventory test-only
+   until mutation, omission, cycle, cone-precision, stable-contract, and
+   behavior evidence authorizes a flag-day V4 proof. Production then allocates
+   no exhaustive dependency or coverage records.
 
-   The next compiler tranche is the architectural proof cut, not another
-   packed container. During semantic construction, assign every executable row
-   exactly once to a callable/program owner, compute its canonical row
-   fingerprint, and record exact row/owner references. Fold owner-local Merkle
-   roots plus stable narrow projection roots and run dependency SCC closure on
-   that summary graph instead of automatically making every rich field record
-   a node. The current 664 owners are an aggregation starting point, not
-   permission to broaden exact dependency cones; compact typed row-level
-   regions remain only where parity proves they are necessary. Keep the
-   exhaustive V3 inventory test-only as an independent materializer until
-   mutation, omission, cycle, cone-precision, stable-contract, and behavior
-   evidence authorizes a flag-day V4 proof. Production then allocates no
-   exhaustive dependency or coverage records.
-
-   Continue by unifying the rich semantic graphs into one sealed database with
-   shared row fingerprints and demand-collected plan instances, deleting each
-   superseded production owner as parity lands. Replace full-`MachinePlan`
-   clone/rewrite/compact/hash finalization with one builder seal. Only then
-   promote independent parsed units and the existing owned checked database
-   into the revisioned compiler service with stable owner/local identities,
-   public/implementation fingerprints, exact cones, backdating,
+   Expand the same database through the rich semantic domains. Carry each
+   ordinary executable body once through `MachinePlan` and represent call-
+   specific parameter/type/PASSED/owner/resource/effect/render context with
+   compact invocation frames rather than recompiling every exact call. Runtime
+   executes verified plan functions and never a semantic AST interpreter or
+   flat fallback. Replace full-`MachinePlan` clone/rewrite/compact/hash
+   finalization with one builder seal. Normal in-memory publication does not
+   retain full construction IR/semantic products or pretty JSON; explicit
+   debug/serialized-artifact intents and bounded pre-seal distributed linking
+   own those products, and acceptance format migration remains controlled.
+   Retain the same request graph across revisions for exact cones, backdating,
    `changed_at`/`verified_at`, cancellation, and clean-full parity. Pull crate
    splits and runtime/compiler dependency inversion only when measured closure
    and rebuild evidence proves the ownership cut. Keep Rust rebuild speed and

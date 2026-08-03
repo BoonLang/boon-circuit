@@ -4393,7 +4393,7 @@ fn project_named_value_contract_type(
                 ))
             }),
             Type::List(item) => {
-                project_one(item, selector).map(|field| Type::List(Box::new(field)))
+                project_one(item, selector).map(|field| Type::List(Type::shared(field)))
             }
             _ => Err(SemanticScopeStorageError::new(format!(
                 "named-value checked projection `{selector}` requires an object or list item, got {ty:?}"
@@ -5287,8 +5287,8 @@ store: [
             "body",
             Type::Bytes(boon_checked::BytesType::Fixed(8)),
         )]);
-        let dynamic = object(vec![("envelope", Type::List(Box::new(dynamic_body)))]);
-        let fixed = object(vec![("envelope", Type::List(Box::new(fixed_body)))]);
+        let dynamic = object(vec![("envelope", Type::List(Type::shared(dynamic_body)))]);
+        let fixed = object(vec![("envelope", Type::List(Type::shared(fixed_body)))]);
         let expected =
             derive_storage_representation(&dynamic, &fixed).expect("exact fixed-BYTES refinement");
         assert!(matches!(

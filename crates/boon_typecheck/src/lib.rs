@@ -7569,7 +7569,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                 }),
                 false,
             )),
-            AstExprKind::ListLiteral { items, .. } => Type::List(Box::new(
+            AstExprKind::ListLiteral { items, .. } => Type::List(Type::shared(
                 items
                     .iter()
                     .filter_map(|item| {
@@ -7582,7 +7582,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                     })
                     .unwrap_or(Type::Unknown),
             )),
-            AstExprKind::SetLiteral { items } => Type::Set(Box::new(
+            AstExprKind::SetLiteral { items } => Type::Set(Type::shared(
                 items
                     .iter()
                     .filter_map(|item| {
@@ -8793,7 +8793,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                     Type::List(item) => Some((**item).clone()),
                     _ => None,
                 };
-                Type::List(Box::new(
+                Type::List(Type::shared(
                     items
                         .iter()
                         .map(|item| self.infer_checked_expr_flow(*item, active).ty)
@@ -8807,7 +8807,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                     Type::Set(item) => Some((**item).clone()),
                     _ => None,
                 };
-                Type::Set(Box::new(
+                Type::Set(Type::shared(
                     items
                         .iter()
                         .map(|item| self.infer_checked_expr_flow(*item, active).ty)
@@ -14509,7 +14509,7 @@ fn merge_principal_context_type(
             path.push("[]".to_owned());
             let merged = merge_principal_context_type(current, incoming, path)?;
             path.pop();
-            Ok(Type::List(Box::new(merged)))
+            Ok(Type::List(Type::shared(merged)))
         }
         (Type::Bytes(BytesType::Dynamic), Type::Bytes(incoming)) => {
             Ok(Type::Bytes(incoming.clone()))
@@ -14616,14 +14616,14 @@ fn alpha_normalize_context_type(
             field_order: shape.field_order.clone(),
             open: shape.open,
         }),
-        Type::List(item) => Type::List(Box::new(alpha_normalize_context_type(
+        Type::List(item) => Type::List(Type::shared(alpha_normalize_context_type(
             item, variables, next_var,
         ))),
         Type::Map { key, value } => Type::Map {
             key: Box::new(alpha_normalize_context_type(key, variables, next_var)),
             value: Box::new(alpha_normalize_context_type(value, variables, next_var)),
         },
-        Type::Set(item) => Type::Set(Box::new(alpha_normalize_context_type(
+        Type::Set(item) => Type::Set(Type::shared(alpha_normalize_context_type(
             item, variables, next_var,
         ))),
         Type::Function { args, result } => Type::Function {
@@ -14713,12 +14713,14 @@ fn pass_scheme_type_with_fallback(ty: &Type, fallback: &Type) -> Type {
             field_order: shape.field_order.clone(),
             open: shape.open,
         }),
-        Type::List(item) => Type::List(Box::new(pass_scheme_type_with_fallback(item, fallback))),
+        Type::List(item) => {
+            Type::List(Type::shared(pass_scheme_type_with_fallback(item, fallback)))
+        }
         Type::Map { key, value } => Type::Map {
             key: Box::new(pass_scheme_type_with_fallback(key, fallback)),
             value: Box::new(pass_scheme_type_with_fallback(value, fallback)),
         },
-        Type::Set(item) => Type::Set(Box::new(pass_scheme_type_with_fallback(item, fallback))),
+        Type::Set(item) => Type::Set(Type::shared(pass_scheme_type_with_fallback(item, fallback))),
         Type::Function { args, result } => Type::Function {
             args: args
                 .iter()
@@ -14791,12 +14793,12 @@ fn freshen_checked_scheme_type(ty: &Type, next_var: &mut u32) -> Type {
             field_order: shape.field_order.clone(),
             open: shape.open,
         }),
-        Type::List(item) => Type::List(Box::new(freshen_checked_scheme_type(item, next_var))),
+        Type::List(item) => Type::List(Type::shared(freshen_checked_scheme_type(item, next_var))),
         Type::Map { key, value } => Type::Map {
             key: Box::new(freshen_checked_scheme_type(key, next_var)),
             value: Box::new(freshen_checked_scheme_type(value, next_var)),
         },
-        Type::Set(item) => Type::Set(Box::new(freshen_checked_scheme_type(item, next_var))),
+        Type::Set(item) => Type::Set(Type::shared(freshen_checked_scheme_type(item, next_var))),
         Type::Function { args, result } => Type::Function {
             args: args
                 .iter()
@@ -14867,7 +14869,7 @@ fn instantiate_checked_type_scheme_for_call(
                 instantiated
             }))
         }
-        Type::List(item) => Type::List(Box::new(instantiate_checked_type_scheme_for_call(
+        Type::List(item) => Type::List(Type::shared(instantiate_checked_type_scheme_for_call(
             item, call, call_vars, next_var,
         ))),
         Type::Map { key, value } => Type::Map {
@@ -14878,7 +14880,7 @@ fn instantiate_checked_type_scheme_for_call(
                 value, call, call_vars, next_var,
             )),
         },
-        Type::Set(item) => Type::Set(Box::new(instantiate_checked_type_scheme_for_call(
+        Type::Set(item) => Type::Set(Type::shared(instantiate_checked_type_scheme_for_call(
             item, call, call_vars, next_var,
         ))),
         Type::Function { args, result } => Type::Function {
@@ -15834,7 +15836,7 @@ fn effect_schema_type_to_type(value_type: &boon_effect_schema::ValueType) -> Typ
             }))
         }
         boon_effect_schema::ValueType::List { item } => {
-            Type::List(Box::new(effect_schema_type_to_type(item)))
+            Type::List(Type::shared(effect_schema_type_to_type(item)))
         }
         boon_effect_schema::ValueType::Record { fields, open } => {
             Type::object(ObjectShape::from_ordered_fields(
@@ -16977,6 +16979,8 @@ struct Checker<'a> {
     checked_statement_values: DenseIndexTable<CheckedExprId>,
     checked_diagnostic_replay: bool,
     checked_diagnostic_projection_active: bool,
+    checked_diagnostic_tasks: Vec<CheckedDiagnosticExpressionTask>,
+    checked_diagnostic_sequence: SmallVec<[CheckedDiagnosticExpressionTask; 12]>,
     #[cfg(test)]
     checked_diagnostic_projection_mode: CheckedDiagnosticProjectionMode,
     diagnostic_replayed: DenseFlagSet,
@@ -17302,6 +17306,8 @@ impl<'a> Checker<'a> {
             checked_statement_values: DenseIndexTable::default(),
             checked_diagnostic_replay: false,
             checked_diagnostic_projection_active: false,
+            checked_diagnostic_tasks: Vec::new(),
+            checked_diagnostic_sequence: SmallVec::new(),
             #[cfg(test)]
             checked_diagnostic_projection_mode: CheckedDiagnosticProjectionMode::Ordered,
             diagnostic_replayed: DenseFlagSet::with_len(program.expressions.len()),
@@ -17554,6 +17560,8 @@ impl<'a> Checker<'a> {
         }
         self.checked_diagnostic_replay = true;
         self.checked_diagnostic_projection_active = false;
+        self.checked_diagnostic_tasks.clear();
+        self.checked_diagnostic_sequence.clear();
         self.diagnostic_replayed = DenseFlagSet::with_len(self.program.expressions.len());
         self.diagnostic_ensure_requests = 0;
         self.diagnostic_lookup_hits = 0;
@@ -18726,7 +18734,7 @@ impl<'a> Checker<'a> {
             .map(|expr_id| self.ensure_expr(expr_id).ty)
             .unwrap_or_else(|| {
                 if matches!(slot_name.as_str(), "items" | "children") {
-                    Type::List(Box::new(open_object_type()))
+                    Type::List(Type::shared(open_object_type()))
                 } else {
                     open_object_type()
                 }
@@ -18917,7 +18925,11 @@ impl<'a> Checker<'a> {
     /// `ensure_expr` dispatch. Unlike a dependency postorder, continuations
     /// preserve checks that occur before, between, and after child reads.
     fn project_checked_expression_diagnostics(&mut self, root: usize) {
-        let mut tasks = vec![CheckedDiagnosticExpressionTask::Enter(root)];
+        let mut tasks = std::mem::take(&mut self.checked_diagnostic_tasks);
+        let mut sequence = std::mem::take(&mut self.checked_diagnostic_sequence);
+        debug_assert!(tasks.is_empty());
+        debug_assert!(sequence.is_empty());
+        tasks.push(CheckedDiagnosticExpressionTask::Enter(root));
         self.checked_diagnostic_projection_active = true;
         while let Some(task) = tasks.pop() {
             match task {
@@ -18927,8 +18939,8 @@ impl<'a> Checker<'a> {
                     {
                         continue;
                     }
-                    let sequence = self.checked_diagnostic_expression_sequence(expression);
-                    tasks.extend(sequence.into_iter().rev());
+                    self.checked_diagnostic_expression_sequence(expression, &mut sequence);
+                    tasks.extend(sequence.drain(..).rev());
                 }
                 CheckedDiagnosticExpressionTask::ReplayLeaf(expression) => {
                     let program = self.program;
@@ -19089,15 +19101,20 @@ impl<'a> Checker<'a> {
             }
         }
         self.checked_diagnostic_projection_active = false;
+        debug_assert!(tasks.is_empty());
+        debug_assert!(sequence.is_empty());
+        self.checked_diagnostic_tasks = tasks;
+        self.checked_diagnostic_sequence = sequence;
     }
 
     fn checked_diagnostic_expression_sequence(
         &self,
         expression_id: usize,
-    ) -> SmallVec<[CheckedDiagnosticExpressionTask; 12]> {
-        let mut sequence = SmallVec::new();
+        sequence: &mut SmallVec<[CheckedDiagnosticExpressionTask; 12]>,
+    ) {
+        debug_assert!(sequence.is_empty());
         let Some(expression) = self.program.expressions.get(expression_id) else {
-            return sequence;
+            return;
         };
         match &expression.kind {
             AstExprKind::BytesLiteral { items, .. } => {
@@ -19113,9 +19130,18 @@ impl<'a> Checker<'a> {
                 ));
             }
             AstExprKind::Object(fields) => {
-                let mut explicit_fields = BTreeSet::new();
+                let mut explicit_fields = SmallVec::<[&str; 8]>::new();
                 for (field_index, field) in fields.iter().enumerate() {
-                    let duplicate = !field.spread && !explicit_fields.insert(field.name.clone());
+                    let duplicate = !field.spread
+                        && if explicit_fields
+                            .iter()
+                            .any(|existing| *existing == field.name)
+                        {
+                            true
+                        } else {
+                            explicit_fields.push(field.name.as_str());
+                            false
+                        };
                     sequence.push(CheckedDiagnosticExpressionTask::Enter(field.value));
                     sequence.push(CheckedDiagnosticExpressionTask::CheckRecordField {
                         expression: expression_id,
@@ -19125,19 +19151,26 @@ impl<'a> Checker<'a> {
                 }
             }
             AstExprKind::MapLiteral { entries } => {
-                let mut static_keys = BTreeMap::<DataValue, usize>::new();
+                let mut static_keys = SmallVec::<[(DataValue, usize); 8]>::new();
                 for entry in entries {
                     if let Some(AstExpr {
                         kind: AstExprKind::MapEntry { key, .. },
                         ..
                     }) = self.program.expressions.get(*entry)
                         && let Some(key_value) = static_key_value(self.program, *key)
-                        && let Some(first) = static_keys.insert(key_value, *key)
                     {
-                        sequence.push(CheckedDiagnosticExpressionTask::CheckMapDuplicate {
-                            key: *key,
-                            first,
-                        });
+                        if let Some((_, previous)) = static_keys
+                            .iter_mut()
+                            .find(|(existing, _)| existing == &key_value)
+                        {
+                            let first = std::mem::replace(previous, *key);
+                            sequence.push(CheckedDiagnosticExpressionTask::CheckMapDuplicate {
+                                key: *key,
+                                first,
+                            });
+                        } else {
+                            static_keys.push((key_value, *key));
+                        }
                     }
                     sequence.push(CheckedDiagnosticExpressionTask::Enter(*entry));
                 }
@@ -19188,7 +19221,7 @@ impl<'a> Checker<'a> {
                         expression_id,
                         op,
                         args,
-                        &mut sequence,
+                        sequence,
                     );
                 } else {
                     sequence.push(CheckedDiagnosticExpressionTask::BuiltinComplete(
@@ -19228,7 +19261,7 @@ impl<'a> Checker<'a> {
                     sequence.push(CheckedDiagnosticExpressionTask::MissingHoldUpdates(
                         expression_id,
                     ));
-                    return sequence;
+                    return;
                 };
                 let mut accumulator = self
                     .finalized_checked_flow(initial)
@@ -19390,7 +19423,7 @@ impl<'a> Checker<'a> {
             }
             AstExprKind::Identifier(value) => {
                 if self.builtin_symbol_exprs.contains(&expression.id) {
-                    return sequence;
+                    return;
                 }
                 if self.is_known_function(value) {
                     sequence.push(CheckedDiagnosticExpressionTask::ReplayLeaf(expression_id));
@@ -19435,7 +19468,6 @@ impl<'a> Checker<'a> {
                 sequence.push(CheckedDiagnosticExpressionTask::ReplayLeaf(expression_id));
             }
         }
-        sequence
     }
 
     fn schedule_projected_contextual_builtin_diagnostics(
@@ -19739,7 +19771,7 @@ impl<'a> Checker<'a> {
             .cloned()
             .unwrap_or_default();
         if fields.is_empty() {
-            return Type::List(Box::new(open_object_type()));
+            return Type::List(Type::shared(open_object_type()));
         }
         Type::object(ObjectShape::from_ordered_fields(
             fields
@@ -20133,7 +20165,7 @@ impl<'a> Checker<'a> {
                     .map(|item| self.ensure_expr(*item).ty)
                     .reduce(|existing, extra| widen_structural_type(&existing, &extra));
                 item_type
-                    .map(|item| Type::List(Box::new(item)))
+                    .map(|item| Type::List(Type::shared(item)))
                     .or_else(|| {
                         exact_expression_statement(&self.program.ast.statements, expr.id).and_then(
                             |statement| {
@@ -20141,7 +20173,7 @@ impl<'a> Checker<'a> {
                             },
                         )
                     })
-                    .unwrap_or_else(|| Type::List(Box::new(open_object_type())))
+                    .unwrap_or_else(|| Type::List(Type::shared(open_object_type())))
             }
             AstExprKind::MapEntry { key, value } => {
                 let key = self.ensure_expr(*key).ty;
@@ -20213,7 +20245,7 @@ impl<'a> Checker<'a> {
                         ),
                     ));
                 }
-                Type::Set(Box::new(item_type))
+                Type::Set(Type::shared(item_type))
             }
             AstExprKind::Call { function, args, .. }
                 if external_function_role(function).is_some() =>
@@ -20334,7 +20366,7 @@ impl<'a> Checker<'a> {
                         ));
                     }
                     let item_type = contextual_body_type.unwrap_or_else(open_object_type);
-                    Type::List(Box::new(item_type))
+                    Type::List(Type::shared(item_type))
                 } else if matches!(op.as_str(), "List/every" | "List/any" | "List/is_not_empty") {
                     true_false_type()
                 } else if op == "List/latest" {
@@ -20363,7 +20395,7 @@ impl<'a> Checker<'a> {
                         .map(|arg| self.ensure_expr(arg.value).ty);
                     match (input_flow.ty, append_item) {
                         (Type::List(input_item), Some(item_ty)) => {
-                            Type::List(Box::new(widen_structural_type(&input_item, &item_ty)))
+                            Type::List(Type::shared(widen_structural_type(&input_item, &item_ty)))
                         }
                         (input_ty, _) => input_ty,
                     }
@@ -22680,7 +22712,7 @@ impl<'a> Checker<'a> {
                             _ => None,
                         })
                 } else if op == "List/map" {
-                    Some(Type::List(Box::new(
+                    Some(Type::List(Type::shared(
                         self.static_list_map_result_item_type(args, active_functions),
                     )))
                 } else if matches!(op.as_str(), "List/any" | "List/every" | "List/is_not_empty") {
@@ -22715,7 +22747,7 @@ impl<'a> Checker<'a> {
                         .and_then(|expr| self.static_expr_type(expr, active_functions));
                     match (input_ty, append_ty) {
                         (Some(Type::List(input_item)), Some(item_ty)) => Some(Type::List(
-                            Box::new(widen_structural_type(&input_item, &item_ty)),
+                            Type::shared(widen_structural_type(&input_item, &item_ty)),
                         )),
                         (Some(input_ty), _) => Some(input_ty),
                         _ => None,
@@ -23467,7 +23499,7 @@ impl<'a> Checker<'a> {
                         });
                     match (ty, append_ty) {
                         (Type::List(item), Some(append_ty)) => {
-                            Type::List(Box::new(widen_structural_type(&item, &append_ty)))
+                            Type::List(Type::shared(widen_structural_type(&item, &append_ty)))
                         }
                         (existing, _) => existing,
                     }
@@ -23702,7 +23734,7 @@ impl<'a> Checker<'a> {
                 None => ty,
             });
         }
-        Some(Type::List(Box::new(
+        Some(Type::List(Type::shared(
             item_type.unwrap_or_else(|| unresolved_shape("empty list item")),
         )))
     }
@@ -26091,7 +26123,7 @@ fn map_type() -> Type {
 }
 
 fn set_type() -> Type {
-    Type::Set(Box::new(map_key_type()))
+    Type::Set(Type::shared(map_key_type()))
 }
 
 fn bits_value_type() -> Type {
@@ -26341,7 +26373,7 @@ impl Default for BuiltinSignatureRegistry {
             "Text/join",
             Type::Text,
             vec![
-                required_parameter("texts", Type::List(Box::new(Type::Text))),
+                required_parameter("texts", Type::List(Type::shared(Type::Text))),
                 optional_parameter("separator", Type::Text),
                 optional_parameter("empty", Type::Text),
             ],
@@ -26662,7 +26694,7 @@ impl Default for BuiltinSignatureRegistry {
                 Type::Number,
                 vec![required_parameter(
                     "list",
-                    Type::List(Box::new(open_object_type())),
+                    Type::List(Type::shared(open_object_type())),
                 )],
                 None,
             );
@@ -26877,7 +26909,7 @@ impl Default for BuiltinSignatureRegistry {
             true_false_type(),
             vec![required_parameter(
                 "list",
-                Type::List(Box::new(open_object_type())),
+                Type::List(Type::shared(open_object_type())),
             )],
             None,
         );
@@ -26911,35 +26943,35 @@ impl Default for BuiltinSignatureRegistry {
             );
         }
 
-        let list_type = || Type::List(Box::new(open_object_type()));
+        let list_type = || Type::List(Type::shared(open_object_type()));
         for (name, body, operation, body_type, result) in [
             (
                 "List/map",
                 "new",
                 ContextualBuiltinKind::Map,
                 contextual_result_type(),
-                Type::List(Box::new(contextual_result_type())),
+                Type::List(Type::shared(contextual_result_type())),
             ),
             (
                 "List/filter",
                 "if",
                 ContextualBuiltinKind::Filter,
                 true_false_type(),
-                Type::List(Box::new(contextual_item_type())),
+                Type::List(Type::shared(contextual_item_type())),
             ),
             (
                 "List/retain",
                 "if",
                 ContextualBuiltinKind::Retain,
                 true_false_type(),
-                Type::List(Box::new(contextual_item_type())),
+                Type::List(Type::shared(contextual_item_type())),
             ),
             (
                 "List/remove",
                 "when",
                 ContextualBuiltinKind::Remove,
                 true_false_type(),
-                Type::List(Box::new(contextual_item_type())),
+                Type::List(Type::shared(contextual_item_type())),
             ),
             (
                 "List/every",
@@ -26967,7 +26999,7 @@ impl Default for BuiltinSignatureRegistry {
                 name,
                 result,
                 vec![
-                    required_parameter("list", Type::List(Box::new(contextual_item_type()))),
+                    required_parameter("list", Type::List(Type::shared(contextual_item_type()))),
                     output_parameter("item", contextual_item_type()),
                     required_parameter(body, body_type),
                 ],
@@ -26980,9 +27012,9 @@ impl Default for BuiltinSignatureRegistry {
         ] {
             register(
                 name,
-                Type::List(Box::new(contextual_item_type())),
+                Type::List(Type::shared(contextual_item_type())),
                 vec![
-                    required_parameter("list", Type::List(Box::new(contextual_item_type()))),
+                    required_parameter("list", Type::List(Type::shared(contextual_item_type()))),
                     output_parameter("item", contextual_item_type()),
                     required_parameter("key", contextual_key_type()),
                     optional_parameter("direction", order_direction_type()),
@@ -26992,9 +27024,9 @@ impl Default for BuiltinSignatureRegistry {
         }
         register(
             "List/take",
-            Type::List(Box::new(contextual_item_type())),
+            Type::List(Type::shared(contextual_item_type())),
             vec![
-                required_parameter("list", Type::List(Box::new(contextual_item_type()))),
+                required_parameter("list", Type::List(Type::shared(contextual_item_type()))),
                 required_parameter("count", Type::Number),
             ],
             None,
@@ -27003,7 +27035,7 @@ impl Default for BuiltinSignatureRegistry {
             "List/page",
             page_result_type(contextual_item_type()),
             vec![
-                required_parameter("list", Type::List(Box::new(contextual_item_type()))),
+                required_parameter("list", Type::List(Type::shared(contextual_item_type()))),
                 required_parameter("size", Type::Number),
                 required_parameter("after", page_position_type()),
             ],
@@ -27011,16 +27043,16 @@ impl Default for BuiltinSignatureRegistry {
         );
         register(
             "List/append",
-            Type::List(Box::new(contextual_item_type())),
+            Type::List(Type::shared(contextual_item_type())),
             vec![
-                required_parameter("list", Type::List(Box::new(contextual_item_type()))),
+                required_parameter("list", Type::List(Type::shared(contextual_item_type()))),
                 required_parameter("item", contextual_item_type()),
             ],
             None,
         );
         register(
             "List/range",
-            Type::List(Box::new(Type::Number)),
+            Type::List(Type::shared(Type::Number)),
             vec![
                 required_parameter("from", Type::Number),
                 required_parameter("to", Type::Number),
@@ -27029,18 +27061,20 @@ impl Default for BuiltinSignatureRegistry {
         );
         register(
             "List/chunk",
-            Type::List(Box::new(Type::object(ObjectShape::from_ordered_fields(
-                [
-                    ("label".to_owned(), Type::Text),
-                    (
-                        "items".to_owned(),
-                        Type::List(Box::new(contextual_item_type())),
-                    ),
-                ],
-                false,
-            )))),
+            Type::List(Type::shared(Type::object(
+                ObjectShape::from_ordered_fields(
+                    [
+                        ("label".to_owned(), Type::Text),
+                        (
+                            "items".to_owned(),
+                            Type::List(Type::shared(contextual_item_type())),
+                        ),
+                    ],
+                    false,
+                ),
+            ))),
             vec![
-                required_parameter("list", Type::List(Box::new(contextual_item_type()))),
+                required_parameter("list", Type::List(Type::shared(contextual_item_type()))),
                 required_parameter("size", Type::Number),
             ],
             None,
@@ -27049,7 +27083,7 @@ impl Default for BuiltinSignatureRegistry {
             "List/get",
             found_or_not_found_type(contextual_item_type()),
             vec![
-                required_parameter("list", Type::List(Box::new(contextual_item_type()))),
+                required_parameter("list", Type::List(Type::shared(contextual_item_type()))),
                 required_parameter("position", Type::Number),
             ],
             None,
@@ -27059,7 +27093,7 @@ impl Default for BuiltinSignatureRegistry {
             contextual_item_type(),
             vec![required_parameter(
                 "list",
-                Type::List(Box::new(contextual_item_type())),
+                Type::List(Type::shared(contextual_item_type())),
             )],
             None,
         );
@@ -27589,7 +27623,11 @@ fn render_constructor_call_contexts(function: &str) -> Vec<AuthoritativeCallCont
 fn render_constructor_parameters(function: &str) -> Option<Vec<AuthoritativeParameter>> {
     let renderable = |name, required| render_parameter(name, Type::RenderContract, required);
     let renderables = |name, required| {
-        render_parameter(name, Type::List(Box::new(Type::RenderContract)), required)
+        render_parameter(
+            name,
+            Type::List(Type::shared(Type::RenderContract)),
+            required,
+        )
     };
     let text = |name, required| render_parameter(name, Type::Text, required);
     let number = |name, required| render_parameter(name, Type::Number, required);
@@ -27709,7 +27747,11 @@ fn render_constructor_parameters(function: &str) -> Option<Vec<AuthoritativePara
             render_object_parameter("bounds", true),
             render_object_parameter("tile_source", true),
             render_object_parameter("interaction", true),
-            render_parameter("overlays", Type::List(Box::new(open_object_type())), true),
+            render_parameter(
+                "overlays",
+                Type::List(Type::shared(open_object_type())),
+                true,
+            ),
             renderables("children", false),
         ],
         "Scene/Element/map" => vec![
@@ -27720,7 +27762,11 @@ fn render_constructor_parameters(function: &str) -> Option<Vec<AuthoritativePara
             render_object_parameter("bounds", true),
             render_object_parameter("tile_source", true),
             render_object_parameter("interaction", true),
-            render_parameter("overlays", Type::List(Box::new(open_object_type())), true),
+            render_parameter(
+                "overlays",
+                Type::List(Type::shared(open_object_type())),
+                true,
+            ),
             renderables("items", false),
         ],
         _ => return None,
@@ -29591,7 +29637,7 @@ fn simple_list_statement_type(statement: &AstStatement, expressions: &[AstExpr])
             None => ty,
         });
     }
-    Type::List(Box::new(item_type.unwrap_or_else(open_object_type)))
+    Type::List(Type::shared(item_type.unwrap_or_else(open_object_type)))
 }
 
 fn simple_statement_value_type(statement: &AstStatement, expressions: &[AstExpr]) -> Option<Type> {
@@ -29740,7 +29786,7 @@ fn statement_value_type_from_bindings(
                                 )
                             })
                             .unwrap_or_else(open_object_type);
-                    Some(Type::List(Box::new(item_type)))
+                    Some(Type::List(Type::shared(item_type)))
                 }
                 AstExprKind::Pipe { op, .. } if op == "List/latest" => {
                     list_item_type_from_list_type(&ty)
@@ -30054,7 +30100,7 @@ where
         .iter()
         .filter_map(|item| expressions.get(*item).and_then(&mut type_for_expr))
         .reduce(|existing, extra| widen_structural_type(&existing, &extra));
-    Type::List(Box::new(item_type.unwrap_or_else(open_object_type)))
+    Type::List(Type::shared(item_type.unwrap_or_else(open_object_type)))
 }
 
 fn simple_expr_type(expr: &AstExpr, expressions: &[AstExpr]) -> Type {
@@ -30143,13 +30189,18 @@ fn simple_expr_type(expr: &AstExpr, expressions: &[AstExpr]) -> Type {
         AstExprKind::Call { function, .. } | AstExprKind::Pipe { op: function, .. }
             if function == "List/chunk" =>
         {
-            Type::List(Box::new(Type::object(ObjectShape::from_ordered_fields(
-                [
-                    ("label".to_owned(), Type::Text),
-                    ("items".to_owned(), Type::List(Box::new(open_object_type()))),
-                ],
-                false,
-            ))))
+            Type::List(Type::shared(Type::object(
+                ObjectShape::from_ordered_fields(
+                    [
+                        ("label".to_owned(), Type::Text),
+                        (
+                            "items".to_owned(),
+                            Type::List(Type::shared(open_object_type())),
+                        ),
+                    ],
+                    false,
+                ),
+            )))
         }
         AstExprKind::Call { function, .. } | AstExprKind::Pipe { op: function, .. }
             if function == "Bool/not"
@@ -30699,7 +30750,7 @@ fn pipe_input_expected_type(function: &str) -> Option<Type> {
     if function == "Stream/pulses" {
         Some(Type::Number)
     } else if function == "Text/join" {
-        Some(Type::List(Box::new(Type::Text)))
+        Some(Type::List(Type::shared(Type::Text)))
     } else if function == "List/map"
         || matches!(
             function,
@@ -30718,7 +30769,7 @@ fn pipe_input_expected_type(function: &str) -> Option<Type> {
                 | "List/latest"
         )
     {
-        Some(Type::List(Box::new(open_object_type())))
+        Some(Type::List(Type::shared(open_object_type())))
     } else if function == "Router/go_to"
         || function.starts_with("Text/")
         || matches!(function, "File/read_text" | "Log/error" | "Log/info")
@@ -30860,7 +30911,7 @@ fn list_argument_expected_type(function: &str, arg_name: Option<&str>) -> Option
             "List/filter" | "List/retain" | "List/remove" | "List/find" | "List/sort_by"
             | "List/then_by" | "List/take" | "List/page",
             Some("list"),
-        ) => Some(Type::List(Box::new(open_object_type()))),
+        ) => Some(Type::List(Type::shared(open_object_type()))),
         ("List/filter" | "List/retain" | "List/every" | "List/any" | "List/find", Some("if")) => {
             Some(true_false_type())
         }
@@ -30893,7 +30944,7 @@ fn text_argument_expected_type(
     piped: bool,
 ) -> Option<Type> {
     match (function, arg_name) {
-        ("Text/join", Some("texts") | None) => Some(Type::List(Box::new(Type::Text))),
+        ("Text/join", Some("texts") | None) => Some(Type::List(Type::shared(Type::Text))),
         ("Text/join", Some("separator" | "empty")) => Some(Type::Text),
         // Current function parameter inference can still classify generic
         // helper parameters as TEXT before their numeric use is observed.
@@ -31306,14 +31357,14 @@ fn render_arg_expected_type(function: &str, arg_name: Option<&str>) -> Option<Ty
                 Some(open_object_type())
             }
             Some("generation") => Some(Type::Number),
-            Some("overlays") => Some(Type::List(Box::new(open_object_type()))),
-            Some("items" | "children") => Some(Type::List(Box::new(Type::RenderContract))),
+            Some("overlays") => Some(Type::List(Type::shared(open_object_type()))),
+            Some("items" | "children") => Some(Type::List(Type::shared(Type::RenderContract))),
             _ => None,
         };
     }
     match arg_name {
         Some("input" | "root" | "child") => Some(Type::RenderContract),
-        Some("items" | "children") => Some(Type::List(Box::new(Type::RenderContract))),
+        Some("items" | "children") => Some(Type::List(Type::shared(Type::RenderContract))),
         Some(
             "label" | "text" | "value" | "display_value" | "edit_value" | "placeholder" | "target",
         ) => Some(Type::Text),
@@ -32236,7 +32287,7 @@ fn forwarded_parameter_requirement_for_path(
             ForwardedParameterPathSegment::Field(field) => Type::object(
                 ObjectShape::from_ordered_fields([(field.clone(), child)], true),
             ),
-            ForwardedParameterPathSegment::ListItem => Type::List(Box::new(child)),
+            ForwardedParameterPathSegment::ListItem => Type::List(Type::shared(child)),
         })
 }
 
@@ -32281,9 +32332,9 @@ fn merge_forwarded_parameter_type(caller: &Type, required: &Type) -> Type {
                 open: caller.open || required.open,
             })
         }
-        (Type::List(caller), Type::List(required)) => {
-            Type::List(Box::new(merge_forwarded_parameter_type(caller, required)))
-        }
+        (Type::List(caller), Type::List(required)) => Type::List(Type::shared(
+            merge_forwarded_parameter_type(caller, required),
+        )),
         _ => merge_canonical_row_type(caller, required),
     }
 }
@@ -32328,7 +32379,7 @@ fn merge_canonical_row_type(canonical: &Type, extra: &Type) -> Type {
                 open: canonical_shape.open || extra_shape.open,
             })
         }
-        (Type::List(canonical_item), Type::List(extra_item)) => Type::List(Box::new(
+        (Type::List(canonical_item), Type::List(extra_item)) => Type::List(Type::shared(
             merge_canonical_row_type(canonical_item, extra_item),
         )),
         _ => widen_structural_type(canonical, extra),
@@ -32423,7 +32474,7 @@ fn widen_structural_type(left: &Type, right: &Type) -> Type {
             Type::Bits { width: *left }
         }
         (Type::List(left), Type::List(right)) => {
-            Type::List(Box::new(widen_structural_type(left, right)))
+            Type::List(Type::shared(widen_structural_type(left, right)))
         }
         (Type::Object(left), Type::Object(right)) => {
             let mut fields = left.fields.clone();
@@ -34714,6 +34765,22 @@ fn collect_contextual_source_payload_list_types(
     fields_by_source: &mut BTreeMap<String, BTreeMap<String, Type>>,
 ) {
     let declarations = declaration_expression_index(program);
+    let mut when_expressions_by_selector = HashMap::<usize, Vec<usize>>::new();
+    for expression in &program.expressions {
+        let AstExprKind::When { input, .. } = &expression.kind else {
+            continue;
+        };
+        let selector = pipeline_source_expr_id(
+            &program.ast.statements,
+            expression.id,
+            *input,
+            &program.expressions,
+        );
+        when_expressions_by_selector
+            .entry(selector)
+            .or_default()
+            .push(expression.id);
+    }
     let mut requirements = BTreeMap::<(String, String), Type>::new();
 
     for expression in &program.expressions {
@@ -34762,14 +34829,19 @@ fn collect_contextual_source_payload_list_types(
             &mut row_fields,
         );
         if function == "List/find" {
-            collect_find_result_field_requirements(expression.id, program, &mut row_fields);
+            collect_find_result_field_requirements(
+                expression.id,
+                program,
+                &when_expressions_by_selector,
+                &mut row_fields,
+            );
         }
         if row_fields.is_empty() {
             continue;
         }
 
         let row_type = contextual_binding_row_type(&row_fields);
-        let list_type = Type::List(Box::new(row_type));
+        let list_type = Type::List(Type::shared(row_type));
         for origin in source_payload_list_field_origins(
             input,
             program,
@@ -34796,21 +34868,15 @@ fn collect_contextual_source_payload_list_types(
 fn collect_find_result_field_requirements(
     find_expression: usize,
     program: &ParsedProgram,
+    when_expressions_by_selector: &HashMap<usize, Vec<usize>>,
     requirements: &mut BTreeMap<Vec<String>, Type>,
 ) {
-    for expression in &program.expressions {
-        let AstExprKind::When { input, .. } = &expression.kind else {
-            continue;
-        };
-        let selector = pipeline_source_expr_id(
-            &program.ast.statements,
-            expression.id,
-            *input,
-            &program.expressions,
-        );
-        if selector != find_expression {
-            continue;
-        }
+    for expression in when_expressions_by_selector
+        .get(&find_expression)
+        .into_iter()
+        .flatten()
+        .filter_map(|expression| program.expressions.get(*expression))
+    {
         for (pattern, output) in when_arms(expression.id, &program.expressions) {
             let AstMatchPattern::Tag { name, fields } = pattern else {
                 continue;
@@ -35195,7 +35261,7 @@ fn insert_source_payload_requirement_path(shape: &mut ObjectShape, path: &[Strin
 
 fn merge_source_payload_structural_requirement(left: &Type, right: &Type) -> Type {
     match (left, right) {
-        (Type::List(left), Type::List(right)) => Type::List(Box::new(
+        (Type::List(left), Type::List(right)) => Type::List(Type::shared(
             merge_source_payload_structural_requirement(left, right),
         )),
         (Type::Object(left), Type::Object(right)) => {
@@ -35342,12 +35408,15 @@ fn host_port_payload_types(
             websocket.open_source.clone(),
             BTreeMap::from([
                 ("path".to_owned(), Type::Text),
-                ("path_segments".to_owned(), Type::List(Box::new(Type::Text))),
+                (
+                    "path_segments".to_owned(),
+                    Type::List(Type::shared(Type::Text)),
+                ),
                 ("query".to_owned(), named_text_pairs_type()),
                 ("headers".to_owned(), named_text_pairs_type()),
                 ("cookies".to_owned(), named_text_pairs_type()),
                 ("peer".to_owned(), Type::Text),
-                ("protocols".to_owned(), Type::List(Box::new(Type::Text))),
+                ("protocols".to_owned(), Type::List(Type::shared(Type::Text))),
             ]),
         );
         payloads.insert(
@@ -35392,7 +35461,10 @@ fn http_request_payload_fields() -> BTreeMap<String, Type> {
         ("method".to_owned(), Type::Text),
         ("scheme".to_owned(), Type::Text),
         ("path".to_owned(), Type::Text),
-        ("path_segments".to_owned(), Type::List(Box::new(Type::Text))),
+        (
+            "path_segments".to_owned(),
+            Type::List(Type::shared(Type::Text)),
+        ),
         ("query".to_owned(), named_text_pairs_type()),
         ("headers".to_owned(), named_text_pairs_type()),
         ("cookies".to_owned(), named_text_pairs_type()),
@@ -35403,13 +35475,15 @@ fn http_request_payload_fields() -> BTreeMap<String, Type> {
 }
 
 fn named_text_pairs_type() -> Type {
-    Type::List(Box::new(Type::object(ObjectShape::from_ordered_fields(
-        [
-            ("name".to_owned(), Type::Text),
-            ("value".to_owned(), Type::Text),
-        ],
-        false,
-    ))))
+    Type::List(Type::shared(Type::object(
+        ObjectShape::from_ordered_fields(
+            [
+                ("name".to_owned(), Type::Text),
+                ("value".to_owned(), Type::Text),
+            ],
+            false,
+        ),
+    )))
 }
 
 fn type_hint_table(
@@ -36071,7 +36145,7 @@ fn statement_pipeline_hint_type(
                     });
                 match (ty, append_ty) {
                     (Type::List(item), Some(append_ty)) => {
-                        Type::List(Box::new(widen_structural_type(&item, &append_ty)))
+                        Type::List(Type::shared(widen_structural_type(&item, &append_ty)))
                     }
                     (existing, _) => existing,
                 }
@@ -36724,7 +36798,7 @@ fn page_result_type(item: Type) -> Type {
                 tag: "Page".to_owned(),
                 fields: ObjectShape::from_ordered_fields(
                     [
-                        ("items".to_owned(), Type::List(Box::new(item))),
+                        ("items".to_owned(), Type::List(Type::shared(item))),
                         ("next".to_owned(), next),
                     ],
                     false,
@@ -36764,7 +36838,7 @@ fn session_info_intrinsic_type(function: &str) -> Option<Type> {
                     fields: ObjectShape::from_ordered_fields(
                         [
                             ("subject".to_owned(), Type::Text),
-                            ("roles".to_owned(), Type::List(Box::new(Type::Text))),
+                            ("roles".to_owned(), Type::List(Type::shared(Type::Text))),
                         ],
                         false,
                     ),
@@ -36951,13 +37025,15 @@ fn open_object_type() -> Type {
 }
 
 fn embedded_program_source_units_type() -> Type {
-    Type::List(Box::new(Type::object(ObjectShape::from_ordered_fields(
-        [
-            ("path".to_owned(), Type::Text),
-            ("source".to_owned(), Type::Text),
-        ],
-        false,
-    ))))
+    Type::List(Type::shared(Type::object(
+        ObjectShape::from_ordered_fields(
+            [
+                ("path".to_owned(), Type::Text),
+                ("source".to_owned(), Type::Text),
+            ],
+            false,
+        ),
+    )))
 }
 
 fn exact_empty_object_type() -> Type {

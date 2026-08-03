@@ -5430,7 +5430,7 @@ mod tests {
                     name: "renamed-list".to_owned(),
                     kind: CheckedParameterKind::Value,
                     flow_type: FlowType {
-                        ty: Type::List(Box::new(Type::Text)),
+                        ty: Type::List(Type::shared(Type::Text)),
                         mode: FlowMode::Continuous,
                     },
                     requirement: CheckedParameterRequirement::Required,
@@ -5458,7 +5458,7 @@ mod tests {
             context_formal: None,
             context_parameter: None,
             result: FlowType {
-                ty: Type::List(Box::new(Type::Text)),
+                ty: Type::List(Type::shared(Type::Text)),
                 mode: FlowMode::Continuous,
             },
             role: ProgramRole::Client,

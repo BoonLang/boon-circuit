@@ -823,7 +823,7 @@ pub(crate) fn derive_contextual_materializations(
                 found: list_type,
             });
         };
-        let item_type = *item_type;
+        let item_type = item_type.into_owned();
         builder.set_local_type(
             candidate.owner,
             SemanticMaterializationLocalId(0),
@@ -863,12 +863,14 @@ pub(crate) fn derive_contextual_materializations(
             .ty
             .clone();
         let result_type = match candidate.operation {
-            SemanticContextualOperationKind::Map => Type::List(Box::new(body_type.clone())),
+            SemanticContextualOperationKind::Map => Type::List(Type::shared(body_type.clone())),
             SemanticContextualOperationKind::Filter
             | SemanticContextualOperationKind::Retain
             | SemanticContextualOperationKind::Remove
             | SemanticContextualOperationKind::SortBy
-            | SemanticContextualOperationKind::ThenBy => Type::List(Box::new(item_type.clone())),
+            | SemanticContextualOperationKind::ThenBy => {
+                Type::List(Type::shared(item_type.clone()))
+            }
             SemanticContextualOperationKind::Every
             | SemanticContextualOperationKind::Any
             | SemanticContextualOperationKind::Find => candidate.result_type,
@@ -978,12 +980,12 @@ fn concrete_type_in_frame(out_net: &OutNet, ty: &Type, frame: Option<OutCallInst
 pub(crate) fn erase_runtime_type_vars(ty: &Type) -> Type {
     match ty {
         Type::Var(_) => Type::Unknown,
-        Type::List(item) => Type::List(Box::new(erase_runtime_type_vars(item))),
+        Type::List(item) => Type::List(Type::shared(erase_runtime_type_vars(item))),
         Type::Map { key, value } => Type::Map {
             key: Box::new(erase_runtime_type_vars(key)),
             value: Box::new(erase_runtime_type_vars(value)),
         },
-        Type::Set(item) => Type::Set(Box::new(erase_runtime_type_vars(item))),
+        Type::Set(item) => Type::Set(Type::shared(erase_runtime_type_vars(item))),
         Type::Function { args, result } => Type::Function {
             args: args.iter().map(erase_runtime_type_vars).collect(),
             result: Box::new(boon_checked::FlowType {
@@ -1152,7 +1154,7 @@ fn concrete_structural_type(
                         .get(item.as_usize())
                         .is_some_and(|expression| expression.flow_type.ty == first)
                 })
-                .then(|| Type::List(Box::new(first)))
+                .then(|| Type::List(Type::shared(first)))
         }
         SemanticExpressionKind::Map { entries } if !entries.is_empty() => {
             let first = expressions.get(entries[0].as_usize())?;
@@ -1188,7 +1190,7 @@ fn concrete_structural_type(
                         .get(item.as_usize())
                         .is_some_and(|expression| expression.flow_type.ty == first)
                 })
-                .then(|| Type::Set(Box::new(first)))
+                .then(|| Type::Set(Type::shared(first)))
         }
         SemanticExpressionKind::Block { result, .. } => expressions
             .get(result.as_usize())

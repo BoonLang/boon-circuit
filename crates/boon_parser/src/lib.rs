@@ -1520,7 +1520,7 @@ fn assemble_canonical_parsed_source_units(
                 lines.push(ParserLine {
                     line: separator_line,
                     indent: separator_column.saturating_sub(1),
-                    symbols: Vec::new(),
+                    symbols: Vec::new().into(),
                     symbol_spans: Vec::new(),
                     start: separator_start,
                     end: separator_end,
@@ -3120,7 +3120,7 @@ fn parser_lines(tokens: &[AstToken], work: &ParseWorkRecorder) -> Vec<ParserLine
                 lines.push(ParserLine {
                     line,
                     indent,
-                    symbols: std::mem::take(&mut symbols),
+                    symbols: std::mem::take(&mut symbols).into(),
                     symbol_spans: std::mem::take(&mut symbol_spans),
                     start,
                     end,
@@ -3142,7 +3142,7 @@ fn parser_lines(tokens: &[AstToken], work: &ParseWorkRecorder) -> Vec<ParserLine
         lines.push(ParserLine {
             line,
             indent,
-            symbols,
+            symbols: symbols.into(),
             symbol_spans,
             start,
             end,
@@ -5209,11 +5209,7 @@ fn validate_source_syntax_with_work(
                 "`LINK` is not supported in boon-circuit examples; declare input ports with `SOURCE`",
             ));
         }
-        if let Some(feature) = LANGUAGE_FEATURE_REGISTRY.iter().find(|feature| {
-            feature.stage == LanguageFeatureStage::Planned
-                && feature.parse_expectation == LanguageFeatureParseExpectation::Reject
-                && feature.spellings.contains(&token.lexeme.as_str())
-        }) {
+        if let Some(feature) = planned_rejected_feature_for_spelling(&token.lexeme) {
             return Err(error(
                 path,
                 token.line,
@@ -5300,6 +5296,32 @@ fn validate_source_syntax_with_work(
     validate_bits_syntax(path, ast, validation_index, work)?;
     validate_bytes_syntax(path, ast, validation_index, work)?;
     Ok(())
+}
+
+fn planned_rejected_feature_for_spelling(
+    spelling: &str,
+) -> Option<&'static boon_syntax::LanguageFeatureSpec> {
+    static INDEX: OnceLock<Box<[(&'static str, &'static boon_syntax::LanguageFeatureSpec)]>> =
+        OnceLock::new();
+    INDEX
+        .get_or_init(|| {
+            let mut index = Vec::new();
+            for feature in LANGUAGE_FEATURE_REGISTRY {
+                if feature.stage != LanguageFeatureStage::Planned
+                    || feature.parse_expectation != LanguageFeatureParseExpectation::Reject
+                {
+                    continue;
+                }
+                for spelling in feature.spellings {
+                    if !index.iter().any(|(existing, _)| existing == spelling) {
+                        index.push((*spelling, feature));
+                    }
+                }
+            }
+            index.into_boxed_slice()
+        })
+        .iter()
+        .find_map(|(candidate, feature)| (*candidate == spelling).then_some(*feature))
 }
 
 fn validate_match_patterns(
@@ -6371,25 +6393,20 @@ fn hidden_runtime_identity_token(value: &str) -> Option<&'static str> {
     let tokens = value
         .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
         .filter(|token| !token.is_empty());
-    const FORBIDDEN: &[&str] = &[
-        "runtime_key",
-        "item_key",
-        "row_key",
-        "hidden_key",
-        "hidden_keys",
-        "hidden_generation",
-        "target_key",
-        "target_generation",
-        "source_id",
-        "bind_epoch",
-        "listkey",
-        "slot",
-    ];
-    tokens.into_iter().find_map(|token| {
-        FORBIDDEN
-            .iter()
-            .copied()
-            .find(|forbidden| token.eq_ignore_ascii_case(forbidden))
+    tokens.into_iter().find_map(|token| match token.len() {
+        4 if token.eq_ignore_ascii_case("slot") => Some("slot"),
+        7 if token.eq_ignore_ascii_case("row_key") => Some("row_key"),
+        7 if token.eq_ignore_ascii_case("listkey") => Some("listkey"),
+        8 if token.eq_ignore_ascii_case("item_key") => Some("item_key"),
+        9 if token.eq_ignore_ascii_case("source_id") => Some("source_id"),
+        10 if token.eq_ignore_ascii_case("hidden_key") => Some("hidden_key"),
+        10 if token.eq_ignore_ascii_case("target_key") => Some("target_key"),
+        10 if token.eq_ignore_ascii_case("bind_epoch") => Some("bind_epoch"),
+        11 if token.eq_ignore_ascii_case("runtime_key") => Some("runtime_key"),
+        11 if token.eq_ignore_ascii_case("hidden_keys") => Some("hidden_keys"),
+        17 if token.eq_ignore_ascii_case("hidden_generation") => Some("hidden_generation"),
+        17 if token.eq_ignore_ascii_case("target_generation") => Some("target_generation"),
+        _ => None,
     })
 }
 
@@ -6594,6 +6611,26 @@ mod tests {
             start,
             end: start + symbols.len(),
         }
+    }
+
+    #[test]
+    fn unchanged_logical_line_and_parser_item_share_symbols() {
+        let ast = parse_ast("shared-symbols.bn", "value: Text/new(value: \"hello\")\n")
+            .expect("fixture parses");
+        let line = ast
+            .lines
+            .iter()
+            .find(|line| !line.symbols.is_empty())
+            .expect("fixture has one logical line");
+        let item = ast
+            .items
+            .iter()
+            .find(|item| item.line == line.line)
+            .expect("fixture has one parser item");
+        assert!(boon_syntax::SharedParserSymbols::ptr_eq(
+            &line.symbols,
+            &item.symbols,
+        ));
     }
 
     fn assert_assembled_references_are_dense_and_in_range(ast: &AstProgram) {

@@ -1194,7 +1194,7 @@ fn synthesize_inline_checked_list_targets(
             let mut concrete = definition.clone();
             concrete.id = producer;
             concrete.value_id = SemanticValueId(producer.as_usize());
-            concrete.flow_type.ty = Type::List(Box::new(checked_list.item_type.clone()));
+            concrete.flow_type.ty = Type::List(Type::shared(checked_list.item_type.clone()));
             let concrete_flow_type = concrete.flow_type.clone();
             execution.expressions.push(concrete);
             let mut concrete_origin = origin.clone();
@@ -6180,7 +6180,7 @@ kept: mapped |> List/retain(item, if: True)
 
     #[test]
     fn lineage_projection_matches_record_scalar_and_new_list_value_semantics() {
-        let list_type = Type::List(Box::new(Type::Unknown));
+        let list_type = Type::List(Type::shared(Type::Unknown));
         let object_type = Type::object(boon_checked::ObjectShape {
             fields: BTreeMap::new(),
             field_order: Vec::new(),
@@ -6325,7 +6325,7 @@ kept: mapped |> List/retain(item, if: True)
             let mut execution = SemanticExecutionGraphV1::default();
             execution.expressions.push(synthetic_expression(
                 0,
-                Type::List(Box::new(Type::Unknown)),
+                Type::List(Type::shared(Type::Unknown)),
                 kind,
             ));
             execution
@@ -6376,7 +6376,7 @@ kept: mapped |> List/retain(item, if: True)
             field_order: Vec::new(),
             open: false,
         });
-        let list_type = Type::List(Box::new(row_type.clone()));
+        let list_type = Type::List(Type::shared(row_type.clone()));
         let host_result_type = Type::object(boon_checked::ObjectShape {
             fields: BTreeMap::from([("rows".to_owned(), list_type.clone())]),
             field_order: vec!["rows".to_owned()],
@@ -6598,7 +6598,7 @@ kept: mapped |> List/retain(item, if: True)
             field_order: Vec::new(),
             open: false,
         });
-        let list_type = Type::List(Box::new(row_type.clone()));
+        let list_type = Type::List(Type::shared(row_type.clone()));
         let rows = DeclId(10);
         let chunks = DeclId(20);
         let mut execution = SemanticExecutionGraphV1::default();
@@ -6628,7 +6628,7 @@ kept: mapped |> List/retain(item, if: True)
             ),
             synthetic_expression(
                 3,
-                Type::List(Box::new(row_type.clone())),
+                Type::List(Type::shared(row_type.clone())),
                 SemanticExpressionKind::Call {
                     call: crate::SemanticCallId(0),
                     callable: crate::SemanticCallableId(0),
@@ -6668,7 +6668,7 @@ kept: mapped |> List/retain(item, if: True)
             ),
             synthetic_expression(
                 4,
-                Type::List(Box::new(row_type.clone())),
+                Type::List(Type::shared(row_type.clone())),
                 SemanticExpressionKind::CanonicalRead {
                     target: chunks,
                     path: "chunks".to_owned(),
@@ -7415,7 +7415,7 @@ chunks: rows |> List/chunk(size: 2)
             checked_expr_id: boon_checked::CheckedExprId(0),
             flow_type: FlowType {
                 mode: boon_checked::FlowMode::Continuous,
-                ty: Type::List(Box::new(Type::object(boon_checked::ObjectShape {
+                ty: Type::List(Type::shared(Type::object(boon_checked::ObjectShape {
                     fields: BTreeMap::new(),
                     field_order: Vec::new(),
                     open: false,

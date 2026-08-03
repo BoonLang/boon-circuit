@@ -22,7 +22,7 @@ pub enum Type {
     VariantSet(SharedVariantSet),
     Object(SharedObjectShape),
     RenderContract,
-    List(Box<Type>),
+    List(SharedType),
     Function {
         args: Vec<Type>,
         result: Box<FlowType>,
@@ -44,7 +44,7 @@ pub enum Type {
         value: Box<Type>,
     },
     /// Canonical SET authority view.
-    Set(Box<Type>),
+    Set(SharedType),
     /// A fixed-width raw bit sequence. Width is part of the static type and is
     /// never inferred from a numeric context.
     Bits {
@@ -56,6 +56,72 @@ impl Type {
     /// Seal an owned object shape into a cheaply cloneable type node.
     pub fn object(shape: ObjectShape) -> Self {
         Self::Object(shape.into())
+    }
+
+    /// Seal a recursively nested type behind an immutable shared edge.
+    ///
+    /// List and set element types cross the inference cache far more often
+    /// than they are rebuilt. Sharing these edges keeps `Type::clone`
+    /// constant-time for collection shapes while preserving the existing
+    /// serialized representation.
+    pub fn shared(ty: Type) -> SharedType {
+        SharedType::new(ty)
+    }
+}
+
+/// An immutable, reference-counted edge to a recursively nested checked type.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct SharedType(Arc<Type>);
+
+impl SharedType {
+    pub fn new(ty: Type) -> Self {
+        Self(Arc::new(ty))
+    }
+
+    pub fn ptr_eq(left: &Self, right: &Self) -> bool {
+        Arc::ptr_eq(&left.0, &right.0)
+    }
+
+    pub fn into_owned(self) -> Type {
+        Arc::unwrap_or_clone(self.0)
+    }
+}
+
+impl Deref for SharedType {
+    type Target = Type;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl AsRef<Type> for SharedType {
+    fn as_ref(&self) -> &Type {
+        &self.0
+    }
+}
+
+impl From<Type> for SharedType {
+    fn from(ty: Type) -> Self {
+        Self::new(ty)
+    }
+}
+
+impl Serialize for SharedType {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.as_ref().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SharedType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Type::deserialize(deserializer).map(Self::new)
     }
 }
 
@@ -1474,7 +1540,7 @@ fn substitute_checked_type_inner(
             active.remove(variable);
             substituted
         }
-        Type::List(item) => Type::List(Box::new(substitute_checked_type_inner(
+        Type::List(item) => Type::List(Type::shared(substitute_checked_type_inner(
             item,
             substitutions,
             active,
@@ -1483,7 +1549,7 @@ fn substitute_checked_type_inner(
             key: Box::new(substitute_checked_type_inner(key, substitutions, active)),
             value: Box::new(substitute_checked_type_inner(value, substitutions, active)),
         },
-        Type::Set(item) => Type::Set(Box::new(substitute_checked_type_inner(
+        Type::Set(item) => Type::Set(Type::shared(substitute_checked_type_inner(
             item,
             substitutions,
             active,
@@ -2196,7 +2262,7 @@ pub fn specialize_checked_call_result(instantiated: &Type, occurrence: &Type) ->
         return instantiated.clone();
     }
     match (instantiated, occurrence) {
-        (Type::List(instantiated), Type::List(occurrence)) => Type::List(Box::new(
+        (Type::List(instantiated), Type::List(occurrence)) => Type::List(Type::shared(
             specialize_checked_call_result(instantiated, occurrence),
         )),
         (
@@ -2218,7 +2284,7 @@ pub fn specialize_checked_call_result(instantiated: &Type, occurrence: &Type) ->
                 occurrence_value,
             )),
         },
-        (Type::Set(instantiated), Type::Set(occurrence)) => Type::Set(Box::new(
+        (Type::Set(instantiated), Type::Set(occurrence)) => Type::Set(Type::shared(
             specialize_checked_call_result(instantiated, occurrence),
         )),
         (Type::Object(instantiated), Type::Object(occurrence)) => {
@@ -2401,7 +2467,7 @@ fn widen_structural_type(left: &Type, right: &Type) -> Type {
             Type::Bits { width: *left }
         }
         (Type::List(left), Type::List(right)) => {
-            Type::List(Box::new(widen_structural_type(left, right)))
+            Type::List(Type::shared(widen_structural_type(left, right)))
         }
         (Type::Object(left), Type::Object(right)) => {
             let mut fields = left.fields.clone();
@@ -2495,7 +2561,11 @@ mod tests {
         let shape_clone = shape.clone();
         assert!(SharedObjectShape::ptr_eq(&shape, &shape_clone));
 
-        let ty = Type::Object(shape);
+        let item = Type::shared(Type::Object(shape));
+        let item_clone = item.clone();
+        assert!(SharedType::ptr_eq(&item, &item_clone));
+
+        let ty = Type::List(item);
         let encoded = serde_json::to_string(&ty).expect("checked type serializes");
         let decoded: Type = serde_json::from_str(&encoded).expect("checked type deserializes");
         assert_eq!(decoded, ty);

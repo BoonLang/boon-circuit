@@ -4189,7 +4189,7 @@ fn contextualize_empty_list_placeholders(
             Some(expected.clone())
         }
         (boon_checked::Type::List(actual), boon_checked::Type::List(expected)) => {
-            Some(boon_checked::Type::List(Box::new(
+            Some(boon_checked::Type::List(boon_checked::Type::shared(
                 contextualize_empty_list_placeholders(actual, expected)?,
             )))
         }

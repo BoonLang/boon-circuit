@@ -1767,7 +1767,7 @@ fn merge_closed_boundary_types(left: &Type, right: &Type) -> Option<Type> {
     }
     match (left, right) {
         (Type::Bytes(_), Type::Bytes(_)) => Some(Type::Bytes(boon_checked::BytesType::Dynamic)),
-        (Type::List(left), Type::List(right)) => Some(Type::List(Box::new(
+        (Type::List(left), Type::List(right)) => Some(Type::List(Type::shared(
             merge_closed_boundary_types(left, right)?,
         ))),
         (Type::Object(left), Type::Object(right))

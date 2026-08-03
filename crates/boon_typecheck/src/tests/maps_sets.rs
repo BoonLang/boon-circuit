@@ -27,8 +27,8 @@ fn map_keys_accept_only_closed_recursive_key_safe_data() {
     }
 
     for key in [
-        Type::List(Box::new(Type::Text)),
-        Type::Set(Box::new(Type::Text)),
+        Type::List(Type::shared(Type::Text)),
+        Type::Set(Type::shared(Type::Text)),
         Type::Map {
             key: Box::new(Type::Text),
             value: Box::new(Type::Number),

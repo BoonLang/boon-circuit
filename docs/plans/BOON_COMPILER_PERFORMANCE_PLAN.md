@@ -334,6 +334,31 @@ Checked-boundary cutover evidence (2026-08-03):
   Phase 1 work is the owned database, compact/interned terms, and measured
   solver/worklist reductions it enables, followed by fresh release profiling.
 
+Current cold-diagnostics candidate evidence:
+
+- Immutable List/Set element edges now share checked type subtrees, the ordered
+  diagnostic projector reuses its task/continuation storage, and source payload
+  analysis indexes `WHEN` selectors once. The parser's logical-line and
+  `ParserItem` views share unchanged symbol vectors; multiline normalization
+  remains copy-on-write. Planned-feature lookup and hidden-identity rejection
+  retain their diagnostic order without repeating registry-wide/name-wide
+  searches for every token.
+- Against the checked-boundary release baseline, NovyWave fresh-process
+  allocation work fell from 1,997,515 calls / 225,753,409 bytes to 1,933,602
+  calls / 219,951,108 bytes. The checked-result SHA-256 remains
+  `495ef4195e0be4869e431c4036b74b6d6397c4b28b7fe7a8a76c76400a7b7992`.
+- One complete three-setup/30-scored direct protocol over the current prebuilt
+  release producer passes all six cold diagnostics time/RSS combinations:
+  Counter is 5.34/5.27 ms p95 fresh/empty, physical TodoMVC is 61.24/61.30 ms,
+  and NovyWave is 234.48/248.86 ms. Maximum observed RSS is 11,140 KiB,
+  27,132 KiB, and 70,868 KiB respectively. Each fixture/mode has one unchanged
+  diagnostic count and one unchanged checked-result digest.
+- NovyWave empty-session has only 1.14 ms of p95 headroom. This is a passing
+  candidate, not the Phase 1 exit: the owned database, measured compact/name
+  interning and worklist reductions, scaling/parity evidence, and fresh
+  adversarial review remain mandatory. Any subsequent frontend change makes
+  this timing evidence stale and requires the full protocol again.
+
 Development profiles and focused debug tests remain directional tools. The
 acceptance producer remains the revision-identified `release` binary required
 by the budget manifest; a faster Rust profile cannot be relabeled as cold
@@ -625,13 +650,14 @@ compiler-service work or any later repository plan:
    modes and their RSS/scaling gates. A crate checkpoint or a parser-only win
    does not permit moving to semantic work while this exit is red.
 
-Current resumption after the checked-boundary cutover: finish item 7's owned
-database work inside `boon_typecheck` rather than performing another crate
-move. First refresh the thin direct profile and release cold baseline on the
-cutover revision; then intern/compact the measured high-copy type/shape/name
-owners, replace the borrowed checker/output reconstruction path with the owned
-database, and reduce the dominant scheme/inference worklists. Reprofile each
-owner-level slice and remain in item 8 until every Phase 1 fixture gate passes.
+Current resumption after the first passing cold-diagnostics candidate: finish
+item 7's owned database inside `boon_typecheck` rather than performing another
+crate move. Complete the measured compact/name interning and reduce the
+dominant contextual-scheme/inference worklists, then run the Phase 1 scaling,
+malformed-source/parity, and fresh adversarial checks. Reprofile every
+owner-level slice and rerun the complete three-setup/30-scored cold protocol
+after the final Phase 1 edit; the narrow empty-session result above cannot be
+reused across source changes.
 
 Once diagnostics pass, use the same loop for semantic component retention,
 single manifest sealing, verified lowering, streaming/hash memory, and backend

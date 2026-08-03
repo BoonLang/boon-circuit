@@ -28,17 +28,18 @@ stronger three-reviewer performance closure defined below.
    counters own scaling gates. Build the release producer explicitly once;
    performance verifiers must never start a nested Cargo build.
 
-   Preserve the landed independent-unit parser, `boon_syntax` cutover, and
-   structured work counters. The first incomplete implementation tranche is
-   one bounded current-release baseline and the measured frontend path: the
-   one-time parser dev-profile A/B, indexed parser validation/assembly, batched
-   hot counters, deterministic non-recursive checked-diagnostic projection,
-   the owned checked database, and the `boon_checked` boundary. Confirm the
-   dominant release owner before a large rewrite, reprofile after each owner-
-   level slice, and keep working until Counter, physical TodoMVC, and NovyWave
-   pass both cold diagnostics modes. Then close semantic sealing, proof,
-   backend, hashing, and memory until both verified-plan modes pass; only
-   afterward may persistent-session warm work satisfy its separate gates.
+   Preserve the landed independent-unit parser, `boon_syntax`/`boon_checked`
+   cutovers, structured work counters, indexed parser validation/assembly, and
+   deterministic non-recursive checked-diagnostic projection. The current
+   release candidate passes the six direct cold diagnostics time/RSS
+   combinations, but NovyWave empty-session has narrow p95 headroom. The first
+   incomplete tranche is therefore the owned checked database, measured
+   compact/name interning, contextual-scheme/inference worklist reduction,
+   scaling/parity evidence, and the fresh Phase 1 adversarial review. Reprofile
+   after each owner-level slice and regenerate the complete cold protocol after
+   the final edit. Then close semantic sealing, proof, backend, hashing, and
+   memory until both verified-plan modes pass; only afterward may persistent-
+   session warm work satisfy its separate gates.
 
    Use the performance plan's edit-loop, milestone-preflight, and full-
    acceptance harness levels. Focused debug tests and direct one-sample producer

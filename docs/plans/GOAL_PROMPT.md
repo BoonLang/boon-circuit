@@ -195,6 +195,16 @@ Current checkpoints to preserve and audit rather than redo:
   makes a bounded current-release confirmation followed by indexed validation/
   assembly plus deterministic non-recursive checked-diagnostic projection the
   first implementation tranche;
+- the current release cold-diagnostics candidate has now completed the exact
+  three-setup/30-scored direct protocol in both cache-disabled modes: Counter
+  is 5.34/5.27 ms p95 fresh/empty, physical TodoMVC is 61.24/61.30 ms, and
+  NovyWave is 234.48/248.86 ms, with maximum RSS 11,140/27,132/70,868 KiB and
+  one stable checked-result digest per fixture. NovyWave fresh allocations fell
+  from 1,997,515 calls / 225,753,409 bytes at the checked-boundary baseline to
+  1,933,602 / 219,951,108. The 248.86 ms empty result has narrow headroom and is
+  not a Phase 1 exit: finish the owned checked database, measured interning and
+  solver/worklist work, scaling/parity proof, and adversarial review, then
+  regenerate the full protocol after the final edit;
 - the current compiler-throughput checkpoint keeps Counter, physical TodoMVC,
   and NovyWave `MachinePlan` output deterministic while replacing copied OUT
   type environments with active-path overlays, retaining canonical-root-reading

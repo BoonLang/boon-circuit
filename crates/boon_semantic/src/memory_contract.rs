@@ -478,7 +478,7 @@ fn build_memories(
                 list.id
             )));
         }
-        let data_type = Type::List(Box::new(list.item_type.clone()));
+        let data_type = Type::List(Type::shared(list.item_type.clone()));
         let field = require_storage_field(storage, storage_field)?;
         if field.flow_type.ty != data_type {
             return Err(SemanticMemoryError::new(format!(
@@ -2812,7 +2812,7 @@ fn validate_memory_shape(
                 let storage_binding = exact_storage_binding(storage, binding)?;
                 let resource = require_list(resources, list)?;
                 if memory.identity.kind != SemanticMemoryKindV1::ListOwner
-                    || memory.data_type != Type::List(Box::new(resource.item_type.clone()))
+                    || memory.data_type != Type::List(Type::shared(resource.item_type.clone()))
                     || row
                         != (SemanticRowBinding {
                             list,

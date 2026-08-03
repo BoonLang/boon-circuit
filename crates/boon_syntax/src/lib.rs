@@ -591,11 +591,108 @@ impl AstProgram {
     }
 }
 
+/// Immutable symbols shared by the logical-line and parsed-item syntax views.
+///
+/// Most physical lines become one parser item without changing their symbol
+/// sequence. Sharing that sequence avoids cloning every token string merely
+/// to retain both read-only views. Multiline normalization uses copy-on-write
+/// mutation, so only the lines it actually joins allocate a distinct vector.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SharedParserSymbols(Arc<Vec<String>>);
+
+impl SharedParserSymbols {
+    pub fn new(symbols: Vec<String>) -> Self {
+        Self(Arc::new(symbols))
+    }
+
+    pub fn ptr_eq(left: &Self, right: &Self) -> bool {
+        Arc::ptr_eq(&left.0, &right.0)
+    }
+
+    pub fn into_owned(self) -> Vec<String> {
+        Arc::unwrap_or_clone(self.0)
+    }
+}
+
+impl std::ops::Deref for SharedParserSymbols {
+    type Target = Vec<String>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for SharedParserSymbols {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        Arc::make_mut(&mut self.0)
+    }
+}
+
+impl AsRef<[String]> for SharedParserSymbols {
+    fn as_ref(&self) -> &[String] {
+        self.0.as_slice()
+    }
+}
+
+impl From<Vec<String>> for SharedParserSymbols {
+    fn from(symbols: Vec<String>) -> Self {
+        Self::new(symbols)
+    }
+}
+
+impl FromIterator<String> for SharedParserSymbols {
+    fn from_iter<T: IntoIterator<Item = String>>(iter: T) -> Self {
+        Self::new(iter.into_iter().collect())
+    }
+}
+
+impl IntoIterator for SharedParserSymbols {
+    type Item = String;
+    type IntoIter = std::vec::IntoIter<String>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.into_owned().into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a SharedParserSymbols {
+    type Item = &'a String;
+    type IntoIter = std::slice::Iter<'a, String>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+impl PartialEq<Vec<String>> for SharedParserSymbols {
+    fn eq(&self, other: &Vec<String>) -> bool {
+        self.as_ref() == other.as_slice()
+    }
+}
+
+impl Serialize for SharedParserSymbols {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.as_ref().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for SharedParserSymbols {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Vec::<String>::deserialize(deserializer).map(Self::new)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ParserLine {
     pub line: usize,
     pub indent: usize,
-    pub symbols: Vec<String>,
+    pub symbols: SharedParserSymbols,
     pub symbol_spans: Vec<(usize, usize)>,
     pub start: usize,
     pub end: usize,
@@ -607,7 +704,7 @@ pub struct ParserItem {
     pub indent: usize,
     pub start: usize,
     pub end: usize,
-    pub symbols: Vec<String>,
+    pub symbols: SharedParserSymbols,
     pub symbol_spans: Vec<(usize, usize)>,
     pub field: Option<String>,
     pub example: Option<String>,

@@ -21,10 +21,7 @@ fn structural_widening_reuses_unchanged_shared_nodes() {
     let Type::Object(widened_equal_shape) = &widened_equal else {
         unreachable!();
     };
-    assert!(SharedObjectShape::ptr_eq(
-        object_shape,
-        widened_equal_shape
-    ));
+    assert!(SharedObjectShape::ptr_eq(object_shape, widened_equal_shape));
 
     let partial = Type::object(ObjectShape::from_ordered_fields(
         [("name".to_owned(), Type::Text)],
@@ -69,6 +66,80 @@ fn structural_widening_still_materializes_real_object_growth() {
     assert_eq!(shape.fields.get("left"), Some(&Type::Text));
     assert_eq!(shape.fields.get("right"), Some(&Type::Number));
     assert!(shape.open);
+}
+
+#[test]
+fn structural_widening_normalizes_an_incomplete_object_order() {
+    let left = Type::object(ObjectShape {
+        fields: BTreeMap::from([("value".to_owned(), Type::Text)]),
+        field_order: Vec::new(),
+        open: false,
+    });
+    let right = Type::object(ObjectShape::from_ordered_fields(
+        [("value".to_owned(), Type::Text)],
+        false,
+    ));
+    let widened = widen_structural_type(&left, &right);
+    let Type::Object(shape) = widened else {
+        unreachable!();
+    };
+    assert_eq!(shape.field_order, vec!["value".to_owned()]);
+}
+
+#[test]
+fn structural_widening_reuses_canonical_variant_sets_until_they_grow() {
+    let variants = SharedVariantSet::new(vec![Variant::Tag("Ready".to_owned())]);
+    let current = Type::VariantSet(variants.clone());
+    let widened_equal = widen_structural_type(&current, &current.clone());
+    let Type::VariantSet(widened_equal_variants) = widened_equal else {
+        unreachable!();
+    };
+    assert!(SharedVariantSet::ptr_eq(&variants, &widened_equal_variants));
+
+    let widened_growth = widen_structural_type(
+        &current,
+        &Type::VariantSet(vec![Variant::Tag("Waiting".to_owned())].into()),
+    );
+    let Type::VariantSet(widened_growth_variants) = widened_growth else {
+        unreachable!();
+    };
+    assert!(!SharedVariantSet::ptr_eq(
+        &variants,
+        &widened_growth_variants
+    ));
+    assert_eq!(
+        widened_growth_variants.as_ref(),
+        &vec![
+            Variant::Tag("Ready".to_owned()),
+            Variant::Tag("Waiting".to_owned())
+        ]
+    );
+}
+
+#[test]
+fn allocation_free_variant_order_matches_the_canonical_text_key() {
+    let tagged = |tag: &str, field_count: usize| Variant::Tagged {
+        tag: tag.to_owned(),
+        fields: ObjectShape::from_ordered_fields::<SharedObjectShape>(
+            (0..field_count).map(|index| (format!("field_{index}"), Type::Text)),
+            false,
+        ),
+    };
+    let candidates = vec![
+        tagged("a", 2),
+        tagged("a", 10),
+        tagged("a:2", 0),
+        Variant::Tag("z".to_owned()),
+        Variant::Tag("a".to_owned()),
+    ];
+    let mut expected = candidates.clone();
+    expected.sort_by_key(|variant| match variant {
+        Variant::Tag(tag) => format!("0:{tag}"),
+        Variant::Tagged { tag, fields } => format!("1:{tag}:{}", fields.fields.len()),
+    });
+    let mut actual = candidates;
+    actual.sort_by(compare_variants_canonically);
+    assert_eq!(actual, expected);
 }
 
 #[test]

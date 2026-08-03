@@ -671,6 +671,7 @@ dependencies = [
  "boon_effect_schema",
  "serde",
  "serde_json",
+ "smallvec",
 ]
 
 [[package]]

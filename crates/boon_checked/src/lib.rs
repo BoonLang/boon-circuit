@@ -9,6 +9,8 @@ use boon_contract::SourceBundleDigestV1;
 use boon_data::{Bits, ExactNumber};
 pub use boon_document_model::ProgramRole;
 use serde::{Deserialize, Serialize};
+use smallvec::SmallVec;
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Deref;
 use std::sync::Arc;
@@ -1465,151 +1467,128 @@ pub fn apply_checked_type_substitution_lookup(
     substitute_checked_type_from_lookup(ty, substitutions)
 }
 
-fn checked_type_has_applicable_substitution(
-    ty: &Type,
-    substitutions: &(impl CheckedTypeSubstitutionLookup + ?Sized),
-) -> bool {
-    match ty {
-        Type::Var(variable) => substitutions
-            .replacement(*variable)
-            .is_some_and(|replacement| replacement != ty),
-        Type::List(item) | Type::Set(item) => {
-            checked_type_has_applicable_substitution(item, substitutions)
-        }
-        Type::Map { key, value } => {
-            checked_type_has_applicable_substitution(key, substitutions)
-                || checked_type_has_applicable_substitution(value, substitutions)
-        }
-        Type::Function { args, result } => {
-            args.iter()
-                .any(|argument| checked_type_has_applicable_substitution(argument, substitutions))
-                || checked_type_has_applicable_substitution(&result.ty, substitutions)
-        }
-        Type::Object(shape) => shape
-            .fields
-            .values()
-            .any(|field| checked_type_has_applicable_substitution(field, substitutions)),
-        Type::VariantSet(variants) => variants.iter().any(|variant| match variant {
-            Variant::Tag(_) => false,
-            Variant::Tagged { fields, .. } => fields
-                .fields
-                .values()
-                .any(|field| checked_type_has_applicable_substitution(field, substitutions)),
-        }),
-        Type::Union(members) => members
-            .iter()
-            .any(|member| checked_type_has_applicable_substitution(member, substitutions)),
-        Type::Text
-        | Type::Number
-        | Type::Bytes(_)
-        | Type::Bits { .. }
-        | Type::Absent
-        | Type::RenderContract
-        | Type::UnresolvedShape { .. }
-        | Type::Unknown => false,
-    }
-}
-
 fn substitute_checked_type_from_lookup(
     ty: &Type,
     substitutions: &(impl CheckedTypeSubstitutionLookup + ?Sized),
 ) -> Type {
-    substitute_checked_type_inner(ty, substitutions, &mut BTreeSet::new())
+    substitute_checked_type_inner(ty, substitutions, &mut SmallVec::new()).0
 }
 
 fn substitute_checked_type_inner(
     ty: &Type,
     substitutions: &(impl CheckedTypeSubstitutionLookup + ?Sized),
-    active: &mut BTreeSet<TypeVar>,
-) -> Type {
-    if !checked_type_has_applicable_substitution(ty, substitutions) {
-        return ty.clone();
-    }
+    active: &mut SmallVec<[TypeVar; 8]>,
+) -> (Type, bool) {
     match ty {
         Type::Var(variable) => {
             let Some(replacement) = substitutions
                 .replacement(*variable)
                 .filter(|replacement| *replacement != ty)
             else {
-                return ty.clone();
+                return (ty.clone(), false);
             };
-            if !active.insert(*variable) {
-                return ty.clone();
+            if active.contains(variable) {
+                return (ty.clone(), false);
             }
-            let substituted = substitute_checked_type_inner(replacement, substitutions, active);
-            active.remove(variable);
-            substituted
+            active.push(*variable);
+            let substituted = substitute_checked_type_inner(replacement, substitutions, active).0;
+            let removed = active.pop();
+            debug_assert_eq!(removed, Some(*variable));
+            let changed = substituted != *ty;
+            (substituted, changed)
         }
-        Type::List(item) => Type::List(Type::shared(substitute_checked_type_inner(
-            item,
-            substitutions,
-            active,
-        ))),
-        Type::Map { key, value } => Type::Map {
-            key: Box::new(substitute_checked_type_inner(key, substitutions, active)),
-            value: Box::new(substitute_checked_type_inner(value, substitutions, active)),
-        },
-        Type::Set(item) => Type::Set(Type::shared(substitute_checked_type_inner(
-            item,
-            substitutions,
-            active,
-        ))),
-        Type::Function { args, result } => Type::Function {
-            args: args
-                .iter()
-                .map(|argument| substitute_checked_type_inner(argument, substitutions, active))
-                .collect(),
-            result: Box::new(FlowType {
-                mode: result.mode,
-                ty: substitute_checked_type_inner(&result.ty, substitutions, active),
-            }),
-        },
-        Type::Object(shape) => Type::object(ObjectShape {
-            fields: shape
-                .fields
-                .iter()
-                .map(|(name, ty)| {
-                    (
-                        name.clone(),
-                        substitute_checked_type_inner(ty, substitutions, active),
-                    )
-                })
-                .collect(),
-            field_order: shape.field_order.clone(),
-            open: shape.open,
-        }),
-        Type::VariantSet(variants) => Type::VariantSet(
-            variants
-                .iter()
-                .map(|variant| match variant {
-                    Variant::Tag(tag) => Variant::Tag(tag.clone()),
-                    Variant::Tagged { tag, fields } => Variant::Tagged {
-                        tag: tag.clone(),
-                        fields: ObjectShape {
-                            fields: fields
-                                .fields
-                                .iter()
-                                .map(|(name, ty)| {
-                                    (
-                                        name.clone(),
-                                        substitute_checked_type_inner(ty, substitutions, active),
-                                    )
-                                })
-                                .collect(),
-                            field_order: fields.field_order.clone(),
-                            open: fields.open,
-                        }
-                        .into(),
+        Type::List(item) => {
+            let (substituted, changed) = substitute_checked_type_inner(item, substitutions, active);
+            if changed {
+                (Type::List(Type::shared(substituted)), true)
+            } else {
+                (ty.clone(), false)
+            }
+        }
+        Type::Map { key, value } => {
+            let (key, key_changed) = substitute_checked_type_inner(key, substitutions, active);
+            let (value, value_changed) =
+                substitute_checked_type_inner(value, substitutions, active);
+            if key_changed || value_changed {
+                (
+                    Type::Map {
+                        key: Box::new(key),
+                        value: Box::new(value),
                     },
-                })
-                .collect(),
-        ),
-        Type::Union(members) => Type::Union(
-            members
-                .iter()
-                .map(|member| substitute_checked_type_inner(member, substitutions, active))
-                .collect(),
-        ),
+                    true,
+                )
+            } else {
+                (ty.clone(), false)
+            }
+        }
+        Type::Set(item) => {
+            let (substituted, changed) = substitute_checked_type_inner(item, substitutions, active);
+            if changed {
+                (Type::Set(Type::shared(substituted)), true)
+            } else {
+                (ty.clone(), false)
+            }
+        }
+        Type::Function { args, result } => {
+            let substituted_args = substitute_checked_type_sequence(args, substitutions, active);
+            let (result_ty, result_changed) =
+                substitute_checked_type_inner(&result.ty, substitutions, active);
+            if substituted_args.is_some() || result_changed {
+                (
+                    Type::Function {
+                        args: substituted_args.unwrap_or_else(|| args.clone()),
+                        result: Box::new(FlowType {
+                            mode: result.mode,
+                            ty: result_ty,
+                        }),
+                    },
+                    true,
+                )
+            } else {
+                (ty.clone(), false)
+            }
+        }
+        Type::Object(shape) => {
+            if let Some(shape) = substitute_checked_object_shape(shape, substitutions, active) {
+                (Type::Object(shape), true)
+            } else {
+                (ty.clone(), false)
+            }
+        }
+        Type::VariantSet(variants) => {
+            let mut changed = None::<Vec<Variant>>;
+            for (index, variant) in variants.iter().enumerate() {
+                let Variant::Tagged { tag, fields } = variant else {
+                    if let Some(changed) = changed.as_mut() {
+                        changed.push(variant.clone());
+                    }
+                    continue;
+                };
+                if let Some(fields) = substitute_checked_object_shape(fields, substitutions, active)
+                {
+                    let changed = changed.get_or_insert_with(|| variants[..index].to_vec());
+                    changed.push(Variant::Tagged {
+                        tag: tag.clone(),
+                        fields,
+                    });
+                } else if let Some(changed) = changed.as_mut() {
+                    changed.push(variant.clone());
+                }
+            }
+            if let Some(variants) = changed {
+                (Type::VariantSet(variants.into()), true)
+            } else {
+                (ty.clone(), false)
+            }
+        }
+        Type::Union(members) => {
+            if let Some(members) = substitute_checked_type_sequence(members, substitutions, active)
+            {
+                (Type::Union(members), true)
+            } else {
+                (ty.clone(), false)
+            }
+        }
         Type::Text
         | Type::Number
         | Type::Bytes(_)
@@ -1617,8 +1596,50 @@ fn substitute_checked_type_inner(
         | Type::Absent
         | Type::RenderContract
         | Type::UnresolvedShape { .. }
-        | Type::Unknown => ty.clone(),
+        | Type::Unknown => (ty.clone(), false),
     }
+}
+
+fn substitute_checked_type_sequence(
+    types: &[Type],
+    substitutions: &(impl CheckedTypeSubstitutionLookup + ?Sized),
+    active: &mut SmallVec<[TypeVar; 8]>,
+) -> Option<Vec<Type>> {
+    let mut changed = None::<Vec<Type>>;
+    for (index, ty) in types.iter().enumerate() {
+        let (substituted, item_changed) = substitute_checked_type_inner(ty, substitutions, active);
+        if item_changed {
+            let changed = changed.get_or_insert_with(|| types[..index].to_vec());
+            changed.push(substituted);
+        } else if let Some(changed) = changed.as_mut() {
+            changed.push(ty.clone());
+        }
+    }
+    changed
+}
+
+fn substitute_checked_object_shape(
+    shape: &SharedObjectShape,
+    substitutions: &(impl CheckedTypeSubstitutionLookup + ?Sized),
+    active: &mut SmallVec<[TypeVar; 8]>,
+) -> Option<SharedObjectShape> {
+    let mut changed = None::<BTreeMap<String, Type>>;
+    for (name, ty) in &shape.fields {
+        let (substituted, field_changed) = substitute_checked_type_inner(ty, substitutions, active);
+        if field_changed {
+            changed
+                .get_or_insert_with(|| shape.fields.clone())
+                .insert(name.clone(), substituted);
+        }
+    }
+    changed.map(|fields| {
+        ObjectShape {
+            fields,
+            field_order: shape.field_order.clone(),
+            open: shape.open,
+        }
+        .into()
+    })
 }
 
 pub fn type_is_recursively_closed(ty: &Type) -> bool {
@@ -2378,7 +2399,7 @@ pub fn canonical_union_type(candidates: Vec<Type>) -> Type {
         }
     }
     if !variants.is_empty() {
-        variants.sort_by_key(variant_sort_key);
+        variants.sort_by(compare_variants_canonically);
         members.push(Type::VariantSet(variants.into()));
     }
     members.sort_by_key(|member| format!("{member:?}"));
@@ -2436,7 +2457,9 @@ fn merge_structural_variant(variants: &mut Vec<Variant>, incoming: Variant) {
     }
 }
 
-fn widen_structural_type(left: &Type, right: &Type) -> Type {
+/// Widen two immutable checked types while retaining any shared recursive node
+/// whose normalized structure does not change.
+pub fn widen_structural_type(left: &Type, right: &Type) -> Type {
     if is_value_placeholder_type(left) {
         return right.clone();
     }
@@ -2445,11 +2468,73 @@ fn widen_structural_type(left: &Type, right: &Type) -> Type {
     }
     match (left, right) {
         (Type::VariantSet(left), Type::VariantSet(right)) => {
-            let mut variants = left.clone().into_owned();
+            let mut changed = None::<Vec<Variant>>;
             for variant in right {
-                merge_structural_variant(&mut variants, variant.clone());
+                let variants = changed.as_deref().unwrap_or(left);
+                let existing = variants
+                    .iter()
+                    .position(|existing| match (existing, variant) {
+                        (Variant::Tag(tag), Variant::Tag(incoming_tag))
+                        | (
+                            Variant::Tag(tag),
+                            Variant::Tagged {
+                                tag: incoming_tag, ..
+                            },
+                        )
+                        | (Variant::Tagged { tag, .. }, Variant::Tag(incoming_tag))
+                        | (
+                            Variant::Tagged { tag, .. },
+                            Variant::Tagged {
+                                tag: incoming_tag, ..
+                            },
+                        ) => tag == incoming_tag,
+                    });
+                match (existing, variant) {
+                    (None, incoming) => changed
+                        .get_or_insert_with(|| left.as_ref().clone())
+                        .push(incoming.clone()),
+                    (Some(_), Variant::Tag(_)) => {}
+                    (Some(index), Variant::Tagged { tag, fields }) => {
+                        let existing_fields = match &variants[index] {
+                            Variant::Tag(_) => None,
+                            Variant::Tagged { fields, .. } => Some(fields),
+                        };
+                        let widened_fields = existing_fields.map_or_else(
+                            || fields.clone(),
+                            |existing_fields| {
+                                let widened = widen_structural_type(
+                                    &Type::Object(existing_fields.clone()),
+                                    &Type::Object(fields.clone()),
+                                );
+                                let Type::Object(fields) = widened else {
+                                    unreachable!(
+                                        "widening two tagged payload records must produce a record"
+                                    );
+                                };
+                                fields
+                            },
+                        );
+                        if existing_fields.is_some_and(|existing_fields| {
+                            SharedObjectShape::ptr_eq(existing_fields, &widened_fields)
+                        }) {
+                            continue;
+                        }
+                        changed.get_or_insert_with(|| left.as_ref().clone())[index] =
+                            Variant::Tagged {
+                                tag: tag.clone(),
+                                fields: widened_fields,
+                            };
+                    }
+                }
             }
-            variants.sort_by_key(variant_sort_key);
+            let left_is_canonical = left
+                .windows(2)
+                .all(|pair| compare_variants_canonically(&pair[0], &pair[1]).is_le());
+            if changed.is_none() && left_is_canonical {
+                return Type::VariantSet(left.clone());
+            }
+            let mut variants = changed.unwrap_or_else(|| left.as_ref().clone());
+            variants.sort_by(compare_variants_canonically);
             Type::VariantSet(variants.into())
         }
         (Type::Absent, ty) | (ty, Type::Absent) => ty.clone(),
@@ -2467,23 +2552,80 @@ fn widen_structural_type(left: &Type, right: &Type) -> Type {
             Type::Bits { width: *left }
         }
         (Type::List(left), Type::List(right)) => {
-            Type::List(Type::shared(widen_structural_type(left, right)))
+            let widened = widen_structural_type(left, right);
+            if checked_type_reuses_node(left, &widened) {
+                Type::List(left.clone())
+            } else {
+                Type::List(Type::shared(widened))
+            }
         }
         (Type::Object(left), Type::Object(right)) => {
-            let mut fields = left.fields.clone();
+            let mut changed_fields = None::<BTreeMap<String, Type>>;
+            let mut added_field = false;
             for (field, ty) in &right.fields {
-                fields
-                    .entry(field.clone())
-                    .and_modify(|existing| *existing = widen_structural_type(existing, ty))
-                    .or_insert_with(|| ty.clone());
+                let current = changed_fields
+                    .as_ref()
+                    .unwrap_or(&left.fields)
+                    .get(field)
+                    .cloned();
+                let widened = current.as_ref().map_or_else(
+                    || ty.clone(),
+                    |existing| widen_structural_type(existing, ty),
+                );
+                if current
+                    .as_ref()
+                    .is_some_and(|existing| checked_type_reuses_node(existing, &widened))
+                {
+                    continue;
+                }
+                added_field |= current.is_none();
+                changed_fields
+                    .get_or_insert_with(|| left.fields.clone())
+                    .insert(field.clone(), widened);
             }
+            let open = left.open || right.open;
+            let complete_field_order = object_shape_has_complete_field_order(left);
+            if changed_fields.is_none() && complete_field_order && open == left.open {
+                return Type::Object(left.clone());
+            }
+            let field_order = if !added_field && complete_field_order {
+                left.field_order.clone()
+            } else {
+                object_field_order_for_widened_shapes(left, right)
+            };
             Type::object(ObjectShape {
-                fields,
-                field_order: object_field_order_for_widened_shapes(left, right),
-                open: left.open || right.open,
+                fields: changed_fields.unwrap_or_else(|| left.fields.clone()),
+                field_order,
+                open,
             })
         }
         _ => open_object_type(),
+    }
+}
+
+/// Whether two checked types already share the same immutable recursive node
+/// (or are the same leaf). This is deliberately narrower than structural
+/// equality: it is the constant-time test used to preserve an existing owner
+/// while structural widening walks a changing aggregate.
+fn checked_type_reuses_node(left: &Type, right: &Type) -> bool {
+    match (left, right) {
+        (Type::VariantSet(left), Type::VariantSet(right)) => SharedVariantSet::ptr_eq(left, right),
+        (Type::Object(left), Type::Object(right)) => SharedObjectShape::ptr_eq(left, right),
+        (Type::List(left), Type::List(right)) | (Type::Set(left), Type::Set(right)) => {
+            SharedType::ptr_eq(left, right)
+        }
+        (Type::Text, Type::Text)
+        | (Type::Number, Type::Number)
+        | (Type::Absent, Type::Absent)
+        | (Type::RenderContract, Type::RenderContract)
+        | (Type::Unknown, Type::Unknown) => true,
+        (Type::Bytes(left), Type::Bytes(right)) => left == right,
+        (Type::Bits { width: left }, Type::Bits { width: right }) => left == right,
+        (Type::Var(left), Type::Var(right)) => left == right,
+        (Type::UnresolvedShape { reason: left }, Type::UnresolvedShape { reason: right }) => {
+            left == right
+        }
+        _ => false,
     }
 }
 
@@ -2526,11 +2668,95 @@ fn object_field_order_for_widened_shapes(left: &ObjectShape, right: &ObjectShape
     order
 }
 
-fn variant_sort_key(variant: &Variant) -> String {
-    match variant {
-        Variant::Tag(tag) => format!("0:{tag}"),
-        Variant::Tagged { tag, fields } => format!("1:{tag}:{}", fields.fields.len()),
+fn object_shape_has_complete_field_order(shape: &ObjectShape) -> bool {
+    shape.field_order.len() == shape.fields.len()
+        && shape.field_order.iter().enumerate().all(|(index, field)| {
+            shape.fields.contains_key(field) && !shape.field_order[..index].contains(field)
+        })
+}
+
+pub fn compare_variants_canonically(left: &Variant, right: &Variant) -> Ordering {
+    match (left, right) {
+        (Variant::Tag(left), Variant::Tag(right)) => left.cmp(right),
+        (Variant::Tag(_), Variant::Tagged { .. }) => Ordering::Less,
+        (Variant::Tagged { .. }, Variant::Tag(_)) => Ordering::Greater,
+        (
+            Variant::Tagged {
+                tag: left_tag,
+                fields: left_fields,
+            },
+            Variant::Tagged {
+                tag: right_tag,
+                fields: right_fields,
+            },
+        ) => compare_tagged_variant_sort_suffixes(
+            left_tag,
+            left_fields.fields.len(),
+            right_tag,
+            right_fields.fields.len(),
+        ),
     }
+}
+
+/// Compare the exact byte sequences produced by `"{tag}:{field_count}"`
+/// without allocating either formatted key. Tag text may itself contain a
+/// colon, so comparing `(tag, field_count)` as a tuple would not preserve the
+/// historical canonical order.
+fn compare_tagged_variant_sort_suffixes(
+    left_tag: &str,
+    left_field_count: usize,
+    right_tag: &str,
+    right_field_count: usize,
+) -> Ordering {
+    let (left_suffix, left_suffix_start) = decimal_sort_suffix(left_field_count);
+    let (right_suffix, right_suffix_start) = decimal_sort_suffix(right_field_count);
+    compare_joined_bytes(
+        left_tag.as_bytes(),
+        &left_suffix[left_suffix_start..],
+        right_tag.as_bytes(),
+        &right_suffix[right_suffix_start..],
+    )
+}
+
+fn decimal_sort_suffix(mut value: usize) -> ([u8; 21], usize) {
+    let mut bytes = [0; 21];
+    let mut start = bytes.len();
+    loop {
+        start -= 1;
+        bytes[start] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    start -= 1;
+    bytes[start] = b':';
+    (bytes, start)
+}
+
+fn compare_joined_bytes(
+    left_head: &[u8],
+    left_tail: &[u8],
+    right_head: &[u8],
+    right_tail: &[u8],
+) -> Ordering {
+    let left_len = left_head.len() + left_tail.len();
+    let right_len = right_head.len() + right_tail.len();
+    for index in 0..left_len.min(right_len) {
+        let left = left_head
+            .get(index)
+            .copied()
+            .unwrap_or_else(|| left_tail[index - left_head.len()]);
+        let right = right_head
+            .get(index)
+            .copied()
+            .unwrap_or_else(|| right_tail[index - right_head.len()]);
+        match left.cmp(&right) {
+            Ordering::Equal => {}
+            ordering => return ordering,
+        }
+    }
+    left_len.cmp(&right_len)
 }
 
 #[cfg(test)]
@@ -2569,6 +2795,44 @@ mod tests {
         let encoded = serde_json::to_string(&ty).expect("checked type serializes");
         let decoded: Type = serde_json::from_str(&encoded).expect("checked type deserializes");
         assert_eq!(decoded, ty);
+    }
+
+    #[test]
+    fn checked_type_substitution_rebuilds_only_the_changed_shared_path() {
+        let stable_shape = SharedObjectShape::new(ObjectShape::from_ordered_fields(
+            [("label".to_owned(), Type::Text)],
+            false,
+        ));
+        let root_shape = SharedObjectShape::new(ObjectShape::from_ordered_fields(
+            [
+                ("value".to_owned(), Type::Var(TypeVar(7))),
+                ("stable".to_owned(), Type::Object(stable_shape.clone())),
+            ],
+            false,
+        ));
+        let root = Type::Object(root_shape.clone());
+
+        let unchanged = apply_checked_type_environment(&root, &BTreeMap::new());
+        let Type::Object(unchanged_shape) = unchanged else {
+            panic!("object substitution must remain an object");
+        };
+        assert!(SharedObjectShape::ptr_eq(&root_shape, &unchanged_shape));
+
+        let substituted =
+            apply_checked_type_environment(&root, &BTreeMap::from([(TypeVar(7), Type::Number)]));
+        let Type::Object(substituted_shape) = substituted else {
+            panic!("object substitution must remain an object");
+        };
+        assert!(!SharedObjectShape::ptr_eq(&root_shape, &substituted_shape));
+        assert_eq!(substituted_shape.fields.get("value"), Some(&Type::Number));
+        let Some(Type::Object(substituted_stable_shape)) = substituted_shape.fields.get("stable")
+        else {
+            panic!("stable field must remain an object");
+        };
+        assert!(SharedObjectShape::ptr_eq(
+            &stable_shape,
+            substituted_stable_shape
+        ));
     }
 
     #[test]

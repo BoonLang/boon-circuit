@@ -305,10 +305,23 @@ Current checkpoints to preserve and audit rather than redo:
   empty allocations fall to 1,666,870/1,666,876 calls and
   208,381,392/208,445,989 bytes. Six-pair medians are 206.28/206.55 ms total
   and 150.21/150.89 ms typecheck, with 65,932/66,352 KiB maximum observed RSS.
-  Next implement compact/canonical type terms for the measured growing
-  aggregate chain without eager whole-shape hashing, then reduce the 24.3 ms
-  contextual-scheme owner, finish scaling/parity proof and fresh adversarial
-  review, and regenerate the full protocol after the final edit;
+  The following compact-type checkpoint moves the one canonical structural
+  operator into `boon_checked`: substitution is one copy-on-write traversal
+  with an inline cycle stack, widening preserves unchanged shared object/list/
+  Tag nodes and normalized field order, and canonical Tag sorting no longer
+  formats allocation-backed keys. No eager shape hash is retained. The exact
+  digest, seven checked-graph tests, all 85 ordinary typechecker tests, and both
+  product gates pass. Fresh/empty allocations fall again to
+  1,621,578/1,621,584 calls and 206,521,350/206,585,947 bytes. An 18-pair
+  directional release batch has 204.74/205.60 ms total and 149.59/150.10 ms
+  typecheck medians, with 223.03/223.09 ms maxima and 65,348/65,924 KiB maximum
+  RSS. Next reduce the measured 23.8 ms contextual-scheme owner, remaining
+  construction/diagnostic work, and name/type interning, then finish scaling/
+  parity proof and fresh adversarial review and regenerate the full protocol.
+  Do not mistake the diagnostics result for verified closure: current direct
+  NovyWave verified samples remain about 7.72/7.56 seconds and 515 MiB,
+  dominated by about 6.9 seconds of semantic construction, so the verified
+  time/RSS gates remain mandatory later blockers;
 - the current compiler-throughput checkpoint keeps Counter, physical TodoMVC,
   and NovyWave `MachinePlan` output deterministic while replacing copied OUT
   type environments with active-path overlays, retaining canonical-root-reading

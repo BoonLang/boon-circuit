@@ -127,12 +127,23 @@ stronger three-reviewer performance closure defined below.
    release worklist falls from about 39.6 to 36.3 ms. Fresh/empty allocations
    are 1,666,870/1,666,876 calls and 208,381,392/208,445,989 bytes. Six-pair
    medians are 206.28/206.55 ms total and 150.21/150.89 ms typecheck, with
-   65,932/66,352 KiB maximum observed RSS. The first tranche still includes
-   compact/canonical type terms for the growing aggregate chain, the measured
-   24.3 ms contextual-scheme owner, remaining construction/diagnostic work,
-   measured name/type interning, scaling/parity evidence, and the fresh Phase 1
-   adversarial review. Reprofile after each owner-level slice and regenerate
-   the complete cold protocol after the final edit. Then close
+   65,932/66,352 KiB maximum observed RSS. The next checkpoint centralizes
+   single-pass copy-on-write substitution and structural widening in
+   `boon_checked`, preserves unchanged shared object/list/Tag nodes and field
+   order, uses an inline substitution-cycle stack, and replaces formatted Tag
+   sort keys with the exact allocation-free comparator. The exact digest,
+   seven checked-graph tests, all 85 ordinary typechecker tests, and both
+   product gates pass. Fresh/empty allocations fall to
+   1,621,578/1,621,584 calls and 206,521,350/206,585,947 bytes. An 18-pair
+   directional release batch has 204.74/205.60 ms total and 149.59/150.10 ms
+   typecheck medians, with 223.03/223.09 ms maxima and 65,348/65,924 KiB maximum
+   RSS. The first tranche still includes the measured 23.8 ms contextual-scheme
+   owner, remaining construction/diagnostic work, measured name/type interning,
+   scaling/parity evidence, and the fresh Phase 1 adversarial review. Reprofile
+   after each owner-level slice and regenerate the complete cold protocol after
+   the final edit. Direct verified NovyWave remains about 7.6--7.7 seconds and
+   515 MiB, dominated by about 6.9 seconds of semantic work; keep that later
+   verified time/RSS closure explicitly red. Then close
    semantic sealing, proof, backend, hashing, and memory until both verified-
    plan modes pass; only afterward may persistent-session warm work satisfy its
    separate gates.

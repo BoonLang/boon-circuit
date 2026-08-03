@@ -576,12 +576,39 @@ Current cold-diagnostics candidate evidence:
   preserved the digest but were slower; eager object fingerprints preserved the
   digest but raised the debug worklist to about 88 ms; and a static unused-type-
   variable classifier found no safe NovyWave edges. None is retained.
-- Continue with compact/canonical structural type terms that avoid rebuilding
-  the still-growing aggregate chain without eager whole-shape hashing, then the
-  measured 24.3 ms contextual-scheme owner, remaining construction/diagnostic
-  work, and measured name/type interning. Finish scaling/parity evidence and a
-  fresh adversarial review before regenerating the full cold protocol after the
-  final Phase 1 edit.
+- The compact/canonical structural owner is now shared by the checked graph
+  instead of duplicated in the typechecker. Substitution is a single
+  copy-on-write traversal: it no longer performs a complete applicability scan
+  at every recursive level, preserves every unchanged shared object/list/Tag
+  node, and uses an eight-entry inline active-variable stack instead of one
+  tree allocation per visited replacement. Structural widening likewise
+  materializes only real list/object/Tag growth, preserves normalized field
+  order without rebuilding its set on a no-op merge, and uses one allocation-
+  free comparator that is byte-for-byte equivalent to the old formatted
+  canonical Tag key. No eager whole-shape hash or NovyWave-specific cache is
+  retained.
+- The exact checked digest remains
+  `495ef4195e0be4869e431c4036b74b6d6397c4b28b7fe7a8a76c76400a7b7992`.
+  All seven checked-graph tests, all 85 ordinary typechecker tests, and both
+  product-scale gates pass. Fresh/empty allocation work falls to
+  1,621,578/1,621,584 calls and 206,521,350/206,585,947 bytes: exactly 45,292
+  calls and 1,860,042 bytes below the preceding worklist checkpoint in each
+  mode. An 18-pair directional release batch has 204.74/205.60 ms complete-
+  diagnostics and 149.59/150.10 ms typecheck medians, 223.03/223.09 ms maxima,
+  and 65,348/65,924 KiB maximum RSS. The release trace reports about 23.8 ms
+  contextual schemes, 36.2 ms checked inference, 11.9 ms diagnostic projection,
+  and 108.6 ms checked-program construction. Counter and physical TodoMVC
+  remain directionally below their cold gates at 4.85 and 52.20 ms.
+- This diagnostics checkpoint does not close verified compilation. Direct
+  NovyWave verified samples remain about 7.72/7.56 seconds fresh/empty and
+  515,228/515,624 KiB, dominated by 6.93/6.80 seconds of semantic construction;
+  the 1,000 ms and 384 MiB verified gates therefore remain red and must be
+  attacked after the frontend tranche rather than hidden by the passing
+  diagnostics result.
+- Continue with the measured 23.8 ms contextual-scheme owner, remaining
+  construction/diagnostic work, and measured name/type interning. Finish
+  scaling/parity evidence and a fresh adversarial review before regenerating
+  the full cold protocol after the final Phase 1 edit.
 
 Development profiles and focused debug tests remain directional tools. The
 acceptance producer remains the revision-identified `release` binary required
@@ -882,10 +909,13 @@ not restore fragmented row vectors or retain construction-only columns. The
 checked worklist now preserves unchanged widened nodes and coalesces only after
 two evidence-only input visits, with mandatory pre-hook refresh and fail-closed
 solver repair; do not replace that boundary with order-dependent recursive
-publication or per-call cache flushing. Next introduce compact/canonical type
-terms for the growing aggregate chain, then reduce contextual/structural work
-and complete measured name/type interning before the Phase 1 scaling,
-malformed-source/parity, and fresh adversarial checks. Use
+publication or per-call cache flushing. The immutable checked graph now owns
+single-pass copy-on-write substitution, widening, and allocation-free exact Tag
+ordering; do not recreate typechecker-local structural operators or eager shape
+fingerprints. Next reduce the measured 23.8 ms contextual-scheme owner and
+remaining construction/diagnostic work, then complete measured name/type
+interning before the Phase 1 scaling, malformed-source/parity, and fresh
+adversarial checks. Use
 the unchanged 1m35s release rebuild after both the net source deletion and this
 runtime win as evidence when evaluating the next ownership/dependency crate
 boundary, but accept a split only under the measured split gates above.

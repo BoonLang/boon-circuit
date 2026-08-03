@@ -6498,9 +6498,7 @@ impl CheckedProgramDatabase {
         }
         let calls_started = trace.then(Instant::now);
         for (call_index, call) in self.calls.iter().enumerate() {
-            let plan = dependencies
-                .call_inference_plans
-                .get(&(call.id.0 as usize));
+            let plan = dependencies.call_inference_plans.get(&(call.id.0 as usize));
             let input_flow_sensitive = plan.is_some_and(|plan| plan.input_flow_sensitive);
             let mut first_output_formal_by_output = BTreeMap::new();
             for entry in &call.entries {
@@ -27907,16 +27905,9 @@ fn boon_facing_type_display_tree_with_depth(
 
 fn sorted_variants(variants: &[Variant]) -> Vec<Variant> {
     let mut sorted = variants.to_vec();
-    sorted.sort_by_key(variant_sort_key);
+    sorted.sort_by(compare_variants_canonically);
     sorted.dedup();
     sorted
-}
-
-fn variant_sort_key(variant: &Variant) -> String {
-    match variant {
-        Variant::Tag(tag) => format!("0:{tag}"),
-        Variant::Tagged { tag, fields } => format!("1:{tag}:{}", fields.fields.len()),
-    }
 }
 
 fn boon_facing_type_label_with_depth(
@@ -32268,157 +32259,8 @@ fn semantic_block_return_statement(statements: &[AstStatement]) -> Option<&AstSt
         .or_else(|| statements.last())
 }
 
-/// Whether two checked types already share the same immutable recursive node
-/// (or are the same leaf). This is deliberately narrower than structural
-/// equality: it is the constant-time test used to preserve an existing owner
-/// while structural widening walks a changing aggregate.
-fn checked_type_reuses_node(left: &Type, right: &Type) -> bool {
-    match (left, right) {
-        (Type::VariantSet(left), Type::VariantSet(right)) => {
-            SharedVariantSet::ptr_eq(left, right)
-        }
-        (Type::Object(left), Type::Object(right)) => SharedObjectShape::ptr_eq(left, right),
-        (Type::List(left), Type::List(right)) | (Type::Set(left), Type::Set(right)) => {
-            SharedType::ptr_eq(left, right)
-        }
-        (Type::Text, Type::Text)
-        | (Type::Number, Type::Number)
-        | (Type::Absent, Type::Absent)
-        | (Type::RenderContract, Type::RenderContract)
-        | (Type::Unknown, Type::Unknown) => true,
-        (Type::Bytes(left), Type::Bytes(right)) => left == right,
-        (Type::Bits { width: left }, Type::Bits { width: right }) => left == right,
-        (Type::Var(left), Type::Var(right)) => left == right,
-        (
-            Type::UnresolvedShape { reason: left },
-            Type::UnresolvedShape { reason: right },
-        ) => left == right,
-        _ => false,
-    }
-}
-
-fn widen_structural_type(left: &Type, right: &Type) -> Type {
-    if is_value_placeholder_type(left) {
-        return right.clone();
-    }
-    if is_value_placeholder_type(right) {
-        return left.clone();
-    }
-    match (left, right) {
-        (Type::VariantSet(left), Type::VariantSet(right)) => {
-            let mut variants = left.clone().into_owned();
-            for variant in right {
-                merge_structural_variant(&mut variants, variant.clone());
-            }
-            variants.sort_by_key(variant_sort_key);
-            Type::VariantSet(variants.into())
-        }
-        (Type::Absent, ty) | (ty, Type::Absent) => ty.clone(),
-        (ty, no_element) if is_no_element_type(no_element) => ty.clone(),
-        (no_element, ty) if is_no_element_type(no_element) => ty.clone(),
-        (Type::Text, Type::Text) => Type::Text,
-        (Type::Number, Type::Number) => Type::Number,
-        (Type::Bytes(left), Type::Bytes(right)) => match (left, right) {
-            (BytesType::Fixed(left), BytesType::Fixed(right)) if left == right => {
-                Type::Bytes(BytesType::Fixed(*left))
-            }
-            _ => Type::Bytes(BytesType::Dynamic),
-        },
-        (Type::Bits { width: left }, Type::Bits { width: right }) if left == right => {
-            Type::Bits { width: *left }
-        }
-        (Type::List(left), Type::List(right)) => {
-            let widened = widen_structural_type(left, right);
-            if checked_type_reuses_node(left, &widened) {
-                Type::List(left.clone())
-            } else {
-                Type::List(Type::shared(widened))
-            }
-        }
-        (Type::Object(left), Type::Object(right)) => {
-            let mut changed_fields = None::<BTreeMap<String, Type>>;
-            for (field, ty) in &right.fields {
-                let current = changed_fields
-                    .as_ref()
-                    .unwrap_or(&left.fields)
-                    .get(field)
-                    .cloned();
-                let widened = current
-                    .as_ref()
-                    .map_or_else(|| ty.clone(), |existing| widen_structural_type(existing, ty));
-                if current
-                    .as_ref()
-                    .is_some_and(|existing| checked_type_reuses_node(existing, &widened))
-                {
-                    continue;
-                }
-                changed_fields
-                    .get_or_insert_with(|| left.fields.clone())
-                    .insert(field.clone(), widened);
-            }
-            let field_order = object_field_order_for_widened_shapes(left, right);
-            let open = left.open || right.open;
-            if changed_fields.is_none() && field_order == left.field_order && open == left.open {
-                return Type::Object(left.clone());
-            }
-            Type::object(ObjectShape {
-                fields: changed_fields.unwrap_or_else(|| left.fields.clone()),
-                field_order,
-                open,
-            })
-        }
-        _ => open_object_type(),
-    }
-}
-
 fn union_structural_type(left: &Type, right: &Type) -> Type {
     canonical_union_type(vec![left.clone(), right.clone()])
-}
-
-fn merge_structural_variant(variants: &mut Vec<Variant>, incoming: Variant) {
-    match incoming {
-        Variant::Tag(incoming_tag) => {
-            if !variants.iter().any(|variant| match variant {
-                Variant::Tag(tag) | Variant::Tagged { tag, .. } => tag == &incoming_tag,
-            }) {
-                variants.push(Variant::Tag(incoming_tag));
-            }
-        }
-        Variant::Tagged {
-            tag: incoming_tag,
-            fields: incoming_fields,
-        } => {
-            let Some(index) = variants.iter().position(|variant| match variant {
-                Variant::Tag(tag) | Variant::Tagged { tag, .. } => tag == &incoming_tag,
-            }) else {
-                variants.push(Variant::Tagged {
-                    tag: incoming_tag,
-                    fields: incoming_fields,
-                });
-                return;
-            };
-            let fields = match &variants[index] {
-                Variant::Tag(_) => incoming_fields,
-                Variant::Tagged {
-                    fields: existing_fields,
-                    ..
-                } => {
-                    let merged = widen_structural_type(
-                        &Type::Object(existing_fields.clone()),
-                        &Type::Object(incoming_fields),
-                    );
-                    let Type::Object(fields) = merged else {
-                        unreachable!("widening two tagged payload records must produce a record");
-                    };
-                    fields
-                }
-            };
-            variants[index] = Variant::Tagged {
-                tag: incoming_tag,
-                fields,
-            };
-        }
-    }
 }
 
 fn widen_hold_type(current: &Type, update: &Type) -> Type {

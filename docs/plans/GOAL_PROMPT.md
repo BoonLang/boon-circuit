@@ -398,7 +398,8 @@ Current checkpoints to preserve and audit rather than redo:
   invariants remain exact. Budget V2 stays red until the V3 provenance report,
   real-host NovyWave behavior scenario, migration/restart matrix, and negative
   cases are complete;
-- resume the performance goal from clean local checkpoint `32bcf40` and follow
+- resume the performance goal from clean local checkpoint `38e6541`, preserving
+  activation/effect checkpoint `32bcf40`, and follow
   `BOON_COMPILER_ARCHITECTURE_REFACTOR_PLAN.md`. The canonical list-dataflow,
   sparse durable-overlay lifecycle, product-faithful `boon_behavior_harness`,
   real local host, retained document hit testing, exact activation-turn
@@ -437,6 +438,26 @@ Current checkpoints to preserve and audit rather than redo:
   ownership cut. Do not stop at this improvement and do not return to receipt-
   hashing or container micro-tuning while the 1,000 ms total and 350 ms
   semantic/proof gates remain red;
+- apply the post-checkpoint owner-unit reassessment, not a receipts-only
+  interpretation of the prior bullet. The current 4,052.379 ms directional
+  sample would still take roughly 2.24 seconds if the entire 1,813.236 ms
+  manifest vanished. Build stable owner body units containing dense checked/
+  semantic/executable rows, local receipts, exact projection dependencies, and
+  a retained plan-function ABI. Link only compact cross-owner OUT/resource/
+  reactive/storage/view/migration summaries, demand roots, and SCCs. Make the
+  sealed canonical program image primary storage; rich component graphs become
+  read-only views or explicit debug/test materializers. Migrate owner-sized
+  batches through proof and plan, deleting each superseded production graph or
+  scan owner in the same batch. Do not accept a database facade that leaves the
+  eager nine-graph pipeline intact. Retain these same units for warm
+  backdating/cancellation and add bounded parallel evaluation only after their
+  dependency graph proves independence;
+- do not preserve V3's 208k subject count in the replacement proof. The
+  test-only oracle maps every historical subject to one canonical owner-unit
+  row and classifier field/domain and independently proves coverage,
+  projection commitments, mutation detection, and exact cones. Production
+  fingerprints each actual database row once, binding all fields plus one
+  typed dependency span. Reject one-receipt-per-historical-child-field designs;
 - expand that vertical cut through the rich semantic domains, deleting each
   superseded production owner. Carry ordinary executable bodies once through
   `MachinePlan` with compact parameter/type/PASSED/owner/resource/effect/render
@@ -588,7 +609,8 @@ Blocking compiler-performance prerequisite:
 
 - Complete `BOON_COMPILER_PERFORMANCE_PLAN.md` before resuming the remaining
   simplification/native-recovery closure or any later production phase.
-- Begin from checkpoint `32bcf40` and the refactor plan's current tranche:
+- Begin from checkpoint `38e6541`, preserving `32bcf40`'s activation/effect
+  boundary, and follow the refactor plan's current owner-unit tranche:
   finish the full real-host oracle on the landed exact activation/effect
   boundary; build one owner/projection `CompilationDb` shared by cold proof and
   later warm currentness; carry retained ordinary functions and compact

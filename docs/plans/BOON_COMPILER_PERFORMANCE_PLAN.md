@@ -691,6 +691,28 @@ Current cold-diagnostics candidate evidence:
   graph builders and delete the corresponding inventory passes; do not resume
   row-hash/container tuning. After that cut, profile and reduce unnecessary
   semantic demand rather than merely making exhaustive demand cheaper.
+- A second whole-pipeline audit strengthens that requirement into an owner-unit
+  refactor. The current 4,052.379 ms/247,284 KiB directional sample spends
+  3,262.360 ms in semantics. Subtracting the entire 1,813.236 ms manifest still
+  leaves roughly 2.24 seconds end to end, so callbacks that emit the same 208k
+  classifications while retaining all eager graphs cannot pass. One stable
+  owner body unit must contain dense checked/semantic/executable rows, local
+  receipts, exact projection dependencies, and a retained plan-function ABI;
+  one compact program link owns only cross-owner OUT/resource/reactive/storage/
+  view/migration summaries and demand SCCs. The sealed canonical image becomes
+  primary storage while rich component graphs become typed views or explicit
+  debug materializers. Migrate complete owner-sized batches and delete the old
+  graph/inventory owner in each batch. Then carry the same units across
+  revisions and parallelize only independent owners. The architecture plan's
+  “Second Whole-Pipeline Reassessment” owns the detailed sequence.
+- Do not preserve V3's 208k subject cardinality as a production V4/V5 proof
+  requirement. The independent test oracle must map every historical subject
+  to exactly one canonical owner-unit row and classifier field/domain and prove
+  projection commitments, mutation detection, and exact dependency cones.
+  Production fingerprints each actual database row once, binding all of its
+  fields, and stores one typed dependency span. A one-receipt-per-historical-
+  child-field design would encode the obsolete rich DTO inventory inside the
+  replacement architecture and is rejected.
 - The current artifact-oracle gate is red and blocks phase exit, but restoring
   the budgeted NovyWave hash would be a correctness regression. Fresh and empty
   modes deterministically emit
@@ -1298,7 +1320,8 @@ counter-only loop before changing the measured parser/typechecker owners.
 
 ### Current Resumption Point: Unified Compilation Database And Retained Plan Functions
 
-Resume from clean local checkpoint `32bcf40` and the detailed sequence in
+Resume from clean local checkpoint `38e6541`, preserve activation/effect
+checkpoint `32bcf40`, and follow the detailed sequence in
 [`BOON_COMPILER_ARCHITECTURE_REFACTOR_PLAN.md`](BOON_COMPILER_ARCHITECTURE_REFACTOR_PLAN.md).
 Do not return to the historical contextual-scheme micro-tranche while verified
 semantic/proof multiplication, duplicate representation lifetimes, whole-
@@ -1312,22 +1335,22 @@ project invalidation, and rebuild fan-out dominate.
 2. Preserve checkpoint `32bcf40`'s exact activation turn, atomic reset/
    activation persistence, deterministic effect transcript, and pre-commit
    pruning. Finish the complete real-host NovyWave migration/restart/
-   provenance/negative oracle; normalize only the store-local epoch. This is
-   the remaining correctness closure before the proof format changes.
-3. Introduce one minimal typed `CompilationDb` vertical slice for the program
-   root plus one representative ordinary callable. Stable owner/projection or
-   definition/invocation-overlay request keys own dense semantic row receipts,
-   compact exact dependency spans, input/result fingerprints, `changed_at`,
-   `verified_at`, and work counters. Drive the slice through checking,
-   semantics, test-only V3 materialization, demand collection, plan, verifier,
-   and runtime, then delete every superseded production owner for that slice.
-4. Expand the same database across checked/OUT/execution/resource/reactive/
-   lowering/view/storage/memory domains. Fold row receipts into owner-local and
-   narrow projection proof roots and run SCC closure on that compact request
-   graph. Keep exhaustive V3 materialization test-only until mutation,
-   omission, cycle, cone-precision, and retained/flat parity evidence
-   authorizes a flag-day V4 migration. Production and the future warm session
-   must not build separate dependency authorities.
+   provenance/negative oracle; normalize only the store-local epoch. V4 is
+   already the production proof schema at checkpoint `38e6541`; the remaining
+   oracle blocks phase acceptance, not permission to restore V3 production.
+3. Introduce the typed `CompilationDb` owner-unit seal and migrate complete
+   checked plus execution projections. Stable interface/body units own dense
+   rows, compact exact dependency spans, canonical receipts, input/result
+   fingerprints, `changed_at`, `verified_at`, work counters, and a retained
+   plan-function ABI. Drive them through test-only V3 materialization, proof,
+   demand collection, plan, verifier, and runtime, then delete the corresponding
+   production inventories and graph owners in the same coherent batch.
+4. Expand the same owner-unit/program-link database across OUT/resource/
+   reactive/lowering/view/storage/memory domains. Fold construction receipts
+   into V4 owner-local and narrow projection roots and run SCC closure only on
+   that compact request graph. Make the sealed canonical image primary storage;
+   rich component graphs become views/debug materializers. Production and the
+   future warm session must not build separate dependency authorities.
 5. Carry ordinary executable definitions through `MachinePlan` once and encode
    call-specific parameter/type/PASSED/owner/resource/effect/render context in
    compact invocation frames. Demand-collect only reachable plan definitions

@@ -206,7 +206,8 @@ stronger three-reviewer performance closure defined below.
    red until V3 records source/old/new identities, the real-host NovyWave
    behavior trace, migration/restart evidence, and focused negative cases.
 
-   Resume from clean local checkpoint `32bcf40` and follow
+   Resume from clean local checkpoint `38e6541`, preserve activation/effect
+   checkpoint `32bcf40`, and follow
    `BOON_COMPILER_ARCHITECTURE_REFACTOR_PLAN.md`. The canonical list-dataflow,
    sparse durable-overlay lifecycle, `boon_behavior_harness`, real local host,
    retained document hit testing, exact activation-turn handoff, atomic reset/
@@ -242,6 +243,25 @@ stronger three-reviewer performance closure defined below.
    the same receipts becoming proof and revision-currentness authority and the
    post-hoc inventory walks deleted. Reprofile semantic demand after that
    ownership cut. Do not spend another tranche on receipt-hash micro-tuning.
+
+   The post-checkpoint whole-pipeline audit also proves that receipt callbacks
+   alone are too small: removing all 1,813.236 ms of current manifest work from
+   the 4,052.379 ms directional sample would still leave about 2.24 seconds.
+   Implement the architecture plan's stable owner body unit and compact program
+   linker. Each unit owns dense checked/semantic/executable rows, row receipts,
+   exact projection dependencies, and a retained plan-function ABI; the linker
+   owns only unavoidable cross-owner OUT/resource/reactive/storage/view/
+   migration summaries, demand roots, and SCCs. Make the compact canonical
+   image primary storage and turn the nine rich component graphs into views or
+   explicit debug materializers. A coherent batch must delete an old graph or
+   scan owner, not merely add a database facade beneath it.
+
+   The test-only V3 oracle proves exhaustive coverage without dictating
+   production cardinality: every V3 subject maps to one canonical owner-unit
+   row and exact classifier field/domain, every database row is covered, and
+   independently folded projection commitments match. Production fingerprints
+   each actual row once and binds one exact typed dependency span; it must not
+   retain one receipt per historical child-field coverage subject.
 
    Expand the same database through the rich semantic domains. Carry each
    ordinary executable body once through `MachinePlan` and represent call-

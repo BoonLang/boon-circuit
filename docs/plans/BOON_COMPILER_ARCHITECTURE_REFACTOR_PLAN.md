@@ -2,13 +2,15 @@
 
 Date: 2026-08-03
 
-Status: active high-leverage execution map, reconciled after activation/effect
-checkpoint `32bcf40`, subordinate to
+Status: active high-leverage execution map, reconciled after compact-proof/
+sealed-plan checkpoint `38e6541` while preserving activation/effect checkpoint
+`32bcf40`, subordinate to
 [`BOON_COMPILER_PERFORMANCE_PLAN.md`](BOON_COMPILER_PERFORMANCE_PLAN.md). The
 performance plan owns all latency, memory, correctness, and final acceptance
 gates. This file owns the architectural sequence first chosen after checkpoint
-`968c56a` and strengthened by the post-`32bcf40` source/primary-reference
-research below; it does not create a second set of weaker exits.
+`968c56a` and strengthened by the post-`32bcf40` and post-`38e6541` source/
+primary-reference research below; it does not create a second set of weaker
+exits.
 
 ## Why This Refactor Exists
 
@@ -279,6 +281,128 @@ clone, rehash, or reverify the same plan. Deserialized plans still use the full
 public verifier. This closes the duplicate publication boundary but does not
 make backend expansion or the end-to-end performance gate green.
 
+### Second Whole-Pipeline Reassessment: Owner Compilation Units
+
+A fresh post-checkpoint directional sample completes in 4,052.379 ms at
+247,284 KiB. Parse plus typecheck use 56.748 + 161.384 ms. Semantic elaboration
+uses 3,262.360 ms: 1,813.236 ms is the compact V4 manifest, about 1,311.717 ms
+is the eager graph-building work before it, and about 137.407 ms builds/hashes
+the canonical core and validates the handoff. IR lowering, backend construction,
+plan validation, and scored serialization remain separately visible at
+37.220, 394.166, 93.479, and 84.037 ms. These are one-sample directional phase
+timers, not non-overlapping p95 acceptance evidence.
+
+The arithmetic rules out a receipts-only plan. Even a free manifest would
+leave roughly 2.24 seconds end to end. The current semantic pipeline builds a
+whole-program OUT graph, execution graph, resource graph, reactive graph,
+lowering contract, storage graph, view graph, and memory graph; V4 then scans
+them, the canonical-core builder maps them again, and the document backend
+expands retained ordinary definitions per invocation. Moving the same 208k
+classifications into callbacks without changing those authorities would only
+move time between labels.
+
+The primary compilation product must instead become one stable owner unit:
+
+```text
+SourceUnitSnapshot
+  -> InterfaceUnit(public declarations, schemes, effects, stable fingerprints)
+  -> OwnerBodyUnit(
+       dense checked/semantic/executable rows,
+       local proof receipts and exact projection dependencies,
+       retained plan function plus typed invocation ABI)
+  -> ProgramLink(
+       OUT/resource/reactive/storage/view/migration cross-owner summaries,
+       demand roots, SCCs, distributed crossings)
+  -> SealedProgramImage(compact canonical tables, proof roots, verifier facts)
+  -> MachinePlanBuilder(plan functions plus compact invocation frames)
+```
+
+`OwnerBodyUnit` is both the cold compilation unit and the warm invalidation
+unit. Rows inside it remain dense direct arrays; they are not general-purpose
+queries. Only public shape, body implementation, effect/resource, storage,
+view, migration, and other proven cross-owner projections become request-graph
+nodes. This preserves a low-overhead straight-line cold path while providing
+the exact result fingerprints and dependency cones needed by the persistent
+session.
+
+This changes the meaning of construction-time proof. A typed table builder
+cannot append a row without simultaneously appending its canonical row
+fingerprint and dependency span. Completeness follows from the sealed dense
+table population plus coverage bitsets, not from rediscovering every serialized
+field as a second `SemanticDependencySubjectV1`. Owner-local rows fold while
+the unit seals; only exact inter-projection edges reach the program linker.
+The V3 materializer remains an independent test oracle during migration, but
+production work must converge toward real row count and owner/projection edge
+count rather than the current 158,953 dependency and 208,283 coverage
+classifications.
+
+The canonical executable image must also become the stored rows, not a final
+clone-shaped projection beside all source semantic graphs. Rich OUT/resource/
+reactive/storage APIs become typed read-only views or explicit debug
+materializers over the database. Verification currently consumes the proof
+digest plus a narrow reactive pulse-fusion projection; those verifier facts can
+be sealed with their source rows so the ordinary verified token carries the
+compact image and certificate, while construction/debug graphs are dropped.
+The mandatory semantic -> verification -> erased-program trust boundary stays
+intact, but its ownership transfers become zero-copy.
+
+Retained definitions must cross every layer, not begin in the document
+backend. OUT currently has 5,147 concrete call instances for 1,821 checked
+calls, while the execution graph retains 312 ordinary bodies and the document
+backend still creates 2,320 ordinary-call scopes and 13,279 cache scopes.
+Interface/body units therefore publish a typed invocation ABI once; OUT and
+semantic links carry overlays, and `MachinePlan` stores verified function code
+plus dense invocation frames. The runtime executes that plan code through its
+typed kernels. It does not interpret checked or semantic ASTs.
+
+For warm work, retain unit-local parser products that already exist in the
+repository and split stable interface summaries from body rows. A body-only
+edit must not rebuild global declaration data or unrelated owners. This follows
+the useful architecture invariants in
+[rust-analyzer](https://rust-analyzer.github.io/book/contributing/architecture.html):
+file-local syntax permits parallel parsing, a compact item summary remains
+stable across body edits, and changing one function body must not invalidate
+facts about another. Roslyn likewise uses immutable, structurally shared syntax
+snapshots, while rustc/Salsa backdate unchanged query results. Boon should adopt
+those ownership rules in its existing typed database rather than import a
+per-expression query framework.
+
+TypeScript 7 reports roughly 8--12x full-build improvements from its native,
+shared-memory implementation and parallelism, but Boon is already native Rust.
+Its current 11.14 million allocation calls and multipass graph amplification
+show that language choice is not the remaining explanation. Parallel owner
+evaluation is a later multiplier over this owner-unit graph, not a substitute
+for deleting repeated representations and scans.
+
+#### Revised Architectural Priority
+
+1. Define the owner-unit/database seal and migrate complete checked plus
+   execution projections into it, deleting their post-hoc V4 inventories in
+   the same tranche. The seal owns stable interface/body fingerprints,
+   canonical row receipts, exact dependency spans, and revision metadata.
+2. Extend that unit through OUT, resource, reactive, lowering, storage, view,
+   and memory construction so the program linker consumes compact summaries
+   rather than nine independently owned graphs. Do this in owner-sized batches,
+   but remeasure only coherent batches that delete an old authority.
+3. Make the sealed canonical program image the primary retained storage and
+   reduce rich graphs to views/debug materializers. Move pulse-fusion and other
+   verifier inputs into sealed facts with mutation/omission negatives.
+4. Carry retained function code and invocation ABIs from owner units through
+   the program link and `MachinePlan`, deleting backend per-call recompilation
+   and cache-scope multiplication.
+5. Retain the same source/interface/body/link units across revisions, add
+   backdating/cancellation, then enable bounded owner parallelism only where
+   the explicit graph proves independence.
+
+The first coding batch may establish a small dependency-bottom database crate
+only if it is required to avoid checked/semantic/compiler dependency cycles.
+Such a crate may own revision numbers, stable owner/projection keys, compact
+receipt/dependency arenas, and memo metadata; it must not own language DTOs,
+runtime types, serialization policy, or a generic expression-query engine.
+Before accepting the split, measure the Rust rebuild closure as a separate
+developer-speed result. The Boon latency result comes only from deleted graph
+owners and passes.
+
 ## Architectural Decisions
 
 ### 1. Activation Is A First-Class Output, Not An Empty Mount
@@ -363,7 +487,13 @@ test-only exhaustive V3 materializer remains temporarily as an independent
 oracle. It must reconstruct the current dependency/coverage facts from the
 same sealed semantic database and prove:
 
-- every V3 subject has exactly one corresponding V4 row receipt;
+- every V3 subject maps to exactly one canonical owner-unit row plus an exact
+  classifier field/domain, and every executable database row is covered;
+- folding the independently materialized V3 subject classifications by their
+  canonical row and projection produces the same owner/projection commitments
+  as the production unit seal. Production does not allocate one receipt per
+  historical child-field subject: the canonical row fingerprint already binds
+  every field, while its typed dependency span binds external reads;
 - owner, projection, and cross-region dependency classifications agree;
 - mutations of every payload domain invalidate the owning implementation root;
 - unrelated-owner mutations do not invalidate another owner root;
@@ -376,9 +506,10 @@ Once the controlled proof migration passes, production must allocate no
 `SemanticDependencyRecordV1` or `SemanticDependencyCoverageV1` inventory. The
 test materializer cannot become a production fallback. Directional exit:
 manifest/proof work is at most 250 ms on NovyWave, the production graph is
-bounded by declared owner/projection regions plus measured compact exceptions
-rather than rich serialized-field cardinality, and end-to-end time/RSS both
-improve. Final acceptance still uses the performance plan's complete protocol.
+bounded by actual sealed database rows and declared owner/projection regions
+plus measured compact exceptions rather than rich serialized-field
+cardinality, and end-to-end time/RSS both improve. Final acceptance still uses
+the performance plan's complete protocol.
 
 ### 3. One Sealed Compilation Database, Not Nine Rich Graph Authorities
 
@@ -557,26 +688,33 @@ compiler latency.
 
 ## Execution Order
 
-1. Preserve checkpoint `32bcf40`; finish the full real-host NovyWave
-   migration/restart/provenance/negative oracle using its exact activation turn
-   and single recorded/replayed host transcript.
-2. Implement the minimal typed `CompilationDb` request/receipt/currentness
-   kernel and one end-to-end program-root plus ordinary-callable vertical
-   slice. Independently materialize V3 in tests, demand-collect the plan slice,
-   retain its executable function plus invocation frame, verify it, and delete
-   every superseded production owner in that slice.
-3. Expand that vertical cut across checked/OUT/execution/resource/reactive/
-   lowering/view/storage/memory domains. Production proof becomes owner-local/
-   projection roots plus the compact exact cross-region request graph; migrate
-   V3 to V4 only with the complete controlled proof evidence. No second warm
+1. Preserve activation checkpoint `32bcf40` and compact-proof/sealed-plan
+   checkpoint `38e6541`. Finish the full real-host NovyWave migration/restart/
+   provenance/negative oracle using the exact activation turn and one recorded/
+   replayed host transcript. V4 is already the production proof schema; this
+   remaining oracle is required before phase acceptance, not permission to
+   restore V3 production or revert the sound persistence type.
+2. Implement the typed `CompilationDb` owner-unit seal and migrate complete
+   checked plus execution projections through it. Each stable interface/body
+   unit owns dense rows, exact dependency spans, canonical receipts,
+   `changed_at`/`verified_at`, fingerprints, and a retained plan-function ABI.
+   Independently materialize V3 in tests and delete the corresponding checked/
+   execution inventory and graph owners in the same coherent batch.
+3. Expand the owner-unit/program-link cut across OUT/resource/reactive/
+   lowering/view/storage/memory domains. Production proof remains V4 owner-
+   local/projection roots plus the compact exact cross-region graph, but roots
+   now arrive from sealed units instead of a post-hoc inventory. Make the
+   canonical program image primary storage; delete each superseded rich graph
+   owner or reduce it to a typed view/debug materializer. No second warm
    dependency graph is allowed.
 4. Complete demand-collected retained plan functions/frames and replace backend
-   clone/rewrite/compact/hash passes with one `MachinePlan` builder seal. Return
-   one non-forgeable `SealedMachinePlan`; normal in-memory publication neither
-   retains construction IR/semantic products nor repeats plan verification or
-   hashing. Explicit debug/serialized-artifact intents and bounded pre-seal
-   distributed linking own those products. Deserialization verifies once, and
-   acceptance format migration remains controlled and scored.
+   per-call expansion plus clone/rewrite/compact/hash passes with one
+   `MachinePlan` builder seal. Return one non-forgeable `SealedMachinePlan`;
+   normal in-memory publication neither retains construction IR/semantic
+   products nor repeats plan verification or hashing. Explicit debug/
+   serialized-artifact intents and bounded pre-seal distributed linking own
+   those products. Deserialization verifies once, and acceptance format
+   migration remains controlled and scored.
 5. Reprofile the complete cold path. Return to a local optimization only when
    the new trace proves it is now the largest remaining owner.
 6. Retain the same source/check/semantic request graph across revisions and

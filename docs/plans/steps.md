@@ -31,10 +31,13 @@ stronger three-reviewer performance closure defined below.
    Preserve the landed independent-unit parser, `boon_syntax`/`boon_checked`
    cutovers, structured work counters, indexed parser validation/assembly, and
    deterministic non-recursive checked-diagnostic projection. The current
-   release candidate passes the six direct cold diagnostics time/RSS
-   combinations, but NovyWave empty-session has narrow p95 headroom. The first
-   incomplete tranche is therefore the owned checked database, measured
-   compact/name interning, contextual-scheme/inference worklist reduction,
+   `677d09d` release candidate passes the six direct cold diagnostics time/RSS
+   combinations, but NovyWave empty-session has narrow p95 headroom and that
+   evidence is stale after the next frontend edit. The parsed snapshot and both
+   checked construction owners are now lifetime-free without a material
+   allocation regression; the remaining first tranche is therefore fusing the
+   duplicate checker/builder into one owned database, measured compact/name
+   interning, contextual-scheme/inference worklist reduction,
    scaling/parity evidence, and the fresh Phase 1 adversarial review. Reprofile
    after each owner-level slice and regenerate the complete cold protocol after
    the final edit. Then close semantic sealing, proof, backend, hashing, and

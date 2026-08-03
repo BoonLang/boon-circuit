@@ -347,17 +347,29 @@ Current cold-diagnostics candidate evidence:
   allocation work fell from 1,997,515 calls / 225,753,409 bytes to 1,933,602
   calls / 219,951,108 bytes. The checked-result SHA-256 remains
   `495ef4195e0be4869e431c4036b74b6d6397c4b28b7fe7a8a76c76400a7b7992`.
-- One complete three-setup/30-scored direct protocol over the current prebuilt
-  release producer passes all six cold diagnostics time/RSS combinations:
+- One complete three-setup/30-scored direct protocol over checkpoint `677d09d`
+  passes all six cold diagnostics time/RSS combinations:
   Counter is 5.34/5.27 ms p95 fresh/empty, physical TodoMVC is 61.24/61.30 ms,
   and NovyWave is 234.48/248.86 ms. Maximum observed RSS is 11,140 KiB,
   27,132 KiB, and 70,868 KiB respectively. Each fixture/mode has one unchanged
   diagnostic count and one unchanged checked-result digest.
-- NovyWave empty-session has only 1.14 ms of p95 headroom. This is a passing
-  candidate, not the Phase 1 exit: the owned database, measured compact/name
-  interning and worklist reductions, scaling/parity evidence, and fresh
-  adversarial review remain mandatory. Any subsequent frontend change makes
-  this timing evidence stale and requires the full protocol again.
+- Checkpoint `677d09d`'s NovyWave empty-session result has only 1.14 ms of p95
+  headroom. It is a passing historical candidate, not the Phase 1 exit, and its
+  timing evidence became stale with the next frontend edit.
+- The next ownership slice makes `ParsedProgram` one immutable `Arc`-backed
+  snapshot, removes the lifetime from both `Checker` and
+  `CheckedProgramBuilder`, passes the complete 64-parser/80-typechecker suite
+  including both product-scale ignored oracles, and retains the exact NovyWave
+  checked-result digest. Function statements use one flat path-segment arena
+  rather than one allocation per function. Current directional release samples
+  are 230.83/229.30 ms fresh/empty; fresh allocation work is 1,933,612 calls /
+  219,965,836 bytes, only 10 calls / 14,728 bytes above `677d09d` while
+  establishing the required lifetime-free ownership boundary.
+- Item 7 is still incomplete: the lifetime-free checker and builder remain two
+  construction owners. Fuse checked construction into one owned database,
+  then complete measured compact/name interning and worklist reductions,
+  scaling/parity evidence, and the fresh adversarial review. Regenerate the
+  full cold protocol after the final Phase 1 edit.
 
 Development profiles and focused debug tests remain directional tools. The
 acceptance producer remains the revision-identified `release` binary required
@@ -652,12 +664,14 @@ compiler-service work or any later repository plan:
 
 Current resumption after the first passing cold-diagnostics candidate: finish
 item 7's owned database inside `boon_typecheck` rather than performing another
-crate move. Complete the measured compact/name interning and reduce the
-dominant contextual-scheme/inference worklists, then run the Phase 1 scaling,
+crate move. The parsed snapshot and both construction owners are now
+lifetime-free; next remove the duplicate checker/builder construction owner.
+Then complete the measured compact/name interning and reduce the dominant
+contextual-scheme/inference worklists before the Phase 1 scaling,
 malformed-source/parity, and fresh adversarial checks. Reprofile every
 owner-level slice and rerun the complete three-setup/30-scored cold protocol
-after the final Phase 1 edit; the narrow empty-session result above cannot be
-reused across source changes.
+after the final Phase 1 edit; checkpoint `677d09d`'s narrow empty-session result
+cannot be reused across these source changes.
 
 Once diagnostics pass, use the same loop for semantic component retention,
 single manifest sealing, verified lowering, streaming/hash memory, and backend

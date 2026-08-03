@@ -501,9 +501,7 @@ result: make() |> consume()
     {
         let (checker, _) = Checker::new_profiled(&parsed);
         let statement = checker
-            .function_statements
-            .get("make")
-            .copied()
+            .function_statement("make")
             .expect("make function statement");
         let Type::Object(result) = checker
             .function_body_return_type("make", statement, &mut BTreeSet::new())

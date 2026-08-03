@@ -85,10 +85,9 @@ impl ParserTrace {
 /// let mut parsed = boon_parser::parse_source("main.bn", "value: 1").unwrap();
 /// parsed.path.clear();
 /// ```
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ParsedProgram {
-    #[serde(flatten)]
-    fields: ParsedProgramFields,
+    fields: std::sync::Arc<ParsedProgramFields>,
 }
 
 impl std::ops::Deref for ParsedProgram {
@@ -101,7 +100,18 @@ impl std::ops::Deref for ParsedProgram {
 
 impl ParsedProgram {
     fn from_parser_fields(fields: ParsedProgramFields) -> Self {
-        Self { fields }
+        Self {
+            fields: std::sync::Arc::new(fields),
+        }
+    }
+}
+
+impl Serialize for ParsedProgram {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.fields.serialize(serializer)
     }
 }
 
@@ -7893,6 +7903,8 @@ selected:
     #[test]
     fn parsed_program_serialization_includes_unforgeable_provenance_fields() {
         let parsed = parse_source("app/main.bn", "value: 1\n").unwrap();
+        let cloned = parsed.clone();
+        assert!(std::sync::Arc::ptr_eq(&parsed.fields, &cloned.fields));
         assert!(std::ptr::eq(
             parsed.expressions.as_slice().as_ptr(),
             parsed.ast.expressions.as_slice().as_ptr(),

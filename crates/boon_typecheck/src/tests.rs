@@ -698,7 +698,7 @@ fn provisional_flow_mode_visits_for_pipeline(pipe_count: usize) -> (usize, usize
     let expression_count = parsed.expressions.len();
     let (mut checker, _) = Checker::new_profiled(&parsed);
     for statement in &parsed.ast.statements {
-        checker.check_statement(statement, false);
+        checker.check_statement(&parsed, statement, false);
     }
     for expression in &parsed.expressions {
         checker.ensure_expr(expression.id);

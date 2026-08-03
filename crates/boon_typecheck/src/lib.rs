@@ -124,8 +124,8 @@ fn checked_intrinsic_v1(kind: CheckedCallableKind, name: &str) -> Option<Checked
     }
 }
 
-struct CheckedProgramBuilder<'a> {
-    program: &'a ParsedProgram,
+struct CheckedProgramBuilder {
+    program: ParsedProgram,
     role: ProgramRole,
     external_value_modes: BTreeMap<String, FlowMode>,
     external_identities: BTreeMap<String, CheckedExternalDeclarationIdentityV1>,
@@ -1349,9 +1349,9 @@ fn checked_contextual_operation_formals(
     })
 }
 
-impl<'a> CheckedProgramBuilder<'a> {
+impl CheckedProgramBuilder {
     fn build(
-        program: &'a ParsedProgram,
+        program: &ParsedProgram,
         inputs: OwnedCheckedConstruction,
     ) -> CheckedProgramBuildOutput {
         let OwnedCheckedConstruction {
@@ -1398,7 +1398,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                 },
             );
             Self {
-                program,
+                program: program.clone(),
                 role: external_types.current_role,
                 external_value_modes: external_types
                     .values
@@ -1505,11 +1505,11 @@ impl<'a> CheckedProgramBuilder<'a> {
             let child_exprs = expression_child_ids(&program.expressions);
             for expr in &program.expressions {
                 if !child_exprs.contains(&expr.id) {
-                    builder.visit_expr(expr.id, BTreeMap::new());
+                    builder.visit_expr(program, expr.id, BTreeMap::new());
                 }
             }
             for expr in &program.expressions {
-                builder.visit_expr(expr.id, BTreeMap::new());
+                builder.visit_expr(program, expr.id, BTreeMap::new());
             }
         });
         checked_program_phase!("index_semantics", builder.rebuild_semantic_indexes());
@@ -2412,8 +2412,8 @@ impl<'a> CheckedProgramBuilder<'a> {
     }
 
     fn register_host_effect_signatures(&mut self) {
-        let operations = self
-            .program
+        let program = self.program.clone();
+        let operations = program
             .expressions
             .iter()
             .filter_map(ast_callable_name)
@@ -2709,7 +2709,12 @@ impl<'a> CheckedProgramBuilder<'a> {
         }
     }
 
-    fn visit_expr(&mut self, expr_id: usize, mut available_outputs: BTreeMap<String, DeclId>) {
+    fn visit_expr(
+        &mut self,
+        program: &ParsedProgram,
+        expr_id: usize,
+        mut available_outputs: BTreeMap<String, DeclId>,
+    ) {
         if !self.visited_exprs.insert(expr_id) {
             return;
         }
@@ -2724,7 +2729,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                 available_outputs.insert(parameter.name.clone(), parameter.decl_id);
             }
         }
-        let Some(expr) = self.program.expressions.get(expr_id) else {
+        let Some(expr) = program.expressions.get(expr_id) else {
             return;
         };
         let (function, raw_pipe_input, args, pass) = match &expr.kind {
@@ -2790,15 +2795,15 @@ impl<'a> CheckedProgramBuilder<'a> {
         }
 
         if let Some(input) = pipe_input {
-            self.visit_expr(input, available_outputs.clone());
+            self.visit_expr(program, input, available_outputs.clone());
         }
         for arg in args {
             if arg.kind == AstCallArgKind::Named {
-                self.visit_expr(arg.value, nested_outputs.clone());
+                self.visit_expr(program, arg.value, nested_outputs.clone());
             }
         }
         if let Some(pass) = pass {
-            self.visit_expr(pass.value, available_outputs.clone());
+            self.visit_expr(program, pass.value, available_outputs.clone());
         }
         for child in direct_expression_children(expr) {
             if raw_pipe_input == Some(child)
@@ -2808,7 +2813,7 @@ impl<'a> CheckedProgramBuilder<'a> {
             {
                 continue;
             }
-            self.visit_expr(child, available_outputs.clone());
+            self.visit_expr(program, child, available_outputs.clone());
         }
     }
 
@@ -2983,7 +2988,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                     });
                 }
                 (CheckedParameterKind::Out, AstCallArgKind::Named) => {
-                    let target_name = expression_single_name(self.program, arg.value);
+                    let target_name = expression_single_name(&self.program, arg.value);
                     let target = target_name
                         .as_deref()
                         .and_then(|name| available_outputs.get(name).copied());
@@ -7091,13 +7096,14 @@ impl<'a> CheckedProgramBuilder<'a> {
 
     fn install_flush_control_contract(&mut self) {
         let inferred =
-            infer_checked_expression_flush_types(self.program, &self.inferred_expr_types);
+            infer_checked_expression_flush_types(&self.program, &self.inferred_expr_types);
         self.expression_flush_types = inferred.types;
         self.diagnostics.extend(inferred.diagnostics);
         let (changed_expressions, changed_declarations) =
             self.invalidate_flush_boundary_authoritative_types();
 
-        for expression in &self.program.expressions {
+        let program = self.program.clone();
+        for expression in &program.expressions {
             let AstExprKind::Hold { initial, .. } = expression.kind else {
                 continue;
             };
@@ -7296,7 +7302,7 @@ impl<'a> CheckedProgramBuilder<'a> {
             inputs
                 .iter()
                 .find_map(|(candidate, value)| (candidate == name).then_some(*value))
-                .and_then(|value| static_integer_expr(self.program, value.0 as usize))
+                .and_then(|value| static_integer_expr(&self.program, value.0 as usize))
                 .and_then(|value| u32::try_from(value).ok())
                 .filter(|width| (1..=MAX_BITS_WIDTH).contains(width))
         };
@@ -7490,7 +7496,7 @@ impl<'a> CheckedProgramBuilder<'a> {
         bindings: &BTreeMap<DeclId, Type>,
         active_callables: &mut BTreeSet<DeclId>,
     ) -> Option<Type> {
-        let program = self.program;
+        let program = self.program.clone();
         let expression = program.expressions.get(expr_id)?;
         let fallback = self
             .inferred_expr_types
@@ -8283,7 +8289,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                 .get(&(expression.0 as usize))
                 .map(|flow| flow.mode);
         }
-        let program = self.program;
+        let program = self.program.clone();
         let expr = program.expressions.get(expression.0 as usize)?;
         let mode = match &expr.kind {
             AstExprKind::Source | AstExprKind::Then { .. } => FlowMode::PresentOrAbsent,
@@ -8738,7 +8744,7 @@ impl<'a> CheckedProgramBuilder<'a> {
         // reference locally so recursive mutable inference can borrow syntax
         // in place instead of cloning a full `AstExpr` and then its kind on
         // every cache miss.
-        let program = self.program;
+        let program = self.program.clone();
         let Some(expr) = program.expressions.get(expr_id) else {
             active.remove(&expr_id);
             return fallback;
@@ -10088,7 +10094,7 @@ impl<'a> CheckedProgramBuilder<'a> {
 
         let mut result = BTreeSet::new();
         visit(
-            self.program,
+            &self.program,
             expression.0 as usize,
             parameters,
             &mut BTreeSet::new(),
@@ -12914,7 +12920,7 @@ impl<'a> CheckedOrderAnalyzer<'a> {
                         });
                         expanded.or_else(|| {
                             declaration.and_then(|declaration| {
-                                checked_declaration_canonical_path(self.program, declaration).map(
+                                checked_declaration_canonical_path(&self.program, declaration).map(
                                     |path| CheckedOrderSemanticExpression::Capture {
                                         path,
                                         projection: projection.clone(),
@@ -16942,8 +16948,8 @@ struct CheckerInitProfile {
     refresh_static_list_bindings_ms: f64,
 }
 
-struct Checker<'a> {
-    program: &'a ParsedProgram,
+struct Checker {
+    program: ParsedProgram,
     external_types: ExternalTypeEnvironment,
     vars: TypeVarStore,
     builtins: BuiltinSignatureRegistry,
@@ -16956,7 +16962,7 @@ struct Checker<'a> {
     source_payload_shape_table: Vec<SourcePayloadSyntaxShapeEntry>,
     source_payload_types: BTreeMap<String, Type>,
     host_port_table: HostPortSyntaxTable,
-    function_statements: BTreeMap<String, &'a AstStatement>,
+    function_statements: FunctionStatementIndex,
     function_call_graph: BTreeMap<String, BTreeSet<String>>,
     expression_owner: DenseIndexTable<String>,
     function_args_by_name: BTreeMap<String, Vec<AstParameter>>,
@@ -17147,12 +17153,12 @@ impl StaticBindingLookup for StaticBindingOverlay<'_> {
     }
 }
 
-impl<'a> Checker<'a> {
-    fn new_profiled(program: &'a ParsedProgram) -> (Self, CheckerInitProfile) {
+impl Checker {
+    fn new_profiled(program: &ParsedProgram) -> (Self, CheckerInitProfile) {
         Self::new_profiled_with_external_types(program, &ExternalTypeEnvironment::default())
     }
 
-    fn new_diagnostics_profiled(program: &'a ParsedProgram) -> (Self, CheckerInitProfile) {
+    fn new_diagnostics_profiled(program: &ParsedProgram) -> (Self, CheckerInitProfile) {
         Self::new_profiled_with_external_types_and_legacy_bindings(
             program,
             &ExternalTypeEnvironment::default(),
@@ -17161,21 +17167,21 @@ impl<'a> Checker<'a> {
     }
 
     fn new_profiled_with_external_types(
-        program: &'a ParsedProgram,
+        program: &ParsedProgram,
         external_types: &ExternalTypeEnvironment,
     ) -> (Self, CheckerInitProfile) {
         Self::new_profiled_with_external_types_and_legacy_bindings(program, external_types, true)
     }
 
     fn new_diagnostics_profiled_with_external_types(
-        program: &'a ParsedProgram,
+        program: &ParsedProgram,
         external_types: &ExternalTypeEnvironment,
     ) -> (Self, CheckerInitProfile) {
         Self::new_profiled_with_external_types_and_legacy_bindings(program, external_types, false)
     }
 
     fn new_profiled_with_external_types_and_legacy_bindings(
-        program: &'a ParsedProgram,
+        program: &ParsedProgram,
         external_types: &ExternalTypeEnvironment,
         initialize_legacy_bindings: bool,
     ) -> (Self, CheckerInitProfile) {
@@ -17206,10 +17212,10 @@ impl<'a> Checker<'a> {
             .collect();
         let source_payload_types_ms = typecheck_elapsed_ms(source_payload_types_started);
         let function_index_started = Instant::now();
-        let function_statements = function_statement_map(&program.ast.statements);
+        let function_statements = function_statement_index(&program.ast.statements);
         let function_call_graph = function_call_graph(program);
         let expression_owner = expression_owner_functions(program);
-        let function_args_by_name = function_args_by_statement_map(&function_statements);
+        let function_args_by_name = function_args_by_statement_index(program, &function_statements);
         let function_arg_call_sites = function_arg_call_site_index(program, &function_args_by_name);
         let function_index_ms = typecheck_elapsed_ms(function_index_started);
         let object_bindings_started = Instant::now();
@@ -17270,7 +17276,7 @@ impl<'a> Checker<'a> {
             })
             .collect();
         let mut checker = Self {
-            program,
+            program: program.clone(),
             external_types: external_types.clone(),
             vars: TypeVarStore::with_reserved_vars(BUILTIN_TYPE_VAR_COUNT),
             builtins: BuiltinSignatureRegistry::default(),
@@ -17400,10 +17406,10 @@ impl<'a> Checker<'a> {
     }
 
     fn build_checked_program_first(&mut self) -> CheckedProgramBuildOutput {
-        let render_context = render_context_syntax_index(self.program);
+        let render_context = render_context_syntax_index(&self.program);
         self.render_context_function_statements = render_context.function_statements;
         let render_slot_statements = render_context.render_slot_statements;
-        self.structured_delimiter_fields = structured_delimiter_field_index(self.program);
+        self.structured_delimiter_fields = structured_delimiter_field_index(&self.program);
         let builtins = std::mem::replace(
             &mut self.builtins,
             BuiltinSignatureRegistry {
@@ -17418,7 +17424,7 @@ impl<'a> Checker<'a> {
             },
         );
         let mut output = CheckedProgramBuilder::build(
-            self.program,
+            &self.program,
             OwnedCheckedConstruction {
                 external_types: std::mem::take(&mut self.external_types),
                 render_slot_statements,
@@ -17640,9 +17646,9 @@ impl<'a> Checker<'a> {
         if self.checked_diagnostic_projection_mode
             == CheckedDiagnosticProjectionMode::RecursiveOracle
         {
-            let program = self.program;
+            let program = self.program.clone();
             for statement in &program.ast.statements {
-                self.check_statement(statement, false);
+                self.check_statement(&program, statement, false);
             }
         } else {
             self.project_checked_statement_diagnostics();
@@ -17939,7 +17945,7 @@ impl<'a> Checker<'a> {
         if include_type_hints {
             let type_hint_table_started = Instant::now();
             type_hint_table = crate::type_hint_table(
-                self.program,
+                &self.program,
                 &self.expr_type_table,
                 &self.function_type_table,
                 &self.render_slot_table,
@@ -17979,7 +17985,7 @@ impl<'a> Checker<'a> {
             if trace_typecheck {
                 eprintln!("boon_typecheck resolved_constant_table:start");
             }
-            let table = resolved_constant_table(self.program);
+            let table = resolved_constant_table(&self.program);
             trace_phase(
                 "resolved_constant_table",
                 typecheck_elapsed_ms(resolved_constant_table_started),
@@ -17989,7 +17995,7 @@ impl<'a> Checker<'a> {
         let builtin_signature_coverage = if runtime_owned_success {
             Vec::new()
         } else {
-            builtin_signature_coverage(self.program)
+            builtin_signature_coverage(&self.program)
         };
         let source_payload_shape_coverage = if runtime_owned_success {
             Vec::new()
@@ -18019,7 +18025,7 @@ impl<'a> Checker<'a> {
             source_payload_shape_coverage,
             source_payload_shape_table,
             host_port_table,
-            full_document_typecheck_coverage: document_root(self.program).is_none_or(|root| {
+            full_document_typecheck_coverage: document_root(&self.program).is_none_or(|root| {
                 statement_expr_ids(root).into_iter().all(|expr_id| {
                     checked_program
                         .expressions
@@ -18149,6 +18155,7 @@ impl<'a> Checker<'a> {
 
     fn begin_checked_diagnostic_statement(
         &mut self,
+        program: &ParsedProgram,
         statement: &AstStatement,
         in_document: bool,
     ) -> CheckedDiagnosticStatementContext {
@@ -18189,13 +18196,13 @@ impl<'a> Checker<'a> {
                 ));
             }
             if let Some(function) =
-                render_constructor_for_expr(expr_id, &self.program.expressions).map(str::to_owned)
+                render_constructor_for_expr(expr_id, &program.expressions).map(str::to_owned)
             {
                 self.check_render_constructor_fields(statement, &function);
             }
         }
         self.check_pipeline_continuation_compatibility(statement);
-        self.check_pattern_constraints(statement);
+        self.check_pattern_constraints(program, statement);
         self.check_hold_update_compatibility(statement);
         self.check_latest_branch_compatibility(statement);
         if self.render_slot_statements.contains(&statement.id) {
@@ -18215,21 +18222,21 @@ impl<'a> Checker<'a> {
         let when_selector = statement
             .expr
             .and_then(|expr_id| {
-                pattern_selector_expr_id(expr_id, &self.program.expressions).map(|input_expr_id| {
+                pattern_selector_expr_id(expr_id, &program.expressions).map(|input_expr_id| {
                     (
                         expr_id,
                         pipeline_source_expr_id(
-                            &self.program.ast.statements,
+                            &program.ast.statements,
                             expr_id,
                             input_expr_id,
-                            &self.program.expressions,
+                            &program.expressions,
                         ),
                     )
                 })
             })
             .map(|(_, selector_expr_id)| {
                 Arc::new(CheckedDiagnosticWhenSelector {
-                    path: pattern_selector_path(self.program.expressions.get(selector_expr_id)),
+                    path: pattern_selector_path(program.expressions.get(selector_expr_id)),
                     ty: self.ensure_expr(selector_expr_id).ty,
                 })
             });
@@ -18242,13 +18249,14 @@ impl<'a> Checker<'a> {
 
     fn begin_checked_diagnostic_child_scope(
         &mut self,
+        program: &ParsedProgram,
         child: &AstStatement,
         when_selector: Option<&CheckedDiagnosticWhenSelector>,
     ) -> CheckedDiagnosticChildCleanup {
         let narrowed_bindings = when_selector.and_then(|selector| {
             let pattern = child
                 .expr
-                .and_then(|expr_id| self.program.expressions.get(expr_id))
+                .and_then(|expr_id| program.expressions.get(expr_id))
                 .and_then(|expr| match &expr.kind {
                     AstExprKind::MatchArm { pattern, .. } => Some(pattern),
                     _ => None,
@@ -18266,7 +18274,7 @@ impl<'a> Checker<'a> {
         let payload_bindings = when_selector.and_then(|selector| {
             let pattern = child
                 .expr
-                .and_then(|expr_id| self.program.expressions.get(expr_id))
+                .and_then(|expr_id| program.expressions.get(expr_id))
                 .and_then(|expr| match &expr.kind {
                     AstExprKind::MatchArm { pattern, .. } => Some(pattern),
                     _ => None,
@@ -18322,7 +18330,7 @@ impl<'a> Checker<'a> {
             FinishFunction,
         }
 
-        let program = self.program;
+        let program = self.program.clone();
         let mut tasks = program
             .ast
             .statements
@@ -18339,7 +18347,8 @@ impl<'a> Checker<'a> {
                     statement,
                     in_document,
                 } => {
-                    let context = self.begin_checked_diagnostic_statement(statement, in_document);
+                    let context =
+                        self.begin_checked_diagnostic_statement(&program, statement, in_document);
                     if context.has_function_bindings {
                         tasks.push(Task::FinishFunction);
                     }
@@ -18360,8 +18369,11 @@ impl<'a> Checker<'a> {
                     in_document,
                     when_selector,
                 } => {
-                    let cleanup = self
-                        .begin_checked_diagnostic_child_scope(statement, when_selector.as_deref());
+                    let cleanup = self.begin_checked_diagnostic_child_scope(
+                        &program,
+                        statement,
+                        when_selector.as_deref(),
+                    );
                     tasks.push(Task::FinishChild(cleanup));
                     tasks.push(Task::Enter {
                         statement,
@@ -18379,12 +18391,20 @@ impl<'a> Checker<'a> {
     }
 
     #[cfg(test)]
-    fn check_statement(&mut self, statement: &AstStatement, in_document: bool) {
-        let context = self.begin_checked_diagnostic_statement(statement, in_document);
+    fn check_statement(
+        &mut self,
+        program: &ParsedProgram,
+        statement: &AstStatement,
+        in_document: bool,
+    ) {
+        let context = self.begin_checked_diagnostic_statement(program, statement, in_document);
         for child in &statement.children {
-            let cleanup =
-                self.begin_checked_diagnostic_child_scope(child, context.when_selector.as_deref());
-            self.check_statement(child, context.next_in_document);
+            let cleanup = self.begin_checked_diagnostic_child_scope(
+                program,
+                child,
+                context.when_selector.as_deref(),
+            );
+            self.check_statement(program, child, context.next_in_document);
             self.finish_checked_diagnostic_child_scope(cleanup);
         }
         if context.has_function_bindings {
@@ -18899,7 +18919,7 @@ impl<'a> Checker<'a> {
                 && use_recursive_oracle
                 && self.diagnostic_replayed.insert(expr_id)
             {
-                let program = self.program;
+                let program = self.program.clone();
                 if let Some(expression) = program.expressions.get(expr_id) {
                     self.replay_checked_expr_diagnostics(expression);
                 }
@@ -18943,7 +18963,7 @@ impl<'a> Checker<'a> {
                     tasks.extend(sequence.drain(..).rev());
                 }
                 CheckedDiagnosticExpressionTask::ReplayLeaf(expression) => {
-                    let program = self.program;
+                    let program = self.program.clone();
                     if let Some(expression) = program.expressions.get(expression) {
                         self.replay_checked_expr_diagnostics(expression);
                     }
@@ -19157,7 +19177,7 @@ impl<'a> Checker<'a> {
                         kind: AstExprKind::MapEntry { key, .. },
                         ..
                     }) = self.program.expressions.get(*entry)
-                        && let Some(key_value) = static_key_value(self.program, *key)
+                        && let Some(key_value) = static_key_value(&self.program, *key)
                     {
                         if let Some((_, previous)) = static_keys
                             .iter_mut()
@@ -19530,11 +19550,12 @@ impl<'a> Checker<'a> {
         else {
             return;
         };
+        let fixed_size = !matches!(size, BytesSizeSyntax::Dynamic);
         let item_type = self.ensure_expr(item).ty;
         match item_type {
             Type::Bytes(BytesType::Fixed(_)) => {}
             Type::Bytes(BytesType::Dynamic) => {
-                if !matches!(size, BytesSizeSyntax::Dynamic) {
+                if fixed_size {
                     self.diagnostics.push(self.diagnostic_for_expr(
                         item,
                         "fixed BYTES constructors cannot contain dynamic BYTES".to_owned(),
@@ -19650,7 +19671,7 @@ impl<'a> Checker<'a> {
     }
 
     fn project_external_call_diagnostics(&mut self, expression: usize) {
-        let program = self.program;
+        let program = self.program.clone();
         let Some(syntax) = program.expressions.get(expression) else {
             return;
         };
@@ -19674,7 +19695,7 @@ impl<'a> Checker<'a> {
     }
 
     fn project_builtin_complete_diagnostics(&mut self, expression: usize) {
-        let program = self.program;
+        let program = self.program.clone();
         let Some(syntax) = program.expressions.get(expression) else {
             return;
         };
@@ -19698,7 +19719,7 @@ impl<'a> Checker<'a> {
     }
 
     fn project_builtin_contextual_head_diagnostics(&mut self, expression: usize) {
-        let program = self.program;
+        let program = self.program.clone();
         let Some(syntax) = program.expressions.get(expression) else {
             return;
         };
@@ -19721,7 +19742,7 @@ impl<'a> Checker<'a> {
     }
 
     fn project_builtin_argument(&mut self, expression: usize, argument: usize) {
-        let program = self.program;
+        let program = self.program.clone();
         let Some(syntax) = program.expressions.get(expression) else {
             return;
         };
@@ -19741,7 +19762,7 @@ impl<'a> Checker<'a> {
     }
 
     fn project_builtin_tail_diagnostics(&mut self, expression: usize) {
-        let program = self.program;
+        let program = self.program.clone();
         let Some(syntax) = program.expressions.get(expression) else {
             return;
         };
@@ -19903,7 +19924,7 @@ impl<'a> Checker<'a> {
                         kind: AstExprKind::MapEntry { key, .. },
                         ..
                     }) = self.program.expressions.get(*entry)
-                        && let Some(key_value) = static_key_value(self.program, *key)
+                        && let Some(key_value) = static_key_value(&self.program, *key)
                         && let Some(first) = static_keys.insert(key_value, *key)
                     {
                         self.diagnostics.push(self.diagnostic_for_expr(
@@ -20200,7 +20221,7 @@ impl<'a> Checker<'a> {
                         kind: AstExprKind::MapEntry { key, .. },
                         ..
                     }) = self.program.expressions.get(*entry)
-                        && let Some(key_value) = static_key_value(self.program, *key)
+                        && let Some(key_value) = static_key_value(&self.program, *key)
                         && let Some(first) = static_keys.insert(key_value, *key)
                     {
                         self.diagnostics.push(self.diagnostic_for_expr(
@@ -20605,6 +20626,13 @@ impl<'a> Checker<'a> {
             )
     }
 
+    fn function_statement(&self, name: &str) -> Option<&AstStatement> {
+        statement_at_path(
+            &self.program.ast.statements,
+            self.function_statements.get(name)?,
+        )
+    }
+
     fn infer_bytes_literal(
         &mut self,
         expr: &AstExpr,
@@ -20917,7 +20945,7 @@ impl<'a> Checker<'a> {
         name: &str,
     ) -> Option<u32> {
         let expr_id = named_arg_expr(args, name)?;
-        let Some(value) = static_exact_number_expr(self.program, expr_id) else {
+        let Some(value) = static_exact_number_expr(&self.program, expr_id) else {
             self.diagnostics.push(self.diagnostic_for_expr(
                 expr_id,
                 format!(
@@ -20962,7 +20990,7 @@ impl<'a> Checker<'a> {
         width: u32,
     ) -> Option<u32> {
         let expr_id = named_arg_expr(args, name)?;
-        let Some(value) = static_exact_number_expr(self.program, expr_id) else {
+        let Some(value) = static_exact_number_expr(&self.program, expr_id) else {
             return None;
         };
         let Ok(value) = value.to_u64_exact() else {
@@ -20995,7 +21023,7 @@ impl<'a> Checker<'a> {
         let Some(expr_id) = named_arg_expr(args, name) else {
             return;
         };
-        let Some(value) = static_exact_number_expr(self.program, expr_id) else {
+        let Some(value) = static_exact_number_expr(&self.program, expr_id) else {
             return;
         };
         if !value.is_whole() || value.is_negative() {
@@ -21229,7 +21257,7 @@ impl<'a> Checker<'a> {
             let Some(value_expr) = named_arg_expr(args, name) else {
                 continue;
             };
-            let Some(value) = static_exact_number_expr(self.program, value_expr) else {
+            let Some(value) = static_exact_number_expr(&self.program, value_expr) else {
                 continue;
             };
             if !value.is_whole() {
@@ -21262,7 +21290,7 @@ impl<'a> Checker<'a> {
         let Some(quantum_expr) = named_arg_expr(args, "to") else {
             return;
         };
-        let Some(quantum) = static_exact_number_expr(self.program, quantum_expr) else {
+        let Some(quantum) = static_exact_number_expr(&self.program, quantum_expr) else {
             return;
         };
         if !quantum.is_positive() {
@@ -21475,7 +21503,7 @@ impl<'a> Checker<'a> {
             ) {
                 continue;
             }
-            match static_integer_expr_checked(self.program, arg.value) {
+            match static_integer_expr_checked(&self.program, arg.value) {
                 Err(StaticIntegerExprError::Overflow) => {
                     self.diagnostics.push(self.diagnostic_for_expr(
                         arg.value,
@@ -21484,7 +21512,7 @@ impl<'a> Checker<'a> {
                         ),
                     ));
                 }
-                Ok(None) if unsupported_literal_static_integer_expr(self.program, arg.value) => {
+                Ok(None) if unsupported_literal_static_integer_expr(&self.program, arg.value) => {
                     self.diagnostics.push(self.diagnostic_for_expr(
                         arg.value,
                         format!(
@@ -22105,7 +22133,7 @@ impl<'a> Checker<'a> {
         if value_parameters.len() != argument_types.len() {
             return None;
         }
-        let statement = self.function_statements.get(function).copied()?;
+        let statement = self.function_statement(function)?;
         let mut bindings = self.user_function_static_bindings(function);
         for (parameter, argument_type) in value_parameters.into_iter().zip(&argument_types) {
             bindings.insert(parameter.name.clone(), argument_type.clone());
@@ -22445,12 +22473,12 @@ impl<'a> Checker<'a> {
     }
 
     fn static_usize_literal(&self, expr_id: usize) -> Option<usize> {
-        let value = static_integer_expr(self.program, expr_id)?;
+        let value = static_integer_expr(&self.program, expr_id)?;
         usize::try_from(value).ok()
     }
 
     fn static_integer_literal(&self, expr_id: usize) -> Option<i128> {
-        static_integer_expr(self.program, expr_id)
+        static_integer_expr(&self.program, expr_id)
     }
 
     fn render_constructor_type_for_args(
@@ -23119,13 +23147,9 @@ impl<'a> Checker<'a> {
         if !active_functions.insert(function.to_owned()) {
             return None;
         }
-        let result = self
-            .function_statements
-            .get(function)
-            .copied()
-            .and_then(|statement| {
-                self.function_body_return_type(function, statement, active_functions)
-            });
+        let result = self.function_statement(function).and_then(|statement| {
+            self.function_body_return_type(function, statement, active_functions)
+        });
         active_functions.remove(function);
         self.function_return_type_cache
             .borrow_mut()
@@ -23952,12 +23976,11 @@ impl<'a> Checker<'a> {
         }
     }
 
-    fn check_pattern_constraints(&mut self, statement: &AstStatement) {
+    fn check_pattern_constraints(&mut self, program: &ParsedProgram, statement: &AstStatement) {
         let Some(expr_id) = statement.expr else {
             return;
         };
-        let Some(selector_expr_id) = pattern_selector_expr_id(expr_id, &self.program.expressions)
-        else {
+        let Some(selector_expr_id) = pattern_selector_expr_id(expr_id, &program.expressions) else {
             return;
         };
         let selector_type = self.ensure_expr(selector_expr_id).ty;
@@ -23966,7 +23989,7 @@ impl<'a> Checker<'a> {
             let Some(AstExpr {
                 kind: AstExprKind::MatchArm { pattern, .. },
                 ..
-            }) = self.program.expressions.get(arm_expr_id)
+            }) = program.expressions.get(arm_expr_id)
             else {
                 continue;
             };
@@ -24470,15 +24493,16 @@ impl<'a> Checker<'a> {
         ) {
             return;
         }
+        let is_scalar_literal = matches!(
+            expr.kind,
+            AstExprKind::StringLiteral(_)
+                | AstExprKind::TextLiteral(_)
+                | AstExprKind::Number(_)
+                | AstExprKind::Tag(_)
+        );
         let AstExprKind::Object(fields) = &expr.kind else {
             let ty = self.ensure_expr(expr_id).ty;
-            if !matches!(
-                expr.kind,
-                AstExprKind::StringLiteral(_)
-                    | AstExprKind::TextLiteral(_)
-                    | AstExprKind::Number(_)
-                    | AstExprKind::Tag(_)
-            ) {
+            if !is_scalar_literal {
                 return;
             }
             if !is_open_object_type(&ty) {
@@ -24636,6 +24660,7 @@ impl<'a> Checker<'a> {
             report_recursive_function_cycles(
                 function,
                 &self.function_call_graph,
+                &self.program.ast.statements,
                 &self.function_statements,
                 &mut visited,
                 &mut active,
@@ -24646,7 +24671,8 @@ impl<'a> Checker<'a> {
     }
 
     fn check_host_effect_calls(&mut self) {
-        for expr in &self.program.expressions {
+        let program = self.program.clone();
+        for expr in &program.expressions {
             let (operation, inline_args, direct_call) = match &expr.kind {
                 AstExprKind::Call { function, args, .. } => (function, args.as_slice(), true),
                 AstExprKind::Pipe { op, args, .. } => (op, args.as_slice(), false),
@@ -24665,7 +24691,7 @@ impl<'a> Checker<'a> {
                 continue;
             }
 
-            let arguments = named_call_argument_exprs(self.program, expr.id, inline_args);
+            let arguments = named_call_argument_exprs(&program, expr.id, inline_args);
             let mut actual = BTreeMap::<&str, usize>::new();
             for (name, value_expr_id) in &arguments {
                 if actual.insert(name.as_str(), *value_expr_id).is_some() {
@@ -24942,18 +24968,72 @@ fn function_call_argument_expr(
         .map(|arg| arg.value)
 }
 
-fn function_statement_map(statements: &[AstStatement]) -> BTreeMap<String, &AstStatement> {
-    let mut functions = BTreeMap::new();
-    collect_function_statements(statements, &mut functions);
+#[derive(Default)]
+struct FunctionStatementIndex {
+    path_segments: Vec<usize>,
+    path_by_name: BTreeMap<String, std::ops::Range<usize>>,
+}
+
+impl FunctionStatementIndex {
+    fn insert(&mut self, name: String, path: &[usize]) {
+        let start = self.path_segments.len();
+        self.path_segments.extend_from_slice(path);
+        let end = self.path_segments.len();
+        self.path_by_name.insert(name, start..end);
+    }
+
+    fn contains_key(&self, name: &str) -> bool {
+        self.path_by_name.contains_key(name)
+    }
+
+    fn get(&self, name: &str) -> Option<&[usize]> {
+        self.path_segments.get(self.path_by_name.get(name)?.clone())
+    }
+}
+
+fn function_statement_index(statements: &[AstStatement]) -> FunctionStatementIndex {
+    fn collect(
+        statements: &[AstStatement],
+        path: &mut SmallVec<[usize; 8]>,
+        functions: &mut FunctionStatementIndex,
+    ) {
+        for (index, statement) in statements.iter().enumerate() {
+            path.push(index);
+            if let AstStatementKind::Function { name, .. } = &statement.kind {
+                functions.insert(name.clone(), path);
+            }
+            collect(&statement.children, path, functions);
+            path.pop();
+        }
+    }
+
+    let mut functions = FunctionStatementIndex::default();
+    collect(statements, &mut SmallVec::new(), &mut functions);
     functions
 }
 
-fn function_args_by_statement_map(
-    function_statements: &BTreeMap<String, &AstStatement>,
+fn statement_at_path<'a>(
+    statements: &'a [AstStatement],
+    path: &[usize],
+) -> Option<&'a AstStatement> {
+    let (first, rest) = path.split_first()?;
+    let mut statement = statements.get(*first)?;
+    for index in rest {
+        statement = statement.children.get(*index)?;
+    }
+    Some(statement)
+}
+
+fn function_args_by_statement_index(
+    program: &ParsedProgram,
+    function_statements: &FunctionStatementIndex,
 ) -> BTreeMap<String, Vec<AstParameter>> {
     function_statements
-        .iter()
-        .filter_map(|(name, statement)| {
+        .path_by_name
+        .keys()
+        .filter_map(|name| {
+            let path = function_statements.get(name)?;
+            let statement = statement_at_path(&program.ast.statements, path)?;
             let AstStatementKind::Function { parameters, .. } = &statement.kind else {
                 return None;
             };
@@ -25046,18 +25126,6 @@ fn collect_multiline_function_arg_call_sites(
             function_args_by_name,
             index,
         );
-    }
-}
-
-fn collect_function_statements<'a>(
-    statements: &'a [AstStatement],
-    functions: &mut BTreeMap<String, &'a AstStatement>,
-) {
-    for statement in statements {
-        if let AstStatementKind::Function { name, .. } = &statement.kind {
-            functions.insert(name.clone(), statement);
-        }
-        collect_function_statements(&statement.children, functions);
     }
 }
 
@@ -25226,7 +25294,8 @@ fn collect_expr_user_function_calls(
 fn report_recursive_function_cycles(
     function: &str,
     graph: &BTreeMap<String, BTreeSet<String>>,
-    function_statements: &BTreeMap<String, &AstStatement>,
+    statements: &[AstStatement],
+    function_statements: &FunctionStatementIndex,
     visited: &mut BTreeSet<String>,
     active: &mut Vec<String>,
     reported: &mut BTreeSet<String>,
@@ -25241,7 +25310,9 @@ fn report_recursive_function_cycles(
         for name in &cycle[..cycle.len().saturating_sub(1)] {
             if reported.insert(name.clone()) {
                 diagnostics.push(diagnostic_for_statement(
-                    function_statements.get(name).copied(),
+                    function_statements
+                        .get(name)
+                        .and_then(|path| statement_at_path(statements, path)),
                     format!(
                         "`FUNCTION {name}` is recursive; recursive functions are not supported by v1 type inference: {}",
                         cycle.join(" -> ")
@@ -25260,6 +25331,7 @@ fn report_recursive_function_cycles(
             report_recursive_function_cycles(
                 call,
                 graph,
+                statements,
                 function_statements,
                 visited,
                 active,

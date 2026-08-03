@@ -206,92 +206,72 @@ stronger three-reviewer performance closure defined below.
    red until V3 records source/old/new identities, the real-host NovyWave
    behavior trace, migration/restart evidence, and focused negative cases.
 
-   Resume from clean local checkpoint `38e6541`, preserve activation/effect
-   checkpoint `32bcf40`, and follow
+   Resume from clean local checkpoint `c870358`, preserve compact-proof/sealed-
+   plan checkpoint `38e6541` and activation/effect checkpoint `32bcf40`, and follow
    `BOON_COMPILER_ARCHITECTURE_REFACTOR_PLAN.md`. The canonical list-dataflow,
    sparse durable-overlay lifecycle, `boon_behavior_harness`, real local host,
    retained document hit testing, exact activation-turn handoff, atomic reset/
    activation persistence, deterministic effect transcript, and pre-commit
    pruning of unleased producer work are landed. The headless harness has a
-   28-crate normal forward closure versus native playground's 38. Finish the
-   complete real-host NovyWave migration/restart/provenance/negative matrix on
-   this route. Preserve the generic list contract and do not add row-handle
-   serialization, projection-specific activation, example shortcuts, a second
+   28-crate normal forward closure versus native playground's 38. Preserve the
+   real-host NovyWave migration/restart/provenance route while compiler
+   ownership changes and complete its negative matrix before phase acceptance;
+   it does not delay the active compiler cut. Preserve the generic list
+   contract and do not add row-handle serialization, projection-specific
+   activation, example shortcuts, a second
    mount/replay authority, or a production flat fallback.
 
-   The next compiler tranche is one typed `CompilationDb`, not another packed
-   proof container followed later by a separate incremental graph. Begin with
-   a vertical program-root plus representative ordinary-callable slice. Stable
-   owner/projection or definition/invocation-overlay requests own dense
-   semantic row receipts, compact exact dependency spans, input/result
-   fingerprints, `changed_at`, `verified_at`, and work counters. Drive that
-   slice through checking, semantics, test-only V3 materialization, demand
-   collection, plan, verifier, and runtime, and delete every superseded
-   production owner for the slice. Keep the exhaustive V3 inventory test-only
-   until mutation, omission, cycle, cone-precision, stable-contract, and
-   behavior evidence authorizes a flag-day V4 proof. Production then allocates
-   no exhaustive dependency or coverage records.
+   The next compiler tranche continues the typed `CompilationDb` kernel from
+   checkpoint `c870358`; it is not another packed proof container followed by a
+   separate incremental graph. The post-checkpoint audit rejects one coarse
+   `OwnerBodyUnit`: use stable interface and authored-definition shards,
+   occurrence-owned invocation shards, top-level authority shards, and an
+   ephemeral link fixed point. Split broad program-root dependency targets.
+   Rows use typed `Pending -> Finalized` construction and distinct local,
+   linked-target, and dense-image digests. The graph registers small stable
+   projections once and uses dense IDs; semantic rows remain in language-owned
+   dense tables rather than becoming generic per-expression queries.
 
-   The first V4 projection-proof slice is now implemented but is not this
-   tranche's exit. It moves V3 to the test oracle and reduces the production
-   proof graph from 159,617 nodes/506,915 edges to 14,518 nodes/43,714 edges.
-   A directional optimized NovyWave sample improves from 4,581.206 ms and
-   317,316 KiB to 3,977.806 ms and 247,092 KiB; manifest time improves from
-   2,321.269 to 1,807.287 ms. The residual manifest still post-processes the
-   checked, execution, and lowering graphs. The active next cut is therefore
-   construction-time row/projection receipt emission in those builders, with
-   the same receipts becoming proof and revision-currentness authority and the
-   post-hoc inventory walks deleted. Reprofile semantic demand after that
-   ownership cut. Do not spend another tranche on receipt-hash micro-tuning.
+   The first V4 projection-proof slice is implemented but is not this tranche's
+   exit. It moves V3 to the test oracle and reduces the production proof graph
+   from 159,617 nodes/506,915 edges to 14,518 nodes/43,714 edges. A directional
+   optimized NovyWave sample improves from 4,581.206 ms and 317,316 KiB to
+   3,977.806 ms and 247,092 KiB; manifest time improves from 2,321.269 to
+   1,807.287 ms. The shared kernel checkpoint is still 4,011.485 ms at 250,416
+   KiB, with 3,265.269 ms semantics and 1,771.603 ms manifest work. The active
+   cut is stable shard identities plus finalization-time checked/execution
+   receipts, with the same receipts owning proof/currentness and the post-hoc
+   inventories deleted. Retain immutable parser unit snapshots and exact cached
+   assembly; add atomic upsert/remove/rename and fail-closed revisions. Do not
+   spend another tranche on receipt-hash micro-tuning.
 
-   The post-checkpoint whole-pipeline audit also proves that receipt callbacks
-   alone are too small: removing all 1,813.236 ms of current manifest work from
-   the 4,052.379 ms directional sample would still leave about 2.24 seconds.
-   Implement the architecture plan's stable owner body unit and compact program
-   linker. Each unit owns dense checked/semantic/executable rows, row receipts,
-   exact projection dependencies, and a retained plan-function ABI; the linker
-   owns only unavoidable cross-owner OUT/resource/reactive/storage/view/
-   migration summaries, demand roots, and SCCs. Make the compact canonical
-   image primary storage and turn the nine rich component graphs into views or
-   explicit debug materializers. A coherent batch must delete an old graph or
-   scan owner, not merely add a database facade beneath it.
+   Receipt callbacks alone are too small: removing all 1,813.236 ms of manifest
+   work from the 4,052.379 ms directional sample would still leave about 2.24
+   seconds. Expand definition/invocation shards through OUT/resource/reactive/
+   lowering/storage/view/memory and make `SealedSemanticImage` primary storage.
+   Link fixed points own only relocations, compact summaries, demand roots,
+   distributed producer/external-event closure, and SCCs. Rich graphs become
+   borrowed views or explicit test/debug materializers and are deleted as
+   production owners. The independent source/V3/V4 oracles prove omissions,
+   mutations, exact cones, and coverage without dictating production row count.
 
-   The test-only V3 oracle proves exhaustive coverage without dictating
-   production cardinality: every V3 subject maps to one canonical owner-unit
-   row and exact classifier field/domain, every database row is covered, and
-   independently folded projection commitments match. Production fingerprints
-   each actual row once and binds one exact typed dependency span; it must not
-   retain one receipt per historical child-field coverage subject.
+   Link ordinary executable definitions once across document, row/scalar, and
+   migration domains; verified variants use compact resolved invocation frames,
+   never a semantic AST or flat fallback. Replace full-plan clone/rewrite/
+   compact/hash and per-consumer executor `Metadata` reconstruction with one
+   consuming `SealedRunnableMachine` builder whose dense indexes are built once.
+   Explicit debug/serialized intents own extra products; untrusted
+   deserialization verifies/builds indexes exactly once.
 
-   The dependency-bottom kernel is now connected to production V4.
-   `boon_compilation_db` owns revision/backdating metadata, compact forward and
-   reverse edges, deterministic SCC sealing, and implementation roots;
-   semantic V4 deletes its duplicate SCC code and owner-by-projection scan.
-   Four kernel tests and all 19 focused manifest tests pass. One fresh
-   directional NovyWave run is 4,011.485 ms at 250,416 KiB, with 3,265.269 ms
-   semantics, 1,771.603 ms manifest work, and 465.455 ms projection sealing.
-   The roughly 40--50 ms gain proves the kernel integration but not the owner-
-   unit exit. Continue by producing canonical rows in owner units and deleting
-   checked/execution inventory ownership.
-
-   Expand the same database through the rich semantic domains. Carry each
-   ordinary executable body once through `MachinePlan` and represent call-
-   specific parameter/type/PASSED/owner/resource/effect/render context with
-   compact invocation frames rather than recompiling every exact call. Runtime
-   executes verified plan functions and never a semantic AST interpreter or
-   flat fallback. Replace full-`MachinePlan` clone/rewrite/compact/hash
-   finalization with one builder seal returning a non-forgeable
-   `SealedMachinePlan`. Normal in-memory publication does not retain full
-   construction IR/semantic products or pretty JSON and does not rehash or
-   reverify the same trusted plan at every handoff; explicit
-   debug/serialized-artifact intents and bounded pre-seal distributed linking
-   own those products, while deserialized/untrusted plans still verify once and
-   acceptance format migration remains controlled.
-   Retain the same request graph across revisions for exact cones, backdating,
-   `changed_at`/`verified_at`, cancellation, and clean-full parity. Pull crate
-   splits and runtime/compiler dependency inversion only when measured closure
-   and rebuild evidence proves the ownership cut. Keep Rust rebuild speed and
-   Boon compile latency as separate gates.
+   Retain these exact source/shard/link/proof/plan-code/runnable requests across
+   revisions for interface backdating, exact cones, add/delete/rename, error
+   recovery, worklist cancellation, atomic latest-generation publication, and
+   clean-full parity. Only then enable at most two graph-proven independent
+   workers. Pull crate splits at durable one-way seams: compiler adapters out of
+   runtime cores, migration tooling out of host core, sealed semantic image/
+   model away from its builder/proof implementation, and runnable image/model
+   away from the executor. Require measured closure/rebuild improvement and keep
+   Rust build speed separate from Boon compile latency.
 
    Use the performance plan's edit-loop, milestone-preflight, and full-
    acceptance harness levels. Focused debug tests and direct one-sample producer

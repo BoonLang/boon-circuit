@@ -72,13 +72,13 @@ Authority and conflict rules:
   evidence soundness, runtime persistence identity, native presentation
   semantics, or the mandatory verified artifact spine.
 - `BOON_COMPILER_ARCHITECTURE_REFACTOR_PLAN.md` is subordinate to those budgets
-  and owns the current post-`32bcf40` implementation sequence: finish the full
-  oracle on the landed exact activation/effect boundary; introduce one typed
-  `CompilationDb` for cold construction, proof receipts, and later revision
-  currentness; retain ordinary executable definitions plus compact invocation
-  frames through `MachinePlan`; seal the plan once; and pull only measured
-  dependency inversions. Its intermediate directional exits never replace the
-  performance plan's complete scored Clear End Condition.
+  and owns the current post-`c870358` sequence: immutable source snapshots;
+  stable interface, definition, invocation, top-level-authority, and link
+  shards in one typed `CompilationDb` graph; one canonical sealed semantic
+  image; a shared plan-code linker across document, row, and migration domains;
+  one consuming `SealedRunnableMachine` builder; persistent currentness; and
+  only measured dependency inversions. Its intermediate directional exits
+  never replace the performance plan's complete scored Clear End Condition.
 - Compiler scaling evidence uses actual parser inspections and
   typechecker/semantic/proof/backend work, never final AST/call/graph sizes as
   substitutes. Build one current two-job release producer explicitly and invoke
@@ -398,16 +398,18 @@ Current checkpoints to preserve and audit rather than redo:
   invariants remain exact. Budget V2 stays red until the V3 provenance report,
   real-host NovyWave behavior scenario, migration/restart matrix, and negative
   cases are complete;
-- resume the performance goal from clean local checkpoint `38e6541`, preserving
-  activation/effect checkpoint `32bcf40`, and follow
+- resume the performance goal from clean local checkpoint `c870358`, preserving
+  compact-proof/sealed-plan checkpoint `38e6541` and activation/effect
+  checkpoint `32bcf40`, and follow
   `BOON_COMPILER_ARCHITECTURE_REFACTOR_PLAN.md`. The canonical list-dataflow,
   sparse durable-overlay lifecycle, product-faithful `boon_behavior_harness`,
   real local host, retained document hit testing, exact activation-turn
   handoff, atomic reset/activation persistence, deterministic effect transcript,
   and pre-commit pruning of unleased producer work are landed. The headless
   harness has a 28-crate normal forward closure versus native playground's 38.
-  Finish the complete real-host NovyWave migration/restart/provenance/negative
-  matrix on this route. Preserve the generic engine contract and do not add
+  Preserve this route and complete the real-host NovyWave migration/restart/
+  provenance/negative matrix before phase acceptance; it does not delay the
+  active compiler cut. Preserve the generic engine contract and do not add
   row-handle durability, projection-specific activation, example shortcuts, a
   second mount/replay authority, or a production flat fallback;
 - prioritize one owner/projection compilation database over further micro-
@@ -438,20 +440,16 @@ Current checkpoints to preserve and audit rather than redo:
   ownership cut. Do not stop at this improvement and do not return to receipt-
   hashing or container micro-tuning while the 1,000 ms total and 350 ms
   semantic/proof gates remain red;
-- apply the post-checkpoint owner-unit reassessment, not a receipts-only
-  interpretation of the prior bullet. The current 4,052.379 ms directional
-  sample would still take roughly 2.24 seconds if the entire 1,813.236 ms
-  manifest vanished. Build stable owner body units containing dense checked/
-  semantic/executable rows, local receipts, exact projection dependencies, and
-  a retained plan-function ABI. Link only compact cross-owner OUT/resource/
-  reactive/storage/view/migration summaries, demand roots, and SCCs. Make the
-  sealed canonical program image primary storage; rich component graphs become
-  read-only views or explicit debug/test materializers. Migrate owner-sized
-  batches through proof and plan, deleting each superseded production graph or
-  scan owner in the same batch. Do not accept a database facade that leaves the
-  eager nine-graph pipeline intact. Retain these same units for warm
-  backdating/cancellation and add bounded parallel evaluation only after their
-  dependency graph proves independence;
+- apply the post-`c870358` architecture audit, not a receipts-only reading. The
+  4,052.379 ms directional sample would still take about 2.24 seconds if the
+  entire manifest vanished. A single `OwnerBodyUnit` is also too coarse: split
+  stable interface and authored definition shards from occurrence-owned
+  invocation shards and ephemeral program/bundle link fixed points. Use typed
+  `Pending -> Finalized` rows with distinct local, linked-target, and dense-
+  image digests; split broad program-root dependencies. Make one sealed
+  semantic image primary storage and delete rich graph owners as borrowed
+  views/test materializers pass. Do not accept a database facade under the
+  eager nine-graph pipeline;
 - preserve the first functional `boon_compilation_db` integration but continue
   through it. The shared kernel now owns revision/backdating metadata, compact
   forward/reverse request edges, deterministic SCC sealing, and implementation
@@ -459,28 +457,29 @@ Current checkpoints to preserve and audit rather than redo:
   scan. Four kernel tests and all 19 focused manifest tests pass. A fresh
   directional NovyWave sample is still 4,011.485 ms at 250,416 KiB, with
   3,265.269 ms semantics and 1,771.603 ms manifest work, so the roughly
-  40--50 ms improvement is not an exit. The next `/goal` work must make owner
-  units produce canonical rows and delete checked/execution inventories, not
-  stop at the crate boundary;
+  40--50 ms improvement is not an exit. The next `/goal` work must establish
+  stable definition/invocation/link identities, make finalized rows produce
+  receipts, and delete checked/execution inventories, not stop at the crate
+  boundary;
 - do not preserve V3's 208k subject count in the replacement proof. The
-  test-only oracle maps every historical subject to one canonical owner-unit
-  row and classifier field/domain and independently proves coverage,
+  test-only oracle maps every historical subject to one canonical finalized
+  shard row and classifier field/domain and independently proves coverage,
   projection commitments, mutation detection, and exact cones. Production
   fingerprints each actual database row once, binding all fields plus one
   typed dependency span. Reject one-receipt-per-historical-child-field designs;
 - expand that vertical cut through the rich semantic domains, deleting each
-  superseded production owner. Carry ordinary executable bodies once through
-  `MachinePlan` with compact parameter/type/PASSED/owner/resource/effect/render
-  invocation frames instead of recompiling each exact call in the backend.
-  Runtime executes verified plan functions, never a semantic AST interpreter
-  or flat fallback. Replace full-plan clone/rewrite/compact/hash finalization
-  with one `MachinePlanBuilder` seal. Normal in-memory publication does not
-  retain complete IR/semantic products or pretty JSON; explicit debug or
-  serialized-artifact intents may materialize them, distributed linking may
-  retain construction IR only until its link seals, and any acceptance format
-  migration remains controlled and scored.
-  Retain the same `CompilationDb` across revisions with exact reverse cones,
-  unchanged-result backdating, cancellation, and clean-full parity. Move
+  superseded production owner. Link ordinary executable definitions once
+  across document, row/scalar, and migration domains with resolved compact
+  invocation frames instead of recompiling exact calls. Runtime never consumes
+  a semantic AST or flat fallback. Replace full-plan clone/rewrite/compact/hash
+  finalization and per-consumer executor metadata reconstruction with one
+  consuming `SealedRunnableMachine` builder whose dense indexes are built once.
+  Normal in-memory publication does not retain complete IR/semantic products or
+  pretty JSON; explicit debug/serialized intents own extra products and
+  untrusted deserialization verifies/builds indexes once. Retain the same
+  source/shard/link/proof/plan/runnable requests across revisions with atomic
+  upsert/remove/rename, exact reverse cones, backdating, worklist cancellation,
+  latest-generation publication, and clean-full parity. Move
   cross-layer IDs and invert compiler/runtime, migration-harness,
   effect-adapter, and content-store
   dependencies only when before/after closure and rebuild measurement proves
@@ -619,17 +618,19 @@ Blocking compiler-performance prerequisite:
 
 - Complete `BOON_COMPILER_PERFORMANCE_PLAN.md` before resuming the remaining
   simplification/native-recovery closure or any later production phase.
-- Begin from checkpoint `38e6541`, preserving `32bcf40`'s activation/effect
-  boundary, and follow the refactor plan's current owner-unit tranche:
-  finish the full real-host oracle on the landed exact activation/effect
-  boundary; build one owner/projection `CompilationDb` shared by cold proof and
-  later warm currentness; carry retained ordinary functions and compact
-  invocation frames through the plan; and use one plan builder seal returning
-  a non-forgeable `SealedMachinePlan`. Explicit diagnostics, verified-preview,
-  serialized-artifact, debug-IR/debug-plan, and distributed-link intents own
-  their products. The ordinary trusted preview must not retain complete IR or
-  repeat plan hashing/verification at each handoff; deserialized/untrusted plans
-  still verify once. The
+- Begin from checkpoint `c870358`, preserving `38e6541`'s compact-proof/sealed-
+  plan work and `32bcf40`'s activation/effect boundary. Follow the refactor
+  plan's corrected shard/image sequence: immutable source snapshots; stable
+  interface, definition, invocation, top-level-authority, and link identities;
+  finalization-time receipts in one cold/warm projection graph; one sealed
+  semantic image; one all-domain plan-code linker; and one consuming
+  `SealedRunnableMachine` builder with dense executor indexes built once.
+  Explicit diagnostics, verified-preview, serialized-artifact, debug-IR/debug-
+  plan, and distributed-link intents own their products. The ordinary trusted
+  preview must not retain complete IR or rebuild plan verification/runtime
+  metadata at each handoff; deserialized/untrusted plans verify/build indexes
+  once. Preserve and complete the real-host migration/restart/provenance oracle
+  before phase acceptance, but do not delay the active compiler cut for it. The
   package-local dev profile choices are already present; do not repeat a stale
   parser-profile task. Use focused correctness and bounded direct release
   preflight while changing each owner, then regenerate the full current two-job

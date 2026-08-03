@@ -3637,7 +3637,7 @@ impl CheckedProgramBuilder {
             }
             if changed_parameters.is_empty() {
                 let callable_type = self.checked_callable_declaration_flow_type(owner_index);
-                self.set_declaration_flow_type(owner.decl_id, callable_type);
+                self.set_signature_declaration_flow_type(owner.decl_id, callable_type);
             } else {
                 let published = self
                     .publish_checked_signature_parameter_changes(owner_index, &changed_parameters);
@@ -3876,10 +3876,6 @@ impl CheckedProgramBuilder {
             .filter(|signature| signature.kind == CheckedCallableKind::User)
             .map(|signature| signature.decl_id)
             .collect::<Vec<_>>();
-        let mut requirements = user_callables
-            .iter()
-            .map(|callable| (*callable, None))
-            .collect::<BTreeMap<_, Option<FlowType>>>();
         let roots_by_owner = reads_by_owner
             .keys()
             .map(|owner| (*owner, self.owned_expression_roots(*owner)))
@@ -3915,6 +3911,36 @@ impl CheckedProgramBuilder {
                     .push(call_index);
             }
         }
+        // A callable without a lexical PASSED read can acquire a context
+        // requirement only by calling one that already has a requirement.
+        // Follow that exact callee-to-caller cone instead of visiting every
+        // user signature once merely to rediscover a stable `None`.
+        let mut contextual_callables = reads_by_owner.keys().copied().collect::<BTreeSet<_>>();
+        let mut pending_contextual_callables =
+            VecDeque::from_iter(contextual_callables.iter().copied());
+        while let Some(callee) = pending_contextual_callables.pop_front() {
+            for dependent in dependents_by_callee
+                .get(&callee)
+                .into_iter()
+                .flatten()
+                .copied()
+            {
+                if contextual_callables.insert(dependent) {
+                    pending_contextual_callables.push_back(dependent);
+                }
+            }
+        }
+        let user_callables = user_callables
+            .into_iter()
+            .filter(|callable| contextual_callables.contains(callable))
+            .collect::<Vec<_>>();
+        for callees in callees_by_owner.values_mut() {
+            callees.retain(|callee| contextual_callables.contains(callee));
+        }
+        let mut requirements = user_callables
+            .iter()
+            .map(|callable| (*callable, None))
+            .collect::<BTreeMap<_, Option<FlowType>>>();
         let iteration_limit = user_callables
             .len()
             .saturating_add(self.calls.len())
@@ -4546,7 +4572,7 @@ impl CheckedProgramBuilder {
             if let Some(value) = &value
                 && let Some(declaration) = self.statement_declarations.get(&plan.statement).copied()
             {
-                self.set_declaration_flow_type(declaration, value.flow_type.clone());
+                self.set_value_declaration_flow_type(declaration, value.flow_type.clone());
             }
             values.insert(plan.statement, value);
         }
@@ -5186,7 +5212,7 @@ impl CheckedProgramBuilder {
                     if matches!(flow_type.ty, Type::Unknown | Type::UnresolvedShape { .. }) {
                         continue;
                     }
-                    if self.set_declaration_flow_type(declaration, flow_type) {
+                    if self.set_value_declaration_flow_type(declaration, flow_type) {
                         Self::enqueue_checked_declaration_dependents(
                             declaration,
                             &dependencies,
@@ -5234,7 +5260,7 @@ impl CheckedProgramBuilder {
                     }
                     self.set_checked_signature_result(index, result);
                     let declaration_type = self.checked_callable_declaration_flow_type(index);
-                    if self.set_declaration_flow_type(callable, declaration_type) {
+                    if self.set_signature_declaration_flow_type(callable, declaration_type) {
                         Self::enqueue_checked_declaration_dependents(
                             callable,
                             &dependencies,
@@ -6842,7 +6868,7 @@ impl CheckedProgramBuilder {
         for (formal, flow_type) in parameter_updates {
             self.set_declaration_flow_type(formal, flow_type);
         }
-        self.set_declaration_flow_type(callable, callable_type);
+        self.set_signature_declaration_flow_type(callable, callable_type);
         Some(callable)
     }
 
@@ -7595,7 +7621,7 @@ impl CheckedProgramBuilder {
             if matches!(flow_type.ty, Type::Unknown | Type::UnresolvedShape { .. }) {
                 continue;
             }
-            changed |= self.set_declaration_flow_type(declaration, flow_type);
+            changed |= self.set_value_declaration_flow_type(declaration, flow_type);
         }
         changed
     }
@@ -10099,6 +10125,44 @@ impl CheckedProgramBuilder {
     }
 
     fn set_declaration_flow_type(&mut self, declaration: DeclId, flow_type: FlowType) -> bool {
+        self.set_declaration_flow_type_with_signature_owner(declaration, flow_type, false)
+    }
+
+    fn set_value_declaration_flow_type(
+        &mut self,
+        declaration: DeclId,
+        flow_type: FlowType,
+    ) -> bool {
+        if self
+            .signature_by_decl
+            .get(&(declaration.0 as usize))
+            .is_some()
+        {
+            return false;
+        }
+        self.set_declaration_flow_type(declaration, flow_type)
+    }
+
+    fn set_signature_declaration_flow_type(
+        &mut self,
+        declaration: DeclId,
+        flow_type: FlowType,
+    ) -> bool {
+        debug_assert!(
+            self.signature_by_decl
+                .get(&(declaration.0 as usize))
+                .is_some(),
+            "signature publication requires a callable declaration"
+        );
+        self.set_declaration_flow_type_with_signature_owner(declaration, flow_type, true)
+    }
+
+    fn set_declaration_flow_type_with_signature_owner(
+        &mut self,
+        declaration: DeclId,
+        flow_type: FlowType,
+        signature_owns_write: bool,
+    ) -> bool {
         let Some(index) = self
             .declaration_by_id
             .get(&(declaration.0 as usize))
@@ -10115,10 +10179,11 @@ impl CheckedProgramBuilder {
             }
             target.flow_type = flow_type;
         }
-        if let Some(signature_index) = self
-            .signature_by_decl
-            .get(&(declaration.0 as usize))
-            .copied()
+        if !signature_owns_write
+            && let Some(signature_index) = self
+                .signature_by_decl
+                .get(&(declaration.0 as usize))
+                .copied()
         {
             self.dirty_signature_declarations.insert(signature_index);
         }

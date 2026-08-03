@@ -460,6 +460,24 @@ Current cold-diagnostics candidate evidence:
   remains unimplemented: remove the duplicate generic callable-declaration
   mutation owner, then retry the contextual cone independently against the
   exact oracle.
+- Callable publication now has an explicit signature-owned API, while the
+  structural, solver, and final value-declaration lanes reject callable IDs
+  instead of temporarily replacing a function type with its raw result. The
+  dirty journal remains a fail-safe for other generic declaration writers.
+  With that duplicate owner removed, the independently retried PASSED worklist
+  follows the exact reverse callee-to-caller cone rooted at lexical PASSED reads
+  and no longer visits context-free user signatures. NovyWave worklist visits
+  fall from 504 to 369 while all 369 real changes, the pre-change tuple oracle,
+  exact digest, and complete 80-test suite remain unchanged. Fresh allocation
+  work is 1,787,633 calls / 212,614,838 bytes and empty-session is 1,787,639 /
+  212,679,435, another 682 calls / 64,584 bytes below the dirty-journal
+  checkpoint in each mode. A six-pair release batch has 219.70/219.39 ms
+  fresh/empty medians and 164.18/164.53 ms typecheck medians; one slow outlier in
+  each mode keeps this directional rather than acceptance evidence. The traced
+  context phase still takes about 10.52 ms because it constructs complete
+  ordered call maps before pruning the worklist, and checked inference still
+  takes 35 rounds. The next contextual slice must move that dependency cone to
+  a compact indexed owner rather than polishing the now-cheap no-op visits.
 - Item 7 is still incomplete: the lifetime-free checker and builder remain two
   construction owners. Fuse checked construction into one owned database,
   then complete measured compact/name interning and worklist reductions,

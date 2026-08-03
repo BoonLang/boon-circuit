@@ -73,10 +73,17 @@ stronger three-reviewer performance closure defined below.
    oracle, exact digest, and all 80 tests pass. Fresh/empty allocation work falls
    to 1,788,315/1,788,321 calls and 212,679,422/212,744,019 bytes. A six-pair
    batch remains bimodal at 225.75/231.58 ms total and 169.80/173.69 ms
-   typecheck, so this is not a latency claim. Duplicate generic callable writes,
-   the independently rejected PASSED cone, and the 35 rounds remain. Remove the
-   duplicate mutation owner and retry the contextual cone against the exact
-   oracle. The remaining first tranche also includes fusing the duplicate
+   typecheck, so this is not a latency claim. Signature-owned callable
+   publication is now explicit, structural/solver/final value lanes reject
+   callable IDs, and the independently retried PASSED worklist follows only the
+   reverse lexical-PASSED caller cone. NovyWave context visits fall from 504 to
+   369 while all 369 changes, the tuple oracle, exact digest, and 80 tests remain
+   unchanged. Fresh/empty allocation work is 1,787,633/1,787,639 calls and
+   212,614,838/212,679,435 bytes. A six-pair batch has 219.70/219.39 ms total and
+   164.18/164.53 ms typecheck medians, with one slow outlier per mode. The
+   context phase remains about 10.52 ms because it builds complete ordered call
+   maps before pruning, and the 35 rounds remain. Move that cone into a compact
+   indexed owner. The remaining first tranche also includes fusing the duplicate
    checker/builder into one owned database, measured compact/name interning, the
    larger contextual/user-call worklist reduction, scaling/parity evidence, and
    the fresh Phase 1 adversarial review. Reprofile after each owner-level slice

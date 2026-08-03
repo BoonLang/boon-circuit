@@ -246,9 +246,17 @@ Current checkpoints to preserve and audit rather than redo:
   1,788,315/1,788,321 calls and 212,679,422/212,744,019 bytes, 709 calls / 64,760
   bytes lower in each mode. A six-pair batch is still bimodal at 225.75/231.58
   ms fresh/empty and 169.80/173.69 ms typecheck, so this is not a latency claim.
-  Duplicate generic callable writes, the independently rejected PASSED cone,
-  and the remaining 35 rounds are still open. Remove that duplicate mutation
-  owner and retry the contextual cone against the exact oracle, then finish the
+  The next ownership slice gives signatures an explicit callable-declaration
+  publication API and makes structural/solver/final value lanes reject callable
+  IDs. The independently retried PASSED worklist then follows only the reverse
+  lexical-PASSED callee-to-caller cone. NovyWave context visits fall from 504 to
+  369 with all 369 changes, the tuple oracle, exact digest, and full suite
+  unchanged. Fresh/empty allocation work falls to 1,787,633/1,787,639 calls and
+  212,614,838/212,679,435 bytes. A six-pair batch has 219.70/219.39 ms total and
+  164.18/164.53 ms typecheck medians, with one slow outlier per mode; this
+  remains directional. The context phase is still about 10.52 ms because it
+  builds complete ordered call maps before pruning, and the 35 inference rounds
+  remain. Move the context cone into a compact indexed owner, then finish the
   duplicate checker/builder owner, measured interning, larger contextual/user-
   call worklist reduction, scaling/parity proof, and adversarial review before
   regenerating the full protocol after the final edit;

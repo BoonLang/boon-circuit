@@ -20,11 +20,23 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::hash::Hash;
 use std::ops::Deref;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
 #[cfg(target_arch = "wasm32")]
 use web_time::Instant;
+
+#[inline]
+fn typecheck_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("BOON_TYPECHECK_TRACE").is_some())
+}
+
+#[inline]
+fn typecheck_statement_trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("BOON_TYPECHECK_STATEMENT_TRACE").is_some())
+}
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
 pub enum Type {
@@ -32,7 +44,7 @@ pub enum Type {
     Number,
     Bytes(BytesType),
     Absent,
-    VariantSet(Vec<Variant>),
+    VariantSet(SharedVariantSet),
     Object(SharedObjectShape),
     RenderContract,
     List(Box<Type>),
@@ -96,6 +108,91 @@ impl Variant {
             tag,
             fields: fields.into(),
         }
+    }
+}
+
+/// An immutable, reference-counted set of canonical Tag alternatives.
+///
+/// Variant domains are copied through the checked solver and its expression
+/// cache far more often than they are rebuilt. Sealing the canonical vector
+/// makes those copies constant-time while retaining the exact serialized
+/// array and deterministic alternative order.
+#[derive(Clone, Debug, Default, Eq, Hash, PartialEq)]
+pub struct SharedVariantSet(Arc<Vec<Variant>>);
+
+impl SharedVariantSet {
+    pub fn new(variants: Vec<Variant>) -> Self {
+        Self(Arc::new(variants))
+    }
+
+    pub fn ptr_eq(left: &Self, right: &Self) -> bool {
+        Arc::ptr_eq(&left.0, &right.0)
+    }
+
+    pub fn into_owned(self) -> Vec<Variant> {
+        Arc::unwrap_or_clone(self.0)
+    }
+}
+
+impl Deref for SharedVariantSet {
+    type Target = Vec<Variant>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl From<Vec<Variant>> for SharedVariantSet {
+    fn from(variants: Vec<Variant>) -> Self {
+        Self::new(variants)
+    }
+}
+
+impl FromIterator<Variant> for SharedVariantSet {
+    fn from_iter<T: IntoIterator<Item = Variant>>(iter: T) -> Self {
+        Self::new(iter.into_iter().collect())
+    }
+}
+
+impl IntoIterator for SharedVariantSet {
+    type Item = Variant;
+    type IntoIter = std::vec::IntoIter<Variant>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.into_owned().into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a SharedVariantSet {
+    type Item = &'a Variant;
+    type IntoIter = std::slice::Iter<'a, Variant>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+impl Serialize for SharedVariantSet {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.as_ref().serialize(serializer)
+    }
+}
+
+impl AsRef<Vec<Variant>> for SharedVariantSet {
+    fn as_ref(&self) -> &Vec<Variant> {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for SharedVariantSet {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Vec::<Variant>::deserialize(deserializer).map(Self::new)
     }
 }
 
@@ -1367,9 +1464,18 @@ pub struct CheckedCall {
     pub contextual_substitutions: Vec<CheckedContextTypeSubstitution>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub type_substitutions: Vec<CheckedTypeSubstitution>,
+    /// The exact call result was selected from syntax-level discriminants at
+    /// this occurrence and can be more precise than the callable's principal
+    /// result scheme.
+    #[serde(default, skip_serializing_if = "checked_bool_is_false")]
+    pub syntax_discriminated_result: bool,
     pub result: FlowType,
     pub role: ProgramRole,
     pub span: CheckedSpan,
+}
+
+fn checked_bool_is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -3033,7 +3139,7 @@ impl<'a> CheckedProgramBuilder<'a> {
             builtins,
             render_contracts,
         } = inputs;
-        let trace_checked_program = std::env::var_os("BOON_TYPECHECK_TRACE").is_some();
+        let trace_checked_program = typecheck_trace_enabled();
         macro_rules! checked_program_phase {
             ($name:literal, $body:expr) => {{
                 let started = trace_checked_program.then(Instant::now);
@@ -4737,6 +4843,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                 context_binding,
                 contextual_substitutions: Vec::new(),
                 type_substitutions: Vec::new(),
+                syntax_discriminated_result: false,
                 result: signature.result.clone(),
                 role: signature.role,
                 span: checked_expr_span(expr),
@@ -5009,7 +5116,7 @@ impl<'a> CheckedProgramBuilder<'a> {
     }
 
     fn prepare_contextual_callable_schemes(&mut self) {
-        let trace = std::env::var_os("BOON_TYPECHECK_TRACE").is_some();
+        let trace = typecheck_trace_enabled();
         self.initialize_checked_scheme_type_var_allocator();
         let projected_started = Instant::now();
         self.infer_user_parameter_schemes();
@@ -5056,7 +5163,7 @@ impl<'a> CheckedProgramBuilder<'a> {
     }
 
     fn propagate_contextual_user_wrapper_schemes(&mut self) -> BTreeSet<DeclId> {
-        let trace = std::env::var_os("BOON_TYPECHECK_TRACE").is_some();
+        let trace = typecheck_trace_enabled();
         let propagation_started = Instant::now();
         let mut next_var = self
             .next_checked_scheme_type_var
@@ -5617,7 +5724,7 @@ impl<'a> CheckedProgramBuilder<'a> {
         let converged = pending.is_empty();
         self.work_counters
             .record_context_scheme_worklist(visits, changes);
-        if std::env::var_os("BOON_TYPECHECK_TRACE").is_some() {
+        if typecheck_trace_enabled() {
             eprintln!(
                 "boon_typecheck checked_program.infer_context_schemes.worklist visits={visits} changes={changes} maximum_visits={maximum_visits} exhausted={converged}"
             );
@@ -6491,7 +6598,7 @@ impl<'a> CheckedProgramBuilder<'a> {
             domain_candidates
                 .entry(parameter)
                 .or_default()
-                .push(Type::VariantSet(variants));
+                .push(Type::VariantSet(variants.into()));
         }
         domain_candidates
             .into_iter()
@@ -6613,7 +6720,7 @@ impl<'a> CheckedProgramBuilder<'a> {
         changed_expressions: Option<&BTreeSet<usize>>,
         quiescence_hook: CheckedTypeInferenceQuiescenceHook,
     ) {
-        let trace = std::env::var_os("BOON_TYPECHECK_TRACE").is_some();
+        let trace = typecheck_trace_enabled();
         let cache_stats_before = self.checked_flow_inference_cache.stats;
         if self.checked_type_inference_dependencies.is_none() {
             self.checked_type_inference_dependencies =
@@ -8392,7 +8499,7 @@ impl<'a> CheckedProgramBuilder<'a> {
     /// scans. This bounded worklist performs those same monotone signature and
     /// call updates immediately and queues only affected callers.
     fn propagate_changed_user_callers(&mut self, mut pending: BTreeSet<DeclId>) -> (bool, bool) {
-        let trace = std::env::var_os("BOON_TYPECHECK_TRACE").is_some();
+        let trace = typecheck_trace_enabled();
         let dependencies = Arc::clone(
             self.checked_type_inference_dependencies
                 .as_ref()
@@ -8876,7 +8983,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                 continue;
             }
             if self.signatures[index].result != result {
-                if std::env::var_os("BOON_TYPECHECK_TRACE").is_some() {
+                if typecheck_trace_enabled() {
                     eprintln!(
                         "boon_typecheck checked_program.refresh_callable changed={} result={}",
                         self.signatures[index].name,
@@ -8922,6 +9029,48 @@ impl<'a> CheckedProgramBuilder<'a> {
         self.infer_checked_overlay_call_type(call_id, &BTreeMap::new(), &mut BTreeSet::new())
     }
 
+    fn infer_checked_static_bits_call_result(
+        &mut self,
+        plan: &CheckedCallInferencePlan,
+    ) -> Option<Type> {
+        let call = self
+            .calls
+            .get(plan.call_index)
+            .filter(|call| call.id == plan.call_id)?;
+        if !is_bits_builtin(&call.function) {
+            return None;
+        }
+        let function = call.function.clone();
+        let inputs = call
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                CheckedCallEntry::Input { name, value, .. } => Some((name.clone(), *value)),
+                CheckedCallEntry::FreshOut { .. } | CheckedCallEntry::ForwardOut { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        let resolved = inputs
+            .iter()
+            .map(|(name, value)| {
+                (
+                    name.clone(),
+                    self.infer_checked_expr_flow_root(value.0 as usize).ty,
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let bits_type = resolved.get("bits").cloned();
+        let named_type = |name: &str| resolved.get(name).cloned();
+        let static_width = |name: &str| {
+            inputs
+                .iter()
+                .find_map(|(candidate, value)| (candidate == name).then_some(*value))
+                .and_then(|value| static_integer_expr(self.program, value.0 as usize))
+                .and_then(|value| u32::try_from(value).ok())
+                .filter(|width| (1..=MAX_BITS_WIDTH).contains(width))
+        };
+        resolved_bits_builtin_result(&function, bits_type, &named_type, &static_width)
+    }
+
     fn infer_checked_overlay_call_type(
         &mut self,
         call_id: CheckedCallId,
@@ -8941,7 +9090,15 @@ impl<'a> CheckedProgramBuilder<'a> {
             .ty
             .clone();
         if !plan.is_user_callable {
-            return Some(call_result);
+            let snapshot = self.snapshot_checked_call_inference(plan)?;
+            return self
+                .infer_checked_overlay_non_user_call_type(
+                    plan,
+                    &snapshot,
+                    caller_bindings,
+                    active_callables,
+                )
+                .or(Some(call_result));
         }
         if !active_callables.insert(plan.callable) {
             return None;
@@ -8994,6 +9151,107 @@ impl<'a> CheckedProgramBuilder<'a> {
         result
     }
 
+    /// Instantiate a builtin/external call inside a user-call overlay without
+    /// mutating the authoritative checked fixed point. Contextual builtins such
+    /// as `List/map` introduce fresh OUT bindings whose types are needed by
+    /// later output-scoped inputs; returning the stored generic result here
+    /// leaks an inner callable's scheme variables into an otherwise concrete
+    /// root occurrence.
+    fn infer_checked_overlay_non_user_call_type(
+        &mut self,
+        plan: &CheckedCallInferencePlan,
+        snapshot: &CheckedCallInferenceSnapshot,
+        caller_bindings: &BTreeMap<DeclId, Type>,
+        active_callables: &mut BTreeSet<DeclId>,
+    ) -> Option<Type> {
+        let mut substitutions = InlineTypeSubstitutions::default();
+        let mut scoped_bindings = caller_bindings.clone();
+
+        for entry_index in plan.parent_inputs.iter().copied() {
+            let CheckedCallInferenceEntryPlan::Input { value, .. } =
+                *plan.entries.get(entry_index)?
+            else {
+                continue;
+            };
+            let parameter = snapshot
+                .parameter_flow_types
+                .get(entry_index)
+                .and_then(Option::as_ref)?;
+            let actual = self.infer_checked_overlay_expr_type(
+                value.0 as usize,
+                caller_bindings,
+                active_callables,
+            )?;
+            unify_checked_type_pattern(&parameter.ty, &actual, &mut substitutions);
+        }
+
+        if let Some(formal) = snapshot.context_formal.as_ref() {
+            let actual = if let Some(value) = plan.explicit_context_input {
+                self.infer_checked_overlay_expr_type(
+                    value.0 as usize,
+                    caller_bindings,
+                    active_callables,
+                )
+            } else {
+                snapshot
+                    .inherited_context
+                    .as_ref()
+                    .map(|flow_type| flow_type.ty.clone())
+            };
+            if let Some(actual) = actual {
+                unify_checked_type_pattern(&formal.ty, &actual, &mut substitutions);
+            }
+        }
+
+        for entry_index in plan.outputs.iter().copied() {
+            let CheckedCallInferenceEntryPlan::Output {
+                output, forwarded, ..
+            } = *plan.entries.get(entry_index)?
+            else {
+                continue;
+            };
+            let parameter = snapshot
+                .parameter_flow_types
+                .get(entry_index)
+                .and_then(Option::as_ref)?;
+            let existing = forwarded
+                .then(|| caller_bindings.get(&output).cloned())
+                .flatten();
+            if let Some(existing) = existing.as_ref() {
+                unify_checked_type_pattern(&parameter.ty, existing, &mut substitutions);
+            }
+            let output_type = existing.unwrap_or_else(|| {
+                substitute_checked_type_from_lookup(&parameter.ty, &substitutions)
+            });
+            scoped_bindings.insert(output, output_type);
+        }
+
+        for entry_index in plan.output_scope_inputs.iter().copied() {
+            let CheckedCallInferenceEntryPlan::Input { value, .. } =
+                *plan.entries.get(entry_index)?
+            else {
+                continue;
+            };
+            let parameter = snapshot
+                .parameter_flow_types
+                .get(entry_index)
+                .and_then(Option::as_ref)?;
+            let actual = self.infer_checked_overlay_expr_type(
+                value.0 as usize,
+                &scoped_bindings,
+                active_callables,
+            )?;
+            unify_checked_type_pattern(&parameter.ty, &actual, &mut substitutions);
+        }
+
+        let instantiated =
+            substitute_checked_type_from_lookup(&snapshot.signature_result.ty, &substitutions);
+        Some(specialize_checked_call_result(
+            &instantiated,
+            &snapshot.call_result.ty,
+        ))
+    }
+
     fn infer_checked_overlay_expr_type(
         &mut self,
         expr_id: usize,
@@ -9043,25 +9301,28 @@ impl<'a> CheckedProgramBuilder<'a> {
                 BytesSizeSyntax::Dynamic | BytesSizeSyntax::Infer => BytesType::Dynamic,
             }),
             AstExprKind::Tag(tag) if tag == "SKIP" => Type::Absent,
-            AstExprKind::Tag(tag) => Type::VariantSet(vec![Variant::Tag(tag.clone())]),
+            AstExprKind::Tag(tag) => Type::VariantSet(vec![Variant::Tag(tag.clone())].into()),
             AstExprKind::Flush { .. } => Type::Absent,
-            AstExprKind::TaggedObject { tag, fields } => Type::VariantSet(vec![Variant::Tagged {
-                tag: tag.clone(),
-                fields: ObjectShape::from_ordered_fields(
-                    fields.iter().filter(|field| !field.spread).map(|field| {
-                        (
-                            field.name.clone(),
-                            self.infer_checked_overlay_expr_type(
-                                field.value,
-                                bindings,
-                                active_callables,
+            AstExprKind::TaggedObject { tag, fields } => Type::VariantSet(
+                vec![Variant::Tagged {
+                    tag: tag.clone(),
+                    fields: ObjectShape::from_ordered_fields(
+                        fields.iter().filter(|field| !field.spread).map(|field| {
+                            (
+                                field.name.clone(),
+                                self.infer_checked_overlay_expr_type(
+                                    field.value,
+                                    bindings,
+                                    active_callables,
+                                )
+                                .unwrap_or(Type::Unknown),
                             )
-                            .unwrap_or(Type::Unknown),
-                        )
-                    }),
-                    false,
-                ),
-            }]),
+                        }),
+                        false,
+                    ),
+                }]
+                .into(),
+            ),
             AstExprKind::Object(fields) => Type::object(ObjectShape::from_ordered_fields(
                 fields.iter().filter(|field| !field.spread).map(|field| {
                     (
@@ -9168,19 +9429,8 @@ impl<'a> CheckedProgramBuilder<'a> {
                     .call_for_expression(CheckedExprId(expr_id as u32))
                     .map(|call| (call.id, call.result.ty.clone()))
                 {
-                    let is_user = self
-                        .checked_type_inference_dependencies
-                        .as_ref()
-                        .and_then(|dependencies| {
-                            dependencies.call_inference_plans.get(&(call_id.0 as usize))
-                        })
-                        .is_some_and(|plan| plan.call_id == call_id && plan.is_user_callable);
-                    if is_user {
-                        self.infer_checked_overlay_call_type(call_id, bindings, active_callables)
-                            .unwrap_or(call_result)
-                    } else {
-                        call_result
-                    }
+                    self.infer_checked_overlay_call_type(call_id, bindings, active_callables)
+                        .unwrap_or(call_result)
                 } else {
                     fallback
                 }
@@ -9377,6 +9627,7 @@ impl<'a> CheckedProgramBuilder<'a> {
         let Some(snapshot) = self.snapshot_checked_call_inference(plan) else {
             return CheckedCallInstantiationChanges::default();
         };
+        let static_bits_result = self.infer_checked_static_bits_call_result(plan);
         let mut substitutions = InlineTypeSubstitutions::default();
         let mut dependency_catch_inputs = SmallVec::<[Type; 4]>::new();
 
@@ -9476,34 +9727,51 @@ impl<'a> CheckedProgramBuilder<'a> {
             unify_checked_type_pattern(&parameter.ty, &actual, &mut substitutions);
         }
 
-        for entry_index in plan.outputs.iter().copied() {
-            let Some(CheckedCallInferenceEntryPlan::Output { output, .. }) =
-                plan.entries.get(entry_index).copied()
-            else {
-                continue;
-            };
-            let Some(parameter) = snapshot
-                .parameter_flow_types
-                .get(entry_index)
-                .and_then(Option::as_ref)
-            else {
-                continue;
-            };
-            if self.set_declaration_flow_type(
-                output,
-                FlowType {
-                    mode: parameter.mode,
-                    ty: substitute_checked_type_from_lookup(&parameter.ty, &substitutions),
-                },
-            ) {
-                changes.any = true;
-                changes.outputs.push(output);
-                output_changed = true;
+        // A second output substitution is meaningful only when an input in
+        // the fresh-OUT scope can add call-local bindings. Calls without such
+        // an input already installed the exact same result in the first pass;
+        // repeating it cloned the complete output type on every solver visit.
+        if !plan.output_scope_inputs.is_empty() {
+            for entry_index in plan.outputs.iter().copied() {
+                let Some(CheckedCallInferenceEntryPlan::Output { output, .. }) =
+                    plan.entries.get(entry_index).copied()
+                else {
+                    continue;
+                };
+                let Some(parameter) = snapshot
+                    .parameter_flow_types
+                    .get(entry_index)
+                    .and_then(Option::as_ref)
+                else {
+                    continue;
+                };
+                if self.set_declaration_flow_type(
+                    output,
+                    FlowType {
+                        mode: parameter.mode,
+                        ty: substitute_checked_type_from_lookup(&parameter.ty, &substitutions),
+                    },
+                ) {
+                    changes.any = true;
+                    changes.outputs.push(output);
+                    output_changed = true;
+                }
             }
         }
         changes.needs_output_scope_revisit = output_changed && !plan.output_scope_inputs.is_empty();
 
-        let mut result_instantiation = substitutions.clone();
+        // Preserve the public call substitutions before adding result-only
+        // recovery bindings, then move the inline store into result
+        // instantiation. Cloning this store duplicated nested structural types
+        // once per call visit even though the original was never mutated again.
+        let type_substitutions = substitutions
+            .iter()
+            .map(|(variable, value)| CheckedTypeSubstitution {
+                variable: *variable,
+                value: substitute_checked_type_from_lookup(value, &substitutions),
+            })
+            .collect::<SmallVec<[_; 4]>>();
+        let mut result_instantiation = substitutions;
         if type_is_recursively_closed(&snapshot.call_result.ty) {
             // Some result variables are determined by call-local syntax rather
             // than a value parameter (for example, the width argument to
@@ -9538,6 +9806,7 @@ impl<'a> CheckedProgramBuilder<'a> {
             .as_ref()
             .filter(|ty| type_has_concrete_outer_shape(ty))
             .cloned();
+        let selected_syntax_discriminated_result = syntax_discriminated_result.is_some();
         // A root call expression is a concrete instantiation site. The
         // syntax-wide scheme remains open inside its callable, but the exact
         // structural result inferred at this occurrence must not be widened
@@ -9555,7 +9824,9 @@ impl<'a> CheckedProgramBuilder<'a> {
         // The call-specific syntax pass has already evaluated that branch with
         // its payload bindings, so its closed result is more precise than the
         // deliberately occurrence-independent principal scheme.
-        let result_type = if let Some(syntax) = syntax_discriminated_result {
+        let result_type = if let Some(static_bits) = static_bits_result {
+            static_bits
+        } else if let Some(syntax) = syntax_discriminated_result {
             syntax
         } else if let Some(concrete) = concrete_root_result {
             concrete
@@ -9567,13 +9838,6 @@ impl<'a> CheckedProgramBuilder<'a> {
                 .compute_checked_call_result_mode_from_plan(plan, snapshot.signature_result.mode),
             ty: result_type,
         };
-        let type_substitutions = substitutions
-            .iter()
-            .map(|(variable, value)| CheckedTypeSubstitution {
-                variable: *variable,
-                value: substitute_checked_type_from_lookup(value, &substitutions),
-            })
-            .collect::<SmallVec<[_; 4]>>();
         let mut context_variables = BTreeSet::new();
         if let Some(formal) = snapshot.context_formal.as_ref() {
             collect_type_vars(&formal.ty, &mut context_variables);
@@ -9598,6 +9862,10 @@ impl<'a> CheckedProgramBuilder<'a> {
             .get_mut(plan.call_index)
             .filter(|target| target.id == call_id)
         {
+            if target.syntax_discriminated_result != selected_syntax_discriminated_result {
+                target.syntax_discriminated_result = selected_syntax_discriminated_result;
+                changes.any = true;
+            }
             if target.result != result {
                 target.result = result.clone();
                 changes.any = true;
@@ -10261,20 +10529,23 @@ impl<'a> CheckedProgramBuilder<'a> {
                 }
                 Type::Absent
             }
-            AstExprKind::Tag(tag) => Type::VariantSet(vec![Variant::Tag(tag.clone())]),
-            AstExprKind::TaggedObject { tag, fields } => Type::VariantSet(vec![Variant::Tagged {
-                tag: tag.clone(),
-                fields: ObjectShape::from_ordered_fields(
-                    fields.iter().filter(|field| !field.spread).map(|field| {
-                        let field_flow = self.infer_checked_expr_flow(field.value, active);
-                        (
-                            field.name.clone(),
-                            self.flush_boundary_flow_type(field.value, field_flow).ty,
-                        )
-                    }),
-                    false,
-                ),
-            }]),
+            AstExprKind::Tag(tag) => Type::VariantSet(vec![Variant::Tag(tag.clone())].into()),
+            AstExprKind::TaggedObject { tag, fields } => Type::VariantSet(
+                vec![Variant::Tagged {
+                    tag: tag.clone(),
+                    fields: ObjectShape::from_ordered_fields(
+                        fields.iter().filter(|field| !field.spread).map(|field| {
+                            let field_flow = self.infer_checked_expr_flow(field.value, active);
+                            (
+                                field.name.clone(),
+                                self.flush_boundary_flow_type(field.value, field_flow).ty,
+                            )
+                        }),
+                        false,
+                    ),
+                }]
+                .into(),
+            ),
             AstExprKind::Object(fields) => Type::object(ObjectShape::from_ordered_fields(
                 fields.iter().filter(|field| !field.spread).map(|field| {
                     let field_flow = self.infer_checked_expr_flow(field.value, active);
@@ -12959,6 +13230,7 @@ impl<'a> CheckedProgramBuilder<'a> {
                 let Some(call) = self.calls.get_mut(call_index) else {
                     continue;
                 };
+                call.syntax_discriminated_result = concrete_syntax_result;
                 let occurrence_expression = expressions
                     .get_mut(call.expression.0 as usize)
                     .filter(|expression| expression.id == call.expression);
@@ -19281,7 +19553,7 @@ impl<'a> Checker<'a> {
         output_ownership: CheckOutputOwnership,
         init_profile: CheckerInitProfile,
     ) -> (CheckOutput, TypeCheckProfile) {
-        let trace_typecheck = std::env::var_os("BOON_TYPECHECK_TRACE").is_some();
+        let trace_typecheck = typecheck_trace_enabled();
         let trace_phase = |phase: &str, elapsed_ms: f64| {
             if trace_typecheck {
                 eprintln!("boon_typecheck {phase}: {elapsed_ms:.3}ms");
@@ -19335,6 +19607,7 @@ impl<'a> Checker<'a> {
         if trace_typecheck {
             eprintln!("boon_typecheck check_statements:start");
         }
+        let checked_diagnostic_projection_started = Instant::now();
         #[cfg(test)]
         if self.checked_diagnostic_projection_mode
             == CheckedDiagnosticProjectionMode::RecursiveOracle
@@ -19348,7 +19621,16 @@ impl<'a> Checker<'a> {
         }
         #[cfg(not(test))]
         self.project_checked_statement_diagnostics();
+        trace_phase(
+            "checked_diagnostics.project_ordered",
+            typecheck_elapsed_ms(checked_diagnostic_projection_started),
+        );
+        let host_effect_diagnostics_started = Instant::now();
         self.check_host_effect_calls();
+        trace_phase(
+            "checked_diagnostics.host_effects",
+            typecheck_elapsed_ms(host_effect_diagnostics_started),
+        );
         let accounted_diagnostic_lookups = self
             .diagnostic_lookup_hits
             .saturating_add(self.diagnostic_lookup_misses);
@@ -19839,7 +20121,7 @@ impl<'a> Checker<'a> {
         statement: &AstStatement,
         in_document: bool,
     ) -> CheckedDiagnosticStatementContext {
-        if std::env::var_os("BOON_TYPECHECK_STATEMENT_TRACE").is_some() {
+        if typecheck_statement_trace_enabled() {
             eprintln!(
                 "boon_typecheck statement kind={:?} expr={:?} line={} children={}",
                 statement.kind,
@@ -19857,9 +20139,10 @@ impl<'a> Checker<'a> {
             ),
             _ => None,
         };
+        let field = statement_field(statement);
         let next_in_document = in_document
-            || statement_field(statement).as_deref() == Some("document")
-            || statement_field(statement).as_deref() == Some("scene")
+            || field == Some("document")
+            || field == Some("scene")
             || self
                 .render_context_function_statements
                 .contains(&statement.id);
@@ -20408,7 +20691,9 @@ impl<'a> Checker<'a> {
     }
 
     fn check_render_slot(&mut self, statement: &AstStatement) {
-        let slot_name = statement_field(statement).unwrap_or_else(|| "items".to_owned());
+        let slot_name = statement_field(statement)
+            .map(str::to_owned)
+            .unwrap_or_else(|| "items".to_owned());
         let expected_contract = self.render_contracts.slot_contract(&slot_name).to_owned();
         let value_expr_id = self
             .checked_statement_values
@@ -20461,7 +20746,7 @@ impl<'a> Checker<'a> {
             if field == "style" {
                 self.check_style_statement(child);
             }
-            let Some(expected) = render_arg_expected_type(function, Some(&field)) else {
+            let Some(expected) = render_arg_expected_type(function, Some(field)) else {
                 continue;
             };
             if !render_arg_should_validate_directly(function, &field) {
@@ -20841,7 +21126,7 @@ impl<'a> Checker<'a> {
                 );
                 if external_function_role(function).is_some() {
                     sequence.push(CheckedDiagnosticExpressionTask::ExternalCall(expression_id));
-                } else {
+                } else if !self.checked_function_parameters.contains_key(function) {
                     sequence.push(CheckedDiagnosticExpressionTask::BuiltinComplete(
                         expression_id,
                     ));
@@ -20850,6 +21135,7 @@ impl<'a> Checker<'a> {
             AstExprKind::Pipe {
                 input, op, args, ..
             } => {
+                let user_callable = self.checked_function_parameters.contains_key(op);
                 let input = pipeline_source_expr_id(
                     &self.program.ast.statements,
                     expression.id,
@@ -20868,6 +21154,12 @@ impl<'a> Checker<'a> {
                 }
                 if external_function_role(op).is_some() {
                     sequence.push(CheckedDiagnosticExpressionTask::ExternalCall(expression_id));
+                } else if user_callable {
+                    // CheckedProgram construction already owns user-call
+                    // argument and result diagnostics. The legacy builtin
+                    // replay would only reread the pipe input and every
+                    // argument before discovering that no builtin contract
+                    // exists for this name.
                 } else if contextual_body_parameter_name(op).is_some() {
                     self.schedule_projected_contextual_builtin_diagnostics(
                         expression_id,
@@ -20880,7 +21172,7 @@ impl<'a> Checker<'a> {
                         expression_id,
                     ));
                 }
-                if external_function_role(op).is_none() {
+                if external_function_role(op).is_none() && !user_callable {
                     if op == "List/map"
                         && let Some(mapped) = list_map_result_expr_id(
                             &self.program.ast.statements,
@@ -20979,7 +21271,6 @@ impl<'a> Checker<'a> {
                         .copied()
                         .map(CheckedDiagnosticExpressionTask::Enter),
                 );
-                sequence.push(CheckedDiagnosticExpressionTask::ReplayLeaf(expression_id));
             }
             AstExprKind::TaggedObject { fields, .. } => {
                 sequence.extend(
@@ -20990,7 +21281,15 @@ impl<'a> Checker<'a> {
                 );
                 sequence.push(CheckedDiagnosticExpressionTask::ReplayLeaf(expression_id));
             }
-            AstExprKind::ListLiteral { items, .. } | AstExprKind::SetLiteral { items } => {
+            AstExprKind::ListLiteral { items, .. } => {
+                sequence.extend(
+                    items
+                        .iter()
+                        .copied()
+                        .map(CheckedDiagnosticExpressionTask::Enter),
+                );
+            }
+            AstExprKind::SetLiteral { items } => {
                 sequence.extend(
                     items
                         .iter()
@@ -21013,7 +21312,6 @@ impl<'a> Checker<'a> {
                         &self.program.expressions,
                     ),
                 ));
-                sequence.push(CheckedDiagnosticExpressionTask::ReplayLeaf(expression_id));
             }
             AstExprKind::Latest { branches } => {
                 sequence.extend(
@@ -21022,7 +21320,6 @@ impl<'a> Checker<'a> {
                         .copied()
                         .map(CheckedDiagnosticExpressionTask::Enter),
                 );
-                sequence.push(CheckedDiagnosticExpressionTask::ReplayLeaf(expression_id));
             }
             AstExprKind::Then { input, output } => {
                 sequence.push(CheckedDiagnosticExpressionTask::Enter(*input));
@@ -21032,7 +21329,6 @@ impl<'a> Checker<'a> {
                         .copied()
                         .map(CheckedDiagnosticExpressionTask::Enter),
                 );
-                sequence.push(CheckedDiagnosticExpressionTask::ReplayLeaf(expression_id));
             }
             AstExprKind::Infix { left, right, .. } => {
                 sequence.push(CheckedDiagnosticExpressionTask::Enter(*left));
@@ -21046,7 +21342,6 @@ impl<'a> Checker<'a> {
                         .copied()
                         .map(CheckedDiagnosticExpressionTask::Enter),
                 );
-                sequence.push(CheckedDiagnosticExpressionTask::ReplayLeaf(expression_id));
             }
             AstExprKind::Block { bindings, result } => {
                 sequence.extend(
@@ -21060,7 +21355,6 @@ impl<'a> Checker<'a> {
                         .copied()
                         .map(CheckedDiagnosticExpressionTask::Enter),
                 );
-                sequence.push(CheckedDiagnosticExpressionTask::ReplayLeaf(expression_id));
             }
             AstExprKind::Delimiter => {
                 sequence.extend(
@@ -21070,23 +21364,28 @@ impl<'a> Checker<'a> {
                         .flatten()
                         .map(|(_, value)| CheckedDiagnosticExpressionTask::Enter(*value)),
                 );
-                sequence.push(CheckedDiagnosticExpressionTask::ReplayLeaf(expression_id));
             }
             AstExprKind::Identifier(value) => {
-                if !self.builtin_symbol_exprs.contains(&expression.id)
-                    && !self.is_known_function(value)
-                    && !self
-                        .local_name_bindings
-                        .iter()
-                        .rev()
-                        .any(|bindings| bindings.contains_key(value))
-                    && !self.name_bindings.contains_key(value)
-                    && let Some(declaration) =
-                        declaration_expr_for_path(&self.declaration_exprs, value)
+                if self.builtin_symbol_exprs.contains(&expression.id) {
+                    return sequence;
+                }
+                if self.is_known_function(value) {
+                    sequence.push(CheckedDiagnosticExpressionTask::ReplayLeaf(expression_id));
+                } else if self
+                    .local_name_bindings
+                    .iter()
+                    .rev()
+                    .any(|bindings| bindings.contains_key(value))
+                    || self.name_bindings.contains_key(value)
+                {
+                    // The finalized checked lookup already proves this read.
+                } else if let Some(declaration) =
+                    declaration_expr_for_path(&self.declaration_exprs, value)
                 {
                     sequence.push(CheckedDiagnosticExpressionTask::Enter(declaration));
+                } else {
+                    sequence.push(CheckedDiagnosticExpressionTask::ReplayLeaf(expression_id));
                 }
-                sequence.push(CheckedDiagnosticExpressionTask::ReplayLeaf(expression_id));
             }
             AstExprKind::Drain { path } => {
                 let parts = drain_path_parts(path);
@@ -21108,9 +21407,8 @@ impl<'a> Checker<'a> {
             | AstExprKind::BitsLiteral { .. }
             | AstExprKind::ByteLiteral { .. }
             | AstExprKind::Tag(_)
-            | AstExprKind::Source
-            | AstExprKind::Unknown(_)
-            | AstExprKind::Arrow { .. } => {
+            | AstExprKind::Source => {}
+            AstExprKind::Unknown(_) | AstExprKind::Arrow { .. } => {
                 sequence.push(CheckedDiagnosticExpressionTask::ReplayLeaf(expression_id));
             }
         }
@@ -21792,7 +22090,7 @@ impl<'a> Checker<'a> {
                 }
                 Type::Absent
             }
-            AstExprKind::Tag(tag) => Type::VariantSet(vec![Variant::Tag(tag.clone())]),
+            AstExprKind::Tag(tag) => Type::VariantSet(vec![Variant::Tag(tag.clone())].into()),
             AstExprKind::TaggedObject { tag, fields } => {
                 let shape = ObjectShape::from_ordered_fields(
                     fields
@@ -21802,7 +22100,7 @@ impl<'a> Checker<'a> {
                     false,
                 );
                 self.check_tagged_object_contract(expr, tag, fields, &shape);
-                Type::VariantSet(vec![Variant::tagged(tag.clone(), shape)])
+                Type::VariantSet(vec![Variant::tagged(tag.clone(), shape)].into())
             }
             AstExprKind::Object(fields) => Type::object(self.infer_record_shape(fields)),
             AstExprKind::Drain { path } => self.type_for_path(expr.id, &drain_path_parts(path)),
@@ -24419,8 +24717,8 @@ impl<'a> Checker<'a> {
             AstExprKind::Object(fields) => Some(Type::object(
                 self.static_record_shape(fields, active_functions),
             )),
-            AstExprKind::TaggedObject { tag, fields } => {
-                Some(Type::VariantSet(vec![Variant::Tagged {
+            AstExprKind::TaggedObject { tag, fields } => Some(Type::VariantSet(
+                vec![Variant::Tagged {
                     tag: tag.clone(),
                     fields: ObjectShape::from_ordered_fields(
                         fields.iter().filter(|field| !field.spread).map(|field| {
@@ -24437,8 +24735,9 @@ impl<'a> Checker<'a> {
                         }),
                         false,
                     ),
-                }]))
-            }
+                }]
+                .into(),
+            )),
             AstExprKind::StringLiteral(_) | AstExprKind::TextLiteral(_) => Some(Type::Text),
             AstExprKind::Number(_) => Some(Type::Number),
             AstExprKind::BitsLiteral { width, .. } => Some(Type::Bits { width: *width }),
@@ -24450,7 +24749,7 @@ impl<'a> Checker<'a> {
                 |expr| self.static_expr_type(expr, active_functions),
             )),
             AstExprKind::Tag(tag) if tag == "SKIP" => Some(Type::Absent),
-            AstExprKind::Tag(tag) => Some(Type::VariantSet(vec![Variant::Tag(tag.clone())])),
+            AstExprKind::Tag(tag) => Some(Type::VariantSet(vec![Variant::Tag(tag.clone())].into())),
             AstExprKind::ListLiteral { items, .. } => Some(static_list_literal_type(
                 items,
                 self.program.expressions.as_slice(),
@@ -26150,7 +26449,7 @@ impl<'a> Checker<'a> {
             if let Some(value_expr_id) =
                 direct_statement_value_expr_id(child, &self.program.expressions)
             {
-                self.check_style_field_value(&field, value_expr_id);
+                self.check_style_field_value(field, value_expr_id);
             } else {
                 self.check_style_statement(child);
             }
@@ -26671,7 +26970,7 @@ fn collect_multiline_function_arg_call_sites(
             {
                 for parameter in parameters {
                     let value = statement.children.iter().find_map(|child| {
-                        (statement_field(child).as_deref() == Some(parameter.name.as_str()))
+                        (statement_field(child) == Some(parameter.name.as_str()))
                             .then(|| direct_statement_value_expr_id(child, expressions))
                             .flatten()
                     });
@@ -26945,7 +27244,7 @@ fn direct_statement_value_expr_id(
                 .then(|| child.expr.or_else(|| first_child_expr_id(child)))
                 .flatten()
             })
-            .collect::<Vec<_>>();
+            .collect::<SmallVec<[usize; 4]>>();
         match expression_children.as_slice() {
             [] => None,
             [single] => Some(*single),
@@ -27283,12 +27582,12 @@ fn expr_single_name(expr: &AstExpr) -> Option<&str> {
     }
 }
 
-fn statement_field(statement: &AstStatement) -> Option<String> {
+fn statement_field(statement: &AstStatement) -> Option<&str> {
     match &statement.kind {
-        AstStatementKind::Field { name } => Some(name.clone()),
+        AstStatementKind::Field { name } => Some(name),
         AstStatementKind::List {
             field: Some(name), ..
-        } => Some(name.clone()),
+        } => Some(name),
         _ => None,
     }
 }
@@ -27785,64 +28084,85 @@ fn bits_result_type() -> Type {
 }
 
 fn bits_direction_type() -> Type {
-    Type::VariantSet(vec![
-        Variant::Tag("Left".to_owned()),
-        Variant::Tag("Right".to_owned()),
-    ])
+    Type::VariantSet(
+        vec![
+            Variant::Tag("Left".to_owned()),
+            Variant::Tag("Right".to_owned()),
+        ]
+        .into(),
+    )
 }
 
 fn bits_interpretation_type() -> Type {
-    Type::VariantSet(vec![
-        Variant::Tag("Unsigned".to_owned()),
-        Variant::Tag("TwosComplement".to_owned()),
-    ])
+    Type::VariantSet(
+        vec![
+            Variant::Tag("Unsigned".to_owned()),
+            Variant::Tag("TwosComplement".to_owned()),
+        ]
+        .into(),
+    )
 }
 
 fn bits_byte_order_type() -> Type {
-    Type::VariantSet(vec![
-        Variant::Tag("BigEndian".to_owned()),
-        Variant::Tag("LittleEndian".to_owned()),
-    ])
+    Type::VariantSet(
+        vec![
+            Variant::Tag("BigEndian".to_owned()),
+            Variant::Tag("LittleEndian".to_owned()),
+        ]
+        .into(),
+    )
 }
 
 fn bits_comparison_type() -> Type {
-    Type::VariantSet(vec![
-        Variant::Tag("Less".to_owned()),
-        Variant::Tag("Equal".to_owned()),
-        Variant::Tag("Greater".to_owned()),
-    ])
+    Type::VariantSet(
+        vec![
+            Variant::Tag("Less".to_owned()),
+            Variant::Tag("Equal".to_owned()),
+            Variant::Tag("Greater".to_owned()),
+        ]
+        .into(),
+    )
 }
 
 fn bits_converted_type(value: Type) -> Type {
-    Type::VariantSet(vec![
-        Variant::Tagged {
-            tag: "Converted".to_owned(),
-            fields: ObjectShape::from_ordered_fields([("value".to_owned(), value)], false),
-        },
-        Variant::Tag("NotWhole".to_owned()),
-        Variant::Tag("OutOfRange".to_owned()),
-    ])
+    Type::VariantSet(
+        vec![
+            Variant::Tagged {
+                tag: "Converted".to_owned(),
+                fields: ObjectShape::from_ordered_fields([("value".to_owned(), value)], false),
+            },
+            Variant::Tag("NotWhole".to_owned()),
+            Variant::Tag("OutOfRange".to_owned()),
+        ]
+        .into(),
+    )
 }
 
 fn bits_added_type(value: Type) -> Type {
-    Type::VariantSet(vec![
-        Variant::Tagged {
-            tag: "Added".to_owned(),
-            fields: ObjectShape::from_ordered_fields([("value".to_owned(), value)], false),
-        },
-        Variant::Tag("Overflow".to_owned()),
-    ])
+    Type::VariantSet(
+        vec![
+            Variant::Tagged {
+                tag: "Added".to_owned(),
+                fields: ObjectShape::from_ordered_fields([("value".to_owned(), value)], false),
+            },
+            Variant::Tag("Overflow".to_owned()),
+        ]
+        .into(),
+    )
 }
 
 fn bits_subtracted_type(value: Type) -> Type {
-    Type::VariantSet(vec![
-        Variant::Tagged {
-            tag: "Subtracted".to_owned(),
-            fields: ObjectShape::from_ordered_fields([("value".to_owned(), value)], false),
-        },
-        Variant::Tag("Underflow".to_owned()),
-        Variant::Tag("Overflow".to_owned()),
-    ])
+    Type::VariantSet(
+        vec![
+            Variant::Tagged {
+                tag: "Subtracted".to_owned(),
+                fields: ObjectShape::from_ordered_fields([("value".to_owned(), value)], false),
+            },
+            Variant::Tag("Underflow".to_owned()),
+            Variant::Tag("Overflow".to_owned()),
+        ]
+        .into(),
+    )
 }
 
 fn dependency_catch_type() -> Type {
@@ -27850,45 +28170,57 @@ fn dependency_catch_type() -> Type {
 }
 
 fn found_or_not_found_type(item: Type) -> Type {
-    Type::VariantSet(vec![
-        Variant::Tagged {
-            tag: "Found".to_owned(),
-            fields: ObjectShape::from_ordered_fields([("value".to_owned(), item)], false),
-        },
-        Variant::Tag("NotFound".to_owned()),
-    ])
+    Type::VariantSet(
+        vec![
+            Variant::Tagged {
+                tag: "Found".to_owned(),
+                fields: ObjectShape::from_ordered_fields([("value".to_owned(), item)], false),
+            },
+            Variant::Tag("NotFound".to_owned()),
+        ]
+        .into(),
+    )
 }
 
 fn found_position_type() -> Type {
-    Type::VariantSet(vec![
-        Variant::Tagged {
-            tag: "Found".to_owned(),
-            fields: ObjectShape::from_ordered_fields(
-                [("position".to_owned(), Type::Number)],
-                false,
-            ),
-        },
-        Variant::Tag("NotFound".to_owned()),
-    ])
+    Type::VariantSet(
+        vec![
+            Variant::Tagged {
+                tag: "Found".to_owned(),
+                fields: ObjectShape::from_ordered_fields(
+                    [("position".to_owned(), Type::Number)],
+                    false,
+                ),
+            },
+            Variant::Tag("NotFound".to_owned()),
+        ]
+        .into(),
+    )
 }
 
 fn parsed_number_type() -> Type {
-    Type::VariantSet(vec![
-        Variant::Tagged {
-            tag: "Parsed".to_owned(),
-            fields: ObjectShape::from_ordered_fields([("value".to_owned(), Type::Number)], false),
-        },
-        Variant::Tagged {
-            tag: "InvalidNumber".to_owned(),
-            fields: ObjectShape::from_ordered_fields(
-                [
-                    ("reason".to_owned(), Type::Text),
-                    ("position".to_owned(), Type::Number),
-                ],
-                false,
-            ),
-        },
-    ])
+    Type::VariantSet(
+        vec![
+            Variant::Tagged {
+                tag: "Parsed".to_owned(),
+                fields: ObjectShape::from_ordered_fields(
+                    [("value".to_owned(), Type::Number)],
+                    false,
+                ),
+            },
+            Variant::Tagged {
+                tag: "InvalidNumber".to_owned(),
+                fields: ObjectShape::from_ordered_fields(
+                    [
+                        ("reason".to_owned(), Type::Text),
+                        ("position".to_owned(), Type::Number),
+                    ],
+                    false,
+                ),
+            },
+        ]
+        .into(),
+    )
 }
 
 impl Default for BuiltinSignatureRegistry {
@@ -29141,7 +29473,9 @@ impl RenderContractRegistry {
                     .find_map(|root| root.constructors.get(function))
             })
             .map(|contract| contract.kind_type(&lookup_fields))
-            .unwrap_or_else(|| Type::VariantSet(vec![Variant::Tag("Renderable".to_owned())]));
+            .unwrap_or_else(|| {
+                Type::VariantSet(vec![Variant::Tag("Renderable".to_owned())].into())
+            });
         ordered_fields.push(("kind".to_owned(), kind));
         Type::object(ObjectShape::from_ordered_fields(ordered_fields, false))
     }
@@ -29932,7 +30266,7 @@ fn validate_deferred_style_constraints(
                 continue;
             }
             if !accepts(constraint.expectation, &ty) {
-                if std::env::var_os("BOON_TYPECHECK_TRACE").is_some() {
+                if typecheck_trace_enabled() {
                     eprintln!(
                         "boon_typecheck diagnostic_replay.style owner={owner:?} expression={} base={} substituted={} substitutions={}",
                         constraint.expression.0,
@@ -30067,7 +30401,7 @@ fn validate_deferred_style_constraints(
             &mut diagnostics,
         );
     }
-    if std::env::var_os("BOON_TYPECHECK_TRACE").is_some() {
+    if typecheck_trace_enabled() {
         eprintln!(
             "boon_typecheck deferred_styles constraints={} relevant_callables={} visited_calls={visited_calls}",
             constraints.len(),
@@ -30583,7 +30917,9 @@ fn narrowed_pattern_binding(selector: &Type, pattern: &AstMatchPattern) -> Optio
         Variant::Tagged { tag, fields } if tag == &pattern_tag => {
             Some(Type::Object(fields.clone()))
         }
-        Variant::Tag(tag) if tag == &pattern_tag => Some(Type::VariantSet(vec![variant.clone()])),
+        Variant::Tag(tag) if tag == &pattern_tag => {
+            Some(Type::VariantSet(vec![variant.clone()].into()))
+        }
         _ => None,
     })
 }
@@ -31154,12 +31490,25 @@ fn statement_pipeline_expr_ids(
     statement: &AstStatement,
     expressions: &[AstExpr],
 ) -> Option<Vec<usize>> {
-    let mut expr_ids = Vec::new();
-    if let Some(expr_id) = statement.expr {
-        expr_ids.push(expr_id);
+    let expr_id = statement.expr?;
+    if expr_is_pipeline_continuation(expr_id, expressions)
+        || !statement.children.iter().any(|child| {
+            matches!(child.kind, AstStatementKind::Expression)
+                && child
+                    .expr
+                    .is_some_and(|child| expr_is_pipeline_continuation(child, expressions))
+        })
+    {
+        return None;
     }
+
+    // Most statements are not pipelines. Delay the heap allocation until a
+    // real continuation is present instead of allocating a one-element Vec
+    // for every statement inspected by diagnostics and checked lowering.
+    let mut expr_ids = Vec::with_capacity(2);
+    expr_ids.push(expr_id);
     collect_pipe_continuation_expr_ids(statement, expressions, &mut expr_ids);
-    expression_sequence_is_pipeline(&expr_ids, expressions).then_some(expr_ids)
+    Some(expr_ids)
 }
 
 fn statement_pipeline_final_expr_id(
@@ -31323,7 +31672,7 @@ fn object_shape_for_statement(statement: &AstStatement, expressions: &[AstExpr])
             let field = statement_field(child)?;
             let ty =
                 simple_statement_value_type(child, expressions).unwrap_or_else(open_object_type);
-            Some((field, ty))
+            Some((field.to_owned(), ty))
         }),
         true,
     )
@@ -31644,7 +31993,7 @@ fn reachable_static_when_arms(
             .collect();
     };
 
-    let mut remaining = variants.clone();
+    let mut remaining = variants.clone().into_owned();
     let mut reachable = Vec::new();
     for arm in arms {
         if remaining.is_empty() {
@@ -31678,7 +32027,7 @@ fn reachable_static_when_arms(
                     expression: *arm,
                     pattern: pattern.clone(),
                     output: *output,
-                    selector_type: Some(Type::VariantSet(matched)),
+                    selector_type: Some(Type::VariantSet(matched.into())),
                     catch_all: false,
                 });
             }
@@ -31690,7 +32039,7 @@ fn reachable_static_when_arms(
                     expression: *arm,
                     pattern: pattern.clone(),
                     output: *output,
-                    selector_type: Some(Type::VariantSet(std::mem::take(&mut remaining))),
+                    selector_type: Some(Type::VariantSet(std::mem::take(&mut remaining).into())),
                     catch_all: true,
                 });
                 break;
@@ -31844,7 +32193,7 @@ fn simple_expr_type(expr: &AstExpr, expressions: &[AstExpr]) -> Type {
             })
         }
         AstExprKind::Tag(value) if value == "SKIP" => Type::Absent,
-        AstExprKind::Tag(value) => Type::VariantSet(vec![Variant::Tag(value.clone())]),
+        AstExprKind::Tag(value) => Type::VariantSet(vec![Variant::Tag(value.clone())].into()),
         AstExprKind::Object(fields) => Type::object(simple_record_shape(fields, expressions)),
         AstExprKind::ListLiteral { items, .. } => {
             static_list_literal_type(items, expressions, |item| {
@@ -32025,7 +32374,7 @@ fn collect_param_requirements_statement(
                 let Some(field) = statement_field(child) else {
                     continue;
                 };
-                let Some(expected) = render_arg_expected_type(function, Some(&field)) else {
+                let Some(expected) = render_arg_expected_type(function, Some(field)) else {
                     continue;
                 };
                 let Some(value_expr) = direct_statement_value_expr_id(child, expressions) else {
@@ -33200,11 +33549,69 @@ fn static_expr_type_from_bindings(
             |expr| static_expr_type_from_bindings(expr, expressions, bindings),
         )),
         AstExprKind::Tag(tag) if tag == "SKIP" => Some(Type::Absent),
-        AstExprKind::Tag(tag) => Some(Type::VariantSet(vec![Variant::Tag(tag.clone())])),
+        AstExprKind::Tag(tag) => Some(Type::VariantSet(vec![Variant::Tag(tag.clone())].into())),
         AstExprKind::Call { .. } | AstExprKind::Pipe { .. } => {
             let ty = simple_expr_type(expr, expressions);
             is_specific_type(&ty).then_some(ty)
         }
+        _ => None,
+    }
+}
+
+fn resolved_bits_builtin_result(
+    function: &str,
+    bits_type: Option<Type>,
+    named_type: &dyn Fn(&str) -> Option<Type>,
+    width_arg: &dyn Fn(&str) -> Option<u32>,
+) -> Option<Type> {
+    let bits_width = match &bits_type {
+        Some(Type::Bits { width }) => Some(*width),
+        _ => None,
+    };
+    let named_bits_width = |name: &str| match named_type(name) {
+        Some(Type::Bits { width }) => Some(width),
+        _ => None,
+    };
+    match function {
+        "Bits/width" | "Bits/to_number" => Some(Type::Number),
+        "Bits/get" => Some(true_false_type()),
+        "Bits/compare" => Some(bits_comparison_type()),
+        "Bits/set"
+        | "Bits/set_slice"
+        | "Bits/and"
+        | "Bits/or"
+        | "Bits/xor"
+        | "Bits/not"
+        | "Bits/shift_left"
+        | "Bits/shift_right"
+        | "Bits/shift_right_arithmetic"
+        | "Bits/rotate_left"
+        | "Bits/rotate_right"
+        | "Bits/add_or_wrap"
+        | "Bits/subtract_or_wrap" => bits_type,
+        "Bits/slice" => width_arg("count").map(|width| Type::Bits { width }),
+        "Bits/concat" => bits_width
+            .zip(named_bits_width("with"))
+            .and_then(|(left, right)| left.checked_add(right))
+            .filter(|width| *width <= MAX_BITS_WIDTH)
+            .map(|width| Type::Bits { width }),
+        "Bits/zero_extend" | "Bits/sign_extend" | "Bits/truncate" | "Bytes/to_bits" => {
+            width_arg("width").map(|width| Type::Bits { width })
+        }
+        "Bits/add_widening" => bits_width
+            .and_then(|width| width.checked_add(1))
+            .filter(|width| *width <= MAX_BITS_WIDTH)
+            .map(|width| Type::Bits { width }),
+        "Bits/try_add" => bits_type.map(bits_added_type),
+        "Bits/try_subtract" => bits_type.map(bits_subtracted_type),
+        "Number/to_bits" => {
+            width_arg("width").map(|width| bits_converted_type(Type::Bits { width }))
+        }
+        "Bits/to_bytes" => bits_width.map(|width| {
+            Type::Bytes(BytesType::Fixed(
+                usize::try_from(width / 8).unwrap_or(usize::MAX),
+            ))
+        }),
         _ => None,
     }
 }
@@ -33272,60 +33679,10 @@ fn static_bits_result_type_from_bindings(
     let bits_type = piped_input
         .or_else(|| named_arg_expr(args, "bits"))
         .and_then(type_for_expr);
-    let bits_width = match &bits_type {
-        Some(Type::Bits { width }) => Some(*width),
-        _ => None,
-    };
     let named_bits_type = |name: &str| named_arg_expr(args, name).and_then(type_for_expr);
-    let named_bits_width = |name: &str| match named_bits_type(name) {
-        Some(Type::Bits { width }) => Some(width),
-        _ => None,
-    };
     let width_arg =
         |name: &str| named_arg_expr(args, name).and_then(|expr| static_width(expressions, expr));
-
-    match function {
-        "Bits/width" | "Bits/to_number" => Some(Type::Number),
-        "Bits/get" => Some(true_false_type()),
-        "Bits/compare" => Some(bits_comparison_type()),
-        "Bits/set"
-        | "Bits/set_slice"
-        | "Bits/and"
-        | "Bits/or"
-        | "Bits/xor"
-        | "Bits/not"
-        | "Bits/shift_left"
-        | "Bits/shift_right"
-        | "Bits/shift_right_arithmetic"
-        | "Bits/rotate_left"
-        | "Bits/rotate_right"
-        | "Bits/add_or_wrap"
-        | "Bits/subtract_or_wrap" => bits_type,
-        "Bits/slice" => width_arg("count").map(|width| Type::Bits { width }),
-        "Bits/concat" => bits_width
-            .zip(named_bits_width("with"))
-            .and_then(|(left, right)| left.checked_add(right))
-            .filter(|width| *width <= MAX_BITS_WIDTH)
-            .map(|width| Type::Bits { width }),
-        "Bits/zero_extend" | "Bits/sign_extend" | "Bits/truncate" | "Bytes/to_bits" => {
-            width_arg("width").map(|width| Type::Bits { width })
-        }
-        "Bits/add_widening" => bits_width
-            .and_then(|width| width.checked_add(1))
-            .filter(|width| *width <= MAX_BITS_WIDTH)
-            .map(|width| Type::Bits { width }),
-        "Bits/try_add" => bits_type.map(bits_added_type),
-        "Bits/try_subtract" => bits_type.map(bits_subtracted_type),
-        "Number/to_bits" => {
-            width_arg("width").map(|width| bits_converted_type(Type::Bits { width }))
-        }
-        "Bits/to_bytes" => bits_width.map(|width| {
-            Type::Bytes(BytesType::Fixed(
-                usize::try_from(width / 8).unwrap_or(usize::MAX),
-            ))
-        }),
-        _ => None,
-    }
+    resolved_bits_builtin_result(function, bits_type, &named_bits_type, &width_arg)
 }
 
 fn static_path_type_from_bindings(
@@ -33415,8 +33772,8 @@ fn static_expr_type_with_external_types(
             }),
             false,
         ))),
-        AstExprKind::TaggedObject { tag, fields } => {
-            Some(Type::VariantSet(vec![Variant::Tagged {
+        AstExprKind::TaggedObject { tag, fields } => Some(Type::VariantSet(
+            vec![Variant::Tagged {
                 tag: tag.clone(),
                 fields: ObjectShape::from_ordered_fields(
                     fields.iter().filter(|field| !field.spread).map(|field| {
@@ -33437,8 +33794,9 @@ fn static_expr_type_with_external_types(
                     }),
                     false,
                 ),
-            }]))
-        }
+            }]
+            .into(),
+        )),
         AstExprKind::Draining { input } => expressions.get(*input).and_then(|input| {
             static_expr_type_with_external_types(input, expressions, bindings, external_types)
         }),
@@ -34102,7 +34460,7 @@ pub fn specialize_checked_call_result(instantiated: &Type, occurrence: &Type) ->
             })
         }
         (Type::VariantSet(instantiated), Type::VariantSet(occurrence)) => {
-            let mut variants = instantiated.clone();
+            let mut variants = instantiated.clone().into_owned();
             for occurrence_variant in occurrence {
                 let Variant::Tagged {
                     tag,
@@ -34135,7 +34493,7 @@ pub fn specialize_checked_call_result(instantiated: &Type, occurrence: &Type) ->
                 };
                 *instantiated_fields = specialized;
             }
-            Type::VariantSet(variants)
+            Type::VariantSet(variants.into())
         }
         (Type::Union(instantiated), Type::Union(occurrence))
             if instantiated.len() == occurrence.len() =>
@@ -34270,12 +34628,12 @@ fn widen_structural_type(left: &Type, right: &Type) -> Type {
     }
     match (left, right) {
         (Type::VariantSet(left), Type::VariantSet(right)) => {
-            let mut variants = left.clone();
+            let mut variants = left.clone().into_owned();
             for variant in right {
                 merge_structural_variant(&mut variants, variant.clone());
             }
             variants.sort_by_key(variant_sort_key);
-            Type::VariantSet(variants)
+            Type::VariantSet(variants.into())
         }
         (Type::Absent, ty) | (ty, Type::Absent) => ty.clone(),
         (ty, no_element) if is_no_element_type(no_element) => ty.clone(),
@@ -34342,7 +34700,7 @@ pub fn canonical_union_type(candidates: Vec<Type>) -> Type {
     }
     if !variants.is_empty() {
         variants.sort_by_key(variant_sort_key);
-        members.push(Type::VariantSet(variants));
+        members.push(Type::VariantSet(variants.into()));
     }
     members.sort_by_key(|member| format!("{member:?}"));
     members.dedup();
@@ -37261,10 +37619,13 @@ fn host_port_payload_types(
             BTreeMap::from([
                 (
                     "kind".to_owned(),
-                    Type::VariantSet(vec![
-                        Variant::Tag("TextMessage".to_owned()),
-                        Variant::Tag("BinaryMessage".to_owned()),
-                    ]),
+                    Type::VariantSet(
+                        vec![
+                            Variant::Tag("TextMessage".to_owned()),
+                            Variant::Tag("BinaryMessage".to_owned()),
+                        ]
+                        .into(),
+                    ),
                 ),
                 ("text".to_owned(), Type::Text),
                 ("bytes".to_owned(), Type::Bytes(BytesType::Dynamic)),
@@ -37670,7 +38031,7 @@ fn collect_statement_type_hints(
             }
             AstStatementKind::List { .. } => {
                 let ty = statement_field(statement)
-                    .and_then(|field| name_bindings.get(&field).cloned())
+                    .and_then(|field| name_bindings.get(field).cloned())
                     .unwrap_or_else(|| simple_list_statement_type(statement, &program.expressions));
                 entries.push(type_hint_entry_for_range(
                     program,
@@ -37804,7 +38165,7 @@ fn statement_hint_type(
         ty
     } else {
         statement_field(statement)
-            .and_then(|field| name_bindings.get(&field).cloned())
+            .and_then(|field| name_bindings.get(field).cloned())
             .or_else(|| value_expr.and_then(|expr_id| expr_types.get(&expr_id).cloned()))
             .unwrap_or_else(|| {
                 Type::object(object_shape_for_statement(statement, &program.expressions))
@@ -38290,7 +38651,7 @@ fn source_payload_tag_selector_type(
         left.cmp(right)
     });
     variants.dedup();
-    (!variants.is_empty()).then_some(Type::VariantSet(variants))
+    (!variants.is_empty()).then_some(Type::VariantSet(variants.into()))
 }
 
 fn collect_payload_hold_update_types(
@@ -38578,10 +38939,13 @@ fn scoped_path(scope: &[String], name: &str) -> String {
 }
 
 fn true_false_type() -> Type {
-    Type::VariantSet(vec![
-        Variant::Tag("False".to_owned()),
-        Variant::Tag("True".to_owned()),
-    ])
+    Type::VariantSet(
+        vec![
+            Variant::Tag("False".to_owned()),
+            Variant::Tag("True".to_owned()),
+        ]
+        .into(),
+    )
 }
 
 fn order_direction_type() -> Type {
@@ -38589,71 +38953,89 @@ fn order_direction_type() -> Type {
 }
 
 fn page_position_type() -> Type {
-    Type::VariantSet(vec![
-        Variant::Tag("Start".to_owned()),
-        Variant::Tagged {
-            tag: "Cursor".to_owned(),
-            fields: ObjectShape::from_ordered_fields(
-                [("value".to_owned(), Type::Bytes(BytesType::Dynamic))],
-                false,
-            ),
-        },
-    ])
+    Type::VariantSet(
+        vec![
+            Variant::Tag("Start".to_owned()),
+            Variant::Tagged {
+                tag: "Cursor".to_owned(),
+                fields: ObjectShape::from_ordered_fields(
+                    [("value".to_owned(), Type::Bytes(BytesType::Dynamic))],
+                    false,
+                ),
+            },
+        ]
+        .into(),
+    )
 }
 
 fn page_result_type(item: Type) -> Type {
-    let next = Type::VariantSet(vec![
-        Variant::Tag("End".to_owned()),
-        Variant::Tagged {
-            tag: "Cursor".to_owned(),
-            fields: ObjectShape::from_ordered_fields(
-                [("value".to_owned(), Type::Bytes(BytesType::Dynamic))],
-                false,
-            ),
-        },
-    ]);
-    Type::VariantSet(vec![
-        Variant::Tagged {
-            tag: "Page".to_owned(),
-            fields: ObjectShape::from_ordered_fields(
-                [
-                    ("items".to_owned(), Type::List(Box::new(item))),
-                    ("next".to_owned(), next),
-                ],
-                false,
-            ),
-        },
-        Variant::Tag("PageExpired".to_owned()),
-        Variant::Tag("InvalidPageCursor".to_owned()),
-        Variant::Tag("InvalidPageSize".to_owned()),
-        Variant::Tag("PageWorkLimitExceeded".to_owned()),
-    ])
-}
-
-fn session_info_intrinsic_type(function: &str) -> Option<Type> {
-    match function {
-        "SessionInfo/status" => Some(Type::VariantSet(vec![
-            Variant::Tag("Connecting".to_owned()),
-            Variant::Tag("Current".to_owned()),
-            Variant::Tag("Stale".to_owned()),
+    let next = Type::VariantSet(
+        vec![
+            Variant::Tag("End".to_owned()),
             Variant::Tagged {
-                tag: "Failed".to_owned(),
-                fields: ObjectShape::from_ordered_fields([("code".to_owned(), Type::Text)], false),
+                tag: "Cursor".to_owned(),
+                fields: ObjectShape::from_ordered_fields(
+                    [("value".to_owned(), Type::Bytes(BytesType::Dynamic))],
+                    false,
+                ),
             },
-        ])),
-        "SessionInfo/principal" => Some(Type::VariantSet(vec![
-            Variant::Tag("Anonymous".to_owned()),
+        ]
+        .into(),
+    );
+    Type::VariantSet(
+        vec![
             Variant::Tagged {
-                tag: "Authenticated".to_owned(),
+                tag: "Page".to_owned(),
                 fields: ObjectShape::from_ordered_fields(
                     [
-                        ("subject".to_owned(), Type::Text),
-                        ("roles".to_owned(), Type::List(Box::new(Type::Text))),
+                        ("items".to_owned(), Type::List(Box::new(item))),
+                        ("next".to_owned(), next),
                     ],
                     false,
                 ),
             },
-        ])),
+            Variant::Tag("PageExpired".to_owned()),
+            Variant::Tag("InvalidPageCursor".to_owned()),
+            Variant::Tag("InvalidPageSize".to_owned()),
+            Variant::Tag("PageWorkLimitExceeded".to_owned()),
+        ]
+        .into(),
+    )
+}
+
+fn session_info_intrinsic_type(function: &str) -> Option<Type> {
+    match function {
+        "SessionInfo/status" => Some(Type::VariantSet(
+            vec![
+                Variant::Tag("Connecting".to_owned()),
+                Variant::Tag("Current".to_owned()),
+                Variant::Tag("Stale".to_owned()),
+                Variant::Tagged {
+                    tag: "Failed".to_owned(),
+                    fields: ObjectShape::from_ordered_fields(
+                        [("code".to_owned(), Type::Text)],
+                        false,
+                    ),
+                },
+            ]
+            .into(),
+        )),
+        "SessionInfo/principal" => Some(Type::VariantSet(
+            vec![
+                Variant::Tag("Anonymous".to_owned()),
+                Variant::Tagged {
+                    tag: "Authenticated".to_owned(),
+                    fields: ObjectShape::from_ordered_fields(
+                        [
+                            ("subject".to_owned(), Type::Text),
+                            ("roles".to_owned(), Type::List(Box::new(Type::Text))),
+                        ],
+                        false,
+                    ),
+                },
+            ]
+            .into(),
+        )),
         _ => None,
     }
 }
@@ -38679,7 +39061,7 @@ fn session_info_role_diagnostic(function: &str, role: ProgramRole) -> String {
 }
 
 fn tag_type(tag: &str) -> Type {
-    Type::VariantSet(vec![Variant::Tag(tag.to_owned())])
+    Type::VariantSet(vec![Variant::Tag(tag.to_owned())].into())
 }
 
 fn tag_union_type(tags: &[&str]) -> Type {

@@ -202,6 +202,17 @@ state:
     |> HOLD state {}
 "#,
         ),
+        (
+            "projection-user-call-errors.bn",
+            r#"
+FUNCTION identity(value) {
+    value
+}
+
+bad_direct: identity(wrong: 1)
+bad_pipe: 1 |> identity(wrong: 2)
+"#,
+        ),
     ];
     let ownerships = [
         CheckOutputOwnership::ReportOwned,
@@ -1095,6 +1106,15 @@ fn cloned_object_and_tagged_types_share_their_sealed_shapes() {
         unreachable!("fixture is a tagged variant")
     };
     assert!(SharedObjectShape::ptr_eq(tagged_shape, cloned_tagged_shape));
+
+    let variants = Type::VariantSet(vec![tagged].into());
+    let variants_clone = variants.clone();
+    let (Type::VariantSet(variants), Type::VariantSet(cloned_variants)) =
+        (&variants, &variants_clone)
+    else {
+        unreachable!("fixture is a variant-set type")
+    };
+    assert!(SharedVariantSet::ptr_eq(variants, cloned_variants));
 }
 
 #[test]
@@ -1137,7 +1157,7 @@ fn shared_object_shape_preserves_object_and_tagged_json() {
     .expect("object type deserializes");
     assert_eq!(decoded_object, object);
 
-    let variants = Type::VariantSet(vec![Variant::tagged("Found".to_owned(), shape)]);
+    let variants = Type::VariantSet(vec![Variant::tagged("Found".to_owned(), shape)].into());
     assert_eq!(
         serde_json::to_value(&variants).expect("tagged type serializes"),
         serde_json::json!({
@@ -1158,14 +1178,17 @@ fn shared_object_shape_preserves_object_and_tagged_json() {
 
 #[test]
 fn closed_type_transforms_reuse_object_and_tagged_shape_allocations() {
-    let tagged = Type::VariantSet(vec![Variant::tagged(
-        "Ready".to_owned(),
-        ObjectShape {
-            fields: BTreeMap::from([("label".to_owned(), Type::Text)]),
-            field_order: vec!["label".to_owned()],
-            open: false,
-        },
-    )]);
+    let tagged = Type::VariantSet(
+        vec![Variant::tagged(
+            "Ready".to_owned(),
+            ObjectShape {
+                fields: BTreeMap::from([("label".to_owned(), Type::Text)]),
+                field_order: vec!["label".to_owned()],
+                open: false,
+            },
+        )]
+        .into(),
+    );
     let closed = Type::object(ObjectShape {
         fields: BTreeMap::from([("state".to_owned(), tagged)]),
         field_order: vec!["state".to_owned()],
@@ -1250,14 +1273,17 @@ fn generic_type_transforms_rebuild_only_shapes_with_applicable_variables() {
             ("generic".to_owned(), Type::Var(variable)),
             (
                 "tagged".to_owned(),
-                Type::VariantSet(vec![Variant::tagged(
-                    "Some".to_owned(),
-                    ObjectShape {
-                        fields: BTreeMap::from([("value".to_owned(), Type::Var(variable))]),
-                        field_order: vec!["value".to_owned()],
-                        open: false,
-                    },
-                )]),
+                Type::VariantSet(
+                    vec![Variant::tagged(
+                        "Some".to_owned(),
+                        ObjectShape {
+                            fields: BTreeMap::from([("value".to_owned(), Type::Var(variable))]),
+                            field_order: vec!["value".to_owned()],
+                            open: false,
+                        },
+                    )]
+                    .into(),
+                ),
             ),
         ]),
         field_order: vec![
@@ -1403,6 +1429,83 @@ FUNCTION increment(value) {
     assert_eq!(
         runtime.report.resolved_constant_table,
         ResolvedConstantTable::default()
+    );
+}
+
+#[test]
+fn nested_contextual_builtin_overlay_closes_selected_user_call_result() {
+    let parsed = boon_parser::parse_source(
+        "nested-contextual-builtin-overlay.bn",
+        r#"
+rows:
+    LIST {
+        [
+            kind: VariableRow
+            id: TEXT { signal-1 }
+            segments: LIST {
+                [
+                    label: TEXT { high }
+                    signal_id: TEXT { signal-1 }
+                ]
+            }
+        ]
+    }
+    |> List/map(item, new: lane_row(row: item))
+
+FUNCTION segment_rows(row) {
+    row.segments
+    |> List/map(item, new: [
+        label: item.label
+        lane_id: row.id
+        signal_id: item.signal_id
+    ])
+}
+
+FUNCTION variable_lane(row) {
+    [
+        kind: row.kind
+        id: row.id
+        segments: segment_rows(row: row)
+    ]
+}
+
+FUNCTION group_lane(row) {
+    [
+        kind: row.kind
+        id: row.id
+        segments: segment_rows(row: row)
+    ]
+}
+
+FUNCTION lane_row(row) {
+    row.kind |> WHEN {
+        VariableRow => variable_lane(row: row)
+        __ => group_lane(row: row)
+    }
+}
+"#,
+    )
+    .expect("nested contextual fixture parses");
+    let checked = check_program(&parsed);
+    assert!(
+        !checked.report.has_errors(),
+        "nested contextual fixture diagnostics: {:#?}",
+        checked.report.diagnostics
+    );
+    let program = checked.program.expect("fixture has a checked program");
+    let call = program
+        .calls
+        .iter()
+        .find(|call| call.function == "lane_row")
+        .expect("fixture has the outer lane_row occurrence");
+    assert!(
+        call.syntax_discriminated_result,
+        "the VariableRow syntax must select the exact lane_row arm"
+    );
+    assert!(
+        type_is_recursively_closed(&call.result.ty),
+        "nested List/map outputs must be instantiated under the outer occurrence: {:#?}",
+        call.result.ty
     );
 }
 

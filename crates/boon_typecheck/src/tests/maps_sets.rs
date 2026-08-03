@@ -5,7 +5,7 @@ fn map_keys_accept_only_closed_recursive_key_safe_data() {
             ("scope".to_owned(), Type::Text),
             (
                 "state".to_owned(),
-                Type::VariantSet(vec![Variant::Tag("Ready".to_owned())]),
+                Type::VariantSet(vec![Variant::Tag("Ready".to_owned())].into()),
             ),
         ],
         false,
@@ -13,7 +13,8 @@ fn map_keys_accept_only_closed_recursive_key_safe_data() {
     let closed_tagged = Type::VariantSet(vec![Variant::Tagged {
         tag: "Cell".to_owned(),
         fields: ObjectShape::from_ordered_fields([("column".to_owned(), Type::Number)], false),
-    }]);
+    }]
+    .into());
 
     for key in [
         Type::Number,

@@ -3543,8 +3543,8 @@ fn concrete_checked_expression_type(
                         concrete_fields.insert(field.name.clone(), field_type);
                     }
                 }
-                Ok(boon_typecheck::Type::VariantSet(vec![
-                    boon_typecheck::Variant::Tagged {
+                Ok(boon_typecheck::Type::VariantSet(
+                    vec![boon_typecheck::Variant::Tagged {
                         tag: tag.clone(),
                         fields: boon_typecheck::ObjectShape {
                             fields: concrete_fields,
@@ -3552,8 +3552,9 @@ fn concrete_checked_expression_type(
                             open,
                         }
                         .into(),
-                    },
-                ]))
+                    }]
+                    .into(),
+                ))
             }
             boon_typecheck::CheckedExpressionKind::When { arms, .. }
             | boon_typecheck::CheckedExpressionKind::While { arms, .. } => {
@@ -4271,7 +4272,16 @@ fn unify_out_contract_type(
     match (pattern, actual) {
         (boon_typecheck::Type::Var(variable), actual) => match substitutions.get(variable) {
             Some(existing) if out_contract_type_is_resolved(existing) && existing != actual => {
-                if !boon_typecheck::resolved_type_is_assignable_to(actual, existing) {
+                if boon_typecheck::resolved_type_is_assignable_to(actual, existing) {
+                    // Preserve the already-known wider bound. The new
+                    // occurrence is a valid specialization of it.
+                } else if boon_typecheck::resolved_type_is_assignable_to(existing, actual) {
+                    // Input order must not decide a generic OUT contract. If
+                    // an earlier occurrence installed a narrower closed
+                    // variant/object and a later occurrence supplies its
+                    // closed supertype, retain the supertype that admits both.
+                    substitutions.insert(*variable, actual.clone());
+                } else {
                     return Err(SemanticError::new(format!(
                         "OUT type variable {:?} has conflicting concrete types {existing:?} and {actual:?}",
                         variable
@@ -5095,6 +5105,25 @@ mod tests {
         FlowType {
             mode: FlowMode::Continuous,
             ty,
+        }
+    }
+
+    #[test]
+    fn out_contract_type_variable_widens_independently_of_input_order() {
+        let variable = boon_typecheck::TypeVar(7);
+        let narrow = Type::VariantSet(vec![boon_typecheck::Variant::Tag("Closed".to_owned())]);
+        let wide = Type::VariantSet(vec![
+            boon_typecheck::Variant::Tag("Closed".to_owned()),
+            boon_typecheck::Variant::Tag("Open".to_owned()),
+        ]);
+
+        for (first, second) in [(&narrow, &wide), (&wide, &narrow)] {
+            let mut substitutions = BTreeMap::new();
+            unify_out_contract_type(&Type::Var(variable), first, &mut substitutions)
+                .expect("first closed type binds the variable");
+            unify_out_contract_type(&Type::Var(variable), second, &mut substitutions)
+                .expect("assignable closed types have a common wider contract");
+            assert_eq!(substitutions.get(&variable), Some(&wide));
         }
     }
 
@@ -6597,6 +6626,42 @@ FUNCTION lane_row(row) {
                 "parent-linked lookup must match the flattened checked environment"
             );
         }
+    }
+
+    #[test]
+    #[ignore = "large NovyWave semantic compiler gate"]
+    fn novywave_checked_program_elaborates_without_occurrence_type_loss() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/novywave");
+        let units = [
+            "hold.bn",
+            "Bridge/NovyBridge.bn",
+            "Generated/Assets.bn",
+            "Generated/NovyReference.bn",
+            "Model/NovyModel.bn",
+            "Theme/NovyTheme.bn",
+            "RUN.bn",
+            "View/NovyView.bn",
+        ]
+        .into_iter()
+        .map(|path| {
+            (
+                path.to_owned(),
+                std::fs::read_to_string(root.join(path)).expect("NovyWave source unit"),
+            )
+        })
+        .collect::<Vec<_>>();
+        let parsed = boon_parser::parse_project("RUN.bn", units).expect("NovyWave project parses");
+        let checked = boon_typecheck::check_program(&parsed);
+        assert!(
+            !checked.report.has_errors(),
+            "NovyWave diagnostics: {:#?}",
+            checked.report.diagnostics
+        );
+        elaborate(
+            checked.program.expect("NovyWave has a checked program"),
+            &[],
+        )
+        .expect("NovyWave semantic elaboration preserves concrete call occurrences");
     }
 
     fn assert_contract_rejection(

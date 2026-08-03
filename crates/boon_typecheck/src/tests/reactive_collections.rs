@@ -653,7 +653,8 @@ fn closed_truth_set_has_no_public_bool_type_alias() {
     let truth = Type::VariantSet(vec![
         Variant::Tag("False".to_owned()),
         Variant::Tag("True".to_owned()),
-    ]);
+    ]
+    .into());
     assert_eq!(boon_facing_type_label(&truth), "True | False");
     assert_eq!(
         boon_facing_type_display_tree(&truth),

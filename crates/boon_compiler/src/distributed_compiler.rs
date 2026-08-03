@@ -1792,14 +1792,14 @@ fn merge_closed_boundary_types(left: &Type, right: &Type) -> Option<Type> {
             }))
         }
         (Type::VariantSet(left), Type::VariantSet(right)) => {
-            let mut variants = left.clone();
+            let mut variants = left.clone().into_owned();
             for candidate in right {
                 if !variants.contains(candidate) {
                     variants.push(candidate.clone());
                 }
             }
             variants.sort_by(|left, right| format!("{left:?}").cmp(&format!("{right:?}")));
-            Some(Type::VariantSet(variants))
+            Some(Type::VariantSet(variants.into()))
         }
         _ => None,
     }

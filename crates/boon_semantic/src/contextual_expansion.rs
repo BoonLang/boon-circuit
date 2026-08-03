@@ -623,10 +623,13 @@ fn push_default_order_direction(
             checked_expr_id: checked_expression.id,
             flow_type: boon_typecheck::FlowType {
                 mode: FlowMode::Continuous,
-                ty: Type::VariantSet(vec![
-                    boon_typecheck::Variant::Tag("Ascending".to_owned()),
-                    boon_typecheck::Variant::Tag("Descending".to_owned()),
-                ]),
+                ty: Type::VariantSet(
+                    vec![
+                        boon_typecheck::Variant::Tag("Ascending".to_owned()),
+                        boon_typecheck::Variant::Tag("Descending".to_owned()),
+                    ]
+                    .into(),
+                ),
             },
             effect: boon_typecheck::CheckedEffectSummary::default(),
             owner,
@@ -1038,10 +1041,15 @@ fn refine_runtime_occurrence_type(existing: &Type, expected: &Type) -> Result<Ty
     let existing_closed = boon_typecheck::type_is_recursively_closed(&existing);
     let expected_closed = boon_typecheck::type_is_recursively_closed(&expected);
     if expected_closed {
-        if existing_closed && !boon_typecheck::resolved_type_is_assignable_to(&existing, &expected)
-        {
+        if existing_closed {
+            if boon_typecheck::resolved_type_is_assignable_to(&expected, &existing) {
+                return Ok(expected);
+            }
+            if boon_typecheck::resolved_type_is_assignable_to(&existing, &expected) {
+                return Ok(existing);
+            }
             return Err(format!(
-                "closed runtime type {existing:?} is not assignable to required type {expected:?}"
+                "closed runtime type {existing:?} is incompatible with required type {expected:?}"
             ));
         }
         // A closed instantiated occurrence is already the exact callable
@@ -1126,10 +1134,13 @@ fn concrete_structural_type(
             let Type::Object(shape) = concrete_record_type(expressions, fields)? else {
                 return None;
             };
-            Some(Type::VariantSet(vec![boon_typecheck::Variant::Tagged {
-                tag: tag.clone(),
-                fields: shape,
-            }]))
+            Some(Type::VariantSet(
+                vec![boon_typecheck::Variant::Tagged {
+                    tag: tag.clone(),
+                    fields: shape,
+                }]
+                .into(),
+            ))
         }
         SemanticExpressionKind::List { items, .. } if !items.is_empty() => {
             let first = expressions.get(items[0].as_usize())?.flow_type.ty.clone();
@@ -1182,6 +1193,21 @@ fn concrete_structural_type(
         SemanticExpressionKind::Block { result, .. } => expressions
             .get(result.as_usize())
             .map(|expression| expression.flow_type.ty.clone()),
+        SemanticExpressionKind::When { arms, .. } if !arms.is_empty() => {
+            let first = expressions
+                .get(arms[0].output.as_usize())?
+                .flow_type
+                .ty
+                .clone();
+            arms.iter()
+                .skip(1)
+                .all(|arm| {
+                    expressions
+                        .get(arm.output.as_usize())
+                        .is_some_and(|expression| expression.flow_type.ty == first)
+                })
+                .then_some(first)
+        }
         _ => None,
     }
 }
@@ -4456,7 +4482,14 @@ fn ordinary_callable_body_dependencies(
                 pending.push(*left);
                 pending.push(*right);
             }
-            CheckedExpressionKind::MatchArm { output, .. } => pending.extend(*output),
+            CheckedExpressionKind::MatchArm { output, .. } => {
+                pending.extend(*output);
+                pending.extend(ordinary_statement_child_values(
+                    program,
+                    lookup,
+                    expression_id,
+                ));
+            }
             CheckedExpressionKind::Block { bindings, result } => {
                 pending.extend(bindings.iter().map(|binding| binding.value));
                 pending.extend(*result);
@@ -4490,6 +4523,47 @@ fn ordinary_callable_body_dependencies(
         }
     }
     Some(dependencies)
+}
+
+/// Return expression values represented by the statement tree beneath a
+/// structural expression. In list-shaped `WHEN` arms the checked expression's
+/// direct output is a delimiter; the actual field/spread values live in the
+/// arm statement's children and are part of the callable body just as much as
+/// an ordinary object expression's fields are.
+fn ordinary_statement_child_values(
+    program: &CheckedProgram,
+    lookup: &CheckedProgramLookup,
+    parent_expression: CheckedExprId,
+) -> Vec<CheckedExprId> {
+    let Some(statement) = lookup
+        .statement_indices_for_value(parent_expression)
+        .iter()
+        .filter_map(|index| program.statements.get(*index))
+        .find(|statement| {
+            statement.value == Some(parent_expression) && !statement.children.is_empty()
+        })
+    else {
+        return Vec::new();
+    };
+    let mut pending = statement.children.iter().rev().copied().collect::<Vec<_>>();
+    let mut visited = BTreeSet::new();
+    let mut values = Vec::new();
+    while let Some(statement) = pending.pop() {
+        if !visited.insert(statement) {
+            continue;
+        }
+        let Some(statement) = lookup.statement(program, statement) else {
+            continue;
+        };
+        match statement.value {
+            Some(value) if value == parent_expression => {
+                pending.extend(statement.children.iter().rev().copied());
+            }
+            Some(value) => values.push(value),
+            None => pending.extend(statement.children.iter().rev().copied()),
+        }
+    }
+    values
 }
 
 fn ordinary_callable_declarations(program: &CheckedProgram) -> BTreeSet<DeclId> {
@@ -5889,6 +5963,16 @@ impl<'a> SemanticExpressionBuilder<'a> {
             .any(|entry| !matches!(entry, CheckedCallEntry::Input { .. }));
         let retained_user_call = self.retain_ordinary_calls
             && callable.kind == CheckedCallableKind::User
+            // A syntax-discriminated call is an occurrence specialization,
+            // not an invocation of the callable's generic body. Retaining a
+            // shared boundary here would materialize every unselected branch
+            // and could not carry the exact occurrence result contract. A
+            // nested call encountered while building a shared ordinary
+            // definition has no concrete frame, so it remains a boundary and
+            // carries its checked occurrence result on that call node.
+            && (callable.context_formal.is_some()
+                || !checked_call.syntax_discriminated_result
+                || (self.current_ordinary_definition.is_some() && instance.is_none()))
             && self
                 .indexes
                 .callable_ids
@@ -5909,7 +5993,7 @@ impl<'a> SemanticExpressionBuilder<'a> {
         if instance.is_none() && !instance_less_ordinary_call {
             if std::env::var_os("BOON_SEMANTIC_TRACE").is_some() {
                 eprintln!(
-                    "boon_semantic missing_call_instance checked_call={} function={} owner={:?} expression={} span={:?} frame={:?} frame_provenance={:?}",
+                    "boon_semantic missing_call_instance checked_call={} function={} owner={:?} expression={} span={:?} frame={:?} frame_provenance={:?} current_ordinary={:?} retained_user_call={} has_out={} call_contexts={} callable_effect={:?} callable_context_formal={:?}",
                     call_id.0,
                     checked_call.function,
                     checked_call.owner_callable,
@@ -5921,6 +6005,12 @@ impl<'a> SemanticExpressionBuilder<'a> {
                         .call_instances
                         .get(frame.as_usize())
                         .map(|instance| instance.provenance)),
+                    self.current_ordinary_definition,
+                    retained_user_call,
+                    has_out,
+                    checked_call.contexts.len(),
+                    callable.effect,
+                    callable.context_formal,
                 );
             }
             return Err(ExpansionError::MissingCallInstance {
@@ -5964,7 +6054,7 @@ impl<'a> SemanticExpressionBuilder<'a> {
                 call: call_id,
                 frame: scoped.frame,
             })?;
-            let result = callable
+            let result_expression = callable
                 .result_expression
                 .ok_or(ExpansionError::MissingFunctionResult(callable.decl_id))?;
             let call_owner = self.out_net.owner_for_call(instance).or(owner);
@@ -5973,7 +6063,7 @@ impl<'a> SemanticExpressionBuilder<'a> {
                 .clone();
             let result = self.expand_with_inherited_owner(
                 ScopedCheckedExpr {
-                    expression: result,
+                    expression: result_expression,
                     frame: Some(instance),
                     evaluation_port: None,
                     value_frame: scoped.value_frame,
@@ -5985,20 +6075,35 @@ impl<'a> SemanticExpressionBuilder<'a> {
             // call-local result instead of leaving the callable's open
             // structural scheme on the shared body syntax.
             let existing_result = self.expressions[result.as_usize()].flow_type.clone();
+            let refined_result_type = refine_runtime_occurrence_type(
+                &existing_result.ty,
+                &concrete_result.ty,
+            )
+            .map_err(|error| {
+                let call_instance = &self.out_net.call_instances[instance.as_usize()];
+                let checked_call = call_instance
+                    .provenance
+                    .call_id
+                    .and_then(|call| self.lookup.call(self.program, call));
+                let checked_result = self.lookup.expression(self.program, result_expression);
+                let expanded_result = &self.expressions[result.as_usize()];
+                ExpansionError::InvalidLocalBindings(format!(
+                    "user call {instance} provenance {:?} function {:?} result expression \
+                             {result} checked {:?} expanded kind {:?} flow {:?} cannot refine its \
+                             occurrence type to {:?}: {error}",
+                    call_instance.provenance,
+                    checked_call.map(|call| call.function.as_str()),
+                    checked_result,
+                    expanded_result.kind,
+                    expanded_result.flow_type,
+                    concrete_result,
+                ))
+            })?;
             self.expressions[result.as_usize()].flow_type = FlowType {
                 mode: concrete_result.mode,
-                ty: refine_runtime_occurrence_type(&existing_result.ty, &concrete_result.ty)
-                    .map_err(|error| {
-                        ExpansionError::InvalidLocalBindings(format!(
-                            "user call {instance} result expression {result} cannot refine its \
-                         occurrence type: {error}"
-                        ))
-                    })?,
+                ty: refined_result_type,
             };
             let concrete_result = self.expressions[result.as_usize()].flow_type.clone();
-            let result_expression = callable
-                .result_expression
-                .ok_or(ExpansionError::MissingFunctionResult(callable.decl_id))?;
             let boundary_expression =
                 self.flush_boundary_origin_for_value(result_expression, result);
             return self.wrap_flush_boundary(
@@ -6629,6 +6734,16 @@ impl<'a> SemanticExpressionBuilder<'a> {
                 return None;
             }
             let definition = self.expressions.get(expression.as_usize())?;
+            if matches!(
+                definition.kind,
+                SemanticExpressionKind::Call { .. }
+                    | SemanticExpressionKind::MaterializationLocal { .. }
+            ) && let Some(tag) = crate::out_net::singleton_tag_for_type_projection(
+                &definition.flow_type.ty,
+                &projection,
+            ) {
+                return Some(StaticSelectorValue::Tag(tag));
+            }
             match &definition.kind {
                 SemanticExpressionKind::Project { input, fields } => {
                     let mut combined = fields.clone();
@@ -7338,6 +7453,81 @@ mod tests {
     }
 
     #[test]
+    fn runtime_occurrence_refinement_keeps_the_narrower_compatible_closed_type() {
+        let narrow = Type::VariantSet(vec![boon_typecheck::Variant::Tag("Closed".to_owned())]);
+        let wide = Type::VariantSet(vec![
+            boon_typecheck::Variant::Tag("Closed".to_owned()),
+            boon_typecheck::Variant::Tag("Open".to_owned()),
+        ]);
+        let disjoint = Type::VariantSet(vec![boon_typecheck::Variant::Tag("Missing".to_owned())]);
+
+        assert_eq!(
+            refine_runtime_occurrence_type(&wide, &narrow).unwrap(),
+            narrow
+        );
+        assert_eq!(
+            refine_runtime_occurrence_type(&narrow, &wide).unwrap(),
+            narrow
+        );
+        assert!(refine_runtime_occurrence_type(&wide, &disjoint).is_err());
+    }
+
+    #[test]
+    fn ordinary_dependency_analysis_visits_structural_match_arm_statements() {
+        let parsed = boon_parser::parse_source(
+            "semantic-ordinary-structural-arm.bn",
+            r#"
+result: wrapper()
+
+FUNCTION wrapper() {
+    Choice |> WHEN {
+        Choice => [
+            value: nested()
+        ]
+    }
+}
+
+FUNCTION nested() {
+    1
+}
+"#,
+        )
+        .unwrap();
+        let checked = boon_typecheck::check_program(&parsed);
+        assert!(
+            !checked.report.has_errors(),
+            "diagnostics: {:#?}",
+            checked.report.diagnostics
+        );
+        let program = checked.program.expect("valid fixture has checked program");
+        let lookup = CheckedProgramLookup::new(&program);
+        let candidates = program
+            .callables
+            .iter()
+            .filter(|callable| ordinary_callable_base_candidate(&program, callable))
+            .map(|callable| callable.decl_id)
+            .collect::<BTreeSet<_>>();
+        let wrapper = program
+            .callables
+            .iter()
+            .find(|callable| callable.name.ends_with("wrapper"))
+            .expect("wrapper callable");
+        let nested = program
+            .callables
+            .iter()
+            .find(|callable| callable.name.ends_with("nested"))
+            .expect("nested callable");
+        let dependencies =
+            ordinary_callable_body_dependencies(&program, &lookup, wrapper, &candidates)
+                .expect("pure structural wrapper is an ordinary candidate");
+        assert_eq!(
+            dependencies,
+            BTreeSet::from([nested.decl_id]),
+            "the delimiter-backed arm must expose its nested call dependency"
+        );
+    }
+
+    #[test]
     fn ordinary_definition_retains_uninstantiated_nested_call_and_exact_pass_capture() {
         let graph = semantic_graph(
             r#"
@@ -7810,6 +8000,40 @@ first: choose(value: First)
 second: choose(value: Second)
 "#,
         );
+    }
+
+    #[test]
+    fn nested_static_dispatch_keeps_the_checked_record_occurrence() {
+        let graph = semantic_graph(
+            r#"
+FUNCTION backend_get(request) {
+    request |> WHEN {
+        Count => 1
+        Range => [extend: 2, compress: 3]
+    }
+}
+
+FUNCTION get(request, backend) {
+    backend |> WHEN {
+        First => backend_get(request: request)
+        Second => backend_get(request: request)
+    }
+}
+
+FUNCTION range() {
+    get(request: Range, backend: First)
+}
+
+result: range()
+"#,
+        );
+
+        assert!(graph.expressions.iter().any(|expression| matches!(
+            &expression.flow_type.ty,
+            Type::Object(shape)
+                if shape.fields.get("extend") == Some(&Type::Number)
+                    && shape.fields.get("compress") == Some(&Type::Number)
+        )));
     }
 
     #[test]

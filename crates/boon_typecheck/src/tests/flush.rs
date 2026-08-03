@@ -1,5 +1,5 @@
 fn closed_tag(name: &str) -> Type {
-    Type::VariantSet(vec![Variant::Tag(name.to_owned())])
+    Type::VariantSet(vec![Variant::Tag(name.to_owned())].into())
 }
 
 fn closed_record(fields: impl IntoIterator<Item = (&'static str, Type)>) -> Type {
@@ -26,7 +26,8 @@ fn boundary_union_is_canonical_and_keeps_structural_alternatives() {
     assert!(members.contains(&Type::VariantSet(vec![
         Variant::Tag("Invalid".to_owned()),
         Variant::Tag("Unavailable".to_owned()),
-    ])));
+    ]
+    .into())));
 }
 
 #[test]
@@ -96,7 +97,8 @@ fn resolved_structural_assignability_preserves_authority_and_narrowing() {
     let truth = Type::VariantSet(vec![
         Variant::Tag("False".to_owned()),
         Variant::Tag("True".to_owned()),
-    ]);
+    ]
+    .into());
     let false_only = closed_tag("False");
     let authority = closed_record([("completed", truth.clone()), ("title", Type::Text)]);
     let narrower = Type::object(ObjectShape::from_ordered_fields(

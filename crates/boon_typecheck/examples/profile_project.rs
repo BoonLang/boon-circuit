@@ -24,6 +24,8 @@ struct FrontendProfile<'a> {
     function_types: Vec<&'a boon_typecheck::FunctionTypeEntry>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     expression_debug: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    call_debug: Vec<String>,
     errors: bool,
     program_available: bool,
     parse_work: boon_parser::ParseWorkCounters,
@@ -150,6 +152,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             "{}: {:?} linked_input={:?} => {}",
                             id, expression.kind, expression.linked_input, flow,
                         )
+                    })
+                })
+                .collect(),
+            call_debug: env::var("BOON_PROFILE_CALLS")
+                .ok()
+                .into_iter()
+                .flat_map(|ids| {
+                    ids.split(',')
+                        .filter_map(|id| id.parse::<u32>().ok())
+                        .collect::<Vec<_>>()
+                })
+                .filter_map(|id| {
+                    output.program.as_ref().and_then(|program| {
+                        program
+                            .calls
+                            .iter()
+                            .find(|call| call.id.0 == id)
+                            .map(|call| format!("{id}: {call:#?}"))
                     })
                 })
                 .collect(),

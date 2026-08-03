@@ -153,6 +153,9 @@ pub struct OutCallInstance {
     #[serde(skip)]
     type_substitution_count: usize,
     pub result: FlowType,
+    /// This frame carries an exact value-level result occurrence selected by
+    /// syntax in this call or inherited through the callable's result path.
+    pub result_is_exact_occurrence: bool,
     /// Present only when this concrete user call directly allocates runtime
     /// resources. Pure forwarding wrappers deliberately have no owner.
     pub owner: Option<StaticOwnerId>,
@@ -831,6 +834,51 @@ impl CheckedStaticSelectorValue {
     }
 }
 
+pub(crate) fn singleton_tag_for_type_projection(
+    ty: &Type,
+    projection: &[String],
+) -> Option<String> {
+    if let Some((field, rest)) = projection.split_first() {
+        return match ty {
+            Type::Object(shape) => {
+                singleton_tag_for_type_projection(shape.fields.get(field)?, rest)
+            }
+            Type::Union(members) => {
+                let mut tags = members
+                    .iter()
+                    .map(|member| singleton_tag_for_type_projection(member, projection));
+                let first = tags.next()??;
+                tags.all(|tag| tag.as_ref() == Some(&first))
+                    .then_some(first)
+            }
+            _ => None,
+        };
+    }
+    match ty {
+        Type::VariantSet(variants) if variants.len() == 1 => match &variants[0] {
+            boon_typecheck::Variant::Tag(tag) | boon_typecheck::Variant::Tagged { tag, .. } => {
+                Some(tag.clone())
+            }
+        },
+        Type::Union(members) => {
+            let mut tags = members
+                .iter()
+                .map(|member| singleton_tag_for_type_projection(member, projection));
+            let first = tags.next()??;
+            tags.all(|tag| tag.as_ref() == Some(&first))
+                .then_some(first)
+        }
+        _ => None,
+    }
+}
+
+fn checked_static_selector_from_type(
+    ty: &Type,
+    projection: &[String],
+) -> Option<CheckedStaticSelectorValue> {
+    singleton_tag_for_type_projection(ty, projection).map(CheckedStaticSelectorValue::Tag)
+}
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 enum StaticOwnerNode {
     Net(OutNetId),
@@ -1030,6 +1078,7 @@ where
             local_type_substitutions: Vec::new(),
             type_substitution_count: 0,
             result: signature.result.clone(),
+            result_is_exact_occurrence: false,
             owner: None,
         });
         self.producer_identity_by_call.insert(call, spec.identity);
@@ -1206,6 +1255,99 @@ where
             .collect()
     }
 
+    fn call_is_callable_result_output(
+        &self,
+        callable: DeclId,
+        target: CheckedExprId,
+        frame: Option<OutCallInstanceId>,
+    ) -> bool {
+        let mut pending = self
+            .signature_by_id
+            .get(&callable)
+            .and_then(|signature| signature.result_expression)
+            .into_iter()
+            .collect::<Vec<_>>();
+        let mut visited = BTreeSet::new();
+        while let Some(current) = pending.pop() {
+            if current == target {
+                return true;
+            }
+            if !visited.insert(current) {
+                continue;
+            }
+            let Some(expression) = self
+                .program
+                .expressions
+                .get(current.0 as usize)
+                .filter(|expression| expression.id == current)
+            else {
+                continue;
+            };
+            match &expression.kind {
+                CheckedExpressionKind::When { input, arms } => {
+                    let selected = self
+                        .static_checked_selector_value(
+                            *input,
+                            frame,
+                            Vec::new(),
+                            &mut BTreeSet::new(),
+                        )
+                        .and_then(|selector| self.selected_checked_arm(&selector, arms));
+                    if let Some(selected) = selected {
+                        pending.push(selected);
+                    } else {
+                        pending.extend(arms.iter().copied());
+                    }
+                }
+                CheckedExpressionKind::While { arms, .. }
+                | CheckedExpressionKind::Latest { branches: arms } => {
+                    pending.extend(arms.iter().copied());
+                }
+                CheckedExpressionKind::MatchArm { output, .. } => pending.extend(*output),
+                CheckedExpressionKind::Block { result, .. } => pending.extend(*result),
+                CheckedExpressionKind::Then { input, output } => {
+                    pending.push(output.unwrap_or(*input));
+                }
+                CheckedExpressionKind::Read {
+                    target, projection, ..
+                } if projection.is_empty() => {
+                    pending.extend(
+                        self.declaration_by_id
+                            .get(target)
+                            .and_then(|declaration| declaration.value),
+                    );
+                }
+                CheckedExpressionKind::Draining { input }
+                | CheckedExpressionKind::Hold { initial: input, .. } => pending.push(*input),
+                CheckedExpressionKind::Call { .. }
+                | CheckedExpressionKind::Passed { .. }
+                | CheckedExpressionKind::ExternalRead { .. }
+                | CheckedExpressionKind::Drain { .. }
+                | CheckedExpressionKind::Read { .. }
+                | CheckedExpressionKind::Text { .. }
+                | CheckedExpressionKind::TextTemplate { .. }
+                | CheckedExpressionKind::Number { .. }
+                | CheckedExpressionKind::Bits { .. }
+                | CheckedExpressionKind::BytesByte { .. }
+                | CheckedExpressionKind::Absent
+                | CheckedExpressionKind::Flush { .. }
+                | CheckedExpressionKind::Tag { .. }
+                | CheckedExpressionKind::TaggedObject { .. }
+                | CheckedExpressionKind::Source
+                | CheckedExpressionKind::Infix { .. }
+                | CheckedExpressionKind::Object { .. }
+                | CheckedExpressionKind::List { .. }
+                | CheckedExpressionKind::MapEntry { .. }
+                | CheckedExpressionKind::Map { .. }
+                | CheckedExpressionKind::Set { .. }
+                | CheckedExpressionKind::Bytes { .. }
+                | CheckedExpressionKind::Delimiter
+                | CheckedExpressionKind::Invalid { .. } => {}
+            }
+        }
+        false
+    }
+
     fn checked_statement_child_values(
         &self,
         parent_expression: CheckedExprId,
@@ -1259,6 +1401,36 @@ where
         })
     }
 
+    fn checked_type_in_frame(&self, frame: OutCallInstanceId, ty: &Type) -> Type {
+        let mut ancestry = Vec::new();
+        let mut next = Some(frame);
+        let mut remaining = self.call_instances.len().saturating_add(1);
+        while let Some(call) = next {
+            if remaining == 0 {
+                break;
+            }
+            remaining -= 1;
+            let Some(instance) = self
+                .call_instances
+                .get(call.as_usize())
+                .filter(|instance| instance.id == call)
+            else {
+                break;
+            };
+            ancestry.push(call);
+            next = instance.parent;
+        }
+        ancestry.reverse();
+        let mut environment = BTreeMap::new();
+        for call in ancestry {
+            for substitution in &self.call_instances[call.as_usize()].local_type_substitutions {
+                let value = apply_checked_type_environment(&substitution.value, &environment);
+                environment.insert(substitution.variable, value);
+            }
+        }
+        apply_checked_type_environment(ty, &environment)
+    }
+
     fn static_checked_selector_value(
         &self,
         expression: CheckedExprId,
@@ -1274,6 +1446,32 @@ where
             .expressions
             .get(expression.0 as usize)
             .filter(|candidate| candidate.id == expression)?;
+        let type_selected_occurrence = match &definition.kind {
+            CheckedExpressionKind::Call { .. } => true,
+            CheckedExpressionKind::Read { target, .. } => self
+                .declaration_by_id
+                .get(target)
+                .is_some_and(|declaration| {
+                    matches!(
+                        declaration.kind,
+                        CheckedDeclarationKind::FreshOut | CheckedDeclarationKind::OutParameter
+                    )
+                }),
+            _ => false,
+        };
+        let inferred_selector = type_selected_occurrence
+            .then(|| {
+                checked_static_selector_from_type(&definition.flow_type.ty, &projection).or_else(
+                    || {
+                        frame.and_then(|frame| {
+                            let concrete =
+                                self.checked_type_in_frame(frame, &definition.flow_type.ty);
+                            checked_static_selector_from_type(&concrete, &projection)
+                        })
+                    },
+                )
+            })
+            .flatten();
         match &definition.kind {
             CheckedExpressionKind::Read {
                 target,
@@ -1310,23 +1508,19 @@ where
                         visited,
                     );
                 }
-                let declaration = self.declaration_by_id.get(target)?;
-                if declaration.kind == CheckedDeclarationKind::Field
+                if let Some(declaration) = self.declaration_by_id.get(target)
+                    && declaration.kind == CheckedDeclarationKind::Field
                     && self
                         .function_owner_by_scope
                         .get(&declaration.scope_id)
                         .copied()
                         .flatten()
                         .is_some()
+                    && let Some(value) = declaration.value
                 {
-                    return self.static_checked_selector_value(
-                        declaration.value?,
-                        frame,
-                        fields,
-                        visited,
-                    );
+                    return self.static_checked_selector_value(value, frame, fields, visited);
                 }
-                None
+                inferred_selector
             }
             CheckedExpressionKind::Passed {
                 formal,
@@ -1401,7 +1595,7 @@ where
             CheckedExpressionKind::Bits { value } if projection.is_empty() => {
                 Some(CheckedStaticSelectorValue::Bits(value.clone()))
             }
-            _ => None,
+            _ => inferred_selector,
         }
     }
 
@@ -1493,10 +1687,24 @@ where
                 .unwrap_or(&checked_call.result);
             let instantiated_result =
                 apply_checked_type_environment(&result_scheme.ty, active_type_environment);
-            let checked_result = boon_typecheck::specialize_checked_call_result(
-                &instantiated_result,
-                &checked_call.result.ty,
-            );
+            let checked_result = if checked_call.syntax_discriminated_result {
+                let checked_occurrence_result = apply_checked_type_environment(
+                    &checked_call.result.ty,
+                    active_type_environment,
+                );
+                // Checked-call finalization owns syntax-discriminated
+                // occurrences. A heterogeneous dispatcher may have a closed
+                // scalar principal while this exact tagged request selects a
+                // closed record/list result; reapplying the principal here
+                // would erase the authoritative occurrence before semantic
+                // expansion.
+                checked_occurrence_result
+            } else {
+                boon_typecheck::specialize_checked_call_result(
+                    &instantiated_result,
+                    &checked_call.result.ty,
+                )
+            };
             let expression_result = self
                 .program
                 .expressions
@@ -1514,25 +1722,48 @@ where
             let enclosing_result = checked_call
                 .owner_callable
                 .and_then(|owner| self.signature_by_id.get(&owner).copied())
-                .filter(|owner| owner.result_expression == Some(checked_call.expression))
-                .and_then(|_| {
-                    parent.map(|parent| self.call_instances[parent.as_usize()].result.clone())
+                .and_then(|owner| {
+                    parent.map(|parent| {
+                        (
+                            owner,
+                            parent,
+                            self.call_instances[parent.as_usize()].result.clone(),
+                            self.call_instances[parent.as_usize()].result_is_exact_occurrence,
+                        )
+                    })
+                })
+                .filter(|(owner, parent, _, parent_is_exact)| {
+                    owner.result_expression == Some(checked_call.expression)
+                        || (*parent_is_exact
+                            && self.call_is_callable_result_output(
+                                owner.decl_id,
+                                checked_call.expression,
+                                Some(*parent),
+                            ))
                 });
             let result_type = enclosing_result
                 .as_ref()
-                .map(|enclosing| {
-                    boon_typecheck::specialize_checked_call_result(
-                        &occurrence_result,
-                        &enclosing.ty,
-                    )
+                .map(|(_, _, enclosing, enclosing_is_exact)| {
+                    if *enclosing_is_exact {
+                        enclosing.ty.clone()
+                    } else {
+                        boon_typecheck::specialize_checked_call_result(
+                            &occurrence_result,
+                            &enclosing.ty,
+                        )
+                    }
                 })
                 .unwrap_or(occurrence_result);
+            let result_is_exact_occurrence = checked_call.syntax_discriminated_result
+                || enclosing_result
+                    .as_ref()
+                    .is_some_and(|(_, _, _, enclosing_is_exact)| *enclosing_is_exact);
             let result = FlowType {
                 // The callable signature supplies the generic result type, but
                 // temporal gating is occurrence-specific and has already been
                 // resolved on the checked call.
                 mode: enclosing_result
-                    .map(|enclosing| enclosing.mode)
+                    .map(|(_, _, enclosing, _)| enclosing.mode)
                     .unwrap_or(checked_call.result.mode),
                 ty: result_type,
             };
@@ -1549,6 +1780,7 @@ where
                 local_type_substitutions,
                 type_substitution_count,
                 result,
+                result_is_exact_occurrence,
                 owner: None,
             });
 
@@ -2440,7 +2672,10 @@ converted: 255 |> Number/to_bits(width: 8, interpretation: Unsigned)
                 .iter()
                 .find(|instance| instance.provenance.call_id == Some(call.id))
                 .unwrap_or_else(|| panic!("missing OUT instance for `{function}`"));
-            assert_eq!(instance.result, call.result);
+            assert_eq!(
+                instance.result, call.result,
+                "checked call: {call:#?}\nOUT instance: {instance:#?}"
+            );
         }
         assert_eq!(
             program
@@ -2488,6 +2723,100 @@ converted: 255 |> Number/to_bits(width: 8, interpretation: Unsigned)
                 .collect::<Vec<_>>(),
             vec!["dispatch", "branch_0"]
         );
+    }
+
+    #[test]
+    fn static_dispatch_uses_singleton_projection_from_a_checked_call_result() {
+        let program = checked_program(
+            "out-net-static-call-result-projection.bn",
+            r#"
+FUNCTION make_row() {
+    [item_kind: VariableRow]
+}
+
+FUNCTION variable_row(row) {
+    [kind: row.item_kind]
+}
+
+FUNCTION group_row(row) {
+    [group: row.item_kind]
+}
+
+FUNCTION dispatch(row) {
+    row.item_kind |> WHEN {
+        VariableRow => variable_row(row: row)
+        __ => group_row(row: row)
+    }
+}
+
+result: dispatch(row: make_row())
+"#,
+        );
+        let built = OutNet::build(&program);
+        assert!(!built.has_errors(), "{:#?}", built.diagnostics);
+        let functions = built
+            .graph
+            .call_instances
+            .iter()
+            .filter_map(|instance| instance.provenance.call_id)
+            .filter_map(|call| {
+                program
+                    .calls
+                    .iter()
+                    .find(|candidate| candidate.id == call)
+                    .map(|call| call.function.as_str())
+            })
+            .collect::<Vec<_>>();
+        assert!(functions.contains(&"make_row"));
+        assert!(functions.contains(&"dispatch"));
+        assert!(functions.contains(&"variable_row"));
+        assert!(!functions.contains(&"group_row"));
+    }
+
+    #[test]
+    fn static_dispatch_uses_singleton_projection_from_a_contextual_out_row() {
+        let program = checked_program(
+            "out-net-static-contextual-row-projection.bn",
+            r#"
+FUNCTION variable_row(row) {
+    [kind: row.item_kind]
+}
+
+FUNCTION group_row(row) {
+    [group: row.item_kind]
+}
+
+FUNCTION dispatch(row) {
+    row.item_kind |> WHEN {
+        VariableRow => variable_row(row: row)
+        __ => group_row(row: row)
+    }
+}
+
+result:
+    LIST { [item_kind: VariableRow] }
+    |> List/map(item, new: dispatch(row: item))
+"#,
+        );
+        let built = OutNet::build(&program);
+        assert!(!built.has_errors(), "{:#?}", built.diagnostics);
+        let functions = built
+            .graph
+            .call_instances
+            .iter()
+            .filter_map(|instance| instance.provenance.call_id)
+            .filter_map(|call| {
+                program
+                    .calls
+                    .iter()
+                    .find(|candidate| candidate.id == call)
+                    .map(|call| call.function.as_str())
+            })
+            .collect::<Vec<_>>();
+        assert!(functions.contains(&"List/map"));
+        assert!(functions.contains(&"dispatch"));
+        assert!(functions.contains(&"variable_row"));
+        assert!(!functions.contains(&"group_row"));
     }
 
     #[test]

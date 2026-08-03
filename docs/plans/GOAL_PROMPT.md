@@ -315,9 +315,20 @@ Current checkpoints to preserve and audit rather than redo:
   1,621,578/1,621,584 calls and 206,521,350/206,585,947 bytes. An 18-pair
   directional release batch has 204.74/205.60 ms total and 149.59/150.10 ms
   typecheck medians, with 223.03/223.09 ms maxima and 65,348/65,924 KiB maximum
-  RSS. Next reduce the measured 23.8 ms contextual-scheme owner, remaining
-  construction/diagnostic work, and name/type interning, then finish scaling/
-  parity proof and fresh adversarial review and regenerate the full protocol.
+  RSS. The next ownership slice reuses the solver's packed call graph throughout
+  contextual inference, packs lexical PASSED reads without cloned paths, and
+  stores structural statement children/values inline or densely. All 85
+  ordinary tests and both product gates pass with the exact digest and
+  unchanged solver work. Fresh/empty allocations fall again to
+  1,613,479/1,613,485 calls and 206,406,282/206,470,879 bytes, exactly 8,099
+  calls and 115,068 bytes below the compact-type checkpoint in each mode. The
+  contextual graph lane falls from about 0.28 to 0.03 ms; an 18-pair batch is
+  noisy at 218.24/220.90 ms total and 159.53/161.72 ms typecheck medians, so
+  this is an ownership/allocation result rather than a total-latency claim.
+  Continue with the measured contextual parameter/worklist and checked-
+  inference owners, remaining construction/diagnostic work, and name/type
+  interning, then finish scaling/parity proof and fresh adversarial review and
+  regenerate the full protocol.
   Do not mistake the diagnostics result for verified closure: current direct
   NovyWave verified samples remain about 7.72/7.56 seconds and 515 MiB,
   dominated by about 6.9 seconds of semantic construction, so the verified

@@ -599,16 +599,37 @@ Current cold-diagnostics candidate evidence:
   contextual schemes, 36.2 ms checked inference, 11.9 ms diagnostic projection,
   and 108.6 ms checked-program construction. Counter and physical TodoMVC
   remain directionally below their cold gates at 4.85 and 52.20 ms.
+- The first contextual-scheme ownership slice now reuses the checked solver's
+  packed user-call graph for PASSED dependency closure, dependency postorder,
+  inherited-call merging, and caller rescheduling instead of rebuilding three
+  ordered maps/sets and rescanning every call. Lexical PASSED reads use one
+  packed declaration adjacency and a reused projection-order buffer instead of
+  per-owner trees and cloned path strings. Structural statement children stay
+  inline at ordinary arity and postorder values use the dense parser statement
+  arena rather than a tree map. Exact DeclId/projection ordering, 369 worklist
+  visits and changes, every checked-inference counter, and the checked digest
+  remain unchanged. All 85 ordinary typechecker tests and both product-scale
+  gates pass. Fresh/empty allocation work falls to
+  1,613,479/1,613,485 calls and 206,406,282/206,470,879 bytes: exactly 8,099
+  calls and 115,068 bytes below the compact-type checkpoint in each mode. A
+  release trace reduces contextual graph reconstruction from about 0.28 to
+  0.03 ms, but the remaining parameter/context-worklist/structural lanes are
+  about 8.65/5.23/4.96 ms. An 18-pair directional batch is system-noisy at
+  218.24/220.90 ms total and 159.53/161.72 ms typecheck medians, with
+  235.28/237.20 ms maxima and 65,372/65,912 KiB maximum RSS. This is an exact
+  allocation and ownership result, not a whole-run latency or Phase 1 exit
+  claim.
 - This diagnostics checkpoint does not close verified compilation. Direct
   NovyWave verified samples remain about 7.72/7.56 seconds fresh/empty and
   515,228/515,624 KiB, dominated by 6.93/6.80 seconds of semantic construction;
   the 1,000 ms and 384 MiB verified gates therefore remain red and must be
   attacked after the frontend tranche rather than hidden by the passing
   diagnostics result.
-- Continue with the measured 23.8 ms contextual-scheme owner, remaining
-  construction/diagnostic work, and measured name/type interning. Finish
-  scaling/parity evidence and a fresh adversarial review before regenerating
-  the full cold protocol after the final Phase 1 edit.
+- Continue from the still-measured contextual parameter/worklist and checked-
+  inference owners, then remaining construction/diagnostic work and measured
+  name/type interning. Finish scaling/parity evidence and a fresh adversarial
+  review before regenerating the full cold protocol after the final Phase 1
+  edit.
 
 Development profiles and focused debug tests remain directional tools. The
 acceptance producer remains the revision-identified `release` binary required

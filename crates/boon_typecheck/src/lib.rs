@@ -1460,7 +1460,7 @@ struct StructuralStatementPlan {
     statement: usize,
     is_function: bool,
     value: Option<CheckedExprId>,
-    children: Box<[usize]>,
+    children: SmallVec<[usize; 4]>,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -4076,15 +4076,17 @@ impl CheckedProgramDatabase {
     fn infer_context_schemes(&mut self) {
         let trace = typecheck_trace_enabled();
         let reads_started = trace.then(Instant::now);
-        let passed_reads = self
-            .program
-            .expressions
-            .iter()
-            .filter(|expression| checked_passed_projection(expression).is_some())
-            .map(|expression| expression.id)
-            .collect::<Vec<_>>();
-        let mut reads_by_owner = BTreeMap::<DeclId, Vec<usize>>::new();
-        for expression in passed_reads {
+        let mut reads_by_owner = PackedAdjacencyBuilder::with_rows(self.next_decl_id as usize);
+        for expression in 0..self.program.expressions.len() {
+            if self
+                .program
+                .expressions
+                .get(expression)
+                .and_then(checked_passed_projection)
+                .is_none()
+            {
+                continue;
+            }
             let owner = self
                 .expression_owner_signatures
                 .get(&expression)
@@ -4092,7 +4094,8 @@ impl CheckedProgramDatabase {
                 .filter(|signature| signature.kind == CheckedCallableKind::User)
                 .map(|signature| signature.decl_id);
             if let Some(owner) = owner {
-                reads_by_owner.entry(owner).or_default().push(expression);
+                let inserted = reads_by_owner.push(owner.0 as usize, expression);
+                debug_assert!(inserted);
             } else {
                 self.contextual_type_diagnostic(
                     expression,
@@ -4100,122 +4103,122 @@ impl CheckedProgramDatabase {
                 );
             }
         }
+        let reads_by_owner = reads_by_owner.finish_sorted_unique();
 
         let mut next_var = self
             .next_checked_scheme_type_var
             .expect("checked scheme type-variable allocator initialized");
-        let mut leaf_vars_by_owner = BTreeMap::new();
-        for (owner, reads) in &reads_by_owner {
-            let paths = reads
-                .iter()
-                .filter_map(|expression| {
-                    self.program
-                        .expressions
-                        .get(*expression)
-                        .and_then(checked_passed_projection)
-                        .map(|projection| projection.to_vec().into_boxed_slice())
-                })
-                .collect::<BTreeSet<_>>();
-            let variables = paths
-                .into_iter()
-                .map(|path| {
-                    let variable = TypeVar(next_var);
-                    next_var = next_var.saturating_add(1);
-                    (path, variable)
-                })
-                .collect::<BTreeMap<_, _>>();
-            leaf_vars_by_owner.insert(*owner, variables);
-        }
         let mut leaf_vars = DenseIndexTable::with_len(self.program.expressions.len());
-        for (owner, reads) in &reads_by_owner {
-            let variables = &leaf_vars_by_owner[owner];
-            for expression in reads {
-                let projection = self
+        let mut reads_by_path = Vec::new();
+        let mut read_owner_count = 0usize;
+        for reads in reads_by_owner.iter().filter(|reads| !reads.is_empty()) {
+            read_owner_count += 1;
+            reads_by_path.extend_from_slice(reads);
+            reads_by_path.sort_unstable_by(|left, right| {
+                let left_projection = self
                     .program
                     .expressions
-                    .get(*expression)
+                    .get(*left)
                     .and_then(checked_passed_projection)
                     .expect("indexed PASSED read keeps its projection");
-                let variable = *variables
-                    .get(projection)
-                    .expect("PASSED projection owns a stable scheme variable");
-                leaf_vars.insert(*expression, variable);
+                let right_projection = self
+                    .program
+                    .expressions
+                    .get(*right)
+                    .and_then(checked_passed_projection)
+                    .expect("indexed PASSED read keeps its projection");
+                left_projection.cmp(right_projection).then(left.cmp(right))
+            });
+
+            let mut previous_expression = None;
+            let mut variable = None;
+            for expression in reads_by_path.iter().copied() {
+                let projection_changed = previous_expression.is_none_or(|previous| {
+                    let previous_projection = self
+                        .program
+                        .expressions
+                        .get(previous)
+                        .and_then(checked_passed_projection)
+                        .expect("indexed PASSED read keeps its projection");
+                    let projection = self
+                        .program
+                        .expressions
+                        .get(expression)
+                        .and_then(checked_passed_projection)
+                        .expect("indexed PASSED read keeps its projection");
+                    previous_projection != projection
+                });
+                if projection_changed {
+                    variable = Some(TypeVar(next_var));
+                    next_var = next_var.saturating_add(1);
+                }
+                leaf_vars.insert(
+                    expression,
+                    variable.expect("PASSED projection owns a stable scheme variable"),
+                );
+                previous_expression = Some(expression);
             }
+            reads_by_path.clear();
         }
         let mut call_scheme_vars = BTreeMap::<(CheckedCallId, TypeVar), TypeVar>::new();
         if let Some(started) = reads_started {
             eprintln!(
                 "boon_typecheck checked_program.infer_context_schemes.reads: {:.3}ms owners={} reads={}",
                 typecheck_elapsed_ms(started),
-                reads_by_owner.len(),
+                read_owner_count,
                 leaf_vars.values().count(),
             );
         }
 
         let graph_started = trace.then(Instant::now);
-        let user_callables = self
-            .signatures
-            .iter()
-            .filter(|signature| signature.kind == CheckedCallableKind::User)
-            .map(|signature| signature.decl_id)
-            .collect::<Vec<_>>();
-        let mut inherited_calls_by_owner = BTreeMap::<DeclId, Vec<usize>>::new();
-        let mut dependents_by_callee = BTreeMap::<DeclId, BTreeSet<DeclId>>::new();
-        let mut callees_by_owner = BTreeMap::<DeclId, BTreeSet<DeclId>>::new();
-        for (call_index, call) in self.calls.iter().enumerate() {
-            let Some(owner) = call.owner_callable else {
-                continue;
-            };
-            let Some(callee) = self.signature_by_declaration(call.callable) else {
-                continue;
-            };
-            if callee.kind != CheckedCallableKind::User {
-                continue;
-            }
-            // Inherited calls merge the callee requirement directly. An
-            // explicit PASS is consumed while traversing the owner's syntax.
-            // Both forms make the owner depend on the callee requirement.
-            dependents_by_callee
-                .entry(callee.decl_id)
-                .or_default()
-                .insert(owner);
-            callees_by_owner
-                .entry(owner)
-                .or_default()
-                .insert(callee.decl_id);
-            if !matches!(call.context_binding, CheckedContextBinding::Explicit { .. }) {
-                inherited_calls_by_owner
-                    .entry(owner)
-                    .or_default()
-                    .push(call_index);
-            }
-        }
+        let dependencies = Arc::clone(
+            self.checked_type_inference_dependencies
+                .as_ref()
+                .expect("checked inference dependencies initialized"),
+        );
         // A callable without a lexical PASSED read can acquire a context
         // requirement only by calling one that already has a requirement.
-        // Follow that exact callee-to-caller cone instead of visiting every
-        // user signature once merely to rediscover a stable `None`.
-        let mut contextual_callables = reads_by_owner.keys().copied().collect::<BTreeSet<_>>();
-        let mut pending_contextual_callables =
-            VecDeque::from_iter(contextual_callables.iter().copied());
+        // Follow that exact callee-to-caller cone over the already-packed call
+        // graph instead of allocating three temporary ordered maps/sets and
+        // rescanning every call to rediscover the same topology.
+        let mut contextual_callables = DenseFlagSet::with_len(self.next_decl_id as usize);
+        let mut pending_contextual_callables = VecDeque::new();
+        for (owner, reads) in reads_by_owner.iter().enumerate() {
+            if reads.is_empty() {
+                continue;
+            }
+            let owner = DeclId(owner as u32);
+            if contextual_callables.insert(owner.0 as usize) {
+                pending_contextual_callables.push_back(owner);
+            }
+        }
         while let Some(callee) = pending_contextual_callables.pop_front() {
-            for dependent in dependents_by_callee
-                .get(&callee)
+            for owner_index in dependencies
+                .wrapper_callers_by_callee
+                .get(callee.0 as usize)
                 .into_iter()
                 .flatten()
-                .copied()
             {
-                if contextual_callables.insert(dependent) {
-                    pending_contextual_callables.push_back(dependent);
+                let Some(owner) = self
+                    .signatures
+                    .get(*owner_index)
+                    .filter(|signature| signature.kind == CheckedCallableKind::User)
+                    .map(|signature| signature.decl_id)
+                else {
+                    continue;
+                };
+                if contextual_callables.insert(owner.0 as usize) {
+                    pending_contextual_callables.push_back(owner);
                 }
             }
         }
-        let user_callables = user_callables
-            .into_iter()
-            .filter(|callable| contextual_callables.contains(callable))
+        let user_callables = dependencies
+            .wrapper_user_signature_indices
+            .iter()
+            .filter_map(|index| self.signatures.get(*index))
+            .filter(|signature| contextual_callables.contains(&(signature.decl_id.0 as usize)))
+            .map(|signature| signature.decl_id)
             .collect::<Vec<_>>();
-        for callees in callees_by_owner.values_mut() {
-            callees.retain(|callee| contextual_callables.contains(callee));
-        }
         let mut requirements = DenseIndexTable::with_len(self.next_decl_id as usize);
         for callable in &user_callables {
             requirements.insert(callable.0 as usize, None);
@@ -4242,7 +4245,11 @@ impl CheckedProgramDatabase {
         // below iterates only recursive components to their fixed point.
         fn dependency_postorder(
             owner: DeclId,
-            callees_by_owner: &BTreeMap<DeclId, BTreeSet<DeclId>>,
+            dependencies: &CheckedTypeInferenceDependencies,
+            calls: &[CheckedCall],
+            signatures: &[CheckedCallableSignature],
+            signature_by_decl: &DenseIndexTable<usize>,
+            contextual_callables: &DenseFlagSet,
             visited: &mut DenseFlagSet,
             active: &mut DenseFlagSet,
             order: &mut Vec<DeclId>,
@@ -4251,8 +4258,34 @@ impl CheckedProgramDatabase {
             if visited.contains(&owner_index) || !active.insert(owner_index) {
                 return;
             }
-            for callee in callees_by_owner.get(&owner).into_iter().flatten() {
-                dependency_postorder(*callee, callees_by_owner, visited, active, order);
+            for call_index in dependencies
+                .wrapper_calls_by_owner
+                .get(owner_index)
+                .into_iter()
+                .flatten()
+            {
+                let Some(callee) = calls
+                    .get(*call_index)
+                    .and_then(|call| signature_by_decl.get(&(call.callable.0 as usize)))
+                    .and_then(|index| signatures.get(*index))
+                    .filter(|signature| signature.kind == CheckedCallableKind::User)
+                    .filter(|signature| {
+                        contextual_callables.contains(&(signature.decl_id.0 as usize))
+                    })
+                else {
+                    continue;
+                };
+                dependency_postorder(
+                    callee.decl_id,
+                    dependencies,
+                    calls,
+                    signatures,
+                    signature_by_decl,
+                    contextual_callables,
+                    visited,
+                    active,
+                    order,
+                );
             }
             active.remove(&owner_index);
             if visited.insert(owner_index) {
@@ -4266,7 +4299,11 @@ impl CheckedProgramDatabase {
         for callable in &user_callables {
             dependency_postorder(
                 *callable,
-                &callees_by_owner,
+                &dependencies,
+                &self.calls,
+                &self.signatures,
+                &self.signature_by_decl,
+                &contextual_callables,
                 &mut ordered,
                 &mut active,
                 &mut initial_order,
@@ -4293,7 +4330,10 @@ impl CheckedProgramDatabase {
             visits += 1;
             let mut next_requirement = None;
 
-            if let Some(reads) = reads_by_owner.get(&owner) {
+            if let Some(reads) = reads_by_owner
+                .get(owner.0 as usize)
+                .filter(|reads| !reads.is_empty())
+            {
                 for expression in reads {
                     let projection = self
                         .program
@@ -4332,11 +4372,22 @@ impl CheckedProgramDatabase {
                 }
             }
 
-            for call_index in inherited_calls_by_owner.get(&owner).into_iter().flatten() {
+            for call_index in dependencies
+                .wrapper_calls_by_owner
+                .get(owner.0 as usize)
+                .into_iter()
+                .flatten()
+            {
                 let call = &self.calls[*call_index];
+                if matches!(call.context_binding, CheckedContextBinding::Explicit { .. }) {
+                    continue;
+                }
                 let Some(callee) = self.signature_by_declaration(call.callable) else {
                     continue;
                 };
+                if callee.kind != CheckedCallableKind::User {
+                    continue;
+                }
                 let Some(requirement) = requirements
                     .get(&(callee.decl_id.0 as usize))
                     .and_then(Option::as_ref)
@@ -4360,11 +4411,23 @@ impl CheckedProgramDatabase {
             }
             requirements.insert(owner.0 as usize, next_requirement);
             changes += 1;
-            if let Some(dependents) = dependents_by_callee.get(&owner) {
-                for dependent in dependents {
-                    if queued.insert(dependent.0 as usize) {
-                        pending.push_back(*dependent);
-                    }
+            for owner_index in dependencies
+                .wrapper_callers_by_callee
+                .get(owner.0 as usize)
+                .into_iter()
+                .flatten()
+            {
+                let Some(dependent) = self
+                    .signatures
+                    .get(*owner_index)
+                    .filter(|signature| signature.kind == CheckedCallableKind::User)
+                    .map(|signature| signature.decl_id)
+                    .filter(|dependent| contextual_callables.contains(&(dependent.0 as usize)))
+                else {
+                    continue;
+                };
+                if queued.insert(dependent.0 as usize) {
+                    pending.push_back(dependent);
                 }
             }
         }
@@ -4393,7 +4456,11 @@ impl CheckedProgramDatabase {
         self.install_context_formals(&mut requirements, &mut next_var);
 
         let mut lexical_passed_types = Vec::new();
-        for (owner, reads) in reads_by_owner {
+        for (owner, reads) in reads_by_owner.iter().enumerate() {
+            if reads.is_empty() {
+                continue;
+            }
+            let owner = DeclId(owner as u32);
             let requirement = self
                 .signature_by_declaration(owner)
                 .and_then(|signature| signature.context_formal)
@@ -4402,7 +4469,7 @@ impl CheckedProgramDatabase {
             let Some(scheme) = requirement else {
                 continue;
             };
-            for expression in reads {
+            for expression in reads.iter().copied() {
                 let Some(projection) = self
                     .program
                     .expressions
@@ -4851,13 +4918,16 @@ impl CheckedProgramDatabase {
     fn infer_structural_user_result_schemes(&mut self) {
         let mut plans = Vec::new();
         self.collect_structural_statement_plans(&self.program.ast.statements, &mut plans);
-        let mut values = BTreeMap::new();
+        // Parser statement IDs are dense within one assembled snapshot. Keep
+        // this phase's postorder values in one arena-shaped table instead of
+        // allocating and tree-walking a BTreeMap entry per statement.
+        let mut values = DenseIndexTable::with_len(plans.len());
         for plan in plans {
             let child_value = plan
                 .children
                 .iter()
                 .rev()
-                .find_map(|child| values.get(child).cloned().flatten());
+                .find_map(|child| values.get(child).cloned());
             let expression_value = plan.value.map(|expression| {
                 let flow_type = self.infer_checked_expr_flow_root(expression.0 as usize);
                 self.set_inferred_expr_flow(expression.0 as usize, flow_type.clone());
@@ -4881,7 +4951,10 @@ impl CheckedProgramDatabase {
             {
                 self.set_value_declaration_flow_type(declaration, value.flow_type.clone());
             }
-            values.insert(plan.statement, value);
+            if let Some(value) = value {
+                let inserted = values.insert_if_in_bounds(plan.statement, value);
+                debug_assert!(inserted);
+            }
         }
 
         let user_bodies = self
@@ -4898,7 +4971,7 @@ impl CheckedProgramDatabase {
 
         let mut changed_signature_indices = Vec::new();
         for (signature_index, body, _) in user_bodies {
-            let Some(result) = values.get(&(body.0 as usize)).cloned().flatten() else {
+            let Some(result) = values.get(&(body.0 as usize)).cloned() else {
                 continue;
             };
             if !result.structural_record

@@ -137,11 +137,20 @@ stronger three-reviewer performance closure defined below.
    1,621,578/1,621,584 calls and 206,521,350/206,585,947 bytes. An 18-pair
    directional release batch has 204.74/205.60 ms total and 149.59/150.10 ms
    typecheck medians, with 223.03/223.09 ms maxima and 65,348/65,924 KiB maximum
-   RSS. The first tranche still includes the measured 23.8 ms contextual-scheme
-   owner, remaining construction/diagnostic work, measured name/type interning,
-   scaling/parity evidence, and the fresh Phase 1 adversarial review. Reprofile
-   after each owner-level slice and regenerate the complete cold protocol after
-   the final edit. Direct verified NovyWave remains about 7.6--7.7 seconds and
+   RSS. The first contextual ownership slice reuses the solver's packed call
+   graph, packs PASSED reads without cloned projection paths, and stores
+   structural statement children/values inline or densely. The exact digest,
+   all 85 ordinary tests, both product gates, and solver work remain unchanged;
+   fresh/empty allocations fall to 1,613,479/1,613,485 calls and
+   206,406,282/206,470,879 bytes. The contextual graph lane falls from about
+   0.28 to 0.03 ms, while an 18-pair system-noisy batch has 218.24/220.90 ms
+   total and 159.53/161.72 ms typecheck medians, so this is not a whole-run
+   latency claim. The first tranche still includes the contextual parameter/
+   worklist and checked-inference owners, remaining construction/diagnostic
+   work, measured name/type interning, scaling/parity evidence, and the fresh
+   Phase 1 adversarial review. Reprofile after each owner-level slice and
+   regenerate the complete cold protocol after the final edit. Direct verified
+   NovyWave remains about 7.6--7.7 seconds and
    515 MiB, dominated by about 6.9 seconds of semantic work; keep that later
    verified time/RSS closure explicitly red. Then close
    semantic sealing, proof, backend, hashing, and memory until both verified-

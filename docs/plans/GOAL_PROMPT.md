@@ -284,9 +284,18 @@ Current checkpoints to preserve and audit rather than redo:
   1,732,728/1,732,734 calls and 210,213,846/210,278,443 bytes; six-pair release
   medians are 213.89/212.96 ms total and 158.70/157.43 ms typecheck. The release
   rebuild remains 1m35s, so the later measured crate/downstream-relink boundary
-  remains open. Continue with remaining measured compact/name interning and
-  contextual-scheme/inference worklist owners, scaling/parity proof, and fresh
-  adversarial review before regenerating the full protocol after the final edit;
+  remains open. Checked reverse dependencies now replace 154,585 fragmented
+  possible-row headers and 26,425 populated-row allocations with immutable
+  packed offsets/edges for 40,880 base and 29,812 derived flow edges; the
+  construction-only pattern column is not retained. The exact digest and every
+  work counter remain unchanged, all 79 ordinary tests and both product gates
+  pass, and fresh/empty allocations fall to 1,687,722/1,687,728 calls and
+  210,064,354/210,128,951 bytes. Six-pair medians fall to 208.89/209.55 ms total
+  and 152.86/153.76 ms typecheck, with 65,768/66,400 KiB maximum RSS. Continue
+  with the dominant 34-round checked-inference worklist, remaining contextual/
+  structural work, and measured name/type interning, then scaling/parity proof
+  and fresh adversarial review before regenerating the full protocol after the
+  final edit;
 - the current compiler-throughput checkpoint keeps Counter, physical TodoMVC,
   and NovyWave `MachinePlan` output deterministic while replacing copied OUT
   type environments with active-path overlays, retaining canonical-root-reading

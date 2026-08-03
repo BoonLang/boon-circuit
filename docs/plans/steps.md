@@ -110,11 +110,19 @@ stronger three-reviewer performance closure defined below.
    allocation work is 1,732,728/1,732,734 calls and
    210,213,846/210,278,443 bytes; six-pair medians are 213.89/212.96 ms total
    and 158.70/157.43 ms typecheck. The unchanged 1m35s release rebuild keeps the
-   measured crate/downstream-relink boundary open. The first tranche still
-   includes remaining compact/name interning, dominant contextual/inference
-   worklist reduction, scaling/parity evidence, and the fresh Phase 1
-   adversarial review. Reprofile after each owner-level slice and regenerate
-   the complete cold protocol after the final edit. Then close
+   measured crate/downstream-relink boundary open. Checked reverse dependencies
+   now pack 154,585 possible base rows, 40,880 base edges, and 29,812 derived
+   flow edges into immutable offsets/edge arrays instead of per-row vectors;
+   the construction-only pattern column is not retained. The exact digest and
+   every work counter remain unchanged, all 79 ordinary tests and both product
+   gates pass, and fresh/empty allocations fall to 1,687,722/1,687,728 calls
+   and 210,064,354/210,128,951 bytes. Six-pair medians are 208.89/209.55 ms total
+   and 152.86/153.76 ms typecheck, with 65,768/66,400 KiB maximum RSS. The first
+   tranche still includes the dominant 34-round inference worklist, remaining
+   contextual/structural work, measured name/type interning, scaling/parity
+   evidence, and the fresh Phase 1 adversarial review. Reprofile after each
+   owner-level slice and regenerate the complete cold protocol after the final
+   edit. Then close
    semantic sealing, proof, backend, hashing, and memory until both verified-
    plan modes pass; only afterward may persistent-session warm work satisfy its
    separate gates.

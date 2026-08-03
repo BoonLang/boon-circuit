@@ -424,6 +424,31 @@ fn dense_index_table_bounded_insert_does_not_expand_for_invalid_expression_ids()
 }
 
 #[test]
+fn packed_adjacency_sorts_deduplicates_and_rejects_invalid_rows() {
+    let mut builder = PackedAdjacencyBuilder::with_rows(4);
+    assert!(builder.push(2, 9usize));
+    assert!(builder.push(0, 4));
+    assert!(builder.push(2, 3));
+    assert!(builder.push(2, 9));
+    assert!(builder.extend(3, [8, 1, 8]));
+    assert!(!builder.push(4, 99));
+    assert!(!builder.extend(usize::MAX, [100]));
+
+    let adjacency = builder.finish_sorted_unique();
+    assert_eq!(adjacency.len(), 4);
+    assert_eq!(adjacency.edge_count(), 5);
+    assert_eq!(adjacency.get(0), Some(&[4][..]));
+    assert_eq!(adjacency.get(1), Some(&[][..]));
+    assert_eq!(adjacency.get(2), Some(&[3, 9][..]));
+    assert_eq!(adjacency.get(3), Some(&[1, 8][..]));
+    assert_eq!(adjacency.get(4), None);
+    assert_eq!(
+        adjacency.iter().collect::<Vec<_>>(),
+        vec![&[4][..], &[][..], &[3, 9][..], &[1, 8][..]]
+    );
+}
+
+#[test]
 fn exact_statement_root_index_matches_first_depth_first_statement() {
     fn statement(id: usize, expr: Option<usize>, children: Vec<AstStatement>) -> AstStatement {
         AstStatement {
@@ -1041,15 +1066,17 @@ fn checked_flow_cache_reuses_unaffected_entries_and_invalidates_only_reverse_clo
 
 #[test]
 fn checked_flow_declaration_invalidation_follows_forwarded_outputs_without_cycles() {
-    let mut readers = vec![Vec::new(); 6];
-    readers[2] = vec![7];
-    readers[3] = vec![9];
-    readers[4] = vec![11, 7];
-    let mut dependents = vec![Vec::new(); 6];
-    dependents[1] = vec![DeclId(2)];
-    dependents[2] = vec![DeclId(3)];
-    dependents[3] = vec![DeclId(4)];
-    dependents[4] = vec![DeclId(2)];
+    let mut readers = PackedAdjacencyBuilder::with_rows(6);
+    readers.push(2, 7);
+    readers.push(3, 9);
+    readers.extend(4, [11, 7]);
+    let readers = readers.finish_sorted_unique();
+    let mut dependents = PackedAdjacencyBuilder::with_rows(6);
+    dependents.push(1, DeclId(2));
+    dependents.push(2, DeclId(3));
+    dependents.push(3, DeclId(4));
+    dependents.push(4, DeclId(2));
+    let dependents = dependents.finish_sorted_unique();
     let mut seen = DenseGenerationSet::with_len(5);
 
     assert_eq!(

@@ -613,8 +613,8 @@ fn invalidate_checked_flow_cache_reverse_closure(
 
 #[cfg(test)]
 fn checked_flow_declaration_invalidation_roots(
-    readers: &[Vec<usize>],
-    dependents: &[Vec<DeclId>],
+    readers: &PackedAdjacency<usize>,
+    dependents: &PackedAdjacency<DeclId>,
     declaration: DeclId,
     seen: &mut DenseGenerationSet,
 ) -> Vec<usize> {
@@ -622,8 +622,8 @@ fn checked_flow_declaration_invalidation_roots(
 }
 
 fn checked_flow_declarations_invalidation_roots(
-    readers: &[Vec<usize>],
-    dependents: &[Vec<DeclId>],
+    readers: &PackedAdjacency<usize>,
+    dependents: &PackedAdjacency<DeclId>,
     declarations: impl IntoIterator<Item = DeclId>,
     seen: &mut DenseGenerationSet,
 ) -> Vec<usize> {
@@ -725,6 +725,108 @@ impl<T> FromIterator<(usize, T)> for DenseIndexTable<T> {
             table.insert(index, value);
         }
         table
+    }
+}
+
+/// Immutable dense-row adjacency stored as one offsets array plus one edge
+/// array.
+///
+/// The checked dependency graph has many more possible rows than non-empty
+/// rows. A `Vec<Vec<T>>` therefore paid one three-word vector header for every
+/// possible expression/declaration and one allocator call for every populated
+/// row. This representation keeps the same sorted row order while making the
+/// graph two contiguous allocations regardless of row fanout.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PackedAdjacency<T> {
+    offsets: Box<[usize]>,
+    edges: Box<[T]>,
+}
+
+impl<T> PackedAdjacency<T> {
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.offsets.len().saturating_sub(1)
+    }
+
+    fn get(&self, row: usize) -> Option<&[T]> {
+        let start = *self.offsets.get(row)?;
+        let end = *self.offsets.get(row.saturating_add(1))?;
+        self.edges.get(start..end)
+    }
+
+    fn iter(&self) -> impl ExactSizeIterator<Item = &[T]> {
+        self.offsets
+            .windows(2)
+            .map(|offsets| &self.edges[offsets[0]..offsets[1]])
+    }
+
+    fn edge_count(&self) -> usize {
+        self.edges.len()
+    }
+}
+
+/// Direct edge collector for [`PackedAdjacency`].
+///
+/// Edges are collected as `(row, value)` pairs and globally sorted once. This
+/// avoids constructing the fragmented row vectors that packing is intended to
+/// replace. Invalid dense IDs retain the old fail-closed behavior and are
+/// rejected without expanding the declared topology.
+struct PackedAdjacencyBuilder<T> {
+    row_count: usize,
+    edges: Vec<(usize, T)>,
+}
+
+impl<T> PackedAdjacencyBuilder<T> {
+    fn with_rows(row_count: usize) -> Self {
+        Self {
+            row_count,
+            edges: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, row: usize, value: T) -> bool {
+        if row >= self.row_count {
+            return false;
+        }
+        self.edges.push((row, value));
+        true
+    }
+
+    fn extend(&mut self, row: usize, values: impl IntoIterator<Item = T>) -> bool {
+        if row >= self.row_count {
+            return false;
+        }
+        self.edges
+            .extend(values.into_iter().map(|value| (row, value)));
+        true
+    }
+}
+
+impl<T> PackedAdjacencyBuilder<T>
+where
+    T: Ord,
+{
+    fn finish_sorted_unique(mut self) -> PackedAdjacency<T> {
+        self.edges.sort_unstable();
+        self.edges.dedup();
+
+        let mut offsets = vec![0usize; self.row_count.saturating_add(1)];
+        for (row, _) in &self.edges {
+            offsets[row.saturating_add(1)] += 1;
+        }
+        for row in 0..self.row_count {
+            offsets[row + 1] += offsets[row];
+        }
+        let edges = self
+            .edges
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        PackedAdjacency {
+            offsets: offsets.into_boxed_slice(),
+            edges,
+        }
     }
 }
 
@@ -1144,48 +1246,77 @@ struct CheckedTypeInferenceDependencies {
     read_inference_plans: DenseIndexTable<CheckedReadInferencePlan>,
     /// Exact Hold update expressions keyed by the Hold parser expression.
     hold_updates_by_expression: DenseIndexTable<Box<[usize]>>,
-    expression_parents: Vec<Vec<usize>>,
-    declarations_by_value: Vec<Vec<DeclId>>,
-    callables_by_result: Vec<Vec<DeclId>>,
-    calls_by_input: Vec<Vec<CheckedCallId>>,
-    parameters_by_actual: Vec<Vec<DeclId>>,
+    expression_parents: PackedAdjacency<usize>,
+    declarations_by_value: PackedAdjacency<DeclId>,
+    callables_by_result: PackedAdjacency<DeclId>,
+    calls_by_input: PackedAdjacency<CheckedCallId>,
+    parameters_by_actual: PackedAdjacency<DeclId>,
     /// Exact reverse of `parameters_by_actual`: every checked input expression
     /// supplied to one formal declaration. Flow inference reads this lane on
     /// parameter cache misses, so it must not rediscover the same relation by
     /// scanning every call in the program.
-    actuals_by_parameter: Vec<Vec<CheckedExprId>>,
-    declaration_readers: Vec<Vec<usize>>,
-    calls_by_output: Vec<Vec<CheckedCallId>>,
-    calls_by_callee: Vec<Vec<CheckedCallId>>,
+    actuals_by_parameter: PackedAdjacency<CheckedExprId>,
+    declaration_readers: PackedAdjacency<usize>,
+    calls_by_output: PackedAdjacency<CheckedCallId>,
+    calls_by_callee: PackedAdjacency<CheckedCallId>,
     /// Every concrete OUT declaration supplied for an OUT formal, keyed by
     /// `DeclId.0`. This is the recursive projected-OUT lane.
-    outputs_by_formal: Vec<Vec<DeclId>>,
+    outputs_by_formal: PackedAdjacency<DeclId>,
     /// Contextual list inputs whose row output is the indexed declaration.
     /// Projected row modes read the list item projection directly.
-    contextual_list_inputs_by_output: Vec<Vec<CheckedExprId>>,
+    contextual_list_inputs_by_output: PackedAdjacency<CheckedExprId>,
     /// Immutable call-vector indexes for contextual wrapper transfer. Call
     /// order remains stable until the post-inference `sort_calls` boundary.
-    wrapper_calls_by_owner: Vec<Vec<usize>>,
+    wrapper_calls_by_owner: PackedAdjacency<usize>,
     /// User signature indexes that directly call each callable declaration.
     /// Each lane is sorted and deduplicated to preserve the former BTreeSet
     /// worklist ordering when a callee changes.
-    wrapper_callers_by_callee: Vec<Vec<usize>>,
+    wrapper_callers_by_callee: PackedAdjacency<usize>,
     wrapper_user_signature_indices: BTreeSet<usize>,
     selector_parameters: Box<[DeclId]>,
-    selector_parameters_by_actual: Vec<Vec<DeclId>>,
+    selector_parameters_by_actual: PackedAdjacency<DeclId>,
     pattern_selector_domains: BTreeMap<DeclId, Type>,
     pattern_selectors: BTreeSet<usize>,
     pattern_binding_sites: Vec<CheckedPatternBindingSite>,
-    pattern_dependents_by_selector: Vec<Vec<usize>>,
     /// Every expression whose cached flow may change immediately when the
     /// indexed expression's authoritative inferred flow changes. This extends
     /// syntax parents with read, call-output, contextual, and pattern lanes.
-    flow_cache_dependents: Vec<Vec<usize>>,
+    flow_cache_dependents: PackedAdjacency<usize>,
     /// Declaration-level reverse edges for forwarded OUT formals. They remain
     /// separate from expression edges so long forwarding chains do not require
     /// a precomputed quadratic transitive closure.
-    flow_cache_declaration_dependents: Vec<Vec<DeclId>>,
-    signature_expression_readers: Vec<Vec<usize>>,
+    flow_cache_declaration_dependents: PackedAdjacency<DeclId>,
+    signature_expression_readers: PackedAdjacency<usize>,
+}
+
+/// Mutable, construction-only half of the checked dependency database.
+/// Adjacency fields collect direct edges and are consumed into immutable packed
+/// rows before inference can observe them.
+struct CheckedTypeInferenceDependencyBuild {
+    call_inference_plans: DenseIndexTable<CheckedCallInferencePlan>,
+    read_inference_plans: DenseIndexTable<CheckedReadInferencePlan>,
+    hold_updates_by_expression: DenseIndexTable<Box<[usize]>>,
+    expression_parents: PackedAdjacencyBuilder<usize>,
+    declarations_by_value: PackedAdjacencyBuilder<DeclId>,
+    callables_by_result: PackedAdjacencyBuilder<DeclId>,
+    calls_by_input: PackedAdjacencyBuilder<CheckedCallId>,
+    parameters_by_actual: PackedAdjacencyBuilder<DeclId>,
+    actuals_by_parameter: PackedAdjacencyBuilder<CheckedExprId>,
+    declaration_readers: PackedAdjacencyBuilder<usize>,
+    calls_by_output: PackedAdjacencyBuilder<CheckedCallId>,
+    calls_by_callee: PackedAdjacencyBuilder<CheckedCallId>,
+    outputs_by_formal: PackedAdjacencyBuilder<DeclId>,
+    contextual_list_inputs_by_output: PackedAdjacencyBuilder<CheckedExprId>,
+    wrapper_calls_by_owner: PackedAdjacencyBuilder<usize>,
+    wrapper_callers_by_callee: PackedAdjacencyBuilder<usize>,
+    wrapper_user_signature_indices: BTreeSet<usize>,
+    selector_parameters: Box<[DeclId]>,
+    selector_parameters_by_actual: PackedAdjacencyBuilder<DeclId>,
+    pattern_selector_domains: BTreeMap<DeclId, Type>,
+    pattern_selectors: BTreeSet<usize>,
+    pattern_binding_sites: Vec<CheckedPatternBindingSite>,
+    pattern_dependents_by_selector: PackedAdjacencyBuilder<usize>,
+    signature_expression_readers: PackedAdjacencyBuilder<usize>,
 }
 
 #[derive(Default)]
@@ -3794,7 +3925,7 @@ impl CheckedProgramDatabase {
                 dependencies
                     .actuals_by_parameter
                     .get(formal.0 as usize)
-                    .map_or(0, Vec::len)
+                    .map_or(0, <[_]>::len)
             })
             .sum::<usize>();
         if let Some(started) = setup_started {
@@ -5763,12 +5894,12 @@ impl CheckedProgramDatabase {
                         let parents = dependencies
                             .expression_parents
                             .get(*expression)
-                            .cloned()
+                            .map(<[_]>::to_vec)
                             .unwrap_or_default();
                         let dependents = dependencies
                             .flow_cache_dependents
                             .get(*expression)
-                            .cloned()
+                            .map(<[_]>::to_vec)
                             .unwrap_or_default();
                         (
                             *expression,
@@ -6173,23 +6304,27 @@ impl CheckedProgramDatabase {
             );
         }
         let allocate_started = trace.then(Instant::now);
-        let mut dependencies = CheckedTypeInferenceDependencies {
+        let mut dependencies = CheckedTypeInferenceDependencyBuild {
             call_inference_plans,
             read_inference_plans: DenseIndexTable::with_len(expression_count),
             hold_updates_by_expression: DenseIndexTable::with_len(expression_count),
-            expression_parents: vec![Vec::new(); expression_count],
-            declarations_by_value: vec![Vec::new(); expression_count],
-            callables_by_result: vec![Vec::new(); expression_count],
-            calls_by_input: vec![Vec::new(); expression_count],
-            parameters_by_actual: vec![Vec::new(); expression_count],
-            actuals_by_parameter: vec![Vec::new(); self.next_decl_id as usize],
-            declaration_readers: vec![Vec::new(); self.next_decl_id as usize],
-            calls_by_output: vec![Vec::new(); self.next_decl_id as usize],
-            calls_by_callee: vec![Vec::new(); self.next_decl_id as usize],
-            outputs_by_formal: vec![Vec::new(); self.next_decl_id as usize],
-            contextual_list_inputs_by_output: vec![Vec::new(); self.next_decl_id as usize],
-            wrapper_calls_by_owner: vec![Vec::new(); self.next_decl_id as usize],
-            wrapper_callers_by_callee: vec![Vec::new(); self.next_decl_id as usize],
+            expression_parents: PackedAdjacencyBuilder::with_rows(expression_count),
+            declarations_by_value: PackedAdjacencyBuilder::with_rows(expression_count),
+            callables_by_result: PackedAdjacencyBuilder::with_rows(expression_count),
+            calls_by_input: PackedAdjacencyBuilder::with_rows(expression_count),
+            parameters_by_actual: PackedAdjacencyBuilder::with_rows(expression_count),
+            actuals_by_parameter: PackedAdjacencyBuilder::with_rows(self.next_decl_id as usize),
+            declaration_readers: PackedAdjacencyBuilder::with_rows(self.next_decl_id as usize),
+            calls_by_output: PackedAdjacencyBuilder::with_rows(self.next_decl_id as usize),
+            calls_by_callee: PackedAdjacencyBuilder::with_rows(self.next_decl_id as usize),
+            outputs_by_formal: PackedAdjacencyBuilder::with_rows(self.next_decl_id as usize),
+            contextual_list_inputs_by_output: PackedAdjacencyBuilder::with_rows(
+                self.next_decl_id as usize,
+            ),
+            wrapper_calls_by_owner: PackedAdjacencyBuilder::with_rows(self.next_decl_id as usize),
+            wrapper_callers_by_callee: PackedAdjacencyBuilder::with_rows(
+                self.next_decl_id as usize,
+            ),
             wrapper_user_signature_indices: self
                 .signatures
                 .iter()
@@ -6199,14 +6334,14 @@ impl CheckedProgramDatabase {
                 })
                 .collect(),
             selector_parameters,
-            selector_parameters_by_actual: vec![Vec::new(); expression_count],
+            selector_parameters_by_actual: PackedAdjacencyBuilder::with_rows(expression_count),
             pattern_selector_domains,
             pattern_selectors: self.pattern_selectors.values().copied().collect(),
             pattern_binding_sites,
-            pattern_dependents_by_selector: vec![Vec::new(); expression_count],
-            flow_cache_dependents: vec![Vec::new(); expression_count],
-            flow_cache_declaration_dependents: vec![Vec::new(); self.next_decl_id as usize],
-            signature_expression_readers: vec![Vec::new(); self.next_decl_id as usize],
+            pattern_dependents_by_selector: PackedAdjacencyBuilder::with_rows(expression_count),
+            signature_expression_readers: PackedAdjacencyBuilder::with_rows(
+                self.next_decl_id as usize,
+            ),
         };
         if let Some(started) = allocate_started {
             eprintln!(
@@ -6229,18 +6364,13 @@ impl CheckedProgramDatabase {
                     .insert_if_in_bounds(expression.id, updates.into_boxed_slice());
             }
             for child in children {
-                if let Some(parents) = dependencies.expression_parents.get_mut(child) {
-                    parents.push(expression.id);
-                }
+                dependencies.expression_parents.push(child, expression.id);
             }
             if let Some(plan) = self.build_checked_read_inference_plan(expression) {
                 if let Some(declaration) = plan.path_target {
-                    if let Some(readers) = dependencies
+                    dependencies
                         .declaration_readers
-                        .get_mut(declaration.0 as usize)
-                    {
-                        readers.push(expression.id);
-                    }
+                        .push(declaration.0 as usize, expression.id);
                 }
                 dependencies
                     .read_inference_plans
@@ -6250,12 +6380,9 @@ impl CheckedProgramDatabase {
                 .and_then(|name| self.signature(name))
                 .map(|signature| signature.decl_id)
             {
-                if let Some(readers) = dependencies
+                dependencies
                     .signature_expression_readers
-                    .get_mut(callable.0 as usize)
-                {
-                    readers.push(expression.id);
-                }
+                    .push(callable.0 as usize, expression.id);
             }
             if let Some(arm) = self
                 .expression_scopes
@@ -6264,34 +6391,29 @@ impl CheckedProgramDatabase {
                 .copied()
                 .flatten()
                 && let Some(selector) = self.pattern_selectors.get(&arm).copied()
-                && let Some(dependents) = dependencies
-                    .pattern_dependents_by_selector
-                    .get_mut(selector)
             {
-                dependents.push(expression.id);
+                dependencies
+                    .pattern_dependents_by_selector
+                    .push(selector, expression.id);
             }
         }
         for (arm, selector) in self.pattern_selectors.iter() {
-            if let Some(dependents) = dependencies
+            dependencies
                 .pattern_dependents_by_selector
-                .get_mut(*selector)
-            {
-                dependents.push(arm);
-            }
+                .push(*selector, arm);
         }
         for declaration in &self.declarations {
-            if let Some(value) = declaration.value
-                && let Some(declarations) =
-                    dependencies.declarations_by_value.get_mut(value.0 as usize)
-            {
-                declarations.push(declaration.id);
+            if let Some(value) = declaration.value {
+                dependencies
+                    .declarations_by_value
+                    .push(value.0 as usize, declaration.id);
             }
         }
         for signature in &self.signatures {
-            if let Some(result) = signature.result_expression
-                && let Some(callables) = dependencies.callables_by_result.get_mut(result.0 as usize)
-            {
-                callables.push(signature.decl_id);
+            if let Some(result) = signature.result_expression {
+                dependencies
+                    .callables_by_result
+                    .push(result.0 as usize, signature.decl_id);
             }
         }
         if let Some(started) = expressions_started {
@@ -6335,18 +6457,12 @@ impl CheckedProgramDatabase {
                         _ => None,
                     })
                 });
-            if let Some(calls) = dependencies
+            dependencies
                 .calls_by_callee
-                .get_mut(call.callable.0 as usize)
-            {
-                calls.push(call.id);
-            }
-            if let Some(readers) = dependencies
+                .push(call.callable.0 as usize, call.id);
+            dependencies
                 .signature_expression_readers
-                .get_mut(call.callable.0 as usize)
-            {
-                readers.push(call.expression.0 as usize);
-            }
+                .push(call.callable.0 as usize, call.expression.0 as usize);
             if let Some(owner) = call.owner_callable
                 && let Some(owner_index) = self.signature_by_decl.get(&(owner.0 as usize)).copied()
                 && self
@@ -6354,45 +6470,29 @@ impl CheckedProgramDatabase {
                     .get(owner_index)
                     .is_some_and(|signature| signature.kind == CheckedCallableKind::User)
             {
-                if let Some(calls) = dependencies
+                dependencies
                     .wrapper_calls_by_owner
-                    .get_mut(owner.0 as usize)
-                {
-                    calls.push(call_index);
-                }
-                if let Some(callers) = dependencies
+                    .push(owner.0 as usize, call_index);
+                dependencies
                     .wrapper_callers_by_callee
-                    .get_mut(call.callable.0 as usize)
-                {
-                    callers.push(owner_index);
-                }
+                    .push(call.callable.0 as usize, owner_index);
             }
             for entry in &call.entries {
                 match entry {
                     CheckedCallEntry::Input { formal, value, .. } => {
-                        if input_flow_sensitive
-                            && let Some(calls) =
-                                dependencies.calls_by_input.get_mut(value.0 as usize)
-                        {
-                            calls.push(call.id);
+                        if input_flow_sensitive {
+                            dependencies.calls_by_input.push(value.0 as usize, call.id);
                         }
-                        if let Some(parameters) =
-                            dependencies.parameters_by_actual.get_mut(value.0 as usize)
-                        {
-                            parameters.push(*formal);
-                        }
-                        if let Some(actuals) =
-                            dependencies.actuals_by_parameter.get_mut(formal.0 as usize)
-                        {
-                            actuals.push(*value);
-                        }
+                        dependencies
+                            .parameters_by_actual
+                            .push(value.0 as usize, *formal);
+                        dependencies
+                            .actuals_by_parameter
+                            .push(formal.0 as usize, *value);
                         if self.syntax_discriminant_parameters.contains(formal) {
-                            if let Some(parameters) = dependencies
+                            dependencies
                                 .selector_parameters_by_actual
-                                .get_mut(value.0 as usize)
-                            {
-                                parameters.push(*formal);
-                            }
+                                .push(value.0 as usize, *formal);
                         }
                     }
                     CheckedCallEntry::FreshOut { formal, output, .. }
@@ -6401,34 +6501,28 @@ impl CheckedProgramDatabase {
                         target: output,
                         ..
                     } => {
-                        if let Some(calls) = dependencies.calls_by_output.get_mut(output.0 as usize)
-                        {
-                            calls.push(call.id);
-                        }
-                        if let Some(outputs) =
-                            dependencies.outputs_by_formal.get_mut(formal.0 as usize)
-                        {
-                            outputs.push(*output);
-                        }
+                        dependencies
+                            .calls_by_output
+                            .push(output.0 as usize, call.id);
+                        dependencies
+                            .outputs_by_formal
+                            .push(formal.0 as usize, *output);
                     }
                 }
             }
             if let Some((row_formal, input)) = contextual_row_input {
                 for (output, formal) in &first_output_formal_by_output {
-                    if *formal == row_formal
-                        && let Some(inputs) = dependencies
+                    if *formal == row_formal {
+                        dependencies
                             .contextual_list_inputs_by_output
-                            .get_mut(output.0 as usize)
-                    {
-                        inputs.push(input);
+                            .push(output.0 as usize, input);
                     }
                 }
             }
             if let CheckedContextBinding::Explicit { value, .. } = call.context_binding
                 && input_flow_sensitive
-                && let Some(calls) = dependencies.calls_by_input.get_mut(value.0 as usize)
             {
-                calls.push(call.id);
+                dependencies.calls_by_input.push(value.0 as usize, call.id);
             }
         }
         if let Some(started) = calls_started {
@@ -6438,70 +6532,49 @@ impl CheckedProgramDatabase {
             );
         }
         let sorting_started = trace.then(Instant::now);
-        for calls in &mut dependencies.wrapper_calls_by_owner {
-            calls.sort_unstable();
-            calls.dedup();
-        }
-        for callers in &mut dependencies.wrapper_callers_by_callee {
-            callers.sort_unstable();
-            callers.dedup();
-        }
-        for values in &mut dependencies.expression_parents {
-            values.sort();
-            values.dedup();
-        }
-        for values in &mut dependencies.declarations_by_value {
-            values.sort();
-            values.dedup();
-        }
-        for values in &mut dependencies.callables_by_result {
-            values.sort();
-            values.dedup();
-        }
-        for values in &mut dependencies.calls_by_input {
-            values.sort();
-            values.dedup();
-        }
-        for values in &mut dependencies.parameters_by_actual {
-            values.sort();
-            values.dedup();
-        }
-        for values in &mut dependencies.selector_parameters_by_actual {
-            values.sort();
-            values.dedup();
-        }
-        for values in &mut dependencies.actuals_by_parameter {
-            values.sort();
-            values.dedup();
-        }
-        for values in &mut dependencies.pattern_dependents_by_selector {
-            values.sort();
-            values.dedup();
-        }
-        for values in &mut dependencies.declaration_readers {
-            values.sort();
-            values.dedup();
-        }
-        for values in &mut dependencies.calls_by_output {
-            values.sort();
-            values.dedup();
-        }
-        for values in &mut dependencies.calls_by_callee {
-            values.sort();
-            values.dedup();
-        }
-        for values in &mut dependencies.outputs_by_formal {
-            values.sort();
-            values.dedup();
-        }
-        for values in &mut dependencies.contextual_list_inputs_by_output {
-            values.sort();
-            values.dedup();
-        }
-        for values in &mut dependencies.signature_expression_readers {
-            values.sort();
-            values.dedup();
-        }
+        let CheckedTypeInferenceDependencyBuild {
+            call_inference_plans,
+            read_inference_plans,
+            hold_updates_by_expression,
+            expression_parents,
+            declarations_by_value,
+            callables_by_result,
+            calls_by_input,
+            parameters_by_actual,
+            actuals_by_parameter,
+            declaration_readers,
+            calls_by_output,
+            calls_by_callee,
+            outputs_by_formal,
+            contextual_list_inputs_by_output,
+            wrapper_calls_by_owner,
+            wrapper_callers_by_callee,
+            wrapper_user_signature_indices,
+            selector_parameters,
+            selector_parameters_by_actual,
+            pattern_selector_domains,
+            pattern_selectors,
+            pattern_binding_sites,
+            pattern_dependents_by_selector,
+            signature_expression_readers,
+        } = dependencies;
+        let expression_parents = expression_parents.finish_sorted_unique();
+        let declarations_by_value = declarations_by_value.finish_sorted_unique();
+        let callables_by_result = callables_by_result.finish_sorted_unique();
+        let calls_by_input = calls_by_input.finish_sorted_unique();
+        let parameters_by_actual = parameters_by_actual.finish_sorted_unique();
+        let actuals_by_parameter = actuals_by_parameter.finish_sorted_unique();
+        let declaration_readers = declaration_readers.finish_sorted_unique();
+        let calls_by_output = calls_by_output.finish_sorted_unique();
+        let calls_by_callee = calls_by_callee.finish_sorted_unique();
+        let outputs_by_formal = outputs_by_formal.finish_sorted_unique();
+        let contextual_list_inputs_by_output =
+            contextual_list_inputs_by_output.finish_sorted_unique();
+        let wrapper_calls_by_owner = wrapper_calls_by_owner.finish_sorted_unique();
+        let wrapper_callers_by_callee = wrapper_callers_by_callee.finish_sorted_unique();
+        let selector_parameters_by_actual = selector_parameters_by_actual.finish_sorted_unique();
+        let pattern_dependents_by_selector = pattern_dependents_by_selector.finish_sorted_unique();
+        let signature_expression_readers = signature_expression_readers.finish_sorted_unique();
         if let Some(started) = sorting_started {
             eprintln!(
                 "boon_typecheck checked_program.build_type_dependencies.sort: {:.3}ms",
@@ -6514,68 +6587,37 @@ impl CheckedProgramDatabase {
         // cover flow-mode reads that intentionally bypass an intermediate
         // declaration update.
         let flow_started = trace.then(Instant::now);
-        {
-            let expression_parents = &dependencies.expression_parents;
-            let flow_cache_dependents = &mut dependencies.flow_cache_dependents;
-            for (child, parents) in expression_parents.iter().enumerate() {
-                if let Some(dependents) = flow_cache_dependents.get_mut(child) {
-                    dependents.extend(parents.iter().copied());
+        let mut flow_cache_dependents = PackedAdjacencyBuilder::with_rows(expression_count);
+        let mut flow_cache_declaration_dependents =
+            PackedAdjacencyBuilder::with_rows(self.next_decl_id as usize);
+        for (child, parents) in expression_parents.iter().enumerate() {
+            flow_cache_dependents.extend(child, parents.iter().copied());
+        }
+        for (value, declarations) in declarations_by_value.iter().enumerate() {
+            for declaration in declarations {
+                if let Some(readers) = declaration_readers.get(declaration.0 as usize) {
+                    flow_cache_dependents.extend(value, readers.iter().copied());
                 }
             }
         }
-        {
-            let declarations_by_value = &dependencies.declarations_by_value;
-            let declaration_readers = &dependencies.declaration_readers;
-            let flow_cache_dependents = &mut dependencies.flow_cache_dependents;
-            for (value, declarations) in declarations_by_value.iter().enumerate() {
-                let Some(dependents) = flow_cache_dependents.get_mut(value) else {
-                    continue;
-                };
-                for declaration in declarations {
-                    if let Some(readers) = declaration_readers.get(declaration.0 as usize) {
-                        dependents.extend(readers.iter().copied());
-                    }
+        for (actual, parameters) in parameters_by_actual.iter().enumerate() {
+            for parameter in parameters {
+                if let Some(readers) = declaration_readers.get(parameter.0 as usize) {
+                    flow_cache_dependents.extend(actual, readers.iter().copied());
                 }
             }
         }
-        {
-            let parameters_by_actual = &dependencies.parameters_by_actual;
-            let declaration_readers = &dependencies.declaration_readers;
-            let flow_cache_dependents = &mut dependencies.flow_cache_dependents;
-            for (actual, parameters) in parameters_by_actual.iter().enumerate() {
-                let Some(dependents) = flow_cache_dependents.get_mut(actual) else {
-                    continue;
-                };
-                for parameter in parameters {
-                    if let Some(readers) = declaration_readers.get(parameter.0 as usize) {
-                        dependents.extend(readers.iter().copied());
-                    }
-                }
-            }
-        }
-        {
-            let pattern_dependents_by_selector = &dependencies.pattern_dependents_by_selector;
-            let flow_cache_dependents = &mut dependencies.flow_cache_dependents;
-            for (selector, pattern_dependents) in pattern_dependents_by_selector.iter().enumerate()
-            {
-                if let Some(dependents) = flow_cache_dependents.get_mut(selector) {
-                    dependents.extend(pattern_dependents.iter().copied());
-                }
-            }
+        for (selector, pattern_dependents) in pattern_dependents_by_selector.iter().enumerate() {
+            flow_cache_dependents.extend(selector, pattern_dependents.iter().copied());
         }
         // A projected read of an OUT formal follows every concrete output
         // occurrence through `checked_out_projection_flow_mode`. Encode that
         // non-syntactic lane from the same exact adjacency consumed at run
         // time, rather than scanning calls a second time here.
-        for (formal, outputs) in dependencies.outputs_by_formal.iter().enumerate() {
+        for (formal, outputs) in outputs_by_formal.iter().enumerate() {
             let formal = DeclId(formal as u32);
             for output in outputs {
-                if let Some(dependents) = dependencies
-                    .flow_cache_declaration_dependents
-                    .get_mut(output.0 as usize)
-                {
-                    dependents.push(formal);
-                }
+                flow_cache_declaration_dependents.push(output.0 as usize, formal);
             }
         }
 
@@ -6583,104 +6625,95 @@ impl CheckedProgramDatabase {
         // inferring a projected mode. Keep this edge exact instead of forming
         // the all-inputs x all-output-readers cross product that the old
         // whole-epoch invalidation happened to conceal.
-        {
-            let contextual_list_inputs_by_output = &dependencies.contextual_list_inputs_by_output;
-            let declaration_readers = &dependencies.declaration_readers;
-            let flow_cache_dependents = &mut dependencies.flow_cache_dependents;
-            for (output, list_inputs) in contextual_list_inputs_by_output.iter().enumerate() {
-                let Some(readers) = declaration_readers.get(output) else {
-                    continue;
-                };
-                for list_input in list_inputs {
-                    if let Some(dependents) = flow_cache_dependents.get_mut(list_input.0 as usize) {
-                        dependents.extend(readers.iter().copied());
-                    }
-                }
+        for (output, list_inputs) in contextual_list_inputs_by_output.iter().enumerate() {
+            let Some(readers) = declaration_readers.get(output) else {
+                continue;
+            };
+            for list_input in list_inputs {
+                flow_cache_dependents.extend(list_input.0 as usize, readers.iter().copied());
             }
         }
-        {
-            let flow_cache_dependents = &mut dependencies.flow_cache_dependents;
-            for call in &self.calls {
-                let inputs =
-                    call.entries
-                        .iter()
-                        .filter_map(|entry| match entry {
-                            CheckedCallEntry::Input { value, .. } => Some(value.0 as usize),
-                            CheckedCallEntry::FreshOut { .. }
-                            | CheckedCallEntry::ForwardOut { .. } => None,
-                        })
-                        .chain(
-                            call.context_binding
-                                .explicit()
-                                .map(|(value, _)| value.0 as usize),
-                        );
-                for input in inputs {
-                    if let Some(dependents) = flow_cache_dependents.get_mut(input) {
-                        dependents.push(call.expression.0 as usize);
-                    }
-                }
+        for call in &self.calls {
+            let inputs = call
+                .entries
+                .iter()
+                .filter_map(|entry| match entry {
+                    CheckedCallEntry::Input { value, .. } => Some(value.0 as usize),
+                    CheckedCallEntry::FreshOut { .. } | CheckedCallEntry::ForwardOut { .. } => None,
+                })
+                .chain(
+                    call.context_binding
+                        .explicit()
+                        .map(|(value, _)| value.0 as usize),
+                );
+            for input in inputs {
+                flow_cache_dependents.push(input, call.expression.0 as usize);
             }
         }
-        {
-            let calls_by_callee = &dependencies.calls_by_callee;
-            let flow_cache_dependents = &mut dependencies.flow_cache_dependents;
-            for signature in &self.signatures {
-                let Some(result) = signature.result_expression else {
-                    continue;
-                };
-                let Some(dependents) = flow_cache_dependents.get_mut(result.0 as usize) else {
-                    continue;
-                };
-                for call in calls_by_callee
-                    .get(signature.decl_id.0 as usize)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|call| self.call_by_checked_id(*call))
-                {
-                    dependents.push(call.expression.0 as usize);
-                }
+        for signature in &self.signatures {
+            let Some(result) = signature.result_expression else {
+                continue;
+            };
+            for call in calls_by_callee
+                .get(signature.decl_id.0 as usize)
+                .into_iter()
+                .flatten()
+                .filter_map(|call| self.call_by_checked_id(*call))
+            {
+                flow_cache_dependents.push(result.0 as usize, call.expression.0 as usize);
             }
         }
-        {
-            let read_inference_plans = &dependencies.read_inference_plans;
-            let flow_cache_dependents = &mut dependencies.flow_cache_dependents;
-            for expression in &self.program.expressions {
-                let Some(plan) = read_inference_plans.get(&expression.id) else {
-                    continue;
-                };
-                if plan.path_target.is_some() {
-                    continue;
-                }
-                let Some(path) = plan.canonical_path.as_deref() else {
-                    continue;
-                };
-                if let Some(value) = declaration_expr_for_path(&self.declaration_exprs, path)
-                    && let Some(dependents) = flow_cache_dependents.get_mut(value)
-                {
-                    dependents.push(expression.id);
-                }
+        for expression in &self.program.expressions {
+            let Some(plan) = read_inference_plans.get(&expression.id) else {
+                continue;
+            };
+            if plan.path_target.is_some() {
+                continue;
+            }
+            let Some(path) = plan.canonical_path.as_deref() else {
+                continue;
+            };
+            if let Some(value) = declaration_expr_for_path(&self.declaration_exprs, path) {
+                flow_cache_dependents.push(value, expression.id);
             }
         }
-        for dependents in &mut dependencies.flow_cache_dependents {
-            dependents.sort_unstable();
-            dependents.dedup();
-        }
-        for dependents in &mut dependencies.flow_cache_declaration_dependents {
-            dependents.sort();
-            dependents.dedup();
-        }
+        let flow_cache_dependents = flow_cache_dependents.finish_sorted_unique();
+        let flow_cache_declaration_dependents =
+            flow_cache_declaration_dependents.finish_sorted_unique();
         if let Some(started) = flow_started {
             eprintln!(
                 "boon_typecheck checked_program.build_type_dependencies.flow: {:.3}ms edges={}",
                 typecheck_elapsed_ms(started),
-                dependencies
-                    .flow_cache_dependents
-                    .iter()
-                    .map(Vec::len)
-                    .sum::<usize>(),
+                flow_cache_dependents.edge_count(),
             );
         }
-        dependencies
+        CheckedTypeInferenceDependencies {
+            call_inference_plans,
+            read_inference_plans,
+            hold_updates_by_expression,
+            expression_parents,
+            declarations_by_value,
+            callables_by_result,
+            calls_by_input,
+            parameters_by_actual,
+            actuals_by_parameter,
+            declaration_readers,
+            calls_by_output,
+            calls_by_callee,
+            outputs_by_formal,
+            contextual_list_inputs_by_output,
+            wrapper_calls_by_owner,
+            wrapper_callers_by_callee,
+            wrapper_user_signature_indices,
+            selector_parameters,
+            selector_parameters_by_actual,
+            pattern_selector_domains,
+            pattern_selectors,
+            pattern_binding_sites,
+            flow_cache_dependents,
+            flow_cache_declaration_dependents,
+            signature_expression_readers,
+        }
     }
 
     fn enable_checked_flow_inference_cache(&mut self) {
@@ -9720,7 +9753,7 @@ impl CheckedProgramDatabase {
             let actuals = dependencies
                 .as_ref()
                 .and_then(|dependencies| dependencies.actuals_by_parameter.get(target.0 as usize))
-                .cloned()
+                .map(<[_]>::to_vec)
                 .unwrap_or_else(|| {
                     // Outside the indexed solver (principally diagnostic
                     // construction), preserve the exact fail-closed behavior.
@@ -12128,7 +12161,7 @@ impl CheckedProgramDatabase {
                 .checked_type_inference_dependencies
                 .as_ref()
                 .and_then(|dependencies| dependencies.calls_by_callee.get(callable.0 as usize))
-                .cloned()
+                .map(<[_]>::to_vec)
                 .unwrap_or_else(|| {
                     self.calls
                         .iter()

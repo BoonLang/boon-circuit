@@ -529,8 +529,27 @@ Current cold-diagnostics candidate evidence:
   typecheck. This is an ownership/deletion result rather than a new percentile
   claim. The locked release rebuild remains 1m35s even after the source cut,
   confirming that the later measured crate/downstream-relink boundary remains
-  open. Next complete measured compact/name interning and dominant contextual-
-  scheme/inference worklist reductions, then scaling/parity evidence and the
+  open.
+- Checked inference reverse dependencies now use immutable packed offset/edge
+  arrays instead of one `Vec` header for each of 154,585 possible base rows and
+  one allocation for each of 26,425 populated rows. Sixteen construction
+  columns collect 40,880 sorted/deduplicated base edges directly; the derived
+  29,812-edge flow graph is packed the same way, and the construction-only
+  pattern column is no longer retained in the final database. The bounded-row,
+  empty-row, last-row, ordering, deduplication, and invalid-ID tests pass. All
+  79 ordinary typechecker tests and both product-scale ignored gates pass; the
+  exact checked digest and every inference/cache/replay work counter are
+  unchanged. Fresh/empty allocation work falls to
+  1,687,722/1,687,728 calls and 210,064,354/210,128,951 bytes, exactly 45,006
+  calls and 149,492 bytes below the owned-database checkpoint in each mode. The
+  release dependency allocation/fill/sort/flow path falls directionally from
+  about 8.1 to 6.6 ms and parameter-scheme setup from about 9.08 to 7.64 ms. A
+  six-pair release batch has 208.89/209.55 ms total and 152.86/153.76 ms
+  typecheck medians, with 65,768/66,400 KiB maximum RSS. The rejected dense
+  counting-scatter and inline-first-edge builders were slower in direct debug
+  A/Bs and are not retained. Next reduce the still-dominant 34-round, roughly
+  38.9 ms checked-inference worklist and remaining contextual/structural work,
+  then finish measured name/type interning, scaling/parity evidence, and the
   fresh adversarial review. Regenerate the full cold protocol after the final
   Phase 1 edit.
 
@@ -828,15 +847,17 @@ compiler-service work or any later repository plan:
 Current resumption after the first passing cold-diagnostics candidate: item 7's
 single owned `CheckedProgramDatabase` is complete inside `boon_typecheck`; do
 not recreate a checker/builder handoff or a latent recursive production engine.
-Next complete measured compact/name interning and reduce the dominant
-contextual-scheme/inference worklists before the Phase 1 scaling,
-malformed-source/parity, and fresh adversarial checks. Use the unchanged 1m35s
-release rebuild after the net source deletion as evidence when evaluating the
-next ownership/dependency crate boundary, but accept a split only under the
-measured split gates above. Reprofile every owner-level slice and rerun the
-complete three-setup/30-scored cold protocol after the final Phase 1 edit;
-checkpoint `677d09d`'s narrow empty-session result cannot be reused across
-these source changes.
+Its hot reverse dependencies are now compact immutable offset/edge arrays; do
+not restore fragmented row vectors or retain construction-only columns. Next
+reduce the dominant 34-round checked-inference worklist and remaining
+contextual/structural work, then complete measured name/type interning before
+the Phase 1 scaling, malformed-source/parity, and fresh adversarial checks. Use
+the unchanged 1m35s release rebuild after both the net source deletion and this
+runtime win as evidence when evaluating the next ownership/dependency crate
+boundary, but accept a split only under the measured split gates above.
+Reprofile every owner-level slice and rerun the complete three-setup/30-scored
+cold protocol after the final Phase 1 edit; checkpoint `677d09d`'s narrow
+empty-session result cannot be reused across these source changes.
 
 Once diagnostics pass, use the same loop for semantic component retention,
 single manifest sealing, verified lowering, streaming/hash memory, and backend

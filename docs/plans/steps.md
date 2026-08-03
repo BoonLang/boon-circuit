@@ -66,11 +66,17 @@ stronger three-reviewer performance closure defined below.
    allocation work falls to 1,789,024 calls / 212,744,182 bytes. A six-sample
    confirmation batch is timing-neutral/noisy at 222.34/219.94 ms fresh/empty,
    while the traced signature-sync subphase falls from about 0.78 to 0.40 ms.
-   Narrowing publication or PASSED work to an apparent changed cone was rejected
-   because the digest changed: complete synchronization currently repairs
-   callable declarations also mutated by ordinary result lanes. Remove that
-   duplicate mutation owner before pruning the repair boundary. The 35 rounds
-   remain. The remaining first tranche is therefore fusing the duplicate
+   The rejected changed-signature/PASSED-cone experiment is now decomposed:
+   generic declaration writes journal the exact callable signatures they
+   disturb, and the unchanged synchronization boundaries publish only that
+   journal plus explicitly changed signatures. The pre-change NovyWave tuple
+   oracle, exact digest, and all 80 tests pass. Fresh/empty allocation work falls
+   to 1,788,315/1,788,321 calls and 212,679,422/212,744,019 bytes. A six-pair
+   batch remains bimodal at 225.75/231.58 ms total and 169.80/173.69 ms
+   typecheck, so this is not a latency claim. Duplicate generic callable writes,
+   the independently rejected PASSED cone, and the 35 rounds remain. Remove the
+   duplicate mutation owner and retry the contextual cone against the exact
+   oracle. The remaining first tranche also includes fusing the duplicate
    checker/builder into one owned database, measured compact/name interning, the
    larger contextual/user-call worklist reduction, scaling/parity evidence, and
    the fresh Phase 1 adversarial review. Reprofile after each owner-level slice

@@ -195,6 +195,12 @@ struct CheckedProgramBuilder {
     checked_flow_pending_expression_invalidations: PendingIdSet<usize>,
     checked_flow_pending_declaration_invalidations: PendingIdSet<DeclId>,
     checked_flow_pending_signature_invalidations: PendingIdSet<DeclId>,
+    /// Callable declarations can be written through generic declaration
+    /// inference before a signature-publication boundary restores the
+    /// signature as their authoritative owner. Journal the exact signature
+    /// indices touched by those writes so the boundary need not rebuild every
+    /// callable declaration in the program.
+    dirty_signature_declarations: PendingIdSet<usize>,
     /// Recursive flow inference can refresh a child cache entry while solving
     /// a different root. Such a child still has to pass through the ordinary
     /// solver publication lane so its dense value and non-expression
@@ -1490,6 +1496,7 @@ impl CheckedProgramBuilder {
                 checked_flow_pending_expression_invalidations: PendingIdSet::default(),
                 checked_flow_pending_declaration_invalidations: PendingIdSet::default(),
                 checked_flow_pending_signature_invalidations: PendingIdSet::default(),
+                dirty_signature_declarations: PendingIdSet::default(),
                 checked_flow_pending_expression_publications: PendingIdSet::default(),
                 checked_type_inference_dependencies: None,
                 wrapper_call_scheme_vars: BTreeMap::new(),
@@ -3787,7 +3794,9 @@ impl CheckedProgramBuilder {
             signature.result = unknown_flow_type();
         }
         self.next_checked_scheme_type_var = Some(next_var);
-        self.sync_signature_declaration_types();
+        self.sync_signature_declaration_types(
+            dependencies.wrapper_user_signature_indices.iter().copied(),
+        );
         // Parameter/signature/declaration schemes changed after the scratch
         // reads above. Reset at that exact ownership boundary so context
         // inference cannot observe a cached answer from the old schemes.
@@ -4554,6 +4563,7 @@ impl CheckedProgramBuilder {
             })
             .collect::<Vec<_>>();
 
+        let mut changed_signature_indices = Vec::new();
         for (signature_index, body, _) in user_bodies {
             let Some(result) = values.get(&(body.0 as usize)).cloned().flatten() else {
                 continue;
@@ -4566,9 +4576,11 @@ impl CheckedProgramBuilder {
             {
                 continue;
             }
-            self.set_checked_signature_result(signature_index, result.flow_type);
+            if self.set_checked_signature_result(signature_index, result.flow_type) {
+                changed_signature_indices.push(signature_index);
+            }
         }
-        self.sync_signature_declaration_types();
+        self.sync_signature_declaration_types(changed_signature_indices);
     }
 
     fn collect_structural_statement_plans(
@@ -4927,7 +4939,13 @@ impl CheckedProgramBuilder {
             .collect()
     }
 
-    fn sync_signature_declaration_types(&mut self) {
+    fn sync_signature_declaration_types(
+        &mut self,
+        changed_signature_indices: impl IntoIterator<Item = usize>,
+    ) {
+        self.dirty_signature_declarations
+            .extend(changed_signature_indices);
+        let signature_indices = self.dirty_signature_declarations.drain_sorted();
         let signatures = &self.signatures;
         let declaration_by_id = &self.declaration_by_id;
         let declarations = &mut self.declarations;
@@ -4949,7 +4967,10 @@ impl CheckedProgramBuilder {
             }
         };
 
-        for signature in signatures {
+        for signature_index in signature_indices.iter().copied() {
+            let Some(signature) = signatures.get(signature_index) else {
+                continue;
+            };
             for parameter in &signature.parameters {
                 publish(parameter.decl_id, parameter.flow_type.clone());
             }
@@ -4969,6 +4990,7 @@ impl CheckedProgramBuilder {
                 },
             );
         }
+        self.dirty_signature_declarations.recycle(signature_indices);
     }
 
     fn infer_checked_types_with_contextual_wrapper_propagation(&mut self) {
@@ -6911,6 +6933,7 @@ impl CheckedProgramBuilder {
         let mut visits = 0usize;
         let mut callable_changed = false;
         let mut call_changed = false;
+        let mut changed_signature_indices = Vec::new();
         while let Some(callable) = pending.pop_first() {
             if visits >= maximum_visits {
                 break;
@@ -6936,6 +6959,7 @@ impl CheckedProgramBuilder {
                 continue;
             }
             self.set_checked_signature_result(signature_index, result);
+            changed_signature_indices.push(signature_index);
             callable_changed = true;
             for call_id in dependencies
                 .calls_by_callee
@@ -6957,7 +6981,7 @@ impl CheckedProgramBuilder {
             }
         }
         if callable_changed {
-            self.sync_signature_declaration_types();
+            self.sync_signature_declaration_types(changed_signature_indices);
         }
         if trace && visits > 0 {
             eprintln!(
@@ -7532,6 +7556,7 @@ impl CheckedProgramBuilder {
             })
             .collect::<Vec<_>>();
         let mut changed = false;
+        let mut changed_signature_indices = Vec::new();
         for (index, expression) in callables {
             let result = self.infer_checked_expr_flow_root(expression.0 as usize);
             let result = self.flush_boundary_flow_type(expression.0 as usize, result);
@@ -7547,11 +7572,12 @@ impl CheckedProgramBuilder {
                     );
                 }
                 self.set_checked_signature_result(index, result);
+                changed_signature_indices.push(index);
                 changed = true;
             }
         }
         if changed {
-            self.sync_signature_declaration_types();
+            self.sync_signature_declaration_types(changed_signature_indices);
         }
         changed
     }
@@ -10080,13 +10106,22 @@ impl CheckedProgramBuilder {
         else {
             return false;
         };
-        let Some(target) = self.declarations.get_mut(index) else {
-            return false;
-        };
-        if target.flow_type == flow_type {
-            return false;
+        {
+            let Some(target) = self.declarations.get_mut(index) else {
+                return false;
+            };
+            if target.flow_type == flow_type {
+                return false;
+            }
+            target.flow_type = flow_type;
         }
-        target.flow_type = flow_type;
+        if let Some(signature_index) = self
+            .signature_by_decl
+            .get(&(declaration.0 as usize))
+            .copied()
+        {
+            self.dirty_signature_declarations.insert(signature_index);
+        }
         self.invalidate_checked_flow_declaration(declaration);
         true
     }

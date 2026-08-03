@@ -443,9 +443,23 @@ Current cold-diagnostics candidate evidence:
   ownership result rather than a latency claim. A narrower changed-signature
   publication plus PASSED dependency-cone experiment was rejected after it
   changed the checked digest. The complete sync currently repairs callable
-  declarations also written by ordinary structural/result lanes; eliminate
-  that duplicate mutation owner with exact parity before safely narrowing the
-  synchronization or contextual cone.
+  declarations also written by ordinary structural/result lanes.
+- The rejected joint experiment is now decomposed at that ownership boundary.
+  Generic declaration writes journal the exact callable-signature indices they
+  disturb, while each existing synchronization point contributes only the
+  signatures whose parameters or results it changed. The same sorted boundary
+  order then republishes the union directly through the dense declaration
+  index; no synchronization point or mutation order moved. The temporary
+  pre-change 35.4 MB NovyWave tuple oracle, the complete 80-test suite, and the
+  exact checked digest all pass. Fresh allocation work falls to 1,788,315 calls
+  / 212,679,422 bytes and empty-session to 1,788,321 / 212,744,019, exactly 709
+  calls / 64,760 bytes below the complete-registry checkpoint in each mode. A
+  six-pair alternating release batch is still bimodal at 225.75/231.58 ms
+  fresh/empty medians and 169.80/173.69 ms typecheck medians, so this is an exact
+  repair-ownership and allocation result, not a latency claim. The PASSED cone
+  remains unimplemented: remove the duplicate generic callable-declaration
+  mutation owner, then retry the contextual cone independently against the
+  exact oracle.
 - Item 7 is still incomplete: the lifetime-free checker and builder remain two
   construction owners. Fuse checked construction into one owned database,
   then complete measured compact/name interning and worklist reductions,

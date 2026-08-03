@@ -237,13 +237,21 @@ Current checkpoints to preserve and audit rather than redo:
   dense declaration index without two full ordered snapshots or an update
   vector. The exact digest and suite pass; fresh allocation work falls to
   1,789,024 calls / 212,744,182 bytes. Its six-sample batch is timing-neutral/
-  noisy at 222.34/219.94 ms fresh/empty, so it is not a latency claim. A narrower
-  changed-signature/PASSED-cone attempt changed the digest and was discarded;
-  first remove the ordinary lanes that also mutate callable declarations, then
-  narrow the repair boundary with parity. The remaining 35 rounds are still
-  open. Finish the duplicate checker/builder owner, measured interning and the
-  larger contextual/user-call worklist reduction, scaling/parity proof, and
-  adversarial review, then regenerate the full protocol after the final edit;
+  noisy at 222.34/219.94 ms fresh/empty, so it is not a latency claim. The
+  changed-signature/PASSED-cone attempt was decomposed after changing the
+  digest: generic declaration writes now journal the exact callable signatures
+  they disturb and the unchanged synchronization boundaries publish only that
+  journal plus explicitly changed signatures. The pre-change NovyWave tuple
+  oracle, exact digest, and complete suite pass. Fresh/empty allocation work is
+  1,788,315/1,788,321 calls and 212,679,422/212,744,019 bytes, 709 calls / 64,760
+  bytes lower in each mode. A six-pair batch is still bimodal at 225.75/231.58
+  ms fresh/empty and 169.80/173.69 ms typecheck, so this is not a latency claim.
+  Duplicate generic callable writes, the independently rejected PASSED cone,
+  and the remaining 35 rounds are still open. Remove that duplicate mutation
+  owner and retry the contextual cone against the exact oracle, then finish the
+  duplicate checker/builder owner, measured interning, larger contextual/user-
+  call worklist reduction, scaling/parity proof, and adversarial review before
+  regenerating the full protocol after the final edit;
 - the current compiler-throughput checkpoint keeps Counter, physical TodoMVC,
   and NovyWave `MachinePlan` output deterministic while replacing copied OUT
   type environments with active-path overlays, retaining canonical-root-reading

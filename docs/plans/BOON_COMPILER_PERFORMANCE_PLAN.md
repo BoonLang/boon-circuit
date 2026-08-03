@@ -429,6 +429,23 @@ Current cold-diagnostics candidate evidence:
   sample attributes about 8.18 ms to dependency/setup inside the 28.31 ms
   contextual-scheme phase and 43.73 ms to checked inference, so the owned
   database and larger contextual/inference work reduction remain open.
+- Signature-to-declaration synchronization now publishes directly through the
+  authoritative dense declaration index instead of constructing complete
+  ordered parameter/callable snapshots and a declaration-update vector. It
+  retains the original complete-registry synchronization points and exact
+  invalidation semantics. The complete 80-test suite and exact NovyWave digest
+  pass. Fresh allocation work is 1,789,024 calls / 212,744,182 bytes, 2,442
+  calls / 1,003,889 bytes below the preceding dependency-plan checkpoint;
+  empty-session is 1,789,030 calls / 212,808,779 bytes. A release trace reduces
+  the user-scheme signature synchronization from about 0.78 to 0.40 ms, but a
+  six-sample confirmation batch is timing-neutral/noisy at 222.34/219.94 ms
+  fresh/empty and 166.27/165.14 ms typecheck, so this is an allocation and
+  ownership result rather than a latency claim. A narrower changed-signature
+  publication plus PASSED dependency-cone experiment was rejected after it
+  changed the checked digest. The complete sync currently repairs callable
+  declarations also written by ordinary structural/result lanes; eliminate
+  that duplicate mutation owner with exact parity before safely narrowing the
+  synchronization or contextual cone.
 - Item 7 is still incomplete: the lifetime-free checker and builder remain two
   construction owners. Fuse checked construction into one owned database,
   then complete measured compact/name interning and worklist reductions,

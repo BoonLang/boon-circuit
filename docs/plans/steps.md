@@ -59,12 +59,22 @@ stronger three-reviewer performance closure defined below.
    filled without a transient 29,812-edge tuple buffer. The complete 80-test
    suite and exact digest pass; a six-sample directional release batch has
    220.22/221.15 ms fresh/empty medians, 165.15/165.51 ms typecheck medians, and
-   1,791,466 fresh allocations / 213,748,071 bytes. The 35 rounds remain. The
-   remaining first tranche is therefore fusing the duplicate checker/builder
-   into one owned database, measured compact/name interning, the larger
-   contextual/user-call worklist reduction, scaling/parity evidence, and the
-   fresh Phase 1 adversarial review. Reprofile after each owner-level slice and
-   regenerate the complete cold protocol after the final edit. Then close
+   1,791,466 fresh allocations / 213,748,071 bytes. Signature-to-declaration
+   publication now writes through the owned dense declaration index instead of
+   constructing two ordered type snapshots and a third update vector at every
+   registry synchronization. The exact digest and complete suite pass; fresh
+   allocation work falls to 1,789,024 calls / 212,744,182 bytes. A six-sample
+   confirmation batch is timing-neutral/noisy at 222.34/219.94 ms fresh/empty,
+   while the traced signature-sync subphase falls from about 0.78 to 0.40 ms.
+   Narrowing publication or PASSED work to an apparent changed cone was rejected
+   because the digest changed: complete synchronization currently repairs
+   callable declarations also mutated by ordinary result lanes. Remove that
+   duplicate mutation owner before pruning the repair boundary. The 35 rounds
+   remain. The remaining first tranche is therefore fusing the duplicate
+   checker/builder into one owned database, measured compact/name interning, the
+   larger contextual/user-call worklist reduction, scaling/parity evidence, and
+   the fresh Phase 1 adversarial review. Reprofile after each owner-level slice
+   and regenerate the complete cold protocol after the final edit. Then close
    semantic sealing, proof, backend, hashing, and memory until both verified-
    plan modes pass; only afterward may persistent-session warm work satisfy its
    separate gates.

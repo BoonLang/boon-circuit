@@ -4928,49 +4928,46 @@ impl CheckedProgramBuilder {
     }
 
     fn sync_signature_declaration_types(&mut self) {
-        let parameter_types = self
-            .signatures
-            .iter()
-            .flat_map(|signature| {
-                signature
-                    .parameters
-                    .iter()
-                    .map(|parameter| (parameter.decl_id, parameter.flow_type.clone()))
-            })
-            .collect::<BTreeMap<_, _>>();
-        let callable_types = self
-            .signatures
-            .iter()
-            .map(|signature| {
-                (
-                    signature.decl_id,
-                    FlowType {
-                        mode: FlowMode::Continuous,
-                        ty: Type::Function {
-                            args: signature
-                                .parameters
-                                .iter()
-                                .filter(|parameter| parameter.kind == CheckedParameterKind::Value)
-                                .map(|parameter| parameter.flow_type.ty.clone())
-                                .collect(),
-                            result: Box::new(signature.result.clone()),
-                        },
+        let signatures = &self.signatures;
+        let declaration_by_id = &self.declaration_by_id;
+        let declarations = &mut self.declarations;
+        let cache_enabled = self.checked_flow_inference_cache_enabled;
+        let pending_invalidations = &mut self.checked_flow_pending_declaration_invalidations;
+        let mut publish = |declaration: DeclId, flow_type: FlowType| {
+            let Some(index) = declaration_by_id.get(&(declaration.0 as usize)).copied() else {
+                return;
+            };
+            let Some(target) = declarations.get_mut(index) else {
+                return;
+            };
+            if target.flow_type == flow_type {
+                return;
+            }
+            target.flow_type = flow_type;
+            if cache_enabled {
+                pending_invalidations.insert(declaration);
+            }
+        };
+
+        for signature in signatures {
+            for parameter in &signature.parameters {
+                publish(parameter.decl_id, parameter.flow_type.clone());
+            }
+            publish(
+                signature.decl_id,
+                FlowType {
+                    mode: FlowMode::Continuous,
+                    ty: Type::Function {
+                        args: signature
+                            .parameters
+                            .iter()
+                            .filter(|parameter| parameter.kind == CheckedParameterKind::Value)
+                            .map(|parameter| parameter.flow_type.ty.clone())
+                            .collect(),
+                        result: Box::new(signature.result.clone()),
                     },
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-        let updates = self
-            .declarations
-            .iter()
-            .filter_map(|declaration| {
-                parameter_types
-                    .get(&declaration.id)
-                    .or_else(|| callable_types.get(&declaration.id))
-                    .map(|flow_type| (declaration.id, flow_type.clone()))
-            })
-            .collect::<Vec<_>>();
-        for (declaration, flow_type) in updates {
-            self.set_declaration_flow_type(declaration, flow_type);
+                },
+            );
         }
     }
 

@@ -232,11 +232,18 @@ Current checkpoints to preserve and audit rather than redo:
   builds the final reverse flow graph without a transient edge tuple buffer. A
   six-sample directional release batch has 220.22/221.15 ms fresh/empty medians,
   165.15/165.51 ms typecheck medians, and 1,791,466 fresh allocations /
-  213,748,071 bytes; the complete suite, exact work, audit, and digest pass. The
-  remaining 35 rounds are still open. Finish the duplicate checker/builder
-  owner, measured interning and the larger contextual/user-call worklist
-  reduction, scaling/parity proof, and adversarial review, then regenerate the
-  full protocol after the final edit;
+  213,748,071 bytes; the complete suite, exact work, audit, and digest pass.
+  Signature-to-declaration synchronization now publishes through the owned
+  dense declaration index without two full ordered snapshots or an update
+  vector. The exact digest and suite pass; fresh allocation work falls to
+  1,789,024 calls / 212,744,182 bytes. Its six-sample batch is timing-neutral/
+  noisy at 222.34/219.94 ms fresh/empty, so it is not a latency claim. A narrower
+  changed-signature/PASSED-cone attempt changed the digest and was discarded;
+  first remove the ordinary lanes that also mutate callable declarations, then
+  narrow the repair boundary with parity. The remaining 35 rounds are still
+  open. Finish the duplicate checker/builder owner, measured interning and the
+  larger contextual/user-call worklist reduction, scaling/parity proof, and
+  adversarial review, then regenerate the full protocol after the final edit;
 - the current compiler-throughput checkpoint keeps Counter, physical TodoMVC,
   and NovyWave `MachinePlan` output deterministic while replacing copied OUT
   type environments with active-path overlays, retaining canonical-root-reading

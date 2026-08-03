@@ -92,11 +92,19 @@ stronger three-reviewer performance closure defined below.
    161.95/162.37 ms typecheck; traced context work falls to 8.22 ms and the
    checked builder is directionally 117.37 ms. The remaining measured owners are
    about 9.08 ms of parameter schemes, 5.17 ms of structural schemes, and 43.23
-   ms/35 rounds of checked inference. The first tranche also includes fusing the
-   duplicate checker/builder into one owned database, remaining interning,
-   scaling/parity evidence, and the fresh Phase 1 adversarial review. Reprofile
-   after each owner-level slice and regenerate the complete cold protocol after
-   the final edit. Then close
+   ms/35 rounds of checked inference. The next solver slice cold-seeds the 618
+   generic input-insensitive/fixed-product calls before the first expression
+   wave and preserves the ordinary order for all input-sensitive calls.
+   NovyWave falls to 34 rounds, 34,653 expression visits, 690 callable visits,
+   and 3,484 call visits; the fixed tuple oracle, clean audit, exact digest, and
+   all 80 tests pass. Fresh/empty allocation work falls to
+   1,732,729/1,732,735 calls and 210,213,894/210,278,491 bytes; six-pair release
+   medians are 214.35/212.82 ms total and 158.87/158.18 ms typecheck. This is
+   directional rather than Phase 1 acceptance. The first tranche still includes
+   fusing the duplicate checker/builder into one owned database, remaining
+   interning, scaling/parity evidence, and the fresh Phase 1 adversarial review.
+   Reprofile after each owner-level slice and regenerate the complete cold
+   protocol after the final edit. Then close
    semantic sealing, proof, backend, hashing, and memory until both verified-
    plan modes pass; only afterward may persistent-session warm work satisfy its
    separate gates.

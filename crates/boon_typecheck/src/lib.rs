@@ -1172,6 +1172,13 @@ struct CheckedTypeInferenceWorkStats {
     call_visits: usize,
     call_changed_visits: usize,
     call_noop_visits: usize,
+    call_result_changes: usize,
+    call_expression_changes: usize,
+    call_type_substitution_changes: usize,
+    call_contextual_substitution_changes: usize,
+    call_syntax_discriminant_changes: usize,
+    call_output_declaration_changes: usize,
+    call_cold_stable_seed_visits: usize,
     call_seed_enqueues: usize,
     call_input_enqueues: usize,
     call_output_enqueues: usize,
@@ -1203,6 +1210,10 @@ struct CheckedCallInstantiationChanges {
     any: bool,
     expression: Option<usize>,
     outputs: Vec<DeclId>,
+    result: bool,
+    type_substitutions: bool,
+    contextual_substitutions: bool,
+    syntax_discriminant: bool,
     /// The first OUT pass changed a declaration read by an output-scoped
     /// actual. That actual may still have a pre-invalidation cached value, so
     /// this call alone needs one post-flush revisit. Result/substitution
@@ -5261,6 +5272,47 @@ impl CheckedProgramBuilder {
         let mut pre_hook_rounds = 0usize;
         let mut wrapper_changed_declarations = 0usize;
 
+        if changed.is_none() {
+            self.flush_checked_flow_invalidations();
+            let calls = pending.calls.drain_sorted();
+            let calls_started = trace.then(Instant::now);
+            let mut cold_seed_changes = 0usize;
+            for call_id in calls.iter().copied() {
+                let input_flow_sensitive = dependencies
+                    .call_inference_plans
+                    .get(&(call_id.0 as usize))
+                    .is_none_or(|plan| plan.input_flow_sensitive);
+                if input_flow_sensitive {
+                    pending.calls.insert(call_id);
+                    continue;
+                }
+                stats.call_visits += 1;
+                stats.call_cold_stable_seed_visits += 1;
+                let changes = self.instantiate_checked_call(call_id);
+                cold_seed_changes += usize::from(Self::publish_checked_call_instantiation_changes(
+                    call_id,
+                    changes,
+                    &dependencies,
+                    &mut pending,
+                    &mut stats,
+                ));
+            }
+            pending.calls.recycle(calls);
+            let cold_seed_ms = calls_started.map(typecheck_elapsed_ms).unwrap_or(0.0);
+            stats.call_ms += cold_seed_ms;
+            self.flush_checked_flow_invalidations();
+            if trace {
+                eprintln!(
+                    "boon_typecheck checked_program.infer_checked_types.cold_stable_call_seed visits={} changes={} noops={} ms={cold_seed_ms:.3}",
+                    stats.call_cold_stable_seed_visits,
+                    cold_seed_changes,
+                    stats
+                        .call_cold_stable_seed_visits
+                        .saturating_sub(cold_seed_changes),
+                );
+            }
+        }
+
         loop {
             while pending.any() && phase_rounds < maximum_rounds {
                 // Mutations from the preceding round are visible as one exact
@@ -5391,36 +5443,13 @@ impl CheckedProgramBuilder {
                 stats.call_visits += calls.len();
                 for call_id in calls.iter().copied() {
                     let changes = self.instantiate_checked_call(call_id);
-                    if !changes.any {
-                        stats.call_noop_visits += 1;
-                        continue;
-                    }
-                    stats.call_changed_visits += 1;
-                    if let Some(expression) = changes.expression {
-                        Self::enqueue_checked_expression_dependents(
-                            expression,
-                            &dependencies,
-                            &mut pending,
-                            &mut stats,
-                        );
-                    }
-                    for declaration in changes.outputs {
-                        Self::enqueue_checked_declaration_dependents(
-                            declaration,
-                            &dependencies,
-                            &mut pending,
-                            &mut stats,
-                            Some(call_id),
-                        );
-                    }
-                    if changes.needs_output_scope_revisit {
-                        Self::enqueue_checked_call(
-                            call_id,
-                            CheckedCallEnqueueCause::OutputScope,
-                            &mut pending,
-                            &mut stats,
-                        );
-                    }
+                    Self::publish_checked_call_instantiation_changes(
+                        call_id,
+                        changes,
+                        &dependencies,
+                        &mut pending,
+                        &mut stats,
+                    );
                 }
                 pending.calls.recycle(calls);
                 stats.call_ms += calls_started.map(typecheck_elapsed_ms).unwrap_or(0.0);
@@ -5811,7 +5840,7 @@ impl CheckedProgramBuilder {
             .then(|| stats.rounds.saturating_sub(pre_hook_rounds))
             .unwrap_or(0);
             eprintln!(
-                "boon_typecheck checked_program.infer_checked_types.worklist seed={} quiescence_hook={quiescence_hook:?} rounds={} pre_hook_rounds={} post_hook_rounds={} wrapper_changed_declarations={} expression_visits={} declaration_visits={} callable_visits={} call_visits={} call_changed_visits={} call_noop_visits={} call_seed_enqueues={} call_input_enqueues={} call_output_enqueues={} call_callee_enqueues={} call_selector_enqueues={} call_output_scope_enqueues={} call_output_origin_skips={} selector_visits={} pattern_visits={} expression_ms={:.3} declaration_ms={:.3} callable_ms={:.3} call_ms={:.3} selector_ms={:.3} pattern_ms={:.3} cache_hits={} cache_misses={} cache_invalidations={} cache_reverse_invalidation_traversals={} cache_full_resets_total={} cache_rejected_invalid_ids={} indexed_read_hits={} indexed_read_missing={} indexed_read_rejected={} indexed_out_hits={} indexed_out_missing={} exhausted={} audit={audit:?} audit_clean={} audit_ms={:.3}",
+                "boon_typecheck checked_program.infer_checked_types.worklist seed={} quiescence_hook={quiescence_hook:?} rounds={} pre_hook_rounds={} post_hook_rounds={} wrapper_changed_declarations={} expression_visits={} declaration_visits={} callable_visits={} call_visits={} call_changed_visits={} call_noop_visits={} call_result_changes={} call_expression_changes={} call_type_substitution_changes={} call_contextual_substitution_changes={} call_syntax_discriminant_changes={} call_output_declaration_changes={} call_cold_stable_seed_visits={} call_seed_enqueues={} call_input_enqueues={} call_output_enqueues={} call_callee_enqueues={} call_selector_enqueues={} call_output_scope_enqueues={} call_output_origin_skips={} selector_visits={} pattern_visits={} expression_ms={:.3} declaration_ms={:.3} callable_ms={:.3} call_ms={:.3} selector_ms={:.3} pattern_ms={:.3} cache_hits={} cache_misses={} cache_invalidations={} cache_reverse_invalidation_traversals={} cache_full_resets_total={} cache_rejected_invalid_ids={} indexed_read_hits={} indexed_read_missing={} indexed_read_rejected={} indexed_out_hits={} indexed_out_missing={} exhausted={} audit={audit:?} audit_clean={} audit_ms={:.3}",
                 if changed.is_some() {
                     "scheme_changes"
                 } else {
@@ -5827,6 +5856,13 @@ impl CheckedProgramBuilder {
                 stats.call_visits,
                 stats.call_changed_visits,
                 stats.call_noop_visits,
+                stats.call_result_changes,
+                stats.call_expression_changes,
+                stats.call_type_substitution_changes,
+                stats.call_contextual_substitution_changes,
+                stats.call_syntax_discriminant_changes,
+                stats.call_output_declaration_changes,
+                stats.call_cold_stable_seed_visits,
                 stats.call_seed_enqueues,
                 stats.call_input_enqueues,
                 stats.call_output_enqueues,
@@ -6850,6 +6886,47 @@ impl CheckedProgramBuilder {
             CheckedCallEnqueueCause::Selector => stats.call_selector_enqueues += 1,
             CheckedCallEnqueueCause::OutputScope => stats.call_output_scope_enqueues += 1,
         }
+    }
+
+    fn publish_checked_call_instantiation_changes(
+        call_id: CheckedCallId,
+        changes: CheckedCallInstantiationChanges,
+        dependencies: &CheckedTypeInferenceDependencies,
+        pending: &mut CheckedTypeInferencePending,
+        stats: &mut CheckedTypeInferenceWorkStats,
+    ) -> bool {
+        if !changes.any {
+            stats.call_noop_visits += 1;
+            return false;
+        }
+        stats.call_changed_visits += 1;
+        stats.call_result_changes += usize::from(changes.result);
+        stats.call_expression_changes += usize::from(changes.expression.is_some());
+        stats.call_type_substitution_changes += usize::from(changes.type_substitutions);
+        stats.call_contextual_substitution_changes += usize::from(changes.contextual_substitutions);
+        stats.call_syntax_discriminant_changes += usize::from(changes.syntax_discriminant);
+        stats.call_output_declaration_changes += changes.outputs.len();
+        if let Some(expression) = changes.expression {
+            Self::enqueue_checked_expression_dependents(expression, dependencies, pending, stats);
+        }
+        for declaration in changes.outputs {
+            Self::enqueue_checked_declaration_dependents(
+                declaration,
+                dependencies,
+                pending,
+                stats,
+                Some(call_id),
+            );
+        }
+        if changes.needs_output_scope_revisit {
+            Self::enqueue_checked_call(
+                call_id,
+                CheckedCallEnqueueCause::OutputScope,
+                pending,
+                stats,
+            );
+        }
+        true
     }
 
     fn enqueue_checked_expression_dependents(
@@ -8575,18 +8652,22 @@ impl CheckedProgramBuilder {
             if target.syntax_discriminated_result != selected_syntax_discriminated_result {
                 target.syntax_discriminated_result = selected_syntax_discriminated_result;
                 changes.any = true;
+                changes.syntax_discriminant = true;
             }
             if target.result != result {
                 target.result = result.clone();
                 changes.any = true;
+                changes.result = true;
             }
             if target.type_substitutions.as_slice() != type_substitutions.as_slice() {
                 target.type_substitutions = type_substitutions.into_vec();
                 changes.any = true;
+                changes.type_substitutions = true;
             }
             if target.contextual_substitutions.as_slice() != contextual_substitutions.as_slice() {
                 target.contextual_substitutions = contextual_substitutions.into_vec();
                 changes.any = true;
+                changes.contextual_substitutions = true;
             }
         }
         if self.set_inferred_expr_flow(plan.call_expression.0 as usize, result) {

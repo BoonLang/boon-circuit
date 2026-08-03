@@ -265,9 +265,18 @@ Current checkpoints to preserve and audit rather than redo:
   161.95/162.37 ms typecheck. The traced context phase falls to 8.22 ms and the
   checked builder is directionally 117.37 ms. Parameter schemes remain about
   9.08 ms, structural schemes 5.17 ms, and checked inference 43.23 ms/35 rounds.
-  Optimize those measured owners, then finish the duplicate checker/builder
-  owner, remaining interning, scaling/parity proof, and adversarial review before
-  regenerating the full protocol after the final edit;
+  The next fixed-point slice now cold-seeds the 618 generic
+  input-insensitive/fixed-product call plans before the first expression wave
+  while preserving the ordinary order for all 1,202 input-sensitive calls.
+  Inference falls to 34 rounds, 34,653 expression visits, 690 callable visits,
+  and 3,484 call visits; the tuple oracle, clean audit, exact digest, and all 80
+  tests pass. Fresh/empty allocation work falls to 1,732,729/1,732,735 calls and
+  210,213,894/210,278,491 bytes. Six-pair release medians are 214.35/212.82 ms
+  total and 158.87/158.18 ms typecheck. This remains directional, not Phase 1
+  acceptance. Continue with the one-owned-database checker/builder fusion,
+  remaining measured interning/worklist owners, scaling/parity proof, and fresh
+  adversarial review before regenerating the full protocol after the final
+  edit;
 - the current compiler-throughput checkpoint keeps Counter, physical TodoMVC,
   and NovyWave `MachinePlan` output deterministic while replacing copied OUT
   type environments with active-path overlays, retaining canonical-root-reading

@@ -497,6 +497,21 @@ Current cold-diagnostics candidate evidence:
   1.86 install); the checked builder is directionally 117.37 ms versus 123.45
   ms. The still-open dominant owners are about 9.08 ms of parameter schemes,
   5.17 ms of structural schemes, and 43.23 ms/35 rounds of checked inference.
+- The cold checked solver now instantiates its 618 input-insensitive,
+  fixed-product calls before the first whole-expression wave, while leaving all
+  1,202 input-sensitive calls in the ordinary stable round order. This uses the
+  generic call-plan sensitivity bit rather than function names or fixture
+  knowledge. NovyWave inference falls from 35 to 34 rounds, 35,930 to 34,653
+  expression visits, 1,032 to 690 callable visits, and 3,848 to 3,484 call
+  visits; callee enqueues fall from 521 to 209. The fixed 35.4 MB pre-change
+  tuple oracle, clean full-sweep audit, exact checked digest, and all 80 tests
+  pass. Fresh/empty allocation work falls to 1,732,729/1,732,735 calls and
+  210,213,894/210,278,491 bytes, 26,126 calls / 1,755,509 bytes below the dense
+  owner checkpoint in each mode. A six-pair release batch has 214.35/212.82 ms
+  total and 158.87/158.18 ms typecheck medians. The locked downstream release
+  rebuild still takes 1m35s, independently confirming that the later measured
+  crate/relink boundary remains open. This is another directional owner-level
+  result, not fresh percentile or Phase 1 acceptance evidence.
 - Item 7 is still incomplete: the lifetime-free checker and builder remain two
   construction owners. Fuse checked construction into one owned database,
   then complete measured compact/name interning and worklist reductions,

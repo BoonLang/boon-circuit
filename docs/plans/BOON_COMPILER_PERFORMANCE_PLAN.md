@@ -1367,16 +1367,23 @@ project invalidation, and rebuild fan-out dominate.
    database to registered dense projection IDs rather than generic row queries.
 4. Retain immutable parser-owned unit snapshots with atomic upsert/remove/
    rename and exact cached project assembly. Make typechecking emit interface
-   and definition shards, migrate checked plus execution rows and finalization-
-   time receipts, and delete their production post-hoc inventories. The old
-   source/V3/V4 derivations remain independent test oracles during the cut.
+   and definition shards, then move the complete checked and execution domains
+   into `SemanticImageBuilder`; resource construction may mutate the pending
+   execution slice, and the slice finalizes only after its post-resource
+   invariant boundary. Delete `SemanticProgram`'s checked/execution owners,
+   their production post-hoc inventories, and the late callable-interface
+   rediscovery in the same flag-day cut. Borrowed legacy views allocate
+   nothing; the old checked/execution artifacts and V3/V4 derivations remain
+   independent test-only oracles. A receipt sidecar beneath the old owners is
+   not this step.
 5. Add invocation shards and migrate OUT/resource/reactive/lowering/storage/
    view/memory into one `SealedSemanticImage` in dependency order. Link fixed
    points consume only compact summaries and relocations; rich graphs become
    borrowed views or test/debug materializers and are deleted as production
    owners. Give verification only the image, certificate, and narrow proof
    tables after distributed link closure.
-6. Carry ordinary executable definitions through one shared plan-code linker
+6. Move demand collection before occurrence expansion and backend lowering,
+   then carry ordinary executable definitions through one shared plan-code linker
    across document, row/scalar, and migration domains. Key verified variants by
    execution domain, resolved layout, overlay/control shape, and capability
    contract; encode occurrences as dense resolved frames. Delete all matching
@@ -1385,7 +1392,9 @@ project invalidation, and rebuild fan-out dominate.
    executor metadata reconstruction with one consuming runnable-image builder.
    Normal compilation returns `SealedRunnableMachine`; explicit debug or
    serialization intents own extra products, and untrusted deserialization
-   verifies/builds dense indexes exactly once. Reprofile after every coherent
+   verifies/builds dense indexes exactly once. The builder and runnable seal
+   are one tranche; a wrapper around the current completed plan is rejected.
+   Reprofile after every coherent
    owner deletion and keep the 250/350/300/100 ms envelopes honest.
 8. Retain these exact source/shard/link/proof/plan-code/runnable requests across
    revisions. Separate public and implementation currentness; require exact

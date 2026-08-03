@@ -518,6 +518,135 @@ owner diagnostics in canonical unit/local-span order. Every incremental
 revision must match a clean full compile for diagnostics, interface/body/link/
 proof/verification digests, plan hash, stable contracts, and behavior.
 
+### Third Whole-Pipeline Audit: Delete Owners, Not Just Inventory Loops
+
+A direct current-HEAD release trace after checkpoint `e475a22` completes in
+4,044.712 ms at 250,736 KiB peak RSS. It preserves plan digest
+`890eff63ce7eff16c5597093179b6878fc8f8ed3e9f49555e73333d71d7bcb42`
+and records 11,045,739 allocation calls / 1,574,453,268 allocated bytes. This
+is one directional sample, not scored p95 evidence, but its nested timers make
+the ownership decision unambiguous:
+
+| Current owner | Directional time |
+| --- | ---: |
+| parse plus complete typecheck | 57.480 + 164.446 ms |
+| eager semantic graphs before proof | about 1,321 ms |
+| post-hoc dependency manifest | 1,819.621 ms |
+| checked / execution / lowering inventory | 374.351 / 478.142 / 272.516 ms |
+| late row resolution, projection folding, and SCC seal | 505.380 ms |
+| duplicate canonical semantic-core digest | 111.129 ms |
+| IR erasure plus its internal audits | 39.376 ms |
+| backend construction | 362.329 ms |
+| plan verification / required serialization | 94.141 / 85.958 ms |
+
+The eager semantic time is not one local loop. It includes a 5,147-occurrence
+OUT graph with 80,743 cumulative substitutions, execution construction, two
+complete execution validations, resource binding, reactive scheduling,
+lowering metadata, storage, views, and memory. In particular, reactive state-
+update-arm derivation is about 162 ms, lowering metadata plus its separate
+digest is about 149 ms, and storage construction is about 147 ms. Therefore a
+faster hash table inside `DependencyCollector`, or moving the same hashes into
+callbacks while retaining every graph, cannot reach the 350 ms semantic/proof
+envelope.
+
+The next flag-day slice is the complete checked-plus-execution ownership cut:
+
+```text
+InterfaceShard + DefinitionShard + InvocationShard
+  -> SemanticImageBuilder<ExecutionPending>
+  -> resource binding, synthesized rows, and lineage backpatches
+  -> SemanticImageBuilder<ExecutionFinalized>
+  -> remaining domain views/builders
+  -> SealedSemanticImage
+```
+
+The execution component cannot seal when contextual expansion first returns.
+Resource construction may synthesize expressions/origins/statements, bind
+materialization source and target lists/scopes, and finalize predecessor
+lineage. Its exact seal is after resource construction and the current
+post-resource invariant boundary. Checked interface rows may begin at the
+typechecker's first checked seal, but the complete checked shard seals only
+after lowering metadata, source/type/host/render tables, and diagnostics are
+attached at the typechecker's final seal.
+
+This slice is complete only when all of the following are true:
+
+- `SemanticProgram` no longer owns `CheckedProgram` or
+  `SemanticExecutionGraphV1`;
+- production contextual/resource construction writes callable interfaces,
+  definitions, invocations, expressions, statements, scopes, sources, states,
+  roots, producer functions, materializations, owners, and origins directly
+  into image-owned columns;
+- remaining legacy semantic algorithms receive zero-allocation borrowed views
+  over those columns, never cloned `Vec` materializations or a second
+  serializable graph facade;
+- callable interface leaves receive a stable callable key and the finalized
+  public-shape digest directly, rather than being rediscovered from dense
+  `SemanticCallableId` values inside the manifest;
+- `inventory_checked`, `inventory_execution`, the post-hoc callable-interface
+  digest loop, and their checked/execution portions of late owner/entity
+  resolution have no production caller;
+- every actual image row is fingerprinted once with all authoritative fields
+  and an ordered stable-relocation span; V3 child-field subjects map to a row
+  plus classifier field/domain only in the independent test oracle;
+- projection-local roots fold finalized row receipts during image sealing and
+  only unique cross-projection relocations enter the request graph. Production
+  does not retain one row per historical coverage subject merely to regroup it
+  in `finish_compact_v4`;
+- the old checked and execution artifacts, inventories, and validators remain
+  available only under test configuration as source-driven omission oracles.
+
+Local row identity, linked dependency identity, and dense image identity stay
+separate. A local receipt commits the canonical row payload and stable
+relocation keys. Link sealing resolves those relocations to projection IDs and
+combines dependency roots. Final image encoding assigns revision-local dense
+IDs and has its own digest. This permits body-result backdating without
+pretending that a different link target or dense encoding is the same object.
+
+The current interface firewall also exposes two correctness gaps that must be
+closed before persistent reuse:
+
+- the program-root public-shape digest currently includes the whole source
+  bundle, so every edit dirties the root; split top-level authority/interface
+  summaries from the final link sink;
+- the callable public-shape digest currently commits `context_scheme: None`.
+  Move the existing payload unchanged for the first cut, then version the
+  interface schema before adding the complete principal context scheme and
+  add a mutation oracle for every dependency-relevant interface field.
+
+Demand collection moves before occurrence expansion and backend lowering.
+After complete diagnostics and interfaces seal, verified intents seed demand
+from published outputs, document/view roots, sources/effects, persistence and
+migration contracts, host ports, producer materializations, and distributed
+imports/exports. Link summaries collect only reachable definition-
+specialization keys and invocation frames. The current backend `demand_plan`
+is too late because it walks an already complete `ErasedProgram`; the current
+distributed provisional demand set is too narrow and discarded after interface
+convergence.
+
+The downstream order is now fixed:
+
+1. delete checked/execution production owners and inventories through the
+   image-owned vertical slice above;
+2. migrate invocation/OUT/resource/reactive/lowering/storage/view/memory rows
+   into the same image and delete each rich graph plus the duplicate canonical
+   mapping/hash as its independent oracle passes;
+3. demand-collect and link shared plan-code variants across document,
+   row/scalar, and migration domains, deleting all recursive function-root
+   lowering and ordinary-call/cache-scope owners;
+4. land the consuming plan builder and `SealedRunnableMachine` together.
+   A standalone seal wrapper is rejected because it would retain completed-
+   plan clone/rewrite/compaction and per-consumer `Metadata::new`;
+5. retain these exact cold units across revisions, make currentness graph-
+   checked and transactional, then allow at most two graph-proven workers.
+
+Warm evidence must be versioned with this cut. The current work-sample
+predicate requires every unit to be reparsed and the preview profile repeats
+diagnostic parse/typecheck provenance, so a genuine incremental implementation
+would paradoxically fail or double-count. Report per-request parsed/reused
+units, recomputed/reused/backdated shards, and currentness work directly while
+keeping clean-full parity as the correctness oracle.
+
 ## Architectural Decisions
 
 ### 1. Activation Is A First-Class Output, Not An Empty Mount

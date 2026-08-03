@@ -468,6 +468,22 @@ Current checkpoints to preserve and audit rather than redo:
   and lowering inventories still cost about 378/477/272 ms and receipt folding
   502 ms. Continue with finalized shard rows and delete those passes; do not
   spend the next tranche tuning the now-small SCC kernel;
+- apply the current-HEAD owner-deletion audit after that firewall. A direct
+  release trace is 4,044.712 ms/250,736 KiB: about 1.321 s builds eager semantic
+  graphs, 1.820 s reconstructs/folds proof, 362 ms expands the backend, and
+  another 111 ms hashes the canonical semantic core. The next checkpoint must
+  move the complete checked and execution domains into image-owned columns,
+  finalize execution only after resource synthesis/binding/lineage, remove
+  `SemanticProgram`'s checked/execution owners and their production inventories,
+  and keep the old artifacts only as independent test oracles. A receipt
+  sidecar or callback beneath the same rich owners is rejected;
+- move verified-intent demand collection before occurrence expansion and
+  backend lowering. Split top-level authority/interface summaries from the
+  final program-link sink, and version the callable interface schema before
+  adding context-scheme facts. Land the eventual consuming plan builder and
+  `SealedRunnableMachine` as one owner-deletion tranche; a seal wrapper that
+  preserves completed-plan rewrites or per-consumer executor metadata is not a
+  checkpoint;
 - do not preserve V3's 208k subject count in the replacement proof. The
   test-only oracle maps every historical subject to one canonical finalized
   shard row and classifier field/domain and independently proves coverage,

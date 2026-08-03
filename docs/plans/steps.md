@@ -253,6 +253,17 @@ stronger three-reviewer performance closure defined below.
    interface/body distinction and continue to finalized shard rows; do not tune
    the now-small SCC kernel or count this as a performance exit.
 
+   A current-HEAD follow-up trace is 4,044.712 ms at 250,736 KiB and confirms
+   that callbacks or an expression receipt sidecar are too small. The next
+   flag-day tranche moves the complete checked and execution domains into
+   `SemanticImageBuilder`, finalizes execution only after resource synthesis/
+   binding/lineage, deletes both retained `SemanticProgram` fields and both
+   production inventories, and leaves the old graphs only as independent test
+   oracles. Move demand collection before semantic occurrence expansion. Pair
+   the eventual consuming plan builder with `SealedRunnableMachine`; do not
+   checkpoint another wrapper that leaves completed-plan rewrites or executor
+   metadata reconstruction alive.
+
    Receipt callbacks alone are too small: removing all 1,813.236 ms of manifest
    work from the 4,052.379 ms directional sample would still leave about 2.24
    seconds. Expand definition/invocation shards through OUT/resource/reactive/

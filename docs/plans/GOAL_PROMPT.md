@@ -452,6 +452,16 @@ Current checkpoints to preserve and audit rather than redo:
   eager nine-graph pipeline intact. Retain these same units for warm
   backdating/cancellation and add bounded parallel evaluation only after their
   dependency graph proves independence;
+- preserve the first functional `boon_compilation_db` integration but continue
+  through it. The shared kernel now owns revision/backdating metadata, compact
+  forward/reverse request edges, deterministic SCC sealing, and implementation
+  roots; semantic V4 has deleted its duplicate SCC code and owner-by-projection
+  scan. Four kernel tests and all 19 focused manifest tests pass. A fresh
+  directional NovyWave sample is still 4,011.485 ms at 250,416 KiB, with
+  3,265.269 ms semantics and 1,771.603 ms manifest work, so the roughly
+  40--50 ms improvement is not an exit. The next `/goal` work must make owner
+  units produce canonical rows and delete checked/execution inventories, not
+  stop at the crate boundary;
 - do not preserve V3's 208k subject count in the replacement proof. The
   test-only oracle maps every historical subject to one canonical owner-unit
   row and classifier field/domain and independently proves coverage,

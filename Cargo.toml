@@ -3,6 +3,7 @@ members = [
     "crates/boon_behavior_harness",
     "crates/boon_phase0_baseline",
     "crates/boon_contract",
+    "crates/boon_compilation_db",
     "crates/boon_data",
     "crates/boon_wire",
     "crates/boon_effect_schema",
@@ -56,6 +57,7 @@ rust-version = "1.88"
 boon_behavior_harness = { path = "crates/boon_behavior_harness" }
 boon_phase0_baseline = { path = "crates/boon_phase0_baseline", default-features = false }
 boon_contract = { path = "crates/boon_contract" }
+boon_compilation_db = { path = "crates/boon_compilation_db" }
 boon_data = { path = "crates/boon_data" }
 boon_wire = { path = "crates/boon_wire" }
 boon_effect_schema = { path = "crates/boon_effect_schema" }

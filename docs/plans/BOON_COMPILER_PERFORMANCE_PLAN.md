@@ -705,6 +705,17 @@ Current cold-diagnostics candidate evidence:
   graph/inventory owner in each batch. Then carry the same units across
   revisions and parallelize only independent owners. The architecture plan's
   “Second Whole-Pipeline Reassessment” owns the detailed sequence.
+- The dependency-bottom kernel is now a real production dependency rather than
+  a plan-only crate seam. `boon_compilation_db` owns request revision/backdating,
+  compact forward/reverse edges, SCC sealing, and implementation-root digests;
+  semantic V4 deletes its duplicate SCC implementation and owner-by-projection
+  scan. Four kernel tests and all 19 focused manifest tests pass. One fresh
+  directional NovyWave sample is 4,011.485 ms at 250,416 KiB, including
+  3,265.269 ms semantics, 1,771.603 ms manifest work, and 465.455 ms projection
+  sealing. This saves only roughly 40--50 ms because the kernel still receives
+  post-hoc exhaustive rows. Continue directly with owner-unit row sealing and
+  deletion of checked/execution inventories; do not count the crate split as
+  the architectural exit.
 - Do not preserve V3's 208k subject cardinality as a production V4/V5 proof
   requirement. The independent test oracle must map every historical subject
   to exactly one canonical owner-unit row and classifier field/domain and prove

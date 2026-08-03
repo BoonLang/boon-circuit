@@ -263,6 +263,17 @@ stronger three-reviewer performance closure defined below.
    each actual row once and binds one exact typed dependency span; it must not
    retain one receipt per historical child-field coverage subject.
 
+   The dependency-bottom kernel is now connected to production V4.
+   `boon_compilation_db` owns revision/backdating metadata, compact forward and
+   reverse edges, deterministic SCC sealing, and implementation roots;
+   semantic V4 deletes its duplicate SCC code and owner-by-projection scan.
+   Four kernel tests and all 19 focused manifest tests pass. One fresh
+   directional NovyWave run is 4,011.485 ms at 250,416 KiB, with 3,265.269 ms
+   semantics, 1,771.603 ms manifest work, and 465.455 ms projection sealing.
+   The roughly 40--50 ms gain proves the kernel integration but not the owner-
+   unit exit. Continue by producing canonical rows in owner units and deleting
+   checked/execution inventory ownership.
+
    Expand the same database through the rich semantic domains. Carry each
    ordinary executable body once through `MachinePlan` and represent call-
    specific parameter/type/PASSED/owner/resource/effect/render context with

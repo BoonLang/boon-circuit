@@ -274,6 +274,18 @@ whether exhaustive semantic demand itself must shrink. This V4 slice is not
 the planned `CompilationDb`, construction-time receipt, or warm-currentness
 exit.
 
+The first dependency-bottom kernel is now wired into the production V4 path:
+`boon_compilation_db` owns revision/backdating metadata, compact forward and
+reverse request edges, deterministic SCC sealing, and implementation-root
+digests. `boon_semantic` no longer owns a second V4 SCC implementation or the
+old owner-by-all-projections scan. Four database tests and all 19 focused
+manifest tests pass, including independent V3/V4 parity. A fresh directional
+NovyWave sample is 4,011.485 ms at 250,416 KiB, with 3,265.269 ms semantics,
+1,771.603 ms manifest work, and 465.455 ms projection sealing. The roughly
+40--50 ms change is useful evidence but deliberately not an exit: the shared
+kernel still receives the same post-hoc rows. The next batch must make owner
+units produce the rows and delete checked/execution inventory ownership.
+
 The same checkpoint introduces a non-forgeable `SealedMachinePlan` for the
 trusted in-process route. It carries the immutable plan, canonical digest, and
 successful verification receipt so normal runtime and artifact handoffs do not

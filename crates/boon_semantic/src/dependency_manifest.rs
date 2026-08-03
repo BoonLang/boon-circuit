@@ -15,6 +15,7 @@ use boon_checked::{
     CheckedParameterKind, CheckedProgram, CheckedStatementKind, DeclId, FlowMode, FlowType,
     LexicalScopeId, ProgramRole, Type, TypeVar,
 };
+use boon_compilation_db::{RequestGraphBuilder, RequestGraphDigestDomains};
 use boon_contract::SourceBundleDigestV1;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1923,11 +1924,13 @@ impl<'a> DependencyProofGraph<'a> {
 /// The iterative Tarjan walk keeps only node-indexed state. It deliberately
 /// does not materialize forward and reverse edge arrays that duplicate every
 /// edge already retained by `DependencyProofGraph`.
+#[cfg(test)]
 struct DependencyProofComponents {
     member_offsets: Vec<usize>,
     member_arena: Vec<usize>,
 }
 
+#[cfg(test)]
 impl DependencyProofComponents {
     fn with_node_capacity(node_count: usize) -> Self {
         let mut member_offsets = Vec::with_capacity(node_count.saturating_add(1));
@@ -3839,90 +3842,6 @@ fn stable_dependency_owner_index_v4(
     Ok(stable)
 }
 
-fn dependency_projection_components_v4(
-    edges: &[Vec<usize>],
-) -> Result<(Vec<usize>, DependencyProofComponents), CallableDependencyManifestError> {
-    let node_count = edges.len();
-    let mut discovery_index = vec![usize::MAX; node_count];
-    let mut low_link = vec![usize::MAX; node_count];
-    let mut component_by_node = vec![usize::MAX; node_count];
-    let mut components = DependencyProofComponents::with_node_capacity(node_count);
-    let mut active = Vec::new();
-    let mut pending = Vec::new();
-    let mut next_discovery_index = 0usize;
-
-    for start in 0..node_count {
-        if discovery_index[start] != usize::MAX {
-            continue;
-        }
-        discovery_index[start] = next_discovery_index;
-        low_link[start] = next_discovery_index;
-        next_discovery_index = next_discovery_index.checked_add(1).ok_or_else(|| {
-            CallableDependencyManifestError::new(
-                "dependency projection discovery index overflows usize",
-            )
-        })?;
-        active.push(start);
-        pending.push((start, 0usize));
-
-        while !pending.is_empty() {
-            let frame = pending.len() - 1;
-            let (node, next_edge) = pending[frame];
-            let targets = edges.get(node).ok_or_else(|| {
-                CallableDependencyManifestError::new(format!(
-                    "dependency projection graph references missing node {node}"
-                ))
-            })?;
-            if next_edge < targets.len() {
-                pending[frame].1 += 1;
-                let target = targets[next_edge];
-                if target >= node_count {
-                    return Err(CallableDependencyManifestError::new(format!(
-                        "dependency projection graph references missing target {target}"
-                    )));
-                }
-                if discovery_index[target] == usize::MAX {
-                    discovery_index[target] = next_discovery_index;
-                    low_link[target] = next_discovery_index;
-                    next_discovery_index =
-                        next_discovery_index.checked_add(1).ok_or_else(|| {
-                            CallableDependencyManifestError::new(
-                                "dependency projection discovery index overflows usize",
-                            )
-                        })?;
-                    active.push(target);
-                    pending.push((target, 0usize));
-                } else if component_by_node[target] == usize::MAX {
-                    low_link[node] = low_link[node].min(discovery_index[target]);
-                }
-                continue;
-            }
-
-            pending.pop();
-            if let Some((parent, _)) = pending.last().copied() {
-                low_link[parent] = low_link[parent].min(low_link[node]);
-            }
-            if low_link[node] != discovery_index[node] {
-                continue;
-            }
-            let component = components.len();
-            components.push_from_active_until(&mut active, node)?;
-            for member in components
-                .members(component)
-                .expect("fresh dependency projection component has members")
-            {
-                component_by_node[*member] = component;
-            }
-        }
-    }
-    if !active.is_empty() {
-        return Err(CallableDependencyManifestError::new(
-            "dependency projection component stack is not empty after traversal",
-        ));
-    }
-    Ok((component_by_node, components))
-}
-
 fn build_dependency_projection_graph_digests_v4(
     owners: &BTreeSet<SemanticDependencyStableOwnerV4>,
     projection_receipts: &BTreeMap<SemanticDependencyProjectionKeyV4, [u8; 32]>,
@@ -3937,181 +3856,57 @@ fn build_dependency_projection_graph_digests_v4(
     ),
     CallableDependencyManifestError,
 > {
-    let mut nodes = owners
-        .iter()
-        .copied()
-        .map(DependencyProjectionNodeV4::Owner)
-        .chain(
-            projection_receipts
-                .keys()
-                .copied()
-                .map(DependencyProjectionNodeV4::Projection),
-        )
-        .collect::<Vec<_>>();
-    nodes.sort();
-    nodes.dedup();
-    let ordinals = nodes
-        .iter()
-        .copied()
-        .enumerate()
-        .map(|(ordinal, node)| (node, ordinal))
-        .collect::<BTreeMap<_, _>>();
-    if ordinals.len() != nodes.len() {
-        return Err(CallableDependencyManifestError::new(
-            "dependency projection graph contains duplicate nodes",
-        ));
+    let mut graph = RequestGraphBuilder::new();
+    for owner in owners.iter().copied() {
+        let node = DependencyProjectionNodeV4::Owner(owner);
+        graph
+            .insert(
+                node,
+                dependency_projection_node_digest_v4(node)?,
+                canonical_dependency_hash(DEPENDENCY_PROJECTION_NODE_DOMAIN_V4, &owner)?,
+            )
+            .map_err(|error| CallableDependencyManifestError::new(error.to_string()))?;
     }
-
-    let mut edges = vec![Vec::new(); nodes.len()];
-    let mut local_digests = Vec::with_capacity(nodes.len());
-    for (ordinal, node) in nodes.iter().copied().enumerate() {
-        match node {
-            DependencyProjectionNodeV4::Owner(owner) => {
-                local_digests.push(canonical_dependency_hash(
-                    DEPENDENCY_PROJECTION_NODE_DOMAIN_V4,
-                    &owner,
-                )?);
-                for projection in projection_receipts
-                    .keys()
-                    .filter(|projection| projection.owner == owner)
-                {
-                    edges[ordinal]
-                        .push(ordinals[&DependencyProjectionNodeV4::Projection(*projection)]);
-                }
-            }
-            DependencyProjectionNodeV4::Projection(projection) => {
-                local_digests.push(*projection_receipts.get(&projection).ok_or_else(|| {
-                    CallableDependencyManifestError::new(format!(
-                        "dependency projection {projection:?} has no receipt"
-                    ))
-                })?);
-                for target in projection_targets
-                    .get(&projection)
-                    .into_iter()
-                    .flatten()
-                    .copied()
-                {
-                    edges[ordinal].push(*ordinals.get(&target).ok_or_else(|| {
-                        CallableDependencyManifestError::new(format!(
-                            "dependency projection {projection:?} references missing target {target:?}"
-                        ))
-                    })?);
-                }
-            }
+    for (projection, receipt) in projection_receipts {
+        let node = DependencyProjectionNodeV4::Projection(*projection);
+        graph
+            .insert(node, dependency_projection_node_digest_v4(node)?, *receipt)
+            .map_err(|error| CallableDependencyManifestError::new(error.to_string()))?;
+        graph.add_dependency(DependencyProjectionNodeV4::Owner(projection.owner), node);
+    }
+    for (projection, targets) in projection_targets {
+        let source = DependencyProjectionNodeV4::Projection(*projection);
+        for target in targets.iter().copied() {
+            graph.add_dependency(source, target);
         }
-        edges[ordinal].sort_unstable();
-        edges[ordinal].dedup();
     }
-
-    let edge_count = edges.iter().map(Vec::len).sum::<usize>();
-    let (component_by_node, components) = dependency_projection_components_v4(&edges)?;
-    let representatives = components
-        .iter()
-        .map(|members| {
-            members.first().copied().ok_or_else(|| {
-                CallableDependencyManifestError::new(
-                    "dependency projection graph produced an empty component",
-                )
-            })
+    let graph = graph
+        .seal(RequestGraphDigestDomains {
+            component: DEPENDENCY_PROJECTION_COMPONENT_DOMAIN_V4,
         })
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut component_digests: Vec<Option<[u8; 32]>> = vec![None; components.len()];
-    let mut dependencies = Vec::new();
-    let mut component_edge_count = 0usize;
-    for component in 0..components.len() {
-        let members = components.members(component).ok_or_else(|| {
-            CallableDependencyManifestError::new(format!(
-                "dependency projection graph has no component {component}"
-            ))
-        })?;
-        dependencies.clear();
-        for member in members.iter().copied() {
-            for target in edges[member].iter().copied() {
-                let target_component = component_by_node[target];
-                if target_component != component {
-                    dependencies.push(target_component);
-                }
-            }
-        }
-        dependencies.sort_unstable_by_key(|target| representatives[*target]);
-        dependencies.dedup();
-        component_edge_count = component_edge_count
-            .checked_add(dependencies.len())
-            .ok_or_else(|| {
-                CallableDependencyManifestError::new(
-                    "dependency projection component edge count overflows usize",
-                )
-            })?;
-        if dependencies
-            .iter()
-            .any(|dependency| *dependency >= component)
-        {
-            return Err(CallableDependencyManifestError::new(format!(
-                "dependency projection Tarjan order is not dependency-first for component {component}"
-            )));
-        }
-
-        let mut hasher = Sha256::new();
-        hasher.update(DEPENDENCY_PROJECTION_COMPONENT_DOMAIN_V4);
-        dependency_proof_update_usize(
-            &mut hasher,
-            members.len(),
-            "dependency projection component member count",
-        )?;
-        for member in members.iter().copied() {
-            hasher.update(dependency_projection_node_digest_v4(nodes[member])?);
-            hasher.update(local_digests[member]);
-        }
-        dependency_proof_update_usize(
-            &mut hasher,
-            dependencies.len(),
-            "dependency projection component dependency count",
-        )?;
-        for dependency in dependencies.iter().copied() {
-            hasher.update(dependency_projection_node_digest_v4(
-                nodes[representatives[dependency]],
-            )?);
-            hasher.update(component_digests[dependency].ok_or_else(|| {
-                CallableDependencyManifestError::new(
-                    "dependency projection component was hashed before its dependency",
-                )
-            })?);
-        }
-        component_digests[component] = Some(hasher.finalize().into());
-    }
-
+        .map_err(|error| CallableDependencyManifestError::new(error.to_string()))?;
     let mut implementation_digests = BTreeMap::new();
     for owner in owners.iter().copied() {
-        let node = ordinals[&DependencyProjectionNodeV4::Owner(owner)];
-        let component = component_by_node[node];
-        let mut hasher = Sha256::new();
-        hasher.update(DEPENDENCY_PROJECTION_IMPLEMENTATION_DOMAIN_V4);
-        hasher.update(dependency_projection_node_digest_v4(
-            DependencyProjectionNodeV4::Owner(owner),
-        )?);
-        hasher.update(dependency_projection_node_digest_v4(
-            nodes[representatives[component]],
-        )?);
-        hasher.update(component_digests[component].ok_or_else(|| {
-            CallableDependencyManifestError::new(format!(
-                "dependency projection owner {owner:?} has no component digest"
-            ))
-        })?);
-        implementation_digests.insert(owner, hasher.finalize().into());
+        let digest = graph
+            .implementation_digest(
+                &DependencyProjectionNodeV4::Owner(owner),
+                DEPENDENCY_PROJECTION_IMPLEMENTATION_DOMAIN_V4,
+            )
+            .map_err(|error| CallableDependencyManifestError::new(error.to_string()))?;
+        implementation_digests.insert(owner, digest);
     }
-
-    let stats = DependencyGraphDigestStats {
-        nodes: nodes.len(),
-        edges: edge_count,
-        components: components.len(),
-        cyclic_components: components
-            .iter()
-            .filter(|members| members.len() > 1)
-            .count(),
-        maximum_component_nodes: components.iter().map(<[usize]>::len).max().unwrap_or(0),
-        component_edges: component_edge_count,
-    };
-    Ok((implementation_digests, stats))
+    let stats = graph.stats();
+    Ok((
+        implementation_digests,
+        DependencyGraphDigestStats {
+            nodes: stats.nodes,
+            edges: stats.edges,
+            components: stats.components,
+            cyclic_components: stats.cyclic_components,
+            maximum_component_nodes: stats.maximum_component_nodes,
+            component_edges: stats.component_edges,
+        },
+    ))
 }
 
 fn top_subject(

@@ -187,7 +187,7 @@ struct CheckedProgramBuilder {
     /// Hidden `Flush<E>` control types keyed by parser expression. This is a
     /// checker-only side table; `E` is folded into the ordinary type exactly
     /// at documented lexical boundaries and never serialized as a public type.
-    expression_flush_types: BTreeMap<usize, Type>,
+    expression_flush_types: DenseIndexTable<Type>,
     checked_flow_inference_cache: CheckedFlowInferenceCache,
     checked_flow_inference_cache_enabled: bool,
     checked_flow_recursion: DenseRecursionGuard,
@@ -1481,7 +1481,9 @@ impl CheckedProgramBuilder {
                 syntax_discriminant_parameters: BTreeSet::new(),
                 syntax_discriminant_parameter_paths: BTreeMap::new(),
                 inferred_expr_types: DenseIndexTable::with_len(program.expressions.len()),
-                expression_flush_types: BTreeMap::new(),
+                // Allocated exactly once when the flush pass owns its final
+                // dense result; no earlier construction phase reads it.
+                expression_flush_types: DenseIndexTable::default(),
                 checked_flow_inference_cache: CheckedFlowInferenceCache::with_len(
                     program.expressions.len(),
                 ),
@@ -7147,20 +7149,36 @@ impl CheckedProgramBuilder {
     }
 
     fn install_flush_control_contract(&mut self) {
+        let trace = typecheck_trace_enabled();
+        let inference_started = trace.then(Instant::now);
         let inferred =
             infer_checked_expression_flush_types(&self.program, &self.inferred_expr_types);
         self.expression_flush_types = inferred.types;
         self.diagnostics.extend(inferred.diagnostics);
+        if let Some(started) = inference_started {
+            eprintln!(
+                "boon_typecheck checked_program.install_flush_control_contract.inference: {:.3}ms",
+                typecheck_elapsed_ms(started),
+            );
+        }
+        let invalidation_started = trace.then(Instant::now);
         let (changed_expressions, changed_declarations) =
             self.invalidate_flush_boundary_authoritative_types();
+        if let Some(started) = invalidation_started {
+            eprintln!(
+                "boon_typecheck checked_program.install_flush_control_contract.invalidation: {:.3}ms",
+                typecheck_elapsed_ms(started),
+            );
+        }
 
+        let hold_validation_started = trace.then(Instant::now);
         let program = self.program.clone();
         for expression in &program.expressions {
             let AstExprKind::Hold { initial, .. } = expression.kind else {
                 continue;
             };
             let initial = expression.linked_input.unwrap_or(initial);
-            if self.expression_flush_types.contains_key(&initial) {
+            if self.expression_flush_types.get(&initial).is_some() {
                 self.contextual_type_diagnostic(
                     initial,
                     "a `HOLD` initializer must produce a valid storable value and cannot `FLUSH`"
@@ -7168,7 +7186,14 @@ impl CheckedProgramBuilder {
                 );
             }
         }
+        if let Some(started) = hold_validation_started {
+            eprintln!(
+                "boon_typecheck checked_program.install_flush_control_contract.hold_validation: {:.3}ms",
+                typecheck_elapsed_ms(started),
+            );
+        }
 
+        let reinference_started = trace.then(Instant::now);
         for expression in &changed_expressions {
             self.invalidate_checked_flow_expressions([*expression]);
         }
@@ -7181,15 +7206,147 @@ impl CheckedProgramBuilder {
                 &changed_expressions,
             );
         }
+        if let Some(started) = reinference_started {
+            eprintln!(
+                "boon_typecheck checked_program.install_flush_control_contract.reinference: {:.3}ms",
+                typecheck_elapsed_ms(started),
+            );
+        }
     }
 
-    fn invalidate_flush_boundary_authoritative_types(
-        &mut self,
+    fn invalidate_flush_boundary_authoritative_types(&self) -> (BTreeSet<usize>, BTreeSet<DeclId>) {
+        let expression_count = self.program.expressions.len();
+        let mut expression_seen = DenseFlagSet::with_len(expression_count);
+        let mut declaration_seen = DenseFlagSet::with_len(self.next_decl_id as usize);
+        let mut direct_flush_declarations = DenseFlagSet::with_len(self.next_decl_id as usize);
+        let mut pending_expressions = VecDeque::new();
+        let mut pending_declarations = VecDeque::new();
+        let mut derived_expressions = BTreeSet::new();
+        let mut derived_declarations = BTreeSet::new();
+
+        for (expression, _) in self.expression_flush_types.iter() {
+            if expression_seen.insert(expression) {
+                pending_expressions.push_back(expression);
+                derived_expressions.insert(expression);
+            }
+        }
+        if pending_expressions.is_empty() {
+            let result = (derived_expressions, derived_declarations);
+            #[cfg(test)]
+            debug_assert_eq!(
+                result,
+                self.invalidate_flush_boundary_authoritative_types_oracle()
+            );
+            return result;
+        }
+
+        for declaration in &self.declarations {
+            if !declaration.value.is_some_and(|value| {
+                self.expression_flush_types
+                    .get(&(value.0 as usize))
+                    .is_some()
+            }) {
+                continue;
+            }
+            direct_flush_declarations.insert(declaration.id.0 as usize);
+            if declaration_seen.insert(declaration.id.0 as usize) {
+                pending_declarations.push_back(declaration.id);
+                derived_declarations.insert(declaration.id);
+            }
+        }
+
+        let dependencies = self
+            .checked_type_inference_dependencies
+            .as_ref()
+            .expect("checked inference dependencies initialized");
+        while !pending_expressions.is_empty() || !pending_declarations.is_empty() {
+            while let Some(expression) = pending_expressions.pop_front() {
+                for parent in dependencies
+                    .expression_parents
+                    .get(expression)
+                    .into_iter()
+                    .flatten()
+                    .copied()
+                {
+                    // The inference index additionally treats HOLD updates as
+                    // dependencies of the HOLD expression. Flush propagation
+                    // already installs such update-derived HOLD roots directly;
+                    // preserve the old lexical-parent closure for later edges.
+                    if self.program.expressions.get(parent).is_some_and(|parent| {
+                        matches!(
+                            &parent.kind,
+                            AstExprKind::Hold { initial, .. }
+                                if parent.linked_input.unwrap_or(*initial) != expression
+                        )
+                    }) {
+                        continue;
+                    }
+                    if expression_seen.insert(parent) {
+                        pending_expressions.push_back(parent);
+                        derived_expressions.insert(parent);
+                    }
+                }
+                for declaration in dependencies
+                    .declarations_by_value
+                    .get(expression)
+                    .into_iter()
+                    .flatten()
+                    .copied()
+                {
+                    if declaration_seen.insert(declaration.0 as usize) {
+                        pending_declarations.push_back(declaration);
+                        derived_declarations.insert(declaration);
+                    }
+                }
+            }
+
+            while let Some(declaration) = pending_declarations.pop_front() {
+                for expression in dependencies
+                    .declaration_readers
+                    .get(declaration.0 as usize)
+                    .into_iter()
+                    .flatten()
+                    .copied()
+                {
+                    if direct_flush_declarations.contains(&(declaration.0 as usize)) {
+                        let scope_id = self
+                            .expression_scopes
+                            .get(&expression)
+                            .copied()
+                            .unwrap_or(LexicalScopeId(0));
+                        if self
+                            .declaration(declaration)
+                            .and_then(|declaration| declaration.body_scope)
+                            .is_some_and(|body| self.scope_descends_from(scope_id, body))
+                        {
+                            continue;
+                        }
+                    }
+                    if expression_seen.insert(expression) {
+                        pending_expressions.push_back(expression);
+                        derived_expressions.insert(expression);
+                    }
+                }
+            }
+        }
+
+        let result = (derived_expressions, derived_declarations);
+        #[cfg(test)]
+        debug_assert_eq!(
+            result,
+            self.invalidate_flush_boundary_authoritative_types_oracle()
+        );
+        result
+    }
+
+    #[cfg(test)]
+    fn invalidate_flush_boundary_authoritative_types_oracle(
+        &self,
     ) -> (BTreeSet<usize>, BTreeSet<DeclId>) {
         let mut derived_expressions = self
             .expression_flush_types
-            .keys()
-            .copied()
+            .iter()
+            .map(|(expression, _)| expression)
             .collect::<BTreeSet<_>>();
         let direct_flush_declarations = self
             .declarations
@@ -7199,7 +7356,8 @@ impl CheckedProgramBuilder {
                     .value
                     .filter(|value| {
                         self.expression_flush_types
-                            .contains_key(&(value.0 as usize))
+                            .get(&(value.0 as usize))
+                            .is_some()
                     })
                     .map(|_| declaration.id)
             })
@@ -15589,13 +15747,13 @@ fn statement_body_container_expression(
     }
 }
 
-fn direct_expression_children(expr: &AstExpr) -> Vec<usize> {
+fn direct_expression_children(expr: &AstExpr) -> SmallVec<[usize; 4]> {
     match &expr.kind {
         AstExprKind::BytesLiteral { items, .. }
         | AstExprKind::ListLiteral { items, .. }
-        | AstExprKind::SetLiteral { items } => items.clone(),
-        AstExprKind::MapLiteral { entries } => entries.clone(),
-        AstExprKind::MapEntry { key, value } => vec![*key, *value],
+        | AstExprKind::SetLiteral { items } => items.iter().copied().collect(),
+        AstExprKind::MapLiteral { entries } => entries.iter().copied().collect(),
+        AstExprKind::MapEntry { key, value } => SmallVec::from_slice(&[*key, *value]),
         AstExprKind::Arrow { left, output, .. } => std::iter::once(*left)
             .chain(output.iter().copied())
             .collect(),
@@ -15628,9 +15786,9 @@ fn direct_expression_children(expr: &AstExpr) -> Vec<usize> {
         AstExprKind::When { input, arms } => std::iter::once(expr.linked_input.unwrap_or(*input))
             .chain(arms.iter().copied())
             .collect(),
-        AstExprKind::Latest { branches } => branches.clone(),
+        AstExprKind::Latest { branches } => branches.iter().copied().collect(),
         AstExprKind::Hold { initial, .. } | AstExprKind::Draining { input: initial } => {
-            vec![expr.linked_input.unwrap_or(*initial)]
+            SmallVec::from_slice(&[expr.linked_input.unwrap_or(*initial)])
         }
         AstExprKind::Then { input, output } => std::iter::once(expr.linked_input.unwrap_or(*input))
             .chain(output.iter().copied())
@@ -15642,7 +15800,7 @@ fn direct_expression_children(expr: &AstExpr) -> Vec<usize> {
             .chain(result.iter().copied())
             .collect(),
         AstExprKind::Flush { payload } => payload.iter().copied().collect(),
-        AstExprKind::Infix { left, right, .. } => vec![*left, *right],
+        AstExprKind::Infix { left, right, .. } => SmallVec::from_slice(&[*left, *right]),
         AstExprKind::StringLiteral(_)
         | AstExprKind::TextLiteral(_)
         | AstExprKind::Number(_)
@@ -15654,12 +15812,12 @@ fn direct_expression_children(expr: &AstExpr) -> Vec<usize> {
         | AstExprKind::Path(_)
         | AstExprKind::Source
         | AstExprKind::Delimiter
-        | AstExprKind::Unknown(_) => Vec::new(),
+        | AstExprKind::Unknown(_) => SmallVec::new(),
     }
 }
 
 struct CheckedFlushInference {
-    types: BTreeMap<usize, Type>,
+    types: DenseIndexTable<Type>,
     diagnostics: Vec<TypeDiagnostic>,
 }
 
@@ -15667,8 +15825,10 @@ fn infer_checked_expression_flush_types(
     program: &ParsedProgram,
     flows: &DenseIndexTable<FlowType>,
 ) -> CheckedFlushInference {
-    let mut memo = BTreeMap::<usize, Option<Type>>::new();
-    let mut active = BTreeSet::new();
+    let expression_count = program.expressions.len();
+    let mut memo = DenseIndexTable::<Type>::with_len(expression_count);
+    let mut completed = DenseFlagSet::with_len(expression_count);
+    let mut active = DenseFlagSet::with_len(expression_count);
     let mut diagnostics = Vec::new();
     for expression in &program.expressions {
         infer_checked_expression_flush_type(
@@ -15676,15 +15836,13 @@ fn infer_checked_expression_flush_types(
             flows,
             expression.id,
             &mut memo,
+            &mut completed,
             &mut active,
             &mut diagnostics,
         );
     }
     CheckedFlushInference {
-        types: memo
-            .into_iter()
-            .filter_map(|(expression, ty)| ty.map(|ty| (expression, ty)))
-            .collect(),
+        types: memo,
         diagnostics,
     }
 }
@@ -15693,12 +15851,13 @@ fn infer_checked_expression_flush_type(
     program: &ParsedProgram,
     flows: &DenseIndexTable<FlowType>,
     expression_id: usize,
-    memo: &mut BTreeMap<usize, Option<Type>>,
-    active: &mut BTreeSet<usize>,
+    memo: &mut DenseIndexTable<Type>,
+    completed: &mut DenseFlagSet,
+    active: &mut DenseFlagSet,
     diagnostics: &mut Vec<TypeDiagnostic>,
 ) -> Option<Type> {
-    if let Some(cached) = memo.get(&expression_id) {
-        return cached.clone();
+    if completed.contains(&expression_id) {
+        return memo.get(&expression_id).cloned();
     }
     if !active.insert(expression_id) {
         return None;
@@ -15740,6 +15899,7 @@ fn infer_checked_expression_flush_type(
                 flows,
                 *payload,
                 memo,
+                completed,
                 active,
                 diagnostics,
             );
@@ -15766,6 +15926,7 @@ fn infer_checked_expression_flush_type(
                     flows,
                     child,
                     memo,
+                    completed,
                     active,
                     diagnostics,
                 );
@@ -15774,7 +15935,15 @@ fn infer_checked_expression_flush_type(
         }
         AstExprKind::Hold { initial, .. } => {
             let initial = expression.linked_input.unwrap_or(*initial);
-            infer_checked_expression_flush_type(program, flows, initial, memo, active, diagnostics);
+            infer_checked_expression_flush_type(
+                program,
+                flows,
+                initial,
+                memo,
+                completed,
+                active,
+                diagnostics,
+            );
             let mut ty = None;
             for update in hold_update_exprs_for_expr(
                 &program.ast.statements,
@@ -15786,6 +15955,7 @@ fn infer_checked_expression_flush_type(
                     flows,
                     update,
                     memo,
+                    completed,
                     active,
                     diagnostics,
                 );
@@ -15801,6 +15971,7 @@ fn infer_checked_expression_flush_type(
                     flows,
                     child,
                     memo,
+                    completed,
                     active,
                     diagnostics,
                 );
@@ -15810,7 +15981,10 @@ fn infer_checked_expression_flush_type(
         }
     };
     active.remove(&expression_id);
-    memo.insert(expression_id, inferred.clone());
+    completed.insert(expression_id);
+    if let Some(ty) = inferred.as_ref() {
+        memo.insert(expression_id, ty.clone());
+    }
     inferred
 }
 

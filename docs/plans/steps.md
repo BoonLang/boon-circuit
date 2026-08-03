@@ -47,14 +47,19 @@ stronger three-reviewer performance closure defined below.
    one immutable parsed-program owner per root rather than cloning/dropping it
    on every cache miss; solver/allocation work is unchanged, while a three-
    sample directional release batch has 227.33/227.73 ms fresh/empty medians.
-   The 35 rounds remain. The remaining first tranche is therefore fusing the
-   duplicate checker/builder into one owned database, measured compact/name
-   interning, the larger contextual/user-call worklist reduction,
-   scaling/parity evidence, and the fresh Phase 1 adversarial review. Reprofile
-   after each owner-level slice and regenerate the complete cold protocol after
-   the final edit. Then close semantic sealing, proof, backend, hashing, and
-   memory until both verified-plan modes pass; only afterward may persistent-
-   session warm work satisfy its separate gates.
+   Dense FLUSH propagation then replaces full-program fixed-point rescans with
+   the authoritative reverse dependency graph, while inline AST-child buffers
+   remove per-node temporary vectors. A six-sample directional release batch
+   has 224.50/225.92 ms fresh/empty medians and 1,827,343 fresh allocations /
+   217,055,736 bytes; the complete suite, FLUSH oracle, and digest pass. The 35
+   rounds remain. The remaining first tranche is therefore fusing the duplicate
+   checker/builder into one owned database, measured compact/name interning,
+   the larger contextual/user-call worklist reduction, scaling/parity evidence,
+   and the fresh Phase 1 adversarial review. Reprofile after each owner-level
+   slice and regenerate the complete cold protocol after the final edit. Then
+   close semantic sealing, proof, backend, hashing, and memory until both
+   verified-plan modes pass; only afterward may persistent-session warm work
+   satisfy its separate gates.
 
    Use the performance plan's edit-loop, milestone-preflight, and full-
    acceptance harness levels. Focused debug tests and direct one-sample producer

@@ -397,6 +397,19 @@ Current cold-diagnostics candidate evidence:
   batch has 227.33/227.73 ms fresh/empty medians and 171.50/172.32 ms typecheck
   medians. This small directional win is not percentile acceptance and does not
   close the remaining construction, interning, or contextual/user-call owners.
+- Hidden FLUSH propagation now stores dense expression results directly and
+  computes the derived expression/declaration closure from the authoritative
+  reverse dependency index instead of rescanning the entire program to a fixed
+  point. Test builds compare that queue against the old whole-program oracle.
+  Direct AST-child walks also use four-entry inline buffers instead of one heap
+  allocation per ordinary node. The complete 80-test suite and exact NovyWave
+  digest pass. A six-sample alternating release edit-loop batch has
+  224.50/225.92 ms fresh/empty medians and 169.20/169.95 ms typecheck medians;
+  fresh allocation work is 1,827,343 calls / 217,055,736 bytes, 101,715 calls /
+  2,005,949 bytes below checkpoint `408433b`. The FLUSH phase itself falls from
+  about 6.4 to 2.25 ms. This remains directional rather than percentile
+  acceptance; contextual schemes and checked inference remain the dominant
+  measured owners.
 - Item 7 is still incomplete: the lifetime-free checker and builder remain two
   construction owners. Fuse checked construction into one owned database,
   then complete measured compact/name interning and worklist reductions,

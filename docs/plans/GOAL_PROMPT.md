@@ -221,8 +221,13 @@ Current checkpoints to preserve and audit rather than redo:
   Recursive flow inference then retains one immutable parsed-program owner per
   root instead of cloning/dropping it on every cache miss. Work and allocation
   counts remain exact; a three-sample directional release batch has
-  227.33/227.73 ms fresh/empty medians. The remaining 35 rounds are still open.
-  Finish the duplicate checker/builder owner, measured interning and the larger
+  227.33/227.73 ms fresh/empty medians. Dense FLUSH propagation then uses the
+  authoritative reverse dependency graph instead of whole-program fixed-point
+  rescans, and inline AST-child buffers remove per-node temporary vectors. A
+  six-sample directional release batch has 224.50/225.92 ms fresh/empty medians
+  and 1,827,343 fresh allocations / 217,055,736 bytes; the full FLUSH oracle,
+  suite, and digest pass. The remaining 35 rounds are still open. Finish the
+  duplicate checker/builder owner, measured interning and the larger
   contextual/user-call worklist reduction, scaling/parity proof, and
   adversarial review, then regenerate the full protocol after the final edit;
 - the current compiler-throughput checkpoint keeps Counter, physical TodoMVC,

@@ -226,10 +226,17 @@ Current checkpoints to preserve and audit rather than redo:
   rescans, and inline AST-child buffers remove per-node temporary vectors. A
   six-sample directional release batch has 224.50/225.92 ms fresh/empty medians
   and 1,827,343 fresh allocations / 217,055,736 bytes; the full FLUSH oracle,
-  suite, and digest pass. The remaining 35 rounds are still open. Finish the
-  duplicate checker/builder owner, measured interning and the larger
-  contextual/user-call worklist reduction, scaling/parity proof, and
-  adversarial review, then regenerate the full protocol after the final edit;
+  suite, and digest pass. Checked-read plans now borrow immutable AST segments,
+  retain canonical text only for unresolved paths, and share declaration-reader
+  storage with invalidation; contextual setup consumes its indexes in place and
+  builds the final reverse flow graph without a transient edge tuple buffer. A
+  six-sample directional release batch has 220.22/221.15 ms fresh/empty medians,
+  165.15/165.51 ms typecheck medians, and 1,791,466 fresh allocations /
+  213,748,071 bytes; the complete suite, exact work, audit, and digest pass. The
+  remaining 35 rounds are still open. Finish the duplicate checker/builder
+  owner, measured interning and the larger contextual/user-call worklist
+  reduction, scaling/parity proof, and adversarial review, then regenerate the
+  full protocol after the final edit;
 - the current compiler-throughput checkpoint keeps Counter, physical TodoMVC,
   and NovyWave `MachinePlan` output deterministic while replacing copied OUT
   type environments with active-path overlays, retaining canonical-root-reading

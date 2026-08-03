@@ -1076,8 +1076,7 @@ struct CheckedCallInferenceSnapshot {
 /// equivalent in many programs, but they are not the same inference edge.
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct CheckedReadInferencePlan {
-    source_parts: Box<[String]>,
-    canonical_path: Box<str>,
+    canonical_path: Option<Box<str>>,
     root_target: Option<DeclId>,
     path_target: Option<DeclId>,
     path_projection: Box<[String]>,
@@ -1146,8 +1145,6 @@ struct CheckedTypeInferenceDependencies {
     /// indexed expression's authoritative inferred flow changes. This extends
     /// syntax parents with read, call-output, contextual, and pattern lanes.
     flow_cache_dependents: Vec<Vec<usize>>,
-    /// Expressions whose cached flow directly reads a declaration.
-    flow_cache_declaration_readers: Vec<Vec<usize>>,
     /// Declaration-level reverse edges for forwarded OUT formals. They remain
     /// separate from expression edges so long forwarding chains do not require
     /// a precomputed quadratic transitive closure.
@@ -3673,8 +3670,9 @@ impl CheckedProgramBuilder {
     }
 
     fn infer_user_parameter_schemes(&mut self) {
+        let trace = typecheck_trace_enabled();
+        let setup_started = trace.then(Instant::now);
         let mut actual_variant_candidates = BTreeMap::<DeclId, Vec<Type>>::new();
-        let pattern_selector_parameters = self.syntax_discriminant_parameters.clone();
         // Selector actuals have heavily overlapping expression subtrees. Build
         // one scratch cache for this phase and read the already-indexed reverse
         // parameter relation rather than scanning every call entry again.
@@ -3684,23 +3682,50 @@ impl CheckedProgramBuilder {
                 .as_ref()
                 .expect("checked inference dependencies initialized"),
         );
-        let pattern_domains = dependencies.pattern_selector_domains.clone();
-        let mut pattern_actuals = Vec::new();
-        for formal in &pattern_selector_parameters {
-            if let Some(actuals) = dependencies.actuals_by_parameter.get(formal.0 as usize) {
-                pattern_actuals.extend(actuals.iter().copied().map(|value| (*formal, value)));
+        let pattern_selector_parameters = &dependencies.selector_parameters;
+        let pattern_actual_count = pattern_selector_parameters
+            .iter()
+            .map(|formal| {
+                dependencies
+                    .actuals_by_parameter
+                    .get(formal.0 as usize)
+                    .map_or(0, Vec::len)
+            })
+            .sum::<usize>();
+        if let Some(started) = setup_started {
+            eprintln!(
+                "boon_typecheck checked_program.infer_user_parameter_schemes.setup: {:.3}ms selectors={} actuals={}",
+                typecheck_elapsed_ms(started),
+                pattern_selector_parameters.len(),
+                pattern_actual_count,
+            );
+        }
+        let actuals_started = trace.then(Instant::now);
+        for formal in pattern_selector_parameters.iter().copied() {
+            for value in dependencies
+                .actuals_by_parameter
+                .get(formal.0 as usize)
+                .into_iter()
+                .flatten()
+                .copied()
+            {
+                let actual = self.infer_checked_expr_flow_root(value.0 as usize).ty;
+                if type_is_variant_domain(&actual) {
+                    actual_variant_candidates
+                        .entry(formal)
+                        .or_default()
+                        .push(actual);
+                }
             }
         }
-        for (formal, value) in pattern_actuals {
-            let actual = self.infer_checked_expr_flow_root(value.0 as usize).ty;
-            if !type_is_variant_domain(&actual) {
-                continue;
-            }
-            actual_variant_candidates
-                .entry(formal)
-                .or_default()
-                .push(actual);
+        if let Some(started) = actuals_started {
+            eprintln!(
+                "boon_typecheck checked_program.infer_user_parameter_schemes.actuals: {:.3}ms candidate_formals={}",
+                typecheck_elapsed_ms(started),
+                actual_variant_candidates.len(),
+            );
         }
+        let domains_started = trace.then(Instant::now);
         // Canonicalization sorts and structurally merges the complete domain.
         // Re-canonicalizing a growing union after every call site repeatedly
         // formatted and copied all prior members, turning high-fanout selector
@@ -3709,40 +3734,46 @@ impl CheckedProgramBuilder {
             .into_iter()
             .map(|(formal, candidates)| (formal, canonical_union_type(candidates)))
             .collect::<BTreeMap<_, _>>();
-        for (formal, pattern_domain) in pattern_domains {
+        for (formal, pattern_domain) in &dependencies.pattern_selector_domains {
             actual_variant_domains
-                .entry(formal)
+                .entry(*formal)
                 .and_modify(|actual| {
                     *actual =
                         complete_pattern_selector_domain(actual.clone(), pattern_domain.clone());
                 })
-                .or_insert(pattern_domain);
+                .or_insert_with(|| pattern_domain.clone());
         }
-        let user_signatures = self
-            .signatures
-            .iter()
-            .enumerate()
-            .filter(|(_, signature)| signature.kind == CheckedCallableKind::User)
-            .map(|(index, signature)| (index, signature.name.clone()))
-            .collect::<Vec<_>>();
-
+        if let Some(started) = domains_started {
+            eprintln!(
+                "boon_typecheck checked_program.infer_user_parameter_schemes.domains: {:.3}ms domains={}",
+                typecheck_elapsed_ms(started),
+                actual_variant_domains.len(),
+            );
+        }
+        let signatures_started = trace.then(Instant::now);
         let mut next_var = self
             .next_checked_scheme_type_var
             .expect("checked scheme type-variable allocator initialized");
-        for (signature_index, name) in user_signatures {
-            for parameter in &mut self.signatures[signature_index].parameters {
+        let function_param_requirements = &self.function_param_requirements;
+        for signature in self
+            .signatures
+            .iter_mut()
+            .filter(|signature| signature.kind == CheckedCallableKind::User)
+        {
+            for parameter in &mut signature.parameters {
                 let inferred_variant_domain = actual_variant_domains
                     .get(&parameter.decl_id)
                     .cloned()
                     .or_else(|| {
                         pattern_selector_parameters
-                            .contains(&parameter.decl_id)
+                            .binary_search(&parameter.decl_id)
+                            .is_ok()
                             .then(|| parameter.flow_type.ty.clone())
                             .filter(type_is_variant_domain)
                     });
                 let seed = inferred_variant_domain.unwrap_or_else(|| {
-                    self.function_param_requirements
-                        .get(&name)
+                    function_param_requirements
+                        .get(&signature.name)
                         .and_then(|parameters| parameters.get(&parameter.name))
                         .cloned()
                         .unwrap_or(Type::Unknown)
@@ -3750,7 +3781,10 @@ impl CheckedProgramBuilder {
                 parameter.flow_type =
                     continuous_flow_type(freshen_checked_scheme_type(&seed, &mut next_var));
             }
-            self.set_checked_signature_result(signature_index, unknown_flow_type());
+            // The scratch flow cache is reset after every user scheme is
+            // installed below, so publishing one invalidation per signature
+            // here would only allocate queue entries that the boundary drops.
+            signature.result = unknown_flow_type();
         }
         self.next_checked_scheme_type_var = Some(next_var);
         self.sync_signature_declaration_types();
@@ -3758,6 +3792,12 @@ impl CheckedProgramBuilder {
         // reads above. Reset at that exact ownership boundary so context
         // inference cannot observe a cached answer from the old schemes.
         self.enable_checked_flow_inference_cache();
+        if let Some(started) = signatures_started {
+            eprintln!(
+                "boon_typecheck checked_program.infer_user_parameter_schemes.signatures: {:.3}ms",
+                typecheck_elapsed_ms(started),
+            );
+        }
     }
 
     fn infer_context_schemes(&mut self) {
@@ -4568,17 +4608,16 @@ impl CheckedProgramBuilder {
         expression: CheckedExprId,
     ) -> Option<(DeclId, Vec<String>)> {
         let expr_id = expression.0 as usize;
-        let parts = checked_read_path_parts(self.program.expressions.get(expr_id)?)?;
         if let Some(plan) = self
             .checked_type_inference_dependencies
             .as_ref()
             .and_then(|dependencies| dependencies.read_inference_plans.get(&expr_id))
-            .filter(|plan| plan.source_parts.as_ref() == parts.as_slice())
         {
             return plan
                 .path_target
                 .map(|target| (target, plan.path_projection.to_vec()));
         }
+        let parts = checked_read_path_parts(self.program.expressions.get(expr_id)?)?;
         let scope_id = self
             .expression_scopes
             .get(&expr_id)
@@ -4605,7 +4644,7 @@ impl CheckedProgramBuilder {
         // of the parser expression. Reject that derived path and preserve the
         // existing resolver as the exact fallback; treating the suffix as a
         // structural projection would skip nested declaration scopes.
-        if plan.source_parts.as_ref() != parts {
+        if !checked_read_path_matches_parts(self.program.expressions.get(expr_id), parts) {
             self.checked_flow_inference_cache
                 .stats
                 .indexed_read_rejected = self
@@ -4620,9 +4659,12 @@ impl CheckedProgramBuilder {
             .stats
             .indexed_read_hits
             .saturating_add(1);
-        plan.path_target.map_or(
-            CheckedReadPathInferenceLookup::Unresolved {
-                canonical_path: &plan.canonical_path,
+        plan.path_target.map_or_else(
+            || CheckedReadPathInferenceLookup::Unresolved {
+                canonical_path: plan
+                    .canonical_path
+                    .as_deref()
+                    .expect("unresolved checked read owns a canonical path"),
             },
             |target| CheckedReadPathInferenceLookup::Resolved {
                 target,
@@ -4645,7 +4687,7 @@ impl CheckedProgramBuilder {
                 .saturating_add(1);
             return CheckedReadRootInferenceLookup::Missing;
         };
-        if plan.source_parts.as_ref() != parts {
+        if !checked_read_path_matches_parts(self.program.expressions.get(expr_id), parts) {
             self.checked_flow_inference_cache
                 .stats
                 .indexed_read_rejected = self
@@ -5844,8 +5886,8 @@ impl CheckedProgramBuilder {
         &self,
         expression: &AstExpr,
     ) -> Option<CheckedReadInferencePlan> {
-        let source_parts = checked_read_path_parts(expression)?;
-        if source_parts.first().is_some_and(|part| part == "PASSED") {
+        let source_parts = checked_read_path_refs(expression)?;
+        if source_parts.first().is_some_and(|part| *part == "PASSED") {
             return None;
         }
         let scope = self
@@ -5857,13 +5899,15 @@ impl CheckedProgramBuilder {
             .first()
             .and_then(|name| self.resolve_checked_read_name(expression.id, scope, name));
         let (path_target, path_projection) = self
-            .resolve_checked_read_path(expression.id, scope, &source_parts)
+            .resolve_checked_read_path_refs(expression.id, scope, &source_parts)
             .map_or((None, Vec::new()), |(target, projection)| {
                 (Some(target), projection)
             });
+        let canonical_path = path_target
+            .is_none()
+            .then(|| source_parts.join(".").into_boxed_str());
         Some(CheckedReadInferencePlan {
-            canonical_path: source_parts.join(".").into_boxed_str(),
-            source_parts: source_parts.into_boxed_slice(),
+            canonical_path,
             root_target,
             path_target,
             path_projection: path_projection.into_boxed_slice(),
@@ -5871,6 +5915,8 @@ impl CheckedProgramBuilder {
     }
 
     fn build_checked_type_inference_dependencies(&self) -> CheckedTypeInferenceDependencies {
+        let trace = typecheck_trace_enabled();
+        let plans_started = trace.then(Instant::now);
         let expression_count = self.program.expressions.len();
         let selector_parameters = self
             .syntax_discriminant_parameters
@@ -5907,6 +5953,15 @@ impl CheckedProgramBuilder {
             })
             .collect::<Vec<_>>();
         pattern_binding_sites.sort_by_key(|site| site.declaration);
+        if let Some(started) = plans_started {
+            eprintln!(
+                "boon_typecheck checked_program.build_type_dependencies.plans: {:.3}ms calls={} patterns={}",
+                typecheck_elapsed_ms(started),
+                call_inference_plans.values().count(),
+                pattern_binding_sites.len(),
+            );
+        }
+        let allocate_started = trace.then(Instant::now);
         let mut dependencies = CheckedTypeInferenceDependencies {
             call_inference_plans,
             read_inference_plans: DenseIndexTable::with_len(expression_count),
@@ -5939,10 +5994,16 @@ impl CheckedProgramBuilder {
             pattern_binding_sites,
             pattern_dependents_by_selector: vec![Vec::new(); expression_count],
             flow_cache_dependents: vec![Vec::new(); expression_count],
-            flow_cache_declaration_readers: vec![Vec::new(); self.next_decl_id as usize],
             flow_cache_declaration_dependents: vec![Vec::new(); self.next_decl_id as usize],
             signature_expression_readers: vec![Vec::new(); self.next_decl_id as usize],
         };
+        if let Some(started) = allocate_started {
+            eprintln!(
+                "boon_typecheck checked_program.build_type_dependencies.allocate: {:.3}ms",
+                typecheck_elapsed_ms(started),
+            );
+        }
+        let expressions_started = trace.then(Instant::now);
         for expression in &self.program.expressions {
             let mut children = direct_expression_children(expression);
             if matches!(&expression.kind, AstExprKind::Hold { .. }) {
@@ -6022,6 +6083,14 @@ impl CheckedProgramBuilder {
                 callables.push(signature.decl_id);
             }
         }
+        if let Some(started) = expressions_started {
+            eprintln!(
+                "boon_typecheck checked_program.build_type_dependencies.expressions: {:.3}ms reads={}",
+                typecheck_elapsed_ms(started),
+                dependencies.read_inference_plans.values().count(),
+            );
+        }
+        let calls_started = trace.then(Instant::now);
         for (call_index, call) in self.calls.iter().enumerate() {
             let input_flow_sensitive = dependencies
                 .call_inference_plans
@@ -6151,6 +6220,13 @@ impl CheckedProgramBuilder {
                 calls.push(call.id);
             }
         }
+        if let Some(started) = calls_started {
+            eprintln!(
+                "boon_typecheck checked_program.build_type_dependencies.calls: {:.3}ms",
+                typecheck_elapsed_ms(started),
+            );
+        }
+        let sorting_started = trace.then(Instant::now);
         for calls in &mut dependencies.wrapper_calls_by_owner {
             calls.sort_unstable();
             calls.dedup();
@@ -6215,49 +6291,66 @@ impl CheckedProgramBuilder {
             values.sort();
             values.dedup();
         }
-        dependencies.flow_cache_declaration_readers = dependencies.declaration_readers.clone();
-
+        if let Some(started) = sorting_started {
+            eprintln!(
+                "boon_typecheck checked_program.build_type_dependencies.sort: {:.3}ms",
+                typecheck_elapsed_ms(started),
+            );
+        }
         // Build the complete immediate expression-flow reverse relation used
         // by persistent memoization. Solver scheduling retains its more
         // granular declaration/call queues above; cache invalidation must also
         // cover flow-mode reads that intentionally bypass an intermediate
         // declaration update.
-        let mut flow_edges = dependencies
-            .expression_parents
-            .iter()
-            .enumerate()
-            .flat_map(|(child, parents)| parents.iter().map(move |parent| (child, *parent)))
-            .collect::<Vec<_>>();
-        for (value, declarations) in dependencies.declarations_by_value.iter().enumerate() {
-            for declaration in declarations {
-                flow_edges.extend(
-                    dependencies
-                        .declaration_readers
-                        .get(declaration.0 as usize)
-                        .into_iter()
-                        .flatten()
-                        .map(|reader| (value, *reader)),
-                );
-            }
-        }
-        for (actual, parameters) in dependencies.parameters_by_actual.iter().enumerate() {
-            for parameter in parameters {
-                flow_edges.extend(
-                    dependencies
-                        .declaration_readers
-                        .get(parameter.0 as usize)
-                        .into_iter()
-                        .flatten()
-                        .map(|reader| (actual, *reader)),
-                );
-            }
-        }
-        for (selector, dependents) in dependencies
-            .pattern_dependents_by_selector
-            .iter()
-            .enumerate()
+        let flow_started = trace.then(Instant::now);
         {
-            flow_edges.extend(dependents.iter().map(|dependent| (selector, *dependent)));
+            let expression_parents = &dependencies.expression_parents;
+            let flow_cache_dependents = &mut dependencies.flow_cache_dependents;
+            for (child, parents) in expression_parents.iter().enumerate() {
+                if let Some(dependents) = flow_cache_dependents.get_mut(child) {
+                    dependents.extend(parents.iter().copied());
+                }
+            }
+        }
+        {
+            let declarations_by_value = &dependencies.declarations_by_value;
+            let declaration_readers = &dependencies.declaration_readers;
+            let flow_cache_dependents = &mut dependencies.flow_cache_dependents;
+            for (value, declarations) in declarations_by_value.iter().enumerate() {
+                let Some(dependents) = flow_cache_dependents.get_mut(value) else {
+                    continue;
+                };
+                for declaration in declarations {
+                    if let Some(readers) = declaration_readers.get(declaration.0 as usize) {
+                        dependents.extend(readers.iter().copied());
+                    }
+                }
+            }
+        }
+        {
+            let parameters_by_actual = &dependencies.parameters_by_actual;
+            let declaration_readers = &dependencies.declaration_readers;
+            let flow_cache_dependents = &mut dependencies.flow_cache_dependents;
+            for (actual, parameters) in parameters_by_actual.iter().enumerate() {
+                let Some(dependents) = flow_cache_dependents.get_mut(actual) else {
+                    continue;
+                };
+                for parameter in parameters {
+                    if let Some(readers) = declaration_readers.get(parameter.0 as usize) {
+                        dependents.extend(readers.iter().copied());
+                    }
+                }
+            }
+        }
+        {
+            let pattern_dependents_by_selector = &dependencies.pattern_dependents_by_selector;
+            let flow_cache_dependents = &mut dependencies.flow_cache_dependents;
+            for (selector, pattern_dependents) in pattern_dependents_by_selector.iter().enumerate()
+            {
+                if let Some(dependents) = flow_cache_dependents.get_mut(selector) {
+                    dependents.extend(pattern_dependents.iter().copied());
+                }
+            }
         }
         // A projected read of an OUT formal follows every concrete output
         // occurrence through `checked_out_projection_flow_mode`. Encode that
@@ -6279,69 +6372,82 @@ impl CheckedProgramBuilder {
         // inferring a projected mode. Keep this edge exact instead of forming
         // the all-inputs x all-output-readers cross product that the old
         // whole-epoch invalidation happened to conceal.
-        for (output, list_inputs) in dependencies
-            .contextual_list_inputs_by_output
-            .iter()
-            .enumerate()
         {
-            let output = DeclId(output as u32);
-            for list_input in list_inputs {
-                flow_edges.extend(
-                    dependencies
-                        .declaration_readers
-                        .get(output.0 as usize)
-                        .into_iter()
-                        .flatten()
-                        .map(|reader| (list_input.0 as usize, *reader)),
-                );
+            let contextual_list_inputs_by_output = &dependencies.contextual_list_inputs_by_output;
+            let declaration_readers = &dependencies.declaration_readers;
+            let flow_cache_dependents = &mut dependencies.flow_cache_dependents;
+            for (output, list_inputs) in contextual_list_inputs_by_output.iter().enumerate() {
+                let Some(readers) = declaration_readers.get(output) else {
+                    continue;
+                };
+                for list_input in list_inputs {
+                    if let Some(dependents) = flow_cache_dependents.get_mut(list_input.0 as usize) {
+                        dependents.extend(readers.iter().copied());
+                    }
+                }
             }
         }
-        for call in &self.calls {
-            let inputs = call
-                .entries
-                .iter()
-                .filter_map(|entry| match entry {
-                    CheckedCallEntry::Input { value, .. } => Some(value.0 as usize),
-                    CheckedCallEntry::FreshOut { .. } | CheckedCallEntry::ForwardOut { .. } => None,
-                })
-                .chain(
-                    call.context_binding
-                        .explicit()
-                        .map(|(value, _)| value.0 as usize),
-                );
-            for input in inputs {
-                flow_edges.push((input, call.expression.0 as usize));
+        {
+            let flow_cache_dependents = &mut dependencies.flow_cache_dependents;
+            for call in &self.calls {
+                let inputs =
+                    call.entries
+                        .iter()
+                        .filter_map(|entry| match entry {
+                            CheckedCallEntry::Input { value, .. } => Some(value.0 as usize),
+                            CheckedCallEntry::FreshOut { .. }
+                            | CheckedCallEntry::ForwardOut { .. } => None,
+                        })
+                        .chain(
+                            call.context_binding
+                                .explicit()
+                                .map(|(value, _)| value.0 as usize),
+                        );
+                for input in inputs {
+                    if let Some(dependents) = flow_cache_dependents.get_mut(input) {
+                        dependents.push(call.expression.0 as usize);
+                    }
+                }
             }
         }
-        for signature in &self.signatures {
-            let Some(result) = signature.result_expression else {
-                continue;
-            };
-            for call in dependencies
-                .calls_by_callee
-                .get(signature.decl_id.0 as usize)
-                .into_iter()
-                .flatten()
-                .filter_map(|call| self.call_by_checked_id(*call))
-            {
-                flow_edges.push((result.0 as usize, call.expression.0 as usize));
+        {
+            let calls_by_callee = &dependencies.calls_by_callee;
+            let flow_cache_dependents = &mut dependencies.flow_cache_dependents;
+            for signature in &self.signatures {
+                let Some(result) = signature.result_expression else {
+                    continue;
+                };
+                let Some(dependents) = flow_cache_dependents.get_mut(result.0 as usize) else {
+                    continue;
+                };
+                for call in calls_by_callee
+                    .get(signature.decl_id.0 as usize)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|call| self.call_by_checked_id(*call))
+                {
+                    dependents.push(call.expression.0 as usize);
+                }
             }
         }
-        for expression in &self.program.expressions {
-            let Some(plan) = dependencies.read_inference_plans.get(&expression.id) else {
-                continue;
-            };
-            if plan.path_target.is_some() {
-                continue;
-            }
-            let path = canonical_checked_path(&plan.source_parts);
-            if let Some(value) = declaration_expr_for_path(&self.named_value_expressions, &path) {
-                flow_edges.push((value, expression.id));
-            }
-        }
-        for (source, dependent) in flow_edges {
-            if let Some(dependents) = dependencies.flow_cache_dependents.get_mut(source) {
-                dependents.push(dependent);
+        {
+            let read_inference_plans = &dependencies.read_inference_plans;
+            let flow_cache_dependents = &mut dependencies.flow_cache_dependents;
+            for expression in &self.program.expressions {
+                let Some(plan) = read_inference_plans.get(&expression.id) else {
+                    continue;
+                };
+                if plan.path_target.is_some() {
+                    continue;
+                }
+                let Some(path) = plan.canonical_path.as_deref() else {
+                    continue;
+                };
+                if let Some(value) = declaration_expr_for_path(&self.named_value_expressions, path)
+                    && let Some(dependents) = flow_cache_dependents.get_mut(value)
+                {
+                    dependents.push(expression.id);
+                }
             }
         }
         for dependents in &mut dependencies.flow_cache_dependents {
@@ -6351,6 +6457,17 @@ impl CheckedProgramBuilder {
         for dependents in &mut dependencies.flow_cache_declaration_dependents {
             dependents.sort();
             dependents.dedup();
+        }
+        if let Some(started) = flow_started {
+            eprintln!(
+                "boon_typecheck checked_program.build_type_dependencies.flow: {:.3}ms edges={}",
+                typecheck_elapsed_ms(started),
+                dependencies
+                    .flow_cache_dependents
+                    .iter()
+                    .map(Vec::len)
+                    .sum::<usize>(),
+            );
         }
         dependencies
     }
@@ -6521,7 +6638,7 @@ impl CheckedProgramBuilder {
                 DenseGenerationSet::with_len(0),
             );
             roots.extend(checked_flow_declarations_invalidation_roots(
-                &dependencies.flow_cache_declaration_readers,
+                &dependencies.declaration_readers,
                 &dependencies.flow_cache_declaration_dependents,
                 declarations.iter().copied(),
                 &mut declaration_seen,
@@ -6640,12 +6757,6 @@ impl CheckedProgramBuilder {
         stats: &mut CheckedTypeInferenceWorkStats,
         excluded_output_call: Option<CheckedCallId>,
     ) {
-        if let Some(readers) = dependencies
-            .flow_cache_declaration_readers
-            .get(declaration.0 as usize)
-        {
-            pending.expressions.extend(readers.iter().copied());
-        }
         if let Some(readers) = dependencies.declaration_readers.get(declaration.0 as usize) {
             pending.expressions.extend(readers.iter().copied());
         }
@@ -12479,11 +12590,51 @@ impl CheckedProgramBuilder {
                 return Some((target, parts[index..].to_vec()));
             };
             let Some(child) = self
-                .scope_declarations
-                .get(&(body_scope, part.clone()))
+                .scope_declarations_by_scope
+                .get(body_scope.0 as usize)
+                .and_then(|declarations| declarations.get(part))
                 .copied()
             else {
                 return Some((target, parts[index..].to_vec()));
+            };
+            target = child;
+        }
+        Some((target, Vec::new()))
+    }
+
+    fn resolve_checked_read_path_refs(
+        &self,
+        expr_id: usize,
+        scope_id: LexicalScopeId,
+        parts: &[&str],
+    ) -> Option<(DeclId, Vec<String>)> {
+        let mut target = self.resolve_checked_read_name(expr_id, scope_id, parts.first()?)?;
+        for (index, part) in parts.iter().enumerate().skip(1) {
+            let Some(body_scope) = self
+                .declaration(target)
+                .and_then(|declaration| declaration.body_scope)
+            else {
+                return Some((
+                    target,
+                    parts[index..]
+                        .iter()
+                        .map(|part| (*part).to_owned())
+                        .collect(),
+                ));
+            };
+            let Some(child) = self
+                .scope_declarations_by_scope
+                .get(body_scope.0 as usize)
+                .and_then(|declarations| declarations.get(*part))
+                .copied()
+            else {
+                return Some((
+                    target,
+                    parts[index..]
+                        .iter()
+                        .map(|part| (*part).to_owned())
+                        .collect(),
+                ));
             };
             target = child;
         }
@@ -14706,6 +14857,59 @@ fn checked_read_path_parts(expression: &AstExpr) -> Option<Vec<String>> {
         AstExprKind::Path(parts) => Some(parts.clone()),
         AstExprKind::Drain { path } => Some(drain_path_parts(path)),
         _ => None,
+    }
+}
+
+fn checked_read_path_refs(expression: &AstExpr) -> Option<SmallVec<[&str; 4]>> {
+    match &expression.kind {
+        AstExprKind::Identifier(name) => Some(SmallVec::from_slice(&[name.as_str()])),
+        AstExprKind::Path(parts) => Some(parts.iter().map(String::as_str).collect()),
+        AstExprKind::Drain {
+            path: AstDrainPath::Binding { name },
+        } => Some(SmallVec::from_slice(&[name.as_str()])),
+        AstExprKind::Drain {
+            path: AstDrainPath::Field { binding, fields },
+        } => Some(
+            std::iter::once(binding.as_str())
+                .chain(fields.iter().map(String::as_str))
+                .collect(),
+        ),
+        AstExprKind::Drain {
+            path: AstDrainPath::Passed { fields },
+        } => Some(
+            std::iter::once("PASSED")
+                .chain(fields.iter().map(String::as_str))
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+fn checked_read_path_matches_parts(expression: Option<&AstExpr>, parts: &[String]) -> bool {
+    let Some(expression) = expression else {
+        return false;
+    };
+    match &expression.kind {
+        AstExprKind::Identifier(name) => {
+            parts.len() == 1 && parts.first().is_some_and(|part| part == name)
+        }
+        AstExprKind::Path(source) => source.as_slice() == parts,
+        AstExprKind::Drain {
+            path: AstDrainPath::Binding { name },
+        } => parts.len() == 1 && parts.first().is_some_and(|part| part == name),
+        AstExprKind::Drain {
+            path: AstDrainPath::Field { binding, fields },
+        } => {
+            parts.first().is_some_and(|part| part == binding)
+                && parts.get(1..).is_some_and(|rest| rest == fields.as_slice())
+        }
+        AstExprKind::Drain {
+            path: AstDrainPath::Passed { fields },
+        } => {
+            parts.first().is_some_and(|part| part == "PASSED")
+                && parts.get(1..).is_some_and(|rest| rest == fields.as_slice())
+        }
+        _ => false,
     }
 }
 

@@ -410,6 +410,25 @@ Current cold-diagnostics candidate evidence:
   about 6.4 to 2.25 ms. This remains directional rather than percentile
   acceptance; contextual schemes and checked inference remain the dominant
   measured owners.
+- Checked-read dependency plans now borrow path segments from the immutable AST
+  while they are built, allocate a canonical path only for unresolved reads,
+  and validate indexed read lookups against that same AST instead of retaining
+  a second owned segment vector per read. Declaration invalidation shares the
+  authoritative reader table instead of cloning it. Contextual parameter setup
+  consumes the sorted selector index and pattern domains in place, visits
+  actuals and mutable user signatures without intermediate vectors, and avoids
+  invalidation entries at the immediately-reset scratch-cache boundary. The
+  final reverse flow graph is filled directly rather than materializing and
+  copying a transient 29,812-edge tuple buffer. The complete 80-test suite,
+  seed-free/full-sweep audit, exact solver counters, and checked digest pass. A
+  six-sample alternating release edit-loop batch has 220.22/221.15 ms
+  fresh/empty medians and 165.15/165.51 ms typecheck medians; fresh allocation
+  work is 1,791,466 calls / 213,748,071 bytes, 35,877 calls / 3,307,665 bytes
+  below the preceding FLUSH checkpoint. Empty-session allocation work falls by
+  the same amounts to 1,791,472 calls / 213,812,668 bytes. A traced release
+  sample attributes about 8.18 ms to dependency/setup inside the 28.31 ms
+  contextual-scheme phase and 43.73 ms to checked inference, so the owned
+  database and larger contextual/inference work reduction remain open.
 - Item 7 is still incomplete: the lifetime-free checker and builder remain two
   construction owners. Fuse checked construction into one owned database,
   then complete measured compact/name interning and worklist reductions,

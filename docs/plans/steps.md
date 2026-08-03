@@ -51,15 +51,23 @@ stronger three-reviewer performance closure defined below.
    the authoritative reverse dependency graph, while inline AST-child buffers
    remove per-node temporary vectors. A six-sample directional release batch
    has 224.50/225.92 ms fresh/empty medians and 1,827,343 fresh allocations /
-   217,055,736 bytes; the complete suite, FLUSH oracle, and digest pass. The 35
-   rounds remain. The remaining first tranche is therefore fusing the duplicate
-   checker/builder into one owned database, measured compact/name interning,
-   the larger contextual/user-call worklist reduction, scaling/parity evidence,
-   and the fresh Phase 1 adversarial review. Reprofile after each owner-level
-   slice and regenerate the complete cold protocol after the final edit. Then
-   close semantic sealing, proof, backend, hashing, and memory until both
-   verified-plan modes pass; only afterward may persistent-session warm work
-   satisfy its separate gates.
+   217,055,736 bytes; the complete suite, FLUSH oracle, and digest pass. Checked
+   read plans now borrow AST path segments while indexing, retain a canonical
+   path only for unresolved reads, and share the authoritative declaration-
+   reader table with invalidation. Contextual setup also consumes indexed
+   selector/domain/signature state in place, and the final flow adjacency is
+   filled without a transient 29,812-edge tuple buffer. The complete 80-test
+   suite and exact digest pass; a six-sample directional release batch has
+   220.22/221.15 ms fresh/empty medians, 165.15/165.51 ms typecheck medians, and
+   1,791,466 fresh allocations / 213,748,071 bytes. The 35 rounds remain. The
+   remaining first tranche is therefore fusing the duplicate checker/builder
+   into one owned database, measured compact/name interning, the larger
+   contextual/user-call worklist reduction, scaling/parity evidence, and the
+   fresh Phase 1 adversarial review. Reprofile after each owner-level slice and
+   regenerate the complete cold protocol after the final edit. Then close
+   semantic sealing, proof, backend, hashing, and memory until both verified-
+   plan modes pass; only afterward may persistent-session warm work satisfy its
+   separate gates.
 
    Use the performance plan's edit-loop, milestone-preflight, and full-
    acceptance harness levels. Focused debug tests and direct one-sample producer

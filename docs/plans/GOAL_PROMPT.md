@@ -212,11 +212,16 @@ Current checkpoints to preserve and audit rather than redo:
   propagation lanes and recycles dense pending buffers; the exact checked
   digest and both product-scale oracles remain unchanged, while a current
   fresh release sample uses 1,932,386 allocations / 219,267,245 bytes and the
-  traced checked builder falls from 134.02 to 130.61 ms. It does not reduce the
-  remaining 35 inference rounds or 5,060 call visits. Finish the duplicate
-  checker/builder owner, measured interning and the larger contextual/call
-  worklist reduction, scaling/parity proof, and adversarial review, then
-  regenerate the full protocol after the final edit;
+  traced checked builder falls from 134.02 to 130.61 ms. Exact call-input
+  sensitivity then seeds concrete fixed-result builtins once while retaining
+  every projection/cache dependency: NovyWave call visits fall from 5,060 to
+  3,848, no-op visits from 1,964 to 752, and directional release samples are
+  229.97/228.51 ms fresh/empty with 1,929,058 fresh allocations / 219,061,685
+  bytes. The complete 80-test suite, full-sweep audit, and exact digest pass.
+  The remaining 35 rounds are still open. Finish the duplicate checker/builder
+  owner, measured interning and the larger contextual/user-call worklist
+  reduction, scaling/parity proof, and adversarial review, then regenerate the
+  full protocol after the final edit;
 - the current compiler-throughput checkpoint keeps Counter, physical TodoMVC,
   and NovyWave `MachinePlan` output deterministic while replacing copied OUT
   type environments with active-path overlays, retaining canonical-root-reading

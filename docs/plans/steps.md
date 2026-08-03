@@ -37,15 +37,21 @@ stronger three-reviewer performance closure defined below.
    checked construction owners are now lifetime-free without a material
    allocation regression. Dense solver queues now retain their buffers and one
    complete dependency index owns expression propagation, reducing a current
-   NovyWave sample by 1,226 allocations without changing its digest, but the 35
-   inference rounds and 5,060 call visits remain. The remaining first tranche
-   is therefore fusing the duplicate checker/builder into one owned database,
-   measured compact/name interning, larger contextual/call worklist reduction,
-   scaling/parity evidence, and the fresh Phase 1 adversarial review. Reprofile
-   after each owner-level slice and regenerate the complete cold protocol after
-   the final edit. Then close semantic sealing, proof, backend, hashing, and
-   memory until both verified-plan modes pass; only afterward may persistent-
-   session warm work satisfy its separate gates.
+   NovyWave sample by 1,226 allocations without changing its digest. Exact
+   call-input sensitivity then removes concrete fixed-result builtins from
+   redundant input-driven instantiation while retaining projection/cache
+   dependencies: call visits fall from 5,060 to 3,848 and no-op visits from
+   1,964 to 752 with the full audit and digest unchanged. Directional release
+   samples are 229.97/228.51 ms fresh/empty and the fresh sample uses 1,929,058
+   allocations / 219,061,685 bytes. The 35 rounds remain. The remaining first
+   tranche is therefore fusing the duplicate checker/builder into one owned
+   database, measured compact/name interning, the larger contextual/user-call
+   worklist reduction, scaling/parity evidence, and the fresh Phase 1
+   adversarial review. Reprofile after each owner-level slice and regenerate
+   the complete cold protocol after the final edit. Then close semantic
+   sealing, proof, backend, hashing, and memory until both verified-plan modes
+   pass; only afterward may persistent-session warm work satisfy its separate
+   gates.
 
    Use the performance plan's edit-loop, milestone-preflight, and full-
    acceptance harness levels. Focused debug tests and direct one-sample producer

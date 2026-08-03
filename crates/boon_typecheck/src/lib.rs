@@ -1041,6 +1041,16 @@ struct CheckedCallInferencePlan {
     is_user_callable: bool,
     result_expression: Option<CheckedExprId>,
     mode: CheckedCallModeInferencePlan,
+    /// Whether a refinement of an actual input can change the call's checked
+    /// result, mode, substitutions, or OUT declarations.
+    ///
+    /// Concrete fixed-result builtins have no such edge: their argument
+    /// compatibility is validated from finalized actual flows later, while
+    /// their checked call product is completely determined on the initial
+    /// seed visit. Treating every argument as a result dependency made these
+    /// calls re-enter both the call and expression worklists after every input
+    /// refinement even though they could only report a no-op.
+    input_flow_sensitive: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -5792,6 +5802,13 @@ impl CheckedProgramBuilder {
             }
             CheckedContextBinding::None => (None, None),
         };
+        let input_flow_sensitive = signature.kind != CheckedCallableKind::Builtin
+            || checked_signature_is_generic(signature)
+            || !matches!(mode, CheckedCallModeInferencePlan::Fixed)
+            || !outputs.is_empty()
+            || !matches!(call.context_binding, CheckedContextBinding::None)
+            || signature.name.starts_with("Field/")
+            || signature.name == "Dependency/catch_cycle";
 
         Some(CheckedCallInferencePlan {
             call_id: call.id,
@@ -5817,6 +5834,7 @@ impl CheckedProgramBuilder {
             is_user_callable: signature.kind == CheckedCallableKind::User,
             result_expression: signature.result_expression,
             mode,
+            input_flow_sensitive,
         })
     }
 
@@ -6003,6 +6021,10 @@ impl CheckedProgramBuilder {
             }
         }
         for (call_index, call) in self.calls.iter().enumerate() {
+            let input_flow_sensitive = dependencies
+                .call_inference_plans
+                .get(&(call.id.0 as usize))
+                .is_some_and(|plan| plan.input_flow_sensitive);
             let mut first_output_formal_by_output = BTreeMap::new();
             for entry in &call.entries {
                 match entry {
@@ -6066,7 +6088,10 @@ impl CheckedProgramBuilder {
             for entry in &call.entries {
                 match entry {
                     CheckedCallEntry::Input { formal, value, .. } => {
-                        if let Some(calls) = dependencies.calls_by_input.get_mut(value.0 as usize) {
+                        if input_flow_sensitive
+                            && let Some(calls) =
+                                dependencies.calls_by_input.get_mut(value.0 as usize)
+                        {
                             calls.push(call.id);
                         }
                         if let Some(parameters) =
@@ -6118,6 +6143,7 @@ impl CheckedProgramBuilder {
                 }
             }
             if let CheckedContextBinding::Explicit { value, .. } = call.context_binding
+                && input_flow_sensitive
                 && let Some(calls) = dependencies.calls_by_input.get_mut(value.0 as usize)
             {
                 calls.push(call.id);

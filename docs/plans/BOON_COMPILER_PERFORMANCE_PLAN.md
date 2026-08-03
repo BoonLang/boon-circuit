@@ -375,7 +375,20 @@ Current cold-diagnostics candidate evidence:
   lifetime-free ownership checkpoint. The traced checked-program builder falls
   directionally from 134.02 to 130.61 ms. This is an owner-level edit-loop
   improvement, not percentile acceptance; inference still takes 35 rounds and
-  5,060 call visits, so the larger contextual/call work owner remains open.
+  5,060 call visits.
+- Call inference plans now distinguish concrete fixed-result builtins whose
+  checked product is independent of changing actual-input flow. They remain in
+  the expression-flow graph where projection inference requires them, but are
+  seeded only once in the call-instantiation worklist; `Field/*` projections
+  and every generic, mode-sensitive, contextual, OUT, user, and dependency-
+  catch call retain their input edges. The complete 80-test typechecker suite,
+  both product oracles, and the fail-closed full-sweep audit pass with the exact
+  NovyWave digest. NovyWave call visits fall from 5,060 to 3,848, no-op visits
+  from 1,964 to 752, and input enqueues from 2,465 to 1,253. Directional current
+  release samples are 229.97/228.51 ms fresh/empty; the fresh sample uses
+  1,929,058 allocations / 219,061,685 bytes, 3,328 calls / 205,560 bytes below
+  checkpoint `69614c2`. This is not percentile acceptance: the remaining 35
+  rounds and contextual/user-call owner remain open.
 - Item 7 is still incomplete: the lifetime-free checker and builder remain two
   construction owners. Fuse checked construction into one owned database,
   then complete measured compact/name interning and worklist reductions,

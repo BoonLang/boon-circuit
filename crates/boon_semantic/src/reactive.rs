@@ -18,7 +18,7 @@ use crate::{
     SemanticStatementId, SemanticStatementKind, SemanticTriggerArmId, SemanticValueId,
     SemanticValueOrigin, StaticOwnerId,
 };
-use boon_typecheck::{
+use boon_checked::{
     CheckedExprId, CheckedExternalDeclarationIdentityV1, CheckedExternalDeclarationKind,
     CheckedIntrinsicV1, DeclId, FlowMode, FlowType, Type,
 };
@@ -3583,7 +3583,7 @@ impl<'a> ReactiveBuilder<'a> {
             let SemanticExpressionKind::Call { call, function, .. } = &expression.kind else {
                 continue;
             };
-            if !boon_typecheck::is_typed_host_effect(function) {
+            if !boon_checked::is_typed_host_effect(function) {
                 continue;
             }
             let value_roots = reachability.value_roots_reaching(expression.id)?;
@@ -3671,7 +3671,7 @@ impl<'a> ReactiveBuilder<'a> {
                         else {
                             return None;
                         };
-                        (boon_typecheck::is_typed_host_effect(candidate_function)
+                        (boon_checked::is_typed_host_effect(candidate_function)
                             && candidate.checked_expr_id == expression.checked_expr_id)
                             .then(|| {
                                 let origin = self
@@ -3735,7 +3735,7 @@ impl<'a> ReactiveBuilder<'a> {
                 continue;
             }
             let callable = self.execution.callable(call_definition.callable)?;
-            if callable.kind != boon_typecheck::CheckedCallableKind::External {
+            if callable.kind != boon_checked::CheckedCallableKind::External {
                 return Err(SemanticReactiveError::new(format!(
                     "external call expression {} maps to non-external callable {}",
                     expression.id, callable.id
@@ -5328,7 +5328,7 @@ mod tests {
         SemanticExpressionOrigin, SemanticScope, SemanticSourceRead, SemanticStaticOwner,
         SemanticValueMember, SemanticValueProvenance,
     };
-    use boon_typecheck::{
+    use boon_checked::{
         CheckedCallableKind, CheckedEffectSummary, CheckedEvaluationScope, CheckedExprId,
         CheckedParameterKind, CheckedParameterRequirement, CheckedScopeKind, CheckedSpan, FlowMode,
         LexicalScopeId, ProgramRole, Type,

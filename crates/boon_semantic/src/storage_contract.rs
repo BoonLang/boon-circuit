@@ -16,10 +16,10 @@ use crate::{
     SemanticSourceOrigin, SemanticStateId, SemanticStatementId, SemanticValueId,
     SemanticValueListAuthorityId, SemanticValueOrigin, SemanticValueProvenance, StaticOwnerId,
 };
-use boon_contract::SourceBundleDigestV1;
-use boon_typecheck::{
+use boon_checked::{
     CheckedExternalDeclarationIdentityV1, CheckedProgram, DeclId, FlowMode, FlowType, Type,
 };
+use boon_contract::SourceBundleDigestV1;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -802,7 +802,7 @@ fn append_list_authority_fields(
                     Type::Unknown | Type::UnresolvedShape { .. } | Type::Var(_)
                 ) {
                     data_type = exact.clone();
-                } else if !boon_typecheck::resolved_type_is_assignable_to(exact, &data_type) {
+                } else if !boon_checked::resolved_type_is_assignable_to(exact, &data_type) {
                     return Err(SemanticScopeStorageError::new(format!(
                         "list {} mutation value field `{}` has type {exact:?}, but its authority schema has type {data_type:?}",
                         list.id,
@@ -1062,7 +1062,7 @@ fn ensure_value_authority_parent(
                     resource_only: false,
                     flow_type: FlowType {
                         mode: FlowMode::Continuous,
-                        ty: Type::object(boon_typecheck::ObjectShape {
+                        ty: Type::object(boon_checked::ObjectShape {
                             fields: BTreeMap::new(),
                             field_order: Vec::new(),
                             open: false,
@@ -1135,7 +1135,7 @@ fn ensure_authority_parent(
                     resource_only: false,
                     flow_type: FlowType {
                         mode: FlowMode::Continuous,
-                        ty: Type::object(boon_typecheck::ObjectShape {
+                        ty: Type::object(boon_checked::ObjectShape {
                             fields: BTreeMap::new(),
                             field_order: Vec::new(),
                             open: false,
@@ -4272,8 +4272,8 @@ fn named_value_origin_exposes_flush_boundary(
     if let Some(statement) = origin.checked.statement {
         fn statement_contains_flush(
             checked: &CheckedProgram,
-            statement: boon_typecheck::CheckedStatementId,
-            visited: &mut BTreeSet<boon_typecheck::CheckedStatementId>,
+            statement: boon_checked::CheckedStatementId,
+            visited: &mut BTreeSet<boon_checked::CheckedStatementId>,
         ) -> Result<bool, SemanticScopeStorageError> {
             if !visited.insert(statement) {
                 return Ok(false);
@@ -4376,8 +4376,8 @@ fn named_value_origin_is_structural_container(
         })?;
     Ok(matches!(
         &expression.kind,
-        boon_typecheck::CheckedExpressionKind::Object { .. }
-            | boon_typecheck::CheckedExpressionKind::List { .. }
+        boon_checked::CheckedExpressionKind::Object { .. }
+            | boon_checked::CheckedExpressionKind::List { .. }
     ))
 }
 
@@ -4421,8 +4421,8 @@ fn derive_storage_representation(
         }
         match (storage, contract) {
             (
-                Type::Bytes(boon_typecheck::BytesType::Dynamic),
-                Type::Bytes(boon_typecheck::BytesType::Fixed(fixed_len)),
+                Type::Bytes(boon_checked::BytesType::Dynamic),
+                Type::Bytes(boon_checked::BytesType::Fixed(fixed_len)),
             ) => {
                 refinements.push(SemanticStorageFixedBytesRefinementV1 {
                     path: path.clone(),
@@ -4477,7 +4477,7 @@ fn derive_storage_representation(
     }
 }
 
-fn canonical_object_field_order(shape: &boon_typecheck::ObjectShape) -> Vec<String> {
+fn canonical_object_field_order(shape: &boon_checked::ObjectShape) -> Vec<String> {
     let mut order = Vec::new();
     let mut seen = BTreeSet::new();
     for field in shape.field_order.iter().chain(shape.fields.keys()) {
@@ -5270,7 +5270,7 @@ store: [
                 .iter()
                 .map(|(name, _)| (*name).to_owned())
                 .collect::<Vec<_>>();
-            Type::object(boon_typecheck::ObjectShape {
+            Type::object(boon_checked::ObjectShape {
                 fields: fields
                     .into_iter()
                     .map(|(name, ty)| (name.to_owned(), ty))
@@ -5281,11 +5281,11 @@ store: [
         };
         let dynamic_body = object(vec![(
             "body",
-            Type::Bytes(boon_typecheck::BytesType::Dynamic),
+            Type::Bytes(boon_checked::BytesType::Dynamic),
         )]);
         let fixed_body = object(vec![(
             "body",
-            Type::Bytes(boon_typecheck::BytesType::Fixed(8)),
+            Type::Bytes(boon_checked::BytesType::Fixed(8)),
         )]);
         let dynamic = object(vec![("envelope", Type::List(Box::new(dynamic_body)))]);
         let fixed = object(vec![("envelope", Type::List(Box::new(fixed_body)))]);

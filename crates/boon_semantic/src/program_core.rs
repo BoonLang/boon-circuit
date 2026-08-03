@@ -48,9 +48,9 @@ pub struct CanonicalProgramCoreV1 {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub materializations: Vec<ContextualMaterialization>,
     pub view_bindings: Vec<ViewBinding>,
-    pub expression_types: boon_typecheck::ExprTypeTable,
-    pub function_types: boon_typecheck::FunctionTypeTable,
-    pub named_value_types: boon_typecheck::NamedValueTypeTable,
+    pub expression_types: boon_checked::ExprTypeTable,
+    pub function_types: boon_checked::FunctionTypeTable,
+    pub named_value_types: boon_checked::NamedValueTypeTable,
 }
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -174,9 +174,9 @@ pub struct DistributedValueReference {
     pub canonical_path: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub local_alias_paths: Vec<String>,
-    pub producer_role: boon_typecheck::ProgramRole,
-    pub flow_mode: boon_typecheck::FlowMode,
-    pub value_type: boon_typecheck::Type,
+    pub producer_role: boon_checked::ProgramRole,
+    pub flow_mode: boon_checked::FlowMode,
+    pub value_type: boon_checked::Type,
 }
 
 pub fn distributed_event_source_path(canonical_path: &str) -> String {
@@ -189,9 +189,9 @@ pub struct DistributedCall {
     pub owner: Option<StaticOwnerId>,
     pub occurrence_path: String,
     pub canonical_function: String,
-    pub producer_role: boon_typecheck::ProgramRole,
-    pub result: boon_typecheck::FlowType,
-    pub effect: boon_typecheck::CheckedEffectSummary,
+    pub producer_role: boon_checked::ProgramRole,
+    pub result: boon_checked::FlowType,
+    pub effect: boon_checked::CheckedEffectSummary,
     pub arguments: Vec<DistributedCallArgument>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub invocation_arms: Vec<TriggerOwnedArm>,
@@ -201,7 +201,7 @@ pub struct DistributedCall {
 pub struct DistributedCallArgument {
     pub name: String,
     pub value: ExecutableExprId,
-    pub flow_type: boon_typecheck::FlowType,
+    pub flow_type: boon_checked::FlowType,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -223,7 +223,7 @@ pub struct ProducerFunctionInstance {
 pub struct ProducerFunctionArgument {
     pub name: String,
     pub parameter: ExecutableParameterId,
-    pub flow_type: boon_typecheck::FlowType,
+    pub flow_type: boon_checked::FlowType,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub input_expressions: Vec<ExecutableExprId>,
 }
@@ -583,7 +583,7 @@ pub enum EventCause {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TriggerOwnedArm {
     pub cause: EventCause,
-    pub gate_checked_expr_id: boon_typecheck::CheckedExprId,
+    pub gate_checked_expr_id: boon_checked::CheckedExprId,
     pub gate_expression_id: ExecutableExprId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<StaticOwnerId>,
@@ -594,7 +594,7 @@ pub struct TriggerOwnedArm {
 pub struct StateUpdateArm {
     pub state: StateId,
     pub cause: EventCause,
-    pub gate_checked_expr_id: boon_typecheck::CheckedExprId,
+    pub gate_checked_expr_id: boon_checked::CheckedExprId,
     pub gate_expression_id: ExecutableExprId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<StaticOwnerId>,
@@ -610,7 +610,7 @@ pub struct StateUpdateArm {
 pub struct HostEffectSchedule {
     pub id: usize,
     pub expression: ExecutableExprId,
-    pub checked_expression: boon_typecheck::CheckedExprId,
+    pub checked_expression: boon_checked::CheckedExprId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<StaticOwnerId>,
     pub operation: String,
@@ -665,9 +665,9 @@ pub struct ExecutableCallContextId {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ExecutableExpression {
     pub id: ExecutableExprId,
-    pub checked_expr_id: boon_typecheck::CheckedExprId,
-    pub flow_type: boon_typecheck::FlowType,
-    pub effect: boon_typecheck::CheckedEffectSummary,
+    pub checked_expr_id: boon_checked::CheckedExprId,
+    pub flow_type: boon_checked::FlowType,
+    pub effect: boon_checked::CheckedEffectSummary,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<StaticOwnerId>,
     #[serde(
@@ -721,7 +721,7 @@ pub struct ExecutableValueMember {
 pub enum ExecutableValueOrigin {
     Runtime,
     Source {
-        source: boon_typecheck::CheckedSourceId,
+        source: boon_checked::CheckedSourceId,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         owner: Option<StaticOwnerId>,
     },
@@ -731,7 +731,7 @@ pub enum ExecutableValueOrigin {
         owner: StaticOwnerId,
     },
     State {
-        state: boon_typecheck::CheckedStateId,
+        state: boon_checked::CheckedStateId,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         owner: Option<StaticOwnerId>,
     },
@@ -860,7 +860,7 @@ pub enum PulseEmissionFilter {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ExecutableRecordField {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub declaration: Option<boon_typecheck::DeclId>,
+    pub declaration: Option<boon_checked::DeclId>,
     pub name: String,
     pub value: ExecutableExprId,
     pub spread: bool,
@@ -869,7 +869,7 @@ pub struct ExecutableRecordField {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ExecutableBlockBinding {
     pub id: ExecutableLocalBindingId,
-    pub declaration: boon_typecheck::DeclId,
+    pub declaration: boon_checked::DeclId,
     pub value: ExecutableExprId,
 }
 
@@ -890,7 +890,7 @@ pub struct ExecutableCallArgument {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ExecutableSelectArm {
-    pub pattern: boon_typecheck::CheckedMatchPattern,
+    pub pattern: boon_checked::CheckedMatchPattern,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bindings: Vec<ExecutablePatternBinding>,
     pub output: ExecutableExprId,
@@ -914,15 +914,15 @@ pub enum ExecutableCallableKind {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ExecutableExpressionKind {
     CanonicalRead {
-        target: boon_typecheck::DeclId,
+        target: boon_checked::DeclId,
         path: String,
         projection: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        source: Option<boon_typecheck::CheckedSourceRead>,
+        source: Option<boon_checked::CheckedSourceRead>,
     },
     LocalRead {
         binding: ExecutableLocalBindingId,
-        declaration: boon_typecheck::DeclId,
+        declaration: boon_checked::DeclId,
         projection: Vec<String>,
     },
     ExternalRead {
@@ -933,7 +933,7 @@ pub enum ExecutableExpressionKind {
         projection: Vec<String>,
     },
     Drain {
-        target: boon_typecheck::DeclId,
+        target: boon_checked::DeclId,
         path: String,
         projection: Vec<String>,
     },
@@ -972,7 +972,7 @@ pub enum ExecutableExpressionKind {
     Call {
         callable_kind: ExecutableCallableKind,
         name: String,
-        intrinsic: Option<boon_typecheck::CheckedIntrinsicV1>,
+        intrinsic: Option<boon_checked::CheckedIntrinsicV1>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         instance: Option<usize>,
         arguments: Vec<ExecutableCallArgument>,
@@ -1017,7 +1017,7 @@ pub enum ExecutableExpressionKind {
         right: ExecutableExprId,
     },
     MatchArm {
-        pattern: boon_typecheck::CheckedMatchPattern,
+        pattern: boon_checked::CheckedMatchPattern,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         output: Option<ExecutableExprId>,
     },
@@ -1103,7 +1103,7 @@ pub struct ExecutableProgram {
 pub struct ExecutableSourceDef {
     pub id: ExecutableSourceId,
     pub origin: ExecutableSourceOrigin,
-    pub declaration: boon_typecheck::DeclId,
+    pub declaration: boon_checked::DeclId,
     pub expression: ExecutableExprId,
     pub binding_path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1114,7 +1114,7 @@ pub struct ExecutableSourceDef {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ExecutableSourceOrigin {
     Checked {
-        source: boon_typecheck::CheckedSourceId,
+        source: boon_checked::CheckedSourceId,
     },
     ProducerInvocation {
         function: FunctionId,
@@ -1125,8 +1125,8 @@ pub enum ExecutableSourceOrigin {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ExecutableStateDef {
     pub id: ExecutableStateId,
-    pub checked_state: boon_typecheck::CheckedStateId,
-    pub declaration: boon_typecheck::DeclId,
+    pub checked_state: boon_checked::CheckedStateId,
+    pub declaration: boon_checked::DeclId,
     pub expression: ExecutableExprId,
     pub initial: ExecutableExprId,
     pub binding_path: String,
@@ -1136,7 +1136,7 @@ pub struct ExecutableStateDef {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ExecutableRoot {
-    pub checked_expr_id: boon_typecheck::CheckedExprId,
+    pub checked_expr_id: boon_checked::CheckedExprId,
     pub expression: ExecutableExprId,
 }
 
@@ -1144,7 +1144,7 @@ pub struct ExecutableRoot {
 pub struct ExecutableFunctionParameter {
     pub id: ExecutableParameterId,
     pub name: String,
-    pub flow_type: boon_typecheck::FlowType,
+    pub flow_type: boon_checked::FlowType,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1153,7 +1153,7 @@ pub struct ExecutableFunction {
     pub identity: [u8; 32],
     pub name: String,
     pub parameters: Vec<ExecutableFunctionParameter>,
-    pub result_type: boon_typecheck::FlowType,
+    pub result_type: boon_checked::FlowType,
     pub root: ExecutableExprId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub invocation_source: Option<ExecutableExprId>,
@@ -1164,7 +1164,7 @@ pub struct ExecutableOrdinaryFunction {
     pub id: FunctionId,
     pub name: String,
     pub parameters: Vec<ExecutableFunctionParameter>,
-    pub result_type: boon_typecheck::FlowType,
+    pub result_type: boon_checked::FlowType,
     pub root: ExecutableExprId,
 }
 
@@ -1172,9 +1172,9 @@ pub struct ExecutableOrdinaryFunction {
 pub struct ExecutableStatement {
     pub id: ExecutableStatementId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub declaration: Option<boon_typecheck::DeclId>,
+    pub declaration: Option<boon_checked::DeclId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub flow_type: Option<boon_typecheck::FlowType>,
+    pub flow_type: Option<boon_checked::FlowType>,
     pub kind: ExecutableStatementKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value: Option<ExecutableExprId>,
@@ -1245,7 +1245,7 @@ pub struct ErasedLocalDef {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub row: Option<ErasedRowBinding>,
     pub source: ExecutableExprId,
-    pub item_type: boon_typecheck::Type,
+    pub item_type: boon_checked::Type,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub members: Vec<ErasedLocalMember>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1315,7 +1315,7 @@ pub struct ErasedFieldDef {
     pub id: FieldId,
     pub role: ErasedFieldRole,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub declaration: Option<boon_typecheck::DeclId>,
+    pub declaration: Option<boon_checked::DeclId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub static_owner: Option<StaticOwnerId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1334,7 +1334,7 @@ pub struct ErasedFieldDef {
     pub producer: Option<ExecutableExprId>,
     #[serde(default)]
     pub resource_only: bool,
-    pub flow_type: boon_typecheck::FlowType,
+    pub flow_type: boon_checked::FlowType,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1423,7 +1423,7 @@ pub enum ErasedReadTarget {
     },
     Local {
         binding: ExecutableLocalBindingId,
-        declaration: boon_typecheck::DeclId,
+        declaration: boon_checked::DeclId,
         value: ExecutableExprId,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         projection: Vec<String>,
@@ -1509,12 +1509,12 @@ pub struct ErasedRowSourceProjection {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ErasedBinding {
     pub id: ErasedBindingId,
-    pub declaration: boon_typecheck::DeclId,
+    pub declaration: boon_checked::DeclId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub static_owner: Option<StaticOwnerId>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub owner_ancestry: Vec<StaticOwnerId>,
-    pub flow_type: boon_typecheck::FlowType,
+    pub flow_type: boon_checked::FlowType,
     pub producer: ExecutableExprId,
     pub diagnostic_path: String,
     pub target: ErasedBindingTarget,
@@ -1576,8 +1576,8 @@ pub struct ContextualMaterialization {
     pub target_list_id: Option<ListId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_scope_id: Option<ScopeId>,
-    pub item_type: boon_typecheck::Type,
-    pub result_type: boon_typecheck::Type,
+    pub item_type: boon_checked::Type,
+    pub result_type: boon_checked::Type,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

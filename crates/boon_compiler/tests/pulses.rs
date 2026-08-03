@@ -145,12 +145,9 @@ fn bounded_pulse_stream_contracts_are_public_to_compiler_consumers() {
     for (function, intrinsic) in [
         (
             "Stream/pulses",
-            boon_typecheck::CheckedIntrinsicV1::StreamPulses,
+            boon_checked::CheckedIntrinsicV1::StreamPulses,
         ),
-        (
-            "Stream/skip",
-            boon_typecheck::CheckedIntrinsicV1::StreamSkip,
-        ),
+        ("Stream/skip", boon_checked::CheckedIntrinsicV1::StreamSkip),
     ] {
         let call = checked
             .calls
@@ -158,7 +155,7 @@ fn bounded_pulse_stream_contracts_are_public_to_compiler_consumers() {
             .find(|call| call.function == function)
             .unwrap_or_else(|| panic!("missing checked call for {function}"));
         assert_eq!(call.intrinsic, Some(intrinsic));
-        assert_eq!(call.result.mode, boon_typecheck::FlowMode::PresentOrAbsent);
+        assert_eq!(call.result.mode, boon_checked::FlowMode::PresentOrAbsent);
     }
     let semantic = boon_semantic::elaborate(checked, &[]).expect("semantic pulse stream");
     let verified = boon_verify::verify_explicit_contracts(semantic).expect("verified pulse stream");
@@ -188,7 +185,7 @@ fn bounded_pulse_stream_contracts_are_public_to_compiler_consumers() {
     assert!(matches!(
         ir.executable.expressions[batch.call_expression.as_usize()].kind,
         core::ExecutableExpressionKind::Call {
-            intrinsic: Some(boon_typecheck::CheckedIntrinsicV1::StreamPulses),
+            intrinsic: Some(boon_checked::CheckedIntrinsicV1::StreamPulses),
             ..
         }
     ));
@@ -207,8 +204,8 @@ fn canonical_fibonacci_pulses_cross_the_verified_ir_spine() {
     let semantic = boon_semantic::elaborate(checked.program.expect("checked Fibonacci"), &[])
         .expect("semantic Fibonacci");
     for intrinsic in [
-        boon_typecheck::CheckedIntrinsicV1::StreamPulses,
-        boon_typecheck::CheckedIntrinsicV1::StreamSkip,
+        boon_checked::CheckedIntrinsicV1::StreamPulses,
+        boon_checked::CheckedIntrinsicV1::StreamSkip,
     ] {
         assert!(
             semantic
@@ -257,12 +254,9 @@ fn canonical_fibonacci_pulses_cross_the_verified_ir_spine() {
     for (function, intrinsic) in [
         (
             "Stream/pulses",
-            boon_typecheck::CheckedIntrinsicV1::StreamPulses,
+            boon_checked::CheckedIntrinsicV1::StreamPulses,
         ),
-        (
-            "Stream/skip",
-            boon_typecheck::CheckedIntrinsicV1::StreamSkip,
-        ),
+        ("Stream/skip", boon_checked::CheckedIntrinsicV1::StreamSkip),
     ] {
         assert!(ir.executable.expressions.iter().any(|expression| {
             matches!(

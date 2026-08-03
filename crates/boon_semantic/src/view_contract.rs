@@ -12,8 +12,8 @@ use crate::{
     SemanticResourceGraphV1, SemanticRowBinding, SemanticScopeId, SemanticScopeStorageGraphV1,
     SemanticSourceId, SemanticValueId, SemanticValueOrigin, SemanticViewCaptureTargetV1,
 };
+use boon_checked::{CheckedCallableKind, DeclId, Type};
 use boon_contract::SourceBundleDigestV1;
-use boon_typecheck::{CheckedCallableKind, DeclId, Type};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -978,7 +978,7 @@ fn canonical_view_kind(ty: &Type) -> Option<String> {
         return None;
     };
     match variants.as_slice() {
-        [boon_typecheck::Variant::Tag(tag)] => Some(tag.clone()),
+        [boon_checked::Variant::Tag(tag)] => Some(tag.clone()),
         _ => None,
     }
 }
@@ -1020,7 +1020,7 @@ fn validate_constructor_call(
     let value_parameters = callable_definition
         .parameters
         .iter()
-        .filter(|parameter| parameter.kind == boon_typecheck::CheckedParameterKind::Value)
+        .filter(|parameter| parameter.kind == boon_checked::CheckedParameterKind::Value)
         .collect::<Vec<_>>();
     if callable_kind != SemanticCallableKind::Builtin
         || callable_definition.kind != CheckedCallableKind::Builtin
@@ -1422,7 +1422,7 @@ fn record_style_render_node(expression: &SemanticExpression) -> bool {
     variants.iter().any(|variant| {
         matches!(
             variant,
-            boon_typecheck::Variant::Tag(tag) if matches!(
+            boon_checked::Variant::Tag(tag) if matches!(
                 tag.as_str(),
                 "Document"
                     | "Scene"
@@ -1566,7 +1566,7 @@ fn semantic_view_binding_graph_digest(
 mod tests {
     use super::*;
 
-    fn checked(source: &str) -> boon_typecheck::CheckedProgram {
+    fn checked(source: &str) -> boon_checked::CheckedProgram {
         let parsed = boon_parser::parse_source("view-contract.bn", source).expect("parse");
         let output = boon_typecheck::check_program(&parsed);
         assert!(

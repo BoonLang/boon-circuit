@@ -29,8 +29,8 @@ pub use resource::*;
 pub use storage_contract::*;
 pub use view_contract::*;
 
+use boon_checked::{CheckedExternalDeclarationIdentityV1, CheckedProgram, DeclId};
 use boon_contract::SourceBundleDigestV1;
-use boon_typecheck::{CheckedExternalDeclarationIdentityV1, CheckedProgram, DeclId};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -94,12 +94,12 @@ pub type ResolvedOutGraph = out_net::OutNet<OutPortContractV1>;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct OutPortContractV1 {
-    pub flow_type: boon_typecheck::FlowType,
-    pub resolved_type: boon_typecheck::Type,
+    pub flow_type: boon_checked::FlowType,
+    pub resolved_type: boon_checked::Type,
     pub shape_digest: [u8; 32],
-    pub lexical_scope: boon_typecheck::LexicalScopeId,
-    pub output_scope: boon_typecheck::LexicalScopeId,
-    pub role: boon_typecheck::ProgramRole,
+    pub lexical_scope: boon_checked::LexicalScopeId,
+    pub output_scope: boon_checked::LexicalScopeId,
+    pub role: boon_checked::ProgramRole,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generation_identity: Option<OutGenerationIdentityV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -110,7 +110,7 @@ pub struct OutPortContractV1 {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct OutGenerationIdentityV1 {
     pub owner: StaticOwnerId,
-    pub output_scope: boon_typecheck::LexicalScopeId,
+    pub output_scope: boon_checked::LexicalScopeId,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -121,27 +121,25 @@ pub struct OutCorrelationIdentityV1 {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct OutPresenceCompatibilityV1 {
-    pub mode: boon_typecheck::FlowMode,
+    pub mode: boon_checked::FlowMode,
     pub may_be_present: bool,
     pub may_be_absent: bool,
 }
 
 impl OutPresenceCompatibilityV1 {
-    const fn from_mode(mode: boon_typecheck::FlowMode) -> Self {
+    const fn from_mode(mode: boon_checked::FlowMode) -> Self {
         match mode {
-            boon_typecheck::FlowMode::Continuous => Self {
+            boon_checked::FlowMode::Continuous => Self {
                 mode,
                 may_be_present: true,
                 may_be_absent: false,
             },
-            boon_typecheck::FlowMode::TickPresent | boon_typecheck::FlowMode::PresentOrAbsent => {
-                Self {
-                    mode,
-                    may_be_present: true,
-                    may_be_absent: true,
-                }
-            }
-            boon_typecheck::FlowMode::Absent => Self {
+            boon_checked::FlowMode::TickPresent | boon_checked::FlowMode::PresentOrAbsent => Self {
+                mode,
+                may_be_present: true,
+                may_be_absent: true,
+            },
+            boon_checked::FlowMode::Absent => Self {
                 mode,
                 may_be_present: false,
                 may_be_absent: true,
@@ -173,7 +171,7 @@ pub struct DistributedCallOccurrence {
     pub call_path: Vec<SemanticCallId>,
     pub occurrence_path: String,
     pub canonical_function: String,
-    pub producer_role: boon_typecheck::ProgramRole,
+    pub producer_role: boon_checked::ProgramRole,
     pub mode: ProducerMaterializationMode,
     pub producer_materialization_identity: [u8; 32],
 }
@@ -186,9 +184,9 @@ pub struct DistributedValueOccurrence {
     pub call_path: Vec<SemanticCallId>,
     pub expression: SemanticExprId,
     pub value: SemanticValueId,
-    pub checked_expression: boon_typecheck::CheckedExprId,
-    pub external_identity: boon_typecheck::CheckedExternalDeclarationIdentityV1,
-    pub producer_role: boon_typecheck::ProgramRole,
+    pub checked_expression: boon_checked::CheckedExprId,
+    pub external_identity: boon_checked::CheckedExternalDeclarationIdentityV1,
+    pub producer_role: boon_checked::ProgramRole,
     /// Diagnostic only; excluded from structural occurrence identity.
     pub occurrence_path: String,
     /// Diagnostic only; excluded from structural occurrence identity.
@@ -208,7 +206,7 @@ fn producer_materialization_identity(
     program: &SemanticProgram,
     root: DistributedCallOccurrenceRoot,
     call_path: &[SemanticCallId],
-    external_identity: boon_typecheck::CheckedExternalDeclarationIdentityV1,
+    external_identity: boon_checked::CheckedExternalDeclarationIdentityV1,
     mode: ProducerMaterializationMode,
 ) -> Result<[u8; 32], SemanticError> {
     canonical_hash(
@@ -255,7 +253,7 @@ pub fn distributed_call_occurrences(
             .get(request.callable.as_usize())
             .filter(|callable| {
                 callable.id == request.callable
-                    && callable.kind == boon_typecheck::CheckedCallableKind::User
+                    && callable.kind == boon_checked::CheckedCallableKind::User
                     && callable.name == request.local_function
             })
             .ok_or_else(|| {
@@ -294,7 +292,7 @@ pub fn distributed_call_occurrences(
             let mut call_path = frame.call_path.clone();
             call_path.push(call.id);
             match callable.kind {
-                boon_typecheck::CheckedCallableKind::User => {
+                boon_checked::CheckedCallableKind::User => {
                     if frame.active_callables.contains(&callable.id) {
                         return Err(SemanticError::new(format!(
                             "distributed call analysis encountered recursive callable `{}`",
@@ -311,7 +309,7 @@ pub fn distributed_call_occurrences(
                         active_callables,
                     });
                 }
-                boon_typecheck::CheckedCallableKind::External => {
+                boon_checked::CheckedCallableKind::External => {
                     let Some(producer_role) = distributed_function_role(&call.function) else {
                         continue;
                     };
@@ -322,7 +320,7 @@ pub fn distributed_call_occurrences(
                         ))
                     })?;
                     if external_identity.kind
-                        != boon_typecheck::CheckedExternalDeclarationKind::Callable
+                        != boon_checked::CheckedExternalDeclarationKind::Callable
                         || external_identity.producer_role != producer_role
                         || callable.external_identity != Some(external_identity)
                     {
@@ -407,7 +405,7 @@ pub fn distributed_call_occurrences(
                         )));
                     }
                 }
-                boon_typecheck::CheckedCallableKind::Builtin => {}
+                boon_checked::CheckedCallableKind::Builtin => {}
             }
         }
     }
@@ -489,8 +487,8 @@ fn distributed_value_occurrence_identity(
     program: &SemanticProgram,
     root: DistributedCallOccurrenceRoot,
     call_path: &[SemanticCallId],
-    checked_expression: boon_typecheck::CheckedExprId,
-    external_identity: boon_typecheck::CheckedExternalDeclarationIdentityV1,
+    checked_expression: boon_checked::CheckedExprId,
+    external_identity: boon_checked::CheckedExternalDeclarationIdentityV1,
 ) -> Result<DistributedValueOccurrenceIdentityV1, SemanticError> {
     // Global SemanticExprId/SemanticValueId coordinates are intentionally not
     // part of this cross-round key: canonically inserting an earlier producer
@@ -534,7 +532,7 @@ pub fn distributed_value_occurrences(
                 expression.id
             ))
         })?;
-        if external_identity.kind != boon_typecheck::CheckedExternalDeclarationKind::Value
+        if external_identity.kind != boon_checked::CheckedExternalDeclarationKind::Value
             || external_identity.producer_role == program.role()
         {
             return Err(SemanticError::new(format!(
@@ -634,13 +632,13 @@ pub struct SemanticProgram {
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct BundleSemanticRoleDigestV1 {
-    pub role: boon_typecheck::ProgramRole,
+    pub role: boon_checked::ProgramRole,
     pub semantic_program_digest: SemanticProgramDigestV1,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct BundleProducerMaterializationRequestV1 {
-    pub role: boon_typecheck::ProgramRole,
+    pub role: boon_checked::ProgramRole,
     pub request: ProducerMaterializationRequest,
 }
 
@@ -656,10 +654,10 @@ pub enum BundleSemanticRouteScopeV1 {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BundleSemanticCallArgumentBindingV1 {
     Explicit {
-        checked_value: boon_typecheck::CheckedExprId,
+        checked_value: boon_checked::CheckedExprId,
         expression: SemanticExprId,
         value: SemanticValueId,
-        flow_type: boon_typecheck::FlowType,
+        flow_type: boon_checked::FlowType,
         from_pipe: bool,
     },
     Omitted,
@@ -673,15 +671,15 @@ pub struct BundleSemanticCallArgumentV1 {
     pub consumer_formal: DeclId,
     pub producer_parameter: SemanticParameterId,
     pub producer_formal: DeclId,
-    pub producer_flow_type: boon_typecheck::FlowType,
-    pub requirement: boon_typecheck::CheckedParameterRequirement,
-    pub evaluation_scope: boon_typecheck::CheckedEvaluationScope,
+    pub producer_flow_type: boon_checked::FlowType,
+    pub requirement: boon_checked::CheckedParameterRequirement,
+    pub evaluation_scope: boon_checked::CheckedEvaluationScope,
     pub binding: BundleSemanticCallArgumentBindingV1,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct BundleSemanticCallCrossingV1 {
-    pub consumer_role: boon_typecheck::ProgramRole,
+    pub consumer_role: boon_checked::ProgramRole,
     pub consumer_call: SemanticCallId,
     pub consumer_callable: SemanticCallableId,
     pub consumer_expression: SemanticExprId,
@@ -692,17 +690,17 @@ pub struct BundleSemanticCallCrossingV1 {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<StaticOwnerId>,
     pub consumer_scope: SemanticScopeId,
-    pub producer_role: boon_typecheck::ProgramRole,
+    pub producer_role: boon_checked::ProgramRole,
     pub producer_callable: SemanticCallableId,
-    pub external_identity: boon_typecheck::CheckedExternalDeclarationIdentityV1,
+    pub external_identity: boon_checked::CheckedExternalDeclarationIdentityV1,
     pub producer_materialization_identity: [u8; 32],
     pub root: DistributedCallOccurrenceRoot,
     pub call_path: Vec<SemanticCallId>,
     pub occurrence_path: String,
     pub canonical_function: String,
     pub local_function: String,
-    pub result: boon_typecheck::FlowType,
-    pub effect: boon_typecheck::CheckedEffectSummary,
+    pub result: boon_checked::FlowType,
+    pub effect: boon_checked::CheckedEffectSummary,
     pub arguments: Vec<BundleSemanticCallArgumentV1>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub invocation_arms: Vec<SemanticTriggerOwnedArmV1>,
@@ -721,7 +719,7 @@ pub enum BundleSemanticValueDeliveryV1 {
     },
     RelayedEvent {
         read: SemanticExprId,
-        external_identity: boon_typecheck::CheckedExternalDeclarationIdentityV1,
+        external_identity: boon_checked::CheckedExternalDeclarationIdentityV1,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         payload_projection: Vec<String>,
     },
@@ -733,20 +731,20 @@ pub struct BundleSemanticValueCrossingV1 {
     pub root: DistributedCallOccurrenceRoot,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub call_path: Vec<SemanticCallId>,
-    pub checked_expression: boon_typecheck::CheckedExprId,
+    pub checked_expression: boon_checked::CheckedExprId,
     /// Diagnostic only; excluded from structural occurrence identity.
     pub occurrence_path: String,
-    pub consumer_role: boon_typecheck::ProgramRole,
+    pub consumer_role: boon_checked::ProgramRole,
     pub consumer_expression: SemanticExprId,
     pub consumer_value: SemanticValueId,
     pub consumer_scope: SemanticScopeId,
-    pub producer_role: boon_typecheck::ProgramRole,
+    pub producer_role: boon_checked::ProgramRole,
     pub producer_declaration: DeclId,
     pub producer_expression: SemanticExprId,
     pub producer_value: SemanticValueId,
-    pub external_identity: boon_typecheck::CheckedExternalDeclarationIdentityV1,
+    pub external_identity: boon_checked::CheckedExternalDeclarationIdentityV1,
     pub canonical_path: String,
-    pub flow_type: boon_typecheck::FlowType,
+    pub flow_type: boon_checked::FlowType,
     pub delivery: BundleSemanticValueDeliveryV1,
     pub route_scope: BundleSemanticRouteScopeV1,
 }
@@ -765,7 +763,7 @@ pub struct BundleSemanticProgramV1 {
 }
 
 impl SemanticProgram {
-    pub fn role(&self) -> boon_typecheck::ProgramRole {
+    pub fn role(&self) -> boon_checked::ProgramRole {
         self.checked_program.role
     }
 
@@ -830,7 +828,7 @@ impl SemanticProgram {
             .callables
             .iter()
             .filter(|callable| {
-                callable.kind == boon_typecheck::CheckedCallableKind::User
+                callable.kind == boon_checked::CheckedCallableKind::User
                     && callable.name == local_function
             })
             .map(|callable| callable.id)
@@ -1000,7 +998,7 @@ fn validate_canonical_core_handoff(program: &SemanticProgram) -> Result<(), Sema
             };
             (matches!(
                 expression.flow_type.mode,
-                boon_typecheck::FlowMode::TickPresent | boon_typecheck::FlowMode::PresentOrAbsent
+                boon_checked::FlowMode::TickPresent | boon_checked::FlowMode::PresentOrAbsent
             ) && external_event_identities.contains(identity))
             .then(|| program_core::distributed_event_source_path(canonical_path))
         })
@@ -1123,13 +1121,13 @@ impl BundleSemanticProgramV1 {
         self.digest
     }
 
-    pub fn role_program(&self, role: boon_typecheck::ProgramRole) -> Option<&SemanticProgram> {
+    pub fn role_program(&self, role: boon_checked::ProgramRole) -> Option<&SemanticProgram> {
         self.programs.iter().find(|program| program.role() == role)
     }
 
     pub fn role_programs(
         &self,
-    ) -> impl ExactSizeIterator<Item = (boon_typecheck::ProgramRole, &SemanticProgram)> {
+    ) -> impl ExactSizeIterator<Item = (boon_checked::ProgramRole, &SemanticProgram)> {
         self.programs
             .iter()
             .map(|program| (program.role(), program))
@@ -1232,9 +1230,9 @@ fn canonical_bundle_programs(
         })
     };
     let programs = [
-        take(boon_typecheck::ProgramRole::Client)?,
-        take(boon_typecheck::ProgramRole::Session)?,
-        take(boon_typecheck::ProgramRole::Server)?,
+        take(boon_checked::ProgramRole::Client)?,
+        take(boon_checked::ProgramRole::Session)?,
+        take(boon_checked::ProgramRole::Server)?,
     ];
     if !by_role.is_empty() {
         return Err(SemanticError::new(
@@ -1246,7 +1244,7 @@ fn canonical_bundle_programs(
 
 fn exact_semantic_scope(
     program: &SemanticProgram,
-    checked_scope: boon_typecheck::LexicalScopeId,
+    checked_scope: boon_checked::LexicalScopeId,
     label: &str,
 ) -> Result<SemanticScopeId, SemanticError> {
     let matches = program
@@ -1267,16 +1265,16 @@ fn exact_semantic_scope(
 }
 
 fn bundle_call_route_scope(
-    consumer: boon_typecheck::ProgramRole,
-    producer: boon_typecheck::ProgramRole,
+    consumer: boon_checked::ProgramRole,
+    producer: boon_checked::ProgramRole,
 ) -> Result<BundleSemanticRouteScopeV1, SemanticError> {
     match (consumer, producer) {
-        (boon_typecheck::ProgramRole::Client, boon_typecheck::ProgramRole::Session)
-        | (boon_typecheck::ProgramRole::Session, boon_typecheck::ProgramRole::Client) => {
+        (boon_checked::ProgramRole::Client, boon_checked::ProgramRole::Session)
+        | (boon_checked::ProgramRole::Session, boon_checked::ProgramRole::Client) => {
             Ok(BundleSemanticRouteScopeV1::SessionLocal)
         }
-        (boon_typecheck::ProgramRole::Session, boon_typecheck::ProgramRole::Server)
-        | (boon_typecheck::ProgramRole::Server, boon_typecheck::ProgramRole::Session) => {
+        (boon_checked::ProgramRole::Session, boon_checked::ProgramRole::Server)
+        | (boon_checked::ProgramRole::Server, boon_checked::ProgramRole::Session) => {
             Ok(BundleSemanticRouteScopeV1::OriginScoped)
         }
         _ => Err(SemanticError::new(format!(
@@ -1288,20 +1286,20 @@ fn bundle_call_route_scope(
 }
 
 fn bundle_value_route_scope(
-    consumer: boon_typecheck::ProgramRole,
-    producer: boon_typecheck::ProgramRole,
+    consumer: boon_checked::ProgramRole,
+    producer: boon_checked::ProgramRole,
     delivery: &BundleSemanticValueDeliveryV1,
     producer_origin_scoped: bool,
 ) -> Result<BundleSemanticRouteScopeV1, SemanticError> {
     match (consumer, producer) {
-        (boon_typecheck::ProgramRole::Client, boon_typecheck::ProgramRole::Session)
-        | (boon_typecheck::ProgramRole::Session, boon_typecheck::ProgramRole::Client) => {
+        (boon_checked::ProgramRole::Client, boon_checked::ProgramRole::Session)
+        | (boon_checked::ProgramRole::Session, boon_checked::ProgramRole::Client) => {
             Ok(BundleSemanticRouteScopeV1::SessionLocal)
         }
-        (boon_typecheck::ProgramRole::Server, boon_typecheck::ProgramRole::Session) => {
+        (boon_checked::ProgramRole::Server, boon_checked::ProgramRole::Session) => {
             Ok(BundleSemanticRouteScopeV1::OriginScoped)
         }
-        (boon_typecheck::ProgramRole::Session, boon_typecheck::ProgramRole::Server) => {
+        (boon_checked::ProgramRole::Session, boon_checked::ProgramRole::Server) => {
             Ok(match delivery {
                 BundleSemanticValueDeliveryV1::Event { .. }
                 | BundleSemanticValueDeliveryV1::RelayedEvent { .. } => {
@@ -1417,7 +1415,7 @@ fn exact_bundle_call_arguments(
         || !call_definition.contexts.is_empty()
         || !matches!(
             call_definition.context_binding,
-            boon_typecheck::CheckedContextBinding::None
+            boon_checked::CheckedContextBinding::None
         )
     {
         return Err(SemanticError::new(format!(
@@ -1474,8 +1472,8 @@ fn exact_bundle_call_arguments(
             || consumer_parameter.name != producer_parameter.name
             || consumer_parameter.name != binding.name
             || consumer_parameter.formal != binding.formal
-            || consumer_parameter.kind != boon_typecheck::CheckedParameterKind::Value
-            || producer_parameter.kind != boon_typecheck::CheckedParameterKind::Value
+            || consumer_parameter.kind != boon_checked::CheckedParameterKind::Value
+            || producer_parameter.kind != boon_checked::CheckedParameterKind::Value
             || consumer_parameter.flow_type != producer_parameter.flow_type
             || consumer_parameter.requirement != producer_parameter.requirement
             || consumer_parameter.requirement != binding.requirement
@@ -1555,7 +1553,7 @@ fn exact_bundle_call_arguments(
                             occurrence.occurrence_path, instance
                         ))
                     })?;
-                let instantiated_value_flow_type = boon_typecheck::FlowType {
+                let instantiated_value_flow_type = boon_checked::FlowType {
                     mode: value_flow_type.mode,
                     ty: consumer_program
                         .resolved_out_graph()
@@ -1597,7 +1595,7 @@ fn exact_bundle_call_arguments(
                     || static_entry.is_some()
                     || matches!(
                         consumer_parameter.requirement,
-                        boon_typecheck::CheckedParameterRequirement::Required
+                        boon_checked::CheckedParameterRequirement::Required
                     )
                 {
                     return Err(SemanticError::new(format!(
@@ -1815,7 +1813,7 @@ fn exact_bundle_value_delivery(
             SemanticExpressionKind::ExternalRead {
                 canonical_path,
                 external_identity,
-            } if expression.flow_type.mode != boon_typecheck::FlowMode::Continuous => {
+            } if expression.flow_type.mode != boon_checked::FlowMode::Continuous => {
                 let external_identity = external_identity.ok_or_else(|| {
                     SemanticError::new(format!(
                         "event-valued semantic alias `{canonical_path}` has no sealed declaration identity"
@@ -1870,7 +1868,7 @@ fn exact_bundle_value_delivery(
 fn semantic_expression_depends_on_role(
     program: &SemanticProgram,
     root: SemanticExprId,
-    producer_role: boon_typecheck::ProgramRole,
+    producer_role: boon_checked::ProgramRole,
 ) -> Result<bool, SemanticError> {
     let execution = program.execution_graph();
     let mut pending = vec![root];
@@ -2174,7 +2172,7 @@ fn derive_bundle_call_closure(
                     occurrence.occurrence_path
                 ))
             })?;
-            if external_identity.kind != boon_typecheck::CheckedExternalDeclarationKind::Callable
+            if external_identity.kind != boon_checked::CheckedExternalDeclarationKind::Callable
                 || external_identity.producer_role != occurrence.producer_role
                 || external_identity.producer_source_bundle_digest_v1
                     != producer.source_bundle_digest_v1()
@@ -2201,7 +2199,7 @@ fn derive_bundle_call_closure(
                 .id;
             let producer_callable_definition =
                 &producer.execution_graph().callables[producer_callable.as_usize()];
-            if producer_callable_definition.kind != boon_typecheck::CheckedCallableKind::User
+            if producer_callable_definition.kind != boon_checked::CheckedCallableKind::User
                 || producer_callable_definition.name != local_function
             {
                 return Err(SemanticError::new(format!(
@@ -2220,7 +2218,7 @@ fn derive_bundle_call_closure(
                         occurrence.occurrence_path, occurrence.callable
                     ))
                 })?;
-            if consumer_callable_definition.kind != boon_typecheck::CheckedCallableKind::External
+            if consumer_callable_definition.kind != boon_checked::CheckedCallableKind::External
                 || consumer_callable_definition.external_identity != Some(external_identity)
             {
                 return Err(SemanticError::new(format!(
@@ -2356,7 +2354,7 @@ fn derive_bundle_call_closure(
                 })?;
             let canonical_path = occurrence.canonical_path.clone();
             let external_identity = occurrence.external_identity;
-            if external_identity.kind != boon_typecheck::CheckedExternalDeclarationKind::Value
+            if external_identity.kind != boon_checked::CheckedExternalDeclarationKind::Value
                 || external_identity.producer_role != occurrence.producer_role
             {
                 return Err(SemanticError::new(format!(
@@ -2441,12 +2439,12 @@ fn derive_bundle_call_closure(
                 &format!("external value read `{canonical_path}`"),
             )?;
             let delivery = exact_bundle_value_delivery(producer, producer_expression)?;
-            let producer_origin_scoped = producer.role() == boon_typecheck::ProgramRole::Server
+            let producer_origin_scoped = producer.role() == boon_checked::ProgramRole::Server
                 && matches!(delivery, BundleSemanticValueDeliveryV1::Current)
                 && semantic_expression_depends_on_role(
                     producer,
                     producer_expression,
-                    boon_typecheck::ProgramRole::Session,
+                    boon_checked::ProgramRole::Session,
                 )?;
             let route_scope = bundle_value_route_scope(
                 consumer.role(),
@@ -2633,7 +2631,7 @@ pub fn elaborate_with_external_event_identities(
             &checked_program,
             producer_roots,
             |call, _, entry| provisional_out_port_contract(&checked_program, call, entry),
-            |kind, _, _, _, _| kind == boon_typecheck::CheckedCallableKind::Builtin,
+            |kind, _, _, _, _| kind == boon_checked::CheckedCallableKind::Builtin,
         )
     )?;
     if out_net.has_errors() {
@@ -2865,13 +2863,13 @@ pub fn elaborate_with_external_event_identities(
 
 fn provisional_out_port_contract(
     program: &CheckedProgram,
-    call: &boon_typecheck::CheckedCall,
-    entry: &boon_typecheck::CheckedCallEntry,
+    call: &boon_checked::CheckedCall,
+    entry: &boon_checked::CheckedCallEntry,
 ) -> Result<OutPortContractV1, SemanticError> {
     let formal = match entry {
-        boon_typecheck::CheckedCallEntry::Input { formal, .. }
-        | boon_typecheck::CheckedCallEntry::FreshOut { formal, .. }
-        | boon_typecheck::CheckedCallEntry::ForwardOut { formal, .. } => *formal,
+        boon_checked::CheckedCallEntry::Input { formal, .. }
+        | boon_checked::CheckedCallEntry::FreshOut { formal, .. }
+        | boon_checked::CheckedCallEntry::ForwardOut { formal, .. } => *formal,
     };
     let callable = program
         .callables
@@ -2893,9 +2891,9 @@ fn provisional_out_port_contract(
                 call.id.0, formal.0
             ))
         })?;
-    let flow_type = boon_typecheck::FlowType {
+    let flow_type = boon_checked::FlowType {
         mode: parameter.flow_type.mode,
-        ty: boon_typecheck::apply_checked_type_substitutions(
+        ty: boon_checked::apply_checked_type_substitutions(
             &parameter.flow_type.ty,
             &call.type_substitutions,
         ),
@@ -2912,8 +2910,8 @@ fn provisional_out_port_contract(
             ))
         })?;
     let output_scope = match entry {
-        boon_typecheck::CheckedCallEntry::FreshOut { scope_id, .. } => *scope_id,
-        boon_typecheck::CheckedCallEntry::ForwardOut { target, .. } => {
+        boon_checked::CheckedCallEntry::FreshOut { scope_id, .. } => *scope_id,
+        boon_checked::CheckedCallEntry::ForwardOut { target, .. } => {
             let declaration = program
                 .declarations
                 .iter()
@@ -2931,7 +2929,7 @@ fn provisional_out_port_contract(
                 ))
             })?
         }
-        boon_typecheck::CheckedCallEntry::Input { .. } => lexical_scope,
+        boon_checked::CheckedCallEntry::Input { .. } => lexical_scope,
     };
     Ok(OutPortContractV1 {
         resolved_type: flow_type.ty.clone(),
@@ -3171,18 +3169,16 @@ fn resolve_out_contracts(
         }
         let substitutions = substitutions
             .into_iter()
-            .map(|(variable, value)| boon_typecheck::CheckedTypeSubstitution { variable, value })
+            .map(|(variable, value)| boon_checked::CheckedTypeSubstitution { variable, value })
             .collect::<Vec<_>>();
-        let resolved_type = boon_typecheck::apply_checked_type_substitutions(
-            &parameter.flow_type.ty,
-            &substitutions,
-        );
+        let resolved_type =
+            boon_checked::apply_checked_type_substitutions(&parameter.flow_type.ty, &substitutions);
         if !out_contract_type_is_resolved(&resolved_type) {
             return Err(SemanticError::new(format!(
                 "OUT port {port_index} has unresolved type {resolved_type:?}"
             )));
         }
-        let flow_type = boon_typecheck::FlowType {
+        let flow_type = boon_checked::FlowType {
             mode: parameter.flow_type.mode,
             ty: resolved_type.clone(),
         };
@@ -3241,9 +3237,9 @@ fn concrete_checked_expression_type(
     program: &CheckedProgram,
     graph: &ResolvedOutGraph,
     scoped: ScopedCheckedExpr,
-    active_substitutions: &BTreeMap<boon_typecheck::TypeVar, boon_typecheck::Type>,
-    visiting: &mut BTreeSet<(boon_typecheck::CheckedExprId, Option<OutCallInstanceId>)>,
-) -> Result<boon_typecheck::Type, SemanticError> {
+    active_substitutions: &BTreeMap<boon_checked::TypeVar, boon_checked::Type>,
+    visiting: &mut BTreeSet<(boon_checked::CheckedExprId, Option<OutCallInstanceId>)>,
+) -> Result<boon_checked::Type, SemanticError> {
     let key = (scoped.expression, scoped.frame);
     if !visiting.insert(key) {
         return Err(SemanticError::new(format!(
@@ -3263,7 +3259,7 @@ fn concrete_checked_expression_type(
                 ))
             })?;
         match &expression.kind {
-            boon_typecheck::CheckedExpressionKind::Call { call } => {
+            boon_checked::CheckedExpressionKind::Call { call } => {
                 let instance_id = graph
                     .call_instance_for_checked_call(*call, scoped.frame)
                     .ok_or_else(|| {
@@ -3414,7 +3410,7 @@ fn concrete_checked_expression_type(
                 if out_contract_type_is_resolved(&result) {
                     return Ok(result);
                 }
-                if callable.kind == boon_typecheck::CheckedCallableKind::User
+                if callable.kind == boon_checked::CheckedCallableKind::User
                     && let Some(result_expression) = callable.result_expression
                 {
                     return concrete_checked_expression_type(
@@ -3432,15 +3428,15 @@ fn concrete_checked_expression_type(
                 }
                 Ok(result)
             }
-            boon_typecheck::CheckedExpressionKind::Block {
+            boon_checked::CheckedExpressionKind::Block {
                 result: Some(result),
                 ..
             }
-            | boon_typecheck::CheckedExpressionKind::MatchArm {
+            | boon_checked::CheckedExpressionKind::MatchArm {
                 output: Some(result),
                 ..
             }
-            | boon_typecheck::CheckedExpressionKind::Then {
+            | boon_checked::CheckedExpressionKind::Then {
                 output: Some(result),
                 ..
             } => concrete_checked_expression_type(
@@ -3455,7 +3451,7 @@ fn concrete_checked_expression_type(
                 active_substitutions,
                 visiting,
             ),
-            boon_typecheck::CheckedExpressionKind::Object { fields } => {
+            boon_checked::CheckedExpressionKind::Object { fields } => {
                 let mut concrete_fields = BTreeMap::new();
                 let mut field_order = Vec::new();
                 let mut open = false;
@@ -3473,7 +3469,7 @@ fn concrete_checked_expression_type(
                         visiting,
                     )?;
                     if field.spread {
-                        let boon_typecheck::Type::Object(shape) = field_type else {
+                        let boon_checked::Type::Object(shape) = field_type else {
                             return Err(SemanticError::new(format!(
                                 "OBJECT expression {} spread field `{}` has non-object concrete type {field_type:?}",
                                 scoped.expression.0, field.name
@@ -3496,13 +3492,13 @@ fn concrete_checked_expression_type(
                         concrete_fields.insert(field.name.clone(), field_type);
                     }
                 }
-                Ok(boon_typecheck::Type::object(boon_typecheck::ObjectShape {
+                Ok(boon_checked::Type::object(boon_checked::ObjectShape {
                     fields: concrete_fields,
                     field_order,
                     open,
                 }))
             }
-            boon_typecheck::CheckedExpressionKind::TaggedObject { tag, fields } => {
+            boon_checked::CheckedExpressionKind::TaggedObject { tag, fields } => {
                 let mut concrete_fields = BTreeMap::new();
                 let mut field_order = Vec::new();
                 let mut open = false;
@@ -3520,7 +3516,7 @@ fn concrete_checked_expression_type(
                         visiting,
                     )?;
                     if field.spread {
-                        let boon_typecheck::Type::Object(shape) = field_type else {
+                        let boon_checked::Type::Object(shape) = field_type else {
                             return Err(SemanticError::new(format!(
                                 "tagged OBJECT expression {} spread field `{}` has non-object concrete type {field_type:?}",
                                 scoped.expression.0, field.name
@@ -3543,10 +3539,10 @@ fn concrete_checked_expression_type(
                         concrete_fields.insert(field.name.clone(), field_type);
                     }
                 }
-                Ok(boon_typecheck::Type::VariantSet(
-                    vec![boon_typecheck::Variant::Tagged {
+                Ok(boon_checked::Type::VariantSet(
+                    vec![boon_checked::Variant::Tagged {
                         tag: tag.clone(),
-                        fields: boon_typecheck::ObjectShape {
+                        fields: boon_checked::ObjectShape {
                             fields: concrete_fields,
                             field_order,
                             open,
@@ -3556,8 +3552,8 @@ fn concrete_checked_expression_type(
                     .into(),
                 ))
             }
-            boon_typecheck::CheckedExpressionKind::When { arms, .. }
-            | boon_typecheck::CheckedExpressionKind::While { arms, .. } => {
+            boon_checked::CheckedExpressionKind::When { arms, .. }
+            | boon_checked::CheckedExpressionKind::While { arms, .. } => {
                 concrete_checked_branch_expression_type(
                     program,
                     graph,
@@ -3567,7 +3563,7 @@ fn concrete_checked_expression_type(
                     visiting,
                 )
             }
-            boon_typecheck::CheckedExpressionKind::Latest { branches } => {
+            boon_checked::CheckedExpressionKind::Latest { branches } => {
                 concrete_checked_branch_expression_type(
                     program,
                     graph,
@@ -3577,7 +3573,7 @@ fn concrete_checked_expression_type(
                     visiting,
                 )
             }
-            boon_typecheck::CheckedExpressionKind::Passed { projection, .. } => {
+            boon_checked::CheckedExpressionKind::Passed { projection, .. } => {
                 let frame = scoped.frame.ok_or_else(|| {
                     SemanticError::new(format!(
                         "PASSED expression {} has no concrete OUT call frame",
@@ -3614,7 +3610,7 @@ fn concrete_checked_expression_type(
                     ))
                 })
             }
-            boon_typecheck::CheckedExpressionKind::Read {
+            boon_checked::CheckedExpressionKind::Read {
                 target, projection, ..
             } => {
                 if let Some(payload_type) = exact_checked_resource_projection_type(
@@ -3648,14 +3644,12 @@ fn concrete_checked_expression_type(
                 );
                 let expression_substitutions = expression_substitutions
                     .into_iter()
-                    .map(
-                        |(variable, value)| boon_typecheck::CheckedTypeSubstitution {
-                            variable,
-                            value,
-                        },
-                    )
+                    .map(|(variable, value)| boon_checked::CheckedTypeSubstitution {
+                        variable,
+                        value,
+                    })
                     .collect::<Vec<_>>();
-                let expression_actual = boon_typecheck::apply_checked_type_substitutions(
+                let expression_actual = boon_checked::apply_checked_type_substitutions(
                     &expression.flow_type.ty,
                     &expression_substitutions,
                 );
@@ -3909,14 +3903,12 @@ fn concrete_checked_expression_type(
                 merge_out_contract_substitutions(&mut substitutions, frame_type_environment);
                 let substitutions = substitutions
                     .into_iter()
-                    .map(
-                        |(variable, value)| boon_typecheck::CheckedTypeSubstitution {
-                            variable,
-                            value,
-                        },
-                    )
+                    .map(|(variable, value)| boon_checked::CheckedTypeSubstitution {
+                        variable,
+                        value,
+                    })
                     .collect::<Vec<_>>();
-                Ok(boon_typecheck::apply_checked_type_substitutions(
+                Ok(boon_checked::apply_checked_type_substitutions(
                     &expression.flow_type.ty,
                     &substitutions,
                 ))
@@ -3931,10 +3923,10 @@ fn concrete_checked_branch_expression_type(
     program: &CheckedProgram,
     graph: &ResolvedOutGraph,
     scoped: ScopedCheckedExpr,
-    branches: &[boon_typecheck::CheckedExprId],
-    active_substitutions: &BTreeMap<boon_typecheck::TypeVar, boon_typecheck::Type>,
-    visiting: &mut BTreeSet<(boon_typecheck::CheckedExprId, Option<OutCallInstanceId>)>,
-) -> Result<boon_typecheck::Type, SemanticError> {
+    branches: &[boon_checked::CheckedExprId],
+    active_substitutions: &BTreeMap<boon_checked::TypeVar, boon_checked::Type>,
+    visiting: &mut BTreeSet<(boon_checked::CheckedExprId, Option<OutCallInstanceId>)>,
+) -> Result<boon_checked::Type, SemanticError> {
     let expression = program
         .expressions
         .iter()
@@ -4020,9 +4012,9 @@ fn concrete_checked_branch_expression_type(
 
 fn exact_checked_resource_projection_type(
     program: &CheckedProgram,
-    expression: boon_typecheck::CheckedExprId,
-    substitutions: &BTreeMap<boon_typecheck::TypeVar, boon_typecheck::Type>,
-) -> Result<Option<boon_typecheck::Type>, SemanticError> {
+    expression: boon_checked::CheckedExprId,
+    substitutions: &BTreeMap<boon_checked::TypeVar, boon_checked::Type>,
+) -> Result<Option<boon_checked::Type>, SemanticError> {
     let requirements = program
         .resource_projection_requirements
         .iter()
@@ -4114,27 +4106,25 @@ fn exact_checked_resource_projection_type(
 }
 
 fn apply_out_contract_substitutions(
-    ty: &boon_typecheck::Type,
-    substitutions: &BTreeMap<boon_typecheck::TypeVar, boon_typecheck::Type>,
-) -> boon_typecheck::Type {
+    ty: &boon_checked::Type,
+    substitutions: &BTreeMap<boon_checked::TypeVar, boon_checked::Type>,
+) -> boon_checked::Type {
     let substitutions = substitutions
         .iter()
-        .map(
-            |(variable, value)| boon_typecheck::CheckedTypeSubstitution {
-                variable: *variable,
-                value: value.clone(),
-            },
-        )
+        .map(|(variable, value)| boon_checked::CheckedTypeSubstitution {
+            variable: *variable,
+            value: value.clone(),
+        })
         .collect::<Vec<_>>();
-    boon_typecheck::apply_checked_type_substitutions(ty, &substitutions)
+    boon_checked::apply_checked_type_substitutions(ty, &substitutions)
 }
 
 fn project_out_contract_type(
-    mut ty: boon_typecheck::Type,
+    mut ty: boon_checked::Type,
     fields: &[String],
-) -> Result<boon_typecheck::Type, SemanticError> {
+) -> Result<boon_checked::Type, SemanticError> {
     for field in fields {
-        let boon_typecheck::Type::Object(shape) = ty else {
+        let boon_checked::Type::Object(shape) = ty else {
             return Err(SemanticError::new(format!(
                 "OUT type projection `{field}` requires an object, got {ty:?}"
             )));
@@ -4149,63 +4139,61 @@ fn project_out_contract_type(
     Ok(ty)
 }
 
-fn out_contract_type_contains_empty_list_placeholder(ty: &boon_typecheck::Type) -> bool {
+fn out_contract_type_contains_empty_list_placeholder(ty: &boon_checked::Type) -> bool {
     match ty {
-        boon_typecheck::Type::UnresolvedShape { reason } => reason == "empty list item",
-        boon_typecheck::Type::List(item) => out_contract_type_contains_empty_list_placeholder(item),
-        boon_typecheck::Type::Map { key, value } => {
+        boon_checked::Type::UnresolvedShape { reason } => reason == "empty list item",
+        boon_checked::Type::List(item) => out_contract_type_contains_empty_list_placeholder(item),
+        boon_checked::Type::Map { key, value } => {
             out_contract_type_contains_empty_list_placeholder(key)
                 || out_contract_type_contains_empty_list_placeholder(value)
         }
-        boon_typecheck::Type::Set(item) => out_contract_type_contains_empty_list_placeholder(item),
-        boon_typecheck::Type::Function { args, result } => {
+        boon_checked::Type::Set(item) => out_contract_type_contains_empty_list_placeholder(item),
+        boon_checked::Type::Function { args, result } => {
             args.iter()
                 .any(out_contract_type_contains_empty_list_placeholder)
                 || out_contract_type_contains_empty_list_placeholder(&result.ty)
         }
-        boon_typecheck::Type::Object(shape) => shape
+        boon_checked::Type::Object(shape) => shape
             .fields
             .values()
             .any(out_contract_type_contains_empty_list_placeholder),
-        boon_typecheck::Type::VariantSet(variants) => {
-            variants.iter().any(|variant| match variant {
-                boon_typecheck::Variant::Tag(_) => false,
-                boon_typecheck::Variant::Tagged { fields, .. } => fields
-                    .fields
-                    .values()
-                    .any(out_contract_type_contains_empty_list_placeholder),
-            })
-        }
-        boon_typecheck::Type::Union(members) => members
+        boon_checked::Type::VariantSet(variants) => variants.iter().any(|variant| match variant {
+            boon_checked::Variant::Tag(_) => false,
+            boon_checked::Variant::Tagged { fields, .. } => fields
+                .fields
+                .values()
+                .any(out_contract_type_contains_empty_list_placeholder),
+        }),
+        boon_checked::Type::Union(members) => members
             .iter()
             .any(out_contract_type_contains_empty_list_placeholder),
-        boon_typecheck::Type::Var(_)
-        | boon_typecheck::Type::Unknown
-        | boon_typecheck::Type::Bits { .. }
-        | boon_typecheck::Type::Text
-        | boon_typecheck::Type::Number
-        | boon_typecheck::Type::Bytes(_)
-        | boon_typecheck::Type::Absent
-        | boon_typecheck::Type::RenderContract => false,
+        boon_checked::Type::Var(_)
+        | boon_checked::Type::Unknown
+        | boon_checked::Type::Bits { .. }
+        | boon_checked::Type::Text
+        | boon_checked::Type::Number
+        | boon_checked::Type::Bytes(_)
+        | boon_checked::Type::Absent
+        | boon_checked::Type::RenderContract => false,
     }
 }
 
 fn contextualize_empty_list_placeholders(
-    actual: &boon_typecheck::Type,
-    expected: &boon_typecheck::Type,
-) -> Option<boon_typecheck::Type> {
+    actual: &boon_checked::Type,
+    expected: &boon_checked::Type,
+) -> Option<boon_checked::Type> {
     match (actual, expected) {
-        (boon_typecheck::Type::UnresolvedShape { reason }, expected)
+        (boon_checked::Type::UnresolvedShape { reason }, expected)
             if reason == "empty list item" && out_contract_type_is_resolved(expected) =>
         {
             Some(expected.clone())
         }
-        (boon_typecheck::Type::List(actual), boon_typecheck::Type::List(expected)) => {
-            Some(boon_typecheck::Type::List(Box::new(
+        (boon_checked::Type::List(actual), boon_checked::Type::List(expected)) => {
+            Some(boon_checked::Type::List(Box::new(
                 contextualize_empty_list_placeholders(actual, expected)?,
             )))
         }
-        (boon_typecheck::Type::Object(actual), boon_typecheck::Type::Object(expected)) => {
+        (boon_checked::Type::Object(actual), boon_checked::Type::Object(expected)) => {
             let mut contextual = actual.as_ref().clone();
             for (name, actual_field) in &actual.fields {
                 if !out_contract_type_contains_empty_list_placeholder(actual_field) {
@@ -4217,32 +4205,32 @@ fn contextualize_empty_list_placeholders(
                     contextualize_empty_list_placeholders(actual_field, expected_field)?,
                 );
             }
-            Some(boon_typecheck::Type::object(contextual))
+            Some(boon_checked::Type::object(contextual))
         }
         (
-            boon_typecheck::Type::Function {
+            boon_checked::Type::Function {
                 args: actual_args,
                 result: actual_result,
             },
-            boon_typecheck::Type::Function {
+            boon_checked::Type::Function {
                 args: expected_args,
                 result: expected_result,
             },
-        ) if actual_args.len() == expected_args.len() => Some(boon_typecheck::Type::Function {
+        ) if actual_args.len() == expected_args.len() => Some(boon_checked::Type::Function {
             args: actual_args
                 .iter()
                 .zip(expected_args)
                 .map(|(actual, expected)| contextualize_empty_list_placeholders(actual, expected))
                 .collect::<Option<Vec<_>>>()?,
-            result: Box::new(boon_typecheck::FlowType {
+            result: Box::new(boon_checked::FlowType {
                 mode: actual_result.mode,
                 ty: contextualize_empty_list_placeholders(&actual_result.ty, &expected_result.ty)?,
             }),
         }),
-        (boon_typecheck::Type::Union(actual), boon_typecheck::Type::Union(expected))
+        (boon_checked::Type::Union(actual), boon_checked::Type::Union(expected))
             if actual.len() == expected.len() =>
         {
-            Some(boon_typecheck::Type::Union(
+            Some(boon_checked::Type::Union(
                 actual
                     .iter()
                     .zip(expected)
@@ -4260,9 +4248,9 @@ fn contextualize_empty_list_placeholders(
 }
 
 fn unify_out_contract_type(
-    pattern: &boon_typecheck::Type,
-    actual: &boon_typecheck::Type,
-    substitutions: &mut BTreeMap<boon_typecheck::TypeVar, boon_typecheck::Type>,
+    pattern: &boon_checked::Type,
+    actual: &boon_checked::Type,
+    substitutions: &mut BTreeMap<boon_checked::TypeVar, boon_checked::Type>,
 ) -> Result<(), SemanticError> {
     if !out_contract_type_is_resolved(actual) {
         return Err(SemanticError::new(format!(
@@ -4270,12 +4258,12 @@ fn unify_out_contract_type(
         )));
     }
     match (pattern, actual) {
-        (boon_typecheck::Type::Var(variable), actual) => match substitutions.get(variable) {
+        (boon_checked::Type::Var(variable), actual) => match substitutions.get(variable) {
             Some(existing) if out_contract_type_is_resolved(existing) && existing != actual => {
-                if boon_typecheck::resolved_type_is_assignable_to(actual, existing) {
+                if boon_checked::resolved_type_is_assignable_to(actual, existing) {
                     // Preserve the already-known wider bound. The new
                     // occurrence is a valid specialization of it.
-                } else if boon_typecheck::resolved_type_is_assignable_to(existing, actual) {
+                } else if boon_checked::resolved_type_is_assignable_to(existing, actual) {
                     // Input order must not decide a generic OUT contract. If
                     // an earlier occurrence installed a narrower closed
                     // variant/object and a later occurrence supplies its
@@ -4292,10 +4280,10 @@ fn unify_out_contract_type(
                 substitutions.insert(*variable, actual.clone());
             }
         },
-        (boon_typecheck::Type::List(pattern), boon_typecheck::Type::List(actual)) => {
+        (boon_checked::Type::List(pattern), boon_checked::Type::List(actual)) => {
             unify_out_contract_type(pattern, actual, substitutions)?;
         }
-        (boon_typecheck::Type::Object(pattern), boon_typecheck::Type::Object(actual)) => {
+        (boon_checked::Type::Object(pattern), boon_checked::Type::Object(actual)) => {
             for (name, pattern) in &pattern.fields {
                 let Some(actual_field) = actual.fields.get(name) else {
                     if actual.open {
@@ -4309,25 +4297,25 @@ fn unify_out_contract_type(
             }
         }
         (
-            boon_typecheck::Type::VariantSet(pattern_variants),
-            boon_typecheck::Type::VariantSet(actual_variants),
+            boon_checked::Type::VariantSet(pattern_variants),
+            boon_checked::Type::VariantSet(actual_variants),
         ) => {
             for actual_variant in actual_variants {
                 let matching = pattern_variants.iter().find(|pattern_variant| {
                     matches!(
                         (pattern_variant, actual_variant),
                         (
-                            boon_typecheck::Variant::Tag(pattern),
-                            boon_typecheck::Variant::Tag(actual)
+                            boon_checked::Variant::Tag(pattern),
+                            boon_checked::Variant::Tag(actual)
                         ) if pattern == actual
                     ) || matches!(
                         (pattern_variant, actual_variant),
                         (
-                            boon_typecheck::Variant::Tagged {
+                            boon_checked::Variant::Tagged {
                                 tag: pattern,
                                 ..
                             },
-                            boon_typecheck::Variant::Tagged { tag: actual, .. }
+                            boon_checked::Variant::Tagged { tag: actual, .. }
                         ) if pattern == actual
                     )
                 });
@@ -4337,11 +4325,11 @@ fn unify_out_contract_type(
                     )));
                 };
                 let (
-                    boon_typecheck::Variant::Tagged {
+                    boon_checked::Variant::Tagged {
                         fields: pattern_fields,
                         ..
                     },
-                    boon_typecheck::Variant::Tagged {
+                    boon_checked::Variant::Tagged {
                         fields: actual_fields,
                         ..
                     },
@@ -4363,15 +4351,15 @@ fn unify_out_contract_type(
             }
         }
         (
-            boon_typecheck::Type::Bytes(boon_typecheck::BytesType::Dynamic),
-            boon_typecheck::Type::Bytes(_),
+            boon_checked::Type::Bytes(boon_checked::BytesType::Dynamic),
+            boon_checked::Type::Bytes(_),
         ) => {}
         (
-            boon_typecheck::Type::Function {
+            boon_checked::Type::Function {
                 args: pattern_args,
                 result: pattern_result,
             },
-            boon_typecheck::Type::Function {
+            boon_checked::Type::Function {
                 args: actual_args,
                 result: actual_result,
             },
@@ -4405,8 +4393,8 @@ fn unify_out_contract_type(
 }
 
 fn merge_out_contract_substitutions(
-    substitutions: &mut BTreeMap<boon_typecheck::TypeVar, boon_typecheck::Type>,
-    additions: impl IntoIterator<Item = (boon_typecheck::TypeVar, boon_typecheck::Type)>,
+    substitutions: &mut BTreeMap<boon_checked::TypeVar, boon_checked::Type>,
+    additions: impl IntoIterator<Item = (boon_checked::TypeVar, boon_checked::Type)>,
 ) {
     for (variable, value) in additions {
         match substitutions.get(&variable) {
@@ -4456,7 +4444,7 @@ fn validate_contextual_bindings(program: &CheckedProgram) -> Result<(), Semantic
                 formal.id.0, formal.callable.0
             ))
         })?;
-        if callable.kind != boon_typecheck::CheckedCallableKind::User {
+        if callable.kind != boon_checked::CheckedCallableKind::User {
             return Err(SemanticError::new(format!(
                 "non-user callable {} owns contextual formal {}",
                 formal.callable.0, formal.id.0
@@ -4509,7 +4497,7 @@ fn validate_contextual_bindings(program: &CheckedProgram) -> Result<(), Semantic
         })?;
         let target_formal = callable.context_formal;
         match call.context_binding {
-            boon_typecheck::CheckedContextBinding::Explicit { value, .. } => {
+            boon_checked::CheckedContextBinding::Explicit { value, .. } => {
                 if target_formal.is_none() {
                     return Err(SemanticError::new(format!(
                         "checked call {} has explicit PASS context for noncontextual callable {}",
@@ -4523,7 +4511,7 @@ fn validate_contextual_bindings(program: &CheckedProgram) -> Result<(), Semantic
                     )));
                 }
             }
-            boon_typecheck::CheckedContextBinding::Inherited { formal } => {
+            boon_checked::CheckedContextBinding::Inherited { formal } => {
                 if target_formal.is_none() {
                     return Err(SemanticError::new(format!(
                         "checked call {} inherits PASS context for noncontextual callable {}",
@@ -4553,7 +4541,7 @@ fn validate_contextual_bindings(program: &CheckedProgram) -> Result<(), Semantic
                     )));
                 }
             }
-            boon_typecheck::CheckedContextBinding::None => {
+            boon_checked::CheckedContextBinding::None => {
                 if let Some(formal) = target_formal {
                     return Err(SemanticError::new(format!(
                         "checked call {} to contextual callable {} has no explicit or inherited binding for formal {}",
@@ -4647,7 +4635,7 @@ fn validate_out_contracts(
                     .any(|scope| scope.id == contract.lexical_scope)
                 || !program.scopes.iter().any(|scope| {
                     scope.id == contract.output_scope
-                        && scope.kind == boon_typecheck::CheckedScopeKind::RepeatedOutput
+                        && scope.kind == boon_checked::CheckedScopeKind::RepeatedOutput
                 })
             {
                 return Err(out_contract_mismatch(net.id, *port_id, "scope"));
@@ -4684,40 +4672,38 @@ fn out_contract_mismatch(
     ))
 }
 
-fn out_contract_type_is_resolved(ty: &boon_typecheck::Type) -> bool {
+fn out_contract_type_is_resolved(ty: &boon_checked::Type) -> bool {
     match ty {
-        boon_typecheck::Type::Var(_)
-        | boon_typecheck::Type::Unknown
-        | boon_typecheck::Type::UnresolvedShape { .. } => false,
-        boon_typecheck::Type::List(item) => out_contract_type_is_resolved(item),
-        boon_typecheck::Type::Map { key, value } => {
+        boon_checked::Type::Var(_)
+        | boon_checked::Type::Unknown
+        | boon_checked::Type::UnresolvedShape { .. } => false,
+        boon_checked::Type::List(item) => out_contract_type_is_resolved(item),
+        boon_checked::Type::Map { key, value } => {
             out_contract_type_is_resolved(key) && out_contract_type_is_resolved(value)
         }
-        boon_typecheck::Type::Set(item) => out_contract_type_is_resolved(item),
-        boon_typecheck::Type::Union(members) => {
+        boon_checked::Type::Set(item) => out_contract_type_is_resolved(item),
+        boon_checked::Type::Union(members) => {
             !members.is_empty() && members.iter().all(out_contract_type_is_resolved)
         }
-        boon_typecheck::Type::Function { args, result } => {
+        boon_checked::Type::Function { args, result } => {
             args.iter().all(out_contract_type_is_resolved)
                 && out_contract_type_is_resolved(&result.ty)
         }
-        boon_typecheck::Type::Object(shape) => {
+        boon_checked::Type::Object(shape) => {
             shape.fields.values().all(out_contract_type_is_resolved)
         }
-        boon_typecheck::Type::VariantSet(variants) => {
-            variants.iter().all(|variant| match variant {
-                boon_typecheck::Variant::Tag(_) => true,
-                boon_typecheck::Variant::Tagged { fields, .. } => {
-                    fields.fields.values().all(out_contract_type_is_resolved)
-                }
-            })
-        }
-        boon_typecheck::Type::Text
-        | boon_typecheck::Type::Number
-        | boon_typecheck::Type::Bytes(_)
-        | boon_typecheck::Type::Bits { .. }
-        | boon_typecheck::Type::Absent
-        | boon_typecheck::Type::RenderContract => true,
+        boon_checked::Type::VariantSet(variants) => variants.iter().all(|variant| match variant {
+            boon_checked::Variant::Tag(_) => true,
+            boon_checked::Variant::Tagged { fields, .. } => {
+                fields.fields.values().all(out_contract_type_is_resolved)
+            }
+        }),
+        boon_checked::Type::Text
+        | boon_checked::Type::Number
+        | boon_checked::Type::Bytes(_)
+        | boon_checked::Type::Bits { .. }
+        | boon_checked::Type::Absent
+        | boon_checked::Type::RenderContract => true,
     }
 }
 
@@ -4768,7 +4754,7 @@ fn resolve_producer_roots(
         .enumerate()
         .map(|(ordinal, request)| {
             let callable = exact_producer_callable(program, &request)?;
-            if callable.result.mode != boon_typecheck::FlowMode::Continuous {
+            if callable.result.mode != boon_checked::FlowMode::Continuous {
                 return Err(SemanticError::new(format!(
                     "producer function `{}` result must be continuous, found {:?}",
                     request.local_function, callable.result.mode
@@ -4777,7 +4763,7 @@ fn resolve_producer_roots(
             let out_parameters = callable
                 .parameters
                 .iter()
-                .filter(|parameter| parameter.kind != boon_typecheck::CheckedParameterKind::Value)
+                .filter(|parameter| parameter.kind != boon_checked::CheckedParameterKind::Value)
                 .map(|parameter| parameter.name.as_str())
                 .collect::<Vec<_>>();
             if !out_parameters.is_empty() {
@@ -4838,8 +4824,8 @@ fn resolve_producer_roots(
                 result_declaration: callable.decl_id,
                 result_path: format!("@producer/{}/result", digest_hex(&request.identity)),
                 result_type: if invocation {
-                    boon_typecheck::FlowType {
-                        mode: boon_typecheck::FlowMode::PresentOrAbsent,
+                    boon_checked::FlowType {
+                        mode: boon_checked::FlowMode::PresentOrAbsent,
                         ty: callable.result.ty.clone(),
                     }
                 } else {
@@ -4854,14 +4840,14 @@ fn resolve_producer_roots(
 fn exact_producer_callable<'a>(
     program: &'a CheckedProgram,
     request: &ProducerMaterializationRequest,
-) -> Result<&'a boon_typecheck::CheckedCallableSignature, SemanticError> {
+) -> Result<&'a boon_checked::CheckedCallableSignature, SemanticError> {
     let Some(callable) = program.callables.get(request.callable.as_usize()) else {
         return Err(SemanticError::new(format!(
             "producer request references missing semantic callable {}",
             request.callable
         )));
     };
-    if callable.kind != boon_typecheck::CheckedCallableKind::User
+    if callable.kind != boon_checked::CheckedCallableKind::User
         || callable.name != request.local_function
     {
         return Err(SemanticError::new(format!(
@@ -4874,7 +4860,7 @@ fn exact_producer_callable<'a>(
 
 pub(crate) fn temporally_gated_checked_expressions(
     program: &CheckedProgram,
-) -> BTreeSet<boon_typecheck::CheckedExprId> {
+) -> BTreeSet<boon_checked::CheckedExprId> {
     let expressions = program
         .expressions
         .iter()
@@ -4888,14 +4874,14 @@ pub(crate) fn temporally_gated_checked_expressions(
     let mut pending = Vec::new();
     for expression in &program.expressions {
         match &expression.kind {
-            boon_typecheck::CheckedExpressionKind::Then {
+            boon_checked::CheckedExpressionKind::Then {
                 output: Some(output),
                 ..
             } => pending.push(*output),
-            boon_typecheck::CheckedExpressionKind::When { input, arms }
-            | boon_typecheck::CheckedExpressionKind::While { input, arms }
+            boon_checked::CheckedExpressionKind::When { input, arms }
+            | boon_checked::CheckedExpressionKind::While { input, arms }
                 if expressions.get(input).is_some_and(|input| {
-                    input.flow_type.mode != boon_typecheck::FlowMode::Continuous
+                    input.flow_type.mode != boon_checked::FlowMode::Continuous
                 }) =>
             {
                 pending.extend(arms.iter().copied());
@@ -4920,16 +4906,16 @@ pub(crate) fn temporally_gated_checked_expressions(
 }
 
 fn checked_expression_children_for_call_analysis(
-    kind: &boon_typecheck::CheckedExpressionKind,
-    calls: &BTreeMap<boon_typecheck::CheckedCallId, &boon_typecheck::CheckedCall>,
-) -> Vec<boon_typecheck::CheckedExprId> {
-    use boon_typecheck::CheckedExpressionKind as Kind;
+    kind: &boon_checked::CheckedExpressionKind,
+    calls: &BTreeMap<boon_checked::CheckedCallId, &boon_checked::CheckedCall>,
+) -> Vec<boon_checked::CheckedExprId> {
+    use boon_checked::CheckedExpressionKind as Kind;
     match kind {
         Kind::TextTemplate { segments } => segments
             .iter()
             .filter_map(|segment| match segment {
-                boon_typecheck::CheckedTextSegment::Dynamic { value } => Some(*value),
-                boon_typecheck::CheckedTextSegment::Static { .. } => None,
+                boon_checked::CheckedTextSegment::Dynamic { value } => Some(*value),
+                boon_checked::CheckedTextSegment::Static { .. } => None,
             })
             .collect(),
         Kind::TaggedObject { fields, .. } | Kind::Object { fields } => {
@@ -4942,7 +4928,7 @@ fn checked_expression_children_for_call_analysis(
                 call.entries
                     .iter()
                     .filter_map(|entry| match entry {
-                        boon_typecheck::CheckedCallEntry::Input { value, .. } => Some(*value),
+                        boon_checked::CheckedCallEntry::Input { value, .. } => Some(*value),
                         _ => None,
                     })
                     .chain(call.context_binding.explicit().map(|(value, _)| value))
@@ -4989,44 +4975,42 @@ fn checked_expression_children_for_call_analysis(
     }
 }
 
-fn distributed_function_role(function: &str) -> Option<boon_typecheck::ProgramRole> {
+fn distributed_function_role(function: &str) -> Option<boon_checked::ProgramRole> {
     match function.split_once('/')?.0 {
-        "Client" => Some(boon_typecheck::ProgramRole::Client),
-        "Session" => Some(boon_typecheck::ProgramRole::Session),
-        "Server" => Some(boon_typecheck::ProgramRole::Server),
+        "Client" => Some(boon_checked::ProgramRole::Client),
+        "Session" => Some(boon_checked::ProgramRole::Session),
+        "Server" => Some(boon_checked::ProgramRole::Server),
         _ => None,
     }
 }
 
-fn runtime_type_contains_var(ty: &boon_typecheck::Type) -> bool {
+fn runtime_type_contains_var(ty: &boon_checked::Type) -> bool {
     match ty {
-        boon_typecheck::Type::Var(_) => true,
-        boon_typecheck::Type::List(item) => runtime_type_contains_var(item),
-        boon_typecheck::Type::Map { key, value } => {
+        boon_checked::Type::Var(_) => true,
+        boon_checked::Type::List(item) => runtime_type_contains_var(item),
+        boon_checked::Type::Map { key, value } => {
             runtime_type_contains_var(key) || runtime_type_contains_var(value)
         }
-        boon_typecheck::Type::Set(item) => runtime_type_contains_var(item),
-        boon_typecheck::Type::Union(members) => members.iter().any(runtime_type_contains_var),
-        boon_typecheck::Type::Function { args, result } => {
+        boon_checked::Type::Set(item) => runtime_type_contains_var(item),
+        boon_checked::Type::Union(members) => members.iter().any(runtime_type_contains_var),
+        boon_checked::Type::Function { args, result } => {
             args.iter().any(runtime_type_contains_var) || runtime_type_contains_var(&result.ty)
         }
-        boon_typecheck::Type::Object(shape) => shape.fields.values().any(runtime_type_contains_var),
-        boon_typecheck::Type::VariantSet(variants) => {
-            variants.iter().any(|variant| match variant {
-                boon_typecheck::Variant::Tag(_) => false,
-                boon_typecheck::Variant::Tagged { fields, .. } => {
-                    fields.fields.values().any(runtime_type_contains_var)
-                }
-            })
-        }
-        boon_typecheck::Type::Text
-        | boon_typecheck::Type::Number
-        | boon_typecheck::Type::Bytes(_)
-        | boon_typecheck::Type::Bits { .. }
-        | boon_typecheck::Type::Absent
-        | boon_typecheck::Type::RenderContract
-        | boon_typecheck::Type::UnresolvedShape { .. }
-        | boon_typecheck::Type::Unknown => false,
+        boon_checked::Type::Object(shape) => shape.fields.values().any(runtime_type_contains_var),
+        boon_checked::Type::VariantSet(variants) => variants.iter().any(|variant| match variant {
+            boon_checked::Variant::Tag(_) => false,
+            boon_checked::Variant::Tagged { fields, .. } => {
+                fields.fields.values().any(runtime_type_contains_var)
+            }
+        }),
+        boon_checked::Type::Text
+        | boon_checked::Type::Number
+        | boon_checked::Type::Bytes(_)
+        | boon_checked::Type::Bits { .. }
+        | boon_checked::Type::Absent
+        | boon_checked::Type::RenderContract
+        | boon_checked::Type::UnresolvedShape { .. }
+        | boon_checked::Type::Unknown => false,
     }
 }
 
@@ -5095,7 +5079,7 @@ impl Error for SemanticError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use boon_typecheck::{
+    use boon_checked::{
         CheckedEffectSummary, CheckedExternalDeclarationIdentityV1, CheckedExternalDeclarationKind,
         CheckedProgram, ExternalFunctionArgument, ExternalFunctionType, ExternalTypeEnvironment,
         FlowMode, FlowType, ProgramRole, Type,
@@ -5110,12 +5094,15 @@ mod tests {
 
     #[test]
     fn out_contract_type_variable_widens_independently_of_input_order() {
-        let variable = boon_typecheck::TypeVar(7);
-        let narrow = Type::VariantSet(vec![boon_typecheck::Variant::Tag("Closed".to_owned())]);
-        let wide = Type::VariantSet(vec![
-            boon_typecheck::Variant::Tag("Closed".to_owned()),
-            boon_typecheck::Variant::Tag("Open".to_owned()),
-        ]);
+        let variable = boon_checked::TypeVar(7);
+        let narrow = Type::VariantSet(vec![boon_checked::Variant::Tag("Closed".to_owned())].into());
+        let wide = Type::VariantSet(
+            vec![
+                boon_checked::Variant::Tag("Closed".to_owned()),
+                boon_checked::Variant::Tag("Open".to_owned()),
+            ]
+            .into(),
+        );
 
         for (first, second) in [(&narrow, &wide), (&wide, &narrow)] {
             let mut substitutions = BTreeMap::new();
@@ -5473,7 +5460,7 @@ store: [
             .execution_graph
             .callables
             .iter()
-            .position(|callable| callable.kind == boon_typecheck::CheckedCallableKind::External)
+            .position(|callable| callable.kind == boon_checked::CheckedCallableKind::External)
             .expect("external callable");
         client.execution_graph.callables[external].external_identity = None;
         client
@@ -5739,7 +5726,7 @@ FUNCTION add_session_twice(value) {
                 &with_request,
                 occurrence.root,
                 &occurrence.call_path,
-                boon_typecheck::CheckedExprId(u32::MAX),
+                boon_checked::CheckedExprId(u32::MAX),
                 occurrence.external_identity,
             )
             .unwrap(),
@@ -6169,7 +6156,7 @@ store: [
                 .push(SemanticCallId(usize::MAX));
         });
         reject_bundle_mutation!(|bundle: &mut BundleSemanticProgramV1| {
-            bundle.value_crossings[0].checked_expression = boon_typecheck::CheckedExprId(u32::MAX);
+            bundle.value_crossings[0].checked_expression = boon_checked::CheckedExprId(u32::MAX);
         });
         reject_bundle_mutation!(|bundle: &mut BundleSemanticProgramV1| {
             bundle.value_crossings[0]
@@ -6282,7 +6269,7 @@ FUNCTION selectable_row(row) {
             &checked,
             producer_roots,
             |call, _, entry| provisional_out_port_contract(&checked, call, entry),
-            |kind, _, _, _, _| kind == boon_typecheck::CheckedCallableKind::Builtin,
+            |kind, _, _, _, _| kind == boon_checked::CheckedCallableKind::Builtin,
         )
         .unwrap();
         assert!(!out_net.has_errors());
@@ -6334,7 +6321,7 @@ store: [
             .find(|expression| {
                 matches!(
                     &expression.kind,
-                    boon_typecheck::CheckedExpressionKind::Read {
+                    boon_checked::CheckedExpressionKind::Read {
                         projection,
                         ..
                     } if projection == &["items"]
@@ -6350,7 +6337,7 @@ store: [
             &checked,
             producer_roots,
             |call, _, entry| provisional_out_port_contract(&checked, call, entry),
-            |kind, _, _, _, _| kind == boon_typecheck::CheckedCallableKind::Builtin,
+            |kind, _, _, _, _| kind == boon_checked::CheckedCallableKind::Builtin,
         )
         .unwrap();
         assert!(!out_net.has_errors());
@@ -6491,10 +6478,13 @@ store: [
             .expect("completed list authority field");
         assert_eq!(
             completed_authority.flow_type.ty,
-            Type::VariantSet(vec![
-                boon_typecheck::Variant::Tag("False".to_owned()),
-                boon_typecheck::Variant::Tag("True".to_owned()),
-            ]),
+            Type::VariantSet(
+                vec![
+                    boon_checked::Variant::Tag("False".to_owned()),
+                    boon_checked::Variant::Tag("True".to_owned()),
+                ]
+                .into(),
+            ),
             "the storage schema must retain the full authority type"
         );
     }
@@ -6622,7 +6612,7 @@ FUNCTION lane_row(row) {
         for variable in environment.keys() {
             assert_eq!(
                 out.apply_type_substitutions(inherited.id, &Type::Var(*variable)),
-                boon_typecheck::apply_checked_type_environment(&Type::Var(*variable), &environment,),
+                boon_checked::apply_checked_type_environment(&Type::Var(*variable), &environment,),
                 "parent-linked lookup must match the flattened checked environment"
             );
         }
@@ -6831,8 +6821,8 @@ seed: 0
     fn resolved_out_contract_rejects_incompatible_type_and_shape() {
         let (checked, graph, port) = wrapped_out_contract_fixture();
         assert_contract_rejection(&checked, &graph, port, "type", |contract| {
-            contract.flow_type.ty = boon_typecheck::Type::Text;
-            contract.resolved_type = boon_typecheck::Type::Text;
+            contract.flow_type.ty = boon_checked::Type::Text;
+            contract.resolved_type = boon_checked::Type::Text;
             contract.shape_digest =
                 canonical_hash(OUT_PORT_SHAPE_DIGEST_DOMAIN, &contract.resolved_type).unwrap();
         });
@@ -6845,13 +6835,13 @@ seed: 0
     fn resolved_out_contract_rejects_incompatible_scope_and_role() {
         let (checked, graph, port) = wrapped_out_contract_fixture();
         assert_contract_rejection(&checked, &graph, port, "scope", |contract| {
-            contract.output_scope = boon_typecheck::LexicalScopeId(u32::MAX);
+            contract.output_scope = boon_checked::LexicalScopeId(u32::MAX);
         });
         assert_contract_rejection(&checked, &graph, port, "role", |contract| {
             contract.role = match contract.role {
-                boon_typecheck::ProgramRole::Client => boon_typecheck::ProgramRole::Server,
-                boon_typecheck::ProgramRole::Session | boon_typecheck::ProgramRole::Server => {
-                    boon_typecheck::ProgramRole::Client
+                boon_checked::ProgramRole::Client => boon_checked::ProgramRole::Server,
+                boon_checked::ProgramRole::Session | boon_checked::ProgramRole::Server => {
+                    boon_checked::ProgramRole::Client
                 }
             };
         });

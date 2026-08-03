@@ -1,14 +1,14 @@
 use std::collections::BTreeMap;
 
-use boon_contract::{CanonicalSourceBundleV1, SourceBundleDigestV1, SourceBundleUnit};
-use boon_document_model::{StyleEditorTypeHint, StyleRichTextSpan};
-use boon_parser::{ParseError, ParsedProgram, lex_source};
-use boon_syntax::{AstToken, AstTokenKind};
-use boon_typecheck::{
+use boon_checked::{
     CheckOutput, CheckedCallEntry, CheckedContextBinding, CheckedDeclarationKind, CheckedProgram,
     CheckedSpan, DeclId, DiagnosticSeverity,
     SemanticOccurrenceKind as CheckedSemanticOccurrenceKind, TypeDisplayNode,
 };
+use boon_contract::{CanonicalSourceBundleV1, SourceBundleDigestV1, SourceBundleUnit};
+use boon_document_model::{StyleEditorTypeHint, StyleRichTextSpan};
+use boon_parser::{ParseError, ParsedProgram, lex_source};
+use boon_syntax::{AstToken, AstTokenKind};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

@@ -43,7 +43,7 @@ pub struct ErasedProgram {
 /// cross-role occurrence against the executable references emitted for its
 /// consumer role.
 pub struct ErasedBundle {
-    role_programs: [(boon_typecheck::ProgramRole, ErasedProgram); 3],
+    role_programs: [(boon_checked::ProgramRole, ErasedProgram); 3],
     bundle_semantic_program_digest: boon_semantic::BundleSemanticProgramDigestV1,
     bundle_verification_manifest_digest: boon_verify::BundleVerificationManifestDigestV1,
 }
@@ -61,13 +61,13 @@ impl ErasedBundle {
         self.bundle_verification_manifest_digest
     }
 
-    pub fn role_program(&self, role: boon_typecheck::ProgramRole) -> Option<&ErasedProgram> {
+    pub fn role_program(&self, role: boon_checked::ProgramRole) -> Option<&ErasedProgram> {
         self.role_programs
             .iter()
             .find_map(|(candidate, program)| (*candidate == role).then_some(program))
     }
 
-    pub fn into_role_programs(self) -> [(boon_typecheck::ProgramRole, ErasedProgram); 3] {
+    pub fn into_role_programs(self) -> [(boon_checked::ProgramRole, ErasedProgram); 3] {
         self.role_programs
     }
 }
@@ -185,15 +185,15 @@ impl ErasedProgram {
         &self.fields.view_bindings
     }
 
-    pub const fn expression_types(&self) -> &boon_typecheck::ExprTypeTable {
+    pub const fn expression_types(&self) -> &boon_checked::ExprTypeTable {
         &self.fields.expression_types
     }
 
-    pub const fn function_types(&self) -> &boon_typecheck::FunctionTypeTable {
+    pub const fn function_types(&self) -> &boon_checked::FunctionTypeTable {
         &self.fields.function_types
     }
 
-    pub const fn named_value_types(&self) -> &boon_typecheck::NamedValueTypeTable {
+    pub const fn named_value_types(&self) -> &boon_checked::NamedValueTypeTable {
         &self.fields.named_value_types
     }
 
@@ -275,7 +275,7 @@ pub fn erase_and_lower_bundle(
     if !manifests.is_empty() {
         return Err("verified bundle contains manifests for unsupported roles".to_owned());
     }
-    let role_programs: [(boon_typecheck::ProgramRole, ErasedProgram); 3] =
+    let role_programs: [(boon_checked::ProgramRole, ErasedProgram); 3] =
         lowered.try_into().map_err(|programs: Vec<_>| {
             format!(
                 "verified bundle erased {} role programs, expected 3",
@@ -283,9 +283,9 @@ pub fn erase_and_lower_bundle(
             )
         })?;
     let expected_roles = [
-        boon_typecheck::ProgramRole::Client,
-        boon_typecheck::ProgramRole::Session,
-        boon_typecheck::ProgramRole::Server,
+        boon_checked::ProgramRole::Client,
+        boon_checked::ProgramRole::Session,
+        boon_checked::ProgramRole::Server,
     ];
     if role_programs
         .iter()
@@ -333,13 +333,13 @@ fn erase_semantic_program(
 
 #[cfg(test)]
 fn lower(program: &ParsedProgram) -> Result<ErasedProgram, String> {
-    lower_with_typecheck(program, &boon_typecheck::ExternalTypeEnvironment::default())
+    lower_with_typecheck(program, &boon_checked::ExternalTypeEnvironment::default())
 }
 
 #[cfg(test)]
 fn lower_with_typecheck(
     program: &ParsedProgram,
-    external_types: &boon_typecheck::ExternalTypeEnvironment,
+    external_types: &boon_checked::ExternalTypeEnvironment,
 ) -> Result<ErasedProgram, String> {
     let trace_lower = std::env::var_os("BOON_IR_LOWER_TRACE").is_some();
     let trace_phase = |phase: &str, elapsed_ms: f64| {
@@ -361,7 +361,7 @@ fn lower_with_typecheck(
         let mut failures = typecheck_report
             .diagnostics
             .iter()
-            .filter(|diagnostic| diagnostic.severity == boon_typecheck::DiagnosticSeverity::Error)
+            .filter(|diagnostic| diagnostic.severity == boon_checked::DiagnosticSeverity::Error)
             .map(|diagnostic| {
                 let location = program
                     .files
@@ -393,7 +393,7 @@ fn lower_with_typecheck(
                     slot.diagnostics
                         .iter()
                         .filter(|diagnostic| {
-                            diagnostic.severity == boon_typecheck::DiagnosticSeverity::Error
+                            diagnostic.severity == boon_checked::DiagnosticSeverity::Error
                         })
                         .map(|diagnostic| {
                             format!(
@@ -530,7 +530,7 @@ fn bind_verified_pulse_fusion(
 }
 
 fn validate_erased_bundle_role_crossings(
-    role: boon_typecheck::ProgramRole,
+    role: boon_checked::ProgramRole,
     program: &mut ErasedProgram,
     call_crossings: &[boon_semantic::BundleSemanticCallCrossingV1],
     value_crossings: &[boon_semantic::BundleSemanticValueCrossingV1],
@@ -1492,11 +1492,11 @@ fn verify_erased_scope_index(program: &ErasedProgram) -> Result<(), String> {
                 declaration.0, statement.id
             ));
         };
-        if flow_type.mode != boon_typecheck::FlowMode::Continuous
+        if flow_type.mode != boon_checked::FlowMode::Continuous
             || !matches!(
                 &flow_type.ty,
-                boon_typecheck::Type::List(item)
-                    if matches!(item.as_ref(), boon_typecheck::Type::Object(_))
+                boon_checked::Type::List(item)
+                    if matches!(item.as_ref(), boon_checked::Type::Object(_))
             )
         {
             continue;
@@ -1995,32 +1995,32 @@ fn verify_erased_row(
     Ok(())
 }
 
-fn distributed_function_role(function: &str) -> Option<boon_typecheck::ProgramRole> {
+fn distributed_function_role(function: &str) -> Option<boon_checked::ProgramRole> {
     function
         .split_once('/')
         .and_then(|(namespace, _)| distributed_role(namespace))
 }
 
-fn distributed_role(namespace: &str) -> Option<boon_typecheck::ProgramRole> {
+fn distributed_role(namespace: &str) -> Option<boon_checked::ProgramRole> {
     Some(match boon_syntax::program_role_root(namespace)? {
-        boon_syntax::ProgramRoleRoot::Client => boon_typecheck::ProgramRole::Client,
-        boon_syntax::ProgramRoleRoot::Session => boon_typecheck::ProgramRole::Session,
-        boon_syntax::ProgramRoleRoot::Server => boon_typecheck::ProgramRole::Server,
+        boon_syntax::ProgramRoleRoot::Client => boon_checked::ProgramRole::Client,
+        boon_syntax::ProgramRoleRoot::Session => boon_checked::ProgramRole::Session,
+        boon_syntax::ProgramRoleRoot::Server => boon_checked::ProgramRole::Server,
     })
 }
 
 fn ensure_distributed_value_flow_is_closed(
-    flow_type: &boon_typecheck::FlowType,
+    flow_type: &boon_checked::FlowType,
     context: &str,
 ) -> Result<(), String> {
-    if flow_type.mode == boon_typecheck::FlowMode::Absent {
+    if flow_type.mode == boon_checked::FlowMode::Absent {
         return Err(format!("{context} is always absent"));
     }
     ensure_distributed_type_is_closed(&flow_type.ty, context)
 }
 
 fn ensure_distributed_type_is_closed(
-    data_type: &boon_typecheck::Type,
+    data_type: &boon_checked::Type,
     context: &str,
 ) -> Result<(), String> {
     if distributed_type_is_closed(data_type) {
@@ -2032,37 +2032,35 @@ fn ensure_distributed_type_is_closed(
     }
 }
 
-fn distributed_type_is_closed(data_type: &boon_typecheck::Type) -> bool {
+fn distributed_type_is_closed(data_type: &boon_checked::Type) -> bool {
     match data_type {
-        boon_typecheck::Type::Text
-        | boon_typecheck::Type::Number
-        | boon_typecheck::Type::Bytes(_)
-        | boon_typecheck::Type::Bits { .. } => true,
-        boon_typecheck::Type::Object(shape) => {
+        boon_checked::Type::Text
+        | boon_checked::Type::Number
+        | boon_checked::Type::Bytes(_)
+        | boon_checked::Type::Bits { .. } => true,
+        boon_checked::Type::Object(shape) => {
             !shape.open && shape.fields.values().all(distributed_type_is_closed)
         }
-        boon_typecheck::Type::List(item) => distributed_type_is_closed(item),
-        boon_typecheck::Type::Map { key, value } => {
+        boon_checked::Type::List(item) => distributed_type_is_closed(item),
+        boon_checked::Type::Map { key, value } => {
             distributed_type_is_closed(key) && distributed_type_is_closed(value)
         }
-        boon_typecheck::Type::Set(item) => distributed_type_is_closed(item),
-        boon_typecheck::Type::Union(members) => {
+        boon_checked::Type::Set(item) => distributed_type_is_closed(item),
+        boon_checked::Type::Union(members) => {
             !members.is_empty() && members.iter().all(distributed_type_is_closed)
         }
-        boon_typecheck::Type::VariantSet(variants) => {
-            variants.iter().all(|variant| match variant {
-                boon_typecheck::Variant::Tag(_) => true,
-                boon_typecheck::Variant::Tagged { fields, .. } => {
-                    !fields.open && fields.fields.values().all(distributed_type_is_closed)
-                }
-            })
-        }
-        boon_typecheck::Type::Absent
-        | boon_typecheck::Type::RenderContract
-        | boon_typecheck::Type::Function { .. }
-        | boon_typecheck::Type::UnresolvedShape { .. }
-        | boon_typecheck::Type::Var(_)
-        | boon_typecheck::Type::Unknown => false,
+        boon_checked::Type::VariantSet(variants) => variants.iter().all(|variant| match variant {
+            boon_checked::Variant::Tag(_) => true,
+            boon_checked::Variant::Tagged { fields, .. } => {
+                !fields.open && fields.fields.values().all(distributed_type_is_closed)
+            }
+        }),
+        boon_checked::Type::Absent
+        | boon_checked::Type::RenderContract
+        | boon_checked::Type::Function { .. }
+        | boon_checked::Type::UnresolvedShape { .. }
+        | boon_checked::Type::Var(_)
+        | boon_checked::Type::Unknown => false,
     }
 }
 
@@ -3043,35 +3041,33 @@ fn verify_runtime_executable_types(program: &ErasedProgram) -> Result<(), String
     Ok(())
 }
 
-fn runtime_type_contains_var(ty: &boon_typecheck::Type) -> bool {
+fn runtime_type_contains_var(ty: &boon_checked::Type) -> bool {
     match ty {
-        boon_typecheck::Type::Var(_) => true,
-        boon_typecheck::Type::List(item) => runtime_type_contains_var(item),
-        boon_typecheck::Type::Map { key, value } => {
+        boon_checked::Type::Var(_) => true,
+        boon_checked::Type::List(item) => runtime_type_contains_var(item),
+        boon_checked::Type::Map { key, value } => {
             runtime_type_contains_var(key) || runtime_type_contains_var(value)
         }
-        boon_typecheck::Type::Set(item) => runtime_type_contains_var(item),
-        boon_typecheck::Type::Union(members) => members.iter().any(runtime_type_contains_var),
-        boon_typecheck::Type::Function { args, result } => {
+        boon_checked::Type::Set(item) => runtime_type_contains_var(item),
+        boon_checked::Type::Union(members) => members.iter().any(runtime_type_contains_var),
+        boon_checked::Type::Function { args, result } => {
             args.iter().any(runtime_type_contains_var) || runtime_type_contains_var(&result.ty)
         }
-        boon_typecheck::Type::Object(shape) => shape.fields.values().any(runtime_type_contains_var),
-        boon_typecheck::Type::VariantSet(variants) => {
-            variants.iter().any(|variant| match variant {
-                boon_typecheck::Variant::Tag(_) => false,
-                boon_typecheck::Variant::Tagged { fields, .. } => {
-                    fields.fields.values().any(runtime_type_contains_var)
-                }
-            })
-        }
-        boon_typecheck::Type::Text
-        | boon_typecheck::Type::Number
-        | boon_typecheck::Type::Bytes(_)
-        | boon_typecheck::Type::Bits { .. }
-        | boon_typecheck::Type::Absent
-        | boon_typecheck::Type::RenderContract
-        | boon_typecheck::Type::UnresolvedShape { .. }
-        | boon_typecheck::Type::Unknown => false,
+        boon_checked::Type::Object(shape) => shape.fields.values().any(runtime_type_contains_var),
+        boon_checked::Type::VariantSet(variants) => variants.iter().any(|variant| match variant {
+            boon_checked::Variant::Tag(_) => false,
+            boon_checked::Variant::Tagged { fields, .. } => {
+                fields.fields.values().any(runtime_type_contains_var)
+            }
+        }),
+        boon_checked::Type::Text
+        | boon_checked::Type::Number
+        | boon_checked::Type::Bytes(_)
+        | boon_checked::Type::Bits { .. }
+        | boon_checked::Type::Absent
+        | boon_checked::Type::RenderContract
+        | boon_checked::Type::UnresolvedShape { .. }
+        | boon_checked::Type::Unknown => false,
     }
 }
 
@@ -3211,9 +3207,9 @@ fn verify_distributed_reference_schedule(program: &ErasedProgram) -> Result<(), 
 }
 
 fn distributed_expr_type(
-    expression_types: &boon_typecheck::ExprTypeTable,
+    expression_types: &boon_checked::ExprTypeTable,
     expr_id: usize,
-) -> Result<&boon_typecheck::FlowType, String> {
+) -> Result<&boon_checked::FlowType, String> {
     expression_types
         .entries
         .iter()
@@ -3238,8 +3234,8 @@ fn require_scheduled_distributed_expr(
 fn verify_distributed_metadata_type(
     program: &ErasedProgram,
     expr_id: ExprId,
-    flow_mode: boon_typecheck::FlowMode,
-    metadata_type: &boon_typecheck::Type,
+    flow_mode: boon_checked::FlowMode,
+    metadata_type: &boon_checked::Type,
     context: &str,
 ) -> Result<(), String> {
     ensure_distributed_type_is_closed(metadata_type, context)?;
@@ -3290,12 +3286,12 @@ fn verify_scope_refs(
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct TypedDerivedListTarget {
     statement: ExecutableStatementId,
-    declaration: boon_typecheck::DeclId,
+    declaration: boon_checked::DeclId,
     producer: ExecutableExprId,
     path: String,
     local_name: String,
     capacity: Option<usize>,
-    item_type: boon_typecheck::Type,
+    item_type: boon_checked::Type,
     item_fields: Vec<String>,
 }
 
@@ -3314,13 +3310,13 @@ fn executable_statement_name_path(kind: &ExecutableStatementKind) -> Option<(&st
 fn direct_list_alias_target(
     executable: &ExecutableProgram,
     statement: &ExecutableStatement,
-) -> Option<boon_typecheck::DeclId> {
+) -> Option<boon_checked::DeclId> {
     let value = statement.value?;
     let expression = executable
         .expressions
         .get(value.as_usize())
         .filter(|expression| expression.id == value)?;
-    if !matches!(&expression.flow_type.ty, boon_typecheck::Type::List(_)) {
+    if !matches!(&expression.flow_type.ty, boon_checked::Type::List(_)) {
         return None;
     }
     match &expression.kind {
@@ -3356,13 +3352,13 @@ fn typed_derived_list_targets(
         if direct_list_alias_target(executable, statement).is_some() {
             continue;
         }
-        if expression.flow_type.mode == boon_typecheck::FlowMode::Absent {
+        if expression.flow_type.mode == boon_checked::FlowMode::Absent {
             continue;
         }
-        let boon_typecheck::Type::List(item_type) = &expression.flow_type.ty else {
+        let boon_checked::Type::List(item_type) = &expression.flow_type.ty else {
             continue;
         };
-        if !matches!(item_type.as_ref(), boon_typecheck::Type::Object(_)) {
+        if !matches!(item_type.as_ref(), boon_checked::Type::Object(_)) {
             continue;
         }
         let Some(declaration) = statement.declaration else {
@@ -3493,8 +3489,8 @@ fn executable_list_item_field_names(
     fields
 }
 
-fn typed_item_field_names(item_type: &boon_typecheck::Type) -> Vec<String> {
-    let boon_typecheck::Type::Object(shape) = item_type else {
+fn typed_item_field_names(item_type: &boon_checked::Type) -> Vec<String> {
+    let boon_checked::Type::Object(shape) = item_type else {
         return Vec::new();
     };
     let mut seen = BTreeSet::new();

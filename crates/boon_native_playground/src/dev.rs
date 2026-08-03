@@ -1790,7 +1790,7 @@ mod tests {
         model.active_file = 0;
         let mut state = DevState::new(model.source());
         let destination = SemanticItem {
-            target: boon_typecheck::DeclId(17),
+            target: boon_checked::DeclId(17),
             kind: SemanticKind::Declaration,
             location: SourceLocation {
                 file_index: 1,
@@ -1852,7 +1852,7 @@ mod tests {
             lines: vec![LineDecorations::default(); 2],
             inspector_hints: Vec::new(),
             semantics: vec![SemanticItem {
-                target: boon_typecheck::DeclId(3),
+                target: boon_checked::DeclId(3),
                 kind: SemanticKind::Reference,
                 location: SourceLocation {
                     file_index: 0,

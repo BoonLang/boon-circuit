@@ -15,10 +15,10 @@ use crate::{
     SemanticStatementKind, SemanticStorageBindingTargetV1, SemanticStorageFieldId,
     SemanticValueOrigin, StaticOwnerId,
 };
-use boon_contract::SourceBundleDigestV1;
-use boon_typecheck::{
+use boon_checked::{
     CheckedExpression, CheckedExpressionKind, CheckedPassedAccess, CheckedProgram, Type, Variant,
 };
+use boon_contract::SourceBundleDigestV1;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -1146,8 +1146,8 @@ fn validate_checked_marker_equivalence(
 
 fn validate_checked_drain_marker(
     expression: SemanticExprId,
-    checked_expression: boon_typecheck::CheckedExprId,
-    target: &boon_typecheck::DeclId,
+    checked_expression: boon_checked::CheckedExprId,
+    target: &boon_checked::DeclId,
     projection: &[String],
     checked_kind: &CheckedExpressionKind,
 ) -> Result<(), SemanticMemoryError> {
@@ -1291,7 +1291,7 @@ fn require_expression(
 
 fn require_checked_expression(
     checked: &CheckedProgram,
-    expression: boon_typecheck::CheckedExprId,
+    expression: boon_checked::CheckedExprId,
 ) -> Result<&CheckedExpression, SemanticMemoryError> {
     checked
         .expressions
@@ -2146,7 +2146,7 @@ fn migration_type_assignable(source: &Type, target: &Type) -> bool {
 fn type_uses_boolean_runtime_representation(data_type: &Type) -> bool {
     match data_type {
         Type::VariantSet(variants) => {
-            boon_typecheck::variants_use_boolean_runtime_representation(variants)
+            boon_checked::variants_use_boolean_runtime_representation(variants)
         }
         _ => false,
     }
@@ -2335,7 +2335,7 @@ struct SemanticMigrationPurityChecker<'a> {
     seen_drains: BTreeSet<SemanticExprId>,
     active_expressions: BTreeSet<SemanticExprId>,
     lexical_bindings:
-        Vec<BTreeMap<crate::SemanticLocalBindingId, (boon_typecheck::DeclId, SemanticExprId)>>,
+        Vec<BTreeMap<crate::SemanticLocalBindingId, (boon_checked::DeclId, SemanticExprId)>>,
     active_bindings: BTreeSet<crate::SemanticLocalBindingId>,
 }
 
@@ -3136,7 +3136,7 @@ mod tests {
     }
 
     fn record_coverage_fixture() -> (Vec<SemanticMemoryV1>, DrainUse, DrainUse) {
-        let record_type = Type::object(boon_typecheck::ObjectShape {
+        let record_type = Type::object(boon_checked::ObjectShape {
             fields: BTreeMap::from([
                 ("density".to_owned(), Type::Number),
                 ("theme".to_owned(), Type::Number),
@@ -3276,11 +3276,11 @@ click_count:
     fn passed_drain_is_rejected_until_context_formal_identity_exists() {
         let error = validate_checked_drain_marker(
             SemanticExprId(0),
-            boon_typecheck::CheckedExprId(0),
-            &boon_typecheck::DeclId(7),
+            boon_checked::CheckedExprId(0),
+            &boon_checked::DeclId(7),
             &[],
             &CheckedExpressionKind::Passed {
-                formal: boon_typecheck::ContextFormalId(3),
+                formal: boon_checked::ContextFormalId(3),
                 projection: vec!["old_count".to_owned()],
                 access: CheckedPassedAccess::Drain,
             },

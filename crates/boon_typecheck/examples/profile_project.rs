@@ -21,7 +21,7 @@ struct FrontendProfile<'a> {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     diagnostic_messages: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    function_types: Vec<&'a boon_typecheck::FunctionTypeEntry>,
+    function_types: Vec<&'a boon_checked::FunctionTypeEntry>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     expression_debug: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -57,7 +57,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let parse_ms = parse_started.elapsed().as_secs_f64() * 1_000.0;
     let typecheck_started = Instant::now();
     let external_types =
-        boon_typecheck::ExternalTypeEnvironment::empty(boon_document_model::ProgramRole::Client);
+        boon_checked::ExternalTypeEnvironment::empty(boon_document_model::ProgramRole::Client);
     let (output, typecheck_profile) = if env::var_os("BOON_PROFILE_EAGER_BINDINGS").is_some() {
         boon_typecheck::check_program_profiled_with_external_types(&parsed, &external_types)
     } else {

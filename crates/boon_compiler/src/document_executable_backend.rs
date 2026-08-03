@@ -1,8 +1,8 @@
 use crate::machine_plan_backend::{ValueIndex, lower_document_runtime_expression};
+use boon_checked::{Type, is_renderable_type};
 use boon_ir::ErasedProgram;
 use boon_plan::*;
 use boon_semantic::program_core as ir;
-use boon_typecheck::{Type, is_renderable_type};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) fn compile_document_plan(
@@ -88,8 +88,8 @@ enum StaticDocumentSelector {
 }
 
 impl StaticDocumentSelector {
-    fn matches(&self, pattern: &boon_typecheck::CheckedMatchPattern) -> bool {
-        use boon_typecheck::CheckedMatchPattern;
+    fn matches(&self, pattern: &boon_checked::CheckedMatchPattern) -> bool {
+        use boon_checked::CheckedMatchPattern;
         match (self, pattern) {
             (_, CheckedMatchPattern::Wildcard | CheckedMatchPattern::Binding { .. }) => true,
             (Self::Text(actual), CheckedMatchPattern::Text { value }) => actual == value,
@@ -1771,9 +1771,9 @@ impl<'a> DocumentCompiler<'a> {
 
     fn compile_pattern(
         &mut self,
-        pattern: &boon_typecheck::CheckedMatchPattern,
+        pattern: &boon_checked::CheckedMatchPattern,
     ) -> Result<DocumentPattern, PlanError> {
-        use boon_typecheck::CheckedMatchPattern;
+        use boon_checked::CheckedMatchPattern;
 
         if matches!(
             pattern,

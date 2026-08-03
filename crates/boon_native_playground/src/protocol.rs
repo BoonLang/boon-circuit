@@ -5,8 +5,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use bincode::Options;
+use boon_checked::TypeDisplayNode;
 use boon_plan::ProgramRole;
-use boon_typecheck::TypeDisplayNode;
 use serde::{Deserialize, Serialize};
 
 pub use boon_editor::language::{LanguageProjectSnapshot, SourceUnit};
@@ -162,11 +162,11 @@ mod migration_scenario_wire {
 // externally tagged wire enum. The public message still owns the editor DTO,
 // and the conversion preserves every field without a JSON/TOML side encoding.
 mod language_snapshot_wire {
+    use boon_checked::{TypeDisplayField, TypeDisplayFunctionArg, TypeDisplayNode};
     use boon_contract::SourceBundleDigestV1;
     use boon_editor::language::{
         InspectorHint, LanguageFileIndex, LanguageProjectSnapshot, SemanticDiagnostic, SemanticItem,
     };
-    use boon_typecheck::{TypeDisplayField, TypeDisplayFunctionArg, TypeDisplayNode};
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
     #[derive(Serialize)]
@@ -1852,12 +1852,12 @@ pub fn read_message(reader: &mut impl Read) -> Result<Option<Message>, ProtocolE
 #[cfg(test)]
 mod tests {
     use super::*;
+    use boon_checked::{DeclId, DiagnosticSeverity, TypeDisplayField, TypeDisplayFunctionArg};
     use boon_contract::{SourceBundleDigestV1, SourceBundleUnit};
     use boon_editor::language::{
         InspectorHint, LanguageFileIndex, SemanticDiagnostic, SemanticItem, SemanticKind,
         SourceLocation,
     };
-    use boon_typecheck::{DeclId, DiagnosticSeverity, TypeDisplayField, TypeDisplayFunctionArg};
 
     fn application() -> ApplicationIdentity {
         ApplicationIdentity::new(

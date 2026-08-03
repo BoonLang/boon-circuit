@@ -1307,8 +1307,8 @@ impl Error for VerifyError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use boon_checked::CheckedProgram;
     use boon_semantic::elaborate;
-    use boon_typecheck::CheckedProgram;
     use serde::de::DeserializeOwned;
 
     fn checked_fixture() -> CheckedProgram {

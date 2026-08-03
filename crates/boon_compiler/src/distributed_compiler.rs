@@ -2,6 +2,12 @@ use super::{
     CompileProfile, CompiledMachinePlanFromSource, CompilerResult, CompilerSourceUnit, elapsed_ms,
     machine_plan_backend, parse_source_units,
 };
+use boon_checked::{
+    CheckOutput, CheckedCallEntry, CheckedCallableKind, CheckedContextBinding,
+    CheckedExternalDeclarationIdentityV1, CheckedExternalDeclarationKind, CheckedParameterKind,
+    CheckedProgram, ExternalFunctionArgument, ExternalFunctionType, ExternalTypeEnvironment,
+    FlowMode, FlowType, FunctionTypeEntry, ObjectShape, Type, TypeCheckReport, Variant,
+};
 use boon_ir::{ErasedProgram, verify_hidden_identity, verify_static_schedule};
 use boon_plan::{
     ApplicationIdentity, DataTypeFieldPlan, DataTypePlan, DataVariantPlan, DistributedCallMode,
@@ -16,12 +22,6 @@ use boon_plan::{
     SourceRoute, TargetProfile, ValueRef, verify_plan,
 };
 use boon_semantic::program_core::{self as core, DistributedCall};
-use boon_typecheck::{
-    CheckOutput, CheckedCallEntry, CheckedCallableKind, CheckedContextBinding,
-    CheckedExternalDeclarationIdentityV1, CheckedExternalDeclarationKind, CheckedParameterKind,
-    CheckedProgram, ExternalFunctionArgument, ExternalFunctionType, ExternalTypeEnvironment,
-    FlowMode, FlowType, FunctionTypeEntry, ObjectShape, Type, TypeCheckReport, Variant,
-};
 use std::collections::{BTreeMap, BTreeSet};
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
@@ -437,7 +437,7 @@ fn resolve_distributed_semantic_fixed_point(
                 .expressions
                 .iter()
                 .filter_map(|expression| {
-                    let boon_typecheck::CheckedExpressionKind::ExternalRead {
+                    let boon_checked::CheckedExpressionKind::ExternalRead {
                         external_identity: Some(identity),
                         ..
                     } = &expression.kind
@@ -465,7 +465,7 @@ fn resolve_distributed_semantic_fixed_point(
         .values()
         .flat_map(|check| check.checked().expressions.iter())
         .filter_map(|expression| {
-            let boon_typecheck::CheckedExpressionKind::ExternalRead {
+            let boon_checked::CheckedExpressionKind::ExternalRead {
                 external_identity: Some(identity),
                 ..
             } = &expression.kind
@@ -721,7 +721,7 @@ struct DistributedSemanticValueContract {
     consumer_role: ProgramRole,
     root: boon_semantic::DistributedCallOccurrenceRoot,
     call_path: Vec<boon_semantic::SemanticCallId>,
-    checked_expression: boon_typecheck::CheckedExprId,
+    checked_expression: boon_checked::CheckedExprId,
     external_identity: CheckedExternalDeclarationIdentityV1,
     producer_role: ProgramRole,
 }
@@ -1063,7 +1063,7 @@ fn collect_provisional_bundle_interface_demands(
 
     for (consumer_role, program) in programs {
         for expression in &program.checked.expressions {
-            let boon_typecheck::CheckedExpressionKind::ExternalRead { canonical_path, .. } =
+            let boon_checked::CheckedExpressionKind::ExternalRead { canonical_path, .. } =
                 &expression.kind
             else {
                 continue;
@@ -1446,7 +1446,7 @@ fn seal_solved_bundle_checks(
                     .diagnostics
                     .iter()
                     .filter(|diagnostic| {
-                        diagnostic.severity == boon_typecheck::DiagnosticSeverity::Error
+                        diagnostic.severity == boon_checked::DiagnosticSeverity::Error
                     })
                     .map(|diagnostic| diagnostic.message.as_str())
                     .collect::<Vec<_>>()
@@ -1478,7 +1478,7 @@ fn seal_solved_bundle_checks(
 
 fn resolve_bundle_external_identities(
     references: &ProvisionalBundleInterfaceDemands,
-    checks: &BTreeMap<ProgramRole, boon_typecheck::CheckOutput>,
+    checks: &BTreeMap<ProgramRole, boon_checked::CheckOutput>,
 ) -> Result<BTreeMap<(ProgramRole, String), CheckedExternalDeclarationIdentityV1>, PlanError> {
     let producer_program = |role: ProgramRole| -> Result<&CheckedProgram, PlanError> {
         let output = checks.get(&role).ok_or_else(|| {
@@ -1489,9 +1489,7 @@ fn resolve_bundle_external_identities(
                 .report
                 .diagnostics
                 .iter()
-                .filter(|diagnostic| {
-                    diagnostic.severity == boon_typecheck::DiagnosticSeverity::Error
-                })
+                .filter(|diagnostic| diagnostic.severity == boon_checked::DiagnosticSeverity::Error)
                 .map(|diagnostic| diagnostic.message.as_str())
                 .collect::<Vec<_>>()
                 .join("; ");
@@ -1630,7 +1628,7 @@ fn build_bundle_environments(
 fn declared_value_declaration(
     program: &CheckedProgram,
     local_path: &str,
-) -> Result<boon_typecheck::DeclId, PlanError> {
+) -> Result<boon_checked::DeclId, PlanError> {
     let matches = program
         .declarations
         .iter()
@@ -1655,7 +1653,7 @@ fn declared_value_declaration(
 fn declared_function_signature<'a>(
     program: &'a CheckedProgram,
     local_function: &str,
-) -> Result<&'a boon_typecheck::CheckedCallableSignature, PlanError> {
+) -> Result<&'a boon_checked::CheckedCallableSignature, PlanError> {
     let matches = program
         .callables
         .iter()
@@ -1768,7 +1766,7 @@ fn merge_closed_boundary_types(left: &Type, right: &Type) -> Option<Type> {
         return Some(left.clone());
     }
     match (left, right) {
-        (Type::Bytes(_), Type::Bytes(_)) => Some(Type::Bytes(boon_typecheck::BytesType::Dynamic)),
+        (Type::Bytes(_), Type::Bytes(_)) => Some(Type::Bytes(boon_checked::BytesType::Dynamic)),
         (Type::List(left), Type::List(right)) => Some(Type::List(Box::new(
             merge_closed_boundary_types(left, right)?,
         ))),
@@ -2921,7 +2919,7 @@ fn bind_checked_expression_refs(
     checked_expr_id: usize,
     value: ValueRef,
 ) -> Result<(), PlanError> {
-    let checked_expr_id = boon_typecheck::CheckedExprId(checked_expr_id as u32);
+    let checked_expr_id = boon_checked::CheckedExprId(checked_expr_id as u32);
     let matches = program
         .executable
         .expressions
@@ -3566,10 +3564,10 @@ fn type_to_data_plan(ty: &Type) -> Option<DataTypePlan> {
     match ty {
         Type::Text => Some(DataTypePlan::Text),
         Type::Number => Some(DataTypePlan::Number),
-        Type::Bytes(boon_typecheck::BytesType::Dynamic) => {
+        Type::Bytes(boon_checked::BytesType::Dynamic) => {
             Some(DataTypePlan::Bytes { fixed_len: None })
         }
-        Type::Bytes(boon_typecheck::BytesType::Fixed(length)) => Some(DataTypePlan::Bytes {
+        Type::Bytes(boon_checked::BytesType::Fixed(length)) => Some(DataTypePlan::Bytes {
             fixed_len: u64::try_from(*length).ok(),
         }),
         Type::Bits { width } => Some(DataTypePlan::Bits { width: *width }),

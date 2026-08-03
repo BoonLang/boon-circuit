@@ -2610,8 +2610,8 @@ fn merge_collection_owner_rows(
         .collect()
 }
 
-fn data_type_plan_from_typecheck_type(ty: &boon_typecheck::Type) -> Option<DataTypePlan> {
-    use boon_typecheck::{BytesType, Type, Variant};
+fn data_type_plan_from_typecheck_type(ty: &boon_checked::Type) -> Option<DataTypePlan> {
+    use boon_checked::{BytesType, Type, Variant};
 
     Some(
         match ty {
@@ -2688,8 +2688,8 @@ fn data_type_plan_from_typecheck_type(ty: &boon_typecheck::Type) -> Option<DataT
     )
 }
 
-fn append_item_field_names(ty: &boon_typecheck::Type) -> Vec<String> {
-    let boon_typecheck::Type::Object(shape) = ty else {
+fn append_item_field_names(ty: &boon_checked::Type) -> Vec<String> {
+    let boon_checked::Type::Object(shape) = ty else {
         return vec!["value".to_owned()];
     };
     let mut names = Vec::new();
@@ -3057,7 +3057,7 @@ fn migration_list_row_fields(
 
 struct ExecutableMigrationExpressionLowerer<'a> {
     program: &'a ErasedProgram,
-    drain_inputs: BTreeMap<boon_typecheck::CheckedExprId, MigrationInputId>,
+    drain_inputs: BTreeMap<boon_checked::CheckedExprId, MigrationInputId>,
     active_expressions: BTreeSet<ir::ExecutableExprId>,
     lexical_bindings: Vec<BTreeMap<ir::ExecutableLocalBindingId, ir::ExecutableExprId>>,
     active_lexical_bindings: BTreeSet<ir::ExecutableLocalBindingId>,
@@ -3460,9 +3460,9 @@ impl ExecutableMigrationExpressionLowerer<'_> {
 fn checked_expr_id(
     expression: ir::ExprId,
     context: &str,
-) -> Result<boon_typecheck::CheckedExprId, PlanError> {
+) -> Result<boon_checked::CheckedExprId, PlanError> {
     u32::try_from(expression.as_usize())
-        .map(boon_typecheck::CheckedExprId)
+        .map(boon_checked::CheckedExprId)
         .map_err(|_| {
             PlanError::new(format!(
                 "{context} expression {} exceeds the checked-expression ID range",
@@ -3643,7 +3643,7 @@ fn migration_recipe(
             None
         };
         let mut grouped_sources =
-            BTreeMap::<boon_typecheck::CheckedExprId, Vec<&ir::MigrationSourceLeaf>>::new();
+            BTreeMap::<boon_checked::CheckedExprId, Vec<&ir::MigrationSourceLeaf>>::new();
         for source in &edge.source_leaves {
             grouped_sources
                 .entry(checked_expr_id(
@@ -6950,7 +6950,7 @@ fn validate_machine_plan_row_expression_reachability(plan: &MachinePlan) -> Resu
 
 pub(crate) fn distributed_exportable_values(
     program: &ErasedProgram,
-) -> Result<BTreeMap<String, (boon_typecheck::FlowType, ValueRef)>, PlanError> {
+) -> Result<BTreeMap<String, (boon_checked::FlowType, ValueRef)>, PlanError> {
     let scalar_fields = ScalarFieldCatalog::new(program)?;
     let index = ValueIndex::new(program, &BTreeMap::new(), &BTreeMap::new(), &scalar_fields)?;
     Ok(program
@@ -7178,8 +7178,7 @@ fn migration_indexed_default_expression(
     arena: &mut PlanRowExpressionArena,
     constants: &mut Vec<PlanConstant>,
 ) -> Result<PlanRowExpressionId, PlanError> {
-    let mut grouped =
-        BTreeMap::<boon_typecheck::CheckedExprId, Vec<&ir::MigrationSourceLeaf>>::new();
+    let mut grouped = BTreeMap::<boon_checked::CheckedExprId, Vec<&ir::MigrationSourceLeaf>>::new();
     for source in &edge.source_leaves {
         grouped
             .entry(checked_expr_id(
@@ -7583,20 +7582,20 @@ fn inferred_builtin_call_value_type(function: &str) -> Option<PlanValueType> {
     }
 }
 
-fn plan_value_type_from_typecheck_type(ty: &boon_typecheck::Type) -> Option<PlanValueType> {
+fn plan_value_type_from_typecheck_type(ty: &boon_checked::Type) -> Option<PlanValueType> {
     match ty {
-        boon_typecheck::Type::Text => Some(PlanValueType::Text),
-        boon_typecheck::Type::Number => Some(PlanValueType::Number),
-        boon_typecheck::Type::Bytes(boon_typecheck::BytesType::Dynamic) => {
+        boon_checked::Type::Text => Some(PlanValueType::Text),
+        boon_checked::Type::Number => Some(PlanValueType::Number),
+        boon_checked::Type::Bytes(boon_checked::BytesType::Dynamic) => {
             Some(PlanValueType::Bytes { fixed_len: None })
         }
-        boon_typecheck::Type::Bytes(boon_typecheck::BytesType::Fixed(len)) => {
+        boon_checked::Type::Bytes(boon_checked::BytesType::Fixed(len)) => {
             Some(PlanValueType::Bytes {
                 fixed_len: Some(*len as u64),
             })
         }
-        boon_typecheck::Type::Bits { width } => Some(PlanValueType::Bits { width: *width }),
-        boon_typecheck::Type::VariantSet(_) => Some(PlanValueType::Tag),
+        boon_checked::Type::Bits { width } => Some(PlanValueType::Bits { width: *width }),
+        boon_checked::Type::VariantSet(_) => Some(PlanValueType::Tag),
         _ => None,
     }
 }
@@ -11221,7 +11220,7 @@ struct ExecutableRowLowerer<'a> {
     state_initializer: Option<ir::StateId>,
     active_materialization_owners: Vec<PlanStaticOwnerId>,
     global_lexical_bindings:
-        &'a BTreeMap<ir::ExecutableLocalBindingId, (boon_typecheck::DeclId, ir::ExecutableExprId)>,
+        &'a BTreeMap<ir::ExecutableLocalBindingId, (boon_checked::DeclId, ir::ExecutableExprId)>,
     lexical_bindings: Vec<BTreeMap<ir::ExecutableLocalBindingId, ir::ExecutableExprId>>,
     active_lexical_bindings: BTreeSet<ir::ExecutableLocalBindingId>,
     active_storage_bindings: BTreeSet<ir::ErasedBindingId>,
@@ -11497,7 +11496,7 @@ impl<'a> ExecutableRowLowerer<'a> {
         }
         if capture.projection.is_empty() {
             return match &local.item_type {
-                boon_typecheck::Type::Object(shape) => {
+                boon_checked::Type::Object(shape) => {
                     let mut names = if shape.field_order.is_empty() {
                         shape.fields.keys().cloned().collect::<Vec<_>>()
                     } else {
@@ -11796,7 +11795,7 @@ impl<'a> ExecutableRowLowerer<'a> {
             return Ok(value);
         }
         match &materialization.item_type {
-            boon_typecheck::Type::Object(shape) => {
+            boon_checked::Type::Object(shape) => {
                 let names = if shape.field_order.is_empty() {
                     shape.fields.keys().cloned().collect::<Vec<_>>()
                 } else {
@@ -12764,7 +12763,7 @@ impl<'a> ExecutableRowLowerer<'a> {
                     .transpose()?;
                 let local_row = event_row_expression.unwrap_or(contextual_row);
                 if projection.is_empty()
-                    && matches!(local_item_type, boon_typecheck::Type::Number)
+                    && matches!(local_item_type, boon_checked::Type::Number)
                     && self
                         .program
                         .lists
@@ -13213,7 +13212,7 @@ impl<'a> ExecutableRowLowerer<'a> {
     fn lexical_binding_value(
         &self,
         binding: ir::ExecutableLocalBindingId,
-        declaration: boon_typecheck::DeclId,
+        declaration: boon_checked::DeclId,
     ) -> Result<ir::ExecutableExprId, PlanError> {
         let (defined_declaration, defined_value) = self
             .global_lexical_bindings
@@ -13249,7 +13248,7 @@ impl<'a> ExecutableRowLowerer<'a> {
     fn lower_local_read(
         &mut self,
         binding: ir::ExecutableLocalBindingId,
-        declaration: boon_typecheck::DeclId,
+        declaration: boon_checked::DeclId,
         projection: &[String],
         inherited_owner: Option<PlanStaticOwnerId>,
     ) -> Result<PlanRowExpressionId, PlanError> {
@@ -14135,9 +14134,9 @@ fn plan_order_operation(
 }
 
 fn executable_select_pattern(
-    pattern: &boon_typecheck::CheckedMatchPattern,
+    pattern: &boon_checked::CheckedMatchPattern,
 ) -> Result<PlanRowSelectPattern, PlanError> {
-    use boon_typecheck::CheckedMatchPattern;
+    use boon_checked::CheckedMatchPattern;
 
     Ok(match pattern {
         CheckedMatchPattern::Wildcard | CheckedMatchPattern::Binding { .. } => {
@@ -14818,7 +14817,7 @@ fn exact_host_effect_expression(
         if matches!(
             &expression.kind,
             ir::ExecutableExpressionKind::Call { name, .. }
-                if boon_typecheck::is_typed_host_effect(name)
+                if boon_checked::is_typed_host_effect(name)
         ) {
             effects.insert(expression_id);
         } else {
@@ -15452,7 +15451,7 @@ pub(super) struct ValueIndex {
     source_by_executable: BTreeMap<ir::ExecutableSourceId, ValueRef>,
     state_by_executable: BTreeMap<ir::ExecutableStateId, ValueRef>,
     lexical_binding_values:
-        BTreeMap<ir::ExecutableLocalBindingId, (boon_typecheck::DeclId, ir::ExecutableExprId)>,
+        BTreeMap<ir::ExecutableLocalBindingId, (boon_checked::DeclId, ir::ExecutableExprId)>,
     state_value_types: BTreeMap<String, PlanValueType>,
     state_data_types: BTreeMap<StateId, DataTypePlan>,
     field_value_types: BTreeMap<FieldId, PlanValueType>,

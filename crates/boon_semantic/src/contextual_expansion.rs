@@ -20,7 +20,7 @@ use crate::{
     OutCallInstanceId, OutInputValue, OutNetId, ResolvedOutGraph as OutNet, ScopedCheckedExpr,
     StaticOwnerId,
 };
-use boon_typecheck::{
+use boon_checked::{
     CheckedCallEntry, CheckedCallId, CheckedCallableKind, CheckedContextBinding,
     CheckedContextualOperation, CheckedDeclarationKind, CheckedExprId, CheckedExpression,
     CheckedExpressionKind, CheckedMatchPattern, CheckedParameterKind, CheckedParameterRequirement,
@@ -34,11 +34,11 @@ fn semantic_parameter_id(callable: SemanticCallableId, ordinal: usize) -> Semant
     SemanticParameterId { callable, ordinal }
 }
 
-fn provisional_semantic_source_id(id: boon_typecheck::CheckedSourceId) -> SemanticSourceId {
+fn provisional_semantic_source_id(id: boon_checked::CheckedSourceId) -> SemanticSourceId {
     SemanticSourceId(id.0 as usize)
 }
 
-fn provisional_semantic_state_id(id: boon_typecheck::CheckedStateId) -> SemanticStateId {
+fn provisional_semantic_state_id(id: boon_checked::CheckedStateId) -> SemanticStateId {
     SemanticStateId(id.0 as usize)
 }
 
@@ -278,12 +278,12 @@ impl fmt::Display for ExpansionError {
 struct CheckedProgramLookup {
     expressions_by_id: BTreeMap<CheckedExprId, Option<usize>>,
     declarations_by_id: BTreeMap<DeclId, Option<usize>>,
-    statements_by_id: BTreeMap<boon_typecheck::CheckedStatementId, Option<usize>>,
-    scopes_by_id: BTreeMap<boon_typecheck::LexicalScopeId, Option<usize>>,
+    statements_by_id: BTreeMap<boon_checked::CheckedStatementId, Option<usize>>,
+    scopes_by_id: BTreeMap<boon_checked::LexicalScopeId, Option<usize>>,
     calls_by_id: BTreeMap<CheckedCallId, Option<usize>>,
     callables_by_declaration: BTreeMap<DeclId, Option<usize>>,
     declarations_by_scope_and_name:
-        BTreeMap<boon_typecheck::LexicalScopeId, BTreeMap<String, Option<DeclId>>>,
+        BTreeMap<boon_checked::LexicalScopeId, BTreeMap<String, Option<DeclId>>>,
     pattern_bindings_by_declaration: BTreeMap<DeclId, Option<usize>>,
     statements_by_value: BTreeMap<CheckedExprId, Vec<usize>>,
     element_contexts_by_declaration: BTreeMap<DeclId, Option<(usize, usize)>>,
@@ -395,7 +395,7 @@ impl CheckedProgramLookup {
         &self,
         program: &'a CheckedProgram,
         declaration: DeclId,
-    ) -> Option<&'a boon_typecheck::CheckedDeclaration> {
+    ) -> Option<&'a boon_checked::CheckedDeclaration> {
         self.declarations_by_id
             .get(&declaration)
             .copied()
@@ -407,8 +407,8 @@ impl CheckedProgramLookup {
     fn statement<'a>(
         &self,
         program: &'a CheckedProgram,
-        statement: boon_typecheck::CheckedStatementId,
-    ) -> Option<&'a boon_typecheck::CheckedStatement> {
+        statement: boon_checked::CheckedStatementId,
+    ) -> Option<&'a boon_checked::CheckedStatement> {
         self.statements_by_id
             .get(&statement)
             .copied()
@@ -420,8 +420,8 @@ impl CheckedProgramLookup {
     fn scope<'a>(
         &self,
         program: &'a CheckedProgram,
-        scope: boon_typecheck::LexicalScopeId,
-    ) -> Option<&'a boon_typecheck::CheckedScope> {
+        scope: boon_checked::LexicalScopeId,
+    ) -> Option<&'a boon_checked::CheckedScope> {
         self.scopes_by_id
             .get(&scope)
             .copied()
@@ -434,7 +434,7 @@ impl CheckedProgramLookup {
         &self,
         program: &'a CheckedProgram,
         call: CheckedCallId,
-    ) -> Option<&'a boon_typecheck::CheckedCall> {
+    ) -> Option<&'a boon_checked::CheckedCall> {
         self.calls_by_id
             .get(&call)
             .copied()
@@ -447,7 +447,7 @@ impl CheckedProgramLookup {
         &self,
         program: &'a CheckedProgram,
         declaration: DeclId,
-    ) -> Option<&'a boon_typecheck::CheckedCallableSignature> {
+    ) -> Option<&'a boon_checked::CheckedCallableSignature> {
         self.callables_by_declaration
             .get(&declaration)
             .copied()
@@ -458,7 +458,7 @@ impl CheckedProgramLookup {
 
     fn declaration_in_exact_scope(
         &self,
-        scope: boon_typecheck::LexicalScopeId,
+        scope: boon_checked::LexicalScopeId,
         name: &str,
     ) -> Option<DeclId> {
         self.declarations_by_scope_and_name
@@ -472,7 +472,7 @@ impl CheckedProgramLookup {
         &self,
         program: &'a CheckedProgram,
         declaration: DeclId,
-    ) -> Option<&'a boon_typecheck::CheckedPatternBinding> {
+    ) -> Option<&'a boon_checked::CheckedPatternBinding> {
         self.pattern_bindings_by_declaration
             .get(&declaration)
             .copied()
@@ -493,8 +493,8 @@ impl CheckedProgramLookup {
         program: &'a CheckedProgram,
         declaration: DeclId,
     ) -> Option<(
-        &'a boon_typecheck::CheckedCall,
-        &'a boon_typecheck::CheckedCallContext,
+        &'a boon_checked::CheckedCall,
+        &'a boon_checked::CheckedCallContext,
     )> {
         let (call, context) = self
             .element_contexts_by_declaration
@@ -534,8 +534,8 @@ impl SemanticExpressionArena {
     fn push(
         &mut self,
         checked_expression: CheckedExprId,
-        checked_scope: boon_typecheck::LexicalScopeId,
-        checked_span: boon_typecheck::CheckedSpan,
+        checked_scope: boon_checked::LexicalScopeId,
+        checked_span: boon_checked::CheckedSpan,
         call_instance: Option<OutCallInstanceId>,
         owning_statement: Option<SemanticStatementId>,
         build: impl FnOnce(SemanticExprId, SemanticValueId) -> SemanticExpression,
@@ -621,17 +621,17 @@ fn push_default_order_direction(
             id,
             value_id,
             checked_expr_id: checked_expression.id,
-            flow_type: boon_typecheck::FlowType {
+            flow_type: boon_checked::FlowType {
                 mode: FlowMode::Continuous,
                 ty: Type::VariantSet(
                     vec![
-                        boon_typecheck::Variant::Tag("Ascending".to_owned()),
-                        boon_typecheck::Variant::Tag("Descending".to_owned()),
+                        boon_checked::Variant::Tag("Ascending".to_owned()),
+                        boon_checked::Variant::Tag("Descending".to_owned()),
                     ]
                     .into(),
                 ),
             },
-            effect: boon_typecheck::CheckedEffectSummary::default(),
+            effect: boon_checked::CheckedEffectSummary::default(),
             owner,
             provenance: runtime_value_provenance(),
             resource_binding_path: None,
@@ -986,12 +986,12 @@ pub(crate) fn erase_runtime_type_vars(ty: &Type) -> Type {
         Type::Set(item) => Type::Set(Box::new(erase_runtime_type_vars(item))),
         Type::Function { args, result } => Type::Function {
             args: args.iter().map(erase_runtime_type_vars).collect(),
-            result: Box::new(boon_typecheck::FlowType {
+            result: Box::new(boon_checked::FlowType {
                 mode: result.mode,
                 ty: erase_runtime_type_vars(&result.ty),
             }),
         },
-        Type::Object(shape) => Type::object(boon_typecheck::ObjectShape {
+        Type::Object(shape) => Type::object(boon_checked::ObjectShape {
             fields: shape
                 .fields
                 .iter()
@@ -1004,11 +1004,11 @@ pub(crate) fn erase_runtime_type_vars(ty: &Type) -> Type {
             variants
                 .iter()
                 .map(|variant| match variant {
-                    boon_typecheck::Variant::Tag(tag) => boon_typecheck::Variant::Tag(tag.clone()),
-                    boon_typecheck::Variant::Tagged { tag, fields } => {
-                        boon_typecheck::Variant::Tagged {
+                    boon_checked::Variant::Tag(tag) => boon_checked::Variant::Tag(tag.clone()),
+                    boon_checked::Variant::Tagged { tag, fields } => {
+                        boon_checked::Variant::Tagged {
                             tag: tag.clone(),
-                            fields: boon_typecheck::ObjectShape {
+                            fields: boon_checked::ObjectShape {
                                 fields: fields
                                     .fields
                                     .iter()
@@ -1038,14 +1038,14 @@ pub(crate) fn erase_runtime_type_vars(ty: &Type) -> Type {
 fn refine_runtime_occurrence_type(existing: &Type, expected: &Type) -> Result<Type, String> {
     let existing = erase_runtime_type_vars(existing);
     let expected = erase_runtime_type_vars(expected);
-    let existing_closed = boon_typecheck::type_is_recursively_closed(&existing);
-    let expected_closed = boon_typecheck::type_is_recursively_closed(&expected);
+    let existing_closed = boon_checked::type_is_recursively_closed(&existing);
+    let expected_closed = boon_checked::type_is_recursively_closed(&expected);
     if expected_closed {
         if existing_closed {
-            if boon_typecheck::resolved_type_is_assignable_to(&expected, &existing) {
+            if boon_checked::resolved_type_is_assignable_to(&expected, &existing) {
                 return Ok(expected);
             }
-            if boon_typecheck::resolved_type_is_assignable_to(&existing, &expected) {
+            if boon_checked::resolved_type_is_assignable_to(&existing, &expected) {
                 return Ok(existing);
             }
             return Err(format!(
@@ -1058,7 +1058,7 @@ fn refine_runtime_occurrence_type(existing: &Type, expected: &Type) -> Result<Ty
         // transparent wrapper layer.
         return Ok(expected);
     }
-    let refined = erase_runtime_type_vars(&boon_typecheck::specialize_checked_call_result(
+    let refined = erase_runtime_type_vars(&boon_checked::specialize_checked_call_result(
         &expected, &existing,
     ));
     Ok(refined)
@@ -1078,7 +1078,7 @@ fn project_concrete_type(mut ty: Type, fields: &[String]) -> Option<Type> {
                     .collect::<Vec<_>>();
                 match projected.as_slice() {
                     [] => return None,
-                    _ => boon_typecheck::canonical_union_type(projected),
+                    _ => boon_checked::canonical_union_type(projected),
                 }
             }
             _ => return None,
@@ -1117,7 +1117,7 @@ fn concrete_record_type(
             typed.insert(field.name.clone(), value_type);
         }
     }
-    Some(Type::object(boon_typecheck::ObjectShape {
+    Some(Type::object(boon_checked::ObjectShape {
         fields: typed,
         field_order: ordered,
         open: false,
@@ -1135,7 +1135,7 @@ fn concrete_structural_type(
                 return None;
             };
             Some(Type::VariantSet(
-                vec![boon_typecheck::Variant::Tagged {
+                vec![boon_checked::Variant::Tagged {
                     tag: tag.clone(),
                     fields: shape,
                 }]
@@ -1214,7 +1214,7 @@ fn concrete_structural_type(
 
 fn semantic_callable_inventory(
     program: &CheckedProgram,
-    semantic_scope_ids: &BTreeMap<boon_typecheck::LexicalScopeId, SemanticScopeId>,
+    semantic_scope_ids: &BTreeMap<boon_checked::LexicalScopeId, SemanticScopeId>,
 ) -> Result<(Vec<SemanticCallable>, BTreeMap<DeclId, SemanticCallableId>), ExpansionError> {
     let mut callable_ids = BTreeMap::new();
     let mut callables = Vec::with_capacity(program.callables.len());
@@ -1292,7 +1292,7 @@ fn semantic_callable_inventory(
 
 fn semantic_call_inventory(
     program: &CheckedProgram,
-    semantic_scope_ids: &BTreeMap<boon_typecheck::LexicalScopeId, SemanticScopeId>,
+    semantic_scope_ids: &BTreeMap<boon_checked::LexicalScopeId, SemanticScopeId>,
     callable_ids: &BTreeMap<DeclId, SemanticCallableId>,
 ) -> Result<(Vec<SemanticCall>, BTreeMap<CheckedCallId, SemanticCallId>), ExpansionError> {
     let expressions = program
@@ -1557,7 +1557,7 @@ pub(crate) fn derive_semantic_execution_graph(
         .filter(|statement| {
             !matches!(
                 statement.kind,
-                boon_typecheck::CheckedStatementKind::Function { .. }
+                boon_checked::CheckedStatementKind::Function { .. }
             ) && !declaration_is_function_local(program, statement.scope_id)
         })
         .map(|statement| statement.id)
@@ -1600,14 +1600,14 @@ pub(crate) fn derive_semantic_execution_graph(
         let semantic_statement = semantic_statement_ids[&statement.id];
         builder.set_current_statement(Some(semantic_statement));
         let declaration = match &statement.kind {
-            boon_typecheck::CheckedStatementKind::Function { declaration }
-            | boon_typecheck::CheckedStatementKind::Field { declaration } => Some(*declaration),
-            boon_typecheck::CheckedStatementKind::Source { declaration, .. }
-            | boon_typecheck::CheckedStatementKind::Hold { declaration, .. }
-            | boon_typecheck::CheckedStatementKind::List { declaration, .. } => *declaration,
-            boon_typecheck::CheckedStatementKind::Block
-            | boon_typecheck::CheckedStatementKind::Spread
-            | boon_typecheck::CheckedStatementKind::Expression => None,
+            boon_checked::CheckedStatementKind::Function { declaration }
+            | boon_checked::CheckedStatementKind::Field { declaration } => Some(*declaration),
+            boon_checked::CheckedStatementKind::Source { declaration, .. }
+            | boon_checked::CheckedStatementKind::Hold { declaration, .. }
+            | boon_checked::CheckedStatementKind::List { declaration, .. } => *declaration,
+            boon_checked::CheckedStatementKind::Block
+            | boon_checked::CheckedStatementKind::Spread
+            | boon_checked::CheckedStatementKind::Expression => None,
         };
         let value = statement
             .value
@@ -1648,15 +1648,15 @@ pub(crate) fn derive_semantic_execution_graph(
                 .unzip()
         };
         let kind = match &statement.kind {
-            boon_typecheck::CheckedStatementKind::Function { .. } => unreachable!(),
-            boon_typecheck::CheckedStatementKind::Field { declaration } => {
+            boon_checked::CheckedStatementKind::Function { .. } => unreachable!(),
+            boon_checked::CheckedStatementKind::Field { declaration } => {
                 let (name, path) = declaration_parts(Some(*declaration));
                 SemanticStatementKind::Field {
                     name: name.ok_or(ExpansionError::MissingDeclaration(*declaration))?,
                     path: path.ok_or(ExpansionError::MissingDeclaration(*declaration))?,
                 }
             }
-            boon_typecheck::CheckedStatementKind::Source { declaration, event } => {
+            boon_checked::CheckedStatementKind::Source { declaration, event } => {
                 let (name, path) = declaration_parts(*declaration);
                 SemanticStatementKind::Source {
                     name,
@@ -1664,7 +1664,7 @@ pub(crate) fn derive_semantic_execution_graph(
                     event: event.clone(),
                 }
             }
-            boon_typecheck::CheckedStatementKind::Hold {
+            boon_checked::CheckedStatementKind::Hold {
                 declaration,
                 name: hold_name,
             } => {
@@ -1675,7 +1675,7 @@ pub(crate) fn derive_semantic_execution_graph(
                     hold_name: hold_name.clone(),
                 }
             }
-            boon_typecheck::CheckedStatementKind::List {
+            boon_checked::CheckedStatementKind::List {
                 declaration,
                 capacity,
             } => {
@@ -1686,9 +1686,9 @@ pub(crate) fn derive_semantic_execution_graph(
                     capacity: *capacity,
                 }
             }
-            boon_typecheck::CheckedStatementKind::Block => SemanticStatementKind::Block,
-            boon_typecheck::CheckedStatementKind::Spread => SemanticStatementKind::Spread,
-            boon_typecheck::CheckedStatementKind::Expression => SemanticStatementKind::Expression,
+            boon_checked::CheckedStatementKind::Block => SemanticStatementKind::Block,
+            boon_checked::CheckedStatementKind::Spread => SemanticStatementKind::Spread,
+            boon_checked::CheckedStatementKind::Expression => SemanticStatementKind::Expression,
         };
         statements.push(SemanticStatement {
             id: semantic_statement,
@@ -1836,13 +1836,13 @@ pub(crate) fn derive_semantic_execution_graph(
                         id: source,
                         value_id,
                         checked_expr_id: checked_result,
-                        flow_type: boon_typecheck::FlowType {
+                        flow_type: boon_checked::FlowType {
                             mode: FlowMode::PresentOrAbsent,
                             ty: Type::Absent,
                         },
-                        effect: boon_typecheck::CheckedEffectSummary {
+                        effect: boon_checked::CheckedEffectSummary {
                             emits_source: true,
-                            ..boon_typecheck::CheckedEffectSummary::default()
+                            ..boon_checked::CheckedEffectSummary::default()
                         },
                         owner: Some(owner),
                         provenance: SemanticValueProvenance {
@@ -1888,7 +1888,7 @@ pub(crate) fn derive_semantic_execution_graph(
                     value_id,
                     checked_expr_id: checked_result,
                     flow_type: producer.spec.result_type.clone(),
-                    effect: boon_typecheck::CheckedEffectSummary {
+                    effect: boon_checked::CheckedEffectSummary {
                         emits_source: true,
                         ..lookup
                             .callable(program, producer.spec.callable)
@@ -2063,7 +2063,7 @@ pub(crate) fn derive_semantic_execution_graph(
                     value_id,
                     checked_expr_id: input_definition.checked_expr_id,
                     flow_type: input_definition.flow_type.clone(),
-                    effect: boon_typecheck::CheckedEffectSummary::default(),
+                    effect: boon_checked::CheckedEffectSummary::default(),
                     owner: input_definition.owner,
                     provenance: input_definition.provenance.clone(),
                     resource_binding_path: None,
@@ -2403,7 +2403,7 @@ struct ExactResourceInstanceContext<'a> {
     statements: &'a [SemanticStatement],
     materializations: &'a [SemanticContextualMaterialization],
     out_net: &'a OutNet,
-    checked_statement: boon_typecheck::CheckedStatementId,
+    checked_statement: boon_checked::CheckedStatementId,
     declaration: DeclId,
     checked_binding: CheckedResourceBinding,
     resource_kind: &'static str,
@@ -2895,12 +2895,12 @@ fn arena_expression_children(kind: &SemanticExpressionKind) -> Vec<SemanticExprI
 fn ensure_resource_definition_statement(
     program: &CheckedProgram,
     lookup: &CheckedProgramLookup,
-    semantic_scope_ids: &BTreeMap<boon_typecheck::LexicalScopeId, SemanticScopeId>,
+    semantic_scope_ids: &BTreeMap<boon_checked::LexicalScopeId, SemanticScopeId>,
     arena: &mut SemanticExpressionArena,
     statements: &mut Vec<SemanticStatement>,
     expression: SemanticExprId,
     suggested_statement: Option<SemanticStatementId>,
-    checked_statement: boon_typecheck::CheckedStatementId,
+    checked_statement: boon_checked::CheckedStatementId,
     declaration: DeclId,
     checked_binding: CheckedResourceBinding,
 ) -> Result<(SemanticExprId, SemanticStatementId), ExpansionError> {
@@ -3073,7 +3073,7 @@ fn ensure_resource_definition_statement(
             .unzip()
     };
     let kind = match &checked.kind {
-        boon_typecheck::CheckedStatementKind::Function { .. } => {
+        boon_checked::CheckedStatementKind::Function { .. } => {
             let (name, path) = declaration_parts(Some(declaration));
             match &checked_binding {
                 CheckedResourceBinding::Source { .. } => SemanticStatementKind::Source {
@@ -3105,14 +3105,14 @@ fn ensure_resource_definition_statement(
                 }
             }
         }
-        boon_typecheck::CheckedStatementKind::Field { declaration } => {
+        boon_checked::CheckedStatementKind::Field { declaration } => {
             let (name, path) = declaration_parts(Some(*declaration));
             SemanticStatementKind::Field {
                 name: name.ok_or(ExpansionError::MissingDeclaration(*declaration))?,
                 path: path.ok_or(ExpansionError::MissingDeclaration(*declaration))?,
             }
         }
-        boon_typecheck::CheckedStatementKind::Source { declaration, event } => {
+        boon_checked::CheckedStatementKind::Source { declaration, event } => {
             let (name, path) = declaration_parts(*declaration);
             SemanticStatementKind::Source {
                 name,
@@ -3120,7 +3120,7 @@ fn ensure_resource_definition_statement(
                 event: event.clone(),
             }
         }
-        boon_typecheck::CheckedStatementKind::Hold {
+        boon_checked::CheckedStatementKind::Hold {
             declaration,
             name: hold_name,
         } => {
@@ -3131,7 +3131,7 @@ fn ensure_resource_definition_statement(
                 hold_name: hold_name.clone(),
             }
         }
-        boon_typecheck::CheckedStatementKind::List {
+        boon_checked::CheckedStatementKind::List {
             declaration,
             capacity,
         } => {
@@ -3142,9 +3142,9 @@ fn ensure_resource_definition_statement(
                 capacity: *capacity,
             }
         }
-        boon_typecheck::CheckedStatementKind::Block => SemanticStatementKind::Block,
-        boon_typecheck::CheckedStatementKind::Spread => SemanticStatementKind::Spread,
-        boon_typecheck::CheckedStatementKind::Expression => SemanticStatementKind::Expression,
+        boon_checked::CheckedStatementKind::Block => SemanticStatementKind::Block,
+        boon_checked::CheckedStatementKind::Spread => SemanticStatementKind::Spread,
+        boon_checked::CheckedStatementKind::Expression => SemanticStatementKind::Expression,
     };
     let statement = SemanticStatementId(statements.len());
     let expression =
@@ -3194,7 +3194,7 @@ fn remap_checked_resource_ids(
     origins: &[SemanticExpressionOrigin],
     semantic_sources: &BTreeMap<
         (
-            boon_typecheck::CheckedSourceId,
+            boon_checked::CheckedSourceId,
             Option<StaticOwnerId>,
             Option<OutCallInstanceId>,
         ),
@@ -3202,7 +3202,7 @@ fn remap_checked_resource_ids(
     >,
     semantic_states: &BTreeMap<
         (
-            boon_typecheck::CheckedStateId,
+            boon_checked::CheckedStateId,
             Option<StaticOwnerId>,
             Option<OutCallInstanceId>,
         ),
@@ -3523,10 +3523,10 @@ fn synthesize_statement_owned_states(
                 value_id,
                 checked_expr_id: initial_expression.checked_expr_id,
                 flow_type,
-                effect: boon_typecheck::CheckedEffectSummary {
+                effect: boon_checked::CheckedEffectSummary {
                     reads_state: true,
                     writes_state: true,
-                    ..boon_typecheck::CheckedEffectSummary::default()
+                    ..boon_checked::CheckedEffectSummary::default()
                 },
                 owner: expression_owner,
                 provenance,
@@ -3799,8 +3799,8 @@ fn contextual_operation_formals(
 
 fn checked_scope(
     program: &CheckedProgram,
-    scope: boon_typecheck::LexicalScopeId,
-) -> Option<&boon_typecheck::CheckedScope> {
+    scope: boon_checked::LexicalScopeId,
+) -> Option<&boon_checked::CheckedScope> {
     program
         .scopes
         .iter()
@@ -3809,7 +3809,7 @@ fn checked_scope(
 
 fn declaration_in_exact_scope(
     lookup: &CheckedProgramLookup,
-    scope: boon_typecheck::LexicalScopeId,
+    scope: boon_checked::LexicalScopeId,
     name: &str,
 ) -> Option<DeclId> {
     lookup.declaration_in_exact_scope(scope, name)
@@ -3818,7 +3818,7 @@ fn declaration_in_exact_scope(
 fn declaration_in_lexical_scope(
     program: &CheckedProgram,
     lookup: &CheckedProgramLookup,
-    mut scope: boon_typecheck::LexicalScopeId,
+    mut scope: boon_checked::LexicalScopeId,
     name: &str,
 ) -> Option<DeclId> {
     let mut visited = BTreeSet::new();
@@ -3833,14 +3833,14 @@ fn declaration_in_lexical_scope(
 
 fn declaration_is_function_local(
     program: &CheckedProgram,
-    mut scope: boon_typecheck::LexicalScopeId,
+    mut scope: boon_checked::LexicalScopeId,
 ) -> bool {
     let mut visited = BTreeSet::new();
     while visited.insert(scope) {
         let Some(current) = checked_scope(program, scope) else {
             return false;
         };
-        if current.kind == boon_typecheck::CheckedScopeKind::Function {
+        if current.kind == boon_checked::CheckedScopeKind::Function {
             return true;
         }
         let Some(parent) = current.parent else {
@@ -3862,17 +3862,17 @@ fn canonical_declaration_path(
     let mut visited = BTreeSet::new();
     while scope != program.root_scope && visited.insert(scope) {
         let current = lookup.scope(program, scope)?;
-        if current.kind == boon_typecheck::CheckedScopeKind::Function {
+        if current.kind == boon_checked::CheckedScopeKind::Function {
             break;
         }
         if let Some(owner) = current.owner
             && let Some(owner) = lookup.declaration(program, owner)
             && matches!(
                 owner.kind,
-                boon_typecheck::CheckedDeclarationKind::Field
-                    | boon_typecheck::CheckedDeclarationKind::Source
-                    | boon_typecheck::CheckedDeclarationKind::Hold
-                    | boon_typecheck::CheckedDeclarationKind::List
+                boon_checked::CheckedDeclarationKind::Field
+                    | boon_checked::CheckedDeclarationKind::Source
+                    | boon_checked::CheckedDeclarationKind::Hold
+                    | boon_checked::CheckedDeclarationKind::List
             )
         {
             segments.push(owner.name.clone());
@@ -4256,8 +4256,8 @@ fn ordinary_boundary_type_inner(ty: &Type, nested: bool) -> bool {
     match ty {
         Type::Text | Type::Number | Type::Bytes(_) | Type::Absent | Type::Bits { .. } => true,
         Type::VariantSet(variants) => variants.iter().all(|variant| match variant {
-            boon_typecheck::Variant::Tag(_) => true,
-            boon_typecheck::Variant::Tagged { fields, .. } => fields
+            boon_checked::Variant::Tag(_) => true,
+            boon_checked::Variant::Tagged { fields, .. } => fields
                 .fields
                 .values()
                 .all(|field| ordinary_boundary_type_inner(field, true)),
@@ -4284,12 +4284,12 @@ fn ordinary_boundary_type_inner(ty: &Type, nested: bool) -> bool {
 fn enclosing_function_owner(
     program: &CheckedProgram,
     lookup: &CheckedProgramLookup,
-    mut scope: boon_typecheck::LexicalScopeId,
+    mut scope: boon_checked::LexicalScopeId,
 ) -> Option<DeclId> {
     let mut visited = BTreeSet::new();
     while visited.insert(scope) {
         let definition = lookup.scope(program, scope)?;
-        if definition.kind == boon_typecheck::CheckedScopeKind::Function {
+        if definition.kind == boon_checked::CheckedScopeKind::Function {
             return definition.owner;
         }
         scope = definition.parent?;
@@ -4299,19 +4299,19 @@ fn enclosing_function_owner(
 
 fn ordinary_callable_base_candidate(
     program: &CheckedProgram,
-    callable: &boon_typecheck::CheckedCallableSignature,
+    callable: &boon_checked::CheckedCallableSignature,
 ) -> bool {
     ordinary_callable_base_rejection(program, callable).is_none()
 }
 
 fn ordinary_callable_base_rejection(
     program: &CheckedProgram,
-    callable: &boon_typecheck::CheckedCallableSignature,
+    callable: &boon_checked::CheckedCallableSignature,
 ) -> Option<&'static str> {
     if callable.kind != CheckedCallableKind::User {
         return Some("not_user");
     }
-    if callable.effect != boon_typecheck::CheckedEffectSummary::default() {
+    if callable.effect != boon_checked::CheckedEffectSummary::default() {
         return Some("effectful");
     }
     if !callable.contexts.is_empty() {
@@ -4336,7 +4336,7 @@ fn ordinary_callable_base_rejection(
     }
     if callable.parameters.iter().any(|parameter| {
         parameter.kind != CheckedParameterKind::Value
-            || parameter.evaluation_scope != boon_typecheck::CheckedEvaluationScope::Parent
+            || parameter.evaluation_scope != boon_checked::CheckedEvaluationScope::Parent
             || !matches!(parameter.requirement, CheckedParameterRequirement::Required)
     }) {
         return Some("parameter_contract");
@@ -4354,7 +4354,7 @@ fn ordinary_callable_base_rejection(
 fn ordinary_callable_body_dependencies(
     program: &CheckedProgram,
     lookup: &CheckedProgramLookup,
-    callable: &boon_typecheck::CheckedCallableSignature,
+    callable: &boon_checked::CheckedCallableSignature,
     candidates: &BTreeSet<DeclId>,
 ) -> Option<BTreeSet<DeclId>> {
     let Some(root) = callable.result_expression else {
@@ -4379,7 +4379,7 @@ fn ordinary_callable_body_dependencies(
         let Some(expression) = lookup.expression(program, expression_id) else {
             return None;
         };
-        if expression.effect != boon_typecheck::CheckedEffectSummary::default() {
+        if expression.effect != boon_checked::CheckedEffectSummary::default() {
             return None;
         }
         match &expression.kind {
@@ -4441,12 +4441,10 @@ fn ordinary_callable_body_dependencies(
                 }
                 match target.kind {
                     CheckedCallableKind::Builtin
-                        if target.effect == boon_typecheck::CheckedEffectSummary::default()
+                        if target.effect == boon_checked::CheckedEffectSummary::default()
                             && target.contexts.is_empty()
                             && target.context_formal.is_none()
-                            && !boon_typecheck::is_registered_render_constructor(
-                                &call.function,
-                            ) => {}
+                            && !boon_checked::is_registered_render_constructor(&call.function) => {}
                     CheckedCallableKind::User if candidates.contains(&target.decl_id) => {
                         dependencies.insert(target.decl_id);
                     }
@@ -5256,7 +5254,7 @@ impl<'a> SemanticExpressionBuilder<'a> {
     fn resolve_ambient_read(
         &self,
         mut frame: Option<OutCallInstanceId>,
-        scope: boon_typecheck::LexicalScopeId,
+        scope: boon_checked::LexicalScopeId,
         path: &str,
     ) -> Option<(DeclId, Vec<String>)> {
         let parts = path
@@ -5332,7 +5330,7 @@ impl<'a> SemanticExpressionBuilder<'a> {
                     .lookup
                     .declaration(self.program, target)
                     .is_some_and(|declaration| {
-                        declaration.kind == boon_typecheck::CheckedDeclarationKind::ElementState
+                        declaration.kind == boon_checked::CheckedDeclarationKind::ElementState
                     })
                 {
                     let (call, context) = self
@@ -5580,7 +5578,7 @@ impl<'a> SemanticExpressionBuilder<'a> {
                     .lookup
                     .declaration(self.program, target)
                     .ok_or(ExpansionError::MissingDeclaration(target))?;
-                if declaration.kind == boon_typecheck::CheckedDeclarationKind::PatternBinding {
+                if declaration.kind == boon_checked::CheckedDeclarationKind::PatternBinding {
                     let binding = self
                         .lookup
                         .pattern_binding(self.program, target)
@@ -5591,7 +5589,7 @@ impl<'a> SemanticExpressionBuilder<'a> {
                     fields.extend(projection);
                     return self.project(&expression, owner, input, fields);
                 }
-                if declaration.kind == boon_typecheck::CheckedDeclarationKind::Field
+                if declaration.kind == boon_checked::CheckedDeclarationKind::Field
                     && declaration_is_function_local(self.program, declaration.scope_id)
                     && !self
                         .program
@@ -5982,7 +5980,7 @@ impl<'a> SemanticExpressionBuilder<'a> {
             && self.current_ordinary_definition.is_some()
             && !has_out
             && checked_call.contexts.is_empty()
-            && callable.effect == boon_typecheck::CheckedEffectSummary::default()
+            && callable.effect == boon_checked::CheckedEffectSummary::default()
             && match callable.kind {
                 CheckedCallableKind::User => retained_user_call,
                 CheckedCallableKind::Builtin => {
@@ -6504,7 +6502,7 @@ impl<'a> SemanticExpressionBuilder<'a> {
         &mut self,
         frame: Option<OutCallInstanceId>,
         value_frame: Option<usize>,
-        fields: Vec<boon_typecheck::CheckedRecordField>,
+        fields: Vec<boon_checked::CheckedRecordField>,
     ) -> Result<Vec<SemanticRecordField>, ExpansionError> {
         fields
             .into_iter()
@@ -6599,9 +6597,9 @@ impl<'a> SemanticExpressionBuilder<'a> {
             return Ok(input);
         };
         let mut flow_type = flow_type.unwrap_or_else(|| origin.flow_type.clone());
-        flow_type.ty = boon_typecheck::canonical_union_type(vec![flow_type.ty, flush_type]);
-        if flow_type.mode == boon_typecheck::FlowMode::Absent {
-            flow_type.mode = boon_typecheck::FlowMode::Continuous;
+        flow_type.ty = boon_checked::canonical_union_type(vec![flow_type.ty, flush_type]);
+        if flow_type.mode == boon_checked::FlowMode::Absent {
+            flow_type.mode = boon_checked::FlowMode::Continuous;
         }
         let boundary = self.push(
             &origin,
@@ -6829,7 +6827,7 @@ impl<'a> SemanticExpressionBuilder<'a> {
                 .statement(self.program, child_id)
                 .ok_or(ExpansionError::MissingExpression(output))?;
             let (declaration, name, spread) = match child.kind {
-                boon_typecheck::CheckedStatementKind::Field { declaration } => (
+                boon_checked::CheckedStatementKind::Field { declaration } => (
                     Some(declaration),
                     self.lookup
                         .declaration(self.program, declaration)
@@ -6838,7 +6836,7 @@ impl<'a> SemanticExpressionBuilder<'a> {
                         .clone(),
                     false,
                 ),
-                boon_typecheck::CheckedStatementKind::Spread => (None, String::new(), true),
+                boon_checked::CheckedStatementKind::Spread => (None, String::new(), true),
                 _ => return self.expand_in_frame(output, frame, value_frame),
             };
             let value = child
@@ -6928,14 +6926,14 @@ impl<'a> SemanticExpressionBuilder<'a> {
                 .entries
                 .iter()
                 .find_map(|entry| match entry {
-                    boon_typecheck::CheckedCallEntry::Input {
+                    boon_checked::CheckedCallEntry::Input {
                         value,
                         from_pipe: true,
                         ..
                     } => Some(*value),
-                    boon_typecheck::CheckedCallEntry::Input { .. }
-                    | boon_typecheck::CheckedCallEntry::FreshOut { .. }
-                    | boon_typecheck::CheckedCallEntry::ForwardOut { .. } => None,
+                    boon_checked::CheckedCallEntry::Input { .. }
+                    | boon_checked::CheckedCallEntry::FreshOut { .. }
+                    | boon_checked::CheckedCallEntry::ForwardOut { .. } => None,
                 }),
             CheckedExpressionKind::Draining { input }
             | CheckedExpressionKind::Hold { initial: input, .. }
@@ -7202,7 +7200,7 @@ impl<'a> SemanticExpressionBuilder<'a> {
         let mut scope = Some(expression.scope_id);
         while let Some(scope_id) = scope {
             let checked_scope = self.lookup.scope(self.program, scope_id)?;
-            if checked_scope.kind == boon_typecheck::CheckedScopeKind::RepeatedOutput {
+            if checked_scope.kind == boon_checked::CheckedScopeKind::RepeatedOutput {
                 let output = checked_scope.owner?;
                 let net = self.out_net.output_net_in_frame(scoped.frame, output)?;
                 return self.out_net.owner_for_net(net);
@@ -7454,12 +7452,16 @@ mod tests {
 
     #[test]
     fn runtime_occurrence_refinement_keeps_the_narrower_compatible_closed_type() {
-        let narrow = Type::VariantSet(vec![boon_typecheck::Variant::Tag("Closed".to_owned())]);
-        let wide = Type::VariantSet(vec![
-            boon_typecheck::Variant::Tag("Closed".to_owned()),
-            boon_typecheck::Variant::Tag("Open".to_owned()),
-        ]);
-        let disjoint = Type::VariantSet(vec![boon_typecheck::Variant::Tag("Missing".to_owned())]);
+        let narrow = Type::VariantSet(vec![boon_checked::Variant::Tag("Closed".to_owned())].into());
+        let wide = Type::VariantSet(
+            vec![
+                boon_checked::Variant::Tag("Closed".to_owned()),
+                boon_checked::Variant::Tag("Open".to_owned()),
+            ]
+            .into(),
+        );
+        let disjoint =
+            Type::VariantSet(vec![boon_checked::Variant::Tag("Missing".to_owned())].into());
 
         assert_eq!(
             refine_runtime_occurrence_type(&wide, &narrow).unwrap(),
@@ -7857,7 +7859,7 @@ store: [
                 Type::VariantSet(variants)
                     if variants.iter().any(|variant| matches!(
                         variant,
-                        boon_typecheck::Variant::Tagged { tag, .. } if tag == "InvalidUpdate"
+                        boon_checked::Variant::Tagged { tag, .. } if tag == "InvalidUpdate"
                     ))
             ),
             "exposed FLUSH boundary expression: {:#?}",

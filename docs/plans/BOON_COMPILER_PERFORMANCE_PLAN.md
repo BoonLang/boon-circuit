@@ -273,6 +273,67 @@ A successful split improves Rust organization and rebuild isolation; it is not
 itself evidence that Boon source compiles faster and is never a reason for the
 performance goal to pause.
 
+#### Current `boon_checked` flag-day dependency graph
+
+The Phase 1 checked-product extraction uses this one-way graph:
+
+```text
+boon_contract   boon_data   boon_document_model   boon_effect_schema
+       \            |              |                     /
+                        boon_checked
+                       /      |      \
+          boon_semantic   boon_verify   boon_ir
+                       \      |      /
+boon_parser + boon_syntax -> boon_typecheck -> boon_compiler
+                               |
+                       editor/compiler callers
+```
+
+- `boon_checked` owns `Type`, immutable checked IDs/tables/expressions/calls,
+  `CheckedProgram`, checked lowering metadata, and their pure lookup and
+  substitution operations. It does not depend on `boon_typecheck`,
+  `boon_parser`, `boon_syntax`, or `ena`.
+- `boon_typecheck` owns parsing-to-checked construction, constraints,
+  unification, worklists, diagnostics projection, and report/session policy. It
+  depends on `boon_checked`; the reverse edge is forbidden.
+- `boon_semantic`, `boon_verify`, and `boon_ir` consume the immutable product
+  from `boon_checked` directly and do not rebuild merely because solver
+  implementation changes. Orchestration crates that invoke checking may depend
+  on both crates, but must import checked DTOs from their owning crate.
+- `CheckedProgramFields` remains an inspectable/serializable DTO, while sealing
+  it as a proof-bearing `CheckedProgram` is an unsafe invariant boundary used
+  only after successful checking. No safe constructor, compatibility re-export,
+  duplicate DTO, or feature-selected old owner is permitted.
+- After cutover, the enabled runtime optimization is an owned checked database
+  with compact/interned immutable terms and direct consumption by later phases;
+  the split itself does not satisfy a Boon latency gate.
+
+Checked-boundary cutover evidence (2026-08-03):
+
+- `boon_checked` is the sole owner of the immutable checked model and pure
+  checked operations. Cargo metadata confirms that it has no parser, syntax,
+  typechecker, or `ena` dependency; `boon_semantic`, `boon_verify`, and
+  `boon_ir` depend on it normally and keep `boon_typecheck` only as a test
+  dependency. No checked DTO is re-exported by `boon_typecheck`.
+- The pre-cutover solver/model owner forced semantic, verification, IR,
+  compiler, runtime, and CLI consumers into the affected Rust rebuild set. On
+  a stabilized post-cutover target, touching only
+  `crates/boon_typecheck/src/lib.rs` and checking the CLI spine rebuilt exactly
+  `boon_typecheck`, `boon_compiler`, `boon_runtime`, and `boon_cli`; semantic,
+  verification, IR, and `boon_checked` stayed fresh. The controlled post-cutover
+  sample took 1.03 seconds and 199,148 KiB peak RSS with one offline two-job
+  Cargo invocation.
+- Six direct checked-operation/serialization/sharing tests, the unsafe-boundary
+  compile-fail doctest, all 78 non-ignored typechecker library tests, and the
+  product-scale checked-diagnostic projection parity test pass. Downstream
+  semantic/verification/IR test binaries compile. One IR test and one verify
+  test that fail in their broad suites were reproduced with the same errors on
+  checkpoint `2ef9b1d`, before the cutover, and are not split regressions.
+- The extraction removed the unused `ena` allocation table from the
+  typechecker. The split has not been counted as a Boon runtime win; the next
+  Phase 1 work is the owned database, compact/interned terms, and measured
+  solver/worklist reductions it enables, followed by fresh release profiling.
+
 Development profiles and focused debug tests remain directional tools. The
 acceptance producer remains the revision-identified `release` binary required
 by the budget manifest; a faster Rust profile cannot be relabeled as cold
@@ -563,6 +624,14 @@ compiler-service work or any later repository plan:
    physical TodoMVC, and NovyWave pass both cache-disabled cold diagnostics
    modes and their RSS/scaling gates. A crate checkpoint or a parser-only win
    does not permit moving to semantic work while this exit is red.
+
+Current resumption after the checked-boundary cutover: finish item 7's owned
+database work inside `boon_typecheck` rather than performing another crate
+move. First refresh the thin direct profile and release cold baseline on the
+cutover revision; then intern/compact the measured high-copy type/shape/name
+owners, replace the borrowed checker/output reconstruction path with the owned
+database, and reduce the dominant scheme/inference worklists. Reprofile each
+owner-level slice and remain in item 8 until every Phase 1 fixture gate passes.
 
 Once diagnostics pass, use the same loop for semantic component retention,
 single manifest sealing, verified lowering, streaming/hash memory, and backend

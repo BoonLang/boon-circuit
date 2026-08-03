@@ -10,12 +10,12 @@
 
 use crate::out_net::{OutCallProvenance, OutInputValue, OutPortId, PassedBinding};
 use crate::*;
-use boon_contract::SourceBundleDigestV1;
-use boon_typecheck::{
+use boon_checked::{
     CheckedCallEntry, CheckedDeclarationKind, CheckedEvaluationScope, CheckedExpressionKind,
     CheckedParameterKind, CheckedProgram, CheckedStatementKind, DeclId, FlowMode, FlowType,
     LexicalScopeId, ProgramRole, Type, TypeVar,
 };
+use boon_contract::SourceBundleDigestV1;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -675,8 +675,7 @@ impl std::error::Error for CallableDependencyManifestError {}
 struct DependencyOwnerIndex {
     callable_by_checked: BTreeMap<DeclId, SemanticCallableId>,
     checked_scope_owner: BTreeMap<LexicalScopeId, SemanticDependencyOwnerV1>,
-    checked_statement_owner:
-        BTreeMap<boon_typecheck::CheckedStatementId, SemanticDependencyOwnerV1>,
+    checked_statement_owner: BTreeMap<boon_checked::CheckedStatementId, SemanticDependencyOwnerV1>,
     expression_owner: Vec<SemanticDependencyOwnerV1>,
     statement_owner: Vec<SemanticDependencyOwnerV1>,
     call_owner: Vec<SemanticDependencyOwnerV1>,
@@ -1240,7 +1239,7 @@ impl DependencyOwnerIndex {
 
     fn checked_statement(
         &self,
-        statement: boon_typecheck::CheckedStatementId,
+        statement: boon_checked::CheckedStatementId,
     ) -> Result<SemanticDependencyOwnerV1, CallableDependencyManifestError> {
         self.checked_statement_owner
             .get(&statement)
@@ -3920,23 +3919,23 @@ fn callable_public_shape_digest(
     struct PublicParameter<'a> {
         ordinal: usize,
         name: &'a str,
-        kind: boon_typecheck::CheckedParameterKind,
+        kind: boon_checked::CheckedParameterKind,
         flow_type: &'a FlowType,
-        requirement: &'a boon_typecheck::CheckedParameterRequirement,
-        evaluation_scope: boon_typecheck::CheckedEvaluationScope,
+        requirement: &'a boon_checked::CheckedParameterRequirement,
+        evaluation_scope: boon_checked::CheckedEvaluationScope,
     }
     #[derive(Serialize)]
     struct PublicCallable<'a> {
-        kind: boon_typecheck::CheckedCallableKind,
+        kind: boon_checked::CheckedCallableKind,
         name: &'a str,
-        external_identity: &'a Option<boon_typecheck::CheckedExternalDeclarationIdentityV1>,
+        external_identity: &'a Option<boon_checked::CheckedExternalDeclarationIdentityV1>,
         parameters: Vec<PublicParameter<'a>>,
         contexts: &'a [SemanticCallableContext],
-        context_scheme: Option<&'a boon_typecheck::CheckedContextScheme>,
+        context_scheme: Option<&'a boon_checked::CheckedContextScheme>,
         result: &'a FlowType,
         role: ProgramRole,
-        effect: boon_typecheck::CheckedEffectSummary,
-        contextual_operation: &'a Option<boon_typecheck::CheckedContextualOperation>,
+        effect: boon_checked::CheckedEffectSummary,
+        contextual_operation: &'a Option<boon_checked::CheckedContextualOperation>,
     }
 
     let parameters = callable
@@ -5187,7 +5186,7 @@ fn checked_expression_dependency(
 }
 
 fn parameter_dependency(
-    parameter: &boon_typecheck::CheckedParameter,
+    parameter: &boon_checked::CheckedParameter,
 ) -> (SemanticDependencyChannelV1, Vec<SemanticDependencyRoleV1>) {
     let channel = match (parameter.kind, parameter.evaluation_scope) {
         (CheckedParameterKind::Out, _) => SemanticDependencyChannelV1::OutFormal,
@@ -9790,11 +9789,11 @@ mod tests {
         name: &str,
         source: &str,
         role: ProgramRole,
-    ) -> boon_typecheck::CheckedProgram {
+    ) -> boon_checked::CheckedProgram {
         let parsed = boon_parser::parse_source(name, source).expect("fixture parses");
         let (output, _) = boon_typecheck::check_program_profiled_with_external_types(
             &parsed,
-            &boon_typecheck::ExternalTypeEnvironment::empty(role),
+            &boon_checked::ExternalTypeEnvironment::empty(role),
         );
         assert!(
             !output.report.has_errors(),

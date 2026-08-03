@@ -9,7 +9,7 @@ use crate::{
     OutCallInstanceId, ProducerFunctionId, ProducerResultStatementId, ResolvedOutGraph,
     StaticOwnerDef, StaticOwnerId,
 };
-use boon_typecheck::{
+use boon_checked::{
     CheckedCallContextKind, CheckedCallId, CheckedCallableKind, CheckedContextBinding,
     CheckedContextTypeSubstitution, CheckedContextualOperation, CheckedEffectSummary,
     CheckedEvaluationScope, CheckedExprId, CheckedExternalDeclarationIdentityV1,
@@ -1902,7 +1902,7 @@ impl SemanticExecutionGraphV1 {
                     ));
                 }
                 if let CheckedParameterRequirement::Optional {
-                    default: boon_typecheck::CheckedParameterDefault::CallableProfile { profile },
+                    default: boon_checked::CheckedParameterDefault::CallableProfile { profile },
                 } = &parameter.requirement
                     && profile.is_empty()
                 {
@@ -2872,7 +2872,7 @@ mod tests {
                 value_id: SemanticValueId(0),
                 checked_expr_id: CheckedExprId(0),
                 flow_type: FlowType {
-                    mode: boon_typecheck::FlowMode::Continuous,
+                    mode: boon_checked::FlowMode::Continuous,
                     ty: Type::Text,
                 },
                 effect: CheckedEffectSummary::default(),
@@ -2907,7 +2907,7 @@ mod tests {
             value_id: SemanticValueId(id),
             checked_expr_id: CheckedExprId(u32::try_from(id).unwrap()),
             flow_type: FlowType {
-                mode: boon_typecheck::FlowMode::Continuous,
+                mode: boon_checked::FlowMode::Continuous,
                 ty: Type::Text,
             },
             effect: CheckedEffectSummary::default(),

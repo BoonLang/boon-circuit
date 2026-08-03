@@ -44,7 +44,7 @@ struct SemanticLowerProfile {
 }
 
 fn verify_and_lower_checked_profiled(
-    checked: boon_typecheck::CheckedProgram,
+    checked: boon_checked::CheckedProgram,
     producer_requests: &[boon_semantic::ProducerMaterializationRequest],
     cancellation: &mut CancellationProbe<'_>,
 ) -> Result<(ErasedProgram, SemanticLowerProfile), String> {
@@ -102,16 +102,16 @@ impl<'a> CancellationProbe<'a> {
 }
 
 fn elaborate_checked(
-    checked: boon_typecheck::CheckedProgram,
+    checked: boon_checked::CheckedProgram,
     producer_requests: &[boon_semantic::ProducerMaterializationRequest],
 ) -> Result<boon_semantic::SemanticProgram, String> {
     elaborate_checked_with_external_event_identities(checked, producer_requests, &[])
 }
 
 fn elaborate_checked_with_external_event_identities(
-    checked: boon_typecheck::CheckedProgram,
+    checked: boon_checked::CheckedProgram,
     producer_requests: &[boon_semantic::ProducerMaterializationRequest],
-    external_event_identities: &[boon_typecheck::CheckedExternalDeclarationIdentityV1],
+    external_event_identities: &[boon_checked::CheckedExternalDeclarationIdentityV1],
 ) -> Result<boon_semantic::SemanticProgram, String> {
     let started = Instant::now();
     let semantic = boon_semantic::elaborate_with_external_event_identities(
@@ -161,7 +161,7 @@ pub struct CheckedDiagnosticsProfile {
 
 pub struct CheckedSourceFromSource {
     pub parsed: ParsedProgram,
-    pub output: boon_typecheck::CheckOutput,
+    pub output: boon_checked::CheckOutput,
     pub profile: CheckedDiagnosticsProfile,
 }
 
@@ -198,7 +198,7 @@ pub fn diagnose_runtime_source_units(
         .0
         .diagnostics
         .into_iter()
-        .filter(|diagnostic| diagnostic.severity == boon_typecheck::DiagnosticSeverity::Error)
+        .filter(|diagnostic| diagnostic.severity == boon_checked::DiagnosticSeverity::Error)
         .map(|diagnostic| {
             let (path, line) = source_file_location(&parsed, diagnostic.line);
             CompilerDiagnostic {
@@ -546,7 +546,7 @@ fn check_source_with_ownership(
     let parse_ms = elapsed_ms(parse_started);
     let source_unit_count = parsed.files.len();
     let expression_count = parsed.expressions.len();
-    let external_types = boon_typecheck::ExternalTypeEnvironment::empty(request.program_role);
+    let external_types = boon_checked::ExternalTypeEnvironment::empty(request.program_role);
     let typecheck_started = Instant::now();
     let (output, typecheck_profile) = match ownership {
         CheckedSourceOwnership::Report => {
@@ -628,7 +628,7 @@ fn compile_parsed_to_machine_plan(
     schema_version: u64,
     migration_predecessors: &[MigrationPredecessorBinding],
 ) -> CompilerResult<CompiledMachinePlanFromSource> {
-    let external_types = boon_typecheck::ExternalTypeEnvironment::empty(program_role);
+    let external_types = boon_checked::ExternalTypeEnvironment::empty(program_role);
     let typecheck_started = Instant::now();
     let (check_output, typecheck_profile) =
         boon_typecheck::check_runtime_program_profiled_with_external_types(
@@ -707,7 +707,7 @@ pub(crate) fn finish_checked_machine_plan_with_cancellation(
 
 #[allow(clippy::too_many_arguments)]
 fn finish_checked_program_to_machine_plan(
-    checked: boon_typecheck::CheckedProgram,
+    checked: boon_checked::CheckedProgram,
     source_unit_count: usize,
     parsed_expression_count: usize,
     parse_work: ParseWorkCounters,
@@ -784,14 +784,14 @@ fn finish_checked_program_to_machine_plan(
 
 fn checked_program_from_output(
     parsed: &ParsedProgram,
-    output: boon_typecheck::CheckOutput,
-) -> CompilerResult<boon_typecheck::CheckedProgram> {
+    output: boon_checked::CheckOutput,
+) -> CompilerResult<boon_checked::CheckedProgram> {
     if output.report.has_errors() {
         let diagnostics = output
             .report
             .diagnostics
             .iter()
-            .filter(|diagnostic| diagnostic.severity == boon_typecheck::DiagnosticSeverity::Error)
+            .filter(|diagnostic| diagnostic.severity == boon_checked::DiagnosticSeverity::Error)
             .map(|diagnostic| {
                 let (path, line) = source_file_location(parsed, diagnostic.line);
                 format!("{path}:{line}: {}", diagnostic.message)
@@ -806,7 +806,7 @@ fn checked_program_from_output(
                         slot.diagnostics
                             .iter()
                             .filter(|diagnostic| {
-                                diagnostic.severity == boon_typecheck::DiagnosticSeverity::Error
+                                diagnostic.severity == boon_checked::DiagnosticSeverity::Error
                             })
                             .map(|diagnostic| {
                                 format!(

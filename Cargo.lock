@@ -662,6 +662,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "boon_checked"
+version = "0.1.0"
+dependencies = [
+ "boon_contract",
+ "boon_data",
+ "boon_document_model",
+ "boon_effect_schema",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "boon_cli"
 version = "0.1.0"
 dependencies = [
@@ -677,6 +689,7 @@ dependencies = [
 name = "boon_compiler"
 version = "0.1.0"
 dependencies = [
+ "boon_checked",
  "boon_data",
  "boon_example_manifest",
  "boon_ir",
@@ -756,6 +769,7 @@ dependencies = [
 name = "boon_editor"
 version = "0.1.0"
 dependencies = [
+ "boon_checked",
  "boon_contract",
  "boon_document_model",
  "boon_parser",
@@ -849,6 +863,7 @@ dependencies = [
 name = "boon_ir"
 version = "0.1.0"
 dependencies = [
+ "boon_checked",
  "boon_contract",
  "boon_data",
  "boon_parser",
@@ -901,6 +916,7 @@ version = "0.1.0"
 dependencies = [
  "arboard",
  "bincode",
+ "boon_checked",
  "boon_compiler",
  "boon_contract",
  "boon_document",
@@ -1055,6 +1071,7 @@ dependencies = [
 name = "boon_semantic"
 version = "0.1.0"
 dependencies = [
+ "boon_checked",
  "boon_contract",
  "boon_data",
  "boon_parser",
@@ -1114,13 +1131,13 @@ dependencies = [
 name = "boon_typecheck"
 version = "0.1.0"
 dependencies = [
+ "boon_checked",
  "boon_contract",
  "boon_data",
  "boon_document_model",
  "boon_effect_schema",
  "boon_parser",
  "boon_syntax",
- "ena",
  "serde",
  "serde_json",
  "smallvec",
@@ -1131,6 +1148,7 @@ dependencies = [
 name = "boon_verify"
 version = "0.1.0"
 dependencies = [
+ "boon_checked",
  "boon_contract",
  "boon_parser",
  "boon_semantic",
@@ -1799,15 +1817,6 @@ name = "either"
 version = "1.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "91622ff5e7162018101f2fea40d6ebf4a78bbe5a49736a2020649edf9693679e"
-
-[[package]]
-name = "ena"
-version = "0.14.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eabffdaee24bd1bf95c5ef7cec31260444317e72ea56c4c91750e8b7ee58d5f1"
-dependencies = [
- "log",
-]
 
 [[package]]
 name = "endi"

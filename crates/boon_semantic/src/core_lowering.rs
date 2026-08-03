@@ -23,7 +23,7 @@ use crate::{
     SemanticValueListAuthorityId, SemanticValueMember, SemanticValueOrigin,
     SemanticValueProvenance, StaticOwnerDef, StaticOwnerId,
 };
-use boon_typecheck::{
+use boon_checked::{
     CheckedExternalDeclarationIdentityV1, CheckedExternalDeclarationKind, DeclId, FlowMode,
     FlowType,
 };
@@ -84,34 +84,34 @@ fn hidden_key_type(name: &str) -> String {
     output
 }
 
-fn semantic_data_type(value: &boon_typecheck::Type) -> program_core::SemanticDataType {
+fn semantic_data_type(value: &boon_checked::Type) -> program_core::SemanticDataType {
     match value {
-        boon_typecheck::Type::Text => program_core::SemanticDataType::Text,
-        boon_typecheck::Type::Number => program_core::SemanticDataType::Number,
-        boon_typecheck::Type::Bytes(boon_typecheck::BytesType::Dynamic) => {
+        boon_checked::Type::Text => program_core::SemanticDataType::Text,
+        boon_checked::Type::Number => program_core::SemanticDataType::Number,
+        boon_checked::Type::Bytes(boon_checked::BytesType::Dynamic) => {
             program_core::SemanticDataType::Bytes { fixed_len: None }
         }
-        boon_typecheck::Type::Bytes(boon_typecheck::BytesType::Fixed(fixed_len)) => {
+        boon_checked::Type::Bytes(boon_checked::BytesType::Fixed(fixed_len)) => {
             program_core::SemanticDataType::Bytes {
                 fixed_len: Some(*fixed_len),
             }
         }
-        boon_typecheck::Type::Bits { width } => {
+        boon_checked::Type::Bits { width } => {
             program_core::SemanticDataType::Bits { width: *width }
         }
-        boon_typecheck::Type::Absent => program_core::SemanticDataType::Unknown {
+        boon_checked::Type::Absent => program_core::SemanticDataType::Unknown {
             reason: "private absence is not semantic data".to_owned(),
         },
-        boon_typecheck::Type::VariantSet(variants) => {
+        boon_checked::Type::VariantSet(variants) => {
             let mut variants = variants
                 .iter()
                 .map(|variant| match variant {
-                    boon_typecheck::Variant::Tag(tag) => program_core::SemanticVariantType {
+                    boon_checked::Variant::Tag(tag) => program_core::SemanticVariantType {
                         tag: tag.clone(),
                         fields: Vec::new(),
                         open: false,
                     },
-                    boon_typecheck::Variant::Tagged { tag, fields } => {
+                    boon_checked::Variant::Tagged { tag, fields } => {
                         program_core::SemanticVariantType {
                             tag: tag.clone(),
                             fields: semantic_type_fields(&fields.fields),
@@ -123,45 +123,43 @@ fn semantic_data_type(value: &boon_typecheck::Type) -> program_core::SemanticDat
             variants.sort_by(|left, right| left.tag.cmp(&right.tag));
             program_core::SemanticDataType::Variant { variants }
         }
-        boon_typecheck::Type::Object(shape) => program_core::SemanticDataType::Record {
+        boon_checked::Type::Object(shape) => program_core::SemanticDataType::Record {
             fields: semantic_type_fields(&shape.fields),
             open: shape.open,
         },
-        boon_typecheck::Type::List(item) => program_core::SemanticDataType::List {
+        boon_checked::Type::List(item) => program_core::SemanticDataType::List {
             item: Box::new(semantic_data_type(item)),
         },
-        boon_typecheck::Type::Map { key, value } => program_core::SemanticDataType::Map {
+        boon_checked::Type::Map { key, value } => program_core::SemanticDataType::Map {
             key: Box::new(semantic_data_type(key)),
             value: Box::new(semantic_data_type(value)),
         },
-        boon_typecheck::Type::Set(item) => program_core::SemanticDataType::Set {
+        boon_checked::Type::Set(item) => program_core::SemanticDataType::Set {
             item: Box::new(semantic_data_type(item)),
         },
-        boon_typecheck::Type::Union(members) => program_core::SemanticDataType::Union {
+        boon_checked::Type::Union(members) => program_core::SemanticDataType::Union {
             members: members.iter().map(semantic_data_type).collect(),
         },
-        boon_typecheck::Type::Function { .. } => program_core::SemanticDataType::Unknown {
+        boon_checked::Type::Function { .. } => program_core::SemanticDataType::Unknown {
             reason: "function values are not semantic memory data".to_owned(),
         },
-        boon_typecheck::Type::RenderContract => program_core::SemanticDataType::Unknown {
+        boon_checked::Type::RenderContract => program_core::SemanticDataType::Unknown {
             reason: "render contracts are not semantic memory data".to_owned(),
         },
-        boon_typecheck::Type::UnresolvedShape { reason } => {
-            program_core::SemanticDataType::Unknown {
-                reason: reason.clone(),
-            }
-        }
-        boon_typecheck::Type::Var(var) => program_core::SemanticDataType::Unknown {
+        boon_checked::Type::UnresolvedShape { reason } => program_core::SemanticDataType::Unknown {
+            reason: reason.clone(),
+        },
+        boon_checked::Type::Var(var) => program_core::SemanticDataType::Unknown {
             reason: format!("unresolved type variable {}", var.0),
         },
-        boon_typecheck::Type::Unknown => program_core::SemanticDataType::Unknown {
+        boon_checked::Type::Unknown => program_core::SemanticDataType::Unknown {
             reason: "unknown type".to_owned(),
         },
     }
 }
 
 fn semantic_type_fields(
-    fields: &BTreeMap<String, boon_typecheck::Type>,
+    fields: &BTreeMap<String, boon_checked::Type>,
 ) -> Vec<program_core::SemanticTypeField> {
     fields
         .iter()
@@ -428,7 +426,7 @@ pub(super) struct MappedSemanticProducerInstance {
 pub(super) struct MappedSemanticTriggerArm {
     pub id: MappedReactiveTriggerId,
     pub cause: EventCause,
-    pub gate_checked_expression: boon_typecheck::CheckedExprId,
+    pub gate_checked_expression: boon_checked::CheckedExprId,
     pub gate_expression: ExecutableExprId,
     pub owner: Option<StaticOwnerId>,
     pub route_scope: ExecutableLexicalScopeId,
@@ -593,7 +591,7 @@ pub(super) struct MappedSemanticHostEffectSchedule {
     pub expression: ExecutableExprId,
     pub value: ExecutableExprId,
     pub call: SemanticCallId,
-    pub checked_expression: boon_typecheck::CheckedExprId,
+    pub checked_expression: boon_checked::CheckedExprId,
     pub owner: Option<StaticOwnerId>,
     pub operation: String,
     pub state_update_arms: Vec<StateUpdateArm>,
@@ -5668,7 +5666,7 @@ fn semantic_expression(
         .ok_or_else(|| format!("missing semantic expression {id}"))
 }
 
-fn runtime_checked_expression_id(id: boon_typecheck::CheckedExprId) -> Result<ExprId, String> {
+fn runtime_checked_expression_id(id: boon_checked::CheckedExprId) -> Result<ExprId, String> {
     let value = usize::try_from(id.0).map_err(|_| {
         format!(
             "checked expression {} exceeds executable usize identity space",
@@ -6155,8 +6153,8 @@ fn map_value_member(
 fn map_source_read(
     graph: &SemanticExecutionGraphV1,
     source: &SemanticSourceRead,
-) -> Result<boon_typecheck::CheckedSourceRead, String> {
-    Ok(boon_typecheck::CheckedSourceRead {
+) -> Result<boon_checked::CheckedSourceRead, String> {
+    Ok(boon_checked::CheckedSourceRead {
         source: checked_source_id(graph, source.source)?,
         payload_projection: source.payload_projection.clone(),
     })
@@ -6165,7 +6163,7 @@ fn map_source_read(
 fn checked_source_id(
     graph: &SemanticExecutionGraphV1,
     source: SemanticSourceId,
-) -> Result<boon_typecheck::CheckedSourceId, String> {
+) -> Result<boon_checked::CheckedSourceId, String> {
     let definition = graph
         .sources
         .get(source.as_usize())
@@ -6183,7 +6181,7 @@ fn checked_source_id(
 fn checked_state_id(
     graph: &SemanticExecutionGraphV1,
     state: SemanticStateId,
-) -> Result<boon_typecheck::CheckedStateId, String> {
+) -> Result<boon_checked::CheckedStateId, String> {
     graph
         .states
         .get(state.as_usize())
@@ -6232,7 +6230,7 @@ fn map_block_binding(
 fn validate_external_value_identity(
     expression: SemanticExprId,
     canonical_path: &str,
-    identity: Option<&boon_typecheck::CheckedExternalDeclarationIdentityV1>,
+    identity: Option<&boon_checked::CheckedExternalDeclarationIdentityV1>,
 ) -> Result<(), String> {
     if canonical_path.is_empty() {
         return Err(format!(
@@ -6400,7 +6398,7 @@ fn map_function(
     function: &SemanticFunction,
 ) -> Result<ExecutableFunction, String> {
     let callable = semantic_callable(graph, function.callable)?;
-    if callable.kind != boon_typecheck::CheckedCallableKind::User {
+    if callable.kind != boon_checked::CheckedCallableKind::User {
         return Err(format!(
             "semantic producer {} references non-user callable {}",
             function.producer, function.callable
@@ -7460,12 +7458,12 @@ fn map_distributed_references(
     ))
 }
 
-fn distributed_role_from_path(path: &str) -> Option<boon_typecheck::ProgramRole> {
+fn distributed_role_from_path(path: &str) -> Option<boon_checked::ProgramRole> {
     let namespace = path.split('/').next()?;
     match namespace {
-        "Client" => Some(boon_typecheck::ProgramRole::Client),
-        "Session" => Some(boon_typecheck::ProgramRole::Session),
-        "Server" => Some(boon_typecheck::ProgramRole::Server),
+        "Client" => Some(boon_checked::ProgramRole::Client),
+        "Session" => Some(boon_checked::ProgramRole::Session),
+        "Server" => Some(boon_checked::ProgramRole::Server),
         _ => None,
     }
 }
@@ -7890,12 +7888,12 @@ fn join_diagnostic_projection(base: &str, projection: &[String]) -> String {
 
 fn map_expression_types(
     metadata: &crate::SemanticLoweringMetadataV1,
-) -> boon_typecheck::ExprTypeTable {
-    boon_typecheck::ExprTypeTable {
+) -> boon_checked::ExprTypeTable {
+    boon_checked::ExprTypeTable {
         entries: metadata
             .expression_types
             .iter()
-            .map(|entry| boon_typecheck::ExprTypeEntry {
+            .map(|entry| boon_checked::ExprTypeEntry {
                 expr_id: entry.checked_expression.0 as usize,
                 flow_type: entry.flow_type.clone(),
             })
@@ -7905,18 +7903,18 @@ fn map_expression_types(
 
 fn map_function_types(
     metadata: &crate::SemanticLoweringMetadataV1,
-) -> boon_typecheck::FunctionTypeTable {
-    boon_typecheck::FunctionTypeTable {
+) -> boon_checked::FunctionTypeTable {
+    boon_checked::FunctionTypeTable {
         entries: metadata
             .function_types
             .iter()
-            .map(|entry| boon_typecheck::FunctionTypeEntry {
+            .map(|entry| boon_checked::FunctionTypeEntry {
                 callable: entry.checked_callable,
                 name: entry.name.clone(),
                 parameters: entry
                     .parameters
                     .iter()
-                    .map(|parameter| boon_typecheck::FunctionTypeParameterEntry {
+                    .map(|parameter| boon_checked::FunctionTypeParameterEntry {
                         formal: parameter.formal,
                         ordinal: parameter.ordinal,
                         name: parameter.name.clone(),
@@ -7932,8 +7930,8 @@ fn map_function_types(
 
 fn map_named_value_types(
     metadata: &crate::SemanticLoweringMetadataV1,
-) -> boon_typecheck::NamedValueTypeTable {
-    boon_typecheck::NamedValueTypeTable {
+) -> boon_checked::NamedValueTypeTable {
+    boon_checked::NamedValueTypeTable {
         checked_statement_sites: metadata
             .named_value_types
             .iter()
@@ -7942,7 +7940,7 @@ fn map_named_value_types(
         entries: metadata
             .named_value_types
             .iter()
-            .map(|entry| boon_typecheck::NamedValueTypeEntry {
+            .map(|entry| boon_checked::NamedValueTypeEntry {
                 path: entry.diagnostic_path.clone(),
                 origins: entry
                     .origins
@@ -8474,24 +8472,24 @@ fn semantic_region_path(base: &str, projection: &[String]) -> String {
 }
 
 fn semantic_region_type<'a>(
-    root: &'a boon_typecheck::Type,
+    root: &'a boon_checked::Type,
     projection: &[String],
-) -> Result<&'a boon_typecheck::Type, String> {
+) -> Result<&'a boon_checked::Type, String> {
     let mut current = root;
     for field in projection {
         current = match current {
-            boon_typecheck::Type::Object(shape) => shape.fields.get(field).ok_or_else(|| {
+            boon_checked::Type::Object(shape) => shape.fields.get(field).ok_or_else(|| {
                 format!(
                     "semantic memory type projection `{}` has no field `{field}`",
                     projection.join(".")
                 )
             })?,
-            boon_typecheck::Type::VariantSet(variants) => {
+            boon_checked::Type::VariantSet(variants) => {
                 let projected = variants
                     .iter()
                     .filter_map(|variant| match variant {
-                        boon_typecheck::Variant::Tagged { fields, .. } => fields.fields.get(field),
-                        boon_typecheck::Variant::Tag(_) => None,
+                        boon_checked::Variant::Tagged { fields, .. } => fields.fields.get(field),
+                        boon_checked::Variant::Tag(_) => None,
                     })
                     .collect::<Vec<_>>();
                 let Some(first) = projected.first().copied() else {

@@ -3,10 +3,10 @@ use super::{
     VerificationPolicyDigestV1, VerificationPolicyV1, VerifyError, canonical_encoding, domain_hash,
     verify_semantic_program,
 };
+use boon_checked::ProgramRole;
 use boon_semantic::{
     BundleSemanticProgramDigestV1, BundleSemanticProgramV1, SemanticProgramDigestV1,
 };
-use boon_typecheck::ProgramRole;
 use serde::{Deserialize, Serialize};
 
 pub const BUNDLE_VERIFICATION_MANIFEST_SCHEMA_V1: &str = "boon.bundle-verification-manifest.v1";
@@ -386,13 +386,13 @@ fn require_exact_role_order(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use boon_parser::parse_source;
-    use boon_semantic::elaborate;
-    use boon_typecheck::{
+    use boon_checked::{
         CheckedExternalDeclarationIdentityV1, CheckedExternalDeclarationKind,
         ExternalTypeEnvironment, FlowMode, FlowType, Type,
-        check_runtime_program_profiled_with_external_types,
     };
+    use boon_parser::parse_source;
+    use boon_semantic::elaborate;
+    use boon_typecheck::check_runtime_program_profiled_with_external_types;
     use serde::de::DeserializeOwned;
 
     type BundleManifestMutation = (&'static str, fn(&mut BundleVerificationManifestV1));

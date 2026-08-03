@@ -5,7 +5,7 @@
 //! executable IR nor a runtime value.
 
 use crate::ProducerMaterializationMode;
-use boon_typecheck::{
+use boon_checked::{
     CheckedCall, CheckedCallEntry, CheckedCallId, CheckedCallableKind, CheckedCallableSignature,
     CheckedContextBinding, CheckedDeclaration, CheckedDeclarationKind, CheckedEvaluationScope,
     CheckedExprId, CheckedExpressionKind, CheckedMatchPattern, CheckedPassedAccess,
@@ -856,7 +856,7 @@ pub(crate) fn singleton_tag_for_type_projection(
     }
     match ty {
         Type::VariantSet(variants) if variants.len() == 1 => match &variants[0] {
-            boon_typecheck::Variant::Tag(tag) | boon_typecheck::Variant::Tagged { tag, .. } => {
+            boon_checked::Variant::Tag(tag) | boon_checked::Variant::Tagged { tag, .. } => {
                 Some(tag.clone())
             }
         },
@@ -998,7 +998,7 @@ where
                     .is_none()
                     && !matches!(
                         statement.kind,
-                        boon_typecheck::CheckedStatementKind::Function { .. }
+                        boon_checked::CheckedStatementKind::Function { .. }
                     )
             })
             .filter_map(|statement| statement.value)
@@ -1192,8 +1192,8 @@ where
                 }
                 CheckedExpressionKind::TextTemplate { segments } => {
                     pending.extend(segments.iter().filter_map(|segment| match segment {
-                        boon_typecheck::CheckedTextSegment::Static { .. } => None,
-                        boon_typecheck::CheckedTextSegment::Dynamic { value } => Some(*value),
+                        boon_checked::CheckedTextSegment::Static { .. } => None,
+                        boon_checked::CheckedTextSegment::Dynamic { value } => Some(*value),
                     }));
                 }
                 CheckedExpressionKind::TaggedObject { fields, .. }
@@ -1700,7 +1700,7 @@ where
                 // expansion.
                 checked_occurrence_result
             } else {
-                boon_typecheck::specialize_checked_call_result(
+                boon_checked::specialize_checked_call_result(
                     &instantiated_result,
                     &checked_call.result.ty,
                 )
@@ -1718,7 +1718,7 @@ where
                 })
                 .unwrap_or_else(|| checked_result.clone());
             let occurrence_result =
-                boon_typecheck::specialize_checked_call_result(&checked_result, &expression_result);
+                boon_checked::specialize_checked_call_result(&checked_result, &expression_result);
             let enclosing_result = checked_call
                 .owner_callable
                 .and_then(|owner| self.signature_by_id.get(&owner).copied())
@@ -1747,7 +1747,7 @@ where
                     if *enclosing_is_exact {
                         enclosing.ty.clone()
                     } else {
-                        boon_typecheck::specialize_checked_call_result(
+                        boon_checked::specialize_checked_call_result(
                             &occurrence_result,
                             &enclosing.ty,
                         )
@@ -2492,10 +2492,10 @@ fn resource_owning_callables(
             continue;
         };
         let directly_allocates = match expression.kind {
-            boon_typecheck::CheckedExpressionKind::Source
-            | boon_typecheck::CheckedExpressionKind::Hold { .. }
-            | boon_typecheck::CheckedExpressionKind::Latest { .. } => true,
-            boon_typecheck::CheckedExpressionKind::Call { call } => calls
+            boon_checked::CheckedExpressionKind::Source
+            | boon_checked::CheckedExpressionKind::Hold { .. }
+            | boon_checked::CheckedExpressionKind::Latest { .. } => true,
+            boon_checked::CheckedExpressionKind::Call { call } => calls
                 .get(&call)
                 .and_then(|call| signatures.get(&call.callable))
                 .is_some_and(|callable| {
@@ -2514,7 +2514,7 @@ fn resource_owning_callables(
     for statement in &program.statements {
         if !matches!(
             statement.kind,
-            boon_typecheck::CheckedStatementKind::List { .. }
+            boon_checked::CheckedStatementKind::List { .. }
         ) {
             continue;
         }
@@ -2634,7 +2634,7 @@ fn cyclic_alias_components(edges: &[(DeclId, DeclId, OutCallProvenance)]) -> Vec
 #[cfg(test)]
 mod tests {
     use super::*;
-    use boon_typecheck::CheckedProgram;
+    use boon_checked::CheckedProgram;
 
     fn checked_program(name: &str, source: &str) -> CheckedProgram {
         let parsed = boon_parser::parse_source(name, source).expect("fixture parses");
@@ -2685,7 +2685,7 @@ converted: 255 |> Number/to_bits(width: 8, interpretation: Unsigned)
                 .unwrap()
                 .result
                 .ty,
-            boon_typecheck::Type::Bits { width: 3 }
+            boon_checked::Type::Bits { width: 3 }
         );
     }
 

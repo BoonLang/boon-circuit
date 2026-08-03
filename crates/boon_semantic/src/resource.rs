@@ -14,7 +14,7 @@ use crate::{
     SemanticStatementKind, SemanticStatementOrigin, SemanticValueId, SemanticValueListAuthorityId,
     StaticOwnerId,
 };
-use boon_typecheck::{
+use boon_checked::{
     CheckedListId, CheckedListKeyPolicy, CheckedProgram, CheckedResourceBinding, CheckedSourceId,
     CheckedSpan, CheckedStateId, CheckedStateKind, CheckedStatementId, DeclId, FlowType, Type,
 };
@@ -676,7 +676,7 @@ fn typed_list_targets(
             item_fields,
             span,
             alias: direct_list_alias_target(execution, statement),
-            absent: expression.flow_type.mode == boon_typecheck::FlowMode::Absent,
+            absent: expression.flow_type.mode == boon_checked::FlowMode::Absent,
             value_only: false,
             origin: SemanticListResourceOriginV1::Derived {
                 statement: statement.id,
@@ -845,7 +845,7 @@ fn typed_list_targets(
 
 fn checked_scope_function_owner(
     checked: &CheckedProgram,
-    mut scope: boon_typecheck::LexicalScopeId,
+    mut scope: boon_checked::LexicalScopeId,
 ) -> Result<Option<DeclId>, String> {
     let mut visited = BTreeSet::new();
     loop {
@@ -865,7 +865,7 @@ fn checked_scope_function_owner(
                     scope.0
                 )
             })?;
-        if definition.kind == boon_typecheck::CheckedScopeKind::Function {
+        if definition.kind == boon_checked::CheckedScopeKind::Function {
             return definition.owner.map(Some).ok_or_else(|| {
                 format!(
                     "checked function scope {} has no owning declaration",
@@ -951,7 +951,7 @@ fn contextual_list_authority_statements(
 
 fn checked_scope_is_function_local(
     checked: &CheckedProgram,
-    scope: boon_typecheck::LexicalScopeId,
+    scope: boon_checked::LexicalScopeId,
 ) -> Result<bool, String> {
     checked_scope_function_owner(checked, scope).map(|owner| owner.is_some())
 }
@@ -991,7 +991,7 @@ fn canonical_inline_list_authority_candidate(
 fn synthesize_inline_checked_list_targets(
     checked: &CheckedProgram,
     execution: &mut SemanticExecutionGraphV1,
-    checked_list: &boon_typecheck::CheckedList,
+    checked_list: &boon_checked::CheckedList,
     path: &str,
 ) -> Result<Vec<ListTarget>, String> {
     let binding = CheckedResourceBinding::ListAuthority {
@@ -1141,7 +1141,7 @@ fn synthesize_inline_checked_list_targets(
         .declarations
         .iter()
         .find(|declaration| declaration.id == checked_list.declaration)
-        .filter(|declaration| declaration.kind != boon_typecheck::CheckedDeclarationKind::Function)
+        .filter(|declaration| declaration.kind != boon_checked::CheckedDeclarationKind::Function)
         .map(|declaration| declaration.name.clone())
         .or_else(|| path.rsplit('.').next().map(str::to_owned))
         .ok_or_else(|| {
@@ -1277,7 +1277,7 @@ fn synthesize_inline_checked_list_targets(
             item_fields,
             span: checked_list.span.into(),
             alias: None,
-            absent: definition.flow_type.mode == boon_typecheck::FlowMode::Absent,
+            absent: definition.flow_type.mode == boon_checked::FlowMode::Absent,
             value_only: true,
             origin: SemanticListResourceOriginV1::CheckedLiteral {
                 checked_list: checked_list.id,
@@ -1665,8 +1665,8 @@ fn semantic_type_contains_collection_authority(ty: &Type) -> bool {
             .values()
             .any(semantic_type_contains_collection_authority),
         Type::VariantSet(variants) => variants.iter().any(|variant| match variant {
-            boon_typecheck::Variant::Tag(_) => false,
-            boon_typecheck::Variant::Tagged { fields, .. } => fields
+            boon_checked::Variant::Tag(_) => false,
+            boon_checked::Variant::Tagged { fields, .. } => fields
                 .fields
                 .values()
                 .any(semantic_type_contains_collection_authority),
@@ -3557,14 +3557,14 @@ fn type_may_supply_projection(ty: &Type, projection: &[String]) -> bool {
                 || shape.open
         }
         Type::VariantSet(variants) => variants.iter().any(|variant| match variant {
-            boon_typecheck::Variant::Tagged { fields, .. } => {
+            boon_checked::Variant::Tagged { fields, .. } => {
                 fields
                     .fields
                     .get(field)
                     .is_some_and(|field_type| type_may_supply_projection(field_type, remaining))
                     || fields.open
             }
-            boon_typecheck::Variant::Tag(_) => false,
+            boon_checked::Variant::Tag(_) => false,
         }),
         Type::Union(members) => members
             .iter()
@@ -3972,7 +3972,7 @@ fn exact_semantic_record_projection(
 fn validate_checked_source_statement(
     checked: &CheckedProgram,
     id: CheckedSourceId,
-    source: &boon_typecheck::CheckedSource,
+    source: &boon_checked::CheckedSource,
 ) -> Result<(), String> {
     let statement = checked
         .statements
@@ -4003,7 +4003,7 @@ fn validate_checked_source_statement(
 fn validate_checked_state_statement(
     checked: &CheckedProgram,
     id: CheckedStateId,
-    state: &boon_typecheck::CheckedState,
+    state: &boon_checked::CheckedState,
 ) -> Result<(), String> {
     let statement = checked
         .statements
@@ -4094,8 +4094,8 @@ fn build_source_resources(
                 }
                 SemanticSourceOrigin::ProducerInvocation { .. } => {
                     if value.flow_type
-                        != (boon_typecheck::FlowType {
-                            mode: boon_typecheck::FlowMode::PresentOrAbsent,
+                        != (boon_checked::FlowType {
+                            mode: boon_checked::FlowMode::PresentOrAbsent,
                             ty: Type::Absent,
                         })
                     {
@@ -4889,7 +4889,7 @@ fn validate_dense_resource_ids(
                 ));
             }
             SemanticValueListRoleV1::Absent
-                if producer.flow_type.mode != boon_typecheck::FlowMode::Absent =>
+                if producer.flow_type.mode != boon_checked::FlowMode::Absent =>
             {
                 return Err(format!(
                     "semantic value-list authority {} has stale absent classification",
@@ -5763,12 +5763,12 @@ mod tests {
         crate::SemanticExpression {
             id: SemanticExprId(id),
             value_id: crate::SemanticValueId(id),
-            checked_expr_id: boon_typecheck::CheckedExprId(id as u32),
+            checked_expr_id: boon_checked::CheckedExprId(id as u32),
             flow_type: FlowType {
-                mode: boon_typecheck::FlowMode::Continuous,
+                mode: boon_checked::FlowMode::Continuous,
                 ty,
             },
-            effect: boon_typecheck::CheckedEffectSummary::default(),
+            effect: boon_checked::CheckedEffectSummary::default(),
             owner: None,
             provenance: crate::SemanticValueProvenance::default(),
             resource_binding_path: None,
@@ -5890,7 +5890,7 @@ FUNCTION segments_for(id) {
                     .is_some_and(|expression| {
                         matches!(
                             &expression.kind,
-                            boon_typecheck::CheckedExpressionKind::List { items, .. }
+                            boon_checked::CheckedExpressionKind::List { items, .. }
                                 if items.is_empty()
                         )
                     })
@@ -5968,7 +5968,7 @@ FUNCTION comparison_segments() {
                     .is_some_and(|expression| {
                         matches!(
                             &expression.kind,
-                            boon_typecheck::CheckedExpressionKind::List { items, .. }
+                            boon_checked::CheckedExpressionKind::List { items, .. }
                                 if items.is_empty()
                         )
                     })
@@ -6181,7 +6181,7 @@ kept: mapped |> List/retain(item, if: True)
     #[test]
     fn lineage_projection_matches_record_scalar_and_new_list_value_semantics() {
         let list_type = Type::List(Box::new(Type::Unknown));
-        let object_type = Type::object(boon_typecheck::ObjectShape {
+        let object_type = Type::object(boon_checked::ObjectShape {
             fields: BTreeMap::new(),
             field_order: Vec::new(),
             open: false,
@@ -6238,10 +6238,10 @@ kept: mapped |> List/retain(item, if: True)
                         name: "List/chunk".to_owned(),
                         function: "List/chunk".to_owned(),
                         intrinsic: None,
-                        role: boon_typecheck::ProgramRole::Client,
-                        effect: boon_typecheck::CheckedEffectSummary::default(),
+                        role: boon_checked::ProgramRole::Client,
+                        effect: boon_checked::CheckedEffectSummary::default(),
                         result: FlowType {
-                            mode: boon_typecheck::FlowMode::Continuous,
+                            mode: boon_checked::FlowMode::Continuous,
                             ty: Type::Unknown,
                         },
                         instance: Some(OutCallInstanceId(0)),
@@ -6371,19 +6371,19 @@ kept: mapped |> List/retain(item, if: True)
 
     #[test]
     fn projected_host_result_list_does_not_inherit_unrelated_argument_rows() {
-        let row_type = Type::object(boon_typecheck::ObjectShape {
+        let row_type = Type::object(boon_checked::ObjectShape {
             fields: BTreeMap::new(),
             field_order: Vec::new(),
             open: false,
         });
         let list_type = Type::List(Box::new(row_type.clone()));
-        let host_result_type = Type::object(boon_typecheck::ObjectShape {
+        let host_result_type = Type::object(boon_checked::ObjectShape {
             fields: BTreeMap::from([("rows".to_owned(), list_type.clone())]),
             field_order: vec!["rows".to_owned()],
             open: false,
         });
         let not_started_type =
-            Type::VariantSet(vec![boon_typecheck::Variant::Tag("NotStarted".to_owned())]);
+            Type::VariantSet(vec![boon_checked::Variant::Tag("NotStarted".to_owned())].into());
         let rows_a = DeclId(10);
         let rows_b = DeclId(20);
         let result = DeclId(30);
@@ -6435,10 +6435,10 @@ kept: mapped |> List/retain(item, if: True)
                     name: "Host/fresh_rows".to_owned(),
                     function: "Host/fresh_rows".to_owned(),
                     intrinsic: None,
-                    role: boon_typecheck::ProgramRole::Client,
-                    effect: boon_typecheck::CheckedEffectSummary::default(),
+                    role: boon_checked::ProgramRole::Client,
+                    effect: boon_checked::CheckedEffectSummary::default(),
                     result: FlowType {
-                        mode: boon_typecheck::FlowMode::Continuous,
+                        mode: boon_checked::FlowMode::Continuous,
                         ty: host_result_type.clone(),
                     },
                     instance: Some(OutCallInstanceId(0)),
@@ -6447,7 +6447,7 @@ kept: mapped |> List/retain(item, if: True)
                             formal: DeclId(40),
                             ordinal: 0,
                             name: "left".to_owned(),
-                            checked_value: boon_typecheck::CheckedExprId(2),
+                            checked_value: boon_checked::CheckedExprId(2),
                             value: SemanticExprId(2),
                             from_pipe: false,
                         },
@@ -6455,7 +6455,7 @@ kept: mapped |> List/retain(item, if: True)
                             formal: DeclId(41),
                             ordinal: 1,
                             name: "right".to_owned(),
-                            checked_value: boon_typecheck::CheckedExprId(3),
+                            checked_value: boon_checked::CheckedExprId(3),
                             value: SemanticExprId(3),
                             from_pipe: false,
                         },
@@ -6493,12 +6493,12 @@ kept: mapped |> List/retain(item, if: True)
                 crate::SemanticStatement {
                     id: SemanticStatementId(id),
                     origin: crate::SemanticStatementOrigin::Checked {
-                        statement: boon_typecheck::CheckedStatementId(id as u32),
+                        statement: boon_checked::CheckedStatementId(id as u32),
                     },
                     scope: crate::SemanticScopeId(0),
                     parent: None,
                     call_instance: None,
-                    span: boon_typecheck::CheckedSpan::default(),
+                    span: boon_checked::CheckedSpan::default(),
                     checked_resources: Vec::new(),
                     declaration: Some(declaration),
                     flow_type: Some(execution.expressions[value].flow_type.clone()),
@@ -6545,8 +6545,8 @@ kept: mapped |> List/retain(item, if: True)
             .map(|expression| crate::SemanticExpressionOrigin {
                 expression: expression.id,
                 checked_expression: expression.checked_expr_id,
-                checked_scope: boon_typecheck::LexicalScopeId(0),
-                checked_span: boon_typecheck::CheckedSpan::default(),
+                checked_scope: boon_checked::LexicalScopeId(0),
+                checked_span: boon_checked::CheckedSpan::default(),
                 owning_statement: match expression.id {
                     SemanticExprId(0) => Some(SemanticStatementId(0)),
                     SemanticExprId(1) => Some(SemanticStatementId(1)),
@@ -6593,7 +6593,7 @@ kept: mapped |> List/retain(item, if: True)
 
     #[test]
     fn storage_scope_resolution_handles_drain_locals_and_only_chunk_items_projection() {
-        let row_type = Type::object(boon_typecheck::ObjectShape {
+        let row_type = Type::object(boon_checked::ObjectShape {
             fields: BTreeMap::new(),
             field_order: Vec::new(),
             open: false,
@@ -6636,10 +6636,10 @@ kept: mapped |> List/retain(item, if: True)
                     name: "List/chunk".to_owned(),
                     function: "List/chunk".to_owned(),
                     intrinsic: None,
-                    role: boon_typecheck::ProgramRole::Client,
-                    effect: boon_typecheck::CheckedEffectSummary::default(),
+                    role: boon_checked::ProgramRole::Client,
+                    effect: boon_checked::CheckedEffectSummary::default(),
                     result: FlowType {
-                        mode: boon_typecheck::FlowMode::Continuous,
+                        mode: boon_checked::FlowMode::Continuous,
                         ty: Type::Unknown,
                     },
                     instance: Some(OutCallInstanceId(0)),
@@ -6648,7 +6648,7 @@ kept: mapped |> List/retain(item, if: True)
                             formal: DeclId(30),
                             ordinal: 0,
                             name: "list".to_owned(),
-                            checked_value: boon_typecheck::CheckedExprId(1),
+                            checked_value: boon_checked::CheckedExprId(1),
                             value: SemanticExprId(1),
                             from_pipe: true,
                         },
@@ -6656,7 +6656,7 @@ kept: mapped |> List/retain(item, if: True)
                             formal: DeclId(31),
                             ordinal: 1,
                             name: "size".to_owned(),
-                            checked_value: boon_typecheck::CheckedExprId(2),
+                            checked_value: boon_checked::CheckedExprId(2),
                             value: SemanticExprId(2),
                             from_pipe: false,
                         },
@@ -6716,12 +6716,12 @@ kept: mapped |> List/retain(item, if: True)
             crate::SemanticStatement {
                 id: SemanticStatementId(0),
                 origin: crate::SemanticStatementOrigin::Checked {
-                    statement: boon_typecheck::CheckedStatementId(0),
+                    statement: boon_checked::CheckedStatementId(0),
                 },
                 scope: crate::SemanticScopeId(0),
                 parent: None,
                 call_instance: None,
-                span: boon_typecheck::CheckedSpan::default(),
+                span: boon_checked::CheckedSpan::default(),
                 checked_resources: Vec::new(),
                 declaration: Some(rows),
                 flow_type: Some(execution.expressions[0].flow_type.clone()),
@@ -6737,12 +6737,12 @@ kept: mapped |> List/retain(item, if: True)
             crate::SemanticStatement {
                 id: SemanticStatementId(1),
                 origin: crate::SemanticStatementOrigin::Checked {
-                    statement: boon_typecheck::CheckedStatementId(1),
+                    statement: boon_checked::CheckedStatementId(1),
                 },
                 scope: crate::SemanticScopeId(0),
                 parent: None,
                 call_instance: None,
-                span: boon_typecheck::CheckedSpan::default(),
+                span: boon_checked::CheckedSpan::default(),
                 checked_resources: Vec::new(),
                 declaration: Some(chunks),
                 flow_type: Some(execution.expressions[3].flow_type.clone()),
@@ -6761,8 +6761,8 @@ kept: mapped |> List/retain(item, if: True)
             .map(|expression| crate::SemanticExpressionOrigin {
                 expression: expression.id,
                 checked_expression: expression.checked_expr_id,
-                checked_scope: boon_typecheck::LexicalScopeId(0),
-                checked_span: boon_typecheck::CheckedSpan::default(),
+                checked_scope: boon_checked::LexicalScopeId(0),
+                checked_span: boon_checked::CheckedSpan::default(),
                 owning_statement: match expression.id {
                     SemanticExprId(0) => Some(SemanticStatementId(0)),
                     SemanticExprId(3) => Some(SemanticStatementId(1)),
@@ -7412,16 +7412,16 @@ chunks: rows |> List/chunk(size: 2)
         graph.expressions.push(crate::SemanticExpression {
             id: SemanticExprId(0),
             value_id: crate::SemanticValueId(0),
-            checked_expr_id: boon_typecheck::CheckedExprId(0),
+            checked_expr_id: boon_checked::CheckedExprId(0),
             flow_type: FlowType {
-                mode: boon_typecheck::FlowMode::Continuous,
-                ty: Type::List(Box::new(Type::object(boon_typecheck::ObjectShape {
+                mode: boon_checked::FlowMode::Continuous,
+                ty: Type::List(Box::new(Type::object(boon_checked::ObjectShape {
                     fields: BTreeMap::new(),
                     field_order: Vec::new(),
                     open: false,
                 }))),
             },
-            effect: boon_typecheck::CheckedEffectSummary::default(),
+            effect: boon_checked::CheckedEffectSummary::default(),
             owner: None,
             provenance: crate::SemanticValueProvenance::default(),
             resource_binding_path: None,
@@ -7434,9 +7434,9 @@ chunks: rows |> List/chunk(size: 2)
             graph.expressions.push(crate::SemanticExpression {
                 id: SemanticExprId(index),
                 value_id: crate::SemanticValueId(index),
-                checked_expr_id: boon_typecheck::CheckedExprId(index as u32),
+                checked_expr_id: boon_checked::CheckedExprId(index as u32),
                 flow_type: graph.expressions[0].flow_type.clone(),
-                effect: boon_typecheck::CheckedEffectSummary::default(),
+                effect: boon_checked::CheckedEffectSummary::default(),
                 owner: None,
                 provenance: crate::SemanticValueProvenance::default(),
                 resource_binding_path: None,

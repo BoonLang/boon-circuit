@@ -6,11 +6,11 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+boon_checked.workspace = true
 boon_contract.workspace = true
 boon_data.workspace = true
 boon_semantic.workspace = true
 boon_syntax.workspace = true
-boon_typecheck.workspace = true
 boon_verify.workspace = true
 serde.workspace = true
 
@@ -19,3 +19,4 @@ web-time.workspace = true
 
 [dev-dependencies]
 boon_parser.workspace = true
+boon_typecheck.workspace = true

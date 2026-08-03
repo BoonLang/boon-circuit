@@ -14,12 +14,12 @@ use crate::{
     SemanticStateId, SemanticStatementId, SemanticStatementOrigin, SemanticValueId,
     SemanticValueListAuthorityId, checked_semantic_root_specs_v1,
 };
-use boon_contract::SourceBundleDigestV1;
-use boon_typecheck::{
+use boon_checked::{
     CheckedCallableKind, CheckedEffectSummary, CheckedExprId, CheckedProgram, CheckedSourceId,
     CheckedStatementId, DeclId, DiagnosticSeverity, FlowType, NamedValueTypeOrigin, Type,
     TypeDiagnostic, Variant,
 };
+use boon_contract::SourceBundleDigestV1;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -1406,7 +1406,7 @@ fn build_source_payload_shapes(
 
 fn validate_source_payload_shape_identity_coverage(
     checked: &CheckedProgram,
-    entries: &[boon_typecheck::SourcePayloadShapeEntry],
+    entries: &[boon_checked::SourcePayloadShapeEntry],
 ) -> Result<(), SemanticLoweringContractError> {
     let expected = checked
         .sources
@@ -1711,7 +1711,7 @@ fn build_host_ports(
 fn resolve_host_source(
     checked: &CheckedProgram,
     resources: &SemanticResourceGraphV1,
-    binding: &boon_typecheck::CheckedHostSourcePortBinding,
+    binding: &boon_checked::CheckedHostSourcePortBinding,
 ) -> Result<SemanticHostSourceBindingV1, SemanticLoweringContractError> {
     let checked_matches = checked
         .sources
@@ -1763,7 +1763,7 @@ fn resolve_host_source(
 
 fn resolve_host_output(
     outputs: &[SemanticOutputContractV1],
-    binding: &boon_typecheck::CheckedHostOutputPortBinding,
+    binding: &boon_checked::CheckedHostOutputPortBinding,
 ) -> Result<SemanticHostOutputBindingV1, SemanticLoweringContractError> {
     let matches = outputs
         .iter()
@@ -1826,7 +1826,7 @@ fn exact_checked_statement(
 fn require_checked_statement(
     checked: &CheckedProgram,
     id: CheckedStatementId,
-) -> Result<&boon_typecheck::CheckedStatement, SemanticLoweringContractError> {
+) -> Result<&boon_checked::CheckedStatement, SemanticLoweringContractError> {
     let matches = checked
         .statements
         .iter()
@@ -1920,7 +1920,7 @@ fn exact_visual_contract_known(
             let value_parameters = callable_definition
                 .parameters
                 .iter()
-                .filter(|parameter| parameter.kind == boon_typecheck::CheckedParameterKind::Value)
+                .filter(|parameter| parameter.kind == boon_checked::CheckedParameterKind::Value)
                 .collect::<Vec<_>>();
             let exact_formals = parameter_bindings.len() == value_parameters.len()
                 && parameter_bindings

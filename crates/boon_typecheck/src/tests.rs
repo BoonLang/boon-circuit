@@ -1,6 +1,115 @@
 use super::*;
 
 #[test]
+fn structural_widening_reuses_unchanged_shared_nodes() {
+    let nested = Type::object(ObjectShape::from_ordered_fields(
+        [("value".to_owned(), Type::Text)],
+        false,
+    ));
+    let object = Type::object(ObjectShape::from_ordered_fields(
+        [
+            ("name".to_owned(), Type::Text),
+            ("nested".to_owned(), nested),
+        ],
+        false,
+    ));
+    let Type::Object(object_shape) = &object else {
+        unreachable!();
+    };
+
+    let widened_equal = widen_structural_type(&object, &object.clone());
+    let Type::Object(widened_equal_shape) = &widened_equal else {
+        unreachable!();
+    };
+    assert!(SharedObjectShape::ptr_eq(
+        object_shape,
+        widened_equal_shape
+    ));
+
+    let partial = Type::object(ObjectShape::from_ordered_fields(
+        [("name".to_owned(), Type::Text)],
+        false,
+    ));
+    let widened_partial = widen_structural_type(&object, &partial);
+    let Type::Object(widened_partial_shape) = &widened_partial else {
+        unreachable!();
+    };
+    assert!(SharedObjectShape::ptr_eq(
+        object_shape,
+        widened_partial_shape
+    ));
+
+    let list_item = Type::shared(object);
+    let list = Type::List(list_item.clone());
+    let widened_list = widen_structural_type(&list, &list.clone());
+    let Type::List(widened_list_item) = widened_list else {
+        unreachable!();
+    };
+    assert!(SharedType::ptr_eq(&list_item, &widened_list_item));
+}
+
+#[test]
+fn structural_widening_still_materializes_real_object_growth() {
+    let left = Type::object(ObjectShape::from_ordered_fields(
+        [("left".to_owned(), Type::Text)],
+        false,
+    ));
+    let right = Type::object(ObjectShape::from_ordered_fields(
+        [("right".to_owned(), Type::Number)],
+        true,
+    ));
+    let widened = widen_structural_type(&left, &right);
+    let Type::Object(shape) = widened else {
+        unreachable!();
+    };
+    assert_eq!(
+        shape.field_order,
+        vec!["left".to_owned(), "right".to_owned()]
+    );
+    assert_eq!(shape.fields.get("left"), Some(&Type::Text));
+    assert_eq!(shape.fields.get("right"), Some(&Type::Number));
+    assert!(shape.open);
+}
+
+#[test]
+fn stable_input_retries_are_deferred_but_other_call_causes_remain_live() {
+    let call = CheckedCallId(7);
+    let mut pending = CheckedTypeInferencePending {
+        defer_inputs_enabled: true,
+        ..CheckedTypeInferencePending::default()
+    };
+    let mut stats = CheckedTypeInferenceWorkStats::default();
+
+    pending.defer_input(call);
+    assert!(!pending.input_is_deferred(call));
+    pending.defer_input(call);
+    assert!(pending.input_is_deferred(call));
+
+    CheckedProgramDatabase::enqueue_checked_call(
+        call,
+        CheckedCallEnqueueCause::Input,
+        &mut pending,
+        &mut stats,
+    );
+    assert!(!pending.calls.contains(call));
+    assert!(pending.artifact_calls.contains(call));
+    assert_eq!(stats.call_input_enqueues, 0);
+    assert_eq!(stats.call_artifact_enqueues, 1);
+
+    CheckedProgramDatabase::enqueue_checked_call(
+        call,
+        CheckedCallEnqueueCause::Callee,
+        &mut pending,
+        &mut stats,
+    );
+    assert!(pending.calls.contains(call));
+    assert_eq!(stats.call_callee_enqueues, 1);
+
+    pending.clear_deferred_input(call);
+    assert!(!pending.input_is_deferred(call));
+}
+
+#[test]
 fn concrete_syntax_result_survives_closed_principal_finalization() {
     let principal = Type::Number;
     let occurrence = Type::object(ObjectShape::from_ordered_fields(

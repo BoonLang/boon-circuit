@@ -118,11 +118,21 @@ stronger three-reviewer performance closure defined below.
    gates pass, and fresh/empty allocations fall to 1,687,722/1,687,728 calls
    and 210,064,354/210,128,951 bytes. Six-pair medians are 208.89/209.55 ms total
    and 152.86/153.76 ms typecheck, with 65,768/66,400 KiB maximum RSS. The first
-   tranche still includes the dominant 34-round inference worklist, remaining
-   contextual/structural work, measured name/type interning, scaling/parity
-   evidence, and the fresh Phase 1 adversarial review. Reprofile after each
-   owner-level slice and regenerate the complete cold protocol after the final
-   edit. Then close
+   worklist follow-up preserves unchanged widened list/object nodes and
+   coalesces input-only retries only after two consecutive no-op/evidence-only
+   visits, with mandatory refresh before the wrapper hook and fail-closed
+   ordinary-solver repair. The exact digest, all 82 ordinary tests, and both
+   product gates pass. NovyWave expression/declaration/call visits fall to
+   34,502/1,876/3,388, input enqueues to 1,127, and no-op visits to 893; the
+   release worklist falls from about 39.6 to 36.3 ms. Fresh/empty allocations
+   are 1,666,870/1,666,876 calls and 208,381,392/208,445,989 bytes. Six-pair
+   medians are 206.28/206.55 ms total and 150.21/150.89 ms typecheck, with
+   65,932/66,352 KiB maximum observed RSS. The first tranche still includes
+   compact/canonical type terms for the growing aggregate chain, the measured
+   24.3 ms contextual-scheme owner, remaining construction/diagnostic work,
+   measured name/type interning, scaling/parity evidence, and the fresh Phase 1
+   adversarial review. Reprofile after each owner-level slice and regenerate
+   the complete cold protocol after the final edit. Then close
    semantic sealing, proof, backend, hashing, and memory until both verified-
    plan modes pass; only afterward may persistent-session warm work satisfy its
    separate gates.

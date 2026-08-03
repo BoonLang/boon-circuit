@@ -1028,6 +1028,12 @@ where
         self.members.is_empty()
     }
 
+    fn contains(&self, value: T) -> bool {
+        self.present
+            .get(value.pending_index())
+            .is_some_and(|present| *present != 0)
+    }
+
     fn drain_sorted(&mut self) -> Vec<T> {
         let mut values = std::mem::take(&mut self.members);
         self.members = std::mem::take(&mut self.spare);
@@ -1089,18 +1095,45 @@ struct CheckedTypeInferencePending {
     declarations: PendingIdSet<DeclId>,
     callables: PendingIdSet<DeclId>,
     calls: PendingIdSet<CheckedCallId>,
+    artifact_calls: PendingIdSet<CheckedCallId>,
+    deferred_input_calls: Vec<u8>,
+    defer_inputs_enabled: bool,
     selector_parameters: PendingIdSet<DeclId>,
     pattern_bindings: bool,
 }
 
 impl CheckedTypeInferencePending {
-    fn any(&self) -> bool {
+    fn propagation_any(&self) -> bool {
         !self.expressions.is_empty()
             || !self.declarations.is_empty()
             || !self.callables.is_empty()
             || !self.calls.is_empty()
             || !self.selector_parameters.is_empty()
             || self.pattern_bindings
+    }
+
+    fn any(&self) -> bool {
+        self.propagation_any() || !self.artifact_calls.is_empty()
+    }
+
+    fn input_is_deferred(&self, call: CheckedCallId) -> bool {
+        self.deferred_input_calls
+            .get(call.0 as usize)
+            .is_some_and(|stable_visits| *stable_visits >= 2)
+    }
+
+    fn defer_input(&mut self, call: CheckedCallId) {
+        let index = call.0 as usize;
+        if index >= self.deferred_input_calls.len() {
+            self.deferred_input_calls.resize(index.saturating_add(1), 0);
+        }
+        self.deferred_input_calls[index] = self.deferred_input_calls[index].saturating_add(1);
+    }
+
+    fn clear_deferred_input(&mut self, call: CheckedCallId) {
+        if let Some(deferred) = self.deferred_input_calls.get_mut(call.0 as usize) {
+            *deferred = 0;
+        }
     }
 }
 
@@ -1335,6 +1368,8 @@ struct CheckedTypeInferenceWorkStats {
     call_syntax_discriminant_changes: usize,
     call_output_declaration_changes: usize,
     call_cold_stable_seed_visits: usize,
+    call_artifact_enqueues: usize,
+    call_artifact_refresh_visits: usize,
     call_seed_enqueues: usize,
     call_input_enqueues: usize,
     call_output_enqueues: usize,
@@ -5362,6 +5397,7 @@ impl CheckedProgramDatabase {
         let mut pending = if let Some(changed) = changed {
             let mut pending = CheckedTypeInferencePending {
                 pattern_bindings: true,
+                defer_inputs_enabled: true,
                 ..CheckedTypeInferencePending::default()
             };
             pending
@@ -5404,6 +5440,9 @@ impl CheckedProgramDatabase {
                     .filter_map(|signature| signature.result_expression.map(|_| signature.decl_id))
                     .collect(),
                 calls: self.calls.iter().map(|call| call.id).collect(),
+                artifact_calls: PendingIdSet::default(),
+                deferred_input_calls: Vec::new(),
+                defer_inputs_enabled: true,
                 selector_parameters: dependencies.selector_parameters.iter().copied().collect(),
                 pattern_bindings: true,
             }
@@ -5473,7 +5512,7 @@ impl CheckedProgramDatabase {
         }
 
         loop {
-            while pending.any() && phase_rounds < maximum_rounds {
+            while pending.propagation_any() && phase_rounds < maximum_rounds {
                 // Mutations from the preceding round are visible as one exact
                 // cache transition. Keeping a round snapshot stable also makes
                 // expression evaluation independent of incidental ID order.
@@ -5677,8 +5716,39 @@ impl CheckedProgramDatabase {
             // then feed its exact mutations back into this same persistent
             // solver/cache instance.
             self.flush_checked_flow_invalidations();
-            if pending.any() {
+            if pending.propagation_any() {
                 break;
+            }
+            // Calls with two consecutive input-triggered no-op/evidence-only
+            // visits coalesce later refinements here. Materialize their exact
+            // final evidence before any quiescence hook observes the solver.
+            // Any unexpected result or output change disables further
+            // coalescing and is fed back into the ordinary worklist.
+            if !pending.artifact_calls.is_empty() {
+                let calls = pending.artifact_calls.drain_sorted();
+                stats.call_visits += calls.len();
+                stats.call_artifact_refresh_visits += calls.len();
+                for call_id in calls.iter().copied() {
+                    let changes = self.instantiate_checked_call(call_id);
+                    Self::publish_checked_call_instantiation_changes(
+                        call_id,
+                        changes,
+                        &dependencies,
+                        &mut pending,
+                        &mut stats,
+                    );
+                }
+                pending.artifact_calls.recycle(calls);
+                self.flush_checked_flow_invalidations();
+                self.enqueue_checked_flow_publications(&mut pending, &mut stats);
+                if pending.propagation_any() {
+                    pending.defer_inputs_enabled = false;
+                    phase_rounds = 0;
+                    continue;
+                }
+                if !pending.artifact_calls.is_empty() {
+                    continue;
+                }
             }
             if wrapper_hook_pending {
                 wrapper_hook_pending = false;
@@ -5698,7 +5768,8 @@ impl CheckedProgramDatabase {
                     );
                 }
                 self.enqueue_checked_flow_publications(&mut pending, &mut stats);
-                if pending.any() {
+                if pending.propagation_any() {
+                    pending.defer_inputs_enabled = false;
                     phase_rounds = 0;
                     continue;
                 }
@@ -5999,7 +6070,7 @@ impl CheckedProgramDatabase {
             .then(|| stats.rounds.saturating_sub(pre_hook_rounds))
             .unwrap_or(0);
             eprintln!(
-                "boon_typecheck checked_program.infer_checked_types.worklist seed={} quiescence_hook={quiescence_hook:?} rounds={} pre_hook_rounds={} post_hook_rounds={} wrapper_changed_declarations={} expression_visits={} declaration_visits={} callable_visits={} call_visits={} call_changed_visits={} call_noop_visits={} call_result_changes={} call_expression_changes={} call_type_substitution_changes={} call_contextual_substitution_changes={} call_syntax_discriminant_changes={} call_output_declaration_changes={} call_cold_stable_seed_visits={} call_seed_enqueues={} call_input_enqueues={} call_output_enqueues={} call_callee_enqueues={} call_selector_enqueues={} call_output_scope_enqueues={} call_output_origin_skips={} selector_visits={} pattern_visits={} expression_ms={:.3} declaration_ms={:.3} callable_ms={:.3} call_ms={:.3} selector_ms={:.3} pattern_ms={:.3} cache_hits={} cache_misses={} cache_invalidations={} cache_reverse_invalidation_traversals={} cache_full_resets_total={} cache_rejected_invalid_ids={} indexed_read_hits={} indexed_read_missing={} indexed_read_rejected={} indexed_out_hits={} indexed_out_missing={} exhausted={} audit={audit:?} audit_clean={} audit_ms={:.3}",
+                "boon_typecheck checked_program.infer_checked_types.worklist seed={} quiescence_hook={quiescence_hook:?} rounds={} pre_hook_rounds={} post_hook_rounds={} wrapper_changed_declarations={} expression_visits={} declaration_visits={} callable_visits={} call_visits={} call_changed_visits={} call_noop_visits={} call_result_changes={} call_expression_changes={} call_type_substitution_changes={} call_contextual_substitution_changes={} call_syntax_discriminant_changes={} call_output_declaration_changes={} call_cold_stable_seed_visits={} call_artifact_enqueues={} call_artifact_refresh_visits={} call_seed_enqueues={} call_input_enqueues={} call_output_enqueues={} call_callee_enqueues={} call_selector_enqueues={} call_output_scope_enqueues={} call_output_origin_skips={} selector_visits={} pattern_visits={} expression_ms={:.3} declaration_ms={:.3} callable_ms={:.3} call_ms={:.3} selector_ms={:.3} pattern_ms={:.3} cache_hits={} cache_misses={} cache_invalidations={} cache_reverse_invalidation_traversals={} cache_full_resets_total={} cache_rejected_invalid_ids={} indexed_read_hits={} indexed_read_missing={} indexed_read_rejected={} indexed_out_hits={} indexed_out_missing={} exhausted={} audit={audit:?} audit_clean={} audit_ms={:.3}",
                 if changed.is_some() {
                     "scheme_changes"
                 } else {
@@ -6022,6 +6093,8 @@ impl CheckedProgramDatabase {
                 stats.call_syntax_discriminant_changes,
                 stats.call_output_declaration_changes,
                 stats.call_cold_stable_seed_visits,
+                stats.call_artifact_enqueues,
+                stats.call_artifact_refresh_visits,
                 stats.call_seed_enqueues,
                 stats.call_input_enqueues,
                 stats.call_output_enqueues,
@@ -6195,7 +6268,11 @@ impl CheckedProgramDatabase {
             || !matches!(call.context_binding, CheckedContextBinding::None)
             || signature.name.starts_with("Field/")
             || signature.name == "Dependency/catch_cycle";
-
+        let syntax_discriminants = if signature.kind == CheckedCallableKind::User {
+            self.checked_call_syntax_discriminants(&call.entries)
+        } else {
+            Box::new([])
+        };
         Some(CheckedCallInferencePlan {
             call_id: call.id,
             call_index,
@@ -6212,11 +6289,7 @@ impl CheckedProgramDatabase {
             explicit_context_input,
             inherited_context_formal_index,
             dependency_catch_cycle: signature.name == "Dependency/catch_cycle",
-            syntax_discriminants: if signature.kind == CheckedCallableKind::User {
-                self.checked_call_syntax_discriminants(&call.entries)
-            } else {
-                Box::new([])
-            },
+            syntax_discriminants,
             is_user_callable: signature.kind == CheckedCallableKind::User,
             result_expression: signature.result_expression,
             mode,
@@ -6425,10 +6498,10 @@ impl CheckedProgramDatabase {
         }
         let calls_started = trace.then(Instant::now);
         for (call_index, call) in self.calls.iter().enumerate() {
-            let input_flow_sensitive = dependencies
+            let plan = dependencies
                 .call_inference_plans
-                .get(&(call.id.0 as usize))
-                .is_some_and(|plan| plan.input_flow_sensitive);
+                .get(&(call.id.0 as usize));
+            let input_flow_sensitive = plan.is_some_and(|plan| plan.input_flow_sensitive);
             let mut first_output_formal_by_output = BTreeMap::new();
             for entry in &call.entries {
                 match entry {
@@ -6937,6 +7010,15 @@ impl CheckedProgramDatabase {
         pending: &mut CheckedTypeInferencePending,
         stats: &mut CheckedTypeInferenceWorkStats,
     ) {
+        if cause == CheckedCallEnqueueCause::Input
+            && pending.defer_inputs_enabled
+            && pending.input_is_deferred(call)
+        {
+            if !pending.calls.contains(call) && pending.artifact_calls.insert(call) {
+                stats.call_artifact_enqueues += 1;
+            }
+            return;
+        }
         if !pending.calls.insert(call) {
             return;
         }
@@ -6956,6 +7038,23 @@ impl CheckedProgramDatabase {
         pending: &mut CheckedTypeInferencePending,
         stats: &mut CheckedTypeInferenceWorkStats,
     ) -> bool {
+        let solver_change = changes.result
+            || changes.expression.is_some()
+            || !changes.outputs.is_empty()
+            || changes.syntax_discriminant
+            || changes.needs_output_scope_revisit;
+        if solver_change {
+            pending.clear_deferred_input(call_id);
+        } else if pending.defer_inputs_enabled {
+            // Two consecutive no-op or substitution-evidence-only visits are
+            // required before coalescing later input retries. A single stable
+            // observation is common while a generic chain is still acquiring
+            // its outer shape; deferring that first gap merely moves real
+            // solver work into repeated quiescence repairs. The mandatory
+            // artifact refresh still fails back into the solver if a later
+            // refinement becomes visible.
+            pending.defer_input(call_id);
+        }
         if !changes.any {
             stats.call_noop_visits += 1;
             return false;
@@ -32169,6 +32268,35 @@ fn semantic_block_return_statement(statements: &[AstStatement]) -> Option<&AstSt
         .or_else(|| statements.last())
 }
 
+/// Whether two checked types already share the same immutable recursive node
+/// (or are the same leaf). This is deliberately narrower than structural
+/// equality: it is the constant-time test used to preserve an existing owner
+/// while structural widening walks a changing aggregate.
+fn checked_type_reuses_node(left: &Type, right: &Type) -> bool {
+    match (left, right) {
+        (Type::VariantSet(left), Type::VariantSet(right)) => {
+            SharedVariantSet::ptr_eq(left, right)
+        }
+        (Type::Object(left), Type::Object(right)) => SharedObjectShape::ptr_eq(left, right),
+        (Type::List(left), Type::List(right)) | (Type::Set(left), Type::Set(right)) => {
+            SharedType::ptr_eq(left, right)
+        }
+        (Type::Text, Type::Text)
+        | (Type::Number, Type::Number)
+        | (Type::Absent, Type::Absent)
+        | (Type::RenderContract, Type::RenderContract)
+        | (Type::Unknown, Type::Unknown) => true,
+        (Type::Bytes(left), Type::Bytes(right)) => left == right,
+        (Type::Bits { width: left }, Type::Bits { width: right }) => left == right,
+        (Type::Var(left), Type::Var(right)) => left == right,
+        (
+            Type::UnresolvedShape { reason: left },
+            Type::UnresolvedShape { reason: right },
+        ) => left == right,
+        _ => false,
+    }
+}
+
 fn widen_structural_type(left: &Type, right: &Type) -> Type {
     if is_value_placeholder_type(left) {
         return right.clone();
@@ -32200,20 +32328,43 @@ fn widen_structural_type(left: &Type, right: &Type) -> Type {
             Type::Bits { width: *left }
         }
         (Type::List(left), Type::List(right)) => {
-            Type::List(Type::shared(widen_structural_type(left, right)))
+            let widened = widen_structural_type(left, right);
+            if checked_type_reuses_node(left, &widened) {
+                Type::List(left.clone())
+            } else {
+                Type::List(Type::shared(widened))
+            }
         }
         (Type::Object(left), Type::Object(right)) => {
-            let mut fields = left.fields.clone();
+            let mut changed_fields = None::<BTreeMap<String, Type>>;
             for (field, ty) in &right.fields {
-                fields
-                    .entry(field.clone())
-                    .and_modify(|existing| *existing = widen_structural_type(existing, ty))
-                    .or_insert_with(|| ty.clone());
+                let current = changed_fields
+                    .as_ref()
+                    .unwrap_or(&left.fields)
+                    .get(field)
+                    .cloned();
+                let widened = current
+                    .as_ref()
+                    .map_or_else(|| ty.clone(), |existing| widen_structural_type(existing, ty));
+                if current
+                    .as_ref()
+                    .is_some_and(|existing| checked_type_reuses_node(existing, &widened))
+                {
+                    continue;
+                }
+                changed_fields
+                    .get_or_insert_with(|| left.fields.clone())
+                    .insert(field.clone(), widened);
+            }
+            let field_order = object_field_order_for_widened_shapes(left, right);
+            let open = left.open || right.open;
+            if changed_fields.is_none() && field_order == left.field_order && open == left.open {
+                return Type::Object(left.clone());
             }
             Type::object(ObjectShape {
-                fields,
-                field_order: object_field_order_for_widened_shapes(left, right),
-                open: left.open || right.open,
+                fields: changed_fields.unwrap_or_else(|| left.fields.clone()),
+                field_order,
+                open,
             })
         }
         _ => open_object_type(),

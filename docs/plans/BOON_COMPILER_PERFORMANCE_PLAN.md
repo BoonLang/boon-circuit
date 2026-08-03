@@ -547,11 +547,41 @@ Current cold-diagnostics candidate evidence:
   six-pair release batch has 208.89/209.55 ms total and 152.86/153.76 ms
   typecheck medians, with 65,768/66,400 KiB maximum RSS. The rejected dense
   counting-scatter and inline-first-edge builders were slower in direct debug
-  A/Bs and are not retained. Next reduce the still-dominant 34-round, roughly
-  38.9 ms checked-inference worklist and remaining contextual/structural work,
-  then finish measured name/type interning, scaling/parity evidence, and the
-  fresh adversarial review. Regenerate the full cold protocol after the final
-  Phase 1 edit.
+  A/Bs and are not retained.
+- Round-level tracing then exposed the actual inference tail: several generic
+  aggregate types grow from roughly 60,000 to 121,000 debug characters while
+  calls repeatedly replace only substitution evidence. Structural widening now
+  keeps the existing shared list/object node and avoids cloning its complete
+  field map when a partial merge makes no semantic change. A call must produce
+  two consecutive input-triggered no-op/evidence-only visits before later input
+  retries may coalesce; every coalesced call is obligatorily refreshed before
+  the contextual-wrapper quiescence hook, and any newly visible result/output
+  disables coalescing and returns to the ordinary solver. This is a generic,
+  fail-closed worklist rule, not a NovyWave/function-name exemption.
+- The exact checked digest remains
+  `495ef4195e0be4869e431c4036b74b6d6397c4b28b7fe7a8a76c76400a7b7992`;
+  all 82 ordinary typechecker tests and both product-scale ignored gates pass.
+  NovyWave expression/declaration/call visits fall from 34,653/1,893/3,484 to
+  34,502/1,876/3,388, input enqueues from 1,227 to 1,127, and no-op visits from
+  957 to 893. Eighteen coalesced calls are refreshed exactly. Stable-round
+  accounting rises from 34 to 36 because two fail-closed repair waves remain;
+  measured work nevertheless falls: the release worklist is about 36.3 ms
+  versus 39.6 ms and its call lane about 14.6 ms versus 17.4 ms.
+- Fresh/empty allocation work is now 1,666,870/1,666,876 calls and
+  208,381,392/208,445,989 bytes, exactly 20,852 calls and 1,682,962 bytes below
+  the packed-graph checkpoint in each mode. A six-pair alternating release
+  batch has 206.28/206.55 ms total and 150.21/150.89 ms typecheck medians; the
+  maximum observed RSS is 65,932/66,352 KiB. Direct recursive publication was
+  rejected because it changed the checked digest; per-call invalidation flushes
+  preserved the digest but were slower; eager object fingerprints preserved the
+  digest but raised the debug worklist to about 88 ms; and a static unused-type-
+  variable classifier found no safe NovyWave edges. None is retained.
+- Continue with compact/canonical structural type terms that avoid rebuilding
+  the still-growing aggregate chain without eager whole-shape hashing, then the
+  measured 24.3 ms contextual-scheme owner, remaining construction/diagnostic
+  work, and measured name/type interning. Finish scaling/parity evidence and a
+  fresh adversarial review before regenerating the full cold protocol after the
+  final Phase 1 edit.
 
 Development profiles and focused debug tests remain directional tools. The
 acceptance producer remains the revision-identified `release` binary required
@@ -848,10 +878,14 @@ Current resumption after the first passing cold-diagnostics candidate: item 7's
 single owned `CheckedProgramDatabase` is complete inside `boon_typecheck`; do
 not recreate a checker/builder handoff or a latent recursive production engine.
 Its hot reverse dependencies are now compact immutable offset/edge arrays; do
-not restore fragmented row vectors or retain construction-only columns. Next
-reduce the dominant 34-round checked-inference worklist and remaining
-contextual/structural work, then complete measured name/type interning before
-the Phase 1 scaling, malformed-source/parity, and fresh adversarial checks. Use
+not restore fragmented row vectors or retain construction-only columns. The
+checked worklist now preserves unchanged widened nodes and coalesces only after
+two evidence-only input visits, with mandatory pre-hook refresh and fail-closed
+solver repair; do not replace that boundary with order-dependent recursive
+publication or per-call cache flushing. Next introduce compact/canonical type
+terms for the growing aggregate chain, then reduce contextual/structural work
+and complete measured name/type interning before the Phase 1 scaling,
+malformed-source/parity, and fresh adversarial checks. Use
 the unchanged 1m35s release rebuild after both the net source deletion and this
 runtime win as evidence when evaluating the next ownership/dependency crate
 boundary, but accept a split only under the measured split gates above.

@@ -292,10 +292,23 @@ Current checkpoints to preserve and audit rather than redo:
   pass, and fresh/empty allocations fall to 1,687,722/1,687,728 calls and
   210,064,354/210,128,951 bytes. Six-pair medians fall to 208.89/209.55 ms total
   and 152.86/153.76 ms typecheck, with 65,768/66,400 KiB maximum RSS. Continue
-  with the dominant 34-round checked-inference worklist, remaining contextual/
-  structural work, and measured name/type interning, then scaling/parity proof
-  and fresh adversarial review before regenerating the full protocol after the
-  final edit;
+  with the dominant checked-inference worklist, remaining contextual/structural
+  work, and measured name/type interning. The next retained slice preserves
+  unchanged widened list/object nodes and coalesces an input-only call retry
+  only after two consecutive no-op/evidence-only visits. Every coalesced call
+  is refreshed before the contextual-wrapper quiescence hook and any visible
+  result/output returns fail-closed to the ordinary solver. The exact digest,
+  all 82 ordinary tests, and both product gates pass. Expression/declaration/
+  call visits fall to 34,502/1,876/3,388, input enqueues to 1,127, and no-op
+  visits to 893; 18 coalesced calls refresh exactly. The release worklist falls
+  from about 39.6 to 36.3 ms despite 36 stable repair rounds versus 34. Fresh/
+  empty allocations fall to 1,666,870/1,666,876 calls and
+  208,381,392/208,445,989 bytes. Six-pair medians are 206.28/206.55 ms total
+  and 150.21/150.89 ms typecheck, with 65,932/66,352 KiB maximum observed RSS.
+  Next implement compact/canonical type terms for the measured growing
+  aggregate chain without eager whole-shape hashing, then reduce the 24.3 ms
+  contextual-scheme owner, finish scaling/parity proof and fresh adversarial
+  review, and regenerate the full protocol after the final edit;
 - the current compiler-throughput checkpoint keeps Counter, physical TodoMVC,
   and NovyWave `MachinePlan` output deterministic while replacing copied OUT
   type environments with active-path overlays, retaining canonical-root-reading

@@ -663,6 +663,17 @@ pub struct ExecutableCallContextId {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ExecutableCallOccurrence {
+    pub id: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checked_call: Option<boon_checked::CheckedCallId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context_ordinals: Vec<usize>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ExecutableExpression {
     pub id: ExecutableExprId,
     pub checked_expr_id: boon_checked::CheckedExprId,
@@ -970,6 +981,7 @@ pub enum ExecutableExpressionKind {
         binding_path: String,
     },
     Call {
+        checked_call: boon_checked::CheckedCallId,
         callable_kind: ExecutableCallableKind,
         name: String,
         intrinsic: Option<boon_checked::CheckedIntrinsicV1>,
@@ -978,14 +990,22 @@ pub enum ExecutableExpressionKind {
         arguments: Vec<ExecutableCallArgument>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         contexts: Vec<ExecutableCallContextId>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        context_ordinals: Vec<usize>,
     },
     /// A call to one shared, context-free semantic callable body.
     UserCall {
+        checked_call: boon_checked::CheckedCallId,
         function: FunctionId,
         name: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         instance: Option<usize>,
         arguments: Vec<ExecutableCallArgument>,
+        /// Exact checked-call type environment for this invocation. Shared
+        /// ordinary bodies keep their principal types; consumers apply this
+        /// small overlay instead of cloning and rewriting the body per call.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        type_substitutions: Vec<boon_checked::CheckedTypeSubstitution>,
     },
     Materialize {
         materialization: usize,
@@ -1097,6 +1117,8 @@ pub struct ExecutableProgram {
     pub functions: Vec<ExecutableFunction>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ordinary_functions: Vec<ExecutableOrdinaryFunction>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub call_occurrences: Vec<ExecutableCallOccurrence>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

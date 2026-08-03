@@ -625,11 +625,74 @@ Current cold-diagnostics candidate evidence:
   the 1,000 ms and 384 MiB verified gates therefore remain red and must be
   attacked after the frontend tranche rather than hidden by the passing
   diagnostics result.
-- Continue from the still-measured contextual parameter/worklist and checked-
-  inference owners, then remaining construction/diagnostic work and measured
-  name/type interning. Finish scaling/parity evidence and a fresh adversarial
-  review before regenerating the full cold protocol after the final Phase 1
-  edit.
+- A fresh high-level trace at checkpoint `c77dabc` makes the architectural
+  multiplier explicit. NovyWave starts with 17,716 checked expressions, 1,820
+  calls, and 663 callables, but produces about 45,000 semantic expressions,
+  5,146 OUT call instances, 247,537 dependency records, 248,201 proof nodes,
+  and 1,060,194 proof edges. The verified compile takes about 7.79 seconds and
+  allocates about 2.99 GB cumulatively at 515,172 KiB peak RSS: semantic
+  construction owns 6.98 seconds, including 3.86 seconds for the dependency
+  manifest. Only 61 of 426 initially pure ordinary-call candidates are retained;
+  357 candidates become `body_not_closed`, while open boundary types reject 71
+  more definitions before dependency closure. This is graph multiplication,
+  not a remaining typechecker-container problem.
+- The first retained-definition/invocation-overlay candidate on 2026-08-03
+  makes the architectural cut material without a fixture-specific path. Open
+  parameter/result types and pure render constructors retain one semantic body;
+  a dense occurrence table carries checked-call identity and constructor-local
+  context ordinals, and executable lowering resolves those overlays against the
+  enclosing callable frame. The dependency manifest records definition and
+  occurrence facts directly. One release NovyWave sample in each cold mode
+  completes in 4,415.27/4,455.01 ms fresh/empty at 317,844/318,428 KiB peak
+  RSS, with 3,758.10/3,777.86 ms semantic time, 16,521 semantic graph nodes,
+  and 10,923,253/10,923,259 allocation calls totaling about 1.552 GB. This is
+  down from about 7.79 seconds, 515,172 KiB, about 45,000 semantic expressions,
+  24.95 million allocations, and 2.99 GB allocated. The RSS gate is now green
+  directionally, while the 1,000 ms time gate remains red.
+- A traced sample attributes 2,368.00 ms of the remaining 3,799.82 ms semantic
+  phase to dependency-manifest construction. The retained execution graph has
+  16,417 expressions, while the manifest still materializes 159,612 dependency
+  records and a 160,276-node/512,204-edge proof graph; coverage and dependency-
+  graph digests alone cost about 354.35 and 653.11 ms. Document/backend lowering
+  is about 409.57 ms, including about 75.25 ms for document construction. After
+  parity is repaired, the next architectural owner is therefore compact direct
+  proof construction/sealing, not another typechecker container micro-edit.
+- Exact plan parity is also still red and blocks phase exit. Fresh and empty
+  modes deterministically emit
+  `f293e8a8ef44c773740f769df19c9c08da717e31fb43ccbd96510396ef6594d6`,
+  not the required NovyWave hash
+  `4d3c284a9240cdc68c70aff7f30c570367e285cc1e8f823585900829bafd8ff7`.
+  The candidate document has 33,910 expressions, 442 constants, 1,444
+  templates, 2,344 initial patches, and 2,430 row expressions versus the
+  accepted oracle's 42,099/450/1,472/17,517/2,454. Preserve the compact
+  semantic representation, but make direct lowering reproduce the accepted
+  executable behavior and identity; do not update the oracle merely because
+  the new representation is faster.
+- Freeze further tiny typechecker/container edits while that multiplier is the
+  dominant verified blocker. The next production tranche is a retained
+  definition plus compact invocation-overlay cut: store each pure callable body
+  once, represent occurrence-specific parameter/PASSED/type/owner/effect and
+  resource bindings in a dense overlay, and leave only genuinely contextual or
+  effect-owning nodes occurrence-specific. Start with the type-polymorphic pure
+  definitions that currently block the ordinary-call dependency closure, but
+  make eligibility semantic and generic rather than fixture- or function-name
+  based. Add deterministic counters for retained definition expressions,
+  invocation overlays, specialized expressions avoided, OUT instances,
+  dependency records, proof nodes, and proof edges. Preserve exact diagnostics,
+  negative proof behavior, and the three budgeted `MachinePlan` hashes; a
+  temporary expanded projection may exist only as a test oracle and must not
+  remain on the production path.
+- After the template/overlay cut materially reduces upstream cardinality, build
+  dependency facts from definitions plus overlays in one indexed construction
+  and compact `SemanticProgram` at sealing. The public artifact should retain
+  the canonical core, exact proof commitments/digests, distributed-discovery
+  projection, and verifier-required pulse-fusion input, not every duplicate
+  construction graph. Direct lowering and streaming hashes remain the next
+  tranche. Do not spend another iteration tuning the current million-edge graph
+  unless a fresh profile after the cardinality cut still assigns it the owner.
+- Return to the remaining Phase 1 name/type interning, scaling/parity evidence,
+  and fresh adversarial review after this architectural verified-compile cut,
+  then regenerate the full cold protocol from the final Phase 1 source state.
 
 Development profiles and focused debug tests remain directional tools. The
 acceptance producer remains the revision-identified `release` binary required

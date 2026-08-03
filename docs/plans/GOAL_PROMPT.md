@@ -333,6 +333,40 @@ Current checkpoints to preserve and audit rather than redo:
   NovyWave verified samples remain about 7.72/7.56 seconds and 515 MiB,
   dominated by about 6.9 seconds of semantic construction, so the verified
   time/RSS gates remain mandatory later blockers;
+- a fresh high-level trace at checkpoint `c77dabc` confirms that the verified
+  blocker is architectural multiplication: 17,716 checked expressions and
+  1,820 calls become about 45,000 semantic expressions and 5,146 OUT call
+  instances, then 247,537 dependency records and a 248,201-node/1,060,194-edge
+  proof graph. The compile takes about 7.79 seconds, allocates about 2.99 GB
+  cumulatively, and peaks at 515,172 KiB. Only 61 of 426 initially pure
+  ordinary candidates are retained; 357 close over an unretained body and 71
+  more are rejected at open boundary types. Stop polishing typechecker
+  containers while this is the dominant owner. Implement retained callable
+  definitions plus dense invocation overlays for parameter, PASSED, type,
+  owner, effect, and resource bindings; begin with the generic type-polymorphic
+  pure closure, preserve exact budgeted plan hashes, and measure retained-body,
+  overlay, avoided-specialization, OUT, dependency-record, proof-node, and
+  proof-edge counts. A flattened expansion may be a test oracle only. Then
+  derive dependency facts once from definitions plus overlays, seal a compact
+  `SemanticProgram`, and proceed to direct lowering/streaming hashes. Resume
+  remaining Phase 1 interning/scaling/parity work after this cardinality cut;
+- the 2026-08-03 retained-definition/invocation-overlay candidate validates the
+  larger direction: NovyWave fresh/empty verified samples fall to
+  4,415.27/4,455.01 ms and 317,844/318,428 KiB, semantic construction falls to
+  3,758.10/3,777.86 ms, and the semantic graph falls to 16,521 nodes with about
+  10.92 million allocations/1.552 GB. Open typed boundaries and pure render
+  constructors now share definitions; compact checked-call occurrences carry
+  constructor contexts and dependency proof classifies those overlays. The RSS
+  gate is directionally green but the 1,000 ms gate is red. Exact plan parity
+  is also red: both modes emit `f293e8a8...` instead of the required
+  `4d3c284a...`, with 33,910 document expressions and 2,344 initial patches
+  versus 42,099 and 17,517 in the oracle. Keep the compact semantic cut, repair
+  direct lowering to preserve the accepted plan behavior and identity, and do
+  not relabel this checkpoint as Phase 1 closure. A trace assigns 2,368.00 ms
+  to the dependency manifest, which still creates 159,612 records and a
+  160,276-node/512,204-edge proof graph from only 16,417 execution expressions;
+  after parity, compact direct proof construction/sealing is the next large
+  owner rather than more typechecker-container work;
 - the current compiler-throughput checkpoint keeps Counter, physical TodoMVC,
   and NovyWave `MachinePlan` output deterministic while replacing copied OUT
   type environments with active-path overlays, retaining canonical-root-reading

@@ -1,5 +1,5 @@
 use crate::machine_plan_backend::{ValueIndex, lower_document_runtime_expression};
-use boon_checked::{Type, is_renderable_type};
+use boon_checked::{CheckedTypeSubstitution, Type, TypeVar, is_renderable_type};
 use boon_ir::ErasedProgram;
 use boon_plan::*;
 use boon_semantic::program_core as ir;
@@ -64,13 +64,21 @@ struct ContextualMaterializationInfo {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct CompileContext {
     cache_scope: usize,
+    call_instance: Option<usize>,
     stable_owner: Option<ir::StaticOwnerId>,
     owner_function: Option<DocumentFunctionId>,
     materialization_locals:
         BTreeMap<(ir::StaticOwnerId, ir::MaterializationLocalId), DocumentParameterId>,
     locals: BTreeMap<ir::ExecutableLocalBindingId, DocumentLocalId>,
-    function_parameters: BTreeMap<ir::ExecutableParameterId, DocumentExprId>,
+    function_parameters: BTreeMap<ir::ExecutableParameterId, DocumentFunctionParameterBinding>,
+    type_substitutions: BTreeMap<TypeVar, Type>,
     pattern_bindings: BTreeMap<String, PatternBindingContext>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DocumentFunctionParameterBinding {
+    value: DocumentExprId,
+    ty: Type,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -107,12 +115,22 @@ struct OrdinaryCallCacheKey {
     arguments: Vec<(usize, usize)>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct OrdinaryCallCacheEntry {
+    call_instance: Option<usize>,
+    type_substitutions: Vec<CheckedTypeSubstitution>,
+    scope: usize,
+}
+
 struct ExecutableCall<'a> {
     expression: &'a ir::ExecutableExpression,
+    checked_call: boon_checked::CheckedCallId,
     callable_kind: ir::ExecutableCallableKind,
     function: &'a str,
+    instance: Option<usize>,
     arguments: &'a [ir::ExecutableCallArgument],
     contexts: &'a [ir::ExecutableCallContextId],
+    context_ordinals: &'a [usize],
 }
 
 struct DocumentCompiler<'a> {
@@ -135,7 +153,8 @@ struct DocumentCompiler<'a> {
     function_ids: BTreeSet<DocumentFunctionId>,
     templates: Vec<DocumentTemplate>,
     template_ids: BTreeSet<DocumentTemplateId>,
-    templates_by_node_expression: BTreeMap<ir::ExecutableExprId, DocumentTemplateId>,
+    templates_by_node_expression:
+        BTreeMap<(Option<usize>, ir::ExecutableExprId), DocumentTemplateId>,
     template_contexts: BTreeMap<DocumentTemplateId, CompileContext>,
     materializations: Vec<DocumentMaterialization>,
     materialization_ids: BTreeSet<DocumentMaterializationId>,
@@ -144,7 +163,7 @@ struct DocumentCompiler<'a> {
     compiled_paths: BTreeMap<(Option<ScopeId>, String), DocumentExprId>,
     compile_stack: Vec<ir::ExecutableExprId>,
     active_ordinary_functions: BTreeSet<ir::FunctionId>,
-    ordinary_call_cache_scopes: BTreeMap<OrdinaryCallCacheKey, usize>,
+    ordinary_call_cache_scopes: BTreeMap<OrdinaryCallCacheKey, Vec<OrdinaryCallCacheEntry>>,
     next_cache_scope: usize,
     next_local: usize,
 }
@@ -407,7 +426,7 @@ impl<'a> DocumentCompiler<'a> {
                 self.compile_distributed_value(
                     expression.id.0,
                     value,
-                    value_class_for_type(&expression.flow_type.ty),
+                    self.invocation_value_class(&expression, context)?,
                 )
             } else {
                 self.compile_expression_kind(&expression, context, input_override)
@@ -691,12 +710,11 @@ impl<'a> DocumentCompiler<'a> {
         input_override: Option<DocumentExprId>,
     ) -> Result<DocumentExprId, PlanError> {
         let compiler_id = expression.id.0;
+        let expression_value_class = self.invocation_value_class(expression, context)?;
         match &expression.kind {
-            ir::ExecutableExpressionKind::CanonicalRead { .. } => self.compile_erased_read(
-                expression.id,
-                context,
-                value_class_for_type(&expression.flow_type.ty),
-            ),
+            ir::ExecutableExpressionKind::CanonicalRead { .. } => {
+                self.compile_erased_read(expression.id, context, expression_value_class)
+            }
             ir::ExecutableExpressionKind::LocalRead {
                 binding,
                 declaration,
@@ -714,7 +732,7 @@ impl<'a> DocumentCompiler<'a> {
                     .collect();
                 Ok(self.push_expr(
                     compiler_id,
-                    value_class_for_type(&expression.flow_type.ty),
+                    expression_value_class,
                     DocumentExprOp::Read {
                         read: DocumentRead::Local { local, projection },
                     },
@@ -725,7 +743,7 @@ impl<'a> DocumentCompiler<'a> {
                     compiler_id,
                     canonical_path,
                     context,
-                    value_class_for_type(&expression.flow_type.ty),
+                    expression_value_class,
                 ),
             ir::ExecutableExpressionKind::ElementState {
                 context,
@@ -737,7 +755,7 @@ impl<'a> DocumentCompiler<'a> {
                     .collect();
                 Ok(self.push_expr(
                     compiler_id,
-                    value_class_for_type(&expression.flow_type.ty),
+                    expression_value_class,
                     DocumentExprOp::Read {
                         read: DocumentRead::ElementState {
                             context: document_element_context(*context),
@@ -776,11 +794,9 @@ impl<'a> DocumentCompiler<'a> {
                     value: vec![*value],
                 },
             )),
-            ir::ExecutableExpressionKind::Absent => Ok(self.push_expr(
-                compiler_id,
-                value_class_for_type(&expression.flow_type.ty),
-                DocumentExprOp::Absent,
-            )),
+            ir::ExecutableExpressionKind::Absent => {
+                Ok(self.push_expr(compiler_id, expression_value_class, DocumentExprOp::Absent))
+            }
             ir::ExecutableExpressionKind::Flush { .. } => Err(PlanError::new(format!(
                 "live FLUSH control at executable expression {compiler_id} cannot be materialized as retained document data"
             ))),
@@ -808,7 +824,7 @@ impl<'a> DocumentCompiler<'a> {
                     .collect();
                 Ok(self.push_expr(
                     compiler_id,
-                    value_class_for_type(&expression.flow_type.ty),
+                    expression_value_class,
                     DocumentExprOp::RuntimeExpression {
                         expression: runtime_expression,
                         bindings,
@@ -865,32 +881,44 @@ impl<'a> DocumentCompiler<'a> {
                 ))
             }
             ir::ExecutableExpressionKind::Call {
+                checked_call,
                 callable_kind,
                 name,
+                instance,
                 arguments,
                 contexts,
+                context_ordinals,
                 ..
             } => self.compile_call(
                 ExecutableCall {
                     expression,
+                    checked_call: *checked_call,
                     callable_kind: *callable_kind,
                     function: name,
+                    instance: *instance,
                     arguments,
                     contexts,
+                    context_ordinals,
                 },
                 context,
                 input_override,
             ),
             ir::ExecutableExpressionKind::UserCall {
+                checked_call,
                 function,
                 name,
+                instance,
                 arguments,
+                type_substitutions,
                 ..
             } => self.compile_user_call(
                 expression,
+                *checked_call,
                 *function,
                 name,
+                *instance,
                 arguments,
+                type_substitutions,
                 context,
                 input_override,
             ),
@@ -960,7 +988,7 @@ impl<'a> DocumentCompiler<'a> {
                         .collect();
                     Ok(self.push_expr(
                         compiler_id,
-                        value_class_for_type(&expression.flow_type.ty),
+                        expression_value_class,
                         DocumentExprOp::RuntimeExpression {
                             expression: runtime_expression,
                             bindings,
@@ -988,7 +1016,7 @@ impl<'a> DocumentCompiler<'a> {
                     name,
                     &[],
                     context,
-                    value_class_for_type(&expression.flow_type.ty),
+                    expression_value_class,
                 )
             }
             ir::ExecutableExpressionKind::Latest { branches } => {
@@ -1003,7 +1031,7 @@ impl<'a> DocumentCompiler<'a> {
                 }
                 Ok(self.push_expr(
                     compiler_id,
-                    value_class_for_type(&expression.flow_type.ty),
+                    expression_value_class,
                     DocumentExprOp::Latest { branches },
                 ))
             }
@@ -1018,7 +1046,7 @@ impl<'a> DocumentCompiler<'a> {
                     .transpose()?;
                 Ok(self.push_expr(
                     compiler_id,
-                    value_class_for_type(&expression.flow_type.ty),
+                    expression_value_class,
                     DocumentExprOp::Then { input, output },
                 ))
             }
@@ -1027,7 +1055,7 @@ impl<'a> DocumentCompiler<'a> {
                 let right = self.compile_expression(*right, context, None)?;
                 Ok(self.push_expr(
                     compiler_id,
-                    value_class_for_type(&expression.flow_type.ty),
+                    expression_value_class,
                     DocumentExprOp::Scalar {
                         operation: scalar_operation(op)?,
                         left,
@@ -1095,7 +1123,7 @@ impl<'a> DocumentCompiler<'a> {
                     fields,
                     context,
                     input_override,
-                    value_class_for_type(&expression.flow_type.ty),
+                    expression_value_class,
                 ),
             ir::ExecutableExpressionKind::MaterializationLocal {
                 owner,
@@ -1108,7 +1136,7 @@ impl<'a> DocumentCompiler<'a> {
                 {
                     return Ok(self.push_expr(
                         compiler_id,
-                        value_class_for_type(&expression.flow_type.ty),
+                        expression_value_class,
                         DocumentExprOp::Read { read },
                     ));
                 }
@@ -1135,7 +1163,7 @@ impl<'a> DocumentCompiler<'a> {
                     .collect();
                 Ok(self.push_expr(
                     compiler_id,
-                    value_class_for_type(&expression.flow_type.ty),
+                    expression_value_class,
                     DocumentExprOp::Read {
                         read: DocumentRead::Parameter {
                             parameter,
@@ -1148,17 +1176,24 @@ impl<'a> DocumentCompiler<'a> {
                 parameter,
                 projection,
             } => {
-                let Some(value) = context.function_parameters.get(parameter).copied() else {
+                let Some(binding) = context.function_parameters.get(parameter) else {
                     return Err(PlanError::new(format!(
                         "standalone executable function parameter {}:{} reached retained document lowering",
                         parameter.function.0, parameter.ordinal
                     )));
                 };
+                let projected_type = project_invocation_type(binding.ty.clone(), projection)
+                    .unwrap_or_else(|| {
+                        boon_checked::apply_checked_type_environment(
+                            &expression.flow_type.ty,
+                            &context.type_substitutions,
+                        )
+                    });
                 Ok(self.project_fields(
                     compiler_id,
-                    value,
+                    binding.value,
                     projection,
-                    value_class_for_type(&expression.flow_type.ty),
+                    value_class_for_type(&projected_type),
                 ))
             }
         }
@@ -1204,15 +1239,77 @@ impl<'a> DocumentCompiler<'a> {
         ))
     }
 
+    fn resolve_call_instance(
+        &self,
+        checked_call: boon_checked::CheckedCallId,
+        explicit: Option<usize>,
+        parent: Option<usize>,
+    ) -> Result<Option<usize>, PlanError> {
+        if let Some(instance) = explicit {
+            let occurrence = self
+                .program
+                .executable
+                .call_occurrences
+                .get(instance)
+                .filter(|occurrence| occurrence.id == instance)
+                .ok_or_else(|| {
+                    PlanError::new(format!(
+                        "document call {} references missing invocation {instance}",
+                        checked_call.0
+                    ))
+                })?;
+            if occurrence.checked_call != Some(checked_call) {
+                return Err(PlanError::new(format!(
+                    "document invocation {instance} maps to checked call {:?}, expected {}",
+                    occurrence.checked_call.map(|call| call.0),
+                    checked_call.0
+                )));
+            }
+            return Ok(Some(instance));
+        }
+
+        let Some(parent) = parent else {
+            return Ok(None);
+        };
+        let mut matches = self
+            .program
+            .executable
+            .call_occurrences
+            .iter()
+            .filter(|occurrence| {
+                occurrence.parent == Some(parent) && occurrence.checked_call == Some(checked_call)
+            })
+            .map(|occurrence| occurrence.id);
+        let Some(instance) = matches.next() else {
+            // Context-free pure calls are deliberately absent from the OUT
+            // occurrence tree. Keep the caller's nearest concrete anchor so
+            // a contextual descendant can still resolve its own overlay.
+            return Ok(None);
+        };
+        if matches.next().is_some() {
+            return Err(PlanError::new(format!(
+                "document invocation {parent} has multiple children for checked call {}",
+                checked_call.0
+            )));
+        }
+        Ok(Some(instance))
+    }
+
     fn compile_user_call(
         &mut self,
         expression: &ir::ExecutableExpression,
+        checked_call: boon_checked::CheckedCallId,
         function_id: ir::FunctionId,
         name: &str,
+        instance: Option<usize>,
         arguments: &[ir::ExecutableCallArgument],
+        type_substitutions: &[CheckedTypeSubstitution],
         caller_context: &CompileContext,
         input_override: Option<DocumentExprId>,
     ) -> Result<DocumentExprId, PlanError> {
+        let call_instance =
+            self.resolve_call_instance(checked_call, instance, caller_context.call_instance)?;
+        let overlay_anchor = call_instance.or(caller_context.call_instance);
         let function = self
             .program
             .executable
@@ -1243,9 +1340,19 @@ impl<'a> DocumentCompiler<'a> {
                     expression.id.0
                 )));
             }
+            let argument_type = self.invocation_argument_type(argument.value, caller_context)?;
             let value = self.compile_call_argument(argument, caller_context, input_override)?;
             cache_arguments.push((parameter.id.ordinal, value.0));
-            if bindings.insert(parameter.id, value).is_some() {
+            if bindings
+                .insert(
+                    parameter.id,
+                    DocumentFunctionParameterBinding {
+                        value,
+                        ty: argument_type,
+                    },
+                )
+                .is_some()
+            {
                 return Err(PlanError::new(format!(
                     "ordinary document call `{name}` binds parameter {} twice",
                     parameter.id.ordinal
@@ -1256,15 +1363,49 @@ impl<'a> DocumentCompiler<'a> {
             function: function_id,
             arguments: cache_arguments,
         };
-        let cache_scope = if let Some(scope) = self.ordinary_call_cache_scopes.get(&cache_key) {
-            *scope
+        let instantiated_type_substitutions = type_substitutions
+            .iter()
+            .map(|substitution| CheckedTypeSubstitution {
+                variable: substitution.variable,
+                value: boon_checked::apply_checked_type_environment(
+                    &substitution.value,
+                    &caller_context.type_substitutions,
+                ),
+            })
+            .collect::<Vec<_>>();
+        let cache_scope = if let Some(scope) = self
+            .ordinary_call_cache_scopes
+            .get(&cache_key)
+            .and_then(|entries| {
+                entries
+                    .iter()
+                    .find(|entry| {
+                        entry.call_instance == overlay_anchor
+                            && entry.type_substitutions == instantiated_type_substitutions
+                    })
+                    .map(|entry| entry.scope)
+            }) {
+            scope
         } else {
             let scope = self.allocate_cache_scope();
-            self.ordinary_call_cache_scopes.insert(cache_key, scope);
+            self.ordinary_call_cache_scopes
+                .entry(cache_key)
+                .or_default()
+                .push(OrdinaryCallCacheEntry {
+                    call_instance: overlay_anchor,
+                    type_substitutions: instantiated_type_substitutions.clone(),
+                    scope,
+                });
             scope
         };
         let mut context = caller_context.clone();
         context.cache_scope = cache_scope;
+        context.call_instance = overlay_anchor;
+        for substitution in instantiated_type_substitutions {
+            context
+                .type_substitutions
+                .insert(substitution.variable, substitution.value);
+        }
         for (parameter, value) in bindings {
             if context
                 .function_parameters
@@ -1287,6 +1428,62 @@ impl<'a> DocumentCompiler<'a> {
         result
     }
 
+    fn invocation_argument_type(
+        &self,
+        expression: ir::ExecutableExprId,
+        context: &CompileContext,
+    ) -> Result<Type, PlanError> {
+        let definition = self.expression(expression)?;
+        match &definition.kind {
+            ir::ExecutableExpressionKind::FunctionParameter {
+                parameter,
+                projection,
+            } => {
+                let binding = context.function_parameters.get(parameter).ok_or_else(|| {
+                    PlanError::new(format!(
+                        "ordinary call argument reads unbound function parameter {}:{}",
+                        parameter.function.0, parameter.ordinal
+                    ))
+                })?;
+                Ok(
+                    project_invocation_type(binding.ty.clone(), projection).unwrap_or_else(|| {
+                        boon_checked::apply_checked_type_environment(
+                            &definition.flow_type.ty,
+                            &context.type_substitutions,
+                        )
+                    }),
+                )
+            }
+            ir::ExecutableExpressionKind::Project { input, fields } => {
+                let input = self.invocation_argument_type(*input, context)?;
+                Ok(project_invocation_type(input, fields).unwrap_or_else(|| {
+                    boon_checked::apply_checked_type_environment(
+                        &definition.flow_type.ty,
+                        &context.type_substitutions,
+                    )
+                }))
+            }
+            ir::ExecutableExpressionKind::Flush { payload }
+            | ir::ExecutableExpressionKind::FlushBoundary { input: payload }
+            | ir::ExecutableExpressionKind::Draining { input: payload } => {
+                self.invocation_argument_type(*payload, context)
+            }
+            _ => Ok(boon_checked::apply_checked_type_environment(
+                &definition.flow_type.ty,
+                &context.type_substitutions,
+            )),
+        }
+    }
+
+    fn invocation_value_class(
+        &self,
+        expression: &ir::ExecutableExpression,
+        context: &CompileContext,
+    ) -> Result<DocumentValueClass, PlanError> {
+        self.invocation_argument_type(expression.id, context)
+            .map(|ty| value_class_for_type(&ty))
+    }
+
     fn compile_call(
         &mut self,
         call: ExecutableCall<'_>,
@@ -1295,12 +1492,73 @@ impl<'a> DocumentCompiler<'a> {
     ) -> Result<DocumentExprId, PlanError> {
         let ExecutableCall {
             expression,
+            checked_call,
             callable_kind,
             function,
+            instance,
             arguments,
             contexts,
+            context_ordinals,
         } = call;
         let compiler_id = expression.id.0;
+        let expression_value_class = self.invocation_value_class(expression, context)?;
+        let call_instance =
+            self.resolve_call_instance(checked_call, instance, context.call_instance)?;
+        let effective_contexts = match call_instance {
+            Some(call_instance) => {
+                let occurrence = self
+                    .program
+                    .executable
+                    .call_occurrences
+                    .get(call_instance)
+                    .filter(|occurrence| occurrence.id == call_instance)
+                    .ok_or_else(|| {
+                        PlanError::new(format!(
+                            "document call {} references missing invocation {call_instance}",
+                            checked_call.0
+                        ))
+                    })?;
+                if occurrence.context_ordinals != context_ordinals {
+                    return Err(PlanError::new(format!(
+                        "document invocation {call_instance} context ordinals {:?} differ from checked call {} ordinals {:?}",
+                        occurrence.context_ordinals, checked_call.0, context_ordinals
+                    )));
+                }
+                let expected = context_ordinals
+                    .iter()
+                    .copied()
+                    .map(|ordinal| ir::ExecutableCallContextId {
+                        call_instance,
+                        ordinal,
+                    })
+                    .collect::<Vec<_>>();
+                if !contexts.is_empty() && contexts != expected {
+                    return Err(PlanError::new(format!(
+                        "document call {} concrete contexts differ from invocation {call_instance}",
+                        checked_call.0
+                    )));
+                }
+                expected
+            }
+            None => {
+                if !context_ordinals.is_empty() || !contexts.is_empty() {
+                    let candidates = self
+                        .program
+                        .executable
+                        .call_occurrences
+                        .iter()
+                        .filter(|occurrence| occurrence.checked_call == Some(checked_call))
+                        .take(16)
+                        .map(|occurrence| (occurrence.id, occurrence.parent))
+                        .collect::<Vec<_>>();
+                    return Err(PlanError::new(format!(
+                        "document call {} owns contexts but has no concrete invocation below {:?}; candidates={candidates:?}",
+                        checked_call.0, context.call_instance
+                    )));
+                }
+                Vec::new()
+            }
+        };
         if callable_kind == ir::ExecutableCallableKind::External {
             return Err(PlanError::new(format!(
                 "external executable call `{function}` at expression {compiler_id} has no directly encoded document import"
@@ -1323,7 +1581,7 @@ impl<'a> DocumentCompiler<'a> {
             let field = self.intern_name(field);
             return Ok(self.push_expr(
                 compiler_id,
-                value_class_for_type(&expression.flow_type.ty),
+                expression_value_class,
                 DocumentExprOp::Project { input, field },
             ));
         }
@@ -1333,9 +1591,16 @@ impl<'a> DocumentCompiler<'a> {
                     "render constructor `{function}` cannot be used as a pipeline operator"
                 )));
             }
-            return self.compile_constructor(expression, constructor, arguments, contexts, context);
+            return self.compile_constructor(
+                expression,
+                constructor,
+                arguments,
+                &effective_contexts,
+                call_instance,
+                context,
+            );
         }
-        if !contexts.is_empty() {
+        if !effective_contexts.is_empty() {
             return Err(PlanError::new(format!(
                 "non-render executable call `{function}` at expression {compiler_id} owns a call-local host context"
             )));
@@ -1371,7 +1636,7 @@ impl<'a> DocumentCompiler<'a> {
         }
         Ok(self.push_expr(
             compiler_id,
-            value_class_for_type(&expression.flow_type.ty),
+            expression_value_class,
             DocumentExprOp::Builtin {
                 builtin,
                 input,
@@ -1408,6 +1673,7 @@ impl<'a> DocumentCompiler<'a> {
         constructor: DocumentConstructor,
         arguments: &[ir::ExecutableCallArgument],
         contexts: &[ir::ExecutableCallContextId],
+        invocation: Option<usize>,
         context: &CompileContext,
     ) -> Result<DocumentExprId, PlanError> {
         let compiler_id = expression.id.0;
@@ -1423,11 +1689,21 @@ impl<'a> DocumentCompiler<'a> {
         verify_map_viewport_constructor_contract(constructor, &compiled_arguments, &self.names)
             .map_err(PlanError::new)?;
         let stable_owner = expression.owner.or(context.stable_owner);
-        let template = DocumentTemplateId(stable_compiler_identity(3, stable_owner, compiler_id)?);
-        let node = DocumentNodeId(stable_compiler_identity(4, stable_owner, compiler_id)?);
+        let template = DocumentTemplateId(stable_invocation_identity(
+            3,
+            stable_owner,
+            invocation,
+            compiler_id,
+        )?);
+        let node = DocumentNodeId(stable_invocation_identity(
+            4,
+            stable_owner,
+            invocation,
+            compiler_id,
+        )?);
         if let Some(previous) = self
             .templates_by_node_expression
-            .insert(expression.id, template)
+            .insert((invocation, expression.id), template)
             && previous != template
         {
             return Err(PlanError::new(format!(
@@ -1728,7 +2004,7 @@ impl<'a> DocumentCompiler<'a> {
                     .map(|arm| self.expressions[arm.output.0].value_class),
             )
             .max_by_key(|class| value_class_rank(*class))
-            .unwrap_or_else(|| value_class_for_type(&expression.flow_type.ty));
+            .unwrap_or(self.invocation_value_class(expression, context)?);
         Ok(self.push_expr(
             expression.id.0,
             class,
@@ -2238,11 +2514,12 @@ impl<'a> DocumentCompiler<'a> {
     fn compile_view_bindings(&mut self) -> Result<Vec<DocumentViewBinding>, PlanError> {
         let mut result = Vec::new();
         for binding in self.program.view_bindings.clone() {
-            let template = self
+            let mut templates = self
                 .templates_by_node_expression
-                .get(&binding.node_expression)
-                .copied()
-                .ok_or_else(|| {
+                .iter()
+                .filter(|((_, expression), _)| *expression == binding.node_expression)
+                .map(|(_, template)| *template);
+            let template = templates.next().ok_or_else(|| {
                     PlanError::new(format!(
                         "view binding {} `{}`.{} references retained node expression {} with no exact document template",
                         binding.id.0,
@@ -2251,6 +2528,12 @@ impl<'a> DocumentCompiler<'a> {
                         binding.node_expression.0
                     ))
                 })?;
+            if templates.any(|candidate| candidate != template) {
+                return Err(PlanError::new(format!(
+                    "view binding {} `{}`.{} references shared node expression {} without an invocation overlay",
+                    binding.id.0, binding.node_kind, binding.attr, binding.node_expression.0
+                )));
+            }
             let context = self
                 .template_contexts
                 .get(&template)
@@ -2741,6 +3024,57 @@ fn stable_compiler_identity(
     Ok((u64::from(kind) << 56) | ((owner as u64) << 32) | compiler_id as u64)
 }
 
+fn stable_invocation_identity(
+    kind: u8,
+    owner: Option<ir::StaticOwnerId>,
+    invocation: Option<usize>,
+    compiler_id: usize,
+) -> Result<u64, PlanError> {
+    let Some(invocation) = invocation else {
+        return stable_compiler_identity(kind, owner, compiler_id);
+    };
+    let invocation_kind: u8 = match (kind, owner.is_some()) {
+        (3, false) => 6,
+        (4, false) => 7,
+        (3, true) => 8,
+        (4, true) => 9,
+        _ => {
+            return Err(PlanError::new(
+                "unsupported invocation-scoped document identity kind",
+            ));
+        }
+    };
+    if let Some(owner) = owner {
+        let owner_invocation = cantor_pair(owner.0 as u128, invocation as u128)?;
+        let payload = cantor_pair(owner_invocation, compiler_id as u128)?;
+        if payload > 0x00ff_ffff_ffff_ffff {
+            return Err(PlanError::new(
+                "owned document invocation identity exceeds its stable encoding",
+            ));
+        }
+        return Ok((u64::from(invocation_kind) << 56) | payload as u64);
+    }
+    if invocation >= 0x00ff_ffff || compiler_id > u32::MAX as usize {
+        return Err(PlanError::new(
+            "document invocation identity exceeds its stable encoding",
+        ));
+    }
+    Ok((u64::from(invocation_kind) << 56) | (((invocation + 1) as u64) << 32) | compiler_id as u64)
+}
+
+fn cantor_pair(left: u128, right: u128) -> Result<u128, PlanError> {
+    let sum = left
+        .checked_add(right)
+        .ok_or_else(|| PlanError::new("document identity pairing overflow"))?;
+    sum.checked_mul(
+        sum.checked_add(1)
+            .ok_or_else(|| PlanError::new("document identity pairing overflow"))?,
+    )
+    .and_then(|product| product.checked_div(2))
+    .and_then(|triangle| triangle.checked_add(right))
+    .ok_or_else(|| PlanError::new("document identity pairing overflow"))
+}
+
 fn joined_path(path: &str, projection: &[String]) -> String {
     if projection.is_empty() {
         path.to_owned()
@@ -3011,6 +3345,29 @@ fn value_class_for_type(ty: &Type) -> DocumentValueClass {
     }
 }
 
+fn project_invocation_type(mut ty: Type, projection: &[String]) -> Option<Type> {
+    for field in projection {
+        ty = match ty {
+            Type::Object(shape) => shape.fields.get(field)?.clone(),
+            Type::Union(members) => {
+                let projected = members
+                    .iter()
+                    .filter_map(|member| match member {
+                        Type::Object(shape) => shape.fields.get(field).cloned(),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                if projected.is_empty() {
+                    return None;
+                }
+                boon_checked::canonical_union_type(projected)
+            }
+            _ => return None,
+        };
+    }
+    Some(ty)
+}
+
 fn executable_debug_label(program: &ErasedProgram, id: ir::ExecutableExprId) -> String {
     let Some(expression) = program.executable.expressions.get(id.as_usize()) else {
         return format!("{id}:missing");
@@ -3127,5 +3484,27 @@ mod tests {
         let scope = synthetic_scope_id(ir::StaticOwnerId(7)).unwrap();
         assert_ne!(scope.0 & (1usize << (usize::BITS - 1)), 0);
         assert_eq!(scope.0 & !(1usize << (usize::BITS - 1)), 7);
+    }
+
+    #[test]
+    fn owned_invocation_identities_preserve_all_three_coordinates() {
+        let identity = stable_invocation_identity(3, Some(ir::StaticOwnerId(7)), Some(11), 13)
+            .expect("owned invocation identity");
+        assert_eq!(
+            identity,
+            stable_invocation_identity(3, Some(ir::StaticOwnerId(7)), Some(11), 13).unwrap()
+        );
+        assert_ne!(
+            identity,
+            stable_invocation_identity(3, Some(ir::StaticOwnerId(8)), Some(11), 13).unwrap()
+        );
+        assert_ne!(
+            identity,
+            stable_invocation_identity(3, Some(ir::StaticOwnerId(7)), Some(12), 13).unwrap()
+        );
+        assert_ne!(
+            identity,
+            stable_invocation_identity(3, Some(ir::StaticOwnerId(7)), Some(11), 14).unwrap()
+        );
     }
 }

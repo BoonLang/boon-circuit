@@ -152,10 +152,37 @@ stronger three-reviewer performance closure defined below.
    regenerate the complete cold protocol after the final edit. Direct verified
    NovyWave remains about 7.6--7.7 seconds and
    515 MiB, dominated by about 6.9 seconds of semantic work; keep that later
-   verified time/RSS closure explicitly red. Then close
-   semantic sealing, proof, backend, hashing, and memory until both verified-
-   plan modes pass; only afterward may persistent-session warm work satisfy its
-   separate gates.
+   verified time/RSS closure explicitly red. A fresh checkpoint-`c77dabc`
+   architecture trace shows 17,716 checked expressions and 1,820 calls growing
+   into about 45,000 semantic expressions, 5,146 OUT instances, 247,537
+   dependency records, and a 248,201-node/1,060,194-edge proof graph, with about
+   2.99 GB of cumulative allocation. Do not continue micro-optimizing the
+   typechecker while this multiplier dominates. Pull forward the retained-
+   definition/compact-invocation-overlay part of semantic sealing: retain pure
+   type-polymorphic bodies once, carry parameter/PASSED/type/owner/effect and
+   resource differences in dense overlays, count avoided specializations, and
+   build proof facts from definitions plus overlays. Preserve the three exact
+   budgeted plan hashes; flattened expansion is test-oracle-only. Once
+   cardinality falls, compact the sealed semantic artifact and close proof,
+   backend, hashing, and memory until both verified-plan modes pass. Then return
+   to remaining Phase 1 interning/scaling/parity closure; only afterward may
+   persistent-session warm work satisfy its separate gates.
+
+   The first 2026-08-03 retained-definition/invocation-overlay candidate cuts
+   NovyWave fresh/empty verified time to 4,415.27/4,455.01 ms, semantic time to
+   3,758.10/3,777.86 ms, peak RSS to 317,844/318,428 KiB, semantic nodes to
+   16,521, and allocations to about 10.92 million calls/1.552 GB. This confirms
+   the architecture and crosses the RSS gate directionally, but not the 1,000
+   ms time gate. Its deterministic `f293e8a8...` plan hash also differs from
+   the required `4d3c284a...`; document expressions/initial patches are
+   33,910/2,344 versus the oracle's 42,099/17,517. Preserve the compact semantic
+   graph and repair direct lowering until exact plan behavior/identity and the
+   remaining latency gate pass. Do not update the oracle to hide the mismatch.
+   The remaining semantic phase is dominated by 2,368.00 ms of dependency-
+   manifest work: 159,612 records become a 160,276-node/512,204-edge graph, with
+   about 1,007 ms in coverage/dependency graph digests alone. After parity,
+   replace that expanded proof construction with compact direct sealing before
+   considering any further small typechecker-container edits.
 
    Use the performance plan's edit-loop, milestone-preflight, and full-
    acceptance harness levels. Focused debug tests and direct one-sample producer

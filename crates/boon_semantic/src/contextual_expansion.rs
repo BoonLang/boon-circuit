@@ -1,15 +1,15 @@
 use crate::execution::{
     SemanticBlockBinding, SemanticCall, SemanticCallArgument, SemanticCallContextArgument,
     SemanticCallContextBinding, SemanticCallContextId, SemanticCallEntry, SemanticCallId,
-    SemanticCallParameterBinding, SemanticCallParameterBindingKind, SemanticCallable,
-    SemanticCallableContext, SemanticCallableContextParameter, SemanticCallableId,
-    SemanticCallableKind, SemanticCallableParameter, SemanticContextualMaterialization,
-    SemanticContextualOperationKind, SemanticContextualOrderKey, SemanticExecutionGraphV1,
-    SemanticExprId, SemanticExpression, SemanticExpressionKind, SemanticExpressionOrigin,
-    SemanticFunction, SemanticFunctionParameter, SemanticLocalBindingId, SemanticMaterializationId,
-    SemanticMaterializationLocalId, SemanticMaterializationResultKind, SemanticParameterId,
-    SemanticPatternBinding, SemanticRecordField, SemanticRoot, SemanticScope, SemanticScopeId,
-    SemanticSelectArm, SemanticSelectKind, SemanticSourceDef, SemanticSourceId,
+    SemanticCallOccurrence, SemanticCallParameterBinding, SemanticCallParameterBindingKind,
+    SemanticCallable, SemanticCallableContext, SemanticCallableContextParameter,
+    SemanticCallableId, SemanticCallableKind, SemanticCallableParameter,
+    SemanticContextualMaterialization, SemanticContextualOperationKind, SemanticContextualOrderKey,
+    SemanticExecutionGraphV1, SemanticExprId, SemanticExpression, SemanticExpressionKind,
+    SemanticExpressionOrigin, SemanticFunction, SemanticFunctionParameter, SemanticLocalBindingId,
+    SemanticMaterializationId, SemanticMaterializationLocalId, SemanticMaterializationResultKind,
+    SemanticParameterId, SemanticPatternBinding, SemanticRecordField, SemanticRoot, SemanticScope,
+    SemanticScopeId, SemanticSelectArm, SemanticSelectKind, SemanticSourceDef, SemanticSourceId,
     SemanticSourceOrigin, SemanticSourceRead, SemanticStateDef, SemanticStateId,
     SemanticStateLifetimeDeriverV1, SemanticStatement, SemanticStatementId, SemanticStatementKind,
     SemanticStatementOrigin, SemanticStaticOwner, SemanticTextSegment, SemanticValueId,
@@ -1529,7 +1529,51 @@ pub(crate) fn derive_semantic_execution_graph(
         })
         .collect::<Result<Vec<_>, ExpansionError>>()?;
     let (mut callables, callable_ids) = semantic_callable_inventory(program, &semantic_scope_ids)?;
-    let (calls, _) = semantic_call_inventory(program, &semantic_scope_ids, &callable_ids)?;
+    let (calls, call_ids) = semantic_call_inventory(program, &semantic_scope_ids, &callable_ids)?;
+    let call_occurrences = out_net
+        .call_instances
+        .iter()
+        .enumerate()
+        .map(|(index, occurrence)| {
+            if occurrence.id.as_usize() != index {
+                return Err(ExpansionError::InvalidLocalBindings(format!(
+                    "OUT call occurrence {} is not dense at index {index}",
+                    occurrence.id
+                )));
+            }
+            let (call, context_ordinals) = match occurrence.provenance.call_id {
+                Some(checked_call) => {
+                    let call = call_ids.get(&checked_call).copied().ok_or_else(|| {
+                        ExpansionError::InvalidLocalBindings(format!(
+                            "OUT call occurrence {} references missing checked call {}",
+                            occurrence.id, checked_call.0
+                        ))
+                    })?;
+                    let checked = lookup.call(program, checked_call).ok_or_else(|| {
+                        ExpansionError::InvalidLocalBindings(format!(
+                            "OUT call occurrence {} references absent checked call {}",
+                            occurrence.id, checked_call.0
+                        ))
+                    })?;
+                    (
+                        Some(call),
+                        checked
+                            .contexts
+                            .iter()
+                            .map(|context| context.signature)
+                            .collect(),
+                    )
+                }
+                None => (None, Vec::new()),
+            };
+            Ok(SemanticCallOccurrence {
+                id: occurrence.id,
+                parent: occurrence.parent,
+                call,
+                context_ordinals,
+            })
+        })
+        .collect::<Result<Vec<_>, ExpansionError>>()?;
     let materializations_by_owner = materializations
         .iter()
         .map(|materialization| (materialization.owner, materialization.id))
@@ -2386,6 +2430,7 @@ pub(crate) fn derive_semantic_execution_graph(
         scopes,
         callables,
         calls,
+        call_occurrences,
         sources,
         states,
         roots,
@@ -4250,11 +4295,11 @@ pub(crate) struct SemanticExpressionBuilderIndexes {
     ordinary_callable_ids: BTreeSet<SemanticCallableId>,
 }
 
-fn ordinary_boundary_type(ty: &Type) -> bool {
-    ordinary_boundary_type_inner(ty, false)
+fn ordinary_template_boundary_type(ty: &Type) -> bool {
+    ordinary_template_boundary_type_inner(ty)
 }
 
-fn ordinary_boundary_type_inner(ty: &Type, nested: bool) -> bool {
+fn ordinary_template_boundary_type_inner(ty: &Type) -> bool {
     match ty {
         Type::Text | Type::Number | Type::Bytes(_) | Type::Absent | Type::Bits { .. } => true,
         Type::VariantSet(variants) => variants.iter().all(|variant| match variant {
@@ -4262,24 +4307,28 @@ fn ordinary_boundary_type_inner(ty: &Type, nested: bool) -> bool {
             boon_checked::Variant::Tagged { fields, .. } => fields
                 .fields
                 .values()
-                .all(|field| ordinary_boundary_type_inner(field, true)),
+                .all(ordinary_template_boundary_type_inner),
         }),
         Type::Object(shape) => shape
             .fields
             .values()
-            .all(|field| ordinary_boundary_type_inner(field, true)),
-        Type::List(item) | Type::Set(item) => ordinary_boundary_type_inner(item, true),
+            .all(ordinary_template_boundary_type_inner),
+        Type::List(item) | Type::Set(item) => ordinary_template_boundary_type_inner(item),
         Type::Map { key, value } => {
-            ordinary_boundary_type_inner(key, true) && ordinary_boundary_type_inner(value, true)
+            ordinary_template_boundary_type_inner(key)
+                && ordinary_template_boundary_type_inner(value)
         }
         Type::Union(members) => {
-            !members.is_empty()
-                && members
-                    .iter()
-                    .all(|member| ordinary_boundary_type_inner(member, true))
+            !members.is_empty() && members.iter().all(ordinary_template_boundary_type_inner)
         }
-        Type::UnresolvedShape { .. } | Type::Var(_) | Type::Unknown => nested,
-        Type::RenderContract | Type::Function { .. } => false,
+        // A retained definition is a template. Its FunctionParameter leaves
+        // are bound by each SemanticExpressionKind::Call occurrence, whose
+        // arguments and result flow type are the compact invocation overlay.
+        // Open checked boundary types therefore do not require a cloned body;
+        // concrete resource/effect ownership remains excluded independently.
+        Type::UnresolvedShape { .. } | Type::Var(_) | Type::Unknown => true,
+        Type::RenderContract => true,
+        Type::Function { .. } => false,
     }
 }
 
@@ -4326,14 +4375,14 @@ fn ordinary_callable_base_rejection(
         let Some(formal) = program.context_formal(formal) else {
             return Some("missing_context_formal");
         };
-        if !ordinary_boundary_type(&formal.scheme.flow_type.ty) {
+        if !ordinary_template_boundary_type(&formal.scheme.flow_type.ty) {
             return Some("context_type");
         }
     }
     if callable.result_expression.is_none() {
         return Some("no_result");
     }
-    if !ordinary_boundary_type(&callable.result.ty) {
+    if !ordinary_template_boundary_type(&callable.result.ty) {
         return Some("result_type");
     }
     if callable.parameters.iter().any(|parameter| {
@@ -4346,7 +4395,7 @@ fn ordinary_callable_base_rejection(
     if callable
         .parameters
         .iter()
-        .any(|parameter| !ordinary_boundary_type(&parameter.flow_type.ty))
+        .any(|parameter| !ordinary_template_boundary_type(&parameter.flow_type.ty))
     {
         return Some("parameter_type");
     }
@@ -4395,6 +4444,13 @@ fn ordinary_callable_body_dependencies(
                 let Some(declaration) = lookup.declaration(program, *target) else {
                     return None;
                 };
+                // Element-state reads need a call-context placeholder in the
+                // retained body. Constructor-local contexts are overlaid
+                // below; keep state-reading definitions specialized until the
+                // corresponding value placeholder is represented explicitly.
+                if declaration.kind == CheckedDeclarationKind::ElementState {
+                    return None;
+                }
                 match enclosing_function_owner(program, lookup, declaration.scope_id) {
                     Some(owner) if owner == callable.decl_id => {
                         if let Some(value) = declaration.value
@@ -4419,11 +4475,10 @@ fn ordinary_callable_body_dependencies(
                 let Some(call) = lookup.call(program, *call) else {
                     return None;
                 };
-                if !call.contexts.is_empty()
-                    || call
-                        .entries
-                        .iter()
-                        .any(|entry| !matches!(entry, CheckedCallEntry::Input { .. }))
+                if call
+                    .entries
+                    .iter()
+                    .any(|entry| !matches!(entry, CheckedCallEntry::Input { .. }))
                 {
                     return None;
                 }
@@ -4444,9 +4499,11 @@ fn ordinary_callable_body_dependencies(
                 match target.kind {
                     CheckedCallableKind::Builtin
                         if target.effect == boon_checked::CheckedEffectSummary::default()
-                            && target.contexts.is_empty()
-                            && target.context_formal.is_none()
-                            && !boon_checked::is_registered_render_constructor(&call.function) => {}
+                            && ((target.contexts.is_empty()
+                                && target.context_formal.is_none())
+                                || boon_checked::is_registered_render_constructor(
+                                    &call.function,
+                                )) => {}
                     CheckedCallableKind::User if candidates.contains(&target.decl_id) => {
                         dependencies.insert(target.decl_id);
                     }
@@ -5963,16 +6020,10 @@ impl<'a> SemanticExpressionBuilder<'a> {
             .any(|entry| !matches!(entry, CheckedCallEntry::Input { .. }));
         let retained_user_call = self.retain_ordinary_calls
             && callable.kind == CheckedCallableKind::User
-            // A syntax-discriminated call is an occurrence specialization,
-            // not an invocation of the callable's generic body. Retaining a
-            // shared boundary here would materialize every unselected branch
-            // and could not carry the exact occurrence result contract. A
-            // nested call encountered while building a shared ordinary
-            // definition has no concrete frame, so it remains a boundary and
-            // carries its checked occurrence result on that call node.
-            && (callable.context_formal.is_some()
-                || !checked_call.syntax_discriminated_result
-                || (self.current_ordinary_definition.is_some() && instance.is_none()))
+            // The call node is the invocation overlay. Its exact occurrence
+            // result and type substitutions select the same static branch
+            // when the shared body is lowered, so syntax-discriminated pure
+            // calls do not require a cloned semantic body.
             && self
                 .indexes
                 .callable_ids
@@ -5981,12 +6032,12 @@ impl<'a> SemanticExpressionBuilder<'a> {
         let instance_less_ordinary_call = instance.is_none()
             && self.current_ordinary_definition.is_some()
             && !has_out
-            && checked_call.contexts.is_empty()
             && callable.effect == boon_checked::CheckedEffectSummary::default()
             && match callable.kind {
                 CheckedCallableKind::User => retained_user_call,
                 CheckedCallableKind::Builtin => {
-                    callable.contexts.is_empty() && callable.context_formal.is_none()
+                    (callable.contexts.is_empty() && callable.context_formal.is_none())
+                        || boon_checked::is_registered_render_constructor(&checked_call.function)
                 }
                 CheckedCallableKind::External => false,
             };
@@ -6339,13 +6390,10 @@ impl<'a> SemanticExpressionBuilder<'a> {
                     ordinal: context.signature,
                 })
                 .collect(),
-            None if checked_call.contexts.is_empty() => Vec::new(),
-            None => {
-                return Err(ExpansionError::MissingCallInstance {
-                    call: call_id,
-                    frame: scoped.frame,
-                });
-            }
+            // A retained definition carries only checked context ordinals.
+            // The invocation overlay resolves them to concrete call-instance
+            // contexts during executable lowering.
+            None => Vec::new(),
         };
         let semantic_call = self
             .indexes
@@ -7716,6 +7764,60 @@ FUNCTION add(value) {
                 ..
             } if projection.len() == 1 && projection[0] == "offset"
         )));
+    }
+
+    #[test]
+    fn ordinary_template_uses_call_overlays_for_open_parameter_and_result_types() {
+        let graph = semantic_graph(
+            r#"
+number_box: box_value(value: 1)
+text_box: box_value(value: TEXT { hello })
+number_value: identity(value: number_box.value)
+text_value: identity(value: text_box.value)
+
+FUNCTION box_value(value) {
+    [value: value]
+}
+
+FUNCTION identity(value) {
+    value
+}
+"#,
+        );
+
+        for name in ["box_value", "identity"] {
+            let callable = graph
+                .callables
+                .iter()
+                .find(|callable| callable.name.ends_with(name))
+                .unwrap_or_else(|| panic!("missing {name} callable"));
+            assert!(
+                callable.semantic_root.is_some(),
+                "pure open-boundary callable {name} must retain one template body"
+            );
+            assert_eq!(
+                graph
+                    .expressions
+                    .iter()
+                    .filter(|expression| matches!(
+                        &expression.kind,
+                        SemanticExpressionKind::Call {
+                            callable: candidate,
+                            callable_kind: SemanticCallableKind::User,
+                            ..
+                        } if *candidate == callable.id
+                    ))
+                    .count(),
+                2,
+                "each {name} invocation must remain one compact call overlay"
+            );
+        }
+
+        assert!(
+            graph.expressions.len() < 40,
+            "open-boundary templates expanded to {} semantic expressions",
+            graph.expressions.len()
+        );
     }
 
     #[test]

@@ -35,15 +35,15 @@ use program_core::{
     ErasedLocalMemberTarget, ErasedOwnerDef, ErasedReadId, ErasedRowBinding,
     ErasedRowSourceProjection, ErasedRowValue, ErasedSourceDef, ErasedSourceOrigin,
     ErasedTemporalBoundary, EventCause, ExecutableBlockBinding, ExecutableCallArgument,
-    ExecutableCallContextId, ExecutableCallableKind, ExecutableExprId, ExecutableExpression,
-    ExecutableExpressionKind, ExecutableFunction, ExecutableFunctionParameter,
-    ExecutableLocalBindingId, ExecutableOrdinaryFunction, ExecutableParameterId,
-    ExecutablePatternBinding, ExecutableProgram, ExecutableRecordField, ExecutableRoot,
-    ExecutableSelectArm, ExecutableSourceDef, ExecutableSourceId, ExecutableSourceOrigin,
-    ExecutableStateDef, ExecutableStateId, ExecutableStatement, ExecutableStatementId,
-    ExecutableStatementKind, ExecutableTextSegment, ExecutableValueMember, ExecutableValueOrigin,
-    ExecutableValueProvenance, ExprId, FieldId, FunctionId, InitialValue, ListId,
-    ListInitialRecord, ListInitializer, ListInitializerInput, ListMemory, ListMutation,
+    ExecutableCallContextId, ExecutableCallOccurrence, ExecutableCallableKind, ExecutableExprId,
+    ExecutableExpression, ExecutableExpressionKind, ExecutableFunction,
+    ExecutableFunctionParameter, ExecutableLocalBindingId, ExecutableOrdinaryFunction,
+    ExecutableParameterId, ExecutablePatternBinding, ExecutableProgram, ExecutableRecordField,
+    ExecutableRoot, ExecutableSelectArm, ExecutableSourceDef, ExecutableSourceId,
+    ExecutableSourceOrigin, ExecutableStateDef, ExecutableStateId, ExecutableStatement,
+    ExecutableStatementId, ExecutableStatementKind, ExecutableTextSegment, ExecutableValueMember,
+    ExecutableValueOrigin, ExecutableValueProvenance, ExprId, FieldId, FunctionId, InitialValue,
+    ListId, ListInitialRecord, ListInitializer, ListInitializerInput, ListMemory, ListMutation,
     ListMutationKind, ListProjection, ListProjectionKind, ListRowInitialField,
     MaterializationLocalId, MaterializationResultKind, ProducerFunctionArgument,
     ProducerFunctionInstance, ScopeId, SourceId, SourcePayloadDescriptor, SourcePayloadField,
@@ -1140,15 +1140,48 @@ fn allocate_local_bindings(
 fn allocate_call_identities(
     graph: &SemanticExecutionGraphV1,
 ) -> Result<AllocatedCallIdentities, String> {
-    let mut instances = BTreeMap::<
-        OutCallInstanceId,
-        (
-            SemanticCallId,
-            SemanticCallableId,
-            BTreeSet<SemanticCallContextId>,
-        ),
-    >::new();
+    let mut call_instances = BTreeMap::new();
     let mut context_definitions = BTreeSet::new();
+    for (index, occurrence) in graph.call_occurrences.iter().enumerate() {
+        if occurrence.id.as_usize() != index {
+            return Err(format!(
+                "semantic call occurrence {} is noncanonical at allocation index {index}",
+                occurrence.id
+            ));
+        }
+        if let Some(parent) = occurrence.parent
+            && parent.as_usize() >= index
+        {
+            return Err(format!(
+                "semantic call occurrence {} has nonpreceding parent {parent}",
+                occurrence.id
+            ));
+        }
+        if occurrence.call.is_none() && !occurrence.context_ordinals.is_empty() {
+            return Err(format!(
+                "synthetic call occurrence {} owns checked-call contexts",
+                occurrence.id
+            ));
+        }
+        if let Some(call) = occurrence.call {
+            semantic_call(graph, call)?;
+        }
+        let mut ordinals = BTreeSet::new();
+        for ordinal in occurrence.context_ordinals.iter().copied() {
+            if !ordinals.insert(ordinal) {
+                return Err(format!(
+                    "semantic call occurrence {} repeats context ordinal {ordinal}",
+                    occurrence.id
+                ));
+            }
+            context_definitions.insert(SemanticCallContextId {
+                call_instance: occurrence.id,
+                ordinal,
+            });
+        }
+        call_instances.insert(occurrence.id, index);
+    }
+
     let mut context_references = BTreeSet::new();
     for expression in &graph.expressions {
         match &expression.kind {
@@ -1168,6 +1201,29 @@ fn allocate_call_identities(
                     }
                     continue;
                 };
+                let occurrence = graph
+                    .call_occurrences
+                    .get(instance.as_usize())
+                    .filter(|occurrence| occurrence.id == instance)
+                    .ok_or_else(|| {
+                        format!(
+                            "semantic call expression {} references missing occurrence {instance}",
+                            expression.id
+                        )
+                    })?;
+                if occurrence.call != Some(*call) {
+                    return Err(format!(
+                        "semantic call expression {} call {call} differs from occurrence {instance} call {:?}",
+                        expression.id, occurrence.call
+                    ));
+                }
+                let call_definition = semantic_call(graph, *call)?;
+                if call_definition.callable != *callable {
+                    return Err(format!(
+                        "semantic call expression {} callable {callable} differs from call {call} callable {}",
+                        expression.id, call_definition.callable
+                    ));
+                }
                 let mut expression_contexts = BTreeSet::new();
                 for context in contexts {
                     if context.call_instance != instance {
@@ -1182,14 +1238,20 @@ fn allocate_call_identities(
                             expression.id, context.ordinal
                         ));
                     }
-                    context_definitions.insert(*context);
                 }
-                let definition = (*call, *callable, expression_contexts);
-                if let Some(previous) = instances.insert(instance, definition.clone())
-                    && previous != definition
-                {
+                let expected_contexts = occurrence
+                    .context_ordinals
+                    .iter()
+                    .copied()
+                    .map(|ordinal| SemanticCallContextId {
+                        call_instance: instance,
+                        ordinal,
+                    })
+                    .collect::<BTreeSet<_>>();
+                if expression_contexts != expected_contexts {
                     return Err(format!(
-                        "semantic call instance {instance} has inconsistent call, callable, or context identity across expression occurrences"
+                        "semantic call expression {} contexts differ from occurrence {instance}",
+                        expression.id
                     ));
                 }
             }
@@ -1207,11 +1269,6 @@ fn allocate_call_identities(
             ));
         }
     }
-    let call_instances = instances
-        .keys()
-        .copied()
-        .map(|instance| (instance, instance.as_usize()))
-        .collect::<BTreeMap<_, _>>();
     let mut call_contexts = BTreeMap::new();
     for context in context_definitions {
         let call_instance = call_instances
@@ -1533,6 +1590,24 @@ fn map_semantic_execution_with_external_events(
         .filter(|callable| callable.semantic_root.is_some())
         .map(|callable| map_ordinary_function(&id_map, callable))
         .collect::<Result<Vec<_>, _>>()?;
+    let call_occurrences = graph
+        .call_occurrences
+        .iter()
+        .map(|occurrence| {
+            Ok(ExecutableCallOccurrence {
+                id: id_map.call_instance(occurrence.id)?,
+                parent: occurrence
+                    .parent
+                    .map(|parent| id_map.call_instance(parent))
+                    .transpose()?,
+                checked_call: occurrence
+                    .call
+                    .map(|call| semantic_call(graph, call).map(|call| call.checked_call))
+                    .transpose()?,
+                context_ordinals: occurrence.context_ordinals.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     let materializations = graph
         .materializations
         .iter()
@@ -1557,6 +1632,7 @@ fn map_semantic_execution_with_external_events(
             roots,
             functions,
             ordinary_functions,
+            call_occurrences,
         },
         materializations,
         static_owners,
@@ -5805,6 +5881,7 @@ fn map_expression_kind(
             binding_path: binding_path.clone(),
         },
         SemanticExpressionKind::Call {
+            call,
             callable,
             callable_kind,
             name,
@@ -5816,6 +5893,7 @@ fn map_expression_kind(
             ..
         } => match callable_kind {
             SemanticCallableKind::User => ExecutableExpressionKind::UserCall {
+                checked_call: semantic_call(graph, *call)?.checked_call,
                 function: ids.callable(*callable)?,
                 name: name.clone(),
                 instance: instance
@@ -5837,9 +5915,11 @@ fn map_expression_kind(
                     }
                     mapped
                 },
+                type_substitutions: semantic_call(graph, *call)?.type_substitutions.clone(),
             },
             SemanticCallableKind::Builtin | SemanticCallableKind::External => {
                 ExecutableExpressionKind::Call {
+                    checked_call: semantic_call(graph, *call)?.checked_call,
                     callable_kind: match callable_kind {
                         SemanticCallableKind::Builtin => ExecutableCallableKind::Builtin,
                         SemanticCallableKind::External => ExecutableCallableKind::External,
@@ -5858,6 +5938,11 @@ fn map_expression_kind(
                         .iter()
                         .map(|context| ids.call_context(*context))
                         .collect::<Result<Vec<_>, _>>()?,
+                    context_ordinals: semantic_call(graph, *call)?
+                        .contexts
+                        .iter()
+                        .map(|context| context.signature)
+                        .collect(),
                 }
             }
         },

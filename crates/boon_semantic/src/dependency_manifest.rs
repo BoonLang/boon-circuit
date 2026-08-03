@@ -18,7 +18,9 @@ use boon_checked::{
 use boon_contract::SourceBundleDigestV1;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+#[cfg(test)]
+use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 
 pub const CALLABLE_DEPENDENCY_MANIFEST_SCHEMA_V3: &str = "boon.callable-dependency-manifest.v3";
@@ -197,6 +199,7 @@ pub enum SemanticDependencyEntityDomainV1 {
     SemanticStatement,
     SemanticCallable,
     SemanticCall,
+    SemanticCallOccurrence,
     SemanticSource,
     SemanticState,
     SemanticActivation,
@@ -337,6 +340,7 @@ pub enum SemanticDependencySubjectKindV1 {
     ExecutionCall,
     ExecutionCallEntry,
     ExecutionCallContext,
+    ExecutionCallOccurrence,
     ExecutionSource,
     ExecutionState,
     ExecutionRoot,
@@ -2115,11 +2119,13 @@ fn dependency_proof_implementation_digest(
     Ok(hasher.finalize().into())
 }
 
+#[cfg(test)]
 struct DependencyProofCsr {
     edge_offsets: Vec<usize>,
     edge_arena: Vec<usize>,
 }
 
+#[cfg(test)]
 impl DependencyProofCsr {
     fn node_count(&self) -> usize {
         self.edge_offsets.len() - 1
@@ -2191,6 +2197,7 @@ impl DependencyProofCsr {
     }
 }
 
+#[cfg(test)]
 fn build_dependency_proof_outgoing_csr(
     graph: &DependencyProofGraph<'_>,
     component_by_node: &[usize],
@@ -2284,6 +2291,7 @@ fn build_dependency_proof_outgoing_csr(
     ))
 }
 
+#[cfg(test)]
 fn dependency_proof_component_digests(
     graph: &DependencyProofGraph<'_>,
     components: &DependencyProofComponents,
@@ -2341,6 +2349,82 @@ fn dependency_proof_component_digests(
         ));
     }
     Ok(component_digests)
+}
+
+/// Commits condensed proof components directly in Tarjan completion order.
+///
+/// Tarjan emits a component only after every distinct component reachable from
+/// it has completed. Component IDs are therefore already a dependency-first
+/// topological order: every inter-component edge from `component` targets a
+/// lower component ID. Reusing that order avoids materializing both forward
+/// and reverse condensation CSRs plus a second ready-queue traversal. One
+/// reusable scratch vector is sufficient to canonicalize each component's
+/// distinct outgoing dependencies before its digest is finalized.
+fn dependency_proof_component_digests_in_tarjan_order(
+    graph: &DependencyProofGraph<'_>,
+    components: &DependencyProofComponents,
+    component_by_node: &[usize],
+    record_leaves: &[[u8; 32]],
+    representatives: &[usize],
+) -> Result<(Vec<Option<[u8; 32]>>, usize, usize), CallableDependencyManifestError> {
+    let mut component_digests = vec![None; components.len()];
+    let mut dependencies = Vec::new();
+    let mut graph_edge_count = 0usize;
+    let mut component_edge_count = 0usize;
+
+    for component in 0..components.len() {
+        let members = components.members(component).ok_or_else(|| {
+            CallableDependencyManifestError::new(format!(
+                "dependency proof has no member slice for component {component}"
+            ))
+        })?;
+        dependencies.clear();
+        for node in members.iter().copied() {
+            let degree = graph.out_degree(node)?;
+            graph_edge_count = graph_edge_count.checked_add(degree).ok_or_else(|| {
+                CallableDependencyManifestError::new(
+                    "dependency proof graph edge count overflows usize",
+                )
+            })?;
+            for edge in 0..degree {
+                let target = graph.edge_target(node, edge)?;
+                let target_component = *component_by_node.get(target).ok_or_else(|| {
+                    CallableDependencyManifestError::new(format!(
+                        "dependency proof edge references unclassified node {target}"
+                    ))
+                })?;
+                if target_component != component {
+                    dependencies.push(target_component);
+                }
+            }
+        }
+        dependencies.sort_unstable_by_key(|target| representatives[*target]);
+        dependencies.dedup();
+        for dependency in dependencies.iter().copied() {
+            if dependency >= component {
+                return Err(CallableDependencyManifestError::new(format!(
+                    "dependency proof Tarjan order is not dependency-first: component {component} references component {dependency}"
+                )));
+            }
+        }
+        component_edge_count = component_edge_count
+            .checked_add(dependencies.len())
+            .ok_or_else(|| {
+                CallableDependencyManifestError::new(
+                    "dependency proof component edge count overflows usize",
+                )
+            })?;
+        let local_hasher = dependency_proof_component_local_hasher(graph, members, record_leaves)?;
+        component_digests[component] = Some(finish_dependency_proof_component_digest(
+            local_hasher,
+            graph,
+            &dependencies,
+            representatives,
+            &component_digests,
+        )?);
+    }
+
+    Ok((component_digests, graph_edge_count, component_edge_count))
 }
 
 #[cfg(test)]
@@ -2461,21 +2545,14 @@ fn build_dependency_graph_digests(
         .collect::<Result<Vec<_>, _>>()?;
 
     let node_count = graph.node_count()?;
-    let (outgoing, edge_count) = build_dependency_proof_outgoing_csr(
-        &graph,
-        &component_by_node,
-        components.len(),
-        &representatives,
-    )?;
-    let parents = outgoing.reverse()?;
-    let component_digests = dependency_proof_component_digests(
-        &graph,
-        &components,
-        &record_leaves,
-        &outgoing,
-        &parents,
-        &representatives,
-    )?;
+    let (component_digests, edge_count, component_edge_count) =
+        dependency_proof_component_digests_in_tarjan_order(
+            &graph,
+            &components,
+            &component_by_node,
+            &record_leaves,
+            &representatives,
+        )?;
     drop(record_leaves);
 
     let digests = dependency_proof_owner_implementation_digests(
@@ -2494,7 +2571,7 @@ fn build_dependency_graph_digests(
             .filter(|members| members.len() > 1)
             .count(),
         maximum_component_nodes: components.iter().map(<[usize]>::len).max().unwrap_or(0),
-        component_edges: outgoing.edge_count(),
+        component_edges: component_edge_count,
     };
     Ok((digests, stats, dependency_record_set_digest))
 }
@@ -6166,6 +6243,43 @@ fn inventory_execution(
                 Vec::new(),
             )?;
         }
+    }
+
+    for occurrence in &execution.call_occurrences {
+        let owner = occurrence
+            .call
+            .map(|call| owners.call(call))
+            .transpose()?
+            .unwrap_or(SemanticDependencyOwnerV1::ProgramRoot);
+        let entity = indexed_entity(
+            SemanticDependencyEntityDomainV1::SemanticCallOccurrence,
+            occurrence.id.as_usize(),
+        );
+        let mut references = vec![dependency_entity(out_call_entity(occurrence.id))];
+        references.extend(occurrence.call.map(call_entity).map(dependency_entity));
+        references.extend(occurrence.parent.map(|parent| {
+            dependency_entity(indexed_entity(
+                SemanticDependencyEntityDomainV1::SemanticCallOccurrence,
+                parent.as_usize(),
+            ))
+        }));
+        collect_dependency!(
+            collector,
+            owner,
+            SemanticDependencyChannelV1::CoverageRouting,
+            vec![SemanticDependencyRoleV1::CoverageOrRouting],
+            top_subject(
+                SemanticDependencySubjectKindV1::ExecutionCallOccurrence,
+                entity,
+            ),
+            SemanticDependencySemanticsV1 {
+                call_instance: Some(occurrence.id),
+                lifetime: SemanticDependencyLifetimeV1::Call,
+                ..SemanticDependencySemanticsV1::default()
+            },
+            occurrence,
+            references,
+        )?;
     }
 
     for source in &execution.sources {

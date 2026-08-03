@@ -153,3 +153,62 @@ document: Document/new(
         document.expressions.len()
     );
 }
+
+#[test]
+fn retained_render_calls_materialize_distinct_invocation_contexts() {
+    let compiled = compile_test_source(
+        "retained-render-calls.bn",
+        r#"
+FUNCTION labeled(value) {
+    Element/label(element: [], style: [], label: value)
+}
+
+document: Document/new(
+    root: Element/stripe(
+        element: []
+        direction: Column
+        style: []
+        items: LIST {
+            labeled(value: TEXT { alpha })
+            labeled(value: TEXT { beta })
+            labeled(value: TEXT { gamma })
+            labeled(value: TEXT { delta })
+        }
+    )
+)
+"#,
+        TargetProfile::SoftwareBounded,
+    )
+    .unwrap();
+
+    let _function = compiled
+        .ir
+        .executable
+        .ordinary_functions
+        .iter()
+        .find(|function| function.name.ends_with("labeled"))
+        .expect("retained render function");
+    let document = compiled.plan.document.as_ref().expect("document plan");
+    let labels = document
+        .templates
+        .iter()
+        .filter(|template| template.constructor == boon_plan::DocumentConstructor::ElementLabel)
+        .collect::<Vec<_>>();
+    assert_eq!(labels.len(), 4, "one label template per call occurrence");
+    assert_eq!(
+        labels
+            .iter()
+            .map(|template| template.id)
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        4,
+        "shared constructor expressions require distinct stable invocation identities"
+    );
+    assert!(
+        labels.iter().all(|template| matches!(
+            document.expressions[template.expression.0].op,
+            boon_plan::DocumentExprOp::Constructor { .. }
+        )),
+        "each invocation must materialize a render constructor"
+    );
+}

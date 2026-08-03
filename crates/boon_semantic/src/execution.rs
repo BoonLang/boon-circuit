@@ -99,6 +99,22 @@ pub struct SemanticCallContextId {
     pub ordinal: usize,
 }
 
+/// One compact concrete invocation in the OUT call tree.
+///
+/// Shared callable definitions refer to checked call sites. An occurrence
+/// overlay resolves such a site relative to its parent invocation and owns the
+/// concrete call-local context ordinals without cloning the callable body.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SemanticCallOccurrence {
+    pub id: OutCallInstanceId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<OutCallInstanceId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call: Option<SemanticCallId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context_ordinals: Vec<usize>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SemanticExpression {
     pub id: SemanticExprId,
@@ -349,12 +365,13 @@ pub struct SemanticCallable {
     pub result_expression: Option<CheckedExprId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contextual_operation: Option<CheckedContextualOperation>,
-    /// Canonical semantic body for an ordinary context-free value callable.
+    /// Canonical semantic body for an ordinary pure callable.
     ///
-    /// Contextual, effectful, OUT-owning, render, and open-typed callables are
-    /// still specialized at their call sites.  A retained body is shared by
-    /// every ordinary call occurrence and reads its inputs through
-    /// [`SemanticExpressionKind::FunctionParameter`].
+    /// A retained body is shared by every ordinary call occurrence and reads
+    /// inputs through [`SemanticExpressionKind::FunctionParameter`]. Open
+    /// boundary types and constructor-local render contexts are supplied by
+    /// compact invocation overlays. Effectful, OUT-owning, external, and
+    /// element-state-reading callables remain specialized.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_root: Option<SemanticExprId>,
 }
@@ -728,6 +745,8 @@ pub struct SemanticExecutionGraphV1 {
     pub callables: Vec<SemanticCallable>,
     pub calls: Vec<SemanticCall>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub call_occurrences: Vec<SemanticCallOccurrence>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sources: Vec<SemanticSourceDef>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub states: Vec<SemanticStateDef>,
@@ -751,6 +770,118 @@ impl SemanticExecutionGraphV1 {
             .get(id.as_usize())
             .filter(|expression| expression.id == id)
             .ok_or_else(|| format!("semantic execution graph references missing expression {id}"))
+    }
+
+    fn retained_definition_expressions(&self) -> Result<BTreeSet<SemanticExprId>, String> {
+        let mut pending = self
+            .callables
+            .iter()
+            .filter_map(|callable| callable.semantic_root)
+            .collect::<Vec<_>>();
+        let mut retained = BTreeSet::new();
+        while let Some(id) = pending.pop() {
+            if !retained.insert(id) {
+                continue;
+            }
+            let expression = self.expression(id)?;
+            pending.extend(expression.kind.direct_children());
+        }
+        Ok(retained)
+    }
+
+    fn validate_call_occurrences(&self, out_net: &ResolvedOutGraph) -> Result<(), String> {
+        if self.call_occurrences.len() != out_net.call_instances.len() {
+            return Err(format!(
+                "semantic call occurrence count {} differs from OUT call count {}",
+                self.call_occurrences.len(),
+                out_net.call_instances.len()
+            ));
+        }
+        for (index, occurrence) in self.call_occurrences.iter().enumerate() {
+            let id = OutCallInstanceId(index);
+            if occurrence.id != id {
+                return Err(format!(
+                    "semantic call occurrence {} is noncanonical at index {index}",
+                    occurrence.id
+                ));
+            }
+            let out = out_net
+                .call_instances
+                .get(index)
+                .filter(|candidate| candidate.id == id)
+                .ok_or_else(|| format!("OUT call occurrence {id} is missing or noncanonical"))?;
+            if occurrence.parent != out.parent {
+                return Err(format!(
+                    "semantic call occurrence {id} parent {:?} differs from OUT parent {:?}",
+                    occurrence.parent, out.parent
+                ));
+            }
+            if let Some(parent) = occurrence.parent
+                && parent.as_usize() >= index
+            {
+                return Err(format!(
+                    "semantic call occurrence {id} has nonpreceding parent {parent}"
+                ));
+            }
+            let expected_call = match out.provenance.call_id {
+                Some(checked_call) => {
+                    let mut matches = self
+                        .calls
+                        .iter()
+                        .filter(|call| call.checked_call == checked_call);
+                    let call = matches.next().ok_or_else(|| {
+                        format!(
+                            "semantic call occurrence {id} references absent checked call {}",
+                            checked_call.0
+                        )
+                    })?;
+                    if matches.next().is_some() {
+                        return Err(format!(
+                            "semantic call occurrence {id} checked call {} is ambiguous",
+                            checked_call.0
+                        ));
+                    }
+                    let callable = self.callable(call.callable)?;
+                    if callable.checked_callable != out.provenance.callable {
+                        return Err(format!(
+                            "semantic call occurrence {id} callable {} differs from OUT callable {}",
+                            callable.checked_callable.0, out.provenance.callable.0
+                        ));
+                    }
+                    Some(call)
+                }
+                None => None,
+            };
+            if occurrence.call != expected_call.map(|call| call.id) {
+                return Err(format!(
+                    "semantic call occurrence {id} call {:?} differs from OUT provenance {:?}",
+                    occurrence.call,
+                    out.provenance.call_id.map(|call| call.0)
+                ));
+            }
+            let expected_contexts = expected_call
+                .into_iter()
+                .flat_map(|call| call.contexts.iter().map(|context| context.signature))
+                .collect::<Vec<_>>();
+            if occurrence.context_ordinals != expected_contexts {
+                return Err(format!(
+                    "semantic call occurrence {id} contexts differ from its checked call"
+                ));
+            }
+            if occurrence
+                .context_ordinals
+                .iter()
+                .copied()
+                .collect::<BTreeSet<_>>()
+                .len()
+                != occurrence.context_ordinals.len()
+            {
+                return Err(format!(
+                    "semantic call occurrence {id} repeats a context ordinal"
+                ));
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn statement(&self, id: SemanticStatementId) -> Result<&SemanticStatement, String> {
@@ -1455,6 +1586,8 @@ impl SemanticExecutionGraphV1 {
         self.validate_dense_ids()?;
         self.validate_callable_and_call_tables()?;
         self.validate_checked_expression_origins(out_net)?;
+        self.validate_call_occurrences(out_net)?;
+        let retained_definition_expressions = self.retained_definition_expressions()?;
 
         let materialization_locals = self
             .materializations
@@ -1479,6 +1612,7 @@ impl SemanticExecutionGraphV1 {
                 &expression.kind,
                 out_net,
                 &materialization_locals,
+                retained_definition_expressions.contains(&expression.id),
                 &mut local_definitions,
                 &mut local_references,
             )?;
@@ -2123,6 +2257,7 @@ impl SemanticExecutionGraphV1 {
         kind: &SemanticExpressionKind,
         out_net: &ResolvedOutGraph,
         materialization_locals: &BTreeSet<(StaticOwnerId, SemanticMaterializationLocalId)>,
+        retained_definition_expression: bool,
         local_definitions: &mut BTreeMap<SemanticLocalBindingId, (DeclId, SemanticExprId)>,
         local_references: &mut BTreeSet<SemanticLocalBindingId>,
     ) -> Result<(), String> {
@@ -2239,14 +2374,25 @@ impl SemanticExecutionGraphV1 {
                             "expression {expression} call instance {instance:?} has stale checked provenance"
                         ));
                     }
-                } else if !contexts.is_empty()
-                    || !call_definition.contexts.is_empty()
-                    || *effect != CheckedEffectSummary::default()
-                    || *callable_kind == SemanticCallableKind::External
-                {
-                    return Err(format!(
-                        "expression {expression} omits its OUT instance for a contextual, effectful, or external call"
-                    ));
+                } else {
+                    let retained_context_overlay = retained_definition_expression
+                        && contexts.is_empty()
+                        && !call_definition.contexts.is_empty()
+                        && *effect == CheckedEffectSummary::default()
+                        && *callable_kind == SemanticCallableKind::Builtin
+                        && boon_checked::is_registered_render_constructor(
+                            &call_definition.function,
+                        );
+                    if (!contexts.is_empty()
+                        || !call_definition.contexts.is_empty()
+                        || *effect != CheckedEffectSummary::default()
+                        || *callable_kind == SemanticCallableKind::External)
+                        && !retained_context_overlay
+                    {
+                        return Err(format!(
+                            "expression {expression} omits its OUT instance for a contextual, effectful, or external call"
+                        ));
+                    }
                 }
                 let value_parameters = callable_definition
                     .parameters
@@ -2441,7 +2587,14 @@ impl SemanticExecutionGraphV1 {
                         Ok(context.ordinal)
                     })
                     .collect::<Result<Vec<_>, String>>()?;
-                if actual_contexts != expected_contexts {
+                let retained_context_overlay = retained_definition_expression
+                    && instance.is_none()
+                    && contexts.is_empty()
+                    && !expected_contexts.is_empty()
+                    && *effect == CheckedEffectSummary::default()
+                    && *callable_kind == SemanticCallableKind::Builtin
+                    && boon_checked::is_registered_render_constructor(&call_definition.function);
+                if actual_contexts != expected_contexts && !retained_context_overlay {
                     return Err(format!(
                         "expression {expression} contexts differ from semantic call {call}"
                     ));

@@ -11,11 +11,11 @@ pub type RequestFingerprint = [u8; 32];
 pub struct Revision(pub u64);
 
 impl Revision {
-    pub fn next(self) -> Result<Self, RequestGraphError> {
+    pub fn next(self) -> Result<Self, CompilationDbError> {
         self.0
             .checked_add(1)
             .map(Self)
-            .ok_or_else(|| RequestGraphError::new("compilation database revision overflow"))
+            .ok_or_else(|| CompilationDbError::new("compilation database revision overflow"))
     }
 }
 
@@ -28,6 +28,7 @@ impl Revision {
 pub struct RequestMemo {
     pub changed_at: Revision,
     pub verified_at: Revision,
+    pub dependencies_verified_at: Revision,
     pub input_fingerprint: RequestFingerprint,
     pub result_fingerprint: RequestFingerprint,
 }
@@ -41,6 +42,7 @@ impl RequestMemo {
         Self {
             changed_at: revision,
             verified_at: revision,
+            dependencies_verified_at: revision,
             input_fingerprint,
             result_fingerprint,
         }
@@ -54,27 +56,41 @@ impl RequestMemo {
     pub fn publish(
         &mut self,
         revision: Revision,
+        dependencies_verified_at: Revision,
         input_fingerprint: RequestFingerprint,
         result_fingerprint: RequestFingerprint,
-    ) -> bool {
+    ) -> Result<bool, CompilationDbError> {
+        if revision <= self.verified_at {
+            return Err(CompilationDbError::new(format!(
+                "compilation request publication revision {} is not newer than verified revision {}",
+                revision.0, self.verified_at.0,
+            )));
+        }
+        if dependencies_verified_at != revision {
+            return Err(CompilationDbError::new(format!(
+                "compilation request dependencies are verified at revision {}, expected {}",
+                dependencies_verified_at.0, revision.0,
+            )));
+        }
         let changed = self.result_fingerprint != result_fingerprint;
         if changed {
             self.changed_at = revision;
         }
         self.verified_at = revision;
+        self.dependencies_verified_at = dependencies_verified_at;
         self.input_fingerprint = input_fingerprint;
         self.result_fingerprint = result_fingerprint;
-        changed
+        Ok(changed)
     }
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct RequestGraphDigestDomains<'a> {
+pub struct ProjectionGraphDigestDomains<'a> {
     pub component: &'a [u8],
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct RequestGraphStats {
+pub struct ProjectionGraphStats {
     pub nodes: usize,
     pub edges: usize,
     pub components: usize,
@@ -89,87 +105,123 @@ struct PendingRequestNode {
     local_digest: RequestFingerprint,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct ProjectionId(u32);
+
+impl ProjectionId {
+    pub const fn as_usize(self) -> usize {
+        self.0 as usize
+    }
+}
+
+struct RegisteredProjection<K> {
+    key: K,
+    node: PendingRequestNode,
+}
+
 /// Cold and warm request graph builder at stable owner/projection granularity.
 ///
 /// Rows inside a request are folded by the language-owned table builder before
 /// insertion. This graph deliberately does not expose per-expression queries.
-pub struct RequestGraphBuilder<K> {
-    nodes: BTreeMap<K, PendingRequestNode>,
-    dependencies: Vec<(K, K)>,
+pub struct ProjectionGraphBuilder<K> {
+    ids: BTreeMap<K, ProjectionId>,
+    nodes: Vec<RegisteredProjection<K>>,
+    dependencies: Vec<(ProjectionId, ProjectionId)>,
 }
 
-impl<K> Default for RequestGraphBuilder<K> {
+impl<K> Default for ProjectionGraphBuilder<K> {
     fn default() -> Self {
         Self {
-            nodes: BTreeMap::new(),
+            ids: BTreeMap::new(),
+            nodes: Vec::new(),
             dependencies: Vec::new(),
         }
     }
 }
 
-impl<K: Clone + Ord> RequestGraphBuilder<K> {
+impl<K: Clone + Ord> ProjectionGraphBuilder<K> {
     pub fn new() -> Self {
         Self::default()
     }
 
-    pub fn insert(
+    pub fn register(
         &mut self,
         key: K,
         identity_digest: RequestFingerprint,
         local_digest: RequestFingerprint,
-    ) -> Result<(), RequestGraphError> {
-        if self
-            .nodes
-            .insert(
-                key,
-                PendingRequestNode {
-                    identity_digest,
-                    local_digest,
-                },
-            )
-            .is_some()
-        {
-            return Err(RequestGraphError::new(
+    ) -> Result<ProjectionId, CompilationDbError> {
+        if self.ids.contains_key(&key) {
+            return Err(CompilationDbError::new(
                 "compilation request graph contains a duplicate key",
             ));
         }
-        Ok(())
+        let ordinal = u32::try_from(self.nodes.len()).map_err(|_| {
+            CompilationDbError::new("compilation projection graph exceeds u32 identities")
+        })?;
+        let id = ProjectionId(ordinal);
+        self.ids.insert(key.clone(), id);
+        self.nodes.push(RegisteredProjection {
+            key,
+            node: PendingRequestNode {
+                identity_digest,
+                local_digest,
+            },
+        });
+        Ok(id)
     }
 
-    pub fn add_dependency(&mut self, request: K, dependency: K) {
+    pub fn id(&self, key: &K) -> Option<ProjectionId> {
+        self.ids.get(key).copied()
+    }
+
+    pub fn add_dependency(
+        &mut self,
+        request: ProjectionId,
+        dependency: ProjectionId,
+    ) -> Result<(), CompilationDbError> {
+        if request.as_usize() >= self.nodes.len() {
+            return Err(CompilationDbError::new(
+                "compilation projection edge has an unregistered source",
+            ));
+        }
+        if dependency.as_usize() >= self.nodes.len() {
+            return Err(CompilationDbError::new(
+                "compilation projection edge has an unregistered target",
+            ));
+        }
         self.dependencies.push((request, dependency));
+        Ok(())
     }
 
     pub fn seal(
         self,
-        domains: RequestGraphDigestDomains<'_>,
-    ) -> Result<SealedRequestGraph<K>, RequestGraphError> {
+        domains: ProjectionGraphDigestDomains<'_>,
+    ) -> Result<SealedProjectionGraph<K>, CompilationDbError> {
         if domains.component.is_empty() {
-            return Err(RequestGraphError::new(
+            return Err(CompilationDbError::new(
                 "compilation request graph component digest domain is empty",
             ));
         }
 
-        let mut keys = Vec::with_capacity(self.nodes.len());
-        let mut identity_digests = Vec::with_capacity(self.nodes.len());
-        let mut local_digests = Vec::with_capacity(self.nodes.len());
+        let mut registered = self.nodes.into_iter().enumerate().collect::<Vec<_>>();
+        registered.sort_unstable_by(|(_, left), (_, right)| left.key.cmp(&right.key));
+        let mut canonical_by_registered = vec![0usize; registered.len()];
+        let mut keys = Vec::with_capacity(registered.len());
+        let mut identity_digests = Vec::with_capacity(registered.len());
+        let mut local_digests = Vec::with_capacity(registered.len());
         let mut ordinals = BTreeMap::new();
-        for (key, node) in self.nodes {
-            let ordinal = keys.len();
-            ordinals.insert(key.clone(), ordinal);
-            keys.push(key);
-            identity_digests.push(node.identity_digest);
-            local_digests.push(node.local_digest);
+        for (canonical, (registered_ordinal, projection)) in registered.into_iter().enumerate() {
+            canonical_by_registered[registered_ordinal] = canonical;
+            ordinals.insert(projection.key.clone(), canonical);
+            keys.push(projection.key);
+            identity_digests.push(projection.node.identity_digest);
+            local_digests.push(projection.node.local_digest);
         }
 
         let mut edges = vec![Vec::new(); keys.len()];
         for (request, dependency) in self.dependencies {
-            let request = ordinals.get(&request).copied().ok_or_else(|| {
-                RequestGraphError::new("compilation request graph edge has an unregistered source")
-            })?;
-            let dependency = ordinals.get(&dependency).copied().ok_or_else(|| {
-                RequestGraphError::new("compilation request graph edge has an unregistered target")
-            })?;
+            let request = canonical_by_registered[request.as_usize()];
+            let dependency = canonical_by_registered[dependency.as_usize()];
             edges[request].push(dependency);
         }
         for targets in &mut edges {
@@ -182,7 +234,7 @@ impl<K: Clone + Ord> RequestGraphBuilder<K> {
             .iter()
             .map(|members| {
                 members.first().copied().ok_or_else(|| {
-                    RequestGraphError::new("compilation request graph produced an empty component")
+                    CompilationDbError::new("compilation request graph produced an empty component")
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -192,7 +244,7 @@ impl<K: Clone + Ord> RequestGraphBuilder<K> {
         let mut component_edge_count = 0usize;
         for component in 0..components.len() {
             let members = components.members(component).ok_or_else(|| {
-                RequestGraphError::new(format!(
+                CompilationDbError::new(format!(
                     "compilation request graph has no component {component}"
                 ))
             })?;
@@ -210,13 +262,13 @@ impl<K: Clone + Ord> RequestGraphBuilder<K> {
             component_edge_count = component_edge_count
                 .checked_add(dependencies.len())
                 .ok_or_else(|| {
-                    RequestGraphError::new("compilation request component edge count overflow")
+                    CompilationDbError::new("compilation request component edge count overflow")
                 })?;
             if dependencies
                 .iter()
                 .any(|dependency| *dependency >= component)
             {
-                return Err(RequestGraphError::new(format!(
+                return Err(CompilationDbError::new(format!(
                     "compilation request Tarjan order is not dependency-first for component {component}"
                 )));
             }
@@ -236,7 +288,7 @@ impl<K: Clone + Ord> RequestGraphBuilder<K> {
             for dependency in dependencies.iter().copied() {
                 hasher.update(identity_digests[representatives[dependency]]);
                 hasher.update(component_digests[dependency].ok_or_else(|| {
-                    RequestGraphError::new(
+                    CompilationDbError::new(
                         "compilation request component was hashed before its dependency",
                     )
                 })?);
@@ -247,7 +299,7 @@ impl<K: Clone + Ord> RequestGraphBuilder<K> {
         let edge_offsets = adjacency_offsets(&edges)?;
         let edge_arena = edges.into_iter().flatten().collect::<Vec<_>>();
         let reverse_edges = reverse_adjacency(keys.len(), &edge_offsets, &edge_arena)?;
-        let stats = RequestGraphStats {
+        let stats = ProjectionGraphStats {
             nodes: keys.len(),
             edges: edge_count,
             components: components.len(),
@@ -259,7 +311,7 @@ impl<K: Clone + Ord> RequestGraphBuilder<K> {
             component_edges: component_edge_count,
         };
 
-        Ok(SealedRequestGraph {
+        Ok(SealedProjectionGraph {
             keys,
             ordinals,
             identity_digests,
@@ -274,7 +326,9 @@ impl<K: Clone + Ord> RequestGraphBuilder<K> {
                 .into_iter()
                 .map(|digest| {
                     digest.ok_or_else(|| {
-                        RequestGraphError::new("compilation request component has no sealed digest")
+                        CompilationDbError::new(
+                            "compilation request component has no sealed digest",
+                        )
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?,
@@ -284,7 +338,7 @@ impl<K: Clone + Ord> RequestGraphBuilder<K> {
     }
 }
 
-pub struct SealedRequestGraph<K> {
+pub struct SealedProjectionGraph<K> {
     keys: Vec<K>,
     ordinals: BTreeMap<K, usize>,
     identity_digests: Vec<RequestFingerprint>,
@@ -297,11 +351,11 @@ pub struct SealedRequestGraph<K> {
     component_members: Vec<usize>,
     component_digests: Vec<RequestFingerprint>,
     component_representatives: Vec<usize>,
-    stats: RequestGraphStats,
+    stats: ProjectionGraphStats,
 }
 
-impl<K: Ord> SealedRequestGraph<K> {
-    pub const fn stats(&self) -> RequestGraphStats {
+impl<K: Ord> SealedProjectionGraph<K> {
+    pub const fn stats(&self) -> ProjectionGraphStats {
         self.stats
     }
 
@@ -331,14 +385,14 @@ impl<K: Ord> SealedRequestGraph<K> {
         &self,
         key: &K,
         domain: &[u8],
-    ) -> Result<RequestFingerprint, RequestGraphError> {
+    ) -> Result<RequestFingerprint, CompilationDbError> {
         if domain.is_empty() {
-            return Err(RequestGraphError::new(
+            return Err(CompilationDbError::new(
                 "compilation request implementation digest domain is empty",
             ));
         }
         let node = *self.ordinals.get(key).ok_or_else(|| {
-            RequestGraphError::new("compilation request implementation key is absent")
+            CompilationDbError::new("compilation request implementation key is absent")
         })?;
         let component = self.component_by_node[node];
         let representative = self.component_representatives[component];
@@ -398,11 +452,11 @@ impl Components {
         &mut self,
         active: &mut Vec<usize>,
         root: usize,
-    ) -> Result<(), RequestGraphError> {
+    ) -> Result<(), CompilationDbError> {
         let start = self.members.len();
         loop {
             let member = active.pop().ok_or_else(|| {
-                RequestGraphError::new("compilation request component stack underflow")
+                CompilationDbError::new("compilation request component stack underflow")
             })?;
             self.members.push(member);
             if member == root {
@@ -417,7 +471,7 @@ impl Components {
 
 fn strongly_connected_components(
     edges: &[Vec<usize>],
-) -> Result<(Vec<usize>, Components), RequestGraphError> {
+) -> Result<(Vec<usize>, Components), CompilationDbError> {
     let node_count = edges.len();
     let mut discovery_index = vec![usize::MAX; node_count];
     let mut low_link = vec![usize::MAX; node_count];
@@ -434,7 +488,7 @@ fn strongly_connected_components(
         discovery_index[start] = next_discovery_index;
         low_link[start] = next_discovery_index;
         next_discovery_index = next_discovery_index.checked_add(1).ok_or_else(|| {
-            RequestGraphError::new("compilation request discovery index overflow")
+            CompilationDbError::new("compilation request discovery index overflow")
         })?;
         active.push(start);
         pending.push((start, 0usize));
@@ -443,7 +497,7 @@ fn strongly_connected_components(
             let frame = pending.len() - 1;
             let (node, next_edge) = pending[frame];
             let targets = edges.get(node).ok_or_else(|| {
-                RequestGraphError::new(format!(
+                CompilationDbError::new(format!(
                     "compilation request graph references missing node {node}"
                 ))
             })?;
@@ -451,7 +505,7 @@ fn strongly_connected_components(
                 pending[frame].1 += 1;
                 let target = targets[next_edge];
                 if target >= node_count {
-                    return Err(RequestGraphError::new(format!(
+                    return Err(CompilationDbError::new(format!(
                         "compilation request graph references missing target {target}"
                     )));
                 }
@@ -460,7 +514,7 @@ fn strongly_connected_components(
                     low_link[target] = next_discovery_index;
                     next_discovery_index =
                         next_discovery_index.checked_add(1).ok_or_else(|| {
-                            RequestGraphError::new("compilation request discovery index overflow")
+                            CompilationDbError::new("compilation request discovery index overflow")
                         })?;
                     active.push(target);
                     pending.push((target, 0usize));
@@ -488,14 +542,14 @@ fn strongly_connected_components(
         }
     }
     if !active.is_empty() {
-        return Err(RequestGraphError::new(
+        return Err(CompilationDbError::new(
             "compilation request component stack is not empty after traversal",
         ));
     }
     Ok((component_by_node, components))
 }
 
-fn adjacency_offsets(edges: &[Vec<usize>]) -> Result<Vec<usize>, RequestGraphError> {
+fn adjacency_offsets(edges: &[Vec<usize>]) -> Result<Vec<usize>, CompilationDbError> {
     let mut offsets = Vec::with_capacity(edges.len().saturating_add(1));
     offsets.push(0usize);
     for targets in edges {
@@ -504,7 +558,7 @@ fn adjacency_offsets(edges: &[Vec<usize>]) -> Result<Vec<usize>, RequestGraphErr
             .copied()
             .expect("request adjacency has an initial offset")
             .checked_add(targets.len())
-            .ok_or_else(|| RequestGraphError::new("request adjacency offset overflow"))?;
+            .ok_or_else(|| CompilationDbError::new("request adjacency offset overflow"))?;
         offsets.push(next);
     }
     Ok(offsets)
@@ -514,15 +568,15 @@ fn reverse_adjacency(
     node_count: usize,
     offsets: &[usize],
     edges: &[usize],
-) -> Result<(Vec<usize>, Vec<usize>), RequestGraphError> {
+) -> Result<(Vec<usize>, Vec<usize>), CompilationDbError> {
     let mut counts = vec![0usize; node_count];
     for target in edges.iter().copied() {
         let count = counts.get_mut(target).ok_or_else(|| {
-            RequestGraphError::new("request reverse adjacency target is out of range")
+            CompilationDbError::new("request reverse adjacency target is out of range")
         })?;
         *count = count
             .checked_add(1)
-            .ok_or_else(|| RequestGraphError::new("request reverse degree overflow"))?;
+            .ok_or_else(|| CompilationDbError::new("request reverse degree overflow"))?;
     }
     let mut reverse_offsets = Vec::with_capacity(node_count.saturating_add(1));
     reverse_offsets.push(0usize);
@@ -532,7 +586,7 @@ fn reverse_adjacency(
             .copied()
             .expect("request reverse adjacency has an initial offset")
             .checked_add(*count)
-            .ok_or_else(|| RequestGraphError::new("request reverse offset overflow"))?;
+            .ok_or_else(|| CompilationDbError::new("request reverse offset overflow"))?;
         reverse_offsets.push(next);
     }
     for (node, count) in counts.iter_mut().enumerate() {
@@ -551,9 +605,13 @@ fn reverse_adjacency(
     Ok((reverse_offsets, reverse_edges))
 }
 
-fn update_count(hasher: &mut Sha256, value: usize, context: &str) -> Result<(), RequestGraphError> {
+fn update_count(
+    hasher: &mut Sha256,
+    value: usize,
+    context: &str,
+) -> Result<(), CompilationDbError> {
     let value = u64::try_from(value).map_err(|_| {
-        RequestGraphError::new(format!(
+        CompilationDbError::new(format!(
             "compilation request {context} exceeds its u64 encoding"
         ))
     })?;
@@ -562,11 +620,11 @@ fn update_count(hasher: &mut Sha256, value: usize, context: &str) -> Result<(), 
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct RequestGraphError {
+pub struct CompilationDbError {
     message: String,
 }
 
-impl RequestGraphError {
+impl CompilationDbError {
     fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
@@ -574,13 +632,13 @@ impl RequestGraphError {
     }
 }
 
-impl fmt::Display for RequestGraphError {
+impl fmt::Display for CompilationDbError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.message)
     }
 }
 
-impl Error for RequestGraphError {}
+impl Error for CompilationDbError {}
 
 #[cfg(test)]
 mod tests {
@@ -593,16 +651,22 @@ mod tests {
         [value; 32]
     }
 
-    fn graph(nodes: &[(u8, u8)], edges: &[(u8, u8)]) -> SealedRequestGraph<u8> {
-        let mut builder = RequestGraphBuilder::new();
+    fn graph(nodes: &[(u8, u8)], edges: &[(u8, u8)]) -> SealedProjectionGraph<u8> {
+        let mut builder = ProjectionGraphBuilder::new();
+        let mut ids = BTreeMap::new();
         for (key, value) in nodes {
-            builder.insert(*key, digest(*key), digest(*value)).unwrap();
+            ids.insert(
+                *key,
+                builder
+                    .register(*key, digest(*key), digest(*value))
+                    .unwrap(),
+            );
         }
         for (source, target) in edges {
-            builder.add_dependency(*source, *target);
+            builder.add_dependency(ids[source], ids[target]).unwrap();
         }
         builder
-            .seal(RequestGraphDigestDomains {
+            .seal(ProjectionGraphDigestDomains {
                 component: COMPONENT_DOMAIN,
             })
             .unwrap()
@@ -664,28 +728,52 @@ mod tests {
     #[test]
     fn unchanged_results_are_backdated() {
         let mut memo = RequestMemo::new(Revision(1), digest(1), digest(2));
-        assert!(!memo.publish(Revision(2), digest(3), digest(2)));
+        assert!(
+            !memo
+                .publish(Revision(2), Revision(2), digest(3), digest(2))
+                .unwrap()
+        );
         assert_eq!(memo.changed_at, Revision(1));
         assert_eq!(memo.verified_at, Revision(2));
-        assert!(memo.publish(Revision(3), digest(4), digest(5)));
+        assert!(
+            memo.publish(Revision(3), Revision(3), digest(4), digest(5))
+                .unwrap()
+        );
         assert_eq!(memo.changed_at, Revision(3));
+        assert!(
+            memo.publish(Revision(3), Revision(3), digest(6), digest(7))
+                .is_err()
+        );
+        assert!(
+            memo.publish(Revision(4), Revision(3), digest(6), digest(7))
+                .is_err()
+        );
     }
 
     #[test]
     fn missing_and_duplicate_nodes_fail_closed() {
-        let mut duplicate = RequestGraphBuilder::new();
-        duplicate.insert(1u8, digest(1), digest(2)).unwrap();
-        assert!(duplicate.insert(1u8, digest(1), digest(2)).is_err());
+        let mut duplicate = ProjectionGraphBuilder::new();
+        duplicate.register(1u8, digest(1), digest(2)).unwrap();
+        assert!(duplicate.register(1u8, digest(1), digest(2)).is_err());
 
-        let mut missing = RequestGraphBuilder::new();
-        missing.insert(1u8, digest(1), digest(2)).unwrap();
-        missing.add_dependency(1, 2);
-        assert!(
-            missing
-                .seal(RequestGraphDigestDomains {
-                    component: COMPONENT_DOMAIN,
-                })
-                .is_err()
-        );
+        let mut missing = ProjectionGraphBuilder::new();
+        let id = missing.register(1u8, digest(1), digest(2)).unwrap();
+        assert!(missing.add_dependency(id, ProjectionId(1)).is_err());
+    }
+
+    #[test]
+    fn registration_order_does_not_change_projection_digests() {
+        let forward = graph(&[(1, 11), (2, 22), (3, 33)], &[(1, 2), (2, 3)]);
+        let reverse = graph(&[(3, 33), (2, 22), (1, 11)], &[(2, 3), (1, 2)]);
+        for key in [1, 2, 3] {
+            assert_eq!(
+                forward
+                    .implementation_digest(&key, IMPLEMENTATION_DOMAIN)
+                    .unwrap(),
+                reverse
+                    .implementation_digest(&key, IMPLEMENTATION_DOMAIN)
+                    .unwrap(),
+            );
+        }
     }
 }

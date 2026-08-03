@@ -15,7 +15,7 @@ use boon_checked::{
     CheckedParameterKind, CheckedProgram, CheckedStatementKind, DeclId, FlowMode, FlowType,
     LexicalScopeId, ProgramRole, Type, TypeVar,
 };
-use boon_compilation_db::{RequestGraphBuilder, RequestGraphDigestDomains};
+use boon_compilation_db::{ProjectionGraphBuilder, ProjectionGraphDigestDomains};
 use boon_contract::SourceBundleDigestV1;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1567,6 +1567,12 @@ fn exact_owner(
 #[derive(Clone, Debug)]
 enum PendingDependencyReference {
     Entity(SemanticDependencyEntityV1),
+    /// A call/use depends on the callee's callable interface projection, not
+    /// every implementation projection owned by that callable.
+    CallableInterface(SemanticCallableId),
+    /// Retained only for independent V3 test-oracle construction and focused
+    /// malformed-owner tests. Production classifiers use exact projections.
+    #[cfg(test)]
     Owner(SemanticDependencyOwnerV1),
 }
 
@@ -1641,6 +1647,7 @@ struct CompactDependencyRecordV4 {
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 enum DependencyProjectionNodeV4 {
     Owner(SemanticDependencyStableOwnerV4),
+    CallableInterface(SemanticDependencyStableOwnerV4),
     Projection(SemanticDependencyProjectionKeyV4),
 }
 
@@ -2982,6 +2989,11 @@ impl DependencyCollector {
                             owner_references_before: referenced_owners.len(),
                         });
                     }
+                    PendingDependencyReference::CallableInterface(callable) => {
+                        referenced_owners.push(SemanticDependencyOwnerV1::Callable {
+                            callable: *callable,
+                        });
+                    }
                     PendingDependencyReference::Owner(owner) => referenced_owners.push(*owner),
                 }
             }
@@ -3367,6 +3379,7 @@ impl DependencyCollector {
         mut self,
         owners: &BTreeSet<SemanticDependencyOwnerV1>,
         stable_owners: &BTreeMap<SemanticDependencyOwnerV1, SemanticDependencyStableOwnerV4>,
+        callable_interface_digests: &BTreeMap<SemanticDependencyOwnerV1, [u8; 32]>,
     ) -> Result<ValidatedCompactDependencyCollectionV4, CallableDependencyManifestError> {
         if self.subjects.len() != self.compact_rows.len() {
             return Err(CallableDependencyManifestError::new(
@@ -3391,6 +3404,21 @@ impl DependencyCollector {
         if unique_stable_owners.len() != stable_owners.len() {
             return Err(CallableDependencyManifestError::new(
                 "compact dependency proof stable owner identities are not unique",
+            ));
+        }
+        let expected_callable_owners = owners
+            .iter()
+            .copied()
+            .filter(|owner| matches!(owner, SemanticDependencyOwnerV1::Callable { .. }))
+            .collect::<BTreeSet<_>>();
+        if callable_interface_digests
+            .keys()
+            .copied()
+            .collect::<BTreeSet<_>>()
+            != expected_callable_owners
+        {
+            return Err(CallableDependencyManifestError::new(
+                "compact dependency proof does not have one interface digest for every callable owner",
             ));
         }
         for (index, row) in self.compact_rows.iter().enumerate() {
@@ -3464,6 +3492,20 @@ impl DependencyCollector {
             let mut targets = Vec::new();
             for reference in references {
                 match reference {
+                    PendingDependencyReference::CallableInterface(callable) => {
+                        let owner = SemanticDependencyOwnerV1::Callable {
+                            callable: *callable,
+                        };
+                        if !owners.contains(&owner) {
+                            return Err(CallableDependencyManifestError::new(format!(
+                                "dependency {record_id} references missing callable interface {callable}"
+                            )));
+                        }
+                        targets.push(DependencyProjectionNodeV4::CallableInterface(
+                            stable_owners[&owner],
+                        ));
+                    }
+                    #[cfg(test)]
                     PendingDependencyReference::Owner(owner) => {
                         if !owners.contains(owner) {
                             return Err(CallableDependencyManifestError::new(format!(
@@ -3585,9 +3627,14 @@ impl DependencyCollector {
             DEPENDENCY_PROJECTION_RECEIPT_SET_DOMAIN_V4,
             &projection_receipts.values().copied().collect::<Vec<_>>(),
         )?;
+        let stable_callable_interface_digests = callable_interface_digests
+            .iter()
+            .map(|(owner, digest)| (stable_owners[owner], *digest))
+            .collect::<BTreeMap<_, _>>();
         let (stable_implementation_digests, graph_stats) =
             build_dependency_projection_graph_digests_v4(
                 &unique_stable_owners,
+                &stable_callable_interface_digests,
                 &projection_receipts,
                 &projection_targets,
             )?;
@@ -3693,8 +3740,12 @@ impl CompactReceiptHashCacheV4 {
                 hasher.update([0]);
                 hasher.update(self.owner_digest(owner)?);
             }
-            DependencyProjectionNodeV4::Projection(projection) => {
+            DependencyProjectionNodeV4::CallableInterface(owner) => {
                 hasher.update([1]);
+                hasher.update(self.owner_digest(owner)?);
+            }
+            DependencyProjectionNodeV4::Projection(projection) => {
+                hasher.update([2]);
                 hasher.update(self.projection_digest(projection)?);
             }
         }
@@ -3844,6 +3895,7 @@ fn stable_dependency_owner_index_v4(
 
 fn build_dependency_projection_graph_digests_v4(
     owners: &BTreeSet<SemanticDependencyStableOwnerV4>,
+    callable_interface_digests: &BTreeMap<SemanticDependencyStableOwnerV4, [u8; 32]>,
     projection_receipts: &BTreeMap<SemanticDependencyProjectionKeyV4, [u8; 32]>,
     projection_targets: &BTreeMap<
         SemanticDependencyProjectionKeyV4,
@@ -3856,32 +3908,67 @@ fn build_dependency_projection_graph_digests_v4(
     ),
     CallableDependencyManifestError,
 > {
-    let mut graph = RequestGraphBuilder::new();
+    let mut graph = ProjectionGraphBuilder::new();
+    let mut node_ids = BTreeMap::new();
     for owner in owners.iter().copied() {
         let node = DependencyProjectionNodeV4::Owner(owner);
-        graph
-            .insert(
+        let id = graph
+            .register(
                 node,
                 dependency_projection_node_digest_v4(node)?,
                 canonical_dependency_hash(DEPENDENCY_PROJECTION_NODE_DOMAIN_V4, &owner)?,
             )
             .map_err(|error| CallableDependencyManifestError::new(error.to_string()))?;
+        node_ids.insert(node, id);
+    }
+    for (owner, digest) in callable_interface_digests {
+        if !owners.contains(owner)
+            || !matches!(owner, SemanticDependencyStableOwnerV4::Callable { .. })
+        {
+            return Err(CallableDependencyManifestError::new(format!(
+                "dependency projection graph has an invalid callable interface owner {owner:?}"
+            )));
+        }
+        let node = DependencyProjectionNodeV4::CallableInterface(*owner);
+        let id = graph
+            .register(node, dependency_projection_node_digest_v4(node)?, *digest)
+            .map_err(|error| CallableDependencyManifestError::new(error.to_string()))?;
+        node_ids.insert(node, id);
+        graph
+            .add_dependency(node_ids[&DependencyProjectionNodeV4::Owner(*owner)], id)
+            .map_err(|error| CallableDependencyManifestError::new(error.to_string()))?;
     }
     for (projection, receipt) in projection_receipts {
         let node = DependencyProjectionNodeV4::Projection(*projection);
-        graph
-            .insert(node, dependency_projection_node_digest_v4(node)?, *receipt)
+        let id = graph
+            .register(node, dependency_projection_node_digest_v4(node)?, *receipt)
             .map_err(|error| CallableDependencyManifestError::new(error.to_string()))?;
-        graph.add_dependency(DependencyProjectionNodeV4::Owner(projection.owner), node);
+        node_ids.insert(node, id);
+        let owner = DependencyProjectionNodeV4::Owner(projection.owner);
+        graph
+            .add_dependency(node_ids[&owner], id)
+            .map_err(|error| CallableDependencyManifestError::new(error.to_string()))?;
     }
     for (projection, targets) in projection_targets {
         let source = DependencyProjectionNodeV4::Projection(*projection);
         for target in targets.iter().copied() {
-            graph.add_dependency(source, target);
+            let source = node_ids.get(&source).copied().ok_or_else(|| {
+                CallableDependencyManifestError::new(format!(
+                    "dependency projection graph is missing source {source:?}"
+                ))
+            })?;
+            let target = node_ids.get(&target).copied().ok_or_else(|| {
+                CallableDependencyManifestError::new(format!(
+                    "dependency projection graph is missing target {target:?}"
+                ))
+            })?;
+            graph
+                .add_dependency(source, target)
+                .map_err(|error| CallableDependencyManifestError::new(error.to_string()))?;
         }
     }
     let graph = graph
-        .seal(RequestGraphDigestDomains {
+        .seal(ProjectionGraphDigestDomains {
             component: DEPENDENCY_PROJECTION_COMPONENT_DOMAIN_V4,
         })
         .map_err(|error| CallableDependencyManifestError::new(error.to_string()))?;
@@ -4089,8 +4176,13 @@ fn dependency_entity(entity: SemanticDependencyEntityV1) -> PendingDependencyRef
     PendingDependencyReference::Entity(entity)
 }
 
+#[cfg(test)]
 fn dependency_owner(owner: SemanticDependencyOwnerV1) -> PendingDependencyReference {
     PendingDependencyReference::Owner(owner)
+}
+
+fn dependency_callable_interface(callable: SemanticCallableId) -> PendingDependencyReference {
+    PendingDependencyReference::CallableInterface(callable)
 }
 
 fn dependency_payload_digest(
@@ -4221,6 +4313,20 @@ pub(crate) fn build_callable_dependency_manifest(
         "stable_owner_index",
         stable_dependency_owner_index_v4(checked, execution, &owners)
     )?;
+    let callable_interface_digests = execution
+        .callables
+        .iter()
+        .map(|callable| {
+            callable_public_shape_digest(callable).map(|digest| {
+                (
+                    SemanticDependencyOwnerV1::Callable {
+                        callable: callable.id,
+                    },
+                    digest,
+                )
+            })
+        })
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
     let mut collector = DependencyCollector::for_program(checked, execution, false);
     let checked_program_digest = dependency_manifest_inventory_phase_v4!(
         "inventory_checked",
@@ -4282,7 +4388,7 @@ pub(crate) fn build_callable_dependency_manifest(
 
     let compact = dependency_manifest_phase_v4!(
         "finish_projection_receipts",
-        collector.finish_compact_v4(&owners, &stable_owners)
+        collector.finish_compact_v4(&owners, &stable_owners, &callable_interface_digests)
     )?;
     let component_digests = dependency_manifest_phase_v4!(
         "component_digests",
@@ -4326,7 +4432,7 @@ pub(crate) fn build_callable_dependency_manifest(
             callable: callable.id,
             checked_callable: callable.checked_callable,
             stable_owner: stable_owners[&owner],
-            public_shape_digest: callable_public_shape_digest(callable)?,
+            public_shape_digest: callable_interface_digests[&owner],
             implementation_dependency_digest: compact.implementation_digests[&owner],
         });
     }
@@ -6029,9 +6135,7 @@ fn inventory_checked(
             },
             call,
             vec![
-                PendingDependencyReference::Owner(SemanticDependencyOwnerV1::Callable {
-                    callable: callee.id,
-                }),
+                dependency_callable_interface(callee.id),
                 PendingDependencyReference::Entity(SemanticDependencyEntityV1::checked(
                     SemanticDependencyEntityDomainV1::CheckedExpression,
                     call.expression.0,
@@ -6960,9 +7064,7 @@ fn inventory_out(
                     call.id, call.provenance.callable.0
                 ))
             })?;
-        let mut call_references = vec![PendingDependencyReference::Owner(
-            SemanticDependencyOwnerV1::Callable { callable: callee },
-        )];
+        let mut call_references = vec![dependency_callable_interface(callee)];
         call_references.extend(call.parent.map(|parent| {
             dependency_entity(SemanticDependencyEntityV1::indexed(
                 SemanticDependencyEntityDomainV1::OutCallInstance,
@@ -7316,9 +7418,7 @@ fn inventory_execution(
                             statement.id, callable.0
                         ))
                     })?;
-                references.push(dependency_owner(SemanticDependencyOwnerV1::Callable {
-                    callable,
-                }));
+                references.push(dependency_callable_interface(callable));
             }
         }
         collect_dependency!(
@@ -7485,9 +7585,7 @@ fn inventory_execution(
             },
             call,
             vec![
-                dependency_owner(SemanticDependencyOwnerV1::Callable {
-                    callable: call.callable,
-                }),
+                dependency_callable_interface(call.callable),
                 dependency_entity(callable_entity(call.callable)),
             ],
         )?;
@@ -7616,9 +7714,7 @@ fn inventory_execution(
                 )));
             }
             SemanticSourceOrigin::ProducerInvocation { function, .. } => {
-                references.push(dependency_owner(SemanticDependencyOwnerV1::Callable {
-                    callable: *function,
-                }));
+                references.push(dependency_callable_interface(*function));
             }
         }
         collect_dependency!(
@@ -7708,7 +7804,7 @@ fn inventory_execution(
             digest: function.identity,
         };
         let mut references = vec![
-            dependency_owner(owner),
+            dependency_callable_interface(function.callable),
             dependency_entity(expression_entity(function.root)),
         ];
         references.extend(
@@ -7908,9 +8004,7 @@ fn semantic_expression_dependency(
             if let Some(instance) = instance {
                 references.push(dependency_entity(out_call_entity(*instance)));
             }
-            references.push(dependency_owner(SemanticDependencyOwnerV1::Callable {
-                callable: *callable,
-            }));
+            references.push(dependency_callable_interface(*callable));
             references.extend(
                 arguments
                     .iter()
@@ -8150,7 +8244,7 @@ fn semantic_expression_dependency(
                     expression.id, parameter.callable
                 )));
             }
-            references.push(dependency_owner(owner));
+            references.push(dependency_callable_interface(parameter.callable));
             (
                 SemanticDependencyChannelV1::ParentValueFormal,
                 vec![SemanticDependencyRoleV1::FormulaBinder],
@@ -8562,9 +8656,7 @@ fn inventory_resources(
             },
             producer,
             vec![
-                dependency_owner(SemanticDependencyOwnerV1::Callable {
-                    callable: producer.callable,
-                }),
+                dependency_callable_interface(producer.callable),
                 dependency_entity(statement_entity(producer.result_statement)),
             ],
         )?;
@@ -8667,9 +8759,7 @@ fn inventory_reactive(
             },
             producer,
             vec![
-                dependency_owner(SemanticDependencyOwnerV1::Callable {
-                    callable: producer.callable,
-                }),
+                dependency_callable_interface(producer.callable),
                 dependency_entity(expression_entity(producer.root_expression)),
                 dependency_entity(statement_entity(producer.result_statement)),
             ],
@@ -9553,9 +9643,7 @@ fn reactive_read_dependency(
         } => (
             SemanticDependencyChannelV1::ParentValueFormal,
             projection.clone(),
-            vec![dependency_owner(SemanticDependencyOwnerV1::Callable {
-                callable: parameter.callable,
-            })],
+            vec![dependency_callable_interface(parameter.callable)],
         ),
     }
 }
@@ -10103,9 +10191,7 @@ fn inventory_view(
                 dependency_entity(view_root_entity(node.root)),
                 dependency_entity(expression_entity(node.expression)),
                 dependency_entity(call_entity(node.call)),
-                dependency_owner(SemanticDependencyOwnerV1::Callable {
-                    callable: node.callable,
-                }),
+                dependency_callable_interface(node.callable),
             ],
         )?;
     }
@@ -10158,9 +10244,7 @@ fn inventory_view(
                 dependency_entity(view_root_entity(argument.root)),
                 dependency_entity(view_node_entity(argument.node)),
                 dependency_entity(call_entity(argument.call)),
-                dependency_owner(SemanticDependencyOwnerV1::Callable {
-                    callable: argument.callable,
-                }),
+                dependency_callable_interface(argument.callable),
                 dependency_entity(SemanticDependencyEntityV1::checked(
                     SemanticDependencyEntityDomainV1::CheckedDeclaration,
                     argument.formal.0,
@@ -11330,19 +11414,23 @@ FUNCTION add(value) {
                         &mut scratch,
                     )
                     .expect("V3 dependency maps to a V4 local receipt");
-                    let mut targets =
-                        record
-                            .referenced_dependencies
-                            .iter()
-                            .map(|target| {
-                                DependencyProjectionNodeV4::Projection(record_projection(
-                                    &proof.dependencies[target.as_usize()],
-                                ))
-                            })
-                            .chain(record.referenced_owners.iter().map(|owner| {
+                    let mut targets = record
+                        .referenced_dependencies
+                        .iter()
+                        .map(|target| {
+                            DependencyProjectionNodeV4::Projection(record_projection(
+                                &proof.dependencies[target.as_usize()],
+                            ))
+                        })
+                        .chain(record.referenced_owners.iter().map(|owner| match owner {
+                            SemanticDependencyOwnerV1::Callable { .. } => {
+                                DependencyProjectionNodeV4::CallableInterface(stable_owners[owner])
+                            }
+                            SemanticDependencyOwnerV1::ProgramRoot => {
                                 DependencyProjectionNodeV4::Owner(stable_owners[owner])
-                            }))
-                            .collect::<Vec<_>>();
+                            }
+                        }))
+                        .collect::<Vec<_>>();
                     targets.sort();
                     targets.dedup();
                     (projection, local_digest, targets)
@@ -11427,8 +11515,23 @@ FUNCTION add(value) {
             );
         }
         let stable_owner_set = stable_owners.values().copied().collect::<BTreeSet<_>>();
+        let callable_interface_digests = program
+            .execution_graph
+            .callables
+            .iter()
+            .map(|callable| {
+                (
+                    stable_owners[&SemanticDependencyOwnerV1::Callable {
+                        callable: callable.id,
+                    }],
+                    callable_public_shape_digest(callable)
+                        .expect("V3 callable has a V4 interface digest"),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
         let (stable_implementation_digests, stats) = build_dependency_projection_graph_digests_v4(
             &stable_owner_set,
+            &callable_interface_digests,
             &projection_receipts,
             &projection_targets,
         )

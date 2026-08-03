@@ -461,6 +461,13 @@ Current checkpoints to preserve and audit rather than redo:
   stable definition/invocation/link identities, make finalized rows produce
   receipts, and delete checked/execution inventories, not stop at the crate
   boundary;
+- preserve the first callable-interface firewall after `c870358` without
+  mistaking it for a time exit. Registered dense projection IDs and leaf
+  public-shape nodes reduce the largest NovyWave SCC from 4,296 nodes to 85,
+  while a directional run remains 3,961.669 ms/250,596 KiB. Checked, execution,
+  and lowering inventories still cost about 378/477/272 ms and receipt folding
+  502 ms. Continue with finalized shard rows and delete those passes; do not
+  spend the next tranche tuning the now-small SCC kernel;
 - do not preserve V3's 208k subject count in the replacement proof. The
   test-only oracle maps every historical subject to one canonical finalized
   shard row and classifier field/domain and independently proves coverage,

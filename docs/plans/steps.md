@@ -245,6 +245,14 @@ stronger three-reviewer performance closure defined below.
    assembly; add atomic upsert/remove/rename and fail-closed revisions. Do not
    spend another tranche on receipt-hash micro-tuning.
 
+   The first callable-interface firewall is now measured. Registered dense
+   projection IDs and leaf public-shape nodes reduce the largest NovyWave proof
+   SCC from 4,296 nodes to 85, but the directional run remains 3,961.669 ms at
+   250,596 KiB. The 378/477/272 ms checked/execution/lowering inventories and
+   502 ms receipt fold remain the active deletion owners. Preserve the exact
+   interface/body distinction and continue to finalized shard rows; do not tune
+   the now-small SCC kernel or count this as a performance exit.
+
    Receipt callbacks alone are too small: removing all 1,813.236 ms of manifest
    work from the 4,052.379 ms directional sample would still leave about 2.24
    seconds. Expand definition/invocation shards through OUT/resource/reactive/

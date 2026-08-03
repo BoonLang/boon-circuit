@@ -713,6 +713,16 @@ Current cold-diagnostics candidate evidence:
   post-hoc exhaustive rows. Continue directly with finalized shard-row sealing and
   deletion of checked/execution inventories; do not count the crate split as
   the architectural exit.
+- The first post-`c870358` interface-firewall cut registers dense projection
+  IDs, rejects stale memo publication, and gives every callable a leaf public-
+  shape node distinct from its implementation summary. A directional
+  NovyWave run is still 3,961.669 ms/250,596 KiB, but the largest projection SCC
+  falls from 4,296 nodes to 85 (15,181 nodes, 44,807 edges, 14,483 components
+  total). This closes the graph-explosion prerequisite for exact cones and
+  later two-worker scheduling, not the latency gate: checked/execution/lowering
+  inventories still take 378/477/272 ms and receipt folding 502 ms. The two-job
+  release rebuild remains 2m43s. Continue with finalized shard rows and delete
+  those inventories; do not tune the now-small SCC kernel.
 - Do not preserve V3's 208k subject cardinality as a production V4/V5 proof
   requirement. The independent test oracle must map every historical subject
   to exactly one canonical finalized shard row and classifier field/domain and prove

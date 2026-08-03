@@ -297,6 +297,22 @@ clone, rehash, or reverify the same plan. Deserialized plans still use the full
 public verifier. This closes the duplicate publication boundary but does not
 make backend expansion or the end-to-end performance gate green.
 
+The first post-`c870358` implementation cut replaces generic key-valued graph
+edges with registered dense projection IDs, makes stale memo publication fail
+closed, and separates callable public interfaces from callable implementation
+summaries. Production call/use dependencies now target leaf interface nodes
+committed by the existing public-shape digest; the broad callable-owner
+reference constructor is test-only. A direct two-job release rebuild takes
+2m43s, confirming that Rust fan-out remains red. One directional NovyWave run
+is 3,961.669 ms at 250,596 KiB, with 3,223.284 ms semantics and 1,816.404 ms
+manifest work. Latency is effectively still red/noisy, but the proof graph's
+largest SCC collapses from 4,296 nodes at `c870358` to 85. The graph now has
+15,181 nodes, 44,807 edges, and 14,483 components. This is the required
+interface firewall for precise invalidation and later bounded parallelism, not
+a timing exit. The next flag-day cut remains finalized checked/execution rows
+and deletion of their 378/477 ms post-hoc inventories; lowering inventory and
+receipt folding remain separately red at 272/502 ms.
+
 ### Second Whole-Pipeline Reassessment: Owner Compilation Units
 
 A fresh post-checkpoint directional sample completes in 4,052.379 ms at

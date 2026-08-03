@@ -387,40 +387,44 @@ Current checkpoints to preserve and audit rather than redo:
   invariants remain exact. Budget V2 stays red until the V3 provenance report,
   real-host NovyWave behavior scenario, migration/restart matrix, and negative
   cases are complete;
-- resume the performance goal from local checkpoint `c05af3a` and the current
-  uncommitted V3 oracle slice. The authored real-host NovyWave trace agrees
-  between retained and test-flat representations; its restart leg exposed a
-  generic authority-activation defect. Replace the compiler's initializer-
-  shape guess and executor's computation-presence guess with one exact
-  compiler-emitted activation plan. Restore durable authority, reconstruct
-  effect-free state-dependent recipes, apply sparse overrides only after rows
-  exist, then rebuild indexes/currentness/demand. Separate structural row-domain
-  authority, sparse durable indexed overlays, and computed row values through
-  one compiler-owned list-dataflow table. The
-  inspected NovyWave plan currently promotes 24 lists and 252 row fields to
-  persistence; `selected_signal_defaults` combines two durable `HOLD` fields
-  with 20 computed/host-backed authority fields. Prune pure derived views,
-  persist overlays by stable structural origin, emit ordered activation steps,
-  and record before/after plan/artifact bytes and activation work. Normalize
-  only the store-local epoch in the differential oracle and prove state-
-  dependent defaults plus host-result-owned lists before the full V3 migration/
-  restart matrix. Treat the `store.variable_rows` `List/chunk` mapped-row
-  persistence failure as a negative architecture proof: do not serialize row
-  handles or add a projection-only executor exception. Once the list contract
-  is stable, replace full-plan fingerprint cloning with a seal-once builder;
+- resume the performance goal from clean local checkpoint `37f874e`. The
+  compiler now emits one canonical list-dataflow/activation contract with
+  stable semantic list identities and type fingerprints; persistence prunes
+  pure `store.variable_rows` and stores derived durable overlays; executor
+  activation restores authority, reconstructs effect-free row domains
+  topologically, initializes defaults, applies overlays only after rows exist,
+  and then rebuilds indexes/currentness/demand. Focused activation tests and the
+  current optimized retained-vs-flat NovyWave oracle pass in 16.90 seconds.
+  Preserve that generic engine contract and do not add row-handle durability,
+  projection-specific activation, or a production flat fallback. The bounded
+  V3 provenance report, complete migration/restart/negative matrix, and budget
+  cross-binding are still open;
 - prioritize the checkpoint-level architecture cuts over further micro-
-  optimization. The live graph audit finds 31 normal transitive dependents of
-  `boon_document_model` and 16 of `boon_compiler`; moving cross-layer execution
-  IDs to a dependency-bottom contract crate predicts 19, while inverting the
-  six runtime/outer compiler dependencies predicts four true compiler
-  producers. Treat those values as hypotheses and publish measured before/
-  after dependency closures and rebuild wall times. Extract the real-host
-  retained-document behavior oracle from the native GPU/editor/window shell so
-  migration iterations do not rebuild presentation code. No compatibility
-  re-export, cosmetic file split, or smaller Rust rebuild may be counted as a
-  Boon latency win. After the activation/oracle gate and enabling boundary
-  cuts, continue demand-driven plan instances, the packed proof summary, and
-  one sealed semantic database with shared fingerprints;
+  optimization. First extract the real-host retained-document behavior oracle
+  from the native GPU/editor/window shell into a product-faithful headless
+  harness owning retained hit testing, authored typed actions, real local host
+  effects, persistent activation, replacement, migration, and restart. The
+  starting native normal workspace closure is 37 crates; focused test bodies
+  take about 0.1--0.2 seconds after linking, but observed dependency-bottom
+  build/relink work takes 38--109 seconds and the first optimized feature build
+  took 3m10s. Prove the same NovyWave trace/artifacts without an example-name or
+  direct-event shortcut, publish before/after closure and rebuild evidence, and
+  then finish V3. Native WGPU evidence remains separate. No compatibility re-
+  export, cosmetic file split, or smaller Rust rebuild may be counted as a Boon
+  latency win;
+- after the narrow oracle boundary, replace full-plan fingerprint cloning with
+  a seal-once builder, then implement demand-collected plan instances, the
+  packed proof summary, and one sealed semantic database with shared
+  fingerprints. `CompilerSession::apply_updates` currently drops its one whole-
+  project checked result for any changed unit; replace that with stable
+  component implementation/public-semantic fingerprints, exact reverse
+  dependency cones, unchanged-result backdating, and `changed_at`/
+  `verified_at` currentness. Current-revision diagnostics and verified
+  publication remain fail-closed, and incremental results must match a clean
+  full compile. The live graph audit also finds 31 normal transitive dependents
+  of `boon_document_model` and 16 of `boon_compiler`; move cross-layer IDs and
+  invert runtime/compiler edges only when before/after measurement proves the
+  ownership and rebuild cut;
 - the current compiler-throughput checkpoint keeps Counter, physical TodoMVC,
   and NovyWave `MachinePlan` output deterministic while replacing copied OUT
   type environments with active-path overlays, retaining canonical-root-reading

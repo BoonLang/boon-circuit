@@ -27,13 +27,13 @@ const MAX_ACTIVE_TRANSIENT_EFFECTS: usize = ACTIVE_FILE_STREAM_LIMIT
     + ACTIVE_DEADLINE_LIMIT
     + WAVEFORM_PENDING_LIMIT;
 
-pub(crate) struct PackageAsset<'a> {
+pub struct PackageAsset<'a> {
     pub url: &'a str,
     pub media: &'a str,
     pub bytes: &'a [u8],
 }
 
-pub(crate) enum TransientHostCompletion {
+pub enum LocalTransientCompletion {
     Single {
         call_id: TransientEffectCallId,
         outcome: Value,
@@ -42,7 +42,7 @@ pub(crate) enum TransientHostCompletion {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum NativeHostLane {
+enum LocalHostLane {
     File,
     Http,
     Services,
@@ -50,22 +50,22 @@ enum NativeHostLane {
 }
 
 struct QueuedSingleCompletion {
-    lane: NativeHostLane,
+    lane: LocalHostLane,
     call_id: TransientEffectCallId,
     outcome: Value,
 }
 
-pub(crate) struct NativeTransientHost {
+pub struct LocalTransientHost {
     file_streams: FileEffectAdapter,
     http: OutboundHttpEffectAdapter,
     services: HostServiceEffectAdapter,
     waveforms: WaveformEffectWorker,
-    calls: ExactCallHostCore<NativeHostLane>,
+    calls: ExactCallHostCore<LocalHostLane>,
     ready: VecDeque<QueuedSingleCompletion>,
     async_runtime: tokio::runtime::Runtime,
 }
 
-impl NativeTransientHost {
+impl LocalTransientHost {
     pub fn new<'a>(
         root: PathBuf,
         assets: impl IntoIterator<Item = PackageAsset<'a>>,
@@ -114,7 +114,7 @@ impl NativeTransientHost {
             .worker_threads(2)
             .enable_all()
             .build()
-            .map_err(|error| format!("cannot start native effect runtime: {error}"))?;
+            .map_err(|error| format!("cannot start local effect runtime: {error}"))?;
         let http = OutboundHttpEffectAdapter::new(
             HttpClient::new(ClientConfig::new(Vec::new())).map_err(|error| error.to_string())?,
             ACTIVE_HTTP_REQUEST_LIMIT,
@@ -130,33 +130,33 @@ impl NativeTransientHost {
         for effect_id in required_effects {
             let mut lanes = Vec::with_capacity(4);
             if file_streams.owns_effect(effect_id) {
-                lanes.push(NativeHostLane::File);
+                lanes.push(LocalHostLane::File);
             }
             if effect_id == http.effect_id() {
-                lanes.push(NativeHostLane::Http);
+                lanes.push(LocalHostLane::Http);
             }
             if services.owns(effect_id) {
-                lanes.push(NativeHostLane::Services);
+                lanes.push(LocalHostLane::Services);
             }
             if waveforms.owns(effect_id) {
-                lanes.push(NativeHostLane::Waveform);
+                lanes.push(LocalHostLane::Waveform);
             }
             let lane = match lanes.as_slice() {
                 [lane] => *lane,
                 [] => {
                     return Err(format!(
-                        "native preview has no adapter for required effect {effect_id}"
+                        "local host has no adapter for required effect {effect_id}"
                     ));
                 }
                 _ => {
                     return Err(format!(
-                        "native preview adapters ambiguously own required effect {effect_id}"
+                        "local host adapters ambiguously own required effect {effect_id}"
                     ));
                 }
             };
             if authorized_effects.insert(effect_id, lane).is_some() {
                 return Err(format!(
-                    "native preview plan repeats required effect {effect_id}"
+                    "local host plan repeats required effect {effect_id}"
                 ));
             }
         }
@@ -195,9 +195,9 @@ impl NativeTransientHost {
             .credit_lanes(credits)
             .map_err(|error| error.to_string())?
         {
-            if lane != NativeHostLane::File {
+            if lane != LocalHostLane::File {
                 return Err(format!(
-                    "native stream credit targets unowned call {}",
+                    "local stream credit targets unowned call {}",
                     grant.call_id
                 ));
             }
@@ -207,7 +207,7 @@ impl NativeTransientHost {
                 .map_err(|error| error.to_string())?
             {
                 return Err(format!(
-                    "native file lane rejected credit for active call {}",
+                    "local file lane rejected credit for active call {}",
                     grant.call_id
                 ));
             }
@@ -224,38 +224,38 @@ impl NativeTransientHost {
         for (lane, invocation) in admitted {
             let _runtime = self.async_runtime.enter();
             let result = match lane {
-                NativeHostLane::File => self
+                LocalHostLane::File => self
                     .file_streams
                     .submit(invocation.clone())
                     .map(|_| ())
                     .map_err(|error| error.to_string()),
-                NativeHostLane::Http => self
+                LocalHostLane::Http => self
                     .http
                     .submit(invocation.clone())
                     .map_err(|error| error.to_string())
                     .map(|submission| {
                         if let Some(completion) = submission.immediate_completion {
                             self.ready.push_back(QueuedSingleCompletion {
-                                lane: NativeHostLane::Http,
+                                lane: LocalHostLane::Http,
                                 call_id: completion.call_id,
                                 outcome: completion.outcome,
                             });
                         }
                     }),
-                NativeHostLane::Services => self
+                LocalHostLane::Services => self
                     .services
                     .submit(invocation.clone())
                     .map_err(|error| error.to_string())
                     .map(|submission| {
                         if let Some(completion) = submission.immediate_completion {
                             self.ready.push_back(QueuedSingleCompletion {
-                                lane: NativeHostLane::Services,
+                                lane: LocalHostLane::Services,
                                 call_id: completion.call_id,
                                 outcome: completion.outcome,
                             });
                         }
                     }),
-                NativeHostLane::Waveform => self
+                LocalHostLane::Waveform => self
                     .waveforms
                     .submit(invocation.clone())
                     .map_err(|error| error.to_string()),
@@ -272,7 +272,7 @@ impl NativeTransientHost {
         Ok(())
     }
 
-    pub fn try_completion(&mut self) -> Result<Option<TransientHostCompletion>, String> {
+    pub fn try_completion(&mut self) -> Result<Option<LocalTransientCompletion>, String> {
         while let Some(completion) = self.ready.pop_front() {
             if self
                 .calls
@@ -281,7 +281,7 @@ impl NativeTransientHost {
             {
                 continue;
             }
-            return Ok(Some(TransientHostCompletion::Single {
+            return Ok(Some(LocalTransientCompletion::Single {
                 call_id: completion.call_id,
                 outcome: completion.outcome,
             }));
@@ -292,9 +292,9 @@ impl NativeTransientHost {
             .map_err(|error| error.to_string())?
         {
             self.calls
-                .accept_result(event.call_id, NativeHostLane::File, event.is_terminal())
+                .accept_result(event.call_id, LocalHostLane::File, event.is_terminal())
                 .map_err(|error| error.to_string())?;
-            return Ok(Some(TransientHostCompletion::File(event)));
+            return Ok(Some(LocalTransientCompletion::File(event)));
         }
         if let Some(completion) = self
             .http
@@ -302,9 +302,9 @@ impl NativeTransientHost {
             .map_err(|error| error.to_string())?
         {
             self.calls
-                .accept_result(completion.call_id, NativeHostLane::Http, true)
+                .accept_result(completion.call_id, LocalHostLane::Http, true)
                 .map_err(|error| error.to_string())?;
-            return Ok(Some(TransientHostCompletion::Single {
+            return Ok(Some(LocalTransientCompletion::Single {
                 call_id: completion.call_id,
                 outcome: completion.outcome,
             }));
@@ -315,9 +315,9 @@ impl NativeTransientHost {
             .map_err(|error| error.to_string())?
         {
             self.calls
-                .accept_result(completion.call_id, NativeHostLane::Services, true)
+                .accept_result(completion.call_id, LocalHostLane::Services, true)
                 .map_err(|error| error.to_string())?;
-            return Ok(Some(TransientHostCompletion::Single {
+            return Ok(Some(LocalTransientCompletion::Single {
                 call_id: completion.call_id,
                 outcome: completion.outcome,
             }));
@@ -330,7 +330,7 @@ impl NativeTransientHost {
             return Ok(None);
         };
         self.calls
-            .accept_result(completion.call_id, NativeHostLane::Waveform, true)
+            .accept_result(completion.call_id, LocalHostLane::Waveform, true)
             .map_err(|error| error.to_string())?;
         Ok(Some(single_completion(completion)))
     }
@@ -345,25 +345,25 @@ impl NativeTransientHost {
         }
     }
 
-    fn cancel_adapter(&mut self, lane: NativeHostLane, call_id: TransientEffectCallId) {
+    fn cancel_adapter(&mut self, lane: LocalHostLane, call_id: TransientEffectCallId) {
         match lane {
-            NativeHostLane::File => {
+            LocalHostLane::File => {
                 self.file_streams.cancel(call_id);
             }
-            NativeHostLane::Http => {
+            LocalHostLane::Http => {
                 self.http.cancel(call_id);
             }
-            NativeHostLane::Services => {
+            LocalHostLane::Services => {
                 self.services.cancel(call_id);
             }
-            NativeHostLane::Waveform => {
+            LocalHostLane::Waveform => {
                 self.waveforms.cancel(call_id);
             }
         }
     }
 }
 
-impl Drop for NativeTransientHost {
+impl Drop for LocalTransientHost {
     fn drop(&mut self) {
         let calls = self.calls.active_call_ids();
         for call_id in calls {
@@ -372,8 +372,8 @@ impl Drop for NativeTransientHost {
     }
 }
 
-fn single_completion(completion: WaveformEffectCompletion) -> TransientHostCompletion {
-    TransientHostCompletion::Single {
+fn single_completion(completion: WaveformEffectCompletion) -> LocalTransientCompletion {
+    LocalTransientCompletion::Single {
         call_id: completion.call_id,
         outcome: completion.outcome,
     }

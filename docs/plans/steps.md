@@ -200,37 +200,46 @@ stronger three-reviewer performance closure defined below.
    red until V3 records source/old/new identities, the real-host NovyWave
    behavior trace, migration/restart evidence, and focused negative cases.
 
-   Resume from local checkpoint `c05af3a` and the current oracle slice. The
-   authored real-host action trace now agrees; restart exposed a generic
-   authority-activation defect. Replace compiler initializer-shape and executor
-   computation-presence guesses with one compiler-emitted activation plan, then
-   prove state-dependent reconstructable defaults and host-result-owned lists
-   before completing the V3 migration/restart matrix. Separate row-domain
-   authority, sparse durable indexed overlays, and computed row values through
-   one canonical list-dataflow table: the
-   inspected NovyWave plan currently promotes 24 lists and 252 row fields to
-   persistence, and `selected_signal_defaults` mixes two durable `HOLD` fields
-   with 20 computed/host-backed authority fields. Prune pure views, emit ordered
-   activation steps, and record before/after plan/artifact bytes and activation
-   work. The `store.variable_rows` `List/chunk` mapped-row serialization failure
-   proves that projection, derived-materialization, initializer, and executor
-   ownership must be unified; do not serialize row handles or add a projection-
-   only exception. Then replace full-`MachinePlan` fingerprint cloning with one
-   seal/compact/fingerprint boundary. Normalize only the store-local epoch in
-   representation comparison.
+   Resume from clean local checkpoint `37f874e`. The canonical list-dataflow
+   and activation contract is now emitted by the compiler and consumed by the
+   executor: it separates complete structural authority, reconstructable
+   derived domains, and durable indexed overlays; prunes pure
+   `store.variable_rows`; reconstructs topologically before applying sparse
+   overlays; and carries stable semantic identities and type fingerprints for
+   every runtime list. Focused activation tests and the current optimized
+   retained-vs-flat NovyWave oracle pass (16.90 seconds), but the bounded V3
+   provenance report, complete migration/restart/negative matrix, and budget
+   cross-binding remain open. Preserve this generic contract and do not add row-
+   handle serialization, projection-only activation, or a production flat
+   fallback.
 
    The checkpoint-level boundary audit now takes priority over more small
-   container edits. Measure and, when confirmed, pull these cuts early: move
-   stable cross-layer execution IDs out of `boon_document_model` (current
-   normal transitive closure 31 crates, predicted 19); invert the six runtime/
-   outer compiler consumers so the compiler closure can fall from 16 to the
-   four true producers; and extract the real-host retained-document behavior
-   oracle from the native GPU/editor/window shell. Every split needs a
-   before/after dependency closure and rebuild time, no compatibility export,
-   and unchanged diagnostics/artifacts. Then continue demand-driven plan
-   instances, packed proof summary, and one sealed semantic database with
-   shared fingerprints. Keep Rust rebuild speed and Boon compile latency as
-   separate measured gates.
+   container edits. First extract the real-host retained-document behavior
+   oracle from the native GPU/editor/window shell. Its normal workspace closure
+   is currently 37 crates; focused bodies run in about 0.1--0.2 seconds after
+   linking, while observed dependency-bottom build/relink work takes 38--109
+   seconds and the first optimized feature build took 3m10s. The narrow harness
+   must preserve retained hit testing, authored typed actions, real local host
+   effects, activation, artifact replacement, migration, and restart without
+   example-name shortcuts. Re-run the same NovyWave trace there, measure the
+   dependency/rebuild cut, then complete V3. Native WGPU evidence stays
+   independent.
+
+   Next replace full-`MachinePlan` fingerprint cloning with one seal/compact/
+   fingerprint boundary, then continue demand-driven plan instances, the packed
+   proof summary, and one sealed semantic database with shared fingerprints.
+   Replace `CompilerSession::apply_updates` whole-project checked-result
+   eviction with stable per-component implementation/public-semantic
+   fingerprints, exact reverse dependency cones, unchanged-result backdating,
+   and `changed_at`/`verified_at` currentness. Complete current-revision
+   diagnostics and verified publication remain fail-closed and every
+   incremental result must match a clean full compile. Move stable cross-layer
+   execution IDs out of `boon_document_model` (current normal transitive closure
+   31 crates, predicted 19) and invert runtime/compiler edges only when measured
+   closures prove the cut. Every split needs a before/after dependency closure
+   and rebuild time, no compatibility export, and unchanged diagnostics/
+   artifacts. Keep Rust rebuild speed and Boon compile latency as separate
+   measured gates.
 
    Use the performance plan's edit-loop, milestone-preflight, and full-
    acceptance harness levels. Focused debug tests and direct one-sample producer

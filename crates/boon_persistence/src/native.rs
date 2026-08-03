@@ -1927,9 +1927,10 @@ fn apply_changes(
                         "cannot remove from missing list {memory_id}"
                     ))
                 })?;
-                if !list.touched {
+                let sparse = !list.touched;
+                if sparse && (*next_key != 0 || *next_order_token != 0) {
                     return Err(StoreError::InvalidAuthority(format!(
-                        "cannot remove from sparse override list {memory_id}"
+                        "sparse override removal for list {memory_id} must not replace allocator state"
                     )));
                 }
                 let index = list
@@ -1945,11 +1946,18 @@ fn apply_changes(
                     })?;
                 let row_ref = list.rows.remove(index);
                 advance_list_record_revision(*memory_id, &mut list, *list_revision)?;
-                list.next_key = *next_key;
-                list.next_order_token = *next_order_token;
+                if !sparse {
+                    list.next_key = *next_key;
+                    list.next_order_token = *next_order_token;
+                }
                 validate_list_record(&list)?;
                 delete_row(rows, app, *memory_id, row_ref.row, limits, blobs)?;
-                save_list(lists, app, *memory_id, &list)?;
+                if sparse && list.rows.is_empty() {
+                    let key = memory_storage_key(app, *memory_id);
+                    lists.remove(key.as_slice()).map_err(backend)?;
+                } else {
+                    save_list(lists, app, *memory_id, &list)?;
+                }
             }
             DurableChange::DeleteList { memory_id } => {
                 delete_list(lists, rows, app, *memory_id, limits, blobs)?;
@@ -3919,7 +3927,7 @@ mod tests {
             driver.execute(PersistenceCommand::Shutdown(ShutdownRequest));
         }
         let mut driver = RedbDriver::open(&path).unwrap();
-        let image = load(&mut driver, app);
+        let image = load(&mut driver, app.clone());
         let stored = &image.lists[&cells];
         assert!(!stored.touched);
         assert_eq!(stored.next_key, 0);
@@ -3928,6 +3936,34 @@ mod tests {
             stored.rows[0].fields[&formula],
             StoredValueShell::Text("=A1+1".to_owned())
         );
+        let retire = CheckpointBatch {
+            application: app.clone(),
+            schema_hash: [1; 32],
+            base_epoch: 1,
+            next_epoch: 2,
+            first_turn_sequence: 3,
+            last_turn_sequence: 3,
+            changes: vec![DurableChange::RemoveRow {
+                memory_id: cells,
+                list_revision: 2,
+                row_key: 2,
+                row_generation: 1,
+                next_key: 0,
+                next_order_token: 0,
+            }],
+            outbox_changes: Vec::new(),
+            content_artifact_changes: Vec::new(),
+            checksum: [0; 32],
+        }
+        .seal();
+        assert!(matches!(
+            driver.execute(PersistenceCommand::Commit(retire)),
+            PersistenceResult::Committed(Ok(CommitAck { epoch: 2, .. }))
+        ));
+        driver.execute(PersistenceCommand::Shutdown(ShutdownRequest));
+
+        let mut driver = RedbDriver::open(&path).unwrap();
+        assert!(!load(&mut driver, app).lists.contains_key(&cells));
     }
 
     #[test]

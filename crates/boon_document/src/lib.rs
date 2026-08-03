@@ -14,6 +14,7 @@ pub use boon_document_model::{
     UiSemanticChange, project_to_map_viewport, unproject_from_map_viewport,
 };
 pub mod render_scene;
+pub mod retained_view;
 #[doc(hidden)]
 pub mod runtime;
 pub mod source_actions;

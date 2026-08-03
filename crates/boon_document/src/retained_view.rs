@@ -1,5 +1,5 @@
-use boon_document::render_scene::RenderTextColumnMeasurer;
-use boon_document::{
+use crate::render_scene::RenderTextColumnMeasurer;
+use crate::{
     Axis, ComputedStyleIdentity, DocumentFrame, DocumentNodeId, DocumentNodeKind, DocumentPatch,
     PatchApplyError, Rect, RenderScene, RenderTextureRef, RenderVisualPrimitive,
     RenderVisualPrimitiveKind, RetainedDocument, RetainedDocumentUpdate,
@@ -7,9 +7,9 @@ use boon_document::{
 use boon_host::Viewport;
 use boon_plan::{OwnerInstanceRoute, SourceRouteToken};
 
-pub(crate) const OPERATOR_CURSOR_LIGHT: [u8; 4] = [255, 255, 255, 255];
-pub(crate) const OPERATOR_CURSOR_DARK: [u8; 4] = [24, 28, 36, 255];
-pub(crate) const OPERATOR_CURSOR_PARTS: [[f32; 4]; 6] = [
+pub const OPERATOR_CURSOR_LIGHT: [u8; 4] = [255, 255, 255, 255];
+pub const OPERATOR_CURSOR_DARK: [u8; 4] = [24, 28, 36, 255];
+pub const OPERATOR_CURSOR_PARTS: [[f32; 4]; 6] = [
     [0.0, 0.0, 2.0, 14.0],
     [2.0, 2.0, 2.0, 12.0],
     [4.0, 4.0, 2.0, 10.0],
@@ -108,7 +108,7 @@ impl RetainedView {
             .map(|item| item.bounds)
     }
 
-    pub fn demands(&self) -> &[boon_document::LayoutDemand] {
+    pub fn demands(&self) -> &[crate::LayoutDemand] {
         self.retained.demands()
     }
 
@@ -190,7 +190,7 @@ impl RetainedView {
             .display_list
             .iter()
             .find(|item| item.node.0 == target.node && item.kind == DocumentNodeKind::TextInput)
-            .map(|item| boon_document::render_scene::text_position_at(item, x, y, columns));
+            .map(|item| crate::render_scene::text_position_at(item, x, y, columns));
         target.text_line = position.map(|position| position.0);
         target.text_column = position.map(|position| position.1);
         Some(target)
@@ -307,7 +307,6 @@ impl RetainedView {
             .collect()
     }
 
-    #[cfg(test)]
     pub fn source_action_diagnostics(&self, source_path: &str) -> Vec<String> {
         self.retained
             .hits()
@@ -417,7 +416,7 @@ impl RetainedView {
         })
     }
 
-    fn visible_hit_target(&self, entry: &boon_document::HitSideTableEntry) -> Option<HitTarget> {
+    fn visible_hit_target(&self, entry: &crate::HitSideTableEntry) -> Option<HitTarget> {
         let mut visible = rect_intersection(entry.bounds, self.retained.scene().viewport)?;
         if let Some(item) = self
             .retained
@@ -467,9 +466,9 @@ fn action_source_intent(action: Option<&str>) -> Option<&str> {
 
 fn entry_matches_owner_text(
     frame: &DocumentFrame,
-    hits: &boon_document::HitSideTable,
+    hits: &crate::HitSideTable,
     owner: &OwnerInstanceRoute,
-    entry: &boon_document::HitSideTableEntry,
+    entry: &crate::HitSideTableEntry,
     expected: &str,
 ) -> bool {
     let Some(node) = frame.nodes.get(&entry.node) else {
@@ -493,7 +492,7 @@ fn entry_matches_owner_text(
 
 fn subtree_matches_semantic_text(
     frame: &DocumentFrame,
-    root: &boon_document::DocumentNode,
+    root: &crate::DocumentNode,
     expected: &str,
 ) -> bool {
     let mut pending = vec![root.id.clone()];
@@ -513,20 +512,17 @@ fn subtree_matches_semantic_text(
     false
 }
 
-pub(crate) fn node_matches_semantic_text(
-    node: &boon_document::DocumentNode,
-    expected: &str,
-) -> bool {
+pub(crate) fn node_matches_semantic_text(node: &crate::DocumentNode, expected: &str) -> bool {
     node.text.as_ref().is_some_and(|text| text.text == expected)
         || ["target", "label", "address"].iter().any(|name| {
             matches!(
                 node.style.get(*name),
-                Some(boon_document::StyleValue::Text(value)) if value == expected
+                Some(crate::StyleValue::Text(value)) if value == expected
             )
         })
 }
 
-fn hit_target(entry: &boon_document::HitSideTableEntry) -> HitTarget {
+fn hit_target(entry: &crate::HitSideTableEntry) -> HitTarget {
     HitTarget {
         node: entry.node.0.clone(),
         source_path: entry.source_path.clone(),
@@ -548,18 +544,18 @@ fn hit_target(entry: &boon_document::HitSideTableEntry) -> HitTarget {
 
 fn scroll_limits(
     document: &DocumentFrame,
-    layout: &boon_document::LayoutFrame,
+    layout: &crate::LayoutFrame,
     root: &DocumentNodeId,
     columns: &mut impl RenderTextColumnMeasurer,
-) -> boon_document::ScrollState {
+) -> crate::ScrollState {
     let Some(root_item) = layout.display_list.iter().find(|item| &item.node == root) else {
-        return boon_document::ScrollState { x: 0.0, y: 0.0 };
+        return crate::ScrollState { x: 0.0, y: 0.0 };
     };
     let current = document
         .nodes
         .get(root)
         .and_then(|node| node.scroll)
-        .unwrap_or(boon_document::ScrollState { x: 0.0, y: 0.0 });
+        .unwrap_or(crate::ScrollState { x: 0.0, y: 0.0 });
     let mut max_right = root_item.bounds.x + root_item.bounds.width;
     let mut max_bottom = root_item.bounds.y + root_item.bounds.height;
     for item in &layout.display_list {
@@ -568,8 +564,8 @@ fn scroll_limits(
             max_bottom = max_bottom.max(item.bounds.y + item.bounds.height + current.y);
         }
     }
-    let text = boon_document::render_scene::text_scroll_limits(root_item, columns);
-    let mut limits = boon_document::ScrollState {
+    let text = crate::render_scene::text_scroll_limits(root_item, columns);
+    let mut limits = crate::ScrollState {
         x: text
             .x
             .max(max_right - (root_item.bounds.x + root_item.bounds.width)),
@@ -618,7 +614,7 @@ fn document_node_is_below(
 
 fn scroll_root_at(
     document: &DocumentFrame,
-    layout: &boon_document::LayoutFrame,
+    layout: &crate::LayoutFrame,
     axis: Axis,
     x: f32,
     y: f32,
@@ -639,7 +635,7 @@ fn scroll_root_at(
 }
 
 fn nearest_scroll_region(
-    regions: &[boon_document::ScrollRegion],
+    regions: &[crate::ScrollRegion],
     axis: Axis,
     x: f32,
     y: f32,
@@ -651,14 +647,10 @@ fn nearest_scroll_region(
         .map(|region| region.node.0.clone())
 }
 
-fn node_scrolls_axis(
-    document: &DocumentFrame,
-    node: &boon_document::DocumentNode,
-    axis: Axis,
-) -> bool {
+fn node_scrolls_axis(document: &DocumentFrame, node: &crate::DocumentNode, axis: Axis) -> bool {
     document
         .scroll_roots
-        .contains_key(&boon_document::ScrollRootId(node.id.0.clone()))
+        .contains_key(&crate::ScrollRootId(node.id.0.clone()))
         || node.kind == DocumentNodeKind::ScrollRoot
         || style_bool(&node.style, "scroll")
         || style_bool(&node.style, "scrollbars")
@@ -668,10 +660,10 @@ fn node_scrolls_axis(
         }
 }
 
-fn style_bool(style: &boon_document::StyleMap, key: &str) -> bool {
+fn style_bool(style: &crate::StyleMap, key: &str) -> bool {
     style
         .get(key)
-        .and_then(boon_document::StyleValue::as_bool)
+        .and_then(crate::StyleValue::as_bool)
         .unwrap_or(false)
 }
 
@@ -692,9 +684,9 @@ fn rect_intersection(left: Rect, right: Rect) -> Option<Rect> {
     })
 }
 
-fn clip_rect(style: &boon_document::StyleMap) -> Option<Rect> {
+fn clip_rect(style: &crate::StyleMap) -> Option<Rect> {
     let number = |name| match style.get(name) {
-        Some(boon_document::StyleValue::Number(value)) if value.is_finite() => Some(*value as f32),
+        Some(crate::StyleValue::Number(value)) if value.is_finite() => Some(*value as f32),
         _ => None,
     };
     Some(Rect {
@@ -712,8 +704,8 @@ fn rect_area(rect: Rect) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use boon_document::render_scene::ApproximateTextColumnMeasurer;
-    use boon_document::{DocumentNode, StyleValue, TextValue};
+    use crate::render_scene::ApproximateTextColumnMeasurer;
+    use crate::{DocumentNode, StyleValue, TextValue};
     use boon_document_model::{SourceBinding, SourceBindingId};
 
     fn add_child(frame: &mut DocumentFrame, mut node: DocumentNode) {

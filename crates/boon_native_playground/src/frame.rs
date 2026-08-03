@@ -17,7 +17,7 @@ use crate::observer::{
     FrameEvidenceKey, FramePresented, InputKind, NATIVE_SESSION_ID_ENV, ObserverEvent,
     ObserverRole, RoleMetadata,
 };
-use crate::view::RetainedView;
+use boon_document::retained_view::RetainedView;
 
 pub struct AcceptedNativeEvent {
     pub envelope: HostEventEnvelope,

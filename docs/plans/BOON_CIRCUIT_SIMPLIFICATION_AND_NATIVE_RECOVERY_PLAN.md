@@ -701,28 +701,37 @@ verifier, and exact persistence comparison in 14.82 seconds. It is preflight,
 not oracle migration: the V3 provenance record, real-host NovyWave interaction
 trace, migration/restart evidence, and negative matrix remain blocking, and no
 flat production fallback exists.
-Resume that work from local checkpoint `c05af3a`. The authored real-host trace
-now agrees across retained and test-flat representations, while artifact
-restart exposed a generic authority-activation ordering defect. The compiler
-performance plan owns the unified compiler-emitted activation plan, focused
-state-dependent/host-owned list tests, and V3 restart closure. That work also
-separates structural row-domain authority and sparse durable indexed overlays
-from computed view fields through one compiler-owned list-dataflow table: the
-inspected NovyWave plan currently promotes 24
-lists and 252 row fields to persistence, while one stateful derived list mixes
-two durable `HOLD` fields with 20 computed/host-backed fields. Pure views must
-leave persistence and activation must consume compiler-emitted ordered steps.
-The `store.variable_rows` `List/chunk` mapped-row serialization failure proves
-that derived materialization, projection, initializer, and executor ownership
-cannot remain separate; row handles must not become durable and a projection-
-only exception is not an engine fix. After that contract is stable, replace
-full-plan fingerprint cloning with one immutable seal/compact/fingerprint
-boundary.
-The whole-system audit also pulls measured compiler/runtime dependency
-inversion, cross-layer ID ownership, and a headless product-behavior oracle
-ahead of more local optimization when those cuts shorten the remaining
-iteration path. Those are performance-enabling refactors, not a relaxation of
-this recovery plan's native GPU evidence or behavior requirements.
+Resume that work from clean local checkpoint `37f874e`. The compiler now emits
+one canonical list-dataflow and activation contract with stable semantic list
+identities/type fingerprints, minimal durable-owner closure, reconstructable
+derived domains, sparse durable overlays, and topological activation; the
+executor consumes that order rather than rediscovering authority. Pure
+`store.variable_rows` is absent from persistence. Focused compiler/executor
+tests and the current optimized retained-vs-flat NovyWave oracle pass in 16.90
+seconds. This closes the original activation defect, but not the bounded V3
+provenance report, complete migration/restart/negative matrix, or budget cross-
+binding. Row handles, projection-only activation exceptions, and a production
+flat fallback remain prohibited.
+The whole-system audit now pulls a product-faithful headless behavior harness
+ahead of further V3 iteration: the oracle's native shell has a 37-workspace-
+crate normal closure, observed dependency-bottom rebuild/relink work of 38--109
+seconds, and a first optimized feature build of 3m10s even though focused test
+bodies take about 0.1--0.2 seconds. Extract retained hit/action routing, real
+local host effects, persistent activation, replacement, migration, and restart
+without example-specific shortcuts; prove the same NovyWave trace/artifacts and
+measure the closure/rebuild cut. Native WGPU evidence remains separate.
+After that boundary, replace full-plan fingerprint cloning with one immutable
+seal/compact/fingerprint boundary, then continue demand-collected instances,
+packed proof summary, and shared sealed semantic fingerprints. The current
+`CompilerSession::apply_updates` whole-project checked-result eviction is also
+an architecture blocker: replace it with stable component implementation/public
+fingerprints, exact dependency cones, unchanged-result backdating, and explicit
+`changed_at`/`verified_at` currentness while keeping complete diagnostics,
+verification, clean-full parity, cancellation, and publication fail-closed.
+Measured compiler/runtime dependency inversion and cross-layer ID ownership are
+performance-enabling refactors only when their before/after closures prove the
+cut; none relaxes this recovery plan's native GPU evidence or behavior
+requirements.
 The traced NovyWave cold path is now about 4.84 seconds of typechecking, 2.84
 seconds of contextual materialization/execution expansion, 3.81 seconds of
 whole-program dependency proof, and 9.51 seconds for semantic elaboration in

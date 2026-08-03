@@ -47,10 +47,11 @@ use crate::observer::{
 use crate::proof::frame_capture_token_digest;
 #[cfg(target_os = "linux")]
 use crate::{
-    native_input::NativeInput,
-    ui::DEV_EDITOR_INPUT_TARGET,
-    view::{OPERATOR_CURSOR_DARK, OPERATOR_CURSOR_LIGHT, OPERATOR_CURSOR_PARTS},
-    workspace_control::WorkspaceGuard,
+    native_input::NativeInput, ui::DEV_EDITOR_INPUT_TARGET, workspace_control::WorkspaceGuard,
+};
+#[cfg(target_os = "linux")]
+use boon_document::retained_view::{
+    OPERATOR_CURSOR_DARK, OPERATOR_CURSOR_LIGHT, OPERATOR_CURSOR_PARTS,
 };
 
 const FORMAT_VERSION: u16 = 2;

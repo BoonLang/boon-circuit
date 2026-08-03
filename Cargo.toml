@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/boon_behavior_harness",
     "crates/boon_phase0_baseline",
     "crates/boon_contract",
     "crates/boon_data",
@@ -33,6 +34,7 @@ members = [
     "crates/boon_host",
     "crates/boon_host_services",
     "crates/boon_host_runtime",
+    "crates/boon_local_host",
     "crates/boon_wellen_host",
     "crates/boon_document",
     "crates/boon_editor",
@@ -51,6 +53,7 @@ license = "MIT OR Apache-2.0"
 rust-version = "1.88"
 
 [workspace.dependencies]
+boon_behavior_harness = { path = "crates/boon_behavior_harness" }
 boon_phase0_baseline = { path = "crates/boon_phase0_baseline", default-features = false }
 boon_contract = { path = "crates/boon_contract" }
 boon_data = { path = "crates/boon_data" }
@@ -82,6 +85,7 @@ boon_document_model = { path = "crates/boon_document_model" }
 boon_host = { path = "crates/boon_host" }
 boon_host_services = { path = "crates/boon_host_services" }
 boon_host_runtime = { path = "crates/boon_host_runtime" }
+boon_local_host = { path = "crates/boon_local_host" }
 boon_wellen_host = { path = "crates/boon_wellen_host" }
 boon_document = { path = "crates/boon_document" }
 boon_editor = { path = "crates/boon_editor" }

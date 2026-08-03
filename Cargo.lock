@@ -662,6 +662,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "boon_behavior_harness"
+version = "0.1.0"
+dependencies = [
+ "boon_compiler",
+ "boon_document",
+ "boon_host",
+ "boon_host_runtime",
+ "boon_local_host",
+ "boon_persistence",
+ "boon_plan",
+ "boon_runtime",
+]
+
+[[package]]
 name = "boon_checked"
 version = "0.1.0"
 dependencies = [
@@ -887,6 +901,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "boon_local_host"
+version = "0.1.0"
+dependencies = [
+ "boon_host_runtime",
+ "boon_host_services",
+ "boon_http_client",
+ "boon_http_runtime",
+ "boon_plan",
+ "boon_runtime",
+ "boon_wellen_host",
+ "tokio",
+]
+
+[[package]]
 name = "boon_native_app_window"
 version = "0.1.0"
 dependencies = [
@@ -930,6 +958,7 @@ dependencies = [
  "boon_host_services",
  "boon_http_client",
  "boon_http_runtime",
+ "boon_local_host",
  "boon_native_app_window",
  "boon_native_gpu",
  "boon_parser",

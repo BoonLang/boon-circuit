@@ -27,10 +27,10 @@ use crate::ui::{
     InspectorMode, InspectorState, MigrationUiState, OUTBOX_WINDOW_ROWS, PersistenceUiState,
     dev_frame, editor_first_line, editor_line_from_target,
 };
-use crate::view::RetainedView;
 use crate::workspace::{
     PersistRequest, PersistenceWorker, ProjectOrigin, ProjectStore, StoredProject,
 };
+use boon_document::retained_view::RetainedView;
 use boon_editor::language::{LanguageProjectSnapshot, LanguageSnapshot, SemanticItem};
 
 pub fn connect(path: &Path) -> Result<Connection, Box<dyn std::error::Error + Send + Sync>> {

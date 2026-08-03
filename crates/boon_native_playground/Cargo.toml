@@ -7,7 +7,6 @@ rust-version.workspace = true
 
 [features]
 default = []
-test-flat-oracle = ["boon_compiler/test-flat-oracle"]
 
 [dependencies]
 boon_checked.workspace = true
@@ -26,6 +25,7 @@ boon_document_model.workspace = true
 boon_editor.workspace = true
 boon_host.workspace = true
 boon_host_runtime.workspace = true
+boon_local_host.workspace = true
 boon_host_services.workspace = true
 boon_http_client.workspace = true
 boon_http_runtime.workspace = true

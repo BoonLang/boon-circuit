@@ -56,7 +56,7 @@ use crate::runtime_view::{
     RuntimeAsyncLaneOutcome, RuntimePlanPublishError, RuntimeSourceDispatch, RuntimeView,
     STATE_ROOT_ENV, digest_hex,
 };
-use crate::view::{HitTarget, RetainedView};
+use boon_document::retained_view::{HitTarget, RetainedView};
 
 pub(crate) const TEST_STEP_LIMIT: usize = 64;
 const OUTBOUND_QUEUE_DEPTH: usize = 8;

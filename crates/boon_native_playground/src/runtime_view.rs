@@ -48,8 +48,8 @@ use crate::protocol::{
     PersistenceOperationStatus, PersistenceSnapshot, PersistenceTimingSummary,
     StateArtifactPreviewSummary, StoredSummary,
 };
-use crate::transient_host::{NativeTransientHost, PackageAsset, TransientHostCompletion};
-use crate::view::HitTarget;
+use boon_document::retained_view::HitTarget;
+use boon_local_host::{LocalTransientCompletion, LocalTransientHost, PackageAsset};
 type ViewResult<T> = Result<T, String>;
 
 const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
@@ -177,7 +177,7 @@ pub struct RuntimeView {
     last_runtime_phase: RuntimePhaseTimings,
     scheduled_sources: Vec<ScheduledSource>,
     effect_worker: HostEffectWorker,
-    transient_host: NativeTransientHost,
+    transient_host: LocalTransientHost,
     next_effect_poll: Option<Instant>,
     distributed_started: Option<Instant>,
     distributed_effect_owners:
@@ -431,7 +431,7 @@ impl RuntimeView {
         .map_err(|error| error.to_string())?;
         let persistence_status = startup.lifecycle.status().persistence;
         let content_root = transient_content_root(&state_root.join("transient"));
-        let mut transient_host = NativeTransientHost::new(
+        let mut transient_host = LocalTransientHost::new(
             content_root,
             assets.iter().map(|asset| PackageAsset {
                 url: &asset.url,
@@ -641,7 +641,7 @@ impl RuntimeView {
         let runtime_turn_sequence = host_started
             .as_ref()
             .map_or(turn.sequence, |turn| turn.sequence);
-        let mut transient_host = NativeTransientHost::new(
+        let mut transient_host = LocalTransientHost::new(
             content_root,
             assets.iter().map(|asset| PackageAsset {
                 url: &asset.url,
@@ -1027,12 +1027,12 @@ impl RuntimeView {
                 changed |= self.poll_distributed_runtime(now)?;
             } else {
                 let turn = match completion {
-                    TransientHostCompletion::Single { call_id, outcome } => self
+                    LocalTransientCompletion::Single { call_id, outcome } => self
                         .runtime
                         .single_mut()?
                         .complete_transient_effect(call_id, outcome)
                         .map_err(|error| error.to_string())?,
-                    TransientHostCompletion::File(event) => {
+                    LocalTransientCompletion::File(event) => {
                         if event.is_stream() {
                             self.runtime
                                 .single_mut()?
@@ -1059,11 +1059,11 @@ impl RuntimeView {
 
     fn complete_distributed_transient_effect(
         &mut self,
-        completion: TransientHostCompletion,
+        completion: LocalTransientCompletion,
     ) -> ViewResult<()> {
         let (call_id, terminal) = match &completion {
-            TransientHostCompletion::Single { call_id, .. } => (*call_id, true),
-            TransientHostCompletion::File(event) => (event.call_id, event.is_terminal()),
+            LocalTransientCompletion::Single { call_id, .. } => (*call_id, true),
+            LocalTransientCompletion::File(event) => (event.call_id, event.is_terminal()),
         };
         let owner = self
             .distributed_effect_owners
@@ -1074,10 +1074,10 @@ impl RuntimeView {
             "distributed effect completion reached a single-role runtime".to_owned()
         })?;
         match completion {
-            TransientHostCompletion::Single { outcome, .. } => runtime
+            LocalTransientCompletion::Single { outcome, .. } => runtime
                 .complete_transient_effect(owner, call_id, outcome)
                 .map_err(|error| error.to_string())?,
-            TransientHostCompletion::File(event) if event.is_stream() => runtime
+            LocalTransientCompletion::File(event) if event.is_stream() => runtime
                 .deliver_transient_effect_result(
                     owner,
                     call_id,
@@ -1085,7 +1085,7 @@ impl RuntimeView {
                     event.outcome,
                 )
                 .map_err(|error| error.to_string())?,
-            TransientHostCompletion::File(event) => runtime
+            LocalTransientCompletion::File(event) => runtime
                 .complete_transient_effect(owner, call_id, event.outcome)
                 .map_err(|error| error.to_string())?,
         }
@@ -3091,7 +3091,7 @@ fn scheduled_sources_from_plan(plan: &MachinePlan) -> ViewResult<Vec<ScheduledSo
 }
 
 fn route_distributed_transient_effects(
-    host: &mut NativeTransientHost,
+    host: &mut LocalTransientHost,
     owners: &mut BTreeMap<boon_runtime::TransientEffectCallId, InProcessTransientEffectOwner>,
     poll: &InProcessPoll,
 ) -> ViewResult<()> {

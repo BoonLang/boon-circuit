@@ -3495,9 +3495,10 @@ async fn apply_sparse_changes(
                                 "cannot remove from missing list {memory_id}"
                             ))
                         })?;
-                if !list.touched {
+                let sparse = !list.touched;
+                if sparse && (*next_key != 0 || *next_order_token != 0) {
                     return Err(StoreError::InvalidAuthority(format!(
-                        "cannot remove from sparse override list {memory_id}"
+                        "sparse override removal for list {memory_id} must not replace allocator state"
                     )));
                 }
                 let index = list
@@ -3513,8 +3514,10 @@ async fn apply_sparse_changes(
                     })?;
                 let row_ref = list.rows.remove(index);
                 advance_list_record_revision(*memory_id, &mut list, *list_revision)?;
-                list.next_key = *next_key;
-                list.next_order_token = *next_order_token;
+                if !sparse {
+                    list.next_key = *next_key;
+                    list.next_order_token = *next_order_token;
+                }
                 validate_list_record(&list).map_err(codec_backend)?;
                 let key = row_storage_key(application, *memory_id, row_ref.row);
                 let old = read_store_bytes(transaction, ROWS, &key)
@@ -3530,7 +3533,18 @@ async fn apply_sparse_changes(
                     limits,
                 )
                 .await?;
-                save_list_record_sparse(transaction, application, *memory_id, &list).await?;
+                if sparse && list.rows.is_empty() {
+                    apply_mutations(
+                        transaction,
+                        vec![StoreMutation::Delete {
+                            store: LISTS,
+                            key: memory_storage_key(application, *memory_id),
+                        }],
+                    )
+                    .await?;
+                } else {
+                    save_list_record_sparse(transaction, application, *memory_id, &list).await?;
+                }
             }
             DurableChange::DeleteList { memory_id } => {
                 delete_list_sparse(transaction, application, *memory_id, limits).await?;

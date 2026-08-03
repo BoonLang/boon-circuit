@@ -1227,6 +1227,12 @@ pub enum AuthorityDelta {
         row: RowId,
         next_key: u64,
     },
+    /// Retires the durable indexed-state overlay for a row whose list structure is derived.
+    /// The row itself is not durable authority, so this must not mutate the stored allocator or
+    /// turn the sparse overlay into a structurally authoritative list.
+    RetireRowOverlay {
+        row: RowId,
+    },
     CreateMap {
         address: CollectionAuthorityAddress,
     },
@@ -1278,7 +1284,8 @@ fn authority_delta_collection_address(
         | AuthorityDelta::SetRowField { .. }
         | AuthorityDelta::ReplaceList { .. }
         | AuthorityDelta::InsertRow { .. }
-        | AuthorityDelta::RemoveRow { .. } => None,
+        | AuthorityDelta::RemoveRow { .. }
+        | AuthorityDelta::RetireRowOverlay { .. } => None,
     }
 }
 
@@ -6813,7 +6820,9 @@ fn authority_delta_is_producer_local(
         }
         AuthorityDelta::ReplaceList { list_id, .. } => ownership.lists.contains(list_id),
         AuthorityDelta::InsertRow { row, .. } => ownership.lists.contains(&row.id.list),
-        AuthorityDelta::RemoveRow { row, .. } => ownership.lists.contains(&row.list),
+        AuthorityDelta::RemoveRow { row, .. } | AuthorityDelta::RetireRowOverlay { row } => {
+            ownership.lists.contains(&row.list)
+        }
         AuthorityDelta::CreateMap { address }
         | AuthorityDelta::MapUpsert { address, .. }
         | AuthorityDelta::MapRemove { address, .. }
@@ -9529,7 +9538,8 @@ struct ListRowsCursor {
 enum AuthorityListRestoreState {
     SparseRows {
         rows: std::vec::IntoIter<RowAuthority>,
-        seen: BTreeSet<RowId>,
+        stored_seen: BTreeSet<RowId>,
+        resolved_seen: BTreeSet<RowId>,
     },
     ReplacementRows {
         rows: std::vec::IntoIter<RowAuthority>,
@@ -11110,7 +11120,8 @@ impl MachineBuildTask {
             }
             AuthorityListRestoreState::SparseRows {
                 rows: rows.into_iter(),
-                seen: BTreeSet::new(),
+                stored_seen: BTreeSet::new(),
+                resolved_seen: BTreeSet::new(),
             }
         };
         Ok(AuthorityListRestoreBuild {
@@ -11126,7 +11137,11 @@ impl MachineBuildTask {
         build: &mut AuthorityListRestoreBuild,
     ) -> Result<bool, Error> {
         match &mut build.state {
-            AuthorityListRestoreState::SparseRows { rows, seen } => {
+            AuthorityListRestoreState::SparseRows {
+                rows,
+                stored_seen,
+                resolved_seen,
+            } => {
                 let Some(restored_row) = rows.next() else {
                     self.session_mut()
                         .lists
@@ -11137,7 +11152,7 @@ impl MachineBuildTask {
                     return Ok(false);
                 };
                 self.work.consume(1)?;
-                if restored_row.id.list != build.list_id || !seen.insert(restored_row.id) {
+                if restored_row.id.list != build.list_id || !stored_seen.insert(restored_row.id) {
                     return Err(Error::InvalidPlan(format!(
                         "restore image contains invalid or repeated row {}:{}:{}",
                         restored_row.id.list.0, restored_row.id.key, restored_row.id.generation
@@ -11174,37 +11189,27 @@ impl MachineBuildTask {
                                 .intern_ancestry_rows(origin.iter().copied())
                         })
                         .transpose()?;
-                    let row = session
-                        .lists
-                        .get(&build.list_id)
-                        .and_then(|list| list.rows.get(&restored_row.id))
-                        .ok_or_else(|| {
-                            Error::InvalidPlan(format!(
-                                "restore row override {}:{} does not exist in current defaults",
-                                restored_row.id.key, restored_row.id.generation
-                            ))
-                        })?;
-                    if row.owner_ancestry != restored_owner {
+                    let resolved_row = session.resolve_sparse_overlay_row(
+                        build.list_id,
+                        restored_row.id,
+                        restored_owner,
+                        restored_origin,
+                    )?;
+                    if !resolved_seen.insert(resolved_row) {
                         return Err(Error::InvalidPlan(format!(
-                            "restore row override {}:{} changed structural owner",
-                            restored_row.id.key, restored_row.id.generation
-                        )));
-                    }
-                    if row.materialization_origin != restored_origin {
-                        return Err(Error::InvalidPlan(format!(
-                            "restore row override {}:{} changed materialization origin",
-                            restored_row.id.key, restored_row.id.generation
+                            "restore list {} maps multiple sparse overrides to row {}:{}",
+                            build.list_id.0, resolved_row.key, resolved_row.generation
                         )));
                     }
                     let row = session
                         .lists
                         .get_mut(&build.list_id)
-                        .and_then(|list| list.rows.get_mut(&restored_row.id))
+                        .and_then(|list| list.rows.get_mut(&resolved_row))
                         .expect("validated sparse restore row remains present");
                     row.fields.extend(restored_fields);
                     for field in field_ids.iter().copied() {
-                        session.touched_row_fields.insert((restored_row.id, field));
-                        session.suspend_row_default(restored_row.id, field)?;
+                        session.touched_row_fields.insert((resolved_row, field));
+                        session.suspend_row_default(resolved_row, field)?;
                     }
                 }
             }
@@ -13776,6 +13781,100 @@ impl MachineInstance {
             .transpose()
     }
 
+    fn resolve_sparse_overlay_row(
+        &self,
+        list_id: ListId,
+        stored_id: RowId,
+        stored_owner: OwnerAncestryId,
+        stored_origin: Option<OwnerAncestryId>,
+    ) -> Result<RowId, Error> {
+        let list = self.lists.get(&list_id).ok_or_else(|| {
+            Error::InvalidPlan(format!(
+                "restore row override references missing list {}",
+                list_id.0
+            ))
+        })?;
+        if let Some(row) = list.rows.get(&stored_id) {
+            if row.owner_ancestry != stored_owner {
+                return Err(Error::InvalidPlan(format!(
+                    "restore row override {}:{} changed structural owner",
+                    stored_id.key, stored_id.generation
+                )));
+            }
+            if row.materialization_origin != stored_origin {
+                return Err(Error::InvalidPlan(format!(
+                    "restore row override {}:{} changed materialization origin",
+                    stored_id.key, stored_id.generation
+                )));
+            }
+            return Ok(stored_id);
+        }
+
+        let origin = stored_origin.ok_or_else(|| {
+            Error::InvalidPlan(format!(
+                "restore row override {}:{} for list {} has no stable materialization origin",
+                stored_id.key, stored_id.generation, list_id.0
+            ))
+        })?;
+        let candidates = list
+            .owner_partitions
+            .values()
+            .filter_map(|partition| partition.by_materialization_origin.get(&origin).copied())
+            .collect::<Vec<_>>();
+        let [resolved] = candidates.as_slice() else {
+            let detail = if candidates.is_empty() {
+                "does not exist in current defaults"
+            } else {
+                "is ambiguous in current defaults"
+            };
+            return Err(Error::InvalidPlan(format!(
+                "restore row override {}:{} for list {} {detail} by stable materialization origin",
+                stored_id.key, stored_id.generation, list_id.0
+            )));
+        };
+        let resolved = *resolved;
+        let current = list.rows.get(&resolved).ok_or_else(|| {
+            Error::InvalidPlan(format!(
+                "restore list {} materialization-origin index references missing row {}:{}",
+                list_id.0, resolved.key, resolved.generation
+            ))
+        })?;
+        if current.materialization_origin != Some(origin) {
+            return Err(Error::InvalidPlan(format!(
+                "restore list {} materialization-origin index is inconsistent",
+                list_id.0
+            )));
+        }
+
+        let stored_owner_rows = self.owner_instances.ancestry_rows(stored_owner)?;
+        let current_owner_rows = self.owner_instances.ancestry_rows(current.owner_ancestry)?;
+        if stored_owner_rows.len() != current_owner_rows.len()
+            || stored_owner_rows
+                .iter()
+                .zip(&current_owner_rows)
+                .any(|(stored, current)| stored.list != current.list)
+        {
+            return Err(Error::InvalidPlan(format!(
+                "restore row override {}:{} changed structural owner shape",
+                stored_id.key, stored_id.generation
+            )));
+        }
+        for (depth, (stored, current)) in stored_owner_rows
+            .iter()
+            .zip(&current_owner_rows)
+            .enumerate()
+        {
+            let is_leaf = depth + 1 == stored_owner_rows.len();
+            if !is_leaf && self.metadata.durable_lists.contains(&stored.list) && stored != current {
+                return Err(Error::InvalidPlan(format!(
+                    "restore row override {}:{} moved between durable structural owners",
+                    stored_id.key, stored_id.generation
+                )));
+            }
+        }
+        Ok(resolved)
+    }
+
     fn provenance_for_materialization_origin(
         &self,
         origin: Option<OwnerAncestryId>,
@@ -14518,6 +14617,10 @@ impl MachineInstance {
                 AuthorityDelta::RemoveRow { row, .. } => {
                     self.metadata.durable_lists.contains(&row.list)
                 }
+                AuthorityDelta::RetireRowOverlay { row } => {
+                    self.metadata.persistent_lists.contains(&row.list)
+                        && !self.metadata.durable_lists.contains(&row.list)
+                }
                 AuthorityDelta::CreateMap { address }
                 | AuthorityDelta::MapUpsert { address, .. }
                 | AuthorityDelta::MapRemove { address, .. }
@@ -14659,6 +14762,23 @@ impl MachineInstance {
                         row_generation: row.generation,
                         next_key: *next_key,
                         next_order_token: list.next_order_token,
+                    })
+                }
+                AuthorityDelta::RetireRowOverlay { row } => {
+                    let memory = self.persistence_list(row.list)?;
+                    let list = self.lists.get(&row.list).ok_or_else(|| {
+                        Error::InvalidPlan(format!(
+                            "durable row-overlay retirement references missing list {}",
+                            row.list.0
+                        ))
+                    })?;
+                    Ok(boon_persistence::DurableChange::RemoveRow {
+                        memory_id: memory.memory_id,
+                        list_revision: list.revision,
+                        row_key: row.key,
+                        row_generation: row.generation,
+                        next_key: 0,
+                        next_order_token: 0,
                     })
                 }
                 AuthorityDelta::CreateMap { address } => {
@@ -24653,7 +24773,8 @@ impl MachineInstance {
                         revision,
                         item: self.resolve_boundary_value(item)?,
                     },
-                    delta @ AuthorityDelta::RemoveRow { .. }
+                    delta @ (AuthorityDelta::RemoveRow { .. }
+                    | AuthorityDelta::RetireRowOverlay { .. })
                     | delta @ AuthorityDelta::CreateMap { .. }
                     | delta @ AuthorityDelta::DeleteMap { .. }
                     | delta @ AuthorityDelta::CreateSet { .. }
@@ -25077,10 +25198,12 @@ impl MachineInstance {
             ordered_rows.push(row);
         }
         if self.set_materialized_partition_order(list_id, insertion_index, &ordered_rows, work)? {
-            work.authority_deltas.push(AuthorityDelta::ReplaceList {
-                list_id,
-                authority: self.list_authority(list_id)?,
-            });
+            if self.metadata.durable_lists.contains(&list_id) {
+                work.authority_deltas.push(AuthorityDelta::ReplaceList {
+                    list_id,
+                    authority: self.list_authority(list_id)?,
+                });
+            }
             self.invalidate_list_structure(list_id, work);
         }
         Ok(EvalValue::List(
@@ -34096,6 +34219,7 @@ impl MachineInstance {
             self.prepare_ordered_index_rows_dirty_for_list(list_id, [row_id]);
         charge_source_order_maintenance(work, &order_maintenance)?;
         prepared_index_dirty.charge(work)?;
+        let durable_structure = self.metadata.durable_lists.contains(&list_id);
         let was_structurally_touched = self.touched_lists.contains(&list_id);
         let list = self
             .lists
@@ -34113,7 +34237,9 @@ impl MachineInstance {
         list.index_owner_partition_row(row_id, &self.owner_instances)?;
         record_source_order_maintenance(work, &order_maintenance);
         self.mark_list_semantic_change(list_id, work)?;
-        self.touched_lists.insert(list_id);
+        if durable_structure {
+            self.touched_lists.insert(list_id);
+        }
         let fanout = prepared_index_dirty.fanout;
         self.commit_ordered_index_dirty(prepared_index_dirty);
         record_ordered_index_fanout(work, fanout);
@@ -34121,66 +34247,68 @@ impl MachineInstance {
         self.initialize_indexed_states(row_id, work)?;
         work.suppress_row_deltas.remove(&row_id);
 
-        let authority_fields = self.authority_fields_for_list(list_id);
-        let row_authority = self
-            .lists
-            .get(&list_id)
-            .and_then(|list| list.rows.get(&row_id))
-            .ok_or_else(|| Error::Evaluation("appended row disappeared".to_owned()))?;
-        let fields = authority_fields
-            .iter()
-            .filter_map(|field| {
-                row_authority
-                    .fields
-                    .get(field)
-                    .cloned()
-                    .map(|value| (*field, value))
-            })
-            .collect();
-        let next_key = self
-            .lists
-            .get(&list_id)
-            .map(|list| list.next_key)
-            .unwrap_or(row_id.key.saturating_add(1));
-        if was_structurally_touched {
-            work.authority_deltas.push(AuthorityDelta::InsertRow {
-                row: RowAuthority {
-                    id: row_id,
-                    source_order_token: self
+        if durable_structure {
+            let authority_fields = self.authority_fields_for_list(list_id);
+            let row_authority = self
+                .lists
+                .get(&list_id)
+                .and_then(|list| list.rows.get(&row_id))
+                .ok_or_else(|| Error::Evaluation("appended row disappeared".to_owned()))?;
+            let fields = authority_fields
+                .iter()
+                .filter_map(|field| {
+                    row_authority
+                        .fields
+                        .get(field)
+                        .cloned()
+                        .map(|value| (*field, value))
+                })
+                .collect();
+            let next_key = self
+                .lists
+                .get(&list_id)
+                .map(|list| list.next_key)
+                .unwrap_or(row_id.key.saturating_add(1));
+            if was_structurally_touched {
+                work.authority_deltas.push(AuthorityDelta::InsertRow {
+                    row: RowAuthority {
+                        id: row_id,
+                        source_order_token: self
+                            .lists
+                            .get(&list_id)
+                            .and_then(|list| list.order_token(row_id))
+                            .ok_or_else(|| {
+                                Error::InvalidPlan(
+                                    "appended authority row has no source-order token".to_owned(),
+                                )
+                            })?,
+                        owner_ancestors: self
+                            .owner_instances
+                            .ancestry_rows(row_authority.owner_ancestry)?,
+                        materialization_origin: row_authority
+                            .materialization_origin
+                            .map(|origin| self.owner_instances.ancestry_rows(origin))
+                            .transpose()?,
+                        fields,
+                        touched_fields: BTreeSet::new(),
+                    },
+                    index: self
                         .lists
                         .get(&list_id)
-                        .and_then(|list| list.order_token(row_id))
-                        .ok_or_else(|| {
-                            Error::InvalidPlan(
-                                "appended authority row has no source-order token".to_owned(),
-                            )
+                        .map(|list| list.order.len().saturating_sub(1))
+                        .unwrap_or(0)
+                        .try_into()
+                        .map_err(|_| {
+                            Error::Evaluation("list insertion index exceeds u64".to_owned())
                         })?,
-                    owner_ancestors: self
-                        .owner_instances
-                        .ancestry_rows(row_authority.owner_ancestry)?,
-                    materialization_origin: row_authority
-                        .materialization_origin
-                        .map(|origin| self.owner_instances.ancestry_rows(origin))
-                        .transpose()?,
-                    fields,
-                    touched_fields: BTreeSet::new(),
-                },
-                index: self
-                    .lists
-                    .get(&list_id)
-                    .map(|list| list.order.len().saturating_sub(1))
-                    .unwrap_or(0)
-                    .try_into()
-                    .map_err(|_| {
-                        Error::Evaluation("list insertion index exceeds u64".to_owned())
-                    })?,
-                next_key,
-            });
-        } else {
-            work.authority_deltas.push(AuthorityDelta::ReplaceList {
-                list_id,
-                authority: self.list_authority(list_id)?,
-            });
+                    next_key,
+                });
+            } else {
+                work.authority_deltas.push(AuthorityDelta::ReplaceList {
+                    list_id,
+                    authority: self.list_authority(list_id)?,
+                });
+            }
         }
 
         self.bind_row_sources(row_id, slot.scope_id)?;
@@ -34304,7 +34432,14 @@ impl MachineInstance {
             .touched_row_fields
             .iter()
             .filter_map(|(candidate, field)| (*candidate == row).then_some(*field))
-            .collect();
+            .collect::<BTreeSet<_>>();
+        let durable_structure = self.metadata.durable_lists.contains(&row.list);
+        let retires_durable_overlay = !durable_structure
+            && touched_fields.iter().any(|field| {
+                self.metadata
+                    .durable_row_fields
+                    .contains(&(row.list, *field))
+            });
         let was_structurally_touched = self.touched_lists.contains(&row.list);
         let prepared_order = self
             .lists
@@ -34348,19 +34483,26 @@ impl MachineInstance {
         self.commit_ordered_index_dirty(prepared_index_dirty);
         record_ordered_index_fanout(work, fanout);
         record_source_order_maintenance(work, &order_maintenance);
-        self.touched_lists.insert(row.list);
+        if durable_structure {
+            self.touched_lists.insert(row.list);
+        }
         self.touched_row_fields
             .retain(|(candidate, _)| *candidate != row);
-        if was_structurally_touched {
-            work.authority_deltas.push(AuthorityDelta::RemoveRow {
-                row,
-                next_key: previous_next_key,
-            });
-        } else {
-            work.authority_deltas.push(AuthorityDelta::ReplaceList {
-                list_id: row.list,
-                authority: self.list_authority(row.list)?,
-            });
+        if durable_structure {
+            if was_structurally_touched {
+                work.authority_deltas.push(AuthorityDelta::RemoveRow {
+                    row,
+                    next_key: previous_next_key,
+                });
+            } else {
+                work.authority_deltas.push(AuthorityDelta::ReplaceList {
+                    list_id: row.list,
+                    authority: self.list_authority(row.list)?,
+                });
+            }
+        } else if retires_durable_overlay {
+            work.authority_deltas
+                .push(AuthorityDelta::RetireRowOverlay { row });
         }
         for field in removed.fields.keys() {
             self.invalidate_row_field(row, *field, work);
@@ -36019,7 +36161,8 @@ fn report_authority_deltas(deltas: Vec<AuthorityDelta>) -> Vec<AuthorityDelta> {
                 index,
                 next_key,
             },
-            delta @ AuthorityDelta::RemoveRow { .. }
+            delta
+            @ (AuthorityDelta::RemoveRow { .. } | AuthorityDelta::RetireRowOverlay { .. })
             | delta @ AuthorityDelta::CreateMap { .. }
             | delta @ AuthorityDelta::DeleteMap { .. }
             | delta @ AuthorityDelta::CreateSet { .. }
@@ -36212,6 +36355,7 @@ fn authority_delta_logical_bytes(delta: &AuthorityDelta) -> u64 {
             .saturating_add(8)
             .saturating_add(8),
         AuthorityDelta::RemoveRow { .. } => 24 + 8,
+        AuthorityDelta::RetireRowOverlay { .. } => 24,
         AuthorityDelta::CreateMap { .. }
         | AuthorityDelta::DeleteMap { .. }
         | AuthorityDelta::CreateSet { .. }

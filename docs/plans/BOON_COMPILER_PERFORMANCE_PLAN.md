@@ -804,8 +804,44 @@ micro-edits while a higher tranche is incomplete.
    shortcut. Native GPU handoff reports remain the independent final evidence
    for presentation and input routing. The headless cut passes only when the
    same NovyWave authored trace and artifacts pass through the extracted
-   harness and its measured rebuild closure is smaller.
-7. **Separate durable row overlays from derived view materialization.** The
+   harness and its measured rebuild closure is smaller. At checkpoint
+   `37f874e`, the native playground's normal workspace closure contains 37
+   crates. Focused oracle bodies take about 0.1--0.2 seconds after linking, but
+   dependency-bottom changes observed 38--109 seconds of build/relink work and
+   the first optimized feature-oracle build took 3m10s. Those are Rust
+   iteration measurements, not Boon latency, and make this boundary a measured
+   prerequisite rather than an organizational preference.
+7. **Build a semantic-surface invalidation firewall for the compiler
+   session.** `CompilerSession::apply_updates` currently sets the single
+   project-wide `checked` slot to `None` after any changed unit. The warm path
+   therefore preserves a last-good artifact but rechecks an undifferentiated
+   project; it has no component interface digest, exact affected-component
+   graph, backdating, or reusable current-result boundary.
+
+   Give each stable source unit, declaration, callable, semantic component,
+   proof obligation, and backend region separate implementation and public-
+   semantic fingerprints. The public fingerprint includes exported names and
+   normalized types, effects, OUT/resource/persistence contracts, and every
+   other fact that can change a dependent result; it excludes private body
+   representation. Resolve dependencies once into exact forward and reverse
+   indexes. An edit dirties its changed components and the reverse cone of any
+   changed public fingerprint. A recomputed component whose result fingerprint
+   is unchanged is backdated so its dependents remain green. Record
+   `changed_at`, `verified_at`, input/result fingerprints, and owning work
+   counters rather than treating cache presence as currentness.
+
+   Complete diagnostics still describe the entire current revision, and an
+   executable artifact publishes only after every reachable current-revision
+   component, exact dependency proof, and verifier result is current. A
+   canceled or superseded revision publishes nothing and cannot borrow an
+   unverified result. Compare every incremental result and diagnostic set with
+   a clean full compile of the same revision. Prove private-body edits, public-
+   surface edits, unrelated-unit edits, transitive invalidation, unchanged-
+   result backdating, deletion/rename, error introduction/recovery, and
+   cancellation races with exact recomputation counters. Only after this graph
+   is explicit may bounded compiler work run in parallel; concurrency is not a
+   substitute for removing whole-project invalidation.
+8. **Separate durable row overlays from derived view materialization.** The
    current NovyWave plan publishes 24 list memories with 252 persisted row
    fields. Only three list schemas contain generated structural-authority
    fields, while 21 computed/static list schemas are still promoted to durable
@@ -844,7 +880,7 @@ micro-edits while a higher tranche is incomplete.
    materializations. Any fix that adds another projection-specific exception
    preserves the competing authorities and is rejected.
 
-8. **Give all list topology one canonical dataflow owner and seal the plan
+9. **Give all list topology one canonical dataflow owner and seal the plan
    once.** Introduce one compiler-owned list-dataflow table covering static
    literals, structural mutation authorities, maps, filters/retains, ordering,
    chunk/group projections, bounded pages, and host/effect-produced row
@@ -914,7 +950,7 @@ the feature-gated oracle seam is implemented, but the recorded V3 migration,
 real-host NovyWave trace, migration/restart matrix, and negative evidence are
 not yet complete.
 
-#### Whole-System Boundary Audit At Checkpoint `c05af3a`
+#### Whole-System Boundary Audit At Checkpoint `37f874e`
 
 This audit deliberately zooms out from the last hot loop. Its figures are live
 source/dependency inventory, not acceptance evidence, and every predicted edge
@@ -926,11 +962,12 @@ cut must be remeasured after implementation.
 | live representations | `SemanticProgram` simultaneously retains checked input, execution/resource/reactive/lowering/view/storage/memory graphs, a dependency manifest, and canonical core data | seal one immutable semantic database with shared row fingerprints and consumer-specific indexed views; delete superseded rich inventories after parity | no second executable authority, exact digests and verifier result, lower retained bytes/allocations |
 | source concentration | `boon_typecheck` is about 40.9 kLOC, `boon_semantic` 69.9 kLOC, `boon_compiler` 27.3 kLOC, `boon_plan` 20.8 kLOC, `boon_plan_executor` 44.4 kLOC, and native playground 34.6 kLOC; the largest files include the 37.2-kLOC executor machine, 36.9-kLOC typechecker root, 16.5-kLOC machine backend, and 16.5-kLOC plan root | split only around durable ownership: stable contract IDs, semantic model/proof, compiler adapters, activation, and headless behavior harness; internal modules alone do not satisfy the gate | smaller normal dependency closure and measured rebuild wall time, no compatibility facade, focused tests remain owned by the new boundary |
 | Rust invalidation | normal transitive dependents are currently 31 for `boon_document_model`, 22 for `boon_checked`, 19 for `boon_semantic`, 16 for `boon_compiler`, 22 for `boon_plan`, 18 for `boon_plan_executor`, and 13 for `boon_runtime`; a semantic edit caused about a five-minute release-native rebuild and a document-model edit about 7m38s | move cross-layer IDs to a dependency-bottom contract crate and source/compiler adapters outward; split semantic proof only once its immutable table seam exists | `cargo metadata` closure before/after, one controlled touched-crate rebuild before/after, unchanged Boon producer artifacts and diagnostics |
+| compiler invalidation | `CompilerSession` owns one optional whole-project checked result and `apply_updates` clears it for every changed unit; last-good preview retention exists, but public-interface fingerprints, affected-component cones, result backdating, and reusable current proof/backend regions do not | stable per-component implementation/public-semantic fingerprints, exact forward/reverse dependencies, `changed_at`/`verified_at` currentness, backdating of unchanged results, and demand-collected verified publication | clean-full parity for every incremental revision; private/public/unrelated/transitive edit counters; deletion/error/cancellation negatives; warm latency and latest-generation gates |
 | persistence activation | compiler initializer-shape provenance and executor computation-presence durability are two competing authorities; sparse overrides can precede state/host-dependent row reconstruction | one compiler-emitted authority activation plan and a deterministic restore/reconstruct/override/index/currentness sequence | focused state-dependent and host-owned tests plus real-host NovyWave migration/restart and negative cases |
 | durable list ownership | the inspected NovyWave plan has 24 persistent list schemas and 252 persisted row fields; 21 schemas have no generated structural-authority fields, while `selected_signal_defaults` mixes two durable `HOLD` fields with 20 computed/host-backed authority fields; the serialized plan snapshot is about 64 MB | compute the minimal durable-owner closure; separate stable row-domain identity and sparse indexed overlays from computed view fields; omit pure derived views from persistence and emit ordered activation steps | before/after list/field/plan/artifact bytes and activation work, exact migration/restart parity, negative tests for missing origins and cyclic activation dependencies |
 | list topology ownership | derived materializations, `ListProjection`/`List/chunk`, storage initializer shape, mutations, indexes, and executor reconstruction scans independently describe overlapping row domains; the real-host oracle tried to persist nested mapped rows in pure `store.variable_rows` | one canonical list-dataflow table with row-identity, replayability, authority, overlay, and dependency columns; all specialized operators lower from it | every list has exactly one topology row, no executor rediscovery, pure-view absence from persistence, projection/map/filter/chunk activation tests, NovyWave restart parity |
 | plan sealing | typed-list fingerprint refresh clones the complete `MachinePlan` before a separate rewrite, compaction, and validation sequence; in the stale 64,029,143-byte JSON snapshot the compact document component is about 26.9 MB while persistence is about 243 KB | one mutable builder followed by one immutable seal: reachable postorder, shared fingerprints, compaction, and validation without a full-plan clone | peak live bytes, finalization time, expression visits, fingerprint parity, exact stable contract and behavior oracle |
-| product behavior harness | the behavior oracle currently lives inside the native playground and carries GPU/window/editor/server rebuild cost even when testing runtime migration | generic headless real-host harness with retained document hit testing and artifact activation; native GPU reports stay separate | identical authored trace/artifacts and a smaller measured rebuild closure; no example-name or render shortcut |
+| product behavior harness | the behavior oracle currently lives inside the native playground and carries GPU/window/editor/server rebuild cost even when testing runtime migration; its normal workspace closure is 37 crates, focused bodies run in about 0.1--0.2 seconds after linking, observed dependency-bottom relinks take 38--109 seconds, and the first optimized feature build took 3m10s | generic headless real-host harness with retained document hit testing and artifact activation; native GPU reports stay separate | identical authored trace/artifacts, before/after normal workspace closure and controlled rebuild wall time, and no example-name or render shortcut |
 
 The target representation lifetime is:
 
@@ -1223,44 +1260,58 @@ build-input freshness, and current release reports remain required before the
 corresponding exits; those gaps do not justify another documentation-only or
 counter-only loop before changing the measured parser/typechecker owners.
 
-### Current Resumption Point: V3 Oracle And Architecture Cut
+### Current Resumption Point: Headless Oracle And Architecture Cut
 
-Resume from local checkpoint `c05af3a` and the current uncommitted oracle
-slice. Do not return to the historical 23.8 ms contextual-scheme tranche while
-the verified semantic/proof multiplier and rebuild fan-out dominate.
+Resume from the clean local checkpoint `37f874e`. Do not return to the
+historical 23.8 ms contextual-scheme tranche while verified semantic/proof
+multiplication, whole-project invalidation, and rebuild fan-out dominate.
 
-1. The authored real-host NovyWave action trace already reaches the same state
-   through retained and test-flat representations. Normalize only the
-   store-local epoch, then finish the V3 migration/restart/negative matrix.
-2. Fix the restart blocker as an engine architecture defect: emit one exact
-   list-dataflow and authority activation plan and make executor activation
-   follow the required
-   restore, effect-free reconstruction, sparse-override, index, currentness,
-   and demand order. Row-domain dependencies, computed row values, and durable
-   indexed overlays are separate: prune pure derived lists from persistence and
-   do not persist host-backed display fields merely because a view owns a
-   row-local `HOLD`. Prove restored-state-dependent defaults, host-result-owned
-   lists, ordered dependent overlays, and missing/cyclic-origin rejection with
-   focused tests before the full NovyWave oracle.
-   The `store.variable_rows` `List/chunk` mapped-row serialization failure is
-   the first negative proof: eliminate its persistence entry through the
-   generic closure and do not add durable row-handle serialization or a
-   projection-only executor exception.
-3. Measure and pull the compiler/runtime dependency inversion, dependency-
-   bottom contract-ID crate, and headless product-behavior harness early when
-   they reduce the rebuild set for the remaining performance work. Record live
-   before/after closures and build wall time; do not accept cosmetic splits.
-4. Replace full-plan clone/rewrite finalization with a seal-once builder after
-   the list-dataflow contract is stable; report plan-component bytes and peak
-   live memory so persistence and document/instance costs stay distinct.
+1. Preserve the landed canonical list-dataflow and activation contract. Every
+   runtime list now has a compiler-emitted stable semantic identity, semantic
+   type fingerprint, activation mode, reconstruction dependencies, and
+   topological order. Persistence computes the minimal durable-owner closure,
+   omits pure `store.variable_rows`, and stores only durable indexed overlays
+   for derived views. Executor activation restores complete authority first,
+   reconstructs effect-free row domains, initializes defaults, applies sparse
+   overlays after their rows exist, and then rebuilds indexes/currentness/
+   demand. The focused compiler/executor activation tests pass, and the current
+   optimized retained-vs-flat NovyWave oracle passes in 16.90 seconds. This is
+   not yet accepted V3 evidence: the bounded provenance report, complete
+   migration/restart/negative matrix, and current budget cross-binding remain
+   open.
+2. Extract the product-faithful behavior oracle from the native GPU shell before
+   iterating further on V3. Move reusable retained layout/hit/action routing and
+   concrete local host effects to single non-native owners, and add a headless
+   harness for persistent runtime activation, authored actions, replacement,
+   migration, and restart. The harness must consume scenario contracts and
+   typed source routes, never an example name or direct event shortcut. Prove
+   the same NovyWave trace/artifacts and publish the workspace dependency
+   closure plus one controlled rebuild before/after. The starting normal native
+   closure is 37 workspace crates; the observed link-dominated edit loop is
+   38--109 seconds even though focused bodies run in about 0.1--0.2 seconds.
+3. Finish the V3 provenance, real-host migration/restart, and negative matrix on
+   that narrow harness, normalizing only the store-local epoch. Keep native WGPU
+   handoff reports as separate presentation/input evidence.
+4. Replace full-plan clone/rewrite finalization with a seal-once builder; report
+   plan-component bytes, expression visits, finalization time, and peak live
+   memory so persistence and document/instance costs stay distinct.
 5. Continue with `PlanInstanceCollector`, the compact proof summary, and one
    sealed semantic database with shared row fingerprints. Delete each rich or
    specialized production representation once its test materializer proves
    parity.
-6. Reprofile after each architecture tranche. Return to Phase 1 interning,
-   scaling, malformed-source/parity, and its fresh adversarial review only after
-   the verified semantic/proof path no longer dominates or the evidence says a
-   different owner is largest.
+6. Replace `CompilerSession`'s whole-project checked-slot invalidation with the
+   semantic-surface firewall: stable implementation/public fingerprints, exact
+   component dependency cones, backdating, demand-collected current verified
+   regions, and fail-closed revision publication. Prove every incremental
+   result against a clean full compile before using it for warm latency.
+7. Measure and pull compiler/runtime dependency inversion and the dependency-
+   bottom contract-ID crate when each cut reduces the affected rebuild closure
+   or enables the owning semantic change. Record live before/after closures and
+   build wall time; do not accept cosmetic splits or compatibility re-exports.
+8. Reprofile after each architecture tranche. Return to remaining Phase 1
+   interning, scaling, malformed-source/parity, and its fresh adversarial review
+   only after the verified semantic/proof path no longer dominates or current
+   evidence identifies a larger owner.
 
 Keep cold and warm Boon latency separate from Rust rebuild latency. A crate cut
 must improve a measured dependency/rebuild boundary; only direct producer
@@ -1318,12 +1369,18 @@ under-approximated historical artifact.
 
 ### Phase 4: Persistent Session And Editor Cutover
 
-1. Implement the compiler-service interface, dependency-cone invalidation,
+1. Replace the current project-wide optional checked slot with the compiler-
+   service semantic-surface database: stable component identities, separate
+   implementation/public-result fingerprints, exact forward/reverse dependency
+   cones, `changed_at`/`verified_at` currentness, unchanged-result backdating,
    revisioned requests, and bounded cancellation.
 2. Remove the fixed editor debounce as a correctness/scheduling boundary and
    eliminate the second preview compile.
 3. Route diagnostics, checking, preview, run, and handoff through the one
-   service while retaining the last verified preview.
+   service while retaining the last verified preview. A current revision may
+   reuse only green verified components and publishes only after all reachable
+   diagnostics/proof/backend regions are current; clean full-compilation parity
+   remains the oracle.
 
 Exit: every warm latency, cancellation, latest-generation, and no-stale-
 publication gate passes under edit and example-switch storms.

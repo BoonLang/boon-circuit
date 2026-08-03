@@ -1,5 +1,3 @@
-#[cfg(all(test, feature = "test-flat-oracle"))]
-mod artifact_oracle;
 mod budget;
 mod catalog;
 mod compile;
@@ -18,10 +16,8 @@ mod proof;
 mod protocol;
 mod readiness;
 mod runtime_view;
-mod transient_host;
 mod ui;
 mod verify;
-mod view;
 mod workspace;
 #[cfg(target_os = "linux")]
 mod workspace_control;

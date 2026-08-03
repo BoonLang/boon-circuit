@@ -1422,30 +1422,39 @@ fn apply_changes(image: &mut RestoreImage, changes: &[DurableChange]) -> Result<
                 next_key,
                 next_order_token,
             } => {
-                let list = image.lists.get_mut(memory_id).ok_or_else(|| {
-                    StoreError::InvalidAuthority(format!(
-                        "cannot remove from missing list {memory_id}"
-                    ))
-                })?;
-                if !list.touched {
-                    return Err(StoreError::InvalidAuthority(format!(
-                        "cannot remove from sparse override list {memory_id}"
-                    )));
-                }
-                let index = list
-                    .rows
-                    .iter()
-                    .position(|row| row.key == *row_key && row.generation == *row_generation)
-                    .ok_or_else(|| {
+                let remove_empty_sparse_list = {
+                    let list = image.lists.get_mut(memory_id).ok_or_else(|| {
                         StoreError::InvalidAuthority(format!(
-                            "list {memory_id} has no row {row_key}:{row_generation}"
+                            "cannot remove from missing list {memory_id}"
                         ))
                     })?;
-                list.rows.remove(index);
-                advance_list_revision(*memory_id, list, *list_revision)?;
-                list.next_key = *next_key;
-                list.next_order_token = *next_order_token;
-                validate_list(*memory_id, list)?;
+                    let sparse = !list.touched;
+                    if sparse && (*next_key != 0 || *next_order_token != 0) {
+                        return Err(StoreError::InvalidAuthority(format!(
+                            "sparse override removal for list {memory_id} must not replace allocator state"
+                        )));
+                    }
+                    let index = list
+                        .rows
+                        .iter()
+                        .position(|row| row.key == *row_key && row.generation == *row_generation)
+                        .ok_or_else(|| {
+                            StoreError::InvalidAuthority(format!(
+                                "list {memory_id} has no row {row_key}:{row_generation}"
+                            ))
+                        })?;
+                    list.rows.remove(index);
+                    advance_list_revision(*memory_id, list, *list_revision)?;
+                    if !sparse {
+                        list.next_key = *next_key;
+                        list.next_order_token = *next_order_token;
+                    }
+                    validate_list(*memory_id, list)?;
+                    sparse && list.rows.is_empty()
+                };
+                if remove_empty_sparse_list {
+                    image.lists.remove(memory_id);
+                }
             }
             DurableChange::DeleteList { memory_id } => {
                 image.lists.remove(memory_id);
@@ -4429,6 +4438,64 @@ mod tests {
         assert_eq!(
             stored.rows[0].fields[&field],
             StoredValueShell::Text("=A1+1".to_owned())
+        );
+    }
+
+    #[test]
+    fn sparse_row_removal_retires_the_overlay_without_materializing_list_authority() {
+        let mut driver = seeded_driver();
+        let list = list_memory("derived_cells");
+        let field = MemoryLeafId::from_memory_path(list, "formula_text").unwrap();
+        let owner = DurableOwner {
+            ancestors: vec![DurableRowId {
+                list_memory_id: list,
+                row_key: 7,
+                row_generation: 1,
+            }],
+        };
+        let batch = CheckpointBatch {
+            application: application(),
+            schema_hash: [1; 32],
+            base_epoch: 0,
+            next_epoch: 1,
+            first_turn_sequence: 1,
+            last_turn_sequence: 1,
+            changes: vec![
+                DurableChange::SetRowField {
+                    memory_id: list,
+                    list_revision: 3,
+                    row_key: 7,
+                    row_generation: 1,
+                    owner,
+                    materialization_origin: None,
+                    field_id: field,
+                    value: StoredValueShell::Text("=A1".to_owned()),
+                },
+                DurableChange::RemoveRow {
+                    memory_id: list,
+                    list_revision: 4,
+                    row_key: 7,
+                    row_generation: 1,
+                    next_key: 0,
+                    next_order_token: 0,
+                },
+            ],
+            outbox_changes: Vec::new(),
+            content_artifact_changes: Vec::new(),
+            checksum: [0; 32],
+        }
+        .seal();
+
+        assert!(matches!(
+            driver.execute(PersistenceCommand::Commit(batch)),
+            PersistenceResult::Committed(Ok(CommitAck { epoch: 1, .. }))
+        ));
+        assert!(
+            !driver
+                .image(&application())
+                .unwrap()
+                .lists
+                .contains_key(&list)
         );
     }
 

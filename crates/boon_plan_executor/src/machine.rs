@@ -4389,7 +4389,10 @@ struct Metadata {
     state_derived_lists_by_state: BTreeMap<StateId, BTreeSet<ListId>>,
     durable_root_states: BTreeSet<StateId>,
     durable_row_fields: BTreeSet<(ListId, FieldId)>,
+    persistent_lists: BTreeSet<ListId>,
     durable_lists: BTreeSet<ListId>,
+    list_dataflow: BTreeMap<ListId, boon_plan::PlanListDataflow>,
+    list_activation_order: Vec<ListId>,
     durable_root_state_by_memory: BTreeMap<boon_plan::MemoryId, StateId>,
     durable_list_by_memory: BTreeMap<boon_plan::MemoryId, DurableListRuntimeMetadata>,
     durable_collection_by_memory: BTreeMap<boon_plan::MemoryId, DurableCollectionRuntimeMetadata>,
@@ -5182,7 +5185,24 @@ impl Metadata {
         }
         let durable_root_states = durable_root_state_by_memory.values().copied().collect();
         let mut durable_row_fields = BTreeSet::new();
+        let mut persistent_lists = BTreeSet::new();
         let mut durable_lists = BTreeSet::new();
+        let list_activation_order = plan
+            .list_dataflow
+            .iter()
+            .map(|entry| entry.list_id)
+            .collect::<Vec<_>>();
+        let list_dataflow = plan
+            .list_dataflow
+            .iter()
+            .cloned()
+            .map(|entry| (entry.list_id, entry))
+            .collect::<BTreeMap<_, _>>();
+        if list_dataflow.len() != plan.list_dataflow.len() {
+            return Err(Error::InvalidPlan(
+                "list dataflow contains duplicate list identities".to_owned(),
+            ));
+        }
         let mut durable_list_by_memory = BTreeMap::new();
         for memory in &plan.persistence.lists {
             let slot = plan
@@ -5196,8 +5216,27 @@ impl Metadata {
                         memory.memory_id
                     ))
                 })?;
-            if !list_computations.contains_key(&slot.list_id) {
+            // Persistence provenance is the compiler-emitted authority
+            // contract. Whether the executor happens to have a computation
+            // for the same list is an implementation detail: a host/result-
+            // materialized list can have a computation and still require its
+            // complete structure to survive activation.
+            let dataflow = list_dataflow.get(&slot.list_id).ok_or_else(|| {
+                Error::InvalidPlan(format!(
+                    "persistent list {} has no canonical list dataflow entry",
+                    slot.list_id.0
+                ))
+            })?;
+            persistent_lists.insert(slot.list_id);
+            if dataflow.activation_mode == boon_plan::ListActivationMode::MaterializedAuthority {
                 durable_lists.insert(slot.list_id);
+            } else if dataflow.activation_mode == boon_plan::ListActivationMode::DerivedDefault
+                && dataflow.reconstruction_output.is_none()
+            {
+                return Err(Error::InvalidPlan(format!(
+                    "persistent list {} declares a derived activation default without a materializer",
+                    slot.list_id.0
+                )));
             }
             let mut fields_by_leaf = BTreeMap::new();
             for field in &memory.row_fields {
@@ -5380,7 +5419,10 @@ impl Metadata {
             state_derived_lists_by_state,
             durable_root_states,
             durable_row_fields,
+            persistent_lists,
             durable_lists,
+            list_dataflow,
+            list_activation_order,
             durable_root_state_by_memory,
             durable_list_by_memory,
             durable_collection_by_memory,
@@ -5878,8 +5920,12 @@ fn stored_row(
         .filter(|(field, _)| !touched_only || row.touched_fields.contains(field))
         .filter_map(|(field, value)| {
             stable_fields.get(field).copied().map(|stable| {
+                let path = format!(
+                    "list `{}` row {}:{} runtime field {}",
+                    memory.semantic_path, row.id.key, row.id.generation, field.0
+                );
                 session
-                    .stored_value_shell(value)
+                    .stored_value_shell(value, &path)
                     .map(|value| (stable, value))
             })
         })
@@ -6427,6 +6473,19 @@ impl Work {
             enforce_work_limit: true,
             ..Self::default()
         }
+    }
+
+    fn clear_non_emitting_authority_tracking(&mut self) {
+        debug_assert!(!self.emit);
+        self.deltas.clear();
+        self.authority_deltas.clear();
+        self.authority_undo.clear();
+        self.undo_root_states.clear();
+        self.undo_row_fields.clear();
+        self.undo_collection_authorities.clear();
+        self.undo_collection_producers.clear();
+        self.pending_collection_operations.clear();
+        self.list_revision_undo.clear();
     }
 
     fn begin_turn(&mut self, last_sequence: Option<u64>, turn_sequence: u64) {
@@ -9400,6 +9459,7 @@ impl MachineTemplate {
 pub struct MachineInstanceBuilder {
     session: MachineInstance,
     authority: Option<AuthoritySnapshot>,
+    authority_is_complete_runtime_snapshot: bool,
     durable_restore: Option<boon_persistence::RestoreImage>,
 }
 
@@ -9498,20 +9558,35 @@ struct AuthorityListRestoreBuild {
 enum AuthorityRestorePhase {
     Begin,
     States,
-    Lists,
+    ReplacementLists,
+    ActivateLists {
+        next: usize,
+        row: usize,
+        stage: ListActivationStage,
+    },
     ValidateRows(ListRowsCursor),
     Maps,
     Sets,
     Complete,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ListActivationStage {
+    Reconstruct,
+    InitializeDefaults,
+    ApplyOverlay,
+}
+
 struct AuthorityRestoreBuild {
     through_turn_sequence: u64,
     states: std::collections::btree_map::IntoIter<StateId, ScalarAuthority>,
-    lists: std::collections::btree_map::IntoIter<ListId, ListAuthority>,
+    replacement_lists: std::collections::btree_map::IntoIter<ListId, ListAuthority>,
+    sparse_lists: BTreeMap<ListId, ListAuthority>,
+    activation_list_ids: Vec<ListId>,
     maps: std::collections::btree_map::IntoIter<CollectionAuthorityAddress, MapAuthority>,
     sets: std::collections::btree_map::IntoIter<CollectionAuthorityAddress, SetAuthority>,
     current_list: Option<AuthorityListRestoreBuild>,
+    allow_non_durable_replacements: bool,
     phase: AuthorityRestorePhase,
 }
 
@@ -9630,6 +9705,7 @@ enum MachineBuildState {
 pub struct MachineBuildTask {
     session: Option<MachineInstance>,
     authority: Option<AuthoritySnapshot>,
+    authority_is_complete_runtime_snapshot: bool,
     durable_restore: Option<boon_persistence::RestoreImage>,
     work: Work,
     state: MachineBuildState,
@@ -9730,7 +9806,11 @@ fn record_ordered_index_integrity(
 }
 
 impl AuthorityRestoreBuild {
-    fn new(authority: AuthoritySnapshot) -> Self {
+    fn new(
+        authority: AuthoritySnapshot,
+        activation_list_ids: Vec<ListId>,
+        allow_non_durable_replacements: bool,
+    ) -> Self {
         let AuthoritySnapshot {
             through_turn_sequence,
             states,
@@ -9738,13 +9818,25 @@ impl AuthorityRestoreBuild {
             maps,
             sets,
         } = authority;
+        let mut replacement_lists = BTreeMap::new();
+        let mut sparse_lists = BTreeMap::new();
+        for (list, authority) in lists {
+            if authority.touched {
+                replacement_lists.insert(list, authority);
+            } else {
+                sparse_lists.insert(list, authority);
+            }
+        }
         Self {
             through_turn_sequence,
             states: states.into_iter(),
-            lists: lists.into_iter(),
+            replacement_lists: replacement_lists.into_iter(),
+            sparse_lists,
+            activation_list_ids,
             maps: maps.into_iter(),
             sets: sets.into_iter(),
             current_list: None,
+            allow_non_durable_replacements,
             phase: AuthorityRestorePhase::Begin,
         }
     }
@@ -9864,12 +9956,14 @@ impl MachineInstanceBuilder {
                 startup_metrics: TurnMetrics::default(),
             },
             authority: None,
+            authority_is_complete_runtime_snapshot: false,
             durable_restore: None,
         })
     }
 
     pub fn restore(mut self, authority: AuthoritySnapshot) -> Self {
         self.authority = Some(authority);
+        self.authority_is_complete_runtime_snapshot = true;
         self.durable_restore = None;
         self
     }
@@ -9877,6 +9971,7 @@ impl MachineInstanceBuilder {
     pub fn restore_durable(mut self, image: boon_persistence::RestoreImage) -> Result<Self, Error> {
         self.session.validate_durable_restore_header(&image)?;
         self.authority = None;
+        self.authority_is_complete_runtime_snapshot = false;
         self.durable_restore = Some(image);
         Ok(self)
     }
@@ -9940,6 +10035,7 @@ impl MachineInstanceBuilder {
         self.session
             .validate_durable_restore_header(&image.authority)?;
         self.authority = None;
+        self.authority_is_complete_runtime_snapshot = false;
         self.durable_restore = Some(image.authority);
         self.session.last_sequence = image.last_source_sequence;
         self.session.options.session_context = image.session_context;
@@ -9953,6 +10049,7 @@ impl MachineInstanceBuilder {
         MachineBuildTask {
             session: Some(self.session),
             authority: self.authority,
+            authority_is_complete_runtime_snapshot: self.authority_is_complete_runtime_snapshot,
             durable_restore: self.durable_restore,
             work,
             state: MachineBuildState::Bootstrap,
@@ -10039,8 +10136,18 @@ impl MachineBuildTask {
                     while remaining != 0 {
                         let Some((slot, row)) = self.next_storage_row(&mut cursor)? else {
                             self.state = if let Some(authority) = self.authority.take() {
+                                let session = self.session.as_ref().expect("active machine build");
+                                let activation_list_ids = session
+                                    .metadata
+                                    .list_activation_order
+                                    .iter()
+                                    .copied()
+                                    .filter(|list| session.metadata.persistent_lists.contains(list))
+                                    .collect();
                                 MachineBuildState::RestoreAuthority(AuthorityRestoreBuild::new(
                                     authority,
+                                    activation_list_ids,
+                                    self.authority_is_complete_runtime_snapshot,
                                 ))
                             } else {
                                 MachineBuildState::IndexedDefaults(IndexedDefaultsCursor::default())
@@ -10765,7 +10872,7 @@ impl MachineBuildTask {
             }
             AuthorityRestorePhase::States => {
                 let Some((state, scalar)) = build.states.next() else {
-                    build.phase = AuthorityRestorePhase::Lists;
+                    build.phase = AuthorityRestorePhase::ReplacementLists;
                     return Ok(false);
                 };
                 {
@@ -10790,15 +10897,135 @@ impl MachineBuildTask {
                     }
                 }
             }
-            AuthorityRestorePhase::Lists => {
+            AuthorityRestorePhase::ReplacementLists => {
                 if let Some(current) = build.current_list.as_mut() {
                     if self.poll_authority_list_restore_step(current)? {
                         build.current_list = None;
                     }
-                } else if let Some((list, authority)) = build.lists.next() {
+                } else if let Some((list, authority)) = build.replacement_lists.next() {
+                    if !build.allow_non_durable_replacements
+                        && !self
+                            .session
+                            .as_ref()
+                            .expect("active machine build")
+                            .metadata
+                            .durable_lists
+                            .contains(&list)
+                    {
+                        return Err(Error::InvalidPlan(format!(
+                            "non-authoritative list {} cannot restore a complete replacement",
+                            list.0
+                        )));
+                    }
                     build.current_list = Some(self.begin_authority_list_restore(list, authority)?);
                 } else {
+                    build.phase = AuthorityRestorePhase::ActivateLists {
+                        next: 0,
+                        row: 0,
+                        stage: ListActivationStage::Reconstruct,
+                    };
+                }
+            }
+            AuthorityRestorePhase::ActivateLists { next, row, stage } => {
+                let Some(list) = build.activation_list_ids.get(*next).copied() else {
+                    if !build.sparse_lists.is_empty() {
+                        return Err(Error::InvalidPlan(format!(
+                            "restore image contains sparse overlays for lists outside the compiler activation order: {:?}",
+                            build
+                                .sparse_lists
+                                .keys()
+                                .map(|list| list.0)
+                                .collect::<Vec<_>>()
+                        )));
+                    }
                     build.phase = AuthorityRestorePhase::ValidateRows(ListRowsCursor::default());
+                    return Ok(false);
+                };
+                let dataflow = self
+                    .session
+                    .as_ref()
+                    .expect("active machine build")
+                    .metadata
+                    .list_dataflow
+                    .get(&list)
+                    .cloned()
+                    .ok_or_else(|| {
+                        Error::InvalidPlan(format!(
+                            "persistent list {} is absent from canonical list dataflow",
+                            list.0
+                        ))
+                    })?;
+                match stage {
+                    ListActivationStage::Reconstruct => {
+                        match dataflow.activation_mode {
+                            boon_plan::ListActivationMode::StaticDefault
+                            | boon_plan::ListActivationMode::MaterializedAuthority => {}
+                            boon_plan::ListActivationMode::DerivedDefault => {
+                                let output = dataflow.reconstruction_output.ok_or_else(|| {
+                                    Error::InvalidPlan(format!(
+                                        "list {} has no activation reconstruction output",
+                                        list.0
+                                    ))
+                                })?;
+                                let mut work = std::mem::take(&mut self.work);
+                                let result = self
+                                    .session_mut()
+                                    .ensure_list_current(output, None, &mut work);
+                                self.work = work;
+                                result?;
+                                self.session_mut().finish_reconstructed_list_default(list);
+                                self.work.clear_non_emitting_authority_tracking();
+                            }
+                        }
+                        *row = 0;
+                        *stage = ListActivationStage::InitializeDefaults;
+                    }
+                    ListActivationStage::InitializeDefaults => {
+                        let default_row = self
+                            .session
+                            .as_ref()
+                            .expect("active machine build")
+                            .lists
+                            .get(&list)
+                            .and_then(|authority| authority.order.get(*row))
+                            .copied();
+                        if let Some(default_row) = default_row {
+                            *row += 1;
+                            let mut work = std::mem::take(&mut self.work);
+                            let result = self
+                                .session_mut()
+                                .initialize_missing_indexed_states(default_row, &mut work);
+                            self.work = work;
+                            result?;
+                        } else {
+                            *stage = ListActivationStage::ApplyOverlay;
+                        }
+                    }
+                    ListActivationStage::ApplyOverlay => {
+                        if let Some(current) = build.current_list.as_mut() {
+                            if self.poll_authority_list_restore_step(current)? {
+                                build.current_list = None;
+                                *next += 1;
+                                *row = 0;
+                                *stage = ListActivationStage::Reconstruct;
+                            }
+                        } else if let Some(authority) = build.sparse_lists.remove(&list) {
+                            if dataflow.activation_mode
+                                == boon_plan::ListActivationMode::MaterializedAuthority
+                            {
+                                return Err(Error::InvalidPlan(format!(
+                                    "materialized-authority list {} cannot restore sparse row overrides",
+                                    list.0
+                                )));
+                            }
+                            build.current_list =
+                                Some(self.begin_authority_list_restore(list, authority)?);
+                        } else {
+                            *next += 1;
+                            *row = 0;
+                            *stage = ListActivationStage::Reconstruct;
+                        }
+                    }
                 }
             }
             AuthorityRestorePhase::ValidateRows(cursor) => {
@@ -14178,7 +14405,13 @@ impl MachineInstance {
             let entries = map
                 .entries
                 .iter()
-                .map(|(key, value)| Ok((stored_value(key)?, self.stored_value_shell(value)?)))
+                .map(|(key, value)| {
+                    let path = format!(
+                        "MAP memory {} authority {} entry",
+                        collection_id.memory_id, address.authority.0
+                    );
+                    Ok((stored_value(key)?, self.stored_value_shell(value, &path)?))
+                })
                 .collect::<Result<BTreeMap<_, _>, Error>>()?;
             let key_generations = map
                 .key_generations
@@ -14368,7 +14601,13 @@ impl MachineInstance {
                             .map(|origin| durable_owner_for_rows(&self.plan, origin))
                             .transpose()?,
                         field_id,
-                        value: self.stored_value_shell(value)?,
+                        value: self.stored_value_shell(
+                            value,
+                            &format!(
+                                "list `{}` row {}:{} runtime field {}",
+                                memory.semantic_path, row.key, row.generation, field.0
+                            ),
+                        )?,
                     })
                 }
                 AuthorityDelta::ReplaceList { list_id, authority } => {
@@ -14466,7 +14705,10 @@ impl MachineInstance {
                         next_key_generation: self
                             .collection_map(address)?
                             .next_key_generation,
-                        value: self.stored_value_shell(value)?,
+                        value: self.stored_value_shell(
+                            value,
+                            &format!("MAP authority {} upsert value", address.authority.0),
+                        )?,
                     })
                 }
                 AuthorityDelta::MapRemove {
@@ -15401,6 +15643,11 @@ impl MachineInstance {
             self.initialize_indexed_state(row, &slot, work)?;
         }
         Ok(())
+    }
+
+    fn finish_reconstructed_list_default(&mut self, list: ListId) {
+        self.touched_lists.remove(&list);
+        self.touched_row_fields.retain(|(row, _)| row.list != list);
     }
 
     fn rebuild_runtime_state_after_rollback(&mut self, work: &mut Work) -> Result<(), Error> {
@@ -16621,6 +16868,7 @@ impl MachineInstance {
     fn stored_value_shell(
         &self,
         value: &Value,
+        path: &str,
     ) -> Result<boon_persistence::StoredValueShell, Error> {
         Ok(match value {
             Value::Number(value) => boon_persistence::StoredValueShell::Number(value.clone()),
@@ -16630,20 +16878,33 @@ impl MachineInstance {
             Value::List(values) => boon_persistence::StoredValueShell::List(
                 values
                     .iter()
-                    .map(|value| self.stored_value_shell(value))
+                    .enumerate()
+                    .map(|(index, value)| {
+                        self.stored_value_shell(value, &format!("{path}[{index}]"))
+                    })
                     .collect::<Result<Vec<_>, _>>()?,
             ),
             Value::Record(fields) => boon_persistence::StoredValueShell::Object(
                 fields
                     .iter()
-                    .map(|(name, value)| Ok((name.clone(), self.stored_value_shell(value)?)))
+                    .map(|(name, value)| {
+                        Ok((
+                            name.clone(),
+                            self.stored_value_shell(value, &format!("{path}.{name}"))?,
+                        ))
+                    })
                     .collect::<Result<BTreeMap<_, _>, Error>>()?,
             ),
             Value::Tag { tag, fields } => boon_persistence::StoredValueShell::Tag {
                 tag: tag.clone(),
                 fields: fields
                     .iter()
-                    .map(|(name, value)| Ok((name.clone(), self.stored_value_shell(value)?)))
+                    .map(|(name, value)| {
+                        Ok((
+                            name.clone(),
+                            self.stored_value_shell(value, &format!("{path}.{name}"))?,
+                        ))
+                    })
                     .collect::<Result<BTreeMap<_, _>, Error>>()?,
             },
             Value::CollectionAuthority { address } => {
@@ -16652,20 +16913,19 @@ impl MachineInstance {
                 )
             }
             Value::Map(_) | Value::Set(_) => {
-                return Err(Error::Evaluation(
-                    "durable MAP values must store nested collections as authority edges, not snapshots"
-                        .to_owned(),
-                ));
+                return Err(Error::Evaluation(format!(
+                    "{path}: durable MAP values must store nested collections as authority edges, not snapshots"
+                )));
             }
             Value::MappedRow { .. } | Value::Row { .. } => {
-                return Err(Error::Evaluation(
-                    "row handles and derived mapped rows are not durable MAP values".to_owned(),
-                ));
+                return Err(Error::Evaluation(format!(
+                    "{path}: row handles and derived mapped rows are not durable MAP values"
+                )));
             }
             Value::HostBound { .. } => {
-                return Err(Error::Evaluation(
-                    "host-bound values are transient and cannot be persisted".to_owned(),
-                ));
+                return Err(Error::Evaluation(format!(
+                    "{path}: host-bound values are transient and cannot be persisted"
+                )));
             }
         })
     }

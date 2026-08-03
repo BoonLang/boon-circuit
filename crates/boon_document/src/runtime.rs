@@ -5557,6 +5557,12 @@ fn scalar_style_value(value: &EvalValue) -> Option<StyleValue> {
         EvalValue::Truth(value) => Some(StyleValue::Bool(*value)),
         EvalValue::Number(value) => value.to_f64_host_rounded().ok().map(StyleValue::Number),
         EvalValue::Text(value) => Some(StyleValue::Text(value.clone())),
+        EvalValue::Tag(name, fields) if fields.is_empty() && name == "True" => {
+            Some(StyleValue::Bool(true))
+        }
+        EvalValue::Tag(name, fields) if fields.is_empty() && name == "False" => {
+            Some(StyleValue::Bool(false))
+        }
         EvalValue::Tag(_, _) => Some(StyleValue::Text(value.text())),
         _ => None,
     }
@@ -5760,11 +5766,10 @@ fn host_source_intent(value: &str) -> bool {
 }
 
 fn style_bool(style: &StyleMap, name: &str) -> bool {
-    match style.get(name) {
-        Some(StyleValue::Bool(value)) => *value,
-        Some(StyleValue::Text(value)) => value.eq_ignore_ascii_case("true"),
-        _ => false,
-    }
+    style
+        .get(name)
+        .and_then(StyleValue::as_bool)
+        .unwrap_or(false)
 }
 
 fn field_name_index(plan: &MachinePlan) -> BTreeMap<FieldId, Vec<String>> {

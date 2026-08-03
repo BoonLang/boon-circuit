@@ -1534,7 +1534,7 @@ FUNCTION file_tree_row(row) {
 
 FUNCTION file_tree_file_button(row) {
     Scene/Element/button(
-        element: [event: [press: row.file_row_elements.select_file], hovered: row.file_row_elements.select_file]
+        element: [event: [press: row.file_row_elements.select_file], hovered: row.file_row_elements.select_file, address: row.selected_file]
         style: [width: Fill, height: 22, paint: False]
         label: tree_row(label_text: row.label, indent_width: row.indent_width, selected: PASSED.store.active_file == row.selected_file)
     )

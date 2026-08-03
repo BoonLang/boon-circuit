@@ -3397,6 +3397,101 @@ pub enum InitialProvenance {
     MaterializedAuthority,
 }
 
+/// Exact startup ownership for one persistent list structure.
+///
+/// This is deliberately independent of whether the executor has a list
+/// computation. A static list may receive durable mutations, an effect-free
+/// derived list must be rebuilt before sparse row overrides are applied, and a
+/// host/result-derived list must restore its complete materialized authority.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ListActivationMode {
+    StaticDefault,
+    DerivedDefault,
+    MaterializedAuthority,
+}
+
+impl ListActivationMode {
+    pub const fn initial_provenance(self) -> InitialProvenance {
+        match self {
+            Self::StaticDefault | Self::DerivedDefault => InitialProvenance::ReconstructableDefault,
+            Self::MaterializedAuthority => InitialProvenance::MaterializedAuthority,
+        }
+    }
+}
+
+/// Canonical row-domain ownership and activation recipe for one runtime list.
+///
+/// Every list slot has exactly one entry. Persistence, activation, and the
+/// executor consume this table instead of inferring ownership from initializer
+/// shape or from whichever operation variant happens to produce the list.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PlanListDataflow {
+    pub list_id: ListId,
+    /// Stable semantic row-domain identity. This exists for every runtime list,
+    /// including pure views that correctly have no persistence schema.
+    pub semantic_identity: MemoryId,
+    pub type_fingerprint: [u8; 32],
+    pub activation_mode: ListActivationMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconstruction_output: Option<ListId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dependencies: Vec<ListId>,
+}
+
+impl PlanListDataflow {
+    pub fn new(
+        list_id: ListId,
+        semantic_identity: MemoryId,
+        type_fingerprint: [u8; 32],
+        activation_mode: ListActivationMode,
+        reconstruction_output: Option<ListId>,
+        mut dependencies: Vec<ListId>,
+    ) -> Result<Self, PlanError> {
+        dependencies.sort_unstable();
+        dependencies.dedup();
+        if dependencies.contains(&list_id) {
+            return Err(PlanError::new(format!(
+                "list {} activation dataflow depends on itself",
+                list_id.0
+            )));
+        }
+        if digest_is_zero(semantic_identity.as_bytes()) || digest_is_zero(&type_fingerprint) {
+            return Err(PlanError::new(format!(
+                "list {} requires nonzero semantic identity and type fingerprint",
+                list_id.0
+            )));
+        }
+        match (activation_mode, &reconstruction_output) {
+            (ListActivationMode::DerivedDefault, Some(_)) => {}
+            (ListActivationMode::DerivedDefault, None) => {
+                return Err(PlanError::new(format!(
+                    "derived-default list {} requires one list reconstruction output",
+                    list_id.0
+                )));
+            }
+            (
+                ListActivationMode::StaticDefault | ListActivationMode::MaterializedAuthority,
+                None,
+            ) => {}
+            _ => {
+                return Err(PlanError::new(format!(
+                    "non-derived list {} cannot carry a reconstruction output",
+                    list_id.0
+                )));
+            }
+        }
+        Ok(Self {
+            list_id,
+            semantic_identity,
+            type_fingerprint,
+            activation_mode,
+            reconstruction_output,
+            dependencies,
+        })
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MemoryLeafPlan {
     pub leaf_id: MemoryLeafId,
@@ -5382,6 +5477,8 @@ pub struct MachinePlan {
     pub host_ports: Vec<HostPortPlan>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub list_indexes: Vec<PlanListIndex>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub list_dataflow: Vec<PlanListDataflow>,
     pub demand: DemandPlan,
     pub document: Option<DocumentPlan>,
     pub row_expressions: PlanRowExpressionArena,
@@ -6507,19 +6604,27 @@ impl<'a> TypedListViewFingerprintContext<'a> {
                     .map(|identity| (slot.state_id, identity))
             })
             .collect();
+        let lists = plan
+            .list_dataflow
+            .iter()
+            .map(|entry| {
+                (
+                    entry.list_id,
+                    (entry.semantic_identity, entry.type_fingerprint),
+                )
+            })
+            .collect();
         let list_memory = plan
             .persistence
             .lists
             .iter()
             .map(|memory| (memory.runtime_slot, memory))
             .collect::<BTreeMap<_, _>>();
-        let mut lists = BTreeMap::new();
         let mut fields = BTreeMap::new();
         for slot in &plan.storage_layout.list_slots {
             let Some(memory) = list_memory.get(&slot.id).copied() else {
                 continue;
             };
-            lists.insert(slot.list_id, (memory.memory_id, memory.type_fingerprint));
             for leaf in &memory.row_fields {
                 if let Some(field) = leaf.runtime_field_id {
                     fields.insert(
@@ -8814,6 +8919,18 @@ impl PlanRowExpressionArena {
                 self.len()
             ))
         })
+    }
+
+    /// Hashes one reachable expression by structural content rather than by
+    /// its position in this arena.
+    pub fn structural_sha256(&self, root: PlanRowExpressionId) -> Result<[u8; 32], PlanError> {
+        let mut normalized = PlanRowExpressionArena::new();
+        let normalized_root = self.clone_normalized_into(root, None, &mut normalized)?;
+        canonical_sha256(&(
+            "boon.plan-row-expression-structure.v1",
+            normalized_root,
+            normalized,
+        ))
     }
 
     pub fn iter(
@@ -13643,6 +13760,14 @@ fn output_list_fields_resolve(
 }
 
 fn persistence_runtime_slots_consistent(plan: &MachinePlan) -> bool {
+    if !list_dataflow_consistent(plan) {
+        return false;
+    }
+    let dataflow_by_list = plan
+        .list_dataflow
+        .iter()
+        .map(|entry| (entry.list_id, entry))
+        .collect::<BTreeMap<_, _>>();
     let mut linked_slots = BTreeSet::new();
     let all_indexed_fields = plan
         .storage_layout
@@ -13699,8 +13824,15 @@ fn persistence_runtime_slots_consistent(plan: &MachinePlan) -> bool {
             .filter_map(|leaf| leaf.runtime_field_id)
             .collect::<BTreeSet<_>>();
         let expected_fields = slot.row_field_ids().collect::<BTreeSet<_>>();
+        let Some(dataflow) = dataflow_by_list.get(&slot.list_id).copied() else {
+            return false;
+        };
         if runtime_fields.len() != list.row_fields.len()
             || !runtime_fields.is_subset(&expected_fields)
+            || dataflow.semantic_identity != list.memory_id
+            || dataflow.activation_mode.initial_provenance() != list.initial_provenance
+            || (slot.initializer_kind == ListInitializerKind::Unknown
+                && dataflow.activation_mode == ListActivationMode::StaticDefault)
             || runtime_fields
                 .intersection(&all_indexed_fields)
                 .any(|field| !durable_indexed_fields.contains(field))
@@ -13718,6 +13850,79 @@ fn persistence_runtime_slots_consistent(plan: &MachinePlan) -> bool {
     linked_slots.len() == plan.persistence.memory.len() + plan.persistence.lists.len()
         && linked_durable_indexed_fields == durable_indexed_fields
         && collection_authorities_consistent(plan)
+}
+
+fn list_dataflow_consistent(plan: &MachinePlan) -> bool {
+    if plan.list_dataflow.len() != plan.storage_layout.list_slots.len() {
+        return false;
+    }
+    let slot_lists = plan
+        .storage_layout
+        .list_slots
+        .iter()
+        .map(|slot| slot.list_id)
+        .collect::<BTreeSet<_>>();
+    let mut seen = BTreeSet::new();
+    let mut semantic_identities = BTreeSet::new();
+    let mut ordinal_by_list = BTreeMap::new();
+    for (ordinal, entry) in plan.list_dataflow.iter().enumerate() {
+        let canonical = PlanListDataflow::new(
+            entry.list_id,
+            entry.semantic_identity,
+            entry.type_fingerprint,
+            entry.activation_mode,
+            entry.reconstruction_output,
+            entry.dependencies.clone(),
+        );
+        if !slot_lists.contains(&entry.list_id)
+            || !seen.insert(entry.list_id)
+            || !semantic_identities.insert(entry.semantic_identity)
+            || !matches!(canonical, Ok(candidate) if candidate == *entry)
+        {
+            return false;
+        }
+        ordinal_by_list.insert(entry.list_id, ordinal);
+    }
+    if seen != slot_lists {
+        return false;
+    }
+    for (ordinal, entry) in plan.list_dataflow.iter().enumerate() {
+        if entry.dependencies.iter().any(|dependency| {
+            ordinal_by_list
+                .get(dependency)
+                .is_none_or(|dependency_ordinal| *dependency_ordinal >= ordinal)
+        }) {
+            return false;
+        }
+        let Some(output) = entry.reconstruction_output else {
+            continue;
+        };
+        let owns_output = plan
+            .regions
+            .iter()
+            .flat_map(|region| &region.ops)
+            .any(|operation| {
+                operation.output == Some(ValueRef::List(output))
+                    && match &operation.kind {
+                        PlanOpKind::DerivedValue {
+                            materialization: Some(materialization),
+                            ..
+                        } => {
+                            materialization.target_list == entry.list_id
+                                || materialization
+                                    .value_list_authorities
+                                    .iter()
+                                    .any(|authority| authority.list_id == entry.list_id)
+                        }
+                        PlanOpKind::ListProjection { .. } => output == entry.list_id,
+                        _ => false,
+                    }
+            });
+        if !owns_output {
+            return false;
+        }
+    }
+    true
 }
 
 fn collection_authorities_consistent(plan: &MachinePlan) -> bool {
@@ -13883,6 +14088,150 @@ pub fn plan_sha256(plan: &MachinePlan) -> Result<String, PlanError> {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+#[derive(Serialize)]
+struct MachinePlanStableContractV1<'a> {
+    schema: &'static str,
+    version: &'a PlanVersion,
+    target_profile: TargetProfile,
+    program_role: ProgramRole,
+    distributed_endpoint: &'a Option<DistributedEndpointPlan>,
+    producer_function_instances: &'a [ProducerFunctionInstancePlan],
+    application: &'a ApplicationPlan,
+    persistence: &'a PersistencePlan,
+    effects: &'a [EffectContract],
+    host_ports: &'a [HostPortPlan],
+    list_indexes: Vec<MachinePlanStableListIndexV1<'a>>,
+    list_dataflow: &'a [PlanListDataflow],
+    demand: &'a DemandPlan,
+    source_routes: &'a [SourceRoute],
+    activations: &'a [PlanActivation],
+    pulse_batches: &'a [PlanPulseBatch],
+    dirty_plan: MachinePlanStableDirtyPlanV1,
+    commit_plan: MachinePlanStableCommitPlanV1,
+    delta_plan: &'a DeltaPlan,
+    capability_summary: MachinePlanStableCapabilityV1,
+}
+
+#[derive(Serialize)]
+struct MachinePlanStableDirtyPlanV1 {
+    unresolved_dependency_edges: usize,
+}
+
+#[derive(Serialize)]
+struct MachinePlanStableCommitPlanV1 {
+    unresolved_state_update_count: usize,
+}
+
+#[derive(Serialize)]
+struct MachinePlanStableCapabilityV1 {
+    executable: bool,
+    typed_lowering_executable: bool,
+    cpu_plan_executor_complete: bool,
+    executable_string_path_count: usize,
+    unresolved_executable_ref_count: usize,
+    unknown_plan_op_count: usize,
+    cpu_plan_executor_unsupported_op_count: usize,
+    runtime_ast_dependency_count: usize,
+    graph_rebuild_count: usize,
+    graph_clones_per_item: usize,
+}
+
+#[derive(Serialize)]
+struct MachinePlanStableListIndexV1<'a> {
+    id: PlanListIndexId,
+    source_list: ListId,
+    keys: Vec<MachinePlanStableListIndexKeyV1<'a>>,
+}
+
+#[derive(Serialize)]
+struct MachinePlanStableListIndexKeyV1<'a> {
+    owner: PlanStaticOwnerId,
+    row_local: PlanLocalId,
+    expression_sha256: [u8; 32],
+    kind: PlanListIndexKeyKind,
+    closed_tags: &'a [String],
+    direction: PlanOrderDirection,
+    multiplicity: PlanListIndexKeyMultiplicity,
+}
+
+/// Hashes the externally stable plan contracts while deliberately excluding
+/// representation-shaped expression, storage, operation, document, constant,
+/// output-reference, and debug arenas.
+///
+/// This digest complements [`plan_sha256`]; it does not replace plan
+/// verification or executable-behavior differential tests.
+pub fn machine_plan_stable_contract_sha256(plan: &MachinePlan) -> Result<String, PlanError> {
+    let list_indexes = plan
+        .list_indexes
+        .iter()
+        .map(|index| {
+            Ok(MachinePlanStableListIndexV1 {
+                id: index.id,
+                source_list: index.source_list,
+                keys: index
+                    .keys
+                    .iter()
+                    .map(|key| {
+                        Ok(MachinePlanStableListIndexKeyV1 {
+                            owner: key.owner,
+                            row_local: key.row_local,
+                            expression_sha256: plan
+                                .row_expressions
+                                .structural_sha256(key.expression)?,
+                            kind: key.kind,
+                            closed_tags: &key.closed_tags,
+                            direction: key.direction,
+                            multiplicity: key.multiplicity,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, PlanError>>()?,
+            })
+        })
+        .collect::<Result<Vec<_>, PlanError>>()?;
+    canonical_sha256(&MachinePlanStableContractV1 {
+        schema: "boon.machine-plan-stable-contract.v1",
+        version: &plan.version,
+        target_profile: plan.target_profile,
+        program_role: plan.program_role,
+        distributed_endpoint: &plan.distributed_endpoint,
+        producer_function_instances: &plan.producer_function_instances,
+        application: &plan.application,
+        persistence: &plan.persistence,
+        effects: &plan.effects,
+        host_ports: &plan.host_ports,
+        list_indexes,
+        list_dataflow: &plan.list_dataflow,
+        demand: &plan.demand,
+        source_routes: &plan.source_routes,
+        activations: &plan.activations,
+        pulse_batches: &plan.pulse_batches,
+        dirty_plan: MachinePlanStableDirtyPlanV1 {
+            unresolved_dependency_edges: plan.dirty_plan.unresolved_dependency_edges,
+        },
+        commit_plan: MachinePlanStableCommitPlanV1 {
+            unresolved_state_update_count: plan.commit_plan.unresolved_state_update_count,
+        },
+        delta_plan: &plan.delta_plan,
+        capability_summary: MachinePlanStableCapabilityV1 {
+            executable: plan.capability_summary.executable,
+            typed_lowering_executable: plan.capability_summary.typed_lowering_executable,
+            cpu_plan_executor_complete: plan.capability_summary.cpu_plan_executor_complete,
+            executable_string_path_count: plan.capability_summary.executable_string_path_count,
+            unresolved_executable_ref_count: plan
+                .capability_summary
+                .unresolved_executable_ref_count,
+            unknown_plan_op_count: plan.capability_summary.unknown_plan_op_count,
+            cpu_plan_executor_unsupported_op_count: plan
+                .capability_summary
+                .cpu_plan_executor_unsupported_op_count,
+            runtime_ast_dependency_count: plan.capability_summary.runtime_ast_dependency_count,
+            graph_rebuild_count: plan.capability_summary.graph_rebuild_count,
+            graph_clones_per_item: plan.capability_summary.graph_clones_per_item,
+        },
+    })
+    .map(|digest| digest_hex(&digest))
 }
 
 pub fn data_type_fingerprint(data_type: &DataTypePlan) -> Result<[u8; 32], PlanError> {

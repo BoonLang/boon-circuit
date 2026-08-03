@@ -161,28 +161,76 @@ stronger three-reviewer performance closure defined below.
    definition/compact-invocation-overlay part of semantic sealing: retain pure
    type-polymorphic bodies once, carry parameter/PASSED/type/owner/effect and
    resource differences in dense overlays, count avoided specializations, and
-   build proof facts from definitions plus overlays. Preserve the three exact
-   budgeted plan hashes; flattened expansion is test-oracle-only. Once
-   cardinality falls, compact the sealed semantic artifact and close proof,
-   backend, hashing, and memory until both verified-plan modes pass. Then return
-   to remaining Phase 1 interning/scaling/parity closure; only afterward may
-   persistent-session warm work satisfy its separate gates.
+   build proof facts from definitions plus overlays. Flattened expansion is
+   test-oracle-only. Once cardinality falls, compact the sealed semantic
+   artifact and close proof, backend, hashing, and memory until both verified-
+   plan modes pass. Then return to remaining Phase 1 interning/scaling/parity
+   closure; only afterward may persistent-session warm work satisfy its
+   separate gates.
 
    The first 2026-08-03 retained-definition/invocation-overlay candidate cuts
    NovyWave fresh/empty verified time to 4,415.27/4,455.01 ms, semantic time to
    3,758.10/3,777.86 ms, peak RSS to 317,844/318,428 KiB, semantic nodes to
    16,521, and allocations to about 10.92 million calls/1.552 GB. This confirms
    the architecture and crosses the RSS gate directionally, but not the 1,000
-   ms time gate. Its deterministic `f293e8a8...` plan hash also differs from
-   the required `4d3c284a...`; document expressions/initial patches are
-   33,910/2,344 versus the oracle's 42,099/17,517. Preserve the compact semantic
-   graph and repair direct lowering until exact plan behavior/identity and the
-   remaining latency gate pass. Do not update the oracle to hide the mismatch.
-   The remaining semantic phase is dominated by 2,368.00 ms of dependency-
-   manifest work: 159,612 records become a 160,276-node/512,204-edge graph, with
-   about 1,007 ms in coverage/dependency graph digests alone. After parity,
-   replace that expanded proof construction with compact direct sealing before
-   considering any further small typechecker-container edits.
+   ms time gate. Its deterministic `f293e8a8...` plan hash differs from the
+   historical `4d3c284a...`, but that old artifact is not a valid oracle: it
+   omits reachable `Widest` from the persistence type of
+   `store.selected_value_column_width_key`. The `c77dabc`-like and retained
+   artifacts include the complete type and have byte-identical persistence
+   sections. Keep budget V2 red; neither restore the unsound artifact nor bless
+   the current hash for speed. Implement the performance plan's test-only flat
+   differential oracle, stable-contract checks, plan/migration/restart and
+   negative tests, and recorded V3 oracle migration first. Then lower
+   definition-plus-overlay instances directly and replace the remaining
+   2,368.00 ms manifest path—159,612 records and a
+   160,276-node/512,204-edge graph, including about 1,007 ms of digest work—with
+   the packed proof summary. Share sealed row fingerprints across later
+   consumers and measure the runtime/compiler loading crate seam before any
+   further small typechecker-container edits.
+
+   The first feature-gated flat-oracle slice is implemented without a
+   production mode switch. Counter and the focused four-state persistence
+   fixture pass stable-contract and multi-turn runtime/document comparison; an
+   explicit optimized NovyWave preflight passes structural contract, verifier,
+   and exact `Compact | Normal | Wide | Widest` persistence comparison in
+   14.82 seconds. Internal arena offsets and duplicated dirty/commit operation
+   counts are not semantic identities; structural expression hashes and exact
+   zero-unresolved invariants replace those raw comparisons. Keep the V2 budget
+   red until V3 records source/old/new identities, the real-host NovyWave
+   behavior trace, migration/restart evidence, and focused negative cases.
+
+   Resume from local checkpoint `c05af3a` and the current oracle slice. The
+   authored real-host action trace now agrees; restart exposed a generic
+   authority-activation defect. Replace compiler initializer-shape and executor
+   computation-presence guesses with one compiler-emitted activation plan, then
+   prove state-dependent reconstructable defaults and host-result-owned lists
+   before completing the V3 migration/restart matrix. Separate row-domain
+   authority, sparse durable indexed overlays, and computed row values through
+   one canonical list-dataflow table: the
+   inspected NovyWave plan currently promotes 24 lists and 252 row fields to
+   persistence, and `selected_signal_defaults` mixes two durable `HOLD` fields
+   with 20 computed/host-backed authority fields. Prune pure views, emit ordered
+   activation steps, and record before/after plan/artifact bytes and activation
+   work. The `store.variable_rows` `List/chunk` mapped-row serialization failure
+   proves that projection, derived-materialization, initializer, and executor
+   ownership must be unified; do not serialize row handles or add a projection-
+   only exception. Then replace full-`MachinePlan` fingerprint cloning with one
+   seal/compact/fingerprint boundary. Normalize only the store-local epoch in
+   representation comparison.
+
+   The checkpoint-level boundary audit now takes priority over more small
+   container edits. Measure and, when confirmed, pull these cuts early: move
+   stable cross-layer execution IDs out of `boon_document_model` (current
+   normal transitive closure 31 crates, predicted 19); invert the six runtime/
+   outer compiler consumers so the compiler closure can fall from 16 to the
+   four true producers; and extract the real-host retained-document behavior
+   oracle from the native GPU/editor/window shell. Every split needs a
+   before/after dependency closure and rebuild time, no compatibility export,
+   and unchanged diagnostics/artifacts. Then continue demand-driven plan
+   instances, packed proof summary, and one sealed semantic database with
+   shared fingerprints. Keep Rust rebuild speed and Boon compile latency as
+   separate measured gates.
 
    Use the performance plan's edit-loop, milestone-preflight, and full-
    acceptance harness levels. Focused debug tests and direct one-sample producer

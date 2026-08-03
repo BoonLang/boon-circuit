@@ -3724,13 +3724,7 @@ fn style_number(style: &StyleMap, key: &str) -> Option<f32> {
 }
 
 fn style_bool(style: &StyleMap, key: &str) -> Option<bool> {
-    match state_style_value(style, key)? {
-        StyleValue::Bool(value) => Some(*value),
-        StyleValue::Text(value) => value.parse::<bool>().ok(),
-        StyleValue::Number(_) | StyleValue::RichTextSpans(_) | StyleValue::EditorTypeHints(_) => {
-            None
-        }
-    }
+    state_style_value(style, key)?.as_bool()
 }
 
 fn style_text<'a>(style: &'a StyleMap, key: &str) -> Option<&'a str> {
@@ -3768,13 +3762,7 @@ fn state_style_value<'a>(style: &'a StyleMap, key: &str) -> Option<&'a StyleValu
 }
 
 fn style_bool_raw(style: &StyleMap, key: &str) -> Option<bool> {
-    match style.get(key)? {
-        StyleValue::Bool(value) => Some(*value),
-        StyleValue::Text(value) => value.parse::<bool>().ok(),
-        StyleValue::Number(_) | StyleValue::RichTextSpans(_) | StyleValue::EditorTypeHints(_) => {
-            None
-        }
-    }
+    style.get(key)?.as_bool()
 }
 
 fn style_color_u8(style: &StyleMap, key: &str) -> Option<[u8; 4]> {

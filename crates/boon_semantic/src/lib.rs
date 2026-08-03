@@ -2594,6 +2594,34 @@ pub fn elaborate_with_external_event_identities(
     producer_materializations: &[ProducerMaterializationRequest],
     external_event_identities: &[CheckedExternalDeclarationIdentityV1],
 ) -> Result<SemanticProgram, SemanticError> {
+    elaborate_with_representation(
+        checked_program,
+        producer_materializations,
+        external_event_identities,
+        true,
+    )
+}
+
+/// Builds the historical occurrence-specialized semantic projection for a
+/// differential test oracle.
+///
+/// This entrypoint does not exist in ordinary builds. It must never be used as
+/// a compiler/runtime fallback or as a production performance path.
+#[cfg(feature = "test-flat-oracle")]
+#[doc(hidden)]
+pub fn elaborate_flat_test_oracle(
+    checked_program: CheckedProgram,
+    producer_materializations: &[ProducerMaterializationRequest],
+) -> Result<SemanticProgram, SemanticError> {
+    elaborate_with_representation(checked_program, producer_materializations, &[], false)
+}
+
+fn elaborate_with_representation(
+    checked_program: CheckedProgram,
+    producer_materializations: &[ProducerMaterializationRequest],
+    external_event_identities: &[CheckedExternalDeclarationIdentityV1],
+    retain_ordinary_calls: bool,
+) -> Result<SemanticProgram, SemanticError> {
     let trace_elaboration = std::env::var_os("BOON_SEMANTIC_TRACE").is_some();
     macro_rules! elaboration_phase {
         ($name:literal, $expression:expr) => {{
@@ -2691,6 +2719,7 @@ pub fn elaborate_with_external_event_identities(
         contextual_expansion::derive_contextual_materializations(
             &checked_program,
             &resolved_out_graph,
+            retain_ordinary_calls,
         )
     )
     .map_err(|error| SemanticError::new(error.to_string()))?;
@@ -2703,6 +2732,7 @@ pub fn elaborate_with_external_event_identities(
             materialization_expressions,
             &expression_builder_indexes,
             &required_ordinary_definitions,
+            retain_ordinary_calls,
         )
     )
     .map_err(|error| SemanticError::new(error.to_string()))?;

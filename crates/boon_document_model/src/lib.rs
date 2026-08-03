@@ -662,6 +662,21 @@ pub enum StyleValue {
     EditorTypeHints(Vec<StyleEditorTypeHint>),
 }
 
+impl StyleValue {
+    /// Decodes the canonical boolean forms accepted at the document boundary.
+    /// Boon closed tags are serialized as `True`/`False` text, while retained
+    /// host state and patches may already carry a typed boolean.
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            Self::Bool(value) => Some(*value),
+            Self::Text(value) if value.eq_ignore_ascii_case("true") => Some(true),
+            Self::Text(value) if value.eq_ignore_ascii_case("false") => Some(false),
+            Self::Number(value) => Some(*value != 0.0),
+            Self::Text(_) | Self::RichTextSpans(_) | Self::EditorTypeHints(_) => None,
+        }
+    }
+}
+
 impl Serialize for StyleValue {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -981,12 +996,10 @@ impl Serialize for DocumentNode {
 }
 
 fn style_flag(style: &StyleMap, key: &str) -> bool {
-    match style.get(key) {
-        Some(StyleValue::Bool(value)) => *value,
-        Some(StyleValue::Text(value)) => value.eq_ignore_ascii_case("true"),
-        Some(StyleValue::Number(value)) => *value != 0.0,
-        Some(StyleValue::RichTextSpans(_) | StyleValue::EditorTypeHints(_)) | None => false,
-    }
+    style
+        .get(key)
+        .and_then(StyleValue::as_bool)
+        .unwrap_or(false)
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

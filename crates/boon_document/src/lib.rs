@@ -716,12 +716,7 @@ fn semantic_style_text_any(style: &StyleMap, keys: &[&str]) -> Option<String> {
 }
 
 fn semantic_style_bool(style: &StyleMap, key: &str) -> Option<bool> {
-    match style.get(key)? {
-        StyleValue::Bool(value) => Some(*value),
-        StyleValue::Text(value) => value.parse::<bool>().ok(),
-        StyleValue::Number(value) => Some(*value != 0.0),
-        StyleValue::RichTextSpans(_) | StyleValue::EditorTypeHints(_) => None,
-    }
+    style.get(key)?.as_bool()
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -6196,13 +6191,7 @@ fn style_spacing(style: &BTreeMap<String, StyleValue>, key: &str) -> Option<f32>
 }
 
 fn style_bool(style: &BTreeMap<String, StyleValue>, key: &str) -> Option<bool> {
-    match style.get(key)? {
-        StyleValue::Bool(value) => Some(*value),
-        StyleValue::Text(value) => value.parse::<bool>().ok(),
-        StyleValue::Number(_) | StyleValue::RichTextSpans(_) | StyleValue::EditorTypeHints(_) => {
-            None
-        }
-    }
+    style.get(key)?.as_bool()
 }
 
 fn apply_clip_to_display_items(items: &mut [DisplayItem], clip: Rect) {

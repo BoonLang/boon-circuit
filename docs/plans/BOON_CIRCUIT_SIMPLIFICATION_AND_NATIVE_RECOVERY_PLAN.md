@@ -682,19 +682,59 @@ instead of rescanning callable bodies to a fixed point.
 
 The post-reboot debug checkpoint completes Counter in 0.09 seconds at 29,992
 KiB, physical TodoMVC in 2.02 seconds at 146,340 KiB, and NovyWave in 20.68
-seconds at 1,000,416 KiB. Their exact plan SHA-256 values remain respectively
+seconds at 1,000,416 KiB. Its historical plan SHA-256 values were respectively
 `dc1fe51b659d1746a0b0b4ae2dcba21d50a9426499eb2bde28dbed988e6cfb08`,
 `c9a12cd0a1bcf748a20e3a072afa09d0f923c2c9dbd664f2343d343494404f96`,
 and `4d3c284a9240cdc68c70aff7f30c570367e285cc1e8f823585900829bafd8ff7`.
+The last value is not an accepted current semantic oracle: that artifact omits
+the source-reachable `Widest` state from
+`store.selected_value_column_width_key`, while both the later `c77dabc`-like
+and retained-overlay artifacts include the complete type and have byte-identical
+persistence sections. The compiler performance plan owns the required
+flat/specialized differential oracle, stable-contract checks, and controlled V3
+oracle migration; neither restoring the invalid artifact nor accepting a faster
+hash without that proof may unblock recovery.
+The first non-default flat-oracle slice now passes Counter and a focused
+four-state width fixture through multi-turn behavior comparison, and an
+explicit optimized NovyWave preflight passes structural stable-contract,
+verifier, and exact persistence comparison in 14.82 seconds. It is preflight,
+not oracle migration: the V3 provenance record, real-host NovyWave interaction
+trace, migration/restart evidence, and negative matrix remain blocking, and no
+flat production fallback exists.
+Resume that work from local checkpoint `c05af3a`. The authored real-host trace
+now agrees across retained and test-flat representations, while artifact
+restart exposed a generic authority-activation ordering defect. The compiler
+performance plan owns the unified compiler-emitted activation plan, focused
+state-dependent/host-owned list tests, and V3 restart closure. That work also
+separates structural row-domain authority and sparse durable indexed overlays
+from computed view fields through one compiler-owned list-dataflow table: the
+inspected NovyWave plan currently promotes 24
+lists and 252 row fields to persistence, while one stateful derived list mixes
+two durable `HOLD` fields with 20 computed/host-backed fields. Pure views must
+leave persistence and activation must consume compiler-emitted ordered steps.
+The `store.variable_rows` `List/chunk` mapped-row serialization failure proves
+that derived materialization, projection, initializer, and executor ownership
+cannot remain separate; row handles must not become durable and a projection-
+only exception is not an engine fix. After that contract is stable, replace
+full-plan fingerprint cloning with one immutable seal/compact/fingerprint
+boundary.
+The whole-system audit also pulls measured compiler/runtime dependency
+inversion, cross-layer ID ownership, and a headless product-behavior oracle
+ahead of more local optimization when those cuts shorten the remaining
+iteration path. Those are performance-enabling refactors, not a relaxation of
+this recovery plan's native GPU evidence or behavior requirements.
 The traced NovyWave cold path is now about 4.84 seconds of typechecking, 2.84
 seconds of contextual materialization/execution expansion, 3.81 seconds of
 whole-program dependency proof, and 9.51 seconds for semantic elaboration in
 total. The next performance slice must retain more shared semantic callable
-definitions and invalidate only affected contextual instances, then separate
-interactive diagnostics/preview compilation from explicit proof and debug-
-artifact generation. Do not return to tactical type-cache invalidation or
-another manifest collection tweak. Phase 1 still requires the remaining
-focused semantic, IR, and compiler regression matrix plus a clean,
+definitions, collect concrete instances from definition-plus-overlay keys,
+replace the expanded manifest/proof inventory with a packed summary index, and
+share sealed semantic fingerprints before separating interactive diagnostics/
+preview compilation from explicit proof and debug-artifact generation. A
+measured compiler-loading/runtime crate seam may support that work, but a crate
+split is not a Boon speed result. Do not return to tactical type-cache
+invalidation or another manifest collection tweak. Phase 1 still requires the
+remaining focused semantic, IR, and compiler regression matrix plus a clean,
 revision-identified remeasurement at the next user-authorized checkpoint.
 
 Cold `dump-plan` throughput is not the interactive acceptance target. Before

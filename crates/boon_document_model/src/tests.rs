@@ -1,6 +1,20 @@
 use super::*;
 
 #[test]
+fn style_boolean_decoder_accepts_boon_tags_and_typed_values() {
+    for value in [StyleValue::Bool(true), StyleValue::Text("True".to_owned())] {
+        assert_eq!(value.as_bool(), Some(true));
+    }
+    for value in [
+        StyleValue::Bool(false),
+        StyleValue::Text("False".to_owned()),
+    ] {
+        assert_eq!(value.as_bool(), Some(false));
+    }
+    assert_eq!(StyleValue::Text("Fill".to_owned()).as_bool(), None);
+}
+
+#[test]
 fn program_capability_profiles_have_stable_names_and_public_default() {
     #[derive(serde::Deserialize)]
     struct ProfileConfig {

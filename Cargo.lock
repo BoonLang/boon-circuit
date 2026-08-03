@@ -692,10 +692,12 @@ version = "0.1.0"
 dependencies = [
  "boon_checked",
  "boon_data",
+ "boon_document",
  "boon_example_manifest",
  "boon_ir",
  "boon_parser",
  "boon_plan",
+ "boon_plan_executor",
  "boon_semantic",
  "boon_syntax",
  "boon_typecheck",

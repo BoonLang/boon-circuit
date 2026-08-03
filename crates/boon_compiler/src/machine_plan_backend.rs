@@ -1856,12 +1856,12 @@ fn migration_storage_default(
     })
 }
 
-fn list_initial_provenance(slot: &ListStorageSlot) -> InitialProvenance {
+fn default_list_activation_mode(slot: &ListStorageSlot) -> ListActivationMode {
     match slot.initializer_kind {
-        ListInitializerKind::Unknown => InitialProvenance::MaterializedAuthority,
+        ListInitializerKind::Unknown => ListActivationMode::MaterializedAuthority,
         ListInitializerKind::RecordLiteral
         | ListInitializerKind::Range
-        | ListInitializerKind::Empty => InitialProvenance::ReconstructableDefault,
+        | ListInitializerKind::Empty => ListActivationMode::StaticDefault,
     }
 }
 
@@ -2134,6 +2134,36 @@ fn semantic_memory_id(memory: &ir::SemanticMemory) -> Result<MemoryId, PlanError
     )
 }
 
+fn semantic_list_identities(
+    program: &ErasedProgram,
+) -> Result<BTreeMap<ListId, (MemoryId, [u8; 32])>, PlanError> {
+    let mut identities = BTreeMap::new();
+    for memory in program.semantic_memory.iter().filter(|memory| {
+        semantic_memory_is_runtime_active(program, memory)
+            && memory.identity.kind == ir::SemanticMemoryKind::ListOwner
+    }) {
+        let ir::SemanticMemoryRuntimeBacking::List { list_id, .. } = memory.runtime_backing else {
+            return Err(PlanError::new(format!(
+                "semantic list `{}` has no runtime list backing",
+                memory.identity.semantic_path
+            )));
+        };
+        let list_id = plan_list_id(list_id);
+        let data_type = semantic_data_type_plan(&memory.data_type).canonicalized();
+        let identity = (
+            semantic_memory_id(memory)?,
+            data_type_fingerprint(&data_type)?,
+        );
+        if identities.insert(list_id, identity).is_some() {
+            return Err(PlanError::new(format!(
+                "runtime list {} has more than one semantic row-domain identity",
+                list_id.0
+            )));
+        }
+    }
+    Ok(identities)
+}
+
 fn semantic_memory_is_active(memory: &ir::SemanticMemory) -> bool {
     matches!(memory.status, ir::SemanticMemoryStatus::Active)
 }
@@ -2299,6 +2329,7 @@ fn semantic_list_memory_plan(
     authority_field_ids: &BTreeMap<(String, String), FieldId>,
     include_draining_fields: bool,
     durable_indexed_memory: Option<&BTreeSet<ir::SemanticMemoryId>>,
+    activation_mode: Option<ListActivationMode>,
 ) -> Result<ListMemoryPlan, PlanError> {
     let list_id = match memory.runtime_backing {
         ir::SemanticMemoryRuntimeBacking::List { list_id, .. } => list_id,
@@ -2328,6 +2359,7 @@ fn semantic_list_memory_plan(
                 memory.identity.semantic_path, list_id.0
             ))
         })?;
+    let activation_mode = activation_mode.unwrap_or_else(|| default_list_activation_mode(slot));
     let owner = semantic_memory_owner(memory);
     let memory_id = semantic_memory_id(memory)?;
     let indexed_memory = program
@@ -2394,7 +2426,7 @@ fn semantic_list_memory_plan(
         })
         .collect::<Vec<_>>();
     let mut row_fields = Vec::new();
-    if !has_indexed_memory {
+    if !has_indexed_memory && activation_mode != ListActivationMode::DerivedDefault {
         for field in &semantic_row_fields {
             let runtime_field_id =
                 storage_input_field_id(program, &list.name, &field.name, authority_field_ids)
@@ -2431,25 +2463,27 @@ fn semantic_list_memory_plan(
                 field_type,
             )?);
         }
-    } else {
-        for field in authority_fields
-            .iter()
-            .filter(|field| !indexed_runtime_fields.contains(&plan_field_id(field.id)))
-        {
-            let runtime_field_id = plan_field_id(field.id);
-            let field_type =
-                data_type_plan_from_typecheck_type(&field.flow_type.ty).ok_or_else(|| {
-                    PlanError::new(format!(
-                        "authoritative field `{}` has no canonical checked type",
-                        field.diagnostic_path
-                    ))
-                })?;
-            row_fields.push(MemoryLeafPlan::new(
-                memory_id,
-                Some(runtime_field_id),
-                list_authority_persistence_path(&memory.identity.semantic_path, field)?,
-                field_type,
-            )?);
+    } else if has_indexed_memory {
+        if activation_mode != ListActivationMode::DerivedDefault {
+            for field in authority_fields
+                .iter()
+                .filter(|field| !indexed_runtime_fields.contains(&plan_field_id(field.id)))
+            {
+                let runtime_field_id = plan_field_id(field.id);
+                let field_type = data_type_plan_from_typecheck_type(&field.flow_type.ty)
+                    .ok_or_else(|| {
+                        PlanError::new(format!(
+                            "authoritative field `{}` has no canonical checked type",
+                            field.diagnostic_path
+                        ))
+                    })?;
+                row_fields.push(MemoryLeafPlan::new(
+                    memory_id,
+                    Some(runtime_field_id),
+                    list_authority_persistence_path(&memory.identity.semantic_path, field)?,
+                    field_type,
+                )?);
+            }
         }
         for field_memory in indexed_memory.into_iter().filter(|field| {
             (include_draining_fields || semantic_memory_is_runtime_active(program, field))
@@ -2529,7 +2563,7 @@ fn semantic_list_memory_plan(
         slot.id,
         memory.identity.semantic_path.clone(),
         data_type,
-        list_initial_provenance(slot),
+        activation_mode.initial_provenance(),
         owner,
         list.hidden_key_type.clone(),
         list.has_generation,
@@ -2900,6 +2934,7 @@ fn durable_migration_source_list_plan(
         std::slice::from_ref(&catalog_slot),
         authority_field_ids,
         true,
+        None,
         None,
     )
 }
@@ -4128,22 +4163,417 @@ fn merge_migration_catalog(
     ))
 }
 
+fn activation_value_is_reconstructable(
+    value: &ValueRef,
+    persistent_states: &BTreeSet<StateId>,
+    persistent_lists: &BTreeSet<ListId>,
+    persistent_row_fields: &BTreeSet<FieldId>,
+    computations: &BTreeMap<ValueRef, &PlanOp>,
+    visiting: &mut BTreeSet<ValueRef>,
+) -> bool {
+    match value {
+        ValueRef::Constant(_) => true,
+        ValueRef::State(state)
+        | ValueRef::StateProjection {
+            state_id: state, ..
+        } => persistent_states.contains(state),
+        ValueRef::List(list) if persistent_lists.contains(list) => true,
+        ValueRef::Field(field) if persistent_row_fields.contains(field) => true,
+        ValueRef::Field(_) | ValueRef::List(_) => {
+            if !visiting.insert(value.clone()) {
+                return false;
+            }
+            let reconstructable = computations.get(value).is_some_and(|operation| {
+                operation.inputs.iter().all(|input| {
+                    activation_value_is_reconstructable(
+                        input,
+                        persistent_states,
+                        persistent_lists,
+                        persistent_row_fields,
+                        computations,
+                        visiting,
+                    )
+                })
+            });
+            visiting.remove(value);
+            reconstructable
+        }
+        ValueRef::Source(_)
+        | ValueRef::SourcePayload { .. }
+        | ValueRef::Pulse(_)
+        | ValueRef::DistributedImport(_) => false,
+    }
+}
+
+fn collect_activation_topology_inputs(
+    arena: &PlanRowExpressionArena,
+    expression: PlanRowExpressionId,
+    list_indexes: &[PlanListIndex],
+    inputs: &mut BTreeSet<ValueRef>,
+    visiting: &mut BTreeSet<PlanRowExpressionId>,
+) -> Result<bool, PlanError> {
+    if !visiting.insert(expression) {
+        return Err(PlanError::new(format!(
+            "activation row-domain expression {} is cyclic",
+            expression.0
+        )));
+    }
+    let node = arena.node(expression)?;
+    let reconstructable = match node {
+        PlanRowExpressionNode::Field { input } => {
+            inputs.insert(input.clone());
+            true
+        }
+        PlanRowExpressionNode::ListRef { list_id }
+        | PlanRowExpressionNode::AuthorityListRef { list_id } => {
+            inputs.insert(ValueRef::List(*list_id));
+            true
+        }
+        PlanRowExpressionNode::ListGetField { list_id, index, .. } => {
+            inputs.insert(ValueRef::List(*list_id));
+            collect_activation_topology_inputs(arena, *index, list_indexes, inputs, visiting)?
+        }
+        PlanRowExpressionNode::ListRowField { row, list_id, .. } => {
+            inputs.insert(ValueRef::List(*list_id));
+            collect_activation_topology_inputs(arena, *row, list_indexes, inputs, visiting)?
+        }
+        // Map preserves the source row domain. Its body and captures determine
+        // row values, not which structural rows exist, so host-result-backed
+        // display fields do not force a complete durable copy of the view.
+        PlanRowExpressionNode::ContextualCollection {
+            operation: PlanContextualOperationKind::Map,
+            source,
+            ..
+        } => collect_activation_topology_inputs(arena, *source, list_indexes, inputs, visiting)?,
+        PlanRowExpressionNode::ListLiteral { .. } => true,
+        PlanRowExpressionNode::ListAccess { access } => {
+            let index = list_indexes
+                .get(access.index.0)
+                .filter(|index| index.id == access.index)
+                .ok_or_else(|| {
+                    PlanError::new(format!(
+                        "activation row domain references missing list index {}",
+                        access.index.0
+                    ))
+                })?;
+            inputs.insert(ValueRef::List(index.source_list));
+            let mut children = Vec::new();
+            node.visit_children(&mut |child| children.push(child));
+            let mut reconstructable = true;
+            for child in children {
+                reconstructable &= collect_activation_topology_inputs(
+                    arena,
+                    child,
+                    list_indexes,
+                    inputs,
+                    visiting,
+                )?;
+            }
+            reconstructable
+        }
+        PlanRowExpressionNode::ListPage { page } => {
+            let index = list_indexes
+                .get(page.access.index.0)
+                .filter(|index| index.id == page.access.index)
+                .ok_or_else(|| {
+                    PlanError::new(format!(
+                        "activation row domain references missing list index {}",
+                        page.access.index.0
+                    ))
+                })?;
+            inputs.insert(ValueRef::List(index.source_list));
+            let mut children = Vec::new();
+            node.visit_children(&mut |child| children.push(child));
+            let mut reconstructable = true;
+            for child in children {
+                reconstructable &= collect_activation_topology_inputs(
+                    arena,
+                    child,
+                    list_indexes,
+                    inputs,
+                    visiting,
+                )?;
+            }
+            reconstructable
+        }
+        PlanRowExpressionNode::EffectResult
+        | PlanRowExpressionNode::TransientEffectResult { .. }
+        | PlanRowExpressionNode::EventRow { .. }
+        | PlanRowExpressionNode::EventSources { .. }
+        | PlanRowExpressionNode::EventSourcePayloads { .. } => false,
+        _ => {
+            let mut children = Vec::new();
+            node.visit_children(&mut |child| children.push(child));
+            let mut reconstructable = true;
+            for child in children {
+                reconstructable &= collect_activation_topology_inputs(
+                    arena,
+                    child,
+                    list_indexes,
+                    inputs,
+                    visiting,
+                )?;
+            }
+            reconstructable
+        }
+    };
+    visiting.remove(&expression);
+    Ok(reconstructable)
+}
+
+fn activation_topology_inputs(
+    operation: &PlanOp,
+    arena: &PlanRowExpressionArena,
+    list_indexes: &[PlanListIndex],
+) -> Result<Option<(bool, BTreeSet<ValueRef>)>, PlanError> {
+    let PlanOpKind::DerivedValue {
+        expression: Some(expression),
+        ..
+    } = &operation.kind
+    else {
+        return Ok(None);
+    };
+    let mut inputs = BTreeSet::new();
+    let mut visiting = BTreeSet::new();
+    let roots = match expression {
+        PlanDerivedExpression::RowExpression { expression }
+        | PlanDerivedExpression::MaterializedRowField { expression, .. } => vec![*expression],
+        PlanDerivedExpression::SourceEventTransform { .. }
+        | PlanDerivedExpression::SourceKeyTextTrimNonEmpty { .. }
+        | PlanDerivedExpression::BoolNot { .. }
+        | PlanDerivedExpression::NumberCompareConst { .. }
+        | PlanDerivedExpression::ValueCompare { .. } => return Ok(None),
+    };
+    for root in roots {
+        if !collect_activation_topology_inputs(
+            arena,
+            root,
+            list_indexes,
+            &mut inputs,
+            &mut visiting,
+        )? {
+            return Ok(Some((false, inputs)));
+        }
+    }
+    Ok(Some((true, inputs)))
+}
+
+fn list_dataflow_plan(
+    regions: &[OperationRegion],
+    list_slots: &[ListStorageSlot],
+    row_expressions: &PlanRowExpressionArena,
+    list_indexes: &[PlanListIndex],
+    persistent_states: &BTreeSet<StateId>,
+    persistent_lists: &BTreeSet<ListId>,
+    materialized_authority_lists: &BTreeSet<ListId>,
+    semantic_identities: &BTreeMap<ListId, (MemoryId, [u8; 32])>,
+) -> Result<Vec<PlanListDataflow>, PlanError> {
+    let persistent_row_fields = list_slots
+        .iter()
+        .filter(|slot| persistent_lists.contains(&slot.list_id))
+        .flat_map(|slot| slot.row_fields.iter().map(|field| field.field_id))
+        .collect::<BTreeSet<_>>();
+    let operations = regions.iter().flat_map(|region| &region.ops);
+    let mut computations = BTreeMap::<ValueRef, &PlanOp>::new();
+    let mut materializers = BTreeMap::<ListId, (&PlanOp, ValueRef)>::new();
+    for operation in operations {
+        if matches!(
+            operation.kind,
+            PlanOpKind::DerivedValue { .. } | PlanOpKind::ListProjection { .. }
+        ) && let Some(output @ (ValueRef::Field(_) | ValueRef::List(_))) = &operation.output
+            && computations.insert(output.clone(), operation).is_some()
+        {
+            return Err(PlanError::new(format!(
+                "activation causality has more than one computation for {output:?}"
+            )));
+        }
+        let targets = match &operation.kind {
+            PlanOpKind::DerivedValue {
+                materialization: Some(materialization),
+                ..
+            } => std::iter::once(materialization.target_list)
+                .chain(
+                    materialization
+                        .value_list_authorities
+                        .iter()
+                        .map(|authority| authority.list_id),
+                )
+                .collect::<Vec<_>>(),
+            PlanOpKind::ListProjection { .. } => match operation.output {
+                Some(ValueRef::List(list)) => vec![list],
+                _ => {
+                    return Err(PlanError::new(format!(
+                        "list projection {} has no list output",
+                        operation.id.0
+                    )));
+                }
+            },
+            _ => Vec::new(),
+        };
+        for target in targets
+            .into_iter()
+            .filter(|target| persistent_lists.contains(target))
+        {
+            let output = operation.output.clone().ok_or_else(|| {
+                PlanError::new(format!(
+                    "list dataflow producer {} has no output",
+                    operation.id.0
+                ))
+            })?;
+            if let Some((previous, _)) = materializers.insert(target, (operation, output))
+                && previous.id != operation.id
+            {
+                return Err(PlanError::new(format!(
+                    "persistent list {} has more than one activation materializer",
+                    target.0
+                )));
+            }
+        }
+    }
+
+    let mut entries = BTreeMap::new();
+    for slot in list_slots {
+        let list = slot.list_id;
+        let (semantic_identity, type_fingerprint) =
+            semantic_identities.get(&list).copied().ok_or_else(|| {
+                PlanError::new(format!(
+                    "runtime list {} has no stable semantic row-domain identity",
+                    list.0
+                ))
+            })?;
+        let (activation_mode, reconstruction_output, dependencies) = if materialized_authority_lists
+            .contains(&list)
+        {
+            (ListActivationMode::MaterializedAuthority, None, Vec::new())
+        } else if let Some((operation, output)) = materializers.get(&list) {
+            let topology_inputs = match &operation.kind {
+                PlanOpKind::ListProjection { projection } => {
+                    let mut inputs = operation.inputs.iter().cloned().collect::<BTreeSet<_>>();
+                    match projection {
+                        PlanListProjection::Chunk { source_list, .. } => {
+                            inputs.insert(ValueRef::List(*source_list));
+                        }
+                        PlanListProjection::ChunkValue { source, .. } => {
+                            inputs.insert(source.clone());
+                        }
+                        PlanListProjection::Unknown { .. } => {}
+                    }
+                    Some((
+                        !matches!(projection, PlanListProjection::Unknown { .. }),
+                        inputs,
+                    ))
+                }
+                _ => activation_topology_inputs(operation, row_expressions, list_indexes)?,
+            };
+            let (reconstructable, inputs) = match topology_inputs {
+                Some((shape_reconstructable, inputs)) => {
+                    let reconstructable = shape_reconstructable
+                        && inputs.iter().all(|input| {
+                            activation_value_is_reconstructable(
+                                input,
+                                persistent_states,
+                                persistent_lists,
+                                &persistent_row_fields,
+                                &computations,
+                                &mut BTreeSet::new(),
+                            )
+                        });
+                    (reconstructable, inputs)
+                }
+                None => {
+                    let inputs = operation.inputs.iter().cloned().collect::<BTreeSet<_>>();
+                    let reconstructable = inputs.iter().all(|input| {
+                        activation_value_is_reconstructable(
+                            input,
+                            persistent_states,
+                            persistent_lists,
+                            &persistent_row_fields,
+                            &computations,
+                            &mut BTreeSet::new(),
+                        )
+                    });
+                    (reconstructable, inputs)
+                }
+            };
+            if reconstructable {
+                let ValueRef::List(reconstruction_output) = output else {
+                    return Err(PlanError::new(format!(
+                        "list {} activation producer {} does not emit a list",
+                        list.0, operation.id.0
+                    )));
+                };
+                (
+                    ListActivationMode::DerivedDefault,
+                    Some(*reconstruction_output),
+                    inputs
+                        .into_iter()
+                        .filter_map(|input| match input {
+                            ValueRef::List(dependency) if dependency != list => Some(dependency),
+                            _ => None,
+                        })
+                        .collect(),
+                )
+            } else {
+                (ListActivationMode::MaterializedAuthority, None, Vec::new())
+            }
+        } else {
+            (default_list_activation_mode(slot), None, Vec::new())
+        };
+        entries.insert(
+            list,
+            PlanListDataflow::new(
+                list,
+                semantic_identity,
+                type_fingerprint,
+                activation_mode,
+                reconstruction_output,
+                dependencies,
+            )?,
+        );
+    }
+
+    let mut ordered = Vec::with_capacity(entries.len());
+    let mut emitted = BTreeSet::new();
+    while !entries.is_empty() {
+        let Some(next) = entries.iter().find_map(|(list, entry)| {
+            entry
+                .dependencies
+                .iter()
+                .all(|dependency| emitted.contains(dependency))
+                .then_some(*list)
+        }) else {
+            return Err(PlanError::new(format!(
+                "list activation dataflow contains a cycle among {:?}",
+                entries.keys().map(|list| list.0).collect::<Vec<_>>()
+            )));
+        };
+        let entry = entries
+            .remove(&next)
+            .expect("selected dataflow entry exists");
+        emitted.insert(next);
+        ordered.push(entry);
+    }
+    Ok(ordered)
+}
+
 fn persistence_plan(
     program: &ErasedProgram,
     application: &ApplicationPlan,
     schema_version: u64,
     scalar_slots: &[ScalarStorageSlot],
     list_slots: &[ListStorageSlot],
+    row_expressions: &PlanRowExpressionArena,
+    list_indexes: &[PlanListIndex],
+    regions: &[OperationRegion],
     authority_field_ids: &BTreeMap<(String, String), FieldId>,
     transient_effect_result_targets: &BTreeSet<ValueRef>,
     transient_producer_states: &BTreeSet<StateId>,
     transient_producer_lists: &BTreeSet<ListId>,
     effect_outbox: Vec<EffectOutboxSchema>,
     migration_predecessors: &[MigrationPredecessorBinding],
-) -> Result<PersistencePlan, PlanError> {
+) -> Result<(PersistencePlan, Vec<PlanListDataflow>), PlanError> {
     let mut memory = Vec::new();
     let mut lists = Vec::new();
-    let mut collections = Vec::new();
     let durable_semantic_memory = program
         .semantic_memory
         .iter()
@@ -4180,6 +4610,94 @@ fn persistence_plan(
         .filter(|memory| memory.identity.kind == ir::SemanticMemoryKind::IndexedField)
         .map(|memory| memory.id)
         .collect::<BTreeSet<_>>();
+    let persistent_states = durable_semantic_memory
+        .iter()
+        .filter_map(|memory| match memory.runtime_backing {
+            ir::SemanticMemoryRuntimeBacking::RootState { state_id, .. }
+            | ir::SemanticMemoryRuntimeBacking::IndexedState { state_id, .. } => {
+                Some(plan_state_id(state_id))
+            }
+            ir::SemanticMemoryRuntimeBacking::List { .. }
+            | ir::SemanticMemoryRuntimeBacking::Collection { .. } => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let persistent_lists = durable_semantic_memory
+        .iter()
+        .filter_map(|memory| match memory.runtime_backing {
+            ir::SemanticMemoryRuntimeBacking::List { list_id, .. } => Some(plan_list_id(list_id)),
+            ir::SemanticMemoryRuntimeBacking::RootState { .. }
+            | ir::SemanticMemoryRuntimeBacking::IndexedState { .. }
+            | ir::SemanticMemoryRuntimeBacking::Collection { .. } => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let materialized_authority_lists = program
+        .list_mutations
+        .iter()
+        .filter(|mutation| list_mutation_owns_authority(program, mutation))
+        .map(|mutation| plan_list_id(mutation.list_id))
+        .collect::<BTreeSet<_>>();
+    let semantic_list_identities = semantic_list_identities(program)?;
+    let list_dataflow = list_dataflow_plan(
+        regions,
+        list_slots,
+        row_expressions,
+        list_indexes,
+        &persistent_states,
+        &persistent_lists,
+        &materialized_authority_lists,
+        &semantic_list_identities,
+    )?;
+    let dataflow_by_list = list_dataflow
+        .iter()
+        .map(|entry| (entry.list_id, entry))
+        .collect::<BTreeMap<_, _>>();
+    let planned_collections = durable_semantic_memory
+        .iter()
+        .filter(|memory| {
+            matches!(
+                memory.identity.kind,
+                ir::SemanticMemoryKind::Map | ir::SemanticMemoryKind::Set
+            )
+        })
+        .map(|memory| semantic_collection_memory_plan(program, memory))
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut durable_list_ids = list_dataflow
+        .iter()
+        .filter_map(|entry| {
+            (entry.activation_mode == ListActivationMode::MaterializedAuthority)
+                .then_some(entry.list_id)
+        })
+        .collect::<BTreeSet<_>>();
+    durable_list_ids.extend(durable_semantic_memory.iter().filter_map(|memory| {
+        match memory.runtime_backing {
+            ir::SemanticMemoryRuntimeBacking::IndexedState {
+                list_id: Some(list_id),
+                ..
+            } if memory.identity.kind == ir::SemanticMemoryKind::IndexedField => {
+                Some(plan_list_id(list_id))
+            }
+            _ => None,
+        }
+    }));
+    durable_list_ids.extend(
+        planned_collections
+            .iter()
+            .flat_map(|collection| collection.runtime_owner_rows.iter().map(|row| row.list)),
+    );
+    durable_list_ids.extend(program.migration_edges.iter().filter_map(|edge| {
+        let memory = program.semantic_memory.get(edge.destination.memory_id.0)?;
+        match memory.runtime_backing {
+            ir::SemanticMemoryRuntimeBacking::List { list_id, .. }
+            | ir::SemanticMemoryRuntimeBacking::IndexedState {
+                list_id: Some(list_id),
+                ..
+            } => Some(plan_list_id(list_id)),
+            ir::SemanticMemoryRuntimeBacking::RootState { .. }
+            | ir::SemanticMemoryRuntimeBacking::IndexedState { list_id: None, .. }
+            | ir::SemanticMemoryRuntimeBacking::Collection { .. } => None,
+        }
+    }));
+
     for semantic_memory in durable_semantic_memory {
         match semantic_memory.identity.kind {
             ir::SemanticMemoryKind::RootScalar | ir::SemanticMemoryKind::IndexedField => {
@@ -4189,17 +4707,36 @@ fn persistence_plan(
                     scalar_slots,
                 )?);
             }
-            ir::SemanticMemoryKind::ListOwner => lists.push(semantic_list_memory_plan(
-                program,
-                semantic_memory,
-                list_slots,
-                authority_field_ids,
-                false,
-                Some(&durable_indexed_memory),
-            )?),
-            ir::SemanticMemoryKind::Map | ir::SemanticMemoryKind::Set => {
-                collections.push(semantic_collection_memory_plan(program, semantic_memory)?);
+            ir::SemanticMemoryKind::ListOwner => {
+                let ir::SemanticMemoryRuntimeBacking::List { list_id, .. } =
+                    semantic_memory.runtime_backing
+                else {
+                    return Err(PlanError::new(format!(
+                        "semantic list `{}` has no list backing while assigning activation",
+                        semantic_memory.identity.semantic_path
+                    )));
+                };
+                let list_id = plan_list_id(list_id);
+                if !durable_list_ids.contains(&list_id) {
+                    continue;
+                }
+                let dataflow = dataflow_by_list.get(&list_id).copied().ok_or_else(|| {
+                    PlanError::new(format!(
+                        "durable semantic list `{}` has no canonical list dataflow entry",
+                        semantic_memory.identity.semantic_path
+                    ))
+                })?;
+                lists.push(semantic_list_memory_plan(
+                    program,
+                    semantic_memory,
+                    list_slots,
+                    authority_field_ids,
+                    false,
+                    Some(&durable_indexed_memory),
+                    Some(dataflow.activation_mode),
+                )?);
             }
+            ir::SemanticMemoryKind::Map | ir::SemanticMemoryKind::Set => {}
         }
     }
     for predecessor in migration_predecessors {
@@ -4225,17 +4762,18 @@ fn persistence_plan(
     let current_migration_recipe_id = current_recipe.map(|recipe| recipe.migration_recipe_id);
     let (migration_recipes, migration_edges) =
         merge_migration_catalog(migration_predecessors, current_recipe, schema_version)?;
-    PersistencePlan::new_with_migrations_effect_outbox_and_collections(
+    let persistence = PersistencePlan::new_with_migrations_effect_outbox_and_collections(
         application,
         schema_version,
         memory,
         lists,
-        collections,
+        planned_collections,
         effect_outbox,
         migration_recipes,
         current_migration_recipe_id,
         migration_edges,
-    )
+    )?;
+    Ok((persistence, list_dataflow))
 }
 
 fn list_mutation_owns_authority(program: &ErasedProgram, mutation: &ir::ListMutation) -> bool {
@@ -5893,12 +6431,15 @@ pub(crate) fn compile_erased_program_with_distributed_context(
         .iter()
         .flat_map(|instance| instance.ownership.lists.iter().copied())
         .collect::<BTreeSet<_>>();
-    let persistence = persistence_plan(
+    let (persistence, list_dataflow) = persistence_plan(
         program,
         &application,
         schema_version,
         &scalar_slots,
         &list_slots,
+        &row_expressions,
+        &list_indexes,
+        &regions,
         &authority_field_ids,
         &transient_effect_result_targets,
         &transient_producer_states,
@@ -5923,6 +6464,7 @@ pub(crate) fn compile_erased_program_with_distributed_context(
         outputs,
         host_ports,
         list_indexes,
+        list_dataflow,
         demand: demand_plan(
             program,
             &scalar_fields,
@@ -15861,6 +16403,225 @@ fn insert_field_value_type_if_absent(
         return;
     }
     field_value_types.entry(field_id).or_insert(value_type);
+}
+
+#[cfg(test)]
+mod activation_plan_tests {
+    use super::*;
+
+    fn materializer(id: usize, target: usize, inputs: Vec<ValueRef>) -> PlanOp {
+        PlanOp {
+            id: PlanOpId(id),
+            kind: PlanOpKind::DerivedValue {
+                derived_kind: PlanDerivedKind::ListView,
+                startup_recompute: false,
+                materialization: Some(PlanListMaterialization {
+                    target_list: ListId(target),
+                    authority_source_list: None,
+                    fields: BTreeMap::new(),
+                    row_field_copies: Vec::new(),
+                    value_list_authorities: Vec::new(),
+                }),
+                expression: None,
+            },
+            inputs,
+            output: Some(ValueRef::List(ListId(target))),
+            indexed: false,
+            unresolved_executable_ref_count: 0,
+        }
+    }
+
+    fn slot(id: usize) -> ListStorageSlot {
+        ListStorageSlot {
+            id: PlanStorageId(id),
+            list_id: ListId(id),
+            scope_id: None,
+            row_fields: Vec::new(),
+            capacity: None,
+            hidden_key_type: "Key".to_owned(),
+            has_generation: true,
+            initializer_kind: ListInitializerKind::Empty,
+            range: None,
+            initial_rows: Vec::new(),
+        }
+    }
+
+    fn identities(count: usize) -> BTreeMap<ListId, (MemoryId, [u8; 32])> {
+        (0..count)
+            .map(|id| {
+                let owner = MemoryOwnerPath {
+                    canonical_module: "tests".to_owned(),
+                    named_owner_path: "root".to_owned(),
+                };
+                let path = format!("list_{id}");
+                let data_type = DataTypePlan::List {
+                    item: Box::new(DataTypePlan::Unknown),
+                };
+                (
+                    ListId(id),
+                    (
+                        MemoryId::from_identity(&owner, &path, MemoryKind::List).unwrap(),
+                        data_type_fingerprint(&data_type).unwrap(),
+                    ),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn activation_causality_materializes_host_results_and_reconstructs_dependents() {
+        let regions = vec![OperationRegion {
+            id: PlanRegionId(0),
+            kind: RegionKind::DerivedEvaluation,
+            ops: vec![
+                materializer(0, 0, vec![ValueRef::State(StateId(0))]),
+                materializer(
+                    1,
+                    1,
+                    vec![ValueRef::List(ListId(0)), ValueRef::State(StateId(1))],
+                ),
+            ],
+        }];
+        let dataflow = list_dataflow_plan(
+            &regions,
+            &[slot(0), slot(1)],
+            &PlanRowExpressionArena::new(),
+            &[],
+            &BTreeSet::from([StateId(1)]),
+            &BTreeSet::from([ListId(0), ListId(1)]),
+            &BTreeSet::new(),
+            &identities(2),
+        )
+        .unwrap();
+        let modes = dataflow
+            .iter()
+            .map(|entry| (entry.list_id, entry.activation_mode))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(modes[&ListId(0)], ListActivationMode::MaterializedAuthority);
+        assert_eq!(modes[&ListId(1)], ListActivationMode::DerivedDefault);
+    }
+
+    #[test]
+    fn activation_causality_separates_row_domain_from_transient_row_values() {
+        let mut row_expressions = PlanRowExpressionArena::new();
+        let source = row_expressions
+            .push(PlanRowExpressionNode::ListRef { list_id: ListId(0) })
+            .unwrap();
+        let transient_value = row_expressions
+            .push(PlanRowExpressionNode::Field {
+                input: ValueRef::State(StateId(0)),
+            })
+            .unwrap();
+        let mapped = row_expressions
+            .push(PlanRowExpressionNode::ContextualCollection {
+                owner: PlanStaticOwnerId(0),
+                operation: PlanContextualOperationKind::Map,
+                source,
+                row_local: PlanLocalId(0),
+                body: transient_value,
+                captures: Vec::new(),
+                indexed_access: None,
+            })
+            .unwrap();
+        let filtered = row_expressions
+            .push(PlanRowExpressionNode::ContextualCollection {
+                owner: PlanStaticOwnerId(1),
+                operation: PlanContextualOperationKind::Filter,
+                source,
+                row_local: PlanLocalId(0),
+                body: transient_value,
+                captures: Vec::new(),
+                indexed_access: None,
+            })
+            .unwrap();
+        let mut mapped_materializer = materializer(
+            0,
+            1,
+            vec![ValueRef::List(ListId(0)), ValueRef::State(StateId(0))],
+        );
+        let PlanOpKind::DerivedValue { expression, .. } = &mut mapped_materializer.kind else {
+            unreachable!();
+        };
+        *expression = Some(PlanDerivedExpression::RowExpression { expression: mapped });
+        let mut filtered_materializer = materializer(
+            1,
+            2,
+            vec![ValueRef::List(ListId(0)), ValueRef::State(StateId(0))],
+        );
+        let PlanOpKind::DerivedValue { expression, .. } = &mut filtered_materializer.kind else {
+            unreachable!();
+        };
+        *expression = Some(PlanDerivedExpression::RowExpression {
+            expression: filtered,
+        });
+        let regions = vec![OperationRegion {
+            id: PlanRegionId(0),
+            kind: RegionKind::DerivedEvaluation,
+            ops: vec![mapped_materializer, filtered_materializer],
+        }];
+        let dataflow = list_dataflow_plan(
+            &regions,
+            &[slot(0), slot(1), slot(2)],
+            &row_expressions,
+            &[],
+            &BTreeSet::new(),
+            &BTreeSet::from([ListId(0), ListId(1), ListId(2)]),
+            &BTreeSet::new(),
+            &identities(3),
+        )
+        .unwrap();
+        let modes = dataflow
+            .iter()
+            .map(|entry| (entry.list_id, entry.activation_mode))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(modes[&ListId(1)], ListActivationMode::DerivedDefault);
+        assert_eq!(modes[&ListId(2)], ListActivationMode::MaterializedAuthority);
+    }
+
+    #[test]
+    fn activation_dataflow_owns_chunk_projection_and_orders_its_source() {
+        let regions = vec![OperationRegion {
+            id: PlanRegionId(0),
+            kind: RegionKind::ListProjections,
+            ops: vec![PlanOp {
+                id: PlanOpId(0),
+                kind: PlanOpKind::ListProjection {
+                    projection: PlanListProjection::Chunk {
+                        source_list: ListId(0),
+                        size: 1,
+                    },
+                },
+                inputs: vec![ValueRef::List(ListId(0))],
+                output: Some(ValueRef::List(ListId(1))),
+                indexed: true,
+                unresolved_executable_ref_count: 0,
+            }],
+        }];
+        let dataflow = list_dataflow_plan(
+            &regions,
+            &[slot(0), slot(1)],
+            &PlanRowExpressionArena::new(),
+            &[],
+            &BTreeSet::new(),
+            &BTreeSet::from([ListId(0), ListId(1)]),
+            &BTreeSet::new(),
+            &identities(2),
+        )
+        .unwrap();
+        assert_eq!(
+            dataflow
+                .iter()
+                .map(|entry| entry.list_id)
+                .collect::<Vec<_>>(),
+            vec![ListId(0), ListId(1)]
+        );
+        assert_eq!(
+            dataflow[1].activation_mode,
+            ListActivationMode::DerivedDefault
+        );
+        assert_eq!(dataflow[1].reconstruction_output, Some(ListId(1)));
+        assert_eq!(dataflow[1].dependencies, vec![ListId(0)]);
+    }
 }
 
 #[cfg(test)]

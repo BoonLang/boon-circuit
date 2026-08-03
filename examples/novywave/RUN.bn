@@ -2446,7 +2446,10 @@ store: [
 
     selected_timeline_cursor_update:
         LATEST {
-            elements.waveform_click.pointer_x |> THEN { Number/project_time(pointer_x: elements.waveform_click.pointer_x, pointer_width: elements.waveform_click.pointer_width, viewport_start: viewport_label_start, viewport_end: viewport_label_end, fallback: selected_timeline_cursor_value) }
+            elements.waveform_click.pointer_x |> THEN {
+                Number/project_time(pointer_x: elements.waveform_click.pointer_x, pointer_width: elements.waveform_click.pointer_width, viewport_start: viewport_label_start, viewport_end: viewport_label_end, fallback: selected_timeline_cursor_value)
+                |> Number/round(to: 1, using: NearestAwayFromZero)
+            }
             elements.cursor_left |> THEN { selected_timeline_cursor_left }
             elements.cursor_right |> THEN { selected_timeline_cursor_right }
             elements.marker_jump |> THEN { selected_timeline_cursor_default }

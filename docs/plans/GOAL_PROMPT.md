@@ -344,12 +344,12 @@ Current checkpoints to preserve and audit rather than redo:
   containers while this is the dominant owner. Implement retained callable
   definitions plus dense invocation overlays for parameter, PASSED, type,
   owner, effect, and resource bindings; begin with the generic type-polymorphic
-  pure closure, preserve exact budgeted plan hashes, and measure retained-body,
-  overlay, avoided-specialization, OUT, dependency-record, proof-node, and
-  proof-edge counts. A flattened expansion may be a test oracle only. Then
-  derive dependency facts once from definitions plus overlays, seal a compact
-  `SemanticProgram`, and proceed to direct lowering/streaming hashes. Resume
-  remaining Phase 1 interning/scaling/parity work after this cardinality cut;
+  pure closure and measure retained-body, overlay, avoided-specialization, OUT,
+  dependency-record, proof-node, and proof-edge counts. A flattened expansion
+  may be a test oracle only. Then derive dependency facts once from definitions
+  plus overlays, seal a compact `SemanticProgram`, and proceed to direct
+  lowering/streaming hashes. Resume remaining Phase 1 interning/scaling/parity
+  work after this cardinality cut;
 - the 2026-08-03 retained-definition/invocation-overlay candidate validates the
   larger direction: NovyWave fresh/empty verified samples fall to
   4,415.27/4,455.01 ms and 317,844/318,428 KiB, semantic construction falls to
@@ -357,16 +357,70 @@ Current checkpoints to preserve and audit rather than redo:
   10.92 million allocations/1.552 GB. Open typed boundaries and pure render
   constructors now share definitions; compact checked-call occurrences carry
   constructor contexts and dependency proof classifies those overlays. The RSS
-  gate is directionally green but the 1,000 ms gate is red. Exact plan parity
-  is also red: both modes emit `f293e8a8...` instead of the required
-  `4d3c284a...`, with 33,910 document expressions and 2,344 initial patches
-  versus 42,099 and 17,517 in the oracle. Keep the compact semantic cut, repair
-  direct lowering to preserve the accepted plan behavior and identity, and do
-  not relabel this checkpoint as Phase 1 closure. A trace assigns 2,368.00 ms
-  to the dependency manifest, which still creates 159,612 records and a
+  gate is directionally green but the 1,000 ms gate is red. Both modes emit
+  deterministic `f293e8a8...`, but the historical budget hash `4d3c284a...` is
+  not a valid semantic oracle: its persistence type for
+  `store.selected_value_column_width_key` omits the source-reachable `Widest`
+  state. The `c77dabc`-like and retained artifacts include all four states and
+  have byte-identical persistence sections. Do not restore the unsound artifact
+  and do not accept `f293e8a8...` merely because it is faster. First implement
+  the performance plan's test-only flat/specialized differential oracle,
+  exact stable-contract section checks, plan verification, migration/restart
+  checks, negative cases, and recorded V3 oracle migration. Keep budget V2 red
+  until that proof passes. A trace assigns 2,368.00 ms to the dependency
+  manifest, which still creates 159,612 records and a
   160,276-node/512,204-edge proof graph from only 16,417 execution expressions;
-  after parity, compact direct proof construction/sealing is the next large
-  owner rather than more typechecker-container work;
+  after oracle repair, add demand-driven retained plan instances and compact
+  direct proof construction/sealing rather than more typechecker-container
+  work. Then share sealed semantic row fingerprints across consumers and split
+  the compiler-loading facade out of `boon_runtime` only at a measured rebuild
+  seam. Follow the complete ranked architecture tranches in the performance
+  plan and do not relabel this checkpoint as Phase 1 closure. The first
+  non-default `test-flat-oracle` slice now parses/checks once and lowers both
+  representations without adding a production fallback. Counter and a focused
+  four-state width fixture pass stable-contract and multi-turn document/
+  snapshot differential tests. An explicit optimized NovyWave preflight passes
+  structural stable-contract, plan-verifier, and exact
+  `Compact | Normal | Wide | Widest` persistence comparison in 14.82 seconds.
+  Raw internal expression offsets and duplicated dirty/commit work counts are
+  normalized or treated as performance telemetry, while zero-unresolved
+  invariants remain exact. Budget V2 stays red until the V3 provenance report,
+  real-host NovyWave behavior scenario, migration/restart matrix, and negative
+  cases are complete;
+- resume the performance goal from local checkpoint `c05af3a` and the current
+  uncommitted V3 oracle slice. The authored real-host NovyWave trace agrees
+  between retained and test-flat representations; its restart leg exposed a
+  generic authority-activation defect. Replace the compiler's initializer-
+  shape guess and executor's computation-presence guess with one exact
+  compiler-emitted activation plan. Restore durable authority, reconstruct
+  effect-free state-dependent recipes, apply sparse overrides only after rows
+  exist, then rebuild indexes/currentness/demand. Separate structural row-domain
+  authority, sparse durable indexed overlays, and computed row values through
+  one compiler-owned list-dataflow table. The
+  inspected NovyWave plan currently promotes 24 lists and 252 row fields to
+  persistence; `selected_signal_defaults` combines two durable `HOLD` fields
+  with 20 computed/host-backed authority fields. Prune pure derived views,
+  persist overlays by stable structural origin, emit ordered activation steps,
+  and record before/after plan/artifact bytes and activation work. Normalize
+  only the store-local epoch in the differential oracle and prove state-
+  dependent defaults plus host-result-owned lists before the full V3 migration/
+  restart matrix. Treat the `store.variable_rows` `List/chunk` mapped-row
+  persistence failure as a negative architecture proof: do not serialize row
+  handles or add a projection-only executor exception. Once the list contract
+  is stable, replace full-plan fingerprint cloning with a seal-once builder;
+- prioritize the checkpoint-level architecture cuts over further micro-
+  optimization. The live graph audit finds 31 normal transitive dependents of
+  `boon_document_model` and 16 of `boon_compiler`; moving cross-layer execution
+  IDs to a dependency-bottom contract crate predicts 19, while inverting the
+  six runtime/outer compiler dependencies predicts four true compiler
+  producers. Treat those values as hypotheses and publish measured before/
+  after dependency closures and rebuild wall times. Extract the real-host
+  retained-document behavior oracle from the native GPU/editor/window shell so
+  migration iterations do not rebuild presentation code. No compatibility
+  re-export, cosmetic file split, or smaller Rust rebuild may be counted as a
+  Boon latency win. After the activation/oracle gate and enabling boundary
+  cuts, continue demand-driven plan instances, the packed proof summary, and
+  one sealed semantic database with shared fingerprints;
 - the current compiler-throughput checkpoint keeps Counter, physical TodoMVC,
   and NovyWave `MachinePlan` output deterministic while replacing copied OUT
   type environments with active-path overlays, retaining canonical-root-reading
@@ -385,10 +439,13 @@ Current checkpoints to preserve and audit rather than redo:
   analyzes each body once and propagates rejection through a reverse dependency
   worklist instead of repeating whole-body fixed-point scans. A post-reboot
   debug measurement completes Counter in 0.09 seconds, physical TodoMVC in 2.02
-  seconds, and NovyWave in 20.68 seconds at 1,000,416 KiB peak RSS; their exact
-  plan SHA-256 values remain `dc1fe51b659d1746a0b0b4ae2dcba21d50a9426499eb2bde28dbed988e6cfb08`,
+  seconds, and NovyWave in 20.68 seconds at 1,000,416 KiB peak RSS; the
+  historical artifacts emitted SHA-256 values
+  `dc1fe51b659d1746a0b0b4ae2dcba21d50a9426499eb2bde28dbed988e6cfb08`,
   `c9a12cd0a1bcf748a20e3a072afa09d0f923c2c9dbd664f2343d343494404f96`,
-  and `4d3c284a9240cdc68c70aff7f30c570367e285cc1e8f823585900829bafd8ff7`;
+  and `4d3c284a9240cdc68c70aff7f30c570367e285cc1e8f823585900829bafd8ff7`.
+  These identify that measurement only; the invalid NovyWave artifact is not a
+  current semantic oracle;
 - after the current diagnostics tranche passes, the full-plan blockers remain
   the historically measured 2.84 seconds of contextual materialization/
   execution expansion and 3.81-second whole-program dependency proof, plus

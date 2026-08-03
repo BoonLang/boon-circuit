@@ -491,6 +491,107 @@ pub fn compile_machine_plan(
     )
 }
 
+/// Retained and occurrence-specialized plans produced from one checked graph.
+///
+/// This type is compiled only for the differential artifact-oracle feature and
+/// is not available to ordinary compiler or runtime builds.
+#[cfg(feature = "test-flat-oracle")]
+#[doc(hidden)]
+pub struct ArtifactOraclePlanPair {
+    pub retained: MachinePlan,
+    pub flat_specialized: MachinePlan,
+}
+
+/// Produces a retained plan and an independently occurrence-specialized test
+/// oracle from the same parsed and checked source.
+///
+/// The flat path is intentionally feature-gated and must never be selected by
+/// production compilation or used as a fallback when retained lowering fails.
+#[cfg(feature = "test-flat-oracle")]
+#[doc(hidden)]
+pub fn compile_artifact_oracle_pair(
+    request: CompileRequest<'_>,
+) -> CompilerResult<ArtifactOraclePlanPair> {
+    let CompileRequest {
+        source,
+        target_profile,
+        program_role,
+        application_identity,
+        schema_version,
+        migration_predecessors,
+    } = request;
+    let (parsed, _) = parse_compile_source(source)?;
+    let external_types = boon_checked::ExternalTypeEnvironment::empty(program_role);
+    let (check_output, _) = boon_typecheck::check_runtime_program_profiled_with_external_types(
+        &parsed,
+        &external_types,
+    );
+    let checked = checked_program_from_output(&parsed, check_output)?;
+    let retained = compile_checked_artifact_oracle_plan(
+        checked.clone(),
+        false,
+        target_profile,
+        program_role,
+        &application_identity,
+        schema_version,
+        migration_predecessors,
+    )?;
+    let flat_specialized = compile_checked_artifact_oracle_plan(
+        checked,
+        true,
+        target_profile,
+        program_role,
+        &application_identity,
+        schema_version,
+        migration_predecessors,
+    )?;
+    Ok(ArtifactOraclePlanPair {
+        retained,
+        flat_specialized,
+    })
+}
+
+#[cfg(feature = "test-flat-oracle")]
+#[allow(clippy::too_many_arguments)]
+fn compile_checked_artifact_oracle_plan(
+    checked: boon_checked::CheckedProgram,
+    flat_specialized: bool,
+    target_profile: TargetProfile,
+    program_role: ProgramRole,
+    application_identity: &ApplicationIdentity,
+    schema_version: u64,
+    migration_predecessors: &[MigrationPredecessorBinding],
+) -> CompilerResult<MachinePlan> {
+    let semantic = if flat_specialized {
+        boon_semantic::elaborate_flat_test_oracle(checked, &[])
+    } else {
+        boon_semantic::elaborate(checked, &[])
+    }
+    .map_err(|error| PlanError::new(error.to_string()))?;
+    let verified = boon_verify::verify_explicit_contracts(semantic)
+        .map_err(|error| PlanError::new(error.to_string()))?;
+    let ir = boon_ir::erase_and_lower(verified).map_err(PlanError::new)?;
+    verify_hidden_identity(&ir)?;
+    verify_static_schedule(&ir)?;
+    let plan = compile_erased_program(
+        &ir,
+        target_profile,
+        program_role,
+        application_identity,
+        schema_version,
+        migration_predecessors,
+    )?;
+    let verification = boon_plan::verify_plan(&plan)?;
+    if verification.status != "pass" {
+        return Err(PlanError::new(format!(
+            "artifact-oracle MachinePlan verification returned {}",
+            verification.status
+        ))
+        .into());
+    }
+    Ok(plan)
+}
+
 pub fn check_source(request: CompilerCheckRequest<'_>) -> CompilerResult<CheckedSourceFromSource> {
     check_source_with_ownership(request, CheckedSourceOwnership::Report)
 }

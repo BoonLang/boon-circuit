@@ -51,7 +51,8 @@ const HIERARCHY_PROGRAM: &str = r#"
 store: [
     request: SOURCE
     result:
-        NotStarted |> HOLD result {
+        LATEST {
+            NotStarted
             request |> THEN {
                 Wellen/hierarchy_page(
                     artifact: request.artifact
@@ -61,9 +62,21 @@ store: [
                 )
             }
         }
+    first_signal:
+        result |> WHEN {
+            HierarchyPage =>
+                result.rows
+                |> List/find(item, if: item.kind == TEXT { Signal })
+                |> WHEN {
+                    Found[value] => value.signal_id
+                    NotFound => TEXT { none }
+                }
+            __ => TEXT { none }
+        }
 ]
 outputs: [
     result: store.result
+    first_signal: store.first_signal
 ]
 "#;
 
@@ -71,7 +84,8 @@ const SIGNAL_PROGRAM: &str = r#"
 store: [
     request: SOURCE
     result:
-        NotStarted |> HOLD result {
+        LATEST {
+            NotStarted
             request |> THEN {
                 Wellen/signal_page(
                     artifact: request.artifact
@@ -94,7 +108,8 @@ const CURSOR_PROGRAM: &str = r#"
 store: [
     request: SOURCE
     result:
-        NotStarted |> HOLD result {
+        LATEST {
+            NotStarted
             request |> THEN {
                 Wellen/cursor_values(
                     artifact: request.artifact
@@ -229,6 +244,68 @@ fn content_store(max_entries: usize) -> ContentStore {
         ContentStoreLimits::new(max_entries, 8 * 1024 * 1024),
     )
     .unwrap()
+}
+
+#[tokio::test]
+async fn hierarchy_page_preserves_vcd_declaration_order() {
+    let path = fixture("simple.vcd");
+    let mut registry = FileCapabilityRegistry::new(1).unwrap();
+    let selected = registry.register_file(&path).unwrap().file_selected_value();
+    let store = content_store(1);
+    let mut stream = FileEffectAdapter::new(registry, store.clone(), 1).unwrap();
+    let mut stream_program = program(FILE_STREAM_PROGRAM, "stream-vcd-order");
+    let content = materialize(&mut stream, &mut stream_program, selected).await;
+
+    let mut wellen = WaveformEffectAdapter::new(store, 1).unwrap();
+    let mut open_program = program(OPEN_PROGRAM, "open-vcd-order");
+    let opened = submit_waveform(
+        &mut wellen,
+        &mut open_program,
+        BTreeMap::from([("content".to_owned(), content.value().unwrap())]),
+    );
+    let artifact = fields(&opened, "WaveformOpened")["artifact"].clone();
+    let mut hierarchy_program = program(HIERARCHY_PROGRAM, "hierarchy-vcd-order");
+    let page = submit_waveform(
+        &mut wellen,
+        &mut hierarchy_program,
+        BTreeMap::from([
+            ("artifact".to_owned(), artifact),
+            (
+                "request_fingerprint".to_owned(),
+                Value::Text("vcd-declaration-order".to_owned()),
+            ),
+            ("offset".to_owned(), number(0)),
+            ("limit".to_owned(), number(256)),
+        ]),
+    );
+    let Value::List(rows) = &fields(&page, "HierarchyPage")["rows"] else {
+        panic!("hierarchy rows must be a List");
+    };
+    let signal_ids = rows
+        .iter()
+        .filter_map(|row| match row {
+            Value::Record(fields)
+                if fields.get("kind") == Some(&Value::Text("Signal".to_owned())) =>
+            {
+                fields.get("signal_id").cloned()
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        signal_ids,
+        [
+            Value::Text("simple_tb.s.A".to_owned()),
+            Value::Text("simple_tb.s.B".to_owned()),
+            Value::Text("simple_tb.s.temperature".to_owned()),
+        ]
+    );
+    assert_eq!(
+        hierarchy_program
+            .output_value_current("first_signal")
+            .unwrap(),
+        Value::Text("simple_tb.s.A".to_owned())
+    );
 }
 
 #[tokio::test]

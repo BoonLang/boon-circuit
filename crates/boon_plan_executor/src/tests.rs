@@ -76,6 +76,13 @@ fn plan(
     let state_label_map = state_labels.iter().copied().collect::<BTreeMap<_, _>>();
     let list_label_map = list_labels.iter().copied().collect::<BTreeMap<_, _>>();
     let field_label_map = field_labels.iter().copied().collect::<BTreeMap<_, _>>();
+    let mutated_lists = ops
+        .iter()
+        .filter_map(|operation| match (&operation.kind, &operation.output) {
+            (PlanOpKind::ListMutation { .. }, Some(ValueRef::List(list))) => Some(*list),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
     let memory = scalar_slots
         .iter()
         .map(|slot| {
@@ -139,7 +146,13 @@ fn plan(
                         open: true,
                     }),
                 },
-                InitialProvenance::ReconstructableDefault,
+                if slot.initializer_kind == ListInitializerKind::Unknown
+                    || mutated_lists.contains(&slot.list_id)
+                {
+                    InitialProvenance::MaterializedAuthority
+                } else {
+                    InitialProvenance::ReconstructableDefault
+                },
                 owner,
                 slot.hidden_key_type.clone(),
                 slot.has_generation,
@@ -149,6 +162,32 @@ fn plan(
         })
         .collect();
     let persistence = PersistencePlan::new(&application, 1, memory, lists, Vec::new()).unwrap();
+    let list_dataflow = list_slots
+        .iter()
+        .map(|slot| {
+            let activation_mode = if slot.initializer_kind == ListInitializerKind::Unknown
+                || mutated_lists.contains(&slot.list_id)
+            {
+                ListActivationMode::MaterializedAuthority
+            } else {
+                ListActivationMode::StaticDefault
+            };
+            let memory = persistence
+                .lists
+                .iter()
+                .find(|memory| memory.runtime_slot == slot.id)
+                .expect("list fixture semantic identity");
+            PlanListDataflow::new(
+                slot.list_id,
+                memory.memory_id,
+                memory.type_fingerprint,
+                activation_mode,
+                None,
+                Vec::new(),
+            )
+            .unwrap()
+        })
+        .collect();
     let mut plan = MachinePlan {
         version: PlanVersion::default(),
         target_profile: TargetProfile::SoftwareDefault,
@@ -161,6 +200,7 @@ fn plan(
         outputs: Vec::new(),
         host_ports: Vec::new(),
         list_indexes: Vec::new(),
+        list_dataflow,
         demand: DemandPlan {
             root_derived_outputs: demand,
         },
@@ -243,6 +283,79 @@ fn plan(
     }
     plan.capability_summary = derive_capability_summary(&plan);
     plan
+}
+
+fn set_list_activation_mode(
+    plan: &mut MachinePlan,
+    list_id: ListId,
+    activation_mode: ListActivationMode,
+) {
+    let mut lists = plan.persistence.lists.clone();
+    let memory = lists
+        .iter_mut()
+        .find(|memory| {
+            plan.storage_layout
+                .list_slots
+                .iter()
+                .any(|slot| slot.id == memory.runtime_slot && slot.list_id == list_id)
+        })
+        .expect("persistent list activation fixture");
+    memory.initial_provenance = activation_mode.initial_provenance();
+    plan.persistence = PersistencePlan::new(
+        &plan.application,
+        plan.persistence.schema_version,
+        plan.persistence.memory.clone(),
+        lists,
+        Vec::new(),
+    )
+    .unwrap();
+    let (reconstruction_output, dependencies) =
+        if activation_mode == ListActivationMode::DerivedDefault {
+            let operation = plan
+                .regions
+                .iter()
+                .flat_map(|region| &region.ops)
+                .find(|operation| {
+                    matches!(operation.output, Some(ValueRef::List(output)) if output == list_id)
+                        && match &operation.kind {
+                            PlanOpKind::DerivedValue {
+                                materialization: Some(materialization),
+                                ..
+                            } => materialization.target_list == list_id,
+                            PlanOpKind::ListProjection { .. } => true,
+                            _ => false,
+                        }
+                })
+                .expect("derived list activation producer");
+            (
+                Some(list_id),
+                operation
+                    .inputs
+                    .iter()
+                    .filter_map(|input| match input {
+                        ValueRef::List(dependency) if *dependency != list_id => Some(*dependency),
+                        _ => None,
+                    })
+                    .collect(),
+            )
+        } else {
+            (None, Vec::new())
+        };
+    let dataflow = plan
+        .list_dataflow
+        .iter_mut()
+        .find(|entry| entry.list_id == list_id)
+        .expect("list activation fixture");
+    *dataflow = PlanListDataflow::new(
+        list_id,
+        dataflow.semantic_identity,
+        dataflow.type_fingerprint,
+        activation_mode,
+        reconstruction_output,
+        dependencies,
+    )
+    .unwrap();
+    plan.list_dataflow.sort_by_key(|entry| entry.list_id);
 }
 
 fn test_data_type(value_type: PlanValueType) -> DataTypePlan {
@@ -1814,8 +1927,13 @@ fn machine_build_task_slices_full_authority_restore_and_runtime_rebuild() {
         "translated durable authority was not cooperatively applied"
     );
     assert_eq!(
-        durable_sliced.authority_snapshot().unwrap(),
-        synchronous.authority_snapshot().unwrap()
+        durable_sliced.snapshot().unwrap(),
+        synchronous.snapshot().unwrap()
+    );
+    let restored_authority = durable_sliced.authority_snapshot().unwrap();
+    assert!(
+        !restored_authority.lists[&list.list_id].touched,
+        "a reconstructable static row domain restores sparse field overlays, not a complete durable replacement"
     );
 }
 
@@ -3219,6 +3337,351 @@ fn indexed_override_does_not_materialize_the_whole_default_list() {
         snapshot.lists[&ListId(0)][1].fields[&FieldId(0)],
         Value::Text("=A1+1".into())
     );
+}
+
+#[test]
+fn activation_restored_root_state_is_available_to_indexed_default_reconstruction() {
+    let mut row_expressions = PlanRowExpressionArena::new();
+    let restored_default = row_field(&mut row_expressions, ValueRef::State(StateId(0)));
+    let list = ListStorageSlot {
+        id: PlanStorageId(2),
+        list_id: ListId(0),
+        scope_id: Some(ScopeId(0)),
+        row_fields: vec![PlanListRowField {
+            field_id: FieldId(0),
+            name: "value".into(),
+            role: PlanListRowFieldRole::Authority,
+        }],
+        capacity: None,
+        hidden_key_type: "Key".into(),
+        has_generation: true,
+        initializer_kind: ListInitializerKind::RecordLiteral,
+        range: None,
+        initial_rows: vec![PlanInitialListRow {
+            fields: vec![PlanInitialListField {
+                name: "value".into(),
+                field_id: Some(FieldId(0)),
+                initializer: PlanInitialListFieldInitializer::Expression {
+                    expression: restored_default,
+                },
+            }],
+        }],
+    };
+    let indexed = ScalarStorageSlot {
+        id: PlanStorageId(1),
+        state_id: StateId(1),
+        owner: PlanOwner {
+            static_owner: PlanStaticOwnerId(0),
+            ancestors: vec![PlanOwnerAncestor {
+                static_owner: PlanStaticOwnerId(0),
+                scope: ScopeId(0),
+                list: ListId(0),
+            }],
+        },
+        value_type: PlanValueType::Number,
+        scope_id: Some(ScopeId(0)),
+        indexed: true,
+        indexed_field_id: Some(FieldId(0)),
+        lifetime: PlanStateLifetime::Persistent,
+        initializer: ScalarInitializerPlan::Expression {
+            expression: restored_default,
+        },
+    };
+    let update = const_update(&mut row_expressions, 0, 0, 0, 1);
+    let machine = plan(
+        RootOutputDemand::Selected(Vec::new()),
+        row_expressions,
+        vec![
+            constant(0, number_constant(7)),
+            constant(1, number_constant(9)),
+        ],
+        vec![route(0, None)],
+        vec![number_slot(0, 0), indexed],
+        vec![list],
+        vec![update],
+        vec![(StateId(0), "store.seed"), (StateId(1), "rows.value")],
+        vec![(ListId(0), "rows")],
+        vec![(FieldId(0), "rows.value")],
+    );
+    let mut session = MachineInstance::new(machine.clone(), SessionOptions::default()).unwrap();
+    session.apply(event(&session, 1, 0, None)).unwrap();
+    let durable = session
+        .durable_restore_image(1, Default::default())
+        .unwrap();
+    let mut restored = MachineInstanceBuilder::new(machine, SessionOptions::default())
+        .unwrap()
+        .restore_durable(durable)
+        .unwrap()
+        .build()
+        .unwrap();
+    let Value::List(rows) = restored
+        .inspect_list_field_current(ListId(0), FieldId(0), 1)
+        .unwrap()
+    else {
+        panic!("indexed default inspection is not a list");
+    };
+    let Value::Record(fields) = &rows[0] else {
+        panic!("indexed default inspection row is not a record");
+    };
+    assert_eq!(fields["value"], number(9));
+}
+
+#[test]
+fn activation_derived_default_is_reconstructed_before_sparse_row_override() {
+    let mut row_expressions = PlanRowExpressionArena::new();
+    let row_id = row_constant(&mut row_expressions, PlanConstantId(0));
+    let item = row(
+        &mut row_expressions,
+        PlanRowExpressionNode::Object {
+            fields: vec![PlanRowObjectField {
+                name: "id".into(),
+                value: row_id,
+                spread: false,
+            }],
+        },
+    );
+    let list_value = row(
+        &mut row_expressions,
+        PlanRowExpressionNode::ListLiteral { items: vec![item] },
+    );
+    let update_value = row_constant(&mut row_expressions, PlanConstantId(2));
+    let list = ListStorageSlot {
+        id: PlanStorageId(1),
+        list_id: ListId(0),
+        scope_id: Some(ScopeId(0)),
+        row_fields: vec![
+            PlanListRowField {
+                field_id: FieldId(0),
+                name: "id".into(),
+                role: PlanListRowFieldRole::Authority,
+            },
+            PlanListRowField {
+                field_id: FieldId(1),
+                name: "value".into(),
+                role: PlanListRowFieldRole::Authority,
+            },
+        ],
+        capacity: None,
+        hidden_key_type: "Key".into(),
+        has_generation: true,
+        initializer_kind: ListInitializerKind::Empty,
+        range: None,
+        initial_rows: Vec::new(),
+    };
+    let indexed = ScalarStorageSlot {
+        id: PlanStorageId(0),
+        state_id: StateId(0),
+        owner: PlanOwner {
+            static_owner: PlanStaticOwnerId(0),
+            ancestors: vec![PlanOwnerAncestor {
+                static_owner: PlanStaticOwnerId(0),
+                scope: ScopeId(0),
+                list: ListId(0),
+            }],
+        },
+        value_type: PlanValueType::Text,
+        scope_id: Some(ScopeId(0)),
+        indexed: true,
+        indexed_field_id: Some(FieldId(1)),
+        lifetime: PlanStateLifetime::Persistent,
+        initializer: ScalarInitializerPlan::Constant {
+            constant_id: PlanConstantId(1),
+        },
+    };
+    let materializer = PlanOp {
+        id: PlanOpId(0),
+        kind: PlanOpKind::DerivedValue {
+            derived_kind: PlanDerivedKind::Pure,
+            startup_recompute: false,
+            materialization: Some(PlanListMaterialization {
+                target_list: ListId(0),
+                authority_source_list: None,
+                fields: BTreeMap::from([("id".to_owned(), FieldId(0))]),
+                row_field_copies: Vec::new(),
+                value_list_authorities: Vec::new(),
+            }),
+            expression: Some(PlanDerivedExpression::RowExpression {
+                expression: list_value,
+            }),
+        },
+        inputs: vec![ValueRef::Constant(PlanConstantId(0))],
+        output: Some(ValueRef::List(ListId(0))),
+        indexed: false,
+        unresolved_executable_ref_count: 0,
+    };
+    let update = PlanOp {
+        id: PlanOpId(1),
+        kind: PlanOpKind::StateUpdate {
+            trigger: ValueRef::Source(SourceId(0)),
+            value: Some(update_value),
+            effect: None,
+        },
+        inputs: vec![ValueRef::Source(SourceId(0))],
+        output: Some(ValueRef::State(StateId(0))),
+        indexed: true,
+        unresolved_executable_ref_count: 0,
+    };
+    let mut machine = plan(
+        RootOutputDemand::Selected(Vec::new()),
+        row_expressions,
+        vec![
+            constant(
+                0,
+                PlanConstantValue::Text {
+                    value: "row".into(),
+                },
+            ),
+            constant(
+                1,
+                PlanConstantValue::Text {
+                    value: "default".into(),
+                },
+            ),
+            constant(
+                2,
+                PlanConstantValue::Text {
+                    value: "override".into(),
+                },
+            ),
+        ],
+        vec![route(0, Some(0))],
+        vec![indexed],
+        vec![list],
+        vec![materializer, update],
+        vec![(StateId(0), "rows.value")],
+        vec![(ListId(0), "rows")],
+        vec![(FieldId(0), "rows.id"), (FieldId(1), "rows.value")],
+    );
+    set_list_activation_mode(&mut machine, ListId(0), ListActivationMode::DerivedDefault);
+    let mut session = MachineInstance::new(machine.clone(), SessionOptions::default()).unwrap();
+    let rows = session.list_rows_current(ListId(0)).unwrap();
+    assert_eq!(rows.len(), 1);
+    session.apply(event(&session, 1, 0, Some(rows[0]))).unwrap();
+    let durable = session
+        .durable_restore_image(1, Default::default())
+        .unwrap();
+    let stored = durable.lists.values().next().unwrap();
+    assert!(!stored.touched);
+    assert_eq!(stored.rows.len(), 1);
+
+    let restored = MachineInstanceBuilder::new(machine, SessionOptions::default())
+        .unwrap()
+        .restore_durable(durable)
+        .unwrap()
+        .build()
+        .unwrap();
+    let snapshot = restored.snapshot().unwrap();
+    assert_eq!(snapshot.lists[&ListId(0)].len(), 1);
+    assert_eq!(
+        snapshot.lists[&ListId(0)][0].fields[&FieldId(1)],
+        Value::Text("override".into())
+    );
+}
+
+#[test]
+fn activation_materialized_authority_stays_durable_even_with_a_list_computation() {
+    let mut row_expressions = PlanRowExpressionArena::new();
+    let empty = row(
+        &mut row_expressions,
+        PlanRowExpressionNode::ListLiteral { items: Vec::new() },
+    );
+    let append_gate = row_field(&mut row_expressions, ValueRef::Source(SourceId(0)));
+    let append_item = row_constant(&mut row_expressions, PlanConstantId(0));
+    let list = ListStorageSlot {
+        id: PlanStorageId(0),
+        list_id: ListId(0),
+        scope_id: Some(ScopeId(0)),
+        row_fields: vec![PlanListRowField {
+            field_id: FieldId(0),
+            name: "value".into(),
+            role: PlanListRowFieldRole::Authority,
+        }],
+        capacity: None,
+        hidden_key_type: "Key".into(),
+        has_generation: true,
+        initializer_kind: ListInitializerKind::Empty,
+        range: None,
+        initial_rows: Vec::new(),
+    };
+    let computation = PlanOp {
+        id: PlanOpId(0),
+        kind: PlanOpKind::DerivedValue {
+            derived_kind: PlanDerivedKind::Pure,
+            startup_recompute: false,
+            materialization: None,
+            expression: Some(PlanDerivedExpression::RowExpression { expression: empty }),
+        },
+        inputs: Vec::new(),
+        output: Some(ValueRef::List(ListId(0))),
+        indexed: false,
+        unresolved_executable_ref_count: 0,
+    };
+    let append = PlanOp {
+        id: PlanOpId(1),
+        kind: PlanOpKind::ListMutation {
+            mutation: PlanListMutation::Append(PlanListAppend {
+                site: 0,
+                ordinal: 0,
+                owner: PlanOwner::root(),
+                trigger: ValueRef::Source(SourceId(0)),
+                gate: append_gate,
+                item: append_item,
+                fields: vec![PlanListAppendField {
+                    name: "value".into(),
+                    field_id: FieldId(0),
+                }],
+                row_field_copies: Vec::new(),
+            }),
+        },
+        inputs: vec![
+            ValueRef::Source(SourceId(0)),
+            ValueRef::Constant(PlanConstantId(0)),
+        ],
+        output: Some(ValueRef::List(ListId(0))),
+        indexed: true,
+        unresolved_executable_ref_count: 0,
+    };
+    let mut machine = plan(
+        RootOutputDemand::Selected(Vec::new()),
+        row_expressions,
+        vec![constant(
+            0,
+            PlanConstantValue::Text {
+                value: "host-row".into(),
+            },
+        )],
+        vec![route(0, None)],
+        Vec::new(),
+        vec![list],
+        vec![computation, append],
+        Vec::new(),
+        vec![(ListId(0), "host_rows")],
+        vec![(FieldId(0), "host_rows.value")],
+    );
+    set_list_activation_mode(
+        &mut machine,
+        ListId(0),
+        ListActivationMode::MaterializedAuthority,
+    );
+    let mut session = MachineInstance::new(machine.clone(), SessionOptions::default()).unwrap();
+    let turn = session.apply(event(&session, 1, 0, None)).unwrap();
+    assert!(matches!(
+        turn.durable_changes.as_slice(),
+        [boon_persistence::DurableChange::SetList { .. }]
+    ));
+    let durable = session
+        .durable_restore_image(1, Default::default())
+        .unwrap();
+    let stored = durable.lists.values().next().unwrap();
+    assert!(stored.touched);
+    assert_eq!(stored.rows.len(), 1);
+    let restored = MachineInstanceBuilder::new(machine, SessionOptions::default())
+        .unwrap()
+        .restore_durable(durable)
+        .unwrap()
+        .build()
+        .unwrap();
+    assert_eq!(restored.list_rows(ListId(0)).len(), 1);
 }
 
 #[test]

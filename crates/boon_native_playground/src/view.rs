@@ -307,6 +307,68 @@ impl RetainedView {
             .collect()
     }
 
+    #[cfg(test)]
+    pub fn source_action_diagnostics(&self, source_path: &str) -> Vec<String> {
+        self.retained
+            .hits()
+            .entries
+            .iter()
+            .filter_map(|entry| {
+                let intents = entry
+                    .source_routes
+                    .iter()
+                    .filter(|route| route.source_path == source_path)
+                    .map(|route| route.intent.clone())
+                    .collect::<Vec<_>>();
+                if intents.is_empty() {
+                    return None;
+                }
+                let topmost = self
+                    .retained
+                    .hits()
+                    .hit_test(
+                        entry.bounds.x + entry.bounds.width * 0.5,
+                        entry.bounds.y + entry.bounds.height * 0.5,
+                    )
+                    .map(|hit| hit.node.0.clone());
+                let visible = self.visible_hit_target(entry).map(|target| Rect {
+                    x: target.bounds_x,
+                    y: target.bounds_y,
+                    width: target.bounds_width,
+                    height: target.bounds_height,
+                });
+                let mut ancestors = Vec::new();
+                let mut current = Some(entry.node.clone());
+                while let Some(id) = current {
+                    let Some(node) = self.retained.frame().nodes.get(&id) else {
+                        break;
+                    };
+                    let item = self
+                        .retained
+                        .layout()
+                        .display_list
+                        .iter()
+                        .find(|item| item.node == id);
+                    ancestors.push(format!(
+                        "{} kind={:?} overlay={:?} bounds={:?} clip={:?}",
+                        id.0,
+                        node.kind,
+                        node.style.get("overlay_children"),
+                        item.map(|item| item.bounds),
+                        item.and_then(|item| clip_rect(&item.style)),
+                    ));
+                    current = node.parent.clone();
+                }
+                Some(format!(
+                    "node={} bounds={:?} intents={intents:?} topmost={topmost:?} visible={visible:?} viewport={:?} ancestors={ancestors:?}",
+                    entry.node.0,
+                    entry.bounds,
+                    self.retained.scene().viewport,
+                ))
+            })
+            .collect()
+    }
+
     pub fn target_for_scenario(
         &self,
         source_path: &str,
@@ -607,12 +669,10 @@ fn node_scrolls_axis(
 }
 
 fn style_bool(style: &boon_document::StyleMap, key: &str) -> bool {
-    match style.get(key) {
-        Some(boon_document::StyleValue::Bool(value)) => *value,
-        Some(boon_document::StyleValue::Text(value)) => value.parse().unwrap_or(false),
-        Some(boon_document::StyleValue::Number(value)) => *value != 0.0,
-        _ => false,
-    }
+    style
+        .get(key)
+        .and_then(boon_document::StyleValue::as_bool)
+        .unwrap_or(false)
 }
 
 fn rect_contains(rect: Rect, x: f32, y: f32) -> bool {

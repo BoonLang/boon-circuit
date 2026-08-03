@@ -22,6 +22,7 @@ fn empty_plan() -> MachinePlan {
         outputs: Vec::new(),
         host_ports: Vec::new(),
         list_indexes: Vec::new(),
+        list_dataflow: Vec::new(),
         demand: DemandPlan {
             root_derived_outputs: RootOutputDemand::Selected(Vec::new()),
         },
@@ -235,6 +236,125 @@ fn plan_row_expression_arena_serde_and_plan_hash_are_deterministic() {
     assert_ne!(
         plan_sha256(&first_plan).unwrap(),
         plan_sha256(&changed).unwrap()
+    );
+}
+
+#[test]
+fn structural_row_expression_hash_ignores_arena_offsets() {
+    let mut first = PlanRowExpressionArena::new();
+    let first_source = first.builder().value(ValueRef::State(StateId(3))).unwrap();
+    let first_root = first
+        .builder()
+        .intern(PlanRowExpressionNode::TextLength {
+            input: first_source,
+        })
+        .unwrap();
+
+    let mut shifted = PlanRowExpressionArena::new();
+    shifted
+        .builder()
+        .value(ValueRef::State(StateId(99)))
+        .unwrap();
+    let shifted_source = shifted
+        .builder()
+        .value(ValueRef::State(StateId(3)))
+        .unwrap();
+    let shifted_root = shifted
+        .builder()
+        .intern(PlanRowExpressionNode::TextLength {
+            input: shifted_source,
+        })
+        .unwrap();
+
+    assert_ne!(first_root, shifted_root);
+    assert_eq!(
+        first.structural_sha256(first_root).unwrap(),
+        shifted.structural_sha256(shifted_root).unwrap()
+    );
+    let changed = shifted
+        .builder()
+        .intern(PlanRowExpressionNode::TextIsEmpty {
+            input: shifted_source,
+        })
+        .unwrap();
+    assert_ne!(
+        first.structural_sha256(first_root).unwrap(),
+        shifted.structural_sha256(changed).unwrap()
+    );
+}
+
+#[test]
+fn stable_contract_hash_normalizes_list_expression_offsets_and_work_counts() {
+    let mut first = empty_plan();
+    let first_source = first
+        .row_expressions
+        .builder()
+        .value(ValueRef::State(StateId(3)))
+        .unwrap();
+    let first_key = first
+        .row_expressions
+        .builder()
+        .intern(PlanRowExpressionNode::TextLength {
+            input: first_source,
+        })
+        .unwrap();
+    first.list_indexes.push(PlanListIndex {
+        id: PlanListIndexId(0),
+        source_list: ListId(0),
+        keys: vec![PlanListIndexKey {
+            owner: PlanStaticOwnerId::ROOT,
+            row_local: PlanLocalId(0),
+            expression: first_key,
+            kind: PlanListIndexKeyKind::Number,
+            closed_tags: Vec::new(),
+            direction: PlanOrderDirection::Ascending,
+            multiplicity: PlanListIndexKeyMultiplicity::One,
+        }],
+    });
+
+    let mut shifted = empty_plan();
+    shifted
+        .row_expressions
+        .builder()
+        .value(ValueRef::State(StateId(99)))
+        .unwrap();
+    let shifted_source = shifted
+        .row_expressions
+        .builder()
+        .value(ValueRef::State(StateId(3)))
+        .unwrap();
+    let shifted_key = shifted
+        .row_expressions
+        .builder()
+        .intern(PlanRowExpressionNode::TextLength {
+            input: shifted_source,
+        })
+        .unwrap();
+    shifted.list_indexes.push(PlanListIndex {
+        id: PlanListIndexId(0),
+        source_list: ListId(0),
+        keys: vec![PlanListIndexKey {
+            owner: PlanStaticOwnerId::ROOT,
+            row_local: PlanLocalId(0),
+            expression: shifted_key,
+            kind: PlanListIndexKeyKind::Number,
+            closed_tags: Vec::new(),
+            direction: PlanOrderDirection::Ascending,
+            multiplicity: PlanListIndexKeyMultiplicity::One,
+        }],
+    });
+    shifted.dirty_plan.dependency_edges = 123;
+    shifted.commit_plan.state_update_count = 456;
+    shifted.capability_summary.operation_count = 789;
+
+    assert_eq!(
+        machine_plan_stable_contract_sha256(&first).unwrap(),
+        machine_plan_stable_contract_sha256(&shifted).unwrap()
+    );
+    shifted.dirty_plan.unresolved_dependency_edges = 1;
+    assert_ne!(
+        machine_plan_stable_contract_sha256(&first).unwrap(),
+        machine_plan_stable_contract_sha256(&shifted).unwrap()
     );
 }
 

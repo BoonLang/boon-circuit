@@ -1,3 +1,5 @@
+#[cfg(all(test, feature = "test-flat-oracle"))]
+mod artifact_oracle;
 mod budget;
 mod catalog;
 mod compile;

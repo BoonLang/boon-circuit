@@ -5,6 +5,13 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+default = []
+# Enables the bounded differential producer used by artifact-oracle tests. It
+# is absent from ordinary compiler binaries and cannot become a runtime
+# fallback.
+test-flat-oracle = ["boon_semantic/test-flat-oracle"]
+
 [dependencies]
 boon_checked.workspace = true
 boon_data.workspace = true
@@ -23,3 +30,12 @@ unicode-segmentation.workspace = true
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 web-time.workspace = true
+
+[dev-dependencies]
+boon_document.workspace = true
+boon_plan_executor.workspace = true
+
+[[test]]
+name = "artifact_oracle"
+path = "tests/artifact_oracle.rs"
+required-features = ["test-flat-oracle"]

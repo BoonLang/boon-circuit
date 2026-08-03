@@ -643,6 +643,7 @@ fn push_default_order_direction(
 pub(crate) fn derive_contextual_materializations(
     program: &CheckedProgram,
     out_net: &OutNet,
+    retain_ordinary_calls: bool,
 ) -> Result<
     (
         Vec<SemanticContextualMaterialization>,
@@ -809,7 +810,9 @@ pub(crate) fn derive_contextual_materializations(
             &materializations_by_owner,
             &materialization_result_types,
         );
-        builder.enable_ordinary_call_boundaries();
+        if retain_ordinary_calls {
+            builder.enable_ordinary_call_boundaries();
+        }
         let local_source =
             builder.expand_with_inherited_owner(candidate.source, candidate.evaluation_owner)?;
         let list_type = builder.expressions[local_source.as_usize()]
@@ -1495,6 +1498,7 @@ pub(crate) fn derive_semantic_execution_graph(
     mut arena: SemanticExpressionArena,
     builder_indexes: &SemanticExpressionBuilderIndexes,
     required_ordinary_definitions: &BTreeSet<SemanticCallableId>,
+    retain_ordinary_calls: bool,
 ) -> Result<SemanticExecutionGraphV1, ExpansionError> {
     let lookup = CheckedProgramLookup::new(program);
     let semantic_scope_ids = program
@@ -1593,7 +1597,9 @@ pub(crate) fn derive_semantic_execution_graph(
         &materializations_by_owner,
         &materialization_result_types,
     );
-    builder.enable_ordinary_call_boundaries();
+    if retain_ordinary_calls {
+        builder.enable_ordinary_call_boundaries();
+    }
     for callable in required_ordinary_definitions {
         builder.schedule_ordinary_definition(*callable);
     }

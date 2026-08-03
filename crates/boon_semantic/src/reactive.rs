@@ -4782,6 +4782,17 @@ impl<'a> TriggerResolver<'a> {
                     arms.insert(self.arm(cause, id, id)?);
                 }
             }
+            SemanticExpressionKind::MaterializationLocal { .. } => {
+                // A contextual local can be a row-owned SOURCE projection.
+                // Resolve that exact occurrence before THEN decides whether
+                // its continuous output is payload or another activation
+                // cause. Falling through to the enclosing materialization's
+                // merged provenance conflates row refresh dependencies with
+                // event ownership.
+                for cause in self.direct_causes(expression)? {
+                    arms.insert(self.arm(cause, id, id)?);
+                }
+            }
             _ => {
                 for child in semantic_expression_children(&expression.kind, self.execution)? {
                     self.collect_trigger_arms(child, terminal, visited, arms)?;

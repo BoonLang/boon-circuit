@@ -35,9 +35,12 @@ stronger three-reviewer performance closure defined below.
    combinations, but NovyWave empty-session has narrow p95 headroom and that
    evidence is stale after the next frontend edit. The parsed snapshot and both
    checked construction owners are now lifetime-free without a material
-   allocation regression; the remaining first tranche is therefore fusing the
-   duplicate checker/builder into one owned database, measured compact/name
-   interning, contextual-scheme/inference worklist reduction,
+   allocation regression. Dense solver queues now retain their buffers and one
+   complete dependency index owns expression propagation, reducing a current
+   NovyWave sample by 1,226 allocations without changing its digest, but the 35
+   inference rounds and 5,060 call visits remain. The remaining first tranche
+   is therefore fusing the duplicate checker/builder into one owned database,
+   measured compact/name interning, larger contextual/call worklist reduction,
    scaling/parity evidence, and the fresh Phase 1 adversarial review. Reprofile
    after each owner-level slice and regenerate the complete cold protocol after
    the final edit. Then close semantic sealing, proof, backend, hashing, and

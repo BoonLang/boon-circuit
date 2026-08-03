@@ -208,9 +208,15 @@ Current checkpoints to preserve and audit rather than redo:
   all 64 parser and 80 typechecker tests including both product-scale oracles,
   and retains the exact checked digest. Its directional NovyWave release
   samples are 230.83/229.30 ms fresh/empty and 1,933,612 fresh allocations /
-  219,965,836 bytes. Finish the remaining duplicate checker/builder owner,
-  measured interning and solver/worklist work, scaling/parity proof, and
-  adversarial review, then regenerate the full protocol after the final edit;
+  219,965,836 bytes. The next worklist slice removes redundant expression
+  propagation lanes and recycles dense pending buffers; the exact checked
+  digest and both product-scale oracles remain unchanged, while a current
+  fresh release sample uses 1,932,386 allocations / 219,267,245 bytes and the
+  traced checked builder falls from 134.02 to 130.61 ms. It does not reduce the
+  remaining 35 inference rounds or 5,060 call visits. Finish the duplicate
+  checker/builder owner, measured interning and the larger contextual/call
+  worklist reduction, scaling/parity proof, and adversarial review, then
+  regenerate the full protocol after the final edit;
 - the current compiler-throughput checkpoint keeps Counter, physical TodoMVC,
   and NovyWave `MachinePlan` output deterministic while replacing copied OUT
   type environments with active-path overlays, retaining canonical-root-reading

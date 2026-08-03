@@ -856,6 +856,7 @@ impl PendingDenseId for CheckedCallId {
 struct PendingIdSet<T> {
     present: Vec<u8>,
     members: Vec<T>,
+    spare: Vec<T>,
 }
 
 impl<T> Default for PendingIdSet<T> {
@@ -863,6 +864,7 @@ impl<T> Default for PendingIdSet<T> {
         Self {
             present: Vec::new(),
             members: Vec::new(),
+            spare: Vec::new(),
         }
     }
 }
@@ -890,11 +892,28 @@ where
 
     fn drain_sorted(&mut self) -> Vec<T> {
         let mut values = std::mem::take(&mut self.members);
+        self.members = std::mem::take(&mut self.spare);
         values.sort_unstable();
         for value in &values {
             self.present[value.pending_index()] = 0;
         }
         values
+    }
+
+    /// Return a completed drain buffer to this set's two-buffer pool.
+    ///
+    /// Solver work discovered while the drain is being processed accumulates
+    /// in `members`; the completed buffer becomes the next spare. When no work
+    /// was discovered, retain the larger buffer as `members` so the next seed
+    /// can append without allocating.
+    fn recycle(&mut self, mut values: Vec<T>) {
+        values.clear();
+        if self.members.is_empty() && values.capacity() > self.members.capacity() {
+            std::mem::swap(&mut self.members, &mut values);
+        }
+        if values.capacity() > self.spare.capacity() {
+            self.spare = values;
+        }
     }
 }
 
@@ -5054,7 +5073,7 @@ impl CheckedProgramBuilder {
                 let expressions_started = trace.then(Instant::now);
                 stats.expression_visits += expressions.len();
                 let mut propagated_expressions = Vec::new();
-                for expression in expressions {
+                for expression in expressions.iter().copied() {
                     let flow_type = self.infer_checked_expr_flow_root(expression);
                     if matches!(flow_type.ty, Type::Unknown | Type::UnresolvedShape { .. }) {
                         continue;
@@ -5071,13 +5090,14 @@ impl CheckedProgramBuilder {
                         &mut stats,
                     );
                 }
+                pending.expressions.recycle(expressions);
                 stats.expression_ms += expressions_started.map(typecheck_elapsed_ms).unwrap_or(0.0);
                 self.flush_checked_flow_invalidations();
 
                 let declarations = pending.declarations.drain_sorted();
                 let declarations_started = trace.then(Instant::now);
                 stats.declaration_visits += declarations.len();
-                for declaration in declarations {
+                for declaration in declarations.iter().copied() {
                     let Some(value) = self
                         .declaration(declaration)
                         .and_then(|declaration| declaration.value)
@@ -5103,6 +5123,7 @@ impl CheckedProgramBuilder {
                         );
                     }
                 }
+                pending.declarations.recycle(declarations);
                 stats.declaration_ms += declarations_started
                     .map(typecheck_elapsed_ms)
                     .unwrap_or(0.0);
@@ -5111,7 +5132,7 @@ impl CheckedProgramBuilder {
                 let callables = pending.callables.drain_sorted();
                 let callables_started = trace.then(Instant::now);
                 stats.callable_visits += callables.len();
-                for callable in callables {
+                for callable in callables.iter().copied() {
                     let Some(index) = self.signature_by_decl.get(&(callable.0 as usize)).copied()
                     else {
                         continue;
@@ -5160,13 +5181,14 @@ impl CheckedProgramBuilder {
                         }
                     }
                 }
+                pending.callables.recycle(callables);
                 stats.callable_ms += callables_started.map(typecheck_elapsed_ms).unwrap_or(0.0);
                 self.flush_checked_flow_invalidations();
 
                 let calls = pending.calls.drain_sorted();
                 let calls_started = trace.then(Instant::now);
                 stats.call_visits += calls.len();
-                for call_id in calls {
+                for call_id in calls.iter().copied() {
                     let changes = self.instantiate_checked_call(call_id);
                     if !changes.any {
                         stats.call_noop_visits += 1;
@@ -5199,6 +5221,7 @@ impl CheckedProgramBuilder {
                         );
                     }
                 }
+                pending.calls.recycle(calls);
                 stats.call_ms += calls_started.map(typecheck_elapsed_ms).unwrap_or(0.0);
                 self.flush_checked_flow_invalidations();
 
@@ -5236,6 +5259,7 @@ impl CheckedProgramBuilder {
                     }
                     stats.selector_ms += selector_started.map(typecheck_elapsed_ms).unwrap_or(0.0);
                 }
+                pending.selector_parameters.recycle(selector_parameters);
                 self.flush_checked_flow_invalidations();
 
                 if std::mem::take(&mut pending.pattern_bindings) {
@@ -6371,10 +6395,10 @@ impl CheckedProgramBuilder {
         stats: &mut CheckedTypeInferenceWorkStats,
     ) {
         let dependencies = self.checked_type_inference_dependencies.as_ref().cloned();
-        for expression in self
+        let publications = self
             .checked_flow_pending_expression_publications
-            .drain_sorted()
-        {
+            .drain_sorted();
+        for expression in publications.iter().copied() {
             let cached = self.checked_flow_inference_cache.entries.get(&expression);
             if expression >= self.program.expressions.len() {
                 continue;
@@ -6400,6 +6424,8 @@ impl CheckedProgramBuilder {
                 );
             }
         }
+        self.checked_flow_pending_expression_publications
+            .recycle(publications);
     }
 
     /// Apply every mutation since the previous solver boundary to its direct
@@ -6448,10 +6474,10 @@ impl CheckedProgramBuilder {
         let mut roots = self
             .checked_flow_pending_expression_invalidations
             .drain_sorted();
-        for callable in self
+        let callables = self
             .checked_flow_pending_signature_invalidations
-            .drain_sorted()
-        {
+            .drain_sorted();
+        for callable in callables.iter().copied() {
             roots.extend(
                 dependencies
                     .signature_expression_readers
@@ -6469,16 +6495,22 @@ impl CheckedProgramBuilder {
             roots.extend(checked_flow_declarations_invalidation_roots(
                 &dependencies.flow_cache_declaration_readers,
                 &dependencies.flow_cache_declaration_dependents,
-                declarations,
+                declarations.iter().copied(),
                 &mut declaration_seen,
             ));
             self.checked_flow_declaration_invalidation_seen = declaration_seen;
         }
         roots.sort_unstable();
         roots.dedup();
-        for expression in roots {
+        for expression in roots.iter().copied() {
             self.checked_flow_inference_cache.invalidate(expression);
         }
+        self.checked_flow_pending_declaration_invalidations
+            .recycle(declarations);
+        self.checked_flow_pending_signature_invalidations
+            .recycle(callables);
+        self.checked_flow_pending_expression_invalidations
+            .recycle(roots);
     }
 
     fn invalidate_checked_flow_declaration(&mut self, declaration: DeclId) {
@@ -6541,9 +6573,6 @@ impl CheckedProgramBuilder {
         if let Some(readers) = dependencies.flow_cache_dependents.get(expression) {
             pending.expressions.extend(readers.iter().copied());
         }
-        if let Some(parents) = dependencies.expression_parents.get(expression) {
-            pending.expressions.extend(parents.iter().copied());
-        }
         if let Some(declarations) = dependencies.declarations_by_value.get(expression) {
             pending.declarations.extend(declarations.iter().copied());
         }
@@ -6573,9 +6602,6 @@ impl CheckedProgramBuilder {
         }
         if dependencies.pattern_selectors.contains(&expression) {
             pending.pattern_bindings = true;
-        }
-        if let Some(dependents) = dependencies.pattern_dependents_by_selector.get(expression) {
-            pending.expressions.extend(dependents.iter().copied());
         }
     }
 

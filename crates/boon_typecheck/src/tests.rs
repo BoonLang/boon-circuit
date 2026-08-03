@@ -105,7 +105,10 @@ fn checked_type_inference_pending_sets_drain_in_canonical_id_order() {
         CheckedCallId(0),
     ]);
 
-    assert_eq!(pending.expressions.drain_sorted(), vec![2, 5, 9]);
+    let expressions = pending.expressions.drain_sorted();
+    assert_eq!(expressions, vec![2, 5, 9]);
+    let expression_capacity = expressions.capacity();
+    pending.expressions.recycle(expressions);
     assert_eq!(
         pending.declarations.drain_sorted(),
         vec![DeclId(1), DeclId(3), DeclId(8)]
@@ -120,9 +123,12 @@ fn checked_type_inference_pending_sets_drain_in_canonical_id_order() {
     );
     assert!(!pending.any());
 
-    // Draining retains the HashSet allocations and still sorts a later round.
+    // Recycling retains the dense worklist buffer and still sorts a later
+    // round canonically.
     pending.expressions.extend([4, 1]);
-    assert_eq!(pending.expressions.drain_sorted(), vec![1, 4]);
+    let expressions = pending.expressions.drain_sorted();
+    assert_eq!(expressions, vec![1, 4]);
+    assert!(expressions.capacity() >= expression_capacity);
 }
 
 #[test]

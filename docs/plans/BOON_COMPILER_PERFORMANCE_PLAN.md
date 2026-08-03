@@ -365,6 +365,17 @@ Current cold-diagnostics candidate evidence:
   are 230.83/229.30 ms fresh/empty; fresh allocation work is 1,933,612 calls /
   219,965,836 bytes, only 10 calls / 14,728 bytes above `677d09d` while
   establishing the required lifetime-free ownership boundary.
+- The subsequent measured worklist slice makes the complete
+  `flow_cache_dependents` index the sole expression-propagation lane instead of
+  redundantly re-enqueueing parent and pattern-selector edges, and recycles the
+  bounded dense pending-set buffers between fixed-point rounds. Both
+  product-scale oracles and the exact checked-result digest remain unchanged.
+  A current release fresh-process sample is 230.78 ms with 1,932,386
+  allocations / 219,267,245 bytes: 1,226 calls / 698,591 bytes below the
+  lifetime-free ownership checkpoint. The traced checked-program builder falls
+  directionally from 134.02 to 130.61 ms. This is an owner-level edit-loop
+  improvement, not percentile acceptance; inference still takes 35 rounds and
+  5,060 call visits, so the larger contextual/call work owner remains open.
 - Item 7 is still incomplete: the lifetime-free checker and builder remain two
   construction owners. Fuse checked construction into one owned database,
   then complete measured compact/name interning and worklist reductions,

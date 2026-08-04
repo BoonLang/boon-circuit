@@ -1629,34 +1629,18 @@ fn exact_drain_destination_candidates(
         if !expression_reaches(execution, materialization.source, drain)? {
             continue;
         }
-        let Some(list) = materialization.target_list_id else {
+        let resource_binding = resources
+            .materialization_binding(materialization.id)
+            .ok_or_else(|| {
+                SemanticMemoryError::new(format!(
+                    "materialization {} has no exact resource binding",
+                    materialization.id
+                ))
+            })?;
+        let Some(target_row) = resource_binding.target else {
             continue;
         };
-        let scope = materialization.target_scope_id.ok_or_else(|| {
-            SemanticMemoryError::new(format!(
-                "materialization {} targets list {} without row scope",
-                materialization.id, list
-            ))
-        })?;
-        let target_row = SemanticRowBinding { list, scope };
-        let resource_bindings = resources
-            .materialization_bindings
-            .iter()
-            .filter(|binding| binding.materialization == materialization.id)
-            .collect::<Vec<_>>();
-        let [resource_binding] = resource_bindings.as_slice() else {
-            return Err(SemanticMemoryError::new(format!(
-                "materialization {} resolves to {} exact resource bindings",
-                materialization.id,
-                resource_bindings.len()
-            )));
-        };
-        if resource_binding.target != Some(target_row) {
-            return Err(SemanticMemoryError::new(format!(
-                "materialization {} target {:?} differs from resource target {:?}",
-                materialization.id, target_row, resource_binding.target
-            )));
-        }
+        let list = target_row.list;
         if materialization.operation != SemanticContextualOperationKind::Map {
             return Err(SemanticMemoryError::new(format!(
                 "whole-list DRAIN destination materialization {} uses {:?}; V1 requires an exact map transfer",
@@ -2988,8 +2972,16 @@ fn validate_memory_shape(
                             edge.id
                         ))
                     })?;
+                let binding = resources
+                    .materialization_binding(materialization.id)
+                    .ok_or_else(|| {
+                        SemanticMemoryError::new(format!(
+                            "semantic migration edge {} references missing resource binding {}",
+                            edge.id, materialization.id
+                        ))
+                    })?;
                 if list != destination_list
-                    || materialization.target_list_id != Some(list)
+                    || binding.target.map(|row| row.list) != Some(list)
                     || materialization.source != source_root
                 {
                     return Err(SemanticMemoryError::new(format!(

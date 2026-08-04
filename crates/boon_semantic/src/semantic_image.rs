@@ -1,11 +1,13 @@
 //! Canonical checked/execution image ownership.
 //!
 //! Contextual expansion constructs the execution columns in `ExecutionPending`.
-//! Resource elaboration is the only phase allowed to mutate those columns. The
-//! builder then crosses a consuming post-resource validation boundary, hashes
-//! every final row once, and seals the checked and execution receipts beside
-//! the columns. Later semantic phases borrow the sealed columns; they never own
-//! or materialize a second execution graph.
+//! Before publication, the builder normalizes any checked inline-list
+//! authorities that must become concrete execution rows. Resource elaboration
+//! then receives immutable columns and owns row/list bindings separately. The
+//! builder crosses one consuming validation boundary, hashes every final row,
+//! and seals the checked and execution receipts beside the columns. Later
+//! semantic phases borrow the sealed columns; they never own or materialize a
+//! second execution graph.
 
 use crate::{
     DistributedCallOccurrenceRoot, OutCallInstanceId, ResolvedOutGraph,
@@ -262,10 +264,15 @@ impl SemanticImageBuilder<ExecutionPending> {
         &self.execution
     }
 
-    /// The resource builder is the sole production mutation window. This is
-    /// crate-private so no downstream phase can acquire mutable columns.
-    pub(super) fn execution_for_resource(&mut self) -> &mut SemanticExecutionImageColumnsV1 {
-        &mut self.execution
+    /// Normalize execution-owned list authority rows before the immutable
+    /// execution/resource boundary. The returned targets are the exact input
+    /// to pure resource-table construction; no later phase receives mutable
+    /// execution columns.
+    pub(crate) fn normalize_resource_authorities(
+        &mut self,
+        checked: &boon_checked::CheckedProgramFields,
+    ) -> Result<crate::resource::PreparedSemanticResourceInputs, String> {
+        crate::resource::prepare_semantic_resource_inputs(checked, &mut self.execution)
     }
 
     pub(crate) fn finalize_execution(

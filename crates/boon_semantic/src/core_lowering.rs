@@ -1613,7 +1613,17 @@ fn map_semantic_execution_with_external_events(
     let materializations = graph
         .materializations
         .iter()
-        .map(|materialization| map_materialization(&id_map, materialization))
+        .map(|materialization| {
+            let binding = resources
+                .materialization_binding(materialization.id)
+                .ok_or_else(|| {
+                    format!(
+                        "semantic materialization {} has no resource binding",
+                        materialization.id
+                    )
+                })?;
+            map_materialization(&id_map, materialization, binding)
+        })
         .collect::<Result<Vec<_>, _>>()?;
     let static_owners = graph
         .static_owners
@@ -3370,7 +3380,14 @@ pub(super) fn map_semantic_storage_join(
         reactive,
         &storage_ids,
     )?;
-    let locals = map_storage_locals(execution, storage_graph, ids, &storage_ids, &fields)?;
+    let locals = map_storage_locals(
+        execution,
+        resource_graph,
+        storage_graph,
+        ids,
+        &storage_ids,
+        &fields,
+    )?;
     let bindings = map_storage_bindings(storage_graph, ids, reactive, &storage_ids, &fields)?;
     let sources = map_storage_sources(resource_graph, storage_graph, ids, reactive, &storage_ids)?;
     let reads = map_storage_reads(
@@ -4172,6 +4189,7 @@ fn map_storage_local_member_forwarding(
 
 fn map_storage_locals(
     execution: &SemanticExecutionImageColumnsV1,
+    resources: &SemanticResourceGraphV1,
     storage: &SemanticScopeStorageGraphV1,
     ids: &SemanticToExecutableMap,
     storage_ids: &SemanticStorageToErasedMap,
@@ -4228,21 +4246,18 @@ fn map_storage_locals(
                 ));
             }
             let row = local.row.map(|row| map_row_binding(ids, row)).transpose()?;
-            let target_row = match (
-                materialization.target_list_id,
-                materialization.target_scope_id,
-            ) {
-                (Some(list), Some(scope)) => {
-                    Some(map_row_binding(ids, SemanticRowBinding { list, scope })?)
-                }
-                (None, None) => None,
-                _ => {
-                    return Err(format!(
-                        "semantic materialization {} has a partial target-row identity",
-                        materialization.id
-                    ));
-                }
-            };
+            let binding = resources
+                .materialization_binding(materialization.id)
+                .ok_or_else(|| {
+                    format!(
+                        "semantic storage local {}:{} has no resource binding",
+                        local.owner, local.local
+                    )
+                })?;
+            let target_row = binding
+                .target
+                .map(|row| map_row_binding(ids, row))
+                .transpose()?;
             let authority_row = target_row.or(row);
             let members = local
                 .members
@@ -6625,13 +6640,14 @@ fn map_ordinary_function(
 fn map_materialization(
     ids: &SemanticToExecutableMap,
     materialization: &SemanticContextualMaterialization,
+    binding: &crate::SemanticMaterializationResourceBindingV1,
 ) -> Result<ContextualMaterialization, String> {
     Ok(ContextualMaterialization {
         id: ids.materialization(materialization.id)?,
         operation: map_operation(materialization.operation),
         source: ids.expression(materialization.source)?,
-        source_row_predecessors: materialization
-            .source_row_predecessors
+        source_row_predecessors: binding
+            .predecessors
             .iter()
             .map(|predecessor| map_row_predecessor(ids, predecessor))
             .collect::<Result<Vec<_>, _>>()?,
@@ -6648,20 +6664,24 @@ fn map_materialization(
         result_kind: map_result_kind(materialization.result_kind),
         row_local: ids.materialization_local(materialization.owner, materialization.row_local)?,
         owner: materialization.owner,
-        source_list_id: materialization
-            .source_list_id
+        source_list_id: binding
+            .source
+            .map(|row| row.list)
             .map(|id| ids.list(id))
             .transpose()?,
-        source_scope_id: materialization
-            .source_scope_id
+        source_scope_id: binding
+            .source
+            .map(|row| row.scope)
             .map(|id| ids.row_scope(id))
             .transpose()?,
-        target_list_id: materialization
-            .target_list_id
+        target_list_id: binding
+            .target
+            .map(|row| row.list)
             .map(|id| ids.list(id))
             .transpose()?,
-        target_scope_id: materialization
-            .target_scope_id
+        target_scope_id: binding
+            .target
+            .map(|row| row.scope)
             .map(|id| ids.row_scope(id))
             .transpose()?,
         item_type: materialization.item_type.clone(),

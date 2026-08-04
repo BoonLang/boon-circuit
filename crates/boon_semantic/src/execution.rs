@@ -1537,8 +1537,6 @@ pub struct SemanticContextualMaterialization {
     pub id: SemanticMaterializationId,
     pub operation: SemanticContextualOperationKind,
     pub source: SemanticExprId,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub source_row_predecessors: Vec<SemanticContextualRowPredecessor>,
     pub body: SemanticExprId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub direction: Option<SemanticExprId>,
@@ -1547,14 +1545,6 @@ pub struct SemanticContextualMaterialization {
     pub result_kind: SemanticMaterializationResultKind,
     pub row_local: SemanticMaterializationLocalId,
     pub owner: StaticOwnerId,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_list_id: Option<SemanticListId>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_scope_id: Option<SemanticRowScopeId>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub target_list_id: Option<SemanticListId>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub target_scope_id: Option<SemanticRowScopeId>,
     pub item_type: Type,
     pub result_type: Type,
 }
@@ -2816,22 +2806,6 @@ impl SemanticExecutionImageColumnsV1 {
                     expression,
                     format!("materialization {} expression", materialization.id),
                 )?;
-            }
-            for predecessor in &materialization.source_row_predecessors {
-                let referenced = match predecessor {
-                    SemanticContextualRowPredecessor::Materialized { materialization }
-                    | SemanticContextualRowPredecessor::Provenance { materialization } => {
-                        Some(*materialization)
-                    }
-                    SemanticContextualRowPredecessor::Value
-                    | SemanticContextualRowPredecessor::Stored { .. } => None,
-                };
-                if let Some(referenced) = referenced {
-                    self.require_materialization(
-                        referenced,
-                        format!("materialization {} predecessor", materialization.id),
-                    )?;
-                }
             }
         }
         Ok(())

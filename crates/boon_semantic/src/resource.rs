@@ -5,14 +5,14 @@
 //! Executable lowering may map these identities, but must not rediscover them.
 
 use crate::{
-    ExecutionPending, OutCallInstanceId, ProducerFunctionId, ProducerMaterializationMode,
-    ResolvedOutGraph, SemanticBlockBinding, SemanticCallableId, SemanticContextualOperationKind,
+    OutCallInstanceId, ProducerFunctionId, ProducerMaterializationMode, ResolvedOutGraph,
+    SemanticBlockBinding, SemanticCallableId, SemanticContextualOperationKind,
     SemanticContextualRowPredecessor, SemanticExecutionImageColumnsV1, SemanticExprId,
-    SemanticExpressionKind, SemanticImageBuilder, SemanticListId, SemanticLocalBindingId,
-    SemanticMaterializationId, SemanticMaterializationResultKind, SemanticRowBinding,
-    SemanticRowScopeId, SemanticSourceId, SemanticSourceOrigin, SemanticStateId, SemanticStatement,
-    SemanticStatementId, SemanticStatementKind, SemanticStatementOrigin, SemanticValueId,
-    SemanticValueListAuthorityId, StaticOwnerId,
+    SemanticExpressionKind, SemanticListId, SemanticLocalBindingId, SemanticMaterializationId,
+    SemanticMaterializationResultKind, SemanticRowBinding, SemanticRowScopeId, SemanticSourceId,
+    SemanticSourceOrigin, SemanticStateId, SemanticStatement, SemanticStatementId,
+    SemanticStatementKind, SemanticStatementOrigin, SemanticValueId, SemanticValueListAuthorityId,
+    StaticOwnerId,
 };
 use boon_checked::{
     CheckedListId, CheckedListKeyPolicy, CheckedProgramFields, CheckedResourceBinding,
@@ -379,6 +379,15 @@ pub struct SemanticProducerResourceV1 {
 }
 
 impl SemanticResourceGraphV1 {
+    pub fn materialization_binding(
+        &self,
+        id: SemanticMaterializationId,
+    ) -> Option<&SemanticMaterializationResourceBindingV1> {
+        self.materialization_bindings
+            .get(id.as_usize())
+            .filter(|binding| binding.materialization == id)
+    }
+
     pub fn validate(
         &self,
         execution: &SemanticExecutionImageColumnsV1,
@@ -407,12 +416,25 @@ impl SemanticResourceGraphV1 {
     }
 }
 
+pub(crate) struct PreparedSemanticResourceInputs {
+    list_targets: Vec<ListTarget>,
+}
+
+pub(crate) fn prepare_semantic_resource_inputs(
+    checked: &CheckedProgramFields,
+    execution: &mut SemanticExecutionImageColumnsV1,
+) -> Result<PreparedSemanticResourceInputs, String> {
+    Ok(PreparedSemanticResourceInputs {
+        list_targets: typed_list_targets(checked, execution)?,
+    })
+}
+
 pub(crate) fn build_semantic_resource_graph(
     checked: &CheckedProgramFields,
     out_net: &ResolvedOutGraph,
-    image: &mut SemanticImageBuilder<ExecutionPending>,
+    execution: &SemanticExecutionImageColumnsV1,
+    prepared: PreparedSemanticResourceInputs,
 ) -> Result<SemanticResourceGraphV1, String> {
-    let execution = image.execution_for_resource();
     let trace_resources = std::env::var_os("BOON_SEMANTIC_TRACE").is_some();
     macro_rules! resource_phase {
         ($name:literal, $expression:expr) => {{
@@ -429,23 +451,19 @@ pub(crate) fn build_semantic_resource_graph(
 
     let (row_scopes, mut lists, value_list_authorities) = resource_phase!(
         "discover_list_resources",
-        discover_list_resources(checked, execution)
+        discover_list_resources(execution, prepared)
     )?;
     let target_lists = resource_phase!(
         "materialization_target_lists",
         materialization_target_lists(execution, &lists)
     )?;
-    resource_phase!(
-        "bind_materialization_targets",
-        bind_materialization_targets(execution, &lists, &target_lists)
-    )?;
-    resource_phase!(
-        "bind_materialization_sources",
-        bind_materialization_sources(execution, &lists)
+    let mut materialization_bindings = resource_phase!(
+        "build_materialization_row_bindings",
+        build_materialization_row_bindings(execution, &lists, &target_lists)
     )?;
     resource_phase!(
         "bind_materialization_lineage",
-        bind_materialization_lineage(execution, &lists)
+        bind_materialization_lineage(execution, &lists, &mut materialization_bindings)
     )?;
     resource_phase!(
         "bind_list_lineage",
@@ -455,40 +473,29 @@ pub(crate) fn build_semantic_resource_graph(
     let mut aliases = Vec::new();
     let sources = resource_phase!(
         "build_source_resources",
-        build_source_resources(checked, execution, &lists, &mut aliases)
+        build_source_resources(
+            checked,
+            execution,
+            &lists,
+            &materialization_bindings,
+            &mut aliases,
+        )
     )?;
     let states = resource_phase!(
         "build_state_resources",
-        build_state_resources(checked, execution, &lists, &mut aliases)
+        build_state_resources(
+            checked,
+            execution,
+            &lists,
+            &materialization_bindings,
+            &mut aliases,
+        )
     )?;
     aliases.sort();
     aliases.dedup();
-    let materialization_bindings = execution
-        .materializations
-        .iter()
-        .map(|materialization| {
-            Ok(SemanticMaterializationResourceBindingV1 {
-                materialization: materialization.id,
-                owner: materialization.owner,
-                source: paired_row_binding(
-                    materialization.source_list_id,
-                    materialization.source_scope_id,
-                    "source",
-                    materialization.owner,
-                )?,
-                target: paired_row_binding(
-                    materialization.target_list_id,
-                    materialization.target_scope_id,
-                    "target",
-                    materialization.owner,
-                )?,
-                predecessors: materialization.source_row_predecessors.clone(),
-            })
-        })
-        .collect::<Result<Vec<_>, String>>()?;
     let list_projections = resource_phase!(
         "discover_list_projections",
-        discover_list_projections(execution, &lists)
+        discover_list_projections(execution, &lists, &materialization_bindings)
     )?;
     let producer_resources = resource_phase!(
         "build_producer_resources",
@@ -545,10 +552,10 @@ type DiscoveredListResources = (
 );
 
 fn discover_list_resources(
-    checked: &CheckedProgramFields,
-    execution: &mut SemanticExecutionImageColumnsV1,
+    execution: &SemanticExecutionImageColumnsV1,
+    prepared: PreparedSemanticResourceInputs,
 ) -> Result<DiscoveredListResources, String> {
-    let targets = typed_list_targets(checked, execution)?;
+    let targets = prepared.list_targets;
     let mut row_scopes = Vec::with_capacity(targets.len());
     let mut lists = Vec::with_capacity(targets.len());
     let mut value_list_authorities = Vec::new();
@@ -2286,26 +2293,11 @@ fn materialization_target_lists(
     Ok(targets)
 }
 
-fn bind_materialization_targets(
-    execution: &mut SemanticExecutionImageColumnsV1,
+fn build_materialization_row_bindings(
+    execution: &SemanticExecutionImageColumnsV1,
     lists: &[SemanticListResourceV1],
     targets: &BTreeMap<StaticOwnerId, SemanticListId>,
-) -> Result<(), String> {
-    for materialization in &mut execution.materializations {
-        let Some(list_id) = targets.get(&materialization.owner).copied() else {
-            continue;
-        };
-        let list = list_resource(lists, list_id)?;
-        materialization.target_list_id = Some(list_id);
-        materialization.target_scope_id = Some(list.row_scope);
-    }
-    Ok(())
-}
-
-fn bind_materialization_sources(
-    execution: &mut SemanticExecutionImageColumnsV1,
-    lists: &[SemanticListResourceV1],
-) -> Result<(), String> {
+) -> Result<Vec<SemanticMaterializationResourceBindingV1>, String> {
     let storage_scopes = semantic_storage_scopes(execution, lists)?;
     let mut scope_lists = BTreeMap::new();
     for list in lists {
@@ -2318,9 +2310,17 @@ fn bind_materialization_sources(
             ));
         }
     }
-    let snapshot = execution.materializations.clone();
-    let mut bindings = Vec::with_capacity(snapshot.len());
-    for materialization in &snapshot {
+    let mut bindings = Vec::with_capacity(execution.materializations.len());
+    for materialization in &execution.materializations {
+        let target = if let Some(list_id) = targets.get(&materialization.owner).copied() {
+            let list = list_resource(lists, list_id)?;
+            Some(SemanticRowBinding {
+                list: list_id,
+                scope: list.row_scope,
+            })
+        } else {
+            None
+        };
         let candidates = storage_scopes
             .get(materialization.source.as_usize())
             .filter(|candidate| {
@@ -2334,7 +2334,7 @@ fn bind_materialization_sources(
             .unwrap_or_default()
             .into_iter()
             .collect::<Vec<_>>();
-        let mut list = match candidates.as_slice() {
+        let mut source_list = match candidates.as_slice() {
             [] => None,
             [scope] => Some(*scope_lists.get(scope).ok_or_else(|| {
                 format!(
@@ -2376,7 +2376,7 @@ fn bind_materialization_sources(
                 ));
             }
         };
-        if list.is_none()
+        if source_list.is_none()
             && (inline_list_authority_root(execution, materialization.source)?.is_some()
                 || matches!(
                     materialization.operation,
@@ -2387,18 +2387,22 @@ fn bind_materialization_sources(
                         | SemanticContextualOperationKind::ThenBy
                 ))
         {
-            list = materialization.target_list_id;
+            source_list = target.map(|row| row.list);
         }
-        let scope = list
+        let source = source_list
             .map(|list| list_resource(lists, list).map(|list| list.row_scope))
-            .transpose()?;
-        bindings.push((list, scope));
+            .transpose()?
+            .zip(source_list)
+            .map(|(scope, list)| SemanticRowBinding { list, scope });
+        bindings.push(SemanticMaterializationResourceBindingV1 {
+            materialization: materialization.id,
+            owner: materialization.owner,
+            source,
+            target,
+            predecessors: Vec::new(),
+        });
     }
-    for (materialization, (list, scope)) in execution.materializations.iter_mut().zip(bindings) {
-        materialization.source_list_id = list;
-        materialization.source_scope_id = scope;
-    }
-    Ok(())
+    Ok(bindings)
 }
 
 /// Resolve the exact row authority visible to a contextual resource.
@@ -2411,6 +2415,7 @@ fn bind_materialization_sources(
 /// reason to guess at an ancestor row.
 fn contextual_resource_row(
     execution: &SemanticExecutionImageColumnsV1,
+    materialization_bindings: &[SemanticMaterializationResourceBindingV1],
     owner: Option<StaticOwnerId>,
 ) -> Result<Option<SemanticRowBinding>, String> {
     let mut current = owner;
@@ -2421,27 +2426,12 @@ fn contextual_resource_row(
                 "contextual resource owner ancestry cycles at {owner}"
             ));
         }
-        let materializations = execution
-            .materializations
+        let materializations = materialization_bindings
             .iter()
-            .filter(|materialization| materialization.owner == owner)
+            .filter(|binding| binding.owner == owner)
             .collect::<Vec<_>>();
         match materializations.as_slice() {
-            [materialization] => {
-                let target = paired_row_binding(
-                    materialization.target_list_id,
-                    materialization.target_scope_id,
-                    "target",
-                    owner,
-                )?;
-                let source = paired_row_binding(
-                    materialization.source_list_id,
-                    materialization.source_scope_id,
-                    "source",
-                    owner,
-                )?;
-                return Ok(target.or(source));
-            }
+            [binding] => return Ok(binding.target.or(binding.source)),
             [] => {}
             _ => {
                 return Err(format!(
@@ -3318,8 +3308,9 @@ enum LineageLeaf {
 }
 
 fn bind_materialization_lineage(
-    execution: &mut SemanticExecutionImageColumnsV1,
+    execution: &SemanticExecutionImageColumnsV1,
     lists: &[SemanticListResourceV1],
+    bindings: &mut [SemanticMaterializationResourceBindingV1],
 ) -> Result<(), String> {
     let statement_values = statement_value_occurrences(execution)?;
     let statement_rows = lists
@@ -3335,34 +3326,20 @@ fn bind_materialization_lineage(
         })
         .collect::<BTreeMap<_, _>>();
     let locals = semantic_local_values(execution)?;
-    let rows = execution
-        .materializations
+    if bindings.len() != execution.materializations.len() {
+        return Err("semantic resource bindings do not exactly cover materializations".to_owned());
+    }
+    let rows = bindings
         .iter()
-        .map(|materialization| {
-            Ok((
-                paired_row_binding(
-                    materialization.source_list_id,
-                    materialization.source_scope_id,
-                    "source",
-                    materialization.owner,
-                )?,
-                paired_row_binding(
-                    materialization.target_list_id,
-                    materialization.target_scope_id,
-                    "target",
-                    materialization.owner,
-                )?,
-            ))
-        })
-        .collect::<Result<Vec<_>, String>>()?;
+        .map(|binding| (binding.source, binding.target))
+        .collect::<Vec<_>>();
     let operations = execution
         .materializations
         .iter()
         .map(|materialization| materialization.operation)
         .collect::<Vec<_>>();
-    let snapshot = execution.materializations.clone();
-    let mut resolved = Vec::with_capacity(snapshot.len());
-    for materialization in &snapshot {
+    let mut resolved = Vec::with_capacity(execution.materializations.len());
+    for materialization in &execution.materializations {
         let leaves = collect_lineage_leaves(
             execution,
             materialization.source,
@@ -3448,7 +3425,7 @@ fn bind_materialization_lineage(
                     });
                 }
                 LineageLeaf::Provenance(input) => {
-                    if input.as_usize() >= snapshot.len() {
+                    if input.as_usize() >= execution.materializations.len() {
                         return Err(format!(
                             "materialization {} references missing provenance input {input}",
                             materialization.id
@@ -3470,10 +3447,10 @@ fn bind_materialization_lineage(
         predecessors.dedup();
         resolved.push(predecessors);
     }
-    for (materialization, predecessors) in execution.materializations.iter_mut().zip(resolved) {
-        materialization.source_row_predecessors = predecessors;
+    for (binding, predecessors) in bindings.iter_mut().zip(resolved) {
+        binding.predecessors = predecessors;
     }
-    verify_semantic_materialization_lineage(&execution.materializations)
+    verify_semantic_materialization_lineage(bindings)
 }
 
 fn bind_list_lineage(
@@ -3877,19 +3854,19 @@ fn collect_lineage_leaves(
 }
 
 fn verify_semantic_materialization_lineage(
-    materializations: &[crate::SemanticContextualMaterialization],
+    bindings: &[SemanticMaterializationResourceBindingV1],
 ) -> Result<(), String> {
-    let mut colors = vec![0_u8; materializations.len()];
-    for start in 0..materializations.len() {
+    let mut colors = vec![0_u8; bindings.len()];
+    for start in 0..bindings.len() {
         if colors[start] == 2 {
             continue;
         }
         let mut pending = vec![(SemanticMaterializationId(start), false)];
         while let Some((id, exiting)) = pending.pop() {
             let index = id.as_usize();
-            let definition = materializations
+            let definition = bindings
                 .get(index)
-                .filter(|candidate| candidate.id == id)
+                .filter(|candidate| candidate.materialization == id)
                 .ok_or_else(|| format!("missing semantic materialization {id}"))?;
             if exiting {
                 colors[index] = 2;
@@ -3906,7 +3883,7 @@ fn verify_semantic_materialization_lineage(
             }
             colors[index] = 1;
             pending.push((id, true));
-            for predecessor in definition.source_row_predecessors.iter().rev() {
+            for predecessor in definition.predecessors.iter().rev() {
                 let input = match predecessor {
                     SemanticContextualRowPredecessor::Materialized { materialization }
                     | SemanticContextualRowPredecessor::Provenance { materialization } => {
@@ -3916,9 +3893,9 @@ fn verify_semantic_materialization_lineage(
                     | SemanticContextualRowPredecessor::Stored { .. } => continue,
                 };
                 let input_index = input.as_usize();
-                if materializations
+                if bindings
                     .get(input_index)
-                    .is_none_or(|candidate| candidate.id != input)
+                    .is_none_or(|candidate| candidate.materialization != input)
                 {
                     return Err(format!(
                         "semantic materialization {id} references missing lineage input {input}"
@@ -4037,12 +4014,14 @@ fn build_source_resources(
     checked: &CheckedProgramFields,
     execution: &SemanticExecutionImageColumnsV1,
     lists: &[SemanticListResourceV1],
+    materialization_bindings: &[SemanticMaterializationResourceBindingV1],
     aliases: &mut Vec<SemanticResourceAliasV1>,
 ) -> Result<Vec<SemanticSourceResourceV1>, String> {
     let mut resources = Vec::with_capacity(execution.sources.len());
     for source in &execution.sources {
         let value = expression(execution, source.expression)?;
-        let authority_row = contextual_resource_row(execution, source.owner)?;
+        let authority_row =
+            contextual_resource_row(execution, materialization_bindings, source.owner)?;
         let target_list_resource = authority_row
             .map(|row| {
                 let list = list_resource(lists, row.list)?;
@@ -4168,6 +4147,7 @@ fn build_state_resources(
     checked: &CheckedProgramFields,
     execution: &SemanticExecutionImageColumnsV1,
     lists: &[SemanticListResourceV1],
+    materialization_bindings: &[SemanticMaterializationResourceBindingV1],
     aliases: &mut Vec<SemanticResourceAliasV1>,
 ) -> Result<Vec<SemanticStateResourceV1>, String> {
     let mut resources = Vec::with_capacity(execution.states.len());
@@ -4229,7 +4209,8 @@ fn build_state_resources(
                 state.declaration.0, state.owner
             ));
         }
-        let authority_row = contextual_resource_row(execution, state.owner)?;
+        let authority_row =
+            contextual_resource_row(execution, materialization_bindings, state.owner)?;
         let target_list_resource = authority_row
             .map(|row| {
                 let list = list_resource(lists, row.list)?;
@@ -4467,6 +4448,7 @@ fn build_producer_resources(
 fn discover_list_projections(
     execution: &SemanticExecutionImageColumnsV1,
     lists: &[SemanticListResourceV1],
+    materialization_bindings: &[SemanticMaterializationResourceBindingV1],
 ) -> Result<Vec<SemanticListProjectionV1>, String> {
     let declaration_lists = lists
         .iter()
@@ -4492,10 +4474,16 @@ fn discover_list_projections(
                 "List/chunk expression {chunk} must have exactly one checked `list` argument"
             ));
         };
-        let source = semantic_list_id(execution, &declaration_lists, &locals, list_argument.value)?
-            .ok_or_else(|| {
-                format!("List/chunk expression {chunk} has no exact semantic list provenance")
-            })?;
+        let source = semantic_list_id(
+            execution,
+            materialization_bindings,
+            &declaration_lists,
+            &locals,
+            list_argument.value,
+        )?
+        .ok_or_else(|| {
+            format!("List/chunk expression {chunk} has no exact semantic list provenance")
+        })?;
         list_resource(lists, source)?;
         let size_arguments = arguments
             .iter()
@@ -4644,6 +4632,7 @@ fn exact_terminal_chunk_branches(
 
 pub(super) fn semantic_list_id(
     execution: &SemanticExecutionImageColumnsV1,
+    materialization_bindings: &[SemanticMaterializationResourceBindingV1],
     lists_by_declaration: &BTreeMap<DeclId, SemanticListId>,
     local_bindings: &BTreeMap<SemanticLocalBindingId, (DeclId, SemanticExprId)>,
     root: SemanticExprId,
@@ -4680,7 +4669,7 @@ pub(super) fn semantic_list_id(
                 current = *value;
             }
             SemanticExpressionKind::Materialize { materialization } => {
-                let definition = execution
+                execution
                     .materializations
                     .get(materialization.as_usize())
                     .filter(|candidate| candidate.id == *materialization)
@@ -4689,7 +4678,15 @@ pub(super) fn semantic_list_id(
                             "list provenance expression {current} references missing materialization {materialization}"
                         )
                     })?;
-                return Ok(definition.target_list_id.or(definition.source_list_id));
+                let binding = materialization_bindings
+                    .get(materialization.as_usize())
+                    .filter(|candidate| candidate.materialization == *materialization)
+                    .ok_or_else(|| {
+                        format!(
+                            "list provenance expression {current} references missing resource binding {materialization}"
+                        )
+                    })?;
+                return Ok(binding.target.or(binding.source).map(|row| row.list));
             }
             SemanticExpressionKind::Block { result, .. } => current = *result,
             SemanticExpressionKind::Project { input, fields } if fields.is_empty() => {
@@ -5086,8 +5083,9 @@ pub(crate) fn validate_checked_list_classification(
     graph: &SemanticResourceGraphV1,
 ) -> Result<(), String> {
     let mut snapshot = execution.clone();
+    let prepared = prepare_semantic_resource_inputs(checked, &mut snapshot)?;
     let (row_scopes, mut lists, value_list_authorities) =
-        discover_list_resources(checked, &mut snapshot)?;
+        discover_list_resources(&snapshot, prepared)?;
     bind_list_lineage(&snapshot, &mut lists)?;
     if graph.row_scopes != row_scopes
         || graph.lists != lists
@@ -5107,10 +5105,20 @@ pub(crate) fn validate_checked_resource_provenance(
     graph: &SemanticResourceGraphV1,
 ) -> Result<(), String> {
     let mut expected_aliases = Vec::new();
-    let expected_sources =
-        build_source_resources(checked, execution, &graph.lists, &mut expected_aliases)?;
-    let expected_states =
-        build_state_resources(checked, execution, &graph.lists, &mut expected_aliases)?;
+    let expected_sources = build_source_resources(
+        checked,
+        execution,
+        &graph.lists,
+        &graph.materialization_bindings,
+        &mut expected_aliases,
+    )?;
+    let expected_states = build_state_resources(
+        checked,
+        execution,
+        &graph.lists,
+        &graph.materialization_bindings,
+        &mut expected_aliases,
+    )?;
     expected_aliases.sort();
     expected_aliases.dedup();
     if graph.sources != expected_sources {
@@ -5137,7 +5145,7 @@ fn validate_materialization_bindings(
     graph: &SemanticResourceGraphV1,
     execution: &SemanticExecutionImageColumnsV1,
 ) -> Result<(), String> {
-    verify_semantic_materialization_lineage(&execution.materializations)?;
+    verify_semantic_materialization_lineage(&graph.materialization_bindings)?;
     if graph.materialization_bindings.len() != execution.materializations.len() {
         return Err("semantic resource bindings do not exactly cover materializations".to_owned());
     }
@@ -5154,25 +5162,9 @@ fn validate_materialization_bindings(
             .get(index)
             .filter(|materialization| materialization.id == id)
             .ok_or_else(|| format!("missing semantic materialization {id}"))?;
-        let source = paired_row_binding(
-            materialization.source_list_id,
-            materialization.source_scope_id,
-            "source",
-            materialization.owner,
-        )?;
-        let target = paired_row_binding(
-            materialization.target_list_id,
-            materialization.target_scope_id,
-            "target",
-            materialization.owner,
-        )?;
-        if binding.owner != materialization.owner
-            || binding.source != source
-            || binding.target != target
-            || binding.predecessors != materialization.source_row_predecessors
-        {
+        if binding.owner != materialization.owner {
             return Err(format!(
-                "semantic materialization binding {id} differs from execution graph"
+                "semantic materialization binding {id} owner differs from execution graph"
             ));
         }
         for row in binding.source.into_iter().chain(binding.target) {
@@ -5235,7 +5227,8 @@ fn validate_list_projections(
     graph: &SemanticResourceGraphV1,
     execution: &SemanticExecutionImageColumnsV1,
 ) -> Result<(), String> {
-    let expected = discover_list_projections(execution, &graph.lists)?;
+    let expected =
+        discover_list_projections(execution, &graph.lists, &graph.materialization_bindings)?;
     if graph.list_projections != expected {
         return Err(
             "semantic list projections do not exactly match executable list authority".to_owned(),
@@ -5565,21 +5558,6 @@ fn call_argument(arguments: &[crate::SemanticCallArgument], name: &str) -> Optio
         .map(|argument| argument.value)
 }
 
-fn paired_row_binding(
-    list: Option<SemanticListId>,
-    scope: Option<SemanticRowScopeId>,
-    role: &str,
-    owner: StaticOwnerId,
-) -> Result<Option<SemanticRowBinding>, String> {
-    match (list, scope) {
-        (None, None) => Ok(None),
-        (Some(list), Some(scope)) => Ok(Some(SemanticRowBinding { list, scope })),
-        _ => Err(format!(
-            "semantic owner {owner} has incomplete {role} row binding: list={list:?}, scope={scope:?}"
-        )),
-    }
-}
-
 fn owner_ancestry(
     owner: Option<StaticOwnerId>,
     owners: &[crate::SemanticStaticOwner],
@@ -5786,19 +5764,24 @@ mod tests {
             id: SemanticMaterializationId(id),
             operation: SemanticContextualOperationKind::Map,
             source,
-            source_row_predecessors: Vec::new(),
             body: source,
             direction: None,
             inherited_order: Vec::new(),
             result_kind: crate::SemanticMaterializationResultKind::RuntimeValue,
             row_local: crate::SemanticMaterializationLocalId(id),
             owner: StaticOwnerId(0),
-            source_list_id: None,
-            source_scope_id: None,
-            target_list_id: None,
-            target_scope_id: None,
             item_type: Type::Unknown,
             result_type: Type::Unknown,
+        }
+    }
+
+    fn synthetic_materialization_binding(id: usize) -> SemanticMaterializationResourceBindingV1 {
+        SemanticMaterializationResourceBindingV1 {
+            materialization: SemanticMaterializationId(id),
+            owner: StaticOwnerId(0),
+            source: None,
+            target: None,
+            predecessors: Vec::new(),
         }
     }
 
@@ -6333,19 +6316,20 @@ kept: mapped |> List/retain(item, if: True)
             execution
                 .materializations
                 .push(synthetic_materialization(0, SemanticExprId(0)));
-            let error = bind_materialization_lineage(&mut execution, &[])
+            let mut bindings = vec![synthetic_materialization_binding(0)];
+            let error = bind_materialization_lineage(&execution, &[], &mut bindings)
                 .expect_err("empty lineage branch must not fabricate a predecessor");
             assert!(error.contains("no exact source-row predecessor"), "{error}");
         }
 
         let mut cycle = vec![
-            synthetic_materialization(0, SemanticExprId(0)),
-            synthetic_materialization(1, SemanticExprId(0)),
+            synthetic_materialization_binding(0),
+            synthetic_materialization_binding(1),
         ];
-        cycle[0].source_row_predecessors = vec![SemanticContextualRowPredecessor::Materialized {
+        cycle[0].predecessors = vec![SemanticContextualRowPredecessor::Materialized {
             materialization: SemanticMaterializationId(1),
         }];
-        cycle[1].source_row_predecessors = vec![SemanticContextualRowPredecessor::Provenance {
+        cycle[1].predecessors = vec![SemanticContextualRowPredecessor::Provenance {
             materialization: SemanticMaterializationId(0),
         }];
         let error = verify_semantic_materialization_lineage(&cycle)
@@ -6358,8 +6342,8 @@ kept: mapped |> List/retain(item, if: True)
         const DEPTH: usize = 8_192;
         let mut materializations = Vec::with_capacity(DEPTH);
         for index in 0..DEPTH {
-            let mut materialization = synthetic_materialization(index, SemanticExprId(0));
-            materialization.source_row_predecessors = if index == 0 {
+            let mut materialization = synthetic_materialization_binding(index);
+            materialization.predecessors = if index == 0 {
                 vec![SemanticContextualRowPredecessor::Value]
             } else {
                 vec![SemanticContextualRowPredecessor::Materialized {
@@ -7361,8 +7345,12 @@ chunks: rows |> List/chunk(size: 2)
                 unreachable!("located chunk call");
             };
             arguments.push(argument);
-            let error = discover_list_projections(&execution, &semantic.resource_graph().lists)
-                .expect_err("duplicate chunk argument must fail closed");
+            let error = discover_list_projections(
+                &execution,
+                &semantic.resource_graph().lists,
+                &semantic.resource_graph().materialization_bindings,
+            )
+            .expect_err("duplicate chunk argument must fail closed");
             assert!(error.contains("exactly one checked"), "{error}");
         }
 
@@ -7399,8 +7387,12 @@ chunks: rows |> List/chunk(size: 2)
             .find(|argument| argument.name == "list")
             .expect("list argument")
             .value = projected_id;
-        let error = discover_list_projections(&execution, &semantic.resource_graph().lists)
-            .expect_err("non-empty list projection must not inherit list identity");
+        let error = discover_list_projections(
+            &execution,
+            &semantic.resource_graph().lists,
+            &semantic.resource_graph().materialization_bindings,
+        )
+        .expect_err("non-empty list projection must not inherit list identity");
         assert!(
             error.contains("no exact semantic list provenance"),
             "{error}"

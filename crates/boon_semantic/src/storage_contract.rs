@@ -1218,8 +1218,15 @@ fn append_materialized_value_fields(
             .iter()
             .filter(|materialization| {
                 materialization.operation == SemanticContextualOperationKind::Map
-                    && materialization.target_list_id == Some(list.id)
-                    && materialization.target_scope_id == Some(list.row_scope)
+                    && resources
+                        .materialization_binding(materialization.id)
+                        .is_some_and(|binding| {
+                            binding.target
+                                == Some(SemanticRowBinding {
+                                    list: list.id,
+                                    scope: list.row_scope,
+                                })
+                        })
             })
             .collect::<Vec<_>>();
         if materializations.is_empty() {
@@ -1289,15 +1296,10 @@ fn append_materialized_value_fields(
             });
         }
     }
-    let materialized_rows = execution
-        .materializations
+    let materialized_rows = resources
+        .materialization_bindings
         .iter()
-        .filter_map(|materialization| {
-            materialization
-                .target_list_id
-                .zip(materialization.target_scope_id)
-                .map(|(list, scope)| SemanticRowBinding { list, scope })
-        })
+        .filter_map(|binding| binding.target)
         .chain(resources.lists.iter().filter_map(|list| {
             list.row_predecessors
                 .iter()
@@ -1977,7 +1979,7 @@ fn discover_detached_captures(
             })?,
         };
         let (target_owner, target_local) =
-            nearest_target_materialization(execution, owners, state_owner, target_row)?;
+            nearest_target_materialization(execution, resources, owners, state_owner, target_row)?;
         let mut roots = vec![state.initial];
         for update in reactive
             .state_update_arms
@@ -2026,6 +2028,7 @@ fn discover_detached_captures(
 
 fn nearest_target_materialization(
     execution: &SemanticExecutionImageColumnsV1,
+    resources: &SemanticResourceGraphV1,
     owners: &[SemanticStorageOwnerV1],
     mut owner: StaticOwnerId,
     row: SemanticRowBinding,
@@ -2034,33 +2037,22 @@ fn nearest_target_materialization(
         let matches = execution
             .materializations
             .iter()
-            .filter(|materialization| {
-                let authority_row = materialization
-                    .target_list_id
-                    .zip(materialization.target_scope_id)
-                    .or_else(|| {
-                        materialization
-                            .source_list_id
-                            .zip(materialization.source_scope_id)
-                    });
-                materialization.owner == owner && authority_row == Some((row.list, row.scope))
+            .filter_map(|materialization| {
+                let binding = resources.materialization_binding(materialization.id)?;
+                let authority_row = binding.target.or(binding.source);
+                (materialization.owner == owner && authority_row == Some(row))
+                    .then_some((materialization, binding))
             })
             .collect::<Vec<_>>();
         match matches.as_slice() {
-            [materialization]
+            [(materialization, binding)]
                 if materialization.operation == SemanticContextualOperationKind::Map
-                    || (materialization
-                        .source_list_id
-                        .zip(materialization.source_scope_id)
-                        == Some((row.list, row.scope))
-                        && materialization
-                            .target_list_id
-                            .zip(materialization.target_scope_id)
-                            .is_none_or(|target| target == (row.list, row.scope))) =>
+                    || (binding.source == Some(row)
+                        && binding.target.is_none_or(|target| target == row)) =>
             {
                 return Ok((owner, materialization.row_local));
             }
-            [materialization] => {
+            [(materialization, _)] => {
                 return Err(SemanticScopeStorageError::new(format!(
                     "row {}/{} state owner {owner} is bound by operation {:?} that does not preserve the authority row",
                     row.list, row.scope, materialization.operation
@@ -2708,6 +2700,15 @@ impl StorageProvenanceResolver<'_> {
                 ))
             })?
             .clone();
+        let binding = self
+            .resources
+            .materialization_binding(materialization.id)
+            .ok_or_else(|| {
+                SemanticScopeStorageError::new(format!(
+                    "source-only classification references missing resource binding {}",
+                    materialization.id
+                ))
+            })?;
         match materialization.operation {
             SemanticContextualOperationKind::Map => {
                 self.expression_path_is_source_only(materialization.body, path)
@@ -2717,25 +2718,24 @@ impl StorageProvenanceResolver<'_> {
             | SemanticContextualOperationKind::Remove
             | SemanticContextualOperationKind::SortBy
             | SemanticContextualOperationKind::ThenBy => {
-                let Some(list) = materialization
-                    .source_list_id
-                    .zip(materialization.source_scope_id)
-                    .and_then(|(list, scope)| {
+                let Some(list) = binding
+                    .source
+                    .and_then(|row| {
                         self.resources
                             .lists
-                            .get(list.as_usize())
+                            .get(row.list.as_usize())
                             .filter(|candidate| {
-                                candidate.id == list && candidate.row_scope == scope
+                                candidate.id == row.list && candidate.row_scope == row.scope
                             })
                     })
                     .cloned()
                 else {
                     return Ok(false);
                 };
-                if materialization.source_row_predecessors.is_empty() {
+                if binding.predecessors.is_empty() {
                     return Ok(false);
                 }
-                for predecessor in &materialization.source_row_predecessors {
+                for predecessor in &binding.predecessors {
                     if !self.predecessor_path_is_source_only(&list, predecessor, path)? {
                         return Ok(false);
                     }
@@ -3100,16 +3100,18 @@ fn build_row_values(
                         "row-value expression {} references missing materialization {materialization}",
                         expression.id
                     ))
-                })?;
+            })?;
             if definition.operation == SemanticContextualOperationKind::Find {
-                let row = match (definition.source_list_id, definition.source_scope_id) {
-                    (Some(list), Some(scope)) => SemanticRowBinding { list, scope },
-                    (None, None) => continue,
-                    _ => {
-                        return Err(SemanticScopeStorageError::new(format!(
-                            "Find materialization {materialization} has an incomplete source row"
-                        )));
-                    }
+                let Some(row) = resources
+                    .materialization_binding(definition.id)
+                    .ok_or_else(|| {
+                        SemanticScopeStorageError::new(format!(
+                            "Find materialization {materialization} has no resource binding"
+                        ))
+                    })?
+                    .source
+                else {
+                    continue;
                 };
                 // `List/find` returns `Found[value: row] | NotFound`. The
                 // typed operation, not a diagnostic field path, owns this
@@ -3144,6 +3146,7 @@ fn build_row_values(
             };
             if let Some(list_id) = crate::resource::semantic_list_id(
                 execution,
+                &resources.materialization_bindings,
                 &lists_by_declaration,
                 &local_bindings,
                 *list_input,
@@ -3350,10 +3353,15 @@ fn build_row_source_projections(
         }
     }
     for materialization in &execution.materializations {
-        let Some(row) = materialization
-            .target_list_id
-            .zip(materialization.target_scope_id)
-            .map(|(list, scope)| SemanticRowBinding { list, scope })
+        let Some(row) = resources
+            .materialization_binding(materialization.id)
+            .ok_or_else(|| {
+                SemanticScopeStorageError::new(format!(
+                    "row source projection references missing resource binding {}",
+                    materialization.id
+                ))
+            })?
+            .target
         else {
             continue;
         };

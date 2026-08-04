@@ -44,8 +44,8 @@ use std::fmt;
 pub const SEMANTIC_PROGRAM_SCHEMA_V1: &str = "boon.semantic-program.v1";
 pub const BUNDLE_SEMANTIC_PROGRAM_SCHEMA_V1: &str = "boon.bundle-semantic-program.v1";
 pub const DEPENDENCY_CLASSIFIER_SCHEMA_DIGEST_V1: [u8; 32] = [
-    0xc4, 0xfe, 0xbe, 0xc8, 0x78, 0xa2, 0xed, 0xa3, 0x5e, 0x71, 0x7e, 0x46, 0x86, 0x68, 0x98, 0xab,
-    0x86, 0xf6, 0x7f, 0x3e, 0x7d, 0xbb, 0x9d, 0x61, 0x93, 0x8c, 0x45, 0x53, 0x55, 0x84, 0xd3, 0xbe,
+    0x49, 0x4a, 0x7b, 0xc9, 0x22, 0xba, 0x0b, 0xc8, 0x6a, 0x79, 0x6b, 0x6a, 0x3e, 0xcc, 0x69, 0x5c,
+    0xb0, 0x4a, 0xab, 0xbe, 0x48, 0xcc, 0xa1, 0x2a, 0xe6, 0xe6, 0x5d, 0xde, 0x1b, 0x80, 0xda, 0xc7,
 ];
 pub const MAX_BUNDLE_SEMANTIC_PRODUCER_REQUESTS_V1: usize = 4_096;
 pub const MAX_BUNDLE_SEMANTIC_PRODUCER_REQUEST_BYTES_V1: usize = 4 * 1024 * 1024;
@@ -2854,6 +2854,11 @@ fn elaborate_with_representation(
         )
     )
     .map_err(|error| SemanticError::new(error.to_string()))?;
+    let prepared_resource_inputs = elaboration_phase!(
+        "normalize_execution_resource_authorities",
+        semantic_image_builder.normalize_resource_authorities(&checked_program)
+    )
+    .map_err(SemanticError::new)?;
     let execution_graph = semantic_image_builder.execution();
     if trace_elaboration {
         eprintln!(
@@ -2880,33 +2885,22 @@ fn elaborate_with_representation(
         execution_graph.validate_checked_roots(&checked_program)
     )
     .map_err(SemanticError::new)?;
-    elaboration_phase!(
-        "validate_execution_graph_before_resources",
-        execution_graph.validate(&resolved_out_graph)
-    )
-    .map_err(SemanticError::new)?;
-    let resource_graph = elaboration_phase!(
-        "build_semantic_resource_graph",
-        resource::build_semantic_resource_graph(
-            &checked_program,
-            &resolved_out_graph,
-            &mut semantic_image_builder,
-        )
-    )
-    .map_err(SemanticError::new)?;
-    elaboration_phase!(
-        "validate_execution_graph_after_resources",
-        semantic_image_builder
-            .execution()
-            .validate(&resolved_out_graph)
-    )
-    .map_err(SemanticError::new)?;
     let semantic_image_builder = elaboration_phase!(
         "finalize_execution_image",
         semantic_image_builder.finalize_execution(&resolved_out_graph)
     )
     .map_err(SemanticError::new)?;
     let execution_graph = semantic_image_builder.execution();
+    let resource_graph = elaboration_phase!(
+        "build_semantic_resource_graph",
+        resource::build_semantic_resource_graph(
+            &checked_program,
+            &resolved_out_graph,
+            execution_graph,
+            prepared_resource_inputs,
+        )
+    )
+    .map_err(SemanticError::new)?;
     let reactive_graph = elaboration_phase!(
         "build_semantic_reactive_graph",
         reactive::build_semantic_reactive_graph_from_validated_inputs(

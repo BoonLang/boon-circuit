@@ -3965,7 +3965,8 @@ impl<'a> ReactiveBuilder<'a> {
                         self.resources,
                         pulse_states,
                     )?;
-                    let read_scope = materialization_local_read_scope(read, self.execution)?;
+                    let read_scope =
+                        materialization_local_read_scope(read, self.execution, self.resources)?;
                     let row_scope = match (trigger_scope, read_scope) {
                         (Some(trigger), Some(read)) if trigger != read => {
                             return Err(SemanticReactiveError::new(format!(
@@ -4626,7 +4627,12 @@ impl<'a> TriggerResolver<'a> {
             .filter(|materialization| {
                 materialization.owner == owner && materialization.row_local == local
             })
-            .filter_map(|materialization| materialization.source_list_id)
+            .filter_map(|materialization| {
+                self.resources
+                    .materialization_binding(materialization.id)
+                    .and_then(|binding| binding.source)
+                    .map(|row| row.list)
+            })
             .collect::<BTreeSet<_>>();
         let mut matches = BTreeSet::new();
         for list_id in source_lists {
@@ -5016,9 +5022,10 @@ impl<'a> TriggerResolver<'a> {
                         materialization.owner == owner && materialization.row_local == local
                     })
                     .filter_map(|materialization| {
-                        materialization
-                            .source_scope_id
-                            .or(materialization.target_scope_id)
+                        self.resources
+                            .materialization_binding(materialization.id)
+                            .and_then(|binding| binding.source.or(binding.target))
+                            .map(|row| row.scope)
                     })
             })
             .collect::<BTreeSet<_>>();
@@ -5154,6 +5161,7 @@ fn require_trigger(
 fn materialization_local_read_scope(
     read: &SemanticReadBindingV1,
     execution: &SemanticExecutionImageColumnsV1,
+    resources: &SemanticResourceGraphV1,
 ) -> Result<Option<SemanticRowScopeId>, SemanticReactiveError> {
     let SemanticReadTargetV1::MaterializationLocal { owner, local, .. } = read.target else {
         return Ok(None);
@@ -5172,7 +5180,15 @@ fn materialization_local_read_scope(
             materializations.len()
         )));
     };
-    Ok(materialization.source_scope_id)
+    let binding = resources
+        .materialization_binding(materialization.id)
+        .ok_or_else(|| {
+            SemanticReactiveError::new(format!(
+                "semantic read {} references missing resource binding {}",
+                read.id, materialization.id
+            ))
+        })?;
+    Ok(binding.source.map(|row| row.scope))
 }
 
 fn trigger_row_scope(

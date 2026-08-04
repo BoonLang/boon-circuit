@@ -10,11 +10,13 @@ use boon_syntax::{
     AstTextSegment, AstToken, AstTokenKind, BytesSizeSyntax, DocumentAst,
     LANGUAGE_FEATURE_REGISTRY, LanguageFeatureParseExpectation, LanguageFeatureStage,
     ParsedProgramFields, ParsedSourceFile, ParsedSourceUnitFields, ParserItem, ParserLine,
-    ProgramKind, SourceUnitId, StableDefinitionKey, StableExpressionChildRole, StableExpressionKey,
-    StableExpressionRouteSegment, StableItemRoute, StableItemRouteSegment, StableOccurrenceKey,
-    StableOccurrenceRoute, StableOwnerKey, StableStatementKind, StableStatementRouteSegment,
-    SyntaxUnitNamespace, UnitItemIndex, UnitItemIndexEntry, UnitItemKind, UnitItemParameter,
-    is_program_role_root, is_reserved_standard_root,
+    ProgramKind, SourceUnitId, StableCheckOwnerKey, StableDefinitionKey, StableExpressionChildRole,
+    StableExpressionKey, StableExpressionRouteSegment, StableItemRoute, StableItemRouteSegment,
+    StableOccurrenceKey, StableOccurrenceRoute, StableOwnerKey, StableStatementKind,
+    StableStatementRouteSegment, SyntaxUnitNamespace, UnitCheckOwnerSlot, UnitChildOwnerBoundary,
+    UnitItemIndex, UnitItemIndexEntry, UnitItemKind, UnitItemParameter, UnitLocalExpressionId,
+    UnitLocalStatementId, UnitOwnerIndex, UnitOwnerIndexEntry, UnitOwnerRoute,
+    UnitStatementLocator, is_program_role_root, is_reserved_standard_root,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -189,6 +191,58 @@ impl ParsedSourceUnit {
         })
     }
 
+    pub fn stable_check_owner_keys(&self) -> impl Iterator<Item = StableCheckOwnerKey> + '_ {
+        self.owner_index
+            .entries()
+            .iter()
+            .map(|entry| stable_check_owner_key(&self.source_unit_id, &entry.route))
+    }
+
+    pub fn owner_index(&self) -> &UnitOwnerIndex {
+        &self.owner_index
+    }
+
+    pub fn owner_view(&self, route: &UnitOwnerRoute) -> Option<UnitOwnerSyntaxView<'_>> {
+        Some(UnitOwnerSyntaxView {
+            fields: &self.fields,
+            entry: self.owner_index.entry(route)?,
+        })
+    }
+
+    pub fn stable_check_owner_for_local_statement(
+        &self,
+        statement_id: usize,
+    ) -> Option<StableCheckOwnerKey> {
+        let statement = UnitLocalStatementId::__parser_new(statement_id)?;
+        stable_check_owner_key_for_slot(
+            &self.source_unit_id,
+            &self.item_index,
+            self.owner_index.statement_owner(statement)?,
+        )
+    }
+
+    pub fn stable_check_owner_for_local_expression(
+        &self,
+        expression_id: usize,
+    ) -> Option<StableCheckOwnerKey> {
+        let expression = UnitLocalExpressionId::__parser_new(expression_id)?;
+        stable_check_owner_key_for_slot(
+            &self.source_unit_id,
+            &self.item_index,
+            self.owner_index.expression_owner(expression)?,
+        )
+    }
+
+    pub fn stable_expression_key_local(&self, expression_id: usize) -> Option<StableExpressionKey> {
+        Some(StableExpressionKey {
+            source_unit_id: self.source_unit_id.clone(),
+            route_digest_v1: *self
+                .expression_route_digests_v1
+                .get(expression_id)?
+                .as_ref()?,
+        })
+    }
+
     pub fn stable_definition_keys(&self) -> impl Iterator<Item = StableDefinitionKey> + '_ {
         self.item_index
             .definitions()
@@ -206,13 +260,7 @@ impl ParsedSourceUnit {
     }
 
     pub fn stable_expression_key(&self, expression_id: usize) -> Option<StableExpressionKey> {
-        Some(StableExpressionKey {
-            source_unit_id: self.source_unit_id.clone(),
-            route_digest_v1: *self
-                .expression_route_digests_v1
-                .get(expression_id)?
-                .as_ref()?,
-        })
+        self.stable_expression_key_local(expression_id)
     }
 
     /// Consume a context-independent parser unit into the unit-native syntax
@@ -225,6 +273,124 @@ impl ParsedSourceUnit {
         link_key: ProjectUnitLinkKey,
     ) -> Result<UnitSyntaxSnapshot, ParseError> {
         into_unit_syntax_snapshot_with_work(self, link_key, &ParseWorkRecorder::disabled())
+    }
+}
+
+fn stable_check_owner_key(
+    source_unit_id: &SourceUnitId,
+    route: &UnitOwnerRoute,
+) -> StableCheckOwnerKey {
+    match route {
+        UnitOwnerRoute::UnitRoot => StableCheckOwnerKey::UnitRoot(source_unit_id.clone()),
+        UnitOwnerRoute::Item(item_route) => StableCheckOwnerKey::Item(StableOwnerKey {
+            source_unit_id: source_unit_id.clone(),
+            item_route: item_route.clone(),
+        }),
+    }
+}
+
+fn stable_check_owner_key_for_slot(
+    source_unit_id: &SourceUnitId,
+    item_index: &UnitItemIndex,
+    slot: UnitCheckOwnerSlot,
+) -> Option<StableCheckOwnerKey> {
+    if slot.is_unit_root() {
+        return Some(StableCheckOwnerKey::UnitRoot(source_unit_id.clone()));
+    }
+    let item = item_index.entries.get(slot.item_index()?)?;
+    Some(StableCheckOwnerKey::Item(StableOwnerKey {
+        source_unit_id: source_unit_id.clone(),
+        item_route: item.route.clone(),
+    }))
+}
+
+fn unit_statement_by_local_id<'a>(
+    fields: &'a ParsedSourceUnitFields,
+    statement: UnitLocalStatementId,
+    depth: usize,
+) -> Option<&'a AstStatement> {
+    if depth > fields.owner_index.statement_count() {
+        return None;
+    }
+    let locator = fields.owner_index.statement_locator(statement)?;
+    match locator.parent() {
+        Some(parent) => unit_statement_by_local_id(fields, parent, depth + 1)?
+            .children
+            .get(locator.child_index()),
+        None => fields.ast.statements.get(locator.child_index()),
+    }
+}
+
+/// Borrowed syntax body for one parser-owned check owner.
+///
+/// The view yields only this owner's statements and expressions. Descendant
+/// item bodies are replaced by the ordered `child_owners` boundary list, so a
+/// checker cannot accidentally perform a whole-unit recursive traversal.
+#[derive(Clone, Copy)]
+pub struct UnitOwnerSyntaxView<'a> {
+    fields: &'a ParsedSourceUnitFields,
+    entry: &'a UnitOwnerIndexEntry,
+}
+
+impl<'a> UnitOwnerSyntaxView<'a> {
+    pub fn source_unit_id(&self) -> &'a SourceUnitId {
+        &self.fields.source_unit_id
+    }
+
+    pub fn route(&self) -> &'a UnitOwnerRoute {
+        &self.entry.route
+    }
+
+    pub fn stable_key(&self) -> StableCheckOwnerKey {
+        stable_check_owner_key(&self.fields.source_unit_id, &self.entry.route)
+    }
+
+    pub fn child_owners(&self) -> &'a [UnitChildOwnerBoundary] {
+        &self.entry.child_owners
+    }
+
+    pub fn child_owner_routes(&self) -> impl Iterator<Item = &'a StableItemRoute> + 'a {
+        self.entry
+            .child_owners
+            .iter()
+            .map(|boundary| &boundary.route)
+    }
+
+    pub fn statement_ids(&self) -> &'a [UnitLocalStatementId] {
+        &self.entry.statements
+    }
+
+    pub fn expression_ids(&self) -> &'a [UnitLocalExpressionId] {
+        &self.entry.expressions
+    }
+
+    pub fn statements(&self) -> impl Iterator<Item = &'a AstStatement> + 'a {
+        let fields = self.fields;
+        self.entry.statements.iter().map(move |statement| {
+            unit_statement_by_local_id(fields, *statement, 0)
+                .expect("parser owner index statement locator resolves")
+        })
+    }
+
+    pub fn expressions(&self) -> impl Iterator<Item = &'a AstExpr> + 'a {
+        let expressions = &self.fields.ast.expressions;
+        self.entry.expressions.iter().map(move |expression| {
+            expressions
+                .get(expression.as_usize())
+                .expect("parser owner index expression locator resolves")
+        })
+    }
+
+    pub fn stable_expression_keys(&self) -> impl Iterator<Item = StableExpressionKey> + 'a {
+        let fields = self.fields;
+        self.entry
+            .expressions
+            .iter()
+            .map(move |expression| StableExpressionKey {
+                source_unit_id: fields.source_unit_id.clone(),
+                route_digest_v1: fields.expression_route_digests_v1[expression.as_usize()]
+                    .expect("owned parser expression has a structural identity"),
+            })
     }
 }
 
@@ -598,6 +764,66 @@ impl UnitSyntaxSnapshot {
         })
     }
 
+    pub fn stable_check_owner_keys(&self) -> impl Iterator<Item = StableCheckOwnerKey> + '_ {
+        self.owner_index
+            .entries()
+            .iter()
+            .map(|entry| stable_check_owner_key(&self.source_unit_id, &entry.route))
+    }
+
+    pub fn owner_index(&self) -> &UnitOwnerIndex {
+        &self.owner_index
+    }
+
+    pub fn owner_view(&self, route: &UnitOwnerRoute) -> Option<UnitOwnerSyntaxView<'_>> {
+        Some(UnitOwnerSyntaxView {
+            fields: &self.fields,
+            entry: self.owner_index.entry(route)?,
+        })
+    }
+
+    pub fn stable_check_owner_for_statement(
+        &self,
+        statement_id: usize,
+    ) -> Option<StableCheckOwnerKey> {
+        let (namespace, local) = __parser_unpack_syntax_node_id(statement_id)?;
+        if namespace != self.namespace {
+            return None;
+        }
+        let statement = UnitLocalStatementId::__parser_new(local)?;
+        stable_check_owner_key_for_slot(
+            &self.source_unit_id,
+            &self.item_index,
+            self.owner_index.statement_owner(statement)?,
+        )
+    }
+
+    pub fn stable_check_owner_for_expression(
+        &self,
+        expression_id: usize,
+    ) -> Option<StableCheckOwnerKey> {
+        let (namespace, local) = __parser_unpack_syntax_node_id(expression_id)?;
+        if namespace != self.namespace {
+            return None;
+        }
+        let expression = UnitLocalExpressionId::__parser_new(local)?;
+        stable_check_owner_key_for_slot(
+            &self.source_unit_id,
+            &self.item_index,
+            self.owner_index.expression_owner(expression)?,
+        )
+    }
+
+    pub fn stable_expression_key_local(&self, expression_id: usize) -> Option<StableExpressionKey> {
+        Some(StableExpressionKey {
+            source_unit_id: self.source_unit_id.clone(),
+            route_digest_v1: *self
+                .expression_route_digests_v1
+                .get(expression_id)?
+                .as_ref()?,
+        })
+    }
+
     pub fn stable_definition_keys(&self) -> impl Iterator<Item = StableDefinitionKey> + '_ {
         self.item_index
             .definitions()
@@ -623,10 +849,7 @@ impl UnitSyntaxSnapshot {
         if namespace != self.namespace {
             return None;
         }
-        Some(StableExpressionKey {
-            source_unit_id: self.source_unit_id.clone(),
-            route_digest_v1: *self.expression_route_digests_v1.get(local)?.as_ref()?,
-        })
+        self.stable_expression_key_local(local)
     }
 }
 
@@ -902,6 +1125,27 @@ impl ProjectSyntaxSnapshot {
         &self.fields.item_index
     }
 
+    pub fn stable_check_owner_keys(&self) -> impl Iterator<Item = StableCheckOwnerKey> + '_ {
+        self.fields
+            .units
+            .iter()
+            .flat_map(|unit| unit.stable_check_owner_keys())
+    }
+
+    pub fn owner_view(&self, owner: &StableCheckOwnerKey) -> Option<UnitOwnerSyntaxView<'_>> {
+        let unit = self
+            .fields
+            .units
+            .iter()
+            .find(|unit| &unit.source_unit_id == owner.source_unit_id())?;
+        match owner {
+            StableCheckOwnerKey::UnitRoot(_) => unit.owner_view(&UnitOwnerRoute::UnitRoot),
+            StableCheckOwnerKey::Item(owner) => {
+                unit.owner_view(&UnitOwnerRoute::Item(owner.item_route.clone()))
+            }
+        }
+    }
+
     pub fn functions(&self) -> &[String] {
         &self.fields.functions
     }
@@ -1001,6 +1245,30 @@ impl ProjectSyntaxSnapshot {
             .units
             .get(*self.fields.unit_by_namespace.get(&namespace)?)?;
         unit.stable_occurrence_key(expression_id)
+    }
+
+    pub fn stable_check_owner_for_statement(
+        &self,
+        statement_id: usize,
+    ) -> Option<StableCheckOwnerKey> {
+        let (namespace, _) = __parser_unpack_syntax_node_id(statement_id)?;
+        let unit = self
+            .fields
+            .units
+            .get(*self.fields.unit_by_namespace.get(&namespace)?)?;
+        unit.stable_check_owner_for_statement(statement_id)
+    }
+
+    pub fn stable_check_owner_for_expression(
+        &self,
+        expression_id: usize,
+    ) -> Option<StableCheckOwnerKey> {
+        let (namespace, _) = __parser_unpack_syntax_node_id(expression_id)?;
+        let unit = self
+            .fields
+            .units
+            .get(*self.fields.unit_by_namespace.get(&namespace)?)?;
+        unit.stable_check_owner_for_expression(expression_id)
     }
 
     pub fn stable_expression_key(&self, expression_id: usize) -> Option<StableExpressionKey> {
@@ -1872,6 +2140,7 @@ fn parse_normalized_source_unit_syntax(
             ast,
             declared_functions,
             item_index,
+            owner_index: expression_identities.owner_index,
             occurrence_routes: expression_identities.occurrence_routes,
             expression_route_digests_v1: expression_identities.expression_route_digests_v1,
         }),
@@ -2665,6 +2934,7 @@ fn assemble_canonical_parsed_source_units(
             mut ast,
             declared_functions: _declared_functions,
             item_index: _item_index,
+            owner_index: _owner_index,
             occurrence_routes: unit_occurrence_routes,
             expression_route_digests_v1: unit_expression_route_digests_v1,
         } = unit.fields;
@@ -8164,6 +8434,7 @@ const STABLE_EXPRESSION_ROOT_DOMAIN_V1: &[u8] = b"boon.stable-expression-root.v1
 const STABLE_EXPRESSION_CHILD_DOMAIN_V1: &[u8] = b"boon.stable-expression-child.v1\0";
 
 struct UnitExpressionIdentities {
+    owner_index: UnitOwnerIndex,
     occurrence_routes: Vec<Option<StableOccurrenceRoute>>,
     expression_route_digests_v1: Vec<Option<[u8; 32]>>,
 }
@@ -8353,30 +8624,123 @@ fn stable_expression_route_digests(
     Ok(digests)
 }
 
+fn stable_expression_owner_slots(
+    path: &str,
+    parents: &[Option<StableExpressionParent>],
+    root_owners: &[UnitCheckOwnerSlot],
+) -> Result<Vec<UnitCheckOwnerSlot>, ParseError> {
+    if parents.len() != root_owners.len() {
+        return Err(parsed_source_unit_invariant_error(
+            path,
+            "expression parent and root-owner columns have different lengths",
+        ));
+    }
+    let expression_count = parents.len();
+    let mut owners = vec![UnitCheckOwnerSlot::__parser_unrouted(); expression_count];
+    let mut chain = Vec::new();
+    for expression in 0..expression_count {
+        if owners[expression].is_routed() {
+            continue;
+        }
+        chain.clear();
+        let mut cursor = expression;
+        let owner = loop {
+            if let Some(owner) = owners
+                .get(cursor)
+                .copied()
+                .filter(|owner| owner.is_routed())
+            {
+                break Some(owner);
+            }
+            if let Some(owner) = root_owners
+                .get(cursor)
+                .copied()
+                .filter(|owner| owner.is_routed())
+            {
+                break Some(owner);
+            }
+            let Some(parent) = parents.get(cursor).and_then(Option::as_ref) else {
+                break None;
+            };
+            chain.push(cursor);
+            cursor = parent.expression;
+            if chain.len() > expression_count {
+                return Err(parsed_source_unit_invariant_error(
+                    path,
+                    format!("expression {expression} has a cyclic owner route"),
+                ));
+            }
+        };
+        let Some(owner) = owner else {
+            continue;
+        };
+        owners[cursor] = owner;
+        owners[expression] = owner;
+        for child in chain.drain(..) {
+            owners[child] = owner;
+        }
+    }
+    Ok(owners)
+}
+
 fn build_unit_expression_identities(
     path: &str,
     ast: &AstProgram,
     item_index: &UnitItemIndex,
 ) -> Result<UnitExpressionIdentities, ParseError> {
     let expression_count = ast.expressions.len();
-    let item_routes = item_index
-        .entries
-        .iter()
-        .map(|entry| (entry.local_statement_id, entry.route.clone()))
-        .collect::<BTreeMap<_, _>>();
+    let mut item_routes = BTreeMap::new();
+    for (item, entry) in item_index.entries.iter().enumerate() {
+        let slot = UnitCheckOwnerSlot::__parser_item(item).ok_or_else(|| {
+            parsed_source_unit_invariant_error(path, "unit owner count exceeds u32")
+        })?;
+        if item_routes
+            .insert(entry.local_statement_id, (entry.route.clone(), slot))
+            .is_some()
+        {
+            return Err(parsed_source_unit_invariant_error(
+                path,
+                format!(
+                    "statement {} appears more than once in the unit item index",
+                    entry.local_statement_id
+                ),
+            ));
+        }
+    }
+    let owner_routes = std::iter::once(UnitOwnerRoute::UnitRoot)
+        .chain(
+            item_index
+                .entries
+                .iter()
+                .map(|entry| UnitOwnerRoute::Item(entry.route.clone())),
+        )
+        .collect::<Vec<_>>();
+    let mut owner_statements = vec![Vec::new(); owner_routes.len()];
+    let mut owner_child_owners = vec![Vec::new(); owner_routes.len()];
+    let mut statement_locators = Vec::<Option<UnitStatementLocator>>::new();
+    let mut statement_owners = Vec::<UnitCheckOwnerSlot>::new();
     let mut parents = vec![None::<StableExpressionParent>; expression_count];
     let mut roots = vec![None::<StableOccurrenceRoute>; expression_count];
+    let mut root_owners = vec![UnitCheckOwnerSlot::__parser_unrouted(); expression_count];
     let mut visited = vec![false; expression_count];
 
     fn register_expression_tree(
         path: &str,
         root: usize,
         base: StableOccurrenceRoute,
+        owner: UnitCheckOwnerSlot,
         ast: &AstProgram,
         parents: &mut [Option<StableExpressionParent>],
         roots: &mut [Option<StableOccurrenceRoute>],
+        root_owners: &mut [UnitCheckOwnerSlot],
         visited: &mut [bool],
     ) -> Result<(), ParseError> {
+        if !owner.is_routed() {
+            return Err(parsed_source_unit_invariant_error(
+                path,
+                "statement expression has no check owner",
+            ));
+        }
         let root_slot = roots.get_mut(root).ok_or_else(|| {
             parsed_source_unit_invariant_error(
                 path,
@@ -8385,6 +8749,12 @@ fn build_unit_expression_identities(
         })?;
         if root_slot.is_none() {
             *root_slot = Some(base);
+            *root_owners.get_mut(root).ok_or_else(|| {
+                parsed_source_unit_invariant_error(
+                    path,
+                    format!("statement expression root owner {root} is out of range"),
+                )
+            })? = owner;
         }
         let mut pending = vec![root];
         while let Some(parent) = pending.pop() {
@@ -8428,9 +8798,14 @@ fn build_unit_expression_identities(
     struct StatementOccurrenceBuilder<'a> {
         path: &'a str,
         ast: &'a AstProgram,
-        item_routes: &'a BTreeMap<usize, StableItemRoute>,
+        item_routes: &'a BTreeMap<usize, (StableItemRoute, UnitCheckOwnerSlot)>,
+        owner_statements: &'a mut [Vec<UnitLocalStatementId>],
+        owner_child_owners: &'a mut [Vec<UnitChildOwnerBoundary>],
+        statement_locators: &'a mut Vec<Option<UnitStatementLocator>>,
+        statement_owners: &'a mut Vec<UnitCheckOwnerSlot>,
         parents: &'a mut [Option<StableExpressionParent>],
         roots: &'a mut [Option<StableOccurrenceRoute>],
+        root_owners: &'a mut [UnitCheckOwnerSlot],
         visited: &'a mut [bool],
     }
 
@@ -8439,7 +8814,9 @@ fn build_unit_expression_identities(
             &mut self,
             statements: &[AstStatement],
             owner: Option<StableItemRoute>,
+            owner_slot: UnitCheckOwnerSlot,
             parent_route: &[StableStatementRouteSegment],
+            parent_statement: Option<UnitLocalStatementId>,
         ) -> Result<(), ParseError> {
             let identities = statements
                 .iter()
@@ -8449,14 +8826,68 @@ fn build_unit_expression_identities(
             for identity in &identities {
                 *remaining.entry(identity.clone()).or_default() += 1;
             }
-            for (statement, (kind, names)) in statements.iter().zip(identities) {
+            for (child_index, (statement, (kind, names))) in
+                statements.iter().zip(identities).enumerate()
+            {
+                let local_statement =
+                    UnitLocalStatementId::__parser_new(statement.id).ok_or_else(|| {
+                        parsed_source_unit_invariant_error(
+                            self.path,
+                            format!("statement {} exceeds the unit-local id bound", statement.id),
+                        )
+                    })?;
+                if self.statement_locators.len() <= statement.id {
+                    self.statement_locators.resize(statement.id + 1, None);
+                    self.statement_owners
+                        .resize(statement.id + 1, UnitCheckOwnerSlot::__parser_unrouted());
+                }
+                let locator = UnitStatementLocator::__parser_new(parent_statement, child_index)
+                    .ok_or_else(|| {
+                        parsed_source_unit_invariant_error(
+                            self.path,
+                            format!(
+                                "statement {} child index exceeds the unit-local bound",
+                                statement.id
+                            ),
+                        )
+                    })?;
+                if self.statement_locators[statement.id]
+                    .replace(locator)
+                    .is_some()
+                {
+                    return Err(parsed_source_unit_invariant_error(
+                        self.path,
+                        format!("statement {} has more than one AST location", statement.id),
+                    ));
+                }
                 let count = remaining
                     .get_mut(&(kind, names.clone()))
                     .expect("statement identity was counted");
                 *count -= 1;
-                let (statement_owner, statement_route) =
-                    if let Some(item_route) = self.item_routes.get(&statement.id) {
-                        (Some(item_route.clone()), Vec::new())
+                let (statement_owner, statement_owner_slot, statement_route) =
+                    if let Some((item_route, item_slot)) = self.item_routes.get(&statement.id) {
+                        let parent_entry = owner_slot.owner_entry_index().ok_or_else(|| {
+                            parsed_source_unit_invariant_error(
+                                self.path,
+                                "nested item has no parent owner entry",
+                            )
+                        })?;
+                        let boundary = UnitChildOwnerBoundary::__parser_new(
+                            item_route.clone(),
+                            parent_statement,
+                            child_index,
+                        )
+                        .ok_or_else(|| {
+                            parsed_source_unit_invariant_error(
+                                self.path,
+                                format!(
+                                    "child owner at statement {} exceeds the unit-local bound",
+                                    statement.id
+                                ),
+                            )
+                        })?;
+                        self.owner_child_owners[parent_entry].push(boundary);
+                        (Some(item_route.clone()), *item_slot, Vec::new())
                     } else {
                         let mut route = parent_route.to_vec();
                         route.push(StableStatementRouteSegment {
@@ -8464,8 +8895,16 @@ fn build_unit_expression_identities(
                             names,
                             matching_sibling_reverse_ordinal: *count,
                         });
-                        (owner.clone(), route)
+                        (owner.clone(), owner_slot, route)
                     };
+                let owner_entry = statement_owner_slot.owner_entry_index().ok_or_else(|| {
+                    parsed_source_unit_invariant_error(
+                        self.path,
+                        format!("statement {} has no owner entry", statement.id),
+                    )
+                })?;
+                self.statement_owners[statement.id] = statement_owner_slot;
+                self.owner_statements[owner_entry].push(local_statement);
                 if let Some(expression) = statement.expr {
                     register_expression_tree(
                         self.path,
@@ -8475,13 +8914,21 @@ fn build_unit_expression_identities(
                             statement_route: statement_route.clone(),
                             expression_route: Vec::new(),
                         },
+                        statement_owner_slot,
                         self.ast,
                         self.parents,
                         self.roots,
+                        self.root_owners,
                         self.visited,
                     )?;
                 }
-                self.visit(&statement.children, statement_owner, &statement_route)?;
+                self.visit(
+                    &statement.children,
+                    statement_owner,
+                    statement_owner_slot,
+                    &statement_route,
+                    Some(local_statement),
+                )?;
             }
             Ok(())
         }
@@ -8491,13 +8938,77 @@ fn build_unit_expression_identities(
         path,
         ast,
         item_routes: &item_routes,
+        owner_statements: &mut owner_statements,
+        owner_child_owners: &mut owner_child_owners,
+        statement_locators: &mut statement_locators,
+        statement_owners: &mut statement_owners,
         parents: &mut parents,
         roots: &mut roots,
+        root_owners: &mut root_owners,
         visited: &mut visited,
     }
-    .visit(&ast.statements, None, &[])?;
+    .visit(
+        &ast.statements,
+        None,
+        UnitCheckOwnerSlot::__parser_unit_root(),
+        &[],
+        None,
+    )?;
+
+    let statement_locators = statement_locators
+        .into_iter()
+        .enumerate()
+        .map(|(statement, locator)| {
+            locator.ok_or_else(|| {
+                parsed_source_unit_invariant_error(
+                    path,
+                    format!("statement {statement} has no direct AST locator"),
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if statement_owners.iter().any(|owner| !owner.is_routed()) {
+        return Err(parsed_source_unit_invariant_error(
+            path,
+            "one or more statements have no check owner",
+        ));
+    }
 
     let expression_route_digests_v1 = stable_expression_route_digests(path, &parents, &roots)?;
+    let expression_owners = stable_expression_owner_slots(path, &parents, &root_owners)?;
+    let mut owner_expressions = vec![Vec::new(); owner_routes.len()];
+    for (expression, owner) in expression_owners.iter().copied().enumerate() {
+        let Some(owner_entry) = owner.owner_entry_index() else {
+            continue;
+        };
+        let expression = UnitLocalExpressionId::__parser_new(expression).ok_or_else(|| {
+            parsed_source_unit_invariant_error(
+                path,
+                "expression count exceeds the unit-local id bound",
+            )
+        })?;
+        owner_expressions[owner_entry].push(expression);
+    }
+    let owner_entries = owner_routes
+        .into_iter()
+        .zip(owner_statements)
+        .zip(owner_expressions)
+        .zip(owner_child_owners)
+        .map(
+            |(((route, statements), expressions), child_owners)| UnitOwnerIndexEntry {
+                route,
+                statements: statements.into_boxed_slice(),
+                expressions: expressions.into_boxed_slice(),
+                child_owners: child_owners.into_boxed_slice(),
+            },
+        )
+        .collect::<Vec<_>>();
+    let owner_index = UnitOwnerIndex::__parser_new(
+        owner_entries,
+        statement_locators,
+        statement_owners,
+        expression_owners,
+    );
     let mut occurrence_routes = vec![None; expression_count];
     for expression in &ast.expressions {
         if !matches!(
@@ -8540,6 +9051,7 @@ fn build_unit_expression_identities(
         occurrence_routes[expression.id] = Some(base);
     }
     Ok(UnitExpressionIdentities {
+        owner_index,
         occurrence_routes,
         expression_route_digests_v1,
     })
@@ -9331,6 +9843,131 @@ document:
     }
 
     #[test]
+    fn unit_owner_index_partitions_root_items_and_function_local_statements() {
+        let parsed = parse_project_source_unit(
+            "app/RUN.bn",
+            "helper(input: 0)\nvalue: 1\nstore: [\n    todos: LIST {\n        [title: TEXT { One }]\n    }\n]\nFUNCTION helper(input) {\n    local: input\n    local\n}\n",
+        )
+        .unwrap();
+
+        let keys = parsed.stable_check_owner_keys().collect::<Vec<_>>();
+        assert_eq!(keys.len(), parsed.item_index.entries.len() + 1);
+        assert_eq!(
+            keys.first(),
+            Some(&StableCheckOwnerKey::UnitRoot(
+                parsed.source_unit_id.clone()
+            ))
+        );
+
+        let mut owned_statements = BTreeSet::new();
+        let mut owned_expressions = BTreeSet::new();
+        for entry in parsed.owner_index().entries() {
+            let view = parsed.owner_view(&entry.route).unwrap();
+            let owner = view.stable_key();
+            for statement in view.statements() {
+                assert_eq!(
+                    parsed.stable_check_owner_for_local_statement(statement.id),
+                    Some(owner.clone())
+                );
+                assert!(owned_statements.insert(statement.id));
+            }
+            for expression in view.expressions() {
+                assert_eq!(
+                    parsed.stable_check_owner_for_local_expression(expression.id),
+                    Some(owner.clone())
+                );
+                assert!(owned_expressions.insert(expression.id));
+            }
+            assert_eq!(
+                view.stable_expression_keys().collect::<BTreeSet<_>>().len(),
+                view.expression_ids().len()
+            );
+        }
+
+        fn collect_statement_ids(statements: &[AstStatement], ids: &mut BTreeSet<usize>) {
+            for statement in statements {
+                assert!(ids.insert(statement.id));
+                collect_statement_ids(&statement.children, ids);
+            }
+        }
+        let mut all_statements = BTreeSet::new();
+        collect_statement_ids(&parsed.ast.statements, &mut all_statements);
+        assert_eq!(owned_statements, all_statements);
+        assert_eq!(
+            owned_expressions,
+            parsed
+                .ast
+                .expressions
+                .iter()
+                .filter(|expression| parsed.stable_expression_key(expression.id).is_some())
+                .map(|expression| expression.id)
+                .collect::<BTreeSet<_>>()
+        );
+
+        let root = parsed.owner_view(&UnitOwnerRoute::UnitRoot).unwrap();
+        let root_child_names = root
+            .child_owners()
+            .iter()
+            .filter_map(|boundary| boundary.route.segments().last()?.names.first().cloned())
+            .collect::<Vec<_>>();
+        assert_eq!(root_child_names, ["value", "store", "helper"]);
+
+        let store = parsed
+            .owner_index()
+            .entries()
+            .iter()
+            .find(|entry| {
+                matches!(
+                    &entry.route,
+                    UnitOwnerRoute::Item(route)
+                        if route.segments().last().is_some_and(|segment| segment.names == ["store"])
+                )
+            })
+            .unwrap();
+        assert_eq!(store.child_owners.len(), 1);
+        assert_eq!(
+            store.child_owners[0].route.segments().last().unwrap().names,
+            ["todos"]
+        );
+
+        let helper = keys
+            .iter()
+            .find(|key| {
+                matches!(
+                    key,
+                    StableCheckOwnerKey::Item(owner)
+                        if owner.item_route.segments().last().is_some_and(|segment| segment.names == ["helper"])
+                )
+            })
+            .unwrap();
+        let local_statement = parsed
+            .ast
+            .statements
+            .iter()
+            .find(|statement| {
+                matches!(&statement.kind, AstStatementKind::Function { name, .. } if name == "helper")
+            })
+            .unwrap()
+            .children
+            .iter()
+            .find(|statement| {
+                matches!(&statement.kind, AstStatementKind::Field { name } if name == "local")
+            })
+            .unwrap();
+        assert_eq!(
+            parsed.stable_check_owner_for_local_statement(local_statement.id),
+            Some(helper.clone())
+        );
+        assert!(!parsed.item_index.entries.iter().any(|entry| {
+            entry
+                .route
+                .segments()
+                .last()
+                .is_some_and(|segment| segment.names == ["local"])
+        }));
+    }
+
+    #[test]
     fn structural_occurrence_keys_ignore_authored_text_and_unrelated_earlier_calls() {
         fn helper_keys(source: &str) -> BTreeMap<String, StableOccurrenceKey> {
             let parsed = parse_project_source_unit("app/RUN.bn", source).unwrap();
@@ -9491,6 +10128,20 @@ document:
             .iter()
             .map(|expression| parsed.stable_expression_key(expression.id).unwrap())
             .collect::<Vec<_>>();
+        let parser_owner_partitions = parsed
+            .owner_index()
+            .entries()
+            .iter()
+            .map(|entry| {
+                let view = parsed.owner_view(&entry.route).unwrap();
+                (
+                    view.stable_key(),
+                    view.statement_ids().len(),
+                    view.stable_expression_keys().collect::<Vec<_>>(),
+                    view.child_owners().to_vec(),
+                )
+            })
+            .collect::<Vec<_>>();
         let link_key = project_unit_link_keys(
             "app/RUN.bn",
             [(
@@ -9510,6 +10161,37 @@ document:
                 linked.stable_expression_key(linked_expression.id),
                 Some(parser_key.clone())
             );
+        }
+        let linked_owner_partitions = linked
+            .owner_index()
+            .entries()
+            .iter()
+            .map(|entry| {
+                let view = linked.owner_view(&entry.route).unwrap();
+                (
+                    view.stable_key(),
+                    view.statement_ids().len(),
+                    view.stable_expression_keys().collect::<Vec<_>>(),
+                    view.child_owners().to_vec(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(linked_owner_partitions, parser_owner_partitions);
+        for entry in linked.owner_index().entries() {
+            let view = linked.owner_view(&entry.route).unwrap();
+            let owner = view.stable_key();
+            for statement in view.statements() {
+                assert_eq!(
+                    linked.stable_check_owner_for_statement(statement.id),
+                    Some(owner.clone())
+                );
+            }
+            for expression in view.expressions() {
+                assert_eq!(
+                    linked.stable_check_owner_for_expression(expression.id),
+                    Some(owner.clone())
+                );
+            }
         }
     }
 

@@ -594,6 +594,288 @@ pub struct StableOwnerKey {
     pub item_route: StableItemRoute,
 }
 
+/// Stable compiler identity of one independently checked syntax owner.
+///
+/// Every authored item is an owner, including fields, sources, holds, lists,
+/// and functions. Each source unit also has one anonymous root owner for
+/// top-level expression/block structure and file-scoped diagnostics. The unit
+/// root is deliberately explicit rather than overloading a missing item route.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+pub enum StableCheckOwnerKey {
+    UnitRoot(SourceUnitId),
+    Item(StableOwnerKey),
+}
+
+impl StableCheckOwnerKey {
+    pub fn source_unit_id(&self) -> &SourceUnitId {
+        match self {
+            Self::UnitRoot(source_unit_id) => source_unit_id,
+            Self::Item(owner) => &owner.source_unit_id,
+        }
+    }
+}
+
+/// Unit-local route used by the parser's compact owner partition.
+///
+/// This route becomes stable only when paired with the surrounding
+/// [`SourceUnitId`]. It never contains a dense statement/expression id.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+pub enum UnitOwnerRoute {
+    UnitRoot,
+    Item(StableItemRoute),
+}
+
+/// Typed unit-local statement lookup id retained by the parser owner index.
+///
+/// This is an intra-snapshot locator only. It must not enter a stable compiler,
+/// semantic, persistence, or artifact identity.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct UnitLocalStatementId(u32);
+
+impl UnitLocalStatementId {
+    #[doc(hidden)]
+    pub fn __parser_new(value: usize) -> Option<Self> {
+        u32::try_from(value).ok().map(Self)
+    }
+
+    pub const fn as_usize(self) -> usize {
+        self.0 as usize
+    }
+}
+
+/// Typed unit-local expression lookup id retained by the parser owner index.
+///
+/// Like [`UnitLocalStatementId`], this is revision-local lookup metadata, not
+/// semantic identity. Stable expression identity is [`StableExpressionKey`].
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct UnitLocalExpressionId(u32);
+
+impl UnitLocalExpressionId {
+    #[doc(hidden)]
+    pub fn __parser_new(value: usize) -> Option<Self> {
+        u32::try_from(value).ok().map(Self)
+    }
+
+    pub const fn as_usize(self) -> usize {
+        self.0 as usize
+    }
+}
+
+/// Compact owner slot used only inside one [`UnitOwnerIndex`].
+///
+/// Zero means that an arena expression is not reachable from a statement,
+/// one means the anonymous unit root, and values above one identify an item
+/// entry. The representation stays private so callers cannot mistake it for a
+/// stable owner identity.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct UnitCheckOwnerSlot(u32);
+
+impl UnitCheckOwnerSlot {
+    #[doc(hidden)]
+    pub const fn __parser_unrouted() -> Self {
+        Self(0)
+    }
+
+    #[doc(hidden)]
+    pub const fn __parser_unit_root() -> Self {
+        Self(1)
+    }
+
+    #[doc(hidden)]
+    pub fn __parser_item(item_index: usize) -> Option<Self> {
+        u32::try_from(item_index)
+            .ok()
+            .and_then(|item| item.checked_add(2))
+            .map(Self)
+    }
+
+    pub const fn is_routed(self) -> bool {
+        self.0 != 0
+    }
+
+    pub const fn is_unit_root(self) -> bool {
+        self.0 == 1
+    }
+
+    pub const fn item_index(self) -> Option<usize> {
+        if self.0 >= 2 {
+            Some((self.0 - 2) as usize)
+        } else {
+            None
+        }
+    }
+
+    pub const fn owner_entry_index(self) -> Option<usize> {
+        if self.is_unit_root() {
+            Some(0)
+        } else if let Some(item) = self.item_index() {
+            Some(item + 1)
+        } else {
+            None
+        }
+    }
+}
+
+/// Direct nested-statement locator for one unit-local statement id.
+///
+/// Parent links avoid allocating an index path for every statement. Resolving
+/// one locator walks only that statement's lexical depth.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UnitStatementLocator {
+    parent: Option<UnitLocalStatementId>,
+    child_index: u32,
+}
+
+/// Exact placement of a descendant owner boundary inside its parent owner.
+///
+/// The child item statement is not part of the parent's body. `parent` and
+/// `child_index` identify where its public interface is observed among the
+/// parent's retained statement tree without copying an AST path.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UnitChildOwnerBoundary {
+    pub route: StableItemRoute,
+    parent: Option<UnitLocalStatementId>,
+    child_index: u32,
+}
+
+impl UnitChildOwnerBoundary {
+    #[doc(hidden)]
+    pub fn __parser_new(
+        route: StableItemRoute,
+        parent: Option<UnitLocalStatementId>,
+        child_index: usize,
+    ) -> Option<Self> {
+        Some(Self {
+            route,
+            parent,
+            child_index: u32::try_from(child_index).ok()?,
+        })
+    }
+
+    pub const fn parent(&self) -> Option<UnitLocalStatementId> {
+        self.parent
+    }
+
+    pub const fn child_index(&self) -> usize {
+        self.child_index as usize
+    }
+}
+
+impl UnitStatementLocator {
+    #[doc(hidden)]
+    pub fn __parser_new(parent: Option<UnitLocalStatementId>, child_index: usize) -> Option<Self> {
+        Some(Self {
+            parent,
+            child_index: u32::try_from(child_index).ok()?,
+        })
+    }
+
+    pub const fn parent(self) -> Option<UnitLocalStatementId> {
+        self.parent
+    }
+
+    pub const fn child_index(self) -> usize {
+        self.child_index as usize
+    }
+}
+
+/// One parser-owned syntax partition for an independently checked owner.
+///
+/// Statement order is preorder within the owner and excludes descendant owner
+/// bodies. Expression order follows the parser arena and likewise excludes
+/// descendant owners. `child_owners` records the exact boundaries where a
+/// checker must consume another owner's public interface instead of descending
+/// into its body.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UnitOwnerIndexEntry {
+    pub route: UnitOwnerRoute,
+    pub statements: Box<[UnitLocalStatementId]>,
+    pub expressions: Box<[UnitLocalExpressionId]>,
+    pub child_owners: Box<[UnitChildOwnerBoundary]>,
+}
+
+/// Complete parser-owned owner partition for one source unit.
+///
+/// Entry zero is always [`UnitOwnerRoute::UnitRoot`]. Every later entry maps
+/// one-for-one to the same-position entry in [`UnitItemIndex`]. Compact slot
+/// columns allow constant-time owner lookup without cloning stable routes per
+/// expression or rescanning the nested AST.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct UnitOwnerIndex {
+    entries: Box<[UnitOwnerIndexEntry]>,
+    statement_locators: Box<[UnitStatementLocator]>,
+    statement_owners: Box<[UnitCheckOwnerSlot]>,
+    expression_owners: Box<[UnitCheckOwnerSlot]>,
+}
+
+impl UnitOwnerIndex {
+    #[doc(hidden)]
+    pub fn __parser_new(
+        entries: Vec<UnitOwnerIndexEntry>,
+        statement_locators: Vec<UnitStatementLocator>,
+        statement_owners: Vec<UnitCheckOwnerSlot>,
+        expression_owners: Vec<UnitCheckOwnerSlot>,
+    ) -> Self {
+        Self {
+            entries: entries.into_boxed_slice(),
+            statement_locators: statement_locators.into_boxed_slice(),
+            statement_owners: statement_owners.into_boxed_slice(),
+            expression_owners: expression_owners.into_boxed_slice(),
+        }
+    }
+
+    pub fn entries(&self) -> &[UnitOwnerIndexEntry] {
+        &self.entries
+    }
+
+    pub fn entry(&self, route: &UnitOwnerRoute) -> Option<&UnitOwnerIndexEntry> {
+        match route {
+            UnitOwnerRoute::UnitRoot => self.entries.first(),
+            UnitOwnerRoute::Item(route) => self
+                .entries
+                .iter()
+                .skip(1)
+                .find(|entry| {
+                    matches!(&entry.route, UnitOwnerRoute::Item(candidate) if candidate == route)
+                }),
+        }
+    }
+
+    pub fn statement_count(&self) -> usize {
+        self.statement_locators.len()
+    }
+
+    pub fn expression_count(&self) -> usize {
+        self.expression_owners.len()
+    }
+
+    pub fn statement_locator(
+        &self,
+        statement: UnitLocalStatementId,
+    ) -> Option<UnitStatementLocator> {
+        self.statement_locators.get(statement.as_usize()).copied()
+    }
+
+    pub fn statement_owner(&self, statement: UnitLocalStatementId) -> Option<UnitCheckOwnerSlot> {
+        self.statement_owners
+            .get(statement.as_usize())
+            .copied()
+            .filter(|owner| owner.is_routed())
+    }
+
+    pub fn expression_owner(
+        &self,
+        expression: UnitLocalExpressionId,
+    ) -> Option<UnitCheckOwnerSlot> {
+        self.expression_owners
+            .get(expression.as_usize())
+            .copied()
+            .filter(|owner| owner.is_routed())
+    }
+}
+
 /// Stable compiler identity of one authored definition.
 ///
 /// This function-only key remains distinct from [`StableOwnerKey`]: callers
@@ -704,6 +986,8 @@ pub struct ParsedSourceUnitFields {
     pub ast: AstProgram,
     pub declared_functions: Vec<String>,
     pub item_index: UnitItemIndex,
+    #[serde(skip)]
+    pub owner_index: UnitOwnerIndex,
     #[serde(skip)]
     pub occurrence_routes: Vec<Option<StableOccurrenceRoute>>,
     #[serde(skip)]

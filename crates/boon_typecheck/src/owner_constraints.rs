@@ -1363,13 +1363,26 @@ pub fn project_owner_constraint_seed(
         }
     }
 
-    let statement_values = input
-        .statements
+    let syntax_graph = crate::OwnerSyntaxGraph::build(input).map_err(|error| {
+        OwnerConstraintSeedError::new(format!(
+            "cannot derive canonical statement values for {:?}: {error}",
+            input.owner
+        ))
+    })?;
+    let statement_values = syntax_graph
+        .statements()
         .iter()
         .filter_map(|statement| {
-            statement
-                .expression
-                .map(|expression| (statement.id, expression))
+            let expression = match statement.canonical_value.as_ref()? {
+                boon_checked::OwnerExpressionRef::Local { expression } => expression.0,
+                boon_checked::OwnerExpressionRef::Child { owner, expression } => {
+                    let external = input.external_expressions.iter().position(|candidate| {
+                        &candidate.owner == owner && &candidate.expression == expression
+                    })?;
+                    u32::try_from(input.expressions.len().checked_add(external)?).ok()?
+                }
+            };
+            Some((statement.id.0, expression))
         })
         .collect::<Vec<_>>();
     let mut references = BTreeSet::new();

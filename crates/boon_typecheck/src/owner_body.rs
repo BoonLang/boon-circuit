@@ -3,15 +3,17 @@ use crate::owner_interface::{
     instantiate_type, merge_effects, pattern_type, true_false_type,
 };
 use crate::{
-    OwnerArgumentKind, OwnerCallableAbiEnvironment, OwnerCollectionKind, OwnerConstraintEdgeRole,
-    OwnerConstraintNodeKind, OwnerConstraintSeed, OwnerConstraintSummary, OwnerDeclarationKind,
+    OwnerAbiCallableContract, OwnerArgumentKind, OwnerCallableAbiEnvironment, OwnerCollectionKind,
+    OwnerConstraintEdgeRole, OwnerConstraintNodeKind, OwnerConstraintSeed, OwnerConstraintSummary,
     OwnerInterfaceSccKey, OwnerInterfaceSccResult, OwnerParameterKind, OwnerPublicInterface,
-    OwnerReferenceKind, OwnerSourceAnchorRole, OwnerSourceAnchorSite, OwnerSourceMap,
+    OwnerReferenceKind, OwnerResultCallTarget, OwnerResultExpressionRef, OwnerResultTransfer,
+    OwnerResultTransferNode, OwnerSourceAnchorRole, OwnerSourceAnchorSite, OwnerSourceMap,
     OwnerSymbolResolution, OwnerSyntaxInput, infix_returns_bool,
 };
 use boon_checked::{
-    BytesType, CheckedEffectSummary, CheckedParameterKind, DiagnosticSeverity, FlowMode, FlowType,
-    ObjectShape, Type, TypeDiagnostic, TypeVar, Variant,
+    BytesType, CheckedEffectSummary, CheckedParameterKind, CheckedTypeSubstitution,
+    DiagnosticSeverity, FlowMode, FlowType, ObjectShape, Type, TypeDiagnostic, TypeVar, Variant,
+    apply_checked_type_substitution_lookup, specialize_checked_call_result, widen_structural_type,
 };
 use boon_syntax::{
     AstExprKind, AstStatementKind, StableCheckOwnerKey, StableExpressionKey, StableStatementKey,
@@ -177,6 +179,9 @@ pub struct InferredOwnerCall {
     pub function: String,
     pub target: InferredOwnerCallableTarget,
     pub inputs: Box<[InferredOwnerCallInput]>,
+    pub type_substitutions: Box<[CheckedTypeSubstitution]>,
+    pub contextual_type_variables: Box<[TypeVar]>,
+    pub syntax_discriminated_result: bool,
     pub result: FlowType,
     pub effect: CheckedEffectSummary,
 }
@@ -409,26 +414,6 @@ fn inferred_expression_ref(
         owner: external.owner.clone(),
         expression: external.expression.clone(),
     })
-}
-
-fn owner_result_expression(seed: &OwnerConstraintSeed) -> Option<u32> {
-    let public = seed
-        .declarations
-        .iter()
-        .find(|declaration| declaration.public)?;
-    seed.statement_values
-        .iter()
-        .find(|(statement, _)| *statement == public.statement)
-        .map(|(_, expression)| *expression)
-        .or_else(|| {
-            (public.kind == OwnerDeclarationKind::Function)
-                .then(|| {
-                    seed.statement_values
-                        .last()
-                        .map(|(_, expression)| *expression)
-                })
-                .flatten()
-        })
 }
 
 fn direct_effect_for(kind: &OwnerConstraintNodeKind) -> CheckedEffectSummary {
@@ -963,6 +948,911 @@ struct InferredCallDraft {
     plan: BodyCallPlan,
     target: InferredOwnerCallableTarget,
     effect: CheckedEffectSummary,
+    type_substitutions: Vec<(TypeVar, Type)>,
+    contextual_type_variables: Vec<TypeVar>,
+    syntax_discriminated_result: bool,
+}
+
+#[derive(Clone)]
+struct EvaluatedResultValue {
+    flow_type: FlowType,
+    parameter_derived: bool,
+    syntax_selected: bool,
+}
+
+struct EvaluatedOwnerResult {
+    value: EvaluatedResultValue,
+    type_substitutions: Vec<(TypeVar, Type)>,
+    contextual_type_variables: Vec<TypeVar>,
+}
+
+struct OwnerResultTransferEvaluator<'a, 'unifier> {
+    interfaces: &'a BTreeMap<StableCheckOwnerKey, &'a OwnerPublicInterface>,
+    abi: &'a OwnerCallableAbiEnvironment,
+    unifier: &'unifier mut TypeUnifier,
+    active_owners: BTreeSet<StableCheckOwnerKey>,
+}
+
+impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
+    fn new(
+        interfaces: &'a BTreeMap<StableCheckOwnerKey, &'a OwnerPublicInterface>,
+        abi: &'a OwnerCallableAbiEnvironment,
+        unifier: &'unifier mut TypeUnifier,
+    ) -> Self {
+        Self {
+            interfaces,
+            abi,
+            unifier,
+            active_owners: BTreeSet::new(),
+        }
+    }
+
+    fn evaluate_owner(
+        &mut self,
+        owner: &StableCheckOwnerKey,
+        arguments: &BTreeMap<u32, EvaluatedResultValue>,
+        context: Option<&EvaluatedResultValue>,
+    ) -> Option<EvaluatedOwnerResult> {
+        let interface = *self.interfaces.get(owner)?;
+        // Interface type variables live in an SCC-local alpha namespace. Give
+        // every invocation its own variables in the caller's unifier so raw
+        // TypeVar ordinals from unrelated SCCs can never alias each other or
+        // the caller's local variables.
+        let mut variables = BTreeMap::new();
+        for variable in &interface.type_variables {
+            variables.insert(*variable, self.unifier.fresh());
+        }
+        let mut substitutions = BTreeMap::new();
+        for parameter in &interface.parameters {
+            if let Some(actual) = arguments.get(&parameter.ordinal) {
+                let formal =
+                    instantiate_type(&parameter.flow_type.ty, self.unifier, &mut variables);
+                crate::unify_checked_type_pattern(
+                    &formal,
+                    &actual.flow_type.ty,
+                    &mut substitutions,
+                );
+            }
+        }
+        if let (Some(formal), Some(actual)) = (&interface.context, context) {
+            let formal = instantiate_type(&formal.flow_type.ty, self.unifier, &mut variables);
+            crate::unify_checked_type_pattern(&formal, &actual.flow_type.ty, &mut substitutions);
+        }
+        let instantiated_result =
+            instantiate_type(&interface.result.ty, self.unifier, &mut variables);
+        let principal = FlowType {
+            mode: interface.result.mode,
+            ty: apply_checked_type_substitution_lookup(&instantiated_result, &substitutions),
+        };
+        let fallbacks = match &interface.result_transfer {
+            OwnerResultTransfer::Principal | OwnerResultTransfer::Parameter { .. } => {
+                BTreeMap::new()
+            }
+            OwnerResultTransfer::Expression { nodes, .. } => nodes
+                .iter()
+                .map(|node| {
+                    let ty = instantiate_type(&node.flow_type.ty, self.unifier, &mut variables);
+                    (
+                        node.expression.clone(),
+                        FlowType {
+                            mode: node.flow_type.mode,
+                            ty: apply_checked_type_substitution_lookup(&ty, &substitutions),
+                        },
+                    )
+                })
+                .collect(),
+        };
+        let mut contextual_type_variables = BTreeSet::new();
+        if let Some(context) = &interface.context {
+            crate::collect_type_vars(&context.flow_type.ty, &mut contextual_type_variables);
+        }
+        let type_substitutions = interface
+            .type_variables
+            .iter()
+            .filter_map(|variable| {
+                let instantiated = variables.get(variable)?;
+                substitutions.get(instantiated).map(|value| {
+                    (
+                        *variable,
+                        apply_checked_type_substitution_lookup(value, &substitutions),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+
+        if !self.active_owners.insert(owner.clone()) {
+            return Some(EvaluatedOwnerResult {
+                value: EvaluatedResultValue {
+                    flow_type: principal,
+                    parameter_derived: arguments.values().any(|value| value.parameter_derived),
+                    syntax_selected: false,
+                },
+                type_substitutions,
+                contextual_type_variables: contextual_type_variables.into_iter().collect(),
+            });
+        }
+        let evaluated = match &interface.result_transfer {
+            OwnerResultTransfer::Principal => None,
+            OwnerResultTransfer::Parameter { read } => {
+                arguments.get(&read.parameter_ordinal).and_then(|actual| {
+                    let ty = if read.projection.is_empty() {
+                        Some(actual.flow_type.ty.clone())
+                    } else {
+                        crate::type_for_nested_path(&actual.flow_type.ty, &read.projection)
+                    }?;
+                    Some(EvaluatedResultValue {
+                        flow_type: FlowType {
+                            mode: actual.flow_type.mode,
+                            ty,
+                        },
+                        parameter_derived: true,
+                        syntax_selected: actual.syntax_selected,
+                    })
+                })
+            }
+            OwnerResultTransfer::Expression { root, nodes } => self.evaluate_expression_ref(
+                root,
+                nodes,
+                arguments,
+                context,
+                &fallbacks,
+                &BTreeMap::new(),
+                &mut BTreeSet::new(),
+            ),
+        };
+        self.active_owners.remove(owner);
+
+        let value = if let Some(mut evaluated) = evaluated {
+            let selected = evaluated.syntax_selected
+                && crate::type_has_concrete_outer_shape(&evaluated.flow_type.ty);
+            evaluated.flow_type.ty = if selected {
+                evaluated.flow_type.ty
+            } else {
+                specialize_checked_call_result(&principal.ty, &evaluated.flow_type.ty)
+            };
+            evaluated.syntax_selected = selected;
+            evaluated
+        } else {
+            EvaluatedResultValue {
+                flow_type: principal,
+                parameter_derived: arguments.values().any(|value| value.parameter_derived),
+                syntax_selected: false,
+            }
+        };
+        Some(EvaluatedOwnerResult {
+            value,
+            type_substitutions,
+            contextual_type_variables: contextual_type_variables.into_iter().collect(),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn evaluate_expression_ref(
+        &mut self,
+        reference: &OwnerResultExpressionRef,
+        nodes: &[OwnerResultTransferNode],
+        arguments: &BTreeMap<u32, EvaluatedResultValue>,
+        context: Option<&EvaluatedResultValue>,
+        fallbacks: &BTreeMap<StableExpressionKey, FlowType>,
+        lexical: &BTreeMap<String, EvaluatedResultValue>,
+        active: &mut BTreeSet<StableExpressionKey>,
+    ) -> Option<EvaluatedResultValue> {
+        match reference {
+            OwnerResultExpressionRef::Child { owner, .. } => {
+                let interface = *self.interfaces.get(owner)?;
+                Some(EvaluatedResultValue {
+                    flow_type: interface.result.clone(),
+                    parameter_derived: false,
+                    syntax_selected: false,
+                })
+            }
+            OwnerResultExpressionRef::Local { expression } => {
+                let index = nodes
+                    .binary_search_by(|node| node.expression.cmp(expression))
+                    .ok()?;
+                let node = &nodes[index];
+                if !active.insert(expression.clone()) {
+                    return transfer_fallback(node, fallbacks);
+                }
+                let value =
+                    self.evaluate_node(node, nodes, arguments, context, fallbacks, lexical, active);
+                active.remove(expression);
+                value
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn evaluate_node(
+        &mut self,
+        node: &OwnerResultTransferNode,
+        nodes: &[OwnerResultTransferNode],
+        arguments: &BTreeMap<u32, EvaluatedResultValue>,
+        context: Option<&EvaluatedResultValue>,
+        fallbacks: &BTreeMap<StableExpressionKey, FlowType>,
+        lexical: &BTreeMap<String, EvaluatedResultValue>,
+        active: &mut BTreeSet<StableExpressionKey>,
+    ) -> Option<EvaluatedResultValue> {
+        let evaluate = |evaluator: &mut Self,
+                        reference: &OwnerResultExpressionRef,
+                        lexical: &BTreeMap<String, EvaluatedResultValue>,
+                        active: &mut BTreeSet<StableExpressionKey>| {
+            evaluator.evaluate_expression_ref(
+                reference, nodes, arguments, context, fallbacks, lexical, active,
+            )
+        };
+        let fallback = transfer_fallback(node, fallbacks)?;
+        if let Some(read) = &node.parameter_read
+            && let Some(actual) = arguments.get(&read.parameter_ordinal)
+        {
+            let ty = if read.projection.is_empty() {
+                Some(actual.flow_type.ty.clone())
+            } else {
+                crate::type_for_nested_path(&actual.flow_type.ty, &read.projection)
+            };
+            if let Some(ty) = ty {
+                return Some(EvaluatedResultValue {
+                    flow_type: FlowType {
+                        mode: actual.flow_type.mode,
+                        ty,
+                    },
+                    parameter_derived: true,
+                    syntax_selected: actual.syntax_selected,
+                });
+            }
+        }
+        if let OwnerConstraintNodeKind::Reference { parts }
+        | OwnerConstraintNodeKind::Drain { parts } = &node.kind
+            && let Some((name, projection)) = parts.split_first()
+            && let Some(value) = lexical.get(name)
+        {
+            let ty = if projection.is_empty() {
+                Some(value.flow_type.ty.clone())
+            } else {
+                crate::type_for_nested_path(&value.flow_type.ty, projection)
+            };
+            if let Some(ty) = ty {
+                return Some(EvaluatedResultValue {
+                    flow_type: FlowType {
+                        mode: value.flow_type.mode,
+                        ty,
+                    },
+                    parameter_derived: value.parameter_derived,
+                    syntax_selected: value.syntax_selected,
+                });
+            }
+        }
+
+        match &node.kind {
+            OwnerConstraintNodeKind::Call { function }
+            | OwnerConstraintNodeKind::Pipe {
+                operation: function,
+            } => self.evaluate_call_node(
+                node, function, nodes, arguments, context, fallbacks, lexical, active,
+            ),
+            OwnerConstraintNodeKind::Record { tag } => {
+                let mut fields = Vec::new();
+                let mut parameter_derived = false;
+                let mut syntax_selected = false;
+                for input in &node.inputs {
+                    let OwnerConstraintEdgeRole::RecordField {
+                        name,
+                        spread: false,
+                    } = &input.role
+                    else {
+                        continue;
+                    };
+                    let value = evaluate(self, &input.expression, lexical, active)?;
+                    parameter_derived |= value.parameter_derived;
+                    syntax_selected |= value.syntax_selected;
+                    fields.push((name.clone(), value.flow_type.ty));
+                }
+                let shape: ObjectShape = ObjectShape::from_ordered_fields(fields, false);
+                Some(EvaluatedResultValue {
+                    flow_type: FlowType {
+                        mode: FlowMode::Continuous,
+                        ty: tag.as_ref().map_or_else(
+                            || Type::object(shape.clone()),
+                            |tag| {
+                                Type::VariantSet(
+                                    vec![Variant::Tagged {
+                                        tag: tag.clone(),
+                                        fields: shape.clone().into(),
+                                    }]
+                                    .into(),
+                                )
+                            },
+                        ),
+                    },
+                    parameter_derived,
+                    syntax_selected,
+                })
+            }
+            OwnerConstraintNodeKind::When => {
+                self.evaluate_when_node(node, nodes, arguments, context, fallbacks, lexical, active)
+            }
+            OwnerConstraintNodeKind::MatchArm { .. } | OwnerConstraintNodeKind::Arrow { .. } => {
+                let output = node.inputs.iter().find(|input| {
+                    matches!(
+                        input.role,
+                        OwnerConstraintEdgeRole::MatchOutput | OwnerConstraintEdgeRole::ArrowOutput
+                    )
+                });
+                output.map_or_else(
+                    || Some(fallback),
+                    |output| evaluate(self, &output.expression, lexical, active),
+                )
+            }
+            OwnerConstraintNodeKind::Block => {
+                let mut lexical = lexical.clone();
+                let mut parameter_derived = false;
+                let mut syntax_selected = false;
+                for input in &node.inputs {
+                    if let OwnerConstraintEdgeRole::BlockBinding { name } = &input.role {
+                        let value = evaluate(self, &input.expression, &lexical, active)?;
+                        parameter_derived |= value.parameter_derived;
+                        syntax_selected |= value.syntax_selected;
+                        lexical.insert(name.clone(), value);
+                    }
+                }
+                if let Some(result) = node
+                    .inputs
+                    .iter()
+                    .find(|input| matches!(input.role, OwnerConstraintEdgeRole::BlockResult))
+                {
+                    let mut value = evaluate(self, &result.expression, &lexical, active)?;
+                    value.parameter_derived |= parameter_derived;
+                    value.syntax_selected |= syntax_selected;
+                    Some(value)
+                } else {
+                    Some(fallback)
+                }
+            }
+            OwnerConstraintNodeKind::Collection { collection, .. } => {
+                let values = node
+                    .inputs
+                    .iter()
+                    .filter(|input| {
+                        matches!(
+                            input.role,
+                            OwnerConstraintEdgeRole::CollectionItem
+                                | OwnerConstraintEdgeRole::MapEntry
+                        )
+                    })
+                    .map(|input| evaluate(self, &input.expression, lexical, active))
+                    .collect::<Option<Vec<_>>>()?;
+                let parameter_derived = values.iter().any(|value| value.parameter_derived);
+                let syntax_selected = values.iter().any(|value| value.syntax_selected);
+                let ty = match collection {
+                    OwnerCollectionKind::List => Type::List(Type::shared(
+                        values
+                            .iter()
+                            .map(|value| value.flow_type.ty.clone())
+                            .reduce(|left, right| widen_structural_type(&left, &right))
+                            .unwrap_or(Type::Unknown),
+                    )),
+                    OwnerCollectionKind::Set => Type::Set(Type::shared(
+                        values
+                            .iter()
+                            .map(|value| value.flow_type.ty.clone())
+                            .reduce(|left, right| widen_structural_type(&left, &right))
+                            .unwrap_or(Type::Unknown),
+                    )),
+                    OwnerCollectionKind::Bytes | OwnerCollectionKind::Map => fallback.flow_type.ty,
+                };
+                Some(EvaluatedResultValue {
+                    flow_type: FlowType {
+                        mode: FlowMode::Continuous,
+                        ty,
+                    },
+                    parameter_derived,
+                    syntax_selected,
+                })
+            }
+            OwnerConstraintNodeKind::Latest => {
+                let values = node
+                    .inputs
+                    .iter()
+                    .filter(|input| matches!(input.role, OwnerConstraintEdgeRole::LatestBranch))
+                    .map(|input| evaluate(self, &input.expression, lexical, active))
+                    .collect::<Option<Vec<_>>>()?;
+                let ty = values
+                    .iter()
+                    .filter(|value| !matches!(value.flow_type.ty, Type::Absent))
+                    .map(|value| value.flow_type.ty.clone())
+                    .reduce(|left, right| widen_structural_type(&left, &right))
+                    .unwrap_or_else(|| fallback.flow_type.ty.clone());
+                Some(EvaluatedResultValue {
+                    flow_type: FlowType {
+                        mode: crate::latest_flow_mode(
+                            values.iter().map(|value| value.flow_type.mode),
+                        )
+                        .unwrap_or(FlowMode::Continuous),
+                        ty,
+                    },
+                    parameter_derived: values.iter().any(|value| value.parameter_derived),
+                    syntax_selected: values.iter().any(|value| value.syntax_selected),
+                })
+            }
+            OwnerConstraintNodeKind::Draining | OwnerConstraintNodeKind::Hold { .. } => node
+                .inputs
+                .first()
+                .and_then(|input| evaluate(self, &input.expression, lexical, active))
+                .map(|mut value| {
+                    if matches!(node.kind, OwnerConstraintNodeKind::Hold { .. }) {
+                        value.flow_type.mode = FlowMode::Continuous;
+                    }
+                    value
+                })
+                .or(Some(fallback)),
+            OwnerConstraintNodeKind::Then => {
+                let value = node
+                    .inputs
+                    .iter()
+                    .find(|input| matches!(input.role, OwnerConstraintEdgeRole::ThenOutput))
+                    .or_else(|| {
+                        node.inputs
+                            .iter()
+                            .find(|input| matches!(input.role, OwnerConstraintEdgeRole::ThenInput))
+                    })
+                    .and_then(|input| evaluate(self, &input.expression, lexical, active));
+                value.map(|mut value| {
+                    value.flow_type.mode = FlowMode::PresentOrAbsent;
+                    value
+                })
+            }
+            OwnerConstraintNodeKind::MapEntry => {
+                let key = node
+                    .inputs
+                    .iter()
+                    .find(|input| matches!(input.role, OwnerConstraintEdgeRole::MapKey))
+                    .and_then(|input| evaluate(self, &input.expression, lexical, active))?;
+                let value = node
+                    .inputs
+                    .iter()
+                    .find(|input| matches!(input.role, OwnerConstraintEdgeRole::MapValue))
+                    .and_then(|input| evaluate(self, &input.expression, lexical, active))?;
+                Some(EvaluatedResultValue {
+                    flow_type: FlowType {
+                        mode: FlowMode::Continuous,
+                        ty: Type::object(ObjectShape::from_ordered_fields(
+                            [
+                                ("key".to_owned(), key.flow_type.ty),
+                                ("value".to_owned(), value.flow_type.ty),
+                            ],
+                            false,
+                        )),
+                    },
+                    parameter_derived: key.parameter_derived || value.parameter_derived,
+                    syntax_selected: key.syntax_selected || value.syntax_selected,
+                })
+            }
+            OwnerConstraintNodeKind::Source => Some(EvaluatedResultValue {
+                flow_type: FlowType {
+                    mode: FlowMode::PresentOrAbsent,
+                    ty: fallback.flow_type.ty,
+                },
+                ..fallback
+            }),
+            OwnerConstraintNodeKind::Tag { name } if name == "SKIP" => Some(EvaluatedResultValue {
+                flow_type: FlowType {
+                    mode: FlowMode::Absent,
+                    ty: Type::Absent,
+                },
+                ..fallback
+            }),
+            _ => Some(fallback),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn evaluate_when_node(
+        &mut self,
+        node: &OwnerResultTransferNode,
+        nodes: &[OwnerResultTransferNode],
+        arguments: &BTreeMap<u32, EvaluatedResultValue>,
+        context: Option<&EvaluatedResultValue>,
+        fallbacks: &BTreeMap<StableExpressionKey, FlowType>,
+        lexical: &BTreeMap<String, EvaluatedResultValue>,
+        active: &mut BTreeSet<StableExpressionKey>,
+    ) -> Option<EvaluatedResultValue> {
+        let selector = node
+            .inputs
+            .iter()
+            .find(|input| matches!(input.role, OwnerConstraintEdgeRole::WhenInput))?;
+        let selector = self.evaluate_expression_ref(
+            &selector.expression,
+            nodes,
+            arguments,
+            context,
+            fallbacks,
+            lexical,
+            active,
+        )?;
+        let selector_is_concrete =
+            crate::type_is_singleton_syntax_discriminant(&selector.flow_type.ty);
+        let mut outputs = Vec::new();
+        for arm in node
+            .inputs
+            .iter()
+            .filter(|input| matches!(input.role, OwnerConstraintEdgeRole::WhenArm))
+        {
+            let OwnerResultExpressionRef::Local { expression } = &arm.expression else {
+                continue;
+            };
+            let arm = nodes
+                .binary_search_by(|node| node.expression.cmp(expression))
+                .ok()
+                .and_then(|index| nodes.get(index))?;
+            let pattern = match &arm.kind {
+                OwnerConstraintNodeKind::MatchArm { pattern }
+                | OwnerConstraintNodeKind::Arrow { pattern } => pattern,
+                _ => continue,
+            };
+            if selector_is_concrete && !owner_pattern_accepts(&selector.flow_type.ty, pattern) {
+                continue;
+            }
+            let mut arm_lexical = lexical.clone();
+            extend_owner_pattern_bindings(&mut arm_lexical, &selector, pattern);
+            let Some(output) = arm.inputs.iter().find(|input| {
+                matches!(
+                    input.role,
+                    OwnerConstraintEdgeRole::MatchOutput | OwnerConstraintEdgeRole::ArrowOutput
+                )
+            }) else {
+                continue;
+            };
+            if let Some(output) = self.evaluate_expression_ref(
+                &output.expression,
+                nodes,
+                arguments,
+                context,
+                fallbacks,
+                &arm_lexical,
+                active,
+            ) && !matches!(output.flow_type.ty, Type::Absent)
+            {
+                outputs.push(output);
+                if selector_is_concrete {
+                    // WHEN is ordered. Once a concrete selector accepts one
+                    // arm, a later wildcard is unreachable and must not widen
+                    // the selected occurrence result.
+                    break;
+                }
+            }
+        }
+        let mut outputs = outputs.into_iter();
+        let first = outputs.next()?;
+        let result = outputs.fold(first, |mut result, next| {
+            result.flow_type.ty = widen_structural_type(&result.flow_type.ty, &next.flow_type.ty);
+            result.parameter_derived |= next.parameter_derived;
+            result.syntax_selected |= next.syntax_selected;
+            result
+        });
+        Some(EvaluatedResultValue {
+            flow_type: FlowType {
+                mode: selector.flow_type.mode,
+                ty: result.flow_type.ty,
+            },
+            parameter_derived: selector.parameter_derived || result.parameter_derived,
+            syntax_selected: result.syntax_selected
+                || (selector.parameter_derived && selector_is_concrete),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn evaluate_call_node(
+        &mut self,
+        node: &OwnerResultTransferNode,
+        function: &str,
+        nodes: &[OwnerResultTransferNode],
+        arguments: &BTreeMap<u32, EvaluatedResultValue>,
+        context: Option<&EvaluatedResultValue>,
+        fallbacks: &BTreeMap<StableExpressionKey, FlowType>,
+        lexical: &BTreeMap<String, EvaluatedResultValue>,
+        active: &mut BTreeSet<StableExpressionKey>,
+    ) -> Option<EvaluatedResultValue> {
+        let fallback = transfer_fallback(node, fallbacks)?;
+        match node.call_target.as_ref()? {
+            OwnerResultCallTarget::Owner { owner } => {
+                let interface = *self.interfaces.get(owner)?;
+                let mut actuals = BTreeMap::new();
+                for parameter in &interface.parameters {
+                    let input = transfer_input_for_parameter(
+                        &node.inputs,
+                        &parameter.name,
+                        parameter.kind,
+                        parameter.ordinal,
+                        interface.parameters.as_ref(),
+                    );
+                    if let Some(input) = input {
+                        let value = self.evaluate_expression_ref(
+                            &input.expression,
+                            nodes,
+                            arguments,
+                            context,
+                            fallbacks,
+                            lexical,
+                            active,
+                        )?;
+                        actuals.insert(parameter.ordinal, value);
+                    }
+                }
+                let explicit_context = node
+                    .inputs
+                    .iter()
+                    .find(|input| {
+                        matches!(
+                            input.role,
+                            OwnerConstraintEdgeRole::CallPass { .. }
+                                | OwnerConstraintEdgeRole::PipePass { .. }
+                        )
+                    })
+                    .and_then(|input| {
+                        self.evaluate_expression_ref(
+                            &input.expression,
+                            nodes,
+                            arguments,
+                            context,
+                            fallbacks,
+                            lexical,
+                            active,
+                        )
+                    });
+                self.evaluate_owner(owner, &actuals, explicit_context.as_ref().or(context))
+                    .map(|result| result.value)
+                    .or(Some(fallback))
+            }
+            OwnerResultCallTarget::Abi {
+                canonical_name,
+                contract_fingerprint_v1,
+            } => {
+                let contract = self.abi.callable(canonical_name)?;
+                let current_fingerprint = boon_contract::canonical_serde_hash_v1(
+                    b"boon.owner-result-abi-call.v1\0",
+                    contract,
+                )
+                .ok()?;
+                if &current_fingerprint != contract_fingerprint_v1 {
+                    return None;
+                }
+                self.evaluate_abi_call(
+                    node, function, contract, nodes, arguments, context, fallbacks, lexical, active,
+                )
+                .or(Some(fallback))
+            }
+            OwnerResultCallTarget::Unresolved | OwnerResultCallTarget::Ambiguous { .. } => {
+                Some(fallback)
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn evaluate_abi_call(
+        &mut self,
+        node: &OwnerResultTransferNode,
+        function: &str,
+        contract: &OwnerAbiCallableContract,
+        nodes: &[OwnerResultTransferNode],
+        arguments: &BTreeMap<u32, EvaluatedResultValue>,
+        context: Option<&EvaluatedResultValue>,
+        fallbacks: &BTreeMap<StableExpressionKey, FlowType>,
+        lexical: &BTreeMap<String, EvaluatedResultValue>,
+        active: &mut BTreeSet<StableExpressionKey>,
+    ) -> Option<EvaluatedResultValue> {
+        let mut actuals = BTreeMap::new();
+        let mut instantiation = BTreeMap::new();
+        for parameter in &contract.parameters {
+            let input = transfer_input_for_abi_parameter(
+                &node.inputs,
+                &parameter.name,
+                parameter.kind,
+                parameter.ordinal,
+                &contract.parameters,
+            );
+            if let Some(input) = input {
+                let actual = self.evaluate_expression_ref(
+                    &input.expression,
+                    nodes,
+                    arguments,
+                    context,
+                    fallbacks,
+                    lexical,
+                    active,
+                )?;
+                crate::unify_checked_type_pattern(
+                    &parameter.flow_type.ty,
+                    &actual.flow_type.ty,
+                    &mut instantiation,
+                );
+                actuals.insert(parameter.ordinal, actual);
+            }
+        }
+        let mut ty = apply_checked_type_substitution_lookup(&contract.result.ty, &instantiation);
+        if let Some(field) = function.strip_prefix("Field/")
+            && let Some(input) = actuals.values().next()
+        {
+            ty = crate::type_for_nested_path(&input.flow_type.ty, &[field.to_owned()])
+                .unwrap_or(Type::Unknown);
+        }
+        let mode = if function == "List/map" {
+            abi_actual_by_name(contract, &actuals, "new")
+                .map(|value| value.flow_type.mode)
+                .unwrap_or(contract.result.mode)
+        } else if function == "List/latest" {
+            abi_actual_by_name(contract, &actuals, "list")
+                .map(|value| value.flow_type.mode)
+                .unwrap_or(contract.result.mode)
+        } else if contract.kind == boon_checked::CheckedCallableKind::External {
+            actuals.values().fold(contract.result.mode, |mode, actual| {
+                crate::merge_flow_modes(mode, actual.flow_type.mode)
+            })
+        } else {
+            contract.result.mode
+        };
+        Some(EvaluatedResultValue {
+            flow_type: FlowType { mode, ty },
+            parameter_derived: actuals.values().any(|value| value.parameter_derived),
+            syntax_selected: actuals.values().any(|value| value.syntax_selected),
+        })
+    }
+}
+
+fn transfer_fallback(
+    node: &OwnerResultTransferNode,
+    fallbacks: &BTreeMap<StableExpressionKey, FlowType>,
+) -> Option<EvaluatedResultValue> {
+    Some(EvaluatedResultValue {
+        flow_type: fallbacks.get(&node.expression)?.clone(),
+        parameter_derived: false,
+        syntax_selected: false,
+    })
+}
+
+fn owner_pattern_accepts(selector: &Type, pattern: &crate::OwnerPatternConstraint) -> bool {
+    match pattern {
+        crate::OwnerPatternConstraint::Wildcard | crate::OwnerPatternConstraint::Binding { .. } => {
+            true
+        }
+        crate::OwnerPatternConstraint::Number => matches!(selector, Type::Number),
+        crate::OwnerPatternConstraint::Text => matches!(selector, Type::Text),
+        crate::OwnerPatternConstraint::Bits { width } => {
+            matches!(selector, Type::Bits { width: actual } if actual == width)
+        }
+        crate::OwnerPatternConstraint::Tag { name, .. } => {
+            matches!(selector, Type::VariantSet(variants) if variants.iter().any(|variant| match variant {
+                Variant::Tag(tag) => tag == name,
+                Variant::Tagged { tag, .. } => tag == name,
+            }))
+        }
+        crate::OwnerPatternConstraint::Invalid => false,
+    }
+}
+
+fn extend_owner_pattern_bindings(
+    bindings: &mut BTreeMap<String, EvaluatedResultValue>,
+    selector: &EvaluatedResultValue,
+    pattern: &crate::OwnerPatternConstraint,
+) {
+    match pattern {
+        crate::OwnerPatternConstraint::Binding { name } => {
+            bindings.insert(name.clone(), selector.clone());
+        }
+        crate::OwnerPatternConstraint::Tag { name, fields } => {
+            let Some(Variant::Tagged { fields: actual, .. }) = (match &selector.flow_type.ty {
+                Type::VariantSet(variants) => variants
+                    .iter()
+                    .find(|variant| matches!(variant, Variant::Tagged { tag, .. } if tag == name)),
+                _ => None,
+            }) else {
+                return;
+            };
+            for field in fields {
+                if let Some(ty) = actual.fields.get(field) {
+                    bindings.insert(
+                        field.clone(),
+                        EvaluatedResultValue {
+                            flow_type: FlowType {
+                                mode: selector.flow_type.mode,
+                                ty: ty.clone(),
+                            },
+                            parameter_derived: selector.parameter_derived,
+                            syntax_selected: selector.syntax_selected,
+                        },
+                    );
+                }
+            }
+        }
+        crate::OwnerPatternConstraint::Wildcard
+        | crate::OwnerPatternConstraint::Number
+        | crate::OwnerPatternConstraint::Text
+        | crate::OwnerPatternConstraint::Invalid
+        | crate::OwnerPatternConstraint::Bits { .. } => {}
+    }
+}
+
+fn transfer_input_for_parameter<'a>(
+    inputs: &'a [crate::OwnerResultTransferInput],
+    name: &str,
+    kind: OwnerParameterKind,
+    ordinal: u32,
+    parameters: &[crate::OwnerInterfaceParameter],
+) -> Option<&'a crate::OwnerResultTransferInput> {
+    inputs.iter().find(|input| match &input.role {
+        OwnerConstraintEdgeRole::CallArgument {
+            kind: argument_kind,
+            name: actual_name,
+        }
+        | OwnerConstraintEdgeRole::PipeArgument {
+            kind: argument_kind,
+            name: actual_name,
+        } => {
+            actual_name == name
+                && matches!(
+                    (kind, argument_kind),
+                    (OwnerParameterKind::Value, OwnerArgumentKind::Named)
+                        | (OwnerParameterKind::Out, OwnerArgumentKind::Named)
+                        | (OwnerParameterKind::Out, OwnerArgumentKind::BareBinding)
+                )
+        }
+        OwnerConstraintEdgeRole::PipeInput => {
+            kind == OwnerParameterKind::Value
+                && parameters
+                    .iter()
+                    .filter(|parameter| parameter.kind == OwnerParameterKind::Value)
+                    .min_by_key(|parameter| parameter.ordinal)
+                    .is_some_and(|parameter| parameter.ordinal == ordinal)
+        }
+        _ => false,
+    })
+}
+
+fn transfer_input_for_abi_parameter<'a>(
+    inputs: &'a [crate::OwnerResultTransferInput],
+    name: &str,
+    kind: CheckedParameterKind,
+    ordinal: u32,
+    parameters: &[crate::OwnerAbiParameterContract],
+) -> Option<&'a crate::OwnerResultTransferInput> {
+    inputs.iter().find(|input| match &input.role {
+        OwnerConstraintEdgeRole::CallArgument {
+            kind: argument_kind,
+            name: actual_name,
+        }
+        | OwnerConstraintEdgeRole::PipeArgument {
+            kind: argument_kind,
+            name: actual_name,
+        } => {
+            actual_name == name
+                && matches!(
+                    (kind, argument_kind),
+                    (CheckedParameterKind::Value, OwnerArgumentKind::Named)
+                        | (CheckedParameterKind::Out, OwnerArgumentKind::Named)
+                        | (CheckedParameterKind::Out, OwnerArgumentKind::BareBinding)
+                )
+        }
+        OwnerConstraintEdgeRole::PipeInput => {
+            kind == CheckedParameterKind::Value
+                && parameters
+                    .iter()
+                    .filter(|parameter| parameter.kind == CheckedParameterKind::Value)
+                    .min_by_key(|parameter| parameter.ordinal)
+                    .is_some_and(|parameter| parameter.ordinal == ordinal)
+        }
+        _ => false,
+    })
+}
+
+fn abi_actual_by_name<'a>(
+    contract: &OwnerAbiCallableContract,
+    actuals: &'a BTreeMap<u32, EvaluatedResultValue>,
+    name: &str,
+) -> Option<&'a EvaluatedResultValue> {
+    contract
+        .parameters
+        .iter()
+        .find(|parameter| parameter.name == name)
+        .and_then(|parameter| actuals.get(&parameter.ordinal))
 }
 
 fn instantiate_call_signature(
@@ -1129,7 +2019,11 @@ fn bind_calls(
                     let projected = bind_projection(unifier, input, &[field.to_owned()]);
                     unifier.unify(Type::Var(call_variable), Type::Var(projected));
                 }
-            } else {
+            } else if !matches!(call.resolution, BodyCallableResolution::Owner(_)) {
+                // A user callable's principal result is intentionally allowed
+                // to be wider than this occurrence (for example a syntax-
+                // dispatched function). Bind user results only after the
+                // frozen result transfer has evaluated the actual arguments.
                 unifier.bind_var(call_variable, result.ty);
             }
 
@@ -1178,9 +2072,229 @@ fn bind_calls(
                 plan: call,
                 target,
                 effect,
+                type_substitutions: Vec::new(),
+                contextual_type_variables: Vec::new(),
+                syntax_discriminated_result: false,
             }
         })
         .collect()
+}
+
+fn body_input_for_parameter(
+    call: &BodyCallPlan,
+    parameter: &crate::OwnerInterfaceParameter,
+    parameters: &[crate::OwnerInterfaceParameter],
+) -> Option<u32> {
+    call.inputs.iter().find_map(|(role, expression)| {
+        let matches_parameter = match role {
+            OwnerConstraintEdgeRole::CallArgument { kind, name }
+            | OwnerConstraintEdgeRole::PipeArgument { kind, name } => {
+                name == &parameter.name
+                    && matches!(
+                        (parameter.kind, kind),
+                        (OwnerParameterKind::Value, OwnerArgumentKind::Named)
+                            | (OwnerParameterKind::Out, OwnerArgumentKind::Named)
+                            | (OwnerParameterKind::Out, OwnerArgumentKind::BareBinding)
+                    )
+            }
+            OwnerConstraintEdgeRole::PipeInput => {
+                parameter.kind == OwnerParameterKind::Value
+                    && parameters
+                        .iter()
+                        .filter(|candidate| candidate.kind == OwnerParameterKind::Value)
+                        .min_by_key(|candidate| candidate.ordinal)
+                        .is_some_and(|candidate| candidate.ordinal == parameter.ordinal)
+            }
+            _ => false,
+        };
+        matches_parameter.then_some(*expression)
+    })
+}
+
+fn body_expression_result_value(
+    reference: u32,
+    seed: &OwnerConstraintSeed,
+    interfaces: &BTreeMap<StableCheckOwnerKey, &OwnerPublicInterface>,
+    unifier: &mut TypeUnifier,
+    expressions: &[TypeVar],
+    external_expressions: &[TypeVar],
+    modes: &[Option<FlowMode>],
+) -> Option<EvaluatedResultValue> {
+    let variable = expression_variable(expressions, external_expressions, reference)?;
+    let index = reference as usize;
+    let mode = if index < expressions.len() {
+        modes.get(index).copied().flatten()
+    } else {
+        seed.external_expressions
+            .get(index.checked_sub(expressions.len())?)
+            .and_then(|external| interfaces.get(&external.owner))
+            .map(|interface| interface.result.mode)
+    }
+    .unwrap_or(FlowMode::Continuous);
+    Some(EvaluatedResultValue {
+        flow_type: FlowType {
+            mode,
+            ty: unifier.resolve(&Type::Var(variable)),
+        },
+        parameter_derived: false,
+        syntax_selected: false,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn refine_owner_call_at(
+    call_index: usize,
+    call_by_expression: &BTreeMap<usize, usize>,
+    states: &mut [u8],
+    drafts: &mut [InferredCallDraft],
+    seed: &OwnerConstraintSeed,
+    interfaces: &BTreeMap<StableCheckOwnerKey, &OwnerPublicInterface>,
+    abi: &OwnerCallableAbiEnvironment,
+    unifier: &mut TypeUnifier,
+    expressions: &[TypeVar],
+    external_expressions: &[TypeVar],
+    caller_context: Option<TypeVar>,
+    modes: &mut [Option<FlowMode>],
+) {
+    match states.get(call_index).copied() {
+        Some(2) | None => return,
+        Some(1) => return,
+        Some(0) | Some(_) => states[call_index] = 1,
+    }
+    let plan = drafts[call_index].plan.clone();
+    for (_, input) in &plan.inputs {
+        let input = *input as usize;
+        if input < expressions.len()
+            && let Some(dependency) = call_by_expression.get(&input).copied()
+        {
+            refine_owner_call_at(
+                dependency,
+                call_by_expression,
+                states,
+                drafts,
+                seed,
+                interfaces,
+                abi,
+                unifier,
+                expressions,
+                external_expressions,
+                caller_context,
+                modes,
+            );
+        }
+    }
+
+    let BodyCallableResolution::Owner(target_owner) = &plan.resolution else {
+        states[call_index] = 2;
+        return;
+    };
+    let Some(target_interface) = interfaces.get(target_owner).copied() else {
+        states[call_index] = 2;
+        return;
+    };
+    let mut arguments = BTreeMap::new();
+    for parameter in &target_interface.parameters {
+        let Some(reference) =
+            body_input_for_parameter(&plan, parameter, target_interface.parameters.as_ref())
+        else {
+            continue;
+        };
+        if let Some(actual) = body_expression_result_value(
+            reference,
+            seed,
+            interfaces,
+            unifier,
+            expressions,
+            external_expressions,
+            modes,
+        ) {
+            arguments.insert(parameter.ordinal, actual);
+        }
+    }
+    let explicit_context = plan
+        .inputs
+        .iter()
+        .find(|(role, _)| {
+            matches!(
+                role,
+                OwnerConstraintEdgeRole::CallPass { .. } | OwnerConstraintEdgeRole::PipePass { .. }
+            )
+        })
+        .and_then(|(_, reference)| {
+            body_expression_result_value(
+                *reference,
+                seed,
+                interfaces,
+                unifier,
+                expressions,
+                external_expressions,
+                modes,
+            )
+        });
+    let inherited_context = caller_context.map(|variable| EvaluatedResultValue {
+        flow_type: FlowType {
+            mode: FlowMode::Continuous,
+            ty: unifier.resolve(&Type::Var(variable)),
+        },
+        parameter_derived: false,
+        syntax_selected: false,
+    });
+    let evaluated = {
+        let mut evaluator = OwnerResultTransferEvaluator::new(interfaces, abi, unifier);
+        evaluator.evaluate_owner(
+            target_owner,
+            &arguments,
+            explicit_context.as_ref().or(inherited_context.as_ref()),
+        )
+    };
+    if let Some(evaluated) = evaluated {
+        unifier.bind_var(
+            expressions[plan.expression],
+            evaluated.value.flow_type.ty.clone(),
+        );
+        modes[plan.expression] = Some(evaluated.value.flow_type.mode);
+        let draft = &mut drafts[call_index];
+        draft.type_substitutions = evaluated.type_substitutions;
+        draft.contextual_type_variables = evaluated.contextual_type_variables;
+        draft.syntax_discriminated_result = evaluated.value.syntax_selected;
+    }
+    states[call_index] = 2;
+}
+
+#[allow(clippy::too_many_arguments)]
+fn refine_owner_call_transfers(
+    drafts: &mut [InferredCallDraft],
+    seed: &OwnerConstraintSeed,
+    interfaces: &BTreeMap<StableCheckOwnerKey, &OwnerPublicInterface>,
+    abi: &OwnerCallableAbiEnvironment,
+    unifier: &mut TypeUnifier,
+    expressions: &[TypeVar],
+    external_expressions: &[TypeVar],
+    caller_context: Option<TypeVar>,
+    modes: &mut [Option<FlowMode>],
+) {
+    let call_by_expression = drafts
+        .iter()
+        .enumerate()
+        .map(|(index, draft)| (draft.plan.expression, index))
+        .collect::<BTreeMap<_, _>>();
+    let mut states = vec![0; drafts.len()];
+    for call_index in 0..drafts.len() {
+        refine_owner_call_at(
+            call_index,
+            &call_by_expression,
+            &mut states,
+            drafts,
+            seed,
+            interfaces,
+            abi,
+            unifier,
+            expressions,
+            external_expressions,
+            caller_context,
+            modes,
+        );
+    }
 }
 
 fn validate_inputs(
@@ -1378,16 +2492,6 @@ pub fn infer_owner_body<'a>(
         &mut work,
     );
 
-    if let Some(result_reference) = owner_result_expression(seed)
-        && let Some(result) =
-            expression_variable(&expressions, &external_expressions, result_reference)
-    {
-        unifier.unify(Type::Var(result), own_result.clone());
-        if let Some(mode) = modes.get_mut(result_reference as usize) {
-            *mode = flow_mode_join(*mode, Some(own_interface.result.mode));
-        }
-    }
-
     for (external, variable) in seed.external_expressions.iter().zip(&external_expressions) {
         let interface = interfaces[&external.owner];
         let mut variables = BTreeMap::new();
@@ -1422,7 +2526,7 @@ pub fn infer_owner_body<'a>(
 
     let mut diagnostics = Vec::new();
     push_invalid_syntax_diagnostics(seed, &mut diagnostics);
-    let call_drafts = bind_calls(
+    let mut call_drafts = bind_calls(
         calls,
         &interfaces,
         &mut unifier,
@@ -1433,6 +2537,17 @@ pub fn infer_owner_body<'a>(
         abi,
         &mut diagnostics,
         &mut work,
+    );
+    refine_owner_call_transfers(
+        &mut call_drafts,
+        seed,
+        &interfaces,
+        abi,
+        &mut unifier,
+        &expressions,
+        &external_expressions,
+        context,
+        &mut modes,
     );
 
     let mut alpha_variables = BTreeMap::new();
@@ -1497,6 +2612,21 @@ pub fn infer_owner_body<'a>(
                     })
                     .collect::<Result<Vec<_>, OwnerBodyInferenceError>>()?
                     .into_boxed_slice(),
+                type_substitutions: draft
+                    .type_substitutions
+                    .into_iter()
+                    .map(|(variable, value)| CheckedTypeSubstitution {
+                        variable,
+                        value: alpha_normalize_type(
+                            &unifier.resolve(&value),
+                            &mut alpha_variables,
+                            &mut next_alpha,
+                        ),
+                    })
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+                contextual_type_variables: draft.contextual_type_variables.into_boxed_slice(),
+                syntax_discriminated_result: draft.syntax_discriminated_result,
                 result: inferred_expressions[draft.plan.expression]
                     .flow_type
                     .clone(),
@@ -1823,6 +2953,148 @@ mod tests {
         assert!(body.relocations.iter().any(|relocation| {
             relocation.kind == OwnerBodyRelocationKind::Callable && relocation.target_owner == zed
         }));
+    }
+
+    #[test]
+    fn generic_call_transfer_matches_the_whole_checker_oracle() {
+        let source = "FUNCTION identity(input) {\n    input\n}\nvalue: identity(input: 1)\n";
+        let unit = link(source);
+        let value = owner_named(&unit, "value");
+        let identity = owner_named(&unit, "identity");
+        let (value_syntax, _, value_seed) = inputs(&unit, &value);
+        let (_, _, identity_seed) = inputs(&unit, &identity);
+        let reference = value_seed
+            .references
+            .iter()
+            .find(|reference| reference.kind == OwnerReferenceKind::Callable)
+            .cloned()
+            .unwrap();
+        let parameters = identity_seed
+            .declarations
+            .iter()
+            .find(|declaration| declaration.public)
+            .unwrap()
+            .parameters
+            .clone();
+        let value_summary = resolve_owner_constraint_seed(
+            &value_seed,
+            [ResolvedOwnerSymbolReference {
+                reference,
+                owner: identity,
+                parameters,
+            }],
+        )
+        .unwrap();
+        let identity_summary = resolve_owner_constraint_seed(&identity_seed, []).unwrap();
+        let interfaces = solve(
+            &[value_seed.clone(), identity_seed],
+            &[value_summary.clone(), identity_summary],
+        );
+        let body = infer(&value_syntax, &value_seed, &value_summary, &interfaces);
+        let call = &body.calls[0];
+
+        let parsed = boon_parser::parse_project(
+            "app/RUN.bn",
+            [("app/RUN.bn".to_owned(), source.to_owned())],
+        )
+        .unwrap();
+        let checked = crate::check_program(&parsed);
+        assert!(checked.report.diagnostics.is_empty());
+        let oracle = checked
+            .program
+            .as_ref()
+            .unwrap()
+            .calls
+            .iter()
+            .find(|call| call.function == "identity")
+            .unwrap();
+
+        assert_eq!(call.result, oracle.result);
+        assert_eq!(call.type_substitutions.len(), 1);
+        assert_eq!(call.type_substitutions[0].variable, TypeVar(0));
+        assert_eq!(
+            call.type_substitutions[0].value,
+            oracle.type_substitutions[0].value
+        );
+        assert_eq!(
+            call.syntax_discriminated_result,
+            oracle.syntax_discriminated_result
+        );
+    }
+
+    #[test]
+    fn syntax_selected_call_transfer_matches_the_whole_checker_oracle() {
+        let source = "FUNCTION choose(kind) {\n    kind |> WHEN {\n        Record => [value: 1]\n        __ => LIST { 1 }\n    }\n}\nvalue: choose(kind: Record)\n";
+        let unit = link(source);
+        let value = owner_named(&unit, "value");
+        let choose = owner_named(&unit, "choose");
+        let (value_syntax, _, value_seed) = inputs(&unit, &value);
+        let (_, _, choose_seed) = inputs(&unit, &choose);
+        let reference = value_seed
+            .references
+            .iter()
+            .find(|reference| reference.kind == OwnerReferenceKind::Callable)
+            .cloned()
+            .unwrap();
+        let parameters = choose_seed
+            .declarations
+            .iter()
+            .find(|declaration| declaration.public)
+            .unwrap()
+            .parameters
+            .clone();
+        let value_summary = resolve_owner_constraint_seed(
+            &value_seed,
+            [ResolvedOwnerSymbolReference {
+                reference,
+                owner: choose.clone(),
+                parameters,
+            }],
+        )
+        .unwrap();
+        let choose_summary = resolve_owner_constraint_seed(&choose_seed, []).unwrap();
+        let interfaces = solve(
+            &[value_seed.clone(), choose_seed],
+            &[value_summary.clone(), choose_summary],
+        );
+        let body = infer(&value_syntax, &value_seed, &value_summary, &interfaces);
+        let call = &body.calls[0];
+
+        let parsed = boon_parser::parse_project(
+            "app/RUN.bn",
+            [("app/RUN.bn".to_owned(), source.to_owned())],
+        )
+        .unwrap();
+        let checked = crate::check_program(&parsed);
+        assert!(
+            checked.report.diagnostics.is_empty(),
+            "syntax oracle diagnostics: {:#?}",
+            checked.report.diagnostics
+        );
+        let oracle = checked
+            .program
+            .as_ref()
+            .unwrap()
+            .calls
+            .iter()
+            .find(|call| call.function == "choose")
+            .unwrap();
+
+        assert_eq!(
+            call.result,
+            oracle.result,
+            "choose transfer: {:#?}",
+            interfaces
+                .iter()
+                .find_map(|result| result.owner(&choose))
+                .unwrap()
+                .result_transfer
+        );
+        assert_eq!(
+            call.syntax_discriminated_result,
+            oracle.syntax_discriminated_result
+        );
+        assert!(call.syntax_discriminated_result);
     }
 
     #[test]

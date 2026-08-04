@@ -3,8 +3,8 @@ use crate::{
     OwnerArgumentKind, OwnerCallableAbiEnvironment, OwnerCollectionKind, OwnerConstraintEdgeRole,
     OwnerConstraintNodeKind, OwnerConstraintSeed, OwnerConstraintSeedError, OwnerConstraintSummary,
     OwnerDeclarationKind, OwnerInterfaceScc, OwnerInterfaceSccKey, OwnerParameterKind,
-    OwnerPatternConstraint, OwnerReferenceKind, RenderContractRegistry, host_effect_signature,
-    infix_returns_bool, session_info_intrinsic_type,
+    OwnerPatternConstraint, OwnerReferenceKind, OwnerSymbolResolution, RenderContractRegistry,
+    host_effect_signature, infix_returns_bool, session_info_intrinsic_type,
 };
 use boon_checked::{
     BytesType, CheckedEffectSummary, CheckedParameterKind, CheckedParameterRequirement, FlowMode,
@@ -39,6 +39,77 @@ pub struct OwnerContextInterface {
     pub projections: Box<[Box<[String]>]>,
 }
 
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum OwnerResultExpressionRef {
+    Local {
+        expression: StableExpressionKey,
+    },
+    Child {
+        owner: StableCheckOwnerKey,
+        expression: StableExpressionKey,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct OwnerResultTransferInput {
+    pub role: OwnerConstraintEdgeRole,
+    pub expression: OwnerResultExpressionRef,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct OwnerResultParameterRead {
+    pub parameter_ordinal: u32,
+    pub projection: Box<[String]>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum OwnerResultCallTarget {
+    Owner {
+        owner: StableCheckOwnerKey,
+    },
+    Abi {
+        canonical_name: String,
+        contract_fingerprint_v1: [u8; 32],
+    },
+    Unresolved,
+    Ambiguous {
+        candidates: Box<[StableCheckOwnerKey]>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct OwnerResultTransferNode {
+    pub expression: StableExpressionKey,
+    pub flow_type: FlowType,
+    pub kind: OwnerConstraintNodeKind,
+    pub inputs: Box<[OwnerResultTransferInput]>,
+    pub parameter_read: Option<OwnerResultParameterRead>,
+    pub call_target: Option<OwnerResultCallTarget>,
+}
+
+/// Minimal stable expression slice required to instantiate one callable result.
+///
+/// Non-callable owners publish `Principal`: their result cannot be instantiated
+/// at another call site. A callable publishes only the backwards-reachable
+/// result slice, expressed with stable identities and frozen ABI/owner targets.
+/// This is the public specialization boundary: callers never copy or inspect an
+/// unrelated part of the callee body to determine result mode or a
+/// syntax-selected result shape.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum OwnerResultTransfer {
+    Principal,
+    Parameter {
+        read: OwnerResultParameterRead,
+    },
+    Expression {
+        root: OwnerResultExpressionRef,
+        nodes: Box<[OwnerResultTransferNode]>,
+    },
+}
+
 /// Preparatory alpha-normalized public surface of one authored check owner.
 ///
 /// Source positions, literal payloads, dense IDs, and body-only fingerprints
@@ -53,6 +124,7 @@ pub struct OwnerPublicInterface {
     pub names: Box<[String]>,
     pub parameters: Box<[OwnerInterfaceParameter]>,
     pub result: FlowType,
+    pub result_transfer: OwnerResultTransfer,
     pub context: Option<OwnerContextInterface>,
     pub effect: CheckedEffectSummary,
     pub type_variables: Box<[TypeVar]>,
@@ -646,6 +718,238 @@ fn owner_result_expression(state: &OwnerSolveState<'_>) -> Option<u32> {
                 })
                 .flatten()
         })
+}
+
+fn owner_result_expression_ref(
+    state: &OwnerSolveState<'_>,
+    reference: u32,
+) -> Result<OwnerResultExpressionRef, OwnerConstraintSeedError> {
+    let reference = reference as usize;
+    if let Some(expression) = state.seed.expressions.get(reference) {
+        return Ok(OwnerResultExpressionRef::Local {
+            expression: expression.expression.clone(),
+        });
+    }
+    let external = state
+        .seed
+        .external_expressions
+        .get(reference.saturating_sub(state.seed.expressions.len()))
+        .ok_or_else(|| {
+            OwnerConstraintSeedError::new(format!(
+                "owner result transfer {:?} references expression {reference} outside its local/external namespace",
+                state.seed.owner
+            ))
+        })?;
+    Ok(OwnerResultExpressionRef::Child {
+        owner: external.owner.clone(),
+        expression: external.expression.clone(),
+    })
+}
+
+fn owner_result_parameter_read(
+    state: &OwnerSolveState<'_>,
+    expression: &crate::OwnerExpressionConstraint,
+) -> Option<OwnerResultParameterRead> {
+    let parts = match &expression.kind {
+        OwnerConstraintNodeKind::Reference { parts } | OwnerConstraintNodeKind::Drain { parts } => {
+            parts
+        }
+        _ => return None,
+    };
+    let (name, projection) = parts.split_first()?;
+    let parameter = state
+        .parameters
+        .iter()
+        .find(|parameter| parameter.name == *name)?;
+    (state.local_roots.get(name) == Some(&Some(parameter.variable))).then(|| {
+        OwnerResultParameterRead {
+            parameter_ordinal: parameter.ordinal,
+            projection: projection.to_vec().into_boxed_slice(),
+        }
+    })
+}
+
+fn owner_result_call_target(
+    state: &OwnerSolveState<'_>,
+    abi: &OwnerCallableAbiEnvironment,
+    expression: &crate::OwnerExpressionConstraint,
+) -> Result<Option<OwnerResultCallTarget>, OwnerConstraintSeedError> {
+    let function = match &expression.kind {
+        OwnerConstraintNodeKind::Call { function }
+        | OwnerConstraintNodeKind::Pipe {
+            operation: function,
+        } => function,
+        _ => return Ok(None),
+    };
+    let resolution = state
+        .summary
+        .symbol_resolutions
+        .iter()
+        .find(|resolution| resolution.reference().expression == expression.expression);
+    let target = match resolution {
+        Some(OwnerSymbolResolution::Resolved { owner, .. }) => OwnerResultCallTarget::Owner {
+            owner: owner.clone(),
+        },
+        Some(OwnerSymbolResolution::Authoritative { .. }) => {
+            let contract = abi.callable(function).ok_or_else(|| {
+                OwnerConstraintSeedError::new(format!(
+                    "owner result transfer {:?} resolved `{function}` as authoritative without a frozen ABI contract",
+                    state.seed.owner
+                ))
+            })?;
+            let contract_fingerprint_v1 = boon_contract::canonical_serde_hash_v1(
+                b"boon.owner-result-abi-call.v1\0",
+                contract,
+            )
+            .map_err(|error| {
+                OwnerConstraintSeedError::new(format!(
+                    "cannot fingerprint owner result ABI call `{function}`: {error}"
+                ))
+            })?;
+            OwnerResultCallTarget::Abi {
+                canonical_name: function.clone(),
+                contract_fingerprint_v1,
+            }
+        }
+        Some(OwnerSymbolResolution::Ambiguous { candidates, .. }) => {
+            OwnerResultCallTarget::Ambiguous {
+                candidates: candidates
+                    .iter()
+                    .map(|candidate| candidate.owner.clone())
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            }
+        }
+        Some(OwnerSymbolResolution::Unresolved { .. }) | None => OwnerResultCallTarget::Unresolved,
+    };
+    Ok(Some(target))
+}
+
+fn owner_result_parameter_alias(
+    state: &OwnerSolveState<'_>,
+    reference: u32,
+) -> Option<OwnerResultParameterRead> {
+    fn resolve(
+        state: &OwnerSolveState<'_>,
+        reference: u32,
+        lexical: &BTreeMap<String, Option<OwnerResultParameterRead>>,
+        active: &mut BTreeSet<u32>,
+    ) -> Option<OwnerResultParameterRead> {
+        let expression = state.seed.expressions.get(reference as usize)?;
+        if !active.insert(reference) {
+            return None;
+        }
+        let result = match &expression.kind {
+            OwnerConstraintNodeKind::Reference { parts } => {
+                let (name, projection) = parts.split_first()?;
+                if let Some(read) = lexical.get(name) {
+                    read.clone().map(|mut read| {
+                        let mut path = read.projection.into_vec();
+                        path.extend(projection.iter().cloned());
+                        read.projection = path.into_boxed_slice();
+                        read
+                    })
+                } else {
+                    owner_result_parameter_read(state, expression)
+                }
+            }
+            OwnerConstraintNodeKind::Block => {
+                let mut lexical = lexical.clone();
+                for input in &expression.inputs {
+                    if let OwnerConstraintEdgeRole::BlockBinding { name } = &input.role {
+                        let binding = resolve(state, input.expression, &lexical, active);
+                        // Preserve lexical shadowing even when the binding is
+                        // not a transparent alias of an owner parameter.
+                        lexical.insert(name.clone(), binding);
+                    }
+                }
+                expression
+                    .inputs
+                    .iter()
+                    .find(|input| matches!(input.role, OwnerConstraintEdgeRole::BlockResult))
+                    .and_then(|input| resolve(state, input.expression, &lexical, active))
+            }
+            _ => None,
+        };
+        active.remove(&reference);
+        result
+    }
+
+    resolve(state, reference, &BTreeMap::new(), &mut BTreeSet::new())
+}
+
+fn build_owner_result_transfer(
+    state: &OwnerSolveState<'_>,
+    abi: &OwnerCallableAbiEnvironment,
+    unifier: &mut TypeUnifier,
+    alpha_variables: &mut BTreeMap<TypeVar, TypeVar>,
+    next_alpha: &mut u32,
+) -> Result<OwnerResultTransfer, OwnerConstraintSeedError> {
+    if state.declaration_kind != Some(OwnerDeclarationKind::Function) {
+        return Ok(OwnerResultTransfer::Principal);
+    }
+    let Some(root) = owner_result_expression(state) else {
+        return Ok(OwnerResultTransfer::Principal);
+    };
+    if let Some(read) = owner_result_parameter_alias(state, root) {
+        return Ok(OwnerResultTransfer::Parameter { read });
+    }
+    let root_ref = owner_result_expression_ref(state, root)?;
+    let mut pending = vec![root];
+    let mut reachable = BTreeSet::new();
+    while let Some(reference) = pending.pop() {
+        if reference as usize >= state.seed.expressions.len() || !reachable.insert(reference) {
+            continue;
+        }
+        pending.extend(
+            state.seed.expressions[reference as usize]
+                .inputs
+                .iter()
+                .map(|input| input.expression),
+        );
+    }
+    let mut reachable = reachable.into_iter().collect::<Vec<_>>();
+    reachable.sort_by(|left, right| {
+        state.seed.expressions[*left as usize]
+            .expression
+            .cmp(&state.seed.expressions[*right as usize].expression)
+    });
+    let nodes = reachable
+        .into_iter()
+        .map(|reference| {
+            let expression = &state.seed.expressions[reference as usize];
+            let inputs = expression
+                .inputs
+                .iter()
+                .map(|input| {
+                    Ok(OwnerResultTransferInput {
+                        role: input.role.clone(),
+                        expression: owner_result_expression_ref(state, input.expression)?,
+                    })
+                })
+                .collect::<Result<Vec<_>, OwnerConstraintSeedError>>()?;
+            let variable = state.expressions[reference as usize];
+            Ok(OwnerResultTransferNode {
+                expression: expression.expression.clone(),
+                flow_type: FlowType {
+                    mode: state.modes[reference as usize].unwrap_or(FlowMode::Continuous),
+                    ty: alpha_normalize_type(
+                        &unifier.resolve(&Type::Var(variable)),
+                        alpha_variables,
+                        next_alpha,
+                    ),
+                },
+                kind: expression.kind.clone(),
+                inputs: inputs.into_boxed_slice(),
+                parameter_read: owner_result_parameter_read(state, expression),
+                call_target: owner_result_call_target(state, abi, expression)?,
+            })
+        })
+        .collect::<Result<Vec<_>, OwnerConstraintSeedError>>()?;
+    Ok(OwnerResultTransfer::Expression {
+        root: root_ref,
+        nodes: nodes.into_boxed_slice(),
+    })
 }
 
 fn solver_surface_snapshot(
@@ -1825,6 +2129,13 @@ pub fn solve_owner_interface_scc<'a>(
                 flow_type,
             }
         });
+        let result_transfer = build_owner_result_transfer(
+            state,
+            abi,
+            &mut unifier,
+            &mut alpha_variables,
+            &mut next_alpha,
+        )?;
         let mut type_variables = BTreeSet::new();
         for parameter in &parameters {
             collect_type_variables(&parameter.flow_type.ty, &mut type_variables);
@@ -1833,12 +2144,18 @@ pub fn solve_owner_interface_scc<'a>(
         if let Some(context) = &context {
             collect_type_variables(&context.flow_type.ty, &mut type_variables);
         }
+        if let OwnerResultTransfer::Expression { nodes, .. } = &result_transfer {
+            for node in nodes {
+                collect_type_variables(&node.flow_type.ty, &mut type_variables);
+            }
+        }
         interfaces.push(OwnerPublicInterface {
             owner: owner.clone(),
             declaration_kind: state.declaration_kind,
             names: state.names.clone(),
             parameters: parameters.into_boxed_slice(),
             result,
+            result_transfer,
             context,
             effect: state.effect,
             type_variables: type_variables
@@ -2108,6 +2425,36 @@ mod tests {
         assert_eq!(interface.parameters[0].flow_type.ty, Type::Var(TypeVar(0)));
         assert_eq!(interface.result.ty, Type::Var(TypeVar(0)));
         assert_eq!(interface.type_variables.as_ref(), [TypeVar(0)]);
+        assert_eq!(
+            interface.result_transfer,
+            OwnerResultTransfer::Parameter {
+                read: OwnerResultParameterRead {
+                    parameter_ordinal: 0,
+                    projection: Box::new([]),
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn result_transfer_excludes_unrelated_child_body_changes() {
+        fn identity_interface(source: &str) -> OwnerPublicInterface {
+            let unit = link(source);
+            let owner = owner_named(&unit, "identity");
+            let seed = seed(&unit, &owner);
+            let summary = resolve_owner_constraint_seed(&seed, []).unwrap();
+            solve(&[seed], &[summary])
+                .into_iter()
+                .find_map(|result| result.owner(&owner).cloned())
+                .unwrap()
+        }
+
+        let number =
+            identity_interface("FUNCTION identity(input) {\n    unused: 1\n    input\n}\n");
+        let text = identity_interface(
+            "FUNCTION identity(input) {\n    unused: TEXT { ignored }\n    input\n}\n",
+        );
+        assert_eq!(number, text);
     }
 
     #[test]

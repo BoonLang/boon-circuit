@@ -598,6 +598,16 @@ Current checkpoints to preserve and audit rather than redo:
   remove the duplicate canonical-core mapping/hash. Deleting one validation,
   sharing a hash buffer, packing the existing collector, or cosmetically
   splitting crates is not the exit;
+- preserve the completed execution/resource ownership checkpoint: execution
+  now seals before resource construction, the resource table alone owns
+  materialization rows and lineage, and resource construction publishes 735
+  typed proof rows directly. The exact ignored NovyWave oracle and architecture
+  verifier pass, while a focused debug trace still reports 1,829.237 ms for
+  execution-image finalization, 604.621 ms for resource derivation, and
+  1,701.115 ms for Manifest with 35,448 replay rows remaining. Treat this as
+  proof that the next work is the larger definition-receipt/compact-invocation
+  execution architecture and direct row/CSR publication, not resource-row or
+  serialization-buffer micro-tuning;
 - move verified-intent demand collection before occurrence expansion and
   backend lowering. Split top-level authority/interface summaries from the
   final program-link sink, and version the callable interface schema before

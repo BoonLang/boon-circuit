@@ -374,6 +374,18 @@ stronger three-reviewer performance closure defined below.
    with a normalized trigger dependency graph, SCC/worklist publication, and
    shared immutable arm spans rather than more caches.
 
+   The execution/resource boundary and the resource proof owner are now
+   sealed. Inline list authorities are normalized during execution building;
+   immutable execution crosses into resource construction; the resource table
+   exclusively owns materialization row bindings and lineage; and its builder
+   emits 735 final typed dependency rows. The focused debug NovyWave oracle and
+   architecture gate pass. Resource ingestion in Manifest is 2.688 ms and
+   35,448 legacy replay rows remain, but execution-image finalization,
+   resource derivation, and Manifest still take 1,829.237, 604.621, and
+   1,701.115 ms. Continue with the larger execution definition-receipt plus
+   compact-invocation-overlay refactor; do not tune resource rows or call this
+   a performance exit.
+
    The post-`ac2b234` high-level audit supersedes a mutating post-resource
    execution seal. Move inline list-authority synthesis into execution
    construction, seal immutable execution once, and make the resource typed

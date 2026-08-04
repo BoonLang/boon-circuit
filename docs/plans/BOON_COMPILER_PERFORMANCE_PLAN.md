@@ -860,6 +860,19 @@ Current cold-diagnostics candidate evidence:
   reactive work later dominates, replace recursive trigger expansion with a
   normalized dependency graph, SCC/worklist publication, and shared immutable
   arm spans rather than more per-expression memo layers.
+- The resource phase now follows the same construction-owned publication rule.
+  Execution is immutable before resource construction, the resource table is
+  the sole materialization source/target/predecessor owner, and production
+  resource construction publishes 735 typed dependency rows directly. In the
+  focused debug NovyWave trace, Manifest resource ingestion is 2.688 ms and
+  only 35,448 legacy replay rows remain; the exact ignored oracle and
+  architecture gate pass. This is an ownership checkpoint, not a speed-gate
+  result: resource derivation is still 604.621 ms, execution-image finalization
+  is 1,829.237 ms, and the remaining Manifest is 1,701.115 ms. The next tranche
+  must replace the post-hoc execution scanner with definition receipts plus
+  compact invocation overlays and construction-owned relocations. Reusing a
+  serialization buffer or tuning the new resource rows is explicitly not the
+  architectural exit.
 - Do not preserve V3's 208k subject cardinality as a production V4/V5 proof
   requirement. The independent test oracle must map every historical subject
   to exactly one canonical finalized shard row and classifier field/domain and prove

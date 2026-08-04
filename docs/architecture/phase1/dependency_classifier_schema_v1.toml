@@ -14964,6 +14964,12 @@ disposition = "r-fca-priv-sp-id-pc-n"
 reviewed = true
 fields = []
 
+[[records.variants]]
+name = "Resource"
+disposition = "r-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = []
+
 [[records]]
 kind = "struct"
 source = "crates/boon_semantic/src/execution.rs"

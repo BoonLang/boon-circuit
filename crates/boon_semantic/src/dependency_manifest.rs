@@ -2052,6 +2052,11 @@ fn resolve_construction_owner(
         ConstructionDependencyOwnerV1::Statement(statement) => owners.statement(*statement),
         ConstructionDependencyOwnerV1::Expression(expression) => owners.expression(*expression),
         ConstructionDependencyOwnerV1::Binding(binding) => owners.binding(*binding),
+        ConstructionDependencyOwnerV1::Source(source) => owners.source(*source),
+        ConstructionDependencyOwnerV1::State(state) => owners.state(*state),
+        ConstructionDependencyOwnerV1::List(list) => owners.list(*list),
+        ConstructionDependencyOwnerV1::ValueList(list) => owners.value_list(*list),
+        ConstructionDependencyOwnerV1::StaticOwner(owner) => owners.static_owner(*owner),
         ConstructionDependencyOwnerV1::Exact(routes) => {
             let candidates = routes
                 .iter()
@@ -2085,6 +2090,11 @@ pub(crate) enum ConstructionDependencyOwnerV1 {
     Statement(SemanticStatementId),
     Expression(SemanticExprId),
     Binding(SemanticBindingId),
+    Source(SemanticSourceId),
+    State(SemanticStateId),
+    List(SemanticListId),
+    ValueList(SemanticValueListAuthorityId),
+    StaticOwner(StaticOwnerId),
     Exact(Vec<ConstructionDependencyOwnerV1>),
 }
 
@@ -2093,6 +2103,7 @@ pub(crate) enum ConstructionDependencyOwnerV1 {
 pub enum ConstructionDependencyDomainV1 {
     #[default]
     Lowering,
+    Resource,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -6074,7 +6085,7 @@ pub(crate) fn list_entity(list: SemanticListId) -> SemanticDependencyEntityV1 {
     )
 }
 
-fn value_list_entity(list: SemanticValueListAuthorityId) -> SemanticDependencyEntityV1 {
+pub(crate) fn value_list_entity(list: SemanticValueListAuthorityId) -> SemanticDependencyEntityV1 {
     indexed_entity(
         SemanticDependencyEntityDomainV1::SemanticValueListAuthority,
         list.as_usize(),
@@ -6224,6 +6235,7 @@ pub(crate) fn build_callable_dependency_manifest_v7(
     out: &ResolvedOutGraph,
     execution: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV1,
+    resource_rows: &ConstructionDependencyRowsV1,
     reactive: &SemanticReactiveGraphV1,
     lowering: &SemanticLoweringContractV2,
     lowering_rows: &ConstructionDependencyRowsV1,
@@ -6388,8 +6400,8 @@ pub(crate) fn build_callable_dependency_manifest_v7(
         inventory_out(out, &owner_index, &mut collector)
     )?;
     phase!(
-        "inventory_resources",
-        inventory_resources(resources, execution, &owner_index, &mut collector)
+        "ingest_resource_rows",
+        collector.ingest_construction_rows(resource_rows, &owner_index)
     )?;
     let reactive_graph_digest = phase!(
         "inventory_reactive",
@@ -10745,6 +10757,7 @@ fn semantic_expression_lifetime(kind: &SemanticExpressionKind) -> SemanticDepend
     }
 }
 
+#[cfg(test)]
 fn inventory_resources(
     resources: &SemanticResourceGraphV1,
     execution: &SemanticExecutionImageColumnsV1,
@@ -11102,6 +11115,7 @@ fn inventory_resources(
     Ok(())
 }
 
+#[cfg(test)]
 fn resource_initializer_expressions(
     initializer: &SemanticListInitializerV1,
 ) -> Vec<PendingDependencyReference> {

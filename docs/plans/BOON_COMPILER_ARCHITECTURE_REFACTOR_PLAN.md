@@ -875,6 +875,22 @@ replace the remaining recursive walk with one normalized trigger-dependency
 graph plus SCC/worklist publication and shared immutable arm spans; do not add
 another layer of expression-specific caches first.
 
+The execution/resource phase-cycle cut is now real. Inline list authorities
+are normalized while execution is building, execution seals before resource
+construction, and the resource table alone owns materialization row bindings
+and predecessor lineage. Resource construction also publishes its 735 final
+typed dependency rows, entity routes, and component commitment instead of
+making Manifest inventory the rich graph again. A focused debug NovyWave trace
+puts resource-row ingestion at 2.688 ms with 35,448 legacy replay rows left;
+the exact ignored oracle and architecture verifier pass. Total time does not
+materially improve yet because the adjacent owners remain: execution-image
+finalization is 1,829.237 ms, resource derivation is 604.621 ms, and Manifest
+is 1,701.115 ms. This evidence rejects further resource-row or hash-buffer
+micro-tuning. The next architecture tranche decomposes execution into stable
+checked-definition receipts and compact occurrence/invocation overlays whose
+builders publish final rows and CSR relocations directly, then deletes the
+post-hoc full execution-image scan and its Manifest replay.
+
 The following second and third audit sections remain evidence and detailed
 design rationale. Where they name a "next" action or staging order, the
 post-`9540262` multiplier audit above supersedes it.

@@ -44,8 +44,8 @@ use std::fmt;
 pub const SEMANTIC_PROGRAM_SCHEMA_V1: &str = "boon.semantic-program.v1";
 pub const BUNDLE_SEMANTIC_PROGRAM_SCHEMA_V1: &str = "boon.bundle-semantic-program.v1";
 pub const DEPENDENCY_CLASSIFIER_SCHEMA_DIGEST_V1: [u8; 32] = [
-    0x49, 0x4a, 0x7b, 0xc9, 0x22, 0xba, 0x0b, 0xc8, 0x6a, 0x79, 0x6b, 0x6a, 0x3e, 0xcc, 0x69, 0x5c,
-    0xb0, 0x4a, 0xab, 0xbe, 0x48, 0xcc, 0xa1, 0x2a, 0xe6, 0xe6, 0x5d, 0xde, 0x1b, 0x80, 0xda, 0xc7,
+    0x42, 0xd7, 0xb2, 0x84, 0xf3, 0xfe, 0xff, 0x8f, 0x7e, 0xdd, 0xfa, 0x34, 0xd8, 0x2a, 0x01, 0x7f,
+    0xe8, 0xe8, 0x23, 0x5d, 0x2d, 0x82, 0x06, 0xd5, 0x68, 0xb8, 0xb7, 0x0e, 0x64, 0x09, 0x7e, 0xfb,
 ];
 pub const MAX_BUNDLE_SEMANTIC_PRODUCER_REQUESTS_V1: usize = 4_096;
 pub const MAX_BUNDLE_SEMANTIC_PRODUCER_REQUEST_BYTES_V1: usize = 4 * 1024 * 1024;
@@ -2891,7 +2891,7 @@ fn elaborate_with_representation(
     )
     .map_err(SemanticError::new)?;
     let execution_graph = semantic_image_builder.execution();
-    let resource_graph = elaboration_phase!(
+    let resource_build = elaboration_phase!(
         "build_semantic_resource_graph",
         resource::build_semantic_resource_graph(
             &checked_program,
@@ -2901,6 +2901,14 @@ fn elaborate_with_representation(
         )
     )
     .map_err(SemanticError::new)?;
+    let resource_graph = resource_build.graph;
+    let resource_dependency_rows = resource_build.dependency_rows;
+    if trace_elaboration {
+        eprintln!(
+            "boon_semantic construction_rows domain=resource rows={}",
+            resource_dependency_rows.len()
+        );
+    }
     let reactive_graph = elaboration_phase!(
         "build_semantic_reactive_graph",
         reactive::build_semantic_reactive_graph_from_validated_inputs(
@@ -2974,6 +2982,7 @@ fn elaborate_with_representation(
             &resolved_out_graph,
             &execution_graph,
             &resource_graph,
+            &resource_dependency_rows,
             &reactive_graph,
             &lowering_contract,
             &lowering_dependency_rows,
@@ -6964,6 +6973,9 @@ seed: 0
         let lowering_dependency_rows =
             lowering_contract::lowering_dependency_rows(&semantic.lowering_contract)
                 .expect("mutated lowering contract has construction dependency rows");
+        let resource_dependency_rows =
+            resource::resource_dependency_rows_for_test(&semantic.resource_graph)
+                .expect("mutated resource graph has construction dependency rows");
         semantic.dependency_manifest = build_callable_dependency_manifest_v7(
             DEPENDENCY_CLASSIFIER_SCHEMA_DIGEST_V1,
             &semantic.checked_program,
@@ -6973,6 +6985,7 @@ seed: 0
             &semantic.resolved_out_graph,
             &semantic.execution_graph,
             &semantic.resource_graph,
+            &resource_dependency_rows,
             &semantic.reactive_graph,
             &semantic.lowering_contract,
             &lowering_dependency_rows,

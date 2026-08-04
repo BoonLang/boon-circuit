@@ -4,15 +4,24 @@
 //! identities and records every storage/resource choice needed by verification.
 //! Executable lowering may map these identities, but must not rediscover them.
 
+use crate::dependency_manifest::{
+    ConstructionDependencyDomainV1, ConstructionDependencyOwnerV1,
+    ConstructionDependencyRowBuilderV1, ConstructionDependencyRowsV1, PendingDependencyReference,
+    dependency_callable_interface, dependency_entity, expression_entity, indexed_entity,
+    list_entity, source_entity, state_entity, statement_entity, top_subject, value_list_entity,
+};
 use crate::{
     OutCallInstanceId, ProducerFunctionId, ProducerMaterializationMode, ResolvedOutGraph,
     SemanticBlockBinding, SemanticCallableId, SemanticContextualOperationKind,
-    SemanticContextualRowPredecessor, SemanticExecutionImageColumnsV1, SemanticExprId,
-    SemanticExpressionKind, SemanticListId, SemanticLocalBindingId, SemanticMaterializationId,
-    SemanticMaterializationResultKind, SemanticRowBinding, SemanticRowScopeId, SemanticSourceId,
-    SemanticSourceOrigin, SemanticStateId, SemanticStatement, SemanticStatementId,
-    SemanticStatementKind, SemanticStatementOrigin, SemanticValueId, SemanticValueListAuthorityId,
-    StaticOwnerId,
+    SemanticContextualRowPredecessor, SemanticDependencyChannelV1,
+    SemanticDependencyEntityDomainV1, SemanticDependencyEntityV1, SemanticDependencyLifetimeV1,
+    SemanticDependencyMultiplicityV1, SemanticDependencyPhaseV1, SemanticDependencyRoleV1,
+    SemanticDependencySemanticsV1, SemanticDependencySubjectKindV1,
+    SemanticExecutionImageColumnsV1, SemanticExprId, SemanticExpressionKind, SemanticListId,
+    SemanticLocalBindingId, SemanticMaterializationId, SemanticMaterializationResultKind,
+    SemanticRowBinding, SemanticRowScopeId, SemanticSourceId, SemanticSourceOrigin,
+    SemanticStateId, SemanticStatement, SemanticStatementId, SemanticStatementKind,
+    SemanticStatementOrigin, SemanticValueId, SemanticValueListAuthorityId, StaticOwnerId,
 };
 use boon_checked::{
     CheckedListId, CheckedListKeyPolicy, CheckedProgramFields, CheckedResourceBinding,
@@ -420,6 +429,11 @@ pub(crate) struct PreparedSemanticResourceInputs {
     list_targets: Vec<ListTarget>,
 }
 
+pub(crate) struct SemanticResourceGraphBuildV2 {
+    pub(crate) graph: SemanticResourceGraphV1,
+    pub(crate) dependency_rows: ConstructionDependencyRowsV1,
+}
+
 pub(crate) fn prepare_semantic_resource_inputs(
     checked: &CheckedProgramFields,
     execution: &mut SemanticExecutionImageColumnsV1,
@@ -434,7 +448,7 @@ pub(crate) fn build_semantic_resource_graph(
     out_net: &ResolvedOutGraph,
     execution: &SemanticExecutionImageColumnsV1,
     prepared: PreparedSemanticResourceInputs,
-) -> Result<SemanticResourceGraphV1, String> {
+) -> Result<SemanticResourceGraphBuildV2, String> {
     let trace_resources = std::env::var_os("BOON_SEMANTIC_TRACE").is_some();
     macro_rules! resource_phase {
         ($name:literal, $expression:expr) => {{
@@ -524,7 +538,11 @@ pub(crate) fn build_semantic_resource_graph(
         "validate_checked_resource_provenance",
         validate_checked_resource_provenance(checked, execution, &graph)
     )?;
-    Ok(graph)
+    let dependency_rows = resource_dependency_rows(&graph).map_err(|error| error.to_string())?;
+    Ok(SemanticResourceGraphBuildV2 {
+        graph,
+        dependency_rows,
+    })
 }
 
 #[derive(Clone)]
@@ -5506,6 +5524,416 @@ fn resource_graph_digest(
     )
     .map(SemanticResourceGraphDigestV1)
     .map_err(|error| format!("canonical semantic resource encoding failed: {error}"))
+}
+
+fn construction_owner_with_static(
+    primary: ConstructionDependencyOwnerV1,
+    owner: Option<StaticOwnerId>,
+) -> ConstructionDependencyOwnerV1 {
+    owner.map_or(primary.clone(), |owner| {
+        ConstructionDependencyOwnerV1::Exact(vec![
+            primary,
+            ConstructionDependencyOwnerV1::StaticOwner(owner),
+        ])
+    })
+}
+
+fn resource_dependency_rows(
+    graph: &SemanticResourceGraphV1,
+) -> Result<ConstructionDependencyRowsV1, crate::CallableDependencyManifestError> {
+    let mut builder = ConstructionDependencyRowBuilderV1::new();
+    let row_count = 1
+        + graph.row_scopes.len()
+        + graph.lists.len()
+        + graph.value_list_authorities.len()
+        + graph.sources.len()
+        + graph.states.len()
+        + graph.aliases.len()
+        + graph.materialization_bindings.len()
+        + graph.list_projections.len()
+        + graph.producer_resources.len();
+    let mut rows = Vec::with_capacity(row_count);
+
+    // Resource construction already computed this canonical component receipt.
+    // Commit it rather than serializing the complete rich graph a second time.
+    rows.push(builder.structural(
+        ConstructionDependencyOwnerV1::ProgramRoot,
+        top_subject(
+            SemanticDependencySubjectKindV1::ResourceGraph,
+            SemanticDependencyEntityV1::Program,
+        ),
+        &graph.digest,
+    )?);
+
+    for row_scope in &graph.row_scopes {
+        rows.push(builder.dependency(
+            ConstructionDependencyOwnerV1::List(row_scope.list),
+            SemanticDependencyChannelV1::CoverageRouting,
+            vec![SemanticDependencyRoleV1::CoverageOrRouting],
+            top_subject(
+                SemanticDependencySubjectKindV1::ResourceRowScope,
+                indexed_entity(
+                    SemanticDependencyEntityDomainV1::SemanticRowScope,
+                    row_scope.id.as_usize(),
+                ),
+            ),
+            SemanticDependencySemanticsV1 {
+                row: Some(SemanticRowBinding {
+                    list: row_scope.list,
+                    scope: row_scope.id,
+                }),
+                lifetime: SemanticDependencyLifetimeV1::Row,
+                ..SemanticDependencySemanticsV1::default()
+            },
+            row_scope,
+            vec![dependency_entity(list_entity(row_scope.list))],
+        )?);
+    }
+
+    for list in &graph.lists {
+        let mut references = vec![
+            dependency_entity(statement_entity(list.statement)),
+            dependency_entity(expression_entity(list.producer)),
+        ];
+        if let SemanticListResourceOriginV1::CheckedLiteral { checked_list } = &list.origin {
+            references.push(dependency_entity(SemanticDependencyEntityV1::checked(
+                SemanticDependencyEntityDomainV1::CheckedList,
+                checked_list.0,
+            )));
+        }
+        references.extend(resource_initializer_references(&list.initializer));
+        rows.push(builder.dependency(
+            ConstructionDependencyOwnerV1::List(list.id),
+            SemanticDependencyChannelV1::ResourceBehavior,
+            vec![
+                SemanticDependencyRoleV1::FixedDefinition,
+                SemanticDependencyRoleV1::ResourceOrProviderBehavior,
+            ],
+            top_subject(
+                SemanticDependencySubjectKindV1::ResourceList,
+                list_entity(list.id),
+            ),
+            SemanticDependencySemanticsV1 {
+                row: Some(SemanticRowBinding {
+                    list: list.id,
+                    scope: list.row_scope,
+                }),
+                multiplicity: SemanticDependencyMultiplicityV1::PerRowMaterialization,
+                lifetime: SemanticDependencyLifetimeV1::Row,
+                ..SemanticDependencySemanticsV1::default()
+            },
+            list,
+            references,
+        )?);
+    }
+
+    for authority in &graph.value_list_authorities {
+        let mut references = vec![
+            dependency_entity(statement_entity(authority.statement)),
+            dependency_entity(expression_entity(authority.producer)),
+        ];
+        if let SemanticListResourceOriginV1::CheckedLiteral { checked_list } = &authority.origin {
+            references.push(dependency_entity(SemanticDependencyEntityV1::checked(
+                SemanticDependencyEntityDomainV1::CheckedList,
+                checked_list.0,
+            )));
+        }
+        references.extend(resource_initializer_references(&authority.initializer));
+        rows.push(builder.dependency(
+            ConstructionDependencyOwnerV1::ValueList(authority.id),
+            SemanticDependencyChannelV1::ResourceBehavior,
+            vec![
+                SemanticDependencyRoleV1::FixedDefinition,
+                SemanticDependencyRoleV1::ResourceOrProviderBehavior,
+            ],
+            top_subject(
+                SemanticDependencySubjectKindV1::ResourceValueListAuthority,
+                value_list_entity(authority.id),
+            ),
+            SemanticDependencySemanticsV1 {
+                multiplicity: SemanticDependencyMultiplicityV1::PerRowMaterialization,
+                lifetime: SemanticDependencyLifetimeV1::Row,
+                ..SemanticDependencySemanticsV1::default()
+            },
+            authority,
+            references,
+        )?);
+    }
+
+    for source in &graph.sources {
+        let mut references = vec![
+            dependency_entity(statement_entity(source.statement)),
+            dependency_entity(expression_entity(source.expression)),
+        ];
+        references.extend(source.target_list.map(list_entity).map(dependency_entity));
+        rows.push(
+            builder.dependency(
+                construction_owner_with_static(
+                    ConstructionDependencyOwnerV1::Source(source.id),
+                    source.owner,
+                ),
+                SemanticDependencyChannelV1::ResourceBehavior,
+                vec![
+                    SemanticDependencyRoleV1::ResourceOrProviderBehavior,
+                    SemanticDependencyRoleV1::CoverageOrRouting,
+                ],
+                top_subject(
+                    SemanticDependencySubjectKindV1::ResourceSource,
+                    source_entity(source.id),
+                ),
+                SemanticDependencySemanticsV1 {
+                    static_owner: source.owner,
+                    row: source
+                        .target_list
+                        .zip(source.row_scope)
+                        .map(|(list, scope)| SemanticRowBinding { list, scope }),
+                    multiplicity: SemanticDependencyMultiplicityV1::PerEvent,
+                    lifetime: SemanticDependencyLifetimeV1::Event,
+                    phase: SemanticDependencyPhaseV1::EventPayload,
+                    ..SemanticDependencySemanticsV1::default()
+                },
+                source,
+                references,
+            )?,
+        );
+    }
+
+    for state in &graph.states {
+        let mut references = vec![
+            dependency_entity(statement_entity(state.statement)),
+            dependency_entity(expression_entity(state.expression)),
+            dependency_entity(expression_entity(state.initial)),
+        ];
+        references.extend(
+            state
+                .expression_members
+                .iter()
+                .copied()
+                .map(expression_entity)
+                .map(dependency_entity),
+        );
+        references.extend(state.target_list.map(list_entity).map(dependency_entity));
+        rows.push(
+            builder.dependency(
+                construction_owner_with_static(
+                    ConstructionDependencyOwnerV1::State(state.id),
+                    state.owner,
+                ),
+                SemanticDependencyChannelV1::ResourceBehavior,
+                vec![
+                    SemanticDependencyRoleV1::FixedDefinition,
+                    SemanticDependencyRoleV1::ResourceOrProviderBehavior,
+                ],
+                top_subject(
+                    SemanticDependencySubjectKindV1::ResourceState,
+                    state_entity(state.id),
+                ),
+                SemanticDependencySemanticsV1 {
+                    flow_type: Some(state.flow_type.clone()),
+                    static_owner: state.owner,
+                    row: state
+                        .target_list
+                        .zip(state.row_scope)
+                        .map(|(list, scope)| SemanticRowBinding { list, scope }),
+                    multiplicity: SemanticDependencyMultiplicityV1::PerTransition,
+                    lifetime: SemanticDependencyLifetimeV1::Snapshot,
+                    phase: SemanticDependencyPhaseV1::Commit,
+                    ..SemanticDependencySemanticsV1::default()
+                },
+                state,
+                references,
+            )?,
+        );
+    }
+
+    for (index, alias) in graph.aliases.iter().enumerate() {
+        let target_owner = match alias.target {
+            SemanticResourceAliasTargetV1::Source(source) => {
+                ConstructionDependencyOwnerV1::Source(source)
+            }
+            SemanticResourceAliasTargetV1::State(state) => {
+                ConstructionDependencyOwnerV1::State(state)
+            }
+        };
+        let target = match alias.target {
+            SemanticResourceAliasTargetV1::Source(source) => source_entity(source),
+            SemanticResourceAliasTargetV1::State(state) => state_entity(state),
+        };
+        rows.push(builder.dependency(
+            construction_owner_with_static(target_owner, alias.owner),
+            SemanticDependencyChannelV1::LexicalCapture,
+            vec![
+                SemanticDependencyRoleV1::FormulaBinder,
+                SemanticDependencyRoleV1::CoverageOrRouting,
+            ],
+            top_subject(
+                SemanticDependencySubjectKindV1::ResourceAlias,
+                indexed_entity(
+                    SemanticDependencyEntityDomainV1::SemanticResourceAlias,
+                    index,
+                ),
+            ),
+            SemanticDependencySemanticsV1 {
+                static_owner: alias.owner,
+                ..SemanticDependencySemanticsV1::default()
+            },
+            alias,
+            vec![dependency_entity(target)],
+        )?);
+    }
+
+    for binding in &graph.materialization_bindings {
+        let mut references = vec![dependency_entity(indexed_entity(
+            SemanticDependencyEntityDomainV1::SemanticMaterialization,
+            binding.materialization.as_usize(),
+        ))];
+        references.extend(
+            binding
+                .source
+                .into_iter()
+                .chain(binding.target)
+                .map(|row| list_entity(row.list))
+                .map(dependency_entity),
+        );
+        rows.push(builder.dependency(
+            ConstructionDependencyOwnerV1::StaticOwner(binding.owner),
+            SemanticDependencyChannelV1::ResourceBehavior,
+            vec![
+                SemanticDependencyRoleV1::ResourceOrProviderBehavior,
+                SemanticDependencyRoleV1::CoverageOrRouting,
+            ],
+            top_subject(
+                SemanticDependencySubjectKindV1::ResourceMaterializationBinding,
+                indexed_entity(
+                    SemanticDependencyEntityDomainV1::SemanticMaterializationBinding,
+                    binding.materialization.as_usize(),
+                ),
+            ),
+            SemanticDependencySemanticsV1 {
+                static_owner: Some(binding.owner),
+                row: binding.target.or(binding.source),
+                multiplicity: SemanticDependencyMultiplicityV1::PerRowMaterialization,
+                lifetime: SemanticDependencyLifetimeV1::Row,
+                ..SemanticDependencySemanticsV1::default()
+            },
+            binding,
+            references,
+        )?);
+    }
+
+    for (index, projection) in graph.list_projections.iter().enumerate() {
+        rows.push(builder.dependency(
+            ConstructionDependencyOwnerV1::List(projection.target),
+            SemanticDependencyChannelV1::ResourceRead,
+            vec![
+                SemanticDependencyRoleV1::FormulaBinder,
+                SemanticDependencyRoleV1::ResourceOrProviderBehavior,
+            ],
+            top_subject(
+                SemanticDependencySubjectKindV1::ResourceListProjection,
+                indexed_entity(
+                    SemanticDependencyEntityDomainV1::SemanticListProjection,
+                    index,
+                ),
+            ),
+            SemanticDependencySemanticsV1 {
+                multiplicity: SemanticDependencyMultiplicityV1::PerRowMaterialization,
+                lifetime: SemanticDependencyLifetimeV1::Row,
+                ..SemanticDependencySemanticsV1::default()
+            },
+            projection,
+            vec![
+                dependency_entity(list_entity(projection.target)),
+                dependency_entity(list_entity(projection.source)),
+            ],
+        )?);
+    }
+
+    for producer in &graph.producer_resources {
+        rows.push(builder.dependency(
+            ConstructionDependencyOwnerV1::StaticOwner(producer.owner),
+            SemanticDependencyChannelV1::ResourceBehavior,
+            vec![
+                SemanticDependencyRoleV1::ResourceOrProviderBehavior,
+                SemanticDependencyRoleV1::CoverageOrRouting,
+            ],
+            top_subject(
+                SemanticDependencySubjectKindV1::ResourceProducer,
+                SemanticDependencyEntityV1::Digest {
+                    domain: SemanticDependencyEntityDomainV1::SemanticProducerResource,
+                    digest: producer.identity,
+                },
+            ),
+            SemanticDependencySemanticsV1 {
+                static_owner: Some(producer.owner),
+                call_instance: Some(producer.root_call),
+                ..SemanticDependencySemanticsV1::default()
+            },
+            producer,
+            vec![
+                dependency_callable_interface(producer.callable),
+                dependency_entity(statement_entity(producer.result_statement)),
+            ],
+        )?);
+    }
+
+    Ok(ConstructionDependencyRowsV1::from_rows(
+        ConstructionDependencyDomainV1::Resource,
+        rows,
+    ))
+}
+
+#[cfg(test)]
+pub(crate) fn resource_dependency_rows_for_test(
+    graph: &SemanticResourceGraphV1,
+) -> Result<ConstructionDependencyRowsV1, crate::CallableDependencyManifestError> {
+    resource_dependency_rows(graph)
+}
+
+fn resource_initializer_references(
+    initializer: &SemanticListInitializerV1,
+) -> Vec<PendingDependencyReference> {
+    let mut expressions = Vec::new();
+    match initializer {
+        SemanticListInitializerV1::Empty => {}
+        SemanticListInitializerV1::RecordLiteral {
+            authority_root,
+            rows,
+        } => {
+            expressions.push(*authority_root);
+            for row in rows {
+                expressions.push(row.expression);
+                for field in &row.fields {
+                    expressions.extend(field.expression);
+                    expressions.extend(field.spread_origin);
+                }
+            }
+        }
+        SemanticListInitializerV1::ValueLiteral {
+            authority_root,
+            values,
+        } => {
+            expressions.push(*authority_root);
+            expressions.extend(values.iter().map(|value| value.expression));
+        }
+        SemanticListInitializerV1::Range {
+            authority_root,
+            from_expression,
+            to_expression,
+            ..
+        } => {
+            expressions.push(*authority_root);
+            expressions.push(*from_expression);
+            expressions.push(*to_expression);
+        }
+    }
+    expressions.sort_unstable();
+    expressions.dedup();
+    expressions
+        .into_iter()
+        .map(expression_entity)
+        .map(dependency_entity)
+        .collect()
 }
 
 fn semantic_local_values(

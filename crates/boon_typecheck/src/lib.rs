@@ -8,7 +8,7 @@ use boon_parser::ParsedProgram;
 use boon_syntax::{
     AstCallArg, AstCallArgKind, AstDrainPath, AstExpr, AstExprKind, AstMatchPattern, AstParameter,
     AstParameterKind, AstPassContext, AstRecordField, AstStatement, AstStatementKind,
-    AstTextSegment, BytesSizeSyntax,
+    AstTextSegment, BytesSizeSyntax, StableOccurrenceKey,
 };
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
@@ -14409,47 +14409,26 @@ const CHECKED_IMAGE_ROW_PAYLOAD_DIGEST_DOMAIN_V2: &[u8] = b"boon.checked-image-r
 const CHECKED_IMAGE_ROW_DIGEST_DOMAIN_V2: &[u8] = b"boon.checked-image-row.v2\0";
 const CHECKED_IMAGE_SHARD_DIGEST_DOMAIN_V2: &[u8] = b"boon.checked-image-shard.v2\0";
 const CHECKED_IMAGE_HANDOFF_DIGEST_DOMAIN_V2: &[u8] = b"boon.checked-image-handoff.v2\0";
-const CHECKED_AUTHORED_CALL_SITE_DOMAIN_V2: &[u8] = b"boon.checked-authored-call-site.v2\0";
+const CHECKED_STRUCTURAL_CALL_SITE_DOMAIN_V3: &[u8] = b"boon.checked-structural-call-site.v3\0";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-struct CheckedAuthoredCallSiteV2 {
-    source_unit: String,
-    owner: CheckedShardOwnerKeyV2,
-    authored_source: String,
-    resolved_function: String,
+struct CheckedStructuralCallSiteV3 {
+    occurrence: StableOccurrenceKey,
 }
 
-fn checked_authored_call_site(
+fn checked_structural_call_site(
     parsed: &ParsedProgram,
-    owner: CheckedShardOwnerKeyV2,
     call: &CheckedCall,
-) -> Result<CheckedAuthoredCallSiteV2, String> {
-    let source_unit = parsed
-        .files
-        .iter()
-        .filter(|file| file.start_line <= call.span.line)
-        .max_by_key(|file| file.start_line)
+) -> Result<CheckedStructuralCallSiteV3, String> {
+    let occurrence = parsed
+        .stable_occurrence_key(call.expression.0 as usize)
         .ok_or_else(|| {
             format!(
-                "checked call {} at line {} has no source-unit identity",
-                call.id.0, call.span.line
+                "checked call {} expression {} has no parser-owned structural occurrence key",
+                call.id.0, call.expression.0
             )
         })?;
-    let authored_source = parsed
-        .source
-        .get(call.span.start..call.span.end)
-        .ok_or_else(|| {
-            format!(
-                "checked call {} has invalid authored byte span {}..{}",
-                call.id.0, call.span.start, call.span.end
-            )
-        })?;
-    Ok(CheckedAuthoredCallSiteV2 {
-        source_unit: source_unit.path.clone(),
-        owner,
-        authored_source: authored_source.to_owned(),
-        resolved_function: call.function.clone(),
-    })
+    Ok(CheckedStructuralCallSiteV3 { occurrence })
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -14961,8 +14940,8 @@ fn checked_image_handoff(
         )?;
     }
 
-    let mut authored_sites = BTreeMap::<[u8; 32], (CheckedAuthoredCallSiteV2, u32)>::new();
-    let authored_calls = program
+    let mut structural_sites = BTreeMap::<[u8; 32], CheckedStructuralCallSiteV3>::new();
+    let structural_calls = program
         .calls
         .iter()
         .map(|call| {
@@ -14970,42 +14949,35 @@ fn checked_image_handoff(
                 .owner_callable
                 .and_then(|owner| callable_owners.get(&owner).cloned())
                 .unwrap_or_else(|| root_owner.clone());
-            let authored_site = checked_authored_call_site(parsed, owner.clone(), call)?;
-            let authored_call_site_digest = boon_contract::canonical_serde_hash_v1(
-                CHECKED_AUTHORED_CALL_SITE_DOMAIN_V2,
-                &authored_site,
+            let structural_site = checked_structural_call_site(parsed, call)?;
+            let structural_call_site_digest = boon_contract::canonical_serde_hash_v1(
+                CHECKED_STRUCTURAL_CALL_SITE_DOMAIN_V3,
+                &structural_site,
             )
             .map_err(|error| format!("failed to hash checked call site: {error}"))?;
-            let entry = authored_sites
-                .entry(authored_call_site_digest)
-                .or_insert_with(|| (authored_site.clone(), 0));
-            if entry.0 != authored_site {
+            if let Some(previous) = structural_sites
+                .insert(structural_call_site_digest, structural_site.clone())
+            {
+                if previous != structural_site {
+                    return Err(format!(
+                        "checked structural call-site digest collision between {previous:?} and {structural_site:?}"
+                    ));
+                }
                 return Err(format!(
-                    "checked call-site digest collision between {:?} and {authored_site:?}",
-                    entry.0
+                    "checked calls share parser-owned structural occurrence {:?}",
+                    structural_site.occurrence
                 ));
             }
-            entry.1 = entry
-                .1
-                .checked_add(1)
-                .ok_or_else(|| "identical checked call-site count overflow".to_owned())?;
-            Ok((call, owner, authored_call_site_digest))
+            Ok((call, owner, structural_call_site_digest))
         })
         .collect::<Result<Vec<_>, String>>()?;
     let mut call_projections = BTreeMap::new();
-    for (call, owner, authored_call_site_digest) in authored_calls {
-        let (_, remaining) = authored_sites
-            .get_mut(&authored_call_site_digest)
-            .expect("authored call was counted before projection construction");
-        *remaining = remaining
-            .checked_sub(1)
-            .expect("authored call count covers every projection");
-        let identical_site_reverse_ordinal = *remaining;
+    for (call, owner, authored_call_site_digest) in structural_calls {
         let projection = CheckedShardProjectionKeyV2 {
             owner,
             region: CheckedShardRegionV2::Invocation {
                 authored_call_site_digest,
-                identical_site_reverse_ordinal,
+                identical_site_reverse_ordinal: 0,
             },
         };
         let callee = callable_owners

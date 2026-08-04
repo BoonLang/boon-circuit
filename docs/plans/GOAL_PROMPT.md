@@ -683,9 +683,19 @@ Current checkpoints to preserve and audit rather than redo:
   plus `N - 1` reused for a one-unit edit. Direct and cached project assembly,
   stable-key, topology, diagnostics, and verified-session focused tests pass.
   Do not call this warm completion: project assembly and typechecking remain
-  whole-program. Continue with structural occurrence routes, typed evaluation
-  request slots, interface SCC/definition results, and deletion of the
-  production checked-image scan;
+  whole-program. The following checkpoint completes structural occurrence
+  routes; continue with typed evaluation request slots, interface SCC/
+  definition results, and deletion of the production checked-image scan;
+- preserve the structural occurrence identity tranche. Parser-owned unit/item/
+  statement/expression routes now identify checked calls and pipes without raw
+  source substrings, offsets, lines, or dense ids; the checker deletes its
+  identical-source counting pass. Exact stability tests and the canonical
+  NovyWave plan hash pass. The initial post-parse route traversal adds roughly
+  16--24 ms to directional debug parsing, so do not call it a latency win or
+  tune its containers next. Implement typed request currentness plus interface/
+  definition artifacts, emit checked receipts during construction, and delete
+  the approximately 392 ms checked-image rescan before revisiting compact route
+  storage;
 - treat the 16.7 ms diagnostics and 100 ms replacement-preview gates as warm
   incremental contracts. A faster full rebuild cannot satisfy them. Record
   executed/reused/backdated requests and require zero unrelated parse/check/

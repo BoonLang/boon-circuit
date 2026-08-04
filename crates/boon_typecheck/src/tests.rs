@@ -121,6 +121,62 @@ FUNCTION helper(value) {
 }
 
 #[test]
+fn structural_call_site_identity_survives_authored_argument_edits() {
+    fn helper_regions(source: &str) -> Vec<CheckedShardRegionV2> {
+        let parsed = boon_parser::parse_source("stable-edited-call-sites.bn", source)
+            .expect("stable edited-call-site fixture parses");
+        let checked = check_program(&parsed)
+            .program
+            .expect("stable edited-call-site fixture checks");
+        checked
+            .calls
+            .iter()
+            .filter(|call| call.function == "helper")
+            .map(|call| {
+                let route = checked
+                    .image_handoff()
+                    .entity_routes
+                    .iter()
+                    .find(|route| {
+                        route.domain == CheckedImageRowDomainV2::Call
+                            && route.dense_index == call.id.0
+                    })
+                    .expect("checked call has an image route");
+                checked
+                    .image_handoff()
+                    .projection(route.projection)
+                    .expect("checked route has a dense projection")
+                    .stable_key
+                    .region
+                    .clone()
+            })
+            .collect()
+    }
+
+    let baseline = helper_regions(
+        r#"
+left: helper(value: 10)
+right: helper(value: 20)
+
+FUNCTION helper(value) {
+    value
+}
+"#,
+    );
+    let edited = helper_regions(
+        r#"
+left : helper(value: 11)
+right: helper(value: 21)
+
+FUNCTION helper(value) {
+    value + 0
+}
+"#,
+    );
+    assert_eq!(edited, baseline);
+}
+
+#[test]
 fn structural_widening_reuses_unchanged_shared_nodes() {
     let nested = Type::object(ObjectShape::from_ordered_fields(
         [("value".to_owned(), Type::Text)],

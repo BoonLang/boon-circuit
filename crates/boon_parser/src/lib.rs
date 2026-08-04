@@ -9,8 +9,10 @@ use boon_syntax::{
     AstStatement, AstStatementKind, AstTextSegment, AstToken, AstTokenKind, BytesSizeSyntax,
     DocumentAst, LANGUAGE_FEATURE_REGISTRY, LanguageFeatureParseExpectation, LanguageFeatureStage,
     ParsedProgramFields, ParsedSourceFile, ParsedSourceUnitFields, ParserItem, ParserLine,
-    ProgramKind, SourceUnitId, StableDefinitionKey, StableItemRoute, StableItemRouteSegment,
-    UnitItemIndex, UnitItemIndexEntry, UnitItemKind, UnitItemParameter, is_program_role_root,
+    ProgramKind, SourceUnitId, StableDefinitionKey, StableExpressionChildRole,
+    StableExpressionRouteSegment, StableItemRoute, StableItemRouteSegment, StableOccurrenceKey,
+    StableOccurrenceRoute, StableStatementKind, StableStatementRouteSegment, UnitItemIndex,
+    UnitItemIndexEntry, UnitItemKind, UnitItemParameter, is_program_role_root,
     is_reserved_standard_root,
 };
 use serde::Serialize;
@@ -106,6 +108,22 @@ impl ParsedProgram {
             fields: std::sync::Arc::new(fields),
         }
     }
+
+    pub fn stable_occurrence_key(&self, expression_id: usize) -> Option<StableOccurrenceKey> {
+        let route = self.occurrence_routes.get(expression_id)?.clone()?;
+        let expression = self.ast.expressions.get(expression_id)?;
+        let source_unit = self
+            .files
+            .iter()
+            .filter(|file| file.start_line <= expression.line)
+            .max_by_key(|file| file.start_line)?
+            .source_unit_id()
+            .ok()?;
+        Some(StableOccurrenceKey {
+            source_unit_id: source_unit,
+            route,
+        })
+    }
 }
 
 impl Serialize for ParsedProgram {
@@ -150,6 +168,13 @@ impl ParsedSourceUnit {
                 source_unit_id: self.source_unit_id.clone(),
                 item_route: entry.route.clone(),
             })
+    }
+
+    pub fn stable_occurrence_key(&self, expression_id: usize) -> Option<StableOccurrenceKey> {
+        Some(StableOccurrenceKey {
+            source_unit_id: self.source_unit_id.clone(),
+            route: self.occurrence_routes.get(expression_id)?.clone()?,
+        })
     }
 }
 
@@ -788,6 +813,7 @@ fn parse_normalized_source_unit_syntax(
     validate_source_unit_boundary_with_work(&path, &source, &ast, &validation_index, work)?;
     let declared_functions = collect_raw_declared_functions_with_work(&ast.statements, work);
     let item_index = build_unit_item_index(&ast.statements);
+    let occurrence_routes = build_unit_occurrence_routes(&path, &ast, &item_index)?;
     work.source_unit_parsed();
 
     Ok((
@@ -798,6 +824,7 @@ fn parse_normalized_source_unit_syntax(
             ast,
             declared_functions,
             item_index,
+            occurrence_routes,
         }),
         validation_index,
     ))
@@ -1555,6 +1582,15 @@ fn assemble_canonical_parsed_source_units(
                 format!("cannot reserve assembled expression arena: {error}"),
             )
         })?;
+    let mut occurrence_routes = Vec::new();
+    occurrence_routes
+        .try_reserve_exact(total_expression_count)
+        .map_err(|error| {
+            parsed_source_unit_invariant_error(
+                &entrypoint,
+                format!("cannot reserve assembled occurrence routes: {error}"),
+            )
+        })?;
     let mut next_line = 1usize;
     let mut statement_offset = 0usize;
 
@@ -1571,6 +1607,7 @@ fn assemble_canonical_parsed_source_units(
             mut ast,
             declared_functions: _declared_functions,
             item_index: _item_index,
+            occurrence_routes: unit_occurrence_routes,
         } = unit.fields;
         if let Some(module) = module.as_deref() {
             namespace_source_unit_module(&mut ast, module, &functions_by_module, work);
@@ -1583,6 +1620,12 @@ fn assemble_canonical_parsed_source_units(
         let byte_offset = source.len();
         let expression_offset = expressions.len();
         let local_expression_count = ast.expressions.len();
+        if unit_occurrence_routes.len() != local_expression_count {
+            return Err(parsed_source_unit_invariant_error(
+                &path,
+                "occurrence-route count does not match the expression arena",
+            ));
+        }
         let rebase = SourceUnitAstRebase {
             path: &path,
             byte_offset,
@@ -1610,6 +1653,7 @@ fn assemble_canonical_parsed_source_units(
         items.extend(unit_items);
         statements.extend(unit_statements);
         expressions.extend(unit_expressions);
+        occurrence_routes.extend(unit_occurrence_routes);
 
         let needs_separator = index + 1 < unit_count && !unit_source.ends_with('\n');
         if needs_separator {
@@ -1680,6 +1724,7 @@ fn assemble_canonical_parsed_source_units(
         || tokens.len() != total_token_capacity
         || items.len() != total_item_count
         || expressions.len() != total_expression_count
+        || occurrence_routes.len() != total_expression_count
         || statement_offset != total_statement_count
     {
         return Err(parsed_source_unit_invariant_error(
@@ -1732,6 +1777,7 @@ fn assemble_canonical_parsed_source_units(
         expressions,
         functions,
         operators,
+        occurrence_routes,
         ast,
     });
     trace.phase(
@@ -6771,6 +6817,443 @@ fn build_unit_item_index(statements: &[AstStatement]) -> UnitItemIndex {
     UnitItemIndex { entries }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StableExpressionParent {
+    expression: usize,
+    segment: StableExpressionRouteSegment,
+}
+
+fn stable_statement_identity(statement: &AstStatement) -> (StableStatementKind, Vec<String>) {
+    match &statement.kind {
+        AstStatementKind::Function { name, .. } => {
+            (StableStatementKind::Function, vec![name.clone()])
+        }
+        AstStatementKind::Field { name } => (StableStatementKind::Field, vec![name.clone()]),
+        AstStatementKind::Source { field, event } => (
+            StableStatementKind::Source,
+            field.iter().chain(event).cloned().collect(),
+        ),
+        AstStatementKind::Hold { field, name } => (
+            StableStatementKind::Hold,
+            field.iter().chain(name).cloned().collect(),
+        ),
+        AstStatementKind::List { field, .. } => {
+            (StableStatementKind::List, field.iter().cloned().collect())
+        }
+        AstStatementKind::Block => (StableStatementKind::Block, Vec::new()),
+        AstStatementKind::Spread => (StableStatementKind::Spread, Vec::new()),
+        AstStatementKind::Expression => (StableStatementKind::Expression, Vec::new()),
+    }
+}
+
+fn stable_expression_child_edges(
+    expression: &AstExpr,
+) -> Vec<(usize, StableExpressionRouteSegment)> {
+    fn fixed(
+        edges: &mut Vec<(usize, StableExpressionRouteSegment)>,
+        expression: usize,
+        role: StableExpressionChildRole,
+    ) {
+        edges.push((
+            expression,
+            StableExpressionRouteSegment {
+                role,
+                label: None,
+                matching_sibling_reverse_ordinal: 0,
+            },
+        ));
+    }
+
+    fn indexed(
+        edges: &mut Vec<(usize, StableExpressionRouteSegment)>,
+        role: StableExpressionChildRole,
+        expressions: impl IntoIterator<Item = usize>,
+    ) {
+        let expressions = expressions.into_iter().collect::<Vec<_>>();
+        let count = expressions.len();
+        edges.extend(
+            expressions
+                .into_iter()
+                .enumerate()
+                .map(|(index, expression)| {
+                    (
+                        expression,
+                        StableExpressionRouteSegment {
+                            role,
+                            label: None,
+                            matching_sibling_reverse_ordinal: count - index - 1,
+                        },
+                    )
+                }),
+        );
+    }
+
+    fn labeled(
+        edges: &mut Vec<(usize, StableExpressionRouteSegment)>,
+        role: StableExpressionChildRole,
+        expressions: impl IntoIterator<Item = (usize, String)>,
+    ) {
+        let expressions = expressions.into_iter().collect::<Vec<_>>();
+        let mut remaining = BTreeMap::<String, usize>::new();
+        for (_, label) in &expressions {
+            *remaining.entry(label.clone()).or_default() += 1;
+        }
+        for (expression, label) in expressions {
+            let count = remaining
+                .get_mut(&label)
+                .expect("labeled expression was counted");
+            *count -= 1;
+            edges.push((
+                expression,
+                StableExpressionRouteSegment {
+                    role,
+                    label: Some(label),
+                    matching_sibling_reverse_ordinal: *count,
+                },
+            ));
+        }
+    }
+
+    let mut edges = Vec::new();
+    match &expression.kind {
+        AstExprKind::TextTemplate { segments } => indexed(
+            &mut edges,
+            StableExpressionChildRole::TextDynamic,
+            segments.iter().filter_map(|segment| match segment {
+                AstTextSegment::Dynamic { value } => Some(*value),
+                AstTextSegment::Static { .. } => None,
+            }),
+        ),
+        AstExprKind::TaggedObject { fields, .. } | AstExprKind::Object(fields) => labeled(
+            &mut edges,
+            StableExpressionChildRole::RecordField,
+            fields.iter().map(|field| (field.value, field.name.clone())),
+        ),
+        AstExprKind::Flush { payload } => {
+            if let Some(payload) = payload {
+                fixed(
+                    &mut edges,
+                    *payload,
+                    StableExpressionChildRole::FlushPayload,
+                );
+            }
+        }
+        AstExprKind::Call { args, pass, .. } => {
+            labeled(
+                &mut edges,
+                StableExpressionChildRole::CallArgument,
+                args.iter().map(|argument| {
+                    let kind = match argument.kind {
+                        AstCallArgKind::BareBinding => "bare",
+                        AstCallArgKind::Named => "named",
+                    };
+                    (argument.value, format!("{kind}:{}", argument.name))
+                }),
+            );
+            if let Some(pass) = pass {
+                fixed(&mut edges, pass.value, StableExpressionChildRole::CallPass);
+            }
+        }
+        AstExprKind::Pipe {
+            input,
+            args,
+            pass,
+            arms,
+            ..
+        } => {
+            fixed(&mut edges, *input, StableExpressionChildRole::PipeInput);
+            labeled(
+                &mut edges,
+                StableExpressionChildRole::PipeArgument,
+                args.iter().map(|argument| {
+                    let kind = match argument.kind {
+                        AstCallArgKind::BareBinding => "bare",
+                        AstCallArgKind::Named => "named",
+                    };
+                    (argument.value, format!("{kind}:{}", argument.name))
+                }),
+            );
+            if let Some(pass) = pass {
+                fixed(&mut edges, pass.value, StableExpressionChildRole::PipePass);
+            }
+            indexed(
+                &mut edges,
+                StableExpressionChildRole::PipeArm,
+                arms.iter().copied(),
+            );
+        }
+        AstExprKind::Draining { input } => {
+            fixed(&mut edges, *input, StableExpressionChildRole::DrainingInput)
+        }
+        AstExprKind::Hold { initial, .. } => {
+            fixed(&mut edges, *initial, StableExpressionChildRole::HoldInitial)
+        }
+        AstExprKind::Latest { branches } => indexed(
+            &mut edges,
+            StableExpressionChildRole::LatestBranch,
+            branches.iter().copied(),
+        ),
+        AstExprKind::When { input, arms } => {
+            fixed(&mut edges, *input, StableExpressionChildRole::WhenInput);
+            indexed(
+                &mut edges,
+                StableExpressionChildRole::WhenArm,
+                arms.iter().copied(),
+            );
+        }
+        AstExprKind::Then { input, output } => {
+            fixed(&mut edges, *input, StableExpressionChildRole::ThenInput);
+            if let Some(output) = output {
+                fixed(&mut edges, *output, StableExpressionChildRole::ThenOutput);
+            }
+        }
+        AstExprKind::Infix { left, right, .. } => {
+            fixed(&mut edges, *left, StableExpressionChildRole::InfixLeft);
+            fixed(&mut edges, *right, StableExpressionChildRole::InfixRight);
+        }
+        AstExprKind::MatchArm { output, .. } => {
+            if let Some(output) = output {
+                fixed(&mut edges, *output, StableExpressionChildRole::MatchOutput);
+            }
+        }
+        AstExprKind::Block { bindings, result } => {
+            labeled(
+                &mut edges,
+                StableExpressionChildRole::BlockBinding,
+                bindings
+                    .iter()
+                    .map(|binding| (binding.value, binding.name.clone())),
+            );
+            if let Some(result) = result {
+                fixed(&mut edges, *result, StableExpressionChildRole::BlockResult);
+            }
+        }
+        AstExprKind::ListLiteral { items, .. }
+        | AstExprKind::BytesLiteral { items, .. }
+        | AstExprKind::SetLiteral { items } => indexed(
+            &mut edges,
+            StableExpressionChildRole::CollectionItem,
+            items.iter().copied(),
+        ),
+        AstExprKind::Arrow { left, output, .. } => {
+            fixed(&mut edges, *left, StableExpressionChildRole::ArrowLeft);
+            if let Some(output) = output {
+                fixed(&mut edges, *output, StableExpressionChildRole::ArrowOutput);
+            }
+        }
+        AstExprKind::MapEntry { key, value } => {
+            fixed(&mut edges, *key, StableExpressionChildRole::MapKey);
+            fixed(&mut edges, *value, StableExpressionChildRole::MapValue);
+        }
+        AstExprKind::MapLiteral { entries } => indexed(
+            &mut edges,
+            StableExpressionChildRole::MapEntry,
+            entries.iter().copied(),
+        ),
+        AstExprKind::Identifier(_)
+        | AstExprKind::Path(_)
+        | AstExprKind::Drain { .. }
+        | AstExprKind::StringLiteral(_)
+        | AstExprKind::TextLiteral(_)
+        | AstExprKind::Number(_)
+        | AstExprKind::ByteLiteral { .. }
+        | AstExprKind::Tag(_)
+        | AstExprKind::Source
+        | AstExprKind::Delimiter
+        | AstExprKind::Unknown(_)
+        | AstExprKind::BitsLiteral { .. } => {}
+    }
+    edges
+}
+
+fn build_unit_occurrence_routes(
+    path: &str,
+    ast: &AstProgram,
+    item_index: &UnitItemIndex,
+) -> Result<Vec<Option<StableOccurrenceRoute>>, ParseError> {
+    let expression_count = ast.expressions.len();
+    let item_routes = item_index
+        .entries
+        .iter()
+        .map(|entry| (entry.local_statement_id, entry.route.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let mut parents = vec![None::<StableExpressionParent>; expression_count];
+    let mut roots = vec![None::<StableOccurrenceRoute>; expression_count];
+    let mut visited = vec![false; expression_count];
+
+    fn register_expression_tree(
+        path: &str,
+        root: usize,
+        base: StableOccurrenceRoute,
+        ast: &AstProgram,
+        parents: &mut [Option<StableExpressionParent>],
+        roots: &mut [Option<StableOccurrenceRoute>],
+        visited: &mut [bool],
+    ) -> Result<(), ParseError> {
+        let root_slot = roots.get_mut(root).ok_or_else(|| {
+            parsed_source_unit_invariant_error(
+                path,
+                format!("statement expression root {root} is out of range"),
+            )
+        })?;
+        if root_slot.is_none() {
+            *root_slot = Some(base);
+        }
+        let mut pending = vec![root];
+        while let Some(parent) = pending.pop() {
+            let was_visited = visited.get_mut(parent).ok_or_else(|| {
+                parsed_source_unit_invariant_error(
+                    path,
+                    format!("expression parent {parent} is out of range"),
+                )
+            })?;
+            if *was_visited {
+                continue;
+            }
+            *was_visited = true;
+            let expression = ast.expressions.get(parent).ok_or_else(|| {
+                parsed_source_unit_invariant_error(
+                    path,
+                    format!("expression parent {parent} is absent"),
+                )
+            })?;
+            let children = stable_expression_child_edges(expression);
+            for (child, segment) in children.into_iter().rev() {
+                let child_parent = parents.get_mut(child).ok_or_else(|| {
+                    parsed_source_unit_invariant_error(
+                        path,
+                        format!("expression child {child} is out of range"),
+                    )
+                })?;
+                let candidate = StableExpressionParent {
+                    expression: parent,
+                    segment,
+                };
+                if child_parent.is_none() {
+                    *child_parent = Some(candidate);
+                    pending.push(child);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    struct StatementOccurrenceBuilder<'a> {
+        path: &'a str,
+        ast: &'a AstProgram,
+        item_routes: &'a BTreeMap<usize, StableItemRoute>,
+        parents: &'a mut [Option<StableExpressionParent>],
+        roots: &'a mut [Option<StableOccurrenceRoute>],
+        visited: &'a mut [bool],
+    }
+
+    impl StatementOccurrenceBuilder<'_> {
+        fn visit(
+            &mut self,
+            statements: &[AstStatement],
+            owner: Option<StableItemRoute>,
+            parent_route: &[StableStatementRouteSegment],
+        ) -> Result<(), ParseError> {
+            let identities = statements
+                .iter()
+                .map(stable_statement_identity)
+                .collect::<Vec<_>>();
+            let mut remaining = BTreeMap::<(StableStatementKind, Vec<String>), usize>::new();
+            for identity in &identities {
+                *remaining.entry(identity.clone()).or_default() += 1;
+            }
+            for (statement, (kind, names)) in statements.iter().zip(identities) {
+                let count = remaining
+                    .get_mut(&(kind, names.clone()))
+                    .expect("statement identity was counted");
+                *count -= 1;
+                let (statement_owner, statement_route) =
+                    if let Some(item_route) = self.item_routes.get(&statement.id) {
+                        (Some(item_route.clone()), Vec::new())
+                    } else {
+                        let mut route = parent_route.to_vec();
+                        route.push(StableStatementRouteSegment {
+                            kind,
+                            names,
+                            matching_sibling_reverse_ordinal: *count,
+                        });
+                        (owner.clone(), route)
+                    };
+                if let Some(expression) = statement.expr {
+                    register_expression_tree(
+                        self.path,
+                        expression,
+                        StableOccurrenceRoute {
+                            owner: statement_owner.clone(),
+                            statement_route: statement_route.clone(),
+                            expression_route: Vec::new(),
+                        },
+                        self.ast,
+                        self.parents,
+                        self.roots,
+                        self.visited,
+                    )?;
+                }
+                self.visit(&statement.children, statement_owner, &statement_route)?;
+            }
+            Ok(())
+        }
+    }
+
+    StatementOccurrenceBuilder {
+        path,
+        ast,
+        item_routes: &item_routes,
+        parents: &mut parents,
+        roots: &mut roots,
+        visited: &mut visited,
+    }
+    .visit(&ast.statements, None, &[])?;
+
+    let mut routes = vec![None; expression_count];
+    for expression in &ast.expressions {
+        if !matches!(
+            expression.kind,
+            AstExprKind::Call { .. } | AstExprKind::Pipe { .. }
+        ) {
+            continue;
+        }
+        let mut cursor = expression.id;
+        let mut expression_route = Vec::new();
+        let mut traversed = 0usize;
+        let mut base = loop {
+            if let Some(base) = roots.get(cursor).and_then(Option::clone) {
+                break base;
+            }
+            let parent = parents
+                .get(cursor)
+                .and_then(Option::as_ref)
+                .ok_or_else(|| {
+                    parsed_source_unit_invariant_error(
+                        path,
+                        format!(
+                            "call/pipe expression {} has no structural root",
+                            expression.id
+                        ),
+                    )
+                })?;
+            expression_route.push(parent.segment.clone());
+            cursor = parent.expression;
+            traversed = traversed.saturating_add(1);
+            if traversed > expression_count {
+                return Err(parsed_source_unit_invariant_error(
+                    path,
+                    format!("call/pipe expression {} route is cyclic", expression.id),
+                ));
+            }
+        };
+        expression_route.reverse();
+        base.expression_route = expression_route;
+        routes[expression.id] = Some(base);
+    }
+    Ok(routes)
+}
+
 #[cfg(test)]
 fn collect_raw_declared_functions(statements: &[AstStatement]) -> Vec<String> {
     collect_raw_declared_functions_with_work(statements, &ParseWorkRecorder::disabled())
@@ -7384,6 +7867,44 @@ document:
         );
         assert_eq!(before_definition.parameters.len(), 1);
         assert_eq!(before_definition.parameters[0].name, "value");
+    }
+
+    #[test]
+    fn structural_occurrence_keys_ignore_authored_text_and_unrelated_earlier_calls() {
+        fn helper_keys(source: &str) -> BTreeMap<String, StableOccurrenceKey> {
+            let parsed = parse_project_source_unit("app/RUN.bn", source).unwrap();
+            parsed
+                .ast
+                .expressions
+                .iter()
+                .filter(|expression| {
+                    matches!(&expression.kind, AstExprKind::Call { function, .. } if function == "helper")
+                })
+                .filter_map(|expression| {
+                    let key = parsed.stable_occurrence_key(expression.id)?;
+                    let owner = key
+                        .route
+                        .owner
+                        .as_ref()?
+                        .segments()
+                        .last()?
+                        .names
+                        .first()?
+                        .clone();
+                    ["left", "right"].contains(&owner.as_str()).then_some((owner, key))
+                })
+                .collect()
+        }
+
+        let baseline = helper_keys(
+            "left: helper(value: 10)\nright: helper(value: 20)\n\nFUNCTION helper(value) {\n    value\n}\n",
+        );
+        let edited = helper_keys(
+            "earlier: helper(value: 999)\nleft : helper(value: 11)\nright: helper(value: 21)\n\nFUNCTION helper(value) {\n    value + 0\n}\n",
+        );
+
+        assert_eq!(edited, baseline);
+        assert_eq!(baseline.len(), 2);
     }
 
     #[test]

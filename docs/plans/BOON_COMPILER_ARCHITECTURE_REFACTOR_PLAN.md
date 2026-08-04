@@ -1864,9 +1864,31 @@ parsed and zero reused.
 Focused parser equivalence, stable-key, changed-unit reuse, topology atomicity,
 and verified-session reuse tests pass. This is not the warm exit: canonical
 assembly still clones/rebases and validates every unit, and typechecking still
-rebuilds the whole `CheckedProgramDatabase`. Next add parser-owned structural
-occurrence routes and typed evaluation request slots, then extract interface
-SCC and checked-definition results and delete `checked_image_handoff`.
+rebuilds the whole `CheckedProgramDatabase`. The next tranche below completes
+parser-owned structural occurrence routes; typed evaluation request slots,
+interface SCC and checked-definition results, and deletion of
+`checked_image_handoff` remain next.
+
+#### Second eighth-audit tranche: structural occurrence identity
+
+Parser-owned structural routes now identify every checked call/pipe occurrence
+by source-unit identity, nearest stable item owner, statement shape/name route,
+and typed expression-child route. The checker no longer hashes raw source
+substrings or runs a second identical-authored-site counting pass; argument,
+callee-body, formatting, and unrelated-earlier-call edits leave the occurrence
+identity stable while their semantic payloads still change. Focused parser and
+typechecker stability tests pass, and the verified NovyWave plan hash remains
+`db18f345676378b8633829c0bbd7870c0a1dc5a2459649c9bbfdd6b8969374ab`.
+
+This tranche is identity infrastructure, not a latency claim. Its initial
+post-parse route builder adds roughly 16--24 ms to directional NovyWave debug
+parsing; a current verified sample is 4,251.545 ms/282,756 KiB. Do not enter a
+container/allocation tuning loop here. First add typed evaluation request slots
+and interface/definition shards, emit final checked receipts during checking,
+and delete the approximately 392 ms `checked_image_handoff`. Revisit route
+storage only after those macro owner deletions, preferably by fusing route
+emission into parsing or retaining compact parent/slot metadata rather than a
+second identity representation.
 
 ## Architectural Decisions
 

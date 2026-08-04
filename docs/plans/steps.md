@@ -504,9 +504,19 @@ stronger three-reviewer performance closure defined below.
    it proves one parsed plus `N - 1` reused. Focused equivalence, identity,
    topology, diagnostics, and verified-session tests pass. Assembly still
    clones/rebases every unit and checking still rebuilds the whole project, so
-   this is an ownership/currentness checkpoint rather than the step exit. Add
-   structural occurrence routes and typed evaluation request slots next, then
-   interface SCC/definition results and direct checked receipts.
+   this is an ownership/currentness checkpoint rather than the step exit. The
+   following checkpoint completes structural occurrence routes; typed
+   evaluation request slots, interface SCC/definition results, and direct
+   checked receipts remain next.
+
+   Structural occurrence identity is now parser-owned and source-insensitive.
+   Checked calls/pipes use the unit/item/statement/expression route rather than
+   authored source slices, and the duplicate-source counting pass is deleted.
+   Focused stability tests and the canonical NovyWave plan hash pass. The first
+   route builder adds measurable parse work, so this is an identity checkpoint,
+   not a speed result. Proceed to typed request currentness and interface/
+   definition artifacts, then delete the approximately 392 ms checked-image
+   rescan before considering route-container tuning.
 
    The post-`ac2b234` high-level audit supersedes a mutating post-resource
    execution seal. Move inline list-authority synthesis into execution

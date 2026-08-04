@@ -996,8 +996,23 @@ Current cold-diagnostics candidate evidence:
   cold validation requires all parsed and zero reused. Focused parser/session/
   verified reuse tests and two-job compiler/producer/verifier checks pass. This
   does not close warm latency: assembly still rebases all units and the checker
-  is still whole-project. Add stable occurrence routes and typed request slots,
-  then extract interface/definition results and delete the checked-image scan.
+  is still whole-project. The following tranche completes stable occurrence
+  routes; typed request slots, interface/definition results, and deletion of the
+  checked-image scan remain next.
+- The structural occurrence tranche is now implemented. Parser-owned routes
+  identify calls/pipes without authored source slices, offsets, lines, or dense
+  ids; the typechecker deletes the raw-source call-site hash and the second
+  identical-site count/reverse-ordinal pass. Formatting, argument, callee-body,
+  and unrelated-earlier-call stability tests pass, and the verified NovyWave
+  plan hash remains
+  `db18f345676378b8633829c0bbd7870c0a1dc5a2459649c9bbfdd6b8969374ab`.
+  This is not a timing exit: the first post-parse route traversal adds roughly
+  16--24 ms to directional debug parsing, and one current verified sample is
+  4,251.545 ms/282,756 KiB with 120.640 ms parse, 708.498 ms typecheck,
+  2,266.805 ms semantic, and 917.666 ms backend work. Continue with typed
+  request currentness, interface/definition shards, and direct checked receipt
+  emission; do not micro-optimize route containers before deleting the roughly
+  392 ms checked handoff and larger whole-program owners.
 - Do not preserve V3's 208k subject cardinality as a production V4/V5 proof
   requirement. The independent test oracle must map every historical subject
   to exactly one canonical finalized shard row and classifier field/domain and prove

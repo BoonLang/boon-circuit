@@ -388,6 +388,8 @@ pub struct ParsedProgramFields {
     pub expressions: SharedAstExpressions,
     pub functions: Vec<String>,
     pub operators: Vec<String>,
+    #[serde(skip)]
+    pub occurrence_routes: Vec<Option<StableOccurrenceRoute>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -517,6 +519,83 @@ pub struct StableDefinitionKey {
     pub item_route: StableItemRoute,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StableStatementKind {
+    Function,
+    Field,
+    Source,
+    Hold,
+    List,
+    Block,
+    Spread,
+    Expression,
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct StableStatementRouteSegment {
+    pub kind: StableStatementKind,
+    pub names: Vec<String>,
+    pub matching_sibling_reverse_ordinal: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StableExpressionChildRole {
+    TextDynamic,
+    RecordField,
+    FlushPayload,
+    CallArgument,
+    CallPass,
+    PipeInput,
+    PipeArgument,
+    PipePass,
+    PipeArm,
+    DrainingInput,
+    HoldInitial,
+    LatestBranch,
+    WhenInput,
+    WhenArm,
+    ThenInput,
+    ThenOutput,
+    InfixLeft,
+    InfixRight,
+    MatchOutput,
+    BlockBinding,
+    BlockResult,
+    CollectionItem,
+    ArrowLeft,
+    ArrowOutput,
+    MapKey,
+    MapValue,
+    MapEntry,
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct StableExpressionRouteSegment {
+    pub role: StableExpressionChildRole,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    pub matching_sibling_reverse_ordinal: usize,
+}
+
+/// Parser-owned structural location of one call/pipe occurrence inside its
+/// nearest stable item owner. No source text, offsets, lines, or dense ids are
+/// part of this route.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct StableOccurrenceRoute {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<StableItemRoute>,
+    pub statement_route: Vec<StableStatementRouteSegment>,
+    pub expression_route: Vec<StableExpressionRouteSegment>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct StableOccurrenceKey {
+    pub source_unit_id: SourceUnitId,
+    pub route: StableOccurrenceRoute,
+}
+
 /// Public read-only schema projected by an opaque parser-produced source unit.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ParsedSourceUnitFields {
@@ -526,6 +605,8 @@ pub struct ParsedSourceUnitFields {
     pub ast: AstProgram,
     pub declared_functions: Vec<String>,
     pub item_index: UnitItemIndex,
+    #[serde(skip)]
+    pub occurrence_routes: Vec<Option<StableOccurrenceRoute>>,
 }
 
 impl ParsedSourceFile {

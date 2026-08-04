@@ -275,14 +275,27 @@ measurements.
 
 ## Implementation Sequence
 
-The first part of step 1 is implemented: parser units own body-insensitive item
-indexes and stable definition routes, while `CompilerSession` retains them by
+Step 1 is now implemented as identity/currentness infrastructure: parser units
+own body-insensitive item indexes, stable definition routes, and structural
+call/pipe occurrence routes, while `CompilerSession` retains them by
 `SourceUnitId`, invalidates only changed units, and applies unit topology
-changes atomically. Producer format V4 and the warm verifier now expose and
+changes atomically. The typechecker uses those occurrence routes instead of
+raw authored source slices and no longer performs the identical-source count/
+reverse-ordinal pass. Producer format V4 and the warm verifier expose and
 enforce exact attempted/parsed/reused unit counts. Canonical assembly still
-rebuilds the global syntax product, stable occurrence routes are not yet
-published, and checking remains whole-project; those are the next open parts of
-steps 1--3 rather than hidden completion claims.
+rebuilds the global syntax product and checking remains whole-project; those
+are the open parts of steps 2--3 rather than hidden completion claims.
+
+The first route implementation deliberately remains visible as architectural
+debt. It is a post-parse tree traversal with allocated route segments and adds
+roughly 16--24 ms to directional NovyWave debug parsing. A current verified
+debug sample is 4,251.545 ms at 282,756 KiB, with 120.640 ms parsing and
+708.498 ms typechecking; the canonical plan hash remains
+`db18f345676378b8633829c0bbd7870c0a1dc5a2459649c9bbfdd6b8969374ab`.
+Do not micro-tune that traversal before deleting the approximately 392 ms
+checked handoff and the larger whole-program semantic/backend owners. When the
+macro cut makes parser routing material, fuse route emission into parsing or
+retain compact parent/slot metadata rather than adding another identity owner.
 
 1. **Stable syntax and item ownership.** Retain `Arc<UnitSyntaxSnapshot>` and a
    body-insensitive `UnitItemIndex` in `CompilerSession`; add structural item

@@ -1175,6 +1175,7 @@ name = "boon_typecheck"
 version = "0.1.0"
 dependencies = [
  "boon_checked",
+ "boon_compilation_db",
  "boon_contract",
  "boon_data",
  "boon_document_model",

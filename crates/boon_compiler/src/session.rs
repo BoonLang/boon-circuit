@@ -17,11 +17,16 @@ use boon_plan::{
     ApplicationIdentity, MigrationPredecessorBinding, PlanError, ProgramRole, TargetProfile,
 };
 use boon_syntax::StableCheckOwnerKey;
-use boon_syntax::{SourceUnitId, SyntaxUnitNamespace};
+use boon_syntax::{SourceUnitId, SyntaxUnitNamespace, UnitItemKind};
 use boon_typecheck::{
-    OwnerSourceMap, OwnerSyntaxInput, project_owner_source_map, project_owner_syntax_input,
+    OwnerConstraintDependencyKind, OwnerConstraintSeed, OwnerConstraintSummary,
+    OwnerDeclarationKind, OwnerInterfaceTopology, OwnerReferenceKind, OwnerSourceMap,
+    OwnerSymbolReference, OwnerSyntaxInput, ResolvedOwnerSymbolReference,
+    build_owner_interface_topology, project_owner_constraint_seed, project_owner_source_map,
+    project_owner_syntax_input, resolve_owner_constraint_seed,
     stable_check_owner_key_fingerprint_v1,
 };
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{
@@ -188,6 +193,11 @@ struct ProjectState {
     link_requests: TypedRequestTable<LinkUnitRequest>,
     owner_input_requests: TypedRequestTable<OwnerInputRequest>,
     owner_source_map_requests: TypedRequestTable<OwnerSourceMapRequest>,
+    owner_constraint_seed_requests: TypedRequestTable<OwnerConstraintSeedRequest>,
+    project_owner_symbol_requests: TypedRequestTable<ProjectOwnerSymbolRequest>,
+    owner_constraint_requests: TypedRequestTable<OwnerConstraintRequest>,
+    project_owner_interface_topology_requests:
+        TypedRequestTable<ProjectOwnerInterfaceTopologyRequest>,
     checked: Option<CheckedSourceFromSource>,
     compiled: Option<(Revision, CompiledSealedMachinePlanFromSource)>,
     request_graph: Option<(
@@ -395,6 +405,180 @@ impl RequestFamily for OwnerSourceMapRequest {
     }
 }
 
+struct OwnerConstraintSeedRequest;
+
+impl RequestFamily for OwnerConstraintSeedRequest {
+    type Key = StableCheckOwnerKey;
+    type Value = Arc<OwnerConstraintSeed>;
+
+    const NAME: &'static str = "boon.compiler.owner-constraint-seed.v1";
+
+    fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
+        stable_check_owner_key_fingerprint_v1(key)
+    }
+
+    fn output_fingerprint(
+        value: &Self::Value,
+    ) -> Result<RequestOutputFingerprint, boon_compilation_db::CompilationDbError> {
+        Ok(RequestOutputFingerprint(value.fingerprint_v1()))
+    }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ProjectOwnerSymbolKey;
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+enum OwnerSymbolNamespace {
+    Value,
+    Callable,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+struct OwnerSymbolKey {
+    namespace: OwnerSymbolNamespace,
+    parts: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+struct OwnerSymbolCandidate {
+    priority: u8,
+    owner: StableCheckOwnerKey,
+    parameters: Box<[boon_typecheck::OwnerParameterConstraint]>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+struct ProjectOwnerSymbolIndex {
+    symbols: BTreeMap<OwnerSymbolKey, Box<[OwnerSymbolCandidate]>>,
+}
+
+impl ProjectOwnerSymbolIndex {
+    fn resolve(
+        &self,
+        owner: &StableCheckOwnerKey,
+        reference: &OwnerSymbolReference,
+    ) -> Option<OwnerSymbolCandidate> {
+        let namespace = match reference.kind {
+            OwnerReferenceKind::Value => OwnerSymbolNamespace::Value,
+            OwnerReferenceKind::Callable => OwnerSymbolNamespace::Callable,
+        };
+        let mut paths = Vec::new();
+        if namespace == OwnerSymbolNamespace::Value {
+            let mut parent = owner_parent_value_path(owner);
+            loop {
+                let mut candidate = parent.clone();
+                candidate.extend(reference.parts.iter().cloned());
+                paths.push(candidate);
+                if parent.pop().is_none() {
+                    break;
+                }
+            }
+        }
+        paths.push(reference.parts.to_vec());
+        paths.into_iter().find_map(|parts| {
+            let candidates = self.symbols.get(&OwnerSymbolKey { namespace, parts })?;
+            let best = candidates.first()?.priority;
+            let mut best_candidates = candidates
+                .iter()
+                .take_while(|candidate| candidate.priority == best);
+            let candidate = best_candidates.next()?;
+            best_candidates.next().is_none().then(|| candidate.clone())
+        })
+    }
+}
+
+struct ProjectOwnerSymbolRequest;
+
+impl RequestFamily for ProjectOwnerSymbolRequest {
+    type Key = ProjectOwnerSymbolKey;
+    type Value = Arc<ProjectOwnerSymbolIndex>;
+
+    const NAME: &'static str = "boon.compiler.project-owner-symbol-index.v1";
+
+    fn key_fingerprint(_key: &Self::Key) -> RequestFingerprint {
+        request_fingerprint(
+            b"boon.compiler.project-owner-symbol-index-key.v1\0",
+            std::iter::empty(),
+        )
+    }
+
+    fn output_fingerprint(
+        value: &Self::Value,
+    ) -> Result<RequestOutputFingerprint, boon_compilation_db::CompilationDbError> {
+        let mut hasher = Sha256::new();
+        hasher.update(b"boon.compiler.project-owner-symbol-index-result.v1\0");
+        hasher.update((value.symbols.len() as u64).to_le_bytes());
+        for (key, candidates) in &value.symbols {
+            hasher.update([match key.namespace {
+                OwnerSymbolNamespace::Value => 0,
+                OwnerSymbolNamespace::Callable => 1,
+            }]);
+            hasher.update((key.parts.len() as u64).to_le_bytes());
+            for part in &key.parts {
+                update_request_fingerprint_part(&mut hasher, part.as_bytes());
+            }
+            hasher.update((candidates.len() as u64).to_le_bytes());
+            for candidate in candidates {
+                hasher.update([candidate.priority]);
+                hasher.update(stable_check_owner_key_fingerprint_v1(&candidate.owner));
+                hasher.update((candidate.parameters.len() as u64).to_le_bytes());
+                for parameter in &candidate.parameters {
+                    update_request_fingerprint_part(&mut hasher, parameter.name.as_bytes());
+                    hasher.update([match parameter.kind {
+                        boon_typecheck::OwnerParameterKind::Value => 0,
+                        boon_typecheck::OwnerParameterKind::Out => 1,
+                    }]);
+                    hasher.update(parameter.ordinal.to_le_bytes());
+                }
+            }
+        }
+        Ok(RequestOutputFingerprint(hasher.finalize().into()))
+    }
+}
+
+struct OwnerConstraintRequest;
+
+impl RequestFamily for OwnerConstraintRequest {
+    type Key = StableCheckOwnerKey;
+    type Value = Arc<OwnerConstraintSummary>;
+
+    const NAME: &'static str = "boon.compiler.owner-constraint-summary.v1";
+
+    fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
+        stable_check_owner_key_fingerprint_v1(key)
+    }
+
+    fn output_fingerprint(
+        value: &Self::Value,
+    ) -> Result<RequestOutputFingerprint, boon_compilation_db::CompilationDbError> {
+        Ok(RequestOutputFingerprint(value.fingerprint_v1()))
+    }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ProjectOwnerInterfaceTopologyKey;
+
+struct ProjectOwnerInterfaceTopologyRequest;
+
+impl RequestFamily for ProjectOwnerInterfaceTopologyRequest {
+    type Key = ProjectOwnerInterfaceTopologyKey;
+    type Value = Arc<OwnerInterfaceTopology>;
+
+    const NAME: &'static str = "boon.compiler.project-owner-interface-topology.v1";
+
+    fn key_fingerprint(_key: &Self::Key) -> RequestFingerprint {
+        request_fingerprint(
+            b"boon.compiler.project-owner-interface-topology-key.v1\0",
+            std::iter::empty(),
+        )
+    }
+
+    fn output_fingerprint(
+        value: &Self::Value,
+    ) -> Result<RequestOutputFingerprint, boon_compilation_db::CompilationDbError> {
+        Ok(RequestOutputFingerprint(value.fingerprint_v1()))
+    }
+}
+
 impl CompilerSession {
     pub fn new() -> Self {
         Self::default()
@@ -421,6 +605,10 @@ impl CompilerSession {
                 link_requests: TypedRequestTable::new(),
                 owner_input_requests: TypedRequestTable::new(),
                 owner_source_map_requests: TypedRequestTable::new(),
+                owner_constraint_seed_requests: TypedRequestTable::new(),
+                project_owner_symbol_requests: TypedRequestTable::new(),
+                owner_constraint_requests: TypedRequestTable::new(),
+                project_owner_interface_topology_requests: TypedRequestTable::new(),
                 checked: None,
                 compiled: None,
                 request_graph: None,
@@ -669,6 +857,16 @@ impl CompilerSession {
             .retain(&mut state.syntax_evaluator, |key| {
                 surviving_sources.contains(key.source_unit_id())
             })?;
+        state
+            .owner_constraint_seed_requests
+            .retain(&mut state.syntax_evaluator, |key| {
+                surviving_sources.contains(key.source_unit_id())
+            })?;
+        state
+            .owner_constraint_requests
+            .retain(&mut state.syntax_evaluator, |key| {
+                surviving_sources.contains(key.source_unit_id())
+            })?;
         state.source = candidate;
         state.revision = Revision(next_revision);
         state.checked = None;
@@ -775,6 +973,53 @@ impl CompilerSession {
         Ok(state
             .owner_source_map_requests
             .current_value(&state.syntax_evaluator, owner)?
+            .map(Arc::clone))
+    }
+
+    /// Returns the current span/literal-payload-free constraint seed.
+    pub fn owner_constraint_seed(
+        &self,
+        project: ProjectId,
+        owner: &StableCheckOwnerKey,
+    ) -> CompilerResult<Option<Arc<OwnerConstraintSeed>>> {
+        let state = self
+            .projects
+            .get(&project)
+            .ok_or_else(|| session_error(format!("unknown compiler project {}", project.0)))?;
+        Ok(state
+            .owner_constraint_seed_requests
+            .current_value(&state.syntax_evaluator, owner)?
+            .map(Arc::clone))
+    }
+
+    /// Returns stable symbol-resolved dependencies for one owner.
+    pub fn owner_constraint_summary(
+        &self,
+        project: ProjectId,
+        owner: &StableCheckOwnerKey,
+    ) -> CompilerResult<Option<Arc<OwnerConstraintSummary>>> {
+        let state = self
+            .projects
+            .get(&project)
+            .ok_or_else(|| session_error(format!("unknown compiler project {}", project.0)))?;
+        Ok(state
+            .owner_constraint_requests
+            .current_value(&state.syntax_evaluator, owner)?
+            .map(Arc::clone))
+    }
+
+    /// Returns the current tagged, dependency-first interface SCC topology.
+    pub fn owner_interface_topology(
+        &self,
+        project: ProjectId,
+    ) -> CompilerResult<Option<Arc<OwnerInterfaceTopology>>> {
+        let state = self
+            .projects
+            .get(&project)
+            .ok_or_else(|| session_error(format!("unknown compiler project {}", project.0)))?;
+        Ok(state
+            .project_owner_interface_topology_requests
+            .current_value(&state.syntax_evaluator, &ProjectOwnerInterfaceTopologyKey)?
             .map(Arc::clone))
     }
 
@@ -1212,6 +1457,16 @@ fn evaluate_owner_requests(
         .retain(&mut state.syntax_evaluator, |owner| {
             live_owners.contains(owner)
         })?;
+    state
+        .owner_constraint_seed_requests
+        .retain(&mut state.syntax_evaluator, |owner| {
+            live_owners.contains(owner)
+        })?;
+    state
+        .owner_constraint_requests
+        .retain(&mut state.syntax_evaluator, |owner| {
+            live_owners.contains(owner)
+        })?;
 
     let owner_input = RequestInputFingerprint(request_fingerprint(
         b"boon.compiler.owner-input-dependencies.v1\0",
@@ -1221,7 +1476,7 @@ fn evaluate_owner_requests(
         b"boon.compiler.owner-source-map-dependencies.v1\0",
         std::iter::empty(),
     ));
-    for owner in owners {
+    for owner in &owners {
         match state.owner_source_map_requests.begin(
             &mut state.syntax_evaluator,
             owner.clone(),
@@ -1235,7 +1490,7 @@ fn evaluate_owner_requests(
                         &mut ticket,
                         owner.source_unit_id(),
                     )?;
-                    let view = parsed.owner_view_for_key(&owner).ok_or_else(|| {
+                    let view = parsed.owner_view_for_key(owner).ok_or_else(|| {
                         session_error(format!(
                             "parsed source has no current owner view for {owner:?}"
                         ))
@@ -1274,7 +1529,7 @@ fn evaluate_owner_requests(
                         &mut ticket,
                         owner.source_unit_id(),
                     )?;
-                    let view = linked.owner_view_for_key(&owner).ok_or_else(|| {
+                    let view = linked.owner_view_for_key(owner).ok_or_else(|| {
                         session_error(format!(
                             "linked source has no current owner view for {owner:?}"
                         ))
@@ -1296,6 +1551,340 @@ fn evaluate_owner_requests(
                     .owner_input_requests
                     .publish(&mut state.syntax_evaluator, ticket, input)?;
             }
+        }
+    }
+    evaluate_owner_constraint_requests(state, linked_units, &owners)?;
+    Ok(())
+}
+
+fn owner_route_value_path(owner: &StableCheckOwnerKey, include_last: bool) -> Vec<String> {
+    let StableCheckOwnerKey::Item(owner) = owner else {
+        return Vec::new();
+    };
+    let segments = owner.item_route.segments();
+    let retained = if include_last {
+        segments
+    } else {
+        &segments[..segments.len().saturating_sub(1)]
+    };
+    let mut path = Vec::new();
+    for segment in retained {
+        if segment.kind == UnitItemKind::Function {
+            continue;
+        }
+        let Some(name) = segment.names.first() else {
+            continue;
+        };
+        if path.last() != Some(name) {
+            path.push(name.clone());
+        }
+    }
+    path
+}
+
+fn owner_parent_value_path(owner: &StableCheckOwnerKey) -> Vec<String> {
+    owner_route_value_path(owner, false)
+}
+
+fn owner_symbol_priority(kind: OwnerDeclarationKind) -> Option<u8> {
+    match kind {
+        OwnerDeclarationKind::Field | OwnerDeclarationKind::Source | OwnerDeclarationKind::List => {
+            Some(0)
+        }
+        OwnerDeclarationKind::Hold => Some(1),
+        OwnerDeclarationKind::Function => None,
+    }
+}
+
+fn add_owner_symbol(
+    symbols: &mut BTreeMap<OwnerSymbolKey, Vec<OwnerSymbolCandidate>>,
+    key: OwnerSymbolKey,
+    candidate: OwnerSymbolCandidate,
+) {
+    symbols.entry(key).or_default().push(candidate);
+}
+
+fn build_project_owner_symbol_index(
+    seeds: &[Arc<OwnerConstraintSeed>],
+    modules: &BTreeMap<SourceUnitId, Option<String>>,
+) -> ProjectOwnerSymbolIndex {
+    let mut symbols = BTreeMap::<OwnerSymbolKey, Vec<OwnerSymbolCandidate>>::new();
+    for seed in seeds {
+        let Some(declaration) = seed
+            .declarations
+            .iter()
+            .find(|declaration| declaration.public)
+        else {
+            continue;
+        };
+        if declaration.kind == OwnerDeclarationKind::Function {
+            let Some(name) = declaration.names.first() else {
+                continue;
+            };
+            let candidate = OwnerSymbolCandidate {
+                priority: 0,
+                owner: seed.owner.clone(),
+                parameters: declaration.parameters.clone(),
+            };
+            add_owner_symbol(
+                &mut symbols,
+                OwnerSymbolKey {
+                    namespace: OwnerSymbolNamespace::Callable,
+                    parts: vec![name.clone()],
+                },
+                candidate.clone(),
+            );
+            if let Some(module) = modules
+                .get(seed.owner.source_unit_id())
+                .and_then(|module| module.as_ref())
+            {
+                add_owner_symbol(
+                    &mut symbols,
+                    OwnerSymbolKey {
+                        namespace: OwnerSymbolNamespace::Callable,
+                        parts: vec![module.clone(), name.clone()],
+                    },
+                    candidate,
+                );
+            }
+            continue;
+        }
+        let Some(priority) = owner_symbol_priority(declaration.kind) else {
+            continue;
+        };
+        let path = owner_route_value_path(&seed.owner, true);
+        if path.is_empty() {
+            continue;
+        }
+        add_owner_symbol(
+            &mut symbols,
+            OwnerSymbolKey {
+                namespace: OwnerSymbolNamespace::Value,
+                parts: path,
+            },
+            OwnerSymbolCandidate {
+                priority,
+                owner: seed.owner.clone(),
+                parameters: Box::new([]),
+            },
+        );
+    }
+    ProjectOwnerSymbolIndex {
+        symbols: symbols
+            .into_iter()
+            .map(|(key, mut candidates)| {
+                candidates.sort();
+                candidates.dedup();
+                (key, candidates.into_boxed_slice())
+            })
+            .collect(),
+    }
+}
+
+fn evaluate_owner_constraint_requests(
+    state: &mut ProjectState,
+    linked_units: &[Arc<UnitSyntaxSnapshot>],
+    owners: &[StableCheckOwnerKey],
+) -> CompilerResult<()> {
+    let seed_input = RequestInputFingerprint(request_fingerprint(
+        b"boon.compiler.owner-constraint-seed-dependencies.v1\0",
+        std::iter::empty(),
+    ));
+    for owner in owners {
+        match state.owner_constraint_seed_requests.begin(
+            &mut state.syntax_evaluator,
+            owner.clone(),
+            seed_input,
+        )? {
+            RequestStart::Reused => {}
+            RequestStart::Execute(mut ticket) => {
+                let seed = (|| -> CompilerResult<_> {
+                    let input = state.owner_input_requests.require(
+                        &state.syntax_evaluator,
+                        &mut ticket,
+                        owner,
+                    )?;
+                    Ok(Arc::new(project_owner_constraint_seed(input)?))
+                })();
+                let seed = match seed {
+                    Ok(seed) => seed,
+                    Err(error) => {
+                        state.owner_constraint_seed_requests.abort(
+                            &mut state.syntax_evaluator,
+                            ticket,
+                            RequestAbortReason::Failed,
+                        )?;
+                        return Err(error);
+                    }
+                };
+                state.owner_constraint_seed_requests.publish(
+                    &mut state.syntax_evaluator,
+                    ticket,
+                    seed,
+                )?;
+            }
+        }
+    }
+
+    let symbol_key = ProjectOwnerSymbolKey;
+    let owner_key_fingerprints = owners
+        .iter()
+        .map(stable_check_owner_key_fingerprint_v1)
+        .collect::<Vec<_>>();
+    let symbol_input = RequestInputFingerprint(request_fingerprint(
+        b"boon.compiler.project-owner-symbol-index-dependencies.v1\0",
+        owner_key_fingerprints.iter().map(<[u8; 32]>::as_slice),
+    ));
+    match state.project_owner_symbol_requests.begin(
+        &mut state.syntax_evaluator,
+        symbol_key.clone(),
+        symbol_input,
+    )? {
+        RequestStart::Reused => {}
+        RequestStart::Execute(mut ticket) => {
+            let symbols = (|| -> CompilerResult<_> {
+                let seeds = owners
+                    .iter()
+                    .map(|owner| {
+                        state
+                            .owner_constraint_seed_requests
+                            .require(&state.syntax_evaluator, &mut ticket, owner)
+                            .map(Arc::clone)
+                            .map_err(Into::into)
+                    })
+                    .collect::<CompilerResult<Vec<_>>>()?;
+                let mut modules = BTreeMap::new();
+                for unit in linked_units {
+                    let linked = state.link_requests.require(
+                        &state.syntax_evaluator,
+                        &mut ticket,
+                        &unit.source_unit_id,
+                    )?;
+                    modules.insert(
+                        linked.source_unit_id.clone(),
+                        linked.module().map(str::to_owned),
+                    );
+                }
+                Ok(Arc::new(build_project_owner_symbol_index(&seeds, &modules)))
+            })();
+            let symbols = match symbols {
+                Ok(symbols) => symbols,
+                Err(error) => {
+                    state.project_owner_symbol_requests.abort(
+                        &mut state.syntax_evaluator,
+                        ticket,
+                        RequestAbortReason::Failed,
+                    )?;
+                    return Err(error);
+                }
+            };
+            state.project_owner_symbol_requests.publish(
+                &mut state.syntax_evaluator,
+                ticket,
+                symbols,
+            )?;
+        }
+    }
+
+    let constraint_input = RequestInputFingerprint(request_fingerprint(
+        b"boon.compiler.owner-constraint-summary-dependencies.v1\0",
+        std::iter::empty(),
+    ));
+    for owner in owners {
+        match state.owner_constraint_requests.begin(
+            &mut state.syntax_evaluator,
+            owner.clone(),
+            constraint_input,
+        )? {
+            RequestStart::Reused => {}
+            RequestStart::Execute(mut ticket) => {
+                let summary = (|| -> CompilerResult<_> {
+                    let seed = Arc::clone(state.owner_constraint_seed_requests.require(
+                        &state.syntax_evaluator,
+                        &mut ticket,
+                        owner,
+                    )?);
+                    let symbols = Arc::clone(state.project_owner_symbol_requests.require(
+                        &state.syntax_evaluator,
+                        &mut ticket,
+                        &symbol_key,
+                    )?);
+                    let dependencies = seed.references.iter().filter_map(|reference| {
+                        let candidate = symbols.resolve(owner, reference)?;
+                        Some(ResolvedOwnerSymbolReference {
+                            reference: reference.clone(),
+                            owner: candidate.owner,
+                            parameters: candidate.parameters,
+                        })
+                    });
+                    Ok(Arc::new(resolve_owner_constraint_seed(
+                        &seed,
+                        dependencies,
+                    )?))
+                })();
+                let summary = match summary {
+                    Ok(summary) => summary,
+                    Err(error) => {
+                        state.owner_constraint_requests.abort(
+                            &mut state.syntax_evaluator,
+                            ticket,
+                            RequestAbortReason::Failed,
+                        )?;
+                        return Err(error);
+                    }
+                };
+                state.owner_constraint_requests.publish(
+                    &mut state.syntax_evaluator,
+                    ticket,
+                    summary,
+                )?;
+            }
+        }
+    }
+
+    let topology_key = ProjectOwnerInterfaceTopologyKey;
+    let topology_input = RequestInputFingerprint(request_fingerprint(
+        b"boon.compiler.project-owner-interface-topology-dependencies.v1\0",
+        owner_key_fingerprints.iter().map(<[u8; 32]>::as_slice),
+    ));
+    match state.project_owner_interface_topology_requests.begin(
+        &mut state.syntax_evaluator,
+        topology_key,
+        topology_input,
+    )? {
+        RequestStart::Reused => {}
+        RequestStart::Execute(mut ticket) => {
+            let topology = (|| -> CompilerResult<_> {
+                let summaries = owners
+                    .iter()
+                    .map(|owner| {
+                        state
+                            .owner_constraint_requests
+                            .require(&state.syntax_evaluator, &mut ticket, owner)
+                            .map(Arc::clone)
+                            .map_err(Into::into)
+                    })
+                    .collect::<CompilerResult<Vec<_>>>()?;
+                Ok(Arc::new(build_owner_interface_topology(
+                    summaries.iter().map(Arc::as_ref),
+                )?))
+            })();
+            let topology = match topology {
+                Ok(topology) => topology,
+                Err(error) => {
+                    state.project_owner_interface_topology_requests.abort(
+                        &mut state.syntax_evaluator,
+                        ticket,
+                        RequestAbortReason::Failed,
+                    )?;
+                    return Err(error);
+                }
+            };
+            state.project_owner_interface_topology_requests.publish(
+                &mut state.syntax_evaluator,
+                ticket,
+                topology,
+            )?;
         }
     }
     Ok(())
@@ -1673,10 +2262,10 @@ mod tests {
             assert_eq!(first.profile.parse_work.nodes_rebased, 0);
         }
         let first_stats = session.frontend_request_stats(project).unwrap();
-        assert_eq!(first_stats.demanded, 18);
-        assert_eq!(first_stats.executed, 18);
+        assert_eq!(first_stats.demanded, 28);
+        assert_eq!(first_stats.executed, 28);
         assert_eq!(first_stats.reused, 0);
-        assert_eq!(first_stats.changed, 18);
+        assert_eq!(first_stats.changed, 28);
         let retained_a = session
             .unit_syntax_snapshot(project, "A.bn")
             .unwrap()
@@ -1712,11 +2301,11 @@ mod tests {
             second.profile.parse_work
         };
         let second_stats = session.frontend_request_stats(project).unwrap();
-        assert_eq!(second_stats.demanded, 36);
-        assert_eq!(second_stats.executed, 25);
-        assert_eq!(second_stats.reused, 11);
-        assert_eq!(second_stats.backdated, 4);
-        assert_eq!(second_stats.changed, 21);
+        assert_eq!(second_stats.demanded, 56);
+        assert_eq!(second_stats.executed, 37);
+        assert_eq!(second_stats.reused, 19);
+        assert_eq!(second_stats.backdated, 6);
+        assert_eq!(second_stats.changed, 31);
 
         let mut isolated = CompilerSession::new();
         let isolated_project = isolated
@@ -1763,7 +2352,7 @@ mod tests {
     fn owner_input_backdates_semantics_independently_from_current_source_maps() {
         let mut session = CompilerSession::new();
         let project = session
-            .open_project(project("left: 1\nright: 2\n"))
+            .open_project(project("left: 1\nright: left\n"))
             .unwrap();
         parse_project_snapshot(session.projects.get_mut(&project).unwrap()).unwrap();
         let unit = session
@@ -1793,9 +2382,36 @@ mod tests {
         let first_root_map = session.owner_source_map(project, &root).unwrap().unwrap();
         let first_left_map = session.owner_source_map(project, &left).unwrap().unwrap();
         let first_right_map = session.owner_source_map(project, &right).unwrap().unwrap();
+        let first_left_seed = session
+            .owner_constraint_seed(project, &left)
+            .unwrap()
+            .unwrap();
+        let first_right_seed = session
+            .owner_constraint_seed(project, &right)
+            .unwrap()
+            .unwrap();
+        let first_left_summary = session
+            .owner_constraint_summary(project, &left)
+            .unwrap()
+            .unwrap();
+        let first_right_summary = session
+            .owner_constraint_summary(project, &right)
+            .unwrap()
+            .unwrap();
+        let first_topology = session.owner_interface_topology(project).unwrap().unwrap();
+        assert_eq!(first_right_summary.dependencies.len(), 1);
+        assert_eq!(first_right_summary.dependencies[0].request, right);
+        assert_eq!(first_right_summary.dependencies[0].dependency, left);
+        assert_eq!(
+            first_right_summary.dependencies[0].kind,
+            OwnerConstraintDependencyKind::ValueRead
+        );
 
         session
-            .apply_update(project, UnitUpdate::new("RUN.bn", "left: 100\nright: 2\n"))
+            .apply_update(
+                project,
+                UnitUpdate::new("RUN.bn", "left: 100\nright: left\n"),
+            )
             .unwrap();
         parse_project_snapshot(session.projects.get_mut(&project).unwrap()).unwrap();
 
@@ -1808,6 +2424,23 @@ mod tests {
         let second_root_map = session.owner_source_map(project, &root).unwrap().unwrap();
         let second_left_map = session.owner_source_map(project, &left).unwrap().unwrap();
         let second_right_map = session.owner_source_map(project, &right).unwrap().unwrap();
+        let second_left_seed = session
+            .owner_constraint_seed(project, &left)
+            .unwrap()
+            .unwrap();
+        let second_right_seed = session
+            .owner_constraint_seed(project, &right)
+            .unwrap()
+            .unwrap();
+        let second_left_summary = session
+            .owner_constraint_summary(project, &left)
+            .unwrap()
+            .unwrap();
+        let second_right_summary = session
+            .owner_constraint_summary(project, &right)
+            .unwrap()
+            .unwrap();
+        let second_topology = session.owner_interface_topology(project).unwrap().unwrap();
 
         assert!(Arc::ptr_eq(&first_root_input, &second_root_input));
         assert!(!Arc::ptr_eq(&first_left_input, &second_left_input));
@@ -1815,6 +2448,11 @@ mod tests {
         assert!(Arc::ptr_eq(&first_root_map, &second_root_map));
         assert!(!Arc::ptr_eq(&first_left_map, &second_left_map));
         assert!(!Arc::ptr_eq(&first_right_map, &second_right_map));
+        assert!(Arc::ptr_eq(&first_left_seed, &second_left_seed));
+        assert!(Arc::ptr_eq(&first_right_seed, &second_right_seed));
+        assert!(Arc::ptr_eq(&first_left_summary, &second_left_summary));
+        assert!(Arc::ptr_eq(&first_right_summary, &second_right_summary));
+        assert!(Arc::ptr_eq(&first_topology, &second_topology));
 
         let state = session.projects.get(&project).unwrap();
         assert_eq!(
@@ -1840,6 +2478,14 @@ mod tests {
                 .unwrap()
                 .changed_at,
             EvaluationRevision(1)
+        );
+        assert_eq!(
+            state
+                .owner_constraint_seed_requests
+                .memo(&state.syntax_evaluator, &left)
+                .unwrap()
+                .changed_at,
+            EvaluationRevision(0)
         );
     }
 
@@ -1890,6 +2536,7 @@ mod tests {
             original_math.link_key().module_functions,
             ["first", "second"]
         );
+        let cold_topology = session.owner_interface_topology(project).unwrap().unwrap();
         let cold_stats = session.frontend_request_stats(project).unwrap();
 
         session
@@ -1910,12 +2557,17 @@ mod tests {
         );
         assert!(!Arc::ptr_eq(&original_math, &exported_math));
         assert!(Arc::ptr_eq(&original_run, &retained_run));
+        let interface_topology = session.owner_interface_topology(project).unwrap().unwrap();
+        assert_eq!(
+            interface_topology.stats.nodes,
+            cold_topology.stats.nodes + 1
+        );
         let interface_stats = session.frontend_request_stats(project).unwrap();
-        assert_eq!(interface_stats.demanded - cold_stats.demanded, 28);
-        assert_eq!(interface_stats.executed - cold_stats.executed, 15);
-        assert_eq!(interface_stats.reused - cold_stats.reused, 13);
-        assert_eq!(interface_stats.backdated - cold_stats.backdated, 5);
-        assert_eq!(interface_stats.changed - cold_stats.changed, 10);
+        assert_eq!(interface_stats.demanded - cold_stats.demanded, 44);
+        assert_eq!(interface_stats.executed - cold_stats.executed, 26);
+        assert_eq!(interface_stats.reused - cold_stats.reused, 18);
+        assert_eq!(interface_stats.backdated - cold_stats.backdated, 12);
+        assert_eq!(interface_stats.changed - cold_stats.changed, 14);
 
         session
             .apply_update(project, UnitUpdate::new("left/Math.bn", first_body_edit))
@@ -1931,12 +2583,14 @@ mod tests {
             .unwrap();
         assert!(Arc::ptr_eq(&exported_math, &body_edit_math));
         assert!(Arc::ptr_eq(&retained_run, &body_edit_run));
+        let body_topology = session.owner_interface_topology(project).unwrap().unwrap();
+        assert!(Arc::ptr_eq(&interface_topology, &body_topology));
         let body_stats = session.frontend_request_stats(project).unwrap();
-        assert_eq!(body_stats.demanded - interface_stats.demanded, 28);
-        assert_eq!(body_stats.executed - interface_stats.executed, 9);
-        assert_eq!(body_stats.reused - interface_stats.reused, 19);
-        assert_eq!(body_stats.backdated - interface_stats.backdated, 4);
-        assert_eq!(body_stats.changed - interface_stats.changed, 5);
+        assert_eq!(body_stats.demanded - interface_stats.demanded, 44);
+        assert_eq!(body_stats.executed - interface_stats.executed, 13);
+        assert_eq!(body_stats.reused - interface_stats.reused, 31);
+        assert_eq!(body_stats.backdated - interface_stats.backdated, 6);
+        assert_eq!(body_stats.changed - interface_stats.changed, 7);
     }
 
     #[test]

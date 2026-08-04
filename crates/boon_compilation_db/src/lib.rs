@@ -1128,6 +1128,34 @@ impl SealedDenseProjectionGraph {
         self.stats
     }
 
+    /// Number of dependency-first strongly connected components.
+    pub fn component_count(&self) -> usize {
+        self.component_digests.len()
+    }
+
+    /// Dependency-first component ordinal for a registered projection.
+    ///
+    /// This ordinal is snapshot-local. Language-owned stable SCC keys must be
+    /// derived from the component's stable member identities instead.
+    pub fn component_ordinal(&self, id: ProjectionId) -> Option<usize> {
+        let node = *self.canonical_by_registered.get(id.as_usize())?;
+        self.component_by_node.get(node).copied()
+    }
+
+    /// Registered projections in one dependency-first component.
+    pub fn component_members_by_ordinal(
+        &self,
+        component: usize,
+    ) -> Option<impl Iterator<Item = ProjectionId> + '_> {
+        let start = *self.component_member_offsets.get(component)?;
+        let end = *self.component_member_offsets.get(component + 1)?;
+        Some(
+            self.component_members[start..end]
+                .iter()
+                .map(|member| ProjectionId(self.registered_by_canonical[*member] as u32)),
+        )
+    }
+
     pub fn dependencies(
         &self,
         id: ProjectionId,
@@ -1205,15 +1233,8 @@ impl SealedDenseProjectionGraph {
         &self,
         id: ProjectionId,
     ) -> Option<impl Iterator<Item = ProjectionId> + '_> {
-        let node = *self.canonical_by_registered.get(id.as_usize())?;
-        let component = self.component_by_node[node];
-        let start = self.component_member_offsets[component];
-        let end = self.component_member_offsets[component + 1];
-        Some(
-            self.component_members[start..end]
-                .iter()
-                .map(|member| ProjectionId(self.registered_by_canonical[*member] as u32)),
-        )
+        let component = self.component_ordinal(id)?;
+        self.component_members_by_ordinal(component)
     }
 }
 
@@ -1672,9 +1693,23 @@ mod tests {
     fn cycles_are_one_component_and_reverse_edges_are_exact() {
         let graph = graph(&[(1, 11), (2, 22), (3, 33)], &[(1, 2), (2, 1), (3, 1)]);
         assert_eq!(graph.sealed.stats().components, 2);
+        assert_eq!(graph.sealed.component_count(), 2);
         assert_eq!(graph.sealed.stats().cyclic_components, 1);
+        let cycle = graph.sealed.component_ordinal(graph.ids[&1]).unwrap();
+        assert_eq!(
+            cycle,
+            graph.sealed.component_ordinal(graph.ids[&2]).unwrap()
+        );
+        assert_ne!(
+            cycle,
+            graph.sealed.component_ordinal(graph.ids[&3]).unwrap()
+        );
         assert_eq!(
             graph.keys(graph.sealed.component_members(graph.ids[&1]).unwrap()),
+            vec![1, 2]
+        );
+        assert_eq!(
+            graph.keys(graph.sealed.component_members_by_ordinal(cycle).unwrap()),
             vec![1, 2]
         );
         assert_eq!(

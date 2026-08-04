@@ -16,7 +16,12 @@ use boon_parser::{
 use boon_plan::{
     ApplicationIdentity, MigrationPredecessorBinding, PlanError, ProgramRole, TargetProfile,
 };
+use boon_syntax::StableCheckOwnerKey;
 use boon_syntax::{SourceUnitId, SyntaxUnitNamespace};
+use boon_typecheck::{
+    OwnerSourceMap, OwnerSyntaxInput, project_owner_source_map, project_owner_syntax_input,
+    stable_check_owner_key_fingerprint_v1,
+};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{
@@ -181,6 +186,8 @@ struct ProjectState {
     project_module_requests: TypedRequestTable<ProjectModuleRequest>,
     unit_link_overlay_requests: TypedRequestTable<UnitLinkOverlayRequest>,
     link_requests: TypedRequestTable<LinkUnitRequest>,
+    owner_input_requests: TypedRequestTable<OwnerInputRequest>,
+    owner_source_map_requests: TypedRequestTable<OwnerSourceMapRequest>,
     checked: Option<CheckedSourceFromSource>,
     compiled: Option<(Revision, CompiledSealedMachinePlanFromSource)>,
     request_graph: Option<(
@@ -350,6 +357,44 @@ impl RequestFamily for LinkUnitRequest {
     }
 }
 
+struct OwnerInputRequest;
+
+impl RequestFamily for OwnerInputRequest {
+    type Key = StableCheckOwnerKey;
+    type Value = Arc<OwnerSyntaxInput>;
+
+    const NAME: &'static str = "boon.compiler.owner-input.v1";
+
+    fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
+        stable_check_owner_key_fingerprint_v1(key)
+    }
+
+    fn output_fingerprint(
+        value: &Self::Value,
+    ) -> Result<RequestOutputFingerprint, boon_compilation_db::CompilationDbError> {
+        Ok(RequestOutputFingerprint(value.fingerprint_v1()))
+    }
+}
+
+struct OwnerSourceMapRequest;
+
+impl RequestFamily for OwnerSourceMapRequest {
+    type Key = StableCheckOwnerKey;
+    type Value = Arc<OwnerSourceMap>;
+
+    const NAME: &'static str = "boon.compiler.owner-source-map.v1";
+
+    fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
+        stable_check_owner_key_fingerprint_v1(key)
+    }
+
+    fn output_fingerprint(
+        value: &Self::Value,
+    ) -> Result<RequestOutputFingerprint, boon_compilation_db::CompilationDbError> {
+        Ok(RequestOutputFingerprint(value.fingerprint_v1()))
+    }
+}
+
 impl CompilerSession {
     pub fn new() -> Self {
         Self::default()
@@ -374,6 +419,8 @@ impl CompilerSession {
                 project_module_requests: TypedRequestTable::new(),
                 unit_link_overlay_requests: TypedRequestTable::new(),
                 link_requests: TypedRequestTable::new(),
+                owner_input_requests: TypedRequestTable::new(),
+                owner_source_map_requests: TypedRequestTable::new(),
                 checked: None,
                 compiled: None,
                 request_graph: None,
@@ -612,6 +659,16 @@ impl CompilerSession {
             .retain(&mut state.syntax_evaluator, |key| {
                 surviving_sources.contains(key)
             })?;
+        state
+            .owner_input_requests
+            .retain(&mut state.syntax_evaluator, |key| {
+                surviving_sources.contains(key.source_unit_id())
+            })?;
+        state
+            .owner_source_map_requests
+            .retain(&mut state.syntax_evaluator, |key| {
+                surviving_sources.contains(key.source_unit_id())
+            })?;
         state.source = candidate;
         state.revision = Revision(next_revision);
         state.checked = None;
@@ -658,8 +715,8 @@ impl CompilerSession {
             .map(|(revision, graph)| (*revision, Arc::clone(graph))))
     }
 
-    /// Cumulative typed parser/link request work for this session project.
-    pub fn syntax_request_stats(
+    /// Cumulative typed frontend request work for this session project.
+    pub fn frontend_request_stats(
         &self,
         project: ProjectId,
     ) -> CompilerResult<RequestEvaluationStats> {
@@ -686,6 +743,38 @@ impl CompilerSession {
         Ok(state
             .link_requests
             .current_value(&state.syntax_evaluator, &source_unit_id)?
+            .map(Arc::clone))
+    }
+
+    /// Returns the current span-free syntax shard for one stable check owner.
+    pub fn owner_syntax_input(
+        &self,
+        project: ProjectId,
+        owner: &StableCheckOwnerKey,
+    ) -> CompilerResult<Option<Arc<OwnerSyntaxInput>>> {
+        let state = self
+            .projects
+            .get(&project)
+            .ok_or_else(|| session_error(format!("unknown compiler project {}", project.0)))?;
+        Ok(state
+            .owner_input_requests
+            .current_value(&state.syntax_evaluator, owner)?
+            .map(Arc::clone))
+    }
+
+    /// Returns current source positions for one stable check owner.
+    pub fn owner_source_map(
+        &self,
+        project: ProjectId,
+        owner: &StableCheckOwnerKey,
+    ) -> CompilerResult<Option<Arc<OwnerSourceMap>>> {
+        let state = self
+            .projects
+            .get(&project)
+            .ok_or_else(|| session_error(format!("unknown compiler project {}", project.0)))?;
+        Ok(state
+            .owner_source_map_requests
+            .current_value(&state.syntax_evaluator, owner)?
             .map(Arc::clone))
     }
 
@@ -1037,7 +1126,7 @@ fn parse_project_snapshot(
         b"boon.compiler.link-unit-input.v1\0",
         std::iter::empty(),
     ));
-    for (source_unit_id, _) in parsed_units {
+    for (source_unit_id, _) in &parsed_units {
         match state.link_requests.begin(
             &mut state.syntax_evaluator,
             source_unit_id.clone(),
@@ -1049,12 +1138,12 @@ fn parse_project_snapshot(
                     let parsed = Arc::clone(state.parse_requests.require(
                         &state.syntax_evaluator,
                         &mut ticket,
-                        &source_unit_id,
+                        source_unit_id,
                     )?);
                     let link_key = state.unit_link_overlay_requests.require(
                         &state.syntax_evaluator,
                         &mut ticket,
-                        &source_unit_id,
+                        source_unit_id,
                     )?;
                     let (linked, profile) = link_project_source_unit_profiled(
                         parsed.as_ref().clone(),
@@ -1083,16 +1172,133 @@ fn parse_project_snapshot(
         let linked = Arc::clone(
             state
                 .link_requests
-                .current_value(&state.syntax_evaluator, &source_unit_id)
+                .current_value(&state.syntax_evaluator, source_unit_id)
                 .expect("request value read occurs outside evaluation")
                 .expect("link request publishes current linked unit syntax"),
         );
         linked_units.push(linked);
     }
 
+    evaluate_owner_requests(state, &linked_units)?;
+
     let project =
         ProjectSyntaxSnapshot::from_unit_snapshots(&state.source.entrypoint, linked_units)?;
     Ok((project, work, started.elapsed().as_secs_f64() * 1_000.0))
+}
+
+fn evaluate_owner_requests(
+    state: &mut ProjectState,
+    linked_units: &[Arc<UnitSyntaxSnapshot>],
+) -> CompilerResult<()> {
+    let mut owners = Vec::new();
+    let mut live_owners = BTreeSet::new();
+    for unit in linked_units {
+        for owner in unit.stable_check_owner_keys() {
+            if !live_owners.insert(owner.clone()) {
+                return Err(session_error(format!(
+                    "compiler project has duplicate stable check owner {owner:?}"
+                )));
+            }
+            owners.push(owner);
+        }
+    }
+    state
+        .owner_input_requests
+        .retain(&mut state.syntax_evaluator, |owner| {
+            live_owners.contains(owner)
+        })?;
+    state
+        .owner_source_map_requests
+        .retain(&mut state.syntax_evaluator, |owner| {
+            live_owners.contains(owner)
+        })?;
+
+    let owner_input = RequestInputFingerprint(request_fingerprint(
+        b"boon.compiler.owner-input-dependencies.v1\0",
+        std::iter::empty(),
+    ));
+    let source_map_input = RequestInputFingerprint(request_fingerprint(
+        b"boon.compiler.owner-source-map-dependencies.v1\0",
+        std::iter::empty(),
+    ));
+    for owner in owners {
+        match state.owner_source_map_requests.begin(
+            &mut state.syntax_evaluator,
+            owner.clone(),
+            source_map_input,
+        )? {
+            RequestStart::Reused => {}
+            RequestStart::Execute(mut ticket) => {
+                let source_map = (|| -> CompilerResult<_> {
+                    let parsed = state.parse_requests.require(
+                        &state.syntax_evaluator,
+                        &mut ticket,
+                        owner.source_unit_id(),
+                    )?;
+                    let view = parsed.owner_view_for_key(&owner).ok_or_else(|| {
+                        session_error(format!(
+                            "parsed source has no current owner view for {owner:?}"
+                        ))
+                    })?;
+                    Ok(Arc::new(project_owner_source_map(view)?))
+                })();
+                let source_map = match source_map {
+                    Ok(source_map) => source_map,
+                    Err(error) => {
+                        state.owner_source_map_requests.abort(
+                            &mut state.syntax_evaluator,
+                            ticket,
+                            RequestAbortReason::Failed,
+                        )?;
+                        return Err(error);
+                    }
+                };
+                state.owner_source_map_requests.publish(
+                    &mut state.syntax_evaluator,
+                    ticket,
+                    source_map,
+                )?;
+            }
+        }
+
+        match state.owner_input_requests.begin(
+            &mut state.syntax_evaluator,
+            owner.clone(),
+            owner_input,
+        )? {
+            RequestStart::Reused => {}
+            RequestStart::Execute(mut ticket) => {
+                let input = (|| -> CompilerResult<_> {
+                    let linked = state.link_requests.require(
+                        &state.syntax_evaluator,
+                        &mut ticket,
+                        owner.source_unit_id(),
+                    )?;
+                    let view = linked.owner_view_for_key(&owner).ok_or_else(|| {
+                        session_error(format!(
+                            "linked source has no current owner view for {owner:?}"
+                        ))
+                    })?;
+                    Ok(Arc::new(project_owner_syntax_input(view)?))
+                })();
+                let input = match input {
+                    Ok(input) => input,
+                    Err(error) => {
+                        state.owner_input_requests.abort(
+                            &mut state.syntax_evaluator,
+                            ticket,
+                            RequestAbortReason::Failed,
+                        )?;
+                        return Err(error);
+                    }
+                };
+                state
+                    .owner_input_requests
+                    .publish(&mut state.syntax_evaluator, ticket, input)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn source_unit_request_fingerprint(path: &str, source: &str) -> RequestFingerprint {
@@ -1466,11 +1672,11 @@ mod tests {
             assert_eq!(first.profile.parse_work.source_units_reused, 0);
             assert_eq!(first.profile.parse_work.nodes_rebased, 0);
         }
-        let first_stats = session.syntax_request_stats(project).unwrap();
-        assert_eq!(first_stats.demanded, 10);
-        assert_eq!(first_stats.executed, 10);
+        let first_stats = session.frontend_request_stats(project).unwrap();
+        assert_eq!(first_stats.demanded, 18);
+        assert_eq!(first_stats.executed, 18);
         assert_eq!(first_stats.reused, 0);
-        assert_eq!(first_stats.changed, 10);
+        assert_eq!(first_stats.changed, 18);
         let retained_a = session
             .unit_syntax_snapshot(project, "A.bn")
             .unwrap()
@@ -1505,12 +1711,12 @@ mod tests {
             assert_eq!(second.profile.parse_work.nodes_rebased, 0);
             second.profile.parse_work
         };
-        let second_stats = session.syntax_request_stats(project).unwrap();
-        assert_eq!(second_stats.demanded, 20);
-        assert_eq!(second_stats.executed, 13);
-        assert_eq!(second_stats.reused, 7);
-        assert_eq!(second_stats.backdated, 1);
-        assert_eq!(second_stats.changed, 12);
+        let second_stats = session.frontend_request_stats(project).unwrap();
+        assert_eq!(second_stats.demanded, 36);
+        assert_eq!(second_stats.executed, 25);
+        assert_eq!(second_stats.reused, 11);
+        assert_eq!(second_stats.backdated, 4);
+        assert_eq!(second_stats.changed, 21);
 
         let mut isolated = CompilerSession::new();
         let isolated_project = isolated
@@ -1551,6 +1757,90 @@ mod tests {
             .unwrap();
         assert!(Arc::ptr_eq(&retained_a, &current_a));
         assert!(!Arc::ptr_eq(&replaced_run, &current_run));
+    }
+
+    #[test]
+    fn owner_input_backdates_semantics_independently_from_current_source_maps() {
+        let mut session = CompilerSession::new();
+        let project = session
+            .open_project(project("left: 1\nright: 2\n"))
+            .unwrap();
+        parse_project_snapshot(session.projects.get_mut(&project).unwrap()).unwrap();
+        let unit = session
+            .unit_syntax_snapshot(project, "RUN.bn")
+            .unwrap()
+            .unwrap();
+        let owner_named = |name: &str| {
+            unit.stable_check_owner_keys()
+                .find(|owner| {
+                    matches!(
+                        owner,
+                        StableCheckOwnerKey::Item(owner)
+                            if owner.item_route.segments().last().is_some_and(|segment| segment.names == [name])
+                    )
+                })
+                .unwrap()
+        };
+        let root = StableCheckOwnerKey::UnitRoot(SourceUnitId::from_path("RUN.bn").unwrap());
+        let left = owner_named("left");
+        let right = owner_named("right");
+        let first_root_input = session.owner_syntax_input(project, &root).unwrap().unwrap();
+        let first_left_input = session.owner_syntax_input(project, &left).unwrap().unwrap();
+        let first_right_input = session
+            .owner_syntax_input(project, &right)
+            .unwrap()
+            .unwrap();
+        let first_root_map = session.owner_source_map(project, &root).unwrap().unwrap();
+        let first_left_map = session.owner_source_map(project, &left).unwrap().unwrap();
+        let first_right_map = session.owner_source_map(project, &right).unwrap().unwrap();
+
+        session
+            .apply_update(project, UnitUpdate::new("RUN.bn", "left: 100\nright: 2\n"))
+            .unwrap();
+        parse_project_snapshot(session.projects.get_mut(&project).unwrap()).unwrap();
+
+        let second_root_input = session.owner_syntax_input(project, &root).unwrap().unwrap();
+        let second_left_input = session.owner_syntax_input(project, &left).unwrap().unwrap();
+        let second_right_input = session
+            .owner_syntax_input(project, &right)
+            .unwrap()
+            .unwrap();
+        let second_root_map = session.owner_source_map(project, &root).unwrap().unwrap();
+        let second_left_map = session.owner_source_map(project, &left).unwrap().unwrap();
+        let second_right_map = session.owner_source_map(project, &right).unwrap().unwrap();
+
+        assert!(Arc::ptr_eq(&first_root_input, &second_root_input));
+        assert!(!Arc::ptr_eq(&first_left_input, &second_left_input));
+        assert!(Arc::ptr_eq(&first_right_input, &second_right_input));
+        assert!(Arc::ptr_eq(&first_root_map, &second_root_map));
+        assert!(!Arc::ptr_eq(&first_left_map, &second_left_map));
+        assert!(!Arc::ptr_eq(&first_right_map, &second_right_map));
+
+        let state = session.projects.get(&project).unwrap();
+        assert_eq!(
+            state
+                .owner_input_requests
+                .memo(&state.syntax_evaluator, &left)
+                .unwrap()
+                .changed_at,
+            EvaluationRevision(1)
+        );
+        assert_eq!(
+            state
+                .owner_input_requests
+                .memo(&state.syntax_evaluator, &right)
+                .unwrap()
+                .changed_at,
+            EvaluationRevision(0)
+        );
+        assert_eq!(
+            state
+                .owner_source_map_requests
+                .memo(&state.syntax_evaluator, &right)
+                .unwrap()
+                .changed_at,
+            EvaluationRevision(1)
+        );
     }
 
     #[test]
@@ -1600,7 +1890,7 @@ mod tests {
             original_math.link_key().module_functions,
             ["first", "second"]
         );
-        let cold_stats = session.syntax_request_stats(project).unwrap();
+        let cold_stats = session.frontend_request_stats(project).unwrap();
 
         session
             .apply_update(project, UnitUpdate::new("left/Math.bn", first_with_export))
@@ -1620,11 +1910,12 @@ mod tests {
         );
         assert!(!Arc::ptr_eq(&original_math, &exported_math));
         assert!(Arc::ptr_eq(&original_run, &retained_run));
-        let interface_stats = session.syntax_request_stats(project).unwrap();
-        assert_eq!(interface_stats.demanded - cold_stats.demanded, 14);
-        assert_eq!(interface_stats.executed - cold_stats.executed, 7);
-        assert_eq!(interface_stats.reused - cold_stats.reused, 7);
-        assert_eq!(interface_stats.changed - cold_stats.changed, 7);
+        let interface_stats = session.frontend_request_stats(project).unwrap();
+        assert_eq!(interface_stats.demanded - cold_stats.demanded, 28);
+        assert_eq!(interface_stats.executed - cold_stats.executed, 15);
+        assert_eq!(interface_stats.reused - cold_stats.reused, 13);
+        assert_eq!(interface_stats.backdated - cold_stats.backdated, 5);
+        assert_eq!(interface_stats.changed - cold_stats.changed, 10);
 
         session
             .apply_update(project, UnitUpdate::new("left/Math.bn", first_body_edit))
@@ -1640,12 +1931,12 @@ mod tests {
             .unwrap();
         assert!(Arc::ptr_eq(&exported_math, &body_edit_math));
         assert!(Arc::ptr_eq(&retained_run, &body_edit_run));
-        let body_stats = session.syntax_request_stats(project).unwrap();
-        assert_eq!(body_stats.demanded - interface_stats.demanded, 14);
-        assert_eq!(body_stats.executed - interface_stats.executed, 3);
-        assert_eq!(body_stats.reused - interface_stats.reused, 11);
-        assert_eq!(body_stats.backdated - interface_stats.backdated, 1);
-        assert_eq!(body_stats.changed - interface_stats.changed, 2);
+        let body_stats = session.frontend_request_stats(project).unwrap();
+        assert_eq!(body_stats.demanded - interface_stats.demanded, 28);
+        assert_eq!(body_stats.executed - interface_stats.executed, 9);
+        assert_eq!(body_stats.reused - interface_stats.reused, 19);
+        assert_eq!(body_stats.backdated - interface_stats.backdated, 4);
+        assert_eq!(body_stats.changed - interface_stats.changed, 5);
     }
 
     #[test]

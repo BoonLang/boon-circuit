@@ -13,11 +13,10 @@ boon_document_model.workspace = true
 boon_effect_schema.workspace = true
 boon_parser.workspace = true
 boon_syntax.workspace = true
+serde_json.workspace = true
 serde.workspace = true
+sha2.workspace = true
 smallvec.workspace = true
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 web-time.workspace = true
-
-[dev-dependencies]
-serde_json.workspace = true

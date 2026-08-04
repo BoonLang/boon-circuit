@@ -1,4 +1,7 @@
 use boon_checked::*;
+mod owner_syntax;
+pub use owner_syntax::*;
+
 use boon_contract::SourceBundleDigestV1;
 use boon_data::{
     Bits, ExactNumber, ExactRoundingRule, MAX_BITS_WIDTH, MAX_NUMBER_TEXT_DIGITS,

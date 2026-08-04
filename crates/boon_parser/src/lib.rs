@@ -206,7 +206,23 @@ impl ParsedSourceUnit {
         Some(UnitOwnerSyntaxView {
             fields: &self.fields,
             entry: self.owner_index.entry(route)?,
+            namespace: None,
         })
+    }
+
+    pub fn owner_view_for_key(
+        &self,
+        owner: &StableCheckOwnerKey,
+    ) -> Option<UnitOwnerSyntaxView<'_>> {
+        if owner.source_unit_id() != &self.source_unit_id {
+            return None;
+        }
+        match owner {
+            StableCheckOwnerKey::UnitRoot(_) => self.owner_view(&UnitOwnerRoute::UnitRoot),
+            StableCheckOwnerKey::Item(owner) => {
+                self.owner_view(&UnitOwnerRoute::Item(owner.item_route.clone()))
+            }
+        }
     }
 
     pub fn stable_check_owner_for_local_statement(
@@ -330,11 +346,16 @@ fn unit_statement_by_local_id<'a>(
 pub struct UnitOwnerSyntaxView<'a> {
     fields: &'a ParsedSourceUnitFields,
     entry: &'a UnitOwnerIndexEntry,
+    namespace: Option<SyntaxUnitNamespace>,
 }
 
 impl<'a> UnitOwnerSyntaxView<'a> {
     pub fn source_unit_id(&self) -> &'a SourceUnitId {
         &self.fields.source_unit_id
+    }
+
+    pub fn path(&self) -> &'a str {
+        &self.fields.path
     }
 
     pub fn route(&self) -> &'a UnitOwnerRoute {
@@ -362,6 +383,64 @@ impl<'a> UnitOwnerSyntaxView<'a> {
 
     pub fn expression_ids(&self) -> &'a [UnitLocalExpressionId] {
         &self.entry.expressions
+    }
+
+    pub fn statement_locator(
+        &self,
+        statement: UnitLocalStatementId,
+    ) -> Option<UnitStatementLocator> {
+        self.fields.owner_index.statement_locator(statement)
+    }
+
+    pub fn stable_expression_key_local(
+        &self,
+        expression: UnitLocalExpressionId,
+    ) -> Option<StableExpressionKey> {
+        Some(StableExpressionKey {
+            source_unit_id: self.fields.source_unit_id.clone(),
+            route_digest_v1: *self
+                .fields
+                .expression_route_digests_v1
+                .get(expression.as_usize())?
+                .as_ref()?,
+        })
+    }
+
+    /// Returns the stable identity for any expression in this source unit.
+    ///
+    /// Owner projections use this only for explicit references that cross a
+    /// child-owner boundary. The returned identity never exposes the unit-
+    /// local arena id as semantic input.
+    pub fn stable_expression_key_for_syntax(
+        &self,
+        expression_id: usize,
+    ) -> Option<StableExpressionKey> {
+        let expression = self.local_expression_id(expression_id)?;
+        self.stable_expression_key_local(expression)
+    }
+
+    /// Returns the stable check owner for any expression in this source unit.
+    pub fn stable_check_owner_for_syntax_expression(
+        &self,
+        expression_id: usize,
+    ) -> Option<StableCheckOwnerKey> {
+        let expression = self.local_expression_id(expression_id)?;
+        stable_check_owner_key_for_slot(
+            &self.fields.source_unit_id,
+            &self.fields.item_index,
+            self.fields.owner_index.expression_owner(expression)?,
+        )
+    }
+
+    fn local_expression_id(&self, expression_id: usize) -> Option<UnitLocalExpressionId> {
+        let local = match self.namespace {
+            Some(expected) => {
+                let (namespace, local) = __parser_unpack_syntax_node_id(expression_id)?;
+                (namespace == expected).then_some(local)?
+            }
+            None => expression_id,
+        };
+        UnitLocalExpressionId::__parser_new(local)
     }
 
     pub fn statements(&self) -> impl Iterator<Item = &'a AstStatement> + 'a {
@@ -779,7 +858,23 @@ impl UnitSyntaxSnapshot {
         Some(UnitOwnerSyntaxView {
             fields: &self.fields,
             entry: self.owner_index.entry(route)?,
+            namespace: Some(self.namespace),
         })
+    }
+
+    pub fn owner_view_for_key(
+        &self,
+        owner: &StableCheckOwnerKey,
+    ) -> Option<UnitOwnerSyntaxView<'_>> {
+        if owner.source_unit_id() != &self.source_unit_id {
+            return None;
+        }
+        match owner {
+            StableCheckOwnerKey::UnitRoot(_) => self.owner_view(&UnitOwnerRoute::UnitRoot),
+            StableCheckOwnerKey::Item(owner) => {
+                self.owner_view(&UnitOwnerRoute::Item(owner.item_route.clone()))
+            }
+        }
     }
 
     pub fn stable_check_owner_for_statement(

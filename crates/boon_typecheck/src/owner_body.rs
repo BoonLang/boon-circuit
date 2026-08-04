@@ -2895,7 +2895,10 @@ pub fn infer_owner_body<'a>(
         let interface = interfaces[&resolved.owner];
         let mut variables = BTreeMap::new();
         let ty = instantiate_type(&interface.result.ty, &mut unifier, &mut variables);
-        unifier.bind_var(expressions[index], ty);
+        let result = unifier.fresh();
+        unifier.bind_var(result, ty);
+        let result = bind_projection(&mut unifier, result, &resolved.projection);
+        unifier.unify(Type::Var(expressions[index]), Type::Var(result));
         modes[index] = flow_mode_join(modes[index], Some(interface.result.mode));
         direct_effects[index] = merge_effects(direct_effects[index], interface.effect);
         work.interface_imports = work.interface_imports.saturating_add(1);
@@ -3313,6 +3316,7 @@ mod tests {
             [ResolvedOwnerSymbolReference {
                 reference: callable_reference,
                 owner: zed.clone(),
+                projection: Box::new([]),
                 parameters,
             }],
         )
@@ -3360,6 +3364,7 @@ mod tests {
             [ResolvedOwnerSymbolReference {
                 reference,
                 owner: identity,
+                projection: Box::new([]),
                 parameters,
             }],
         )
@@ -3427,6 +3432,7 @@ mod tests {
             [ResolvedOwnerSymbolReference {
                 reference,
                 owner: choose.clone(),
+                projection: Box::new([]),
                 parameters,
             }],
         )
@@ -3500,6 +3506,7 @@ mod tests {
             [ResolvedOwnerSymbolReference {
                 reference,
                 owner: leaf,
+                projection: Box::new([]),
                 parameters: Box::new([]),
             }],
         )
@@ -3592,6 +3599,7 @@ mod tests {
             [ResolvedOwnerSymbolReference {
                 reference: inherited_reference,
                 owner: leaf,
+                projection: Box::new([]),
                 parameters: Box::new([]),
             }],
         )
@@ -3601,6 +3609,7 @@ mod tests {
             [ResolvedOwnerSymbolReference {
                 reference: value_reference,
                 owner: inherited,
+                projection: Box::new([]),
                 parameters: Box::new([]),
             }],
         )
@@ -3662,11 +3671,13 @@ mod tests {
                     Some("rows") => Some(ResolvedOwnerSymbolReference {
                         reference: reference.clone(),
                         owner: rows.clone(),
+                        projection: Box::new([]),
                         parameters: Box::new([]),
                     }),
                     Some("sorted") => Some(ResolvedOwnerSymbolReference {
                         reference: reference.clone(),
                         owner: sorted.clone(),
+                        projection: Box::new([]),
                         parameters: sorted_parameters.clone(),
                     }),
                     _ => None,
@@ -3758,6 +3769,7 @@ mod tests {
             [ResolvedOwnerSymbolReference {
                 reference,
                 owner: take,
+                projection: Box::new([]),
                 parameters,
             }],
         )

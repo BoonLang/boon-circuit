@@ -71,6 +71,16 @@ pub struct OwnerChildInput {
     pub child_index: u32,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum OwnerContainingScopeInput {
+    ProjectRoot,
+    OwnerStatement {
+        owner: StableCheckOwnerKey,
+        statement: StableStatementKey,
+    },
+}
+
 /// Span-free, owner-bounded syntax consumed by future interface/body requests.
 ///
 /// Expression references use one compact namespace: local expressions come
@@ -80,6 +90,7 @@ pub struct OwnerChildInput {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OwnerSyntaxInput {
     pub owner: StableCheckOwnerKey,
+    pub containing_scope: OwnerContainingScopeInput,
     pub statements: Box<[OwnerStatementInput]>,
     pub expressions: Box<[OwnerExpressionInput]>,
     pub external_expressions: Box<[OwnerExternalExpressionInput]>,
@@ -529,6 +540,47 @@ pub fn project_owner_syntax_input(
     view: UnitOwnerSyntaxView<'_>,
 ) -> Result<OwnerSyntaxInput, OwnerSyntaxProjectionError> {
     let owner = view.stable_key();
+    let containing_scope = match &owner {
+        StableCheckOwnerKey::UnitRoot(_) => OwnerContainingScopeInput::ProjectRoot,
+        StableCheckOwnerKey::Item(_) => {
+            let root = *view.statement_ids().first().ok_or_else(|| {
+                OwnerSyntaxProjectionError::new(format!(
+                    "item owner {owner:?} has no root statement"
+                ))
+            })?;
+            let parent = view
+                .statement_locator(root)
+                .ok_or_else(|| {
+                    OwnerSyntaxProjectionError::new(format!(
+                        "item owner {owner:?} has no root statement locator"
+                    ))
+                })?
+                .parent();
+            match parent {
+                None => OwnerContainingScopeInput::ProjectRoot,
+                Some(parent) => {
+                    let statement = view.stable_statement_key_local(parent).ok_or_else(|| {
+                        OwnerSyntaxProjectionError::new(format!(
+                            "item owner {owner:?} has no stable containing statement"
+                        ))
+                    })?;
+                    let parent_owner = statement.route.owner.clone().map_or_else(
+                        || StableCheckOwnerKey::UnitRoot(owner.source_unit_id().clone()),
+                        |item_route| {
+                            StableCheckOwnerKey::Item(StableOwnerKey {
+                                source_unit_id: owner.source_unit_id().clone(),
+                                item_route,
+                            })
+                        },
+                    );
+                    OwnerContainingScopeInput::OwnerStatement {
+                        owner: parent_owner,
+                        statement,
+                    }
+                }
+            }
+        }
+    };
     let mut statement_by_local = BTreeMap::<UnitLocalStatementId, u32>::new();
     let mut statement_by_syntax = BTreeMap::<usize, u32>::new();
     for (dense, (local, statement)) in view
@@ -655,6 +707,7 @@ pub fn project_owner_syntax_input(
         OWNER_SYNTAX_FINGERPRINT_DOMAIN_V1,
         &(
             &owner,
+            &containing_scope,
             &statements,
             &expressions,
             &external_expressions,
@@ -663,6 +716,7 @@ pub fn project_owner_syntax_input(
     )?;
     Ok(OwnerSyntaxInput {
         owner,
+        containing_scope,
         statements: statements.into_boxed_slice(),
         expressions: expressions.into_boxed_slice(),
         external_expressions: external_expressions.into_boxed_slice(),

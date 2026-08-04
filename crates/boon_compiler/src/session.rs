@@ -507,8 +507,13 @@ struct ProjectOwnerSymbolIndex {
 }
 
 enum ProjectOwnerSymbolLookup {
-    Resolved(OwnerSymbolCandidate),
-    Ambiguous(Box<[OwnerSymbolCandidate]>),
+    Resolved {
+        candidate: OwnerSymbolCandidate,
+        projection: Box<[String]>,
+    },
+    Ambiguous {
+        candidates: Box<[OwnerSymbolCandidate]>,
+    },
     Unresolved,
 }
 
@@ -536,22 +541,38 @@ impl ProjectOwnerSymbolIndex {
         }
         paths.push(reference.parts.to_vec());
         for parts in paths {
-            let Some(candidates) = self.symbols.get(&OwnerSymbolKey { namespace, parts }) else {
-                continue;
-            };
-            let Some(best) = candidates.first().map(|candidate| candidate.priority) else {
-                continue;
-            };
-            let best_candidates = candidates
-                .iter()
-                .take_while(|candidate| candidate.priority == best)
-                .cloned()
-                .collect::<Vec<_>>();
-            return if let [candidate] = best_candidates.as_slice() {
-                ProjectOwnerSymbolLookup::Resolved(candidate.clone())
+            let minimum_prefix = if namespace == OwnerSymbolNamespace::Value {
+                1
             } else {
-                ProjectOwnerSymbolLookup::Ambiguous(best_candidates.into_boxed_slice())
+                parts.len()
             };
+            for prefix_len in (minimum_prefix..=parts.len()).rev() {
+                let Some(candidates) = self.symbols.get(&OwnerSymbolKey {
+                    namespace,
+                    parts: parts[..prefix_len].to_vec(),
+                }) else {
+                    continue;
+                };
+                let Some(best) = candidates.first().map(|candidate| candidate.priority) else {
+                    continue;
+                };
+                let best_candidates = candidates
+                    .iter()
+                    .take_while(|candidate| candidate.priority == best)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let projection = parts[prefix_len..].to_vec().into_boxed_slice();
+                return if let [candidate] = best_candidates.as_slice() {
+                    ProjectOwnerSymbolLookup::Resolved {
+                        candidate: candidate.clone(),
+                        projection,
+                    }
+                } else {
+                    ProjectOwnerSymbolLookup::Ambiguous {
+                        candidates: best_candidates.into_boxed_slice(),
+                    }
+                };
+            }
         }
         ProjectOwnerSymbolLookup::Unresolved
     }
@@ -2141,14 +2162,16 @@ fn evaluate_owner_constraint_requests(
                     )?);
                     let resolutions = seed.references.iter().map(|reference| {
                         match symbols.resolve(owner, reference) {
-                            ProjectOwnerSymbolLookup::Resolved(candidate) => {
-                                OwnerSymbolResolution::Resolved {
-                                    reference: reference.clone(),
-                                    owner: candidate.owner,
-                                    parameters: candidate.parameters,
-                                }
-                            }
-                            ProjectOwnerSymbolLookup::Ambiguous(candidates) => {
+                            ProjectOwnerSymbolLookup::Resolved {
+                                candidate,
+                                projection,
+                            } => OwnerSymbolResolution::Resolved {
+                                reference: reference.clone(),
+                                owner: candidate.owner,
+                                projection,
+                                parameters: candidate.parameters,
+                            },
+                            ProjectOwnerSymbolLookup::Ambiguous { candidates } => {
                                 OwnerSymbolResolution::Ambiguous {
                                     reference: reference.clone(),
                                     candidates: candidates
@@ -3224,6 +3247,44 @@ mod tests {
                 .unwrap()
                 .changed_at,
             EvaluationRevision(0)
+        );
+    }
+
+    #[test]
+    fn owner_value_resolution_keeps_the_longest_prefix_projection() {
+        let mut session = CompilerSession::new();
+        let project = session
+            .open_project(project("record: [value: 1]\nselected: record.value\n"))
+            .unwrap();
+        parse_project_snapshot(session.projects.get_mut(&project).unwrap()).unwrap();
+        let unit = session
+            .unit_syntax_snapshot(project, "RUN.bn")
+            .unwrap()
+            .unwrap();
+        let selected = unit
+            .stable_check_owner_keys()
+            .find(|owner| {
+                matches!(
+                    owner,
+                    StableCheckOwnerKey::Item(owner)
+                        if owner.item_route.segments().last().is_some_and(|segment| segment.names == ["selected"])
+                )
+            })
+            .unwrap();
+        let summary = session
+            .owner_constraint_summary(project, &selected)
+            .unwrap()
+            .unwrap();
+        let resolved = summary.resolved_references.first().unwrap();
+        assert_eq!(resolved.projection.as_ref(), ["value"]);
+
+        let body = session
+            .owner_body_inference(project, &selected)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            body.expressions.last().unwrap().flow_type.ty,
+            boon_checked::Type::Number
         );
     }
 

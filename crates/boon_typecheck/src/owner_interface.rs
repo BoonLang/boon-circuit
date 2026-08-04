@@ -1806,11 +1806,15 @@ pub fn solve_owner_interface_scc<'a>(
                 continue;
             };
             if let Some(result) = internal_results.get(&resolved.owner) {
-                unifier.unify(Type::Var(expression), Type::Var(*result));
+                let result = bind_projection(&mut unifier, *result, &resolved.projection);
+                unifier.unify(Type::Var(expression), Type::Var(result));
             } else if let Some(interface) = dependency_interfaces.get(&resolved.owner) {
                 let mut variables = BTreeMap::new();
                 let ty = instantiate_type(&interface.result.ty, &mut unifier, &mut variables);
-                unifier.bind_var(expression, ty);
+                let result = unifier.fresh();
+                unifier.bind_var(result, ty);
+                let result = bind_projection(&mut unifier, result, &resolved.projection);
+                unifier.unify(Type::Var(expression), Type::Var(result));
             }
             work.cross_owner_constraints = work.cross_owner_constraints.saturating_add(1);
         }
@@ -2502,6 +2506,7 @@ mod tests {
             [ResolvedOwnerSymbolReference {
                 reference,
                 owner: left.clone(),
+                projection: Box::new([]),
                 parameters: Box::new([]),
             }],
         )
@@ -2548,6 +2553,7 @@ mod tests {
             [ResolvedOwnerSymbolReference {
                 reference: callable_reference,
                 owner: zed.clone(),
+                projection: Box::new([]),
                 parameters,
             }],
         )
@@ -2641,6 +2647,7 @@ mod tests {
             [ResolvedOwnerSymbolReference {
                 reference,
                 owner: leaf.clone(),
+                projection: Box::new([]),
                 parameters: Box::new([]),
             }],
         )

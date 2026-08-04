@@ -124,6 +124,13 @@ pub struct OwnerAbiDeclarationKey {
     pub external_identity: Option<CheckedExternalDeclarationIdentityV1>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum OwnerAbiMemberRef {
+    Declaration,
+    Parameter { ordinal: u32 },
+}
+
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum OwnerDeclarationRef {
@@ -137,6 +144,7 @@ pub enum OwnerDeclarationRef {
     Abi {
         canonical_name: String,
         declaration: OwnerAbiDeclarationKey,
+        member: OwnerAbiMemberRef,
     },
 }
 
@@ -206,7 +214,7 @@ pub struct OwnerScopeRow {
 pub struct OwnerDeclarationRow {
     pub id: OwnerDeclarationId,
     pub stable_key: OwnerDeclarationStableKey,
-    pub scope_id: OwnerScopeId,
+    pub scope: OwnerScopeRef,
     pub name: String,
     pub kind: crate::CheckedDeclarationKind,
     pub flow_type: FlowType,
@@ -385,7 +393,7 @@ pub enum OwnerExpressionKind {
 pub struct OwnerExpressionRow {
     pub id: OwnerExpressionId,
     pub stable_key: StableExpressionKey,
-    pub scope_id: OwnerScopeId,
+    pub scope: OwnerScopeRef,
     pub declaration: Option<OwnerDeclarationId>,
     pub flow_type: FlowType,
     pub flush_type: Option<Type>,
@@ -440,7 +448,7 @@ pub enum OwnerResourceBinding {
 pub struct OwnerStatementRow {
     pub id: OwnerStatementId,
     pub stable_key: StableStatementKey,
-    pub scope_id: OwnerScopeId,
+    pub scope: OwnerScopeRef,
     pub kind: OwnerStatementKind,
     pub resources: Vec<OwnerResourceBinding>,
     pub value: Option<OwnerExpressionRef>,
@@ -487,7 +495,7 @@ pub struct OwnerContextFormalRow {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct OwnerCallableRow {
     pub declaration: OwnerDeclarationId,
-    pub scope_id: OwnerScopeId,
+    pub scope: OwnerScopeRef,
     pub kind: CheckedCallableKind,
     pub name: String,
     pub intrinsic: Option<CheckedIntrinsicV1>,
@@ -667,7 +675,7 @@ pub struct OwnerSourceRow {
     pub declaration: OwnerDeclarationId,
     pub statement: OwnerStatementId,
     pub expression: OwnerExpressionId,
-    pub owner_scope: OwnerScopeId,
+    pub owner_scope: OwnerScopeRef,
     pub path: OwnerSemanticPath,
     pub interval_ms: Option<u64>,
     pub payload_type: Type,
@@ -681,7 +689,7 @@ pub struct OwnerStateRow {
     pub statement: OwnerStatementId,
     pub expression: OwnerExpressionId,
     pub initial: OwnerExpressionRef,
-    pub owner_scope: OwnerScopeId,
+    pub owner_scope: OwnerScopeRef,
     pub path: OwnerSemanticPath,
     pub kind: CheckedStateKind,
     pub flow_type: FlowType,
@@ -694,7 +702,7 @@ pub struct OwnerListRow {
     pub declaration: OwnerDeclarationId,
     pub statement: OwnerStatementId,
     pub producer: OwnerExpressionId,
-    pub owner_scope: OwnerScopeId,
+    pub owner_scope: OwnerScopeRef,
     pub path: OwnerSemanticPath,
     pub item_type: Type,
     pub capacity: Option<usize>,
@@ -753,6 +761,7 @@ pub enum OwnerRelocationTarget {
     AbiDeclaration {
         canonical_name: String,
         declaration: OwnerAbiDeclarationKey,
+        member: OwnerAbiMemberRef,
     },
     ProjectRootScope,
 }

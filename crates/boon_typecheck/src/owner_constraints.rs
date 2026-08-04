@@ -329,6 +329,13 @@ impl From<&OwnerConstraintDependency> for OwnerInterfaceTopologyEdge {
 pub struct ResolvedOwnerSymbolReference {
     pub reference: OwnerSymbolReference,
     pub owner: StableCheckOwnerKey,
+    /// Path suffix selected below the stable owner declaration.
+    ///
+    /// Project symbol lookup resolves the longest declaration prefix and
+    /// retains the remaining fields here.  Treating an object-field read as
+    /// the complete owner value would give owner-local inference a wider and
+    /// sometimes entirely different type.
+    pub projection: Box<[String]>,
     pub parameters: Box<[OwnerParameterConstraint]>,
 }
 
@@ -350,6 +357,7 @@ pub enum OwnerSymbolResolution {
     Resolved {
         reference: OwnerSymbolReference,
         owner: StableCheckOwnerKey,
+        projection: Box<[String]>,
         parameters: Box<[OwnerParameterConstraint]>,
     },
     Authoritative {
@@ -379,10 +387,12 @@ impl OwnerSymbolResolution {
             Self::Resolved {
                 reference,
                 owner,
+                projection,
                 parameters,
             } => Some(ResolvedOwnerSymbolReference {
                 reference: reference.clone(),
                 owner: owner.clone(),
+                projection: projection.clone(),
                 parameters: parameters.clone(),
             }),
             Self::Authoritative { .. } | Self::Unresolved { .. } | Self::Ambiguous { .. } => None,
@@ -395,6 +405,7 @@ impl From<ResolvedOwnerSymbolReference> for OwnerSymbolResolution {
         Self::Resolved {
             reference: resolved.reference,
             owner: resolved.owner,
+            projection: resolved.projection,
             parameters: resolved.parameters,
         }
     }
@@ -679,6 +690,7 @@ fn append_callable_interface_dependencies(
     let ResolvedOwnerSymbolReference {
         reference,
         owner: callable,
+        projection: _,
         parameters,
     } = resolved;
     let expression = seed
@@ -1707,6 +1719,7 @@ mod tests {
             [ResolvedOwnerSymbolReference {
                 reference,
                 owner: callable.clone(),
+                projection: Box::new([]),
                 parameters,
             }],
         )

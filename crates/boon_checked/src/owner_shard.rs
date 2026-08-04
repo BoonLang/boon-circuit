@@ -146,6 +146,9 @@ pub enum OwnerDeclarationRef {
         declaration: OwnerAbiDeclarationKey,
         member: OwnerAbiMemberRef,
     },
+    ScopeOwner {
+        scope: OwnerScopeRef,
+    },
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -184,6 +187,7 @@ pub enum OwnerExpressionRef {
 pub struct OwnerSourceStableKey {
     pub owner: StableCheckOwnerKey,
     pub statement: StableStatementKey,
+    pub expression: StableExpressionKey,
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -243,6 +247,21 @@ pub enum OwnerSourceSite {
     CallPass {
         expression: StableExpressionKey,
     },
+    PipeArgument {
+        expression: StableExpressionKey,
+        ordinal: u32,
+    },
+    PipePass {
+        expression: StableExpressionKey,
+    },
+    RecordField {
+        expression: StableExpressionKey,
+        ordinal: u32,
+    },
+    BlockBinding {
+        expression: StableExpressionKey,
+        ordinal: u32,
+    },
     PatternBinding {
         expression: StableExpressionKey,
         ordinal: u32,
@@ -254,7 +273,7 @@ pub enum OwnerSourceSite {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct OwnerRecordField {
-    pub declaration: Option<OwnerDeclarationId>,
+    pub declaration: Option<OwnerDeclarationRef>,
     pub name: String,
     pub value: OwnerExpressionRef,
     pub spread: bool,
@@ -394,7 +413,7 @@ pub struct OwnerExpressionRow {
     pub id: OwnerExpressionId,
     pub stable_key: StableExpressionKey,
     pub scope: OwnerScopeRef,
-    pub declaration: Option<OwnerDeclarationId>,
+    pub declaration: Option<OwnerDeclarationRef>,
     pub flow_type: FlowType,
     pub flush_type: Option<Type>,
     pub effect: CheckedEffectSummary,
@@ -672,7 +691,7 @@ pub struct OwnerSemanticPath {
 pub struct OwnerSourceRow {
     pub id: OwnerSourceId,
     pub stable_key: OwnerSourceStableKey,
-    pub declaration: OwnerDeclarationId,
+    pub declaration: OwnerDeclarationRef,
     pub statement: OwnerStatementId,
     pub expression: OwnerExpressionId,
     pub owner_scope: OwnerScopeRef,
@@ -685,7 +704,7 @@ pub struct OwnerSourceRow {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct OwnerStateRow {
     pub id: OwnerStateId,
-    pub declaration: OwnerDeclarationId,
+    pub declaration: OwnerDeclarationRef,
     pub statement: OwnerStatementId,
     pub expression: OwnerExpressionId,
     pub initial: OwnerExpressionRef,
@@ -699,7 +718,7 @@ pub struct OwnerStateRow {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct OwnerListRow {
     pub id: OwnerListId,
-    pub declaration: OwnerDeclarationId,
+    pub declaration: OwnerDeclarationRef,
     pub statement: OwnerStatementId,
     pub producer: OwnerExpressionId,
     pub owner_scope: OwnerScopeRef,

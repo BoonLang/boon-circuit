@@ -1,8 +1,9 @@
+use boon_checked::CheckedValueUse;
 use boon_parser::UnitOwnerSyntaxView;
 use boon_syntax::{
     AstBlockBinding, AstCallArg, AstExprKind, AstParameter, AstPassContext, AstRecordField,
     AstStatementKind, AstTextSegment, StableCheckOwnerKey, StableExpressionKey, StableOwnerKey,
-    StableStatementKey, UnitLocalStatementId,
+    StableStatementKey, UnitItemKind, UnitLocalStatementId,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -44,6 +45,7 @@ pub struct OwnerStatementInput {
     pub child_index: u32,
     pub kind: AstStatementKind,
     pub expression: Option<u32>,
+    pub value_use: CheckedValueUse,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -536,6 +538,219 @@ fn child_owner_key(
     })
 }
 
+fn owner_expression_contains_render_constructor(
+    expression: usize,
+    expressions: &[OwnerExpressionInput],
+    seen: &mut std::collections::BTreeSet<usize>,
+) -> bool {
+    if !seen.insert(expression) {
+        return false;
+    }
+    let Some(expression) = expressions.get(expression) else {
+        return false;
+    };
+    let contains = |value, seen: &mut std::collections::BTreeSet<_>| {
+        owner_expression_contains_render_constructor(value, expressions, seen)
+    };
+    match &expression.kind {
+        AstExprKind::Call { function, args, .. } => {
+            crate::is_registered_render_constructor(function)
+                || args.iter().any(|argument| contains(argument.value, seen))
+        }
+        AstExprKind::Pipe {
+            input, op, args, ..
+        } => {
+            crate::is_registered_render_constructor(op)
+                || contains(*input, seen)
+                || args.iter().any(|argument| contains(argument.value, seen))
+        }
+        AstExprKind::Hold { initial, .. }
+        | AstExprKind::When { input: initial, .. }
+        | AstExprKind::Draining { input: initial } => contains(*initial, seen),
+        AstExprKind::Then { input, output } => {
+            contains(*input, seen) || output.is_some_and(|output| contains(output, seen))
+        }
+        AstExprKind::MatchArm {
+            output: Some(output),
+            ..
+        } => contains(*output, seen),
+        AstExprKind::Block { bindings, result } => {
+            bindings.iter().any(|binding| contains(binding.value, seen))
+                || result.is_some_and(|result| contains(result, seen))
+        }
+        AstExprKind::Infix { left, right, .. } => contains(*left, seen) || contains(*right, seen),
+        AstExprKind::Object(fields) | AstExprKind::TaggedObject { fields, .. } => {
+            fields.iter().any(|field| contains(field.value, seen))
+        }
+        AstExprKind::BytesLiteral { items, .. }
+        | AstExprKind::ListLiteral { items, .. }
+        | AstExprKind::SetLiteral { items } => items.iter().any(|item| contains(*item, seen)),
+        AstExprKind::MapLiteral { entries } => entries.iter().any(|entry| contains(*entry, seen)),
+        AstExprKind::MapEntry { key, value } => contains(*key, seen) || contains(*value, seen),
+        AstExprKind::Arrow { left, output, .. } => {
+            contains(*left, seen) || output.is_some_and(|output| contains(output, seen))
+        }
+        AstExprKind::TextTemplate { segments } => segments.iter().any(|segment| match segment {
+            AstTextSegment::Static { .. } => false,
+            AstTextSegment::Dynamic { value } => contains(*value, seen),
+        }),
+        AstExprKind::Flush {
+            payload: Some(payload),
+        } => contains(*payload, seen),
+        AstExprKind::Tag(tag) if tag == "NoElement" => true,
+        AstExprKind::Identifier(_)
+        | AstExprKind::Path(_)
+        | AstExprKind::Drain { .. }
+        | AstExprKind::StringLiteral(_)
+        | AstExprKind::TextLiteral(_)
+        | AstExprKind::ByteLiteral { .. }
+        | AstExprKind::Number(_)
+        | AstExprKind::BitsLiteral { .. }
+        | AstExprKind::Tag(_)
+        | AstExprKind::Source
+        | AstExprKind::Latest { .. }
+        | AstExprKind::MatchArm { output: None, .. }
+        | AstExprKind::Delimiter
+        | AstExprKind::Flush { payload: None }
+        | AstExprKind::Unknown(_) => false,
+    }
+}
+
+fn owner_statement_field(statement: &OwnerStatementInput) -> Option<&str> {
+    match &statement.kind {
+        AstStatementKind::Field { name } => Some(name),
+        AstStatementKind::List {
+            field: Some(name), ..
+        } => Some(name),
+        _ => None,
+    }
+}
+
+fn classify_owner_statement_value_uses(
+    statements: &mut [OwnerStatementInput],
+    expressions: &[OwnerExpressionInput],
+    inherited_render_context: bool,
+) {
+    fn contains_render_context(
+        statement: usize,
+        statements: &[OwnerStatementInput],
+        expressions: &[OwnerExpressionInput],
+        children: &[Vec<usize>],
+        functions: &mut std::collections::BTreeSet<usize>,
+    ) -> bool {
+        let child_contains = children[statement].iter().copied().any(|child| {
+            contains_render_context(child, statements, expressions, children, functions)
+        });
+        let field_contains = owner_statement_field(&statements[statement]).is_some_and(|field| {
+            matches!(
+                field,
+                "document" | "scene" | "root" | "child" | "items" | "children"
+            )
+        });
+        let expression_contains = statements[statement].expression.is_some_and(|expression| {
+            owner_expression_contains_render_constructor(
+                expression as usize,
+                expressions,
+                &mut std::collections::BTreeSet::new(),
+            )
+        });
+        let contains = child_contains || field_contains || expression_contains;
+        if contains
+            && matches!(
+                statements[statement].kind,
+                AstStatementKind::Function { .. }
+            )
+        {
+            functions.insert(statement);
+        }
+        contains
+    }
+
+    fn collect_slots(
+        statement: usize,
+        in_render_context: bool,
+        statements: &mut [OwnerStatementInput],
+        children: &[Vec<usize>],
+        functions: &std::collections::BTreeSet<usize>,
+    ) {
+        let field = owner_statement_field(&statements[statement]).map(str::to_owned);
+        let next_in_render_context = in_render_context
+            || matches!(field.as_deref(), Some("document" | "scene"))
+            || functions.contains(&statement);
+        if next_in_render_context
+            && matches!(
+                field.as_deref(),
+                Some("root" | "child" | "items" | "children")
+            )
+        {
+            statements[statement].value_use = CheckedValueUse::RenderSlot;
+        }
+        for child in children[statement].iter().copied() {
+            collect_slots(
+                child,
+                next_in_render_context,
+                statements,
+                children,
+                functions,
+            );
+        }
+    }
+
+    let mut children = vec![Vec::new(); statements.len()];
+    let mut roots = Vec::new();
+    for (index, statement) in statements.iter().enumerate() {
+        match statement.parent {
+            Some(parent) if (parent as usize) < children.len() => {
+                children[parent as usize].push(index)
+            }
+            _ => roots.push(index),
+        }
+    }
+    let mut functions = std::collections::BTreeSet::new();
+    for root in roots.iter().copied() {
+        let _ = contains_render_context(root, statements, expressions, &children, &mut functions);
+    }
+    for root in roots {
+        collect_slots(
+            root,
+            inherited_render_context,
+            statements,
+            &children,
+            &functions,
+        );
+    }
+}
+
+fn containing_scope_is_render_context(containing_scope: &OwnerContainingScopeInput) -> bool {
+    let OwnerContainingScopeInput::OwnerStatement { owner, statement } = containing_scope else {
+        return false;
+    };
+    let owner_context = match owner {
+        StableCheckOwnerKey::UnitRoot(_) => false,
+        StableCheckOwnerKey::Item(owner) => owner.item_route.segments().iter().any(|segment| {
+            segment.kind == UnitItemKind::Function
+                || segment.names.iter().any(|name| {
+                    matches!(
+                        name.as_str(),
+                        "document" | "scene" | "root" | "child" | "items" | "children"
+                    )
+                })
+        }),
+    };
+    owner_context
+        || statement
+            .route
+            .statement_route
+            .iter()
+            .flat_map(|segment| &segment.names)
+            .any(|name| {
+                matches!(
+                    name.as_str(),
+                    "document" | "scene" | "root" | "child" | "items" | "children"
+                )
+            })
+}
+
 pub fn project_owner_syntax_input(
     view: UnitOwnerSyntaxView<'_>,
 ) -> Result<OwnerSyntaxInput, OwnerSyntaxProjectionError> {
@@ -650,6 +865,7 @@ pub fn project_owner_syntax_input(
             child_index,
             kind,
             expression,
+            value_use: CheckedValueUse::RuntimeValue,
         });
     }
 
@@ -682,6 +898,11 @@ pub fn project_owner_syntax_input(
             kind,
         });
     }
+    classify_owner_statement_value_uses(
+        &mut statements,
+        &expressions,
+        containing_scope_is_render_context(&containing_scope),
+    );
     let external_expressions = expression_projection.into_external_expressions();
 
     let mut child_owners = Vec::with_capacity(view.child_owners().len());

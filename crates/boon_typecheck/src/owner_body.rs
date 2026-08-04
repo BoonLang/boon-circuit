@@ -9,12 +9,13 @@ use crate::{
     OwnerInterfaceEvaluationScope, OwnerInterfaceSccKey, OwnerInterfaceSccResult,
     OwnerParameterKind, OwnerPublicInterface, OwnerReferenceKind, OwnerResultCallTarget,
     OwnerResultExpressionRef, OwnerResultTransfer, OwnerResultTransferNode, OwnerSourceAnchorRole,
-    OwnerSourceAnchorSite, OwnerSourceMap, OwnerSymbolResolution, OwnerSyntaxInput,
-    infix_returns_bool,
+    OwnerSourceAnchorSite, OwnerSourceMap, OwnerSymbolResolution, OwnerSyntaxGraph,
+    OwnerSyntaxInput, infix_returns_bool,
 };
 use boon_checked::{
     BytesType, CheckedEffectSummary, CheckedParameterKind, CheckedTypeSubstitution,
-    DiagnosticSeverity, FlowMode, FlowType, ObjectShape, Type, TypeDiagnostic, TypeVar, Variant,
+    DiagnosticSeverity, FlowMode, FlowType, ObjectShape, OwnerExpressionId, OwnerExpressionRef,
+    OwnerStatementChild, OwnerStatementId, Type, TypeDiagnostic, TypeVar, Variant,
     apply_checked_type_substitution_lookup, specialize_checked_call_result, widen_structural_type,
 };
 use boon_data::{ExactNumber, MAX_BITS_WIDTH};
@@ -141,6 +142,7 @@ pub struct InferredOwnerExpression {
     pub id: OwnerInferenceExpressionId,
     pub stable_key: StableExpressionKey,
     pub flow_type: FlowType,
+    pub flush_type: Option<Type>,
     pub direct_effect: CheckedEffectSummary,
     pub kind: AstExprKind,
 }
@@ -432,6 +434,343 @@ fn direct_effect_for(kind: &OwnerConstraintNodeKind) -> CheckedEffectSummary {
         },
         _ => CheckedEffectSummary::default(),
     }
+}
+
+fn merge_owner_flush_type(target: &mut Option<Type>, extra: Option<Type>) {
+    let Some(extra) = extra else {
+        return;
+    };
+    *target = Some(match target.take() {
+        Some(current) => crate::union_structural_type(&current, &extra),
+        None => extra,
+    });
+}
+
+fn owner_flush_payload_type_is_closed(ty: &Type) -> bool {
+    match ty {
+        Type::Text | Type::Number | Type::Bytes(_) | Type::Bits { .. } => true,
+        Type::VariantSet(variants) => {
+            !variants.is_empty()
+                && variants.iter().all(|variant| match variant {
+                    Variant::Tag(_) => true,
+                    Variant::Tagged { fields, .. } => {
+                        !fields.open
+                            && fields
+                                .fields
+                                .values()
+                                .all(owner_flush_payload_type_is_closed)
+                    }
+                })
+        }
+        Type::Object(shape) => {
+            !shape.open
+                && shape
+                    .fields
+                    .values()
+                    .all(owner_flush_payload_type_is_closed)
+        }
+        Type::Union(members) => {
+            !members.is_empty() && members.iter().all(owner_flush_payload_type_is_closed)
+        }
+        Type::Unknown
+        | Type::Var(_)
+        | Type::UnresolvedShape { .. }
+        | Type::Absent
+        | Type::List(_)
+        | Type::Map { .. }
+        | Type::Set(_)
+        | Type::Function { .. }
+        | Type::RenderContract => false,
+    }
+}
+
+fn owner_flush_payload_is_closed_tag_algebra(ty: &Type) -> bool {
+    let Type::VariantSet(variants) = ty else {
+        return false;
+    };
+    !variants.is_empty()
+        && variants.iter().all(|variant| match variant {
+            Variant::Tag(_) => true,
+            Variant::Tagged { fields, .. } => {
+                !fields.open
+                    && fields
+                        .fields
+                        .values()
+                        .all(owner_flush_payload_type_is_closed)
+            }
+        })
+}
+
+fn owner_statement_update_values(
+    graph: &OwnerSyntaxGraph,
+    statement: OwnerStatementId,
+) -> Vec<OwnerExpressionId> {
+    let Some(statement) = graph.statement(statement) else {
+        return Vec::new();
+    };
+    if let Some(OwnerExpressionRef::Local { expression }) = statement.canonical_value {
+        return vec![expression];
+    }
+    statement
+        .children
+        .iter()
+        .filter_map(|child| match child {
+            OwnerStatementChild::Local { statement } => Some(*statement),
+            OwnerStatementChild::Owner { .. } => None,
+        })
+        .flat_map(|child| owner_statement_update_values(graph, child))
+        .collect()
+}
+
+fn owner_hold_update_expressions(
+    syntax: &OwnerSyntaxInput,
+    graph: &OwnerSyntaxGraph,
+    expression: OwnerExpressionId,
+) -> Vec<OwnerExpressionId> {
+    let Some(statement) = syntax
+        .statements
+        .iter()
+        .find(|statement| statement.expression == Some(expression.0))
+        .map(|statement| OwnerStatementId(statement.id))
+    else {
+        return Vec::new();
+    };
+    let Some(statement) = graph.statement(statement) else {
+        return Vec::new();
+    };
+    let mut updates = Vec::new();
+    for child in statement.children.iter().filter_map(|child| match child {
+        OwnerStatementChild::Local { statement } => Some(*statement),
+        OwnerStatementChild::Owner { .. } => None,
+    }) {
+        let Some(child_node) = graph.statement(child) else {
+            continue;
+        };
+        let continuation = syntax
+            .statements
+            .get(child.0 as usize)
+            .and_then(|statement| statement.expression)
+            .and_then(|expression| syntax.expressions.get(expression as usize))
+            .is_some_and(|expression| expression.linked_input.is_some());
+        let update_start = updates.len();
+        let child_is_latest = child_node
+            .direct_value
+            .as_ref()
+            .and_then(|value| match value {
+                OwnerExpressionRef::Local { expression } => {
+                    syntax.expressions.get(expression.0 as usize)
+                }
+                OwnerExpressionRef::Child { .. } => None,
+            })
+            .is_some_and(|expression| matches!(expression.kind, AstExprKind::Latest { .. }));
+        if child_is_latest {
+            updates.extend(
+                child_node
+                    .children
+                    .iter()
+                    .filter_map(|grandchild| match grandchild {
+                        OwnerStatementChild::Local { statement } => Some(*statement),
+                        OwnerStatementChild::Owner { .. } => None,
+                    })
+                    .flat_map(|grandchild| owner_statement_update_values(graph, grandchild)),
+            );
+        } else {
+            updates.extend(owner_statement_update_values(graph, child));
+        }
+        if continuation && update_start > 0 && updates.len() > update_start {
+            updates.remove(update_start - 1);
+        }
+    }
+    updates
+}
+
+fn infer_owner_expression_flush_types(
+    syntax: &OwnerSyntaxInput,
+    flows: &[FlowType],
+    diagnostics: &mut Vec<OwnerDiagnosticTemplate>,
+) -> Result<Vec<Option<Type>>, OwnerBodyInferenceError> {
+    fn infer(
+        syntax: &OwnerSyntaxInput,
+        graph: &OwnerSyntaxGraph,
+        flows: &[FlowType],
+        expression: OwnerExpressionId,
+        memo: &mut [Option<Type>],
+        completed: &mut [bool],
+        active: &mut [bool],
+        diagnostics: &mut Vec<OwnerDiagnosticTemplate>,
+    ) -> Option<Type> {
+        let index = expression.0 as usize;
+        if *completed.get(index)? {
+            return memo[index].clone();
+        }
+        if std::mem::replace(active.get_mut(index)?, true) {
+            return None;
+        }
+        let input = syntax.expressions.get(index)?;
+        let inferred = match &input.kind {
+            AstExprKind::Flush {
+                payload: Some(payload),
+            } => {
+                let payload = OwnerExpressionId(u32::try_from(*payload).ok()?);
+                let payload_flow = flows.get(payload.0 as usize).cloned().unwrap_or(FlowType {
+                    mode: FlowMode::Continuous,
+                    ty: Type::Unknown,
+                });
+                if payload_flow.mode != FlowMode::Continuous
+                    || !owner_flush_payload_is_closed_tag_algebra(&payload_flow.ty)
+                {
+                    let site = syntax
+                        .expressions
+                        .get(payload.0 as usize)
+                        .map(|payload| payload.stable_key.clone())
+                        .unwrap_or_else(|| input.stable_key.clone());
+                    diagnostics.push(OwnerDiagnosticTemplate {
+                        severity: DiagnosticSeverity::Error,
+                        code: "invalid_flush_payload".to_owned(),
+                        message: format!(
+                            "`FLUSH` payload must be a continuous closed Tag, tagged object, or closed union without collection, flow, or host values; found {}",
+                            crate::boon_facing_type_label(&payload_flow.ty)
+                        ),
+                        site: OwnerSourceAnchorSite::Expression { expression: site },
+                        role: None,
+                    });
+                }
+                let mut ty = (!matches!(
+                    payload_flow.ty,
+                    Type::Unknown | Type::UnresolvedShape { .. } | Type::Absent
+                ))
+                .then_some(payload_flow.ty);
+                let nested = infer(
+                    syntax,
+                    graph,
+                    flows,
+                    payload,
+                    memo,
+                    completed,
+                    active,
+                    diagnostics,
+                );
+                merge_owner_flush_type(&mut ty, nested);
+                ty
+            }
+            AstExprKind::Flush { payload: None } => {
+                diagnostics.push(OwnerDiagnosticTemplate {
+                    severity: DiagnosticSeverity::Error,
+                    code: "missing_flush_payload".to_owned(),
+                    message: "`FLUSH` requires exactly one payload expression".to_owned(),
+                    site: OwnerSourceAnchorSite::Expression {
+                        expression: input.stable_key.clone(),
+                    },
+                    role: None,
+                });
+                None
+            }
+            AstExprKind::Block { .. }
+            | AstExprKind::Object(_)
+            | AstExprKind::TaggedObject { .. } => {
+                for child in graph
+                    .expression_inputs(expression)
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(|child| match child {
+                        OwnerExpressionRef::Local { expression } => Some(*expression),
+                        OwnerExpressionRef::Child { .. } => None,
+                    })
+                {
+                    let _ = infer(
+                        syntax,
+                        graph,
+                        flows,
+                        child,
+                        memo,
+                        completed,
+                        active,
+                        diagnostics,
+                    );
+                }
+                None
+            }
+            AstExprKind::Hold { initial, .. } => {
+                if *initial < syntax.expressions.len() {
+                    let _ = infer(
+                        syntax,
+                        graph,
+                        flows,
+                        OwnerExpressionId(*initial as u32),
+                        memo,
+                        completed,
+                        active,
+                        diagnostics,
+                    );
+                }
+                let mut ty = None;
+                for update in owner_hold_update_expressions(syntax, graph, expression) {
+                    let update = infer(
+                        syntax,
+                        graph,
+                        flows,
+                        update,
+                        memo,
+                        completed,
+                        active,
+                        diagnostics,
+                    );
+                    merge_owner_flush_type(&mut ty, update);
+                }
+                ty
+            }
+            _ => {
+                let mut ty = None;
+                let children = graph
+                    .expression_inputs(expression)
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(|child| match child {
+                        OwnerExpressionRef::Local { expression } => Some(*expression),
+                        OwnerExpressionRef::Child { .. } => None,
+                    })
+                    .collect::<Vec<_>>();
+                for child in children {
+                    let child = infer(
+                        syntax,
+                        graph,
+                        flows,
+                        child,
+                        memo,
+                        completed,
+                        active,
+                        diagnostics,
+                    );
+                    merge_owner_flush_type(&mut ty, child);
+                }
+                ty
+            }
+        };
+        active[index] = false;
+        completed[index] = true;
+        memo[index] = inferred.clone();
+        inferred
+    }
+
+    let graph = OwnerSyntaxGraph::build(syntax)
+        .map_err(|error| OwnerBodyInferenceError::new(error.to_string()))?;
+    let mut memo = vec![None; syntax.expressions.len()];
+    let mut completed = vec![false; syntax.expressions.len()];
+    let mut active = vec![false; syntax.expressions.len()];
+    for index in 0..syntax.expressions.len() {
+        let expression = OwnerExpressionId(checked_u32(index, "flush expression id")?);
+        let _ = infer(
+            syntax,
+            &graph,
+            flows,
+            expression,
+            &mut memo,
+            &mut completed,
+            &mut active,
+            diagnostics,
+        );
+    }
+    Ok(memo)
 }
 
 fn push_invalid_syntax_diagnostics(
@@ -2953,6 +3292,21 @@ pub fn infer_owner_body<'a>(
             &mut next_alpha,
         );
     }
+    let inferred_flows = syntax
+        .expressions
+        .iter()
+        .enumerate()
+        .map(|(index, _)| FlowType {
+            mode: modes[index].unwrap_or(FlowMode::Continuous),
+            ty: alpha_normalize_type(
+                &unifier.resolve(&Type::Var(expressions[index])),
+                &mut alpha_variables,
+                &mut next_alpha,
+            ),
+        })
+        .collect::<Vec<_>>();
+    let flush_types =
+        infer_owner_expression_flush_types(syntax, &inferred_flows, &mut diagnostics)?;
     let inferred_expressions = syntax
         .expressions
         .iter()
@@ -2961,14 +3315,8 @@ pub fn infer_owner_body<'a>(
             Ok(InferredOwnerExpression {
                 id: OwnerInferenceExpressionId(checked_u32(index, "inferred expression id")?),
                 stable_key: expression.stable_key.clone(),
-                flow_type: FlowType {
-                    mode: modes[index].unwrap_or(FlowMode::Continuous),
-                    ty: alpha_normalize_type(
-                        &unifier.resolve(&Type::Var(expressions[index])),
-                        &mut alpha_variables,
-                        &mut next_alpha,
-                    ),
-                },
+                flow_type: inferred_flows[index].clone(),
+                flush_type: flush_types[index].clone(),
                 direct_effect: direct_effects[index],
                 kind: expression.kind.clone(),
             })

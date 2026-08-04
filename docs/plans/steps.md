@@ -558,6 +558,20 @@ stronger three-reviewer performance closure defined below.
    dependency capture, cycles, backdating, generation publication, and typed
    values before claiming any warm progress.
 
+   Checkpoint `42c1aa9` now lands that typed shared evaluator and replaces the
+   parse/link sum cache with exact parse, item-summary, namespace, module,
+   per-unit overlay, and link request families. Generation publication,
+   indirect cycles, automatic `require` edges, reverse-edge replacement,
+   backdating, tombstones, and fail-closed evaluation reads have focused
+   coverage; module-interface and body-only edits prove the expected syntax
+   cones. This is still not M2 or latency closure. Continue immediately with
+   every authored item plus per-unit anonymous root as check owners, tagged
+   interface SCCs, immutable body/source-map shards, diagnostic aggregation,
+   and construction-owned receipts. Delete `ProjectState.checked`, the whole-
+   project production checker path, and `checked_image_handoff`; do not spend
+   the next tranche tuning evaluator containers or applying Polars-style unsafe
+   to scans whose ownership is scheduled for deletion.
+
    The post-`ac2b234` high-level audit supersedes a mutating post-resource
    execution seal. Move inline list-authority synthesis into execution
    construction, seal immutable execution once, and make the resource typed

@@ -707,6 +707,23 @@ Current checkpoints to preserve and audit rather than redo:
   definition artifacts, emit checked receipts during construction, and delete
   the approximately 392 ms checked-image rescan before revisiting compact route
   storage;
+- preserve checkpoint `42c1aa9`'s typed, generation-safe shared evaluator and
+  exact syntax request spine: parse unit, body-insensitive unit link summary,
+  project namespace plan, per-module index, per-unit link overlay, and linked
+  unit. Automatic `require` edges, full indirect-cycle paths, reverse-edge
+  replacement, backdating, tombstones, cancellation/supersession accounting,
+  and fail-closed raw reads are now the only production evaluator path. The
+  module-interface test must keep relinking only the affected module and a
+  body-only edit must keep unrelated linked units pointer-shared. This is not
+  M2 or a warm-gate pass: `LinkUnit` still rewrites a cloned AST and
+  `ProjectState.checked` still forces whole-project checking. Build the complete
+  authored-owner plus unit-root input/source-map/constraint/interface-SCC/body
+  spine next, then delete the whole-project checked owner and production
+  `checked_image_handoff`. Do not substitute request-container micro-tuning or
+  Polars-style unsafe for these owner deletions; reconsider narrow unsafe
+  shard/CSR kernels only after a profile shows safe mechanics dominate the new
+  architecture and require safe API encapsulation plus parity and Miri/fuzz
+  evidence;
 - follow the post-`e510726` macro-architecture audit, reconciled through
   `a48f488`, in
   `BOON_COMPILER_MACRO_ARCHITECTURE_RESEARCH.md`. The historical trace exposed

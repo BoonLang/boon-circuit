@@ -1695,9 +1695,30 @@ counter-only loop before changing the measured parser/typechecker owners.
 
 ### Current Resumption Point: Definition Artifacts, Thin Link, Sealed Runnable
 
-Continue from local checkpoint `a48f488`, which adds unit-native production
-checking to the earlier whole-program ownership, compact execution receipt,
-request-graph, compact-proof/sealed-plan, and activation/effect checkpoints.
+The current local implementation checkpoint is `42c1aa9`. It completes the
+typed, generation-safe cross-family request graph and migrates syntax work to
+`ParseUnit -> UnitLinkSummary -> ProjectNamespacePlan / ProjectModuleIndex ->
+UnitLinkOverlay -> LinkUnit`, with exact module-interface and body-only reuse
+tests. This is evaluator substrate, not a latency-gate pass: the last measured
+Todo warm diagnostics/replacement-preview results remain approximately
+122/660 ms and the session still clears one whole-project checked result.
+
+Resume by removing that whole-project owner, not by tuning request-map lookups
+or introducing unsafe dense loops. Build every authored owner plus per-unit
+anonymous roots into owner input/source-map/constraint requests, solve tagged
+interface SCCs, check immutable owner bodies under frozen interfaces, aggregate
+diagnostics, and assemble the compatibility checked DTO without checking. In
+the same flag-day tranche delete `ProjectState.checked`, the production whole-
+project checker calls, legacy global owner/call indexes, and the deferred
+checked-image scan as construction-owned receipts replace it. Only after this
+and the later semantic/thin-link owner deletions should profiling decide
+whether narrowly encapsulated unsafe shard/CSR construction has measurable
+value; Polars-style unsafe is not permission to accelerate work that the plan
+requires deleting.
+
+Checkpoint `a48f488` remains the unit-native M1 ancestor of `42c1aa9`; preserve
+its production checking, compact execution receipt, proof/sealed-plan, and
+activation/effect contracts while continuing from the newer checkpoint.
 Follow the detailed sequence in
 [`BOON_COMPILER_ARCHITECTURE_REFACTOR_PLAN.md`](BOON_COMPILER_ARCHITECTURE_REFACTOR_PLAN.md)
 and the selected post-checkpoint design in

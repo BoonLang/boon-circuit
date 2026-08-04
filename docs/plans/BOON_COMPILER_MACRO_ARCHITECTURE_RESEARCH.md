@@ -485,6 +485,49 @@ interface checks only its affected definition cone; diagnostics report zero
 runtime artifact rows; a verified request reuses those exact checked shards;
 `assemble_report` no longer contains a whole-program handoff scan.
 
+#### Post-`42c1aa9` evaluator checkpoint
+
+Checkpoint `42c1aa9` lands the currentness substrate but does not close M2 or
+either warm latency gate. `boon_compilation_db` now owns one generation-checked
+cross-family evaluation graph with typed value tables, automatic `require`
+edges, deterministic indirect-cycle paths, reverse edges, backdating,
+tombstones, failure/cancellation/supersession accounting, and fail-closed raw
+value reads during evaluation. The session uses the exact syntax spine
+
+```text
+ParseUnit
+  -> UnitLinkSummary
+  -> ProjectNamespacePlan / ProjectModuleIndex
+  -> UnitLinkOverlay
+  -> LinkUnit
+```
+
+instead of the former parse/link sum enum and caller-declared dependencies. A
+module-export test proves that an interface change relinks only units in that
+module while an implementation-only edit keeps the other linked units shared.
+The old evaluator was deleted rather than retained as a compatibility path.
+
+This checkpoint deliberately leaves two larger red owners. `LinkUnit` still
+clones and rewrites the parsed AST instead of exposing a fully immutable typed
+overlay, and `ProjectState.checked` still owns one whole-project checker result.
+The next implementation tranche is therefore not evaluator micro-tuning. Add
+`StableCheckOwnerKey::{Item(StableOwnerKey), UnitRoot(SourceUnitId)}` and the
+complete owner spine `OwnerInput -> OwnerSourceMap -> ConstraintSummary ->
+InterfaceScc -> Body -> DiagnosticsAggregate -> CheckedAssembly`. It must cover
+functions plus every field/source/hold/list owner, including the Todo benchmark
+edit under `store/todos`, then delete `ProjectState.checked`, whole-project
+production check entrypoints, the name-keyed owner/call indexes, and
+`checked_image_handoff` as the new construction-owned receipts land.
+
+The Polars-style unsafe techniques reviewed after this checkpoint—unchecked
+indexing, uninitialized buffers, shared raw pointers, trusted iterator lengths,
+and zero-copy reinterpretation—are not substitutes for that owner deletion.
+They may be reconsidered only after profiles on the new owner/shard/CSR kernels
+show a dominant safe-language overhead. Prefer exact-size safe collection and
+`bytemuck`-checked typed views first; any remaining unsafe boundary must be
+narrow, encapsulated behind a safe API, measured against the safe version, and
+covered by mutation, fuzz/Miri where applicable, parity, and generation tests.
+
 ### M3. Carry one definition through normalized semantic facts and plan code
 
 - Publish one `DefinitionExecutableArtifact` containing checked body receipt,

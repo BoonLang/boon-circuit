@@ -319,6 +319,17 @@ Do not micro-tune that traversal. Land the identity/overlay boundary as the
 first part of the real evaluator tranche, then delete the checked handoff and
 the larger whole-program semantic/backend owners.
 
+Checkpoint `42c1aa9` completes the evaluator half of step 2: one shared typed
+graph now drives parse, body-insensitive item summaries, namespace planning,
+per-module exports, per-unit link overlays, and linked syntax with exact
+captured dependencies. The remaining step-2 work is the immutable AST overlay
+and the final packed-syntax/checked-slot firewall. Step 3 must start from all
+`StableOwnerKey` variants plus a synthetic `UnitRoot(SourceUnitId)`, not a
+function-only pilot, because the warm Todo edit belongs to the top-level
+`store/todos` list owner. Its first production exit deletes the session's
+whole-project checked slot and old checker entrypoints; wrapping or slicing a
+fresh `CheckedProgramDatabase` is still rejected.
+
 1. **Stable syntax and item ownership.** Retain `Arc<UnitSyntaxSnapshot>` and a
    body-insensitive `UnitItemIndex` in `CompilerSession`; add structural item
    and occurrence routes plus atomic unit upsert/remove/rename. Prove unchanged

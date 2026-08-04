@@ -584,6 +584,20 @@ Current checkpoints to preserve and audit rather than redo:
   re-import owner next; if trigger planning later dominates, replace its
   recursive expansion with one normalized dependency/SCC plan and shared arm
   spans;
+- apply the post-`ac2b234` phase-ownership audit before another micro-
+  optimization. Resource construction currently mutates execution to
+  synthesize inline list-authority expressions/statements and backpatches
+  materialization row bindings, then copies those bindings into its own table.
+  Move authority normalization into `ExecutionBuilding`, seal execution once,
+  make the resource table the sole source/target/lineage owner, and migrate all
+  consumers. Emit final typed rows, entity routes, component receipts, and CSR
+  relocations from their construction owners; delete `execution_for_resource`,
+  the post-hoc execution handoff, repeated whole-execution validations, and the
+  execution/resource Manifest inventories as one coherent flag-day cut. Then
+  extend the same publication rule through reactive/storage/view/memory and
+  remove the duplicate canonical-core mapping/hash. Deleting one validation,
+  sharing a hash buffer, packing the existing collector, or cosmetically
+  splitting crates is not the exit;
 - move verified-intent demand collection before occurrence expansion and
   backend lowering. Split top-level authority/interface summaries from the
   final program-link sink, and version the callable interface schema before

@@ -374,6 +374,19 @@ stronger three-reviewer performance closure defined below.
    with a normalized trigger dependency graph, SCC/worklist publication, and
    shared immutable arm spans rather than more caches.
 
+   The post-`ac2b234` high-level audit supersedes a mutating post-resource
+   execution seal. Move inline list-authority synthesis into execution
+   construction, seal immutable execution once, and make the resource typed
+   table the only owner of materialization source/target rows and predecessor
+   lineage. Migrate every resource/reactive/storage/view/memory/core consumer,
+   then delete the corresponding execution fields and `execution_for_resource`.
+   Execution/resource builders must publish their final row receipts, entity
+   routes, component digest, and typed CSR relocations directly; delete the
+   post-hoc execution handoff, repeated whole-execution validations, duplicate
+   binding cross-check, and execution/resource Manifest inventory in the same
+   flag-day tranche. Do not checkpoint the deletion of one validation or one
+   allocation as architectural completion.
+
    Receipt callbacks alone are too small: removing all 1,813.236 ms of manifest
    work from the 4,052.379 ms directional sample would still leave about 2.24
    seconds. Expand definition/invocation shards through OUT/resource/reactive/

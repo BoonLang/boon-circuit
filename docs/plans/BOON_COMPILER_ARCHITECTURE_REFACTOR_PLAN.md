@@ -1217,6 +1217,113 @@ would paradoxically fail or double-count. Report per-request parsed/reused
 units, recomputed/reused/backdated shards, and currentness work directly while
 keeping clean-full parity as the correctness oracle.
 
+### Fourth Whole-Pipeline Audit: Break The Phase Cycle And Publish Once
+
+The post-`ac2b234` source audit corrects the third audit's proposed seal point.
+Resource construction is not intrinsically entitled to mutate execution. It
+currently does so because `synthesize_inline_checked_list_targets` creates
+semantic expressions, origins, and statements late, while the binding passes
+backpatch source/target list and scope IDs plus predecessor lineage into
+`SemanticContextualMaterialization`. The resource graph then copies those same
+bindings into `materialization_bindings`, and downstream code reads a mixture of
+both owners. `execution_for_resource` therefore exposes a phase cycle, not a
+durable semantic boundary.
+
+The replacement boundary is:
+
+```text
+checked definitions + demanded invocation frames
+  -> ExecutionBuilding
+  -> normalize inline list authorities and statement ownership
+  -> ExecutionSealed (immutable expressions/statements/materializations)
+  -> ResourceTable (sole row/list binding and lineage owner)
+  -> construction-owned domain tables and local receipts
+  -> one compact relocation/SCC linker
+  -> SealedSemanticImage
+```
+
+The normalization pass may reuse the current exact checked-list and occurrence
+logic initially, but it runs before execution publication and emits ordinary
+image rows through the same builder. Once `ExecutionSealed` exists, no resource,
+reactive, storage, view, memory, proof, or backend API receives mutable execution
+columns. `SemanticContextualMaterialization` retains operation, expression,
+owner, type, and local identity only. `SemanticMaterializationResourceBindingV1`
+or its sealed-table successor exclusively owns source/target rows and
+predecessor lineage. Consumers use a dense materialization-to-binding route;
+they never search or cross-check a duplicate execution copy.
+
+This phase cut also removes adjacent repeated work. The current elaborator
+validates execution before resources, validates it again after resources, and
+`finalize_execution` performs the same post-resource validation a third time.
+It then calls `execution_image_handoff`, which rediscovers routes for every
+scope, expression, statement, callable, call, occurrence, source, state, root,
+function, materialization, and owner; serializes/hashes every rich payload;
+allocates relocation-digest vectors; and seals a second projection image.
+The target performs local insertion checks, exactly one cross-table execution/
+resource seal audit, and construction-owned row hashing into reusable scratch
+storage. There is no post-hoc execution handoff scanner.
+
+The same publication rule applies to the remaining domains. Resource,
+reactive, lowering, storage, view, and memory builders publish a typed table and
+one `DomainSeal`-equivalent product containing the component digest, stable
+projection rows, dense entity routes, and typed CSR relocations. Manifest V7's
+current `DependencyCollector` still creates `compact_rows`, `compact_records`,
+`compact_references`, subject and entity maps, re-registers checked/execution
+projections, and inventories the rich domain graphs. Replace it with one linker
+over the domain seals. The manifest becomes a signed/materialized view of that
+sealed projection graph; it is not a second compiler. A canonical domain row is
+serialized and hashed once by its construction owner.
+
+The broader lifetime audit exposes three following owner deletions:
+
+1. `SemanticProgram` still retains six rich domain graphs beside
+   `CanonicalProgramCoreV2`, and `semantic_program_digest` serializes/hashes the
+   mapped core again. Make the normalized sealed image the backend input; rich
+   graphs become explicit debug/test materializers, the canonical core becomes
+   a borrowed executable projection or disappears, and the program digest folds
+   construction-owned domain/link receipts.
+2. Machine-plan finalization clones the complete plan to calculate typed-list
+   view fingerprints, rewrites roots, compacts in a second traversal, validates,
+   and later makes each trusted `MachineTemplate` rebuild `Metadata`. The shared
+   plan-code linker and consuming runnable builder assign final dense IDs in
+   reachable postorder, compute fingerprints before publication, and return
+   `SealedRunnableMachine { plan, indexes, receipt, digest }` with indexes built
+   once.
+3. `CompilerSession::apply_updates` currently replaces source strings and sets
+   the whole checked slot to `None`; the existing `CompilationDb` is used as a
+   one-shot manifest SCC/fingerprint helper rather than retained compiler
+   currentness. After the cold owners above are normalized, make that same
+   database own immutable source snapshots and stable interface/definition/
+   invocation/domain/link/plan/runnable requests with red/green verification,
+   unchanged-result backdating, exact reverse cones, cancellation, and atomic
+   latest-revision publication.
+
+Crate splitting follows these ownership seams rather than preceding them. The
+durable candidates are a dependency-bottom semantic image/model owner, a
+semantic build/proof implementation owner, and a dependency-bottom runnable
+image/model owner. A split is accepted only when consumers depend on the small
+sealed model without pulling the builders and a measured edit rebuilds fewer
+crates or relinks. Moving the current mutually dependent rich graphs into new
+packages or re-exporting them through a facade is rejected.
+
+The immediate coherent tranche is the complete phase-seal cut, not removal of
+one redundant validation in isolation:
+
+1. move inline-list-authority normalization to `ExecutionBuilding` and prove
+   exact execution/resource parity;
+2. make the resource table the only materialization row-binding/lineage owner
+   and migrate every consumer before deleting the execution fields;
+3. emit execution and resource routes, row receipts, and relocations while
+   constructing their final rows;
+4. delete `execution_for_resource`, `execution_image_handoff`, the duplicate
+   materialization-binding checks, the repeated whole-execution validations,
+   and the execution/resource Manifest inventories in the same flag-day tranche;
+5. reprofile the exact NovyWave oracle before selecting the next whole owner.
+
+This supersedes the earlier statement that execution's exact seal belongs
+after a mutating resource builder. It preserves the same semantic facts and
+oracles while assigning each fact to one phase and publishing it once.
+
 ## Architectural Decisions
 
 ### 1. Activation Is A First-Class Output, Not An Empty Mount

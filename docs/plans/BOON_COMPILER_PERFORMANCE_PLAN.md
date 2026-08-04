@@ -1487,6 +1487,38 @@ Do not return to the historical contextual-scheme micro-tranche while verified
 semantic/proof multiplication, duplicate representation lifetimes, whole-
 project invalidation, and rebuild fan-out dominate.
 
+The post-`ac2b234` high-level audit makes the next tranche more precise than
+"speed up finalization." The live pipeline gives the resource builder mutable
+execution columns so it can synthesize inline list-authority rows and backpatch
+materialization list/scope/lineage fields. It then copies those bindings into a
+resource table, validates execution three times across the boundary, rescans and
+hashes every execution row into an execution handoff, reimports the handoff and
+all remaining rich graphs into Manifest V7, maps the graphs into a second
+canonical core, and later rebuilds runnable indexes per trusted consumer.
+
+Execute the phase-seal architecture in the refactor plan before further local
+reactive/container work:
+
+1. normalize inline list authorities during execution construction and publish
+   immutable `ExecutionSealed` columns;
+2. give the resource table exclusive ownership of materialization source/
+   target row bindings and predecessor lineage, migrating all consumers and
+   deleting the execution copies;
+3. make execution/resource and then every remaining domain builder emit final
+   typed rows, component digests, entity routes, and CSR relocations once;
+4. link those compact seals directly, deleting the post-hoc execution handoff,
+   rich-domain Manifest inventories, duplicate canonical-core mapping/hash, and
+   superseded rich retained owners as their independent oracles pass;
+5. follow with the shared all-domain plan-code linker and consuming
+   `SealedRunnableMachine`, then retain those exact requests in the existing
+   `CompilationDb` across `CompilerSession` revisions.
+
+Do not count deleting only the third validation, reusing a hash buffer, packing
+`DependencyCollector`, or moving files into crates as this tranche. Those may
+fall out of the owner deletion but do not establish its exit. Split crates only
+at the resulting one-way semantic-image and runnable-image seams, with measured
+Rust rebuild closure; keep that evidence separate from Boon latency.
+
 1. Preserve the landed canonical list-dataflow and sparse-overlay lifecycle.
    The headless `boon_behavior_harness`, `boon_local_host`, and retained
    document hit testing are now extracted from the native shell. Their normal

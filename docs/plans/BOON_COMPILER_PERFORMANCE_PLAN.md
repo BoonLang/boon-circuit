@@ -900,6 +900,21 @@ Current cold-diagnostics candidate evidence:
   a correctness and ownership checkpoint, not a timing win: the full V2 row
   mirror remains allocated and hashed and must be deleted by the compact-row
   tranche before NovyWave is rescored.
+- The post-`addb056` whole-system audit promotes one persistent definition-to-
+  runnable request graph above the remaining local optimizations. The parser
+  already owns independent unit artifacts, verified intent already precedes
+  OUT, and `RequestMemo` already models result backdating, but normal compilation
+  reassembles a monolithic parsed program, retains all ordinary definitions,
+  constructs and discards the cold proof graph, and clears the whole checked
+  session slot on any edit. Cold and warm compilation must execute the same
+  unit/interface/definition/invocation/domain/link/runnable requests. Finish
+  the V2 execution-mirror deletion as the first vertical slice, then retain
+  unit/definition snapshots, make verified intent the sole demand queue, link
+  one executable module per demanded definition, replace Manifest with compact
+  summary/CSR linking, and consume those products into one runnable image.
+  Distributed closure becomes a delta link rather than repeated three-role
+  semantic rebuilds. See the architecture plan's sixth audit; crate splits and
+  bounded parallel evaluation occur only at the one-way seams it creates.
 - Do not preserve V3's 208k subject cardinality as a production V4/V5 proof
   requirement. The independent test oracle must map every historical subject
   to exactly one canonical finalized shard row and classifier field/domain and prove

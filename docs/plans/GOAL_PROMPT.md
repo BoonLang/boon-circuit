@@ -631,6 +631,21 @@ Current checkpoints to preserve and audit rather than redo:
   Production consumes these routes and legacy route rediscovery is test-only
   parity evidence. Do not score this as speed progress while the V2 proof-row
   mirror still exists;
+- follow the post-`addb056` whole-system architecture, not a sequence of local
+  loop or hashing tweaks. Cold and warm compilation use one persistent
+  definition-to-runnable request graph: immutable per-unit syntax snapshots,
+  stable interfaces and definition receipts, demanded executable definition
+  shards, compact invocation overlays, construction-owned domain summaries,
+  one relocation/SCC link, and a consuming runnable builder. Delete the V2
+  execution mirror and Manifest import as the first vertical cut; then connect
+  parser unit artifacts and request backdating to `CompilerSession`, make
+  verified intent the sole demand queue, delete repeated ordinary-body
+  lowerers, and replace repeated distributed-role elaboration with delta
+  linking. A whole-program cache beside the old passes is rejected;
+- treat the 16.7 ms diagnostics and 100 ms replacement-preview gates as warm
+  incremental contracts. A faster full rebuild cannot satisfy them. Record
+  executed/reused/backdated requests and require zero unrelated parse/check/
+  semantic/proof/plan work for a constant-cone edit;
 - move verified-intent demand collection before occurrence expansion and
   backend lowering. Split top-level authority/interface summaries from the
   final program-link sink, and version the callable interface schema before

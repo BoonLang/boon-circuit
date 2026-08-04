@@ -414,6 +414,18 @@ stronger three-reviewer performance closure defined below.
    closes route ownership but not performance: compact executable row receipts
    and deletion of the V2 proof mirror remain the next required cut.
 
+   The post-`addb056` whole-system audit now governs the subsequent work. Cold
+   and warm compilation must be two initial states of one persistent
+   definition-to-runnable request graph, not separate pipelines and not a
+   cache facade around the current passes. Complete the compact executable-row
+   vertical slice and delete the V2 mirror/Manifest import together; then
+   retain parser unit and definition snapshots with result backdating, turn
+   verified intent into the sole demand queue, link ordinary definition code
+   once, replace rich domain inventories with compact summary/CSR linking, and
+   consume the result into the runnable image. Follow with a delta-based
+   distributed fixed point and only then split crates at measured one-way
+   contract/build/service seams. Warm edits must prove zero unrelated work.
+
    The post-`ac2b234` high-level audit supersedes a mutating post-resource
    execution seal. Move inline list-authority synthesis into execution
    construction, seal immutable execution once, and make the resource typed

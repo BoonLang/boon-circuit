@@ -1458,6 +1458,169 @@ does not count as a performance result: V2 continues to allocate and hash the
 47,296-row proof mirror, so the next architectural cut remains construction-
 owned compact executable receipts followed by deletion of that mirror.
 
+### Sixth Whole-System Audit: One Persistent Definition-to-Runnable Graph
+
+The construction-route work is a prerequisite, but it is not the final
+architecture. A current-tree audit after `addb056` finds five whole-program
+boundaries that still multiply the same authored program:
+
+1. `boon_parser` can already issue an independent `ParsedSourceUnit`, but normal
+   compilation immediately assembles all units into one rebased
+   `ParsedProgram`. The session retains none of the unit products.
+2. `VerifiedSemanticIntentV1` now runs before OUT expansion, but normal retained
+   compilation seeds it with every ordinary callable. It therefore provides
+   useful root classification without yet being the sole demand worklist.
+3. `SemanticProgram` simultaneously owns the sealed checked/execution image,
+   OUT, resource, reactive, lowering, view, storage, memory, canonical-core,
+   and Manifest products. Manifest V7 then imports most of those graphs into a
+   second projection graph, and `semantic_program_digest` serializes the full
+   canonical core after its facts have already been committed elsewhere.
+4. `CompilerSession::apply_updates` clears the complete checked slot on any
+   changed unit. `boon_compilation_db::RequestMemo` implements revision,
+   verification, and result backdating semantics, but has no production user;
+   the cold proof graph is constructed and discarded instead of becoming the
+   warm currentness graph.
+5. document, migration, and row/scalar backends still lower ordinary callable
+   roots independently, plan row-expression finalization clones the complete
+   `MachinePlan`, and distributed closure re-elaborates all three roles on each
+   round plus a confirmation pass.
+
+These are larger than collection, hashing-buffer, or loop optimizations. They
+also explain why the 16.7 ms affected-diagnostics budget cannot be reached by
+making the existing cold pipeline merely faster. The replacement is one
+persistent request graph whose result cells own the final products:
+
+```text
+empty database (cold) OR prior immutable ProjectSnapshot (warm)
+  -> UnitSyntaxSnapshot[SourceUnitId]
+  -> UnitInterface + DefinitionReceipt[StableDefinitionId]
+  -> demanded DefinitionExecutableShard[definition, specialization]
+       { code, typed rows, source map, proof receipt, outgoing relocations }
+  -> InvocationOverlay[stable call route, specialization, bindings]
+  -> DomainSummary[resource/reactive/storage/view/memory]
+  -> BundleLinkSummary + relocation/SCC fixed point
+  -> consuming RunnableImageBuilder
+  -> SealedRunnableMachine + optional diagnostic/debug materializers
+```
+
+Cold and warm compilation must execute the same requests. Cold starts with no
+memoized values; warm reuses or backdates unchanged results. There is no
+whole-program cache beside the production compiler and no second dependency
+graph beside proof. A query may retain its compact result or only its receipt,
+depending on recomputation cost, but both use the same stable identity,
+dependency list, `changed_at`, and `verified_at` data.
+
+#### Architectural cuts and owner deletions
+
+| cut | replacement owner | production owners deleted by the cut | primary benefit |
+| --- | --- | --- | --- |
+| unit snapshot | structurally shared `ProjectSnapshot` of canonical per-unit syntax and stable structural paths | repeated parsing of unchanged units and monolithic AST rebasing as the warm source authority | makes source edits proportional to changed units and gives call/definition identity a parser-owned route |
+| definition artifact | one immutable checked interface plus one body/executable/proof shard per demanded definition variant | post-hoc checked/execution row scanners and repeated rich definition bodies | makes proof and executable construction a byproduct of the same work |
+| demand/link | one root-driven work queue and compact invocation overlays | eager ordinary occurrence bodies, candidate-local contextual builders, and cumulative invocation-path expansion | prevents work instead of compressing it after expansion |
+| semantic/domain seal | typed construction-owned tables plus compact summaries/CSR relocations | the multi-owner `SemanticProgram` graph set, Manifest re-import index, and full canonical-core rehash | removes the largest cold allocation and hashing multipliers |
+| plan-code link | one definition code module linked into document, migration, row/scalar, and role roots | three recursive ordinary-call lowerers and per-occurrence body code | compiles ordinary logic once and bounds specialization explicitly |
+| runnable seal | one consuming builder that constructs dense runtime indexes once | IR-plus-plan retention, whole-plan fingerprint clone/rewrite, repeated validation/digest/index construction | lowers peak live memory and eliminates final full-plan passes |
+| retained service | the same request graph and immutable snapshots installed in `CompilerSession` | whole checked-slot invalidation and whole-runnable rebuild after a local edit | is the only credible path to the 16.7 ms/100 ms warm gates |
+| bundle delta link | persistent role shards plus monotone producer/event deltas | three full semantic elaborations per fixed-point round and the full confirmation rebuild | makes distributed closure proportional to newly discovered crossings |
+
+The unit-snapshot cut is deeper than caching the current assembled
+`ParsedProgram`. Stable identities become `(SourceUnitId, structural route)`;
+snapshot-local dense IDs are assigned only when a consumer asks for a packed
+image. Formatting or an unrelated earlier insertion may change local content
+or source-map coordinates without rekeying every later definition/call. The
+complete diagnostics path can still materialize a project view, but that view
+is not the retained source authority.
+
+The demand cut must also finish the job begun by `VerifiedSemanticIntentV1`.
+Each request is keyed by stable definition, type/layout specialization,
+control/effect capability, and only the context coordinates that change
+semantics. A direct pure ordinary call links the definition shard and supplies
+an invocation frame; it does not instantiate another body. Stateful,
+resource-owning, and consequential-effect definitions remain demanded, but
+their scheduled roots are explicit rather than justified by retaining every
+lexical call. Static branch selection happens before child requests are queued.
+
+The compact link follows ThinLTO's useful shape: local artifacts publish small
+summaries and relocations, a combined index resolves cross-artifact closure,
+and consuming backends receive only demanded imports. It does not adopt LLVM
+IR and does not defer Boon's verifier. Boon's proof is cheaper when the final
+typed row receipt and dependency span are emitted by the same definition/domain
+builder; a later Manifest compiler should have nothing left to rediscover.
+
+The request graph should initially execute deterministically on one thread.
+Once definition/domain requests are isolated from siblings, bounded parallel
+evaluation may use at most the configured worker and memory budget. MLIR's
+operation-pass rules are a useful constraint: a request may read immutable
+ancestors and its declared inputs, but may not mutate sibling products or rely
+on global pass state. Parallelism is an optional scheduler property, not a way
+to hide graph explosion.
+
+#### Crate boundaries after the model stabilizes
+
+The current source inventory is itself a development-latency warning:
+`boon_semantic` is about 77.7k Rust lines, `boon_typecheck` 41.8k, and
+`boon_compiler` 26.3k; `machine_plan_backend.rs` alone is about 17.3k. Split
+only at one-way ownership seams created above:
+
+- a dependency-bottom semantic snapshot/receipt model crate;
+- semantic construction and compact-link implementation crates;
+- a dependency-bottom runnable-image contract plus a consuming builder;
+- a persistent compiler-service crate containing revisions, cancellation, and
+  publication policy;
+- a plan-code linker separated from host/CLI integration.
+
+Do not split today's mutually dependent algorithms into facade crates. Measure
+the reverse Rust dependency closure and controlled rebuild before and after
+each seam. A successful split moves stable contracts below volatile builders,
+reduces downstream rebuild work, and preserves one runtime/compiler path; a
+file move without those effects is rejected.
+
+#### Implementation priority after the route checkpoint
+
+1. Complete one definition/execution vertical slice: canonical executable row
+   receipts and source maps consume V3 routes, proof borrows those receipts,
+   and the V2 47,296-row mirror plus its Manifest import are deleted together.
+2. Promote parser unit products, stable structural definition/call routes, and
+   `RequestMemo` into an immutable `ProjectSnapshot`. Prove unit reuse and
+   result backdating before expanding the cache surface.
+3. Turn verified intent into the sole demand queue and publish one executable
+   definition shard plus compact invocation frames. Delete replaced OUT/
+   contextual body expansion and all three backend ordinary-body lowerers in
+   vertical slices.
+4. Move remaining semantic domains to construction-owned tables and replace
+   Manifest with the compact summary/relocation linker. Fold the semantic
+   digest from existing receipts rather than serializing the canonical core.
+5. Land the consuming runnable builder, then the bundle delta linker, and only
+   then split crates at the proven one-way seams.
+
+Every cut records executed/reused/backdated requests, parsed/reused units,
+changed interfaces, demanded/pruned definitions and branches, definition
+variants, invocation overlays, linked relocations, proof rows, full-program
+materializations, maximum simultaneously live artifact bytes, and cancellation
+latency. A warm constant edit must report zero unrelated unit parses,
+definition checks, semantic shards, proof components, and plan modules. Clean
+full parity, exact dependency cones, stable migration/activation behavior, and
+the independent rich/flat materializers remain correctness oracles; they are
+not production fallback paths.
+
+Primary architecture references for this whole-system cut:
+
+- [rustc red/green query evaluation and stable fingerprints](https://rustc-dev-guide.rust-lang.org/queries/incremental-compilation.html)
+- [Salsa backdating, revisions, and durability](https://salsa-rs.github.io/salsa/reference/algorithm.html)
+- [Roslyn immutable solution/document snapshots](https://learn.microsoft.com/en-us/dotnet/csharp/roslyn-sdk/work-with-workspace)
+- [TypeScript affected-file builder programs](https://github.com/microsoft/TypeScript/wiki/Using-the-Compiler-API)
+- [Swift immutable declarations and fine-grained request evaluation](https://www.swift.org/blog/swift-5.2-released/)
+- [LLVM ThinLTO summary-index linking](https://clang.llvm.org/docs/ThinLTO.html)
+- [MLIR isolated operation pipelines](https://mlir.llvm.org/docs/PassManagement/)
+- [Zig incremental-compilation CI and retained compiler work](https://ziglang.org/devlog/2024/)
+
+Jai's implementation is not publicly documented enough to use as an
+engineering contract. The useful comparison is therefore outcome-based:
+complete cold diagnostics, cold verified runnable output, and warm affected
+updates are measured separately. TypeScript-like affected-file reuse and
+Jai-like perceived responsiveness require the persistent request path above;
+they cannot be claimed from a faster full rebuild.
+
 ## Architectural Decisions
 
 ### 1. Activation Is A First-Class Output, Not An Empty Mount

@@ -9,6 +9,13 @@ the sequencing in
 This document does not create weaker latency, memory, correctness, or evidence
 exits.
 
+The post-`e510726` macro refinement in
+[`BOON_COMPILER_MACRO_ARCHITECTURE_RESEARCH.md`](BOON_COMPILER_MACRO_ARCHITECTURE_RESEARCH.md)
+is authoritative for current implementation order. It preserves the
+definition-artifact/thin-link model below while deleting global syntax assembly
+before definition checking and adding normalized semantic fact sections plus
+compositional phase seals.
+
 ## Decision
 
 Replace the remaining phase-owned whole-program pipeline with a persistent

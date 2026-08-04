@@ -19,6 +19,7 @@ Read AGENTS.md and these contracts completely before editing:
 - docs/plans/BOON_COMPILER_PERFORMANCE_PLAN.md
 - docs/plans/BOON_COMPILER_ARCHITECTURE_REFACTOR_PLAN.md
 - docs/plans/BOON_COMPILER_DEFINITION_ARTIFACT_RESEARCH.md
+- docs/plans/BOON_COMPILER_MACRO_ARCHITECTURE_RESEARCH.md
 - docs/plans/BOON_CIRCUIT_SIMPLIFICATION_AND_NATIVE_RECOVERY_PLAN.md
 - docs/plans/BOON_LANGUAGE_FOUNDATIONS_PLAN.md
 - docs/plans/BOON_OUT_PARAMETERS_AND_ORDER_INDEPENDENT_BINDINGS_PLAN.md
@@ -84,6 +85,14 @@ Authority and conflict rules:
   `SealedRunnableMachine` builder; persistent currentness; and only measured
   dependency inversions. Its intermediate directional exits never replace the
   performance plan's complete scored Clear End Condition.
+- `BOON_COMPILER_MACRO_ARCHITECTURE_RESEARCH.md` refines that implementation
+  order after structural occurrence identity: eliminate production global
+  syntax assembly before definition checking; make compiler intents request
+  roots; publish normalized semantic fact sections once; use definition plan-
+  code modules, thin linking, compositional phase seals, and one consuming
+  runnable builder; and split model/builder/link crates only after measured
+  one-way seams exist. It does not replace the mandatory artifact spine or any
+  performance/evidence budget.
 - Compiler scaling evidence uses actual parser inspections and
   typechecker/semantic/proof/backend work, never final AST/call/graph sizes as
   substitutes. Build one current two-job release producer explicitly and invoke
@@ -696,6 +705,16 @@ Current checkpoints to preserve and audit rather than redo:
   definition artifacts, emit checked receipts during construction, and delete
   the approximately 392 ms checked-image rescan before revisiting compact route
   storage;
+- follow the post-`e510726` macro-architecture audit in
+  `BOON_COMPILER_MACRO_ARCHITECTURE_RESEARCH.md`. The fresh trace ranks a
+  54.017 ms canonical syntax assembly/validation owner, 408.603 ms checked
+  report handoff, 286.195 ms execution receipt rescan, 422.191 ms Manifest,
+  764.193 ms pre-document backend, 106.305 ms plan validation, and 535.917 ms
+  scored export serialization. Do not tune the structural-route containers.
+  First make the persistent compiler unit-native and delete global syntax
+  assembly; then install typed interface/definition requests and delete the
+  checked handoff; then migrate normalized domain facts, shared plan-code,
+  thin link, compositional phase seals, and consuming runnable publication;
 - treat the 16.7 ms diagnostics and 100 ms replacement-preview gates as warm
   incremental contracts. A faster full rebuild cannot satisfy them. Record
   executed/reused/backdated requests and require zero unrelated parse/check/

@@ -15,8 +15,12 @@ exit.
 
 [`BOON_COMPILER_ARCHITECTURE_REFACTOR_PLAN.md`](BOON_COMPILER_ARCHITECTURE_REFACTOR_PLAN.md)
 is the current high-leverage execution map derived from the live
-post-`c870358` audit. Its post-`d177af9` architecture decision is detailed in
-[`BOON_COMPILER_DEFINITION_ARTIFACT_RESEARCH.md`](BOON_COMPILER_DEFINITION_ARTIFACT_RESEARCH.md).
+post-`c870358` audit. Its post-`d177af9` definition-artifact decision is detailed
+in
+[`BOON_COMPILER_DEFINITION_ARTIFACT_RESEARCH.md`](BOON_COMPILER_DEFINITION_ARTIFACT_RESEARCH.md);
+the post-`e510726` unit-native/fact-store/compositional-seal refinement is
+detailed in
+[`BOON_COMPILER_MACRO_ARCHITECTURE_RESEARCH.md`](BOON_COMPILER_MACRO_ARCHITECTURE_RESEARCH.md).
 This plan remains authoritative for every budget and exit; the refactor plan
 fixes the order and deletion criteria for reaching them.
 
@@ -1013,6 +1017,18 @@ Current cold-diagnostics candidate evidence:
   request currentness, interface/definition shards, and direct checked receipt
   emission; do not micro-optimize route containers before deleting the roughly
   392 ms checked handoff and larger whole-program owners.
+- The required post-`e510726` high-level audit now ranks whole owners from a
+  fresh trace: canonical bundle validation/assembly is 18.000/36.017 ms;
+  checked `assemble_report` is 408.603 ms; semantic execution handoff and
+  Manifest are 286.195/422.191 ms; the backend spends 764.193 ms before
+  document lowering; plan validation is 106.305 ms; and the scored explicit
+  export serialization is 535.917 ms. The selected architecture keeps unit
+  syntax native through checking, makes intents request roots, publishes one
+  normalized semantic fact/relocation store, compiles each definition into one
+  shared plan-code module, and uses thin link plus opaque compositional phase
+  seals before consuming runnable publication. Follow
+  `BOON_COMPILER_MACRO_ARCHITECTURE_RESEARCH.md`; these directional timings are
+  prioritization evidence, not additive savings or acceptance.
 - Do not preserve V3's 208k subject cardinality as a production V4/V5 proof
   requirement. The independent test oracle must map every historical subject
   to exactly one canonical finalized shard row and classifier field/domain and prove
@@ -1652,6 +1668,17 @@ rescan while introducing those results; then migrate demanded definition
 artifacts, thin link, runnable publication, and distributed deltas. Do not tune
 the retained snapshot or split the current phase crates before those ownership
 seams exist.
+
+The post-`e510726` macro audit further supersedes an implementation that creates
+definition shards on revision-global assembled syntax. First replace the
+persistent compiler's global `ParsedProgram` with unit-native
+`ProjectSyntaxSnapshot` and migrate checker keys/source mapping; delete canonical
+bundle clone/rebase/validation from session requests. Then add typed request
+currentness and checked definition shards, delete `checked_image_handoff`, and
+continue through normalized fact sections, shared plan-code modules, thin link,
+compositional phase seals, and consuming runnable publication. The exact
+sequence, measurements, and rejection rules are in
+[`BOON_COMPILER_MACRO_ARCHITECTURE_RESEARCH.md`](BOON_COMPILER_MACRO_ARCHITECTURE_RESEARCH.md).
 
 The post-`ac2b234` high-level audit makes the next tranche more precise than
 "speed up finalization." The live pipeline gives the resource builder mutable

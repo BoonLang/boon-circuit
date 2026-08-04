@@ -518,6 +518,18 @@ stronger three-reviewer performance closure defined below.
    definition artifacts, then delete the approximately 392 ms checked-image
    rescan before considering route-container tuning.
 
+   The post-`e510726` macro audit is recorded in
+   `BOON_COMPILER_MACRO_ARCHITECTURE_RESEARCH.md`. It keeps definition artifacts
+   and thin linking but corrects three remaining batch owners: production must
+   stop assembling a global `ParsedProgram`; semantic domains must publish one
+   normalized fact/relocation store instead of overlapping rich graphs; and
+   trusted phase proof must use construction-owned compositional seals rather
+   than rescanning completed snapshots. Begin by migrating the persistent
+   checker to unit-native syntax and deleting canonical bundle assembly, then
+   implement interface/definition requests and delete the 408.603 ms checked
+   handoff. Continue through shared plan-code, domain deltas, thin link, one
+   consuming runnable builder, distributed deltas, and measured crate seams.
+
    The post-`ac2b234` high-level audit supersedes a mutating post-resource
    execution seal. Move inline list-authority synthesis into execution
    construction, seal immutable execution once, and make the resource typed

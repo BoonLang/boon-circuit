@@ -2,10 +2,10 @@
 
 Date: 2026-08-03
 
-Status: active high-leverage execution map, reconciled through the post-`d177af9`
-definition-artifact/thin-link research after the first seventh-audit retained-
-request-graph tranche, while preserving whole-program audit checkpoint
-`d113544`, compact execution-receipt checkpoint `96b1611`,
+Status: active high-leverage execution map, reconciled through the post-`e510726`
+unit-native/fact-store/compositional-seal research after the definition-artifact/
+thin-link and structural-identity tranches, while preserving whole-program audit
+checkpoint `d113544`, compact execution-receipt checkpoint `96b1611`,
 shared-request-graph checkpoint `c870358`, compact-proof/sealed-plan checkpoint
 `38e6541`, and activation/effect checkpoint `32bcf40`, subordinate to
 [`BOON_COMPILER_PERFORMANCE_PLAN.md`](BOON_COMPILER_PERFORMANCE_PLAN.md). The
@@ -1889,6 +1889,35 @@ and delete the approximately 392 ms `checked_image_handoff`. Revisit route
 storage only after those macro owner deletions, preferably by fusing route
 emission into parsing or retaining compact parent/slot metadata rather than a
 second identity representation.
+
+### Ninth High-Level Audit: Unit-Native Syntax, Normalized Facts, Phase Seals
+
+The required post-`e510726` macro audit is complete and recorded in
+[`BOON_COMPILER_MACRO_ARCHITECTURE_RESEARCH.md`](BOON_COMPILER_MACRO_ARCHITECTURE_RESEARCH.md).
+It preserves definition artifacts and thin linking while correcting three
+remaining batch assumptions. Retained source units must remain unit-native
+through checking rather than feed a reconstructed global `ParsedProgram`;
+semantic domains must publish one normalized typed fact/relocation store rather
+than overlapping rich graph products; and trusted phase boundaries must close
+construction-owned compositional section seals rather than rescan completed
+snapshots.
+
+The fresh trace ranks those cuts ahead of route/container work: canonical
+bundle validation plus assembly is 54.017 ms, checked `assemble_report` is
+408.603 ms, execution receipt projection is 286.195 ms, Manifest/request-graph
+construction is 422.191 ms, backend pre-document work is 764.193 ms, plan
+validation is 106.305 ms, and the scored explicit export serializer is
+535.917 ms. These times overlap and are not additive promises.
+
+The new resumption order is therefore: delete production global syntax
+assembly and revision-global syntax keys; implement typed interface/definition
+requests and delete `checked_image_handoff`; carry a definition through one
+normalized semantic/plan-code artifact while deleting all matching recursive
+body owners; migrate domains to delta fact sections; thin-link and verify an
+opaque linked image; consume it into one runnable machine; then land
+distributed deltas and measured model/builder/link crate seams. Do not split
+crates or tune structural route storage before the owner boundary it serves is
+real.
 
 ## Architectural Decisions
 

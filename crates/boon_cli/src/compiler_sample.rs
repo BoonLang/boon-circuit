@@ -1338,7 +1338,7 @@ fn checked_result_sha256(
     serde_json::to_writer(
         &mut hasher,
         &(
-            &checked.parsed,
+            checked.syntax.source_bundle_digest_v1(),
             checked.output.checked_program_fields(),
             &checked.output.report,
         ),

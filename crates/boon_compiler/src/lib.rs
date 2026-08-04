@@ -1,8 +1,8 @@
 use boon_example_manifest::{ExampleEntry, ExampleManifest};
 use boon_ir::{ErasedProgram, verify_hidden_identity, verify_static_schedule};
 use boon_parser::{
-    ParseError, ParseProfile, ParseWorkCounters, ParsedProgram, parse_project,
-    parse_project_profiled, parse_source_profiled,
+    ParseError, ParseProfile, ParseWorkCounters, ParsedProgram, ProjectSyntaxSnapshot,
+    parse_project, parse_project_profiled, parse_source_profiled,
 };
 pub use boon_plan::{
     ApplicationIdentity, MachinePlan, MigrationPredecessorBinding, PlanError, ProgramRole,
@@ -169,8 +169,36 @@ pub struct CheckedDiagnosticsProfile {
     pub total_ms: f64,
 }
 
+pub enum CheckedSourceSyntax {
+    Assembled(ParsedProgram),
+    UnitNative(ProjectSyntaxSnapshot),
+}
+
+impl CheckedSourceSyntax {
+    pub fn source_bundle_digest_v1(&self) -> boon_contract::SourceBundleDigestV1 {
+        match self {
+            Self::Assembled(program) => program.source_bundle_digest_v1,
+            Self::UnitNative(program) => program.source_bundle_digest_v1(),
+        }
+    }
+
+    pub fn assembled(&self) -> Option<&ParsedProgram> {
+        match self {
+            Self::Assembled(program) => Some(program),
+            Self::UnitNative(_) => None,
+        }
+    }
+
+    pub fn unit_native(&self) -> Option<&ProjectSyntaxSnapshot> {
+        match self {
+            Self::Assembled(_) => None,
+            Self::UnitNative(program) => Some(program),
+        }
+    }
+}
+
 pub struct CheckedSourceFromSource {
-    pub parsed: ParsedProgram,
+    pub syntax: CheckedSourceSyntax,
     pub output: boon_checked::CheckOutput,
     pub profile: CheckedDiagnosticsProfile,
 }
@@ -586,7 +614,7 @@ pub fn compile_artifact_oracle_pair(
         &parsed,
         &external_types,
     );
-    let checked = checked_program_from_output(&parsed, check_output)?;
+    let checked = checked_program_from_output(CheckedSyntaxRef::Assembled(&parsed), check_output)?;
     let retained = compile_checked_artifact_oracle_plan(
         checked.clone(),
         false,
@@ -713,14 +741,14 @@ fn check_source_with_ownership(
     )
 }
 
-pub(crate) fn check_diagnostics_parsed_source(
-    parsed: ParsedProgram,
+pub(crate) fn check_diagnostics_project_syntax_source(
+    syntax: ProjectSyntaxSnapshot,
     parse_work: ParseWorkCounters,
     parse_ms: f64,
     program_role: ProgramRole,
 ) -> CompilerResult<CheckedSourceFromSource> {
-    check_parsed_source_with_ownership(
-        parsed,
+    check_syntax_source_with_ownership(
+        CheckedSourceSyntax::UnitNative(syntax),
         parse_work,
         parse_ms,
         program_role,
@@ -728,14 +756,14 @@ pub(crate) fn check_diagnostics_parsed_source(
     )
 }
 
-pub(crate) fn check_runtime_parsed_source(
-    parsed: ParsedProgram,
+pub(crate) fn check_runtime_project_syntax_source(
+    syntax: ProjectSyntaxSnapshot,
     parse_work: ParseWorkCounters,
     parse_ms: f64,
     program_role: ProgramRole,
 ) -> CompilerResult<CheckedSourceFromSource> {
-    check_parsed_source_with_ownership(
-        parsed,
+    check_syntax_source_with_ownership(
+        CheckedSourceSyntax::UnitNative(syntax),
         parse_work,
         parse_ms,
         program_role,
@@ -750,30 +778,74 @@ fn check_parsed_source_with_ownership(
     program_role: ProgramRole,
     ownership: CheckedSourceOwnership,
 ) -> CompilerResult<CheckedSourceFromSource> {
+    check_syntax_source_with_ownership(
+        CheckedSourceSyntax::Assembled(parsed),
+        parse_work,
+        parse_ms,
+        program_role,
+        ownership,
+    )
+}
+
+fn check_syntax_source_with_ownership(
+    syntax: CheckedSourceSyntax,
+    parse_work: ParseWorkCounters,
+    parse_ms: f64,
+    program_role: ProgramRole,
+    ownership: CheckedSourceOwnership,
+) -> CompilerResult<CheckedSourceFromSource> {
     let check_started = Instant::now();
-    let source_unit_count = parsed.files.len();
-    let expression_count = parsed.expressions.len();
+    let (source_unit_count, expression_count) = match &syntax {
+        CheckedSourceSyntax::Assembled(program) => (program.files.len(), program.expressions.len()),
+        CheckedSourceSyntax::UnitNative(program) => {
+            (program.units().len(), program.expression_count())
+        }
+    };
     let external_types = boon_checked::ExternalTypeEnvironment::empty(program_role);
     let typecheck_started = Instant::now();
-    let (output, typecheck_profile) = match ownership {
-        CheckedSourceOwnership::Report => {
-            boon_typecheck::check_program_profiled_with_external_types(&parsed, &external_types)
+    let (output, typecheck_profile) = match (&syntax, ownership) {
+        (CheckedSourceSyntax::Assembled(program), CheckedSourceOwnership::Report) => {
+            boon_typecheck::check_program_profiled_with_external_types(program, &external_types)
         }
-        CheckedSourceOwnership::Editor => {
+        (CheckedSourceSyntax::Assembled(program), CheckedSourceOwnership::Editor) => {
             boon_typecheck::check_editor_program_profiled_with_external_types(
-                &parsed,
+                program,
                 &external_types,
             )
         }
-        CheckedSourceOwnership::Diagnostics => {
+        (CheckedSourceSyntax::Assembled(program), CheckedSourceOwnership::Diagnostics) => {
             boon_typecheck::check_diagnostics_program_profiled_with_external_types(
-                &parsed,
+                program,
                 &external_types,
             )
         }
-        CheckedSourceOwnership::Runtime => {
+        (CheckedSourceSyntax::Assembled(program), CheckedSourceOwnership::Runtime) => {
             boon_typecheck::check_runtime_program_profiled_with_external_types(
-                &parsed,
+                program,
+                &external_types,
+            )
+        }
+        (CheckedSourceSyntax::UnitNative(program), CheckedSourceOwnership::Report) => {
+            boon_typecheck::check_project_program_profiled_with_external_types(
+                program,
+                &external_types,
+            )
+        }
+        (CheckedSourceSyntax::UnitNative(program), CheckedSourceOwnership::Editor) => {
+            boon_typecheck::check_project_editor_program_profiled_with_external_types(
+                program,
+                &external_types,
+            )
+        }
+        (CheckedSourceSyntax::UnitNative(program), CheckedSourceOwnership::Diagnostics) => {
+            boon_typecheck::check_project_diagnostics_program_profiled_with_external_types(
+                program,
+                &external_types,
+            )
+        }
+        (CheckedSourceSyntax::UnitNative(program), CheckedSourceOwnership::Runtime) => {
+            boon_typecheck::check_project_runtime_program_profiled_with_external_types(
+                program,
                 &external_types,
             )
         }
@@ -788,7 +860,7 @@ fn check_parsed_source_with_ownership(
             .map(|slot| slot.diagnostics.len())
             .sum::<usize>();
     Ok(CheckedSourceFromSource {
-        parsed,
+        syntax,
         output,
         profile: CheckedDiagnosticsProfile {
             source_unit_count,
@@ -848,7 +920,7 @@ fn compile_parsed_to_machine_plan(
     }
     let source_unit_count = parsed.files.len();
     let parsed_expression_count = parsed.expressions.len();
-    let checked = checked_program_from_output(&parsed, check_output)?;
+    let checked = checked_program_from_output(CheckedSyntaxRef::Assembled(&parsed), check_output)?;
     finish_checked_program_to_machine_plan(
         checked,
         source_unit_count,
@@ -889,13 +961,17 @@ pub(crate) fn finish_checked_machine_plan_with_cancellation(
     let mut cancellation = CancellationProbe::new(cancellation);
     cancellation.checkpoint().map_err(PlanError::new)?;
     let CheckedSourceFromSource {
-        parsed,
+        syntax,
         output,
         mut profile,
     } = checked_source;
     let deferred_runtime_handoff = output.construction.is_some();
     let runtime_handoff_started = Instant::now();
-    let checked = checked_program_from_output(&parsed, output)?;
+    let syntax = match &syntax {
+        CheckedSourceSyntax::Assembled(program) => CheckedSyntaxRef::Assembled(program),
+        CheckedSourceSyntax::UnitNative(program) => CheckedSyntaxRef::UnitNative(program),
+    };
+    let checked = checked_program_from_output(syntax, output)?;
     if deferred_runtime_handoff {
         let runtime_handoff_ms = elapsed_ms(runtime_handoff_started);
         profile.typecheck_ms += runtime_handoff_ms;
@@ -1012,8 +1088,38 @@ fn finish_checked_program_to_machine_plan(
     })
 }
 
+#[derive(Clone, Copy)]
+enum CheckedSyntaxRef<'a> {
+    Assembled(&'a ParsedProgram),
+    UnitNative(&'a ProjectSyntaxSnapshot),
+}
+
+impl CheckedSyntaxRef<'_> {
+    fn source_file_location(self, global_line: usize) -> (String, usize) {
+        match self {
+            Self::Assembled(program) => source_file_location(program, global_line),
+            Self::UnitNative(program) => program
+                .source_layouts()
+                .iter()
+                .filter(|layout| layout.start_line <= global_line)
+                .max_by_key(|layout| layout.start_line)
+                .map_or_else(
+                    || (program.path().to_owned(), global_line),
+                    |layout| {
+                        (
+                            layout.path.clone(),
+                            global_line
+                                .saturating_sub(layout.start_line)
+                                .saturating_add(1),
+                        )
+                    },
+                ),
+        }
+    }
+}
+
 fn checked_program_from_output(
-    parsed: &ParsedProgram,
+    syntax: CheckedSyntaxRef<'_>,
     output: boon_checked::CheckOutput,
 ) -> CompilerResult<boon_checked::CheckedProgram> {
     if output.report.has_errors() {
@@ -1023,7 +1129,7 @@ fn checked_program_from_output(
             .iter()
             .filter(|diagnostic| diagnostic.severity == boon_checked::DiagnosticSeverity::Error)
             .map(|diagnostic| {
-                let (path, line) = source_file_location(parsed, diagnostic.line);
+                let (path, line) = syntax.source_file_location(diagnostic.line);
                 format!("{path}:{line}: {}", diagnostic.message)
             })
             .chain(
@@ -1056,10 +1162,16 @@ fn checked_program_from_output(
     }
     match (output.program, output.construction) {
         (Some(program), None) => Ok(program),
-        (None, Some(construction)) => {
-            boon_typecheck::seal_checked_program_construction(parsed, construction)
-                .map_err(|error| PlanError::new(error).into())
-        }
+        (None, Some(construction)) => match syntax {
+            CheckedSyntaxRef::Assembled(program) => {
+                boon_typecheck::seal_checked_program_construction(program, construction)
+                    .map_err(|error| PlanError::new(error).into())
+            }
+            CheckedSyntaxRef::UnitNative(program) => {
+                boon_typecheck::seal_project_checked_program_construction(program, construction)
+                    .map_err(|error| PlanError::new(error).into())
+            }
+        },
         (Some(_), Some(_)) => Err(PlanError::new(
             "typecheck produced both a sealed and construction-only CheckedProgram",
         )

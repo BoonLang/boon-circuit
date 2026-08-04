@@ -1,11 +1,11 @@
 use crate::{
     CheckedCompileRequest, CheckedSourceFromSource, CompiledSealedMachinePlanFromSource,
-    CompilerResult, CompilerSourceUnit, check_diagnostics_parsed_source,
-    check_runtime_parsed_source, finish_checked_machine_plan_with_cancellation,
+    CompilerResult, CompilerSourceUnit, check_diagnostics_project_syntax_source,
+    check_runtime_project_syntax_source, finish_checked_machine_plan_with_cancellation,
 };
 use boon_parser::{
-    ParseWorkCounters, ParsedProgram, ParsedSourceUnit, assemble_parsed_source_units_profiled,
-    parse_project_source_unit_profiled,
+    ParseWorkCounters, ParsedSourceUnit, ProjectSyntaxSnapshot, UnitSyntaxSnapshot,
+    link_project_source_unit_profiled, parse_project_source_unit_profiled, project_unit_link_keys,
 };
 use boon_plan::{
     ApplicationIdentity, MigrationPredecessorBinding, PlanError, ProgramRole, TargetProfile,
@@ -167,13 +167,18 @@ pub struct CompilerSession {
 struct ProjectState {
     source: CompilerProject,
     revision: Revision,
-    parsed_units: BTreeMap<SourceUnitId, Arc<ParsedSourceUnit>>,
+    parsed_units: BTreeMap<SourceUnitId, RetainedUnitSyntax>,
     checked: Option<CheckedSourceFromSource>,
     compiled: Option<(Revision, CompiledSealedMachinePlanFromSource)>,
     request_graph: Option<(
         Revision,
         Arc<boon_compilation_db::SealedRequestGraphSnapshot>,
     )>,
+}
+
+struct RetainedUnitSyntax {
+    parsed: Arc<ParsedSourceUnit>,
+    linked: Option<Arc<UnitSyntaxSnapshot>>,
 }
 
 impl CompilerSession {
@@ -396,7 +401,7 @@ impl CompilerSession {
         state.parsed_units.retain(|source_unit_id, snapshot| {
             surviving_sources
                 .get(source_unit_id)
-                .is_some_and(|source| *source == snapshot.source.as_str())
+                .is_some_and(|source| *source == snapshot.parsed.source.as_str())
         });
         state.source = candidate;
         state.revision = Revision(state.revision.0.saturating_add(1));
@@ -450,14 +455,17 @@ impl CompilerSession {
         &self,
         project: ProjectId,
         path: &str,
-    ) -> CompilerResult<Option<Arc<ParsedSourceUnit>>> {
+    ) -> CompilerResult<Option<Arc<UnitSyntaxSnapshot>>> {
         let state = self
             .projects
             .get(&project)
             .ok_or_else(|| session_error(format!("unknown compiler project {}", project.0)))?;
         let source_unit_id = SourceUnitId::from_path(path)
             .map_err(|error| session_error(format!("invalid source unit `{path}`: {error}")))?;
-        Ok(state.parsed_units.get(&source_unit_id).map(Arc::clone))
+        Ok(state
+            .parsed_units
+            .get(&source_unit_id)
+            .and_then(|unit| unit.linked.as_ref().map(Arc::clone)))
     }
 
     pub fn request<'a>(
@@ -483,7 +491,7 @@ impl CompilerSession {
         if intent == CompileIntent::Diagnostics {
             if state.checked.is_none() {
                 let (parsed, parse_work, parse_ms) = parse_project_snapshot(state)?;
-                state.checked = Some(check_diagnostics_parsed_source(
+                state.checked = Some(check_diagnostics_project_syntax_source(
                     parsed,
                     parse_work,
                     parse_ms,
@@ -506,7 +514,7 @@ impl CompilerSession {
         if !current_artifact_available {
             if state.checked.is_none() {
                 let (parsed, parse_work, parse_ms) = parse_project_snapshot(state)?;
-                state.checked = Some(check_runtime_parsed_source(
+                state.checked = Some(check_runtime_project_syntax_source(
                     parsed,
                     parse_work,
                     parse_ms,
@@ -560,10 +568,10 @@ impl CompilerSession {
 
 fn parse_project_snapshot(
     state: &mut ProjectState,
-) -> CompilerResult<(ParsedProgram, ParseWorkCounters, f64)> {
+) -> CompilerResult<(ProjectSyntaxSnapshot, ParseWorkCounters, f64)> {
     let started = Instant::now();
     let mut work = ParseWorkCounters::default();
-    let mut snapshots = Vec::with_capacity(state.source.units.len());
+    let mut parsed_units = Vec::with_capacity(state.source.units.len());
 
     for unit in &state.source.units {
         let source_unit_id = SourceUnitId::from_path(&unit.path).map_err(|error| {
@@ -575,10 +583,10 @@ fn parse_project_snapshot(
         if let Some(snapshot) = state
             .parsed_units
             .get(&source_unit_id)
-            .filter(|snapshot| snapshot.source == unit.source)
+            .filter(|snapshot| snapshot.parsed.source == unit.source)
         {
             work.record_reused_source_units(1);
-            snapshots.push(Arc::clone(snapshot));
+            parsed_units.push(Arc::clone(&snapshot.parsed));
             continue;
         }
 
@@ -586,20 +594,54 @@ fn parse_project_snapshot(
             parse_project_source_unit_profiled(unit.path.clone(), unit.source.clone());
         work.accumulate(profile.work_counters);
         let snapshot = Arc::new(parsed?);
-        state
-            .parsed_units
-            .insert(source_unit_id, Arc::clone(&snapshot));
-        snapshots.push(snapshot);
+        state.parsed_units.insert(
+            source_unit_id,
+            RetainedUnitSyntax {
+                parsed: Arc::clone(&snapshot),
+                linked: None,
+            },
+        );
+        parsed_units.push(snapshot);
     }
 
-    let units = snapshots
-        .into_iter()
-        .map(|snapshot| snapshot.as_ref().clone())
-        .collect();
-    let (parsed, assembly_profile) =
-        assemble_parsed_source_units_profiled(&state.source.entrypoint, units);
-    work.accumulate(assembly_profile.work_counters);
-    Ok((parsed?, work, started.elapsed().as_secs_f64() * 1_000.0))
+    let link_keys = project_unit_link_keys(
+        &state.source.entrypoint,
+        parsed_units
+            .iter()
+            .map(|unit| (unit.source_unit_id.clone(), unit.declared_functions.clone())),
+    )?;
+    let mut linked_units = Vec::with_capacity(parsed_units.len());
+    for parsed in parsed_units {
+        let source_unit_id = parsed.source_unit_id.clone();
+        let link_key = link_keys.get(&source_unit_id).cloned().ok_or_else(|| {
+            session_error(format!(
+                "compiler project source unit `{}` has no project link context",
+                parsed.path
+            ))
+        })?;
+        let retained = state
+            .parsed_units
+            .get_mut(&source_unit_id)
+            .expect("parsed project unit is retained before linking");
+        if let Some(linked) = retained
+            .linked
+            .as_ref()
+            .filter(|linked| linked.link_key() == &link_key)
+        {
+            linked_units.push(Arc::clone(linked));
+            continue;
+        }
+        let (linked, profile) =
+            link_project_source_unit_profiled(parsed.as_ref().clone(), link_key);
+        work.accumulate(profile.work_counters);
+        let linked = Arc::new(linked?);
+        retained.linked = Some(Arc::clone(&linked));
+        linked_units.push(linked);
+    }
+
+    let project =
+        ProjectSyntaxSnapshot::from_unit_snapshots(&state.source.entrypoint, linked_units)?;
+    Ok((project, work, started.elapsed().as_secs_f64() * 1_000.0))
 }
 
 fn validate_project(project: &CompilerProject) -> CompilerResult<()> {
@@ -698,6 +740,64 @@ mod tests {
             .plan()
             .clone();
         assert_eq!(first_plan, second_plan);
+    }
+
+    #[test]
+    fn unit_native_session_verified_artifact_matches_assembled_oracle() {
+        let units = vec![
+            CompilerSourceUnit {
+                path: "RUN.bn".to_owned(),
+                source: "value: Math/double(input: 2)\n".to_owned(),
+            },
+            CompilerSourceUnit {
+                path: "Math.bn".to_owned(),
+                source: "FUNCTION double(input) {\n    input + input\n}\n".to_owned(),
+            },
+        ];
+        let mut session = CompilerSession::new();
+        let project = session
+            .open_project(CompilerProject::new(
+                "RUN.bn",
+                units.clone(),
+                TargetProfile::SoftwareDefault,
+                ProgramRole::Server,
+                ApplicationIdentity::compiler_default(),
+            ))
+            .unwrap();
+        let revision = session.revision(project).unwrap();
+        let unit_native = session
+            .request(
+                project,
+                revision,
+                CompileIntent::VerifiedPreview,
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        let unit_native = unit_native.compiled().unwrap();
+        let unit_native_artifact = (
+            unit_native.source_bundle_digest_v1,
+            unit_native.semantic_program_digest,
+            unit_native.verification_manifest_digest,
+            unit_native.plan.plan().clone(),
+            unit_native.plan.plan_hash().to_owned(),
+        );
+
+        let assembled = crate::compile_sealed_machine_plan(crate::CompileRequest::source_units(
+            "RUN.bn",
+            &units,
+            TargetProfile::SoftwareDefault,
+            ProgramRole::Server,
+            ApplicationIdentity::compiler_default(),
+        ))
+        .unwrap();
+        let assembled_artifact = (
+            assembled.source_bundle_digest_v1,
+            assembled.semantic_program_digest,
+            assembled.verification_manifest_digest,
+            assembled.plan.plan().clone(),
+            assembled.plan.plan_hash().to_owned(),
+        );
+        assert_eq!(unit_native_artifact, assembled_artifact);
     }
 
     #[test]
@@ -840,6 +940,7 @@ mod tests {
             assert_eq!(first.profile.parse_work.source_units_attempted, 2);
             assert_eq!(first.profile.parse_work.source_units_parsed, 2);
             assert_eq!(first.profile.parse_work.source_units_reused, 0);
+            assert_eq!(first.profile.parse_work.nodes_rebased, 0);
         }
         let retained_a = session
             .unit_syntax_snapshot(project, "A.bn")
@@ -859,7 +960,7 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        {
+        let second_work = {
             let result = session
                 .request(
                     project,
@@ -872,7 +973,38 @@ mod tests {
             assert_eq!(second.profile.parse_work.source_units_attempted, 1);
             assert_eq!(second.profile.parse_work.source_units_parsed, 1);
             assert_eq!(second.profile.parse_work.source_units_reused, 1);
-        }
+            assert_eq!(second.profile.parse_work.nodes_rebased, 0);
+            second.profile.parse_work
+        };
+
+        let mut isolated = CompilerSession::new();
+        let isolated_project = isolated
+            .open_project(CompilerProject::new(
+                "RUN.bn",
+                vec![CompilerSourceUnit {
+                    path: "RUN.bn".to_owned(),
+                    source: "value: 2\n".to_owned(),
+                }],
+                TargetProfile::SoftwareDefault,
+                ProgramRole::Server,
+                ApplicationIdentity::compiler_default(),
+            ))
+            .unwrap();
+        let isolated_revision = isolated.revision(isolated_project).unwrap();
+        let isolated_result = isolated
+            .request(
+                isolated_project,
+                isolated_revision,
+                CompileIntent::Diagnostics,
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        let mut isolated_work = isolated_result.diagnostics().unwrap().profile.parse_work;
+        isolated_work.record_reused_source_units(1);
+        assert_eq!(
+            second_work, isolated_work,
+            "warm parser and validation work must equal the changed unit alone",
+        );
 
         let current_a = session
             .unit_syntax_snapshot(project, "A.bn")

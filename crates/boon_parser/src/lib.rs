@@ -4,15 +4,16 @@ use boon_contract::{
 #[cfg(test)]
 use boon_syntax::ProgramRoleRoot;
 use boon_syntax::{
-    AstBlockBinding, AstCallArg, AstCallArgKind, AstDrainPath, AstExpr, AstExprKind,
-    AstMatchPattern, AstParameter, AstParameterKind, AstPassContext, AstProgram, AstRecordField,
-    AstStatement, AstStatementKind, AstTextSegment, AstToken, AstTokenKind, BytesSizeSyntax,
-    DocumentAst, LANGUAGE_FEATURE_REGISTRY, LanguageFeatureParseExpectation, LanguageFeatureStage,
+    __parser_pack_syntax_node_id, __parser_unpack_syntax_node_id, AstBlockBinding, AstCallArg,
+    AstCallArgKind, AstDrainPath, AstExpr, AstExprKind, AstMatchPattern, AstParameter,
+    AstParameterKind, AstPassContext, AstProgram, AstRecordField, AstStatement, AstStatementKind,
+    AstTextSegment, AstToken, AstTokenKind, BytesSizeSyntax, DocumentAst,
+    LANGUAGE_FEATURE_REGISTRY, LanguageFeatureParseExpectation, LanguageFeatureStage,
     ParsedProgramFields, ParsedSourceFile, ParsedSourceUnitFields, ParserItem, ParserLine,
     ProgramKind, SourceUnitId, StableDefinitionKey, StableExpressionChildRole,
     StableExpressionRouteSegment, StableItemRoute, StableItemRouteSegment, StableOccurrenceKey,
-    StableOccurrenceRoute, StableStatementKind, StableStatementRouteSegment, UnitItemIndex,
-    UnitItemIndexEntry, UnitItemKind, UnitItemParameter, is_program_role_root,
+    StableOccurrenceRoute, StableStatementKind, StableStatementRouteSegment, SyntaxUnitNamespace,
+    UnitItemIndex, UnitItemIndexEntry, UnitItemKind, UnitItemParameter, is_program_role_root,
     is_reserved_standard_root,
 };
 use serde::Serialize;
@@ -175,6 +176,909 @@ impl ParsedSourceUnit {
             source_unit_id: self.source_unit_id.clone(),
             route: self.occurrence_routes.get(expression_id)?.clone()?,
         })
+    }
+
+    /// Consume a context-independent parser unit into the unit-native syntax
+    /// representation used by the persistent compiler.
+    ///
+    /// The mutation happens while this unit is uniquely owned. It does not
+    /// clone another unit and never constructs a project-global AST arena.
+    pub fn into_unit_syntax_snapshot(
+        self,
+        link_key: ProjectUnitLinkKey,
+    ) -> Result<UnitSyntaxSnapshot, ParseError> {
+        into_unit_syntax_snapshot_with_work(self, link_key, &ParseWorkRecorder::disabled())
+    }
+}
+
+fn into_unit_syntax_snapshot_with_work(
+    mut parsed: ParsedSourceUnit,
+    link_key: ProjectUnitLinkKey,
+    work: &ParseWorkRecorder,
+) -> Result<UnitSyntaxSnapshot, ParseError> {
+    if let Some(module) = link_key.module.as_deref() {
+        let functions_by_module = BTreeMap::from([(
+            module.to_owned(),
+            link_key.module_functions.iter().cloned().collect(),
+        )]);
+        namespace_source_unit_module(&mut parsed.fields.ast, module, &functions_by_module, work);
+    }
+    let validation_index = ValidationIndex::build(&parsed.fields.ast, work);
+    validate_source_syntax_with_work(
+        &parsed.fields.path,
+        &parsed.fields.ast,
+        &validation_index,
+        work,
+    )?;
+    validate_balanced_brackets_with_work(&parsed.fields.path, &parsed.fields.ast, work)?;
+    validate_list_capacities_with_work(
+        &parsed.fields.path,
+        &parsed.fields.ast,
+        &validation_index,
+        work,
+    )?;
+    validate_no_reducer_style_update_with_work(
+        &parsed.fields.path,
+        &parsed.fields.ast,
+        &validation_index,
+        work,
+    )?;
+    validate_no_hidden_identity_leak_with_work(
+        &parsed.fields.path,
+        &parsed.fields.ast,
+        &validation_index,
+        work,
+    )?;
+    pack_source_unit_syntax_ids(
+        &parsed.fields.path,
+        &mut parsed.fields.ast,
+        link_key.namespace,
+    )?;
+    Ok(UnitSyntaxSnapshot {
+        fields: parsed.fields,
+        namespace: link_key.namespace,
+        module: link_key.module.clone(),
+        link_key,
+    })
+}
+
+/// Project-link one freshly parsed unit and return deterministic validation /
+/// namespace work. Session cache hits never call this function.
+pub fn link_project_source_unit_profiled(
+    parsed: ParsedSourceUnit,
+    link_key: ProjectUnitLinkKey,
+) -> (Result<UnitSyntaxSnapshot, ParseError>, ParseProfile) {
+    let work = ParseWorkRecorder::enabled();
+    let linked = into_unit_syntax_snapshot_with_work(parsed, link_key, &work);
+    (linked, work.finish())
+}
+
+/// Assign deterministic, collision-checked namespaces from stable source-unit
+/// paths. Open addressing is deterministic in canonical path order. A rare
+/// collision can relink the colliding units, but it cannot silently alias two
+/// syntax arenas.
+pub fn project_syntax_namespaces(
+    paths: impl IntoIterator<Item = SourceUnitId>,
+) -> Result<BTreeMap<SourceUnitId, SyntaxUnitNamespace>, ParseError> {
+    let mut paths = paths.into_iter().collect::<Vec<_>>();
+    paths.sort();
+    paths.dedup();
+    if paths.len() > usize::from(SyntaxUnitNamespace::MAX) {
+        return Err(ParseError {
+            path: String::new(),
+            line: None,
+            column: None,
+            message: format!(
+                "project has {} source units but the unit-native syntax namespace supports at most {}",
+                paths.len(),
+                SyntaxUnitNamespace::MAX,
+            ),
+        });
+    }
+    let mut occupied = BTreeSet::new();
+    let mut assigned = BTreeMap::new();
+    for path in paths {
+        let mut hash = 0xcbf29ce484222325u64;
+        for byte in path.as_str().as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        let mut candidate = u16::try_from(hash % u64::from(SyntaxUnitNamespace::MAX))
+            .unwrap_or_default()
+            .saturating_add(1);
+        let start = candidate;
+        loop {
+            if occupied.insert(candidate) {
+                let namespace = SyntaxUnitNamespace::__parser_new(candidate)
+                    .expect("candidate is inside syntax namespace range");
+                assigned.insert(path, namespace);
+                break;
+            }
+            candidate = if candidate == SyntaxUnitNamespace::MAX {
+                1
+            } else {
+                candidate + 1
+            };
+            if candidate == start {
+                return Err(ParseError {
+                    path: path.into_string(),
+                    line: None,
+                    column: None,
+                    message: "unit-native syntax namespace is exhausted".to_owned(),
+                });
+            }
+        }
+    }
+    Ok(assigned)
+}
+
+/// Compute the body-insensitive link context for already parsed units.
+pub fn project_unit_link_keys(
+    entrypoint: &str,
+    units: impl IntoIterator<Item = (SourceUnitId, Vec<String>)>,
+) -> Result<BTreeMap<SourceUnitId, ProjectUnitLinkKey>, ParseError> {
+    let units = units.into_iter().collect::<Vec<_>>();
+    let namespaces = project_syntax_namespaces(units.iter().map(|(id, _)| id.clone()))?;
+    let mut functions_by_module = BTreeMap::<String, BTreeSet<String>>::new();
+    for (source_unit_id, functions) in &units {
+        if let Some(module) = module_name_for_project_file(entrypoint, source_unit_id.as_str()) {
+            functions_by_module
+                .entry(module)
+                .or_default()
+                .extend(functions.iter().cloned());
+        }
+    }
+    let mut keys = BTreeMap::new();
+    for (source_unit_id, _) in units {
+        let module = module_name_for_project_file(entrypoint, source_unit_id.as_str());
+        let module_functions = module
+            .as_ref()
+            .and_then(|module| functions_by_module.get(module))
+            .map(|functions| functions.iter().cloned().collect())
+            .unwrap_or_default();
+        keys.insert(
+            source_unit_id.clone(),
+            ProjectUnitLinkKey {
+                namespace: *namespaces.get(&source_unit_id).ok_or_else(|| ParseError {
+                    path: source_unit_id.as_str().to_owned(),
+                    line: None,
+                    column: None,
+                    message: "source unit has no syntax namespace".to_owned(),
+                })?,
+                module,
+                module_functions,
+            },
+        );
+    }
+    Ok(keys)
+}
+
+fn pack_source_unit_syntax_ids(
+    path: &str,
+    ast: &mut AstProgram,
+    namespace: SyntaxUnitNamespace,
+) -> Result<(), ParseError> {
+    fn pack(path: &str, namespace: SyntaxUnitNamespace, local: usize) -> Result<usize, ParseError> {
+        __parser_pack_syntax_node_id(namespace, local).ok_or_else(|| {
+            parsed_source_unit_invariant_error(
+                path,
+                format!("unit-local syntax id {local} exceeds the packed syntax bound"),
+            )
+        })
+    }
+
+    fn pack_statement(
+        path: &str,
+        namespace: SyntaxUnitNamespace,
+        statement: &mut AstStatement,
+    ) -> Result<(), ParseError> {
+        statement.id = pack(path, namespace, statement.id)?;
+        if let Some(expression) = &mut statement.expr {
+            *expression = pack(path, namespace, *expression)?;
+        }
+        for child in &mut statement.children {
+            pack_statement(path, namespace, child)?;
+        }
+        Ok(())
+    }
+
+    fn pack_expression_reference(
+        path: &str,
+        namespace: SyntaxUnitNamespace,
+        reference: &mut usize,
+    ) -> Result<(), ParseError> {
+        *reference = pack(path, namespace, *reference)?;
+        Ok(())
+    }
+
+    for statement in &mut ast.statements {
+        pack_statement(path, namespace, statement)?;
+    }
+    for expression in ast.expressions.__parser_make_mut() {
+        expression.id = pack(path, namespace, expression.id)?;
+        if let Some(input) = &mut expression.linked_input {
+            pack_expression_reference(path, namespace, input)?;
+        }
+        match &mut expression.kind {
+            AstExprKind::TextTemplate { segments } => {
+                for segment in segments {
+                    if let AstTextSegment::Dynamic { value } = segment {
+                        pack_expression_reference(path, namespace, value)?;
+                    }
+                }
+            }
+            AstExprKind::TaggedObject { fields, .. } | AstExprKind::Object(fields) => {
+                for field in fields {
+                    pack_expression_reference(path, namespace, &mut field.value)?;
+                }
+            }
+            AstExprKind::Flush { payload } => {
+                if let Some(payload) = payload {
+                    pack_expression_reference(path, namespace, payload)?;
+                }
+            }
+            AstExprKind::Call { args, pass, .. } => {
+                for argument in args {
+                    pack_expression_reference(path, namespace, &mut argument.value)?;
+                }
+                if let Some(pass) = pass {
+                    pack_expression_reference(path, namespace, &mut pass.value)?;
+                }
+            }
+            AstExprKind::Pipe {
+                input,
+                args,
+                pass,
+                arms,
+                ..
+            } => {
+                pack_expression_reference(path, namespace, input)?;
+                for argument in args {
+                    pack_expression_reference(path, namespace, &mut argument.value)?;
+                }
+                if let Some(pass) = pass {
+                    pack_expression_reference(path, namespace, &mut pass.value)?;
+                }
+                for arm in arms {
+                    pack_expression_reference(path, namespace, arm)?;
+                }
+            }
+            AstExprKind::Draining { input } => {
+                pack_expression_reference(path, namespace, input)?;
+            }
+            AstExprKind::Hold { initial, .. } => {
+                pack_expression_reference(path, namespace, initial)?;
+            }
+            AstExprKind::Latest { branches } => {
+                for branch in branches {
+                    pack_expression_reference(path, namespace, branch)?;
+                }
+            }
+            AstExprKind::When { input, arms } => {
+                pack_expression_reference(path, namespace, input)?;
+                for arm in arms {
+                    pack_expression_reference(path, namespace, arm)?;
+                }
+            }
+            AstExprKind::Then { input, output } => {
+                pack_expression_reference(path, namespace, input)?;
+                if let Some(output) = output {
+                    pack_expression_reference(path, namespace, output)?;
+                }
+            }
+            AstExprKind::Infix { left, right, .. } => {
+                pack_expression_reference(path, namespace, left)?;
+                pack_expression_reference(path, namespace, right)?;
+            }
+            AstExprKind::MatchArm { output, .. } => {
+                if let Some(output) = output {
+                    pack_expression_reference(path, namespace, output)?;
+                }
+            }
+            AstExprKind::Block { bindings, result } => {
+                for binding in bindings {
+                    binding.statement = pack(path, namespace, binding.statement)?;
+                    pack_expression_reference(path, namespace, &mut binding.value)?;
+                }
+                if let Some(result) = result {
+                    pack_expression_reference(path, namespace, result)?;
+                }
+            }
+            AstExprKind::ListLiteral { items, .. }
+            | AstExprKind::BytesLiteral { items, .. }
+            | AstExprKind::SetLiteral { items } => {
+                for item in items {
+                    pack_expression_reference(path, namespace, item)?;
+                }
+            }
+            AstExprKind::Arrow { left, output, .. } => {
+                pack_expression_reference(path, namespace, left)?;
+                if let Some(output) = output {
+                    pack_expression_reference(path, namespace, output)?;
+                }
+            }
+            AstExprKind::MapEntry { key, value } => {
+                pack_expression_reference(path, namespace, key)?;
+                pack_expression_reference(path, namespace, value)?;
+            }
+            AstExprKind::MapLiteral { entries } => {
+                for entry in entries {
+                    pack_expression_reference(path, namespace, entry)?;
+                }
+            }
+            AstExprKind::Identifier(_)
+            | AstExprKind::Path(_)
+            | AstExprKind::Drain { .. }
+            | AstExprKind::StringLiteral(_)
+            | AstExprKind::TextLiteral(_)
+            | AstExprKind::Number(_)
+            | AstExprKind::ByteLiteral { .. }
+            | AstExprKind::Tag(_)
+            | AstExprKind::Source
+            | AstExprKind::Delimiter
+            | AstExprKind::Unknown(_)
+            | AstExprKind::BitsLiteral { .. } => {}
+        }
+    }
+    Ok(())
+}
+
+/// Project context that affects only syntax lookup and authored module names.
+///
+/// The key is intentionally body-insensitive. A body edit can rebuild one unit
+/// snapshot while every other unit remains shared; adding or removing a module
+/// function relinks only units whose module lookup actually changed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProjectUnitLinkKey {
+    pub namespace: SyntaxUnitNamespace,
+    pub module: Option<String>,
+    pub module_functions: Vec<String>,
+}
+
+/// Immutable unit-native syntax used by the persistent compiler.
+///
+/// Expression and statement arenas remain physically owned by this unit. Their
+/// packed ids contain the collision-checked unit namespace, so a project view
+/// can borrow the arenas directly without copying or rebasing their nodes.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct UnitSyntaxSnapshot {
+    #[serde(flatten)]
+    fields: ParsedSourceUnitFields,
+    namespace: SyntaxUnitNamespace,
+    module: Option<String>,
+    #[serde(skip)]
+    link_key: ProjectUnitLinkKey,
+}
+
+impl std::ops::Deref for UnitSyntaxSnapshot {
+    type Target = ParsedSourceUnitFields;
+
+    fn deref(&self) -> &Self::Target {
+        &self.fields
+    }
+}
+
+impl UnitSyntaxSnapshot {
+    pub fn namespace(&self) -> SyntaxUnitNamespace {
+        self.namespace
+    }
+
+    pub fn module(&self) -> Option<&str> {
+        self.module.as_deref()
+    }
+
+    pub fn link_key(&self) -> &ProjectUnitLinkKey {
+        &self.link_key
+    }
+
+    pub fn stable_definition_keys(&self) -> impl Iterator<Item = StableDefinitionKey> + '_ {
+        self.item_index
+            .definitions()
+            .map(|entry| StableDefinitionKey {
+                source_unit_id: self.source_unit_id.clone(),
+                item_route: entry.route.clone(),
+            })
+    }
+
+    pub fn stable_occurrence_key(&self, expression_id: usize) -> Option<StableOccurrenceKey> {
+        let (namespace, local) = __parser_unpack_syntax_node_id(expression_id)?;
+        if namespace != self.namespace {
+            return None;
+        }
+        Some(StableOccurrenceKey {
+            source_unit_id: self.source_unit_id.clone(),
+            route: self.occurrence_routes.get(local)?.clone()?,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ProjectItemIndexEntry {
+    pub definition_key: Option<StableDefinitionKey>,
+    pub source_unit_id: SourceUnitId,
+    pub route: StableItemRoute,
+    pub local_statement_id: usize,
+    pub statement_id: usize,
+    pub kind: UnitItemKind,
+    pub names: Vec<String>,
+    pub parameters: Vec<UnitItemParameter>,
+}
+
+/// Body-insensitive item headers over unit-native project syntax.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct ProjectItemIndex {
+    pub entries: Vec<ProjectItemIndexEntry>,
+}
+
+impl ProjectItemIndex {
+    pub fn definitions(&self) -> impl Iterator<Item = &ProjectItemIndexEntry> {
+        self.entries
+            .iter()
+            .filter(|entry| entry.definition_key.is_some())
+    }
+}
+
+/// One source unit's position inside the canonical project source map.
+///
+/// AST locations remain unit-local. Global offsets are computed through this
+/// compact map only for the legacy checked/artifact projection that still
+/// requires them; no AST node is rewritten when an earlier unit changes size.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ProjectSourceUnitLayout {
+    pub source_unit_id: SourceUnitId,
+    pub path: String,
+    pub start_line: usize,
+    pub start_byte: usize,
+    pub source_len: usize,
+    pub line_count: usize,
+    pub module: Option<String>,
+    pub namespace: SyntaxUnitNamespace,
+}
+
+/// Opaque unit-native project syntax snapshot.
+///
+/// This is the production checker input. It owns only `Arc` unit snapshots,
+/// body-insensitive indexes, and a compact source map. It contains no global
+/// AST arena, concatenated source buffer, or rebased statement/expression
+/// copy.
+#[derive(Clone, Debug)]
+pub struct ProjectSyntaxSnapshot {
+    fields: std::sync::Arc<ProjectSyntaxSnapshotFields>,
+}
+
+#[derive(Debug)]
+struct ProjectSyntaxSnapshotFields {
+    source_bundle_digest_v1: SourceBundleDigestV1,
+    path: String,
+    units: Vec<std::sync::Arc<UnitSyntaxSnapshot>>,
+    unit_by_namespace: BTreeMap<SyntaxUnitNamespace, usize>,
+    source_layouts: Vec<ProjectSourceUnitLayout>,
+    item_index: ProjectItemIndex,
+    functions: Vec<String>,
+    operators: Vec<String>,
+    expression_offsets: Vec<usize>,
+    statement_offsets: Vec<usize>,
+    expression_count: usize,
+    statement_count: usize,
+}
+
+impl ProjectSyntaxSnapshot {
+    pub fn from_unit_snapshots(
+        entrypoint: &str,
+        mut units: Vec<std::sync::Arc<UnitSyntaxSnapshot>>,
+    ) -> Result<Self, ParseError> {
+        units.sort_by(|left, right| {
+            left.source_unit_id
+                .as_str()
+                .as_bytes()
+                .cmp(right.source_unit_id.as_str().as_bytes())
+        });
+        let bundle = CanonicalSourceBundleV1::new(
+            entrypoint,
+            units
+                .iter()
+                .map(|unit| SourceBundleUnit::new(&unit.path, &unit.source)),
+        )
+        .map_err(|error| source_bundle_parse_error(entrypoint, error))?;
+        let path = bundle.entrypoint().to_owned();
+        let source_bundle_digest_v1 = bundle.digest();
+        drop(bundle);
+
+        let mut unit_by_namespace = BTreeMap::new();
+        let mut source_layouts = Vec::with_capacity(units.len());
+        let mut item_index = ProjectItemIndex::default();
+        let mut functions = Vec::new();
+        let mut operators = Vec::new();
+        let mut expression_count = 0usize;
+        let mut statement_count = 0usize;
+        let mut expression_offsets = Vec::with_capacity(units.len());
+        let mut statement_offsets = Vec::with_capacity(units.len());
+        let mut next_line = 1usize;
+        let mut next_byte = 0usize;
+
+        for (unit_index, unit) in units.iter().enumerate() {
+            if unit.path != unit.source_unit_id.as_str() {
+                return Err(parsed_source_unit_invariant_error(
+                    &unit.path,
+                    "unit syntax path does not match its SourceUnitId",
+                ));
+            }
+            if unit_by_namespace
+                .insert(unit.namespace, unit_index)
+                .is_some()
+            {
+                return Err(parsed_source_unit_invariant_error(
+                    &unit.path,
+                    "unit syntax namespace collides inside the project snapshot",
+                ));
+            }
+            expression_offsets.push(expression_count);
+            statement_offsets.push(statement_count);
+            expression_count = expression_count
+                .checked_add(unit.ast.expressions.len())
+                .ok_or_else(|| {
+                    parsed_source_unit_invariant_error(
+                        &unit.path,
+                        "project expression count overflows usize",
+                    )
+                })?;
+            let mut expected_local_statement = 0usize;
+            let local_statement_count = unit_native_statement_count(
+                &unit.path,
+                &unit.ast.statements,
+                unit.namespace,
+                &mut expected_local_statement,
+            )?;
+            statement_count = statement_count
+                .checked_add(local_statement_count)
+                .ok_or_else(|| {
+                    parsed_source_unit_invariant_error(
+                        &unit.path,
+                        "project statement count overflows usize",
+                    )
+                })?;
+            let line_count = unit.source.lines().count().max(1);
+            source_layouts.push(ProjectSourceUnitLayout {
+                source_unit_id: unit.source_unit_id.clone(),
+                path: unit.path.clone(),
+                start_line: next_line,
+                start_byte: next_byte,
+                source_len: unit.source.len(),
+                line_count,
+                module: unit.module.clone(),
+                namespace: unit.namespace,
+            });
+            for entry in &unit.item_index.entries {
+                let statement_id =
+                    __parser_pack_syntax_node_id(unit.namespace, entry.local_statement_id)
+                        .ok_or_else(|| {
+                            parsed_source_unit_invariant_error(
+                                &unit.path,
+                                "item statement id exceeds the unit syntax bound",
+                            )
+                        })?;
+                let mut names = entry.names.clone();
+                if entry.kind == UnitItemKind::Function
+                    && let Some(module) = unit.module.as_deref()
+                {
+                    for name in &mut names {
+                        if !name.contains('/') {
+                            *name = format!("{module}/{name}");
+                        }
+                    }
+                }
+                item_index.entries.push(ProjectItemIndexEntry {
+                    definition_key: entry.is_definition().then(|| StableDefinitionKey {
+                        source_unit_id: unit.source_unit_id.clone(),
+                        item_route: entry.route.clone(),
+                    }),
+                    source_unit_id: unit.source_unit_id.clone(),
+                    route: entry.route.clone(),
+                    local_statement_id: entry.local_statement_id,
+                    statement_id,
+                    kind: entry.kind,
+                    names,
+                    parameters: entry.parameters.clone(),
+                });
+            }
+            collect_raw_declared_functions_with_work(
+                &unit.ast.statements,
+                &ParseWorkRecorder::disabled(),
+            )
+            .into_iter()
+            .for_each(|function| functions.push(function));
+            for item in &unit.ast.items {
+                for operator in &item.operators {
+                    if !operators.iter().any(|existing| existing == operator) {
+                        operators.push(operator.clone());
+                    }
+                }
+            }
+            next_line = next_line.checked_add(line_count).ok_or_else(|| {
+                parsed_source_unit_invariant_error(&unit.path, "project line count overflows usize")
+            })?;
+            next_byte = next_byte.checked_add(unit.source.len()).ok_or_else(|| {
+                parsed_source_unit_invariant_error(
+                    &unit.path,
+                    "project source bytes overflow usize",
+                )
+            })?;
+            if unit_index + 1 < units.len() && !unit.source.ends_with('\n') {
+                next_byte = next_byte.checked_add(1).ok_or_else(|| {
+                    parsed_source_unit_invariant_error(
+                        &unit.path,
+                        "project source separator overflows usize",
+                    )
+                })?;
+            }
+        }
+
+        Ok(Self {
+            fields: std::sync::Arc::new(ProjectSyntaxSnapshotFields {
+                source_bundle_digest_v1,
+                path,
+                units,
+                unit_by_namespace,
+                source_layouts,
+                item_index,
+                functions,
+                operators,
+                expression_offsets,
+                statement_offsets,
+                expression_count,
+                statement_count,
+            }),
+        })
+    }
+
+    pub fn source_bundle_digest_v1(&self) -> SourceBundleDigestV1 {
+        self.fields.source_bundle_digest_v1
+    }
+
+    pub fn path(&self) -> &str {
+        &self.fields.path
+    }
+
+    pub fn kind(&self) -> ProgramKind {
+        ProgramKind::Generic
+    }
+
+    pub fn units(&self) -> &[std::sync::Arc<UnitSyntaxSnapshot>] {
+        &self.fields.units
+    }
+
+    pub fn source_layouts(&self) -> &[ProjectSourceUnitLayout] {
+        &self.fields.source_layouts
+    }
+
+    pub fn item_index(&self) -> &ProjectItemIndex {
+        &self.fields.item_index
+    }
+
+    pub fn functions(&self) -> &[String] {
+        &self.fields.functions
+    }
+
+    pub fn operators(&self) -> &[String] {
+        &self.fields.operators
+    }
+
+    pub fn expression_count(&self) -> usize {
+        self.fields.expression_count
+    }
+
+    pub fn statement_count(&self) -> usize {
+        self.fields.statement_count
+    }
+
+    /// Dense checked-artifact slot for a project-local expression lookup id.
+    ///
+    /// Slots are a legacy/output projection only. Parser nodes and persistent
+    /// request keys retain the unit namespace plus local id and are never
+    /// rewritten when an earlier unit changes size.
+    pub fn expression_slot(&self, expression_id: usize) -> Option<usize> {
+        let (namespace, local) = __parser_unpack_syntax_node_id(expression_id)?;
+        let unit = *self.fields.unit_by_namespace.get(&namespace)?;
+        (local < self.fields.units.get(unit)?.ast.expressions.len())
+            .then(|| self.fields.expression_offsets[unit].checked_add(local))
+            .flatten()
+    }
+
+    pub fn expression_id_for_slot(&self, slot: usize) -> Option<usize> {
+        if slot >= self.fields.expression_count {
+            return None;
+        }
+        let unit = self
+            .fields
+            .expression_offsets
+            .partition_point(|offset| *offset <= slot)
+            .checked_sub(1)?;
+        __parser_pack_syntax_node_id(
+            self.fields.units.get(unit)?.namespace,
+            slot.checked_sub(self.fields.expression_offsets[unit])?,
+        )
+    }
+
+    pub fn statement_slot(&self, statement_id: usize) -> Option<usize> {
+        let (namespace, local) = __parser_unpack_syntax_node_id(statement_id)?;
+        let unit = *self.fields.unit_by_namespace.get(&namespace)?;
+        let end = self
+            .fields
+            .statement_offsets
+            .get(unit + 1)
+            .copied()
+            .unwrap_or(self.fields.statement_count);
+        (local < end.checked_sub(self.fields.statement_offsets[unit])?)
+            .then(|| self.fields.statement_offsets[unit].checked_add(local))
+            .flatten()
+    }
+
+    pub fn statement_id_for_slot(&self, slot: usize) -> Option<usize> {
+        if slot >= self.fields.statement_count {
+            return None;
+        }
+        let unit = self
+            .fields
+            .statement_offsets
+            .partition_point(|offset| *offset <= slot)
+            .checked_sub(1)?;
+        __parser_pack_syntax_node_id(
+            self.fields.units.get(unit)?.namespace,
+            slot.checked_sub(self.fields.statement_offsets[unit])?,
+        )
+    }
+
+    pub fn expressions(&self) -> ProjectExpressionArena<'_> {
+        ProjectExpressionArena { project: self }
+    }
+
+    pub fn root_statement_units(&self) -> ProjectRootStatementUnits<'_> {
+        ProjectRootStatementUnits {
+            units: self.fields.units.iter(),
+        }
+    }
+
+    pub fn expression_source_layout(
+        &self,
+        expression_id: usize,
+    ) -> Option<&ProjectSourceUnitLayout> {
+        let (namespace, _) = __parser_unpack_syntax_node_id(expression_id)?;
+        let index = *self.fields.unit_by_namespace.get(&namespace)?;
+        self.fields.source_layouts.get(index)
+    }
+
+    pub fn stable_occurrence_key(&self, expression_id: usize) -> Option<StableOccurrenceKey> {
+        let (namespace, _) = __parser_unpack_syntax_node_id(expression_id)?;
+        let unit = self
+            .fields
+            .units
+            .get(*self.fields.unit_by_namespace.get(&namespace)?)?;
+        unit.stable_occurrence_key(expression_id)
+    }
+
+    pub fn global_line(&self, syntax_id: usize, local_line: usize) -> Option<usize> {
+        let layout = self.expression_source_layout(syntax_id)?;
+        layout.start_line.checked_add(local_line.checked_sub(1)?)
+    }
+
+    pub fn global_byte(&self, syntax_id: usize, local_byte: usize) -> Option<usize> {
+        let layout = self.expression_source_layout(syntax_id)?;
+        (local_byte <= layout.source_len)
+            .then(|| layout.start_byte.checked_add(local_byte))
+            .flatten()
+    }
+}
+
+fn unit_native_statement_count(
+    path: &str,
+    statements: &[AstStatement],
+    namespace: SyntaxUnitNamespace,
+    expected_local: &mut usize,
+) -> Result<usize, ParseError> {
+    let mut count = 0usize;
+    for statement in statements {
+        let Some((actual_namespace, local)) = __parser_unpack_syntax_node_id(statement.id) else {
+            return Err(parsed_source_unit_invariant_error(
+                path,
+                "unit-native statement has an untagged id",
+            ));
+        };
+        if actual_namespace != namespace || local != *expected_local {
+            return Err(parsed_source_unit_invariant_error(
+                path,
+                format!(
+                    "unit-native statement id {} does not match namespace {} local id {}",
+                    statement.id,
+                    namespace.get(),
+                    *expected_local,
+                ),
+            ));
+        }
+        *expected_local = expected_local.checked_add(1).ok_or_else(|| {
+            parsed_source_unit_invariant_error(path, "unit statement count overflows usize")
+        })?;
+        count = count.checked_add(1).ok_or_else(|| {
+            parsed_source_unit_invariant_error(path, "unit statement count overflows usize")
+        })?;
+        count = count
+            .checked_add(unit_native_statement_count(
+                path,
+                &statement.children,
+                namespace,
+                expected_local,
+            )?)
+            .ok_or_else(|| {
+                parsed_source_unit_invariant_error(path, "unit statement count overflows usize")
+            })?;
+    }
+    Ok(count)
+}
+
+#[derive(Clone, Copy)]
+pub struct ProjectExpressionArena<'a> {
+    project: &'a ProjectSyntaxSnapshot,
+}
+
+impl<'a> ProjectExpressionArena<'a> {
+    pub fn len(self) -> usize {
+        self.project.expression_count()
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn get(self, expression_id: usize) -> Option<&'a AstExpr> {
+        let (namespace, local) = __parser_unpack_syntax_node_id(expression_id)?;
+        let unit = self
+            .project
+            .fields
+            .units
+            .get(*self.project.fields.unit_by_namespace.get(&namespace)?)?;
+        let expression = unit.ast.expressions.get(local)?;
+        (expression.id == expression_id).then_some(expression)
+    }
+
+    pub fn get_slot(self, slot: usize) -> Option<&'a AstExpr> {
+        self.get(self.project.expression_id_for_slot(slot)?)
+    }
+
+    pub fn iter(self) -> ProjectExpressionIter<'a> {
+        ProjectExpressionIter {
+            units: self.project.fields.units.iter(),
+            expressions: None,
+        }
+    }
+}
+
+pub struct ProjectExpressionIter<'a> {
+    units: std::slice::Iter<'a, std::sync::Arc<UnitSyntaxSnapshot>>,
+    expressions: Option<std::slice::Iter<'a, AstExpr>>,
+}
+
+impl<'a> Iterator for ProjectExpressionIter<'a> {
+    type Item = &'a AstExpr;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if let Some(expression) = self.expressions.as_mut().and_then(Iterator::next) {
+                return Some(expression);
+            }
+            self.expressions = Some(self.units.next()?.ast.expressions.iter());
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct ProjectRootStatementUnits<'a> {
+    units: std::slice::Iter<'a, std::sync::Arc<UnitSyntaxSnapshot>>,
+}
+
+impl<'a> Iterator for ProjectRootStatementUnits<'a> {
+    type Item = &'a [AstStatement];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.units.next().map(|unit| unit.ast.statements.as_slice())
     }
 }
 
@@ -742,6 +1646,80 @@ pub fn parse_project_source_unit_profiled(
     let work = ParseWorkRecorder::enabled();
     let parsed = parse_project_source_unit_with_work(path, source, &work);
     (parsed, work.finish())
+}
+
+/// Parse a project directly into immutable unit-native syntax.
+///
+/// Unlike [`parse_project`], this route never concatenates source, clones AST
+/// nodes into one arena, rebases unit-local positions, or performs a second
+/// whole-bundle AST validation. It is the cold counterpart of the persistent
+/// compiler session's retained-unit route.
+pub fn parse_project_syntax(
+    entrypoint: impl Into<String>,
+    files: impl IntoIterator<Item = (String, String)>,
+) -> Result<ProjectSyntaxSnapshot, ParseError> {
+    parse_project_syntax_with_work(entrypoint, files, &ParseWorkRecorder::disabled())
+}
+
+pub fn parse_project_syntax_profiled(
+    entrypoint: impl Into<String>,
+    files: impl IntoIterator<Item = (String, String)>,
+) -> (Result<ProjectSyntaxSnapshot, ParseError>, ParseProfile) {
+    let work = ParseWorkRecorder::enabled();
+    let parsed = parse_project_syntax_with_work(entrypoint, files, &work);
+    (parsed, work.finish())
+}
+
+fn parse_project_syntax_with_work(
+    entrypoint: impl Into<String>,
+    files: impl IntoIterator<Item = (String, String)>,
+    work: &ParseWorkRecorder,
+) -> Result<ProjectSyntaxSnapshot, ParseError> {
+    let entrypoint = entrypoint.into();
+    let files = files.into_iter().collect::<Vec<_>>();
+    let bundle = CanonicalSourceBundleV1::new(
+        &entrypoint,
+        files
+            .iter()
+            .map(|(path, source)| SourceBundleUnit::new(path, source)),
+    )
+    .map_err(|error| source_bundle_parse_error(&entrypoint, error))?;
+    let entrypoint = bundle.entrypoint().to_owned();
+    let mut raw_units = Vec::with_capacity(bundle.units().len());
+    for unit in bundle.units() {
+        work.source_unit_attempted();
+        reject_reserved_module_path(unit.path())?;
+        let source_unit_id = SourceUnitId::from_path(unit.path())
+            .map_err(|error| source_unit_parse_error(unit.path(), error))?;
+        let (parsed, _) = parse_normalized_source_unit_syntax(
+            source_unit_id,
+            unit.source().to_owned(),
+            ParserTrace::from_environment(),
+            ValidationIndexScope::Boundary,
+            work,
+        )?;
+        raw_units.push(parsed);
+    }
+    drop(bundle);
+    let link_keys = project_unit_link_keys(
+        &entrypoint,
+        raw_units
+            .iter()
+            .map(|unit| (unit.source_unit_id.clone(), unit.declared_functions.clone())),
+    )?;
+    let mut units = Vec::with_capacity(raw_units.len());
+    for unit in raw_units {
+        let link_key = link_keys
+            .get(&unit.source_unit_id)
+            .cloned()
+            .ok_or_else(|| {
+                parsed_source_unit_invariant_error(&unit.path, "unit has no project link key")
+            })?;
+        units.push(std::sync::Arc::new(into_unit_syntax_snapshot_with_work(
+            unit, link_key, work,
+        )?));
+    }
+    ProjectSyntaxSnapshot::from_unit_snapshots(&entrypoint, units)
 }
 
 fn parse_project_source_unit_with_work(
@@ -7835,6 +8813,115 @@ document:
             !serde_json::to_string(&before)
                 .unwrap()
                 .contains("source_unit_id")
+        );
+    }
+
+    #[test]
+    fn project_syntax_keeps_unit_arenas_local_when_earlier_source_grows() {
+        let files = [
+            (
+                "app/Math.bn".to_owned(),
+                "FUNCTION double(input) {\n    input + input\n}\n".to_owned(),
+            ),
+            (
+                "app/RUN.bn".to_owned(),
+                "value: Math/double(input: 2)\n".to_owned(),
+            ),
+        ];
+        let before = parse_project_syntax("app/RUN.bn", files.clone()).unwrap();
+        let after = parse_project_syntax(
+            "app/RUN.bn",
+            [
+                (
+                    "app/000_notes.bn".to_owned(),
+                    "note: Text/new(value: \"a much longer unrelated source unit\")\n".to_owned(),
+                ),
+                files[0].clone(),
+                files[1].clone(),
+            ],
+        )
+        .unwrap();
+
+        let before_math = before
+            .units()
+            .iter()
+            .find(|unit| unit.path == "app/Math.bn")
+            .unwrap();
+        let after_math = after
+            .units()
+            .iter()
+            .find(|unit| unit.path == "app/Math.bn")
+            .unwrap();
+        assert_eq!(before_math.namespace(), after_math.namespace());
+        assert_eq!(before_math.ast, after_math.ast);
+        assert_eq!(before_math.item_index, after_math.item_index);
+
+        let expression = before_math.ast.expressions.first().unwrap();
+        let (namespace, local) = __parser_unpack_syntax_node_id(expression.id).unwrap();
+        assert_eq!(namespace, before_math.namespace());
+        assert_eq!(local, 0);
+        assert!(before.expressions().get(expression.id).is_some());
+        assert_eq!(
+            expression.line,
+            after_math.ast.expressions.first().unwrap().line,
+            "unit AST locations stay local when an earlier unit is inserted",
+        );
+
+        let before_layout = before
+            .source_layouts()
+            .iter()
+            .find(|layout| layout.path == "app/Math.bn")
+            .unwrap();
+        let after_layout = after
+            .source_layouts()
+            .iter()
+            .find(|layout| layout.path == "app/Math.bn")
+            .unwrap();
+        assert_ne!(before_layout.start_line, after_layout.start_line);
+        assert_ne!(before_layout.start_byte, after_layout.start_byte);
+    }
+
+    #[test]
+    fn project_syntax_namespaces_module_headers_without_rekeying_definitions() {
+        let project = parse_project_syntax(
+            "app/RUN.bn",
+            [
+                (
+                    "app/Math.bn".to_owned(),
+                    "FUNCTION double(input) {\n    input + input\n}\nFUNCTION quad(input) {\n    double(input: double(input: input))\n}\n".to_owned(),
+                ),
+                (
+                    "app/RUN.bn".to_owned(),
+                    "value: Math/quad(input: 2)\n".to_owned(),
+                ),
+            ],
+        )
+        .unwrap();
+        let math = project
+            .units()
+            .iter()
+            .find(|unit| unit.path == "app/Math.bn")
+            .unwrap();
+        assert_eq!(math.module(), Some("Math"));
+        let function_names = collect_raw_declared_functions(&math.ast.statements);
+        assert_eq!(function_names, ["Math/double", "Math/quad"]);
+        assert!(math.ast.expressions.iter().any(|expression| {
+            matches!(
+                &expression.kind,
+                AstExprKind::Call { function, .. } if function == "Math/double"
+            )
+        }));
+        let definition_names = project
+            .item_index()
+            .definitions()
+            .flat_map(|entry| entry.names.iter().map(String::as_str))
+            .collect::<Vec<_>>();
+        assert_eq!(definition_names, ["Math/double", "Math/quad"]);
+        assert!(
+            project
+                .item_index()
+                .definitions()
+                .all(|entry| entry.definition_key.is_some())
         );
     }
 

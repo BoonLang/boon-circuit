@@ -163,12 +163,16 @@ FUNCTION value_text(value) {
     let Type::VariantSet(variants) = value_type else {
         panic!("value_text domain is not a variant set: {value_type:?}");
     };
-    assert!(variants.iter().any(
-        |variant| matches!(variant, Variant::Tagged { tag, .. } if tag == "BinaryValue")
-    ));
-    assert!(variants.iter().any(
-        |variant| matches!(variant, Variant::Tagged { tag, .. } if tag == "StringValue")
-    ));
+    assert!(
+        variants
+            .iter()
+            .any(|variant| matches!(variant, Variant::Tagged { tag, .. } if tag == "BinaryValue"))
+    );
+    assert!(
+        variants
+            .iter()
+            .any(|variant| matches!(variant, Variant::Tagged { tag, .. } if tag == "StringValue"))
+    );
     let transition = &program
         .callables
         .iter()
@@ -343,7 +347,10 @@ fixed_style: make_fixed_style()
         .find(|entry| entry.path == "classic_style")
         .expect("classic style type");
     let Type::Object(style) = &style.flow_type.ty else {
-        panic!("spread result must remain an object: {:#?}", style.flow_type.ty);
+        panic!(
+            "spread result must remain an object: {:#?}",
+            style.flow_type.ty
+        );
     };
     assert_eq!(style.fields.get("width"), Some(&Type::Number));
 }
@@ -387,7 +394,12 @@ second: wrapper(of: Fancy[hovered: True])
         .entries
         .iter()
         .find(|entry| entry.name == "dispatch")
-        .and_then(|entry| entry.parameters.iter().find(|parameter| parameter.name == "request"))
+        .and_then(|entry| {
+            entry
+                .parameters
+                .iter()
+                .find(|parameter| parameter.name == "request")
+        })
         .expect("dispatch request parameter");
     assert!(matches!(
         &request.flow_type.ty,
@@ -613,11 +625,6 @@ value: invalid_cycle()
     }));
 }
 
-
-
-
-
-
 #[test]
 fn singleton_latest_is_rejected_as_a_meaningless_merge() {
     let parsed = boon_parser::parse_source(
@@ -642,17 +649,15 @@ store: [
     }));
 }
 
-
-
-
-
 #[test]
 fn closed_truth_set_has_no_public_bool_type_alias() {
-    let truth = Type::VariantSet(vec![
-        Variant::Tag("False".to_owned()),
-        Variant::Tag("True".to_owned()),
-    ]
-    .into());
+    let truth = Type::VariantSet(
+        vec![
+            Variant::Tag("False".to_owned()),
+            Variant::Tag("True".to_owned()),
+        ]
+        .into(),
+    );
     assert_eq!(boon_facing_type_label(&truth), "True | False");
     assert_eq!(
         boon_facing_type_display_tree(&truth),
@@ -668,11 +673,9 @@ fn closed_truth_set_has_no_public_bool_type_alias() {
         }
     );
 
-    let parsed = boon_parser::parse_source(
-        "truth-diagnostic.bn",
-        "value: TEXT { no } |> Bool/not()\n",
-    )
-    .unwrap();
+    let parsed =
+        boon_parser::parse_source("truth-diagnostic.bn", "value: TEXT { no } |> Bool/not()\n")
+            .unwrap();
     let output = check_program(&parsed);
     let diagnostic = output
         .report
@@ -683,16 +686,6 @@ fn closed_truth_set_has_no_public_bool_type_alias() {
     assert!(diagnostic.message.contains("expected: True | False"));
     assert!(!diagnostic.message.contains(concat!("BO", "OL")));
 }
-
-
-
-
-
-
-
-
-
-
 
 #[test]
 fn then_by_rejects_a_plain_or_chain_clearing_input() {
@@ -893,7 +886,8 @@ result: remember()
 "#,
     )
     .unwrap();
-    let modes = flow_bindings(&parsed, &ExternalTypeEnvironment::default());
+    let syntax = TypecheckSyntaxProgram::Assembled(parsed.clone());
+    let modes = flow_bindings(&syntax, &ExternalTypeEnvironment::default());
     assert_eq!(
         flow_binding_mode(&modes, "chosen"),
         Some(FlowMode::PresentOrAbsent)

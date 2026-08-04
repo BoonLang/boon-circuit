@@ -4,12 +4,13 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use boon_compiler::{
-    CancellationToken, CompileIntent, CompilerProject, CompilerSession, CompilerSourceUnit,
-    ProjectId, Revision as CompilerRevision, UnitUpdate,
+    CancellationToken, CheckedSourceSyntax, CompileIntent, CompilerProject, CompilerSession,
+    CompilerSourceUnit, ProjectId, Revision as CompilerRevision, UnitUpdate,
 };
 use boon_contract::{CanonicalSourceBundleV1, SourceBundleDigestV1, SourceBundleUnit};
 use boon_editor::language::{
-    LanguageProjectSnapshot, project_checked_language, project_parse_error_language,
+    LanguageProjectSnapshot, project_checked_language, project_checked_unit_native_language,
+    project_parse_error_language,
 };
 use boon_plan::{
     DEFAULT_PERSISTENCE_SCHEMA_VERSION, MachinePlan, MigrationPredecessorBinding, ProgramRole,
@@ -563,12 +564,22 @@ impl PreviewCompiler {
                 let checked = result.diagnostics().ok_or_else(|| {
                     "diagnostics compiler request produced no checked source".to_owned()
                 })?;
-                project_checked_language(
-                    language_revision,
-                    units,
-                    &checked.parsed,
-                    &checked.output,
-                )?
+                match &checked.syntax {
+                    CheckedSourceSyntax::Assembled(program) => project_checked_language(
+                        language_revision,
+                        units,
+                        program,
+                        &checked.output,
+                    )?,
+                    CheckedSourceSyntax::UnitNative(program) => {
+                        project_checked_unit_native_language(
+                            language_revision,
+                            units,
+                            program,
+                            &checked.output,
+                        )?
+                    }
+                }
             };
             cancellation_checkpoint(cancellation)?;
             self.cache_built_in_language(project, revision, projected.clone())?;
@@ -592,8 +603,8 @@ impl PreviewCompiler {
                 .compiled()
                 .ok_or_else(|| "verified compiler request produced no MachinePlan".to_owned())?
                 .plan
-                .clone();
-            Arc::new(plan)
+                .shared_plan();
+            plan
         };
         cancellation_checkpoint(cancellation)?;
         let slot = self
@@ -875,12 +886,17 @@ fn compile_source_bundle(
         let checked = diagnostics
             .diagnostics()
             .ok_or_else(|| "migration diagnostics request produced no checked source".to_owned())?;
-        *language = Some(project_checked_language(
-            language_revision,
-            editor_units,
-            &checked.parsed,
-            &checked.output,
-        )?);
+        *language = Some(match &checked.syntax {
+            CheckedSourceSyntax::Assembled(program) => {
+                project_checked_language(language_revision, editor_units, program, &checked.output)?
+            }
+            CheckedSourceSyntax::UnitNative(program) => project_checked_unit_native_language(
+                language_revision,
+                editor_units,
+                program,
+                &checked.output,
+            )?,
+        });
         cancellation_checkpoint(cancellation)?;
     }
     let result = session
@@ -890,9 +906,9 @@ fn compile_source_bundle(
         .compiled()
         .ok_or_else(|| "verified compiler request produced no MachinePlan".to_owned())?
         .plan
-        .clone();
+        .shared_plan();
     cancellation_checkpoint(cancellation)?;
-    Ok(Arc::new(plan))
+    Ok(plan)
 }
 
 fn cancellation_checkpoint(cancellation: &CancellationToken) -> Result<(), String> {

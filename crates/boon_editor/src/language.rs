@@ -7,7 +7,7 @@ use boon_checked::{
 };
 use boon_contract::{CanonicalSourceBundleV1, SourceBundleDigestV1, SourceBundleUnit};
 use boon_document_model::{StyleEditorTypeHint, StyleRichTextSpan};
-use boon_parser::{ParseError, ParsedProgram, lex_source};
+use boon_parser::{ParseError, ParsedProgram, ProjectSyntaxSnapshot, lex_source};
 use boon_syntax::{AstToken, AstTokenKind};
 use serde::{Deserialize, Serialize};
 
@@ -274,12 +274,62 @@ pub fn project_checked_language(
     program: &ParsedProgram,
     output: &CheckOutput,
 ) -> Result<LanguageProjectSnapshot, String> {
-    let bundle = canonical_source_bundle(&program.path, units)?;
-    if bundle.digest() != program.source_bundle_digest_v1 {
+    project_checked_language_syntax(
+        revision,
+        units,
+        CheckedLanguageSyntax::Assembled(program),
+        output,
+    )
+}
+
+pub fn project_checked_unit_native_language(
+    revision: u64,
+    units: &[SourceUnit],
+    program: &ProjectSyntaxSnapshot,
+    output: &CheckOutput,
+) -> Result<LanguageProjectSnapshot, String> {
+    project_checked_language_syntax(
+        revision,
+        units,
+        CheckedLanguageSyntax::UnitNative(program),
+        output,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum CheckedLanguageSyntax<'a> {
+    Assembled(&'a ParsedProgram),
+    UnitNative(&'a ProjectSyntaxSnapshot),
+}
+
+impl<'a> CheckedLanguageSyntax<'a> {
+    fn path(self) -> &'a str {
+        match self {
+            Self::Assembled(program) => &program.path,
+            Self::UnitNative(program) => program.path(),
+        }
+    }
+
+    fn digest(self) -> SourceBundleDigestV1 {
+        match self {
+            Self::Assembled(program) => program.source_bundle_digest_v1,
+            Self::UnitNative(program) => program.source_bundle_digest_v1(),
+        }
+    }
+}
+
+fn project_checked_language_syntax(
+    revision: u64,
+    units: &[SourceUnit],
+    program: CheckedLanguageSyntax<'_>,
+    output: &CheckOutput,
+) -> Result<LanguageProjectSnapshot, String> {
+    let bundle = canonical_source_bundle(program.path(), units)?;
+    if bundle.digest() != program.digest() {
         return Err(format!(
             "language projection source digest {} differs from parsed digest {}",
             bundle.digest(),
-            program.source_bundle_digest_v1
+            program.digest()
         ));
     }
     let canonical_to_dev_file = canonical_to_dev_file_mapping(program, units)?;
@@ -305,7 +355,14 @@ pub fn project_checked_language(
     // Diagnostics requests intentionally omit this global presentation
     // sidecar. Materialize it here from the already-checked tables, without a
     // second parse or type solve, only when an editor projection is requested.
-    let type_hints = boon_typecheck::project_type_hints(program, output);
+    let type_hints = match program {
+        CheckedLanguageSyntax::Assembled(program) => {
+            boon_typecheck::project_type_hints(program, output)
+        }
+        CheckedLanguageSyntax::UnitNative(program) => {
+            boon_typecheck::project_type_hints_for_project(program, output)
+        }
+    };
     for hint in &type_hints.entries {
         let Some(mut location) = source_location_for_span(
             program,
@@ -414,13 +471,25 @@ fn canonical_source_bundle<'a>(
 }
 
 fn canonical_to_dev_file_mapping(
-    program: &ParsedProgram,
+    program: CheckedLanguageSyntax<'_>,
     units: &[SourceUnit],
 ) -> Result<Vec<usize>, String> {
-    if program.files.len() != units.len() {
+    let canonical_paths = match program {
+        CheckedLanguageSyntax::Assembled(program) => program
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>(),
+        CheckedLanguageSyntax::UnitNative(program) => program
+            .source_layouts()
+            .iter()
+            .map(|layout| layout.path.as_str())
+            .collect::<Vec<_>>(),
+    };
+    if canonical_paths.len() != units.len() {
         return Err(format!(
             "parsed language file count {} differs from dev source count {}",
-            program.files.len(),
+            canonical_paths.len(),
             units.len()
         ));
     }
@@ -432,15 +501,11 @@ fn canonical_to_dev_file_mapping(
             return Err(format!("duplicate normalized dev source path `{path}`"));
         }
     }
-    program
-        .files
-        .iter()
-        .map(|file| {
-            dev_by_path.get(&file.path).copied().ok_or_else(|| {
-                format!(
-                    "parsed source path `{}` is absent from the dev source snapshot",
-                    file.path
-                )
+    canonical_paths
+        .into_iter()
+        .map(|path| {
+            dev_by_path.get(path).copied().ok_or_else(|| {
+                format!("parsed source path `{path}` is absent from the dev source snapshot")
             })
         })
         .collect()
@@ -452,7 +517,10 @@ fn remap_source_location(location: &mut SourceLocation, canonical_to_dev_file: &
     }
 }
 
-fn semantic_items(program: &ParsedProgram, checked: &CheckedProgramFields) -> Vec<SemanticItem> {
+fn semantic_items(
+    program: CheckedLanguageSyntax<'_>,
+    checked: &CheckedProgramFields,
+) -> Vec<SemanticItem> {
     let declarations = checked
         .declarations
         .iter()
@@ -477,7 +545,7 @@ fn semantic_items(program: &ParsedProgram, checked: &CheckedProgramFields) -> Ve
                         .map(|name| (*name).to_owned())
                 })
                 .unwrap_or_else(|| format!("declaration {}", occurrence.target.0));
-            let span = refine_semantic_span(occurrence.span, &program.ast.tokens, kind, &name);
+            let span = refine_semantic_span_for_syntax(program, occurrence.span, kind, &name);
             let location = source_location_for_span(program, span)?;
             let declaration_kind = declaration.map(|declaration| declaration.kind);
             let out_related = matches!(
@@ -709,7 +777,58 @@ fn semantic_description(
     }
 }
 
-fn source_location_for_span(program: &ParsedProgram, span: CheckedSpan) -> Option<SourceLocation> {
+fn source_location_for_span(
+    program: CheckedLanguageSyntax<'_>,
+    span: CheckedSpan,
+) -> Option<SourceLocation> {
+    match program {
+        CheckedLanguageSyntax::Assembled(program) => {
+            source_location_for_assembled_span(program, span)
+        }
+        CheckedLanguageSyntax::UnitNative(program) => {
+            let layouts = program.source_layouts();
+            let by_line = layouts.iter().enumerate().find(|(_, layout)| {
+                span.line >= layout.start_line
+                    && span.line < layout.start_line.saturating_add(layout.line_count)
+            });
+            let (file_index, layout) = by_line.or_else(|| {
+                layouts.iter().enumerate().find(|(_, layout)| {
+                    let file_end = layout.start_byte.saturating_add(layout.source_len);
+                    (layout.start_byte <= span.start && span.start < file_end)
+                        || (layout.source_len == 0 && span.start == layout.start_byte)
+                })
+            })?;
+            let unit = program.units().get(file_index)?;
+            let local_start = span
+                .start
+                .saturating_sub(layout.start_byte)
+                .min(unit.source.len());
+            let line = if span.line >= layout.start_line {
+                span.line.saturating_sub(layout.start_line)
+            } else {
+                unit.source[..local_start]
+                    .bytes()
+                    .filter(|byte| *byte == b'\n')
+                    .count()
+            };
+            Some(SourceLocation {
+                file_index,
+                path: layout.path.clone(),
+                line,
+                start: local_start,
+                end: span
+                    .end
+                    .saturating_sub(layout.start_byte)
+                    .min(unit.source.len()),
+            })
+        }
+    }
+}
+
+fn source_location_for_assembled_span(
+    program: &ParsedProgram,
+    span: CheckedSpan,
+) -> Option<SourceLocation> {
     let by_line = program
         .files
         .iter()
@@ -753,6 +872,53 @@ fn source_location_for_span(program: &ParsedProgram, span: CheckedSpan) -> Optio
         start: local_start,
         end: span.end.saturating_sub(file_start).min(file.source.len()),
     })
+}
+
+fn refine_semantic_span_for_syntax(
+    program: CheckedLanguageSyntax<'_>,
+    span: CheckedSpan,
+    kind: SemanticKind,
+    name: &str,
+) -> CheckedSpan {
+    match program {
+        CheckedLanguageSyntax::Assembled(program) => {
+            refine_semantic_span(span, &program.ast.tokens, kind, name)
+        }
+        CheckedLanguageSyntax::UnitNative(program) => {
+            let Some((unit_index, layout)) =
+                program
+                    .source_layouts()
+                    .iter()
+                    .enumerate()
+                    .find(|(_, layout)| {
+                        let end = layout.start_byte.saturating_add(layout.source_len);
+                        (layout.start_byte <= span.start && span.start < end)
+                            || (layout.source_len == 0 && span.start == layout.start_byte)
+                    })
+            else {
+                return span;
+            };
+            let Some(unit) = program.units().get(unit_index) else {
+                return span;
+            };
+            let local = CheckedSpan {
+                line: span
+                    .line
+                    .saturating_sub(layout.start_line)
+                    .saturating_add(1),
+                start: span.start.saturating_sub(layout.start_byte),
+                end: span.end.saturating_sub(layout.start_byte),
+            };
+            let refined = refine_semantic_span(local, &unit.ast.tokens, kind, name);
+            CheckedSpan {
+                line: layout
+                    .start_line
+                    .saturating_add(refined.line.saturating_sub(1)),
+                start: layout.start_byte.saturating_add(refined.start),
+                end: layout.start_byte.saturating_add(refined.end),
+            }
+        }
+    }
 }
 
 fn refine_semantic_span(
@@ -1317,6 +1483,40 @@ result: wrapper(PASS: [store: [count: 1]])
                 );
             }
         }
+    }
+
+    #[test]
+    fn unit_native_language_projection_matches_assembled_project_exactly() {
+        let units = vec![
+            SourceUnit {
+                path: "RUN.bn".to_owned(),
+                source: "result: Math/double(value: 21)\n".to_owned(),
+            },
+            SourceUnit {
+                path: "Math.bn".to_owned(),
+                source: "FUNCTION double(value) {\n    value * 2\n}\n".to_owned(),
+            },
+        ];
+        let files = units
+            .iter()
+            .map(|unit| (unit.path.clone(), unit.source.clone()))
+            .collect::<Vec<_>>();
+        let assembled = boon_parser::parse_project("RUN.bn", files.clone()).unwrap();
+        let unit_native = boon_parser::parse_project_syntax("RUN.bn", files).unwrap();
+        let assembled_output = boon_typecheck::check_program(&assembled);
+        let unit_native_output =
+            boon_typecheck::check_project_program_profiled_with_external_types(
+                &unit_native,
+                &boon_checked::ExternalTypeEnvironment::default(),
+            )
+            .0;
+
+        let assembled_projection =
+            project_checked_language(23, &units, &assembled, &assembled_output).unwrap();
+        let unit_native_projection =
+            project_checked_unit_native_language(23, &units, &unit_native, &unit_native_output)
+                .unwrap();
+        assert_eq!(unit_native_projection, assembled_projection);
     }
 
     #[test]

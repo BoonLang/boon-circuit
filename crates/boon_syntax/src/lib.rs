@@ -431,6 +431,71 @@ impl fmt::Display for SourceUnitId {
     }
 }
 
+/// Collision-checked project-local namespace for unit-local syntax arena ids.
+///
+/// The namespace is a lookup aid inside one `ProjectSyntaxSnapshot`
+/// and is never a cross-revision compiler identity. Stable compiler keys use
+/// [`SourceUnitId`] plus parser-owned structural routes instead. Keeping the
+/// namespace in the parser artifact lets a project borrow unchanged unit
+/// arenas directly without cloning and rebasing every node into one global
+/// `ParsedProgram` arena.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct SyntaxUnitNamespace(u16);
+
+impl SyntaxUnitNamespace {
+    /// The packed syntax-id layout reserves twelve namespace bits and nineteen
+    /// unit-local bits below a tag bit. Namespace zero is deliberately
+    /// reserved so malformed/default ids fail closed.
+    pub const MAX: u16 = (1 << 12) - 1;
+
+    #[doc(hidden)]
+    pub fn __parser_new(value: u16) -> Option<Self> {
+        (value > 0 && value <= Self::MAX).then_some(Self(value))
+    }
+
+    pub fn get(self) -> u16 {
+        self.0
+    }
+}
+
+const PACKED_SYNTAX_LOCAL_BITS: u32 = 19;
+const PACKED_SYNTAX_LOCAL_MASK: usize = (1usize << PACKED_SYNTAX_LOCAL_BITS) - 1;
+// Keep the representation explicitly 32-bit: checked syntax references use
+// `u32`, and a host-width tag would be truncated on 64-bit machines.
+const PACKED_SYNTAX_TAG: usize = 1usize << 31;
+
+/// Maximum number of expression or statement nodes in one unit-native syntax
+/// arena. This is a representation bound, not a language collection bound.
+pub const MAX_UNIT_SYNTAX_NODES: usize = PACKED_SYNTAX_LOCAL_MASK + 1;
+
+/// Pack one unit-local arena index into a project-readable syntax lookup id.
+///
+/// This function is parser infrastructure. The packed value must not enter a
+/// stable definition, occurrence, semantic, persistence, or artifact key.
+#[doc(hidden)]
+pub fn __parser_pack_syntax_node_id(namespace: SyntaxUnitNamespace, local: usize) -> Option<usize> {
+    if local >= MAX_UNIT_SYNTAX_NODES {
+        return None;
+    }
+    Some(PACKED_SYNTAX_TAG | (usize::from(namespace.get()) << PACKED_SYNTAX_LOCAL_BITS) | local)
+}
+
+/// Decode a unit-native syntax lookup id.
+///
+/// Untagged ids belong to the legacy assembled parser artifact and return
+/// `None`; production project snapshots never mix the two representations.
+#[doc(hidden)]
+pub fn __parser_unpack_syntax_node_id(id: usize) -> Option<(SyntaxUnitNamespace, usize)> {
+    if id > u32::MAX as usize || id & PACKED_SYNTAX_TAG == 0 {
+        return None;
+    }
+    let namespace =
+        ((id >> PACKED_SYNTAX_LOCAL_BITS) & usize::from(SyntaxUnitNamespace::MAX)) as u16;
+    let namespace = SyntaxUnitNamespace::__parser_new(namespace)?;
+    Some((namespace, id & PACKED_SYNTAX_LOCAL_MASK))
+}
+
 /// Body-insensitive kind used by parser-owned stable item routes.
 ///
 /// This is deliberately smaller than [`AstStatementKind`]. A route identifies

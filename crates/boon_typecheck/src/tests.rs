@@ -1,6 +1,86 @@
 use super::*;
 
 #[test]
+fn unit_native_project_check_matches_assembled_project_exactly() {
+    let files = vec![
+        (
+            "app/A.bn".to_owned(),
+            "value: Z/double(input: 2)\n".to_owned(),
+        ),
+        (
+            "app/Z.bn".to_owned(),
+            "FUNCTION double(input) {\n    input + input\n}\n".to_owned(),
+        ),
+    ];
+    let assembled = boon_parser::parse_project("app/A.bn", files.clone())
+        .expect("assembled project fixture parses");
+    let unit_native = boon_parser::parse_project_syntax("app/A.bn", files)
+        .expect("unit-native project fixture parses");
+    let external_types = ExternalTypeEnvironment::default();
+
+    let assembled = check_program_profiled_with_external_types(&assembled, &external_types).0;
+    let unit_native =
+        check_project_program_profiled_with_external_types(&unit_native, &external_types).0;
+
+    assert_eq!(
+        unit_native.report, assembled.report,
+        "typecheck report parity"
+    );
+    let unit_fields = unit_native.checked_program_fields().unwrap();
+    let assembled_fields = assembled.checked_program_fields().unwrap();
+    assert_eq!(unit_fields.scopes, assembled_fields.scopes, "scope parity");
+    assert_eq!(
+        unit_fields.declarations, assembled_fields.declarations,
+        "declaration parity",
+    );
+    assert_eq!(
+        unit_fields.statements, assembled_fields.statements,
+        "statement parity"
+    );
+    assert_eq!(
+        unit_fields.expressions, assembled_fields.expressions,
+        "expression parity"
+    );
+    assert_eq!(unit_fields.calls, assembled_fields.calls, "call parity");
+    assert_eq!(
+        unit_fields.occurrences, assembled_fields.occurrences,
+        "occurrence parity"
+    );
+    assert_eq!(unit_fields, assembled_fields, "checked graph parity");
+    assert_eq!(unit_native, assembled, "sealed image handoff parity");
+}
+
+#[test]
+fn unit_native_project_diagnostics_match_assembled_source_positions_exactly() {
+    let files = vec![
+        ("app/A.bn".to_owned(), "a: 1\n".to_owned()),
+        (
+            "app/RUN.bn".to_owned(),
+            "value: definitely_missing\n".to_owned(),
+        ),
+    ];
+    let assembled = boon_parser::parse_project("app/RUN.bn", files.clone())
+        .expect("assembled diagnostic fixture parses");
+    let unit_native = boon_parser::parse_project_syntax("app/RUN.bn", files)
+        .expect("unit-native diagnostic fixture parses");
+    let external_types = ExternalTypeEnvironment::default();
+
+    let assembled =
+        check_diagnostics_program_profiled_with_external_types(&assembled, &external_types).0;
+    let unit_native = check_project_diagnostics_program_profiled_with_external_types(
+        &unit_native,
+        &external_types,
+    )
+    .0;
+
+    assert_eq!(unit_native.report, assembled.report);
+    assert_eq!(
+        unit_native.checked_program_fields(),
+        assembled.checked_program_fields(),
+    );
+}
+
+#[test]
 fn authored_call_site_identity_survives_an_unrelated_earlier_call() {
     fn helper_sites(source: &str) -> BTreeMap<String, CheckedShardRegionV2> {
         let parsed = boon_parser::parse_source("stable-call-sites.bn", source)
@@ -833,12 +913,13 @@ fn exact_statement_root_index_matches_first_depth_first_statement() {
         statement(13, Some(1), Vec::new()),
         statement(14, Some(4), Vec::new()),
     ];
-    let index = exact_statement_by_root_expression(&statements, 3);
+    let index = exact_statement_by_root_expression(statements.as_slice().into(), 3);
 
     for expr_id in 0..3 {
         assert_eq!(
             index.get(&expr_id).copied(),
-            exact_expression_statement(&statements, expr_id).map(|statement| statement.id)
+            exact_expression_statement(statements.as_slice().into(), expr_id)
+                .map(|statement| statement.id)
         );
     }
     assert_eq!(index.entries.len(), 3);
@@ -871,7 +952,7 @@ fn known_statement_index_preserves_nested_and_following_pipeline_values() {
         }
     }
 
-    let expressions = vec![
+    let expressions: SharedAstExpressions = vec![
         expression(0, AstExprKind::Identifier("input".to_owned())),
         expression(1, AstExprKind::Delimiter),
         expression(
@@ -895,7 +976,8 @@ fn known_statement_index_preserves_nested_and_following_pipeline_values() {
                 arms: Vec::new(),
             },
         ),
-    ];
+    ]
+    .into();
     let nested = vec![statement(
         0,
         0,
@@ -912,24 +994,37 @@ fn known_statement_index_preserves_nested_and_following_pipeline_values() {
         for (statement_index, statement) in statements.iter().enumerate() {
             assert_eq!(
                 canonical_statement_value_expression_at_known_index(
-                    statements,
+                    statements.as_slice().into(),
                     statement_index,
-                    &expressions,
+                    TypecheckExpressionArena::Assembled(&expressions),
                 ),
-                canonical_statement_value_expression(statements, statement, &expressions)
+                canonical_statement_value_expression(
+                    statements.as_slice().into(),
+                    statement,
+                    TypecheckExpressionArena::Assembled(&expressions),
+                )
             );
         }
     }
     assert_eq!(
-        canonical_block_value_expression(&nested, &expressions),
+        canonical_block_value_expression(
+            nested.as_slice().into(),
+            TypecheckExpressionArena::Assembled(&expressions),
+        ),
         Some(4)
     );
     assert_eq!(
-        canonical_block_value_expression(&following, &expressions),
+        canonical_block_value_expression(
+            following.as_slice().into(),
+            TypecheckExpressionArena::Assembled(&expressions),
+        ),
         Some(4)
     );
     assert_eq!(
-        canonical_block_value_expression(&direct, &expressions),
+        canonical_block_value_expression(
+            direct.as_slice().into(),
+            TypecheckExpressionArena::Assembled(&expressions),
+        ),
         Some(0)
     );
 }
@@ -1086,9 +1181,10 @@ fn provisional_flow_mode_visits_for_pipeline(pipe_count: usize) -> (usize, usize
     let parsed = boon_parser::parse_source("flow-mode-linear.bn", &source)
         .expect("generated boolean pipeline parses");
     let expression_count = parsed.expressions.len();
-    let (mut checker, _) = CheckedProgramDatabase::new_profiled(&parsed);
+    let syntax = TypecheckSyntaxProgram::Assembled(parsed.clone());
+    let (mut checker, _) = CheckedProgramDatabase::new_profiled(&syntax);
     for statement in &parsed.ast.statements {
-        checker.check_statement(&parsed, statement, false);
+        checker.check_statement(&syntax, statement, false);
     }
     for expression in &parsed.expressions {
         checker.ensure_expr(expression.id);
@@ -1146,17 +1242,21 @@ FUNCTION fibonacci(position) {
             .get(raw_input)
             .is_some_and(expr_is_pipe_placeholder)
         {
-            previous_pipeline_expr_id(&parsed.ast.statements, expression.id, &parsed.expressions)
-                .unwrap_or(raw_input)
+            previous_pipeline_expr_id(
+                parsed.ast.statements.as_slice().into(),
+                expression.id,
+                TypecheckExpressionArena::Assembled(&parsed.expressions),
+            )
+            .unwrap_or(raw_input)
         } else {
             raw_input
         };
         assert_eq!(
             pipeline_source_expr_id(
-                &parsed.ast.statements,
+                parsed.ast.statements.as_slice().into(),
                 expression.id,
                 raw_input,
-                &parsed.expressions,
+                TypecheckExpressionArena::Assembled(&parsed.expressions),
             ),
             expected,
             "pipeline predecessor mismatch for expression {} ({:?})",

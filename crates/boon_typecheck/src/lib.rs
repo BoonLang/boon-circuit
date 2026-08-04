@@ -1,7 +1,9 @@
 use boon_checked::*;
+mod owner_body;
 mod owner_constraints;
 mod owner_interface;
 mod owner_syntax;
+pub use owner_body::*;
 pub use owner_constraints::*;
 pub use owner_interface::*;
 pub use owner_syntax::*;
@@ -2127,7 +2129,7 @@ struct CheckedCallInstantiationChanges {
     needs_output_scope_revisit: bool,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize)]
 enum ContextualBuiltinKind {
     Map,
     Filter,
@@ -2140,7 +2142,7 @@ enum ContextualBuiltinKind {
     ThenBy,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 struct AuthoritativeParameter {
     name: String,
     kind: CheckedParameterKind,
@@ -2148,7 +2150,7 @@ struct AuthoritativeParameter {
     requirement: CheckedParameterRequirement,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 struct AuthoritativeCallableSignature {
     parameters: Vec<AuthoritativeParameter>,
     call_contexts: Vec<AuthoritativeCallContext>,
@@ -2157,7 +2159,7 @@ struct AuthoritativeCallableSignature {
     contextual_builtin: Option<ContextualBuiltinKind>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 struct AuthoritativeCallContext {
     name: String,
     kind: CheckedCallContextKind,

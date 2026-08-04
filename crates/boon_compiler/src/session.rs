@@ -19,12 +19,13 @@ use boon_plan::{
 use boon_syntax::StableCheckOwnerKey;
 use boon_syntax::{SourceUnitId, SyntaxUnitNamespace, UnitItemKind};
 use boon_typecheck::{
-    OwnerConstraintDependencyKind, OwnerConstraintSeed, OwnerConstraintSummary,
-    OwnerDeclarationKind, OwnerInterfaceScc, OwnerInterfaceSccKey, OwnerInterfaceSccResult,
-    OwnerInterfaceTopology, OwnerReferenceKind, OwnerSourceMap, OwnerSymbolReference,
-    OwnerSyntaxInput, ResolvedOwnerSymbolReference, build_owner_interface_topology,
+    AmbiguousOwnerSymbolCandidate, OwnerBodyInferenceShard, OwnerConstraintDependencyKind,
+    OwnerConstraintSeed, OwnerConstraintSummary, OwnerDeclarationKind, OwnerInterfaceScc,
+    OwnerInterfaceSccKey, OwnerInterfaceSccResult, OwnerInterfaceTopology, OwnerReferenceKind,
+    OwnerSourceMap, OwnerSymbolReference, OwnerSymbolResolution, OwnerSyntaxInput,
+    build_owner_interface_topology, infer_owner_body, is_authoritative_callable_name,
     project_owner_constraint_seed, project_owner_source_map, project_owner_syntax_input,
-    resolve_owner_constraint_seed, solve_owner_interface_scc,
+    resolve_owner_constraint_seed_with_resolutions, solve_owner_interface_scc,
     stable_check_owner_key_fingerprint_v1,
 };
 use serde::Serialize;
@@ -201,6 +202,7 @@ struct ProjectState {
         TypedRequestTable<ProjectOwnerInterfaceTopologyRequest>,
     owner_interface_scc_plan_requests: TypedRequestTable<OwnerInterfaceSccPlanRequest>,
     owner_interface_scc_requests: TypedRequestTable<OwnerInterfaceSccRequest>,
+    owner_body_inference_requests: TypedRequestTable<OwnerBodyInferenceRequest>,
     checked: Option<CheckedSourceFromSource>,
     compiled: Option<(Revision, CompiledSealedMachinePlanFromSource)>,
     request_graph: Option<(
@@ -454,12 +456,18 @@ struct ProjectOwnerSymbolIndex {
     symbols: BTreeMap<OwnerSymbolKey, Box<[OwnerSymbolCandidate]>>,
 }
 
+enum ProjectOwnerSymbolLookup {
+    Resolved(OwnerSymbolCandidate),
+    Ambiguous(Box<[OwnerSymbolCandidate]>),
+    Unresolved,
+}
+
 impl ProjectOwnerSymbolIndex {
     fn resolve(
         &self,
         owner: &StableCheckOwnerKey,
         reference: &OwnerSymbolReference,
-    ) -> Option<OwnerSymbolCandidate> {
+    ) -> ProjectOwnerSymbolLookup {
         let namespace = match reference.kind {
             OwnerReferenceKind::Value => OwnerSymbolNamespace::Value,
             OwnerReferenceKind::Callable => OwnerSymbolNamespace::Callable,
@@ -477,15 +485,25 @@ impl ProjectOwnerSymbolIndex {
             }
         }
         paths.push(reference.parts.to_vec());
-        paths.into_iter().find_map(|parts| {
-            let candidates = self.symbols.get(&OwnerSymbolKey { namespace, parts })?;
-            let best = candidates.first()?.priority;
-            let mut best_candidates = candidates
+        for parts in paths {
+            let Some(candidates) = self.symbols.get(&OwnerSymbolKey { namespace, parts }) else {
+                continue;
+            };
+            let Some(best) = candidates.first().map(|candidate| candidate.priority) else {
+                continue;
+            };
+            let best_candidates = candidates
                 .iter()
-                .take_while(|candidate| candidate.priority == best);
-            let candidate = best_candidates.next()?;
-            best_candidates.next().is_none().then(|| candidate.clone())
-        })
+                .take_while(|candidate| candidate.priority == best)
+                .cloned()
+                .collect::<Vec<_>>();
+            return if let [candidate] = best_candidates.as_slice() {
+                ProjectOwnerSymbolLookup::Resolved(candidate.clone())
+            } else {
+                ProjectOwnerSymbolLookup::Ambiguous(best_candidates.into_boxed_slice())
+            };
+        }
+        ProjectOwnerSymbolLookup::Unresolved
     }
 }
 
@@ -628,6 +646,25 @@ impl RequestFamily for OwnerInterfaceSccRequest {
     }
 }
 
+struct OwnerBodyInferenceRequest;
+
+impl RequestFamily for OwnerBodyInferenceRequest {
+    type Key = StableCheckOwnerKey;
+    type Value = Arc<OwnerBodyInferenceShard>;
+
+    const NAME: &'static str = "boon.compiler.owner-body-inference.v1";
+
+    fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
+        stable_check_owner_key_fingerprint_v1(key)
+    }
+
+    fn output_fingerprint(
+        value: &Self::Value,
+    ) -> Result<RequestOutputFingerprint, boon_compilation_db::CompilationDbError> {
+        Ok(RequestOutputFingerprint(value.fingerprint_v1()))
+    }
+}
+
 impl CompilerSession {
     pub fn new() -> Self {
         Self::default()
@@ -660,6 +697,7 @@ impl CompilerSession {
                 project_owner_interface_topology_requests: TypedRequestTable::new(),
                 owner_interface_scc_plan_requests: TypedRequestTable::new(),
                 owner_interface_scc_requests: TypedRequestTable::new(),
+                owner_body_inference_requests: TypedRequestTable::new(),
                 checked: None,
                 compiled: None,
                 request_graph: None,
@@ -932,6 +970,11 @@ impl CompilerSession {
                     .iter()
                     .all(|owner| surviving_sources.contains(owner.source_unit_id()))
             })?;
+        state
+            .owner_body_inference_requests
+            .retain(&mut state.syntax_evaluator, |owner| {
+                surviving_sources.contains(owner.source_unit_id())
+            })?;
         state.source = candidate;
         state.revision = Revision(next_revision);
         state.checked = None;
@@ -1111,6 +1154,24 @@ impl CompilerSession {
         Ok(state
             .owner_interface_scc_requests
             .current_value(&state.syntax_evaluator, &scc.key)?
+            .map(Arc::clone))
+    }
+
+    /// Returns the current immutable, span-free inference result for one
+    /// stable owner. This is preparatory input to checked-row construction;
+    /// it is not a checked-program shard.
+    pub fn owner_body_inference(
+        &self,
+        project: ProjectId,
+        owner: &StableCheckOwnerKey,
+    ) -> CompilerResult<Option<Arc<OwnerBodyInferenceShard>>> {
+        let state = self
+            .projects
+            .get(&project)
+            .ok_or_else(|| session_error(format!("unknown compiler project {}", project.0)))?;
+        Ok(state
+            .owner_body_inference_requests
+            .current_value(&state.syntax_evaluator, owner)?
             .map(Arc::clone))
     }
 
@@ -1558,6 +1619,11 @@ fn evaluate_owner_requests(
         .retain(&mut state.syntax_evaluator, |owner| {
             live_owners.contains(owner)
         })?;
+    state
+        .owner_body_inference_requests
+        .retain(&mut state.syntax_evaluator, |owner| {
+            live_owners.contains(owner)
+        })?;
 
     let owner_input = RequestInputFingerprint(request_fingerprint(
         b"boon.compiler.owner-input-dependencies.v1\0",
@@ -1900,17 +1966,49 @@ fn evaluate_owner_constraint_requests(
                         &mut ticket,
                         &symbol_key,
                     )?);
-                    let dependencies = seed.references.iter().filter_map(|reference| {
-                        let candidate = symbols.resolve(owner, reference)?;
-                        Some(ResolvedOwnerSymbolReference {
-                            reference: reference.clone(),
-                            owner: candidate.owner,
-                            parameters: candidate.parameters,
-                        })
+                    let resolutions = seed.references.iter().map(|reference| {
+                        match symbols.resolve(owner, reference) {
+                            ProjectOwnerSymbolLookup::Resolved(candidate) => {
+                                OwnerSymbolResolution::Resolved {
+                                    reference: reference.clone(),
+                                    owner: candidate.owner,
+                                    parameters: candidate.parameters,
+                                }
+                            }
+                            ProjectOwnerSymbolLookup::Ambiguous(candidates) => {
+                                OwnerSymbolResolution::Ambiguous {
+                                    reference: reference.clone(),
+                                    candidates: candidates
+                                        .into_vec()
+                                        .into_iter()
+                                        .map(|candidate| AmbiguousOwnerSymbolCandidate {
+                                            owner: candidate.owner,
+                                            parameters: candidate.parameters,
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .into_boxed_slice(),
+                                }
+                            }
+                            ProjectOwnerSymbolLookup::Unresolved
+                                if reference.kind == OwnerReferenceKind::Callable
+                                    && is_authoritative_callable_name(
+                                        &reference.parts.join("/"),
+                                    ) =>
+                            {
+                                OwnerSymbolResolution::Authoritative {
+                                    reference: reference.clone(),
+                                }
+                            }
+                            ProjectOwnerSymbolLookup::Unresolved => {
+                                OwnerSymbolResolution::Unresolved {
+                                    reference: reference.clone(),
+                                }
+                            }
+                        }
                     });
-                    Ok(Arc::new(resolve_owner_constraint_seed(
+                    Ok(Arc::new(resolve_owner_constraint_seed_with_resolutions(
                         &seed,
-                        dependencies,
+                        resolutions,
                     )?))
                 })();
                 let summary = match summary {
@@ -2127,6 +2225,165 @@ fn evaluate_owner_interface_scc_requests(state: &mut ProjectState) -> CompilerRe
                     &mut state.syntax_evaluator,
                     ticket,
                     result,
+                )?;
+            }
+        }
+    }
+    evaluate_owner_body_inference_requests(state, &topology)
+}
+
+fn owner_body_inference_interface_plan(
+    topology: &OwnerInterfaceTopology,
+    seed: &OwnerConstraintSeed,
+    summary: &OwnerConstraintSummary,
+) -> CompilerResult<BTreeMap<StableCheckOwnerKey, OwnerInterfaceSccKey>> {
+    let required = std::iter::once(seed.owner.clone())
+        .chain(
+            seed.external_expressions
+                .iter()
+                .map(|external| external.owner.clone()),
+        )
+        .chain(
+            summary
+                .resolved_references
+                .iter()
+                .map(|resolved| resolved.owner.clone()),
+        )
+        .collect::<BTreeSet<_>>();
+    required
+        .into_iter()
+        .map(|owner| {
+            let key = topology
+                .scc_for_owner(&owner)
+                .map(|scc| scc.key.clone())
+                .ok_or_else(|| {
+                    session_error(format!(
+                        "owner body inference {:?} imports owner {owner:?} without an interface SCC",
+                        seed.owner
+                    ))
+                })?;
+            Ok((owner, key))
+        })
+        .collect()
+}
+
+fn owner_body_inference_plan_fingerprint(
+    plan: &BTreeMap<StableCheckOwnerKey, OwnerInterfaceSccKey>,
+    program_role: ProgramRole,
+) -> RequestInputFingerprint {
+    let mut hasher = Sha256::new();
+    hasher.update(b"boon.compiler.owner-body-inference-dependencies.v1\0");
+    hasher.update(program_role.as_str().as_bytes());
+    hasher.update([0]);
+    hasher.update((plan.len() as u64).to_le_bytes());
+    for (owner, scc) in plan {
+        hasher.update(stable_check_owner_key_fingerprint_v1(owner));
+        hasher.update(OwnerInterfaceSccPlanRequest::key_fingerprint(scc));
+    }
+    RequestInputFingerprint(hasher.finalize().into())
+}
+
+fn evaluate_owner_body_inference_requests(
+    state: &mut ProjectState,
+    topology: &OwnerInterfaceTopology,
+) -> CompilerResult<()> {
+    let owners = topology
+        .sccs
+        .iter()
+        .flat_map(|scc| scc.key.members.iter().cloned())
+        .collect::<Vec<_>>();
+    for owner in owners {
+        let seed = Arc::clone(
+            state
+                .owner_constraint_seed_requests
+                .current_value(&state.syntax_evaluator, &owner)?
+                .ok_or_else(|| {
+                    session_error(format!(
+                        "owner body inference {owner:?} has no current constraint seed"
+                    ))
+                })?,
+        );
+        let summary = Arc::clone(
+            state
+                .owner_constraint_requests
+                .current_value(&state.syntax_evaluator, &owner)?
+                .ok_or_else(|| {
+                    session_error(format!(
+                        "owner body inference {owner:?} has no current resolved summary"
+                    ))
+                })?,
+        );
+        let plan = owner_body_inference_interface_plan(topology, &seed, &summary)?;
+        match state.owner_body_inference_requests.begin(
+            &mut state.syntax_evaluator,
+            owner.clone(),
+            owner_body_inference_plan_fingerprint(&plan, state.source.program_role),
+        )? {
+            RequestStart::Reused => {}
+            RequestStart::Execute(mut ticket) => {
+                let body = (|| -> CompilerResult<_> {
+                    let syntax = Arc::clone(state.owner_input_requests.require(
+                        &state.syntax_evaluator,
+                        &mut ticket,
+                        &owner,
+                    )?);
+                    let seed = Arc::clone(state.owner_constraint_seed_requests.require(
+                        &state.syntax_evaluator,
+                        &mut ticket,
+                        &owner,
+                    )?);
+                    let summary = Arc::clone(state.owner_constraint_requests.require(
+                        &state.syntax_evaluator,
+                        &mut ticket,
+                        &owner,
+                    )?);
+                    let result_keys = plan.values().cloned().collect::<BTreeSet<_>>();
+                    let results = result_keys
+                        .iter()
+                        .map(|key| {
+                            state
+                                .owner_interface_scc_requests
+                                .require(&state.syntax_evaluator, &mut ticket, key)
+                                .map(Arc::clone)
+                                .map_err(Into::into)
+                        })
+                        .collect::<CompilerResult<Vec<_>>>()?;
+                    let own_scc = results
+                        .iter()
+                        .find(|result| result.key.members.contains(&owner))
+                        .ok_or_else(|| {
+                            session_error(format!(
+                                "owner body inference {owner:?} has no frozen own interface SCC"
+                            ))
+                        })?;
+                    let imports = results
+                        .iter()
+                        .filter(|result| result.key != own_scc.key)
+                        .map(AsRef::as_ref);
+                    Ok(Arc::new(infer_owner_body(
+                        &syntax,
+                        &seed,
+                        &summary,
+                        state.source.program_role,
+                        own_scc,
+                        imports,
+                    )?))
+                })();
+                let body = match body {
+                    Ok(body) => body,
+                    Err(error) => {
+                        state.owner_body_inference_requests.abort(
+                            &mut state.syntax_evaluator,
+                            ticket,
+                            RequestAbortReason::Failed,
+                        )?;
+                        return Err(error);
+                    }
+                };
+                state.owner_body_inference_requests.publish(
+                    &mut state.syntax_evaluator,
+                    ticket,
+                    body,
                 )?;
             }
         }
@@ -2506,10 +2763,10 @@ mod tests {
             assert_eq!(first.profile.parse_work.nodes_rebased, 0);
         }
         let first_stats = session.frontend_request_stats(project).unwrap();
-        assert_eq!(first_stats.demanded, 36);
-        assert_eq!(first_stats.executed, 36);
+        assert_eq!(first_stats.demanded, 40);
+        assert_eq!(first_stats.executed, 40);
         assert_eq!(first_stats.reused, 0);
-        assert_eq!(first_stats.changed, 36);
+        assert_eq!(first_stats.changed, 40);
         let retained_a = session
             .unit_syntax_snapshot(project, "A.bn")
             .unwrap()
@@ -2545,11 +2802,11 @@ mod tests {
             second.profile.parse_work
         };
         let second_stats = session.frontend_request_stats(project).unwrap();
-        assert_eq!(second_stats.demanded, 72);
-        assert_eq!(second_stats.executed, 45);
-        assert_eq!(second_stats.reused, 27);
+        assert_eq!(second_stats.demanded, 80);
+        assert_eq!(second_stats.executed, 50);
+        assert_eq!(second_stats.reused, 30);
         assert_eq!(second_stats.backdated, 6);
-        assert_eq!(second_stats.changed, 39);
+        assert_eq!(second_stats.changed, 44);
 
         let mut isolated = CompilerSession::new();
         let isolated_project = isolated
@@ -2651,6 +2908,14 @@ mod tests {
             .owner_interface_result(project, &right)
             .unwrap()
             .unwrap();
+        let first_left_body = session
+            .owner_body_inference(project, &left)
+            .unwrap()
+            .unwrap();
+        let first_right_body = session
+            .owner_body_inference(project, &right)
+            .unwrap()
+            .unwrap();
         assert_eq!(first_right_summary.dependencies.len(), 1);
         assert_eq!(first_right_summary.dependencies[0].request, right);
         assert_eq!(first_right_summary.dependencies[0].dependency, left);
@@ -2701,6 +2966,14 @@ mod tests {
             .owner_interface_result(project, &right)
             .unwrap()
             .unwrap();
+        let second_left_body = session
+            .owner_body_inference(project, &left)
+            .unwrap()
+            .unwrap();
+        let second_right_body = session
+            .owner_body_inference(project, &right)
+            .unwrap()
+            .unwrap();
 
         assert!(Arc::ptr_eq(&first_root_input, &second_root_input));
         assert!(!Arc::ptr_eq(&first_left_input, &second_left_input));
@@ -2715,6 +2988,8 @@ mod tests {
         assert!(Arc::ptr_eq(&first_topology, &second_topology));
         assert!(Arc::ptr_eq(&first_left_interface, &second_left_interface));
         assert!(Arc::ptr_eq(&first_right_interface, &second_right_interface));
+        assert!(!Arc::ptr_eq(&first_left_body, &second_left_body));
+        assert!(Arc::ptr_eq(&first_right_body, &second_right_body));
 
         let state = session.projects.get(&project).unwrap();
         assert_eq!(
@@ -2787,6 +3062,10 @@ mod tests {
             .owner_interface_result(project, &owner)
             .unwrap()
             .unwrap();
+        let first_body = session
+            .owner_body_inference(project, &owner)
+            .unwrap()
+            .unwrap();
         let first_owner = first_interface.owner(&owner).unwrap();
         assert_eq!(
             first_owner.parameters[0].flow_type.ty,
@@ -2809,8 +3088,13 @@ mod tests {
             .owner_interface_result(project, &owner)
             .unwrap()
             .unwrap();
+        let second_body = session
+            .owner_body_inference(project, &owner)
+            .unwrap()
+            .unwrap();
         assert!(!Arc::ptr_eq(&first_seed, &second_seed));
         assert!(Arc::ptr_eq(&first_interface, &second_interface));
+        assert!(!Arc::ptr_eq(&first_body, &second_body));
         let state = session.projects.get(&project).unwrap();
         let key = second_interface.key.clone();
         let memo = state
@@ -2819,6 +3103,12 @@ mod tests {
             .unwrap();
         assert_eq!(memo.changed_at, EvaluationRevision(0));
         assert_eq!(memo.verified_at, EvaluationRevision(1));
+        let body_memo = state
+            .owner_body_inference_requests
+            .memo(&state.syntax_evaluator, &owner)
+            .unwrap();
+        assert_eq!(body_memo.changed_at, EvaluationRevision(1));
+        assert_eq!(body_memo.verified_at, EvaluationRevision(1));
     }
 
     #[test]
@@ -2895,11 +3185,11 @@ mod tests {
             cold_topology.stats.nodes + 1
         );
         let interface_stats = session.frontend_request_stats(project).unwrap();
-        assert_eq!(interface_stats.demanded - cold_stats.demanded, 58);
-        assert_eq!(interface_stats.executed - cold_stats.executed, 34);
-        assert_eq!(interface_stats.reused - cold_stats.reused, 24);
+        assert_eq!(interface_stats.demanded - cold_stats.demanded, 65);
+        assert_eq!(interface_stats.executed - cold_stats.executed, 36);
+        assert_eq!(interface_stats.reused - cold_stats.reused, 29);
         assert_eq!(interface_stats.backdated - cold_stats.backdated, 18);
-        assert_eq!(interface_stats.changed - cold_stats.changed, 16);
+        assert_eq!(interface_stats.changed - cold_stats.changed, 18);
 
         session
             .apply_update(project, UnitUpdate::new("left/Math.bn", first_body_edit))
@@ -2918,11 +3208,11 @@ mod tests {
         let body_topology = session.owner_interface_topology(project).unwrap().unwrap();
         assert!(Arc::ptr_eq(&interface_topology, &body_topology));
         let body_stats = session.frontend_request_stats(project).unwrap();
-        assert_eq!(body_stats.demanded - interface_stats.demanded, 58);
-        assert_eq!(body_stats.executed - interface_stats.executed, 14);
-        assert_eq!(body_stats.reused - interface_stats.reused, 44);
+        assert_eq!(body_stats.demanded - interface_stats.demanded, 65);
+        assert_eq!(body_stats.executed - interface_stats.executed, 15);
+        assert_eq!(body_stats.reused - interface_stats.reused, 50);
         assert_eq!(body_stats.backdated - interface_stats.backdated, 6);
-        assert_eq!(body_stats.changed - interface_stats.changed, 8);
+        assert_eq!(body_stats.changed - interface_stats.changed, 9);
     }
 
     #[test]

@@ -322,6 +322,74 @@ pub struct ResolvedOwnerSymbolReference {
     pub owner: StableCheckOwnerKey,
     pub parameters: Box<[OwnerParameterConstraint]>,
 }
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct AmbiguousOwnerSymbolCandidate {
+    pub owner: StableCheckOwnerKey,
+    pub parameters: Box<[OwnerParameterConstraint]>,
+}
+
+/// Exact project/authoritative resolution state for one owner reference.
+///
+/// Absence and ambiguity are deliberately retained instead of being collapsed
+/// into a missing dependency edge. Later body diagnostics can therefore
+/// distinguish an unknown name from multiple equally ranked project targets,
+/// while authoritative callables remain explicit inputs to ABI currentness.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(tag = "resolution", rename_all = "snake_case")]
+pub enum OwnerSymbolResolution {
+    Resolved {
+        reference: OwnerSymbolReference,
+        owner: StableCheckOwnerKey,
+        parameters: Box<[OwnerParameterConstraint]>,
+    },
+    Authoritative {
+        reference: OwnerSymbolReference,
+    },
+    Unresolved {
+        reference: OwnerSymbolReference,
+    },
+    Ambiguous {
+        reference: OwnerSymbolReference,
+        candidates: Box<[AmbiguousOwnerSymbolCandidate]>,
+    },
+}
+
+impl OwnerSymbolResolution {
+    pub fn reference(&self) -> &OwnerSymbolReference {
+        match self {
+            Self::Resolved { reference, .. }
+            | Self::Authoritative { reference }
+            | Self::Unresolved { reference }
+            | Self::Ambiguous { reference, .. } => reference,
+        }
+    }
+
+    fn resolved(&self) -> Option<ResolvedOwnerSymbolReference> {
+        match self {
+            Self::Resolved {
+                reference,
+                owner,
+                parameters,
+            } => Some(ResolvedOwnerSymbolReference {
+                reference: reference.clone(),
+                owner: owner.clone(),
+                parameters: parameters.clone(),
+            }),
+            Self::Authoritative { .. } | Self::Unresolved { .. } | Self::Ambiguous { .. } => None,
+        }
+    }
+}
+
+impl From<ResolvedOwnerSymbolReference> for OwnerSymbolResolution {
+    fn from(resolved: ResolvedOwnerSymbolReference) -> Self {
+        Self::Resolved {
+            reference: resolved.reference,
+            owner: resolved.owner,
+            parameters: resolved.parameters,
+        }
+    }
+}
 /// Symbol-resolved owner dependency and constraint identity.
 ///
 /// The large flat constraint nodes remain shared in [`OwnerConstraintSeed`].
@@ -337,6 +405,10 @@ pub struct OwnerConstraintSummary {
     /// from repeating project name lookup or guessing a target from an edge
     /// whose direction was inverted for `ActualToFormal`/`PassedContext`.
     pub resolved_references: Box<[ResolvedOwnerSymbolReference]>,
+    /// One lossless state for every reference in the seed, including
+    /// authoritative, unresolved, and ambiguous references that create no
+    /// project-interface dependency edge.
+    pub symbol_resolutions: Box<[OwnerSymbolResolution]>,
     pub dependencies: Box<[OwnerConstraintDependency]>,
     fingerprint_v1: [u8; 32],
     topology_fingerprint_v1: [u8; 32],
@@ -736,6 +808,35 @@ pub fn resolve_owner_constraint_seed(
     seed: &OwnerConstraintSeed,
     referenced_dependencies: impl IntoIterator<Item = ResolvedOwnerSymbolReference>,
 ) -> Result<OwnerConstraintSummary, OwnerConstraintSeedError> {
+    let mut resolutions = referenced_dependencies
+        .into_iter()
+        .map(OwnerSymbolResolution::from)
+        .map(|resolution| (resolution.reference().clone(), resolution))
+        .collect::<BTreeMap<_, _>>();
+    for reference in &seed.references {
+        resolutions.entry(reference.clone()).or_insert_with(|| {
+            if reference.kind == OwnerReferenceKind::Callable
+                && crate::owner_interface::is_authoritative_callable_name(
+                    &reference.parts.join("/"),
+                )
+            {
+                OwnerSymbolResolution::Authoritative {
+                    reference: reference.clone(),
+                }
+            } else {
+                OwnerSymbolResolution::Unresolved {
+                    reference: reference.clone(),
+                }
+            }
+        });
+    }
+    resolve_owner_constraint_seed_with_resolutions(seed, resolutions.into_values())
+}
+
+pub fn resolve_owner_constraint_seed_with_resolutions(
+    seed: &OwnerConstraintSeed,
+    resolutions: impl IntoIterator<Item = OwnerSymbolResolution>,
+) -> Result<OwnerConstraintSummary, OwnerConstraintSeedError> {
     let mut dependencies = BTreeSet::new();
     let mut resolved_references = BTreeSet::new();
     for external in &seed.external_expressions {
@@ -750,7 +851,26 @@ pub fn resolve_owner_constraint_seed(
             parameter_ordinal: None,
         });
     }
-    for resolved in referenced_dependencies {
+    let mut symbol_resolutions = BTreeMap::new();
+    for resolution in resolutions {
+        let reference = resolution.reference().clone();
+        if !seed.references.contains(&reference) {
+            return Err(OwnerConstraintSeedError::new(format!(
+                "owner constraint resolution references an expression absent from {:?}",
+                seed.owner
+            )));
+        }
+        if symbol_resolutions
+            .insert(reference.clone(), resolution.clone())
+            .is_some()
+        {
+            return Err(OwnerConstraintSeedError::new(format!(
+                "owner constraint resolution contains duplicate state for {reference:?}"
+            )));
+        }
+        let Some(resolved) = resolution.resolved() else {
+            continue;
+        };
         resolved_references.insert(resolved.clone());
         match resolved.reference.kind {
             OwnerReferenceKind::Value => {
@@ -767,7 +887,16 @@ pub fn resolve_owner_constraint_seed(
             }
         }
     }
+    if symbol_resolutions.keys().collect::<BTreeSet<_>>()
+        != seed.references.iter().collect::<BTreeSet<_>>()
+    {
+        return Err(OwnerConstraintSeedError::new(format!(
+            "owner constraint resolutions do not cover every reference in {:?}",
+            seed.owner
+        )));
+    }
     let resolved_references = resolved_references.into_iter().collect::<Vec<_>>();
+    let symbol_resolutions = symbol_resolutions.into_values().collect::<Vec<_>>();
     let dependencies = dependencies.into_iter().collect::<Vec<_>>();
     let topology_dependencies = dependencies
         .iter()
@@ -789,6 +918,7 @@ pub fn resolve_owner_constraint_seed(
             stable_check_owner_key_fingerprint_v1(&seed.owner),
             seed.fingerprint_v1(),
             &resolved_references,
+            &symbol_resolutions,
             &dependencies,
         ),
     )?;
@@ -796,6 +926,7 @@ pub fn resolve_owner_constraint_seed(
         owner: seed.owner.clone(),
         seed_fingerprint_v1: seed.fingerprint_v1(),
         resolved_references: resolved_references.into_boxed_slice(),
+        symbol_resolutions: symbol_resolutions.into_boxed_slice(),
         dependencies: dependencies.into_boxed_slice(),
         fingerprint_v1,
         topology_fingerprint_v1,
@@ -1459,5 +1590,57 @@ mod tests {
         assert_eq!(topology.sccs.len(), 1);
         assert_eq!(topology.sccs[0].key.members.len(), 2);
         assert!(topology.sccs[0].dependencies.is_empty());
+    }
+
+    #[test]
+    fn exact_symbol_resolution_preserves_ambiguity_and_rejects_missing_states() {
+        let unit = link("left: 1\nright: 2\nvalue: mystery()\n");
+        let value = owner_named(&unit, "value");
+        let left = owner_named(&unit, "left");
+        let right = owner_named(&unit, "right");
+        let seed = summary(&unit, &value);
+        let reference = seed.references.first().cloned().unwrap();
+
+        assert!(resolve_owner_constraint_seed_with_resolutions(&seed, []).is_err());
+        let resolved = resolve_owner_constraint_seed_with_resolutions(
+            &seed,
+            [OwnerSymbolResolution::Ambiguous {
+                reference: reference.clone(),
+                candidates: vec![
+                    AmbiguousOwnerSymbolCandidate {
+                        owner: left,
+                        parameters: Box::new([]),
+                    },
+                    AmbiguousOwnerSymbolCandidate {
+                        owner: right,
+                        parameters: Box::new([]),
+                    },
+                ]
+                .into_boxed_slice(),
+            }],
+        )
+        .unwrap();
+
+        assert!(resolved.resolved_references.is_empty());
+        assert!(resolved.dependencies.is_empty());
+        assert!(matches!(
+            resolved.symbol_resolutions.as_ref(),
+            [OwnerSymbolResolution::Ambiguous {
+                reference: retained,
+                candidates,
+            }] if retained == &reference && candidates.len() == 2
+        ));
+    }
+
+    #[test]
+    fn compatibility_resolution_marks_default_builtins_authoritative() {
+        let unit = link("value: Number/to_text(value: 1)\n");
+        let value = owner_named(&unit, "value");
+        let seed = summary(&unit, &value);
+        let resolved = resolve_owner_constraint_seed(&seed, []).unwrap();
+        assert!(matches!(
+            resolved.symbol_resolutions.as_ref(),
+            [OwnerSymbolResolution::Authoritative { .. }]
+        ));
     }
 }

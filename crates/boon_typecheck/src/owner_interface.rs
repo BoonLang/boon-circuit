@@ -58,6 +58,10 @@ pub struct OwnerInterfaceSolveWork {
 pub struct OwnerInterfaceSccResult {
     pub key: OwnerInterfaceSccKey,
     pub owners: Box<[OwnerPublicInterface]>,
+    /// Size of the SCC-local alpha-normalized type-variable namespace.
+    /// Consumers must instantiate this namespace instead of treating the raw
+    /// `TypeVar` values from distinct SCCs as globally unique.
+    pub type_variable_count: u32,
     pub work: OwnerInterfaceSolveWork,
     fingerprint_v1: [u8; 32],
 }
@@ -76,7 +80,7 @@ impl OwnerInterfaceSccResult {
 }
 
 #[derive(Default)]
-struct TypeUnifier {
+pub(crate) struct TypeUnifier {
     parents: Vec<u32>,
     ranks: Vec<u8>,
     bindings: Vec<Option<Type>>,
@@ -84,7 +88,7 @@ struct TypeUnifier {
 }
 
 impl TypeUnifier {
-    fn fresh(&mut self) -> TypeVar {
+    pub(crate) fn fresh(&mut self) -> TypeVar {
         let id = u32::try_from(self.parents.len()).expect("interface type-variable bound");
         self.parents.push(id);
         self.ranks.push(0);
@@ -113,7 +117,7 @@ impl TypeUnifier {
         }
     }
 
-    fn resolve(&mut self, ty: &Type) -> Type {
+    pub(crate) fn resolve(&mut self, ty: &Type) -> Type {
         self.resolve_inner(ty, &mut BTreeSet::new())
     }
 
@@ -242,7 +246,7 @@ impl TypeUnifier {
         }
     }
 
-    fn bind_var(&mut self, variable: TypeVar, incoming: Type) {
+    pub(crate) fn bind_var(&mut self, variable: TypeVar, incoming: Type) {
         self.steps = self.steps.saturating_add(1);
         let variable = self.root(variable);
         let incoming = self.resolve(&incoming);
@@ -321,7 +325,7 @@ impl TypeUnifier {
         }
     }
 
-    fn unify(&mut self, left: Type, right: Type) {
+    pub(crate) fn unify(&mut self, left: Type, right: Type) {
         self.steps = self.steps.saturating_add(1);
         match (left, right) {
             (Type::Var(left), Type::Var(right)) => self.union(left, right),
@@ -352,6 +356,10 @@ impl TypeUnifier {
             _ => {}
         }
     }
+
+    pub(crate) const fn steps(&self) -> u64 {
+        self.steps
+    }
 }
 
 #[derive(Clone)]
@@ -381,7 +389,11 @@ struct CrossCall {
     stable_expression: StableExpressionKey,
 }
 
-fn add_local_root(roots: &mut BTreeMap<String, Option<TypeVar>>, name: String, variable: TypeVar) {
+pub(crate) fn add_local_root(
+    roots: &mut BTreeMap<String, Option<TypeVar>>,
+    name: String,
+    variable: TypeVar,
+) {
     match roots.entry(name) {
         std::collections::btree_map::Entry::Vacant(entry) => {
             entry.insert(Some(variable));
@@ -394,7 +406,7 @@ fn add_local_root(roots: &mut BTreeMap<String, Option<TypeVar>>, name: String, v
     }
 }
 
-fn flow_mode_join(left: Option<FlowMode>, right: Option<FlowMode>) -> Option<FlowMode> {
+pub(crate) fn flow_mode_join(left: Option<FlowMode>, right: Option<FlowMode>) -> Option<FlowMode> {
     match (left, right) {
         (None, mode) | (mode, None) => mode,
         (Some(FlowMode::Absent), _) | (_, Some(FlowMode::Absent)) => Some(FlowMode::Absent),
@@ -408,7 +420,10 @@ fn flow_mode_join(left: Option<FlowMode>, right: Option<FlowMode>) -> Option<Flo
     }
 }
 
-fn merge_effects(left: CheckedEffectSummary, right: CheckedEffectSummary) -> CheckedEffectSummary {
+pub(crate) fn merge_effects(
+    left: CheckedEffectSummary,
+    right: CheckedEffectSummary,
+) -> CheckedEffectSummary {
     CheckedEffectSummary {
         reads_state: left.reads_state || right.reads_state,
         writes_state: left.writes_state || right.writes_state,
@@ -417,7 +432,7 @@ fn merge_effects(left: CheckedEffectSummary, right: CheckedEffectSummary) -> Che
     }
 }
 
-fn true_false_type() -> Type {
+pub(crate) fn true_false_type() -> Type {
     Type::VariantSet(
         vec![
             Variant::Tag("False".to_owned()),
@@ -427,7 +442,7 @@ fn true_false_type() -> Type {
     )
 }
 
-fn pattern_type(pattern: &OwnerPatternConstraint, unifier: &mut TypeUnifier) -> Type {
+pub(crate) fn pattern_type(pattern: &OwnerPatternConstraint, unifier: &mut TypeUnifier) -> Type {
     match pattern {
         OwnerPatternConstraint::Wildcard | OwnerPatternConstraint::Invalid => Type::Unknown,
         OwnerPatternConstraint::Number => Type::Number,
@@ -452,7 +467,11 @@ fn pattern_type(pattern: &OwnerPatternConstraint, unifier: &mut TypeUnifier) -> 
     }
 }
 
-fn bind_projection(unifier: &mut TypeUnifier, root: TypeVar, fields: &[String]) -> TypeVar {
+pub(crate) fn bind_projection(
+    unifier: &mut TypeUnifier,
+    root: TypeVar,
+    fields: &[String],
+) -> TypeVar {
     let mut current = root;
     for field in fields {
         let next = unifier.fresh();
@@ -533,7 +552,7 @@ fn solver_surface_snapshot(
         .collect()
 }
 
-fn authoritative_signature(
+pub(crate) fn authoritative_signature(
     function: &str,
     builtins: &BuiltinSignatureRegistry,
     render: &RenderContractRegistry,
@@ -611,7 +630,19 @@ fn authoritative_signature(
         })
 }
 
-fn instantiate_type(
+/// Whether the default compiler ABI owns a callable name independently of
+/// project symbol resolution. The exact signature is still fingerprinted by
+/// the consuming owner-body request.
+pub fn is_authoritative_callable_name(function: &str) -> bool {
+    authoritative_signature(
+        function,
+        &BuiltinSignatureRegistry::default(),
+        &RenderContractRegistry::default(),
+    )
+    .is_some()
+}
+
+pub(crate) fn instantiate_type(
     ty: &Type,
     unifier: &mut TypeUnifier,
     variables: &mut BTreeMap<TypeVar, TypeVar>,
@@ -733,7 +764,7 @@ fn collect_type_variables(ty: &Type, variables: &mut BTreeSet<TypeVar>) {
     }
 }
 
-fn alpha_normalize_type(
+pub(crate) fn alpha_normalize_type(
     ty: &Type,
     variables: &mut BTreeMap<TypeVar, TypeVar>,
     next: &mut u32,
@@ -1598,7 +1629,7 @@ pub fn solve_owner_interface_scc<'a>(
     work.unification_steps = unifier.steps;
     let fingerprint_v1 = boon_contract::canonical_serde_hash_v1(
         OWNER_INTERFACE_SCC_RESULT_DOMAIN_V1,
-        &(&scc.key, &interfaces),
+        &(&scc.key, &interfaces, next_alpha),
     )
     .map_err(|error| {
         OwnerConstraintSeedError::new(format!(
@@ -1608,6 +1639,7 @@ pub fn solve_owner_interface_scc<'a>(
     Ok(OwnerInterfaceSccResult {
         key: scc.key.clone(),
         owners: interfaces.into_boxed_slice(),
+        type_variable_count: next_alpha,
         work,
         fingerprint_v1,
     })

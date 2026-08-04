@@ -72,13 +72,15 @@ Authority and conflict rules:
   evidence soundness, runtime persistence identity, native presentation
   semantics, or the mandatory verified artifact spine.
 - `BOON_COMPILER_ARCHITECTURE_REFACTOR_PLAN.md` is subordinate to those budgets
-  and owns the current post-`c870358` sequence: immutable source snapshots;
-  stable interface, definition, invocation, top-level-authority, and link
-  shards in one typed `CompilationDb` graph; one canonical sealed semantic
-  image; a shared plan-code linker across document, row, and migration domains;
-  one consuming `SealedRunnableMachine` builder; persistent currentness; and
-  only measured dependency inversions. Its intermediate directional exits
-  never replace the performance plan's complete scored Clear End Condition.
+  and owns the current post-`174eb4b` decision: immutable source snapshots;
+  stable interface, definition, structural occurrence, top-level-authority,
+  and link shards; verified demand before occurrence expansion; one dense
+  construction-owned semantic image and direct proof seal; compact bundle link
+  summaries; a shared plan-code linker across document, row, and migration
+  domains; one consuming `SealedRunnableMachine` builder; persistent
+  currentness; and only measured dependency inversions. Its intermediate
+  directional exits never replace the performance plan's complete scored Clear
+  End Condition.
 - Compiler scaling evidence uses actual parser inspections and
   typechecker/semantic/proof/backend work, never final AST/call/graph sizes as
   substitutes. Build one current two-job release producer explicitly and invoke
@@ -399,9 +401,9 @@ Current checkpoints to preserve and audit rather than redo:
   invariants remain exact. Budget V2 stays red until the V3 provenance report,
   real-host NovyWave behavior scenario, migration/restart matrix, and negative
   cases are complete;
-- resume the performance goal from clean local checkpoint `c870358`, preserving
-  compact-proof/sealed-plan checkpoint `38e6541` and activation/effect
-  checkpoint `32bcf40`, and follow
+- continue the performance goal from local checkpoint `174eb4b`, which
+  preserves `c870358`'s compilation database, compact-proof/sealed-plan
+  checkpoint `38e6541`, and activation/effect checkpoint `32bcf40`, and follow
   `BOON_COMPILER_ARCHITECTURE_REFACTOR_PLAN.md`. The canonical list-dataflow,
   sparse durable-overlay lifecycle, product-faithful `boon_behavior_harness`,
   real local host, retained document hit testing, exact activation-turn
@@ -478,8 +480,8 @@ Current checkpoints to preserve and audit rather than redo:
   `SemanticProgram`'s checked/execution owners and their production inventories,
   and keep the old artifacts only as independent test oracles. A receipt
   sidecar or callback beneath the same rich owners is rejected;
-- preserve the resulting checked/execution ownership checkpoint without
-  mistaking its first representation for a speed result. The typechecker now
+- preserve the resulting checked/execution ownership checkpoint `174eb4b`
+  without mistaking its first representation for a speed result. The typechecker now
   owns one opaque checked seal, resource owns the only pending-execution
   mutation window, production `SemanticProgram` drops both prior owners, and
   Manifest V5 imports finalized receipts with source-owner parity oracles.
@@ -487,13 +489,41 @@ Current checkpoints to preserve and audit rather than redo:
   NovyWave sample regresses to 5,665.819 ms/507,428 KiB because full stable
   projection keys and invocation-path vectors are cloned into row routes and
   119,441 edges; execution-image finalization alone costs 1,142.939 ms. After
-  checkpointing this required seam, `/goal` must first perform a fresh
-  whole-pipeline architecture audit and implement the highest-leverage
-  replacement: intern projection/path identity once behind dense IDs and one
-  relocation arena, avoid reconstructing final row fingerprints, delete the
-  next complete rich-domain owner, and move verified demand before expansion
-  when the audit confirms it. Do not respond to this regression with isolated
-  map, hash, allocator, or serializer tweaks;
+  checkpointing this required seam, do not respond to the regression with
+  isolated map, hash, allocator, or serializer tweaks;
+- apply the completed post-`174eb4b` whole-pipeline audit. Three independent
+  read-only reviews of projection/image ownership, semantic demand expansion,
+  and the complete artifact spine select one flag-day replacement: stable
+  parser-derived occurrence identities; one collision-checked dense owner/path/
+  projection registry; typed row columns and CSR relocations; direct Manifest
+  V6 sealing without V1/V5 import; verified-intent demand before OUT/contextual
+  occurrence expansion; one sealed semantic authority; compact distributed
+  link summaries; one plan-code linker across document/row/migration; and one
+  consuming `SealedRunnableMachine` with runtime indexes built once. Follow the
+  architecture plan's exact staging, deletion ledger, fingerprint domains,
+  counters, independent oracles, and anti-facade rejection tests. Each vertical
+  batch must delete an existing scan, rich graph, recursive lowerer, or metadata
+  reconstruction owner. Do not accept an interner-only patch, V2 wrapper over
+  V1/V5, production compatibility path, or crate re-export as progress;
+- preserve the first dense V2/V6 working-tree cut only as a checkpoint, not a
+  performance or architecture exit. Checked stable keys are owned once behind
+  dense routes/CSR relocations; execution projections reference checked IDs and
+  parent-pointer invocation paths; Manifest V6 imports fixed digests and dense
+  edges; and snapshot-local call identity uses a reverse duplicate ordinal, so
+  unrelated or identical earlier calls do not renumber later duplicates. It is
+  not yet parser-owned structural identity: raw source text/path and rich DTO
+  payloads with dense IDs/spans still contaminate snapshot receipts. A final
+  two-job release rebuild takes 3m00s; its direct optimized NovyWave sample is
+  3,549.342 ms/274,896 KiB with the unchanged plan hash, 375.894 ms execution-
+  image finalization, 727.061 ms manifest work, and 1,805,377,118 allocated
+  bytes. The V2 builders still scan finished rich
+  checked/execution columns, demand still follows 5,147 eager OUT instances,
+  49,283 execution rows and 78,336 legacy proof rows remain, and the other rich
+  semantic graphs/canonical core/backend lowerers are still live. Continue by
+  moving verified intent before OUT/contextual expansion and delete the
+  superseded scanner/owner with parser structural occurrence routes, typed
+  normalized row payloads, the first demanded definition, and compact
+  occurrence frames; do not tune the dense containers or claim Phase 1;
 - move verified-intent demand collection before occurrence expansion and
   backend lowering. Split top-level authority/interface summaries from the
   final program-link sink, and version the callable interface schema before
@@ -658,8 +688,9 @@ Blocking compiler-performance prerequisite:
 
 - Complete `BOON_COMPILER_PERFORMANCE_PLAN.md` before resuming the remaining
   simplification/native-recovery closure or any later production phase.
-- Begin from checkpoint `c870358`, preserving `38e6541`'s compact-proof/sealed-
-  plan work and `32bcf40`'s activation/effect boundary. Follow the refactor
+- Begin from checkpoint `174eb4b`, which preserves `c870358`'s compilation
+  database, `38e6541`'s compact-proof/sealed-plan work, and `32bcf40`'s
+  activation/effect boundary. Follow the refactor
   plan's corrected shard/image sequence: immutable source snapshots; stable
   interface, definition, invocation, top-level-authority, and link identities;
   finalization-time receipts in one cold/warm projection graph; one sealed

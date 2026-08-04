@@ -316,7 +316,8 @@ receipt folding remain separately red at 272/502 ms.
 ### Checked/Execution Sealed-Image Ownership Checkpoint (2026-08-03)
 
 The first complete checked-plus-execution ownership cut is now implemented as
-a required architecture checkpoint, not a performance exit. `CheckedProgram`
+a required architecture checkpoint in commit `174eb4b`, not a performance
+exit. `CheckedProgram`
 is an opaque `boon_checked` product issued through one audited unsafe seal in
 `boon_typecheck`; `boon_semantic` has no production dependency on the
 typechecker. The typechecker final seal emits stable checked shard receipts
@@ -372,6 +373,235 @@ full key trees per row; migrate the remaining OUT/resource/reactive/lowering/
 storage/view/memory owners into the image; and move verified-intent demand
 before occurrence expansion. Do not optimize `BTreeMap` operations or the
 already-small SCC kernel while these representation multipliers remain.
+
+### Post-`174eb4b` Whole-Pipeline Architecture Decision (2026-08-03)
+
+Three fresh-context, read-only audits independently traced projection/image
+ownership, demand/occurrence expansion, and the complete artifact lifetime from
+typechecking through executor metadata. They agree that V1 is a useful
+construction-ownership witness but is not the final image, proof, or
+incremental-currentness seam. It still recursively owns projection and call-
+path keys, derives invocation identity from owner-local order, hashes post-hoc
+DTO scans, seals roles before bundle relocation closure, imports the result into
+Manifest V5, retains seven rich semantic graphs plus a canonical-core copy, and
+re-lowers ordinary bodies in several backends. Tuning maps, serializers, row
+hashes, or SCC sealing inside that shape is rejected.
+
+The selected replacement is one flag-day production architecture, implemented
+in internally verifiable tranches without a production fallback:
+
+```text
+complete checked diagnostics + stable interfaces/definitions
+  -> VerifiedIntent roots
+  -> demanded definition specializations + compact invocation frames
+  -> SemanticImageBuilderV2<Local>
+  -> compact role/bundle link summaries + relocation fixed point
+  -> SemanticImageBuilderV2<Linked>
+  -> narrow proof view + verification receipt
+  -> SealedSemanticImageV2
+  -> shared all-domain plan-code linker
+  -> SealedRunnableMachine(plan image + runtime indexes + receipt)
+```
+
+#### 1. Canonical identity and row storage
+
+Replace the checked/execution V1 DTO families, Manifest V5 key import, and the
+generic rich-key projection graph together. One registry owns revision-local
+dense `OwnerId`, `SymbolId`, `StablePathId`, `InvocationPathId`,
+`ProjectionId`, `RowId`, and `RelocationId` values. Stable paths and invocation
+paths are collision-checked parent-pointer tries; full paths are debug views,
+not vectors copied into rows. An authored call occurrence receives a parser-
+derived structural identity. Inserting an earlier call must not renumber later
+occurrences. Revision-local dense IDs and owner-local ordinals never enter a
+stable fingerprint, persistence key, or cross-revision request key.
+
+The retained image contains one owner table, path tables, a projection table,
+typed domain columns, one row-metadata arena, flat CSR relocation/edge arenas,
+projection receipts, and dense entity-owner columns. Do not retain
+`Vec<{domain, index, rich key}>` routes or a second serializable proof model.
+Every canonical row is finalized once after its last legal mutation and stores
+one exact relocation span. Preserve four distinct commitments:
+
+1. stable owner/projection/path key fingerprint;
+2. local row payload fingerprint normalized to stable references;
+3. linked projection/SCC fingerprint after relocation resolution; and
+4. canonical dense image encoding digest.
+
+This tranche deletes `CheckedImageHandoffBuilderV1`,
+`ExecutionImageHandoffBuilderV1`, their post-hoc scans, rich V1 route/receipt
+keys, `SemanticDependencyProjectionKeyV5`, `PresealedProjectionIndexV5`, and
+the key-valued `ProjectionGraphBuilder<K>` production path. Manifest V6 consumes
+the image's finalized receipts and dense edges directly; it does not import or
+re-inventory the image. The V3/V4/V5 source materializers remain test-only,
+independent omission and mutation oracles until the controlled replacement
+gate passes.
+
+#### 2. Demand before semantic occurrence expansion
+
+Complete checking and deterministic diagnostics remain eager. Immediately
+after the checked seal, `VerifiedIntent` roots published outputs, top-level
+executable statements, state/source/effect ownership, persistence and migration
+entries, host ports, producer materializations, and distributed imports and
+exports. A queue keyed by
+`{definition, execution domain, resolved layout, overlay/control shape,
+capability contract}` requests canonical definition bodies once. Occurrences
+carry compact frames for arguments, substitutions, PASSED, OUT ports, owners,
+resources, effects, rendering, and materialization bindings.
+
+Replace eager recursive `OutNetBuilder` instantiation and per-candidate
+contextual body cloning with a demanded link solver, one definition-body
+builder, and one frame builder. Statically proven dead branches create no
+execution/proof/backend rows; dynamic inactivity, empty collections, and
+offscreen work are not compile-time unreachability. Distinct authored
+occurrences retain distinct state/source/effect identities. OUT remains
+compile-time topology, and PASSED/FLUSH/DRAIN/DRAINING/HOLD/LATEST, commit,
+deltas, effects, persistence, migration, and currentness retain their existing
+semantics. Delete the late backend demand pass when this demand owner is live.
+
+#### 3. One semantic authority and compact bundle link
+
+Migrate OUT/resource/reactive/lowering/storage/view/memory algorithms to write
+or finalize typed image columns. Delete each rich production graph immediately
+when its independent source-driven oracle and last consumer move. Delete
+`SemanticProgram` and `CanonicalProgramCoreV1` as retained authorities rather
+than wrapping them behind V2; useful row schemas move into the image.
+Verification receives borrowed pulse/arm/effect/crossing projections and a
+small receipt, not ownership of the semantic program.
+
+Elaborate each role locally once. Distributed rounds exchange only compact
+exports, requirements, producer/external-event facts, relocations, and digests;
+they never clone `CheckedProgram` or rerun full semantic elaboration. Apply
+relocations once after monotone convergence, then seal the bundle. Confirmation
+replays the compact link digest instead of rebuilding the roles.
+
+#### 4. One code linker and one runnable publication
+
+Link ordinary code once per compatible specialization across document,
+row/scalar, and migration execution. Delete document call-cache scopes and all
+three recursive ordinary-call body lowerers together. Invocation frames contain
+resolved dense bindings, never a semantic AST or unresolved substitution.
+
+The consuming linker assigns final IDs, reachability, structural fingerprints,
+plan tables, and runtime indexes once and returns `SealedRunnableMachine`.
+Normal compilation must not retain semantic graphs, canonical core, IR, and
+plan simultaneously; `MachineTemplate::from_runnable` clones one `Arc` and does
+not call `Metadata::new`. Untrusted deserialization remains a separate path that
+verifies and constructs indexes exactly once.
+
+#### 5. Currentness, bounded parallelism, and crate seams
+
+Retain the same source/interface/definition/invocation/link/proof/plan/runnable
+requests across revisions. Body-only edits backdate unchanged interfaces;
+public edits invalidate the exact reverse cone; insertion, deletion, rename,
+errors, cancellation, and stale generations fail closed; a clean full compile
+and every incremental result remain identical. Enable at most two workers only
+after dense dependencies prove requests independent. Shared-memory parallelism
+is a multiplier after de-duplication, not a substitute for it.
+
+Split crates only after these models stabilize. The intended low-fanout seams
+are `boon_semantic_image` for stable semantic-image schemas/receipts/borrowed
+views and `boon_machine_image` for the sealed plan/runtime-index contract.
+Compiler adapters move outward from runtime cores. Do not split each semantic
+domain into a crate, preserve rich DTOs through re-exports, or count Rust rebuild
+speed as Boon compile latency. Every split requires before/after reverse-
+dependency closure and two-job rebuild evidence and must enable the immediately
+following owner deletion.
+
+The external architecture evidence supports these boundaries rather than a
+copy of another compiler. [rust-analyzer's architecture](https://rust-analyzer.github.io/book/contributing/architecture.html)
+keeps body-local edits from invalidating global derived data and uses compact
+IDs; [Salsa](https://salsa-rs.github.io/salsa/overview.html) uses interning and
+tracked deterministic queries; [Swift's request evaluator](https://github.com/swiftlang/swift/blob/main/docs/RequestEvaluator.md)
+centralizes fine-grained dependency caching and cycle handling; and the
+[TypeScript native port](https://devblogs.microsoft.com/typescript/typescript-native-port/)
+plus [TypeScript 7 RC](https://devblogs.microsoft.com/typescript/announcing-typescript-7-0-rc/)
+show the benefit and memory tradeoff of parallel checking. For Boon, the
+measured 18.66 million allocations and repeated body/image/proof ownership must
+fall before parallel compilation is allowed to amplify the remaining work.
+
+#### Flag-day rejection and acceptance gates
+
+Reject the tranche if V2 coexists as a production facade over V1/V5, receipts
+scan finished vectors, proof/link views own cloned models, bundle rounds invoke
+semantic elaboration, any backend still recursively lowers ordinary bodies,
+`SealedRunnableMachine` still triggers executor metadata reconstruction, or a
+feature flag/adapter preserves the old production path.
+
+Required evidence includes exact definition/occurrence/specialization/frame and
+row/domain counters; unique path nodes versus cumulative logical depth; queue
+enqueued/processed/reused/pruned/error accounting; zero unresolved relocations;
+zero legacy proof rows, post-hoc inventories, retained rich graph owners, and
+recursive backend lowerers; one runtime-index build per runnable seal; stable
+digest invariance under allocation-order perturbation; precise edit cones and
+clean-full parity; direct/wrapped OUT/PASSED equivalence; independent behavior,
+artifact, migration/restart, effect, currentness, and mutation oracles; scaling
+fixtures; and fresh NovyWave time/RSS reports. The first implementation batch
+must delete an existing V1/V5 scan or owner while carrying one real demanded
+definition and occurrence through the dense image. Adding only an interner,
+side table, database shell, crate, or new DTO does not qualify.
+
+#### First dense V2/V6 spine: checkpoint candidate, not tranche exit
+
+The first implementation cut after `174eb4b` replaces the public checked and
+execution V1 handoff families and Manifest V5 in one flag-day working tree.
+Checked V2 owns each stable projection key once, routes and relocations by
+canonical `CheckedImageProjectionIdV2`, and stores one flat CSR relocation
+arena. Execution V2 references checked projections by dense ID, interns
+invocation ancestry as collision-checked parent-pointer nodes, stores each
+execution projection identity once, and uses dense route/CSR tables. Manifest
+V6 imports the image's stable-key digests, receipts, dense routes, and CSR
+edges; it no longer clones full checked owner keys or recursive invocation paths
+into its projection namespace. The compilation graph's production API likewise
+accepts collision-checked dense projection IDs rather than generic rich keys.
+Authored call sites currently use a parser/source-derived snapshot digest plus
+an identical-site reverse ordinal. Focused oracles prove that unrelated and
+identical earlier calls do not renumber later identical sites. This is only a
+snapshot-local checkpoint identity: raw source text, source paths, and rich
+owner data still enter the key, so it does not satisfy the target parser-owned
+structural identity or cross-revision currentness contract.
+
+This is a coherent representation checkpoint candidate, not completion of the
+first demand/image tranche. `checked_image_handoff` and
+`execution_image_handoff` still scan finalized rich checked/execution columns;
+the checked and execution registries are linked rather than yet one complete
+all-domain image builder; OUT and contextual occurrence expansion still happen
+before demand; Manifest V6 still inventories 78,336 legacy-domain rows; and
+resource/reactive/lowering/storage/view/memory graphs, canonical core, backend
+recursive ordinary-call lowerers, distributed re-elaboration, and executor
+metadata reconstruction still exist. Therefore the anti-facade exit remains
+red even though the old V1/V5 wire shapes are gone.
+
+The required three-way adversarial review found another deliberate red line in
+this checkpoint: checked and execution row payload hashes still serialize rich
+snapshot DTOs containing dense IDs and spans. Owner-local row ordinals have
+now been removed from the row fingerprints, duplicate call sites count from the
+end, relocation spans use checked arithmetic, V6 receipt layers have distinct
+digest domains, and manifest row accounting fails closed. But these payload
+hashes are snapshot receipts, not the normalized stable-reference fingerprints
+required for persistent currentness. The next vertical slice must create
+parser-owned structural occurrence routes and typed canonical row payloads
+while moving their production construction into the demand/image builder; it
+must not reinterpret this checkpoint's digests as cross-revision cache keys.
+
+One final two-job release rebuild takes 3m00s. Its direct optimized NovyWave
+edit-loop sample, not acceptance evidence, finishes in 3,549.342 ms at 274,896
+KiB peak RSS with the unchanged plan hash
+`890eff63ce7eff16c5597093179b6878fc8f8ed3e9f49555e73333d71d7bcb42`.
+Semantic time is 2,480.719 ms. Execution-image finalization falls from
+1,142.939 to 375.894 ms and manifest work from 1,534.308 to 727.061 ms;
+allocated bytes fall from 2,989,230,512 to 1,805,377,118. Allocation calls are
+12,517,443, so no allocation-count improvement is claimed. Architecture, 19
+focused manifest tests, minimal manifest, authored-call insertion, state-
+lifetime, bundle freeze/mutation, and the ignored NovyWave occurrence oracle
+pass. This evidence authorizes the checkpoint only. The next production cut
+must move verified-intent demand before OUT/contextual expansion, carry a real
+demanded definition and occurrence through the image, and delete its replaced
+scanner/owner; it must then migrate the remaining legacy domains rather than
+tune the V2 containers.
+
+The following second and third audit sections remain evidence and detailed
+design rationale. Where they name a "next" action or staging order, the
+post-`174eb4b` decision above supersedes it.
 
 ### Second Whole-Pipeline Reassessment: Owner Compilation Units
 
@@ -497,7 +727,11 @@ already native Rust; its 11.14 million allocation calls and multipass graph
 amplification must disappear first. Use at most two compiler workers after the
 request graph proves independence.
 
-#### Post-`c870358` Architectural Priority
+#### Historical Post-`c870358` Architectural Priority
+
+Items 1 and 2 below led to checkpoint `174eb4b`. The current production order
+starts with the dense V2/Manifest V6 and demand-first vertical tranche in the
+post-`174eb4b` decision; this list remains the provenance of that decision.
 
 1. Specify stable source/interface/definition/invocation/top-level/link keys,
    local/linked/image fingerprint domains, finalization typestates, and small

@@ -724,7 +724,8 @@ Current cold-diagnostics candidate evidence:
   release rebuild remains 2m43s. Continue with finalized shard rows and delete
   those inventories; do not tune the now-small SCC kernel.
 - The checked/execution owner-deletion checkpoint is now real but its first
-  representation is a measured regression, not an optimization result.
+  representation is a measured regression, not an optimization result. It is
+  preserved by local commit `174eb4b`.
   `SemanticProgram` drops its production checked/execution owners, resource is
   the sole execution mutation window, Manifest V5 imports finalized handoffs,
   and the old checked/execution inventories are test-only. Architecture,
@@ -737,11 +738,56 @@ Current cold-diagnostics candidate evidence:
   Full stable projection keys and invocation-path vectors are cloned through
   row routes and 119,441 edges, while 78,336 legacy-domain rows remain. Treat
   this as the required boundary checkpoint allowed by optimization-loop step
-  6, then immediately replace the representation through a whole-pipeline
-  audit: one interned projection/path registry, dense relocation spans, one
-  typed final-row fingerprint, remaining rich-domain owner deletion, and
-  pre-expansion demand. Do not polish maps, serializers, or the 156-node
-  maximum SCC as the next task.
+  6. Do not polish maps, serializers, or the 156-node maximum SCC as the next
+  task.
+- The required post-`174eb4b` whole-pipeline audit is complete. Three
+  independent read-only reviews of projection/image ownership, semantic demand,
+  and artifact lifetime converge on one replacement rather than separate
+  micro-optimizations. Replace V1 checked/execution handoffs, Manifest V5 import,
+  and the rich-key request graph with one collision-checked dense owner/path/
+  projection registry, typed row columns, and CSR relocation/edge arenas.
+  Authored call-site identity comes from stable source structure, never owner-
+  local ordinals; local-row, linked-projection, and dense-image fingerprints
+  remain distinct. Move verified-intent demand immediately after complete
+  checking, then build canonical definition variants once and carry compact
+  occurrence frames through OUT, contextual semantics, proof, and all backend
+  domains. Migrate OUT/resource/reactive/lowering/storage/view/memory into the
+  same image, run distributed convergence over compact summaries rather than
+  full re-elaboration, link ordinary code once across document/row/migration,
+  and consume the result into `SealedRunnableMachine` with runtime indexes built
+  once. The exact staging, deletion ledger, anti-facade tests, and counters are
+  authoritative in the architecture plan's post-`174eb4b` decision. The first
+  implementation batch must delete an existing V1/V5 scan or owner while
+  carrying a real demanded definition/occurrence through the dense image; an
+  interner-only patch, side table, wrapper, feature fallback, or crate re-export
+  is not progress.
+- The first dense V2/V6 spine is now a measured checkpoint candidate, not the
+  tranche exit. Checked V2 owns stable keys once with dense routes and CSR
+  relocations; execution V2 uses dense projections plus collision-checked
+  parent-pointer invocation paths; Manifest V6 consumes their fixed digests and
+  dense edges without rebuilding recursive key trees; and the compilation graph
+  accepts dense registered projections. The V1/V5 public production schemas are
+  gone. Snapshot-local authored-call identity survives both unrelated and
+  identical earlier insertions by using a reverse duplicate ordinal. It is not
+  yet the parser-owned structural identity required for currentness: raw source
+  text/path and rich DTO payloads containing dense IDs and spans still enter
+  snapshot receipts. Owner-local row ordinals are removed, CSR arithmetic and
+  V6 count accounting fail closed, and receipt aggregation domains are now
+  separated. One
+  final two-job release rebuild takes 3m00s; its direct optimized NovyWave
+  sample is 3,549.342 ms at 274,896 KiB with the unchanged plan hash. Semantic
+  work is 2,480.719 ms; execution-image finalization falls to 375.894 ms,
+  manifest work to 727.061 ms, and allocated bytes to 1,805,377,118. This is
+  directional, not scored evidence. The two V2
+  builders still scan finalized rich columns, OUT still creates 5,147 eager call
+  instances before demand, the execution image still seals 49,283 rows, and
+  Manifest V6 still folds 78,336 legacy rows. Resource/reactive/lowering/
+  storage/view/memory owners and canonical core also remain. Continue directly
+  with parser structural occurrence routes, typed normalized row payloads, and
+  verified intent before OUT/contextual expansion. Carry one demanded
+  definition body plus compact occurrence frames and delete the corresponding
+  scan/rich owner in the same slice. Do not optimize the new maps or declare
+  Phase 1 complete.
 - Do not preserve V3's 208k subject cardinality as a production V4/V5 proof
   requirement. The independent test oracle must map every historical subject
   to exactly one canonical finalized shard row and classifier field/domain and prove
@@ -1005,16 +1051,17 @@ Boon's `HOLD`, hidden row identity, migration, and activation contracts remain
 the semantic authority; this precedent only reinforces that a view name must
 not automatically imply durable storage.
 
-The post-`c870358` implementation order is therefore: preserve the landed
+The post-`174eb4b` implementation order is therefore: preserve the landed
 list-dataflow, durable-overlay, exact-activation, effect-transcript, and
 headless-harness cuts; preserve and complete the real-host NovyWave oracle
-before phase acceptance without delaying compiler work; establish stable
-interface/definition/invocation/top-level/link shards and finalized receipts;
-build one sealed semantic image while deleting rich graph owners; link plan
-code once across document, row/scalar, and migration domains; and publish one
-sealed runnable image with runtime indexes built once. Retain these same
-requests for warm revisions. Pull measured dependency inversion only at stable
-seams that shorten those tranches.
+before phase acceptance without delaying compiler work; replace ordinal V1/V5
+identity and re-import with stable structural occurrences plus the single dense
+row/relocation image; collect verified demand before occurrence expansion;
+delete the remaining rich graph owners into that image; converge distributed
+links over compact summaries; link plan code once across document, row/scalar,
+and migration domains; and publish one sealed runnable image with runtime
+indexes built once. Retain these same requests for warm revisions. Pull
+measured dependency inversion only at stable seams that shorten those tranches.
 Return to local optimization only when fresh counters show that no higher
 architectural tranche dominates. Each crate cut must publish a before/after
 dependency closure and build wall time, preserve artifact and diagnostic
@@ -1357,10 +1404,11 @@ build-input freshness, and current release reports remain required before the
 corresponding exits; those gaps do not justify another documentation-only or
 counter-only loop before changing the measured parser/typechecker owners.
 
-### Current Resumption Point: Sharded Semantic Image And Sealed Runnable
+### Current Resumption Point: Dense Demand-First Image And Sealed Runnable
 
-Resume from clean local checkpoint `c870358`, preserve compact-proof/sealed-plan
-checkpoint `38e6541` and activation/effect checkpoint `32bcf40`, and follow the detailed sequence in
+Continue from local checkpoint `174eb4b`, which preserves `c870358`'s
+compilation database, compact-proof/sealed-plan checkpoint `38e6541`, and
+activation/effect checkpoint `32bcf40`, and follow the detailed sequence in
 [`BOON_COMPILER_ARCHITECTURE_REFACTOR_PLAN.md`](BOON_COMPILER_ARCHITECTURE_REFACTOR_PLAN.md).
 Do not return to the historical contextual-scheme micro-tranche while verified
 semantic/proof multiplication, duplicate representation lifetimes, whole-
@@ -1379,30 +1427,29 @@ project invalidation, and rebuild fan-out dominate.
    production proof schema at checkpoint `38e6541`. The remaining oracle does
    not delay the active compiler architecture cut and is not permission to
    restore V3 production.
-3. Replace the corrected-away single `OwnerBodyUnit` concept with stable
-   interface, definition, invocation, top-level-authority, and link shards.
-   Specify local/linked/image fingerprint domains, relocations, and typed
-   `Pending -> Finalized` rows; split the broad program-root target. Narrow the
-   database to registered dense projection IDs rather than generic row queries.
+3. Preserve `174eb4b`'s opaque checked seal and sole resource mutation window,
+   then replace its provisional V1/V5 representation rather than tuning it.
+   Use parser-derived structural occurrence identities, one collision-checked
+   owner/path/projection registry, typed row columns, parent-pointer paths, and
+   CSR relocations. Keep stable-key, local-row, linked-projection, and dense-
+   image digests separate. Manifest V6 consumes those rows directly. Delete
+   the V1 handoff builders, V5 import/index, and rich-key graph path in the same
+   vertical migration; do not leave a production compatibility adapter.
 4. Retain immutable parser-owned unit snapshots with atomic upsert/remove/
-   rename and exact cached project assembly. Make typechecking emit interface
-   and definition shards, then move the complete checked and execution domains
-   into `SemanticImageBuilder`; resource construction may mutate the pending
-   execution slice, and the slice finalizes only after its post-resource
-   invariant boundary. Delete `SemanticProgram`'s checked/execution owners,
-   their production post-hoc inventories, and the late callable-interface
-   rediscovery in the same flag-day cut. Borrowed legacy views allocate
-   nothing; the old checked/execution artifacts and V3/V4 derivations remain
-   independent test-only oracles. A receipt sidecar beneath the old owners is
-   not this step.
-5. Add invocation shards and migrate OUT/resource/reactive/lowering/storage/
-   view/memory into one `SealedSemanticImage` in dependency order. Link fixed
-   points consume only compact summaries and relocations; rich graphs become
-   borrowed views or test/debug materializers and are deleted as production
-   owners. Give verification only the image, certificate, and narrow proof
-   tables after distributed link closure.
-6. Move demand collection before occurrence expansion and backend lowering,
-   then carry ordinary executable definitions through one shared plan-code linker
+   rename and exact cached project assembly. After complete checking, collect
+   verified intents and demand canonical definition variants before OUT or
+   contextual occurrence expansion. Carry arguments, substitutions, PASSED,
+   OUT, owner/resource/effect/render bindings in compact invocation frames.
+   Delete eager body cloning and the late backend demand owner as parity gates
+   pass.
+5. Migrate OUT/resource/reactive/lowering/storage/view/memory into the same
+   image in dependency order. Delete each rich graph and the duplicate
+   canonical-core mapping immediately after its independent source-driven
+   omission/mutation oracle and final consumer move. Iterate distributed
+   closure over compact summaries and relocations, never full semantic role
+   re-elaboration. Give verification only borrowed proof views and a receipt
+   after bundle link closure.
+6. Carry ordinary executable definitions through one shared plan-code linker
    across document, row/scalar, and migration domains. Key verified variants by
    execution domain, resolved layout, overlay/control shape, and capability
    contract; encode occurrences as dense resolved frames. Delete all matching

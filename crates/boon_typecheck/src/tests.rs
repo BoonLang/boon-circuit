@@ -1,6 +1,126 @@
 use super::*;
 
 #[test]
+fn authored_call_site_identity_survives_an_unrelated_earlier_call() {
+    fn helper_sites(source: &str) -> BTreeMap<String, CheckedShardRegionV2> {
+        let parsed = boon_parser::parse_source("stable-call-sites.bn", source)
+            .expect("stable call-site fixture parses");
+        let checked = check_program(&parsed)
+            .program
+            .expect("stable call-site fixture checks");
+        checked
+            .calls
+            .iter()
+            .filter(|call| call.function == "helper")
+            .map(|call| {
+                let authored = parsed.source[call.span.start..call.span.end].to_owned();
+                let route = checked
+                    .image_handoff()
+                    .entity_routes
+                    .iter()
+                    .find(|route| {
+                        route.domain == CheckedImageRowDomainV2::Call
+                            && route.dense_index == call.id.0
+                    })
+                    .expect("checked call has an image route");
+                let projection = checked
+                    .image_handoff()
+                    .projection(route.projection)
+                    .expect("checked route has a dense projection");
+                (authored, projection.stable_key.region.clone())
+            })
+            .collect()
+    }
+
+    let baseline = helper_sites(
+        r#"
+left: helper(value: 10)
+right: helper(value: 20)
+
+FUNCTION helper(value) {
+    value
+}
+"#,
+    );
+    let inserted = helper_sites(
+        r#"
+unrelated: 1 + 2
+left: helper(value: 10)
+right: helper(value: 20)
+
+FUNCTION helper(value) {
+    value
+}
+"#,
+    );
+    assert_eq!(inserted, baseline);
+    assert!(baseline.values().all(|region| matches!(
+        region,
+        CheckedShardRegionV2::Invocation {
+            authored_call_site_digest: _,
+            identical_site_reverse_ordinal: 0,
+        }
+    )));
+}
+
+#[test]
+fn authored_call_site_identity_survives_an_identical_earlier_call() {
+    fn helper_sites(source: &str) -> Vec<CheckedShardRegionV2> {
+        let parsed = boon_parser::parse_source("stable-identical-call-sites.bn", source)
+            .expect("stable identical-call-site fixture parses");
+        let checked = check_program(&parsed)
+            .program
+            .expect("stable identical-call-site fixture checks");
+        checked
+            .calls
+            .iter()
+            .filter(|call| call.function == "helper")
+            .map(|call| {
+                let route = checked
+                    .image_handoff()
+                    .entity_routes
+                    .iter()
+                    .find(|route| {
+                        route.domain == CheckedImageRowDomainV2::Call
+                            && route.dense_index == call.id.0
+                    })
+                    .expect("checked call has an image route");
+                checked
+                    .image_handoff()
+                    .projection(route.projection)
+                    .expect("checked route has a dense projection")
+                    .stable_key
+                    .region
+                    .clone()
+            })
+            .collect()
+    }
+
+    let baseline = helper_sites(
+        r#"
+left: helper(value: 10)
+right: helper(value: 10)
+
+FUNCTION helper(value) {
+    value
+}
+"#,
+    );
+    let inserted = helper_sites(
+        r#"
+earlier: helper(value: 10)
+left: helper(value: 10)
+right: helper(value: 10)
+
+FUNCTION helper(value) {
+    value
+}
+"#,
+    );
+    assert_eq!(&inserted[1..], baseline);
+}
+
+#[test]
 fn structural_widening_reuses_unchanged_shared_nodes() {
     let nested = Type::object(ObjectShape::from_ordered_fields(
         [("value".to_owned(), Type::Text)],

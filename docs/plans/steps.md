@@ -206,8 +206,9 @@ stronger three-reviewer performance closure defined below.
    red until V3 records source/old/new identities, the real-host NovyWave
    behavior trace, migration/restart evidence, and focused negative cases.
 
-   Resume from clean local checkpoint `c870358`, preserve compact-proof/sealed-
-   plan checkpoint `38e6541` and activation/effect checkpoint `32bcf40`, and follow
+   Continue from local checkpoint `174eb4b`, which preserves `c870358`'s
+   compilation database, compact-proof/sealed-plan checkpoint `38e6541`, and
+   activation/effect checkpoint `32bcf40`, and follow
    `BOON_COMPILER_ARCHITECTURE_REFACTOR_PLAN.md`. The canonical list-dataflow,
    sparse durable-overlay lifecycle, `boon_behavior_harness`, real local host,
    retained document hit testing, exact activation-turn handoff, atomic reset/
@@ -264,21 +265,49 @@ stronger three-reviewer performance closure defined below.
    checkpoint another wrapper that leaves completed-plan rewrites or executor
    metadata reconstruction alive.
 
-   That checked/execution owner-deletion boundary is now implemented and is a
-   local checkpoint prerequisite, not the step exit. `CheckedProgram` is
+   That checked/execution owner-deletion boundary is now implemented in local
+   checkpoint `174eb4b` and is not the step exit. `CheckedProgram` is
    sealed once by the typechecker; `SemanticImageBuilder` owns pending/final
    execution across the resource boundary; production `SemanticProgram` drops
    checked/execution fields; and Manifest V5 imports their receipts while old
    inventories remain test-only. Focused owner/manifest/NovyWave oracles and
    the architecture gate pass. The first representation is intentionally red:
    one optimized NovyWave sample is 5,665.819 ms/507,428 KiB, with 1,142.939 ms
-   image finalization and 18.66 million allocations. After the local commit,
-   perform a new high-level audit before more implementation. The next selected
-   tranche must eliminate recursively cloned stable projection/path keys with
-   one interned dense registry and relocation arena, then choose between
-   remaining rich-domain owner deletion and pre-expansion demand according to
-   measured whole-pipeline leverage. Do not treat map/hash micro-tuning as
-   progress on this regression.
+   image finalization and 18.66 million allocations. Do not treat map/hash
+   micro-tuning as progress on this regression.
+
+   The required post-`174eb4b` high-level audit is complete. Three independent
+   reviews of projection/image ownership, semantic demand expansion, and the
+   complete semantic-to-runnable artifact lifetime reject further V1 tuning.
+   Execute the architecture plan's post-`174eb4b` flag-day sequence: stable
+   parser-derived occurrence identities; one collision-checked dense owner/
+   path/projection registry; typed final rows and CSR relocations; direct
+   Manifest V6 sealing without a re-import graph; verified-intent demand before
+   OUT/contextual occurrence expansion; one semantic authority; compact bundle
+   link summaries; one all-domain plan-code linker; and one consuming runnable
+   image with indexes built once. Delete the superseded scanner or owner in
+   each vertical batch. A V2 facade over V1/V5, an interner-only side table, a
+   production compatibility feature, or a crate that merely re-exports rich
+   DTOs is a failed tranche.
+
+   The first dense V2/V6 cut is a checkpoint candidate, not the step exit.
+   Checked stable keys now have one owner plus dense route/CSR tables;
+   execution uses dense projections and collision-checked parent-pointer call
+   paths; Manifest V6 imports fixed digests and dense edges; and snapshot-local
+   call identity survives unrelated and identical earlier insertion through a
+   reverse duplicate ordinal. Raw source text/path and rich DTO payloads with
+   dense IDs/spans still prevent structural cross-revision currentness. A final
+   two-job release rebuild takes 3m00s; its direct optimized NovyWave sample is
+   3,549.342 ms at 274,896 KiB with the unchanged plan hash; image finalization
+   is 375.894 ms, manifest work 727.061 ms, and allocated bytes 1,805,377,118.
+   The V2 handoff builders still scan finished
+   rich columns, however, while 5,147 eager OUT instances, 49,283 execution
+   rows, 78,336 legacy proof rows, the other rich semantic graphs/canonical
+   core, and recursive backend lowerers remain. The immediate step is parser-
+   owned structural occurrence routes, typed normalized row payloads, verified
+   intent before OUT/contextual expansion, one demanded definition plus compact
+   occurrence frames, and deletion of the replaced scanner/owner. Do not stop
+   at this checkpoint or optimize its containers.
 
    Receipt callbacks alone are too small: removing all 1,813.236 ms of manifest
    work from the 4,052.379 ms directional sample would still leave about 2.24

@@ -1,7 +1,6 @@
 #![forbid(unsafe_code)]
 
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 
@@ -114,64 +113,46 @@ impl ProjectionId {
     }
 }
 
-struct RegisteredProjection<K> {
-    key: K,
-    node: PendingRequestNode,
-}
-
 /// Cold and warm request graph builder at stable owner/projection granularity.
 ///
 /// Rows inside a request are folded by the language-owned table builder before
-/// insertion. This graph deliberately does not expose per-expression queries.
-pub struct ProjectionGraphBuilder<K> {
-    ids: BTreeMap<K, ProjectionId>,
-    nodes: Vec<RegisteredProjection<K>>,
+/// insertion. Stable semantic keys are interned and collision-checked by the
+/// language-owned image before this boundary. This graph therefore carries
+/// only dense IDs and fixed fingerprints; it never clones or re-indexes rich
+/// language keys.
+pub struct DenseProjectionGraphBuilder {
+    nodes: Vec<PendingRequestNode>,
     dependencies: Vec<(ProjectionId, ProjectionId)>,
 }
 
-impl<K> Default for ProjectionGraphBuilder<K> {
+impl Default for DenseProjectionGraphBuilder {
     fn default() -> Self {
         Self {
-            ids: BTreeMap::new(),
             nodes: Vec::new(),
             dependencies: Vec::new(),
         }
     }
 }
 
-impl<K: Clone + Ord> ProjectionGraphBuilder<K> {
+impl DenseProjectionGraphBuilder {
     pub fn new() -> Self {
         Self::default()
     }
 
     pub fn register(
         &mut self,
-        key: K,
         identity_digest: RequestFingerprint,
         local_digest: RequestFingerprint,
     ) -> Result<ProjectionId, CompilationDbError> {
-        if self.ids.contains_key(&key) {
-            return Err(CompilationDbError::new(
-                "compilation request graph contains a duplicate key",
-            ));
-        }
         let ordinal = u32::try_from(self.nodes.len()).map_err(|_| {
             CompilationDbError::new("compilation projection graph exceeds u32 identities")
         })?;
         let id = ProjectionId(ordinal);
-        self.ids.insert(key.clone(), id);
-        self.nodes.push(RegisteredProjection {
-            key,
-            node: PendingRequestNode {
-                identity_digest,
-                local_digest,
-            },
+        self.nodes.push(PendingRequestNode {
+            identity_digest,
+            local_digest,
         });
         Ok(id)
-    }
-
-    pub fn id(&self, key: &K) -> Option<ProjectionId> {
-        self.ids.get(key).copied()
     }
 
     pub fn add_dependency(
@@ -196,7 +177,7 @@ impl<K: Clone + Ord> ProjectionGraphBuilder<K> {
     pub fn seal(
         self,
         domains: ProjectionGraphDigestDomains<'_>,
-    ) -> Result<SealedProjectionGraph<K>, CompilationDbError> {
+    ) -> Result<SealedDenseProjectionGraph, CompilationDbError> {
         if domains.component.is_empty() {
             return Err(CompilationDbError::new(
                 "compilation request graph component digest domain is empty",
@@ -204,21 +185,27 @@ impl<K: Clone + Ord> ProjectionGraphBuilder<K> {
         }
 
         let mut registered = self.nodes.into_iter().enumerate().collect::<Vec<_>>();
-        registered.sort_unstable_by(|(_, left), (_, right)| left.key.cmp(&right.key));
+        registered.sort_unstable_by_key(|(_, node)| node.identity_digest);
+        if registered
+            .windows(2)
+            .any(|pair| pair[0].1.identity_digest == pair[1].1.identity_digest)
+        {
+            return Err(CompilationDbError::new(
+                "compilation request graph contains duplicate stable identity fingerprints",
+            ));
+        }
         let mut canonical_by_registered = vec![0usize; registered.len()];
-        let mut keys = Vec::with_capacity(registered.len());
+        let mut registered_by_canonical = Vec::with_capacity(registered.len());
         let mut identity_digests = Vec::with_capacity(registered.len());
         let mut local_digests = Vec::with_capacity(registered.len());
-        let mut ordinals = BTreeMap::new();
-        for (canonical, (registered_ordinal, projection)) in registered.into_iter().enumerate() {
+        for (canonical, (registered_ordinal, node)) in registered.into_iter().enumerate() {
             canonical_by_registered[registered_ordinal] = canonical;
-            ordinals.insert(projection.key.clone(), canonical);
-            keys.push(projection.key);
-            identity_digests.push(projection.node.identity_digest);
-            local_digests.push(projection.node.local_digest);
+            registered_by_canonical.push(registered_ordinal);
+            identity_digests.push(node.identity_digest);
+            local_digests.push(node.local_digest);
         }
 
-        let mut edges = vec![Vec::new(); keys.len()];
+        let mut edges = vec![Vec::new(); identity_digests.len()];
         for (request, dependency) in self.dependencies {
             let request = canonical_by_registered[request.as_usize()];
             let dependency = canonical_by_registered[dependency.as_usize()];
@@ -298,9 +285,9 @@ impl<K: Clone + Ord> ProjectionGraphBuilder<K> {
 
         let edge_offsets = adjacency_offsets(&edges)?;
         let edge_arena = edges.into_iter().flatten().collect::<Vec<_>>();
-        let reverse_edges = reverse_adjacency(keys.len(), &edge_offsets, &edge_arena)?;
+        let reverse_edges = reverse_adjacency(identity_digests.len(), &edge_offsets, &edge_arena)?;
         let stats = ProjectionGraphStats {
-            nodes: keys.len(),
+            nodes: identity_digests.len(),
             edges: edge_count,
             components: components.len(),
             cyclic_components: components
@@ -311,9 +298,9 @@ impl<K: Clone + Ord> ProjectionGraphBuilder<K> {
             component_edges: component_edge_count,
         };
 
-        Ok(SealedProjectionGraph {
-            keys,
-            ordinals,
+        Ok(SealedDenseProjectionGraph {
+            canonical_by_registered,
+            registered_by_canonical,
             identity_digests,
             edge_offsets,
             edge_arena,
@@ -338,9 +325,9 @@ impl<K: Clone + Ord> ProjectionGraphBuilder<K> {
     }
 }
 
-pub struct SealedProjectionGraph<K> {
-    keys: Vec<K>,
-    ordinals: BTreeMap<K, usize>,
+pub struct SealedDenseProjectionGraph {
+    canonical_by_registered: Vec<usize>,
+    registered_by_canonical: Vec<usize>,
     identity_digests: Vec<RequestFingerprint>,
     edge_offsets: Vec<usize>,
     edge_arena: Vec<usize>,
@@ -354,36 +341,42 @@ pub struct SealedProjectionGraph<K> {
     stats: ProjectionGraphStats,
 }
 
-impl<K: Ord> SealedProjectionGraph<K> {
+impl SealedDenseProjectionGraph {
     pub const fn stats(&self) -> ProjectionGraphStats {
         self.stats
     }
 
-    pub fn dependencies(&self, key: &K) -> Option<impl Iterator<Item = &K>> {
-        let ordinal = *self.ordinals.get(key)?;
+    pub fn dependencies(
+        &self,
+        id: ProjectionId,
+    ) -> Option<impl Iterator<Item = ProjectionId> + '_> {
+        let ordinal = *self.canonical_by_registered.get(id.as_usize())?;
         let start = self.edge_offsets[ordinal];
         let end = self.edge_offsets[ordinal + 1];
         Some(
             self.edge_arena[start..end]
                 .iter()
-                .map(|target| &self.keys[*target]),
+                .map(|target| ProjectionId(self.registered_by_canonical[*target] as u32)),
         )
     }
 
-    pub fn reverse_dependents(&self, key: &K) -> Option<impl Iterator<Item = &K>> {
-        let ordinal = *self.ordinals.get(key)?;
+    pub fn reverse_dependents(
+        &self,
+        id: ProjectionId,
+    ) -> Option<impl Iterator<Item = ProjectionId> + '_> {
+        let ordinal = *self.canonical_by_registered.get(id.as_usize())?;
         let start = self.reverse_edge_offsets[ordinal];
         let end = self.reverse_edge_offsets[ordinal + 1];
         Some(
             self.reverse_edge_arena[start..end]
                 .iter()
-                .map(|source| &self.keys[*source]),
+                .map(|source| ProjectionId(self.registered_by_canonical[*source] as u32)),
         )
     }
 
     pub fn implementation_digest(
         &self,
-        key: &K,
+        id: ProjectionId,
         domain: &[u8],
     ) -> Result<RequestFingerprint, CompilationDbError> {
         if domain.is_empty() {
@@ -391,9 +384,12 @@ impl<K: Ord> SealedProjectionGraph<K> {
                 "compilation request implementation digest domain is empty",
             ));
         }
-        let node = *self.ordinals.get(key).ok_or_else(|| {
-            CompilationDbError::new("compilation request implementation key is absent")
-        })?;
+        let node = *self
+            .canonical_by_registered
+            .get(id.as_usize())
+            .ok_or_else(|| {
+                CompilationDbError::new("compilation request implementation key is absent")
+            })?;
         let component = self.component_by_node[node];
         let representative = self.component_representatives[component];
         let mut hasher = Sha256::new();
@@ -404,15 +400,18 @@ impl<K: Ord> SealedProjectionGraph<K> {
         Ok(hasher.finalize().into())
     }
 
-    pub fn component_members(&self, key: &K) -> Option<impl Iterator<Item = &K>> {
-        let node = *self.ordinals.get(key)?;
+    pub fn component_members(
+        &self,
+        id: ProjectionId,
+    ) -> Option<impl Iterator<Item = ProjectionId> + '_> {
+        let node = *self.canonical_by_registered.get(id.as_usize())?;
         let component = self.component_by_node[node];
         let start = self.component_member_offsets[component];
         let end = self.component_member_offsets[component + 1];
         Some(
             self.component_members[start..end]
                 .iter()
-                .map(|member| &self.keys[*member]),
+                .map(|member| ProjectionId(self.registered_by_canonical[*member] as u32)),
         )
     }
 }
@@ -643,6 +642,7 @@ impl Error for CompilationDbError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     const COMPONENT_DOMAIN: &[u8] = b"test.request-component.v1\0";
     const IMPLEMENTATION_DOMAIN: &[u8] = b"test.request-implementation.v1\0";
@@ -651,25 +651,47 @@ mod tests {
         [value; 32]
     }
 
-    fn graph(nodes: &[(u8, u8)], edges: &[(u8, u8)]) -> SealedProjectionGraph<u8> {
-        let mut builder = ProjectionGraphBuilder::new();
+    struct TestGraph {
+        sealed: SealedDenseProjectionGraph,
+        ids: BTreeMap<u8, ProjectionId>,
+        keys_by_id: Vec<u8>,
+    }
+
+    impl TestGraph {
+        fn implementation_digest(&self, key: u8) -> RequestFingerprint {
+            self.sealed
+                .implementation_digest(self.ids[&key], IMPLEMENTATION_DOMAIN)
+                .unwrap()
+        }
+
+        fn keys(&self, ids: impl Iterator<Item = ProjectionId>) -> Vec<u8> {
+            ids.map(|id| self.keys_by_id[id.as_usize()]).collect()
+        }
+    }
+
+    fn graph(nodes: &[(u8, u8)], edges: &[(u8, u8)]) -> TestGraph {
+        let mut builder = DenseProjectionGraphBuilder::new();
         let mut ids = BTreeMap::new();
+        let mut keys_by_id = Vec::new();
         for (key, value) in nodes {
-            ids.insert(
-                *key,
-                builder
-                    .register(*key, digest(*key), digest(*value))
-                    .unwrap(),
-            );
+            let id = builder.register(digest(*key), digest(*value)).unwrap();
+            assert_eq!(id.as_usize(), keys_by_id.len());
+            keys_by_id.push(*key);
+            ids.insert(*key, id);
         }
         for (source, target) in edges {
             builder.add_dependency(ids[source], ids[target]).unwrap();
         }
-        builder
+        let sealed = builder
             .seal(ProjectionGraphDigestDomains {
                 component: COMPONENT_DOMAIN,
             })
-            .unwrap()
+            .unwrap();
+        TestGraph {
+            sealed,
+            ids,
+            keys_by_id,
+        }
     }
 
     #[test]
@@ -677,50 +699,30 @@ mod tests {
         let before = graph(&[(1, 11), (2, 22), (3, 33)], &[(1, 2)]);
         let after = graph(&[(1, 11), (2, 44), (3, 33)], &[(1, 2)]);
         assert_ne!(
-            before
-                .implementation_digest(&1, IMPLEMENTATION_DOMAIN)
-                .unwrap(),
-            after
-                .implementation_digest(&1, IMPLEMENTATION_DOMAIN)
-                .unwrap()
+            before.implementation_digest(1),
+            after.implementation_digest(1)
         );
         assert_ne!(
-            before
-                .implementation_digest(&2, IMPLEMENTATION_DOMAIN)
-                .unwrap(),
-            after
-                .implementation_digest(&2, IMPLEMENTATION_DOMAIN)
-                .unwrap()
+            before.implementation_digest(2),
+            after.implementation_digest(2)
         );
         assert_eq!(
-            before
-                .implementation_digest(&3, IMPLEMENTATION_DOMAIN)
-                .unwrap(),
-            after
-                .implementation_digest(&3, IMPLEMENTATION_DOMAIN)
-                .unwrap()
+            before.implementation_digest(3),
+            after.implementation_digest(3)
         );
     }
 
     #[test]
     fn cycles_are_one_component_and_reverse_edges_are_exact() {
         let graph = graph(&[(1, 11), (2, 22), (3, 33)], &[(1, 2), (2, 1), (3, 1)]);
-        assert_eq!(graph.stats().components, 2);
-        assert_eq!(graph.stats().cyclic_components, 1);
+        assert_eq!(graph.sealed.stats().components, 2);
+        assert_eq!(graph.sealed.stats().cyclic_components, 1);
         assert_eq!(
-            graph
-                .component_members(&1)
-                .unwrap()
-                .copied()
-                .collect::<Vec<_>>(),
+            graph.keys(graph.sealed.component_members(graph.ids[&1]).unwrap()),
             vec![1, 2]
         );
         assert_eq!(
-            graph
-                .reverse_dependents(&1)
-                .unwrap()
-                .copied()
-                .collect::<Vec<_>>(),
+            graph.keys(graph.sealed.reverse_dependents(graph.ids[&1]).unwrap()),
             vec![2, 3]
         );
     }
@@ -752,12 +754,19 @@ mod tests {
 
     #[test]
     fn missing_and_duplicate_nodes_fail_closed() {
-        let mut duplicate = ProjectionGraphBuilder::new();
-        duplicate.register(1u8, digest(1), digest(2)).unwrap();
-        assert!(duplicate.register(1u8, digest(1), digest(2)).is_err());
+        let mut duplicate = DenseProjectionGraphBuilder::new();
+        duplicate.register(digest(1), digest(2)).unwrap();
+        duplicate.register(digest(1), digest(2)).unwrap();
+        assert!(
+            duplicate
+                .seal(ProjectionGraphDigestDomains {
+                    component: COMPONENT_DOMAIN,
+                })
+                .is_err()
+        );
 
-        let mut missing = ProjectionGraphBuilder::new();
-        let id = missing.register(1u8, digest(1), digest(2)).unwrap();
+        let mut missing = DenseProjectionGraphBuilder::new();
+        let id = missing.register(digest(1), digest(2)).unwrap();
         assert!(missing.add_dependency(id, ProjectionId(1)).is_err());
     }
 
@@ -767,12 +776,8 @@ mod tests {
         let reverse = graph(&[(3, 33), (2, 22), (1, 11)], &[(2, 3), (1, 2)]);
         for key in [1, 2, 3] {
             assert_eq!(
-                forward
-                    .implementation_digest(&key, IMPLEMENTATION_DOMAIN)
-                    .unwrap(),
-                reverse
-                    .implementation_digest(&key, IMPLEMENTATION_DOMAIN)
-                    .unwrap(),
+                forward.implementation_digest(key),
+                reverse.implementation_digest(key),
             );
         }
     }

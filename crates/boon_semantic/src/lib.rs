@@ -43,8 +43,8 @@ use std::fmt;
 pub const SEMANTIC_PROGRAM_SCHEMA_V1: &str = "boon.semantic-program.v1";
 pub const BUNDLE_SEMANTIC_PROGRAM_SCHEMA_V1: &str = "boon.bundle-semantic-program.v1";
 pub const DEPENDENCY_CLASSIFIER_SCHEMA_DIGEST_V1: [u8; 32] = [
-    0x41, 0xed, 0x0e, 0x1d, 0x47, 0xfc, 0x91, 0xeb, 0xc3, 0x26, 0x1b, 0x39, 0xe2, 0x25, 0xd7, 0x01,
-    0x49, 0x08, 0x05, 0x53, 0xb8, 0xf6, 0x65, 0x74, 0xe0, 0xcb, 0xa7, 0xe2, 0x96, 0x93, 0x78, 0xad,
+    0xf5, 0x34, 0x79, 0x17, 0xe4, 0x97, 0x74, 0xa8, 0x2a, 0xac, 0xa6, 0xb2, 0xa0, 0x80, 0xf2, 0x34,
+    0xcf, 0x45, 0x2a, 0x8e, 0x3a, 0x2f, 0xe4, 0xa5, 0xeb, 0xa4, 0x9b, 0x43, 0x10, 0x82, 0x62, 0x7d,
 ];
 pub const MAX_BUNDLE_SEMANTIC_PRODUCER_REQUESTS_V1: usize = 4_096;
 pub const MAX_BUNDLE_SEMANTIC_PRODUCER_REQUEST_BYTES_V1: usize = 4 * 1024 * 1024;
@@ -618,7 +618,7 @@ pub fn distributed_value_occurrences(
 pub struct SemanticProgram {
     source_bundle_digest_v1: SourceBundleDigestV1,
     role: boon_checked::ProgramRole,
-    semantic_image: SealedSemanticImageV1,
+    semantic_image: SealedSemanticImageV2,
     #[cfg(test)]
     checked_program: CheckedProgramFields,
     #[cfg(test)]
@@ -632,7 +632,7 @@ pub struct SemanticProgram {
     scope_storage_graph: SemanticScopeStorageGraphV1,
     memory_graph: SemanticMemoryGraphV1,
     canonical_core: program_core::CanonicalProgramCoreV1,
-    dependency_manifest: CallableDependencyManifestV5,
+    dependency_manifest: CallableDependencyManifestV6,
     digest: SemanticProgramDigestV1,
 }
 
@@ -781,7 +781,7 @@ impl SemanticProgram {
         self.digest
     }
 
-    pub const fn dependency_manifest(&self) -> &CallableDependencyManifestV5 {
+    pub const fn dependency_manifest(&self) -> &CallableDependencyManifestV6 {
         &self.dependency_manifest
     }
 
@@ -793,7 +793,7 @@ impl SemanticProgram {
         &self.resolved_out_graph
     }
 
-    pub const fn semantic_image(&self) -> &SealedSemanticImageV1 {
+    pub const fn semantic_image(&self) -> &SealedSemanticImageV2 {
         &self.semantic_image
     }
 
@@ -2948,7 +2948,7 @@ fn elaborate_with_representation(
     .map_err(|error| SemanticError::new(error.to_string()))?;
     let dependency_manifest = elaboration_phase!(
         "build_callable_dependency_manifest",
-        build_callable_dependency_manifest_v5(
+        build_callable_dependency_manifest_v6(
             DEPENDENCY_CLASSIFIER_SCHEMA_DIGEST_V1,
             &checked_program,
             semantic_image_builder.checked_handoff(),
@@ -6943,7 +6943,7 @@ seed: 0
             &semantic.lowering_contract,
         )
         .expect("mutated OUT owner has a fresh deterministic memory graph");
-        semantic.dependency_manifest = build_callable_dependency_manifest_v5(
+        semantic.dependency_manifest = build_callable_dependency_manifest_v6(
             DEPENDENCY_CLASSIFIER_SCHEMA_DIGEST_V1,
             &semantic.checked_program,
             semantic.semantic_image.checked_handoff(),

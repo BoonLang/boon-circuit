@@ -1683,17 +1683,17 @@ pub fn type_is_recursively_closed(ty: &Type) -> bool {
 ///     CheckedProgram { fields }
 /// }
 /// ```
-pub const CHECKED_IMAGE_HANDOFF_SCHEMA_V1: &str = "boon.checked-image-handoff.v1";
+pub const CHECKED_IMAGE_HANDOFF_SCHEMA_V2: &str = "boon.checked-image-handoff.v2";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum CheckedShardCallableKindV1 {
+pub enum CheckedShardCallableKindV2 {
     User,
     Builtin,
     External,
 }
 
-impl From<CheckedCallableKind> for CheckedShardCallableKindV1 {
+impl From<CheckedCallableKind> for CheckedShardCallableKindV2 {
     fn from(kind: CheckedCallableKind) -> Self {
         match kind {
             CheckedCallableKind::User => Self::User,
@@ -1706,13 +1706,13 @@ impl From<CheckedCallableKind> for CheckedShardCallableKindV1 {
 /// Revision-stable checked owner used before semantic dense IDs exist.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum CheckedShardOwnerKeyV1 {
+pub enum CheckedShardOwnerKeyV2 {
     ProgramTopLevel {
         role: ProgramRole,
     },
     Callable {
         role: ProgramRole,
-        callable_kind: CheckedShardCallableKindV1,
+        callable_kind: CheckedShardCallableKindV2,
         name: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         external_identity: Option<CheckedExternalDeclarationIdentityV1>,
@@ -1721,22 +1721,27 @@ pub enum CheckedShardOwnerKeyV1 {
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub enum CheckedShardRegionV1 {
+pub enum CheckedShardRegionV2 {
     Interface,
     Definition,
-    Invocation { owner_local_ordinal: u32 },
-    TopLevelAuthority { canonical_path: String },
+    Invocation {
+        authored_call_site_digest: [u8; 32],
+        identical_site_reverse_ordinal: u32,
+    },
+    TopLevelAuthority {
+        canonical_path: String,
+    },
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-pub struct CheckedShardProjectionKeyV1 {
-    pub owner: CheckedShardOwnerKeyV1,
-    pub region: CheckedShardRegionV1,
+pub struct CheckedShardProjectionKeyV2 {
+    pub owner: CheckedShardOwnerKeyV2,
+    pub region: CheckedShardRegionV2,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum CheckedImageRowDomainV1 {
+pub enum CheckedImageRowDomainV2 {
     Header,
     Scope,
     Declaration,
@@ -1764,50 +1769,87 @@ pub enum CheckedImageRowDomainV1 {
     Diagnostic,
 }
 
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-pub struct CheckedImageRowKeyV1 {
-    pub projection: CheckedShardProjectionKeyV1,
-    pub domain: CheckedImageRowDomainV1,
-    pub owner_local_ordinal: u32,
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct CheckedImageProjectionIdV2(pub u32);
+
+impl CheckedImageProjectionIdV2 {
+    pub const fn as_usize(self) -> usize {
+        self.0 as usize
+    }
 }
 
-/// A local row receipt commits the final payload once and names unresolved
-/// stable projection targets without importing semantic dense IDs.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct CheckedImageRowReceiptV1 {
-    pub key: CheckedImageRowKeyV1,
-    pub payload_digest: [u8; 32],
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub relocations: Vec<CheckedShardProjectionKeyV1>,
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CheckedImageRelocationSpanV2 {
+    pub start: u32,
+    pub len: u32,
 }
 
+impl CheckedImageRelocationSpanV2 {
+    pub fn checked_range(self) -> Option<std::ops::Range<usize>> {
+        let end = self.start.checked_add(self.len)?;
+        Some(self.start as usize..end as usize)
+    }
+}
+
+/// One canonical checked projection. The stable key is owned exactly once;
+/// every route and relocation names this record by a revision-local dense ID.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct CheckedShardReceiptV1 {
-    pub projection: CheckedShardProjectionKeyV1,
+pub struct CheckedImageProjectionV2 {
+    pub stable_key: CheckedShardProjectionKeyV2,
+    pub stable_key_digest: [u8; 32],
     pub local_content_digest: [u8; 32],
     pub row_count: u32,
     pub dependency_row_count: u32,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub relocations: Vec<CheckedShardProjectionKeyV1>,
+    pub relocation_span: CheckedImageRelocationSpanV2,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct CheckedImageEntityRouteV1 {
-    pub domain: CheckedImageRowDomainV1,
+pub struct CheckedImageEntityRouteV2 {
+    pub domain: CheckedImageRowDomainV2,
     pub dense_index: u32,
-    pub projection: CheckedShardProjectionKeyV1,
+    pub projection: CheckedImageProjectionIdV2,
 }
 
 /// Consuming typechecker handoff. Semantic elaboration imports these receipts
 /// directly; it must not rescan the rich checked DTO to rediscover them.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct CheckedImageHandoffV1 {
+pub struct CheckedImageHandoffV2 {
     pub schema: String,
     pub source_bundle_digest_v1: SourceBundleDigestV1,
     pub role: ProgramRole,
-    pub shards: Vec<CheckedShardReceiptV1>,
-    pub entity_routes: Vec<CheckedImageEntityRouteV1>,
+    pub projections: Vec<CheckedImageProjectionV2>,
+    pub relocations: Vec<CheckedImageProjectionIdV2>,
+    pub entity_routes: Vec<CheckedImageEntityRouteV2>,
     pub local_image_digest: [u8; 32],
+}
+
+impl CheckedImageHandoffV2 {
+    pub fn projection(&self, id: CheckedImageProjectionIdV2) -> Option<&CheckedImageProjectionV2> {
+        self.projections.get(id.as_usize())
+    }
+
+    pub fn projection_relocations(
+        &self,
+        id: CheckedImageProjectionIdV2,
+    ) -> Option<&[CheckedImageProjectionIdV2]> {
+        let projection = self.projection(id)?;
+        self.relocations
+            .get(projection.relocation_span.checked_range()?)
+    }
+
+    pub fn entity_projection(
+        &self,
+        domain: CheckedImageRowDomainV2,
+        dense_index: usize,
+    ) -> Option<CheckedImageProjectionIdV2> {
+        let dense_index = u32::try_from(dense_index).ok()?;
+        self.entity_routes
+            .binary_search_by_key(&(domain, dense_index), |route| {
+                (route.domain, route.dense_index)
+            })
+            .ok()
+            .map(|index| self.entity_routes[index].projection)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -1815,7 +1857,7 @@ pub struct CheckedProgram {
     #[serde(flatten)]
     fields: CheckedProgramFields,
     #[serde(skip)]
-    image_handoff: CheckedImageHandoffV1,
+    image_handoff: CheckedImageHandoffV2,
 }
 
 /// Public read-only schema projected by an opaque [`CheckedProgram`].
@@ -2043,7 +2085,7 @@ impl CheckedProgram {
     /// must never synthesize an empty or sentinel digest.
     pub unsafe fn from_typechecker_parts_unchecked(
         fields: CheckedProgramFields,
-        image_handoff: CheckedImageHandoffV1,
+        image_handoff: CheckedImageHandoffV2,
     ) -> Self {
         Self {
             fields,
@@ -2055,11 +2097,11 @@ impl CheckedProgram {
     ///
     /// This does not create another proof-bearing product; resealing modified
     /// fields still requires the unsafe typechecker invariant boundary.
-    pub fn into_parts(self) -> (CheckedProgramFields, CheckedImageHandoffV1) {
+    pub fn into_parts(self) -> (CheckedProgramFields, CheckedImageHandoffV2) {
         (self.fields, self.image_handoff)
     }
 
-    pub fn image_handoff(&self) -> &CheckedImageHandoffV1 {
+    pub fn image_handoff(&self) -> &CheckedImageHandoffV2 {
         &self.image_handoff
     }
 }

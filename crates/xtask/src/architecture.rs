@@ -728,7 +728,7 @@ fn verified_semantic_compiler_spine(workspace: &Path) -> Result<String, String> 
         &semantic,
         "SemanticProgram",
         "semantic_image",
-        "SealedSemanticImageV1",
+        "SealedSemanticImageV2",
     )?;
     verify_required_direct_field(&ir, "ErasedProgram", "fields", "CanonicalProgramCoreV1")?;
     verify_required_direct_field(
@@ -772,7 +772,7 @@ fn verified_semantic_compiler_spine(workspace: &Path) -> Result<String, String> 
     for required in [
         "pub struct SemanticProgram",
         "pub fn elaborate(",
-        "CallableDependencyManifestV5",
+        "CallableDependencyManifestV6",
         "#[cfg(test)]\n    checked_program: CheckedProgramFields",
         "#[cfg(test)]\n    execution_graph: SemanticExecutionImageColumnsV1",
     ] {

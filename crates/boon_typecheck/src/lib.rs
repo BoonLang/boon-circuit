@@ -14404,144 +14404,307 @@ fn checked_declaration_canonical_path(
     Some(segments.join("."))
 }
 
-const CHECKED_IMAGE_ROW_PAYLOAD_DIGEST_DOMAIN_V1: &[u8] = b"boon.checked-image-row-payload.v1\0";
-const CHECKED_IMAGE_SHARD_DIGEST_DOMAIN_V1: &[u8] = b"boon.checked-image-shard.v1\0";
-const CHECKED_IMAGE_HANDOFF_DIGEST_DOMAIN_V1: &[u8] = b"boon.checked-image-handoff.v1\0";
+const CHECKED_IMAGE_PROJECTION_KEY_DOMAIN_V2: &[u8] = b"boon.checked-image-projection-key.v2\0";
+const CHECKED_IMAGE_ROW_PAYLOAD_DIGEST_DOMAIN_V2: &[u8] = b"boon.checked-image-row-payload.v2\0";
+const CHECKED_IMAGE_ROW_DIGEST_DOMAIN_V2: &[u8] = b"boon.checked-image-row.v2\0";
+const CHECKED_IMAGE_SHARD_DIGEST_DOMAIN_V2: &[u8] = b"boon.checked-image-shard.v2\0";
+const CHECKED_IMAGE_HANDOFF_DIGEST_DOMAIN_V2: &[u8] = b"boon.checked-image-handoff.v2\0";
+const CHECKED_AUTHORED_CALL_SITE_DOMAIN_V2: &[u8] = b"boon.checked-authored-call-site.v2\0";
 
-struct CheckedImageHandoffBuilderV1 {
-    rows: BTreeMap<CheckedShardProjectionKeyV1, Vec<CheckedImageRowReceiptV1>>,
-    next_ordinals: BTreeMap<(CheckedShardProjectionKeyV1, CheckedImageRowDomainV1), u32>,
-    entity_routes: Vec<CheckedImageEntityRouteV1>,
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct CheckedAuthoredCallSiteV2 {
+    source_unit: String,
+    owner: CheckedShardOwnerKeyV2,
+    authored_source: String,
+    resolved_function: String,
 }
 
-impl CheckedImageHandoffBuilderV1 {
+fn checked_authored_call_site(
+    parsed: &ParsedProgram,
+    owner: CheckedShardOwnerKeyV2,
+    call: &CheckedCall,
+) -> Result<CheckedAuthoredCallSiteV2, String> {
+    let source_unit = parsed
+        .files
+        .iter()
+        .filter(|file| file.start_line <= call.span.line)
+        .max_by_key(|file| file.start_line)
+        .ok_or_else(|| {
+            format!(
+                "checked call {} at line {} has no source-unit identity",
+                call.id.0, call.span.line
+            )
+        })?;
+    let authored_source = parsed
+        .source
+        .get(call.span.start..call.span.end)
+        .ok_or_else(|| {
+            format!(
+                "checked call {} has invalid authored byte span {}..{}",
+                call.id.0, call.span.start, call.span.end
+            )
+        })?;
+    Ok(CheckedAuthoredCallSiteV2 {
+        source_unit: source_unit.path.clone(),
+        owner,
+        authored_source: authored_source.to_owned(),
+        resolved_function: call.function.clone(),
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct PendingCheckedProjectionIdV2(u32);
+
+impl PendingCheckedProjectionIdV2 {
+    const fn as_usize(self) -> usize {
+        self.0 as usize
+    }
+}
+
+struct PendingCheckedProjectionV2 {
+    stable_key_digest: [u8; 32],
+    row_digests: Vec<[u8; 32]>,
+    dependency_row_count: u32,
+    relocations: Vec<PendingCheckedProjectionIdV2>,
+}
+
+#[derive(Serialize)]
+struct CheckedImageRowFingerprintV2<'a> {
+    projection_stable_key_digest: [u8; 32],
+    domain: CheckedImageRowDomainV2,
+    payload_digest: [u8; 32],
+    relocation_stable_key_digests: &'a [[u8; 32]],
+}
+
+struct CheckedImageHandoffBuilderV2 {
+    ids: BTreeMap<CheckedShardProjectionKeyV2, PendingCheckedProjectionIdV2>,
+    projections: Vec<PendingCheckedProjectionV2>,
+    entity_routes: Vec<(CheckedImageRowDomainV2, u32, PendingCheckedProjectionIdV2)>,
+}
+
+impl CheckedImageHandoffBuilderV2 {
     fn new() -> Self {
         Self {
-            rows: BTreeMap::new(),
-            next_ordinals: BTreeMap::new(),
+            ids: BTreeMap::new(),
+            projections: Vec::new(),
             entity_routes: Vec::new(),
         }
     }
 
+    fn intern(
+        &mut self,
+        projection: CheckedShardProjectionKeyV2,
+    ) -> Result<PendingCheckedProjectionIdV2, String> {
+        if let Some(id) = self.ids.get(&projection) {
+            return Ok(*id);
+        }
+        let id = PendingCheckedProjectionIdV2(
+            u32::try_from(self.projections.len())
+                .map_err(|_| "checked image projection registry exceeds u32".to_owned())?,
+        );
+        let stable_key_digest = boon_contract::canonical_serde_hash_v1(
+            CHECKED_IMAGE_PROJECTION_KEY_DOMAIN_V2,
+            &projection,
+        )
+        .map_err(|error| format!("failed to hash checked projection key: {error}"))?;
+        self.ids.insert(projection, id);
+        self.projections.push(PendingCheckedProjectionV2 {
+            stable_key_digest,
+            row_digests: Vec::new(),
+            dependency_row_count: 0,
+            relocations: Vec::new(),
+        });
+        Ok(id)
+    }
+
     fn push_row(
         &mut self,
-        projection: CheckedShardProjectionKeyV1,
-        domain: CheckedImageRowDomainV1,
+        projection: CheckedShardProjectionKeyV2,
+        domain: CheckedImageRowDomainV2,
         payload: &impl Serialize,
-        mut relocations: Vec<CheckedShardProjectionKeyV1>,
+        mut relocations: Vec<CheckedShardProjectionKeyV2>,
     ) -> Result<(), String> {
         relocations.sort();
         relocations.dedup();
         relocations.retain(|target| target != &projection);
-        let ordinal = self
-            .next_ordinals
-            .entry((projection.clone(), domain))
-            .or_default();
-        let owner_local_ordinal = *ordinal;
-        *ordinal = ordinal
-            .checked_add(1)
-            .ok_or_else(|| "checked image row ordinal overflow".to_owned())?;
+        let projection = self.intern(projection)?;
         let payload_digest = boon_contract::canonical_serde_hash_v1(
-            CHECKED_IMAGE_ROW_PAYLOAD_DIGEST_DOMAIN_V1,
+            CHECKED_IMAGE_ROW_PAYLOAD_DIGEST_DOMAIN_V2,
             payload,
         )
         .map_err(|error| format!("failed to hash checked image row: {error}"))?;
-        self.rows
-            .entry(projection.clone())
-            .or_default()
-            .push(CheckedImageRowReceiptV1 {
-                key: CheckedImageRowKeyV1 {
-                    projection,
-                    domain,
-                    owner_local_ordinal,
-                },
+        let relocations = relocations
+            .into_iter()
+            .map(|target| self.intern(target))
+            .collect::<Result<Vec<_>, _>>()?;
+        let relocation_stable_key_digests = relocations
+            .iter()
+            .map(|target| self.projections[target.as_usize()].stable_key_digest)
+            .collect::<Vec<_>>();
+        let projection_stable_key_digest =
+            self.projections[projection.as_usize()].stable_key_digest;
+        let row_digest = boon_contract::canonical_serde_hash_v1(
+            CHECKED_IMAGE_ROW_DIGEST_DOMAIN_V2,
+            &CheckedImageRowFingerprintV2 {
+                projection_stable_key_digest,
+                domain,
                 payload_digest,
-                relocations,
-            });
+                relocation_stable_key_digests: &relocation_stable_key_digests,
+            },
+        )
+        .map_err(|error| format!("failed to hash checked image row fingerprint: {error}"))?;
+        let pending = &mut self.projections[projection.as_usize()];
+        pending.row_digests.push(row_digest);
+        if !relocations.is_empty() {
+            pending.dependency_row_count = pending
+                .dependency_row_count
+                .checked_add(1)
+                .ok_or_else(|| "checked image dependency row count overflow".to_owned())?;
+        }
+        pending.relocations.extend(relocations);
         Ok(())
     }
 
     fn route(
         &mut self,
-        domain: CheckedImageRowDomainV1,
+        domain: CheckedImageRowDomainV2,
         dense_index: usize,
-        projection: CheckedShardProjectionKeyV1,
+        projection: CheckedShardProjectionKeyV2,
     ) -> Result<(), String> {
         let dense_index = u32::try_from(dense_index)
             .map_err(|_| "checked image entity route exceeds u32".to_owned())?;
-        self.entity_routes.push(CheckedImageEntityRouteV1 {
-            domain,
-            dense_index,
-            projection,
-        });
+        let projection = self.intern(projection)?;
+        self.entity_routes.push((domain, dense_index, projection));
         Ok(())
     }
 
     fn finish(
-        mut self,
+        self,
         source_bundle_digest_v1: SourceBundleDigestV1,
         role: ProgramRole,
-    ) -> Result<CheckedImageHandoffV1, String> {
-        let mut shards = Vec::with_capacity(self.rows.len());
-        for (projection, rows) in self.rows {
-            let row_count = u32::try_from(rows.len())
+    ) -> Result<CheckedImageHandoffV2, String> {
+        let Self {
+            ids,
+            mut projections,
+            mut entity_routes,
+        } = self;
+        let mut key_by_pending_id = vec![None; projections.len()];
+        let mut canonical_by_pending_id =
+            vec![CheckedImageProjectionIdV2(u32::MAX); projections.len()];
+        let mut digest_owner = BTreeMap::new();
+        for (canonical_index, (key, pending_id)) in ids.iter().enumerate() {
+            key_by_pending_id[pending_id.as_usize()] = Some(key);
+            canonical_by_pending_id[pending_id.as_usize()] = CheckedImageProjectionIdV2(
+                u32::try_from(canonical_index)
+                    .map_err(|_| "checked image canonical projection index exceeds u32")?,
+            );
+            let digest = projections[pending_id.as_usize()].stable_key_digest;
+            if let Some(previous) = digest_owner.insert(digest, key)
+                && previous != key
+            {
+                return Err(format!(
+                    "checked image stable-key digest collision between {previous:?} and {key:?}"
+                ));
+            }
+        }
+        let stable_key_digests = projections
+            .iter()
+            .map(|projection| projection.stable_key_digest)
+            .collect::<Vec<_>>();
+        let mut sealed_projections = Vec::with_capacity(projections.len());
+        let mut relocation_arena = Vec::new();
+        for (stable_key, pending_id) in &ids {
+            let pending = &mut projections[pending_id.as_usize()];
+            if pending.row_digests.is_empty() {
+                return Err(format!(
+                    "checked image projection {stable_key:?} has no local rows"
+                ));
+            }
+            let row_count = u32::try_from(pending.row_digests.len())
                 .map_err(|_| "checked image shard row count exceeds u32".to_owned())?;
-            let dependency_row_count = u32::try_from(
-                rows.iter()
-                    .filter(|row| !row.relocations.is_empty())
-                    .count(),
-            )
-            .map_err(|_| "checked image shard dependency row count exceeds u32".to_owned())?;
-            let mut relocations = rows
-                .iter()
-                .flat_map(|row| row.relocations.iter().cloned())
-                .collect::<Vec<_>>();
-            relocations.sort();
-            relocations.dedup();
+            pending.relocations.sort_unstable_by(|left, right| {
+                stable_key_digests[left.as_usize()].cmp(&stable_key_digests[right.as_usize()])
+            });
+            pending.relocations.dedup();
+            let relocation_start = u32::try_from(relocation_arena.len())
+                .map_err(|_| "checked image relocation arena exceeds u32")?;
+            let relocation_len = u32::try_from(pending.relocations.len())
+                .map_err(|_| "checked image projection relocation span exceeds u32")?;
+            relocation_start
+                .checked_add(relocation_len)
+                .ok_or_else(|| "checked image relocation arena exceeds u32".to_owned())?;
+            relocation_arena.extend(
+                pending
+                    .relocations
+                    .iter()
+                    .map(|target| canonical_by_pending_id[target.as_usize()]),
+            );
             let local_content_digest = boon_contract::canonical_serde_hash_v1(
-                CHECKED_IMAGE_SHARD_DIGEST_DOMAIN_V1,
-                &(projection.clone(), rows),
+                CHECKED_IMAGE_SHARD_DIGEST_DOMAIN_V2,
+                &(pending.stable_key_digest, &pending.row_digests),
             )
             .map_err(|error| format!("failed to hash checked image shard: {error}"))?;
-            shards.push(CheckedShardReceiptV1 {
-                projection,
+            sealed_projections.push(CheckedImageProjectionV2 {
+                stable_key: stable_key.clone(),
+                stable_key_digest: pending.stable_key_digest,
                 local_content_digest,
                 row_count,
-                dependency_row_count,
-                relocations,
+                dependency_row_count: pending.dependency_row_count,
+                relocation_span: CheckedImageRelocationSpanV2 {
+                    start: relocation_start,
+                    len: relocation_len,
+                },
             });
         }
-        self.entity_routes
-            .sort_by_key(|route| (route.domain, route.dense_index, route.projection.clone()));
-        if self.entity_routes.windows(2).any(|pair| {
-            (pair[0].domain, pair[0].dense_index) == (pair[1].domain, pair[1].dense_index)
-        }) {
+        entity_routes.sort_unstable_by(|left, right| {
+            (left.0, left.1, key_by_pending_id[left.2.as_usize()]).cmp(&(
+                right.0,
+                right.1,
+                key_by_pending_id[right.2.as_usize()],
+            ))
+        });
+        if entity_routes
+            .windows(2)
+            .any(|pair| (pair[0].0, pair[0].1) == (pair[1].0, pair[1].1))
+        {
             return Err("checked image entity identity routes to multiple projections".to_owned());
         }
+        let entity_routes = entity_routes
+            .into_iter()
+            .map(|(domain, dense_index, projection)| {
+                Ok(CheckedImageEntityRouteV2 {
+                    domain,
+                    dense_index,
+                    projection: canonical_by_pending_id[projection.as_usize()],
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
         let local_image_digest = boon_contract::canonical_serde_hash_v1(
-            CHECKED_IMAGE_HANDOFF_DIGEST_DOMAIN_V1,
+            CHECKED_IMAGE_HANDOFF_DIGEST_DOMAIN_V2,
             &(
-                CHECKED_IMAGE_HANDOFF_SCHEMA_V1,
+                CHECKED_IMAGE_HANDOFF_SCHEMA_V2,
                 source_bundle_digest_v1,
                 role,
-                &shards,
-                &self.entity_routes,
+                &sealed_projections,
+                &relocation_arena,
+                &entity_routes,
             ),
         )
         .map_err(|error| format!("failed to hash checked image handoff: {error}"))?;
-        Ok(CheckedImageHandoffV1 {
-            schema: CHECKED_IMAGE_HANDOFF_SCHEMA_V1.to_owned(),
+        Ok(CheckedImageHandoffV2 {
+            schema: CHECKED_IMAGE_HANDOFF_SCHEMA_V2.to_owned(),
             source_bundle_digest_v1,
             role,
-            shards,
-            entity_routes: self.entity_routes,
+            projections: sealed_projections,
+            relocations: relocation_arena,
+            entity_routes,
             local_image_digest,
         })
     }
 }
 
-fn checked_stable_owner(callable: &CheckedCallableSignature) -> CheckedShardOwnerKeyV1 {
-    CheckedShardOwnerKeyV1::Callable {
+fn checked_stable_owner(callable: &CheckedCallableSignature) -> CheckedShardOwnerKeyV2 {
+    CheckedShardOwnerKeyV2::Callable {
         role: callable.role,
         callable_kind: callable.kind.into(),
         name: callable.name.clone(),
@@ -14549,25 +14712,25 @@ fn checked_stable_owner(callable: &CheckedCallableSignature) -> CheckedShardOwne
     }
 }
 
-fn checked_definition_projection(owner: CheckedShardOwnerKeyV1) -> CheckedShardProjectionKeyV1 {
-    CheckedShardProjectionKeyV1 {
+fn checked_definition_projection(owner: CheckedShardOwnerKeyV2) -> CheckedShardProjectionKeyV2 {
+    CheckedShardProjectionKeyV2 {
         owner,
-        region: CheckedShardRegionV1::Definition,
+        region: CheckedShardRegionV2::Definition,
     }
 }
 
-fn checked_interface_projection(owner: CheckedShardOwnerKeyV1) -> CheckedShardProjectionKeyV1 {
-    CheckedShardProjectionKeyV1 {
+fn checked_interface_projection(owner: CheckedShardOwnerKeyV2) -> CheckedShardProjectionKeyV2 {
+    CheckedShardProjectionKeyV2 {
         owner,
-        region: CheckedShardRegionV1::Interface,
+        region: CheckedShardRegionV2::Interface,
     }
 }
 
 fn checked_owner_for_scope(
     program: &CheckedProgramFields,
-    callable_owners: &BTreeMap<DeclId, CheckedShardOwnerKeyV1>,
+    callable_owners: &BTreeMap<DeclId, CheckedShardOwnerKeyV2>,
     mut scope: LexicalScopeId,
-) -> Result<CheckedShardOwnerKeyV1, String> {
+) -> Result<CheckedShardOwnerKeyV2, String> {
     let mut visited = BTreeSet::new();
     loop {
         if !visited.insert(scope) {
@@ -14589,7 +14752,7 @@ fn checked_owner_for_scope(
             });
         }
         let Some(parent) = current.parent else {
-            return Ok(CheckedShardOwnerKeyV1::ProgramTopLevel { role: program.role });
+            return Ok(CheckedShardOwnerKeyV2::ProgramTopLevel { role: program.role });
         };
         scope = parent;
     }
@@ -14597,22 +14760,25 @@ fn checked_owner_for_scope(
 
 fn checked_authority_projection(
     program: &CheckedProgramFields,
-    owner: CheckedShardOwnerKeyV1,
+    owner: CheckedShardOwnerKeyV2,
     path: &CheckedSemanticPath,
-) -> CheckedShardProjectionKeyV1 {
-    if matches!(owner, CheckedShardOwnerKeyV1::ProgramTopLevel { .. })
+) -> CheckedShardProjectionKeyV2 {
+    if matches!(owner, CheckedShardOwnerKeyV2::ProgramTopLevel { .. })
         && let Some(canonical_path) = program.semantic_path(path)
     {
-        return CheckedShardProjectionKeyV1 {
+        return CheckedShardProjectionKeyV2 {
             owner,
-            region: CheckedShardRegionV1::TopLevelAuthority { canonical_path },
+            region: CheckedShardRegionV2::TopLevelAuthority { canonical_path },
         };
     }
     checked_definition_projection(owner)
 }
 
-fn checked_image_handoff(program: &CheckedProgramFields) -> Result<CheckedImageHandoffV1, String> {
-    let root_owner = CheckedShardOwnerKeyV1::ProgramTopLevel { role: program.role };
+fn checked_image_handoff(
+    program: &CheckedProgramFields,
+    parsed: &ParsedProgram,
+) -> Result<CheckedImageHandoffV2, String> {
+    let root_owner = CheckedShardOwnerKeyV2::ProgramTopLevel { role: program.role };
     let root_definition = checked_definition_projection(root_owner.clone());
     let root_interface = checked_interface_projection(root_owner.clone());
     let callable_owners = program
@@ -14659,10 +14825,10 @@ fn checked_image_handoff(program: &CheckedProgramFields) -> Result<CheckedImageH
         })
         .collect::<Result<BTreeMap<_, _>, String>>()?;
 
-    let mut builder = CheckedImageHandoffBuilderV1::new();
+    let mut builder = CheckedImageHandoffBuilderV2::new();
     builder.push_row(
         root_interface,
-        CheckedImageRowDomainV1::Header,
+        CheckedImageRowDomainV2::Header,
         &(
             program.source_bundle_digest_v1,
             program.role,
@@ -14680,12 +14846,12 @@ fn checked_image_handoff(program: &CheckedProgramFields) -> Result<CheckedImageH
         )?);
         builder.push_row(
             projection.clone(),
-            CheckedImageRowDomainV1::Scope,
+            CheckedImageRowDomainV2::Scope,
             scope,
             Vec::new(),
         )?;
         builder.route(
-            CheckedImageRowDomainV1::Scope,
+            CheckedImageRowDomainV2::Scope,
             scope.id.0 as usize,
             projection,
         )?;
@@ -14699,12 +14865,12 @@ fn checked_image_handoff(program: &CheckedProgramFields) -> Result<CheckedImageH
         );
         builder.push_row(
             projection.clone(),
-            CheckedImageRowDomainV1::Declaration,
+            CheckedImageRowDomainV2::Declaration,
             declaration,
             Vec::new(),
         )?;
         builder.route(
-            CheckedImageRowDomainV1::Declaration,
+            CheckedImageRowDomainV2::Declaration,
             declaration.id.0 as usize,
             projection,
         )?;
@@ -14721,12 +14887,12 @@ fn checked_image_handoff(program: &CheckedProgramFields) -> Result<CheckedImageH
             .collect();
         builder.push_row(
             projection.clone(),
-            CheckedImageRowDomainV1::Statement,
+            CheckedImageRowDomainV2::Statement,
             statement,
             relocations,
         )?;
         builder.route(
-            CheckedImageRowDomainV1::Statement,
+            CheckedImageRowDomainV2::Statement,
             statement.id.0 as usize,
             projection,
         )?;
@@ -14748,12 +14914,12 @@ fn checked_image_handoff(program: &CheckedProgramFields) -> Result<CheckedImageH
             .collect();
         builder.push_row(
             projection.clone(),
-            CheckedImageRowDomainV1::Expression,
+            CheckedImageRowDomainV2::Expression,
             expression,
             relocations,
         )?;
         builder.route(
-            CheckedImageRowDomainV1::Expression,
+            CheckedImageRowDomainV2::Expression,
             expression.id.0 as usize,
             projection,
         )?;
@@ -14766,12 +14932,12 @@ fn checked_image_handoff(program: &CheckedProgramFields) -> Result<CheckedImageH
         let projection = checked_interface_projection(owner);
         builder.push_row(
             projection.clone(),
-            CheckedImageRowDomainV1::Callable,
+            CheckedImageRowDomainV2::Callable,
             callable,
             Vec::new(),
         )?;
         builder.route(
-            CheckedImageRowDomainV1::Callable,
+            CheckedImageRowDomainV2::Callable,
             callable.decl_id.0 as usize,
             projection,
         )?;
@@ -14784,33 +14950,62 @@ fn checked_image_handoff(program: &CheckedProgramFields) -> Result<CheckedImageH
         let projection = checked_interface_projection(owner);
         builder.push_row(
             projection.clone(),
-            CheckedImageRowDomainV1::ContextFormal,
+            CheckedImageRowDomainV2::ContextFormal,
             formal,
             Vec::new(),
         )?;
         builder.route(
-            CheckedImageRowDomainV1::ContextFormal,
+            CheckedImageRowDomainV2::ContextFormal,
             formal.id.0 as usize,
             projection,
         )?;
     }
 
-    let mut invocation_counts = BTreeMap::<CheckedShardOwnerKeyV1, u32>::new();
+    let mut authored_sites = BTreeMap::<[u8; 32], (CheckedAuthoredCallSiteV2, u32)>::new();
+    let authored_calls = program
+        .calls
+        .iter()
+        .map(|call| {
+            let owner = call
+                .owner_callable
+                .and_then(|owner| callable_owners.get(&owner).cloned())
+                .unwrap_or_else(|| root_owner.clone());
+            let authored_site = checked_authored_call_site(parsed, owner.clone(), call)?;
+            let authored_call_site_digest = boon_contract::canonical_serde_hash_v1(
+                CHECKED_AUTHORED_CALL_SITE_DOMAIN_V2,
+                &authored_site,
+            )
+            .map_err(|error| format!("failed to hash checked call site: {error}"))?;
+            let entry = authored_sites
+                .entry(authored_call_site_digest)
+                .or_insert_with(|| (authored_site.clone(), 0));
+            if entry.0 != authored_site {
+                return Err(format!(
+                    "checked call-site digest collision between {:?} and {authored_site:?}",
+                    entry.0
+                ));
+            }
+            entry.1 = entry
+                .1
+                .checked_add(1)
+                .ok_or_else(|| "identical checked call-site count overflow".to_owned())?;
+            Ok((call, owner, authored_call_site_digest))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     let mut call_projections = BTreeMap::new();
-    for call in &program.calls {
-        let owner = call
-            .owner_callable
-            .and_then(|owner| callable_owners.get(&owner).cloned())
-            .unwrap_or_else(|| root_owner.clone());
-        let ordinal = invocation_counts.entry(owner.clone()).or_default();
-        let owner_local_ordinal = *ordinal;
-        *ordinal = ordinal
-            .checked_add(1)
-            .ok_or_else(|| "checked invocation ordinal overflow".to_owned())?;
-        let projection = CheckedShardProjectionKeyV1 {
+    for (call, owner, authored_call_site_digest) in authored_calls {
+        let (_, remaining) = authored_sites
+            .get_mut(&authored_call_site_digest)
+            .expect("authored call was counted before projection construction");
+        *remaining = remaining
+            .checked_sub(1)
+            .expect("authored call count covers every projection");
+        let identical_site_reverse_ordinal = *remaining;
+        let projection = CheckedShardProjectionKeyV2 {
             owner,
-            region: CheckedShardRegionV1::Invocation {
-                owner_local_ordinal,
+            region: CheckedShardRegionV2::Invocation {
+                authored_call_site_digest,
+                identical_site_reverse_ordinal,
             },
         };
         let callee = callable_owners
@@ -14819,12 +15014,12 @@ fn checked_image_handoff(program: &CheckedProgramFields) -> Result<CheckedImageH
             .ok_or_else(|| format!("checked call {} has no stable callee owner", call.id.0))?;
         builder.push_row(
             projection.clone(),
-            CheckedImageRowDomainV1::Call,
+            CheckedImageRowDomainV2::Call,
             call,
             vec![checked_interface_projection(callee)],
         )?;
         builder.route(
-            CheckedImageRowDomainV1::Call,
+            CheckedImageRowDomainV2::Call,
             call.id.0 as usize,
             projection.clone(),
         )?;
@@ -14837,7 +15032,7 @@ fn checked_image_handoff(program: &CheckedProgramFields) -> Result<CheckedImageH
             .ok_or_else(|| format!("result path references missing call {}", path.call.0))?;
         builder.push_row(
             projection,
-            CheckedImageRowDomainV1::CallResultPath,
+            CheckedImageRowDomainV2::CallResultPath,
             path,
             Vec::new(),
         )?;
@@ -14849,7 +15044,7 @@ fn checked_image_handoff(program: &CheckedProgramFields) -> Result<CheckedImageH
             .ok_or_else(|| format!("order chain references missing call {}", chain.call.0))?;
         builder.push_row(
             projection,
-            CheckedImageRowDomainV1::OrderChain,
+            CheckedImageRowDomainV2::OrderChain,
             chain,
             Vec::new(),
         )?;
@@ -14862,11 +15057,11 @@ fn checked_image_handoff(program: &CheckedProgramFields) -> Result<CheckedImageH
         let projection = checked_definition_projection(owner);
         builder.push_row(
             projection.clone(),
-            CheckedImageRowDomainV1::PatternBinding,
+            CheckedImageRowDomainV2::PatternBinding,
             binding,
             Vec::new(),
         )?;
-        builder.route(CheckedImageRowDomainV1::PatternBinding, index, projection)?;
+        builder.route(CheckedImageRowDomainV2::PatternBinding, index, projection)?;
     }
     for (index, requirement) in program.resource_projection_requirements.iter().enumerate() {
         let projection = expression_projections
@@ -14881,12 +15076,12 @@ fn checked_image_handoff(program: &CheckedProgramFields) -> Result<CheckedImageH
             .collect();
         builder.push_row(
             projection.clone(),
-            CheckedImageRowDomainV1::ResourceProjection,
+            CheckedImageRowDomainV2::ResourceProjection,
             requirement,
             relocations,
         )?;
         builder.route(
-            CheckedImageRowDomainV1::ResourceProjection,
+            CheckedImageRowDomainV2::ResourceProjection,
             index,
             projection,
         )?;
@@ -14901,12 +15096,12 @@ fn checked_image_handoff(program: &CheckedProgramFields) -> Result<CheckedImageH
             .collect();
         builder.push_row(
             projection.clone(),
-            CheckedImageRowDomainV1::Source,
+            CheckedImageRowDomainV2::Source,
             source,
             relocations,
         )?;
         builder.route(
-            CheckedImageRowDomainV1::Source,
+            CheckedImageRowDomainV2::Source,
             source.id.0 as usize,
             projection,
         )?;
@@ -14920,12 +15115,12 @@ fn checked_image_handoff(program: &CheckedProgramFields) -> Result<CheckedImageH
             .collect();
         builder.push_row(
             projection.clone(),
-            CheckedImageRowDomainV1::State,
+            CheckedImageRowDomainV2::State,
             state,
             relocations,
         )?;
         builder.route(
-            CheckedImageRowDomainV1::State,
+            CheckedImageRowDomainV2::State,
             state.id.0 as usize,
             projection,
         )?;
@@ -14940,12 +15135,12 @@ fn checked_image_handoff(program: &CheckedProgramFields) -> Result<CheckedImageH
             .collect();
         builder.push_row(
             projection.clone(),
-            CheckedImageRowDomainV1::List,
+            CheckedImageRowDomainV2::List,
             list,
             relocations,
         )?;
         builder.route(
-            CheckedImageRowDomainV1::List,
+            CheckedImageRowDomainV2::List,
             list.id.0 as usize,
             projection,
         )?;
@@ -14958,18 +15153,18 @@ fn checked_image_handoff(program: &CheckedProgramFields) -> Result<CheckedImageH
         let projection = checked_definition_projection(owner);
         builder.push_row(
             projection.clone(),
-            CheckedImageRowDomainV1::Occurrence,
+            CheckedImageRowDomainV2::Occurrence,
             occurrence,
             Vec::new(),
         )?;
-        builder.route(CheckedImageRowDomainV1::Occurrence, index, projection)?;
+        builder.route(CheckedImageRowDomainV2::Occurrence, index, projection)?;
     }
 
     let metadata = &program.lowering_metadata;
     for unit in &metadata.source_units {
         builder.push_row(
             root_definition.clone(),
-            CheckedImageRowDomainV1::SourceUnitMetadata,
+            CheckedImageRowDomainV2::SourceUnitMetadata,
             unit,
             Vec::new(),
         )?;
@@ -14989,14 +15184,14 @@ fn checked_image_handoff(program: &CheckedProgramFields) -> Result<CheckedImageH
             .unwrap_or_else(|| root_owner.clone());
         builder.push_row(
             checked_definition_projection(owner),
-            CheckedImageRowDomainV1::SourcePayloadShape,
+            CheckedImageRowDomainV2::SourcePayloadShape,
             shape,
             Vec::new(),
         )?;
     }
     builder.push_row(
         root_definition.clone(),
-        CheckedImageRowDomainV1::HostPort,
+        CheckedImageRowDomainV2::HostPort,
         &metadata.host_port_table,
         Vec::new(),
     )?;
@@ -15007,7 +15202,7 @@ fn checked_image_handoff(program: &CheckedProgramFields) -> Result<CheckedImageH
             .unwrap_or_else(|| root_owner.clone());
         builder.push_row(
             checked_definition_projection(owner),
-            CheckedImageRowDomainV1::OutputRootType,
+            CheckedImageRowDomainV2::OutputRootType,
             output,
             Vec::new(),
         )?;
@@ -15021,7 +15216,7 @@ fn checked_image_handoff(program: &CheckedProgramFields) -> Result<CheckedImageH
             .unwrap_or_else(|| root_definition.clone());
         builder.push_row(
             projection,
-            CheckedImageRowDomainV1::ExpressionType,
+            CheckedImageRowDomainV2::ExpressionType,
             entry,
             Vec::new(),
         )?;
@@ -15033,7 +15228,7 @@ fn checked_image_handoff(program: &CheckedProgramFields) -> Result<CheckedImageH
             .unwrap_or_else(|| root_owner.clone());
         builder.push_row(
             checked_interface_projection(owner),
-            CheckedImageRowDomainV1::FunctionType,
+            CheckedImageRowDomainV2::FunctionType,
             entry,
             Vec::new(),
         )?;
@@ -15058,7 +15253,7 @@ fn checked_image_handoff(program: &CheckedProgramFields) -> Result<CheckedImageH
             .unwrap_or_else(|| root_definition.clone());
         builder.push_row(
             projection,
-            CheckedImageRowDomainV1::NamedValueType,
+            CheckedImageRowDomainV2::NamedValueType,
             &(*statement, entry),
             Vec::new(),
         )?;
@@ -15072,7 +15267,7 @@ fn checked_image_handoff(program: &CheckedProgramFields) -> Result<CheckedImageH
             .unwrap_or_else(|| root_definition.clone());
         builder.push_row(
             projection,
-            CheckedImageRowDomainV1::RenderSlot,
+            CheckedImageRowDomainV2::RenderSlot,
             slot,
             Vec::new(),
         )?;
@@ -15080,7 +15275,7 @@ fn checked_image_handoff(program: &CheckedProgramFields) -> Result<CheckedImageH
     for diagnostic in &metadata.diagnostics {
         builder.push_row(
             root_definition.clone(),
-            CheckedImageRowDomainV1::Diagnostic,
+            CheckedImageRowDomainV2::Diagnostic,
             diagnostic,
             Vec::new(),
         )?;
@@ -19749,7 +19944,7 @@ impl CheckedProgramDatabase {
                 lowering_metadata.render_slot_table = report.render_slot_table.clone();
             }
             checked_fields.lowering_metadata = lowering_metadata;
-            let image_handoff = checked_image_handoff(&checked_fields)
+            let image_handoff = checked_image_handoff(&checked_fields, &self.program)
                 .expect("validated checked fields must seal an image handoff");
             // SAFETY: the checked graph itself is unchanged. This final seal
             // attaches the lowering/report projections derived and validated

@@ -23,6 +23,7 @@ use boon_plan::{
 };
 use boon_semantic::program_core::{self as core, DistributedCall};
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
 #[cfg(target_arch = "wasm32")]
@@ -80,6 +81,7 @@ impl CompiledDistributedMachinePlans {
 struct LoweredRole {
     request: DistributedCompilerProgram,
     ir: ErasedProgram,
+    request_graph: Arc<boon_compilation_db::SealedRequestGraphSnapshot>,
     source_unit_count: usize,
     parse_ms: f64,
     lower_ms: f64,
@@ -259,6 +261,10 @@ fn compile_distributed_runtime_source_programs_inner(
         bundle,
         prelinked_calls,
     } = resolve_distributed_semantic_fixed_point(&solved.checks)?;
+    let mut request_graphs = bundle
+        .role_programs()
+        .map(|(role, semantic)| (role, semantic.request_graph_snapshot()))
+        .collect::<BTreeMap<_, _>>();
     let lower_started = Instant::now();
     let verified_bundle = boon_verify::verify_bundle(
         bundle,
@@ -281,6 +287,9 @@ fn compile_distributed_runtime_source_programs_inner(
             erased_programs
                 .remove(&role)
                 .expect("atomically erased role authority"),
+            request_graphs
+                .remove(&role)
+                .expect("atomically erased role request graph"),
             lower_ms,
         )?;
         lowered.insert(role, program);
@@ -1027,6 +1036,7 @@ fn parse_role(request: &DistributedCompilerProgram) -> CompilerResult<ParsedRole
 fn lower_parsed_role(
     program: &ParsedRole,
     ir: ErasedProgram,
+    request_graph: Arc<boon_compilation_db::SealedRequestGraphSnapshot>,
     lower_ms: f64,
 ) -> CompilerResult<LoweredRole> {
     let verify_started = Instant::now();
@@ -1036,6 +1046,7 @@ fn lower_parsed_role(
     Ok(LoweredRole {
         request: program.request.clone(),
         ir,
+        request_graph,
         source_unit_count: program.parsed.files.len(),
         parse_ms: program.parse_ms,
         lower_ms,
@@ -2565,6 +2576,7 @@ fn link_lowered_roles(
                     plan_validation_ms: 0.0,
                     total_ms: program.parse_ms + program.lower_ms + program.verify_ms + compile_ms,
                 },
+                request_graph: Arc::clone(&program.request_graph),
             },
         );
     }

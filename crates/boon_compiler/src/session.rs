@@ -136,6 +136,10 @@ struct ProjectState {
     revision: Revision,
     checked: Option<CheckedSourceFromSource>,
     compiled: Option<(Revision, CompiledSealedMachinePlanFromSource)>,
+    request_graph: Option<(
+        Revision,
+        Arc<boon_compilation_db::SealedRequestGraphSnapshot>,
+    )>,
 }
 
 impl CompilerSession {
@@ -154,6 +158,7 @@ impl CompilerSession {
                 revision: Revision(0),
                 checked: None,
                 compiled: None,
+                request_graph: None,
             },
         );
         Ok(id)
@@ -263,6 +268,25 @@ impl CompilerSession {
             .map(|(revision, compiled)| (*revision, compiled)))
     }
 
+    pub fn request_graph_snapshot(
+        &self,
+        project: ProjectId,
+    ) -> CompilerResult<
+        Option<(
+            Revision,
+            Arc<boon_compilation_db::SealedRequestGraphSnapshot>,
+        )>,
+    > {
+        let state = self
+            .projects
+            .get(&project)
+            .ok_or_else(|| session_error(format!("unknown compiler project {}", project.0)))?;
+        Ok(state
+            .request_graph
+            .as_ref()
+            .map(|(revision, graph)| (*revision, Arc::clone(graph))))
+    }
+
     pub fn request<'a>(
         &'a mut self,
         project: ProjectId,
@@ -340,11 +364,16 @@ impl CompilerSession {
                     &state.source.migration_predecessors,
                 ),
                 Some(cancellation),
-            )?
-            .seal()?;
+            )?;
             if cancellation.is_canceled() {
                 return Err(canceled_error());
             }
+            let request_graph = compiled.request_graph_snapshot();
+            let compiled = compiled.seal()?;
+            if cancellation.is_canceled() {
+                return Err(canceled_error());
+            }
+            state.request_graph = Some((revision, request_graph));
             state.compiled = Some((revision, compiled));
         }
         Ok(CompilerSessionResult::Verified {
@@ -435,6 +464,40 @@ mod tests {
             .plan()
             .clone();
         assert_eq!(first_plan, second_plan);
+    }
+
+    #[test]
+    fn verified_request_installs_and_retains_the_cold_request_graph_snapshot() {
+        let mut session = CompilerSession::new();
+        let project = session.open_project(project("value: 1")).unwrap();
+        let revision = session.revision(project).unwrap();
+        session
+            .request(
+                project,
+                revision,
+                CompileIntent::VerifiedPreview,
+                &CancellationToken::new(),
+            )
+            .unwrap();
+
+        let (graph_revision, graph) = session
+            .request_graph_snapshot(project)
+            .unwrap()
+            .expect("verified request installs its request graph");
+        assert_eq!(graph_revision, revision);
+        assert_eq!(graph.revision(), boon_compilation_db::Revision(0));
+        assert!(graph.request_count() > 0);
+
+        let next_revision = session
+            .apply_update(project, UnitUpdate::new("RUN.bn", "value: 2"))
+            .unwrap();
+        let (retained_revision, retained) = session
+            .request_graph_snapshot(project)
+            .unwrap()
+            .expect("source update keeps the last verified graph alive");
+        assert_eq!(retained_revision, revision);
+        assert!(Arc::ptr_eq(&graph, &retained));
+        assert_ne!(next_revision, retained_revision);
     }
 
     #[test]

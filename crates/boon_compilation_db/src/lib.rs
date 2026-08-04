@@ -101,13 +101,17 @@ pub struct ProjectionGraphStats {
 #[derive(Clone, Copy, Debug)]
 struct PendingRequestNode {
     identity_digest: RequestFingerprint,
-    local_digest: RequestFingerprint,
+    local_digest: Option<RequestFingerprint>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct ProjectionId(u32);
 
 impl ProjectionId {
+    pub fn from_usize(value: usize) -> Option<Self> {
+        u32::try_from(value).ok().map(Self)
+    }
+
     pub const fn as_usize(self) -> usize {
         self.0 as usize
     }
@@ -144,15 +148,49 @@ impl DenseProjectionGraphBuilder {
         identity_digest: RequestFingerprint,
         local_digest: RequestFingerprint,
     ) -> Result<ProjectionId, CompilationDbError> {
+        let id = self.register_pending(identity_digest)?;
+        self.set_local_digest(id, local_digest)?;
+        Ok(id)
+    }
+
+    /// Registers one stable request before its result receipt is available.
+    ///
+    /// Some language-owned builders need the dense identity to resolve exact
+    /// dependency edges while they are still folding rows. Sealing fails closed
+    /// unless every pending request receives exactly one local digest.
+    pub fn register_pending(
+        &mut self,
+        identity_digest: RequestFingerprint,
+    ) -> Result<ProjectionId, CompilationDbError> {
         let ordinal = u32::try_from(self.nodes.len()).map_err(|_| {
             CompilationDbError::new("compilation projection graph exceeds u32 identities")
         })?;
         let id = ProjectionId(ordinal);
         self.nodes.push(PendingRequestNode {
             identity_digest,
-            local_digest,
+            local_digest: None,
         });
         Ok(id)
+    }
+
+    pub fn set_local_digest(
+        &mut self,
+        id: ProjectionId,
+        local_digest: RequestFingerprint,
+    ) -> Result<(), CompilationDbError> {
+        let node = self.nodes.get_mut(id.as_usize()).ok_or_else(|| {
+            CompilationDbError::new("compilation request receipt has an unregistered identity")
+        })?;
+        if node.local_digest.replace(local_digest).is_some() {
+            return Err(CompilationDbError::new(
+                "compilation request receipt is published more than once",
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn local_digest(&self, id: ProjectionId) -> Option<RequestFingerprint> {
+        self.nodes.get(id.as_usize())?.local_digest
     }
 
     pub fn add_dependency(
@@ -202,7 +240,11 @@ impl DenseProjectionGraphBuilder {
             canonical_by_registered[registered_ordinal] = canonical;
             registered_by_canonical.push(registered_ordinal);
             identity_digests.push(node.identity_digest);
-            local_digests.push(node.local_digest);
+            local_digests.push(node.local_digest.ok_or_else(|| {
+                CompilationDbError::new(
+                    "compilation request graph contains an unsealed pending request",
+                )
+            })?);
         }
 
         let mut edges = vec![Vec::new(); identity_digests.len()];
@@ -302,6 +344,7 @@ impl DenseProjectionGraphBuilder {
             canonical_by_registered,
             registered_by_canonical,
             identity_digests,
+            local_digests,
             edge_offsets,
             edge_arena,
             reverse_edge_offsets: reverse_edges.0,
@@ -323,12 +366,27 @@ impl DenseProjectionGraphBuilder {
             stats,
         })
     }
+
+    /// Seals the exact cold request graph and publishes revision metadata for
+    /// later warm red/green evaluation. The same graph is therefore proof
+    /// authority and currentness authority rather than a disposable digest
+    /// helper followed by a second incremental database.
+    pub fn seal_snapshot(
+        self,
+        domains: ProjectionGraphDigestDomains<'_>,
+        revision: Revision,
+    ) -> Result<SealedRequestGraphSnapshot, CompilationDbError> {
+        let graph = self.seal(domains)?;
+        SealedRequestGraphSnapshot::new(graph, revision)
+    }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SealedDenseProjectionGraph {
     canonical_by_registered: Vec<usize>,
     registered_by_canonical: Vec<usize>,
     identity_digests: Vec<RequestFingerprint>,
+    local_digests: Vec<RequestFingerprint>,
     edge_offsets: Vec<usize>,
     edge_arena: Vec<usize>,
     reverse_edge_offsets: Vec<usize>,
@@ -358,6 +416,25 @@ impl SealedDenseProjectionGraph {
                 .iter()
                 .map(|target| ProjectionId(self.registered_by_canonical[*target] as u32)),
         )
+    }
+
+    pub fn id_by_identity_digest(
+        &self,
+        identity_digest: RequestFingerprint,
+    ) -> Option<ProjectionId> {
+        let canonical = self.identity_digests.binary_search(&identity_digest).ok()?;
+        let registered = *self.registered_by_canonical.get(canonical)?;
+        u32::try_from(registered).ok().map(ProjectionId)
+    }
+
+    pub fn identity_digest(&self, id: ProjectionId) -> Option<RequestFingerprint> {
+        let canonical = *self.canonical_by_registered.get(id.as_usize())?;
+        self.identity_digests.get(canonical).copied()
+    }
+
+    pub fn local_digest(&self, id: ProjectionId) -> Option<RequestFingerprint> {
+        let canonical = *self.canonical_by_registered.get(id.as_usize())?;
+        self.local_digests.get(canonical).copied()
     }
 
     pub fn reverse_dependents(
@@ -413,6 +490,68 @@ impl SealedDenseProjectionGraph {
                 .iter()
                 .map(|member| ProjectionId(self.registered_by_canonical[*member] as u32)),
         )
+    }
+}
+
+/// Immutable request topology plus the revision-zero memo state produced by a
+/// cold compiler request. Language components retain their typed values; this
+/// snapshot retains only stable identities, exact dependency cones, SCC proof
+/// receipts, and red/green publication metadata.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SealedRequestGraphSnapshot {
+    revision: Revision,
+    graph: SealedDenseProjectionGraph,
+    memos: Vec<RequestMemo>,
+}
+
+impl SealedRequestGraphSnapshot {
+    fn new(
+        graph: SealedDenseProjectionGraph,
+        revision: Revision,
+    ) -> Result<Self, CompilationDbError> {
+        let mut memos = Vec::with_capacity(graph.canonical_by_registered.len());
+        for registered in 0..graph.canonical_by_registered.len() {
+            let registered = u32::try_from(registered).map_err(|_| {
+                CompilationDbError::new("compilation request snapshot exceeds u32 identities")
+            })?;
+            let id = ProjectionId(registered);
+            let input_fingerprint = graph.local_digest(id).ok_or_else(|| {
+                CompilationDbError::new("compilation request snapshot has no local receipt")
+            })?;
+            memos.push(RequestMemo::new(
+                revision,
+                input_fingerprint,
+                input_fingerprint,
+            ));
+        }
+        Ok(Self {
+            revision,
+            graph,
+            memos,
+        })
+    }
+
+    pub const fn revision(&self) -> Revision {
+        self.revision
+    }
+
+    pub const fn graph(&self) -> &SealedDenseProjectionGraph {
+        &self.graph
+    }
+
+    pub fn memo(&self, id: ProjectionId) -> Option<&RequestMemo> {
+        self.memos.get(id.as_usize())
+    }
+
+    pub fn id_by_identity_digest(
+        &self,
+        identity_digest: RequestFingerprint,
+    ) -> Option<ProjectionId> {
+        self.graph.id_by_identity_digest(identity_digest)
+    }
+
+    pub fn request_count(&self) -> usize {
+        self.memos.len()
     }
 }
 
@@ -692,6 +831,56 @@ mod tests {
             ids,
             keys_by_id,
         }
+    }
+
+    #[test]
+    fn cold_snapshot_retains_exact_request_memos_and_identity_lookup() {
+        let mut builder = DenseProjectionGraphBuilder::new();
+        let root = builder.register(digest(1), digest(11)).unwrap();
+        let child = builder.register_pending(digest(2)).unwrap();
+        builder.add_dependency(root, child).unwrap();
+        builder.set_local_digest(child, digest(22)).unwrap();
+        let snapshot = builder
+            .seal_snapshot(
+                ProjectionGraphDigestDomains {
+                    component: COMPONENT_DOMAIN,
+                },
+                Revision(0),
+            )
+            .unwrap();
+
+        assert_eq!(snapshot.revision(), Revision(0));
+        assert_eq!(snapshot.request_count(), 2);
+        assert_eq!(snapshot.id_by_identity_digest(digest(1)), Some(root));
+        assert_eq!(snapshot.id_by_identity_digest(digest(2)), Some(child));
+        assert_eq!(snapshot.memo(root).unwrap().result_fingerprint, digest(11));
+        assert_eq!(snapshot.memo(child).unwrap().result_fingerprint, digest(22));
+        assert_eq!(
+            snapshot
+                .graph()
+                .dependencies(root)
+                .unwrap()
+                .collect::<Vec<_>>(),
+            vec![child]
+        );
+    }
+
+    #[test]
+    fn pending_request_must_publish_exactly_one_receipt_before_seal() {
+        let mut missing = DenseProjectionGraphBuilder::new();
+        missing.register_pending(digest(1)).unwrap();
+        assert!(
+            missing
+                .seal(ProjectionGraphDigestDomains {
+                    component: COMPONENT_DOMAIN,
+                })
+                .is_err()
+        );
+
+        let mut duplicate = DenseProjectionGraphBuilder::new();
+        let id = duplicate.register_pending(digest(1)).unwrap();
+        duplicate.set_local_digest(id, digest(2)).unwrap();
+        assert!(duplicate.set_local_digest(id, digest(3)).is_err());
     }
 
     #[test]

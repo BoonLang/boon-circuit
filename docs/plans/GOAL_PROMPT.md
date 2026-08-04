@@ -644,6 +644,19 @@ Current checkpoints to preserve and audit rather than redo:
   code linker, consuming runnable builder, and distributed delta linker. Only
   split crates at those proven one-way seams and require measured Rust
   invalidation improvement separately from Boon latency;
+- preserve the first seventh-audit request-graph owner deletion. Manifest V7
+  now publishes finalized projection receipts and checked/execution/remaining-
+  domain plus owner edges into one graph and seals that graph as a retained
+  revision-zero request snapshot. Root/callable proof digests and session
+  currentness share its exact identity/CSR/SCC/memo authority; the second
+  Manifest registration/edge-import graph is deleted, and the normal sealed
+  runtime artifact does not carry compiler currentness state. The current
+  directional evidence is 8,315 nodes/29,131 edges, 415.329 ms Manifest work,
+  and 4,112.475 ms/260,660 KiB overall with the unchanged plan hash. This is not
+  a latency/RSS gate or warm-reuse result. Locally checkpoint it, re-audit the
+  whole pipeline for larger refactors, then retain parser-unit and checker
+  interface/definition results with exact dependencies, backdating, and zero-
+  unrelated-work evidence before proceeding to demand/link/runnable cuts;
 - treat the 16.7 ms diagnostics and 100 ms replacement-preview gates as warm
   incremental contracts. A faster full rebuild cannot satisfy them. Record
   executed/reused/backdated requests and require zero unrelated parse/check/

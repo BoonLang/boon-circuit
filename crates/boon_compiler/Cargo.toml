@@ -14,6 +14,7 @@ test-flat-oracle = ["boon_semantic/test-flat-oracle"]
 
 [dependencies]
 boon_checked.workspace = true
+boon_compilation_db.workspace = true
 boon_contract.workspace = true
 boon_data.workspace = true
 boon_example_manifest.workspace = true

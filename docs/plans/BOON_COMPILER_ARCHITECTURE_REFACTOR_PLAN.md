@@ -2,10 +2,11 @@
 
 Date: 2026-08-03
 
-Status: active high-leverage execution map, reconciled through compact execution-
-receipt checkpoint `96b1611` while preserving shared-request-graph checkpoint
-`c870358`, compact-proof/sealed-plan checkpoint `38e6541`, and activation/effect
-checkpoint `32bcf40`, subordinate to
+Status: active high-leverage execution map, reconciled through the first
+seventh-audit retained-request-graph tranche after whole-program audit checkpoint
+`d113544`, while preserving compact execution-receipt checkpoint `96b1611`,
+shared-request-graph checkpoint `c870358`, compact-proof/sealed-plan checkpoint
+`38e6541`, and activation/effect checkpoint `32bcf40`, subordinate to
 [`BOON_COMPILER_PERFORMANCE_PLAN.md`](BOON_COMPILER_PERFORMANCE_PLAN.md). The
 performance plan owns all latency, memory, correctness, and final acceptance
 gates. This file owns the architectural sequence first chosen after checkpoint
@@ -1737,6 +1738,44 @@ compiler service versus one-shot adapters. Splitting the present mutually
 dependent 77 kLOC semantic, 38 kLOC typecheck, or 26 kLOC compiler algorithms
 before those cuts would add interfaces without reducing either Boon work or the
 Rust invalidation cone.
+
+#### First seventh-audit tranche: retain the graph that proof already built
+
+The first owner deletion is now implemented. Manifest V7 registers its compact
+projection identities as pending requests in one `DenseProjectionGraphBuilder`,
+publishes each finalized local receipt exactly once, adds checked, execution,
+remaining-domain, and owner edges to that same graph, and seals it as a
+revision-zero `SealedRequestGraphSnapshot`. The snapshot retains stable identity
+lookup, exact forward/reverse CSR, SCCs, local digests, and one `RequestMemo` per
+request. Missing or duplicate receipt publication fails closed.
+
+The former `build_dependency_projection_graph_digests_v7` registration and
+edge-copy pass is deleted. Manifest root and callable implementation digests now
+come from the retained graph, `SemanticProgram` cross-checks that graph against
+its compact proof, and the unsealed compiler handoff transfers it to
+`CompilerSession` before the ordinary sealed plan artifact is published. A
+source update invalidates the verified artifact but keeps the last verified
+snapshot available until a newer revision publishes atomically; normal sealed
+runtime artifacts do not retain compiler currentness state.
+
+A direct current debug NovyWave trace has 8,315 graph nodes, 29,131 edges,
+7,992 components, three cyclic components, a maximum SCC of 296 nodes, and
+26,218 component edges. Manifest takes 415.329 ms. The corresponding untraced
+sample is 4,112.475 ms at 260,660 KiB peak RSS, with the unchanged plan hash
+`db18f345676378b8633829c0bbd7870c0a1dc5a2459649c9bbfdd6b8969374ab` and
+11,541,264 allocation calls / 1,558,986,278 allocated bytes. Compared with the
+adjacent `96b1611` directional sample, allocation calls fall by 7,187 and bytes
+by 1,005,305, while total time and RSS are noisy/slightly worse. This is an
+authority/currentness checkpoint, not a latency exit and not warm reuse yet.
+
+The next tranche is therefore not another graph-container optimization. Retain
+immutable parser-unit products and checker interface/definition result cells in
+the same session-owned snapshot, make their exact dependencies and backdating
+observable, and prove a changed unit does zero unrelated parse/check work. Only
+then turn verified intent into the sole demand queue and delete the repeated
+ordinary-body expansion/link owners. The larger architecture must be
+re-researched at this boundary before selecting implementation details; a
+whole-program cache, query facade, or premature crate split remains rejected.
 
 ## Architectural Decisions
 

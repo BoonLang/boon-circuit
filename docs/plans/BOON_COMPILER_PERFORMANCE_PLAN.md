@@ -950,6 +950,24 @@ Current cold-diagnostics candidate evidence:
   consuming runnable builder, and make distributed linking delta-based. Do not
   insert a cache/database facade or split a crate while the replaced owner is
   still executing.
+- The first seventh-audit owner deletion now makes Manifest V7's compact
+  projection registry the sole request/proof graph. Pending projections publish
+  exactly one local receipt, checked/execution/remaining-domain and owner edges
+  enter that graph directly, and sealing retains a revision-zero snapshot with
+  stable identity lookup, exact forward/reverse CSR, SCCs, and one `RequestMemo`
+  per request. The second owner/projection/edge registration pass is deleted;
+  Manifest root/callable digests derive from the retained graph, and
+  `CompilerSession` retains the last verified graph without putting compiler
+  state in the normal sealed runtime artifact. A current direct debug trace is
+  8,315 nodes/29,131 edges and 415.329 ms Manifest work. Its untraced sample is
+  4,112.475 ms at 260,660 KiB, with unchanged plan hash, 11,541,264 allocation
+  calls, and 1,558,986,278 allocated bytes. The adjacent sample is faster and
+  smaller in RSS, so this is not a time/RSS win or gate closure; only allocation
+  calls/bytes move modestly down. Checkpoint the authority/currentness cut, then
+  re-audit the higher-level pipeline and proceed to retained parser-unit and
+  checker interface/definition results with exact backdating and zero-unrelated-
+  work evidence. Do not micro-optimize the new snapshot or claim warm reuse from
+  retaining a cold memo alone.
 - Do not preserve V3's 208k subject cardinality as a production V4/V5 proof
   requirement. The independent test oracle must map every historical subject
   to exactly one canonical finalized shard row and classifier field/domain and prove

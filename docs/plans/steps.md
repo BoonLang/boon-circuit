@@ -464,6 +464,21 @@ stronger three-reviewer performance closure defined below.
    runnable builder, distributed delta linker, and measured one-way crate
    seams, in that order.
 
+   The first seventh-audit cut now completes that graph-owner deletion.
+   Manifest V7 publishes finalized receipts and all dependency/owner edges into
+   one builder and seals the same 8,315-node/29,131-edge graph as a retained
+   revision-zero request snapshot with exact CSR, SCCs, identity lookup, and
+   memos. The old graph registration/import function is gone; semantic proof
+   digests and session currentness share the sealed graph, while normal runtime
+   artifacts do not retain it. The exact ignored NovyWave V2/V3 owner oracle,
+   focused graph/session tests, compiler checks, and architecture verifier pass.
+   One current debug sample is 4,112.475 ms/260,660 KiB with unchanged plan hash;
+   Manifest is 415.329 ms and allocation work is 11,541,264 calls /
+   1,558,986,278 bytes. This is an ownership checkpoint, not a latency or warm-
+   reuse exit. Checkpoint it, perform a new high-level architecture audit, then
+   retain immutable parser units and checker interface/definition results with
+   exact backdating and zero unrelated work before demand/link/runnable cuts.
+
    The post-`ac2b234` high-level audit supersedes a mutating post-resource
    execution seal. Move inline list-authority synthesis into execution
    construction, seal immutable execution once, and make the resource typed

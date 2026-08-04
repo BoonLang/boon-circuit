@@ -11,6 +11,7 @@ pub use boon_plan::{
 use serde::de::DeserializeOwned;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::Instant;
 use unicode_segmentation::UnicodeSegmentation;
@@ -47,13 +48,21 @@ fn verify_and_lower_checked_profiled(
     checked: boon_checked::CheckedProgram,
     producer_requests: &[boon_semantic::ProducerMaterializationRequest],
     cancellation: &mut CancellationProbe<'_>,
-) -> Result<(ErasedProgram, SemanticLowerProfile), String> {
+) -> Result<
+    (
+        ErasedProgram,
+        Arc<boon_compilation_db::SealedRequestGraphSnapshot>,
+        SemanticLowerProfile,
+    ),
+    String,
+> {
     cancellation.checkpoint()?;
     let semantic_started = Instant::now();
     let semantic = elaborate_checked(checked, producer_requests)?;
     let semantic_ms = elapsed_ms(semantic_started);
     cancellation.checkpoint()?;
     let contract_verify_started = Instant::now();
+    let request_graph = semantic.request_graph_snapshot();
     let verified =
         boon_verify::verify_explicit_contracts(semantic).map_err(|error| error.to_string())?;
     let contract_verify_ms = elapsed_ms(contract_verify_started);
@@ -70,6 +79,7 @@ fn verify_and_lower_checked_profiled(
     cancellation.checkpoint()?;
     Ok((
         ir,
+        request_graph,
         SemanticLowerProfile {
             semantic_ms,
             contract_verify_ms,
@@ -271,6 +281,7 @@ pub struct CompiledMachinePlanFromSource {
     pub ir: ErasedProgram,
     pub plan: MachinePlan,
     pub profile: CompileProfile,
+    request_graph: Arc<boon_compilation_db::SealedRequestGraphSnapshot>,
 }
 
 /// Normal verified publication product.
@@ -289,6 +300,10 @@ pub struct CompiledSealedMachinePlanFromSource {
 }
 
 impl CompiledMachinePlanFromSource {
+    pub fn request_graph_snapshot(&self) -> Arc<boon_compilation_db::SealedRequestGraphSnapshot> {
+        Arc::clone(&self.request_graph)
+    }
+
     pub fn seal(self) -> CompilerResult<CompiledSealedMachinePlanFromSource> {
         let seal_started = Instant::now();
         let source_bundle_digest_v1 = self.ir.source_bundle_digest_v1();
@@ -890,7 +905,7 @@ fn finish_checked_program_to_machine_plan(
         );
     }
     let lower_started = Instant::now();
-    let (ir, semantic_profile) =
+    let (ir, request_graph, semantic_profile) =
         verify_and_lower_checked_profiled(checked, &[], &mut cancellation)?;
     let lower_ms = elapsed_ms(lower_started);
     cancellation.checkpoint().map_err(PlanError::new)?;
@@ -933,7 +948,12 @@ fn finish_checked_program_to_machine_plan(
         plan_validation_ms: 0.0,
         total_ms: elapsed_before_finish_ms + elapsed_ms(finish_started),
     };
-    Ok(CompiledMachinePlanFromSource { ir, plan, profile })
+    Ok(CompiledMachinePlanFromSource {
+        ir,
+        plan,
+        profile,
+        request_graph,
+    })
 }
 
 fn checked_program_from_output(

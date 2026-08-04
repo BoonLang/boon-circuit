@@ -8401,6 +8401,7 @@ fields = [
   { name = "memory_graph", disposition = "r-rc-priv-sp-id-pc-n", reviewed = true },
   { name = "canonical_core", disposition = "r-c-priv-sp-id-pc-n", reviewed = true },
   { name = "dependency_manifest", disposition = "r-d-diag-so-n", reviewed = true },
+  { name = "request_graph", disposition = "r-c-priv-id-pc-n", reviewed = true },
   { name = "digest", disposition = "r-a-priv-sp-id-n", reviewed = true },
 ]
 

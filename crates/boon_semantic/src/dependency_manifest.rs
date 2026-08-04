@@ -21,7 +21,10 @@ use boon_checked::{
     CheckedShardOwnerKeyV2, CheckedShardProjectionKeyV2, CheckedShardRegionV2, DeclId, FlowMode,
     FlowType, ProgramRole, Type, TypeVar,
 };
-use boon_compilation_db::{DenseProjectionGraphBuilder, ProjectionGraphDigestDomains};
+use boon_compilation_db::{
+    DenseProjectionGraphBuilder, ProjectionGraphDigestDomains, ProjectionId,
+    Revision as CompilationRevision, SealedRequestGraphSnapshot,
+};
 use boon_contract::SourceBundleDigestV1;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -815,6 +818,11 @@ pub struct CallableDependencyManifestV7 {
     pub proof_digests: CallableDependencyProofDigestsV7,
     pub manifest_digest: CallableDependencyManifestDigestV1,
     sealed_manifest_digest: [u8; 32],
+}
+
+pub(crate) struct CallableDependencyManifestBuildV7 {
+    pub manifest: CallableDependencyManifestV7,
+    pub request_graph: SealedRequestGraphSnapshot,
 }
 
 /// Test-only reconstruction of the exhaustive dependency proof.
@@ -2379,6 +2387,7 @@ struct ValidatedCompactDependencyCollectionV4 {
 #[derive(Debug)]
 struct ValidatedCompactDependencyCollectionV7 {
     implementation_digests: BTreeMap<SemanticDependencyOwnerV1, [u8; 32]>,
+    request_graph: SealedRequestGraphSnapshot,
     projection_receipts_digest: [u8; 32],
     checked_row_count: usize,
     execution_row_count: usize,
@@ -2396,22 +2405,9 @@ enum DependencyProjectionNodeV7 {
     Projection(SemanticDependencyProjectionKeyV7),
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-struct ManifestProjectionIdV7(u32);
-
-impl ManifestProjectionIdV7 {
-    const fn as_usize(self) -> usize {
-        self.0 as usize
-    }
-}
-
 struct DenseManifestProjectionV7 {
     stable_key_digest: [u8; 32],
-    graph_identity_digest: [u8; 32],
-    local_content_digest: Option<[u8; 32]>,
-    receipt_member_digest: Option<[u8; 32]>,
     owner: SemanticDependencyStableOwnerV4,
-    targets: Vec<ManifestProjectionIdV7>,
     canonical_rank: usize,
 }
 
@@ -2423,10 +2419,11 @@ struct DenseManifestProjectionV7 {
 /// graph rather than cloning the keys into receipt, owner, target, and graph
 /// maps again.
 struct DenseManifestProjectionIndexV7 {
-    ids: BTreeMap<SemanticDependencyProjectionKeyV7, ManifestProjectionIdV7>,
+    ids: BTreeMap<SemanticDependencyProjectionKeyV7, ProjectionId>,
     projections: Vec<DenseManifestProjectionV7>,
-    entity_routes: HashMap<SemanticDependencyEntityV1, ManifestProjectionIdV7>,
-    callable_interfaces: BTreeMap<SemanticCallableId, ManifestProjectionIdV7>,
+    graph: DenseProjectionGraphBuilder,
+    entity_routes: HashMap<SemanticDependencyEntityV1, ProjectionId>,
+    callable_interfaces: BTreeMap<SemanticCallableId, ProjectionId>,
     checked_row_count: usize,
     checked_dependency_row_count: usize,
     execution_row_count: usize,
@@ -2438,6 +2435,7 @@ impl DenseManifestProjectionIndexV7 {
         Self {
             ids: BTreeMap::new(),
             projections: Vec::new(),
+            graph: DenseProjectionGraphBuilder::new(),
             entity_routes: HashMap::new(),
             callable_interfaces: BTreeMap::new(),
             checked_row_count: 0,
@@ -2452,36 +2450,42 @@ impl DenseManifestProjectionIndexV7 {
         key: SemanticDependencyProjectionKeyV7,
         owner: SemanticDependencyStableOwnerV4,
         local_content_digest: Option<[u8; 32]>,
-    ) -> Result<ManifestProjectionIdV7, CallableDependencyManifestError> {
+    ) -> Result<ProjectionId, CallableDependencyManifestError> {
         if self.ids.contains_key(&key) {
             return Err(CallableDependencyManifestError::new(format!(
                 "V7 projection {key:?} is registered more than once"
             )));
         }
-        let ordinal = u32::try_from(self.projections.len()).map_err(|_| {
-            CallableDependencyManifestError::new("V7 projection registry exceeds u32 identities")
-        })?;
-        let id = ManifestProjectionIdV7(ordinal);
         let stable_key_digest =
             canonical_dependency_hash(DEPENDENCY_PROJECTION_KEY_DOMAIN_V7, &key)?;
         let graph_identity_digest = canonical_dependency_hash(
             DEPENDENCY_PROJECTION_NODE_DOMAIN_V7,
             &DependencyProjectionNodeV7::Projection(key.clone()),
         )?;
+        let id = self
+            .graph
+            .register_pending(graph_identity_digest)
+            .map_err(|error| CallableDependencyManifestError::new(error.to_string()))?;
+        if let Some(local_content_digest) = local_content_digest {
+            self.graph
+                .set_local_digest(id, local_content_digest)
+                .map_err(|error| CallableDependencyManifestError::new(error.to_string()))?;
+        }
+        if id.as_usize() != self.projections.len() {
+            return Err(CallableDependencyManifestError::new(
+                "V7 projection registry and request graph identities diverged",
+            ));
+        }
         self.ids.insert(key, id);
         self.projections.push(DenseManifestProjectionV7 {
             stable_key_digest,
-            graph_identity_digest,
-            local_content_digest,
-            receipt_member_digest: None,
             owner,
-            targets: Vec::new(),
             canonical_rank: usize::MAX,
         });
         Ok(id)
     }
 
-    fn id(&self, key: &SemanticDependencyProjectionKeyV7) -> Option<ManifestProjectionIdV7> {
+    fn id(&self, key: &SemanticDependencyProjectionKeyV7) -> Option<ProjectionId> {
         self.ids.get(key).copied()
     }
 
@@ -2489,7 +2493,7 @@ impl DenseManifestProjectionIndexV7 {
         &mut self,
         key: SemanticDependencyProjectionKeyV7,
         owner: SemanticDependencyStableOwnerV4,
-    ) -> Result<ManifestProjectionIdV7, CallableDependencyManifestError> {
+    ) -> Result<ProjectionId, CallableDependencyManifestError> {
         if let Some(id) = self.id(&key) {
             if self.projection(id)?.owner != owner {
                 return Err(CallableDependencyManifestError::new(format!(
@@ -2503,56 +2507,57 @@ impl DenseManifestProjectionIndexV7 {
 
     fn projection(
         &self,
-        id: ManifestProjectionIdV7,
+        id: ProjectionId,
     ) -> Result<&DenseManifestProjectionV7, CallableDependencyManifestError> {
         self.projections.get(id.as_usize()).ok_or_else(|| {
             CallableDependencyManifestError::new(format!(
                 "V7 projection registry has no dense identity {}",
-                id.0
+                id.as_usize()
             ))
         })
     }
 
     fn projection_mut(
         &mut self,
-        id: ManifestProjectionIdV7,
+        id: ProjectionId,
     ) -> Result<&mut DenseManifestProjectionV7, CallableDependencyManifestError> {
         self.projections.get_mut(id.as_usize()).ok_or_else(|| {
             CallableDependencyManifestError::new(format!(
                 "V7 projection registry has no dense identity {}",
-                id.0
+                id.as_usize()
             ))
         })
     }
 
     fn add_target(
         &mut self,
-        source: ManifestProjectionIdV7,
-        target: ManifestProjectionIdV7,
+        source: ProjectionId,
+        target: ProjectionId,
     ) -> Result<(), CallableDependencyManifestError> {
         if target.as_usize() >= self.projections.len() {
             return Err(CallableDependencyManifestError::new(format!(
                 "V7 projection {} references missing target {}",
-                source.0, target.0
+                source.as_usize(),
+                target.as_usize()
             )));
         }
-        self.projection_mut(source)?.targets.push(target);
-        Ok(())
+        self.graph
+            .add_dependency(source, target)
+            .map_err(|error| CallableDependencyManifestError::new(error.to_string()))
     }
 
     fn set_receipt(
         &mut self,
-        id: ManifestProjectionIdV7,
+        id: ProjectionId,
         receipt: [u8; 32],
     ) -> Result<(), CallableDependencyManifestError> {
-        let projection = self.projection_mut(id)?;
-        if projection.local_content_digest.replace(receipt).is_some() {
-            return Err(CallableDependencyManifestError::new(format!(
-                "V7 projection {} is sealed more than once",
-                id.0
-            )));
-        }
-        Ok(())
+        self.graph
+            .set_local_digest(id, receipt)
+            .map_err(|error| CallableDependencyManifestError::new(error.to_string()))
+    }
+
+    fn local_digest(&self, id: ProjectionId) -> Option<[u8; 32]> {
+        self.graph.local_digest(id)
     }
 
     fn finalize_canonical_order(&mut self) -> Result<(), CallableDependencyManifestError> {
@@ -2560,46 +2565,86 @@ impl DenseManifestProjectionIndexV7 {
         for (rank, id) in canonical_ids.into_iter().enumerate() {
             self.projection_mut(id)?.canonical_rank = rank;
         }
-        let ranks = self
+        if self
             .projections
             .iter()
-            .map(|projection| projection.canonical_rank)
-            .collect::<Vec<_>>();
-        if ranks.contains(&usize::MAX) {
+            .any(|projection| projection.canonical_rank == usize::MAX)
+        {
             return Err(CallableDependencyManifestError::new(
                 "V7 projection registry has an unranked identity",
             ));
         }
-        for projection in &mut self.projections {
-            projection
-                .targets
-                .sort_unstable_by_key(|target| ranks[target.as_usize()]);
-            projection.targets.dedup();
-        }
         Ok(())
     }
 
-    fn finalize_receipt_members(&mut self) -> Result<(), CallableDependencyManifestError> {
-        let (ids, projections) = (&self.ids, &mut self.projections);
-        for (key, id) in ids {
-            let projection = projections.get_mut(id.as_usize()).ok_or_else(|| {
-                CallableDependencyManifestError::new(format!(
-                    "V7 projection registry has no dense identity {}",
-                    id.0
-                ))
-            })?;
-            let receipt = projection.local_content_digest.ok_or_else(|| {
-                CallableDependencyManifestError::new(format!(
-                    "V7 projection {key:?} has no local receipt"
-                ))
-            })?;
-            projection.receipt_member_digest = Some(canonical_dependency_hash(
-                DEPENDENCY_PROJECTION_RECEIPT_MEMBER_DOMAIN_V7,
-                &(key, receipt),
-            )?);
-        }
-        Ok(())
+    fn receipt_members(&self) -> Result<Vec<[u8; 32]>, CallableDependencyManifestError> {
+        self.ids
+            .iter()
+            .map(|(key, id)| {
+                let receipt = self.local_digest(*id).ok_or_else(|| {
+                    CallableDependencyManifestError::new(format!(
+                        "V7 projection {key:?} has no local receipt"
+                    ))
+                })?;
+                canonical_dependency_hash(
+                    DEPENDENCY_PROJECTION_RECEIPT_MEMBER_DOMAIN_V7,
+                    &(key, receipt),
+                )
+            })
+            .collect()
     }
+
+    fn seal_request_graph(
+        mut self,
+        owners: &BTreeSet<SemanticDependencyStableOwnerV4>,
+    ) -> Result<SealedManifestRequestGraphV7, CallableDependencyManifestError> {
+        let mut owner_ids = BTreeMap::new();
+        for owner in owners.iter().copied() {
+            let node = DependencyProjectionNodeV7::Owner(owner);
+            let id = self
+                .graph
+                .register(
+                    canonical_dependency_hash(DEPENDENCY_PROJECTION_NODE_DOMAIN_V7, &node)?,
+                    canonical_dependency_hash(DEPENDENCY_PROJECTION_NODE_DOMAIN_V7, &owner)?,
+                )
+                .map_err(|error| CallableDependencyManifestError::new(error.to_string()))?;
+            owner_ids.insert(owner, id);
+        }
+        for (ordinal, projection) in self.projections.iter().enumerate() {
+            let projection_id = ProjectionId::from_usize(ordinal).ok_or_else(|| {
+                CallableDependencyManifestError::new(
+                    "V7 projection registry exceeds u32 request identities",
+                )
+            })?;
+            let owner_id = owner_ids.get(&projection.owner).copied().ok_or_else(|| {
+                CallableDependencyManifestError::new(format!(
+                    "V7 projection {ordinal} has unknown owner {:?}",
+                    projection.owner
+                ))
+            })?;
+            self.graph
+                .add_dependency(owner_id, projection_id)
+                .map_err(|error| CallableDependencyManifestError::new(error.to_string()))?;
+        }
+        let snapshot = self
+            .graph
+            .seal_snapshot(
+                ProjectionGraphDigestDomains {
+                    component: DEPENDENCY_PROJECTION_COMPONENT_DOMAIN_V7,
+                },
+                CompilationRevision(0),
+            )
+            .map_err(|error| CallableDependencyManifestError::new(error.to_string()))?;
+        Ok(SealedManifestRequestGraphV7 {
+            snapshot,
+            owner_ids,
+        })
+    }
+}
+
+struct SealedManifestRequestGraphV7 {
+    snapshot: SealedRequestGraphSnapshot,
+    owner_ids: BTreeMap<SemanticDependencyStableOwnerV4, ProjectionId>,
 }
 
 #[cfg(test)]
@@ -3109,6 +3154,7 @@ fn dependency_proof_components(
 }
 
 #[derive(Clone, Copy, Debug, Default)]
+#[cfg(test)]
 struct DependencyGraphDigestStats {
     nodes: usize,
     edges: usize,
@@ -4804,9 +4850,9 @@ impl DependencyCollector {
         };
 
         struct PendingDenseProjectionRowV7 {
-            projection: ManifestProjectionIdV7,
+            projection: ProjectionId,
             local_digest: [u8; 32],
-            targets: Vec<ManifestProjectionIdV7>,
+            targets: Vec<ProjectionId>,
         }
 
         let mut pending_rows = (0..self.compact_rows.len())
@@ -4939,7 +4985,6 @@ impl DependencyCollector {
         let mut legacy_rows = (0..presealed.projections.len())
             .map(|_| Vec::new())
             .collect::<Vec<Vec<[u8; 32]>>>();
-        let mut legacy_edges = Vec::new();
         for (index, pending) in pending_rows.into_iter().enumerate() {
             let mut pending = pending.ok_or_else(|| {
                 CallableDependencyManifestError::new(format!(
@@ -4961,23 +5006,20 @@ impl DependencyCollector {
                 &target_digests,
             )?;
             legacy_rows[pending.projection.as_usize()].push(digest);
-            legacy_edges.extend(
-                pending
-                    .targets
-                    .into_iter()
-                    .map(|target| (pending.projection, target)),
-            );
+            for target in pending.targets {
+                presealed.add_target(pending.projection, target)?;
+            }
         }
         for (ordinal, rows) in legacy_rows.into_iter().enumerate() {
             if rows.is_empty() {
                 continue;
             }
-            let id = ManifestProjectionIdV7(u32::try_from(ordinal).map_err(|_| {
+            let id = ProjectionId::from_usize(ordinal).ok_or_else(|| {
                 CallableDependencyManifestError::new(
                     "V7 legacy projection ordinal exceeds u32 identities",
                 )
-            })?);
-            if presealed.projection(id)?.local_content_digest.is_some() {
+            })?;
+            if presealed.local_digest(id).is_some() {
                 return Err(CallableDependencyManifestError::new(format!(
                     "V7 dense projection {ordinal} mixes image and legacy rows"
                 )));
@@ -4988,48 +5030,36 @@ impl DependencyCollector {
             )?;
             presealed.set_receipt(id, receipt)?;
         }
-        for (source, target) in legacy_edges {
-            presealed.add_target(source, target)?;
-        }
         presealed.finalize_canonical_order()?;
-        presealed.finalize_receipt_members()?;
-
-        let stable_owner_set = stable_owners.values().copied().collect::<BTreeSet<_>>();
-        let (stable_implementation_digests, graph_stats) =
-            build_dependency_projection_graph_digests_v7(&stable_owner_set, &presealed)?;
-        let implementation_digests = stable_owners
-            .iter()
-            .map(|(dense, stable)| {
-                stable_implementation_digests
-                    .get(stable)
-                    .copied()
-                    .map(|digest| (*dense, digest))
-                    .ok_or_else(|| {
-                        CallableDependencyManifestError::new(format!(
-                            "stable dependency owner {stable:?} has no V7 implementation digest"
-                        ))
-                    })
-            })
-            .collect::<Result<BTreeMap<_, _>, _>>()?;
-        let receipt_members = presealed
-            .ids
-            .values()
-            .map(|id| {
-                presealed
-                    .projection(*id)?
-                    .receipt_member_digest
-                    .ok_or_else(|| {
-                        CallableDependencyManifestError::new(format!(
-                            "V7 projection {} has no receipt member digest",
-                            id.0
-                        ))
-                    })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let receipt_members = presealed.receipt_members()?;
         let projection_receipts_digest = compact_digest_sequence_v4(
             DEPENDENCY_PROJECTION_RECEIPT_SET_DOMAIN_V7,
             &receipt_members,
         )?;
+        let checked_row_count = presealed.checked_row_count;
+        let checked_dependency_row_count = presealed.checked_dependency_row_count;
+        let execution_row_count = presealed.execution_row_count;
+        let execution_dependency_row_count = presealed.execution_dependency_row_count;
+        let projection_count = presealed.projections.len();
+        let stable_owner_set = stable_owners.values().copied().collect::<BTreeSet<_>>();
+        let sealed_graph = presealed.seal_request_graph(&stable_owner_set)?;
+        let graph_stats = sealed_graph.snapshot.graph().stats();
+        let implementation_digests = stable_owners
+            .iter()
+            .map(|(dense, stable)| {
+                let owner_id = sealed_graph.owner_ids.get(stable).copied().ok_or_else(|| {
+                    CallableDependencyManifestError::new(format!(
+                        "stable dependency owner {stable:?} has no request identity"
+                    ))
+                })?;
+                let digest = sealed_graph
+                    .snapshot
+                    .graph()
+                    .implementation_digest(owner_id, DEPENDENCY_PROJECTION_IMPLEMENTATION_DOMAIN_V7)
+                    .map_err(|error| CallableDependencyManifestError::new(error.to_string()))?;
+                Ok((*dense, digest))
+            })
+            .collect::<Result<BTreeMap<_, _>, CallableDependencyManifestError>>()?;
         let construction_row_count = self
             .compact_rows
             .iter()
@@ -5053,22 +5083,20 @@ impl DependencyCollector {
                 graph_stats.cyclic_components,
                 graph_stats.maximum_component_nodes,
                 graph_stats.component_edges,
-                presealed.checked_row_count,
-                presealed.execution_row_count,
+                checked_row_count,
+                execution_row_count,
                 construction_row_count,
                 remaining_row_count,
             );
         }
-        let dependency_record_count = presealed
-            .checked_dependency_row_count
-            .checked_add(presealed.execution_dependency_row_count)
+        let dependency_record_count = checked_dependency_row_count
+            .checked_add(execution_dependency_row_count)
             .and_then(|count| count.checked_add(self.compact_records.len()))
             .ok_or_else(|| {
                 CallableDependencyManifestError::new("V7 dependency record count overflow")
             })?;
-        let coverage_record_count = presealed
-            .checked_row_count
-            .checked_add(presealed.execution_row_count)
+        let coverage_record_count = checked_row_count
+            .checked_add(execution_row_count)
             .and_then(|count| count.checked_add(construction_row_count))
             .and_then(|count| count.checked_add(remaining_row_count))
             .ok_or_else(|| {
@@ -5076,14 +5104,15 @@ impl DependencyCollector {
             })?;
         Ok(ValidatedCompactDependencyCollectionV7 {
             implementation_digests,
+            request_graph: sealed_graph.snapshot,
             projection_receipts_digest,
-            checked_row_count: presealed.checked_row_count,
-            execution_row_count: presealed.execution_row_count,
+            checked_row_count,
+            execution_row_count,
             construction_row_count,
             remaining_row_count,
             dependency_record_count,
             coverage_record_count,
-            projection_count: presealed.projections.len(),
+            projection_count,
             projection_edge_count: graph_stats.edges,
         })
     }
@@ -5425,16 +5454,17 @@ fn execution_projection_owner_v7(
 }
 
 fn insert_presealed_entity_route_v7(
-    routes: &mut HashMap<SemanticDependencyEntityV1, ManifestProjectionIdV7>,
+    routes: &mut HashMap<SemanticDependencyEntityV1, ProjectionId>,
     entity: SemanticDependencyEntityV1,
-    projection: ManifestProjectionIdV7,
+    projection: ProjectionId,
 ) -> Result<(), CallableDependencyManifestError> {
     if let Some(previous) = routes.insert(entity.clone(), projection)
         && previous != projection
     {
         return Err(CallableDependencyManifestError::new(format!(
             "presealed entity {entity:?} routes to both {} and {}",
-            previous.0, projection.0
+            previous.as_usize(),
+            projection.as_usize()
         )));
     }
     Ok(())
@@ -5822,97 +5852,6 @@ fn build_dense_projection_index_v7(
     Ok(index)
 }
 
-fn build_dependency_projection_graph_digests_v7(
-    owners: &BTreeSet<SemanticDependencyStableOwnerV4>,
-    projections: &DenseManifestProjectionIndexV7,
-) -> Result<
-    (
-        BTreeMap<SemanticDependencyStableOwnerV4, [u8; 32]>,
-        DependencyGraphDigestStats,
-    ),
-    CallableDependencyManifestError,
-> {
-    let mut graph = DenseProjectionGraphBuilder::new();
-    let mut owner_ids = BTreeMap::new();
-    for owner in owners.iter().copied() {
-        let node = DependencyProjectionNodeV7::Owner(owner);
-        let id = graph
-            .register(
-                canonical_dependency_hash(DEPENDENCY_PROJECTION_NODE_DOMAIN_V7, &node)?,
-                canonical_dependency_hash(DEPENDENCY_PROJECTION_NODE_DOMAIN_V7, &owner)?,
-            )
-            .map_err(|error| CallableDependencyManifestError::new(error.to_string()))?;
-        owner_ids.insert(owner, id);
-    }
-    let mut projection_ids = Vec::with_capacity(projections.projections.len());
-    for (ordinal, projection) in projections.projections.iter().enumerate() {
-        if !owners.contains(&projection.owner) {
-            return Err(CallableDependencyManifestError::new(format!(
-                "V7 dense projection {ordinal} has unknown owner {:?}",
-                projection.owner
-            )));
-        }
-        let receipt = projection.local_content_digest.ok_or_else(|| {
-            CallableDependencyManifestError::new(format!(
-                "V7 dense projection {ordinal} has no local receipt"
-            ))
-        })?;
-        let id = graph
-            .register(projection.graph_identity_digest, receipt)
-            .map_err(|error| CallableDependencyManifestError::new(error.to_string()))?;
-        projection_ids.push(id);
-        graph
-            .add_dependency(owner_ids[&projection.owner], id)
-            .map_err(|error| CallableDependencyManifestError::new(error.to_string()))?;
-    }
-    for (ordinal, projection) in projections.projections.iter().enumerate() {
-        let source = projection_ids[ordinal];
-        for target in &projection.targets {
-            let target_id = projection_ids
-                .get(target.as_usize())
-                .copied()
-                .ok_or_else(|| {
-                    CallableDependencyManifestError::new(format!(
-                        "V7 dense projection {ordinal} references missing target {}",
-                        target.0
-                    ))
-                })?;
-            graph
-                .add_dependency(source, target_id)
-                .map_err(|error| CallableDependencyManifestError::new(error.to_string()))?;
-        }
-    }
-    let graph = graph
-        .seal(ProjectionGraphDigestDomains {
-            component: DEPENDENCY_PROJECTION_COMPONENT_DOMAIN_V7,
-        })
-        .map_err(|error| CallableDependencyManifestError::new(error.to_string()))?;
-    let mut implementation_digests = BTreeMap::new();
-    for owner in owners.iter().copied() {
-        implementation_digests.insert(
-            owner,
-            graph
-                .implementation_digest(
-                    owner_ids[&owner],
-                    DEPENDENCY_PROJECTION_IMPLEMENTATION_DOMAIN_V7,
-                )
-                .map_err(|error| CallableDependencyManifestError::new(error.to_string()))?,
-        );
-    }
-    let stats = graph.stats();
-    Ok((
-        implementation_digests,
-        DependencyGraphDigestStats {
-            nodes: stats.nodes,
-            edges: stats.edges,
-            components: stats.components,
-            cyclic_components: stats.cyclic_components,
-            maximum_component_nodes: stats.maximum_component_nodes,
-            component_edges: stats.component_edges,
-        },
-    ))
-}
-
 #[cfg(test)]
 fn build_dependency_projection_graph_digests_v4(
     owners: &BTreeSet<SemanticDependencyStableOwnerV4>,
@@ -6277,7 +6216,7 @@ pub(crate) fn build_callable_dependency_manifest_v7(
     view: &SemanticViewBindingGraphV1,
     storage: &SemanticScopeStorageGraphV1,
     memory: &SemanticMemoryGraphV1,
-) -> Result<CallableDependencyManifestV7, CallableDependencyManifestError> {
+) -> Result<CallableDependencyManifestBuildV7, CallableDependencyManifestError> {
     let trace = std::env::var_os("BOON_SEMANTIC_TRACE").is_some();
     macro_rules! phase {
         ($name:literal, $expression:expr) => {{
@@ -6381,15 +6320,12 @@ pub(crate) fn build_callable_dependency_manifest_v7(
                         callable.id
                     ))
                 })?;
-            let digest = presealed
-                .projection(projection)?
-                .local_content_digest
-                .ok_or_else(|| {
-                    CallableDependencyManifestError::new(format!(
-                        "semantic callable {} interface has no receipt",
-                        callable.id
-                    ))
-                })?;
+            let digest = presealed.local_digest(projection).ok_or_else(|| {
+                CallableDependencyManifestError::new(format!(
+                    "semantic callable {} interface has no receipt",
+                    callable.id
+                ))
+            })?;
             Ok((callable.id, digest))
         })
         .collect::<Result<BTreeMap<_, _>, _>>()?;
@@ -6416,8 +6352,7 @@ pub(crate) fn build_callable_dependency_manifest_v7(
     };
     let root_public_shape_digest = presealed
         .id(&root_key)
-        .and_then(|id| presealed.projections.get(id.as_usize()))
-        .and_then(|projection| projection.local_content_digest)
+        .and_then(|id| presealed.local_digest(id))
         .ok_or_else(|| {
             CallableDependencyManifestError::new(
                 "V7 dependency manifest has no top-level interface receipt",
@@ -6554,7 +6489,10 @@ pub(crate) fn build_callable_dependency_manifest_v7(
         sealed_manifest_digest: [0; 32],
     };
     manifest.sealed_manifest_digest = sealed_callable_dependency_manifest_digest_v7(&manifest)?;
-    Ok(manifest)
+    Ok(CallableDependencyManifestBuildV7 {
+        manifest,
+        request_graph: compact.request_graph,
+    })
 }
 
 #[cfg(test)]

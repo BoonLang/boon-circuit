@@ -40,12 +40,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
+use std::sync::Arc;
 
 pub const SEMANTIC_PROGRAM_SCHEMA_V1: &str = "boon.semantic-program.v1";
 pub const BUNDLE_SEMANTIC_PROGRAM_SCHEMA_V1: &str = "boon.bundle-semantic-program.v1";
 pub const DEPENDENCY_CLASSIFIER_SCHEMA_DIGEST_V1: [u8; 32] = [
-    0x81, 0xd2, 0x22, 0x72, 0xee, 0xba, 0x12, 0xf1, 0xbf, 0x5e, 0xc4, 0x3c, 0xad, 0x88, 0x8f, 0x33,
-    0x2d, 0xd9, 0x6b, 0x73, 0x79, 0xa9, 0x6d, 0xdf, 0x49, 0x5c, 0x3d, 0x17, 0xcb, 0xf0, 0xd6, 0x25,
+    0x96, 0x08, 0x9c, 0x2b, 0x5f, 0xbf, 0x04, 0x9a, 0x1e, 0xd1, 0xe5, 0x66, 0xd1, 0x96, 0xa7, 0x63,
+    0x3e, 0x95, 0x89, 0x0a, 0xc3, 0x00, 0xbb, 0x1b, 0xb4, 0x9c, 0x7c, 0xab, 0xed, 0x30, 0xe4, 0xfb,
 ];
 pub const MAX_BUNDLE_SEMANTIC_PRODUCER_REQUESTS_V1: usize = 4_096;
 pub const MAX_BUNDLE_SEMANTIC_PRODUCER_REQUEST_BYTES_V1: usize = 4 * 1024 * 1024;
@@ -634,6 +635,7 @@ pub struct SemanticProgram {
     memory_graph: SemanticMemoryGraphV1,
     canonical_core: program_core::CanonicalProgramCoreV2,
     dependency_manifest: CallableDependencyManifestV7,
+    request_graph: Arc<boon_compilation_db::SealedRequestGraphSnapshot>,
     digest: SemanticProgramDigestV1,
 }
 
@@ -784,6 +786,10 @@ impl SemanticProgram {
 
     pub const fn dependency_manifest(&self) -> &CallableDependencyManifestV7 {
         &self.dependency_manifest
+    }
+
+    pub fn request_graph_snapshot(&self) -> Arc<boon_compilation_db::SealedRequestGraphSnapshot> {
+        Arc::clone(&self.request_graph)
     }
 
     pub const fn checked_program_digest(&self) -> CheckedProgramDigestV1 {
@@ -971,6 +977,24 @@ impl SemanticProgram {
                 self.execution_graph(),
             )
             .map_err(|error| SemanticError::new(error.to_string()))?;
+        let request_graph_stats = self.request_graph.graph().stats();
+        let expected_request_count = self
+            .dependency_manifest
+            .proof_digests
+            .projection_count
+            .checked_add(self.dependency_manifest.callable_entries.len())
+            .and_then(|count| count.checked_add(1))
+            .ok_or_else(|| SemanticError::new("semantic request graph count overflow"))?;
+        if self.request_graph.revision() != boon_compilation_db::Revision(0)
+            || self.request_graph.request_count() != expected_request_count
+            || request_graph_stats.nodes != expected_request_count
+            || request_graph_stats.edges
+                != self.dependency_manifest.proof_digests.projection_edge_count
+        {
+            return Err(SemanticError::new(
+                "semantic request graph differs from its compact dependency proof",
+            ));
+        }
         validate_canonical_core_handoff(self)?;
         let expected = semantic_program_digest(self)?;
         if self.digest != expected {
@@ -3012,7 +3036,7 @@ fn elaborate_with_representation(
     )
     .map_err(SemanticError::new)?;
     let execution_graph = semantic_image_builder.execution();
-    let dependency_manifest = elaboration_phase!(
+    let dependency_build = elaboration_phase!(
         "build_callable_dependency_manifest",
         build_callable_dependency_manifest_v7(
             DEPENDENCY_CLASSIFIER_SCHEMA_DIGEST_V1,
@@ -3033,6 +3057,8 @@ fn elaborate_with_representation(
         )
     )
     .map_err(|error| SemanticError::new(error.to_string()))?;
+    let dependency_manifest = dependency_build.manifest;
+    let request_graph = Arc::new(dependency_build.request_graph);
     #[cfg(test)]
     let execution_graph_oracle = (*execution_graph).clone();
     let semantic_image = elaboration_phase!("seal_semantic_image", semantic_image_builder.seal())
@@ -3055,6 +3081,7 @@ fn elaborate_with_representation(
         memory_graph,
         canonical_core,
         dependency_manifest,
+        request_graph,
         digest: SemanticProgramDigestV1([0; 32]),
     };
     semantic.digest = elaboration_phase!(
@@ -7004,7 +7031,7 @@ seed: 0
         let resource_dependency_rows =
             resource::resource_dependency_rows_for_test(&semantic.resource_graph)
                 .expect("mutated resource graph has construction dependency rows");
-        semantic.dependency_manifest = build_callable_dependency_manifest_v7(
+        let dependency_build = build_callable_dependency_manifest_v7(
             DEPENDENCY_CLASSIFIER_SCHEMA_DIGEST_V1,
             &semantic.checked_program,
             semantic.semantic_image.checked_handoff(),
@@ -7022,6 +7049,8 @@ seed: 0
             &semantic.memory_graph,
         )
         .expect("mutated OUT owner has a fresh dependency manifest");
+        semantic.dependency_manifest = dependency_build.manifest;
+        semantic.request_graph = Arc::new(dependency_build.request_graph);
         let error = semantic
             .validate()
             .expect_err("mutated resolved graph must invalidate semantic digest");

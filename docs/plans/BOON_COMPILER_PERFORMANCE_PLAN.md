@@ -932,6 +932,24 @@ Current cold-diagnostics candidate evidence:
   does not create warm reuse. Continue with the compact summary linker and
   persistent unit/definition request cells; do not resume map or hash-loop
   tuning.
+- A second direct debug sample at `96b1611` reports 4,029.882 ms total and
+  257,892 KiB peak RSS: parse/typecheck are 91.054/691.933 ms, semantic is
+  2,284.212 ms, backend is 724.634 ms (574.313 ms before document lowering),
+  plan validation is 104.649 ms, and serialization is 553.520 ms. The live-tree
+  audit confirms that these are representation-lifetime multipliers, not one
+  remaining hot loop. Project assembly rebases 115,683 nodes and performs
+  1,049,157 validation visits; the fresh checker database and all of its reverse
+  dependency/worklist state are discarded; Manifest copies its compact
+  projection registry into a second sealed graph and drops it; three backend
+  paths recursively lower ordinary bodies; final row fingerprinting clones the
+  complete plan; and distributed closure fully re-elaborates all roles plus a
+  confirmation pass. Follow the architecture plan's seventh audit. First
+  consume the compact projection registry into one retained revision-zero
+  request graph and delete Manifest's graph-import loop; then retain unit and
+  interface/definition cells, replace the three ordinary lowerers, land the
+  consuming runnable builder, and make distributed linking delta-based. Do not
+  insert a cache/database facade or split a crate while the replaced owner is
+  still executing.
 - Do not preserve V3's 208k subject cardinality as a production V4/V5 proof
   requirement. The independent test oracle must map every historical subject
   to exactly one canonical finalized shard row and classifier field/domain and prove

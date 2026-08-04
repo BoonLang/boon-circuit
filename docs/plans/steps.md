@@ -442,6 +442,28 @@ stronger three-reviewer performance closure defined below.
    rebuilds remain. Continue with the persistent unit/definition request graph
    and compact summary linker, not local hashing tweaks.
 
+   The post-`96b1611` current-tree audit makes the next owner deletion exact.
+   A second direct debug NovyWave sample is 4,029.882 ms/257,892 KiB, with
+   91.054 ms parse, 691.933 ms typecheck, 2,284.212 ms semantic, 724.634 ms
+   backend, 104.649 ms plan validation, and 553.520 ms serialization. Normal
+   assembly still rebases all unit syntax; every check discards its dense
+   reverse-dependency/worklist database; Manifest copies its compact projection
+   registry into a second sealed graph and drops it; document, migration, and
+   row/scalar paths lower ordinary bodies independently; final row
+   fingerprinting clones the whole plan; and distributed closure rebuilds every
+   role plus a confirmation pass.
+
+   First consume the V3/remaining-domain projection registry directly into the
+   retained revision-zero request graph and derive the compact proof summary
+   from that graph. Delete Manifest's second registration/edge-import loop in
+   the same tranche. Next retain immutable parser-unit and checker
+   interface/definition result cells in `CompilerSession`, with exact reverse
+   cones and backdating. A graph facade around the old import, a final-artifact
+   cache around whole recheck, or a crate split before an owner is deleted does
+   not count. Then land the shared ordinary definition-code linker, consuming
+   runnable builder, distributed delta linker, and measured one-way crate
+   seams, in that order.
+
    The post-`ac2b234` high-level audit supersedes a mutating post-resource
    execution seal. Move inline list-authority synthesis into execution
    construction, seal immutable execution once, and make the resource typed

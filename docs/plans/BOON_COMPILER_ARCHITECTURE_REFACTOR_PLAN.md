@@ -2,9 +2,10 @@
 
 Date: 2026-08-03
 
-Status: active high-leverage execution map, reconciled after shared-request-
-graph checkpoint `c870358` while preserving compact-proof/sealed-plan checkpoint
-`38e6541` and activation/effect checkpoint `32bcf40`, subordinate to
+Status: active high-leverage execution map, reconciled through compact execution-
+receipt checkpoint `96b1611` while preserving shared-request-graph checkpoint
+`c870358`, compact-proof/sealed-plan checkpoint `38e6541`, and activation/effect
+checkpoint `32bcf40`, subordinate to
 [`BOON_COMPILER_PERFORMANCE_PLAN.md`](BOON_COMPILER_PERFORMANCE_PLAN.md). The
 performance plan owns all latency, memory, correctness, and final acceptance
 gates. This file owns the architectural sequence first chosen after checkpoint
@@ -1598,21 +1599,25 @@ each seam. A successful split moves stable contracts below volatile builders,
 reduces downstream rebuild work, and preserves one runtime/compiler path; a
 file move without those effects is rejected.
 
-#### Implementation priority after the route checkpoint
+#### Implementation priority after the compact-receipt checkpoint
 
-1. Complete one definition/execution vertical slice: canonical executable row
-   receipts and source maps consume V3 routes, proof borrows those receipts,
-   and the V2 47,296-row mirror plus its Manifest import are deleted together.
-2. Promote parser unit products, stable structural definition/call routes, and
-   `RequestMemo` into an immutable `ProjectSnapshot`. Prove unit reuse and
-   result backdating before expanding the cache surface.
+1. Consume the existing V3 projection registry into the shared sealed request
+   graph without re-registering every owner, projection, and edge in Manifest.
+   Derive the compact proof summary from that graph, retain its revision-zero
+   request memos, and delete the production Manifest graph-import loop in the
+   same tranche.
+2. Promote parser unit products, stable structural definition/call routes, the
+   checker definition/interface results, and `RequestMemo` into an immutable
+   `ProjectSnapshot`. Prove unit reuse and result backdating before expanding
+   the retained result surface.
 3. Turn verified intent into the sole demand queue and publish one executable
    definition shard plus compact invocation frames. Delete replaced OUT/
    contextual body expansion and all three backend ordinary-body lowerers in
    vertical slices.
 4. Move remaining semantic domains to construction-owned tables and replace
-   Manifest with the compact summary/relocation linker. Fold the semantic
-   digest from existing receipts rather than serializing the canonical core.
+   the residual Manifest inventories with the compact summary/relocation
+   linker. Fold the semantic digest from existing receipts rather than
+   serializing the canonical core.
 5. Land the consuming runnable builder, then the bundle delta linker, and only
    then split crates at the proven one-way seams.
 
@@ -1643,6 +1648,95 @@ complete cold diagnostics, cold verified runnable output, and warm affected
 updates are measured separately. TypeScript-like affected-file reuse and
 Jai-like perceived responsiveness require the persistent request path above;
 they cannot be claimed from a faster full rebuild.
+
+### Seventh Current-Tree Audit: Stop Reconstituting The Program
+
+A second direct debug NovyWave sample at `96b1611` separates the remaining
+owners after the V3 receipt win. It is directional edit-loop evidence, not a
+scored release report:
+
+| Stage | Current directional result |
+| --- | ---: |
+| complete verified artifact | 4,029.882 ms, 257,892 KiB peak RSS |
+| parse / typecheck | 91.054 / 691.933 ms |
+| semantic construction | 2,284.212 ms |
+| contract verification / IR lowering / IR validation | 0.572 / 45.699 / 10.951 ms |
+| backend total | 724.634 ms |
+| backend pre-document / document / finalization | 574.313 / 106.577 / 30.042 ms |
+| plan validation / serialization | 104.649 / 553.520 ms |
+| cumulative allocation | 11,548,451 calls / 1,559,991,583 bytes |
+
+The unchanged plan hash is
+`db18f345676378b8633829c0bbd7870c0a1dc5a2459649c9bbfdd6b8969374ab`.
+The sample confirms that the 82.7% execution-seal and 75.9% Manifest reductions
+did not move work into verification or IR; the remaining time is distributed
+across owners that each recreate a whole-program view.
+
+The live ownership audit is more specific than the earlier conceptual graph:
+
+1. `ParsedSourceUnit` is already a context-independent unit-local product, but
+   canonical project assembly validates every unit, clones and qualifies its
+   syntax, rebases every local token/line/item/statement/expression identity,
+   and concatenates one global `ParsedProgram`. The NovyWave trace records
+   115,683 rebased nodes and 1,049,157 parser-validation visits. Caching only the
+   assembled program cannot make an edit proportional to the changed unit.
+2. Every typecheck constructs a fresh `CheckedProgramDatabase`, including dense
+   call/declaration/scope indexes, reverse inference dependencies, dirty queues,
+   worklists, and inference caches, and then consumes it into one
+   `CheckedProgram`. `CompilerSession` retains only an optional whole checked
+   result and clears it for any changed unit. The checker already contains much
+   of the required incremental machinery, but its lifetime is cold-only.
+3. Manifest V7 first owns `DenseManifestProjectionIndexV7`, then
+   `build_dependency_projection_graph_digests_v7` registers every owner and
+   projection in a second `DenseProjectionGraphBuilder`, copies every edge,
+   seals SCC/forward/reverse data, extracts owner digests and statistics, and
+   drops the graph. `RequestMemo` has correct revision/backdating semantics but
+   no production caller. This is the first owner to delete because the retained
+   graph is also the currentness backbone required by every later cut.
+4. `SemanticProgram` retains the semantic image plus OUT/resource/reactive/
+   lowering/view/storage/memory/core/Manifest products, while the verified
+   lowering handoff consumes only canonical core and two digests. The semantic
+   digest hashes the complete canonical core again. These domain products must
+   become request results or borrowed/debug views, not parallel retained
+   authorities.
+5. Ordinary callable bodies are recursively rebound and lowered independently
+   by the document backend, migration expression lowerer, and row/scalar
+   lowering path. Backend pre-document work is 574.313 ms. One demanded typed
+   definition-code shard with relocations and compact invocation frames must
+   replace all three body interpreters; sharing only their lookup cache would
+   preserve three semantic authorities.
+6. `refresh_typed_list_view_fingerprints` clones the complete `MachinePlan`
+   before rewrite/compaction/validation, while distributed linking clones every
+   checked role and fully re-elaborates Client/Session/Server on every round and
+   again for confirmation. A consuming runnable builder and a delta role linker
+   delete those final whole-product loops after definition/domain requests are
+   stable.
+
+The architectural unit is therefore a result-owning request cell, not a phase
+cache. A cell has a stable semantic identity, declared dependency span, compact
+result or receipt, public and implementation fingerprints, `changed_at`,
+`verified_at`, and work counters. Unit syntax, interface, definition body,
+definition code, invocation overlay, domain summary, bundle link, and runnable
+seal are different typed cell kinds in one graph. Revision zero and later
+revisions run the same evaluator.
+
+The first tranche is intentionally narrow but must be destructive: make the
+V3/remaining-domain projection registry feed one sealed request graph directly,
+derive Manifest's root/callable proof summary from it, retain that graph with
+the compilation snapshot, and remove
+`build_dependency_projection_graph_digests_v7` plus its second registration and
+edge arenas. A generic database facade while the import loop survives is a
+failed tranche. The next tranche installs structurally shared unit snapshots
+and durable checker interface/definition cells in `CompilerSession`; a final-
+artifact cache is likewise rejected.
+
+Only after those identities and lifetimes are real should source be split into
+smaller crates. The measured seams are model versus builder for semantic
+receipts, model versus consuming builder for runnable images, and persistent
+compiler service versus one-shot adapters. Splitting the present mutually
+dependent 77 kLOC semantic, 38 kLOC typecheck, or 26 kLOC compiler algorithms
+before those cuts would add interfaces without reducing either Boon work or the
+Rust invalidation cone.
 
 ## Architectural Decisions
 

@@ -631,6 +631,19 @@ Current checkpoints to preserve and audit rather than redo:
   the sole demand queue, delete repeated ordinary-body lowerers, and replace
   repeated distributed-role elaboration with delta linking. A whole-program
   cache beside the old passes is rejected;
+- apply the post-`96b1611` seventh current-tree audit when choosing the next
+  tranche. One directional debug sample is still 4,029.882 ms/257,892 KiB, with
+  91.054 ms parse, 691.933 ms typecheck, 2,284.212 ms semantic, 724.634 ms
+  backend, 104.649 ms plan validation, and 553.520 ms serialization. The next
+  cut must consume the V3/remaining-domain projection registry directly into
+  one retained revision-zero request graph, derive the compact Manifest proof
+  summary from it, and delete Manifest's second owner/projection/edge import.
+  Then retain structurally shared parser units and checker interface/definition
+  result cells in `CompilerSession`; do not add a final-artifact cache or query
+  shell around whole reparse/recheck. Follow with the one ordinary definition-
+  code linker, consuming runnable builder, and distributed delta linker. Only
+  split crates at those proven one-way seams and require measured Rust
+  invalidation improvement separately from Boon latency;
 - treat the 16.7 ms diagnostics and 100 ms replacement-preview gates as warm
   incremental contracts. A faster full rebuild cannot satisfy them. Record
   executed/reused/backdated requests and require zero unrelated parse/check/

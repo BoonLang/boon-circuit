@@ -15,8 +15,10 @@ exit.
 
 [`BOON_COMPILER_ARCHITECTURE_REFACTOR_PLAN.md`](BOON_COMPILER_ARCHITECTURE_REFACTOR_PLAN.md)
 is the current high-leverage execution map derived from the live
-post-`c870358` audit. This plan remains authoritative for every budget and exit;
-the refactor plan fixes the order and deletion criteria for reaching them.
+post-`c870358` audit. Its post-`d177af9` architecture decision is detailed in
+[`BOON_COMPILER_DEFINITION_ARTIFACT_RESEARCH.md`](BOON_COMPILER_DEFINITION_ARTIFACT_RESEARCH.md).
+This plan remains authoritative for every budget and exit; the refactor plan
+fixes the order and deletion criteria for reaching them.
 
 ## Purpose And Authority
 
@@ -968,6 +970,21 @@ Current cold-diagnostics candidate evidence:
   checker interface/definition results with exact backdating and zero-unrelated-
   work evidence. Do not micro-optimize the new snapshot or claim warm reuse from
   retaining a cold memo alone.
+- The required post-`d177af9` high-level research selects definition artifacts
+  plus thin linking, not another proof-graph or hash-container micro-tranche.
+  The retained semantic graph is a valid revision-zero proof snapshot but is
+  not yet a compiler evaluator: its nodes are proof projections and its edges
+  include runtime/reactive cycles. Keep one database and identity registry, but
+  separate typed evaluation/currentness edges from proof/link relocations. Add
+  parser-owned stable item/occurrence routes, a body-insensitive unit item
+  index, interface SCC results, and immutable checked definition shards. Emit
+  checked receipts during checker construction and delete the approximately
+  392 ms production `checked_image_handoff` scan. Then carry demanded
+  definitions through one semantic/plan-code artifact, delete all three old
+  ordinary-body lowerers, thin-link domain summaries/relocations, and consume
+  the result into one runnable image. The complete selected design and flag-day
+  sequence are in
+  `BOON_COMPILER_DEFINITION_ARTIFACT_RESEARCH.md`.
 - Do not preserve V3's 208k subject cardinality as a production V4/V5 proof
   requirement. The independent test oracle must map every historical subject
   to exactly one canonical finalized shard row and classifier field/domain and prove
@@ -1584,16 +1601,29 @@ build-input freshness, and current release reports remain required before the
 corresponding exits; those gaps do not justify another documentation-only or
 counter-only loop before changing the measured parser/typechecker owners.
 
-### Current Resumption Point: Dense Demand-First Image And Sealed Runnable
+### Current Resumption Point: Definition Artifacts, Thin Link, Sealed Runnable
 
-Continue from local checkpoint `9540262`, which preserves `174eb4b`'s checked/
-execution ownership boundary, `c870358`'s compilation database,
-compact-proof/sealed-plan checkpoint `38e6541`, and
-activation/effect checkpoint `32bcf40`, and follow the detailed sequence in
-[`BOON_COMPILER_ARCHITECTURE_REFACTOR_PLAN.md`](BOON_COMPILER_ARCHITECTURE_REFACTOR_PLAN.md).
+Continue from local checkpoint `d177af9`, which preserves `d113544`'s whole-
+program ownership audit, `96b1611`'s compact execution receipts, `c870358`'s
+compilation database, compact-proof/sealed-plan checkpoint `38e6541`, and
+activation/effect checkpoint `32bcf40`. Follow the detailed sequence in
+[`BOON_COMPILER_ARCHITECTURE_REFACTOR_PLAN.md`](BOON_COMPILER_ARCHITECTURE_REFACTOR_PLAN.md)
+and the selected post-checkpoint design in
+[`BOON_COMPILER_DEFINITION_ARTIFACT_RESEARCH.md`](BOON_COMPILER_DEFINITION_ARTIFACT_RESEARCH.md).
 Do not return to the historical contextual-scheme micro-tranche while verified
 semantic/proof multiplication, duplicate representation lifetimes, whole-
 project invalidation, and rebuild fan-out dominate.
+
+The post-`d177af9` research supersedes any wording below that treats one sealed
+semantic proof graph as the complete request evaluator. Use one database and
+stable identity registry with separate typed evaluation/currentness edges and
+proof/link relocations. Start with parser-owned stable item/occurrence routes,
+retained unit item indexes, real request revision/backdating, interface SCCs,
+and immutable checked definition shards. Delete the production checked-image
+rescan while introducing those results; then migrate demanded definition
+artifacts, thin link, runnable publication, and distributed deltas. Do not tune
+the retained snapshot or split the current phase crates before those ownership
+seams exist.
 
 The post-`ac2b234` high-level audit makes the next tranche more precise than
 "speed up finalization." The live pipeline gives the resource builder mutable
@@ -1646,13 +1676,16 @@ Rust rebuild closure; keep that evidence separate from Boon latency.
    persistence identity, and dense IDs. Normalize typed row payloads to stable
    references while the demand builder replaces the post-hoc scanner; do not
    tune the checkpoint containers or add a production compatibility adapter.
-4. Retain immutable parser-owned unit snapshots with atomic upsert/remove/
-   rename and exact cached project assembly. After complete checking, collect
-   verified intents and demand canonical definition variants before OUT or
-   contextual occurrence expansion. Carry arguments, substitutions, PASSED,
-   OUT, owner/resource/effect/render bindings in compact invocation frames.
-   Delete eager body cloning and the late backend demand owner as parity gates
-   pass.
+4. Retain immutable parser-owned unit snapshots and body-insensitive item
+   indexes with atomic upsert/remove/rename. Give definitions and occurrences
+   parser-owned structural routes, keep evaluation edges separate from proof
+   relocations, and extract interface SCC plus immutable checked-definition
+   results. Emit checked receipts while checking and delete the production
+   checked-image rescan. After complete diagnostics, collect verified intents
+   and demand canonical definition variants before OUT or contextual occurrence
+   expansion. Carry arguments, substitutions, PASSED, OUT, owner/resource/
+   effect/render bindings in compact invocation frames. Delete eager body
+   cloning and every matching late backend body owner as parity gates pass.
 5. Migrate OUT/resource/reactive/lowering/storage/view/memory into the same
    image in dependency order. Manifest V7's construction-owned lowering rows
    are only the first transition edge: replace the lowering checked-type-table

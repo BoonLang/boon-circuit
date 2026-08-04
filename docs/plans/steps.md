@@ -479,6 +479,23 @@ stronger three-reviewer performance closure defined below.
    retain immutable parser units and checker interface/definition results with
    exact backdating and zero unrelated work before demand/link/runnable cuts.
 
+   The required post-`d177af9` high-level audit is now complete and is recorded
+   in `BOON_COMPILER_DEFINITION_ARTIFACT_RESEARCH.md`. It selects a persistent
+   definition-artifact compiler plus thin linking, not more tuning inside the
+   retained proof snapshot. Keep one database and stable identity registry, but
+   separate compiler evaluation/currentness edges from cyclic proof/link
+   relocations. First add parser-owned stable item/occurrence routes, body-
+   insensitive unit item indexes, revision/backdating request slots, interface
+   SCCs, and immutable checked-definition results. Emit checked receipts during
+   construction and delete the approximately 392 ms production checked-image
+   rescan. Then migrate demanded definitions end to end through one semantic/
+   plan-code artifact, deleting their old OUT/contextual and document, row/
+   scalar, and migration body owners. Continue through construction-owned
+   domain artifacts, thin summary/relocation link, consuming runnable
+   publication, distributed deltas, and only then measured crate splits and at
+   most two independent workers. A cold memo or faster whole rebuild is not
+   warm evidence; require zero unrelated work for a body/constant edit.
+
    The post-`ac2b234` high-level audit supersedes a mutating post-resource
    execution seal. Move inline list-authority synthesis into execution
    construction, seal immutable execution once, and make the resource typed

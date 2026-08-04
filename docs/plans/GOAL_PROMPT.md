@@ -18,6 +18,7 @@ Read AGENTS.md and these contracts completely before editing:
 - docs/plans/steps.md
 - docs/plans/BOON_COMPILER_PERFORMANCE_PLAN.md
 - docs/plans/BOON_COMPILER_ARCHITECTURE_REFACTOR_PLAN.md
+- docs/plans/BOON_COMPILER_DEFINITION_ARTIFACT_RESEARCH.md
 - docs/plans/BOON_CIRCUIT_SIMPLIFICATION_AND_NATIVE_RECOVERY_PLAN.md
 - docs/plans/BOON_LANGUAGE_FOUNDATIONS_PLAN.md
 - docs/plans/BOON_OUT_PARAMETERS_AND_ORDER_INDEPENDENT_BINDINGS_PLAN.md
@@ -72,16 +73,17 @@ Authority and conflict rules:
   evidence soundness, runtime persistence identity, native presentation
   semantics, or the mandatory verified artifact spine.
 - `BOON_COMPILER_ARCHITECTURE_REFACTOR_PLAN.md` is subordinate to those budgets
-  and owns the current post-`9540262` multiplier decision: immutable source
-  snapshots; separate canonical-snapshot, session-lineage, semantic/persistence,
-  and dense identity planes; stable interface, definition, top-level-authority,
-  and link shards; verified demand before occurrence expansion; one dense
-  construction-owned semantic image and direct proof seal; compact bundle link
-  summaries; a shared plan-code linker across document, row, and migration
-  domains; one consuming `SealedRunnableMachine` builder; persistent
-  currentness; and only measured dependency inversions. Its intermediate
-  directional exits never replace the performance plan's complete scored Clear
-  End Condition.
+  and owns the current post-`d177af9` multiplier decision, detailed by
+  `BOON_COMPILER_DEFINITION_ARTIFACT_RESEARCH.md`: immutable source and body-
+  insensitive item snapshots; parser-owned stable definition/occurrence routes;
+  separate canonical-snapshot, session-lineage, semantic/persistence, and dense
+  identity planes; one database with typed evaluation/currentness edges distinct
+  from proof/link relocations; interface SCC and checked-definition shards;
+  demanded definition executable artifacts; construction-owned domain
+  artifacts; thin summary/relocation linking; one consuming
+  `SealedRunnableMachine` builder; persistent currentness; and only measured
+  dependency inversions. Its intermediate directional exits never replace the
+  performance plan's complete scored Clear End Condition.
 - Compiler scaling evidence uses actual parser inspections and
   typechecker/semantic/proof/backend work, never final AST/call/graph sizes as
   substitutes. Build one current two-job release producer explicitly and invoke
@@ -657,6 +659,22 @@ Current checkpoints to preserve and audit rather than redo:
   whole pipeline for larger refactors, then retain parser-unit and checker
   interface/definition results with exact dependencies, backdating, and zero-
   unrelated-work evidence before proceeding to demand/link/runnable cuts;
+- follow the completed post-`d177af9` definition-artifact/thin-link research,
+  not another local container optimization. The retained graph remains the
+  revision-zero semantic proof snapshot, but compiler evaluation/currentness
+  dependencies are a separate typed edge plane from cyclic proof/link
+  relocations in the same database and identity registry. First add parser-
+  owned structural item/occurrence routes, a body-insensitive unit item index,
+  typed request revision/backdating, interface SCCs, and immutable checked-
+  definition results. Emit checked receipts during construction and delete the
+  approximately 392 ms production checked-image rescan. Then carry each
+  demanded definition through one semantic/plan-code artifact, delete its old
+  OUT/contextual and three backend recursive-body owners, thin-link domain
+  summaries/relocations, and consume the linked image into one runnable
+  machine. Normal preview does not serialize pretty JSON. Distributed roles
+  publish deltas instead of full confirmation elaborations. The exact flag-day
+  sequence and rejection rules are in
+  `BOON_COMPILER_DEFINITION_ARTIFACT_RESEARCH.md`;
 - treat the 16.7 ms diagnostics and 100 ms replacement-preview gates as warm
   incremental contracts. A faster full rebuild cannot satisfy them. Record
   executed/reused/backdated requests and require zero unrelated parse/check/
@@ -825,16 +843,18 @@ Blocking compiler-performance prerequisite:
 
 - Complete `BOON_COMPILER_PERFORMANCE_PLAN.md` before resuming the remaining
   simplification/native-recovery closure or any later production phase.
-- Begin from checkpoint `9540262`, which preserves `174eb4b`'s checked/
-  execution ownership boundary, `c870358`'s compilation database, `38e6541`'s
-  compact-proof/sealed-plan work, and `32bcf40`'s activation/effect boundary.
-  Follow the refactor plan's post-checkpoint multiplier sequence: immutable
-  source snapshots; separate canonical snapshot, session lineage, semantic/
-  persistence, and dense identities; stable interface, definition, top-level-
-  authority, and link identities;
-  finalization-time receipts in one cold/warm projection graph; one sealed
-  semantic image; one all-domain plan-code linker; and one consuming
-  `SealedRunnableMachine` builder with dense executor indexes built once.
+- Begin from checkpoint `d177af9`, which preserves `d113544`'s whole-program
+  ownership audit, `96b1611`'s compact execution receipts, `c870358`'s
+  compilation database, `38e6541`'s compact-proof/sealed-plan work, and
+  `32bcf40`'s activation/effect boundary. Follow the post-checkpoint definition-
+  artifact sequence: immutable unit syntax and body-insensitive item indexes;
+  parser-owned stable definition/occurrence routes; separate canonical
+  snapshot, session lineage, semantic/persistence, and dense identities; typed
+  evaluation/currentness edges distinct from proof/link relocations; interface
+  SCC and checked-definition shards; demanded definition executable artifacts
+  with compact invocation frames; construction-owned domain artifacts and thin
+  linking; and one consuming `SealedRunnableMachine` builder with dense
+  executor indexes built once.
   Explicit diagnostics, verified-preview, serialized-artifact, debug-IR/debug-
   plan, and distributed-link intents own their products. The ordinary trusted
   preview must not retain complete IR or rebuild plan verification/runtime

@@ -2,9 +2,10 @@
 
 Date: 2026-08-03
 
-Status: active high-leverage execution map, reconciled through the first
-seventh-audit retained-request-graph tranche after whole-program audit checkpoint
-`d113544`, while preserving compact execution-receipt checkpoint `96b1611`,
+Status: active high-leverage execution map, reconciled through the post-`d177af9`
+definition-artifact/thin-link research after the first seventh-audit retained-
+request-graph tranche, while preserving whole-program audit checkpoint
+`d113544`, compact execution-receipt checkpoint `96b1611`,
 shared-request-graph checkpoint `c870358`, compact-proof/sealed-plan checkpoint
 `38e6541`, and activation/effect checkpoint `32bcf40`, subordinate to
 [`BOON_COMPILER_PERFORMANCE_PLAN.md`](BOON_COMPILER_PERFORMANCE_PLAN.md). The
@@ -12,8 +13,9 @@ performance plan owns all latency, memory, correctness, and final acceptance
 gates. This file owns the architectural sequence first chosen after checkpoint
 `968c56a` and strengthened by the post-`32bcf40`, post-`38e6541`, and
 post-`c870358` source/
-primary-reference research below; it does not create a second set of weaker
-exits.
+primary-reference research below and in
+[`BOON_COMPILER_DEFINITION_ARTIFACT_RESEARCH.md`](BOON_COMPILER_DEFINITION_ARTIFACT_RESEARCH.md);
+it does not create a second set of weaker exits.
 
 ## Why This Refactor Exists
 
@@ -69,14 +71,16 @@ proof, backend lowering, and later incremental currentness.
 ## Target Shape
 
 ```text
-one CompilationDb, used in one-shot cold and persistent warm modes
-  SourceUnitSnapshot -> InterfaceShard + DefinitionShard
-    -> demand-collected InvocationShards
-    -> ephemeral LinkFixedPoint over relocations and compact summaries
-    -> one SealedSemanticImage with exact proof/currentness receipts
-    -> shared plan-code linker across document, row, and migration domains
-    -> one consuming RunnableMachineImage builder
-    -> SealedRunnableMachine(plan tables + dense runtime indexes + receipt)
+one CompilationDb and stable identity registry
+  evaluation/currentness edges (compiler work; acyclic except explicit SCCs)
+  proof/link relocations       (runtime semantics; cycles are allowed)
+
+ProjectSnapshot -> UnitSyntaxSnapshot -> body-insensitive UnitItemIndex
+  -> InterfaceSccResult -> CheckedDefinitionShard
+  -> demanded DefinitionExecutableArtifact + compact InvocationFrames
+  -> DomainArtifacts -> ThinLink(summaries + relocations + explicit SCCs)
+  -> ContractVerifiedLinkedImage -> consuming RunnableMachineImage builder
+  -> SealedRunnableMachine(plan tables + dense runtime indexes + receipt)
 ```
 
 The executable path has one authority at each arrow. Exhaustive dependency
@@ -1777,6 +1781,66 @@ ordinary-body expansion/link owners. The larger architecture must be
 re-researched at this boundary before selecting implementation details; a
 whole-program cache, query facade, or premature crate split remains rejected.
 
+### Eighth High-Level Audit: Definition Artifacts And Thin Linking
+
+The required post-`d177af9` architecture research is complete. Its detailed
+decision record is
+[`BOON_COMPILER_DEFINITION_ARTIFACT_RESEARCH.md`](BOON_COMPILER_DEFINITION_ARTIFACT_RESEARCH.md).
+The retained graph checkpoint deleted a real owner, but the new audit corrects
+one important abstraction: the graph is presently a sealed semantic proof
+snapshot, not yet the compiler's complete request evaluator. Its nodes are
+mostly proof projections and its edges include runtime/reactive cycles. Using
+those cycles directly for compiler currentness would turn the measured
+296-node semantic SCC into an unnecessarily coarse invalidation unit.
+
+Keep one `CompilationDb` and one identity registry, but publish two typed edge
+planes from every artifact: evaluation/currentness dependencies and proof/link
+relocations. The former schedules and backdates compiler work; the latter
+preserves executable semantics and may contain cycles. This separation does not
+create duplicate semantic authorities because one construction owns both
+spans.
+
+The live trace ranks the larger owner deletions above new micro-optimization:
+
+1. `checked_image_handoff` rescans and canonical-serializes the already-built
+   checked program during `assemble_report`; this post-hoc handoff accounts for
+   about 392 ms in the current directional typechecker trace. Checker requests
+   must emit immutable definition receipts directly and delete that scan.
+2. The normal semantic product retains a sealed image plus the rich OUT,
+   resource, reactive, lowering, view, storage, memory, core, Manifest, and
+   graph products. A definition artifact spanning checking, semantic rows,
+   proof relocations, and plan code replaces those parallel phase authorities.
+3. Document, row/scalar, and migration backends recursively lower ordinary
+   bodies independently. One `DefinitionExecutableArtifact` plus compact
+   resolved invocation frames must delete all three traversals for each
+   migrated definition.
+4. A ThinLTO-like link over compact summaries and relocations replaces
+   monolithic semantic merge, duplicate canonical-core hashing, and complete
+   distributed role re-elaboration. Only demanded definition/domain artifacts
+   are materialized.
+5. One consuming runnable builder owns final dense IDs, validation, executor
+   indexes, and the canonical sectioned artifact. Normal in-memory preview does
+   not clone a completed `MachinePlan`, rebuild executor metadata, or serialize
+   pretty JSON.
+
+The selected first implementation tranche is now stable syntax/item identity
+plus a real typed request database, followed immediately by interface SCC and
+per-definition checker results. `StableDefinitionKey` is source-unit identity
+plus a parser-owned item route; `StableOccurrenceKey` adds a parser-owned
+structural body route. Raw source substrings, lines, offsets, global dense IDs,
+and revision-local arena IDs are forbidden as cross-revision keys. Public
+interface and implementation fingerprints are separate so a body edit can
+backdate its unchanged interface and leave unrelated definitions green.
+
+After that foundation, migrate one ordinary definition end to end through a
+definition executable artifact and delete its old checker handoff, OUT/
+contextual expansion, and all matching backend body lowerers in the same
+vertical slice. Continue across semantic domains, thin link, consuming runnable
+publication, distributed deltas, and only then measured crate extraction and
+two-worker scheduling. The first warm proof is exact zero unrelated parse,
+interface, definition, semantic, proof, plan-code, and runnable work for a
+constant/body edit; retaining revision-zero cold memos alone does not count.
+
 ## Architectural Decisions
 
 ### 1. Activation Is A First-Class Output, Not An Empty Mount
@@ -2075,46 +2139,49 @@ compiler latency.
    clean-full oracles while changing ownership; do not resume game or later
    product work. The complete real-host migration/restart/provenance matrix is
    still a phase-acceptance gate, not a reason to delay the compiler cut.
-2. Unify fail-closed revisions and specify stable source/interface/definition/
-   invocation/top-level/link keys, small projection kinds, local/linked/image
-   fingerprint domains, relocation identities, and `Pending -> Finalized` row
-   contracts. Retain immutable parsed-source-unit snapshots; support atomic
-   upsert/remove/rename and exact cached project assembly.
-3. Narrow the database graph to dense registered projection IDs. Make
-   typechecking emit interface and definition shards, then migrate complete
-   checked plus execution rows and finalization-time receipts. Independently
-   reconstruct source/V3/V4 facts in tests and delete the corresponding
-   production post-hoc inventories in the same coherent batch.
-4. Introduce invocation shards and expand the same image builder through OUT,
-   resource, reactive, lowering, storage, view, and memory in dependency order.
-   Delete each superseded rich graph owner as its borrowed view/test
-   materializer passes; do not stack the row image underneath every old DTO.
-5. Run producer/external-event/distributed link fixed points over compact
-   summaries and relocations. Seal one role/bundle `SealedSemanticImage`, give
-   verification a narrow proof view, and delete post-seal `SemanticProgram`
-   retention plus duplicate canonical mapping/hash.
-6. Add one shared plan-code linker across document, row/scalar, and migration
-   domains. Demand-collect `(definition, specialization key)` pairs, emit dense
-   invocation frames, and delete all corresponding cache scopes, parameter-
-   binding stacks, and recursive function-root lowering together.
-7. Replace full-plan clone/rewrite/compaction and per-consumer executor metadata
-   construction with one consuming runnable-image builder. Normal compilation
-   returns `SealedRunnableMachine`; explicit debug/serialization intents own
-   their extra products, and untrusted deserialization verifies/builds indexes
-   exactly once.
-8. Reprofile the complete cold path after each coherent owner deletion. Return
-   to a local optimization only when the new trace proves it is the largest
-   remaining owner; the scored p95/RSS gates remain the only performance exit.
-9. Retain these same snapshots, shards, link results, proof regions, plan-code
-   variants, and runnable indexes across revisions. Close interface backdating,
-   exact invalidation cones, add/delete/rename, error recovery, cancellation,
-   stale/latest races, clean-full parity, and every warm time/RSS gate. Enable
-   at most two deterministic workers only for graph-proven independent work.
-10. Pull measured dependency inversions and crate splits at the earliest stable
-    seams that shorten the next tranche. Priorities are outer compiler adapters
-    out of runtime cores, migration tooling out of host core, stable semantic
-    image/model versus builder/proof, and runnable image/model versus executor.
-    Never let a re-export facade or file-only split replace steps 2--9.
+2. Retain immutable parser-unit snapshots and a body-insensitive item index.
+   Specify parser-owned source/interface/definition/occurrence/top-level/link
+   keys; separate public, implementation, proof, and source-map fingerprints;
+   support atomic unit upsert/remove/rename. Raw text, offsets, lines, global
+   dense IDs, and revision-local arena IDs are not cross-revision keys.
+3. Turn `CompilationDb` into a typed request-currentness service. Keep compiler
+   evaluation/reverse-cone edges distinct from proof/link relocations, while
+   publishing both from one artifact. Add revisions, backdating, generation-
+   checked publication, work counters, and bounded cancellation. Do not wrap
+   the old whole phases in a query facade.
+4. Extract interface SCCs and immutable checked-definition shards from the
+   fresh monolithic checker. Emit checked receipts while constructing those
+   shards and delete production `checked_image_handoff`; prove a body edit with
+   a backdated interface performs zero unrelated checks.
+5. Migrate one ordinary definition end to end into a demanded
+   `DefinitionExecutableArtifact`: checked body, diagnostics/source map,
+   semantic rows, proof relocations, and normalized plan code. Encode calls as
+   compact invocation frames and delete the matching OUT/contextual plus
+   document, row/scalar, and migration recursive body owners together.
+6. Expand definition and construction-owned domain artifacts through OUT,
+   resource, reactive, lowering, storage, view, memory, migration, and
+   distributed authority. Delete each superseded rich graph/Manifest inventory
+   as its independent source materializer passes; never stack the replacement
+   underneath every old DTO.
+7. Run producer/external-event/distributed closure over compact summaries and
+   typed relocations. Thin-link only demanded modules, seal one contract-
+   verified linked image, and delete post-seal `SemanticProgram` retention,
+   duplicate canonical mapping/hash, and full-role confirmation elaboration.
+8. Consume the linked image into one runnable builder. Normal compilation
+   returns `SealedRunnableMachine` with final dense tables and executor indexes
+   built once; explicit debug/serialization requests own pretty JSON or rich
+   views, and untrusted deserialization verifies/builds indexes exactly once.
+9. Reprofile the complete cold and warm paths after each coherent owner
+   deletion. Return to a local optimization only when the new trace proves it
+   is the largest remaining owner; the scored p95/RSS gates remain the only
+   performance exit. Close exact cones, add/delete/rename, error recovery,
+   cancellation, stale/latest races, clean-full parity, and every warm gate.
+10. Pull measured dependency inversions and crate splits only at the stable
+    syntax/item, checked model/builder, definition/domain artifact, thin-link,
+    runnable model/builder/executor, compiler-service/adapter, and migration-
+    tooling seams. Enable at most two deterministic workers only for graph-
+    proven independent requests. Never let a re-export facade or file-only
+    split replace steps 2--9.
 11. Run the full cold and warm acceptance protocol, complete migration/restart/
     provenance negatives, and the three fresh-context adversarial reviews
     required by the performance plan.

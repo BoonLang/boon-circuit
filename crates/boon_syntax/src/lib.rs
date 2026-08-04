@@ -806,6 +806,7 @@ pub struct UnitOwnerIndexEntry {
 pub struct UnitOwnerIndex {
     entries: Box<[UnitOwnerIndexEntry]>,
     statement_locators: Box<[UnitStatementLocator]>,
+    statement_routes: Box<[StableStatementRoute]>,
     statement_owners: Box<[UnitCheckOwnerSlot]>,
     expression_owners: Box<[UnitCheckOwnerSlot]>,
 }
@@ -815,12 +816,14 @@ impl UnitOwnerIndex {
     pub fn __parser_new(
         entries: Vec<UnitOwnerIndexEntry>,
         statement_locators: Vec<UnitStatementLocator>,
+        statement_routes: Vec<StableStatementRoute>,
         statement_owners: Vec<UnitCheckOwnerSlot>,
         expression_owners: Vec<UnitCheckOwnerSlot>,
     ) -> Self {
         Self {
             entries: entries.into_boxed_slice(),
             statement_locators: statement_locators.into_boxed_slice(),
+            statement_routes: statement_routes.into_boxed_slice(),
             statement_owners: statement_owners.into_boxed_slice(),
             expression_owners: expression_owners.into_boxed_slice(),
         }
@@ -856,6 +859,13 @@ impl UnitOwnerIndex {
         statement: UnitLocalStatementId,
     ) -> Option<UnitStatementLocator> {
         self.statement_locators.get(statement.as_usize()).copied()
+    }
+
+    pub fn statement_route(
+        &self,
+        statement: UnitLocalStatementId,
+    ) -> Option<&StableStatementRoute> {
+        self.statement_routes.get(statement.as_usize())
     }
 
     pub fn statement_owner(&self, statement: UnitLocalStatementId) -> Option<UnitCheckOwnerSlot> {
@@ -905,6 +915,22 @@ pub struct StableStatementRouteSegment {
     pub kind: StableStatementKind,
     pub names: Vec<String>,
     pub matching_sibling_reverse_ordinal: usize,
+}
+
+/// Parser-owned structural location of one statement inside its nearest
+/// stable authored item. Item-root statements use an empty `statement_route`;
+/// the item owner itself supplies their identity.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct StableStatementRoute {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<StableItemRoute>,
+    pub statement_route: Vec<StableStatementRouteSegment>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct StableStatementKey {
+    pub source_unit_id: SourceUnitId,
+    pub route: StableStatementRoute,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]

@@ -1,9 +1,11 @@
 use boon_checked::*;
 mod owner_body;
+mod owner_checked;
 mod owner_constraints;
 mod owner_interface;
 mod owner_syntax;
 pub use owner_body::*;
+pub use owner_checked::*;
 pub use owner_constraints::*;
 pub use owner_interface::*;
 pub use owner_syntax::*;

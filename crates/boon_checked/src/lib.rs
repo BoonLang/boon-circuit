@@ -5,6 +5,9 @@
 //! typechecker may cross the unsafe sealing boundary to create a
 //! proof-bearing [`CheckedProgram`].
 
+mod owner_shard;
+pub use owner_shard::*;
+
 use boon_contract::SourceBundleDigestV1;
 use boon_data::{Bits, ExactNumber};
 pub use boon_document_model::ProgramRole;

@@ -12,11 +12,12 @@ use boon_syntax::{
     ParsedProgramFields, ParsedSourceFile, ParsedSourceUnitFields, ParserItem, ParserLine,
     ProgramKind, SourceUnitId, StableCheckOwnerKey, StableDefinitionKey, StableExpressionChildRole,
     StableExpressionKey, StableExpressionRouteSegment, StableItemRoute, StableItemRouteSegment,
-    StableOccurrenceKey, StableOccurrenceRoute, StableOwnerKey, StableStatementKind,
-    StableStatementRouteSegment, SyntaxUnitNamespace, UnitCheckOwnerSlot, UnitChildOwnerBoundary,
-    UnitItemIndex, UnitItemIndexEntry, UnitItemKind, UnitItemParameter, UnitLocalExpressionId,
-    UnitLocalStatementId, UnitOwnerIndex, UnitOwnerIndexEntry, UnitOwnerRoute,
-    UnitStatementLocator, is_program_role_root, is_reserved_standard_root,
+    StableOccurrenceKey, StableOccurrenceRoute, StableOwnerKey, StableStatementKey,
+    StableStatementKind, StableStatementRoute, StableStatementRouteSegment, SyntaxUnitNamespace,
+    UnitCheckOwnerSlot, UnitChildOwnerBoundary, UnitItemIndex, UnitItemIndexEntry, UnitItemKind,
+    UnitItemParameter, UnitLocalExpressionId, UnitLocalStatementId, UnitOwnerIndex,
+    UnitOwnerIndexEntry, UnitOwnerRoute, UnitStatementLocator, is_program_role_root,
+    is_reserved_standard_root,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -249,6 +250,14 @@ impl ParsedSourceUnit {
         )
     }
 
+    pub fn stable_statement_key_local(&self, statement_id: usize) -> Option<StableStatementKey> {
+        let statement = UnitLocalStatementId::__parser_new(statement_id)?;
+        Some(StableStatementKey {
+            source_unit_id: self.source_unit_id.clone(),
+            route: self.owner_index.statement_route(statement)?.clone(),
+        })
+    }
+
     pub fn stable_expression_key_local(&self, expression_id: usize) -> Option<StableExpressionKey> {
         Some(StableExpressionKey {
             source_unit_id: self.source_unit_id.clone(),
@@ -390,6 +399,16 @@ impl<'a> UnitOwnerSyntaxView<'a> {
         statement: UnitLocalStatementId,
     ) -> Option<UnitStatementLocator> {
         self.fields.owner_index.statement_locator(statement)
+    }
+
+    pub fn stable_statement_key_local(
+        &self,
+        statement: UnitLocalStatementId,
+    ) -> Option<StableStatementKey> {
+        Some(StableStatementKey {
+            source_unit_id: self.fields.source_unit_id.clone(),
+            route: self.fields.owner_index.statement_route(statement)?.clone(),
+        })
     }
 
     pub fn stable_expression_key_local(
@@ -909,6 +928,18 @@ impl UnitSyntaxSnapshot {
         )
     }
 
+    pub fn stable_statement_key(&self, statement_id: usize) -> Option<StableStatementKey> {
+        let (namespace, local) = __parser_unpack_syntax_node_id(statement_id)?;
+        if namespace != self.namespace {
+            return None;
+        }
+        let statement = UnitLocalStatementId::__parser_new(local)?;
+        Some(StableStatementKey {
+            source_unit_id: self.source_unit_id.clone(),
+            route: self.owner_index.statement_route(statement)?.clone(),
+        })
+    }
+
     pub fn stable_expression_key_local(&self, expression_id: usize) -> Option<StableExpressionKey> {
         Some(StableExpressionKey {
             source_unit_id: self.source_unit_id.clone(),
@@ -1364,6 +1395,15 @@ impl ProjectSyntaxSnapshot {
             .units
             .get(*self.fields.unit_by_namespace.get(&namespace)?)?;
         unit.stable_check_owner_for_expression(expression_id)
+    }
+
+    pub fn stable_statement_key(&self, statement_id: usize) -> Option<StableStatementKey> {
+        let (namespace, _) = __parser_unpack_syntax_node_id(statement_id)?;
+        let unit = self
+            .fields
+            .units
+            .get(*self.fields.unit_by_namespace.get(&namespace)?)?;
+        unit.stable_statement_key(statement_id)
     }
 
     pub fn stable_expression_key(&self, expression_id: usize) -> Option<StableExpressionKey> {
@@ -8813,6 +8853,7 @@ fn build_unit_expression_identities(
     let mut owner_statements = vec![Vec::new(); owner_routes.len()];
     let mut owner_child_owners = vec![Vec::new(); owner_routes.len()];
     let mut statement_locators = Vec::<Option<UnitStatementLocator>>::new();
+    let mut statement_routes = Vec::<Option<StableStatementRoute>>::new();
     let mut statement_owners = Vec::<UnitCheckOwnerSlot>::new();
     let mut parents = vec![None::<StableExpressionParent>; expression_count];
     let mut roots = vec![None::<StableOccurrenceRoute>; expression_count];
@@ -8897,6 +8938,7 @@ fn build_unit_expression_identities(
         owner_statements: &'a mut [Vec<UnitLocalStatementId>],
         owner_child_owners: &'a mut [Vec<UnitChildOwnerBoundary>],
         statement_locators: &'a mut Vec<Option<UnitStatementLocator>>,
+        statement_routes: &'a mut Vec<Option<StableStatementRoute>>,
         statement_owners: &'a mut Vec<UnitCheckOwnerSlot>,
         parents: &'a mut [Option<StableExpressionParent>],
         roots: &'a mut [Option<StableOccurrenceRoute>],
@@ -8933,6 +8975,7 @@ fn build_unit_expression_identities(
                     })?;
                 if self.statement_locators.len() <= statement.id {
                     self.statement_locators.resize(statement.id + 1, None);
+                    self.statement_routes.resize(statement.id + 1, None);
                     self.statement_owners
                         .resize(statement.id + 1, UnitCheckOwnerSlot::__parser_unrouted());
                 }
@@ -8992,6 +9035,19 @@ fn build_unit_expression_identities(
                         });
                         (owner.clone(), owner_slot, route)
                     };
+                let stable_statement_route = StableStatementRoute {
+                    owner: statement_owner.clone(),
+                    statement_route: statement_route.clone(),
+                };
+                if self.statement_routes[statement.id]
+                    .replace(stable_statement_route)
+                    .is_some()
+                {
+                    return Err(parsed_source_unit_invariant_error(
+                        self.path,
+                        format!("statement {} has more than one stable route", statement.id),
+                    ));
+                }
                 let owner_entry = statement_owner_slot.owner_entry_index().ok_or_else(|| {
                     parsed_source_unit_invariant_error(
                         self.path,
@@ -9036,6 +9092,7 @@ fn build_unit_expression_identities(
         owner_statements: &mut owner_statements,
         owner_child_owners: &mut owner_child_owners,
         statement_locators: &mut statement_locators,
+        statement_routes: &mut statement_routes,
         statement_owners: &mut statement_owners,
         parents: &mut parents,
         roots: &mut roots,
@@ -9058,6 +9115,18 @@ fn build_unit_expression_identities(
                 parsed_source_unit_invariant_error(
                     path,
                     format!("statement {statement} has no direct AST locator"),
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let statement_routes = statement_routes
+        .into_iter()
+        .enumerate()
+        .map(|(statement, route)| {
+            route.ok_or_else(|| {
+                parsed_source_unit_invariant_error(
+                    path,
+                    format!("statement {statement} has no stable route"),
                 )
             })
         })
@@ -9101,6 +9170,7 @@ fn build_unit_expression_identities(
     let owner_index = UnitOwnerIndex::__parser_new(
         owner_entries,
         statement_locators,
+        statement_routes,
         statement_owners,
         expression_owners,
     );
@@ -9977,6 +10047,14 @@ document:
                 view.stable_expression_keys().collect::<BTreeSet<_>>().len(),
                 view.expression_ids().len()
             );
+            assert_eq!(
+                view.statement_ids()
+                    .iter()
+                    .filter_map(|statement| view.stable_statement_key_local(*statement))
+                    .collect::<BTreeSet<_>>()
+                    .len(),
+                view.statement_ids().len()
+            );
         }
 
         fn collect_statement_ids(statements: &[AstStatement], ids: &mut BTreeSet<usize>) {
@@ -10060,6 +10138,37 @@ document:
                 .last()
                 .is_some_and(|segment| segment.names == ["local"])
         }));
+    }
+
+    #[test]
+    fn stable_statement_keys_ignore_payloads_spans_and_unrelated_siblings() {
+        fn helper_keys(source: &str) -> Vec<StableStatementKey> {
+            let parsed = parse_project_source_unit("app/RUN.bn", source).unwrap();
+            let helper = parsed
+                .owner_index()
+                .entries()
+                .iter()
+                .find(|entry| {
+                    matches!(
+                        &entry.route,
+                        UnitOwnerRoute::Item(route)
+                            if route.segments().last().is_some_and(|segment| segment.names == ["helper"])
+                    )
+                })
+                .unwrap();
+            let view = parsed.owner_view(&helper.route).unwrap();
+            view.statement_ids()
+                .iter()
+                .map(|statement| view.stable_statement_key_local(*statement).unwrap())
+                .collect()
+        }
+
+        let baseline = helper_keys("FUNCTION helper(input) {\n    local: input\n    local\n}\n");
+        let edited = helper_keys(
+            "earlier: 999\nFUNCTION helper(input) {\n    local : input + 0\n    local\n}\n",
+        );
+        assert_eq!(edited, baseline);
+        assert_eq!(baseline.len(), 3);
     }
 
     #[test]
@@ -10231,7 +10340,10 @@ document:
                 let view = parsed.owner_view(&entry.route).unwrap();
                 (
                     view.stable_key(),
-                    view.statement_ids().len(),
+                    view.statement_ids()
+                        .iter()
+                        .map(|statement| view.stable_statement_key_local(*statement).unwrap())
+                        .collect::<Vec<_>>(),
                     view.stable_expression_keys().collect::<Vec<_>>(),
                     view.child_owners().to_vec(),
                 )
@@ -10265,7 +10377,10 @@ document:
                 let view = linked.owner_view(&entry.route).unwrap();
                 (
                     view.stable_key(),
-                    view.statement_ids().len(),
+                    view.statement_ids()
+                        .iter()
+                        .map(|statement| view.stable_statement_key_local(*statement).unwrap())
+                        .collect::<Vec<_>>(),
                     view.stable_expression_keys().collect::<Vec<_>>(),
                     view.child_owners().to_vec(),
                 )
@@ -10275,10 +10390,14 @@ document:
         for entry in linked.owner_index().entries() {
             let view = linked.owner_view(&entry.route).unwrap();
             let owner = view.stable_key();
-            for statement in view.statements() {
+            for (local, statement) in view.statement_ids().iter().copied().zip(view.statements()) {
                 assert_eq!(
                     linked.stable_check_owner_for_statement(statement.id),
                     Some(owner.clone())
+                );
+                assert_eq!(
+                    linked.stable_statement_key(statement.id),
+                    view.stable_statement_key_local(local)
                 );
             }
             for expression in view.expressions() {

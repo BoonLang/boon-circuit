@@ -2,7 +2,7 @@ use boon_parser::UnitOwnerSyntaxView;
 use boon_syntax::{
     AstBlockBinding, AstCallArg, AstExprKind, AstParameter, AstPassContext, AstRecordField,
     AstStatementKind, AstTextSegment, StableCheckOwnerKey, StableExpressionKey, StableOwnerKey,
-    UnitLocalStatementId,
+    StableStatementKey, UnitLocalStatementId,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -39,6 +39,7 @@ impl Error for OwnerSyntaxProjectionError {}
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct OwnerStatementInput {
     pub id: u32,
+    pub stable_key: StableStatementKey,
     pub parent: Option<u32>,
     pub child_index: u32,
     pub kind: AstStatementKind,
@@ -101,6 +102,7 @@ impl OwnerSyntaxInput {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct OwnerStatementSource {
     pub statement: u32,
+    pub stable_key: StableStatementKey,
     pub line: u64,
     pub start: u64,
     pub end: u64,
@@ -586,6 +588,12 @@ pub fn project_owner_syntax_input(
             .transpose()?;
         statements.push(OwnerStatementInput {
             id,
+            stable_key: view.stable_statement_key_local(local).ok_or_else(|| {
+                OwnerSyntaxProjectionError::new(format!(
+                    "owner {owner:?} statement {} has no stable key",
+                    local.as_usize()
+                ))
+            })?,
             parent,
             child_index,
             kind,
@@ -673,10 +681,22 @@ pub fn project_owner_source_map(
         .collect::<BTreeMap<_, _>>();
     let mut anchors = Vec::new();
     let mut statements = Vec::with_capacity(view.statement_ids().len());
-    for (statement, syntax) in view.statements().enumerate() {
+    for (statement, (local, syntax)) in view
+        .statement_ids()
+        .iter()
+        .copied()
+        .zip(view.statements())
+        .enumerate()
+    {
         let statement = checked_u32(statement, "owner source statement count")?;
         statements.push(OwnerStatementSource {
             statement,
+            stable_key: view.stable_statement_key_local(local).ok_or_else(|| {
+                OwnerSyntaxProjectionError::new(format!(
+                    "owner {owner:?} statement {} has no stable source key",
+                    local.as_usize()
+                ))
+            })?,
             line: checked_u64(syntax.line, "statement line")?,
             start: checked_u64(syntax.start, "statement start")?,
             end: checked_u64(syntax.end, "statement end")?,

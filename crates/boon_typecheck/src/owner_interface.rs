@@ -7,8 +7,8 @@ use crate::{
     session_info_intrinsic_type,
 };
 use boon_checked::{
-    BytesType, CheckedEffectSummary, CheckedParameterKind, FlowMode, FlowType, ObjectShape, Type,
-    TypeVar, Variant, widen_structural_type,
+    BytesType, CheckedEffectSummary, CheckedParameterKind, CheckedParameterRequirement, FlowMode,
+    FlowType, ObjectShape, Type, TypeVar, Variant, widen_structural_type,
 };
 use boon_syntax::{StableCheckOwnerKey, StableExpressionKey};
 use serde::Serialize;
@@ -22,13 +22,30 @@ pub struct OwnerInterfaceParameter {
     pub kind: OwnerParameterKind,
     pub ordinal: u32,
     pub flow_type: FlowType,
+    pub requirement: CheckedParameterRequirement,
+    pub evaluation_scope: OwnerInterfaceEvaluationScope,
 }
 
-/// Alpha-normalized public surface of one authored check owner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum OwnerInterfaceEvaluationScope {
+    Parent,
+    Output { parameter_ordinal: u32 },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct OwnerContextInterface {
+    pub flow_type: FlowType,
+    pub projections: Box<[Box<[String]>]>,
+}
+
+/// Preparatory alpha-normalized public surface of one authored check owner.
 ///
 /// Source positions, literal payloads, dense IDs, and body-only fingerprints
-/// are absent. This is the exact currentness firewall consumed by dependent
-/// SCC and body requests.
+/// are absent. Parameter requirements/scopes and exact context projections are
+/// explicit, but this does not become the production currentness firewall
+/// until the result/mode specialization transfer and frozen project ABI input
+/// are present and the normalized monolithic oracle passes.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct OwnerPublicInterface {
     pub owner: StableCheckOwnerKey,
@@ -36,7 +53,7 @@ pub struct OwnerPublicInterface {
     pub names: Box<[String]>,
     pub parameters: Box<[OwnerInterfaceParameter]>,
     pub result: FlowType,
-    pub context: Option<FlowType>,
+    pub context: Option<OwnerContextInterface>,
     pub effect: CheckedEffectSummary,
     pub type_variables: Box<[TypeVar]>,
 }
@@ -1433,7 +1450,7 @@ pub fn solve_owner_interface_scc<'a>(
                         .collect();
                     let result = instantiate_type(&callee.result.ty, &mut unifier, &mut *variables);
                     let context = callee.context.as_ref().map(|context| {
-                        instantiate_type(&context.ty, &mut unifier, &mut *variables)
+                        instantiate_type(&context.flow_type.ty, &mut unifier, &mut *variables)
                     });
                     (
                         parameters,
@@ -1584,6 +1601,8 @@ pub fn solve_owner_interface_scc<'a>(
                         mode: FlowMode::Continuous,
                         ty: alpha_normalize_type(&ty, &mut alpha_variables, &mut next_alpha),
                     },
+                    requirement: CheckedParameterRequirement::Required,
+                    evaluation_scope: OwnerInterfaceEvaluationScope::Parent,
                 }
             })
             .collect::<Vec<_>>();
@@ -1600,9 +1619,19 @@ pub fn solve_owner_interface_scc<'a>(
             ty: alpha_normalize_type(&result_ty, &mut alpha_variables, &mut next_alpha),
         };
         let context_ty = unifier.resolve(&Type::Var(state.context));
-        let context = (!matches!(context_ty, Type::Var(_) | Type::Unknown)).then(|| FlowType {
-            mode: FlowMode::Continuous,
-            ty: alpha_normalize_type(&context_ty, &mut alpha_variables, &mut next_alpha),
+        let context = (!matches!(context_ty, Type::Var(_) | Type::Unknown)).then(|| {
+            let flow_type = FlowType {
+                mode: FlowMode::Continuous,
+                ty: alpha_normalize_type(&context_ty, &mut alpha_variables, &mut next_alpha),
+            };
+            OwnerContextInterface {
+                projections: crate::context_scheme_projections(&flow_type.ty)
+                    .into_iter()
+                    .map(Vec::into_boxed_slice)
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+                flow_type,
+            }
         });
         let mut type_variables = BTreeSet::new();
         for parameter in &parameters {
@@ -1610,7 +1639,7 @@ pub fn solve_owner_interface_scc<'a>(
         }
         collect_type_variables(&result.ty, &mut type_variables);
         if let Some(context) = &context {
-            collect_type_variables(&context.ty, &mut type_variables);
+            collect_type_variables(&context.flow_type.ty, &mut type_variables);
         }
         interfaces.push(OwnerPublicInterface {
             owner: owner.clone(),

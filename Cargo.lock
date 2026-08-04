@@ -683,6 +683,7 @@ dependencies = [
  "boon_data",
  "boon_document_model",
  "boon_effect_schema",
+ "boon_syntax",
  "serde",
  "serde_json",
  "smallvec",

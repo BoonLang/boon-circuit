@@ -14,7 +14,9 @@ use boon_checked::{
     ObjectShape, Type, TypeDiagnostic, TypeVar, Variant,
 };
 use boon_document_model::ProgramRole;
-use boon_syntax::{AstExprKind, AstStatementKind, StableCheckOwnerKey, StableExpressionKey};
+use boon_syntax::{
+    AstExprKind, AstStatementKind, StableCheckOwnerKey, StableExpressionKey, StableStatementKey,
+};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -117,6 +119,7 @@ pub struct OwnerBodyInferenceBasis {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct InferredOwnerStatement {
     pub id: OwnerInferenceStatementId,
+    pub stable_key: StableStatementKey,
     pub parent: Option<OwnerInferenceStatementId>,
     pub child_index: u32,
     pub kind: AstStatementKind,
@@ -1025,7 +1028,7 @@ fn instantiate_call_signature(
             context: interface
                 .context
                 .as_ref()
-                .map(|context| instantiate_type(&context.ty, unifier, &mut variables)),
+                .map(|context| instantiate_type(&context.flow_type.ty, unifier, &mut variables)),
             effect: interface.effect,
             target: InferredOwnerCallableTarget::Owner {
                 owner: target.clone(),
@@ -1355,7 +1358,7 @@ pub fn infer_owner_body<'a>(
     }
     let context = own_interface.context.as_ref().map(|context| {
         let variable = unifier.fresh();
-        let ty = instantiate_type(&context.ty, &mut unifier, &mut own_variables);
+        let ty = instantiate_type(&context.flow_type.ty, &mut unifier, &mut own_variables);
         unifier.bind_var(variable, ty);
         variable
     });
@@ -1540,6 +1543,7 @@ pub fn infer_owner_body<'a>(
         .iter()
         .map(|statement| InferredOwnerStatement {
             id: OwnerInferenceStatementId(statement.id),
+            stable_key: statement.stable_key.clone(),
             parent: statement.parent.map(OwnerInferenceStatementId),
             child_index: statement.child_index,
             kind: statement.kind.clone(),

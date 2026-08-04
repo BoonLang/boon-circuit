@@ -20,10 +20,11 @@ use boon_syntax::StableCheckOwnerKey;
 use boon_syntax::{SourceUnitId, SyntaxUnitNamespace, UnitItemKind};
 use boon_typecheck::{
     OwnerConstraintDependencyKind, OwnerConstraintSeed, OwnerConstraintSummary,
-    OwnerDeclarationKind, OwnerInterfaceTopology, OwnerReferenceKind, OwnerSourceMap,
-    OwnerSymbolReference, OwnerSyntaxInput, ResolvedOwnerSymbolReference,
-    build_owner_interface_topology, project_owner_constraint_seed, project_owner_source_map,
-    project_owner_syntax_input, resolve_owner_constraint_seed,
+    OwnerDeclarationKind, OwnerInterfaceScc, OwnerInterfaceSccKey, OwnerInterfaceSccResult,
+    OwnerInterfaceTopology, OwnerReferenceKind, OwnerSourceMap, OwnerSymbolReference,
+    OwnerSyntaxInput, ResolvedOwnerSymbolReference, build_owner_interface_topology,
+    project_owner_constraint_seed, project_owner_source_map, project_owner_syntax_input,
+    resolve_owner_constraint_seed, solve_owner_interface_scc,
     stable_check_owner_key_fingerprint_v1,
 };
 use serde::Serialize;
@@ -198,6 +199,8 @@ struct ProjectState {
     owner_constraint_requests: TypedRequestTable<OwnerConstraintRequest>,
     project_owner_interface_topology_requests:
         TypedRequestTable<ProjectOwnerInterfaceTopologyRequest>,
+    owner_interface_scc_plan_requests: TypedRequestTable<OwnerInterfaceSccPlanRequest>,
+    owner_interface_scc_requests: TypedRequestTable<OwnerInterfaceSccRequest>,
     checked: Option<CheckedSourceFromSource>,
     compiled: Option<(Revision, CompiledSealedMachinePlanFromSource)>,
     request_graph: Option<(
@@ -392,7 +395,7 @@ impl RequestFamily for OwnerSourceMapRequest {
     type Key = StableCheckOwnerKey;
     type Value = Arc<OwnerSourceMap>;
 
-    const NAME: &'static str = "boon.compiler.owner-source-map.v1";
+    const NAME: &'static str = "boon.compiler.owner-source-map.v2";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         stable_check_owner_key_fingerprint_v1(key)
@@ -401,7 +404,7 @@ impl RequestFamily for OwnerSourceMapRequest {
     fn output_fingerprint(
         value: &Self::Value,
     ) -> Result<RequestOutputFingerprint, boon_compilation_db::CompilationDbError> {
-        Ok(RequestOutputFingerprint(value.fingerprint_v1()))
+        Ok(RequestOutputFingerprint(value.fingerprint_v2()))
     }
 }
 
@@ -579,6 +582,52 @@ impl RequestFamily for ProjectOwnerInterfaceTopologyRequest {
     }
 }
 
+struct OwnerInterfaceSccPlanRequest;
+
+impl RequestFamily for OwnerInterfaceSccPlanRequest {
+    type Key = OwnerInterfaceSccKey;
+    type Value = Arc<OwnerInterfaceScc>;
+
+    const NAME: &'static str = "boon.compiler.owner-interface-scc-plan.v1";
+
+    fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
+        let fingerprints = key
+            .members
+            .iter()
+            .map(stable_check_owner_key_fingerprint_v1)
+            .collect::<Vec<_>>();
+        request_fingerprint(
+            b"boon.compiler.owner-interface-scc-plan-key.v1\0",
+            fingerprints.iter().map(<[u8; 32]>::as_slice),
+        )
+    }
+
+    fn output_fingerprint(
+        value: &Self::Value,
+    ) -> Result<RequestOutputFingerprint, boon_compilation_db::CompilationDbError> {
+        Ok(RequestOutputFingerprint(value.fingerprint_v1()))
+    }
+}
+
+struct OwnerInterfaceSccRequest;
+
+impl RequestFamily for OwnerInterfaceSccRequest {
+    type Key = OwnerInterfaceSccKey;
+    type Value = Arc<OwnerInterfaceSccResult>;
+
+    const NAME: &'static str = "boon.compiler.owner-interface-scc-result.v1";
+
+    fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
+        OwnerInterfaceSccPlanRequest::key_fingerprint(key)
+    }
+
+    fn output_fingerprint(
+        value: &Self::Value,
+    ) -> Result<RequestOutputFingerprint, boon_compilation_db::CompilationDbError> {
+        Ok(RequestOutputFingerprint(value.fingerprint_v1()))
+    }
+}
+
 impl CompilerSession {
     pub fn new() -> Self {
         Self::default()
@@ -609,6 +658,8 @@ impl CompilerSession {
                 project_owner_symbol_requests: TypedRequestTable::new(),
                 owner_constraint_requests: TypedRequestTable::new(),
                 project_owner_interface_topology_requests: TypedRequestTable::new(),
+                owner_interface_scc_plan_requests: TypedRequestTable::new(),
+                owner_interface_scc_requests: TypedRequestTable::new(),
                 checked: None,
                 compiled: None,
                 request_graph: None,
@@ -867,6 +918,20 @@ impl CompilerSession {
             .retain(&mut state.syntax_evaluator, |key| {
                 surviving_sources.contains(key.source_unit_id())
             })?;
+        state
+            .owner_interface_scc_plan_requests
+            .retain(&mut state.syntax_evaluator, |key| {
+                key.members
+                    .iter()
+                    .all(|owner| surviving_sources.contains(owner.source_unit_id()))
+            })?;
+        state
+            .owner_interface_scc_requests
+            .retain(&mut state.syntax_evaluator, |key| {
+                key.members
+                    .iter()
+                    .all(|owner| surviving_sources.contains(owner.source_unit_id()))
+            })?;
         state.source = candidate;
         state.revision = Revision(next_revision);
         state.checked = None;
@@ -1020,6 +1085,32 @@ impl CompilerSession {
         Ok(state
             .project_owner_interface_topology_requests
             .current_value(&state.syntax_evaluator, &ProjectOwnerInterfaceTopologyKey)?
+            .map(Arc::clone))
+    }
+
+    /// Returns the alpha-normalized current interface result for the SCC that
+    /// owns `owner`.
+    pub fn owner_interface_result(
+        &self,
+        project: ProjectId,
+        owner: &StableCheckOwnerKey,
+    ) -> CompilerResult<Option<Arc<OwnerInterfaceSccResult>>> {
+        let state = self
+            .projects
+            .get(&project)
+            .ok_or_else(|| session_error(format!("unknown compiler project {}", project.0)))?;
+        let Some(topology) = state
+            .project_owner_interface_topology_requests
+            .current_value(&state.syntax_evaluator, &ProjectOwnerInterfaceTopologyKey)?
+        else {
+            return Ok(None);
+        };
+        let Some(scc) = topology.scc_for_owner(owner) else {
+            return Ok(None);
+        };
+        Ok(state
+            .owner_interface_scc_requests
+            .current_value(&state.syntax_evaluator, &scc.key)?
             .map(Arc::clone))
     }
 
@@ -1887,6 +1978,159 @@ fn evaluate_owner_constraint_requests(
             )?;
         }
     }
+    evaluate_owner_interface_scc_requests(state)?;
+    Ok(())
+}
+
+fn evaluate_owner_interface_scc_requests(state: &mut ProjectState) -> CompilerResult<()> {
+    let topology = Arc::clone(
+        state
+            .project_owner_interface_topology_requests
+            .current_value(&state.syntax_evaluator, &ProjectOwnerInterfaceTopologyKey)?
+            .ok_or_else(|| session_error("owner interface topology was not published"))?,
+    );
+    let live_keys = topology
+        .sccs
+        .iter()
+        .map(|scc| scc.key.clone())
+        .collect::<BTreeSet<_>>();
+    state
+        .owner_interface_scc_plan_requests
+        .retain(&mut state.syntax_evaluator, |key| live_keys.contains(key))?;
+    state
+        .owner_interface_scc_requests
+        .retain(&mut state.syntax_evaluator, |key| live_keys.contains(key))?;
+
+    let plan_input = RequestInputFingerprint(request_fingerprint(
+        b"boon.compiler.owner-interface-scc-plan-dependencies.v1\0",
+        std::iter::empty(),
+    ));
+    for expected in &topology.sccs {
+        match state.owner_interface_scc_plan_requests.begin(
+            &mut state.syntax_evaluator,
+            expected.key.clone(),
+            plan_input,
+        )? {
+            RequestStart::Reused => {}
+            RequestStart::Execute(mut ticket) => {
+                let plan = (|| -> CompilerResult<_> {
+                    let topology = state.project_owner_interface_topology_requests.require(
+                        &state.syntax_evaluator,
+                        &mut ticket,
+                        &ProjectOwnerInterfaceTopologyKey,
+                    )?;
+                    topology
+                        .sccs
+                        .iter()
+                        .find(|scc| scc.key == expected.key)
+                        .cloned()
+                        .map(Arc::new)
+                        .ok_or_else(|| {
+                            session_error(format!(
+                                "owner interface topology has no SCC plan for {:?}",
+                                expected.key
+                            ))
+                        })
+                })();
+                let plan = match plan {
+                    Ok(plan) => plan,
+                    Err(error) => {
+                        state.owner_interface_scc_plan_requests.abort(
+                            &mut state.syntax_evaluator,
+                            ticket,
+                            RequestAbortReason::Failed,
+                        )?;
+                        return Err(error);
+                    }
+                };
+                state.owner_interface_scc_plan_requests.publish(
+                    &mut state.syntax_evaluator,
+                    ticket,
+                    plan,
+                )?;
+            }
+        }
+    }
+
+    let result_input = RequestInputFingerprint(request_fingerprint(
+        b"boon.compiler.owner-interface-scc-result-dependencies.v1\0",
+        std::iter::empty(),
+    ));
+    for expected in &topology.sccs {
+        match state.owner_interface_scc_requests.begin(
+            &mut state.syntax_evaluator,
+            expected.key.clone(),
+            result_input,
+        )? {
+            RequestStart::Reused => {}
+            RequestStart::Execute(mut ticket) => {
+                let result = (|| -> CompilerResult<_> {
+                    let plan = Arc::clone(state.owner_interface_scc_plan_requests.require(
+                        &state.syntax_evaluator,
+                        &mut ticket,
+                        &expected.key,
+                    )?);
+                    let seeds = plan
+                        .key
+                        .members
+                        .iter()
+                        .map(|owner| {
+                            state
+                                .owner_constraint_seed_requests
+                                .require(&state.syntax_evaluator, &mut ticket, owner)
+                                .map(Arc::clone)
+                                .map_err(Into::into)
+                        })
+                        .collect::<CompilerResult<Vec<_>>>()?;
+                    let summaries = plan
+                        .key
+                        .members
+                        .iter()
+                        .map(|owner| {
+                            state
+                                .owner_constraint_requests
+                                .require(&state.syntax_evaluator, &mut ticket, owner)
+                                .map(Arc::clone)
+                                .map_err(Into::into)
+                        })
+                        .collect::<CompilerResult<Vec<_>>>()?;
+                    let dependencies = plan
+                        .dependencies
+                        .iter()
+                        .map(|dependency| {
+                            state
+                                .owner_interface_scc_requests
+                                .require(&state.syntax_evaluator, &mut ticket, dependency)
+                                .map(Arc::clone)
+                                .map_err(Into::into)
+                        })
+                        .collect::<CompilerResult<Vec<_>>>()?;
+                    Ok(Arc::new(solve_owner_interface_scc(
+                        &plan,
+                        seeds.iter().map(Arc::as_ref),
+                        summaries.iter().map(Arc::as_ref),
+                        dependencies.iter().map(Arc::as_ref),
+                    )?))
+                })();
+                let result = match result {
+                    Ok(result) => result,
+                    Err(error) => {
+                        state.owner_interface_scc_requests.abort(
+                            &mut state.syntax_evaluator,
+                            ticket,
+                            RequestAbortReason::Failed,
+                        )?;
+                        return Err(error);
+                    }
+                };
+                state.owner_interface_scc_requests.publish(
+                    &mut state.syntax_evaluator,
+                    ticket,
+                    result,
+                )?;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -2262,10 +2506,10 @@ mod tests {
             assert_eq!(first.profile.parse_work.nodes_rebased, 0);
         }
         let first_stats = session.frontend_request_stats(project).unwrap();
-        assert_eq!(first_stats.demanded, 28);
-        assert_eq!(first_stats.executed, 28);
+        assert_eq!(first_stats.demanded, 36);
+        assert_eq!(first_stats.executed, 36);
         assert_eq!(first_stats.reused, 0);
-        assert_eq!(first_stats.changed, 28);
+        assert_eq!(first_stats.changed, 36);
         let retained_a = session
             .unit_syntax_snapshot(project, "A.bn")
             .unwrap()
@@ -2301,11 +2545,11 @@ mod tests {
             second.profile.parse_work
         };
         let second_stats = session.frontend_request_stats(project).unwrap();
-        assert_eq!(second_stats.demanded, 56);
-        assert_eq!(second_stats.executed, 37);
-        assert_eq!(second_stats.reused, 19);
+        assert_eq!(second_stats.demanded, 72);
+        assert_eq!(second_stats.executed, 45);
+        assert_eq!(second_stats.reused, 27);
         assert_eq!(second_stats.backdated, 6);
-        assert_eq!(second_stats.changed, 31);
+        assert_eq!(second_stats.changed, 39);
 
         let mut isolated = CompilerSession::new();
         let isolated_project = isolated
@@ -2399,6 +2643,14 @@ mod tests {
             .unwrap()
             .unwrap();
         let first_topology = session.owner_interface_topology(project).unwrap().unwrap();
+        let first_left_interface = session
+            .owner_interface_result(project, &left)
+            .unwrap()
+            .unwrap();
+        let first_right_interface = session
+            .owner_interface_result(project, &right)
+            .unwrap()
+            .unwrap();
         assert_eq!(first_right_summary.dependencies.len(), 1);
         assert_eq!(first_right_summary.dependencies[0].request, right);
         assert_eq!(first_right_summary.dependencies[0].dependency, left);
@@ -2441,6 +2693,14 @@ mod tests {
             .unwrap()
             .unwrap();
         let second_topology = session.owner_interface_topology(project).unwrap().unwrap();
+        let second_left_interface = session
+            .owner_interface_result(project, &left)
+            .unwrap()
+            .unwrap();
+        let second_right_interface = session
+            .owner_interface_result(project, &right)
+            .unwrap()
+            .unwrap();
 
         assert!(Arc::ptr_eq(&first_root_input, &second_root_input));
         assert!(!Arc::ptr_eq(&first_left_input, &second_left_input));
@@ -2453,6 +2713,8 @@ mod tests {
         assert!(Arc::ptr_eq(&first_left_summary, &second_left_summary));
         assert!(Arc::ptr_eq(&first_right_summary, &second_right_summary));
         assert!(Arc::ptr_eq(&first_topology, &second_topology));
+        assert!(Arc::ptr_eq(&first_left_interface, &second_left_interface));
+        assert!(Arc::ptr_eq(&first_right_interface, &second_right_interface));
 
         let state = session.projects.get(&project).unwrap();
         assert_eq!(
@@ -2487,6 +2749,76 @@ mod tests {
                 .changed_at,
             EvaluationRevision(0)
         );
+    }
+
+    #[test]
+    fn body_edit_backdates_an_unchanged_alpha_normalized_interface() {
+        let before = "FUNCTION identity(input) {\n    input\n}\n";
+        let after = concat!(
+            "FUNCTION identity(input) {\n",
+            "    BLOCK {\n",
+            "        result: input\n",
+            "        result\n",
+            "    }\n",
+            "}\n",
+        );
+        let mut session = CompilerSession::new();
+        let project = session.open_project(project(before)).unwrap();
+        parse_project_snapshot(session.projects.get_mut(&project).unwrap()).unwrap();
+        let unit = session
+            .unit_syntax_snapshot(project, "RUN.bn")
+            .unwrap()
+            .unwrap();
+        let owner = unit
+            .stable_check_owner_keys()
+            .find(|owner| {
+                matches!(
+                    owner,
+                    StableCheckOwnerKey::Item(owner)
+                        if owner.item_route.segments().last().is_some_and(|segment| segment.names == ["identity"])
+                )
+            })
+            .unwrap();
+        let first_seed = session
+            .owner_constraint_seed(project, &owner)
+            .unwrap()
+            .unwrap();
+        let first_interface = session
+            .owner_interface_result(project, &owner)
+            .unwrap()
+            .unwrap();
+        let first_owner = first_interface.owner(&owner).unwrap();
+        assert_eq!(
+            first_owner.parameters[0].flow_type.ty,
+            boon_checked::Type::Var(boon_checked::TypeVar(0))
+        );
+        assert_eq!(
+            first_owner.result.ty,
+            boon_checked::Type::Var(boon_checked::TypeVar(0))
+        );
+
+        session
+            .apply_update(project, UnitUpdate::new("RUN.bn", after))
+            .unwrap();
+        parse_project_snapshot(session.projects.get_mut(&project).unwrap()).unwrap();
+        let second_seed = session
+            .owner_constraint_seed(project, &owner)
+            .unwrap()
+            .unwrap();
+        let second_interface = session
+            .owner_interface_result(project, &owner)
+            .unwrap()
+            .unwrap();
+        assert!(!Arc::ptr_eq(&first_seed, &second_seed));
+        assert!(Arc::ptr_eq(&first_interface, &second_interface));
+        let state = session.projects.get(&project).unwrap();
+        let key = second_interface.key.clone();
+        let memo = state
+            .owner_interface_scc_requests
+            .memo(&state.syntax_evaluator, &key)
+            .unwrap();
+        assert_eq!(memo.changed_at, EvaluationRevision(0));
+        assert_eq!(memo.verified_at, EvaluationRevision(1));
     }
 
     #[test]
@@ -2563,11 +2895,11 @@ mod tests {
             cold_topology.stats.nodes + 1
         );
         let interface_stats = session.frontend_request_stats(project).unwrap();
-        assert_eq!(interface_stats.demanded - cold_stats.demanded, 44);
-        assert_eq!(interface_stats.executed - cold_stats.executed, 26);
-        assert_eq!(interface_stats.reused - cold_stats.reused, 18);
-        assert_eq!(interface_stats.backdated - cold_stats.backdated, 12);
-        assert_eq!(interface_stats.changed - cold_stats.changed, 14);
+        assert_eq!(interface_stats.demanded - cold_stats.demanded, 58);
+        assert_eq!(interface_stats.executed - cold_stats.executed, 34);
+        assert_eq!(interface_stats.reused - cold_stats.reused, 24);
+        assert_eq!(interface_stats.backdated - cold_stats.backdated, 18);
+        assert_eq!(interface_stats.changed - cold_stats.changed, 16);
 
         session
             .apply_update(project, UnitUpdate::new("left/Math.bn", first_body_edit))
@@ -2586,11 +2918,11 @@ mod tests {
         let body_topology = session.owner_interface_topology(project).unwrap().unwrap();
         assert!(Arc::ptr_eq(&interface_topology, &body_topology));
         let body_stats = session.frontend_request_stats(project).unwrap();
-        assert_eq!(body_stats.demanded - interface_stats.demanded, 44);
-        assert_eq!(body_stats.executed - interface_stats.executed, 13);
-        assert_eq!(body_stats.reused - interface_stats.reused, 31);
+        assert_eq!(body_stats.demanded - interface_stats.demanded, 58);
+        assert_eq!(body_stats.executed - interface_stats.executed, 14);
+        assert_eq!(body_stats.reused - interface_stats.reused, 44);
         assert_eq!(body_stats.backdated - interface_stats.backdated, 6);
-        assert_eq!(body_stats.changed - interface_stats.changed, 7);
+        assert_eq!(body_stats.changed - interface_stats.changed, 8);
     }
 
     #[test]

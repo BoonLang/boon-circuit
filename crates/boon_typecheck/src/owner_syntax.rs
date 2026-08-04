@@ -13,7 +13,7 @@ use std::io::{self, Write};
 
 const OWNER_KEY_FINGERPRINT_DOMAIN_V1: &[u8] = b"boon.check-owner-key.v1\0";
 const OWNER_SYNTAX_FINGERPRINT_DOMAIN_V1: &[u8] = b"boon.owner-syntax-input.v1\0";
-const OWNER_SOURCE_MAP_FINGERPRINT_DOMAIN_V1: &[u8] = b"boon.owner-source-map.v1\0";
+const OWNER_SOURCE_MAP_FINGERPRINT_DOMAIN_V2: &[u8] = b"boon.owner-source-map.v2\0";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OwnerSyntaxProjectionError {
@@ -114,6 +114,34 @@ pub struct OwnerExpressionSource {
     pub end: u64,
 }
 
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum OwnerSourceAnchorSite {
+    Statement { statement: u32 },
+    Expression { expression: StableExpressionKey },
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum OwnerSourceAnchorRole {
+    FunctionParameter { ordinal: u32 },
+    CallArgument { ordinal: u32 },
+    CallPass,
+    PipeArgument { ordinal: u32 },
+    PipePass,
+    RecordField { ordinal: u32 },
+    BlockBinding { ordinal: u32 },
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct OwnerSourceAnchor {
+    pub site: OwnerSourceAnchorSite,
+    pub role: OwnerSourceAnchorRole,
+    pub line: u64,
+    pub start: u64,
+    pub end: u64,
+}
+
 /// Current source positions for one owner, fingerprinted independently from
 /// its semantics so formatting edits cannot invalidate checked body results.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -122,12 +150,24 @@ pub struct OwnerSourceMap {
     pub path: String,
     pub statements: Box<[OwnerStatementSource]>,
     pub expressions: Box<[OwnerExpressionSource]>,
-    fingerprint_v1: [u8; 32],
+    pub anchors: Box<[OwnerSourceAnchor]>,
+    fingerprint_v2: [u8; 32],
 }
 
 impl OwnerSourceMap {
-    pub const fn fingerprint_v1(&self) -> [u8; 32] {
-        self.fingerprint_v1
+    pub const fn fingerprint_v2(&self) -> [u8; 32] {
+        self.fingerprint_v2
+    }
+
+    pub fn anchor(
+        &self,
+        site: &OwnerSourceAnchorSite,
+        role: OwnerSourceAnchorRole,
+    ) -> Option<&OwnerSourceAnchor> {
+        self.anchors
+            .binary_search_by(|anchor| (&anchor.site, anchor.role).cmp(&(site, role)))
+            .ok()
+            .and_then(|index| self.anchors.get(index))
     }
 }
 
@@ -627,35 +667,180 @@ pub fn project_owner_source_map(
     view: UnitOwnerSyntaxView<'_>,
 ) -> Result<OwnerSourceMap, OwnerSyntaxProjectionError> {
     let owner = view.stable_key();
+    let expression_lines = view
+        .expressions()
+        .map(|expression| (expression.id, expression.line))
+        .collect::<BTreeMap<_, _>>();
+    let mut anchors = Vec::new();
     let mut statements = Vec::with_capacity(view.statement_ids().len());
     for (statement, syntax) in view.statements().enumerate() {
+        let statement = checked_u32(statement, "owner source statement count")?;
         statements.push(OwnerStatementSource {
-            statement: checked_u32(statement, "owner source statement count")?,
+            statement,
             line: checked_u64(syntax.line, "statement line")?,
             start: checked_u64(syntax.start, "statement start")?,
             end: checked_u64(syntax.end, "statement end")?,
         });
+        if let AstStatementKind::Function { parameters, .. } = &syntax.kind {
+            for parameter in parameters {
+                anchors.push(OwnerSourceAnchor {
+                    site: OwnerSourceAnchorSite::Statement { statement },
+                    role: OwnerSourceAnchorRole::FunctionParameter {
+                        ordinal: checked_u32(parameter.ordinal, "function parameter ordinal")?,
+                    },
+                    line: checked_u64(syntax.line, "function parameter line")?,
+                    start: checked_u64(parameter.start, "function parameter start")?,
+                    end: checked_u64(parameter.end, "function parameter end")?,
+                });
+            }
+        }
     }
     let mut expressions = Vec::with_capacity(view.expression_ids().len());
     for (syntax, expression) in view.expressions().zip(view.stable_expression_keys()) {
+        let expression_site = OwnerSourceAnchorSite::Expression {
+            expression: expression.clone(),
+        };
         expressions.push(OwnerExpressionSource {
             expression,
             line: checked_u64(syntax.line, "expression line")?,
             start: checked_u64(syntax.start, "expression start")?,
             end: checked_u64(syntax.end, "expression end")?,
         });
+        let mut push_anchor = |role: OwnerSourceAnchorRole,
+                               line: usize,
+                               start: usize,
+                               end: usize|
+         -> Result<(), OwnerSyntaxProjectionError> {
+            anchors.push(OwnerSourceAnchor {
+                site: expression_site.clone(),
+                role,
+                line: checked_u64(line, "expression subspan line")?,
+                start: checked_u64(start, "expression subspan start")?,
+                end: checked_u64(end, "expression subspan end")?,
+            });
+            Ok(())
+        };
+        match &syntax.kind {
+            AstExprKind::Call { args, pass, .. } => {
+                for (ordinal, argument) in args.iter().enumerate() {
+                    push_anchor(
+                        OwnerSourceAnchorRole::CallArgument {
+                            ordinal: checked_u32(ordinal, "call argument ordinal")?,
+                        },
+                        syntax.line,
+                        argument.start,
+                        argument.end,
+                    )?;
+                }
+                if let Some(pass) = pass {
+                    push_anchor(
+                        OwnerSourceAnchorRole::CallPass,
+                        expression_lines
+                            .get(&pass.value)
+                            .copied()
+                            .unwrap_or(syntax.line),
+                        pass.start,
+                        pass.end,
+                    )?;
+                }
+            }
+            AstExprKind::Pipe { args, pass, .. } => {
+                for (ordinal, argument) in args.iter().enumerate() {
+                    push_anchor(
+                        OwnerSourceAnchorRole::PipeArgument {
+                            ordinal: checked_u32(ordinal, "pipe argument ordinal")?,
+                        },
+                        syntax.line,
+                        argument.start,
+                        argument.end,
+                    )?;
+                }
+                if let Some(pass) = pass {
+                    push_anchor(
+                        OwnerSourceAnchorRole::PipePass,
+                        expression_lines
+                            .get(&pass.value)
+                            .copied()
+                            .unwrap_or(syntax.line),
+                        pass.start,
+                        pass.end,
+                    )?;
+                }
+            }
+            AstExprKind::TaggedObject { fields, .. } | AstExprKind::Object(fields) => {
+                for (ordinal, field) in fields.iter().enumerate() {
+                    push_anchor(
+                        OwnerSourceAnchorRole::RecordField {
+                            ordinal: checked_u32(ordinal, "record field ordinal")?,
+                        },
+                        syntax.line,
+                        field.start,
+                        field.end,
+                    )?;
+                }
+            }
+            AstExprKind::Block { bindings, .. } => {
+                for (ordinal, binding) in bindings.iter().enumerate() {
+                    push_anchor(
+                        OwnerSourceAnchorRole::BlockBinding {
+                            ordinal: checked_u32(ordinal, "block binding ordinal")?,
+                        },
+                        syntax.line,
+                        binding.start,
+                        binding.end,
+                    )?;
+                }
+            }
+            AstExprKind::Identifier(_)
+            | AstExprKind::Path(_)
+            | AstExprKind::Drain { .. }
+            | AstExprKind::StringLiteral(_)
+            | AstExprKind::TextLiteral(_)
+            | AstExprKind::TextTemplate { .. }
+            | AstExprKind::Number(_)
+            | AstExprKind::ByteLiteral { .. }
+            | AstExprKind::Tag(_)
+            | AstExprKind::Flush { .. }
+            | AstExprKind::Source
+            | AstExprKind::Draining { .. }
+            | AstExprKind::Hold { .. }
+            | AstExprKind::Latest { .. }
+            | AstExprKind::When { .. }
+            | AstExprKind::Then { .. }
+            | AstExprKind::Infix { .. }
+            | AstExprKind::MatchArm { .. }
+            | AstExprKind::ListLiteral { .. }
+            | AstExprKind::BytesLiteral { .. }
+            | AstExprKind::Delimiter
+            | AstExprKind::Unknown(_)
+            | AstExprKind::Arrow { .. }
+            | AstExprKind::MapEntry { .. }
+            | AstExprKind::MapLiteral { .. }
+            | AstExprKind::SetLiteral { .. }
+            | AstExprKind::BitsLiteral { .. } => {}
+        }
+    }
+    anchors.sort_by(|left, right| (&left.site, left.role).cmp(&(&right.site, right.role)));
+    if anchors
+        .windows(2)
+        .any(|pair| pair[0].site == pair[1].site && pair[0].role == pair[1].role)
+    {
+        return Err(OwnerSyntaxProjectionError::new(format!(
+            "owner {owner:?} has duplicate source anchors"
+        )));
     }
     let path = view.path().to_owned();
-    let fingerprint_v1 = fingerprint_serialized(
-        OWNER_SOURCE_MAP_FINGERPRINT_DOMAIN_V1,
-        &(&owner, &path, &statements, &expressions),
+    let fingerprint_v2 = fingerprint_serialized(
+        OWNER_SOURCE_MAP_FINGERPRINT_DOMAIN_V2,
+        &(&owner, &path, &statements, &expressions, &anchors),
     )?;
     Ok(OwnerSourceMap {
         owner,
         path,
         statements: statements.into_boxed_slice(),
         expressions: expressions.into_boxed_slice(),
-        fingerprint_v1,
+        anchors: anchors.into_boxed_slice(),
+        fingerprint_v2,
     })
 }
 
@@ -665,6 +850,7 @@ mod tests {
     use boon_parser::{
         ParsedSourceUnit, UnitSyntaxSnapshot, parse_project_source_unit, project_unit_link_keys,
     };
+    use std::collections::BTreeSet;
 
     fn link(parsed: ParsedSourceUnit) -> UnitSyntaxSnapshot {
         let key = project_unit_link_keys(
@@ -723,7 +909,7 @@ mod tests {
             project_owner_source_map(before.owner_view_for_key(&before_helper).unwrap()).unwrap();
         let after_map =
             project_owner_source_map(after.owner_view_for_key(&after_helper).unwrap()).unwrap();
-        assert_ne!(before_map.fingerprint_v1(), after_map.fingerprint_v1());
+        assert_ne!(before_map.fingerprint_v2(), after_map.fingerprint_v2());
 
         let before_right = owner_named(&before, "right");
         let after_right = owner_named(&after, "right");
@@ -755,10 +941,47 @@ mod tests {
         assert_ne!(
             project_owner_source_map(compact.owner_view_for_key(&compact_owner).unwrap())
                 .unwrap()
-                .fingerprint_v1(),
+                .fingerprint_v2(),
             project_owner_source_map(spaced.owner_view_for_key(&spaced_owner).unwrap())
                 .unwrap()
-                .fingerprint_v1()
+                .fingerprint_v2()
+        );
+    }
+
+    #[test]
+    fn owner_source_map_retains_exact_diagnostic_subspans() {
+        let unit = link(
+            parse_project_source_unit(
+                "app/RUN.bn",
+                "FUNCTION helper(input) {\n    input\n}\nFUNCTION subject(input, output: OUT) {\n    BLOCK {\n        record: [value: input]\n        helper(input: record, PASS: [theme: input])\n    }\n}\n",
+            )
+            .unwrap(),
+        );
+        let owner = owner_named(&unit, "subject");
+        let source_map =
+            project_owner_source_map(unit.owner_view_for_key(&owner).unwrap()).unwrap();
+        let roles = source_map
+            .anchors
+            .iter()
+            .map(|anchor| anchor.role)
+            .collect::<BTreeSet<_>>();
+        assert!(roles.contains(&OwnerSourceAnchorRole::FunctionParameter { ordinal: 0 }));
+        assert!(roles.contains(&OwnerSourceAnchorRole::FunctionParameter { ordinal: 1 }));
+        assert!(roles.contains(&OwnerSourceAnchorRole::CallArgument { ordinal: 0 }));
+        assert!(roles.contains(&OwnerSourceAnchorRole::CallPass));
+        assert!(roles.contains(&OwnerSourceAnchorRole::RecordField { ordinal: 0 }));
+        assert!(roles.contains(&OwnerSourceAnchorRole::BlockBinding { ordinal: 0 }));
+        assert!(
+            source_map
+                .anchors
+                .iter()
+                .all(|anchor| anchor.start < anchor.end)
+        );
+        assert!(
+            source_map
+                .anchors
+                .windows(2)
+                .all(|pair| { (&pair[0].site, pair[0].role) < (&pair[1].site, pair[1].role) })
         );
     }
 

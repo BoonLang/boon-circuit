@@ -29,7 +29,7 @@ pub struct OwnerConstraintSeedError {
 }
 
 impl OwnerConstraintSeedError {
-    fn new(message: impl Into<String>) -> Self {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
         }
@@ -316,7 +316,7 @@ impl From<&OwnerConstraintDependency> for OwnerInterfaceTopologyEdge {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct ResolvedOwnerSymbolReference {
     pub reference: OwnerSymbolReference,
     pub owner: StableCheckOwnerKey,
@@ -331,6 +331,12 @@ pub struct ResolvedOwnerSymbolReference {
 pub struct OwnerConstraintSummary {
     pub owner: StableCheckOwnerKey,
     pub seed_fingerprint_v1: [u8; 32],
+    /// Exact symbol targets used by the SCC solver and later body checker.
+    ///
+    /// Keeping this mapping beside the dependency rows prevents those stages
+    /// from repeating project name lookup or guessing a target from an edge
+    /// whose direction was inverted for `ActualToFormal`/`PassedContext`.
+    pub resolved_references: Box<[ResolvedOwnerSymbolReference]>,
     pub dependencies: Box<[OwnerConstraintDependency]>,
     fingerprint_v1: [u8; 32],
     topology_fingerprint_v1: [u8; 32],
@@ -731,6 +737,7 @@ pub fn resolve_owner_constraint_seed(
     referenced_dependencies: impl IntoIterator<Item = ResolvedOwnerSymbolReference>,
 ) -> Result<OwnerConstraintSummary, OwnerConstraintSeedError> {
     let mut dependencies = BTreeSet::new();
+    let mut resolved_references = BTreeSet::new();
     for external in &seed.external_expressions {
         if external.owner == seed.owner {
             continue;
@@ -744,9 +751,7 @@ pub fn resolve_owner_constraint_seed(
         });
     }
     for resolved in referenced_dependencies {
-        if resolved.owner == seed.owner {
-            continue;
-        }
+        resolved_references.insert(resolved.clone());
         match resolved.reference.kind {
             OwnerReferenceKind::Value => {
                 dependencies.insert(OwnerConstraintDependency {
@@ -762,6 +767,7 @@ pub fn resolve_owner_constraint_seed(
             }
         }
     }
+    let resolved_references = resolved_references.into_iter().collect::<Vec<_>>();
     let dependencies = dependencies.into_iter().collect::<Vec<_>>();
     let topology_dependencies = dependencies
         .iter()
@@ -782,12 +788,14 @@ pub fn resolve_owner_constraint_seed(
         &(
             stable_check_owner_key_fingerprint_v1(&seed.owner),
             seed.fingerprint_v1(),
+            &resolved_references,
             &dependencies,
         ),
     )?;
     Ok(OwnerConstraintSummary {
         owner: seed.owner.clone(),
         seed_fingerprint_v1: seed.fingerprint_v1(),
+        resolved_references: resolved_references.into_boxed_slice(),
         dependencies: dependencies.into_boxed_slice(),
         fingerprint_v1,
         topology_fingerprint_v1,

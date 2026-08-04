@@ -15160,6 +15160,36 @@ fields = [
 ]
 
 [[records]]
+kind = "enum"
+source = "crates/boon_semantic/src/semantic_image.rs"
+name = "ExecutionConstructionProjectionV3"
+
+[[records.variants]]
+name = "Checked"
+disposition = "r-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+  { name = "projection", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+]
+
+[[records.variants]]
+name = "Invocation"
+disposition = "r-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+  { name = "occurrence", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+]
+
+[[records.variants]]
+name = "Producer"
+disposition = "r-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+  { name = "identity", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "definition", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+]
+
+[[records]]
 kind = "struct"
 source = "crates/boon_semantic/src/semantic_image.rs"
 name = "ExecutionImageHandoffV2"

@@ -1447,6 +1447,17 @@ identity/route prerequisite for construction-owned executable rows; it is not
 yet a cold or warm speed result and the V2 full-row mirror still must be
 deleted.
 
+The next route checkpoint binds every dense semantic expression and statement,
+plus every static owner, to that construction spine after resource-authority
+normalization has emitted its final generated rows. Production handoff now
+consumes those bound routes; the old expression, statement, and owner route
+rediscovery exists only under `cfg(test)` as an independent parity oracle. This
+removes a second ownership decision from production and prevents generated
+authority rows from falling outside the route image. It still deliberately
+does not count as a performance result: V2 continues to allocate and hash the
+47,296-row proof mirror, so the next architectural cut remains construction-
+owned compact executable receipts followed by deletion of that mirror.
+
 ## Architectural Decisions
 
 ### 1. Activation Is A First-Class Output, Not An Empty Mount

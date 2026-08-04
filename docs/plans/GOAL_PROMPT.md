@@ -625,6 +625,12 @@ Current checkpoints to preserve and audit rather than redo:
   and discarded after sealing. Continue directly into compact executable-row
   and CSR publication and delete the V2 47,296-row mirror; the route checkpoint
   alone is not a speed result or phase exit;
+- preserve the construction-bound entity-route checkpoint: after resource
+  authority normalization completes the final semantic row set, every dense
+  expression, statement, and static owner is assigned once to the V3 spine.
+  Production consumes these routes and legacy route rediscovery is test-only
+  parity evidence. Do not score this as speed progress while the V2 proof-row
+  mirror still exists;
 - move verified-intent demand collection before occurrence expansion and
   backend lowering. Split top-level authority/interface summaries from the
   final program-link sink, and version the callable interface schema before

@@ -407,6 +407,13 @@ stronger three-reviewer performance closure defined below.
    direct compact executable rows and CSR relocations; do not score the route
    checkpoint while the V2 47,296-row mirror remains.
 
+   The construction-bound route checkpoint now assigns all final semantic
+   expressions, statements, and static owners after resource normalization to
+   that V3 spine. Production no longer rediscovers those owners; the legacy
+   route builders remain only as an independent `cfg(test)` parity oracle. This
+   closes route ownership but not performance: compact executable row receipts
+   and deletion of the V2 proof mirror remain the next required cut.
+
    The post-`ac2b234` high-level audit supersedes a mutating post-resource
    execution seal. Move inline list-authority synthesis into execution
    construction, seal immutable execution once, and make the resource typed

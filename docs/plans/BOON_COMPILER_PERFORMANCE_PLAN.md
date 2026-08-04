@@ -893,6 +893,13 @@ Current cold-diagnostics candidate evidence:
   exact ignored NovyWave oracle pass. Do not score this identity checkpoint:
   direct executable row/CSR publication and deletion of the V2 rich-row mirror
   are still required before remeasurement counts as progress toward a gate.
+- Dense expression, statement, and static-owner routes are now bound to the V3
+  spine after resource-authority normalization has produced the final row set.
+  The production V2 bridge consumes those routes, while its former route
+  discovery is compiled only in tests as an independent parity oracle. This is
+  a correctness and ownership checkpoint, not a timing win: the full V2 row
+  mirror remains allocated and hashed and must be deleted by the compact-row
+  tranche before NovyWave is rescored.
 - Do not preserve V3's 208k subject cardinality as a production V4/V5 proof
   requirement. The independent test oracle must map every historical subject
   to exactly one canonical finalized shard row and classifier field/domain and prove

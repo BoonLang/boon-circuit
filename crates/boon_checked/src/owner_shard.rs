@@ -84,7 +84,7 @@ pub enum OwnerScopeStableKey {
 #[serde(rename_all = "snake_case")]
 pub enum OwnerStatementScopeRole {
     Body,
-    RepeatedOutput,
+    RepeatedOutput { parameter_ordinal: u32 },
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -290,7 +290,7 @@ pub enum OwnerExpressionKind {
     },
     ExternalRead {
         canonical_path: String,
-        declaration: OwnerAbiDeclarationKey,
+        declaration: Option<OwnerAbiDeclarationKey>,
     },
     Drain {
         target: OwnerDeclarationRef,

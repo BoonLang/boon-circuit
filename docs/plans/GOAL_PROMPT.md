@@ -675,6 +675,17 @@ Current checkpoints to preserve and audit rather than redo:
   publish deltas instead of full confirmation elaborations. The exact flag-day
   sequence and rejection rules are in
   `BOON_COMPILER_DEFINITION_ARTIFACT_RESEARCH.md`;
+- preserve the first post-research syntax/session tranche. `ParsedSourceUnit`
+  owns a body-insensitive item index and stable definition keys; a session
+  retains unit syntax by `SourceUnitId`, reparses only changed identities, and
+  applies upsert/remove/rename atomically. Producer format V4 exposes attempted,
+  parsed, and reused units, and the warm verifier requires exactly one parsed
+  plus `N - 1` reused for a one-unit edit. Direct and cached project assembly,
+  stable-key, topology, diagnostics, and verified-session focused tests pass.
+  Do not call this warm completion: project assembly and typechecking remain
+  whole-program. Continue with structural occurrence routes, typed evaluation
+  request slots, interface SCC/definition results, and deletion of the
+  production checked-image scan;
 - treat the 16.7 ms diagnostics and 100 ms replacement-preview gates as warm
   incremental contracts. A faster full rebuild cannot satisfy them. Record
   executed/reused/backdated requests and require zero unrelated parse/check/

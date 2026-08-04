@@ -275,6 +275,15 @@ measurements.
 
 ## Implementation Sequence
 
+The first part of step 1 is implemented: parser units own body-insensitive item
+indexes and stable definition routes, while `CompilerSession` retains them by
+`SourceUnitId`, invalidates only changed units, and applies unit topology
+changes atomically. Producer format V4 and the warm verifier now expose and
+enforce exact attempted/parsed/reused unit counts. Canonical assembly still
+rebuilds the global syntax product, stable occurrence routes are not yet
+published, and checking remains whole-project; those are the next open parts of
+steps 1--3 rather than hidden completion claims.
+
 1. **Stable syntax and item ownership.** Retain `Arc<UnitSyntaxSnapshot>` and a
    body-insensitive `UnitItemIndex` in `CompilerSession`; add structural item
    and occurrence routes plus atomic unit upsert/remove/rename. Prove unchanged

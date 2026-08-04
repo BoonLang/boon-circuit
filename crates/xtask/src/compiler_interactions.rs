@@ -10,8 +10,8 @@ use crate::report_v2::{
     unix_time_ms,
 };
 
-const FORMAT_VERSION: u16 = 2;
-const PRODUCER_FORMAT_VERSION: u16 = 3;
+const FORMAT_VERSION: u16 = 3;
+const PRODUCER_FORMAT_VERSION: u16 = 4;
 const BUDGET_FORMAT_VERSION: u16 = 2;
 const REPORT_CONTRACT: &str = "boon-compiler-interactions-v2";
 const DEFAULT_BUDGET: &str = "budgets/compiler.toml";
@@ -1110,9 +1110,9 @@ fn validate_warm_batch(
             || sample.diagnostics_work.source_units == 0
             || sample.diagnostics_work.parsed_expressions == 0
             || sample.diagnostics_work.checked_expressions == 0
-            || !sample.diagnostics_work.has_complete_frontend_work()
+            || !has_single_unit_edit_frontend_work(&sample.diagnostics_work)
             || sample.diagnostics_work.semantic_graph_nodes != 0
-            || !sample.preview_work.has_complete_frontend_work()
+            || !has_single_unit_edit_frontend_work(&sample.preview_work)
             || sample.preview_work.semantic_graph_nodes == 0
             || sample
                 .diagnostics_phase
@@ -1248,6 +1248,13 @@ fn warm_edit_times_valid(sample: &WarmEditSample) -> bool {
         && sample.edit_to_diagnostics_ms <= sample.edit_to_verified_preview_ms + 0.05
 }
 
+fn has_single_unit_edit_frontend_work(work: &WorkSample) -> bool {
+    work.has_complete_frontend_work()
+        && work.parse.source_units_attempted == 1
+        && work.parse.source_units_parsed == 1
+        && work.parse.source_units_reused.checked_add(1) == Some(work.source_units)
+}
+
 fn validate_scaling_sample(
     sample: &SyntheticScalingBatch,
     budget: &ScalingWorkloadBudget,
@@ -1270,7 +1277,7 @@ fn validate_scaling_sample(
         || sample.work.source_units == 0
         || sample.work.parsed_expressions == 0
         || sample.work.checked_expressions == 0
-        || !sample.work.has_complete_frontend_work()
+        || !sample.work.has_cold_complete_frontend_work()
         || sample
             .phase
             .values()

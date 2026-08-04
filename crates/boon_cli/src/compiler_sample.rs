@@ -14,7 +14,7 @@ use crate::{
     CompilerAllocationCounters, compiler_allocation_counters, reset_compiler_allocation_counters,
 };
 
-const FORMAT_VERSION: u16 = 3;
+const FORMAT_VERSION: u16 = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -209,6 +209,7 @@ impl From<CompilerAllocationCounters> for AllocationSample {
 struct ParserWorkSample {
     source_units_attempted: usize,
     source_units_parsed: usize,
+    source_units_reused: usize,
     source_bytes_inspected: usize,
     token_inspections: usize,
     symbol_inspections: usize,
@@ -284,6 +285,7 @@ macro_rules! parser_work_sample {
         ParserWorkSample {
             source_units_attempted: work.source_units_attempted,
             source_units_parsed: work.source_units_parsed,
+            source_units_reused: work.source_units_reused,
             source_bytes_inspected: work.source_bytes_inspected,
             token_inspections: work.token_inspections,
             symbol_inspections: work.symbol_inspections,

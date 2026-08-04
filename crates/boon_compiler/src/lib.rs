@@ -30,7 +30,7 @@ pub use distributed_compiler::{
 };
 pub use session::{
     CancellationToken, CompileIntent, CompilerProject, CompilerSession, CompilerSessionResult,
-    ProjectId, Revision, UnitUpdate,
+    ProjectId, Revision, UnitChange, UnitUpdate,
 };
 
 pub type CompilerResult<T> = Result<T, Box<dyn std::error::Error>>;
@@ -701,13 +701,59 @@ fn check_source_with_ownership(
     request: CompilerCheckRequest<'_>,
     ownership: CheckedSourceOwnership,
 ) -> CompilerResult<CheckedSourceFromSource> {
-    let total_started = Instant::now();
     let parse_started = Instant::now();
     let (parsed, parse_work) = parse_compile_source(request.source)?;
     let parse_ms = elapsed_ms(parse_started);
+    check_parsed_source_with_ownership(
+        parsed,
+        parse_work,
+        parse_ms,
+        request.program_role,
+        ownership,
+    )
+}
+
+pub(crate) fn check_diagnostics_parsed_source(
+    parsed: ParsedProgram,
+    parse_work: ParseWorkCounters,
+    parse_ms: f64,
+    program_role: ProgramRole,
+) -> CompilerResult<CheckedSourceFromSource> {
+    check_parsed_source_with_ownership(
+        parsed,
+        parse_work,
+        parse_ms,
+        program_role,
+        CheckedSourceOwnership::Diagnostics,
+    )
+}
+
+pub(crate) fn check_runtime_parsed_source(
+    parsed: ParsedProgram,
+    parse_work: ParseWorkCounters,
+    parse_ms: f64,
+    program_role: ProgramRole,
+) -> CompilerResult<CheckedSourceFromSource> {
+    check_parsed_source_with_ownership(
+        parsed,
+        parse_work,
+        parse_ms,
+        program_role,
+        CheckedSourceOwnership::Runtime,
+    )
+}
+
+fn check_parsed_source_with_ownership(
+    parsed: ParsedProgram,
+    parse_work: ParseWorkCounters,
+    parse_ms: f64,
+    program_role: ProgramRole,
+    ownership: CheckedSourceOwnership,
+) -> CompilerResult<CheckedSourceFromSource> {
+    let check_started = Instant::now();
     let source_unit_count = parsed.files.len();
     let expression_count = parsed.expressions.len();
-    let external_types = boon_checked::ExternalTypeEnvironment::empty(request.program_role);
+    let external_types = boon_checked::ExternalTypeEnvironment::empty(program_role);
     let typecheck_started = Instant::now();
     let (output, typecheck_profile) = match ownership {
         CheckedSourceOwnership::Report => {
@@ -752,7 +798,7 @@ fn check_source_with_ownership(
             typecheck_work: typecheck_profile.work_counters,
             parse_ms,
             typecheck_ms,
-            total_ms: elapsed_ms(total_started),
+            total_ms: parse_ms + elapsed_ms(check_started),
         },
     })
 }

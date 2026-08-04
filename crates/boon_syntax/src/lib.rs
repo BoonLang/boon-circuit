@@ -429,6 +429,94 @@ impl fmt::Display for SourceUnitId {
     }
 }
 
+/// Body-insensitive kind used by parser-owned stable item routes.
+///
+/// This is deliberately smaller than [`AstStatementKind`]. A route identifies
+/// an authored item across revisions; expression bodies, byte offsets, lines,
+/// and revision-local dense statement ids are not part of that identity.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnitItemKind {
+    Function,
+    Field,
+    Source,
+    Hold,
+    List,
+}
+
+/// One structural segment in a parser-owned item route.
+///
+/// `names` contains the authored header names relevant to the statement kind.
+/// `matching_sibling_ordinal` counts only preceding siblings with the same kind
+/// and names, so inserting an unrelated sibling does not rekey the item.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct StableItemRouteSegment {
+    pub kind: UnitItemKind,
+    pub names: Vec<String>,
+    pub matching_sibling_ordinal: usize,
+}
+
+/// Structural, body-insensitive route of one authored item inside a source
+/// unit. The surrounding [`SourceUnitId`] supplies project-local unit identity.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(transparent)]
+pub struct StableItemRoute(Vec<StableItemRouteSegment>);
+
+impl StableItemRoute {
+    #[doc(hidden)]
+    pub fn __parser_from_segments(segments: Vec<StableItemRouteSegment>) -> Self {
+        Self(segments)
+    }
+
+    pub fn segments(&self) -> &[StableItemRouteSegment] {
+        &self.0
+    }
+}
+
+/// Body-insensitive function parameter header retained by the unit item index.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct UnitItemParameter {
+    pub name: String,
+    pub kind: AstParameterKind,
+    pub ordinal: usize,
+}
+
+/// One parser-owned item header. `local_statement_id` is an intra-artifact
+/// lookup aid only; cross-revision consumers use `route`.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct UnitItemIndexEntry {
+    pub route: StableItemRoute,
+    pub local_statement_id: usize,
+    pub kind: UnitItemKind,
+    pub names: Vec<String>,
+    pub parameters: Vec<UnitItemParameter>,
+}
+
+impl UnitItemIndexEntry {
+    pub fn is_definition(&self) -> bool {
+        self.kind == UnitItemKind::Function
+    }
+}
+
+/// Body-insensitive item headers emitted once with a parsed source unit.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+pub struct UnitItemIndex {
+    pub entries: Vec<UnitItemIndexEntry>,
+}
+
+impl UnitItemIndex {
+    pub fn definitions(&self) -> impl Iterator<Item = &UnitItemIndexEntry> {
+        self.entries.iter().filter(|entry| entry.is_definition())
+    }
+}
+
+/// Stable compiler identity of one authored definition.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct StableDefinitionKey {
+    pub source_unit_id: SourceUnitId,
+    pub item_route: StableItemRoute,
+}
+
 /// Public read-only schema projected by an opaque parser-produced source unit.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ParsedSourceUnitFields {
@@ -437,6 +525,7 @@ pub struct ParsedSourceUnitFields {
     pub source: String,
     pub ast: AstProgram,
     pub declared_functions: Vec<String>,
+    pub item_index: UnitItemIndex,
 }
 
 impl ParsedSourceFile {

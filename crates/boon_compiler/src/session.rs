@@ -1,16 +1,25 @@
 use crate::{
     CheckedCompileRequest, CheckedSourceFromSource, CompiledSealedMachinePlanFromSource,
-    CompilerCheckRequest, CompilerResult, CompilerSourceUnit, check_diagnostics_source,
-    check_runtime_source, finish_checked_machine_plan_with_cancellation,
+    CompilerResult, CompilerSourceUnit, check_diagnostics_parsed_source,
+    check_runtime_parsed_source, finish_checked_machine_plan_with_cancellation,
+};
+use boon_parser::{
+    ParseWorkCounters, ParsedProgram, ParsedSourceUnit, assemble_parsed_source_units_profiled,
+    parse_project_source_unit_profiled,
 };
 use boon_plan::{
     ApplicationIdentity, MigrationPredecessorBinding, PlanError, ProgramRole, TargetProfile,
 };
+use boon_syntax::SourceUnitId;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::Instant;
+#[cfg(target_arch = "wasm32")]
+use web_time::Instant;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct ProjectId(pub u64);
@@ -82,6 +91,30 @@ impl UnitUpdate {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum UnitChange {
+    Upsert(UnitUpdate),
+    Remove { path: String },
+    Rename { from: String, to: String },
+}
+
+impl UnitChange {
+    pub fn upsert(path: impl Into<String>, source: impl Into<String>) -> Self {
+        Self::Upsert(UnitUpdate::new(path, source))
+    }
+
+    pub fn remove(path: impl Into<String>) -> Self {
+        Self::Remove { path: path.into() }
+    }
+
+    pub fn rename(from: impl Into<String>, to: impl Into<String>) -> Self {
+        Self::Rename {
+            from: from.into(),
+            to: to.into(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct CancellationToken {
     canceled: Arc<AtomicBool>,
@@ -134,6 +167,7 @@ pub struct CompilerSession {
 struct ProjectState {
     source: CompilerProject,
     revision: Revision,
+    parsed_units: BTreeMap<SourceUnitId, Arc<ParsedSourceUnit>>,
     checked: Option<CheckedSourceFromSource>,
     compiled: Option<(Revision, CompiledSealedMachinePlanFromSource)>,
     request_graph: Option<(
@@ -156,6 +190,7 @@ impl CompilerSession {
             ProjectState {
                 source: project,
                 revision: Revision(0),
+                parsed_units: BTreeMap::new(),
                 checked: None,
                 compiled: None,
                 request_graph: None,
@@ -236,7 +271,16 @@ impl CompilerSession {
                         project.0, update.path
                     ))
                 })?;
-            unit.source = update.source;
+            if unit.source != update.source {
+                let source_unit_id = SourceUnitId::from_path(&unit.path).map_err(|error| {
+                    session_error(format!(
+                        "compiler project {} has invalid source unit `{}`: {error}",
+                        project.0, unit.path
+                    ))
+                })?;
+                state.parsed_units.remove(&source_unit_id);
+                unit.source = update.source;
+            }
         }
         state.revision = Revision(state.revision.0.saturating_add(1));
         state.checked = None;
@@ -244,6 +288,119 @@ impl CompilerSession {
         // checks and verifies. Invalid or canceled source must not blank a
         // running preview; only a successful current-revision request replaces
         // this slot.
+        Ok(state.revision)
+    }
+
+    /// Atomically applies source-unit topology and content changes.
+    ///
+    /// Upsert may add or replace a unit. Rename deliberately creates a new
+    /// [`SourceUnitId`], and renaming the entrypoint moves the entrypoint with
+    /// it. The complete candidate project validates before the live revision or
+    /// retained syntax snapshot changes.
+    pub fn apply_unit_changes(
+        &mut self,
+        project: ProjectId,
+        changes: impl IntoIterator<Item = UnitChange>,
+    ) -> CompilerResult<Revision> {
+        let state = self
+            .projects
+            .get_mut(&project)
+            .ok_or_else(|| session_error(format!("unknown compiler project {}", project.0)))?;
+        let changes = changes.into_iter().collect::<Vec<_>>();
+        if changes.is_empty() {
+            return Ok(state.revision);
+        }
+
+        let mut candidate = state.source.clone();
+        for change in changes {
+            match change {
+                UnitChange::Upsert(update) => {
+                    if update.path.is_empty() {
+                        return Err(session_error(format!(
+                            "compiler project {} upsert has an empty source path",
+                            project.0
+                        )));
+                    }
+                    if let Some(unit) = candidate
+                        .units
+                        .iter_mut()
+                        .find(|unit| unit.path == update.path)
+                    {
+                        unit.source = update.source;
+                    } else {
+                        candidate.units.push(CompilerSourceUnit {
+                            path: update.path,
+                            source: update.source,
+                        });
+                    }
+                }
+                UnitChange::Remove { path } => {
+                    let index = candidate
+                        .units
+                        .iter()
+                        .position(|unit| unit.path == path)
+                        .ok_or_else(|| {
+                            session_error(format!(
+                                "compiler project {} has no source unit `{path}`",
+                                project.0
+                            ))
+                        })?;
+                    candidate.units.remove(index);
+                }
+                UnitChange::Rename { from, to } => {
+                    if from.is_empty() || to.is_empty() {
+                        return Err(session_error(format!(
+                            "compiler project {} rename has an empty source path",
+                            project.0
+                        )));
+                    }
+                    if from != to && candidate.units.iter().any(|unit| unit.path == to) {
+                        return Err(session_error(format!(
+                            "compiler project {} already has source unit `{to}`",
+                            project.0
+                        )));
+                    }
+                    let unit = candidate
+                        .units
+                        .iter_mut()
+                        .find(|unit| unit.path == from)
+                        .ok_or_else(|| {
+                            session_error(format!(
+                                "compiler project {} has no source unit `{from}`",
+                                project.0
+                            ))
+                        })?;
+                    unit.path = to.clone();
+                    if candidate.entrypoint == from {
+                        candidate.entrypoint = to;
+                    }
+                }
+            }
+        }
+        validate_project(&candidate)?;
+        if candidate.entrypoint == state.source.entrypoint && candidate.units == state.source.units
+        {
+            return Ok(state.revision);
+        }
+
+        let mut surviving_sources = BTreeMap::new();
+        for unit in &candidate.units {
+            let source_unit_id = SourceUnitId::from_path(&unit.path).map_err(|error| {
+                session_error(format!(
+                    "compiler project {} has invalid source unit `{}`: {error}",
+                    project.0, unit.path
+                ))
+            })?;
+            surviving_sources.insert(source_unit_id, unit.source.as_str());
+        }
+        state.parsed_units.retain(|source_unit_id, snapshot| {
+            surviving_sources
+                .get(source_unit_id)
+                .is_some_and(|source| *source == snapshot.source.as_str())
+        });
+        state.source = candidate;
+        state.revision = Revision(state.revision.0.saturating_add(1));
+        state.checked = None;
         Ok(state.revision)
     }
 
@@ -287,6 +444,22 @@ impl CompilerSession {
             .map(|(revision, graph)| (*revision, Arc::clone(graph))))
     }
 
+    /// Returns the retained context-independent syntax artifact for one unit,
+    /// if that unit has been parsed by a request in this session.
+    pub fn unit_syntax_snapshot(
+        &self,
+        project: ProjectId,
+        path: &str,
+    ) -> CompilerResult<Option<Arc<ParsedSourceUnit>>> {
+        let state = self
+            .projects
+            .get(&project)
+            .ok_or_else(|| session_error(format!("unknown compiler project {}", project.0)))?;
+        let source_unit_id = SourceUnitId::from_path(path)
+            .map_err(|error| session_error(format!("invalid source unit `{path}`: {error}")))?;
+        Ok(state.parsed_units.get(&source_unit_id).map(Arc::clone))
+    }
+
     pub fn request<'a>(
         &'a mut self,
         project: ProjectId,
@@ -309,12 +482,12 @@ impl CompilerSession {
         }
         if intent == CompileIntent::Diagnostics {
             if state.checked.is_none() {
-                state.checked = Some(check_diagnostics_source(
-                    CompilerCheckRequest::source_units(
-                        &state.source.entrypoint,
-                        &state.source.units,
-                        state.source.program_role,
-                    ),
+                let (parsed, parse_work, parse_ms) = parse_project_snapshot(state)?;
+                state.checked = Some(check_diagnostics_parsed_source(
+                    parsed,
+                    parse_work,
+                    parse_ms,
+                    state.source.program_role,
                 )?);
             }
             if cancellation.is_canceled() {
@@ -332,11 +505,13 @@ impl CompilerSession {
             .is_some_and(|(compiled_revision, _)| *compiled_revision == revision);
         if !current_artifact_available {
             if state.checked.is_none() {
-                state.checked = Some(check_runtime_source(CompilerCheckRequest::source_units(
-                    &state.source.entrypoint,
-                    &state.source.units,
+                let (parsed, parse_work, parse_ms) = parse_project_snapshot(state)?;
+                state.checked = Some(check_runtime_parsed_source(
+                    parsed,
+                    parse_work,
+                    parse_ms,
                     state.source.program_role,
-                ))?);
+                )?);
             }
             if cancellation.is_canceled() {
                 state.checked = None;
@@ -383,20 +558,76 @@ impl CompilerSession {
     }
 }
 
+fn parse_project_snapshot(
+    state: &mut ProjectState,
+) -> CompilerResult<(ParsedProgram, ParseWorkCounters, f64)> {
+    let started = Instant::now();
+    let mut work = ParseWorkCounters::default();
+    let mut snapshots = Vec::with_capacity(state.source.units.len());
+
+    for unit in &state.source.units {
+        let source_unit_id = SourceUnitId::from_path(&unit.path).map_err(|error| {
+            session_error(format!(
+                "compiler project has invalid source unit `{}`: {error}",
+                unit.path
+            ))
+        })?;
+        if let Some(snapshot) = state
+            .parsed_units
+            .get(&source_unit_id)
+            .filter(|snapshot| snapshot.source == unit.source)
+        {
+            work.record_reused_source_units(1);
+            snapshots.push(Arc::clone(snapshot));
+            continue;
+        }
+
+        let (parsed, profile) =
+            parse_project_source_unit_profiled(unit.path.clone(), unit.source.clone());
+        work.accumulate(profile.work_counters);
+        let snapshot = Arc::new(parsed?);
+        state
+            .parsed_units
+            .insert(source_unit_id, Arc::clone(&snapshot));
+        snapshots.push(snapshot);
+    }
+
+    let units = snapshots
+        .into_iter()
+        .map(|snapshot| snapshot.as_ref().clone())
+        .collect();
+    let (parsed, assembly_profile) =
+        assemble_parsed_source_units_profiled(&state.source.entrypoint, units);
+    work.accumulate(assembly_profile.work_counters);
+    Ok((parsed?, work, started.elapsed().as_secs_f64() * 1_000.0))
+}
+
 fn validate_project(project: &CompilerProject) -> CompilerResult<()> {
     if project.units.is_empty() {
         return Err(session_error("compiler project source bundle is empty"));
     }
+    let entrypoint = SourceUnitId::from_path(&project.entrypoint).map_err(|error| {
+        session_error(format!(
+            "compiler project entrypoint `{}` is invalid: {error}",
+            project.entrypoint
+        ))
+    })?;
     let mut paths = BTreeSet::new();
     for unit in &project.units {
-        if unit.path.is_empty() || !paths.insert(unit.path.as_str()) {
+        let source_unit_id = SourceUnitId::from_path(&unit.path).map_err(|error| {
+            session_error(format!(
+                "compiler project source path `{}` is invalid: {error}",
+                unit.path
+            ))
+        })?;
+        if !paths.insert(source_unit_id) {
             return Err(session_error(format!(
-                "compiler project has an empty or duplicate source path `{}`",
+                "compiler project has a duplicate canonical source path `{}`",
                 unit.path
             )));
         }
     }
-    if !paths.contains(project.entrypoint.as_str()) {
+    if !paths.contains(&entrypoint) {
         return Err(session_error(format!(
             "compiler project entrypoint `{}` is absent from its source bundle",
             project.entrypoint
@@ -570,6 +801,170 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("missing.bn"));
         assert_eq!(session.revision(project).unwrap(), Revision(1));
+    }
+
+    #[test]
+    fn session_reuses_unchanged_unit_syntax_and_reparses_only_the_changed_unit() {
+        let mut session = CompilerSession::new();
+        let source_project = CompilerProject::new(
+            "RUN.bn",
+            vec![
+                CompilerSourceUnit {
+                    path: "A.bn".to_owned(),
+                    source: "a: 1\n".to_owned(),
+                },
+                CompilerSourceUnit {
+                    path: "RUN.bn".to_owned(),
+                    source: "value: 1\n".to_owned(),
+                },
+            ],
+            TargetProfile::SoftwareDefault,
+            ProgramRole::Server,
+            ApplicationIdentity::compiler_default(),
+        );
+        let project = session.open_project(source_project).unwrap();
+        let first_revision = session.revision(project).unwrap();
+        {
+            let result = session
+                .request(
+                    project,
+                    first_revision,
+                    CompileIntent::Diagnostics,
+                    &CancellationToken::new(),
+                )
+                .unwrap();
+            let first = result.diagnostics().unwrap();
+            assert_eq!(first.profile.parse_work.source_units_attempted, 2);
+            assert_eq!(first.profile.parse_work.source_units_parsed, 2);
+            assert_eq!(first.profile.parse_work.source_units_reused, 0);
+        }
+        let retained_a = session
+            .unit_syntax_snapshot(project, "A.bn")
+            .unwrap()
+            .unwrap();
+        let replaced_run = session
+            .unit_syntax_snapshot(project, "RUN.bn")
+            .unwrap()
+            .unwrap();
+
+        let second_revision = session
+            .apply_update(project, UnitUpdate::new("RUN.bn", "value: 2\n"))
+            .unwrap();
+        assert!(
+            session
+                .unit_syntax_snapshot(project, "RUN.bn")
+                .unwrap()
+                .is_none()
+        );
+        {
+            let result = session
+                .request(
+                    project,
+                    second_revision,
+                    CompileIntent::Diagnostics,
+                    &CancellationToken::new(),
+                )
+                .unwrap();
+            let second = result.diagnostics().unwrap();
+            assert_eq!(second.profile.parse_work.source_units_attempted, 1);
+            assert_eq!(second.profile.parse_work.source_units_parsed, 1);
+            assert_eq!(second.profile.parse_work.source_units_reused, 1);
+        }
+
+        let current_a = session
+            .unit_syntax_snapshot(project, "A.bn")
+            .unwrap()
+            .unwrap();
+        let current_run = session
+            .unit_syntax_snapshot(project, "RUN.bn")
+            .unwrap()
+            .unwrap();
+        assert!(Arc::ptr_eq(&retained_a, &current_a));
+        assert!(!Arc::ptr_eq(&replaced_run, &current_run));
+    }
+
+    #[test]
+    fn unit_topology_changes_are_atomic_and_preserve_unaffected_syntax() {
+        let mut session = CompilerSession::new();
+        let project = session
+            .open_project(CompilerProject::new(
+                "RUN.bn",
+                vec![
+                    CompilerSourceUnit {
+                        path: "A.bn".to_owned(),
+                        source: "a: 1\n".to_owned(),
+                    },
+                    CompilerSourceUnit {
+                        path: "RUN.bn".to_owned(),
+                        source: "value: 1\n".to_owned(),
+                    },
+                ],
+                TargetProfile::SoftwareDefault,
+                ProgramRole::Server,
+                ApplicationIdentity::compiler_default(),
+            ))
+            .unwrap();
+        let revision = session.revision(project).unwrap();
+        session
+            .request(
+                project,
+                revision,
+                CompileIntent::Diagnostics,
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        let retained_run = session
+            .unit_syntax_snapshot(project, "RUN.bn")
+            .unwrap()
+            .unwrap();
+
+        let revision = session
+            .apply_unit_changes(
+                project,
+                [
+                    UnitChange::rename("A.bn", "C.bn"),
+                    UnitChange::upsert("B.bn", "b: 2\n"),
+                ],
+            )
+            .unwrap();
+        let result = session
+            .request(
+                project,
+                revision,
+                CompileIntent::Diagnostics,
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        let diagnostics = result.diagnostics().unwrap();
+        assert_eq!(diagnostics.profile.parse_work.source_units_attempted, 2);
+        assert_eq!(diagnostics.profile.parse_work.source_units_parsed, 2);
+        assert_eq!(diagnostics.profile.parse_work.source_units_reused, 1);
+        drop(result);
+        assert!(Arc::ptr_eq(
+            &retained_run,
+            &session
+                .unit_syntax_snapshot(project, "RUN.bn")
+                .unwrap()
+                .unwrap()
+        ));
+        assert!(
+            session
+                .unit_syntax_snapshot(project, "A.bn")
+                .unwrap()
+                .is_none()
+        );
+
+        let error = session
+            .apply_unit_changes(project, [UnitChange::remove("RUN.bn")])
+            .unwrap_err();
+        assert!(error.to_string().contains("entrypoint"));
+        assert_eq!(session.revision(project).unwrap(), revision);
+        assert!(
+            session
+                .unit_syntax_snapshot(project, "RUN.bn")
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]

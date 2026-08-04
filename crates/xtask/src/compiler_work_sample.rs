@@ -68,6 +68,7 @@ fn newest_build_input(path: &Path, newest: &mut Option<(SystemTime, PathBuf)>) -
 pub(crate) struct ParserWorkSample {
     pub(crate) source_units_attempted: usize,
     pub(crate) source_units_parsed: usize,
+    pub(crate) source_units_reused: usize,
     pub(crate) source_bytes_inspected: usize,
     pub(crate) token_inspections: usize,
     pub(crate) symbol_inspections: usize,
@@ -156,8 +157,12 @@ pub(crate) struct WorkSample {
 impl WorkSample {
     pub(crate) fn has_complete_frontend_work(self) -> bool {
         self.source_units > 0
-            && self.parse.source_units_attempted == self.source_units
-            && self.parse.source_units_parsed == self.source_units
+            && self
+                .parse
+                .source_units_attempted
+                .checked_add(self.parse.source_units_reused)
+                == Some(self.source_units)
+            && self.parse.source_units_parsed == self.parse.source_units_attempted
             && self.parse.source_bytes_inspected > 0
             && self.parse.token_inspections > 0
             && self.parse.statement_visits > 0
@@ -169,5 +174,12 @@ impl WorkSample {
             && self.typecheck.diagnostic_replay_requests > 0
             && self.typecheck.inference_calls_are_accounted()
             && self.typecheck.diagnostic_replay_is_accounted()
+    }
+
+    pub(crate) fn has_cold_complete_frontend_work(self) -> bool {
+        self.has_complete_frontend_work()
+            && self.parse.source_units_attempted == self.source_units
+            && self.parse.source_units_parsed == self.source_units
+            && self.parse.source_units_reused == 0
     }
 }

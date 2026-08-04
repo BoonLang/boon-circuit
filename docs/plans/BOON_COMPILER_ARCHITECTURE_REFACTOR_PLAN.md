@@ -1841,6 +1841,33 @@ two-worker scheduling. The first warm proof is exact zero unrelated parse,
 interface, definition, semantic, proof, plan-code, and runnable work for a
 constant/body edit; retaining revision-zero cold memos alone does not count.
 
+#### First eighth-audit tranche: retain unit syntax and parser-owned item routes
+
+The first syntax/session boundary is implemented. Every `ParsedSourceUnit` now
+owns a body-insensitive `UnitItemIndex`; authored definitions use
+`StableDefinitionKey { SourceUnitId, StableItemRoute }`, whose segments contain
+header kind/names and an ordinal only among matching siblings. Function body
+statements, offsets, lines, and local dense ids are excluded, so an unrelated
+item insertion or body change preserves the definition key even when the local
+statement id moves.
+
+`CompilerSession` retains each unit artifact behind `Arc`, reparses cache misses
+with the exact project-unit parser boundary, and assembles reused plus changed
+units through the ordinary canonical assembler. Content updates evict only the
+changed `SourceUnitId`; atomic upsert/remove/rename validates a complete
+candidate project before publication and retains every unchanged unit. Parser
+work now distinguishes attempted, parsed, and reused units. Producer format V4
+and the warm verifier require a one-unit edit to report exactly one attempted/
+parsed unit plus `N - 1` reused units; cold reports still require all units
+parsed and zero reused.
+
+Focused parser equivalence, stable-key, changed-unit reuse, topology atomicity,
+and verified-session reuse tests pass. This is not the warm exit: canonical
+assembly still clones/rebases and validates every unit, and typechecking still
+rebuilds the whole `CheckedProgramDatabase`. Next add parser-owned structural
+occurrence routes and typed evaluation request slots, then extract interface
+SCC and checked-definition results and delete `checked_image_handoff`.
+
 ## Architectural Decisions
 
 ### 1. Activation Is A First-Class Output, Not An Empty Mount

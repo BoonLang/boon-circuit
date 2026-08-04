@@ -985,6 +985,19 @@ Current cold-diagnostics candidate evidence:
   the result into one runnable image. The complete selected design and flag-day
   sequence are in
   `BOON_COMPILER_DEFINITION_ARTIFACT_RESEARCH.md`.
+- The first post-research syntax/session tranche is implemented. Parser units
+  now retain a body-insensitive item index and stable definition keys derived
+  from `SourceUnitId` plus parser-owned structural header routes. A persistent
+  session retains `Arc` unit syntax, invalidates only changed unit identities,
+  and atomically supports upsert/remove/rename. Its exact project-unit parse
+  route plus canonical assembly matches direct project parsing. Parser work and
+  producer format V4 now report attempted/parsed/reused units; the warm verifier
+  requires one parsed plus `N - 1` reused units for every one-unit edit, while
+  cold validation requires all parsed and zero reused. Focused parser/session/
+  verified reuse tests and two-job compiler/producer/verifier checks pass. This
+  does not close warm latency: assembly still rebases all units and the checker
+  is still whole-project. Add stable occurrence routes and typed request slots,
+  then extract interface/definition results and delete the checked-image scan.
 - Do not preserve V3's 208k subject cardinality as a production V4/V5 proof
   requirement. The independent test oracle must map every historical subject
   to exactly one canonical finalized shard row and classifier field/domain and prove

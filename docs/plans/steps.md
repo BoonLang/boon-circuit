@@ -496,6 +496,18 @@ stronger three-reviewer performance closure defined below.
    most two independent workers. A cold memo or faster whole rebuild is not
    warm evidence; require zero unrelated work for a body/constant edit.
 
+   The first eighth-audit implementation tranche now retains `Arc` parser-unit
+   artifacts and body-insensitive item indexes with stable definition routes.
+   Content edits invalidate one `SourceUnitId`; upsert/remove/rename is atomic
+   and preserves unaffected artifacts. Producer format V4 records attempted,
+   parsed, and reused units, and the warm verifier rejects a one-unit edit unless
+   it proves one parsed plus `N - 1` reused. Focused equivalence, identity,
+   topology, diagnostics, and verified-session tests pass. Assembly still
+   clones/rebases every unit and checking still rebuilds the whole project, so
+   this is an ownership/currentness checkpoint rather than the step exit. Add
+   structural occurrence routes and typed evaluation request slots next, then
+   interface SCC/definition results and direct checked receipts.
+
    The post-`ac2b234` high-level audit supersedes a mutating post-resource
    execution seal. Move inline list-authority synthesis into execution
    construction, seal immutable execution once, and make the resource typed

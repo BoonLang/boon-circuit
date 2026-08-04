@@ -9,7 +9,9 @@ use boon_syntax::{
     AstStatement, AstStatementKind, AstTextSegment, AstToken, AstTokenKind, BytesSizeSyntax,
     DocumentAst, LANGUAGE_FEATURE_REGISTRY, LanguageFeatureParseExpectation, LanguageFeatureStage,
     ParsedProgramFields, ParsedSourceFile, ParsedSourceUnitFields, ParserItem, ParserLine,
-    ProgramKind, SourceUnitId, is_program_role_root, is_reserved_standard_root,
+    ProgramKind, SourceUnitId, StableDefinitionKey, StableItemRoute, StableItemRouteSegment,
+    UnitItemIndex, UnitItemIndexEntry, UnitItemKind, UnitItemParameter, is_program_role_root,
+    is_reserved_standard_root,
 };
 use serde::Serialize;
 use std::cell::Cell;
@@ -140,6 +142,15 @@ impl ParsedSourceUnit {
     fn from_parser_fields(fields: ParsedSourceUnitFields) -> Self {
         Self { fields }
     }
+
+    pub fn stable_definition_keys(&self) -> impl Iterator<Item = StableDefinitionKey> + '_ {
+        self.item_index
+            .definitions()
+            .map(|entry| StableDefinitionKey {
+                source_unit_id: self.source_unit_id.clone(),
+                item_route: entry.route.clone(),
+            })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -169,6 +180,8 @@ pub struct ParseWorkCounters {
     pub source_units_attempted: usize,
     /// Source units whose context-independent syntax artifact was issued.
     pub source_units_parsed: usize,
+    /// Source units whose previously parsed artifact was reused by a session.
+    pub source_units_reused: usize,
     /// Source bytes inspected by lexer scanning and position tracking.
     pub source_bytes_inspected: usize,
     /// Token visits performed while constructing and validating syntax.
@@ -185,6 +198,41 @@ pub struct ParseWorkCounters {
     pub validation_visits: usize,
 }
 
+impl ParseWorkCounters {
+    pub fn accumulate(&mut self, other: Self) {
+        self.source_units_attempted = self
+            .source_units_attempted
+            .saturating_add(other.source_units_attempted);
+        self.source_units_parsed = self
+            .source_units_parsed
+            .saturating_add(other.source_units_parsed);
+        self.source_units_reused = self
+            .source_units_reused
+            .saturating_add(other.source_units_reused);
+        self.source_bytes_inspected = self
+            .source_bytes_inspected
+            .saturating_add(other.source_bytes_inspected);
+        self.token_inspections = self
+            .token_inspections
+            .saturating_add(other.token_inspections);
+        self.symbol_inspections = self
+            .symbol_inspections
+            .saturating_add(other.symbol_inspections);
+        self.statement_visits = self.statement_visits.saturating_add(other.statement_visits);
+        self.expression_visits = self
+            .expression_visits
+            .saturating_add(other.expression_visits);
+        self.nodes_rebased = self.nodes_rebased.saturating_add(other.nodes_rebased);
+        self.validation_visits = self
+            .validation_visits
+            .saturating_add(other.validation_visits);
+    }
+
+    pub fn record_reused_source_units(&mut self, count: usize) {
+        self.source_units_reused = self.source_units_reused.saturating_add(count);
+    }
+}
+
 /// Timer-free parser profile returned alongside success or failure.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct ParseProfile {
@@ -195,6 +243,7 @@ struct ParseWorkRecorder {
     enabled: bool,
     source_units_attempted: Cell<usize>,
     source_units_parsed: Cell<usize>,
+    source_units_reused: Cell<usize>,
     source_bytes_inspected: Cell<usize>,
     token_inspections: Cell<usize>,
     symbol_inspections: Cell<usize>,
@@ -210,6 +259,7 @@ impl ParseWorkRecorder {
             enabled,
             source_units_attempted: Cell::new(0),
             source_units_parsed: Cell::new(0),
+            source_units_reused: Cell::new(0),
             source_bytes_inspected: Cell::new(0),
             token_inspections: Cell::new(0),
             symbol_inspections: Cell::new(0),
@@ -292,6 +342,7 @@ impl ParseWorkRecorder {
             work_counters: ParseWorkCounters {
                 source_units_attempted: self.source_units_attempted.get(),
                 source_units_parsed: self.source_units_parsed.get(),
+                source_units_reused: self.source_units_reused.get(),
                 source_bytes_inspected: self.source_bytes_inspected.get(),
                 token_inspections: self.token_inspections.get(),
                 symbol_inspections: self.symbol_inspections.get(),
@@ -647,6 +698,49 @@ pub fn parse_source_unit_profiled(
     (parsed, work.finish())
 }
 
+/// Parses one project source unit with the exact context-independent boundary
+/// used by [`parse_project`]. Project-wide source policy is intentionally
+/// deferred until the cached units are assembled.
+pub fn parse_project_source_unit(
+    path: impl Into<String>,
+    source: impl Into<String>,
+) -> Result<ParsedSourceUnit, ParseError> {
+    parse_project_source_unit_with_work(path, source, &ParseWorkRecorder::disabled())
+}
+
+/// Profiled cacheable project-unit parser. This is the persistent compiler
+/// session's parse miss route; cache hits do not call it.
+pub fn parse_project_source_unit_profiled(
+    path: impl Into<String>,
+    source: impl Into<String>,
+) -> (Result<ParsedSourceUnit, ParseError>, ParseProfile) {
+    let work = ParseWorkRecorder::enabled();
+    let parsed = parse_project_source_unit_with_work(path, source, &work);
+    (parsed, work.finish())
+}
+
+fn parse_project_source_unit_with_work(
+    path: impl Into<String>,
+    source: impl Into<String>,
+    work: &ParseWorkRecorder,
+) -> Result<ParsedSourceUnit, ParseError> {
+    work.source_unit_attempted();
+    let input_path = path.into();
+    let source = source.into();
+    let source_unit_id = SourceUnitId::from_path(&input_path)
+        .map_err(|error| source_unit_parse_error(&input_path, error))?;
+    let path = source_unit_id.as_str().to_owned();
+    reject_reserved_module_path(&path)?;
+    parse_normalized_source_unit_syntax(
+        source_unit_id,
+        source,
+        ParserTrace::from_environment(),
+        ValidationIndexScope::Boundary,
+        work,
+    )
+    .map(|(unit, _validation_index)| unit)
+}
+
 fn parse_source_unit_with_work(
     path: impl Into<String>,
     source: impl Into<String>,
@@ -693,6 +787,7 @@ fn parse_normalized_source_unit_syntax(
     };
     validate_source_unit_boundary_with_work(&path, &source, &ast, &validation_index, work)?;
     let declared_functions = collect_raw_declared_functions_with_work(&ast.statements, work);
+    let item_index = build_unit_item_index(&ast.statements);
     work.source_unit_parsed();
 
     Ok((
@@ -702,6 +797,7 @@ fn parse_normalized_source_unit_syntax(
             source,
             ast,
             declared_functions,
+            item_index,
         }),
         validation_index,
     ))
@@ -1189,13 +1285,32 @@ fn eof_column(source: &str) -> Result<usize, ParseError> {
         })
 }
 
-/// Test wrapper that canonicalizes arbitrary raw-unit order before assembly.
-/// The production bundle route calls the canonical inner assembler directly
-/// so it sorts and hashes exactly once.
-#[cfg(test)]
-fn assemble_parsed_source_units(
+/// Canonicalizes and assembles previously parsed project units.
+///
+/// Persistent compiler sessions use this after reusing unchanged unit
+/// artifacts and parsing only cache misses. The ordinary project parser calls
+/// the canonical inner assembler directly because it already owns an ordered
+/// source bundle.
+pub fn assemble_parsed_source_units(
+    entrypoint: &str,
+    units: Vec<ParsedSourceUnit>,
+) -> Result<ParsedProgram, ParseError> {
+    assemble_parsed_source_units_with_work(entrypoint, units, &ParseWorkRecorder::disabled())
+}
+
+pub fn assemble_parsed_source_units_profiled(
+    entrypoint: &str,
+    units: Vec<ParsedSourceUnit>,
+) -> (Result<ParsedProgram, ParseError>, ParseProfile) {
+    let work = ParseWorkRecorder::enabled();
+    let parsed = assemble_parsed_source_units_with_work(entrypoint, units, &work);
+    (parsed, work.finish())
+}
+
+fn assemble_parsed_source_units_with_work(
     entrypoint: &str,
     mut units: Vec<ParsedSourceUnit>,
+    work: &ParseWorkRecorder,
 ) -> Result<ParsedProgram, ParseError> {
     for unit in &units {
         if unit.path != unit.source_unit_id.as_str() {
@@ -1226,12 +1341,7 @@ fn assemble_parsed_source_units(
     let source_bundle_digest_v1 = bundle.digest();
     drop(bundle);
 
-    assemble_canonical_parsed_source_units(
-        entrypoint,
-        source_bundle_digest_v1,
-        units,
-        &ParseWorkRecorder::disabled(),
-    )
+    assemble_canonical_parsed_source_units(entrypoint, source_bundle_digest_v1, units, work)
 }
 
 /// Assembles source units already validated and ordered by a canonical bundle.
@@ -1460,6 +1570,7 @@ fn assemble_canonical_parsed_source_units(
             source: unit_source,
             mut ast,
             declared_functions: _declared_functions,
+            item_index: _item_index,
         } = unit.fields;
         if let Some(module) = module.as_deref() {
             namespace_source_unit_module(&mut ast, module, &functions_by_module, work);
@@ -6550,6 +6661,116 @@ fn collect_functions_with_work(
         .collect()
 }
 
+fn build_unit_item_index(statements: &[AstStatement]) -> UnitItemIndex {
+    fn header(
+        statement: &AstStatement,
+    ) -> Option<(UnitItemKind, Vec<String>, Vec<UnitItemParameter>)> {
+        let (kind, names, parameters) = match &statement.kind {
+            AstStatementKind::Function { name, parameters } => (
+                UnitItemKind::Function,
+                vec![name.clone()],
+                parameters
+                    .iter()
+                    .map(|parameter| UnitItemParameter {
+                        name: parameter.name.clone(),
+                        kind: parameter.kind,
+                        ordinal: parameter.ordinal,
+                    })
+                    .collect(),
+            ),
+            AstStatementKind::Field { name } => {
+                (UnitItemKind::Field, vec![name.clone()], Vec::new())
+            }
+            AstStatementKind::Source { field, event } => (
+                UnitItemKind::Source,
+                field.iter().chain(event).cloned().collect(),
+                Vec::new(),
+            ),
+            AstStatementKind::Hold { field, name } => (
+                UnitItemKind::Hold,
+                field.iter().chain(name).cloned().collect(),
+                Vec::new(),
+            ),
+            AstStatementKind::List { field, .. } => (
+                UnitItemKind::List,
+                field.iter().cloned().collect(),
+                Vec::new(),
+            ),
+            AstStatementKind::Block | AstStatementKind::Spread | AstStatementKind::Expression => {
+                return None;
+            }
+        };
+        Some((kind, names, parameters))
+    }
+
+    fn visit(
+        statements: &[AstStatement],
+        parent: &[StableItemRouteSegment],
+        inside_definition: bool,
+        matching_sibling_counts: &mut BTreeMap<(UnitItemKind, Vec<String>), usize>,
+        entries: &mut Vec<UnitItemIndexEntry>,
+    ) {
+        for statement in statements {
+            let Some((kind, names, parameters)) = header(statement) else {
+                // Anonymous expression/block structure is intentionally not a
+                // route segment. Declarations below it remain in the nearest
+                // authored item scope, so body-only edits cannot rekey them.
+                visit(
+                    &statement.children,
+                    parent,
+                    inside_definition,
+                    matching_sibling_counts,
+                    entries,
+                );
+                continue;
+            };
+            if inside_definition && kind != UnitItemKind::Function {
+                // Ordinary fields/sources/holds/lists inside a function are
+                // implementation body statements, not item-tree interface
+                // entries. Nested functions remain authored definitions.
+                visit(
+                    &statement.children,
+                    parent,
+                    true,
+                    matching_sibling_counts,
+                    entries,
+                );
+                continue;
+            }
+            let matching_sibling_ordinal = matching_sibling_counts
+                .entry((kind, names.clone()))
+                .and_modify(|count| *count = count.saturating_add(1))
+                .or_insert(0);
+            let mut route = parent.to_vec();
+            route.push(StableItemRouteSegment {
+                kind,
+                names: names.clone(),
+                matching_sibling_ordinal: *matching_sibling_ordinal,
+            });
+            entries.push(UnitItemIndexEntry {
+                route: StableItemRoute::__parser_from_segments(route.clone()),
+                local_statement_id: statement.id,
+                kind,
+                names,
+                parameters,
+            });
+            let mut child_counts = BTreeMap::new();
+            visit(
+                &statement.children,
+                &route,
+                inside_definition || kind == UnitItemKind::Function,
+                &mut child_counts,
+                entries,
+            );
+        }
+    }
+
+    let mut entries = Vec::new();
+    let mut root_counts = BTreeMap::new();
+    visit(statements, &[], false, &mut root_counts, &mut entries);
+    UnitItemIndex { entries }
+}
+
 #[cfg(test)]
 fn collect_raw_declared_functions(statements: &[AstStatement]) -> Vec<String> {
     collect_raw_declared_functions_with_work(statements, &ParseWorkRecorder::disabled())
@@ -6896,6 +7117,7 @@ document:
         let work = first_profile.work_counters;
         assert_eq!(work.source_units_attempted, 1);
         assert_eq!(work.source_units_parsed, 1);
+        assert_eq!(work.source_units_reused, 0);
         assert!(work.source_bytes_inspected >= source.len());
         assert!(work.token_inspections > 0);
         assert!(work.symbol_inspections > 0);
@@ -7134,6 +7356,37 @@ document:
     }
 
     #[test]
+    fn unit_item_index_keeps_definition_identity_across_body_and_unrelated_item_edits() {
+        let before = parse_project_source_unit(
+            "app/Math.bn",
+            "FUNCTION helper(value) {\n    result: value\n}\n",
+        )
+        .unwrap();
+        let after = parse_project_source_unit(
+            "app/Math.bn",
+            "unrelated: 42\nFUNCTION helper(value) {\n    result: value + 1\n}\n",
+        )
+        .unwrap();
+
+        let before_keys = before.stable_definition_keys().collect::<Vec<_>>();
+        let after_keys = after.stable_definition_keys().collect::<Vec<_>>();
+        assert_eq!(before_keys, after_keys);
+        assert_eq!(before_keys.len(), 1);
+        assert_eq!(before.item_index.entries.len(), 1);
+        assert_eq!(after.item_index.entries.len(), 2);
+
+        let before_definition = before.item_index.definitions().next().unwrap();
+        let after_definition = after.item_index.definitions().next().unwrap();
+        assert_eq!(before_definition.route, after_definition.route);
+        assert_ne!(
+            before_definition.local_statement_id,
+            after_definition.local_statement_id
+        );
+        assert_eq!(before_definition.parameters.len(), 1);
+        assert_eq!(before_definition.parameters[0].name, "value");
+    }
+
+    #[test]
     fn parsed_source_unit_is_normalized_raw_and_unit_local() {
         fn statement_ids(statements: &[AstStatement], source_len: usize, ids: &mut Vec<usize>) {
             for statement in statements {
@@ -7318,6 +7571,32 @@ selected:
             matches!(&expression.kind, AstExprKind::Call { args, .. }
                 if args.iter().any(|arg| arg.value >= base_expression_count))
         }));
+    }
+
+    #[test]
+    fn cached_project_unit_route_matches_direct_project_parse() {
+        let files = vec![
+            (
+                "project/Math.bn".to_owned(),
+                "FUNCTION double(value) {\n    result: value + value\n}\n".to_owned(),
+            ),
+            (
+                "project/RUN.bn".to_owned(),
+                "result: Math/double(value: 2)\n".to_owned(),
+            ),
+        ];
+        let direct = parse_project("project/RUN.bn", files.clone()).unwrap();
+        let units = files
+            .into_iter()
+            .map(|(path, source)| parse_project_source_unit(path, source).unwrap())
+            .collect();
+        let (cached, assembly_profile) =
+            assemble_parsed_source_units_profiled("project/RUN.bn", units);
+
+        assert_eq!(cached.unwrap(), direct);
+        assert_eq!(assembly_profile.work_counters.source_units_attempted, 0);
+        assert_eq!(assembly_profile.work_counters.source_units_parsed, 0);
+        assert!(assembly_profile.work_counters.nodes_rebased > 0);
     }
 
     #[test]

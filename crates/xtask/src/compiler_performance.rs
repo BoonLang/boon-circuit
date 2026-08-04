@@ -10,8 +10,8 @@ use crate::report_v2::{
     unix_time_ms,
 };
 
-const REPORT_FORMAT_VERSION: u16 = 4;
-const PRODUCER_FORMAT_VERSION: u16 = 3;
+const REPORT_FORMAT_VERSION: u16 = 5;
+const PRODUCER_FORMAT_VERSION: u16 = 4;
 const BUDGET_FORMAT_VERSION: u16 = 2;
 const REPORT_CONTRACT: &str = "boon-compiler-performance-v4";
 const DEFAULT_BUDGET: &str = "budgets/compiler.toml";
@@ -397,6 +397,8 @@ struct WorkSummary {
     semantic_graph_nodes: CountSummary,
     cancellation_checkpoints: CountSummary,
     parse_source_units_attempted: CountSummary,
+    parse_source_units_parsed: CountSummary,
+    parse_source_units_reused: CountSummary,
     parse_expression_visits: CountSummary,
     parse_validation_visits: CountSummary,
     typecheck_inference_expression_visits: CountSummary,
@@ -833,7 +835,7 @@ fn validate_sample_shape(sample: &Sample, intent: SampleIntent) -> ToolResult<()
     if sample.allocations.allocation_calls == 0 || sample.allocations.allocated_bytes == 0 {
         return Err("compiler sample allocation counters are unavailable or zero".into());
     }
-    if !sample.work.has_complete_frontend_work() {
+    if !sample.work.has_cold_complete_frontend_work() {
         return Err("compiler sample frontend work counters are incomplete or inconsistent".into());
     }
     validate_sha256(
@@ -1616,6 +1618,8 @@ fn summarize_work(samples: &[Sample]) -> WorkSummary {
         semantic_graph_nodes: values(|work| work.semantic_graph_nodes),
         cancellation_checkpoints: values(|work| work.cancellation_checkpoints),
         parse_source_units_attempted: values(|work| work.parse.source_units_attempted),
+        parse_source_units_parsed: values(|work| work.parse.source_units_parsed),
+        parse_source_units_reused: values(|work| work.parse.source_units_reused),
         parse_expression_visits: values(|work| work.parse.expression_visits),
         parse_validation_visits: values(|work| work.parse.validation_visits),
         typecheck_inference_expression_visits: u64_values(|work| {

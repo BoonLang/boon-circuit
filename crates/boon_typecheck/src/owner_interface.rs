@@ -13,8 +13,11 @@ use boon_checked::{
 use boon_syntax::{StableCheckOwnerKey, StableExpressionKey};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 const OWNER_INTERFACE_SCC_RESULT_DOMAIN_V1: &[u8] = b"boon.owner-interface-scc-result.v1\0";
+const OWNER_INTERFACE_SCC_CURRENTNESS_DOMAIN_V1: &[u8] =
+    b"boon.owner-interface-scc-currentness.v1\0";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct OwnerInterfaceParameter {
@@ -143,6 +146,34 @@ pub struct OwnerInterfaceSolveWork {
     pub unification_steps: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct OwnerInterfaceSccOwnerBasis {
+    pub owner: StableCheckOwnerKey,
+    pub seed_fingerprint_v1: [u8; 32],
+    pub summary_fingerprint_v1: [u8; 32],
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct OwnerInterfaceSccDependencyBasis {
+    pub key: OwnerInterfaceSccKey,
+    pub result_fingerprint_v1: [u8; 32],
+}
+
+/// Exact frozen inputs used for one interface-SCC solve.
+///
+/// This receipt is deliberately separate from the semantic result
+/// fingerprint. A changed basis whose normalized public interfaces are equal
+/// may therefore backdate dependents, while direct artifact consumers can
+/// still reject a result paired with stale inputs.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct OwnerInterfaceSccBasis {
+    pub key: OwnerInterfaceSccKey,
+    pub topology_fingerprint_v1: [u8; 32],
+    pub owners: Box<[OwnerInterfaceSccOwnerBasis]>,
+    pub dependency_results: Box<[OwnerInterfaceSccDependencyBasis]>,
+    pub inference_abi_fingerprint_v1: [u8; 32],
+}
+
 /// Atomic result for one tagged interface SCC.
 ///
 /// `work` is telemetry and is deliberately excluded from `fingerprint_v1`.
@@ -170,6 +201,69 @@ impl OwnerInterfaceSccResult {
             .ok()
             .and_then(|index| self.owners.get(index))
     }
+}
+
+/// Latest evaluator-owned pairing of exact solve inputs with a retained
+/// semantic interface result.
+///
+/// This receipt intentionally changes when the basis changes even if the
+/// normalized public interface backdates to an older semantic value.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct OwnerInterfaceSccCurrentnessReceipt {
+    basis: OwnerInterfaceSccBasis,
+    result_fingerprint_v1: [u8; 32],
+    fingerprint_v1: [u8; 32],
+}
+
+impl OwnerInterfaceSccCurrentnessReceipt {
+    pub const fn basis(&self) -> &OwnerInterfaceSccBasis {
+        &self.basis
+    }
+
+    pub const fn result_fingerprint_v1(&self) -> [u8; 32] {
+        self.result_fingerprint_v1
+    }
+
+    pub const fn fingerprint_v1(&self) -> [u8; 32] {
+        self.fingerprint_v1
+    }
+
+    fn from_current_evaluation(
+        basis: OwnerInterfaceSccBasis,
+        result: &OwnerInterfaceSccResult,
+    ) -> Result<Self, OwnerConstraintSeedError> {
+        if basis.key != result.key {
+            return Err(OwnerConstraintSeedError::new(
+                "interface currentness basis and semantic result name different SCCs",
+            ));
+        }
+        let result_fingerprint_v1 = result.fingerprint_v1();
+        let fingerprint_v1 = boon_contract::canonical_serde_hash_v1(
+            OWNER_INTERFACE_SCC_CURRENTNESS_DOMAIN_V1,
+            &(&basis, result_fingerprint_v1),
+        )
+        .map_err(|error| {
+            OwnerConstraintSeedError::new(format!(
+                "cannot fingerprint owner interface SCC currentness: {error}"
+            ))
+        })?;
+        Ok(Self {
+            basis,
+            result_fingerprint_v1,
+            fingerprint_v1,
+        })
+    }
+}
+
+/// Latest exact evaluation paired with its semantic public projection.
+///
+/// Evaluators fingerprint this value by `currentness`; a child projection
+/// request publishes `result` by its semantic fingerprint and can therefore
+/// backdate without retaining a stale basis as current proof.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OwnerInterfaceSccEvaluation {
+    pub currentness: OwnerInterfaceSccCurrentnessReceipt,
+    pub result: Arc<OwnerInterfaceSccResult>,
 }
 
 #[derive(Default)]
@@ -1440,14 +1534,14 @@ pub(crate) fn alpha_normalize_type(
     }
 }
 
-/// Solve one dependency-first tagged interface SCC atomically.
-pub fn solve_owner_interface_scc<'a>(
+/// Evaluate one dependency-first tagged interface SCC atomically.
+pub fn evaluate_owner_interface_scc<'a>(
     scc: &OwnerInterfaceScc,
     abi: &OwnerCallableAbiEnvironment,
     seeds: impl IntoIterator<Item = &'a OwnerConstraintSeed>,
     summaries: impl IntoIterator<Item = &'a OwnerConstraintSummary>,
     dependency_results: impl IntoIterator<Item = &'a OwnerInterfaceSccResult>,
-) -> Result<OwnerInterfaceSccResult, OwnerConstraintSeedError> {
+) -> Result<OwnerInterfaceSccEvaluation, OwnerConstraintSeedError> {
     let seeds = seeds
         .into_iter()
         .map(|seed| (seed.owner.clone(), seed))
@@ -1472,9 +1566,10 @@ pub fn solve_owner_interface_scc<'a>(
         }
     }
 
+    let dependency_results = dependency_results.into_iter().collect::<Vec<_>>();
     let mut dependency_interfaces = BTreeMap::new();
     let mut dependency_keys = BTreeSet::new();
-    for result in dependency_results {
+    for result in &dependency_results {
         if !dependency_keys.insert(result.key.clone()) {
             return Err(OwnerConstraintSeedError::new(
                 "interface SCC received a duplicate dependency result",
@@ -1497,6 +1592,31 @@ pub fn solve_owner_interface_scc<'a>(
         ));
     }
 
+    let owners = scc
+        .key
+        .members
+        .iter()
+        .map(|owner| OwnerInterfaceSccOwnerBasis {
+            owner: owner.clone(),
+            seed_fingerprint_v1: seeds[owner].fingerprint_v1(),
+            summary_fingerprint_v1: summaries[owner].fingerprint_v1(),
+        })
+        .collect::<Vec<_>>();
+    let mut dependency_basis = dependency_results
+        .iter()
+        .map(|result| OwnerInterfaceSccDependencyBasis {
+            key: result.key.clone(),
+            result_fingerprint_v1: result.fingerprint_v1(),
+        })
+        .collect::<Vec<_>>();
+    dependency_basis.sort_by(|left, right| left.key.cmp(&right.key));
+    let basis = OwnerInterfaceSccBasis {
+        key: scc.key.clone(),
+        topology_fingerprint_v1: scc.fingerprint_v1(),
+        owners: owners.into_boxed_slice(),
+        dependency_results: dependency_basis.into_boxed_slice(),
+        inference_abi_fingerprint_v1: abi.fingerprint_v1(),
+    };
     let mut unifier = TypeUnifier::default();
     let mut states = BTreeMap::<StableCheckOwnerKey, OwnerSolveState<'_>>::new();
     for owner in &scc.key.members {
@@ -1608,6 +1728,35 @@ pub fn solve_owner_interface_scc<'a>(
                     add_local_root(&mut state.local_roots, name.clone(), variable);
                 }
             }
+        }
+    }
+
+    // A transparent result wrapper is part of the public type equation, not
+    // merely result-transfer metadata.  In particular, BLOCK-local aliases
+    // can be projected correctly even when their lexical reference is not a
+    // unique owner-wide root.  Freeze that exact equation before solving the
+    // remaining expression graph so an alpha-equivalent wrapper cannot split
+    // a callable's parameter and result variables.
+    for state in states.values() {
+        let Some(root) = owner_result_expression(state) else {
+            continue;
+        };
+        let Some(read) = owner_result_parameter_alias(state, root) else {
+            continue;
+        };
+        let Some(parameter) = state
+            .parameters
+            .iter()
+            .find(|parameter| parameter.ordinal == read.parameter_ordinal)
+        else {
+            return Err(OwnerConstraintSeedError::new(format!(
+                "owner interface {:?} result aliases absent parameter ordinal {}",
+                state.seed.owner, read.parameter_ordinal
+            )));
+        };
+        let projected = bind_projection(&mut unifier, parameter.variable, &read.projection);
+        if let Some(result) = expression_variable(state, root) {
+            unifier.unify(Type::Var(result), Type::Var(projected));
         }
     }
 
@@ -2479,13 +2628,32 @@ pub fn solve_owner_interface_scc<'a>(
             "cannot fingerprint owner interface SCC result: {error}"
         ))
     })?;
-    Ok(OwnerInterfaceSccResult {
+    let result = Arc::new(OwnerInterfaceSccResult {
         key: scc.key.clone(),
         owners: interfaces.into_boxed_slice(),
         type_variable_count: next_alpha,
         work,
         fingerprint_v1,
+    });
+    let currentness = OwnerInterfaceSccCurrentnessReceipt::from_current_evaluation(basis, &result)?;
+    Ok(OwnerInterfaceSccEvaluation {
+        currentness,
+        result,
     })
+}
+
+/// Direct convenience projection for callers that do not retain evaluator
+/// currentness. Persistent request graphs should publish the evaluation and
+/// semantic result as two request families.
+pub fn solve_owner_interface_scc<'a>(
+    scc: &OwnerInterfaceScc,
+    abi: &OwnerCallableAbiEnvironment,
+    seeds: impl IntoIterator<Item = &'a OwnerConstraintSeed>,
+    summaries: impl IntoIterator<Item = &'a OwnerConstraintSummary>,
+    dependency_results: impl IntoIterator<Item = &'a OwnerInterfaceSccResult>,
+) -> Result<OwnerInterfaceSccResult, OwnerConstraintSeedError> {
+    evaluate_owner_interface_scc(scc, abi, seeds, summaries, dependency_results)
+        .map(|evaluation| Arc::unwrap_or_clone(evaluation.result))
 }
 
 #[cfg(test)]
@@ -2727,6 +2895,36 @@ mod tests {
         let results = solve(&[seed], &[summary]);
         let interface = results[0].owner(&owner).unwrap();
         assert_eq!(interface.parameters.len(), 1);
+        assert_eq!(interface.parameters[0].flow_type.ty, Type::Var(TypeVar(0)));
+        assert_eq!(interface.result.ty, Type::Var(TypeVar(0)));
+        assert_eq!(interface.type_variables.as_ref(), [TypeVar(0)]);
+        assert_eq!(
+            interface.result_transfer,
+            OwnerResultTransfer::Parameter {
+                read: OwnerResultParameterRead {
+                    parameter_ordinal: 0,
+                    projection: Box::new([]),
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn transparent_block_alias_preserves_parameter_result_equation() {
+        let unit = link(concat!(
+            "FUNCTION identity(input) {\n",
+            "    BLOCK {\n",
+            "        result: input\n",
+            "        result\n",
+            "    }\n",
+            "}\n",
+        ));
+        let owner = owner_named(&unit, "identity");
+        let seed = seed(&unit, &owner);
+        let summary = resolve_owner_constraint_seed(&seed, []).unwrap();
+        let results = solve(&[seed], &[summary]);
+        let interface = results[0].owner(&owner).unwrap();
+
         assert_eq!(interface.parameters[0].flow_type.ty, Type::Var(TypeVar(0)));
         assert_eq!(interface.result.ty, Type::Var(TypeVar(0)));
         assert_eq!(interface.type_variables.as_ref(), [TypeVar(0)]);

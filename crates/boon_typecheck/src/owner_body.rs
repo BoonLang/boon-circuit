@@ -26,10 +26,13 @@ use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt;
+use std::sync::Arc;
 
 const OWNER_BODY_INFERENCE_DOMAIN_V1: &[u8] = b"boon.owner-body-inference.v1\0";
 const OWNER_BODY_INFERENCE_CONTENT_DOMAIN_V1: &[u8] = b"boon.owner-body-inference-content.v1\0";
 const OWNER_BODY_INTERFACE_DOMAIN_V1: &[u8] = b"boon.owner-body-interface-import.v1\0";
+const OWNER_BODY_INFERENCE_CURRENTNESS_DOMAIN_V1: &[u8] =
+    b"boon.owner-body-inference-currentness.v1\0";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OwnerBodyInferenceError {
@@ -117,7 +120,7 @@ pub struct OwnerBodyInferenceBasis {
     pub summary_fingerprint_v1: [u8; 32],
     pub own_scc: FrozenOwnerInterfaceSccRef,
     pub imports: Box<[FrozenOwnerInterfaceSccRef]>,
-    pub authoritative_abi_fingerprint_v1: [u8; 32],
+    pub inference_abi_fingerprint_v1: [u8; 32],
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -232,8 +235,7 @@ pub struct OwnerBodyInferenceReceipt {
 /// deliberately excluded from the result fingerprint.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OwnerBodyInferenceShard {
-    pub basis: OwnerBodyInferenceBasis,
-    pub interface_imports: Box<[OwnerBodyInterfaceImport]>,
+    pub owner: StableCheckOwnerKey,
     pub statements: Box<[InferredOwnerStatement]>,
     pub children: Box<[InferredOwnerChild]>,
     pub expressions: Box<[InferredOwnerExpression]>,
@@ -260,8 +262,66 @@ impl OwnerBodyInferenceShard {
 
 impl OwnerBodyInferenceShard {
     pub fn owner(&self) -> &StableCheckOwnerKey {
-        &self.basis.owner
+        &self.owner
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct OwnerBodyInferenceCurrentnessReceipt {
+    basis: OwnerBodyInferenceBasis,
+    /// Exact latest provider/interface identities used for this evaluation.
+    /// These cannot live on the backdatable semantic shard because an equal
+    /// body may be retained after a provider publishes a new equivalent SCC.
+    interface_imports: Box<[OwnerBodyInterfaceImport]>,
+    result_fingerprint_v1: [u8; 32],
+    fingerprint_v1: [u8; 32],
+}
+
+impl OwnerBodyInferenceCurrentnessReceipt {
+    pub const fn basis(&self) -> &OwnerBodyInferenceBasis {
+        &self.basis
+    }
+
+    pub fn interface_imports(&self) -> &[OwnerBodyInterfaceImport] {
+        &self.interface_imports
+    }
+
+    pub const fn result_fingerprint_v1(&self) -> [u8; 32] {
+        self.result_fingerprint_v1
+    }
+
+    pub const fn fingerprint_v1(&self) -> [u8; 32] {
+        self.fingerprint_v1
+    }
+
+    fn from_current_evaluation(
+        basis: OwnerBodyInferenceBasis,
+        interface_imports: Box<[OwnerBodyInterfaceImport]>,
+        result: &OwnerBodyInferenceShard,
+    ) -> Result<Self, OwnerBodyInferenceError> {
+        if basis.owner != *result.owner() {
+            return Err(OwnerBodyInferenceError::new(
+                "body currentness basis and semantic result name different owners",
+            ));
+        }
+        let result_fingerprint_v1 = result.fingerprint_v1();
+        let fingerprint_v1 = fingerprint(
+            OWNER_BODY_INFERENCE_CURRENTNESS_DOMAIN_V1,
+            &(&basis, &interface_imports, result_fingerprint_v1),
+        )?;
+        Ok(Self {
+            basis,
+            interface_imports,
+            result_fingerprint_v1,
+            fingerprint_v1,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OwnerBodyInferenceEvaluation {
+    pub currentness: OwnerBodyInferenceCurrentnessReceipt,
+    pub result: Arc<OwnerBodyInferenceShard>,
 }
 
 fn fingerprint<T: Serialize>(
@@ -3525,14 +3585,14 @@ fn validate_inputs(
 /// child-value, value-read, and callable interfaces named by the resolved
 /// owner inputs plus the exact transitive dependencies of their public result
 /// transfer slices.
-pub fn infer_owner_body<'a>(
+pub fn evaluate_owner_body<'a>(
     syntax: &OwnerSyntaxInput,
     seed: &OwnerConstraintSeed,
     summary: &OwnerConstraintSummary,
     abi: &OwnerCallableAbiEnvironment,
     own_scc: &'a OwnerInterfaceSccResult,
     imported_sccs: impl IntoIterator<Item = &'a OwnerInterfaceSccResult>,
-) -> Result<OwnerBodyInferenceShard, OwnerBodyInferenceError> {
+) -> Result<OwnerBodyInferenceEvaluation, OwnerBodyInferenceError> {
     validate_inputs(syntax, seed, summary, own_scc)?;
     let mut supplied_keys = BTreeSet::new();
     let mut supplied_results = Vec::new();
@@ -3584,7 +3644,7 @@ pub fn infer_owner_body<'a>(
         .expect("validated own SCC is present exactly once");
     let own_scc_ref = frozen_results.remove(own_scc_index);
     frozen_results.sort_by(|left, right| left.key.cmp(&right.key));
-    let authoritative_abi_fingerprint_v1 = abi.fingerprint_v1();
+    let inference_abi_fingerprint_v1 = abi.fingerprint_v1();
     let basis = OwnerBodyInferenceBasis {
         owner: seed.owner.clone(),
         syntax_fingerprint_v1: syntax.fingerprint_v1(),
@@ -3592,9 +3652,8 @@ pub fn infer_owner_body<'a>(
         summary_fingerprint_v1: summary.fingerprint_v1(),
         own_scc: own_scc_ref,
         imports: frozen_results.into_boxed_slice(),
-        authoritative_abi_fingerprint_v1,
+        inference_abi_fingerprint_v1,
     };
-
     let mut interface_imports = interfaces
         .values()
         .map(|interface| {
@@ -3974,7 +4033,6 @@ pub fn infer_owner_body<'a>(
     let local_content_digest_v1 = fingerprint(
         OWNER_BODY_INFERENCE_CONTENT_DOMAIN_V1,
         &(
-            &interface_imports,
             &inferred_statements,
             &inferred_children,
             &inferred_expressions,
@@ -3996,8 +4054,7 @@ pub fn infer_owner_body<'a>(
     let fingerprint_v1 = fingerprint(
         OWNER_BODY_INFERENCE_DOMAIN_V1,
         &(
-            &basis,
-            &interface_imports,
+            &seed.owner,
             &inferred_statements,
             &inferred_children,
             &inferred_expressions,
@@ -4009,9 +4066,8 @@ pub fn infer_owner_body<'a>(
         ),
     )?;
     work.unification_steps = unifier.steps();
-    Ok(OwnerBodyInferenceShard {
-        basis,
-        interface_imports: interface_imports.into_boxed_slice(),
+    let result = Arc::new(OwnerBodyInferenceShard {
+        owner: seed.owner.clone(),
         statements: inferred_statements.into_boxed_slice(),
         children: inferred_children.into_boxed_slice(),
         expressions: inferred_expressions.into_boxed_slice(),
@@ -4022,7 +4078,31 @@ pub fn infer_owner_body<'a>(
         receipt,
         work,
         fingerprint_v1,
+    });
+    let currentness = OwnerBodyInferenceCurrentnessReceipt::from_current_evaluation(
+        basis,
+        interface_imports.into_boxed_slice(),
+        &result,
+    )?;
+    Ok(OwnerBodyInferenceEvaluation {
+        currentness,
+        result,
     })
+}
+
+/// Direct convenience projection for callers that do not retain evaluator
+/// currentness. Persistent request graphs should publish evaluation and
+/// semantic body as separate request families.
+pub fn infer_owner_body<'a>(
+    syntax: &OwnerSyntaxInput,
+    seed: &OwnerConstraintSeed,
+    summary: &OwnerConstraintSummary,
+    abi: &OwnerCallableAbiEnvironment,
+    own_scc: &'a OwnerInterfaceSccResult,
+    imported_sccs: impl IntoIterator<Item = &'a OwnerInterfaceSccResult>,
+) -> Result<OwnerBodyInferenceShard, OwnerBodyInferenceError> {
+    evaluate_owner_body(syntax, seed, summary, abi, own_scc, imported_sccs)
+        .map(|evaluation| Arc::unwrap_or_clone(evaluation.result))
 }
 
 #[cfg(test)]

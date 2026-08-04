@@ -7,8 +7,9 @@
 
 use crate::{
     InferredOwnerCall, InferredOwnerCallableTarget, OwnerAbiCallableContract, OwnerAbiEnvironment,
-    OwnerAbiEvaluationScope, OwnerAbiValueContract, OwnerArgumentKind, OwnerBodyInferenceShard,
-    OwnerCheckedReceiptSink, OwnerConstraintEdgeRole, OwnerConstraintSeed, OwnerConstraintSummary,
+    OwnerAbiEvaluationScope, OwnerAbiValueContract, OwnerArgumentKind,
+    OwnerBodyInferenceCurrentnessReceipt, OwnerBodyInferenceShard, OwnerCheckedReceiptSink,
+    OwnerConstraintEdgeRole, OwnerConstraintSeed, OwnerConstraintSummary,
     OwnerContainingScopeInput, OwnerDeclarationKind, OwnerInferenceExpressionRef,
     OwnerInterfaceEvaluationScope, OwnerInterfaceSccResult, OwnerParameterKind,
     OwnerPublicInterface, OwnerSourceAnchorSite, OwnerSyntaxGraph, OwnerSyntaxInput,
@@ -52,6 +53,7 @@ pub struct CheckedOwnerShardBasis {
     pub seed_fingerprint_v1: [u8; 32],
     pub summary_fingerprint_v1: [u8; 32],
     pub body_fingerprint_v1: [u8; 32],
+    pub body_currentness_fingerprint_v1: [u8; 32],
     pub own_interface_scc_fingerprint_v1: [u8; 32],
     pub authoritative_abi_fingerprint_v1: [u8; 32],
 }
@@ -113,6 +115,7 @@ fn validate_inputs(
     seed: &OwnerConstraintSeed,
     summary: &OwnerConstraintSummary,
     body: &OwnerBodyInferenceShard,
+    body_currentness: &OwnerBodyInferenceCurrentnessReceipt,
     abi: &OwnerAbiEnvironment,
     own_scc: &OwnerInterfaceSccResult,
 ) -> Result<(), CheckedOwnerBuildError> {
@@ -126,11 +129,22 @@ fn validate_inputs(
             "checked owner inputs disagree on stable owner {owner:?}"
         )));
     }
-    if seed.fingerprint_v1() != body.basis.seed_fingerprint_v1
-        || summary.fingerprint_v1() != body.basis.summary_fingerprint_v1
-        || syntax.fingerprint_v1() != body.basis.syntax_fingerprint_v1
-        || abi.fingerprint_v1() != body.basis.authoritative_abi_fingerprint_v1
-        || own_scc.fingerprint_v1() != body.basis.own_scc.result_fingerprint_v1
+    let inference_abi_fingerprint_v1 = abi
+        .callable_environment()
+        .map_err(|error| {
+            CheckedOwnerBuildError::new(format!(
+                "cannot validate checked owner inference ABI: {error}"
+            ))
+        })?
+        .fingerprint_v1();
+    let body_basis = body_currentness.basis();
+    if body_currentness.result_fingerprint_v1() != body.fingerprint_v1()
+        || body_basis.owner != *owner
+        || seed.fingerprint_v1() != body_basis.seed_fingerprint_v1
+        || summary.fingerprint_v1() != body_basis.summary_fingerprint_v1
+        || syntax.fingerprint_v1() != body_basis.syntax_fingerprint_v1
+        || inference_abi_fingerprint_v1 != body_basis.inference_abi_fingerprint_v1
+        || own_scc.fingerprint_v1() != body_basis.own_scc.result_fingerprint_v1
     {
         return Err(CheckedOwnerBuildError::new(format!(
             "checked owner inputs for {owner:?} do not match the frozen body basis"
@@ -159,7 +173,7 @@ fn validate_inputs(
     }
     for call in &body.calls {
         if matches!(call.target, InferredOwnerCallableTarget::Owner { ref owner } if own_scc.owner(owner).is_none())
-            && !body.interface_imports.iter().any(|import| {
+            && !body_currentness.interface_imports().iter().any(|import| {
                 matches!(call.target, InferredOwnerCallableTarget::Owner { owner: ref target } if &import.owner == target)
             })
         {
@@ -174,19 +188,21 @@ fn validate_inputs(
 
 fn validated_frozen_interfaces<'a>(
     body: &OwnerBodyInferenceShard,
+    body_currentness: &OwnerBodyInferenceCurrentnessReceipt,
     own_scc: &'a OwnerInterfaceSccResult,
     imported_sccs: impl IntoIterator<Item = &'a OwnerInterfaceSccResult>,
 ) -> Result<BTreeMap<StableCheckOwnerKey, &'a OwnerPublicInterface>, CheckedOwnerBuildError> {
+    let body_basis = body_currentness.basis();
     let mut expected = BTreeMap::new();
     if expected
-        .insert(body.basis.own_scc.key.clone(), &body.basis.own_scc)
+        .insert(body_basis.own_scc.key.clone(), &body_basis.own_scc)
         .is_some()
     {
         return Err(CheckedOwnerBuildError::new(
             "checked owner body repeats its own frozen interface SCC",
         ));
     }
-    for frozen in &body.basis.imports {
+    for frozen in &body_basis.imports {
         if expected.insert(frozen.key.clone(), frozen).is_some() {
             return Err(CheckedOwnerBuildError::new(format!(
                 "checked owner body repeats frozen interface SCC {:?}",
@@ -195,7 +211,7 @@ fn validated_frozen_interfaces<'a>(
         }
     }
 
-    if own_scc.key != body.basis.own_scc.key {
+    if own_scc.key != body_basis.own_scc.key {
         return Err(CheckedOwnerBuildError::new(format!(
             "checked owner {:?} received the wrong own interface SCC",
             body.owner()
@@ -251,7 +267,7 @@ fn validated_frozen_interfaces<'a>(
     }
 
     let mut imports = BTreeMap::new();
-    for import in &body.interface_imports {
+    for import in body_currentness.interface_imports() {
         if imports.insert(import.owner.clone(), import).is_some() {
             return Err(CheckedOwnerBuildError::new(format!(
                 "checked owner {:?} repeats interface import {:?}",
@@ -4946,13 +4962,15 @@ pub fn build_checked_owner_shard<'a>(
     seed: &OwnerConstraintSeed,
     summary: &OwnerConstraintSummary,
     body: &OwnerBodyInferenceShard,
+    body_currentness: &OwnerBodyInferenceCurrentnessReceipt,
     abi: &OwnerAbiEnvironment,
     own_scc: &'a OwnerInterfaceSccResult,
     imported_sccs: impl IntoIterator<Item = &'a OwnerInterfaceSccResult>,
 ) -> Result<CheckedOwnerShard, CheckedOwnerBuildError> {
-    validate_inputs(syntax, seed, summary, body, abi, own_scc)?;
+    validate_inputs(syntax, seed, summary, body, body_currentness, abi, own_scc)?;
 
-    let mut interfaces = validated_frozen_interfaces(body, own_scc, imported_sccs)?;
+    let mut interfaces =
+        validated_frozen_interfaces(body, body_currentness, own_scc, imported_sccs)?;
     let own_interface = interfaces.remove(&syntax.owner).ok_or_else(|| {
         CheckedOwnerBuildError::new(format!(
             "checked owner {:?} has no frozen public interface",
@@ -4965,6 +4983,7 @@ pub fn build_checked_owner_shard<'a>(
         seed_fingerprint_v1: seed.fingerprint_v1(),
         summary_fingerprint_v1: summary.fingerprint_v1(),
         body_fingerprint_v1: body.fingerprint_v1(),
+        body_currentness_fingerprint_v1: body_currentness.fingerprint_v1(),
         own_interface_scc_fingerprint_v1: own_scc.fingerprint_v1(),
         authoritative_abi_fingerprint_v1: abi.fingerprint_v1(),
     };

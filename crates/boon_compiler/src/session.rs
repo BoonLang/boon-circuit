@@ -18,16 +18,18 @@ use boon_plan::{
 };
 use boon_syntax::StableCheckOwnerKey;
 use boon_syntax::{SourceUnitId, SyntaxUnitNamespace, UnitItemKind};
+#[cfg(test)]
+use boon_typecheck::OwnerConstraintDependencyKind;
 use boon_typecheck::{
-    AmbiguousOwnerSymbolCandidate, OwnerAbiEnvironment, OwnerBodyInferenceShard,
-    OwnerCallableAbiEnvironment, OwnerConstraintDependencyKind, OwnerConstraintSeed,
-    OwnerConstraintSummary, OwnerDeclarationKind, OwnerInterfaceScc, OwnerInterfaceSccKey,
-    OwnerInterfaceSccResult, OwnerInterfaceTopology, OwnerReferenceKind, OwnerSourceMap,
-    OwnerSymbolReference, OwnerSymbolResolution, OwnerSyntaxInput, build_owner_interface_topology,
-    infer_owner_body, owner_body_required_interface_owners, project_owner_abi_environment,
+    AmbiguousOwnerSymbolCandidate, OwnerAbiEnvironment, OwnerBodyInferenceEvaluation,
+    OwnerBodyInferenceShard, OwnerCallableAbiEnvironment, OwnerConstraintSeed,
+    OwnerConstraintSummary, OwnerDeclarationKind, OwnerInterfaceScc, OwnerInterfaceSccEvaluation,
+    OwnerInterfaceSccKey, OwnerInterfaceSccResult, OwnerInterfaceTopology, OwnerReferenceKind,
+    OwnerSourceMap, OwnerSymbolReference, OwnerSymbolResolution, OwnerSyntaxInput,
+    build_owner_interface_topology, evaluate_owner_body, evaluate_owner_interface_scc,
+    owner_body_required_interface_owners, project_owner_abi_environment,
     project_owner_constraint_seed, project_owner_source_map, project_owner_syntax_input,
-    resolve_owner_constraint_seed_with_resolutions, solve_owner_interface_scc,
-    stable_check_owner_key_fingerprint_v1,
+    resolve_owner_constraint_seed_with_resolutions, stable_check_owner_key_fingerprint_v1,
 };
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -204,7 +206,10 @@ struct ProjectState {
     project_owner_interface_topology_requests:
         TypedRequestTable<ProjectOwnerInterfaceTopologyRequest>,
     owner_interface_scc_plan_requests: TypedRequestTable<OwnerInterfaceSccPlanRequest>,
+    owner_interface_scc_evaluation_requests: TypedRequestTable<OwnerInterfaceSccEvaluationRequest>,
     owner_interface_scc_requests: TypedRequestTable<OwnerInterfaceSccRequest>,
+    owner_body_inference_evaluation_requests:
+        TypedRequestTable<OwnerBodyInferenceEvaluationRequest>,
     owner_body_inference_requests: TypedRequestTable<OwnerBodyInferenceRequest>,
     checked: Option<CheckedSourceFromSource>,
     compiled: Option<(Revision, CompiledSealedMachinePlanFromSource)>,
@@ -698,6 +703,25 @@ impl RequestFamily for OwnerInterfaceSccPlanRequest {
     }
 }
 
+struct OwnerInterfaceSccEvaluationRequest;
+
+impl RequestFamily for OwnerInterfaceSccEvaluationRequest {
+    type Key = OwnerInterfaceSccKey;
+    type Value = Arc<OwnerInterfaceSccEvaluation>;
+
+    const NAME: &'static str = "boon.compiler.owner-interface-scc-evaluation.v1";
+
+    fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
+        OwnerInterfaceSccPlanRequest::key_fingerprint(key)
+    }
+
+    fn output_fingerprint(
+        value: &Self::Value,
+    ) -> Result<RequestOutputFingerprint, boon_compilation_db::CompilationDbError> {
+        Ok(RequestOutputFingerprint(value.currentness.fingerprint_v1()))
+    }
+}
+
 struct OwnerInterfaceSccRequest;
 
 impl RequestFamily for OwnerInterfaceSccRequest {
@@ -714,6 +738,25 @@ impl RequestFamily for OwnerInterfaceSccRequest {
         value: &Self::Value,
     ) -> Result<RequestOutputFingerprint, boon_compilation_db::CompilationDbError> {
         Ok(RequestOutputFingerprint(value.fingerprint_v1()))
+    }
+}
+
+struct OwnerBodyInferenceEvaluationRequest;
+
+impl RequestFamily for OwnerBodyInferenceEvaluationRequest {
+    type Key = StableCheckOwnerKey;
+    type Value = Arc<OwnerBodyInferenceEvaluation>;
+
+    const NAME: &'static str = "boon.compiler.owner-body-inference-evaluation.v1";
+
+    fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
+        stable_check_owner_key_fingerprint_v1(key)
+    }
+
+    fn output_fingerprint(
+        value: &Self::Value,
+    ) -> Result<RequestOutputFingerprint, boon_compilation_db::CompilationDbError> {
+        Ok(RequestOutputFingerprint(value.currentness.fingerprint_v1()))
     }
 }
 
@@ -769,7 +812,9 @@ impl CompilerSession {
                 owner_constraint_requests: TypedRequestTable::new(),
                 project_owner_interface_topology_requests: TypedRequestTable::new(),
                 owner_interface_scc_plan_requests: TypedRequestTable::new(),
+                owner_interface_scc_evaluation_requests: TypedRequestTable::new(),
                 owner_interface_scc_requests: TypedRequestTable::new(),
+                owner_body_inference_evaluation_requests: TypedRequestTable::new(),
                 owner_body_inference_requests: TypedRequestTable::new(),
                 checked: None,
                 compiled: None,
@@ -1694,6 +1739,11 @@ fn evaluate_owner_requests(
             live_owners.contains(owner)
         })?;
     state
+        .owner_body_inference_evaluation_requests
+        .retain(&mut state.syntax_evaluator, |owner| {
+            live_owners.contains(owner)
+        })?;
+    state
         .owner_body_inference_requests
         .retain(&mut state.syntax_evaluator, |owner| {
             live_owners.contains(owner)
@@ -2296,6 +2346,9 @@ fn evaluate_owner_interface_scc_requests(state: &mut ProjectState) -> CompilerRe
         .owner_interface_scc_plan_requests
         .retain(&mut state.syntax_evaluator, |key| live_keys.contains(key))?;
     state
+        .owner_interface_scc_evaluation_requests
+        .retain(&mut state.syntax_evaluator, |key| live_keys.contains(key))?;
+    state
         .owner_interface_scc_requests
         .retain(&mut state.syntax_evaluator, |key| live_keys.contains(key))?;
 
@@ -2350,19 +2403,23 @@ fn evaluate_owner_interface_scc_requests(state: &mut ProjectState) -> CompilerRe
         }
     }
 
-    let result_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.owner-interface-scc-result-dependencies.v1\0",
+    let evaluation_input = RequestInputFingerprint(request_fingerprint(
+        b"boon.compiler.owner-interface-scc-evaluation-dependencies.v1\0",
         [abi_fingerprint.as_slice()],
     ));
+    let result_input = RequestInputFingerprint(request_fingerprint(
+        b"boon.compiler.owner-interface-scc-result-projection-dependencies.v1\0",
+        std::iter::empty(),
+    ));
     for expected in &topology.sccs {
-        match state.owner_interface_scc_requests.begin(
+        match state.owner_interface_scc_evaluation_requests.begin(
             &mut state.syntax_evaluator,
             expected.key.clone(),
-            result_input,
+            evaluation_input,
         )? {
             RequestStart::Reused => {}
             RequestStart::Execute(mut ticket) => {
-                let result = (|| -> CompilerResult<_> {
+                let evaluation = (|| -> CompilerResult<_> {
                     let plan = Arc::clone(state.owner_interface_scc_plan_requests.require(
                         &state.syntax_evaluator,
                         &mut ticket,
@@ -2408,13 +2465,46 @@ fn evaluate_owner_interface_scc_requests(state: &mut ProjectState) -> CompilerRe
                                 .map_err(Into::into)
                         })
                         .collect::<CompilerResult<Vec<_>>>()?;
-                    Ok(Arc::new(solve_owner_interface_scc(
+                    Ok(Arc::new(evaluate_owner_interface_scc(
                         &plan,
                         &abi,
                         seeds.iter().map(Arc::as_ref),
                         summaries.iter().map(Arc::as_ref),
                         dependencies.iter().map(Arc::as_ref),
                     )?))
+                })();
+                let evaluation = match evaluation {
+                    Ok(evaluation) => evaluation,
+                    Err(error) => {
+                        state.owner_interface_scc_evaluation_requests.abort(
+                            &mut state.syntax_evaluator,
+                            ticket,
+                            RequestAbortReason::Failed,
+                        )?;
+                        return Err(error);
+                    }
+                };
+                state.owner_interface_scc_evaluation_requests.publish(
+                    &mut state.syntax_evaluator,
+                    ticket,
+                    evaluation,
+                )?;
+            }
+        }
+        match state.owner_interface_scc_requests.begin(
+            &mut state.syntax_evaluator,
+            expected.key.clone(),
+            result_input,
+        )? {
+            RequestStart::Reused => {}
+            RequestStart::Execute(mut ticket) => {
+                let result = (|| -> CompilerResult<_> {
+                    let evaluation = state.owner_interface_scc_evaluation_requests.require(
+                        &state.syntax_evaluator,
+                        &mut ticket,
+                        &expected.key,
+                    )?;
+                    Ok(Arc::clone(&evaluation.result))
                 })();
                 let result = match result {
                     Ok(result) => result,
@@ -2538,14 +2628,15 @@ fn evaluate_owner_body_inference_requests(
                 })?,
         );
         let plan = owner_body_inference_interface_plan(topology, &seed, &summary, &interfaces)?;
-        match state.owner_body_inference_requests.begin(
+        let evaluation_input = owner_body_inference_plan_fingerprint(&plan, abi_fingerprint);
+        match state.owner_body_inference_evaluation_requests.begin(
             &mut state.syntax_evaluator,
             owner.clone(),
-            owner_body_inference_plan_fingerprint(&plan, abi_fingerprint),
+            evaluation_input,
         )? {
             RequestStart::Reused => {}
             RequestStart::Execute(mut ticket) => {
-                let body = (|| -> CompilerResult<_> {
+                let evaluation = (|| -> CompilerResult<_> {
                     let syntax = Arc::clone(state.owner_input_requests.require(
                         &state.syntax_evaluator,
                         &mut ticket,
@@ -2589,9 +2680,46 @@ fn evaluate_owner_body_inference_requests(
                         .iter()
                         .filter(|result| result.key != own_scc.key)
                         .map(AsRef::as_ref);
-                    Ok(Arc::new(infer_owner_body(
+                    Ok(Arc::new(evaluate_owner_body(
                         &syntax, &seed, &summary, &abi, own_scc, imports,
                     )?))
+                })();
+                let evaluation = match evaluation {
+                    Ok(evaluation) => evaluation,
+                    Err(error) => {
+                        state.owner_body_inference_evaluation_requests.abort(
+                            &mut state.syntax_evaluator,
+                            ticket,
+                            RequestAbortReason::Failed,
+                        )?;
+                        return Err(error);
+                    }
+                };
+                state.owner_body_inference_evaluation_requests.publish(
+                    &mut state.syntax_evaluator,
+                    ticket,
+                    evaluation,
+                )?;
+            }
+        }
+        let result_input = RequestInputFingerprint(request_fingerprint(
+            b"boon.compiler.owner-body-inference-result-projection-dependencies.v1\0",
+            std::iter::empty(),
+        ));
+        match state.owner_body_inference_requests.begin(
+            &mut state.syntax_evaluator,
+            owner.clone(),
+            result_input,
+        )? {
+            RequestStart::Reused => {}
+            RequestStart::Execute(mut ticket) => {
+                let body = (|| -> CompilerResult<_> {
+                    let evaluation = state.owner_body_inference_evaluation_requests.require(
+                        &state.syntax_evaluator,
+                        &mut ticket,
+                        &owner,
+                    )?;
+                    Ok(Arc::clone(&evaluation.result))
                 })();
                 let body = match body {
                     Ok(body) => body,
@@ -3328,6 +3456,20 @@ mod tests {
             .owner_body_inference(project, &owner)
             .unwrap()
             .unwrap();
+        let first_interface_evaluation = {
+            let state = session.projects.get(&project).unwrap();
+            Arc::clone(
+                state
+                    .owner_interface_scc_evaluation_requests
+                    .current_value(&state.syntax_evaluator, &first_interface.key)
+                    .unwrap()
+                    .unwrap(),
+            )
+        };
+        assert!(Arc::ptr_eq(
+            &first_interface_evaluation.result,
+            &first_interface,
+        ));
         let first_owner = first_interface.owner(&owner).unwrap();
         assert_eq!(
             first_owner.parameters[0].flow_type.ty,
@@ -3354,11 +3496,55 @@ mod tests {
             .owner_body_inference(project, &owner)
             .unwrap()
             .unwrap();
+        let second_interface_evaluation = {
+            let state = session.projects.get(&project).unwrap();
+            Arc::clone(
+                state
+                    .owner_interface_scc_evaluation_requests
+                    .current_value(&state.syntax_evaluator, &second_interface.key)
+                    .unwrap()
+                    .unwrap(),
+            )
+        };
         assert!(!Arc::ptr_eq(&first_seed, &second_seed));
+        assert_eq!(first_interface.owners, second_interface.owners);
+        assert_eq!(
+            first_interface.type_variable_count,
+            second_interface.type_variable_count,
+        );
+        assert_eq!(
+            first_interface.fingerprint_v1(),
+            second_interface.fingerprint_v1(),
+            "an alpha-equivalent body edit changed the semantic interface fingerprint",
+        );
         assert!(Arc::ptr_eq(&first_interface, &second_interface));
+        assert!(!Arc::ptr_eq(
+            &first_interface_evaluation,
+            &second_interface_evaluation,
+        ));
+        assert_ne!(
+            first_interface_evaluation.currentness.fingerprint_v1(),
+            second_interface_evaluation.currentness.fingerprint_v1(),
+        );
+        assert_eq!(
+            second_interface_evaluation
+                .currentness
+                .result_fingerprint_v1(),
+            second_interface.fingerprint_v1(),
+        );
+        assert!(!Arc::ptr_eq(
+            &second_interface_evaluation.result,
+            &second_interface,
+        ));
         assert!(!Arc::ptr_eq(&first_body, &second_body));
         let state = session.projects.get(&project).unwrap();
         let key = second_interface.key.clone();
+        let evaluation_memo = state
+            .owner_interface_scc_evaluation_requests
+            .memo(&state.syntax_evaluator, &key)
+            .unwrap();
+        assert_eq!(evaluation_memo.changed_at, EvaluationRevision(1));
+        assert_eq!(evaluation_memo.verified_at, EvaluationRevision(1));
         let memo = state
             .owner_interface_scc_requests
             .memo(&state.syntax_evaluator, &key)
@@ -3409,8 +3595,20 @@ mod tests {
             .owner_body_inference(project, &value)
             .unwrap()
             .unwrap();
-        let imported = body
-            .interface_imports
+        let body_evaluation = {
+            let state = session.projects.get(&project).unwrap();
+            Arc::clone(
+                state
+                    .owner_body_inference_evaluation_requests
+                    .current_value(&state.syntax_evaluator, &value)
+                    .unwrap()
+                    .unwrap(),
+            )
+        };
+        assert!(Arc::ptr_eq(&body_evaluation.result, &body));
+        let imported = body_evaluation
+            .currentness
+            .interface_imports()
             .iter()
             .map(|interface| interface.owner.clone())
             .collect::<BTreeSet<_>>();

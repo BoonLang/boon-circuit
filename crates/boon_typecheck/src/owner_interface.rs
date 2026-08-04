@@ -1,10 +1,10 @@
 use crate::{
     AuthoritativeCallableSignature, AuthoritativeParameter, BuiltinSignatureRegistry,
-    OwnerArgumentKind, OwnerCollectionKind, OwnerConstraintEdgeRole, OwnerConstraintNodeKind,
-    OwnerConstraintSeed, OwnerConstraintSeedError, OwnerConstraintSummary, OwnerDeclarationKind,
-    OwnerInterfaceScc, OwnerInterfaceSccKey, OwnerParameterKind, OwnerPatternConstraint,
-    OwnerReferenceKind, RenderContractRegistry, host_effect_signature, infix_returns_bool,
-    session_info_intrinsic_type,
+    OwnerArgumentKind, OwnerCallableAbiEnvironment, OwnerCollectionKind, OwnerConstraintEdgeRole,
+    OwnerConstraintNodeKind, OwnerConstraintSeed, OwnerConstraintSeedError, OwnerConstraintSummary,
+    OwnerDeclarationKind, OwnerInterfaceScc, OwnerInterfaceSccKey, OwnerParameterKind,
+    OwnerPatternConstraint, OwnerReferenceKind, RenderContractRegistry, host_effect_signature,
+    infix_returns_bool, session_info_intrinsic_type,
 };
 use boon_checked::{
     BytesType, CheckedEffectSummary, CheckedParameterKind, CheckedParameterRequirement, FlowMode,
@@ -380,12 +380,21 @@ impl TypeUnifier {
 }
 
 #[derive(Clone)]
+struct OwnerSolveParameter {
+    name: String,
+    kind: OwnerParameterKind,
+    ordinal: u32,
+    variable: TypeVar,
+    evaluation_scope: OwnerInterfaceEvaluationScope,
+}
+
+#[derive(Clone)]
 struct OwnerSolveState<'a> {
     seed: &'a OwnerConstraintSeed,
     summary: &'a OwnerConstraintSummary,
     declaration_kind: Option<OwnerDeclarationKind>,
     names: Box<[String]>,
-    parameters: Vec<(String, OwnerParameterKind, u32, TypeVar)>,
+    parameters: Vec<OwnerSolveParameter>,
     context: TypeVar,
     result: TypeVar,
     expressions: Vec<TypeVar>,
@@ -404,6 +413,15 @@ struct CrossCall {
     function: String,
     inputs: Box<[(OwnerConstraintEdgeRole, u32)]>,
     stable_expression: StableExpressionKey,
+}
+
+#[derive(Clone)]
+struct InstantiatedInterfaceParameter {
+    name: String,
+    kind: OwnerParameterKind,
+    ordinal: u32,
+    ty: Type,
+    evaluation_scope: OwnerInterfaceEvaluationScope,
 }
 
 pub(crate) fn add_local_root(
@@ -514,6 +532,97 @@ fn expression_variable(state: &OwnerSolveState<'_>, reference: u32) -> Option<Ty
     })
 }
 
+fn direct_owner_parameter_ordinal(state: &OwnerSolveState<'_>, reference: u32) -> Option<u32> {
+    let expression = state.seed.expressions.get(reference as usize)?;
+    let parts = match &expression.kind {
+        OwnerConstraintNodeKind::Reference { parts } | OwnerConstraintNodeKind::Drain { parts } => {
+            parts
+        }
+        _ => return None,
+    };
+    let [name] = parts.as_ref() else {
+        return None;
+    };
+    let parameter = state
+        .parameters
+        .iter()
+        .find(|parameter| parameter.name == *name)?;
+    (state.local_roots.get(name) == Some(&Some(parameter.variable))).then_some(parameter.ordinal)
+}
+
+fn referenced_owner_parameter_ordinals(
+    state: &OwnerSolveState<'_>,
+    reference: u32,
+) -> BTreeSet<u32> {
+    let mut referenced = BTreeSet::new();
+    let mut pending = vec![reference];
+    let mut visited = BTreeSet::new();
+    while let Some(reference) = pending.pop() {
+        if reference as usize >= state.seed.expressions.len() || !visited.insert(reference) {
+            continue;
+        }
+        let expression = &state.seed.expressions[reference as usize];
+        if let OwnerConstraintNodeKind::Reference { parts }
+        | OwnerConstraintNodeKind::Drain { parts } = &expression.kind
+            && let Some(name) = parts.first()
+            && let Some(parameter) = state
+                .parameters
+                .iter()
+                .find(|parameter| parameter.name == *name)
+            && state.local_roots.get(name) == Some(&Some(parameter.variable))
+        {
+            referenced.insert(parameter.ordinal);
+        }
+        pending.extend(expression.inputs.iter().map(|input| input.expression));
+    }
+    referenced
+}
+
+fn call_input_for_parameter(
+    call: &CrossCall,
+    parameter: &InstantiatedInterfaceParameter,
+    parameters: &[InstantiatedInterfaceParameter],
+) -> Option<u32> {
+    call.inputs
+        .iter()
+        .find_map(|(role, expression)| match role {
+            OwnerConstraintEdgeRole::CallArgument { name, .. }
+            | OwnerConstraintEdgeRole::PipeArgument { name, .. }
+                if *name == parameter.name =>
+            {
+                Some(*expression)
+            }
+            OwnerConstraintEdgeRole::PipeInput
+                if parameters
+                    .iter()
+                    .find(|candidate| candidate.kind == OwnerParameterKind::Value)
+                    .is_some_and(|candidate| candidate.ordinal == parameter.ordinal) =>
+            {
+                Some(*expression)
+            }
+            _ => None,
+        })
+}
+
+fn forwarded_owner_output_ordinal(
+    caller: &OwnerSolveState<'_>,
+    call: &CrossCall,
+    parameters: &[InstantiatedInterfaceParameter],
+    output_ordinal: u32,
+) -> Option<u32> {
+    let output = parameters.iter().find(|parameter| {
+        parameter.kind == OwnerParameterKind::Out && parameter.ordinal == output_ordinal
+    })?;
+    let expression = call_input_for_parameter(call, output, parameters)?;
+    let owner_ordinal = direct_owner_parameter_ordinal(caller, expression)?;
+    caller
+        .parameters
+        .iter()
+        .find(|parameter| parameter.ordinal == owner_ordinal)
+        .filter(|parameter| parameter.kind == OwnerParameterKind::Out)
+        .map(|parameter| parameter.ordinal)
+}
+
 fn owner_result_expression(state: &OwnerSolveState<'_>) -> Option<u32> {
     let public = state
         .seed
@@ -549,6 +658,7 @@ fn solver_surface_snapshot(
     Type,
     CheckedEffectSummary,
     Vec<Option<FlowMode>>,
+    Vec<OwnerInterfaceEvaluationScope>,
 )> {
     states
         .iter()
@@ -558,12 +668,17 @@ fn solver_surface_snapshot(
                 state
                     .parameters
                     .iter()
-                    .map(|(_, _, _, variable)| unifier.resolve(&Type::Var(*variable)))
+                    .map(|parameter| unifier.resolve(&Type::Var(parameter.variable)))
                     .collect(),
                 unifier.resolve(&Type::Var(state.result)),
                 unifier.resolve(&Type::Var(state.context)),
                 state.effect,
                 state.modes.clone(),
+                state
+                    .parameters
+                    .iter()
+                    .map(|parameter| parameter.evaluation_scope)
+                    .collect(),
             )
         })
         .collect()
@@ -860,6 +975,7 @@ pub(crate) fn alpha_normalize_type(
 /// Solve one dependency-first tagged interface SCC atomically.
 pub fn solve_owner_interface_scc<'a>(
     scc: &OwnerInterfaceScc,
+    abi: &OwnerCallableAbiEnvironment,
     seeds: impl IntoIterator<Item = &'a OwnerConstraintSeed>,
     summaries: impl IntoIterator<Item = &'a OwnerConstraintSummary>,
     dependency_results: impl IntoIterator<Item = &'a OwnerInterfaceSccResult>,
@@ -927,12 +1043,13 @@ pub fn solve_owner_interface_scc<'a>(
         if let Some(public) = public {
             for parameter in &public.parameters {
                 let variable = unifier.fresh();
-                parameters.push((
-                    parameter.name.clone(),
-                    parameter.kind,
-                    parameter.ordinal,
+                parameters.push(OwnerSolveParameter {
+                    name: parameter.name.clone(),
+                    kind: parameter.kind,
+                    ordinal: parameter.ordinal,
                     variable,
-                ));
+                    evaluation_scope: OwnerInterfaceEvaluationScope::Parent,
+                });
                 add_local_root(&mut local_roots, parameter.name.clone(), variable);
             }
         }
@@ -1377,9 +1494,13 @@ pub fn solve_owner_interface_scc<'a>(
         }
     }
 
-    let builtins = BuiltinSignatureRegistry::default();
-    let render = RenderContractRegistry::default();
     let mut call_variables = vec![BTreeMap::new(); calls.len()];
+    // Context schemes are instantiated independently from the ordinary call
+    // result/parameter scheme. The checked-program oracle deliberately gives
+    // an inherited PASSED requirement its own per-call variables; sharing this
+    // substitution map would incorrectly couple a wrapper's result type to its
+    // inherited context leaf.
+    let mut call_context_variables = vec![BTreeMap::new(); calls.len()];
     let mut previous = solver_surface_snapshot(&mut unifier, &states);
     let maximum_rounds = states.len().saturating_add(calls.len()).saturating_add(2);
     let mut converged = calls.is_empty();
@@ -1389,6 +1510,7 @@ pub fn solve_owner_interface_scc<'a>(
                 OwnerConstraintSeedError::new("interface call has no caller state")
             })?;
             let variables = &mut call_variables[call_index];
+            let context_variables = &mut call_context_variables[call_index];
             let (parameters, result, result_mode, context, effect) = if let Some(target) =
                 &call.target
             {
@@ -1396,17 +1518,16 @@ pub fn solve_owner_interface_scc<'a>(
                     let parameters = callee
                         .parameters
                         .iter()
-                        .map(|(name, kind, ordinal, variable)| {
-                            (
-                                name.clone(),
-                                *kind,
-                                *ordinal,
-                                instantiate_type(
-                                    &unifier.resolve(&Type::Var(*variable)),
-                                    &mut unifier,
-                                    &mut *variables,
-                                ),
-                            )
+                        .map(|parameter| InstantiatedInterfaceParameter {
+                            name: parameter.name.clone(),
+                            kind: parameter.kind,
+                            ordinal: parameter.ordinal,
+                            ty: instantiate_type(
+                                &unifier.resolve(&Type::Var(parameter.variable)),
+                                &mut unifier,
+                                &mut *variables,
+                            ),
+                            evaluation_scope: parameter.evaluation_scope,
                         })
                         .collect::<Vec<_>>();
                     let result = instantiate_type(
@@ -1417,7 +1538,7 @@ pub fn solve_owner_interface_scc<'a>(
                     let context = instantiate_type(
                         &unifier.resolve(&Type::Var(callee.context)),
                         &mut unifier,
-                        &mut *variables,
+                        &mut *context_variables,
                     );
                     let result_mode = owner_result_expression(callee)
                         .and_then(|expression| {
@@ -1435,22 +1556,25 @@ pub fn solve_owner_interface_scc<'a>(
                     let parameters = callee
                         .parameters
                         .iter()
-                        .map(|parameter| {
-                            (
-                                parameter.name.clone(),
-                                parameter.kind,
-                                parameter.ordinal,
-                                instantiate_type(
-                                    &parameter.flow_type.ty,
-                                    &mut unifier,
-                                    &mut *variables,
-                                ),
-                            )
+                        .map(|parameter| InstantiatedInterfaceParameter {
+                            name: parameter.name.clone(),
+                            kind: parameter.kind,
+                            ordinal: parameter.ordinal,
+                            ty: instantiate_type(
+                                &parameter.flow_type.ty,
+                                &mut unifier,
+                                &mut *variables,
+                            ),
+                            evaluation_scope: parameter.evaluation_scope,
                         })
                         .collect();
                     let result = instantiate_type(&callee.result.ty, &mut unifier, &mut *variables);
                     let context = callee.context.as_ref().map(|context| {
-                        instantiate_type(&context.flow_type.ty, &mut unifier, &mut *variables)
+                        instantiate_type(
+                            &context.flow_type.ty,
+                            &mut unifier,
+                            &mut *context_variables,
+                        )
                     });
                     (
                         parameters,
@@ -1468,27 +1592,31 @@ pub fn solve_owner_interface_scc<'a>(
                         CheckedEffectSummary::default(),
                     )
                 }
-            } else if let Some(signature) =
-                authoritative_signature(&call.function, &builtins, &render)
-            {
+            } else if let Some(signature) = abi.callable(&call.function) {
                 let parameters = signature
                     .parameters
                     .iter()
                     .enumerate()
-                    .map(|(ordinal, parameter)| {
-                        (
-                            parameter.name.clone(),
-                            match parameter.kind {
-                                CheckedParameterKind::Value => OwnerParameterKind::Value,
-                                CheckedParameterKind::Out => OwnerParameterKind::Out,
-                            },
-                            ordinal as u32,
-                            instantiate_type(
-                                &parameter.flow_type.ty,
-                                &mut unifier,
-                                &mut *variables,
-                            ),
-                        )
+                    .map(|(ordinal, parameter)| InstantiatedInterfaceParameter {
+                        name: parameter.name.clone(),
+                        kind: match parameter.kind {
+                            CheckedParameterKind::Value => OwnerParameterKind::Value,
+                            CheckedParameterKind::Out => OwnerParameterKind::Out,
+                        },
+                        ordinal: ordinal as u32,
+                        ty: instantiate_type(
+                            &parameter.flow_type.ty,
+                            &mut unifier,
+                            &mut *variables,
+                        ),
+                        evaluation_scope: match parameter.evaluation_scope {
+                            crate::OwnerAbiEvaluationScope::Parent => {
+                                OwnerInterfaceEvaluationScope::Parent
+                            }
+                            crate::OwnerAbiEvaluationScope::Output { parameter_ordinal } => {
+                                OwnerInterfaceEvaluationScope::Output { parameter_ordinal }
+                            }
+                        },
                     })
                     .collect();
                 let result = instantiate_type(&signature.result.ty, &mut unifier, &mut *variables);
@@ -1509,7 +1637,48 @@ pub fn solve_owner_interface_scc<'a>(
                 )
             };
 
+            let mut evaluation_scope_updates = Vec::new();
+            for parameter in &parameters {
+                let OwnerInterfaceEvaluationScope::Output {
+                    parameter_ordinal: output_ordinal,
+                } = parameter.evaluation_scope
+                else {
+                    continue;
+                };
+                let Some(owner_output_ordinal) =
+                    forwarded_owner_output_ordinal(caller, call, &parameters, output_ordinal)
+                else {
+                    continue;
+                };
+                let Some(actual) = call_input_for_parameter(call, parameter, &parameters) else {
+                    continue;
+                };
+                for owner_parameter_ordinal in referenced_owner_parameter_ordinals(caller, actual) {
+                    if caller.parameters.iter().any(|owner_parameter| {
+                        owner_parameter.ordinal == owner_parameter_ordinal
+                            && owner_parameter.kind == OwnerParameterKind::Value
+                    }) {
+                        evaluation_scope_updates.push((
+                            owner_parameter_ordinal,
+                            OwnerInterfaceEvaluationScope::Output {
+                                parameter_ordinal: owner_output_ordinal,
+                            },
+                        ));
+                    }
+                }
+            }
+
             let call_variable = caller.expressions[call.expression];
+            let has_explicit_pass = call.inputs.iter().any(|(role, _)| {
+                matches!(
+                    role,
+                    OwnerConstraintEdgeRole::CallPass { .. }
+                        | OwnerConstraintEdgeRole::PipePass { .. }
+                )
+            });
+            if !has_explicit_pass && let Some(context) = &context {
+                unifier.unify(Type::Var(caller.context), context.clone());
+            }
             if let Some(field) = call.function.strip_prefix("Field/") {
                 if let Some((_, input)) = call
                     .inputs
@@ -1529,23 +1698,22 @@ pub fn solve_owner_interface_scc<'a>(
                 };
                 match role {
                     OwnerConstraintEdgeRole::PipeInput => {
-                        if let Some((_, _, _, expected)) = parameters
+                        if let Some(expected) = parameters
                             .iter()
-                            .find(|(_, kind, _, _)| *kind == OwnerParameterKind::Value)
+                            .find(|parameter| parameter.kind == OwnerParameterKind::Value)
                         {
-                            unifier.unify(Type::Var(input), expected.clone());
+                            unifier.unify(Type::Var(input), expected.ty.clone());
                         }
                     }
                     OwnerConstraintEdgeRole::CallArgument { kind, name }
                     | OwnerConstraintEdgeRole::PipeArgument { kind, name } => {
-                        if let Some((_, parameter_kind, _, expected)) = parameters
-                            .iter()
-                            .find(|(parameter, _, _, _)| parameter == name)
+                        if let Some(parameter) =
+                            parameters.iter().find(|parameter| parameter.name == *name)
                         {
-                            match (parameter_kind, kind) {
+                            match (&parameter.kind, kind) {
                                 (OwnerParameterKind::Value, OwnerArgumentKind::Named)
                                 | (OwnerParameterKind::Out, OwnerArgumentKind::Named) => {
-                                    unifier.unify(Type::Var(input), expected.clone());
+                                    unifier.unify(Type::Var(input), parameter.ty.clone());
                                 }
                                 (OwnerParameterKind::Out, OwnerArgumentKind::BareBinding)
                                 | (OwnerParameterKind::Value, OwnerArgumentKind::BareBinding) => {}
@@ -1565,6 +1733,30 @@ pub fn solve_owner_interface_scc<'a>(
                 state.effect = merge_effects(state.effect, effect);
                 state.modes[call.expression] =
                     flow_mode_join(state.modes[call.expression], Some(result_mode));
+                for (ordinal, incoming) in evaluation_scope_updates {
+                    let parameter = state
+                        .parameters
+                        .iter_mut()
+                        .find(|parameter| parameter.ordinal == ordinal)
+                        .ok_or_else(|| {
+                            OwnerConstraintSeedError::new(format!(
+                                "owner interface {:?} has no parameter ordinal {ordinal}",
+                                state.seed.owner
+                            ))
+                        })?;
+                    match (parameter.evaluation_scope, incoming) {
+                        (OwnerInterfaceEvaluationScope::Parent, incoming) => {
+                            parameter.evaluation_scope = incoming;
+                        }
+                        (current, incoming) if current == incoming => {}
+                        (current, incoming) => {
+                            return Err(OwnerConstraintSeedError::new(format!(
+                                "owner interface {:?} parameter `{}` requires incompatible evaluation scopes {current:?} and {incoming:?}",
+                                state.seed.owner, parameter.name
+                            )));
+                        }
+                    }
+                }
             }
             let _ = call.stable_expression;
             work.cross_owner_constraints = work.cross_owner_constraints.saturating_add(1);
@@ -1591,18 +1783,18 @@ pub fn solve_owner_interface_scc<'a>(
         let parameters = state
             .parameters
             .iter()
-            .map(|(name, kind, ordinal, variable)| {
-                let ty = unifier.resolve(&Type::Var(*variable));
+            .map(|parameter| {
+                let ty = unifier.resolve(&Type::Var(parameter.variable));
                 OwnerInterfaceParameter {
-                    name: name.clone(),
-                    kind: *kind,
-                    ordinal: *ordinal,
+                    name: parameter.name.clone(),
+                    kind: parameter.kind,
+                    ordinal: parameter.ordinal,
                     flow_type: FlowType {
                         mode: FlowMode::Continuous,
                         ty: alpha_normalize_type(&ty, &mut alpha_variables, &mut next_alpha),
                     },
                     requirement: CheckedParameterRequirement::Required,
-                    evaluation_scope: OwnerInterfaceEvaluationScope::Parent,
+                    evaluation_scope: parameter.evaluation_scope,
                 }
             })
             .collect::<Vec<_>>();
@@ -1681,7 +1873,11 @@ mod tests {
         ResolvedOwnerSymbolReference, build_owner_interface_topology,
         project_owner_constraint_seed, project_owner_syntax_input, resolve_owner_constraint_seed,
     };
-    use boon_parser::{UnitSyntaxSnapshot, parse_project_source_unit, project_unit_link_keys};
+    use boon_parser::{
+        ProjectSyntaxSnapshot, UnitSyntaxSnapshot, parse_project_source_unit,
+        project_unit_link_keys,
+    };
+    use std::sync::Arc;
 
     fn link(source: &str) -> UnitSyntaxSnapshot {
         let parsed = parse_project_source_unit("app/RUN.bn", source).unwrap();
@@ -1715,10 +1911,24 @@ mod tests {
         project_owner_constraint_seed(&syntax).unwrap()
     }
 
+    fn test_abi() -> OwnerCallableAbiEnvironment {
+        let unit = link("value: 1\n");
+        let project =
+            ProjectSyntaxSnapshot::from_unit_snapshots("app/RUN.bn", vec![Arc::new(unit)]).unwrap();
+        crate::project_owner_abi_environment(
+            &project,
+            &boon_checked::ExternalTypeEnvironment::empty(boon_checked::ProgramRole::Client),
+        )
+        .unwrap()
+        .callable_environment()
+        .unwrap()
+    }
+
     fn solve(
         seeds: &[OwnerConstraintSeed],
         summaries: &[OwnerConstraintSummary],
     ) -> Vec<OwnerInterfaceSccResult> {
+        let abi = test_abi();
         let topology = build_owner_interface_topology(summaries.iter()).unwrap();
         let seeds = seeds
             .iter()
@@ -1737,6 +1947,7 @@ mod tests {
                 .collect::<Vec<_>>();
             let result = solve_owner_interface_scc(
                 scc,
+                &abi,
                 scc.key.members.iter().map(|owner| seeds[owner]),
                 scc.key.members.iter().map(|owner| summaries[owner]),
                 dependencies,
@@ -1751,40 +1962,138 @@ mod tests {
             .collect()
     }
 
-    fn checked_callable_interface(
-        source: &str,
-        name: &str,
-    ) -> (Vec<FlowType>, FlowType, CheckedEffectSummary) {
+    #[derive(Debug, Eq, PartialEq)]
+    struct NormalizedCheckedParameter {
+        name: String,
+        kind: OwnerParameterKind,
+        ordinal: u32,
+        flow_type: FlowType,
+        requirement: CheckedParameterRequirement,
+        evaluation_scope: OwnerInterfaceEvaluationScope,
+    }
+
+    #[derive(Debug, Eq, PartialEq)]
+    struct NormalizedCheckedInterface {
+        parameters: Vec<NormalizedCheckedParameter>,
+        result: FlowType,
+        context: Option<OwnerContextInterface>,
+        effect: CheckedEffectSummary,
+    }
+
+    fn checked_callable_interface(source: &str, name: &str) -> NormalizedCheckedInterface {
         let parsed = boon_parser::parse_project(
             "app/RUN.bn",
             [("app/RUN.bn".to_owned(), source.to_owned())],
         )
         .unwrap();
         let checked = crate::check_program(&parsed);
-        let callable = checked
-            .checked_program_fields()
-            .unwrap()
+        let fields = checked.checked_program_fields().unwrap();
+        let callable = fields
             .callables
             .iter()
             .find(|callable| {
                 callable.kind == boon_checked::CheckedCallableKind::User && callable.name == name
             })
             .unwrap();
+        assert_eq!(callable.kind, boon_checked::CheckedCallableKind::User);
+        assert_eq!(callable.intrinsic, None);
+        assert_eq!(callable.external_identity, None);
+        assert!(callable.contexts.is_empty());
+        assert_eq!(callable.contextual_operation, None);
+        assert_eq!(callable.role, boon_checked::ProgramRole::Client);
         let mut variables = BTreeMap::new();
         let mut next = 0;
         let parameters = callable
             .parameters
             .iter()
-            .map(|parameter| FlowType {
-                mode: parameter.flow_type.mode,
-                ty: alpha_normalize_type(&parameter.flow_type.ty, &mut variables, &mut next),
+            .map(|parameter| NormalizedCheckedParameter {
+                name: parameter.name.clone(),
+                kind: match parameter.kind {
+                    CheckedParameterKind::Value => OwnerParameterKind::Value,
+                    CheckedParameterKind::Out => OwnerParameterKind::Out,
+                },
+                ordinal: u32::try_from(parameter.ordinal).unwrap(),
+                flow_type: FlowType {
+                    mode: parameter.flow_type.mode,
+                    ty: alpha_normalize_type(&parameter.flow_type.ty, &mut variables, &mut next),
+                },
+                requirement: parameter.requirement.clone(),
+                evaluation_scope: match parameter.evaluation_scope {
+                    boon_checked::CheckedEvaluationScope::Parent => {
+                        OwnerInterfaceEvaluationScope::Parent
+                    }
+                    boon_checked::CheckedEvaluationScope::Output { formal } => {
+                        let parameter_ordinal = callable
+                            .parameters
+                            .iter()
+                            .find(|parameter| parameter.decl_id == formal)
+                            .map(|parameter| u32::try_from(parameter.ordinal).unwrap())
+                            .unwrap();
+                        OwnerInterfaceEvaluationScope::Output { parameter_ordinal }
+                    }
+                },
             })
             .collect();
         let result = FlowType {
             mode: callable.result.mode,
             ty: alpha_normalize_type(&callable.result.ty, &mut variables, &mut next),
         };
-        (parameters, result, callable.effect)
+        let context = callable.context_formal.map(|formal| {
+            let formal = fields.context_formal(formal).unwrap();
+            OwnerContextInterface {
+                flow_type: FlowType {
+                    mode: formal.scheme.flow_type.mode,
+                    ty: alpha_normalize_type(
+                        &formal.scheme.flow_type.ty,
+                        &mut variables,
+                        &mut next,
+                    ),
+                },
+                projections: formal
+                    .scheme
+                    .projections
+                    .iter()
+                    .cloned()
+                    .map(Vec::into_boxed_slice)
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            }
+        });
+        NormalizedCheckedInterface {
+            parameters,
+            result,
+            context,
+            effect: callable.effect,
+        }
+    }
+
+    fn assert_checked_interface_parity(source: &str, name: &str) {
+        let unit = link(source);
+        let owner = owner_named(&unit, name);
+        let seed = seed(&unit, &owner);
+        let summary = resolve_owner_constraint_seed(&seed, []).unwrap();
+        let results = solve(&[seed], &[summary]);
+        let interface = results[0].owner(&owner).unwrap();
+        let checked = checked_callable_interface(source, name);
+        let parameters = interface
+            .parameters
+            .iter()
+            .map(|parameter| NormalizedCheckedParameter {
+                name: parameter.name.clone(),
+                kind: parameter.kind,
+                ordinal: parameter.ordinal,
+                flow_type: parameter.flow_type.clone(),
+                requirement: parameter.requirement.clone(),
+                evaluation_scope: parameter.evaluation_scope,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(parameters, checked.parameters, "{name} parameter interface");
+        assert_eq!(interface.result, checked.result, "{name} result interface");
+        assert_eq!(
+            interface.context, checked.context,
+            "{name} context interface"
+        );
+        assert_eq!(interface.effect, checked.effect, "{name} effect interface");
     }
 
     #[test]
@@ -1908,24 +2217,83 @@ mod tests {
                 "increment",
             ),
         ] {
-            let unit = link(source);
-            let owner = owner_named(&unit, name);
-            let seed = seed(&unit, &owner);
-            let summary = resolve_owner_constraint_seed(&seed, []).unwrap();
-            let results = solve(&[seed], &[summary]);
-            let interface = results[0].owner(&owner).unwrap();
-            let (parameters, result, effect) = checked_callable_interface(source, name);
+            assert_checked_interface_parity(source, name);
+        }
+    }
+
+    #[test]
+    fn passed_context_interface_matches_the_independent_whole_checker_oracle() {
+        assert_checked_interface_parity(
+            concat!(
+                "FUNCTION leaf() {\n",
+                "    PASSED.store.count\n",
+                "}\n",
+                "value: leaf(PASS: [store: [count: 1]])\n",
+            ),
+            "leaf",
+        );
+    }
+
+    #[test]
+    fn output_scoped_parameter_interface_matches_the_independent_whole_checker_oracle() {
+        assert_checked_interface_parity(
+            concat!(
+                "FUNCTION sorted(list, entry: OUT, key) {\n",
+                "    list |> List/sort_by(item: entry, key: key, direction: Ascending)\n",
+                "}\n",
+                "rows: LIST { [rank: 1] }\n",
+                "ordered: rows |> sorted(entry, key: entry.rank)\n",
+            ),
+            "sorted",
+        );
+    }
+
+    #[test]
+    fn inherited_context_interface_matches_the_independent_whole_checker_oracle() {
+        let source = concat!(
+            "FUNCTION leaf() {\n",
+            "    PASSED.store.count\n",
+            "}\n",
+            "FUNCTION inherited() {\n",
+            "    leaf()\n",
+            "}\n",
+            "value: inherited(PASS: [store: [count: 1]])\n",
+        );
+        let unit = link(source);
+        let leaf = owner_named(&unit, "leaf");
+        let inherited = owner_named(&unit, "inherited");
+        let leaf_seed = seed(&unit, &leaf);
+        let inherited_seed = seed(&unit, &inherited);
+        let leaf_summary = resolve_owner_constraint_seed(&leaf_seed, []).unwrap();
+        let reference = inherited_seed
+            .references
+            .iter()
+            .find(|reference| reference.kind == OwnerReferenceKind::Callable)
+            .cloned()
+            .unwrap();
+        let inherited_summary = resolve_owner_constraint_seed(
+            &inherited_seed,
+            [ResolvedOwnerSymbolReference {
+                reference,
+                owner: leaf.clone(),
+                parameters: Box::new([]),
+            }],
+        )
+        .unwrap();
+        let results = solve(
+            &[leaf_seed, inherited_seed],
+            &[leaf_summary, inherited_summary],
+        );
+        for (owner, name) in [(leaf, "leaf"), (inherited, "inherited")] {
+            let interface = results
+                .iter()
+                .find_map(|result| result.owner(&owner))
+                .unwrap();
             assert_eq!(
-                interface
-                    .parameters
-                    .iter()
-                    .map(|parameter| parameter.flow_type.clone())
-                    .collect::<Vec<_>>(),
-                parameters,
-                "{name} parameter interface parity",
+                interface.context,
+                checked_callable_interface(source, name).context,
+                "{name} inherited context interface",
             );
-            assert_eq!(interface.result, result, "{name} result interface parity");
-            assert_eq!(interface.effect, effect, "{name} effect interface parity");
         }
     }
 }

@@ -19,12 +19,13 @@ use boon_plan::{
 use boon_syntax::StableCheckOwnerKey;
 use boon_syntax::{SourceUnitId, SyntaxUnitNamespace, UnitItemKind};
 use boon_typecheck::{
-    AmbiguousOwnerSymbolCandidate, OwnerBodyInferenceShard, OwnerConstraintDependencyKind,
-    OwnerConstraintSeed, OwnerConstraintSummary, OwnerDeclarationKind, OwnerInterfaceScc,
-    OwnerInterfaceSccKey, OwnerInterfaceSccResult, OwnerInterfaceTopology, OwnerReferenceKind,
-    OwnerSourceMap, OwnerSymbolReference, OwnerSymbolResolution, OwnerSyntaxInput,
-    build_owner_interface_topology, infer_owner_body, is_authoritative_callable_name,
-    project_owner_constraint_seed, project_owner_source_map, project_owner_syntax_input,
+    AmbiguousOwnerSymbolCandidate, OwnerAbiEnvironment, OwnerBodyInferenceShard,
+    OwnerCallableAbiEnvironment, OwnerConstraintDependencyKind, OwnerConstraintSeed,
+    OwnerConstraintSummary, OwnerDeclarationKind, OwnerInterfaceScc, OwnerInterfaceSccKey,
+    OwnerInterfaceSccResult, OwnerInterfaceTopology, OwnerReferenceKind, OwnerSourceMap,
+    OwnerSymbolReference, OwnerSymbolResolution, OwnerSyntaxInput, build_owner_interface_topology,
+    infer_owner_body, project_owner_abi_environment, project_owner_constraint_seed,
+    project_owner_source_map, project_owner_syntax_input,
     resolve_owner_constraint_seed_with_resolutions, solve_owner_interface_scc,
     stable_check_owner_key_fingerprint_v1,
 };
@@ -196,6 +197,8 @@ struct ProjectState {
     owner_input_requests: TypedRequestTable<OwnerInputRequest>,
     owner_source_map_requests: TypedRequestTable<OwnerSourceMapRequest>,
     owner_constraint_seed_requests: TypedRequestTable<OwnerConstraintSeedRequest>,
+    project_owner_abi_requests: TypedRequestTable<ProjectOwnerAbiRequest>,
+    project_owner_callable_abi_requests: TypedRequestTable<ProjectOwnerCallableAbiRequest>,
     project_owner_symbol_requests: TypedRequestTable<ProjectOwnerSymbolRequest>,
     owner_constraint_requests: TypedRequestTable<OwnerConstraintRequest>,
     project_owner_interface_topology_requests:
@@ -420,6 +423,53 @@ impl RequestFamily for OwnerConstraintSeedRequest {
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         stable_check_owner_key_fingerprint_v1(key)
+    }
+
+    fn output_fingerprint(
+        value: &Self::Value,
+    ) -> Result<RequestOutputFingerprint, boon_compilation_db::CompilationDbError> {
+        Ok(RequestOutputFingerprint(value.fingerprint_v1()))
+    }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct ProjectOwnerAbiKey;
+
+struct ProjectOwnerAbiRequest;
+
+impl RequestFamily for ProjectOwnerAbiRequest {
+    type Key = ProjectOwnerAbiKey;
+    type Value = Arc<OwnerAbiEnvironment>;
+
+    const NAME: &'static str = "boon.compiler.project-owner-abi.v1";
+
+    fn key_fingerprint(_key: &Self::Key) -> RequestFingerprint {
+        request_fingerprint(
+            b"boon.compiler.project-owner-abi-key.v1\0",
+            std::iter::empty(),
+        )
+    }
+
+    fn output_fingerprint(
+        value: &Self::Value,
+    ) -> Result<RequestOutputFingerprint, boon_compilation_db::CompilationDbError> {
+        Ok(RequestOutputFingerprint(value.fingerprint_v1()))
+    }
+}
+
+struct ProjectOwnerCallableAbiRequest;
+
+impl RequestFamily for ProjectOwnerCallableAbiRequest {
+    type Key = ProjectOwnerAbiKey;
+    type Value = Arc<OwnerCallableAbiEnvironment>;
+
+    const NAME: &'static str = "boon.compiler.project-owner-callable-abi.v1";
+
+    fn key_fingerprint(_key: &Self::Key) -> RequestFingerprint {
+        request_fingerprint(
+            b"boon.compiler.project-owner-callable-abi-key.v1\0",
+            std::iter::empty(),
+        )
     }
 
     fn output_fingerprint(
@@ -692,6 +742,8 @@ impl CompilerSession {
                 owner_input_requests: TypedRequestTable::new(),
                 owner_source_map_requests: TypedRequestTable::new(),
                 owner_constraint_seed_requests: TypedRequestTable::new(),
+                project_owner_abi_requests: TypedRequestTable::new(),
+                project_owner_callable_abi_requests: TypedRequestTable::new(),
                 project_owner_symbol_requests: TypedRequestTable::new(),
                 owner_constraint_requests: TypedRequestTable::new(),
                 project_owner_interface_topology_requests: TypedRequestTable::new(),
@@ -1599,6 +1651,7 @@ fn evaluate_owner_requests(
             owners.push(owner);
         }
     }
+    evaluate_project_owner_abi_request(state, linked_units)?;
     state
         .owner_input_requests
         .retain(&mut state.syntax_evaluator, |owner| {
@@ -1712,6 +1765,115 @@ fn evaluate_owner_requests(
     }
     evaluate_owner_constraint_requests(state, linked_units, &owners)?;
     Ok(())
+}
+
+fn project_owner_abi_input_fingerprint(
+    state: &ProjectState,
+    linked_units: &[Arc<UnitSyntaxSnapshot>],
+) -> RequestInputFingerprint {
+    let mut hasher = Sha256::new();
+    hasher.update(b"boon.compiler.project-owner-abi-dependencies.v1\0");
+    update_request_fingerprint_part(&mut hasher, state.source.entrypoint.as_bytes());
+    update_request_fingerprint_part(&mut hasher, state.source.program_role.as_str().as_bytes());
+    hasher.update((linked_units.len() as u64).to_le_bytes());
+    for unit in linked_units {
+        update_request_fingerprint_part(&mut hasher, unit.source_unit_id.as_str().as_bytes());
+    }
+    RequestInputFingerprint(hasher.finalize().into())
+}
+
+fn evaluate_project_owner_abi_request(
+    state: &mut ProjectState,
+    linked_units: &[Arc<UnitSyntaxSnapshot>],
+) -> CompilerResult<()> {
+    let key = ProjectOwnerAbiKey;
+    let input_fingerprint = project_owner_abi_input_fingerprint(state, linked_units);
+    match state.project_owner_abi_requests.begin(
+        &mut state.syntax_evaluator,
+        key,
+        input_fingerprint,
+    )? {
+        RequestStart::Reused => {}
+        RequestStart::Execute(mut ticket) => {
+            let abi = (|| -> CompilerResult<_> {
+                let mut required_units = Vec::with_capacity(linked_units.len());
+                for unit in linked_units {
+                    required_units.push(Arc::clone(state.link_requests.require(
+                        &state.syntax_evaluator,
+                        &mut ticket,
+                        &unit.source_unit_id,
+                    )?));
+                }
+                let project = ProjectSyntaxSnapshot::from_unit_snapshots(
+                    &state.source.entrypoint,
+                    required_units,
+                )?;
+                let external_types =
+                    boon_checked::ExternalTypeEnvironment::empty(state.source.program_role);
+                Ok(Arc::new(project_owner_abi_environment(
+                    &project,
+                    &external_types,
+                )?))
+            })();
+            let abi = match abi {
+                Ok(abi) => abi,
+                Err(error) => {
+                    state.project_owner_abi_requests.abort(
+                        &mut state.syntax_evaluator,
+                        ticket,
+                        RequestAbortReason::Failed,
+                    )?;
+                    return Err(error);
+                }
+            };
+            state
+                .project_owner_abi_requests
+                .publish(&mut state.syntax_evaluator, ticket, abi)?;
+        }
+    }
+    evaluate_project_owner_callable_abi_request(state)
+}
+
+fn evaluate_project_owner_callable_abi_request(state: &mut ProjectState) -> CompilerResult<()> {
+    let key = ProjectOwnerAbiKey;
+    let input = RequestInputFingerprint(request_fingerprint(
+        b"boon.compiler.project-owner-callable-abi-dependencies.v1\0",
+        std::iter::empty(),
+    ));
+    match state.project_owner_callable_abi_requests.begin(
+        &mut state.syntax_evaluator,
+        key,
+        input,
+    )? {
+        RequestStart::Reused => Ok(()),
+        RequestStart::Execute(mut ticket) => {
+            let callable_abi = (|| -> CompilerResult<_> {
+                let abi = state.project_owner_abi_requests.require(
+                    &state.syntax_evaluator,
+                    &mut ticket,
+                    &ProjectOwnerAbiKey,
+                )?;
+                Ok(Arc::new(abi.callable_environment()?))
+            })();
+            let callable_abi = match callable_abi {
+                Ok(callable_abi) => callable_abi,
+                Err(error) => {
+                    state.project_owner_callable_abi_requests.abort(
+                        &mut state.syntax_evaluator,
+                        ticket,
+                        RequestAbortReason::Failed,
+                    )?;
+                    return Err(error);
+                }
+            };
+            state.project_owner_callable_abi_requests.publish(
+                &mut state.syntax_evaluator,
+                ticket,
+                callable_abi,
+            )?;
+            Ok(())
+        }
+    }
 }
 
 fn owner_route_value_path(owner: &StableCheckOwnerKey, include_last: bool) -> Vec<String> {
@@ -1843,6 +2005,12 @@ fn evaluate_owner_constraint_requests(
     linked_units: &[Arc<UnitSyntaxSnapshot>],
     owners: &[StableCheckOwnerKey],
 ) -> CompilerResult<()> {
+    let abi_key = ProjectOwnerAbiKey;
+    let abi_fingerprint = state
+        .project_owner_callable_abi_requests
+        .current_value(&state.syntax_evaluator, &abi_key)?
+        .ok_or_else(|| session_error("project owner callable ABI was not published"))?
+        .fingerprint_v1();
     let seed_input = RequestInputFingerprint(request_fingerprint(
         b"boon.compiler.owner-constraint-seed-dependencies.v1\0",
         std::iter::empty(),
@@ -1945,7 +2113,7 @@ fn evaluate_owner_constraint_requests(
 
     let constraint_input = RequestInputFingerprint(request_fingerprint(
         b"boon.compiler.owner-constraint-summary-dependencies.v1\0",
-        std::iter::empty(),
+        [abi_fingerprint.as_slice()],
     ));
     for owner in owners {
         match state.owner_constraint_requests.begin(
@@ -1965,6 +2133,11 @@ fn evaluate_owner_constraint_requests(
                         &state.syntax_evaluator,
                         &mut ticket,
                         &symbol_key,
+                    )?);
+                    let abi = Arc::clone(state.project_owner_callable_abi_requests.require(
+                        &state.syntax_evaluator,
+                        &mut ticket,
+                        &abi_key,
                     )?);
                     let resolutions = seed.references.iter().map(|reference| {
                         match symbols.resolve(owner, reference) {
@@ -1991,9 +2164,7 @@ fn evaluate_owner_constraint_requests(
                             }
                             ProjectOwnerSymbolLookup::Unresolved
                                 if reference.kind == OwnerReferenceKind::Callable
-                                    && is_authoritative_callable_name(
-                                        &reference.parts.join("/"),
-                                    ) =>
+                                    && abi.callable(&reference.parts.join("/")).is_some() =>
                             {
                                 OwnerSymbolResolution::Authoritative {
                                     reference: reference.clone(),
@@ -2081,6 +2252,12 @@ fn evaluate_owner_constraint_requests(
 }
 
 fn evaluate_owner_interface_scc_requests(state: &mut ProjectState) -> CompilerResult<()> {
+    let abi_key = ProjectOwnerAbiKey;
+    let abi_fingerprint = state
+        .project_owner_callable_abi_requests
+        .current_value(&state.syntax_evaluator, &abi_key)?
+        .ok_or_else(|| session_error("project owner callable ABI was not published"))?
+        .fingerprint_v1();
     let topology = Arc::clone(
         state
             .project_owner_interface_topology_requests
@@ -2152,7 +2329,7 @@ fn evaluate_owner_interface_scc_requests(state: &mut ProjectState) -> CompilerRe
 
     let result_input = RequestInputFingerprint(request_fingerprint(
         b"boon.compiler.owner-interface-scc-result-dependencies.v1\0",
-        std::iter::empty(),
+        [abi_fingerprint.as_slice()],
     ));
     for expected in &topology.sccs {
         match state.owner_interface_scc_requests.begin(
@@ -2167,6 +2344,11 @@ fn evaluate_owner_interface_scc_requests(state: &mut ProjectState) -> CompilerRe
                         &state.syntax_evaluator,
                         &mut ticket,
                         &expected.key,
+                    )?);
+                    let abi = Arc::clone(state.project_owner_callable_abi_requests.require(
+                        &state.syntax_evaluator,
+                        &mut ticket,
+                        &abi_key,
                     )?);
                     let seeds = plan
                         .key
@@ -2205,6 +2387,7 @@ fn evaluate_owner_interface_scc_requests(state: &mut ProjectState) -> CompilerRe
                         .collect::<CompilerResult<Vec<_>>>()?;
                     Ok(Arc::new(solve_owner_interface_scc(
                         &plan,
+                        &abi,
                         seeds.iter().map(Arc::as_ref),
                         summaries.iter().map(Arc::as_ref),
                         dependencies.iter().map(Arc::as_ref),
@@ -2269,12 +2452,11 @@ fn owner_body_inference_interface_plan(
 
 fn owner_body_inference_plan_fingerprint(
     plan: &BTreeMap<StableCheckOwnerKey, OwnerInterfaceSccKey>,
-    program_role: ProgramRole,
+    abi_fingerprint: [u8; 32],
 ) -> RequestInputFingerprint {
     let mut hasher = Sha256::new();
     hasher.update(b"boon.compiler.owner-body-inference-dependencies.v1\0");
-    hasher.update(program_role.as_str().as_bytes());
-    hasher.update([0]);
+    hasher.update(abi_fingerprint);
     hasher.update((plan.len() as u64).to_le_bytes());
     for (owner, scc) in plan {
         hasher.update(stable_check_owner_key_fingerprint_v1(owner));
@@ -2287,6 +2469,12 @@ fn evaluate_owner_body_inference_requests(
     state: &mut ProjectState,
     topology: &OwnerInterfaceTopology,
 ) -> CompilerResult<()> {
+    let abi_key = ProjectOwnerAbiKey;
+    let abi_fingerprint = state
+        .project_owner_callable_abi_requests
+        .current_value(&state.syntax_evaluator, &abi_key)?
+        .ok_or_else(|| session_error("project owner callable ABI was not published"))?
+        .fingerprint_v1();
     let owners = topology
         .sccs
         .iter()
@@ -2317,7 +2505,7 @@ fn evaluate_owner_body_inference_requests(
         match state.owner_body_inference_requests.begin(
             &mut state.syntax_evaluator,
             owner.clone(),
-            owner_body_inference_plan_fingerprint(&plan, state.source.program_role),
+            owner_body_inference_plan_fingerprint(&plan, abi_fingerprint),
         )? {
             RequestStart::Reused => {}
             RequestStart::Execute(mut ticket) => {
@@ -2336,6 +2524,11 @@ fn evaluate_owner_body_inference_requests(
                         &state.syntax_evaluator,
                         &mut ticket,
                         &owner,
+                    )?);
+                    let abi = Arc::clone(state.project_owner_callable_abi_requests.require(
+                        &state.syntax_evaluator,
+                        &mut ticket,
+                        &abi_key,
                     )?);
                     let result_keys = plan.values().cloned().collect::<BTreeSet<_>>();
                     let results = result_keys
@@ -2361,12 +2554,7 @@ fn evaluate_owner_body_inference_requests(
                         .filter(|result| result.key != own_scc.key)
                         .map(AsRef::as_ref);
                     Ok(Arc::new(infer_owner_body(
-                        &syntax,
-                        &seed,
-                        &summary,
-                        state.source.program_role,
-                        own_scc,
-                        imports,
+                        &syntax, &seed, &summary, &abi, own_scc, imports,
                     )?))
                 })();
                 let body = match body {
@@ -2763,10 +2951,10 @@ mod tests {
             assert_eq!(first.profile.parse_work.nodes_rebased, 0);
         }
         let first_stats = session.frontend_request_stats(project).unwrap();
-        assert_eq!(first_stats.demanded, 40);
-        assert_eq!(first_stats.executed, 40);
+        assert_eq!(first_stats.demanded, 42);
+        assert_eq!(first_stats.executed, 42);
         assert_eq!(first_stats.reused, 0);
-        assert_eq!(first_stats.changed, 40);
+        assert_eq!(first_stats.changed, 42);
         let retained_a = session
             .unit_syntax_snapshot(project, "A.bn")
             .unwrap()
@@ -2802,11 +2990,11 @@ mod tests {
             second.profile.parse_work
         };
         let second_stats = session.frontend_request_stats(project).unwrap();
-        assert_eq!(second_stats.demanded, 80);
-        assert_eq!(second_stats.executed, 50);
-        assert_eq!(second_stats.reused, 30);
-        assert_eq!(second_stats.backdated, 6);
-        assert_eq!(second_stats.changed, 44);
+        assert_eq!(second_stats.demanded, 84);
+        assert_eq!(second_stats.executed, 53);
+        assert_eq!(second_stats.reused, 31);
+        assert_eq!(second_stats.backdated, 7);
+        assert_eq!(second_stats.changed, 46);
 
         let mut isolated = CompilerSession::new();
         let isolated_project = isolated
@@ -3185,11 +3373,11 @@ mod tests {
             cold_topology.stats.nodes + 1
         );
         let interface_stats = session.frontend_request_stats(project).unwrap();
-        assert_eq!(interface_stats.demanded - cold_stats.demanded, 65);
-        assert_eq!(interface_stats.executed - cold_stats.executed, 36);
+        assert_eq!(interface_stats.demanded - cold_stats.demanded, 67);
+        assert_eq!(interface_stats.executed - cold_stats.executed, 38);
         assert_eq!(interface_stats.reused - cold_stats.reused, 29);
-        assert_eq!(interface_stats.backdated - cold_stats.backdated, 18);
-        assert_eq!(interface_stats.changed - cold_stats.changed, 18);
+        assert_eq!(interface_stats.backdated - cold_stats.backdated, 19);
+        assert_eq!(interface_stats.changed - cold_stats.changed, 19);
 
         session
             .apply_update(project, UnitUpdate::new("left/Math.bn", first_body_edit))
@@ -3208,11 +3396,11 @@ mod tests {
         let body_topology = session.owner_interface_topology(project).unwrap().unwrap();
         assert!(Arc::ptr_eq(&interface_topology, &body_topology));
         let body_stats = session.frontend_request_stats(project).unwrap();
-        assert_eq!(body_stats.demanded - interface_stats.demanded, 65);
-        assert_eq!(body_stats.executed - interface_stats.executed, 15);
+        assert_eq!(body_stats.demanded - interface_stats.demanded, 67);
+        assert_eq!(body_stats.executed - interface_stats.executed, 17);
         assert_eq!(body_stats.reused - interface_stats.reused, 50);
-        assert_eq!(body_stats.backdated - interface_stats.backdated, 6);
-        assert_eq!(body_stats.changed - interface_stats.changed, 9);
+        assert_eq!(body_stats.backdated - interface_stats.backdated, 7);
+        assert_eq!(body_stats.changed - interface_stats.changed, 10);
     }
 
     #[test]

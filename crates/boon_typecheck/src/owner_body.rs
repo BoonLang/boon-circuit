@@ -1,19 +1,18 @@
 use crate::owner_interface::{
-    TypeUnifier, add_local_root, alpha_normalize_type, authoritative_signature, bind_projection,
-    flow_mode_join, instantiate_type, merge_effects, pattern_type, true_false_type,
+    TypeUnifier, add_local_root, alpha_normalize_type, bind_projection, flow_mode_join,
+    instantiate_type, merge_effects, pattern_type, true_false_type,
 };
 use crate::{
-    BuiltinSignatureRegistry, OwnerArgumentKind, OwnerCollectionKind, OwnerConstraintEdgeRole,
+    OwnerArgumentKind, OwnerCallableAbiEnvironment, OwnerCollectionKind, OwnerConstraintEdgeRole,
     OwnerConstraintNodeKind, OwnerConstraintSeed, OwnerConstraintSummary, OwnerDeclarationKind,
     OwnerInterfaceSccKey, OwnerInterfaceSccResult, OwnerParameterKind, OwnerPublicInterface,
     OwnerReferenceKind, OwnerSourceAnchorRole, OwnerSourceAnchorSite, OwnerSourceMap,
-    OwnerSymbolResolution, OwnerSyntaxInput, RenderContractRegistry, infix_returns_bool,
+    OwnerSymbolResolution, OwnerSyntaxInput, infix_returns_bool,
 };
 use boon_checked::{
     BytesType, CheckedEffectSummary, CheckedParameterKind, DiagnosticSeverity, FlowMode, FlowType,
     ObjectShape, Type, TypeDiagnostic, TypeVar, Variant,
 };
-use boon_document_model::ProgramRole;
 use boon_syntax::{
     AstExprKind, AstStatementKind, StableCheckOwnerKey, StableExpressionKey, StableStatementKey,
 };
@@ -25,7 +24,6 @@ use std::fmt;
 const OWNER_BODY_INFERENCE_DOMAIN_V1: &[u8] = b"boon.owner-body-inference.v1\0";
 const OWNER_BODY_INFERENCE_CONTENT_DOMAIN_V1: &[u8] = b"boon.owner-body-inference-content.v1\0";
 const OWNER_BODY_INTERFACE_DOMAIN_V1: &[u8] = b"boon.owner-body-interface-import.v1\0";
-const OWNER_BODY_AUTHORITATIVE_ABI_DOMAIN_V1: &[u8] = b"boon.owner-body-authoritative-abi.v1\0";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OwnerBodyInferenceError {
@@ -593,35 +591,6 @@ fn frozen_scc_ref(
     })
 }
 
-fn authoritative_abi_fingerprint_v1(
-    program_role: ProgramRole,
-    seed: &OwnerConstraintSeed,
-) -> Result<[u8; 32], OwnerBodyInferenceError> {
-    let builtins = BuiltinSignatureRegistry::default();
-    let render = RenderContractRegistry::default();
-    let signatures = seed
-        .expressions
-        .iter()
-        .filter_map(|expression| match &expression.kind {
-            OwnerConstraintNodeKind::Call { function } => Some(function),
-            OwnerConstraintNodeKind::Pipe { operation } => Some(operation),
-            _ => None,
-        })
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .map(|name| {
-            (
-                name.clone(),
-                authoritative_signature(name, &builtins, &render),
-            )
-        })
-        .collect::<Vec<_>>();
-    fingerprint(
-        OWNER_BODY_AUTHORITATIVE_ABI_DOMAIN_V1,
-        &(program_role, signatures),
-    )
-}
-
 fn bind_local_constraints(
     seed: &OwnerConstraintSeed,
     summary: &OwnerConstraintSummary,
@@ -1000,8 +969,7 @@ fn instantiate_call_signature(
     call: &BodyCallPlan,
     interfaces: &BTreeMap<StableCheckOwnerKey, &OwnerPublicInterface>,
     unifier: &mut TypeUnifier,
-    builtins: &BuiltinSignatureRegistry,
-    render: &RenderContractRegistry,
+    abi: &OwnerCallableAbiEnvironment,
 ) -> Option<InstantiatedCallSignature> {
     let mut variables = BTreeMap::new();
     if let BodyCallableResolution::Owner(target) = &call.resolution {
@@ -1038,8 +1006,8 @@ fn instantiate_call_signature(
     if !matches!(&call.resolution, BodyCallableResolution::Authoritative) {
         return None;
     }
-    authoritative_signature(&call.function, builtins, render).map(|signature| {
-        InstantiatedCallSignature {
+    abi.callable(&call.function)
+        .map(|signature| InstantiatedCallSignature {
             parameters: signature
                 .parameters
                 .iter()
@@ -1064,8 +1032,7 @@ fn instantiate_call_signature(
             context: None,
             effect: signature.effect,
             target: InferredOwnerCallableTarget::Authoritative,
-        }
-    })
+        })
 }
 
 fn bind_calls(
@@ -1076,17 +1043,15 @@ fn bind_calls(
     external_expressions: &[TypeVar],
     modes: &mut [Option<FlowMode>],
     direct_effects: &mut [CheckedEffectSummary],
+    abi: &OwnerCallableAbiEnvironment,
     diagnostics: &mut Vec<OwnerDiagnosticTemplate>,
     work: &mut OwnerBodyInferenceWork,
 ) -> Vec<InferredCallDraft> {
-    let builtins = BuiltinSignatureRegistry::default();
-    let render = RenderContractRegistry::default();
     calls
         .into_iter()
         .map(|call| {
             work.calls = work.calls.saturating_add(1);
-            let signature =
-                instantiate_call_signature(&call, interfaces, unifier, &builtins, &render);
+            let signature = instantiate_call_signature(&call, interfaces, unifier, abi);
             let call_variable = expressions[call.expression];
             let (parameters, result, context, effect, target) = match signature {
                 Some(signature) => (
@@ -1261,7 +1226,7 @@ pub fn infer_owner_body<'a>(
     syntax: &OwnerSyntaxInput,
     seed: &OwnerConstraintSeed,
     summary: &OwnerConstraintSummary,
-    program_role: ProgramRole,
+    abi: &OwnerCallableAbiEnvironment,
     own_scc: &'a OwnerInterfaceSccResult,
     imported_sccs: impl IntoIterator<Item = &'a OwnerInterfaceSccResult>,
 ) -> Result<OwnerBodyInferenceShard, OwnerBodyInferenceError> {
@@ -1308,7 +1273,7 @@ pub fn infer_owner_body<'a>(
         .expect("validated own SCC is present exactly once");
     let own_scc_ref = frozen_results.remove(own_scc_index);
     frozen_results.sort_by(|left, right| left.key.cmp(&right.key));
-    let authoritative_abi_fingerprint_v1 = authoritative_abi_fingerprint_v1(program_role, seed)?;
+    let authoritative_abi_fingerprint_v1 = abi.fingerprint_v1();
     let basis = OwnerBodyInferenceBasis {
         owner: seed.owner.clone(),
         syntax_fingerprint_v1: syntax.fingerprint_v1(),
@@ -1465,6 +1430,7 @@ pub fn infer_owner_body<'a>(
         &external_expressions,
         &mut modes,
         &mut direct_effects,
+        abi,
         &mut diagnostics,
         &mut work,
     );
@@ -1623,7 +1589,11 @@ mod tests {
         project_owner_constraint_seed, project_owner_source_map, project_owner_syntax_input,
         resolve_owner_constraint_seed, solve_owner_interface_scc,
     };
-    use boon_parser::{UnitSyntaxSnapshot, parse_project_source_unit, project_unit_link_keys};
+    use boon_parser::{
+        ProjectSyntaxSnapshot, UnitSyntaxSnapshot, parse_project_source_unit,
+        project_unit_link_keys,
+    };
+    use std::sync::Arc;
 
     fn link(source: &str) -> UnitSyntaxSnapshot {
         let parsed = parse_project_source_unit("app/RUN.bn", source).unwrap();
@@ -1663,10 +1633,24 @@ mod tests {
         (syntax, source_map, seed)
     }
 
+    fn test_abi() -> OwnerCallableAbiEnvironment {
+        let unit = link("value: 1\n");
+        let project =
+            ProjectSyntaxSnapshot::from_unit_snapshots("app/RUN.bn", vec![Arc::new(unit)]).unwrap();
+        crate::project_owner_abi_environment(
+            &project,
+            &boon_checked::ExternalTypeEnvironment::empty(boon_checked::ProgramRole::Client),
+        )
+        .unwrap()
+        .callable_environment()
+        .unwrap()
+    }
+
     fn solve(
         seeds: &[OwnerConstraintSeed],
         summaries: &[OwnerConstraintSummary],
     ) -> Vec<crate::OwnerInterfaceSccResult> {
+        let abi = test_abi();
         let topology = build_owner_interface_topology(summaries.iter()).unwrap();
         let seeds = seeds
             .iter()
@@ -1685,6 +1669,7 @@ mod tests {
                 .collect::<Vec<_>>();
             let result = solve_owner_interface_scc(
                 scc,
+                &abi,
                 scc.key.members.iter().map(|owner| seeds[owner]),
                 scc.key.members.iter().map(|owner| summaries[owner]),
                 dependencies,
@@ -1705,6 +1690,7 @@ mod tests {
         summary: &OwnerConstraintSummary,
         results: &[OwnerInterfaceSccResult],
     ) -> OwnerBodyInferenceShard {
+        let abi = test_abi();
         let own_scc = results
             .iter()
             .find(|result| result.key.members.contains(&seed.owner))
@@ -1713,7 +1699,7 @@ mod tests {
             syntax,
             seed,
             summary,
-            ProgramRole::Client,
+            &abi,
             own_scc,
             results.iter().filter(|result| result.key != own_scc.key),
         )

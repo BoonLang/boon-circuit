@@ -1860,6 +1860,20 @@ pub struct CheckedProgram {
     image_handoff: CheckedImageHandoffV2,
 }
 
+/// Completed typechecker construction before a runtime handoff is requested.
+///
+/// Diagnostics and editor projections may inspect these immutable checked
+/// fields directly. Semantic lowering cannot consume this type: the explicit
+/// typechecker sealing request must first derive the checked-image receipts and
+/// return a [`CheckedProgram`]. Keeping the two capabilities distinct lets a
+/// diagnostics-only request avoid runtime publication work without discarding
+/// the completed typecheck.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct CheckedProgramConstruction {
+    #[serde(flatten)]
+    fields: CheckedProgramFields,
+}
+
 /// Public read-only schema projected by an opaque [`CheckedProgram`].
 ///
 /// Deserializing or constructing this DTO never creates a typechecker product.
@@ -1977,6 +1991,14 @@ impl CheckedProgramFields {
 }
 
 impl std::ops::Deref for CheckedProgram {
+    type Target = CheckedProgramFields;
+
+    fn deref(&self) -> &Self::Target {
+        &self.fields
+    }
+}
+
+impl std::ops::Deref for CheckedProgramConstruction {
     type Target = CheckedProgramFields;
 
     fn deref(&self) -> &Self::Target {
@@ -2103,6 +2125,28 @@ impl CheckedProgram {
 
     pub fn image_handoff(&self) -> &CheckedImageHandoffV2 {
         &self.image_handoff
+    }
+}
+
+impl CheckedProgramConstruction {
+    /// Publish completed checked fields without claiming that runtime handoff
+    /// receipts have been built.
+    ///
+    /// # Safety
+    ///
+    /// The caller must be the successful typechecker construction path and
+    /// must prove the same checked-field invariants required by
+    /// [`CheckedProgram::from_typechecker_parts_unchecked`]. This constructor
+    /// deliberately does not grant semantic-lowering authority.
+    pub unsafe fn from_typechecker_fields_unchecked(fields: CheckedProgramFields) -> Self {
+        Self { fields }
+    }
+
+    /// Return the completed fields to the typechecker's explicit runtime seal
+    /// request. No runtime capability is created by this operation.
+    #[doc(hidden)]
+    pub fn __typechecker_into_fields(self) -> CheckedProgramFields {
+        self.fields
     }
 }
 
@@ -2242,7 +2286,21 @@ pub struct TypeCheckReport {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CheckOutput {
     pub program: Option<CheckedProgram>,
+    /// Completed checked construction retained by a diagnostics-only request.
+    /// It can be inspected for editor projections but must be explicitly
+    /// sealed by the typechecker before semantic lowering.
+    pub construction: Option<CheckedProgramConstruction>,
     pub report: TypeCheckReport,
+}
+
+impl CheckOutput {
+    /// Inspect the completed checked fields independently of whether this
+    /// request also asked for runtime handoff receipts.
+    pub fn checked_program_fields(&self) -> Option<&CheckedProgramFields> {
+        self.program
+            .as_deref()
+            .or_else(|| self.construction.as_deref())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

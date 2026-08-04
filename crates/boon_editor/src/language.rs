@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 
 use boon_checked::{
-    CheckOutput, CheckedCallEntry, CheckedContextBinding, CheckedDeclarationKind, CheckedProgram,
-    CheckedSpan, DeclId, DiagnosticSeverity,
+    CheckOutput, CheckedCallEntry, CheckedContextBinding, CheckedDeclarationKind,
+    CheckedProgramFields, CheckedSpan, DeclId, DiagnosticSeverity,
     SemanticOccurrenceKind as CheckedSemanticOccurrenceKind, TypeDisplayNode,
 };
 use boon_contract::{CanonicalSourceBundleV1, SourceBundleDigestV1, SourceBundleUnit};
@@ -296,7 +296,7 @@ pub fn project_checked_language(
     let mut semantics = Vec::new();
     let mut diagnostics = Vec::new();
 
-    if let Some(checked) = output.program.as_ref() {
+    if let Some(checked) = output.checked_program_fields() {
         semantics = semantic_items(program, checked);
         for item in &mut semantics {
             remap_source_location(&mut item.location, &canonical_to_dev_file);
@@ -452,7 +452,7 @@ fn remap_source_location(location: &mut SourceLocation, canonical_to_dev_file: &
     }
 }
 
-fn semantic_items(program: &ParsedProgram, checked: &CheckedProgram) -> Vec<SemanticItem> {
+fn semantic_items(program: &ParsedProgram, checked: &CheckedProgramFields) -> Vec<SemanticItem> {
     let declarations = checked
         .declarations
         .iter()
@@ -564,7 +564,7 @@ fn semantic_priority(kind: SemanticKind) -> u8 {
 }
 
 fn semantic_description(
-    checked: &CheckedProgram,
+    checked: &CheckedProgramFields,
     target: DeclId,
     span: CheckedSpan,
     kind: SemanticKind,

@@ -11551,6 +11551,7 @@ source = "crates/boon_checked/src/lib.rs"
 name = "CheckOutput"
 fields = [
   { name = "program", disposition = "r-r-priv-sp-id-n", reviewed = true },
+  { name = "construction", disposition = "r-r-priv-sp-id-n", reviewed = true },
   { name = "report", disposition = "r-r-priv-sp-id-n", reviewed = true },
 ]
 
@@ -12657,6 +12658,14 @@ name = "CheckedProgram"
 fields = [
   { name = "fields", disposition = "r-f-priv-sp-id-n", reviewed = true },
   { name = "image_handoff", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_checked/src/lib.rs"
+name = "CheckedProgramConstruction"
+fields = [
+  { name = "fields", disposition = "r-f-priv-sp-id-n", reviewed = true },
 ]
 
 [[records]]

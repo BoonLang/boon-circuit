@@ -1919,6 +1919,22 @@ distributed deltas and measured model/builder/link crate seams. Do not split
 crates or tune structural route storage before the owner boundary it serves is
 real.
 
+The first safe intent cut is now landed ahead of M1: diagnostics publishes a
+completed `CheckedProgramConstruction`, not a runtime `CheckedProgram`, and
+therefore performs no checked-image handoff scan. A later verified request
+consumes those exact fields, rebinds their parser source digest, builds the
+handoff once, and grants the existing opaque checked capability; no second
+parse or type solve occurs. A fresh debug NovyWave empty-session diagnostic is
+422.445 ms/92,432 KiB, with `assemble_report` observed at 2.083/2.133 ms rather
+than the earlier 408.603 ms. The canonical verified plan hash remains
+`db18f345676378b8633829c0bbd7870c0a1dc5a2459649c9bbfdd6b8969374ab`.
+
+This does not reorder the remaining architecture. The session still constructs
+global syntax and a whole checked graph; verified publication still runs the
+63,657-row scanner. Proceed with M1, then make definition construction emit the
+receipts that delete that deferred scanner entirely. Do not regress by dropping
+the checked construction and re-typechecking after diagnostics.
+
 ## Architectural Decisions
 
 ### 1. Activation Is A First-Class Output, Not An Empty Mount

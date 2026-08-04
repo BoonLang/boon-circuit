@@ -1029,6 +1029,21 @@ Current cold-diagnostics candidate evidence:
   seals before consuming runnable publication. Follow
   `BOON_COMPILER_MACRO_ARCHITECTURE_RESEARCH.md`; these directional timings are
   prioritization evidence, not additive savings or acceptance.
+- The first intent-rooted owner deletion is implemented without waiting for
+  definition shards. Diagnostics now retain an opaque
+  `CheckedProgramConstruction` and skip the whole `checked_image_handoff`;
+  verified preview consumes and seals those exact checked fields later without
+  reparsing or re-typechecking. Focused source-digest rejection, sealed-program
+  parity, type-hint projection, and diagnostics-to-verified session tests pass.
+  Fresh debug NovyWave diagnostics is 422.445 ms/92,432 KiB with 120.842 ms
+  parse and 292.423 ms typecheck, while traced `assemble_report` is 2.083/2.133
+  ms instead of the earlier 408.603 ms. Verified output remains
+  4,198.712 ms/282,604 KiB with canonical plan hash
+  `db18f345676378b8633829c0bbd7870c0a1dc5a2459649c9bbfdd6b8969374ab`.
+  This is not M2 closure: verified publication still derives the full 63,657-
+  row handoff, checking is still whole-project, and the warm 16.7/100 ms gates
+  remain red. Continue with M1 unit-native syntax, then construction-owned
+  definition receipts and deletion of the deferred whole handoff scanner.
 - Do not preserve V3's 208k subject cardinality as a production V4/V5 proof
   requirement. The independent test oracle must map every historical subject
   to exactly one canonical finalized shard row and classifier field/domain and prove

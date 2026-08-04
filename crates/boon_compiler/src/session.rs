@@ -678,6 +678,9 @@ mod tests {
                 .report
                 .has_errors()
         );
+        let diagnostics_output = &diagnostics.diagnostics().unwrap().output;
+        assert!(diagnostics_output.program.is_none());
+        assert!(diagnostics_output.construction.is_some());
         let first_plan = session
             .request(project, revision, CompileIntent::VerifiedPreview, &token)
             .unwrap()

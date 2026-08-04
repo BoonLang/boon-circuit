@@ -530,6 +530,18 @@ stronger three-reviewer performance closure defined below.
    handoff. Continue through shared plan-code, domain deltas, thin link, one
    consuming runnable builder, distributed deltas, and measured crate seams.
 
+   Preserve the landed checked-capability split while doing that work.
+   Diagnostics retains a completed `CheckedProgramConstruction` and skips the
+   checked-image scan; verified preview consumes and seals those exact fields
+   later without another parse or type solve. Focused digest rejection, exact
+   sealed-program parity, and session reuse pass. Fresh debug NovyWave
+   diagnostics is 422.445 ms/92,432 KiB, with traced `assemble_report` reduced
+   from 408.603 ms to 2.083/2.133 ms; the verified plan hash remains
+   `db18f345676378b8633829c0bbd7870c0a1dc5a2459649c9bbfdd6b8969374ab`.
+   This is not M1/M2 closure: global syntax, whole checking, and the verified-
+   only 63,657-row handoff still exist. Delete those owners in the planned
+   order, and never regain reuse by re-typechecking after diagnostics.
+
    The post-`ac2b234` high-level audit supersedes a mutating post-resource
    execution seal. Move inline list-authority synthesis into execution
    construction, seal immutable execution once, and make the resource typed

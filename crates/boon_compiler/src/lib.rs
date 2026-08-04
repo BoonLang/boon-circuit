@@ -891,9 +891,19 @@ pub(crate) fn finish_checked_machine_plan_with_cancellation(
     let CheckedSourceFromSource {
         parsed,
         output,
-        profile,
+        mut profile,
     } = checked_source;
+    let deferred_runtime_handoff = output.construction.is_some();
+    let runtime_handoff_started = Instant::now();
     let checked = checked_program_from_output(&parsed, output)?;
+    if deferred_runtime_handoff {
+        let runtime_handoff_ms = elapsed_ms(runtime_handoff_started);
+        profile.typecheck_ms += runtime_handoff_ms;
+        profile.total_ms += runtime_handoff_ms;
+        if std::env::var_os("BOON_COMPILER_LOWER_TRACE").is_some() {
+            eprintln!("boon_compiler deferred checked runtime handoff: {runtime_handoff_ms:.3}ms");
+        }
+    }
     if checked.role != request.program_role {
         return Err(PlanError::new(format!(
             "checked program role {:?} differs from requested backend role {:?}",
@@ -1044,9 +1054,20 @@ fn checked_program_from_output(
         ))
         .into());
     }
-    output.program.ok_or_else(|| {
-        PlanError::new("typecheck produced no CheckedProgram for valid source").into()
-    })
+    match (output.program, output.construction) {
+        (Some(program), None) => Ok(program),
+        (None, Some(construction)) => {
+            boon_typecheck::seal_checked_program_construction(parsed, construction)
+                .map_err(|error| PlanError::new(error).into())
+        }
+        (Some(_), Some(_)) => Err(PlanError::new(
+            "typecheck produced both a sealed and construction-only CheckedProgram",
+        )
+        .into()),
+        (None, None) => {
+            Err(PlanError::new("typecheck produced no CheckedProgram for valid source").into())
+        }
+    }
 }
 
 fn parse_source_units(

@@ -740,10 +740,12 @@ fn ordered_checked_diagnostic_projection_matches_product_examples() {
                 }
             }
 
-            let ordered_json = serde_json::to_value((&ordered.program, &ordered.report))
-                .expect("ordered projection serializes");
-            let oracle_json = serde_json::to_value((&oracle.program, &oracle.report))
-                .expect("recursive projection serializes");
+            let ordered_json =
+                serde_json::to_value((ordered.checked_program_fields(), &ordered.report))
+                    .expect("ordered projection serializes");
+            let oracle_json =
+                serde_json::to_value((oracle.checked_program_fields(), &oracle.report))
+                    .expect("recursive projection serializes");
             let (path, ordered_value, oracle_value) =
                 first_difference(&mut "$".to_owned(), &ordered_json, &oracle_json)
                     .expect("unequal projections have a serialized difference");
@@ -754,9 +756,9 @@ fn ordered_checked_diagnostic_projection_matches_product_examples() {
         let eager = project_diagnostics(&parsed, true);
         let lean = project_diagnostics(&parsed, false);
         if eager != lean {
-            let eager_json = serde_json::to_value((&eager.program, &eager.report))
+            let eager_json = serde_json::to_value((eager.checked_program_fields(), &eager.report))
                 .expect("eager diagnostics serialize");
-            let lean_json = serde_json::to_value((&lean.program, &lean.report))
+            let lean_json = serde_json::to_value((lean.checked_program_fields(), &lean.report))
                 .expect("checked-only diagnostics serialize");
             let (path, eager_value, lean_value) =
                 first_json_difference(&mut "$".to_owned(), &eager_json, &lean_json)
@@ -1935,11 +1937,14 @@ fn novywave_checked_database_is_seed_free_and_deterministic() {
         "seed-free NovyWave diagnostics: {:#?}",
         baseline.report.diagnostics
     );
+    assert!(baseline.program.is_none());
     assert!(
-        baseline.program.is_some(),
-        "NovyWave must remain executable"
+        baseline.construction.is_some(),
+        "NovyWave diagnostics must retain completed checked construction"
     );
-    let checked = baseline.program.as_ref().expect("checked NovyWave");
+    let checked = baseline
+        .checked_program_fields()
+        .expect("checked NovyWave construction");
     let selected_signal_defaults = checked
         .lowering_metadata
         .named_value_type_table
@@ -2056,10 +2061,33 @@ FUNCTION increment(value) {
         project_type_hints(&parsed, &diagnostics_owned),
         report_owned.report.type_hint_table
     );
+    assert!(diagnostics_owned.program.is_none());
+    assert!(diagnostics_owned.construction.is_some());
     assert_eq!(
-        diagnostics_owned.program.as_ref(),
-        report_owned.program.as_ref()
+        diagnostics_owned.checked_program_fields(),
+        report_owned.checked_program_fields()
     );
+    let sealed = seal_checked_program_construction(
+        &parsed,
+        diagnostics_owned
+            .construction
+            .clone()
+            .expect("diagnostics retain construction"),
+    )
+    .expect("diagnostics construction seals for runtime");
+    assert_eq!(Some(&sealed), report_owned.program.as_ref());
+
+    let other = boon_parser::parse_source("other.bn", "value: 2\n")
+        .expect("mismatched source fixture parses");
+    let error = seal_checked_program_construction(
+        &other,
+        diagnostics_owned
+            .construction
+            .clone()
+            .expect("diagnostics retain construction"),
+    )
+    .expect_err("runtime sealing must bind the exact parsed snapshot");
+    assert!(error.contains("source digest"));
 }
 
 #[test]

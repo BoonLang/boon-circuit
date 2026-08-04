@@ -347,6 +347,41 @@ reported separately.
 
 ## Implementation Sequence
 
+### Landed precursor: split checked construction from runtime publication
+
+The first intent-rooted owner cut now distinguishes a completed
+`CheckedProgramConstruction` from the runtime-authoritative `CheckedProgram`.
+A diagnostics request publishes the former and performs no
+`checked_image_handoff` scan. Editor projections read the same immutable
+checked fields, while a later verified request consumes that exact construction,
+derives the runtime handoff once, and then grants the opaque checked capability.
+It neither reparses nor re-typechecks the revision. Source-digest rebinding and
+exact sealed-program parity are focused negative/positive gates.
+
+One fresh debug empty-session NovyWave sample after the cut is 422.445 ms and
+92,432 KiB, divided into 120.842 ms parse and 292.423 ms typecheck. The earlier
+directional diagnostics trace was about 827.547 ms with 408.603 ms in
+`assemble_report`; an already-built test producer now observes 2.083/2.133 ms
+there. The checked-result digest is
+`94d724aabccf402bcc6070d0854c03aaebad394dd69c3a1e75a60355b894d159`.
+A fresh verified sample remains 4,198.712 ms/282,604 KiB and preserves plan
+hash `db18f345676378b8633829c0bbd7870c0a1dc5a2459649c9bbfdd6b8969374ab`.
+These are directional debug observations, not release acceptance.
+
+This precursor does not close M1 or M2. The global parsed arena and whole
+checked construction remain, and verified publication still runs the complete
+63,657-row handoff scanner. M1 remains next; M2 must replace that deferred
+whole scan with construction-owned definition receipts rather than merely
+keeping it off the diagnostics path.
+
+The touched checked-result API caused a one-invocation, two-job debug CLI build
+to recompile `boon_semantic`, `boon_typecheck`, `boon_verify`, `boon_ir`,
+`boon_compiler`, `boon_runtime`, and `boon_cli`, taking 2m43s. That is rebuild-
+cone evidence, not a controlled crate-split benchmark. Once the checked shard
+seam is complete, measure separating stable checked semantic/image types from
+diagnostics/construction/service results so a service-output edit does not
+invalidate semantic verification and runtime crates.
+
 ### M1. Delete production global syntax assembly
 
 - Add opaque `ProjectSyntaxSnapshot` over `Arc<UnitSyntaxSnapshot>` plus a

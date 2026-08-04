@@ -889,9 +889,8 @@ fn synthetic_scaling_sample(args: &[String]) -> Result<(), Box<dyn std::error::E
             }
             let source_digest = checked
                 .output
-                .program
-                .as_ref()
-                .ok_or("synthetic diagnostics produced no CheckedProgram")?
+                .checked_program_fields()
+                .ok_or("synthetic diagnostics produced no checked construction")?
                 .source_bundle_digest_v1
                 .to_string();
             let (work, phase) = checked_work_and_phase(checked)?;
@@ -1035,9 +1034,8 @@ fn checked_work_and_phase(
 ) -> Result<(WorkSample, PhaseSample), Box<dyn std::error::Error>> {
     let program = checked
         .output
-        .program
-        .as_ref()
-        .ok_or("checked measurement result has no CheckedProgram")?;
+        .checked_program_fields()
+        .ok_or("checked measurement result has no checked construction")?;
     Ok((
         WorkSample {
             source_units: checked.profile.source_unit_count,
@@ -1132,9 +1130,8 @@ fn diagnostics_sample(source: &Path) -> Result<Sample, Box<dyn std::error::Error
     let compiler_peak_rss_kib = peak_rss_kib();
     let program = checked
         .output
-        .program
-        .as_ref()
-        .ok_or("valid performance fixture produced no CheckedProgram")?;
+        .checked_program_fields()
+        .ok_or("valid performance fixture produced no checked construction")?;
     if checked.output.report.has_errors() {
         return Err(format!(
             "performance fixture produced {} diagnostic(s)",
@@ -1195,9 +1192,8 @@ fn session_diagnostics_sample(source: &Path) -> Result<Sample, Box<dyn std::erro
     let compiler_peak_rss_kib = peak_rss_kib();
     let program = checked
         .output
-        .program
-        .as_ref()
-        .ok_or("valid performance fixture produced no CheckedProgram")?;
+        .checked_program_fields()
+        .ok_or("valid performance fixture produced no checked construction")?;
     if checked.output.report.has_errors() {
         return Err(format!(
             "performance fixture produced {} diagnostic(s)",
@@ -1343,7 +1339,7 @@ fn checked_result_sha256(
         &mut hasher,
         &(
             &checked.parsed,
-            &checked.output.program,
+            checked.output.checked_program_fields(),
             &checked.output.report,
         ),
     )?;

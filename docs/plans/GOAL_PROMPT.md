@@ -715,6 +715,18 @@ Current checkpoints to preserve and audit rather than redo:
   assembly; then install typed interface/definition requests and delete the
   checked handoff; then migrate normalized domain facts, shared plan-code,
   thin link, compositional phase seals, and consuming runnable publication;
+- preserve the landed diagnostics/runtime capability split. Diagnostics owns a
+  completed `CheckedProgramConstruction` and performs no checked-image handoff;
+  verified preview consumes and seals those exact checked fields later without
+  another parse or type solve. Focused digest rejection and exact sealed-
+  program/session parity pass. Fresh debug NovyWave diagnostics is
+  422.445 ms/92,432 KiB (120.842 ms parse, 292.423 ms typecheck), and traced
+  `assemble_report` is 2.083/2.133 ms instead of 408.603 ms. The verified plan
+  hash remains `db18f345676378b8633829c0bbd7870c0a1dc5a2459649c9bbfdd6b8969374ab`.
+  Do not call this M2 or latency closure: checking and syntax are whole-project,
+  verified publication still runs the 63,657-row scanner, and the warm gates
+  remain red. Continue with unit-native M1, then definition receipts that
+  delete the deferred scan rather than rechecking after diagnostics;
 - treat the 16.7 ms diagnostics and 100 ms replacement-preview gates as warm
   incremental contracts. A faster full rebuild cannot satisfy them. Record
   executed/reused/backdated requests and require zero unrelated parse/check/

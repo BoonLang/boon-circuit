@@ -15256,6 +15256,37 @@ fn checked_image_handoff(
     builder.finish(program.source_bundle_digest_v1, program.role)
 }
 
+/// Consume a completed diagnostics construction and grant the runtime checked
+/// capability only after deriving its checked-image receipts.
+///
+/// Diagnostics intentionally stop before this request. A later verified
+/// request can reuse the exact checked fields and pay the runtime publication
+/// cost once, without parsing or solving the program again.
+pub fn seal_checked_program_construction(
+    parsed: &ParsedProgram,
+    construction: CheckedProgramConstruction,
+) -> Result<CheckedProgram, String> {
+    seal_checked_program_fields(parsed, construction.__typechecker_into_fields())
+}
+
+fn seal_checked_program_fields(
+    parsed: &ParsedProgram,
+    fields: CheckedProgramFields,
+) -> Result<CheckedProgram, String> {
+    if fields.source_bundle_digest_v1 != parsed.source_bundle_digest_v1 {
+        return Err(format!(
+            "checked construction source digest {} differs from parsed source digest {}",
+            fields.source_bundle_digest_v1, parsed.source_bundle_digest_v1
+        ));
+    }
+    let image_handoff = checked_image_handoff(&fields, parsed)?;
+    // SAFETY: callers supply fields only from the successful typechecker
+    // boundary or its opaque `CheckedProgramConstruction`. The source digest
+    // is re-bound above and `checked_image_handoff` validates and seals the
+    // runtime receipts.
+    Ok(unsafe { CheckedProgram::from_typechecker_parts_unchecked(fields, image_handoff) })
+}
+
 fn validate_structural_lowering_metadata(
     program: &CheckedProgramFields,
     lookup: &CheckedProgramLookup<'_>,
@@ -18231,7 +18262,7 @@ pub fn project_type_hints(program: &ParsedProgram, output: &CheckOutput) -> Type
     }
 
     let (expr_type_table, function_type_table, render_slot_table, source_payload_shape_table) =
-        if let Some(checked) = output.program.as_ref() {
+        if let Some(checked) = output.checked_program_fields() {
             let metadata = &checked.lowering_metadata;
             (
                 &metadata.expr_type_table,
@@ -19857,7 +19888,7 @@ impl CheckedProgramDatabase {
             constraints,
             diagnostics: std::mem::take(&mut self.diagnostics),
         };
-        let program = program_is_available.then(|| {
+        let (program, construction) = if program_is_available {
             let mut checked_fields = checked_program;
             let mut lowering_metadata = CheckedProgramLoweringMetadata {
                 source_units: self
@@ -19916,16 +19947,31 @@ impl CheckedProgramDatabase {
                 lowering_metadata.render_slot_table = report.render_slot_table.clone();
             }
             checked_fields.lowering_metadata = lowering_metadata;
-            let image_handoff = checked_image_handoff(&checked_fields, &self.program)
-                .expect("validated checked fields must seal an image handoff");
-            // SAFETY: the checked graph itself is unchanged. This final seal
-            // attaches the lowering/report projections derived and validated
-            // above, plus the construction-owned image receipts, before the
-            // product leaves the typechecker.
-            unsafe {
-                CheckedProgram::from_typechecker_parts_unchecked(checked_fields, image_handoff)
+            if output_ownership == CheckOutputOwnership::DiagnosticsOwned {
+                // SAFETY: the checked graph and lowering metadata completed
+                // every typechecker validation above. Diagnostics deliberately
+                // retain that construction without claiming runtime handoff
+                // receipts have been requested.
+                (
+                    None,
+                    Some(unsafe {
+                        CheckedProgramConstruction::from_typechecker_fields_unchecked(
+                            checked_fields,
+                        )
+                    }),
+                )
+            } else {
+                (
+                    Some(
+                        seal_checked_program_fields(&self.program, checked_fields)
+                            .expect("validated checked fields must seal an image handoff"),
+                    ),
+                    None,
+                )
             }
-        });
+        } else {
+            (None, None)
+        };
         let assemble_report_ms = typecheck_elapsed_ms(assemble_report_started);
         trace_phase("assemble_report", assemble_report_ms);
         work_counters.record_diagnostic_replay(
@@ -19947,7 +19993,11 @@ impl CheckedProgramDatabase {
             "every checked inference call visit must be changed or a no-op"
         );
         (
-            CheckOutput { program, report },
+            CheckOutput {
+                program,
+                construction,
+                report,
+            },
             TypeCheckProfile {
                 work_counters,
                 checker_init_ms: init_profile.checker_init_ms,

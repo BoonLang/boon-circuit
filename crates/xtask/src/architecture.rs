@@ -722,7 +722,7 @@ fn verified_semantic_compiler_spine(workspace: &Path) -> Result<String, String> 
         &semantic,
         "SemanticProgram",
         "canonical_core",
-        "CanonicalProgramCoreV1",
+        "CanonicalProgramCoreV2",
     )?;
     verify_required_direct_field(
         &semantic,
@@ -730,7 +730,7 @@ fn verified_semantic_compiler_spine(workspace: &Path) -> Result<String, String> 
         "semantic_image",
         "SealedSemanticImageV2",
     )?;
-    verify_required_direct_field(&ir, "ErasedProgram", "fields", "CanonicalProgramCoreV1")?;
+    verify_required_direct_field(&ir, "ErasedProgram", "fields", "CanonicalProgramCoreV2")?;
     verify_required_direct_field(
         &ir,
         "ErasedProgram",
@@ -755,8 +755,8 @@ fn verified_semantic_compiler_spine(workspace: &Path) -> Result<String, String> 
             "semantic or verifier source reaches upward into executable boon_ir types".to_owned(),
         );
     }
-    if exact_struct_definition_lines(&program_core, "CanonicalProgramCoreV1").count() != 1 {
-        return Err("boon_semantic must own exactly one public CanonicalProgramCoreV1".to_owned());
+    if exact_struct_definition_lines(&program_core, "CanonicalProgramCoreV2").count() != 1 {
+        return Err("boon_semantic must own exactly one public CanonicalProgramCoreV2".to_owned());
     }
     for forbidden in [
         "pub struct ErasedProgramFields",
@@ -1130,7 +1130,7 @@ fn verify_semantic_core_ownership_boundary(workspace: &Path) -> Result<(), Strin
         "map_semantic_resources",
         "lower_verified_semantic_execution",
         "build_canonical_program_core",
-        "CanonicalProgramCoreV1 {",
+        "CanonicalProgramCoreV2 {",
     ] {
         if ir.contains(forbidden) {
             return Err(format!(
@@ -1152,7 +1152,7 @@ fn verify_semantic_core_ownership_boundary(workspace: &Path) -> Result<(), Strin
 
     for required in [
         "mod core_lowering;",
-        "canonical_core: program_core::CanonicalProgramCoreV1",
+        "canonical_core: program_core::CanonicalProgramCoreV2",
         "canonical_core_digest: [u8; 32]",
         "validate_canonical_core_handoff(self)?;",
         "core_lowering::build_canonical_program_core(",
@@ -1194,12 +1194,12 @@ fn verify_semantic_core_ownership_boundary(workspace: &Path) -> Result<(), Strin
         }
     }
     if lowering
-        .matches("program_core::CanonicalProgramCoreV1 {")
+        .matches("program_core::CanonicalProgramCoreV2 {")
         .count()
         != 1
     {
         return Err(
-            "semantic core construction must emit exactly one CanonicalProgramCoreV1".to_owned(),
+            "semantic core construction must emit exactly one CanonicalProgramCoreV2".to_owned(),
         );
     }
     for forbidden in [

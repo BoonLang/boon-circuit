@@ -459,10 +459,6 @@ pub enum SemanticDependencySubjectKindV1 {
     ReactiveMigrationInput,
     LoweringMetadata,
     LoweringSourceUnit,
-    LoweringExpressionType,
-    LoweringExpressionOccurrence,
-    LoweringFunctionType,
-    LoweringFunctionParameter,
     LoweringNamedValue,
     LoweringRenderSlot,
     LoweringSourcePayload,
@@ -2050,11 +2046,6 @@ fn resolve_construction_owner(
 ) -> Result<SemanticDependencyOwnerV1, CallableDependencyManifestError> {
     match route {
         ConstructionDependencyOwnerV1::ProgramRoot => Ok(SemanticDependencyOwnerV1::ProgramRoot),
-        ConstructionDependencyOwnerV1::Callable(callable) => {
-            Ok(SemanticDependencyOwnerV1::Callable {
-                callable: *callable,
-            })
-        }
         ConstructionDependencyOwnerV1::CheckedStatement(statement) => {
             owners.checked_statement(*statement)
         }
@@ -2090,7 +2081,6 @@ pub(crate) enum PendingDependencyReference {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ConstructionDependencyOwnerV1 {
     ProgramRoot,
-    Callable(SemanticCallableId),
     CheckedStatement(boon_checked::CheckedStatementId),
     Statement(SemanticStatementId),
     Expression(SemanticExprId),
@@ -6026,6 +6016,7 @@ pub(crate) fn statement_entity(statement: SemanticStatementId) -> SemanticDepend
     )
 }
 
+#[cfg(test)]
 pub(crate) fn callable_entity(callable: SemanticCallableId) -> SemanticDependencyEntityV1 {
     indexed_entity(
         SemanticDependencyEntityDomainV1::SemanticCallable,
@@ -6234,7 +6225,7 @@ pub(crate) fn build_callable_dependency_manifest_v7(
     execution: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV1,
     reactive: &SemanticReactiveGraphV1,
-    lowering: &SemanticLoweringContractV1,
+    lowering: &SemanticLoweringContractV2,
     lowering_rows: &ConstructionDependencyRowsV1,
     view: &SemanticViewBindingGraphV1,
     storage: &SemanticScopeStorageGraphV1,
@@ -6529,7 +6520,7 @@ pub(crate) fn build_callable_dependency_manifest(
     execution: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV1,
     reactive: &SemanticReactiveGraphV1,
-    lowering: &SemanticLoweringContractV1,
+    lowering: &SemanticLoweringContractV2,
     view: &SemanticViewBindingGraphV1,
     storage: &SemanticScopeStorageGraphV1,
     memory: &SemanticMemoryGraphV1,
@@ -6778,7 +6769,7 @@ fn build_callable_dependency_construction(
     execution: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV1,
     reactive: &SemanticReactiveGraphV1,
-    lowering: &SemanticLoweringContractV1,
+    lowering: &SemanticLoweringContractV2,
     view: &SemanticViewBindingGraphV1,
     storage: &SemanticScopeStorageGraphV1,
     memory: &SemanticMemoryGraphV1,
@@ -7148,7 +7139,7 @@ fn build_callable_dependency_proof_manifest(
     execution: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV1,
     reactive: &SemanticReactiveGraphV1,
-    lowering: &SemanticLoweringContractV1,
+    lowering: &SemanticLoweringContractV2,
     view: &SemanticViewBindingGraphV1,
     storage: &SemanticScopeStorageGraphV1,
     memory: &SemanticMemoryGraphV1,
@@ -7445,7 +7436,7 @@ impl CallableDependencyProofManifestV3 {
         execution: &SemanticExecutionImageColumnsV1,
         resources: &SemanticResourceGraphV1,
         reactive: &SemanticReactiveGraphV1,
-        lowering: &SemanticLoweringContractV1,
+        lowering: &SemanticLoweringContractV2,
         view: &SemanticViewBindingGraphV1,
         storage: &SemanticScopeStorageGraphV1,
         memory: &SemanticMemoryGraphV1,
@@ -7696,7 +7687,7 @@ impl CallableDependencyManifestV4 {
         execution: &SemanticExecutionImageColumnsV1,
         resources: &SemanticResourceGraphV1,
         reactive: &SemanticReactiveGraphV1,
-        lowering: &SemanticLoweringContractV1,
+        lowering: &SemanticLoweringContractV2,
         view: &SemanticViewBindingGraphV1,
         storage: &SemanticScopeStorageGraphV1,
         memory: &SemanticMemoryGraphV1,
@@ -7813,7 +7804,7 @@ impl CallableDependencyManifestV3 {
         execution: &SemanticExecutionImageColumnsV1,
         resources: &SemanticResourceGraphV1,
         reactive: &SemanticReactiveGraphV1,
-        lowering: &SemanticLoweringContractV1,
+        lowering: &SemanticLoweringContractV2,
         view: &SemanticViewBindingGraphV1,
         storage: &SemanticScopeStorageGraphV1,
         memory: &SemanticMemoryGraphV1,
@@ -12119,7 +12110,7 @@ fn view_capture_target_entity(target: SemanticViewCaptureTargetV1) -> SemanticDe
 
 #[cfg(test)]
 fn inventory_lowering(
-    lowering: &SemanticLoweringContractV1,
+    lowering: &SemanticLoweringContractV2,
     execution: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV1,
     owners: &DependencyOwnerIndex,
@@ -12162,104 +12153,6 @@ fn inventory_lowering(
             ),
             unit,
         )?;
-    }
-
-    for source_expression in &lowering.metadata.expression_types {
-        let entity = indexed_entity(
-            SemanticDependencyEntityDomainV1::SourceExpression,
-            source_expression.id.as_usize(),
-        );
-        collect_dependency!(
-            collector,
-            SemanticDependencyOwnerV1::ProgramRoot,
-            SemanticDependencyChannelV1::TypeAndFlowInstance,
-            vec![
-                SemanticDependencyRoleV1::FixedDefinition,
-                SemanticDependencyRoleV1::AssuranceOrActivation,
-            ],
-            top_subject(
-                SemanticDependencySubjectKindV1::LoweringExpressionType,
-                entity.clone(),
-            ),
-            SemanticDependencySemanticsV1 {
-                flow_type: Some(source_expression.flow_type.clone()),
-                ..SemanticDependencySemanticsV1::default()
-            },
-            source_expression,
-            Vec::new(),
-        )?;
-        for (ordinal, occurrence) in source_expression.occurrences.iter().enumerate() {
-            collect_dependency!(
-                collector,
-                owners.expression(occurrence.expression)?,
-                SemanticDependencyChannelV1::TypeAndFlowInstance,
-                vec![
-                    SemanticDependencyRoleV1::FixedDefinition,
-                    SemanticDependencyRoleV1::AssuranceOrActivation,
-                ],
-                child_subject(
-                    SemanticDependencySubjectKindV1::LoweringExpressionOccurrence,
-                    entity.clone(),
-                    ordinal,
-                ),
-                SemanticDependencySemanticsV1 {
-                    flow_type: Some(occurrence.flow_type.clone()),
-                    ..SemanticDependencySemanticsV1::default()
-                },
-                occurrence,
-                vec![dependency_entity(expression_entity(occurrence.expression))],
-            )?;
-        }
-    }
-
-    for function in &lowering.metadata.function_types {
-        let owner = SemanticDependencyOwnerV1::Callable {
-            callable: function.callable,
-        };
-        let entity = callable_entity(function.callable);
-        collect_dependency!(
-            collector,
-            owner,
-            SemanticDependencyChannelV1::TypeAndFlowInstance,
-            vec![
-                SemanticDependencyRoleV1::FixedDefinition,
-                SemanticDependencyRoleV1::AssuranceOrActivation,
-            ],
-            top_subject(
-                SemanticDependencySubjectKindV1::LoweringFunctionType,
-                entity.clone(),
-            ),
-            SemanticDependencySemanticsV1 {
-                flow_type: Some(function.result.clone()),
-                visibility: SemanticDependencyVisibilityV1::Public,
-                ..SemanticDependencySemanticsV1::default()
-            },
-            function,
-            vec![dependency_entity(callable_entity(function.callable))],
-        )?;
-        for (ordinal, parameter) in function.parameters.iter().enumerate() {
-            collect_dependency!(
-                collector,
-                owner,
-                SemanticDependencyChannelV1::TypeAndFlowInstance,
-                vec![
-                    SemanticDependencyRoleV1::FormulaBinder,
-                    SemanticDependencyRoleV1::AssuranceOrActivation,
-                ],
-                child_subject(
-                    SemanticDependencySubjectKindV1::LoweringFunctionParameter,
-                    entity.clone(),
-                    ordinal,
-                ),
-                SemanticDependencySemanticsV1 {
-                    flow_type: Some(parameter.flow_type.clone()),
-                    visibility: SemanticDependencyVisibilityV1::Public,
-                    ..SemanticDependencySemanticsV1::default()
-                },
-                parameter,
-                Vec::new(),
-            )?;
-        }
     }
 
     for named in &lowering.metadata.named_value_types {

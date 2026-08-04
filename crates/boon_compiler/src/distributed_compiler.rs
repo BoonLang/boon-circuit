@@ -199,7 +199,7 @@ struct FunctionLink {
     local_function: String,
     stable_identity: DistributedDeclarationId,
     export_id: ExportId,
-    signature: FunctionTypeEntry,
+    signature: core::ProducerFunctionInstance,
     result_type: DataTypePlan,
 }
 
@@ -2126,10 +2126,9 @@ fn link_lowered_roles(
                     None => ValueRef::Source(link.event_source_id.expect("event link source")),
                 },
             };
-            bind_checked_expression_refs(
+            bind_executable_expression_ref(
                 &mut context.expression_refs,
-                &consumer.ir,
-                reference.expr_id.as_usize(),
+                reference.expression,
                 imported_value_ref.clone(),
             )?;
             context
@@ -2177,18 +2176,38 @@ fn link_lowered_roles(
             let producer_role = call.producer_role;
             let local_function =
                 strip_role_function_prefix(&call.canonical_function, producer_role)?;
+            let prelinked_key = (*consumer_role, call.occurrence_path.clone());
+            let prelinked = prelinked_calls.get(&prelinked_key).ok_or_else(|| {
+                PlanError::new(format!(
+                    "distributed call `{}` occurrence `{}` was not resolved before lowering",
+                    call.canonical_function, call.occurrence_path
+                ))
+            })?;
+            let producer = lowered.get(&producer_role).expect("producer program");
+            let producer_instance = find_producer_function_instance(
+                &producer.ir,
+                prelinked.producer_materialization_identity,
+                &local_function,
+            )?;
             let function_key = (producer_role, call.canonical_function.clone());
             let function = if let Some(function) = function_links.get(&function_key) {
-                function.clone()
-            } else {
-                let producer = lowered.get(&producer_role).expect("producer program");
-                let signature = find_function_signature(&producer.ir, &local_function)?.clone();
-                let result_type = type_to_data_plan(&signature.result.ty).ok_or_else(|| {
-                    PlanError::new(format!(
-                        "distributed function `{}` result is not a closed boundary type",
+                if !producer_function_interfaces_match(&function.signature, producer_instance) {
+                    return Err(PlanError::new(format!(
+                        "distributed function `{}` materializations have conflicting execution-owned interfaces",
                         call.canonical_function
                     ))
-                })?;
+                    .into());
+                }
+                function.clone()
+            } else {
+                let signature = producer_instance.clone();
+                let result_type =
+                    type_to_data_plan(&signature.result_type.ty).ok_or_else(|| {
+                        PlanError::new(format!(
+                            "distributed function `{}` result is not a closed boundary type",
+                            call.canonical_function
+                        ))
+                    })?;
                 let stable_identity = DistributedDeclarationId::from_semantic_path(
                     role_namespace(producer_role),
                     &local_function,
@@ -2241,13 +2260,6 @@ fn link_lowered_roles(
                 ))
                 .into());
             }
-            let prelinked_key = (*consumer_role, call.occurrence_path.clone());
-            let prelinked = prelinked_calls.get(&prelinked_key).ok_or_else(|| {
-                PlanError::new(format!(
-                    "distributed call `{}` occurrence `{}` was not resolved before lowering",
-                    call.canonical_function, call.occurrence_path
-                ))
-            })?;
             if prelinked.consumer_role != *consumer_role
                 || prelinked.occurrence_path != call.occurrence_path
                 || prelinked.canonical_function != call.canonical_function
@@ -2369,7 +2381,7 @@ fn link_lowered_roles(
     for function in function_links.values() {
         let parameters = function
             .signature
-            .parameters
+            .arguments
             .iter()
             .map(|parameter| {
                 type_to_data_plan(&parameter.flow_type.ty)
@@ -2912,39 +2924,6 @@ fn link_lowered_roles(
         .collect(),
         client_projection: None,
     })
-}
-
-fn bind_checked_expression_refs(
-    refs: &mut BTreeMap<core::ExecutableExprId, ValueRef>,
-    program: &ErasedProgram,
-    checked_expr_id: usize,
-    value: ValueRef,
-) -> Result<(), PlanError> {
-    let checked_expr_id = boon_checked::CheckedExprId(checked_expr_id as u32);
-    let matches = program
-        .executable
-        .expressions
-        .iter()
-        .filter(|expression| expression.checked_expr_id == checked_expr_id)
-        .map(|expression| expression.id)
-        .collect::<Vec<_>>();
-    if matches.is_empty() {
-        return Err(PlanError::new(format!(
-            "distributed checked expression {} has no executable identity",
-            checked_expr_id.0
-        )));
-    }
-    for expression in matches {
-        if let Some(previous) = refs.insert(expression, value.clone())
-            && previous != value
-        {
-            return Err(PlanError::new(format!(
-                "distributed executable expression {} resolves to conflicting values",
-                expression.0
-            )));
-        }
-    }
-    Ok(())
 }
 
 fn bind_executable_expression_ref(
@@ -3510,30 +3489,52 @@ fn distributed_call_row_bindings(
     Ok(bindings)
 }
 
-fn find_function_signature<'a>(
+fn find_producer_function_instance<'a>(
     program: &'a ErasedProgram,
+    identity: [u8; 32],
     local_function: &str,
-) -> Result<&'a FunctionTypeEntry, PlanError> {
+) -> Result<&'a core::ProducerFunctionInstance, PlanError> {
     let matches = program
-        .function_types
-        .entries
+        .producer_function_instances
         .iter()
-        .filter(|entry| {
-            entry.name == local_function
-                || local_function
-                    .rsplit_once('/')
-                    .is_some_and(|(_, suffix)| suffix == entry.name)
-        })
+        .filter(|instance| instance.identity == identity)
         .collect::<Vec<_>>();
     match matches.as_slice() {
-        [signature] => Ok(*signature),
+        [instance]
+            if instance.function_name == local_function
+                || local_function
+                    .rsplit_once('/')
+                    .is_some_and(|(_, suffix)| suffix == instance.function_name) =>
+        {
+            Ok(*instance)
+        }
+        [instance] => Err(PlanError::new(format!(
+            "distributed function `{local_function}` materialization resolves to execution-owned function `{}`",
+            instance.function_name
+        ))),
         [] => Err(PlanError::new(format!(
-            "distributed function `{local_function}` has no checked local signature"
+            "distributed function `{local_function}` has no exact execution-owned producer materialization {}",
+            distributed_identity_hex(&identity)
         ))),
         _ => Err(PlanError::new(format!(
-            "distributed function `{local_function}` has an ambiguous local signature"
+            "distributed function `{local_function}` has an ambiguous execution-owned producer materialization"
         ))),
     }
+}
+
+fn producer_function_interfaces_match(
+    left: &core::ProducerFunctionInstance,
+    right: &core::ProducerFunctionInstance,
+) -> bool {
+    left.function_name == right.function_name
+        && left.result_type == right.result_type
+        && left.effect == right.effect
+        && left.arguments.len() == right.arguments.len()
+        && left
+            .arguments
+            .iter()
+            .zip(&right.arguments)
+            .all(|(left, right)| left.name == right.name && left.flow_type == right.flow_type)
 }
 
 fn strip_role_value_prefix(path: &str, role: ProgramRole) -> Result<String, PlanError> {
@@ -3634,4 +3635,110 @@ fn object_fields(shape: &ObjectShape) -> Option<Vec<DataTypeFieldPlan>> {
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CLIENT_SOURCE: &str = r#"
+store: [
+    increment: SOURCE
+    count: Session/store.count
+    shared_count: Session/store.shared_count
+    doubled: Session/store.doubled
+]
+
+scene: Scene/Element/text(
+    element: [events: [press: store.increment]]
+    style: [width: Fill]
+    text: TEXT { Distributed core fixture }
+)
+"#;
+
+    const SESSION_SOURCE: &str = r#"
+store: [
+    increment: Client/store.increment
+    ready: Server/store.ready
+    count:
+        0 |> HOLD count {
+            increment |> THEN { count + 1 }
+        }
+    shared_count: Server/store.shared_count
+    doubled: Server/double(value: count)
+]
+"#;
+
+    const SERVER_SOURCE: &str = r#"
+store: [
+    ready: True
+    increment: Session/store.increment
+    shared_count:
+        0 |> HOLD shared_count {
+            increment |> THEN { shared_count + 1 }
+        }
+]
+
+FUNCTION double(value) {
+    value * 2
+}
+"#;
+
+    fn distributed_request(role: ProgramRole, source: &str) -> DistributedCompilerProgram {
+        DistributedCompilerProgram {
+            revision: 1,
+            role,
+            source_label: "RUN.bn".to_owned(),
+            units: vec![CompilerSourceUnit {
+                path: "RUN.bn".to_owned(),
+                source: source.to_owned(),
+            }],
+            application: ApplicationIdentity::new(
+                "dev.boon.distributed-core-fixture",
+                format!("test-{}", role.as_str()),
+                "distributed-core-fixture",
+            ),
+            schema_version: 1,
+            migration_predecessors: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn execution_owned_interfaces_link_distributed_values_and_calls() {
+        let compiled = compile_distributed_runtime_source_programs(
+            &[
+                distributed_request(ProgramRole::Client, CLIENT_SOURCE),
+                distributed_request(ProgramRole::Session, SESSION_SOURCE),
+                distributed_request(ProgramRole::Server, SERVER_SOURCE),
+            ],
+            TargetProfile::SoftwareDefault,
+        )
+        .expect("execution-owned distributed fixture should compile");
+
+        assert_eq!(compiled.programs.len(), 3);
+        let client = compiled
+            .graph
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.role == ProgramRole::Client)
+            .expect("client endpoint");
+        let session = compiled
+            .graph
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.role == ProgramRole::Session)
+            .expect("session endpoint");
+        let server = compiled
+            .graph
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.role == ProgramRole::Server)
+            .expect("server endpoint");
+
+        assert_eq!(client.value_imports.len(), 3);
+        assert_eq!(session.remote_call_sites.len(), 1);
+        assert_eq!(server.function_exports.len(), 1);
+        assert_eq!(session.remote_call_sites[0].arguments.len(), 1);
+        assert_eq!(server.function_exports[0].parameters.len(), 1);
+    }
 }

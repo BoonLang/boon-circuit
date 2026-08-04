@@ -9,7 +9,7 @@
 use crate::{
     SemanticBindingId, SemanticBindingTargetV1, SemanticContextualOperationKind,
     SemanticExecutionImageColumnsV1, SemanticExprId, SemanticExpression, SemanticExpressionKind,
-    SemanticListId, SemanticLoweringContractV1, SemanticMaterializationId, SemanticMigrationId,
+    SemanticListId, SemanticLoweringContractV2, SemanticMaterializationId, SemanticMigrationId,
     SemanticReactiveGraphV1, SemanticReadTargetV1, SemanticResourceGraphV1, SemanticRowBinding,
     SemanticScopeStorageGraphV1, SemanticSelectKind, SemanticSourceUnitId, SemanticStateId,
     SemanticStatementKind, SemanticStorageBindingTargetV1, SemanticStorageFieldId,
@@ -288,7 +288,7 @@ pub(crate) fn build_semantic_memory_graph(
     resources: &SemanticResourceGraphV1,
     reactive: &SemanticReactiveGraphV1,
     storage: &SemanticScopeStorageGraphV1,
-    lowering: &SemanticLoweringContractV1,
+    lowering: &SemanticLoweringContractV2,
 ) -> Result<SemanticMemoryGraphV1, SemanticMemoryError> {
     if checked.source_bundle_digest_v1 != storage.source_bundle_digest_v1
         || checked.source_bundle_digest_v1 != lowering.metadata.source_bundle_digest_v1
@@ -333,7 +333,7 @@ impl SemanticMemoryGraphV1 {
         resources: &SemanticResourceGraphV1,
         reactive: &SemanticReactiveGraphV1,
         storage: &SemanticScopeStorageGraphV1,
-        lowering: &SemanticLoweringContractV1,
+        lowering: &SemanticLoweringContractV2,
     ) -> Result<(), SemanticMemoryError> {
         let expected = build_semantic_memory_graph(
             checked, execution, resources, reactive, storage, lowering,
@@ -353,7 +353,7 @@ fn build_memories(
     resources: &SemanticResourceGraphV1,
     reactive: &SemanticReactiveGraphV1,
     storage: &SemanticScopeStorageGraphV1,
-    lowering: &SemanticLoweringContractV1,
+    lowering: &SemanticLoweringContractV2,
 ) -> Result<Vec<SemanticMemoryV1>, SemanticMemoryError> {
     let mut memories = Vec::with_capacity(
         resources.states.len() + resources.lists.len() + execution.expressions.len(),
@@ -936,7 +936,7 @@ fn insert_memory_identity(
 }
 
 fn exact_source_unit(
-    lowering: &SemanticLoweringContractV1,
+    lowering: &SemanticLoweringContractV2,
     line: usize,
     path: &str,
 ) -> Result<(SemanticSourceUnitId, String), SemanticMemoryError> {

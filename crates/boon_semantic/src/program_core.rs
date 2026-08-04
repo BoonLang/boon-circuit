@@ -7,7 +7,7 @@ use std::fmt;
 /// The core is inspectable and serializable, but compiler backends accept it
 /// only after `boon_verify` binds it into the opaque `boon_ir::ErasedProgram`.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct CanonicalProgramCoreV1 {
+pub struct CanonicalProgramCoreV2 {
     pub executable: ExecutableProgram,
     pub scope_index: ErasedScopeIndex,
     pub expression_count: usize,
@@ -48,9 +48,8 @@ pub struct CanonicalProgramCoreV1 {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub materializations: Vec<ContextualMaterialization>,
     pub view_bindings: Vec<ViewBinding>,
-    pub expression_types: boon_checked::ExprTypeTable,
-    pub function_types: boon_checked::FunctionTypeTable,
-    pub named_value_types: boon_checked::NamedValueTypeTable,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub named_value_interfaces: Vec<NamedValueInterface>,
 }
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -170,13 +169,25 @@ pub struct DistributedReferences {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DistributedValueReference {
-    pub expr_id: ExprId,
+    pub expression: ExecutableExprId,
     pub canonical_path: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub local_alias_paths: Vec<String>,
     pub producer_role: boon_checked::ProgramRole,
     pub flow_mode: boon_checked::FlowMode,
     pub value_type: boon_checked::Type,
+}
+
+/// Narrow public value interface retained for distributed export discovery.
+///
+/// Checked origin inventories and source-expression tables are intentionally
+/// absent: the runnable image needs only the canonical semantic path and its
+/// closed flow contract. The backend resolves the path against final storage
+/// once and rejects ambiguous targets.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct NamedValueInterface {
+    pub canonical_path: String,
+    pub flow_type: boon_checked::FlowType,
 }
 
 pub fn distributed_event_source_path(canonical_path: &str) -> String {
@@ -210,6 +221,8 @@ pub struct ProducerFunctionInstance {
     pub owner: StaticOwnerId,
     pub function: FunctionId,
     pub function_name: String,
+    pub result_type: boon_checked::FlowType,
+    pub effect: boon_checked::CheckedEffectSummary,
     pub result_field: FieldId,
     pub result_path: String,
     pub root: ExecutableExprId,

@@ -827,14 +827,25 @@ Current cold-diagnostics candidate evidence:
   NovyWave oracle preserves the 11,608-node/82,364-edge topology and passes.
   Committing the already sealed metadata/contract digests eliminates two
   duplicate aggregate serializations (about 434 ms in that debug trace), but
-  fine-grained metadata-row generation still costs about 737 ms. This exposes
-  a larger bridge: lowering copies checked expression/function/named-value type
-  tables into semantic DTOs, canonical-core lowering maps them back to checked
-  tables, and distributed/backend consumers scan them again. Replace that
-  round trip with diagnostic source-map rows, typed semantic interface rows,
-  and the existing execution/storage type owners; then delete all three checked
-  tables from the runnable core and their DTO/proof inventories. Do not optimize
-  the 36,979 transitional rows or retain a production compatibility adapter.
+  fine-grained metadata-row generation still costs about 737 ms. The resulting
+  higher-level audit exposed and the next flag-day cut deletes that larger
+  bridge: `SemanticLoweringContractV2` deletes the full expression/function
+  inventories, and `CanonicalProgramCoreV2` deletes all three full checked
+  tables from the runnable core. Remaining lowering named-value metadata is
+  projected into a narrow transitional interface rather than reconstructed as
+  a checked table. Distributed reads carry exact executable-expression identities,
+  export discovery consumes narrow named-value interfaces, and remote callable
+  contracts come from exact producer materializations, including result and
+  effect ownership even when there is no local ordinary-call entry. A focused
+  three-role value/call regression and architecture gate pass without a global
+  table fallback. On fresh debug NovyWave evidence, construction rows fall from
+  36,979 to 1,885, metadata generation falls from about 736.6 to 120.7 ms, and
+  the graph falls to 10,640 nodes/80,698 edges; the focused run is 12.67 s and
+  remains far outside acceptance. Continue by making diagnostic maps optional,
+  folding the remaining named-value interface into typed storage/interface
+  ownership, and deleting the resource/reactive/storage/view/memory replay
+  scanners as their construction-owned table/CSR spans become directly sealed.
+  Do not optimize the 1,885 transitional rows or retain a compatibility adapter.
 - Do not preserve V3's 208k subject cardinality as a production V4/V5 proof
   requirement. The independent test oracle must map every historical subject
   to exactly one canonical finalized shard row and classifier field/domain and prove

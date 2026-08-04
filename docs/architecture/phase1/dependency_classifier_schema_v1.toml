@@ -1021,7 +1021,7 @@ fields = [
 [[records]]
 kind = "struct"
 source = "crates/boon_semantic/src/program_core.rs"
-name = "CanonicalProgramCoreV1"
+name = "CanonicalProgramCoreV2"
 fields = [
   { name = "executable", disposition = "r-f-priv-id-pc-n", reviewed = true },
   { name = "scope_index", disposition = "r-fc-priv-id-pc-n", reviewed = true },
@@ -1049,9 +1049,7 @@ fields = [
   { name = "list_projections", disposition = "r-fr-priv-id-pc-n", reviewed = true },
   { name = "materializations", disposition = "r-fr-priv-id-pc-n", reviewed = true },
   { name = "view_bindings", disposition = "r-f-priv-id-pc-n", reviewed = true },
-  { name = "expression_types", disposition = "r-f-priv-id-pc-n", reviewed = true },
-  { name = "function_types", disposition = "r-f-priv-id-pc-n", reviewed = true },
-  { name = "named_value_types", disposition = "r-f-priv-id-pc-n", reviewed = true },
+  { name = "named_value_interfaces", disposition = "r-f-priv-id-pc-n", reviewed = true },
 ]
 
 [[records]]
@@ -1303,12 +1301,21 @@ kind = "struct"
 source = "crates/boon_semantic/src/program_core.rs"
 name = "DistributedValueReference"
 fields = [
-  { name = "expr_id", disposition = "a-fc-priv-id-pc-n", reviewed = true },
+  { name = "expression", disposition = "r-fc-priv-id-pc-n", reviewed = true },
   { name = "canonical_path", disposition = "a-fc-priv-id-pc-n", reviewed = true },
   { name = "local_alias_paths", disposition = "r-frc-priv-id-pc-n", reviewed = true },
   { name = "producer_role", disposition = "r-frc-priv-id-pc-n", reviewed = true },
   { name = "flow_mode", disposition = "r-fc-priv-id-pc-n", reviewed = true },
   { name = "value_type", disposition = "r-fc-priv-id-pc-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_semantic/src/program_core.rs"
+name = "NamedValueInterface"
+fields = [
+  { name = "canonical_path", disposition = "a-fc-priv-id-pc-n", reviewed = true },
+  { name = "flow_type", disposition = "r-fc-priv-id-pc-n", reviewed = true },
 ]
 
 [[records]]
@@ -3021,6 +3028,8 @@ fields = [
   { name = "owner", disposition = "r-frc-priv-id-pc-n", reviewed = true },
   { name = "function", disposition = "r-frc-priv-id-pc-n", reviewed = true },
   { name = "function_name", disposition = "a-frc-priv-id-pc-n", reviewed = true },
+  { name = "result_type", disposition = "r-frc-priv-id-pc-n", reviewed = true },
+  { name = "effect", disposition = "r-frca-priv-id-pc-n", reviewed = true },
   { name = "result_field", disposition = "r-frc-priv-id-pc-n", reviewed = true },
   { name = "result_path", disposition = "a-frc-priv-id-pc-n", reviewed = true },
   { name = "root", disposition = "r-frc-priv-id-pc-n", reviewed = true },
@@ -4207,6 +4216,8 @@ fields = [
   { name = "owner", disposition = "r-rc-priv-id-pc-n", reviewed = true },
   { name = "function", disposition = "r-frc-priv-id-pc-n", reviewed = true },
   { name = "function_name", disposition = "a-frc-priv-id-pc-n", reviewed = true },
+  { name = "result_type", disposition = "r-frc-priv-id-pc-n", reviewed = true },
+  { name = "effect", disposition = "r-frca-priv-id-pc-n", reviewed = true },
   { name = "result_field", disposition = "r-frc-priv-id-pc-n", reviewed = true },
   { name = "result_path", disposition = "a-frc-priv-id-pc-n", reviewed = true },
   { name = "root", disposition = "r-frc-priv-id-pc-n", reviewed = true },
@@ -6342,34 +6353,6 @@ fields = [
 ]
 
 [[records.variants]]
-name = "LoweringExpressionType"
-disposition = "a-fc-priv-sp-id-pc-n"
-reviewed = true
-fields = [
-]
-
-[[records.variants]]
-name = "LoweringExpressionOccurrence"
-disposition = "a-fc-priv-sp-id-pc-n"
-reviewed = true
-fields = [
-]
-
-[[records.variants]]
-name = "LoweringFunctionType"
-disposition = "a-fc-priv-sp-id-pc-n"
-reviewed = true
-fields = [
-]
-
-[[records.variants]]
-name = "LoweringFunctionParameter"
-disposition = "a-fc-priv-sp-id-pc-n"
-reviewed = true
-fields = [
-]
-
-[[records.variants]]
 name = "LoweringNamedValue"
 disposition = "a-fc-priv-sp-id-pc-n"
 reviewed = true
@@ -8445,31 +8428,6 @@ fields = [
 [[records]]
 kind = "struct"
 source = "crates/boon_semantic/src/lowering_contract.rs"
-name = "SemanticFunctionParameterTypeV1"
-fields = [
-  { name = "parameter", disposition = "r-fc-priv-sp-id-pc-n", reviewed = true },
-  { name = "formal", disposition = "r-fc-priv-sp-id-pc-n", reviewed = true },
-  { name = "ordinal", disposition = "a-fc-priv-sp-id-pc-n", reviewed = true },
-  { name = "name", disposition = "a-fc-priv-sp-id-pc-n", reviewed = true },
-  { name = "flow_type", disposition = "r-fc-priv-sp-id-pc-n", reviewed = true },
-]
-
-[[records]]
-kind = "struct"
-source = "crates/boon_semantic/src/lowering_contract.rs"
-name = "SemanticFunctionTypeV1"
-fields = [
-  { name = "callable", disposition = "r-fc-priv-sp-id-pc-n", reviewed = true },
-  { name = "checked_callable", disposition = "r-fc-priv-sp-id-pc-n", reviewed = true },
-  { name = "name", disposition = "a-fc-priv-sp-id-pc-n", reviewed = true },
-  { name = "parameters", disposition = "r-fc-priv-sp-id-pc-n", reviewed = true },
-  { name = "result", disposition = "r-fc-priv-sp-id-pc-n", reviewed = true },
-  { name = "effect", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
-]
-
-[[records]]
-kind = "struct"
-source = "crates/boon_semantic/src/lowering_contract.rs"
 name = "SemanticHostOutputBindingV1"
 fields = [
   { name = "output", disposition = "r-frc-priv-sp-id-pc-n", reviewed = true },
@@ -8535,7 +8493,7 @@ fields = [
 [[records]]
 kind = "struct"
 source = "crates/boon_semantic/src/lowering_contract.rs"
-name = "SemanticLoweringContractDigestV1"
+name = "SemanticLoweringContractDigestV2"
 fields = [
   { name = "0", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
 ]
@@ -8551,7 +8509,7 @@ fields = [
 [[records]]
 kind = "struct"
 source = "crates/boon_semantic/src/lowering_contract.rs"
-name = "SemanticLoweringContractV1"
+name = "SemanticLoweringContractV2"
 fields = [
   { name = "schema", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
   { name = "metadata", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
@@ -8564,7 +8522,7 @@ fields = [
 [[records]]
 kind = "struct"
 source = "crates/boon_semantic/src/lowering_contract.rs"
-name = "SemanticLoweringMetadataDigestV1"
+name = "SemanticLoweringMetadataDigestV2"
 fields = [
   { name = "0", disposition = "a-ca-priv-sp-id-pc-n", reviewed = true },
 ]
@@ -8572,7 +8530,7 @@ fields = [
 [[records]]
 kind = "struct"
 source = "crates/boon_semantic/src/lowering_contract.rs"
-name = "SemanticLoweringMetadataV1"
+name = "SemanticLoweringMetadataV2"
 fields = [
   { name = "schema", disposition = "a-ca-priv-sp-id-pc-n", reviewed = true },
   { name = "source_bundle_digest_v1", disposition = "a-rca-priv-sp-id-pc-n", reviewed = true },
@@ -8580,8 +8538,6 @@ fields = [
   { name = "checked_expression_count", disposition = "a-fc-priv-sp-id-pc-n", reviewed = true },
   { name = "dynamic_fallback_count", disposition = "a-ca-priv-sp-id-pc-n", reviewed = true },
   { name = "source_units", disposition = "r-rc-priv-sp-id-pc-n", reviewed = true },
-  { name = "expression_types", disposition = "r-fc-priv-sp-id-pc-n", reviewed = true },
-  { name = "function_types", disposition = "r-fc-priv-sp-id-pc-n", reviewed = true },
   { name = "named_value_types", disposition = "r-fc-priv-sp-id-pc-n", reviewed = true },
   { name = "render_slots", disposition = "r-ca-priv-sp-id-pc-n", reviewed = true },
   { name = "source_payload_shapes", disposition = "r-rc-priv-sp-id-pc-n", reviewed = true },
@@ -8715,34 +8671,6 @@ fields = [
   { name = "expected_contract", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
   { name = "actual_type", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
   { name = "diagnostics", disposition = "r-ca-priv-sp-id-pc-n", reviewed = true },
-]
-
-[[records]]
-kind = "struct"
-source = "crates/boon_semantic/src/lowering_contract.rs"
-name = "SemanticSourceExpressionId"
-fields = [
-  { name = "0", disposition = "a-frc-priv-sp-id-pc-n", reviewed = true },
-]
-
-[[records]]
-kind = "struct"
-source = "crates/boon_semantic/src/lowering_contract.rs"
-name = "SemanticSourceExpressionOccurrenceV1"
-fields = [
-  { name = "expression", disposition = "r-frc-priv-sp-id-pc-n", reviewed = true },
-  { name = "flow_type", disposition = "r-frc-priv-sp-id-pc-n", reviewed = true },
-]
-
-[[records]]
-kind = "struct"
-source = "crates/boon_semantic/src/lowering_contract.rs"
-name = "SemanticSourceExpressionTypeV1"
-fields = [
-  { name = "id", disposition = "a-frc-priv-sp-id-pc-n", reviewed = true },
-  { name = "checked_expression", disposition = "r-frc-priv-sp-id-pc-n", reviewed = true },
-  { name = "occurrences", disposition = "r-frc-priv-sp-id-pc-n", reviewed = true },
-  { name = "flow_type", disposition = "r-frc-priv-sp-id-pc-n", reviewed = true },
 ]
 
 [[records]]

@@ -11,20 +11,19 @@ use crate::ResolvedOutGraph;
 use crate::dependency_manifest::{
     ConstructionDependencyDomainV1, ConstructionDependencyOwnerV1,
     ConstructionDependencyRowBuilderV1, ConstructionDependencyRowV1, ConstructionDependencyRowsV1,
-    binding_entity, callable_entity, child_subject, dependency_entity, expression_entity,
-    field_entity, indexed_entity, list_entity, source_entity, state_entity, statement_entity,
-    top_subject,
+    binding_entity, child_subject, dependency_entity, expression_entity, field_entity,
+    indexed_entity, list_entity, source_entity, state_entity, statement_entity, top_subject,
 };
 use crate::{
     CallableDependencyManifestError, SemanticBindingId, SemanticBindingTargetV1,
-    SemanticCallableId, SemanticDependencyChannelV1, SemanticDependencyEntityDomainV1,
-    SemanticDependencyEntityV1, SemanticDependencyLifetimeV1, SemanticDependencyRoleV1,
-    SemanticDependencySemanticsV1, SemanticDependencySubjectKindV1, SemanticDependencyVisibilityV1,
+    SemanticDependencyChannelV1, SemanticDependencyEntityDomainV1, SemanticDependencyEntityV1,
+    SemanticDependencyLifetimeV1, SemanticDependencyRoleV1, SemanticDependencySemanticsV1,
+    SemanticDependencySubjectKindV1, SemanticDependencyVisibilityV1,
     SemanticExecutionImageColumnsV1, SemanticExprId, SemanticExpressionKind, SemanticFieldId,
-    SemanticListId, SemanticLocalBindingId, SemanticParameterId, SemanticReactiveGraphV1,
-    SemanticResourceGraphV1, SemanticRootKindV1, SemanticSourceId, SemanticSourceOrigin,
-    SemanticStateId, SemanticStatementId, SemanticStatementOrigin, SemanticValueId,
-    SemanticValueListAuthorityId, checked_semantic_root_specs_v1,
+    SemanticListId, SemanticLocalBindingId, SemanticReactiveGraphV1, SemanticResourceGraphV1,
+    SemanticRootKindV1, SemanticSourceId, SemanticSourceOrigin, SemanticStateId,
+    SemanticStatementId, SemanticStatementOrigin, SemanticValueId, SemanticValueListAuthorityId,
+    checked_semantic_root_specs_v1,
 };
 #[cfg(test)]
 use boon_checked::CheckedProgram;
@@ -38,11 +37,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-pub const SEMANTIC_LOWERING_CONTRACT_SCHEMA_V1: &str = "boon.semantic-lowering-contract.v1";
-pub const SEMANTIC_LOWERING_METADATA_SCHEMA_V1: &str = "boon.semantic-lowering-metadata.v1";
+pub const SEMANTIC_LOWERING_CONTRACT_SCHEMA_V2: &str = "boon.semantic-lowering-contract.v2";
+pub const SEMANTIC_LOWERING_METADATA_SCHEMA_V2: &str = "boon.semantic-lowering-metadata.v2";
 
-const SEMANTIC_LOWERING_CONTRACT_DIGEST_DOMAIN: &[u8] = b"boon.semantic-lowering-contract.v1\0";
-const SEMANTIC_LOWERING_METADATA_DIGEST_DOMAIN: &[u8] = b"boon.semantic-lowering-metadata.v1\0";
+const SEMANTIC_LOWERING_CONTRACT_DIGEST_DOMAIN: &[u8] = b"boon.semantic-lowering-contract.v2\0";
+const SEMANTIC_LOWERING_METADATA_DIGEST_DOMAIN: &[u8] = b"boon.semantic-lowering-metadata.v2\0";
 
 macro_rules! typed_lowering_id {
     ($($name:ident),+ $(,)?) => {
@@ -79,7 +78,6 @@ macro_rules! typed_lowering_id {
 
 typed_lowering_id!(
     SemanticSourceUnitId,
-    SemanticSourceExpressionId,
     SemanticNamedValueId,
     SemanticDiagnosticId,
     SemanticRenderSlotId,
@@ -114,16 +112,16 @@ macro_rules! digest_type {
     };
 }
 
-digest_type!(SemanticLoweringMetadataDigestV1);
-digest_type!(SemanticLoweringContractDigestV1);
+digest_type!(SemanticLoweringMetadataDigestV2);
+digest_type!(SemanticLoweringContractDigestV2);
 
 /// The complete A-C authority: lowering metadata, output contracts, and host
 /// ports. Scope/storage topology and full view bindings intentionally live in
 /// the next boundary and are not represented by placeholders here.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct SemanticLoweringContractV1 {
+pub struct SemanticLoweringContractV2 {
     pub schema: String,
-    pub metadata: SemanticLoweringMetadataV1,
+    pub metadata: SemanticLoweringMetadataV2,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub output_contracts: Vec<SemanticOutputContractV1>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -133,15 +131,15 @@ pub struct SemanticLoweringContractV1 {
     /// exact regions to private mutable storage.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub transient_collections: Vec<SemanticTransientCollectionV1>,
-    pub digest: SemanticLoweringContractDigestV1,
+    pub digest: SemanticLoweringContractDigestV2,
 }
 
 /// Production construction product. The normalized dependency rows are
 /// sealed by Manifest V7 and then dropped; the rich lowering contract remains
 /// available to code generation until the all-domain semantic image migration
 /// makes its typed columns the sole owner.
-pub(crate) struct SemanticLoweringContractBuildV1 {
-    pub(crate) contract: SemanticLoweringContractV1,
+pub(crate) struct SemanticLoweringContractBuildV2 {
+    pub(crate) contract: SemanticLoweringContractV2,
     pub(crate) dependency_rows: ConstructionDependencyRowsV1,
 }
 
@@ -260,7 +258,7 @@ pub struct SemanticTransientCollectionV1 {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct SemanticLoweringMetadataV1 {
+pub struct SemanticLoweringMetadataV2 {
     pub schema: String,
     pub source_bundle_digest_v1: SourceBundleDigestV1,
     pub original_source_expression_count: usize,
@@ -268,10 +266,6 @@ pub struct SemanticLoweringMetadataV1 {
     pub dynamic_fallback_count: usize,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub source_units: Vec<SemanticSourceUnitV1>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub expression_types: Vec<SemanticSourceExpressionTypeV1>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub function_types: Vec<SemanticFunctionTypeV1>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub named_value_types: Vec<SemanticNamedValueTypeV1>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -282,7 +276,7 @@ pub struct SemanticLoweringMetadataV1 {
     pub diagnostics: Vec<SemanticTypeDiagnosticV1>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub program_diagnostics: Vec<SemanticDiagnosticId>,
-    pub digest: SemanticLoweringMetadataDigestV1,
+    pub digest: SemanticLoweringMetadataDigestV2,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -293,45 +287,6 @@ pub struct SemanticSourceUnitV1 {
     pub module: Option<String>,
     pub start_line: usize,
     pub line_count: usize,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct SemanticSourceExpressionTypeV1 {
-    pub id: SemanticSourceExpressionId,
-    /// Checked provenance only. Semantic execution identity is carried by
-    /// `occurrences`.
-    pub checked_expression: CheckedExprId,
-    pub occurrences: Vec<SemanticSourceExpressionOccurrenceV1>,
-    pub flow_type: FlowType,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct SemanticSourceExpressionOccurrenceV1 {
-    pub expression: SemanticExprId,
-    /// Exact normalized type after contextual substitution. This may differ
-    /// from the source expression's principal checked type.
-    pub flow_type: FlowType,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct SemanticFunctionTypeV1 {
-    pub callable: SemanticCallableId,
-    pub checked_callable: DeclId,
-    /// Diagnostic spelling retained from the checked side table.
-    pub name: String,
-    pub parameters: Vec<SemanticFunctionParameterTypeV1>,
-    pub result: FlowType,
-    pub effect: CheckedEffectSummary,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct SemanticFunctionParameterTypeV1 {
-    pub parameter: SemanticParameterId,
-    pub formal: DeclId,
-    pub ordinal: usize,
-    /// Diagnostic spelling retained from the checked side table.
-    pub name: String,
-    pub flow_type: FlowType,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -522,7 +477,7 @@ pub(crate) fn build_semantic_lowering_contract(
     resources: &SemanticResourceGraphV1,
     reactive: &SemanticReactiveGraphV1,
     out_net: &ResolvedOutGraph,
-) -> Result<SemanticLoweringContractV1, SemanticLoweringContractError> {
+) -> Result<SemanticLoweringContractV2, SemanticLoweringContractError> {
     execution
         .validate(out_net)
         .map_err(SemanticLoweringContractError::new)?;
@@ -542,7 +497,7 @@ pub(crate) fn build_semantic_lowering_contract_with_dependency_rows(
     execution: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV1,
     reactive: &SemanticReactiveGraphV1,
-) -> Result<SemanticLoweringContractBuildV1, SemanticLoweringContractError> {
+) -> Result<SemanticLoweringContractBuildV2, SemanticLoweringContractError> {
     let trace = std::env::var_os("BOON_SEMANTIC_TRACE").is_some();
     macro_rules! lowering_phase {
         ($name:literal, $expression:expr) => {{
@@ -608,13 +563,13 @@ pub(crate) fn build_semantic_lowering_contract_with_dependency_rows(
         "transient_collections",
         build_transient_collections(execution, resources)
     )?;
-    let mut contract = SemanticLoweringContractV1 {
-        schema: SEMANTIC_LOWERING_CONTRACT_SCHEMA_V1.to_owned(),
+    let mut contract = SemanticLoweringContractV2 {
+        schema: SEMANTIC_LOWERING_CONTRACT_SCHEMA_V2.to_owned(),
         metadata,
         output_contracts,
         host_ports,
         transient_collections,
-        digest: SemanticLoweringContractDigestV1([0; 32]),
+        digest: SemanticLoweringContractDigestV2([0; 32]),
     };
     contract.digest = lowering_phase!("digest", lowering_contract_digest(&contract))?;
     let contract_dependency_row = lowering_phase!(
@@ -633,7 +588,7 @@ pub(crate) fn build_semantic_lowering_contract_with_dependency_rows(
     rows.append(&mut host_port_dependency_rows);
     let dependency_rows =
         ConstructionDependencyRowsV1::from_rows(ConstructionDependencyDomainV1::Lowering, rows);
-    Ok(SemanticLoweringContractBuildV1 {
+    Ok(SemanticLoweringContractBuildV2 {
         contract,
         dependency_rows,
     })
@@ -641,7 +596,7 @@ pub(crate) fn build_semantic_lowering_contract_with_dependency_rows(
 
 #[cfg(test)]
 pub(crate) fn lowering_dependency_rows(
-    lowering: &SemanticLoweringContractV1,
+    lowering: &SemanticLoweringContractV2,
 ) -> Result<ConstructionDependencyRowsV1, CallableDependencyManifestError> {
     let mut builder = ConstructionDependencyRowBuilderV1::new();
     let mut rows = Vec::new();
@@ -657,7 +612,7 @@ pub(crate) fn lowering_dependency_rows(
 
 fn lowering_contract_dependency_row(
     builder: &mut ConstructionDependencyRowBuilderV1,
-    lowering: &SemanticLoweringContractV1,
+    lowering: &SemanticLoweringContractV2,
 ) -> Result<ConstructionDependencyRowV1, CallableDependencyManifestError> {
     // The lowering digest already commits the complete contract under its
     // versioned domain. Hash that fixed commitment into the dependency row
@@ -675,7 +630,7 @@ fn lowering_contract_dependency_row(
 fn append_lowering_metadata_dependency_rows(
     builder: &mut ConstructionDependencyRowBuilderV1,
     rows: &mut Vec<ConstructionDependencyRowV1>,
-    metadata: &SemanticLoweringMetadataV1,
+    metadata: &SemanticLoweringMetadataV2,
 ) -> Result<(), CallableDependencyManifestError> {
     let program = ConstructionDependencyOwnerV1::ProgramRoot;
     rows.push(builder.dependency(
@@ -709,98 +664,6 @@ fn append_lowering_metadata_dependency_rows(
             ),
             unit,
         )?);
-    }
-
-    for source_expression in &metadata.expression_types {
-        let entity = indexed_entity(
-            SemanticDependencyEntityDomainV1::SourceExpression,
-            source_expression.id.as_usize(),
-        );
-        rows.push(builder.dependency(
-            program.clone(),
-            SemanticDependencyChannelV1::TypeAndFlowInstance,
-            vec![
-                SemanticDependencyRoleV1::FixedDefinition,
-                SemanticDependencyRoleV1::AssuranceOrActivation,
-            ],
-            top_subject(
-                SemanticDependencySubjectKindV1::LoweringExpressionType,
-                entity.clone(),
-            ),
-            SemanticDependencySemanticsV1 {
-                flow_type: Some(source_expression.flow_type.clone()),
-                ..SemanticDependencySemanticsV1::default()
-            },
-            source_expression,
-            Vec::new(),
-        )?);
-        for (ordinal, occurrence) in source_expression.occurrences.iter().enumerate() {
-            rows.push(builder.dependency(
-                ConstructionDependencyOwnerV1::Expression(occurrence.expression),
-                SemanticDependencyChannelV1::TypeAndFlowInstance,
-                vec![
-                    SemanticDependencyRoleV1::FixedDefinition,
-                    SemanticDependencyRoleV1::AssuranceOrActivation,
-                ],
-                child_subject(
-                    SemanticDependencySubjectKindV1::LoweringExpressionOccurrence,
-                    entity.clone(),
-                    ordinal,
-                ),
-                SemanticDependencySemanticsV1 {
-                    flow_type: Some(occurrence.flow_type.clone()),
-                    ..SemanticDependencySemanticsV1::default()
-                },
-                occurrence,
-                vec![dependency_entity(expression_entity(occurrence.expression))],
-            )?);
-        }
-    }
-
-    for function in &metadata.function_types {
-        let owner = ConstructionDependencyOwnerV1::Callable(function.callable);
-        let entity = callable_entity(function.callable);
-        rows.push(builder.dependency(
-            owner.clone(),
-            SemanticDependencyChannelV1::TypeAndFlowInstance,
-            vec![
-                SemanticDependencyRoleV1::FixedDefinition,
-                SemanticDependencyRoleV1::AssuranceOrActivation,
-            ],
-            top_subject(
-                SemanticDependencySubjectKindV1::LoweringFunctionType,
-                entity.clone(),
-            ),
-            SemanticDependencySemanticsV1 {
-                flow_type: Some(function.result.clone()),
-                visibility: SemanticDependencyVisibilityV1::Public,
-                ..SemanticDependencySemanticsV1::default()
-            },
-            function,
-            vec![dependency_entity(callable_entity(function.callable))],
-        )?);
-        for (ordinal, parameter) in function.parameters.iter().enumerate() {
-            rows.push(builder.dependency(
-                owner.clone(),
-                SemanticDependencyChannelV1::TypeAndFlowInstance,
-                vec![
-                    SemanticDependencyRoleV1::FormulaBinder,
-                    SemanticDependencyRoleV1::AssuranceOrActivation,
-                ],
-                child_subject(
-                    SemanticDependencySubjectKindV1::LoweringFunctionParameter,
-                    entity.clone(),
-                    ordinal,
-                ),
-                SemanticDependencySemanticsV1 {
-                    flow_type: Some(parameter.flow_type.clone()),
-                    visibility: SemanticDependencyVisibilityV1::Public,
-                    ..SemanticDependencySemanticsV1::default()
-                },
-                parameter,
-                Vec::new(),
-            )?);
-        }
     }
 
     for named in &metadata.named_value_types {
@@ -1102,7 +965,7 @@ fn append_lowering_host_port_dependency_rows(
     Ok(())
 }
 
-impl SemanticLoweringContractV1 {
+impl SemanticLoweringContractV2 {
     /// Fail closed by re-deriving all checked-to-semantic joins and both
     /// canonical digests.
     #[cfg(test)]
@@ -1130,7 +993,7 @@ fn build_lowering_metadata(
     execution: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV1,
     reactive: &SemanticReactiveGraphV1,
-) -> Result<SemanticLoweringMetadataV1, SemanticLoweringContractError> {
+) -> Result<SemanticLoweringMetadataV2, SemanticLoweringContractError> {
     let lowering = &checked.lowering_metadata;
     let source_units = lowering
         .source_units
@@ -1146,8 +1009,6 @@ fn build_lowering_metadata(
         .collect::<Vec<_>>();
     validate_source_units(&source_units)?;
 
-    let expression_types = build_expression_types(checked, execution)?;
-    let function_types = build_function_types(checked, execution)?;
     let named_value_types = build_named_value_types(checked, execution, resources, reactive)?;
     let source_payload_shapes = build_source_payload_shapes(checked, resources)?;
 
@@ -1167,21 +1028,19 @@ fn build_lowering_metadata(
         )));
     }
 
-    let mut metadata = SemanticLoweringMetadataV1 {
-        schema: SEMANTIC_LOWERING_METADATA_SCHEMA_V1.to_owned(),
+    let mut metadata = SemanticLoweringMetadataV2 {
+        schema: SEMANTIC_LOWERING_METADATA_SCHEMA_V2.to_owned(),
         source_bundle_digest_v1: checked.source_bundle_digest_v1,
         original_source_expression_count: lowering.original_source_expression_count,
         checked_expression_count: lowering.checked_expression_count,
         dynamic_fallback_count: lowering.dynamic_fallback_count,
         source_units,
-        expression_types,
-        function_types,
         named_value_types,
         render_slots,
         source_payload_shapes,
         diagnostics,
         program_diagnostics,
-        digest: SemanticLoweringMetadataDigestV1([0; 32]),
+        digest: SemanticLoweringMetadataDigestV2([0; 32]),
     };
     metadata.digest = lowering_metadata_digest(&metadata)?;
     Ok(metadata)
@@ -1211,187 +1070,6 @@ fn validate_source_units(
         }
     }
     Ok(())
-}
-
-fn build_expression_types(
-    checked: &CheckedProgramFields,
-    execution: &SemanticExecutionImageColumnsV1,
-) -> Result<Vec<SemanticSourceExpressionTypeV1>, SemanticLoweringContractError> {
-    let lowering = &checked.lowering_metadata;
-    let mut occurrences_by_checked = vec![Vec::new(); checked.expressions.len()];
-    for origin in &execution.checked_expression_origins {
-        let checked_index = origin.checked_expression.0 as usize;
-        let Some(occurrences) = occurrences_by_checked.get_mut(checked_index) else {
-            return Err(SemanticLoweringContractError::new(format!(
-                "semantic occurrence {} references out-of-range checked expression {}",
-                origin.expression, origin.checked_expression.0
-            )));
-        };
-        occurrences.push(origin.expression);
-    }
-    for occurrences in &mut occurrences_by_checked {
-        occurrences.sort();
-        occurrences.dedup();
-    }
-    let mut entries = lowering.expr_type_table.entries.iter().collect::<Vec<_>>();
-    entries.sort_by_key(|entry| entry.expr_id);
-    if entries.len() != lowering.original_source_expression_count {
-        return Err(SemanticLoweringContractError::new(format!(
-            "source expression type table has {} entries, expected total source coverage {}",
-            entries.len(),
-            lowering.original_source_expression_count
-        )));
-    }
-
-    entries
-        .into_iter()
-        .enumerate()
-        .map(|(index, entry)| {
-            if entry.expr_id != index {
-                return Err(SemanticLoweringContractError::new(format!(
-                    "source expression type table is not dense at {index}; found {}",
-                    entry.expr_id
-                )));
-            }
-            let checked_id = CheckedExprId(u32::try_from(entry.expr_id).map_err(|_| {
-                SemanticLoweringContractError::new(format!(
-                    "source expression {} exceeds checked identity range",
-                    entry.expr_id
-                ))
-            })?);
-            let checked_expression = checked
-                .expressions
-                .get(entry.expr_id)
-                .filter(|expression| expression.id == checked_id)
-                .ok_or_else(|| {
-                    SemanticLoweringContractError::new(format!(
-                        "source expression {} has no dense opaque checked expression",
-                        entry.expr_id
-                    ))
-                })?;
-            if checked_expression.flow_type != entry.flow_type {
-                return Err(SemanticLoweringContractError::new(format!(
-                    "source expression {} type table differs from its checked expression",
-                    entry.expr_id
-                )));
-            }
-            let occurrence_ids = occurrences_by_checked
-                .get(entry.expr_id)
-                .expect("checked expression occurrence index is dense");
-            // Function declarations and other source-only expressions can be
-            // fully checked without producing a normalized runtime node. An
-            // explicitly empty vector is the exact coverage result; it is not
-            // a synthesized fallback identity.
-            let occurrences = occurrence_ids
-                .iter()
-                .copied()
-                .map(|occurrence| {
-                    let expression = require_expression(execution, occurrence)?;
-                    if expression.checked_expr_id != checked_id {
-                        return Err(SemanticLoweringContractError::new(format!(
-                            "semantic occurrence {occurrence} differs from source expression {} provenance",
-                            entry.expr_id
-                        )));
-                    }
-                    Ok(SemanticSourceExpressionOccurrenceV1 {
-                        expression: occurrence,
-                        flow_type: expression.flow_type.clone(),
-                    })
-                })
-                .collect::<Result<Vec<_>, SemanticLoweringContractError>>()?;
-            Ok(SemanticSourceExpressionTypeV1 {
-                id: SemanticSourceExpressionId(index),
-                checked_expression: checked_id,
-                occurrences,
-                flow_type: entry.flow_type.clone(),
-            })
-        })
-        .collect()
-}
-
-fn build_function_types(
-    checked: &CheckedProgramFields,
-    execution: &SemanticExecutionImageColumnsV1,
-) -> Result<Vec<SemanticFunctionTypeV1>, SemanticLoweringContractError> {
-    let user_callables = execution
-        .callables
-        .iter()
-        .filter(|callable| callable.kind == CheckedCallableKind::User)
-        .collect::<Vec<_>>();
-    if checked.lowering_metadata.function_type_table.entries.len() != user_callables.len() {
-        return Err(SemanticLoweringContractError::new(format!(
-            "function type table has {} entries for {} semantic user callables",
-            checked.lowering_metadata.function_type_table.entries.len(),
-            user_callables.len()
-        )));
-    }
-
-    let mut used = BTreeSet::new();
-    let mut functions = Vec::with_capacity(user_callables.len());
-    for entry in &checked.lowering_metadata.function_type_table.entries {
-        let matches = user_callables
-            .iter()
-            .filter(|callable| callable.checked_callable == entry.callable)
-            .copied()
-            .collect::<Vec<_>>();
-        let [callable] = matches.as_slice() else {
-            return Err(SemanticLoweringContractError::new(format!(
-                "function type entry `{}` checked callable {} resolves to {} semantic user callables",
-                entry.name,
-                entry.callable.0,
-                matches.len()
-            )));
-        };
-        if callable.name != entry.name
-            || callable.parameters.len() != entry.parameters.len()
-            || callable.result != entry.result
-            || callable.effect != entry.effect
-        {
-            return Err(SemanticLoweringContractError::new(format!(
-                "function type entry `{}` differs from semantic callable {}",
-                entry.name, callable.id
-            )));
-        }
-        for (parameter, entry_parameter) in callable.parameters.iter().zip(&entry.parameters) {
-            if parameter.formal != entry_parameter.formal
-                || parameter.ordinal != entry_parameter.ordinal
-                || parameter.name != entry_parameter.name
-                || parameter.flow_type != entry_parameter.flow_type
-            {
-                return Err(SemanticLoweringContractError::new(format!(
-                    "function type entry `{}` parameter {} differs from semantic parameter {:?}",
-                    entry.name, entry_parameter.ordinal, parameter.id
-                )));
-            }
-        }
-        if !used.insert(callable.id) {
-            return Err(SemanticLoweringContractError::new(format!(
-                "semantic user callable {} is represented by multiple function type entries",
-                callable.id
-            )));
-        }
-        let parameters = callable
-            .parameters
-            .iter()
-            .map(|parameter| SemanticFunctionParameterTypeV1 {
-                parameter: parameter.id,
-                formal: parameter.formal,
-                ordinal: parameter.ordinal,
-                name: parameter.name.clone(),
-                flow_type: parameter.flow_type.clone(),
-            })
-            .collect();
-        functions.push(SemanticFunctionTypeV1 {
-            callable: callable.id,
-            checked_callable: callable.checked_callable,
-            name: entry.name.clone(),
-            parameters,
-            result: entry.result.clone(),
-            effect: entry.effect,
-        });
-    }
-    functions.sort_by_key(|function| function.callable);
-    Ok(functions)
 }
 
 fn build_named_value_types(
@@ -3299,8 +2977,6 @@ struct LoweringMetadataDigestPayload<'a> {
     checked_expression_count: usize,
     dynamic_fallback_count: usize,
     source_units: &'a [SemanticSourceUnitV1],
-    expression_types: &'a [SemanticSourceExpressionTypeV1],
-    function_types: &'a [SemanticFunctionTypeV1],
     named_value_types: &'a [SemanticNamedValueTypeV1],
     render_slots: &'a [SemanticRenderSlotV1],
     source_payload_shapes: &'a [SemanticSourcePayloadShapeV1],
@@ -3309,8 +2985,8 @@ struct LoweringMetadataDigestPayload<'a> {
 }
 
 fn lowering_metadata_digest(
-    metadata: &SemanticLoweringMetadataV1,
-) -> Result<SemanticLoweringMetadataDigestV1, SemanticLoweringContractError> {
+    metadata: &SemanticLoweringMetadataV2,
+) -> Result<SemanticLoweringMetadataDigestV2, SemanticLoweringContractError> {
     let payload = LoweringMetadataDigestPayload {
         schema: &metadata.schema,
         source_bundle_digest_v1: metadata.source_bundle_digest_v1,
@@ -3318,8 +2994,6 @@ fn lowering_metadata_digest(
         checked_expression_count: metadata.checked_expression_count,
         dynamic_fallback_count: metadata.dynamic_fallback_count,
         source_units: &metadata.source_units,
-        expression_types: &metadata.expression_types,
-        function_types: &metadata.function_types,
         named_value_types: &metadata.named_value_types,
         render_slots: &metadata.render_slots,
         source_payload_shapes: &metadata.source_payload_shapes,
@@ -3327,7 +3001,7 @@ fn lowering_metadata_digest(
         program_diagnostics: &metadata.program_diagnostics,
     };
     boon_contract::canonical_serde_hash_v1(SEMANTIC_LOWERING_METADATA_DIGEST_DOMAIN, &payload)
-        .map(SemanticLoweringMetadataDigestV1)
+        .map(SemanticLoweringMetadataDigestV2)
         .map_err(|error| {
             SemanticLoweringContractError::new(format!(
                 "failed to hash semantic lowering metadata: {error}"
@@ -3338,15 +3012,15 @@ fn lowering_metadata_digest(
 #[derive(Serialize)]
 struct LoweringContractDigestPayload<'a> {
     schema: &'a str,
-    metadata: &'a SemanticLoweringMetadataV1,
+    metadata: &'a SemanticLoweringMetadataV2,
     output_contracts: &'a [SemanticOutputContractV1],
     host_ports: &'a [SemanticHostPortBindingV1],
     transient_collections: &'a [SemanticTransientCollectionV1],
 }
 
 fn lowering_contract_digest(
-    contract: &SemanticLoweringContractV1,
-) -> Result<SemanticLoweringContractDigestV1, SemanticLoweringContractError> {
+    contract: &SemanticLoweringContractV2,
+) -> Result<SemanticLoweringContractDigestV2, SemanticLoweringContractError> {
     let payload = LoweringContractDigestPayload {
         schema: &contract.schema,
         metadata: &contract.metadata,
@@ -3355,7 +3029,7 @@ fn lowering_contract_digest(
         transient_collections: &contract.transient_collections,
     };
     boon_contract::canonical_serde_hash_v1(SEMANTIC_LOWERING_CONTRACT_DIGEST_DOMAIN, &payload)
-        .map(SemanticLoweringContractDigestV1)
+        .map(SemanticLoweringContractDigestV2)
         .map_err(|error| {
             SemanticLoweringContractError::new(format!(
                 "failed to hash semantic lowering contract: {error}"
@@ -3383,7 +3057,7 @@ mod tests {
     fn contract_for(
         checked: &CheckedProgramFields,
         semantic: &crate::SemanticProgram,
-    ) -> SemanticLoweringContractV1 {
+    ) -> SemanticLoweringContractV2 {
         build_semantic_lowering_contract(
             checked,
             semantic.execution_graph(),
@@ -3543,7 +3217,7 @@ FUNCTION make_row(initial) {
     }
 
     #[test]
-    fn metadata_has_dense_total_expression_and_diagnostic_identity() {
+    fn metadata_keeps_source_counts_and_dense_diagnostic_identity() {
         let (checked, semantic) = checked_and_semantic(
             "metadata.bn",
             r#"
@@ -3560,26 +3234,23 @@ outputs: [
         );
         let contract = contract_for(&checked, &semantic);
         assert_eq!(
-            contract.metadata.expression_types.len(),
-            contract.metadata.original_source_expression_count
+            contract.metadata.original_source_expression_count,
+            checked.lowering_metadata.original_source_expression_count
         );
-        let mut occurrence_count = 0;
-        for (index, expression) in contract.metadata.expression_types.iter().enumerate() {
-            assert_eq!(expression.id, SemanticSourceExpressionId(index));
-            for occurrence in &expression.occurrences {
-                occurrence_count += 1;
-                assert_eq!(
-                    semantic.execution_graph().expressions[occurrence.expression.as_usize()]
-                        .flow_type,
-                    occurrence.flow_type
-                );
-            }
-        }
-        assert!(occurrence_count > 0);
+        assert_eq!(
+            contract.metadata.checked_expression_count,
+            checked.expressions.len()
+        );
+        assert!(
+            semantic
+                .execution_graph()
+                .callables
+                .iter()
+                .any(|callable| callable.kind == CheckedCallableKind::User)
+        );
         for (index, diagnostic) in contract.metadata.diagnostics.iter().enumerate() {
             assert_eq!(diagnostic.id, SemanticDiagnosticId(index));
         }
-        assert_eq!(contract.metadata.function_types.len(), 1);
     }
 
     #[test]

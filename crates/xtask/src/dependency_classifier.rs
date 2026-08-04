@@ -2046,7 +2046,7 @@ fields = [
 
         let debug_fields = suggest_disposition(
             "crates/boon_semantic/src/program_core.rs",
-            "CanonicalProgramCoreV1",
+            "CanonicalProgramCoreV2",
             "debug_fields",
             None,
         );
@@ -2198,7 +2198,7 @@ fields = [
                     .get(&(source.path.clone(), name.clone()))
                     .or_else(|| {
                         (source.path == "crates/boon_semantic/src/program_core.rs").then(|| {
-                            let previous_name = if name == "CanonicalProgramCoreV1" {
+                            let previous_name = if name == "CanonicalProgramCoreV2" {
                                 "ErasedProgramFields"
                             } else {
                                 name.as_str()

@@ -9,7 +9,7 @@ use crate::{
     SemanticExprId, SemanticExpression, SemanticExpressionKind, SemanticFieldId, SemanticFunction,
     SemanticFunctionParameter, SemanticInitialValueV1, SemanticListId, SemanticListInitializerV1,
     SemanticListKeyPolicyV1, SemanticListMutationKindV1, SemanticListProjectionKindV1,
-    SemanticLocalBindingId, SemanticLoweringContractV1, SemanticMaterializationId,
+    SemanticLocalBindingId, SemanticLoweringContractV2, SemanticMaterializationId,
     SemanticMaterializationLocalId, SemanticMaterializationResultKind, SemanticParameterId,
     SemanticPatternBinding, SemanticReactiveGraphV1, SemanticReadId, SemanticReadTargetV1,
     SemanticRecordField, SemanticResourceGraphV1, SemanticRoot, SemanticRowBinding,
@@ -414,6 +414,8 @@ pub(super) struct MappedSemanticProducerInstance {
     pub owner: StaticOwnerId,
     pub function: FunctionId,
     pub function_name: String,
+    pub result_type: FlowType,
+    pub effect: boon_checked::CheckedEffectSummary,
     pub result_field: MappedReactiveFieldId,
     pub result_path: String,
     pub root: ExecutableExprId,
@@ -3257,11 +3259,12 @@ fn map_reactive_producer_instance(
             producer_identity_text(instance.identity)
         ));
     }
-    if semantic_execution_expression(execution, instance.root_expression)?.value_id
-        != instance.root_value
+    let root_expression = semantic_execution_expression(execution, instance.root_expression)?;
+    if root_expression.value_id != instance.root_value
+        || root_expression.flow_type != function.result_type
     {
         return Err(format!(
-            "semantic producer instance {} has stale root value provenance",
+            "semantic producer instance {} has stale root value/type provenance",
             producer_identity_text(instance.identity)
         ));
     }
@@ -3325,6 +3328,8 @@ fn map_reactive_producer_instance(
         owner: instance.owner,
         function: function_id,
         function_name: function.name.clone(),
+        result_type: function.result_type.clone(),
+        effect: callable.effect,
         result_field: result_field.id,
         result_path: instance.result_path.clone(),
         root: ids.expression(instance.root_expression)?,
@@ -5433,6 +5438,8 @@ fn finalize_producer_instances(
                 owner: mapped.owner,
                 function: mapped.function,
                 function_name: mapped.function_name.clone(),
+                result_type: mapped.result_type.clone(),
+                effect: mapped.effect,
                 result_field: field,
                 result_path: mapped.result_path.clone(),
                 root: mapped.root,
@@ -7113,11 +7120,11 @@ pub(crate) fn build_canonical_program_core(
     execution_graph: &SemanticExecutionImageColumnsV1,
     resource_graph: &SemanticResourceGraphV1,
     reactive_graph: &SemanticReactiveGraphV1,
-    lowering_contract: &SemanticLoweringContractV1,
+    lowering_contract: &SemanticLoweringContractV2,
     view_binding_graph: &crate::SemanticViewBindingGraphV1,
     scope_storage_graph: &SemanticScopeStorageGraphV1,
     memory_graph: &crate::SemanticMemoryGraphV1,
-) -> Result<program_core::CanonicalProgramCoreV1, String> {
+) -> Result<program_core::CanonicalProgramCoreV2, String> {
     let mapped =
         map_semantic_execution_with_reactive(execution_graph, resource_graph, reactive_graph)?;
     let resources = map_semantic_resources(execution_graph, resource_graph, &mapped.id_map)?;
@@ -7139,13 +7146,13 @@ fn finish_canonical_program_core(
     execution_graph: &SemanticExecutionImageColumnsV1,
     resource_graph: &SemanticResourceGraphV1,
     reactive_graph: &SemanticReactiveGraphV1,
-    lowering_contract: &SemanticLoweringContractV1,
+    lowering_contract: &SemanticLoweringContractV2,
     view_binding_graph: &crate::SemanticViewBindingGraphV1,
     scope_storage_graph: &SemanticScopeStorageGraphV1,
     memory_graph: &crate::SemanticMemoryGraphV1,
     mapped: MappedSemanticExecution,
     resources: MappedSemanticResources,
-) -> Result<program_core::CanonicalProgramCoreV1, String> {
+) -> Result<program_core::CanonicalProgramCoreV2, String> {
     let mut resources = resources;
     let reactive = map_semantic_reactive(
         execution_graph,
@@ -7200,9 +7207,7 @@ fn finish_canonical_program_core(
     )?;
     let transient_collections =
         map_transient_collections(lowering_contract, memory_graph, &mapped.id_map)?;
-    let expression_types = map_expression_types(&lowering_contract.metadata);
-    let function_types = map_function_types(&lowering_contract.metadata);
-    let named_value_types = map_named_value_types(&lowering_contract.metadata);
+    let named_value_interfaces = map_named_value_interfaces(&lowering_contract.metadata);
     let debug_source_units = map_debug_source_units(&lowering_contract.metadata)?;
     let debug_fields = map_semantic_field_entries(
         &storage.fields,
@@ -7264,7 +7269,7 @@ fn finish_canonical_program_core(
     }
     let graph_node_count = executable.expressions.len();
 
-    Ok(program_core::CanonicalProgramCoreV1 {
+    Ok(program_core::CanonicalProgramCoreV2 {
         executable,
         scope_index: program_core::ErasedScopeIndex {
             owners,
@@ -7312,9 +7317,7 @@ fn finish_canonical_program_core(
         list_projections,
         materializations,
         view_bindings,
-        expression_types,
-        function_types,
-        named_value_types,
+        named_value_interfaces,
     })
 }
 
@@ -7410,7 +7413,7 @@ fn map_distributed_references(
                 local_alias_paths.sort();
                 local_alias_paths.dedup();
                 value_references.push(program_core::DistributedValueReference {
-                    expr_id: ExprId(executable.checked_expr_id.0 as usize),
+                    expression,
                     canonical_path: reference.canonical_path.clone(),
                     local_alias_paths,
                     producer_role,
@@ -7720,7 +7723,7 @@ fn finalize_storage_dependency_uses(
 }
 
 fn map_output_values(
-    lowering: &SemanticLoweringContractV1,
+    lowering: &SemanticLoweringContractV2,
     ids: &SemanticToExecutableMap,
     storage_ids: &SemanticStorageToErasedMap,
 ) -> Result<Vec<program_core::OutputRootValue>, String> {
@@ -7773,7 +7776,7 @@ fn map_output_values(
         .collect()
 }
 
-fn map_host_ports(lowering: &SemanticLoweringContractV1) -> Vec<program_core::HostPortDeclaration> {
+fn map_host_ports(lowering: &SemanticLoweringContractV2) -> Vec<program_core::HostPortDeclaration> {
     lowering
         .host_ports
         .iter()
@@ -7971,75 +7974,21 @@ fn join_diagnostic_projection(base: &str, projection: &[String]) -> String {
     }
 }
 
-fn map_expression_types(
-    metadata: &crate::SemanticLoweringMetadataV1,
-) -> boon_checked::ExprTypeTable {
-    boon_checked::ExprTypeTable {
-        entries: metadata
-            .expression_types
-            .iter()
-            .map(|entry| boon_checked::ExprTypeEntry {
-                expr_id: entry.checked_expression.0 as usize,
-                flow_type: entry.flow_type.clone(),
-            })
-            .collect(),
-    }
-}
-
-fn map_function_types(
-    metadata: &crate::SemanticLoweringMetadataV1,
-) -> boon_checked::FunctionTypeTable {
-    boon_checked::FunctionTypeTable {
-        entries: metadata
-            .function_types
-            .iter()
-            .map(|entry| boon_checked::FunctionTypeEntry {
-                callable: entry.checked_callable,
-                name: entry.name.clone(),
-                parameters: entry
-                    .parameters
-                    .iter()
-                    .map(|parameter| boon_checked::FunctionTypeParameterEntry {
-                        formal: parameter.formal,
-                        ordinal: parameter.ordinal,
-                        name: parameter.name.clone(),
-                        flow_type: parameter.flow_type.clone(),
-                    })
-                    .collect(),
-                result: entry.result.clone(),
-                effect: entry.effect,
-            })
-            .collect(),
-    }
-}
-
-fn map_named_value_types(
-    metadata: &crate::SemanticLoweringMetadataV1,
-) -> boon_checked::NamedValueTypeTable {
-    boon_checked::NamedValueTypeTable {
-        checked_statement_sites: metadata
-            .named_value_types
-            .iter()
-            .map(|entry| entry.checked_statement)
-            .collect(),
-        entries: metadata
-            .named_value_types
-            .iter()
-            .map(|entry| boon_checked::NamedValueTypeEntry {
-                path: entry.diagnostic_path.clone(),
-                origins: entry
-                    .origins
-                    .iter()
-                    .map(|origin| origin.checked.clone())
-                    .collect(),
-                flow_type: entry.flow_type.clone(),
-            })
-            .collect(),
-    }
+fn map_named_value_interfaces(
+    metadata: &crate::SemanticLoweringMetadataV2,
+) -> Vec<program_core::NamedValueInterface> {
+    metadata
+        .named_value_types
+        .iter()
+        .map(|entry| program_core::NamedValueInterface {
+            canonical_path: entry.diagnostic_path.clone(),
+            flow_type: entry.flow_type.clone(),
+        })
+        .collect()
 }
 
 fn map_debug_source_units(
-    metadata: &crate::SemanticLoweringMetadataV1,
+    metadata: &crate::SemanticLoweringMetadataV2,
 ) -> Result<Vec<program_core::SemanticSourceUnit>, String> {
     metadata
         .source_units
@@ -8356,7 +8305,7 @@ fn map_semantic_memory(
 }
 
 fn map_transient_collections(
-    lowering: &SemanticLoweringContractV1,
+    lowering: &SemanticLoweringContractV2,
     memory: &crate::SemanticMemoryGraphV1,
     ids: &SemanticToExecutableMap,
 ) -> Result<Vec<program_core::TransientCollection>, String> {

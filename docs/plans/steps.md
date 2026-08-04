@@ -345,11 +345,20 @@ stronger three-reviewer performance closure defined below.
    11,608/82,364 projection topology and the architecture gate passes. Reusing
    sealed metadata/contract digests removes about 434 ms of duplicate debug
    serialization, but roughly 737 ms remains in fine-grained metadata rows.
-   Treat that as evidence to delete the checked expression/function/named-value
-   table round trip, not as a new micro-optimization loop. Publish optional
-   diagnostic source-map rows and typed interface rows, keep execution/storage
-   as the type authority, migrate every downstream consumer, and delete the
-   checked tables plus their semantic DTO/proof inventories without a fallback.
+   That evidence drove a completed flag-day table cut:
+   `SemanticLoweringContractV2` deletes full expression/function inventories,
+   while `CanonicalProgramCoreV2` deletes all three full checked tables from
+   the runnable core. Remaining lowering named-value metadata projects a narrow
+   transitional interface. Distributed values now use exact executable
+   identities, and remote function contracts are owned by exact sealed
+   producer materializations even when no local ordinary-call entry exists. A
+   focused three-role value/call regression and architecture gate pass. Fresh
+   debug NovyWave evidence has 1,885 lowering rows, about 120.7 ms metadata
+   generation, 10,640 nodes/80,698 edges, and a 12.67 s focused semantic run.
+   Do not tune those remaining rows. Make diagnostic maps optional, move the
+   remaining named interface into typed storage/interface ownership, and delete
+   the resource/reactive/storage/view/memory replay scanners and rich duplicate
+   owners as their construction-owned table/CSR spans are sealed directly.
 
    Receipt callbacks alone are too small: removing all 1,813.236 ms of manifest
    work from the 4,052.379 ms directional sample would still leave about 2.24

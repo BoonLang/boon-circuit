@@ -12,7 +12,7 @@ use crate::{
     SemanticBindingId, SemanticBindingTargetV1, SemanticCallId, SemanticContextualMaterialization,
     SemanticContextualOperationKind, SemanticContextualRowPredecessor,
     SemanticExecutionImageColumnsV1, SemanticExprId, SemanticExpressionKind, SemanticFieldId,
-    SemanticListId, SemanticLoweringContractV1, SemanticMaterializationLocalId,
+    SemanticListId, SemanticLoweringContractV2, SemanticMaterializationLocalId,
     SemanticNamedValueId, SemanticReactiveGraphV1, SemanticReadId, SemanticReadTargetV1,
     SemanticResourceGraphV1, SemanticRowBinding, SemanticSourceId, SemanticSourceOrigin,
     SemanticStateId, SemanticStatementId, SemanticValueId, SemanticValueListAuthorityId,
@@ -476,7 +476,7 @@ pub(crate) fn build_semantic_scope_storage_graph(
     execution: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV1,
     reactive: &SemanticReactiveGraphV1,
-    lowering: &SemanticLoweringContractV1,
+    lowering: &SemanticLoweringContractV2,
     out_net: &ResolvedOutGraph,
 ) -> Result<SemanticScopeStorageGraphV1, SemanticScopeStorageError> {
     execution
@@ -499,7 +499,7 @@ pub(crate) fn build_semantic_scope_storage_graph_from_validated_inputs(
     execution: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV1,
     reactive: &SemanticReactiveGraphV1,
-    lowering: &SemanticLoweringContractV1,
+    lowering: &SemanticLoweringContractV2,
 ) -> Result<SemanticScopeStorageGraphV1, SemanticScopeStorageError> {
     let owners = build_owners(execution, resources)?;
     let mut fields = build_storage_fields(checked, execution, resources, reactive)?;
@@ -546,7 +546,7 @@ impl SemanticScopeStorageGraphV1 {
         execution: &SemanticExecutionImageColumnsV1,
         resources: &SemanticResourceGraphV1,
         reactive: &SemanticReactiveGraphV1,
-        lowering: &SemanticLoweringContractV1,
+        lowering: &SemanticLoweringContractV2,
         out_net: &ResolvedOutGraph,
     ) -> Result<(), SemanticScopeStorageError> {
         let expected = build_semantic_scope_storage_graph(
@@ -3594,7 +3594,7 @@ fn build_named_value_storage(
     execution: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV1,
     reactive: &SemanticReactiveGraphV1,
-    lowering: &SemanticLoweringContractV1,
+    lowering: &SemanticLoweringContractV2,
     fields: &[SemanticStorageFieldV1],
     bindings: &[SemanticStorageBindingV1],
 ) -> Result<Vec<SemanticNamedValueStorageV1>, SemanticScopeStorageError> {
@@ -4528,7 +4528,7 @@ fn validate_storage_shape(
     execution: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV1,
     reactive: &SemanticReactiveGraphV1,
-    lowering: &SemanticLoweringContractV1,
+    lowering: &SemanticLoweringContractV2,
 ) -> Result<(), SemanticScopeStorageError> {
     if graph.schema != SEMANTIC_SCOPE_STORAGE_GRAPH_SCHEMA_V1
         || graph.source_bundle_digest_v1 != checked.source_bundle_digest_v1
@@ -4663,7 +4663,7 @@ fn validate_named_value_storage_shape(
     execution: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV1,
     reactive: &SemanticReactiveGraphV1,
-    lowering: &SemanticLoweringContractV1,
+    lowering: &SemanticLoweringContractV2,
 ) -> Result<(), SemanticScopeStorageError> {
     let mut row_cursor = 0;
     let mut projection_cursor = 0;

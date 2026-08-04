@@ -7495,24 +7495,33 @@ pub(crate) fn distributed_exportable_values(
 ) -> Result<BTreeMap<String, (boon_checked::FlowType, ValueRef)>, PlanError> {
     let scalar_fields = ScalarFieldCatalog::new(program)?;
     let index = ValueIndex::new(program, &BTreeMap::new(), &BTreeMap::new(), &scalar_fields)?;
-    Ok(program
-        .named_value_types
-        .entries
-        .iter()
-        .filter_map(|entry| {
-            let value_ref = index.resolve(&entry.path)?;
-            matches!(
-                value_ref,
-                ValueRef::Source(_)
-                    | ValueRef::SourcePayload { .. }
-                    | ValueRef::State(_)
-                    | ValueRef::StateProjection { .. }
-                    | ValueRef::Field(_)
-                    | ValueRef::Constant(_)
-            )
-            .then(|| (entry.path.clone(), (entry.flow_type.clone(), value_ref)))
-        })
-        .collect())
+    let mut values = BTreeMap::new();
+    for interface in &program.named_value_interfaces {
+        let Some(value_ref) = index.resolve(&interface.canonical_path) else {
+            continue;
+        };
+        if !matches!(
+            value_ref,
+            ValueRef::Source(_)
+                | ValueRef::SourcePayload { .. }
+                | ValueRef::State(_)
+                | ValueRef::StateProjection { .. }
+                | ValueRef::Field(_)
+                | ValueRef::Constant(_)
+        ) {
+            continue;
+        }
+        let candidate = (interface.flow_type.clone(), value_ref);
+        if let Some(previous) = values.insert(interface.canonical_path.clone(), candidate.clone())
+            && previous != candidate
+        {
+            return Err(PlanError::new(format!(
+                "named value interface `{}` resolves to conflicting typed values",
+                interface.canonical_path
+            )));
+        }
+    }
+    Ok(values)
 }
 
 pub(crate) fn lower_distributed_root_expression(
@@ -13968,20 +13977,7 @@ impl<'a> ExecutableRowLowerer<'a> {
                             "executable read {expression} references missing distributed value {reference}"
                         ))
                     })?;
-                let checked = self
-                    .program
-                    .executable
-                    .expressions
-                    .get(read.expression.as_usize())
-                    .filter(|expression| expression.id == read.expression)
-                    .map(|expression| expression.checked_expr_id.0 as usize)
-                    .ok_or_else(|| {
-                        PlanError::new(format!(
-                            "distributed erased read {} has no executable expression",
-                            read.expression
-                        ))
-                    })?;
-                if reference.expr_id.as_usize() != checked {
+                if reference.expression != read.expression {
                     return Err(PlanError::new(format!(
                         "distributed reference {reference:?} does not own executable read {}",
                         read.expression

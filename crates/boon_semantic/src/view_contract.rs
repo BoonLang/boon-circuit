@@ -7,7 +7,7 @@
 use crate::{
     SemanticBindingId, SemanticCallId, SemanticCallableId, SemanticCallableKind, SemanticCaptureId,
     SemanticExecutionImageColumnsV1, SemanticExprId, SemanticExpression, SemanticExpressionKind,
-    SemanticLoweringContractV1, SemanticOutputContractId, SemanticOutputContractKindV1,
+    SemanticLoweringContractV2, SemanticOutputContractId, SemanticOutputContractKindV1,
     SemanticReactiveGraphV1, SemanticReadBindingV1, SemanticReadId, SemanticReadTargetV1,
     SemanticResourceGraphV1, SemanticRowBinding, SemanticScopeId, SemanticScopeStorageGraphV1,
     SemanticSourceId, SemanticValueId, SemanticValueOrigin, SemanticViewCaptureTargetV1,
@@ -212,7 +212,7 @@ pub fn build_semantic_view_binding_graph(
     resources: &SemanticResourceGraphV1,
     reactive: &SemanticReactiveGraphV1,
     storage: &SemanticScopeStorageGraphV1,
-    lowering: &SemanticLoweringContractV1,
+    lowering: &SemanticLoweringContractV2,
 ) -> Result<SemanticViewBindingGraphV1, SemanticViewBindingError> {
     let mut graph =
         derive_semantic_view_binding_graph(execution, resources, reactive, storage, lowering)?;
@@ -227,7 +227,7 @@ impl SemanticViewBindingGraphV1 {
         resources: &SemanticResourceGraphV1,
         reactive: &SemanticReactiveGraphV1,
         storage: &SemanticScopeStorageGraphV1,
-        lowering: &SemanticLoweringContractV1,
+        lowering: &SemanticLoweringContractV2,
     ) -> Result<(), SemanticViewBindingError> {
         if self.schema != SEMANTIC_VIEW_BINDING_GRAPH_SCHEMA_V1
             || self.source_bundle_digest_v1 != lowering.metadata.source_bundle_digest_v1
@@ -620,7 +620,7 @@ fn derive_semantic_view_binding_graph(
     resources: &SemanticResourceGraphV1,
     reactive: &SemanticReactiveGraphV1,
     storage: &SemanticScopeStorageGraphV1,
-    lowering: &SemanticLoweringContractV1,
+    lowering: &SemanticLoweringContractV2,
 ) -> Result<SemanticViewBindingGraphV1, SemanticViewBindingError> {
     let mut roots = Vec::new();
     let mut nodes = Vec::new();

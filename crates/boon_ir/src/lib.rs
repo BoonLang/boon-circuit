@@ -15,9 +15,9 @@ use web_time::Instant;
 ///
 /// ```compile_fail
 /// use boon_ir::ErasedProgram;
-/// use boon_semantic::program_core::CanonicalProgramCoreV1;
+/// use boon_semantic::program_core::CanonicalProgramCoreV2;
 ///
-/// fn forge(fields: CanonicalProgramCoreV1) -> ErasedProgram {
+/// fn forge(fields: CanonicalProgramCoreV2) -> ErasedProgram {
 ///     ErasedProgram {
 ///         fields,
 ///         source_bundle_digest_v1: todo!(),
@@ -29,7 +29,7 @@ use web_time::Instant;
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ErasedProgram {
     #[serde(flatten)]
-    fields: CanonicalProgramCoreV1,
+    fields: CanonicalProgramCoreV2,
     source_bundle_digest_v1: boon_contract::SourceBundleDigestV1,
     semantic_program_digest: boon_semantic::SemanticProgramDigestV1,
     verification_manifest_digest: boon_verify::VerificationManifestDigestV1,
@@ -73,7 +73,7 @@ impl ErasedBundle {
 }
 
 impl std::ops::Deref for ErasedProgram {
-    type Target = CanonicalProgramCoreV1;
+    type Target = CanonicalProgramCoreV2;
 
     fn deref(&self) -> &Self::Target {
         &self.fields
@@ -185,16 +185,8 @@ impl ErasedProgram {
         &self.fields.view_bindings
     }
 
-    pub const fn expression_types(&self) -> &boon_checked::ExprTypeTable {
-        &self.fields.expression_types
-    }
-
-    pub const fn function_types(&self) -> &boon_checked::FunctionTypeTable {
-        &self.fields.function_types
-    }
-
-    pub const fn named_value_types(&self) -> &boon_checked::NamedValueTypeTable {
-        &self.fields.named_value_types
+    pub fn named_value_interfaces(&self) -> &[NamedValueInterface] {
+        &self.fields.named_value_interfaces
     }
 
     pub const fn semantic_program_digest(&self) -> boon_semantic::SemanticProgramDigestV1 {
@@ -420,7 +412,7 @@ fn lower_with_typecheck(
 }
 
 fn bind_verified_pulse_fusion(
-    fields: &mut CanonicalProgramCoreV1,
+    fields: &mut CanonicalProgramCoreV2,
     decisions: &[boon_verify::VerifiedPulseFusionDecisionV1],
 ) -> Result<(), String> {
     if decisions.len() != fields.pulse_batches.len() {
@@ -665,7 +657,7 @@ fn validate_erased_bundle_role_crossings(
             .iter()
             .enumerate()
             .filter(|(_, reference)| {
-                reference.expr_id == ExprId(crossing.checked_expression.0 as usize)
+                reference.expression == expression
                     && reference.canonical_path == crossing.canonical_path
                     && reference.producer_role == crossing.producer_role
             })
@@ -3102,21 +3094,25 @@ fn verify_materialization_locals(
 }
 
 fn verify_distributed_reference_schedule(program: &ErasedProgram) -> Result<(), String> {
-    let scheduled_expr_ids = program
-        .executable
-        .expressions
-        .iter()
-        .map(|expression| ExprId(expression.checked_expr_id.0 as usize))
-        .collect::<BTreeSet<_>>();
-    let mut reference_expr_ids = BTreeSet::new();
+    let mut reference_expressions = BTreeSet::new();
     for reference in &program.role_references().value_references {
-        if !reference_expr_ids.insert(reference.expr_id) {
+        if !reference_expressions.insert(reference.expression) {
             return Err(format!(
                 "distributed expression {} is represented more than once",
-                reference.expr_id
+                reference.expression
             ));
         }
-        require_scheduled_distributed_expr(reference.expr_id, &scheduled_expr_ids)?;
+        let expression = program
+            .executable
+            .expressions
+            .get(reference.expression.as_usize())
+            .filter(|candidate| candidate.id == reference.expression)
+            .ok_or_else(|| {
+                format!(
+                    "distributed value `{}` references missing executable expression {}",
+                    reference.canonical_path, reference.expression
+                )
+            })?;
         if distributed_function_role(&reference.canonical_path) != Some(reference.producer_role) {
             return Err(format!(
                 "distributed value `{}` does not match producer role {:?}",
@@ -3124,8 +3120,7 @@ fn verify_distributed_reference_schedule(program: &ErasedProgram) -> Result<(), 
             ));
         }
         verify_distributed_metadata_type(
-            program,
-            reference.expr_id,
+            &expression.flow_type,
             reference.flow_mode,
             &reference.value_type,
             &format!("distributed value `{}`", reference.canonical_path),
@@ -3206,44 +3201,17 @@ fn verify_distributed_reference_schedule(program: &ErasedProgram) -> Result<(), 
     Ok(())
 }
 
-fn distributed_expr_type(
-    expression_types: &boon_checked::ExprTypeTable,
-    expr_id: usize,
-) -> Result<&boon_checked::FlowType, String> {
-    expression_types
-        .entries
-        .iter()
-        .find(|entry| entry.expr_id == expr_id)
-        .map(|entry| &entry.flow_type)
-        .ok_or_else(|| format!("distributed expression {expr_id} has no checked type"))
-}
-
-fn require_scheduled_distributed_expr(
-    expr_id: ExprId,
-    scheduled_expr_ids: &BTreeSet<ExprId>,
-) -> Result<(), String> {
-    if scheduled_expr_ids.contains(&expr_id) {
-        Ok(())
-    } else {
-        Err(format!(
-            "distributed expression {expr_id} is not in the static schedule"
-        ))
-    }
-}
-
 fn verify_distributed_metadata_type(
-    program: &ErasedProgram,
-    expr_id: ExprId,
+    executable_type: &boon_checked::FlowType,
     flow_mode: boon_checked::FlowMode,
     metadata_type: &boon_checked::Type,
     context: &str,
 ) -> Result<(), String> {
     ensure_distributed_type_is_closed(metadata_type, context)?;
-    let checked = distributed_expr_type(&program.expression_types, expr_id.as_usize())?;
-    if checked.mode != flow_mode {
+    if executable_type.mode != flow_mode {
         return Err(format!("{context} flow mode does not match its metadata"));
     }
-    if &checked.ty != metadata_type {
+    if &executable_type.ty != metadata_type {
         return Err(format!(
             "{context} metadata type does not match its checked expression type"
         ));

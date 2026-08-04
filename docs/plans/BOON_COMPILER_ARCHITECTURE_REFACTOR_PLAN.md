@@ -806,8 +806,8 @@ and exportable named values. The expression table also carries occurrence rows
 that already exist in the execution image. Preserving one proof row per member
 of that round trip would make the historical bridge permanent.
 
-The next flag-day slice therefore replaces this round trip with three narrow
-products owned by the sealed semantic image:
+The first flag-day table cut now replaces that round trip with narrow products
+owned by the sealed semantic image:
 
 1. diagnostic source-map rows own source units, original-expression coverage,
    and diagnostics without entering the runnable authority unless explicitly
@@ -817,14 +817,39 @@ products owned by the sealed semantic image:
 3. execution/storage rows remain the sole owner of expression flow types and
    normalized named-value targets.
 
-Migrate storage, distributed linking, verification, and the machine-plan
-backend to those rows, then delete `map_expression_types`, `map_function_types`,
-`map_named_value_types`, the three checked tables from `CanonicalProgramCoreV1`
-and `ErasedProgram`, and their lowering DTO/proof inventories. Seal proof roots
-directly over the resulting typed table rows and CSR spans. No compatibility
-adapter may keep the checked tables alive in production. This owner deletion
-precedes another attempt to tune the 36,979 rows, crate splitting, or parallel
-execution.
+`SemanticLoweringContractV2` now deletes the full expression/function type
+inventories, while `CanonicalProgramCoreV2` deletes all three full checked
+tables from the runnable core. The remaining lowering named-value metadata is a
+transitional construction owner projected into a narrow interface rather than
+reconstructed as a checked table. Distributed value references carry the exact
+`ExecutableExprId`; backend export discovery consumes a narrow
+`NamedValueInterface`; and remotely demanded functions are linked from the
+exact sealed `ProducerFunctionInstance`, which now owns parameter, result, and
+effect types. This last detail is essential: a function used only across a role
+boundary correctly has no ordinary local-call entry. The focused three-role
+regression proves three cross-role values plus a remote call/function export,
+so no global function table or compatibility lookup remains reachable.
+
+The fresh focused debug NovyWave oracle builds 1,885 construction-owned
+lowering rows rather than 36,979, a 94.9% reduction. Lowering metadata falls
+from about 736.6 ms to 120.7 ms, its dependency rows take 36.0 ms, Manifest
+ingestion takes 4.4 ms, and final projection sealing takes 529.1 ms. The graph
+falls from 11,608/82,364 to 10,640 nodes/80,698 edges while the 36,183
+not-yet-migrated legacy rows remain. The whole focused semantic test is 12.67 s
+after an incremental build, versus 13.99 s before this owner deletion. These
+are directional debug measurements, not release acceptance evidence.
+
+Do not return to tuning the 1,885 rows. The same trace now identifies the next
+architectural owners: execution-image finalization is about 1.88 s, reactive
+derivation about 1.30 s, and the remaining Manifest build about 1.72 s. Move
+resource/reactive/storage/view/memory facts to construction-owned typed tables
+and seal borrowed table/CSR spans directly, deleting each production replay
+scanner and rich duplicate owner in the same tranche. Move diagnostic-only
+source maps out of the runnable core and fold the remaining named-value
+interface into its storage/interface owner. Then make `SealedSemanticImage`
+the primary retained authority and land the shared plan-code linker. No
+compatibility adapter may resurrect the checked tables, preserve the lowering
+named-value inventory permanently, or keep rich graphs beside the replacement.
 
 The following second and third audit sections remain evidence and detailed
 design rationale. Where they name a "next" action or staging order, the

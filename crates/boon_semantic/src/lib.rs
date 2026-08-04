@@ -44,8 +44,8 @@ use std::fmt;
 pub const SEMANTIC_PROGRAM_SCHEMA_V1: &str = "boon.semantic-program.v1";
 pub const BUNDLE_SEMANTIC_PROGRAM_SCHEMA_V1: &str = "boon.bundle-semantic-program.v1";
 pub const DEPENDENCY_CLASSIFIER_SCHEMA_DIGEST_V1: [u8; 32] = [
-    0x05, 0x79, 0xa8, 0x96, 0x2f, 0xad, 0xb8, 0x2a, 0x63, 0x8a, 0x6c, 0x01, 0x79, 0x73, 0x70, 0xd5,
-    0x2a, 0x35, 0xde, 0x5a, 0x9a, 0x52, 0xd7, 0x69, 0x34, 0x29, 0x10, 0x20, 0x7b, 0xda, 0xf0, 0x5d,
+    0xc4, 0xfe, 0xbe, 0xc8, 0x78, 0xa2, 0xed, 0xa3, 0x5e, 0x71, 0x7e, 0x46, 0x86, 0x68, 0x98, 0xab,
+    0x86, 0xf6, 0x7f, 0x3e, 0x7d, 0xbb, 0x9d, 0x61, 0x93, 0x8c, 0x45, 0x53, 0x55, 0x84, 0xd3, 0xbe,
 ];
 pub const MAX_BUNDLE_SEMANTIC_PRODUCER_REQUESTS_V1: usize = 4_096;
 pub const MAX_BUNDLE_SEMANTIC_PRODUCER_REQUEST_BYTES_V1: usize = 4 * 1024 * 1024;
@@ -54,7 +54,7 @@ pub const MAX_BUNDLE_SEMANTIC_CALL_CROSSING_BYTES_V1: usize = 32 * 1024 * 1024;
 pub const MAX_BUNDLE_SEMANTIC_VALUE_CROSSINGS_V1: usize = 16_384;
 pub const MAX_BUNDLE_SEMANTIC_VALUE_CROSSING_BYTES_V1: usize = 32 * 1024 * 1024;
 const SEMANTIC_PROGRAM_DIGEST_DOMAIN: &[u8] = b"boon.semantic-program.v1\0";
-const CANONICAL_PROGRAM_CORE_DIGEST_DOMAIN: &[u8] = b"boon.canonical-program-core.v1\0";
+const CANONICAL_PROGRAM_CORE_DIGEST_DOMAIN: &[u8] = b"boon.canonical-program-core.v2\0";
 const BUNDLE_SEMANTIC_PROGRAM_DIGEST_DOMAIN: &[u8] = b"boon.bundle-semantic-program.v1\0";
 const OUT_PORT_SHAPE_DIGEST_DOMAIN: &[u8] = b"boon.out-port-shape.v1\0";
 const PRODUCER_MATERIALIZATION_IDENTITY_DOMAIN: &[u8] =
@@ -628,11 +628,11 @@ pub struct SemanticProgram {
     resolved_out_graph: ResolvedOutGraph,
     resource_graph: SemanticResourceGraphV1,
     reactive_graph: SemanticReactiveGraphV1,
-    lowering_contract: SemanticLoweringContractV1,
+    lowering_contract: SemanticLoweringContractV2,
     view_binding_graph: SemanticViewBindingGraphV1,
     scope_storage_graph: SemanticScopeStorageGraphV1,
     memory_graph: SemanticMemoryGraphV1,
-    canonical_core: program_core::CanonicalProgramCoreV1,
+    canonical_core: program_core::CanonicalProgramCoreV2,
     dependency_manifest: CallableDependencyManifestV7,
     digest: SemanticProgramDigestV1,
 }
@@ -817,7 +817,7 @@ impl SemanticProgram {
         &self.reactive_graph
     }
 
-    pub const fn lowering_contract(&self) -> &SemanticLoweringContractV1 {
+    pub const fn lowering_contract(&self) -> &SemanticLoweringContractV2 {
         &self.lowering_contract
     }
 
@@ -988,7 +988,7 @@ impl SemanticProgram {
         self,
     ) -> (
         SourceBundleDigestV1,
-        program_core::CanonicalProgramCoreV1,
+        program_core::CanonicalProgramCoreV2,
         SemanticProgramDigestV1,
         CallableDependencyManifestDigestV1,
     ) {

@@ -557,12 +557,20 @@ Current checkpoints to preserve and audit rather than redo:
   are emitted by lowering and V7 leaves 36,183 legacy rows. The focused debug
   oracle and architecture gate pass, and reuse of sealed aggregate digests
   removes about 434 ms of duplicate debug serialization. The remaining roughly
-  737 ms exposes a checked-type-table round trip: expression/function/named-
-  value tables are copied into lowering DTOs, reconstructed in canonical core,
-  and scanned again downstream. Replace them with optional diagnostic source-
-  map rows, typed semantic interface rows, and execution/storage-owned types;
-  migrate storage/distributed/backend consumers and delete the checked tables,
-  lowering DTO inventories, and their proof rows without a compatibility path;
+  737 ms exposed a checked-type-table round trip. The next flag-day cut is now
+  landed as `SemanticLoweringContractV2`/`CanonicalProgramCoreV2`: full
+  expression/function lowering inventories and all three full checked tables
+  in the runnable core are deleted. The remaining lowering named-value metadata
+  projects only a narrow transitional interface; distributed values use exact
+  executable identities, and remote function contracts come from exact sealed
+  producer materializations. Fresh debug NovyWave evidence has 1,885 lowering
+  rows, 120.7 ms metadata generation, a 10,640-node/80,698-edge graph, and a
+  12.67 s focused semantic run. This is progress, not acceptance. Continue with
+  optional diagnostic source maps, deletion of the transitional named metadata
+  into storage-owned interfaces, and direct
+  construction/sealing of resource/reactive/storage/view/memory table and CSR
+  spans; delete each replay scanner and rich duplicate owner without a
+  compatibility path;
 - move verified-intent demand collection before occurrence expansion and
   backend lowering. Split top-level authority/interface summaries from the
   final program-link sink, and version the callable interface schema before

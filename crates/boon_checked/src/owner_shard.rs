@@ -774,6 +774,9 @@ pub enum OwnerRelocationTarget {
         owner: StableCheckOwnerKey,
         expression: StableExpressionKey,
     },
+    ChildOwner {
+        owner: StableCheckOwnerKey,
+    },
     Source {
         source: OwnerSourceStableKey,
     },

@@ -9,14 +9,14 @@ use crate::{
     OwnerInterfaceEvaluationScope, OwnerInterfaceSccKey, OwnerInterfaceSccResult,
     OwnerParameterKind, OwnerPublicInterface, OwnerReferenceKind, OwnerResultCallTarget,
     OwnerResultExpressionRef, OwnerResultTransfer, OwnerResultTransferNode, OwnerSourceAnchorRole,
-    OwnerSourceAnchorSite, OwnerSourceMap, OwnerSymbolResolution, OwnerSyntaxGraph,
-    OwnerSyntaxInput, infix_returns_bool,
+    OwnerSourceAnchorSite, OwnerSourceMap, OwnerSymbolResolution, OwnerSyntaxInput,
+    infix_returns_bool,
 };
 use boon_checked::{
-    BytesType, CheckedEffectSummary, CheckedParameterKind, CheckedTypeSubstitution,
-    DiagnosticSeverity, FlowMode, FlowType, ObjectShape, OwnerExpressionId, OwnerExpressionRef,
-    OwnerStatementChild, OwnerStatementId, Type, TypeDiagnostic, TypeVar, Variant,
-    apply_checked_type_substitution_lookup, specialize_checked_call_result, widen_structural_type,
+    BytesType, CheckedCallableKind, CheckedEffectSummary, CheckedParameterKind,
+    CheckedParameterRequirement, CheckedTypeSubstitution, DiagnosticSeverity, FlowMode, FlowType,
+    ObjectShape, Type, TypeDiagnostic, TypeVar, Variant, apply_checked_type_substitution_lookup,
+    specialize_checked_call_result, widen_structural_type,
 };
 use boon_data::{ExactNumber, MAX_BITS_WIDTH};
 use boon_syntax::{
@@ -187,6 +187,7 @@ pub struct InferredOwnerCall {
     pub type_substitutions: Box<[CheckedTypeSubstitution]>,
     pub contextual_type_variables: Box<[TypeVar]>,
     pub syntax_discriminated_result: bool,
+    pub valid: bool,
     pub result: FlowType,
     pub effect: CheckedEffectSummary,
 }
@@ -272,7 +273,7 @@ fn fingerprint<T: Serialize>(
     })
 }
 
-fn interface_fingerprint(
+pub(crate) fn owner_body_interface_fingerprint_v1(
     interface: &OwnerPublicInterface,
 ) -> Result<[u8; 32], OwnerBodyInferenceError> {
     fingerprint(OWNER_BODY_INTERFACE_DOMAIN_V1, interface)
@@ -400,6 +401,24 @@ fn expression_variable(
     })
 }
 
+fn body_expression_boundary_variable(
+    expressions: &[TypeVar],
+    external_expressions: &[TypeVar],
+    expression_flushes: &[TypeVar],
+    external_expression_flushes: &[TypeVar],
+    reference: u32,
+    unifier: &mut TypeUnifier,
+) -> Option<TypeVar> {
+    let value = expression_variable(expressions, external_expressions, reference)?;
+    let flush = expression_variable(expression_flushes, external_expression_flushes, reference)?;
+    let boundary = unifier.fresh();
+    unifier.bind_var(
+        boundary,
+        boon_checked::canonical_union_type(vec![Type::Var(value), Type::Var(flush)]),
+    );
+    Some(boundary)
+}
+
 fn inferred_expression_ref(
     syntax: &OwnerSyntaxInput,
     reference: u32,
@@ -427,23 +446,22 @@ fn direct_effect_for(kind: &OwnerConstraintNodeKind) -> CheckedEffectSummary {
             emits_source: true,
             ..CheckedEffectSummary::default()
         },
-        OwnerConstraintNodeKind::Hold { .. } => CheckedEffectSummary {
-            reads_state: true,
-            writes_state: true,
+        OwnerConstraintNodeKind::Hold { .. } | OwnerConstraintNodeKind::Latest => {
+            CheckedEffectSummary {
+                reads_state: true,
+                writes_state: true,
+                ..CheckedEffectSummary::default()
+            }
+        }
+        OwnerConstraintNodeKind::Call { function }
+        | OwnerConstraintNodeKind::Pipe {
+            operation: function,
+        } if boon_effect_schema::host_effect_spec(function).is_some() => CheckedEffectSummary {
+            invokes_host: true,
             ..CheckedEffectSummary::default()
         },
         _ => CheckedEffectSummary::default(),
     }
-}
-
-fn merge_owner_flush_type(target: &mut Option<Type>, extra: Option<Type>) {
-    let Some(extra) = extra else {
-        return;
-    };
-    *target = Some(match target.take() {
-        Some(current) => crate::union_structural_type(&current, &extra),
-        None => extra,
-    });
 }
 
 fn owner_flush_payload_type_is_closed(ty: &Type) -> bool {
@@ -501,118 +519,23 @@ fn owner_flush_payload_is_closed_tag_algebra(ty: &Type) -> bool {
         })
 }
 
-fn owner_statement_update_values(
-    graph: &OwnerSyntaxGraph,
-    statement: OwnerStatementId,
-) -> Vec<OwnerExpressionId> {
-    let Some(statement) = graph.statement(statement) else {
-        return Vec::new();
-    };
-    if let Some(OwnerExpressionRef::Local { expression }) = statement.canonical_value {
-        return vec![expression];
-    }
-    statement
-        .children
-        .iter()
-        .filter_map(|child| match child {
-            OwnerStatementChild::Local { statement } => Some(*statement),
-            OwnerStatementChild::Owner { .. } => None,
-        })
-        .flat_map(|child| owner_statement_update_values(graph, child))
-        .collect()
-}
-
-fn owner_hold_update_expressions(
-    syntax: &OwnerSyntaxInput,
-    graph: &OwnerSyntaxGraph,
-    expression: OwnerExpressionId,
-) -> Vec<OwnerExpressionId> {
-    let Some(statement) = syntax
-        .statements
-        .iter()
-        .find(|statement| statement.expression == Some(expression.0))
-        .map(|statement| OwnerStatementId(statement.id))
-    else {
-        return Vec::new();
-    };
-    let Some(statement) = graph.statement(statement) else {
-        return Vec::new();
-    };
-    let mut updates = Vec::new();
-    for child in statement.children.iter().filter_map(|child| match child {
-        OwnerStatementChild::Local { statement } => Some(*statement),
-        OwnerStatementChild::Owner { .. } => None,
-    }) {
-        let Some(child_node) = graph.statement(child) else {
-            continue;
-        };
-        let continuation = syntax
-            .statements
-            .get(child.0 as usize)
-            .and_then(|statement| statement.expression)
-            .and_then(|expression| syntax.expressions.get(expression as usize))
-            .is_some_and(|expression| expression.linked_input.is_some());
-        let update_start = updates.len();
-        let child_is_latest = child_node
-            .direct_value
-            .as_ref()
-            .and_then(|value| match value {
-                OwnerExpressionRef::Local { expression } => {
-                    syntax.expressions.get(expression.0 as usize)
-                }
-                OwnerExpressionRef::Child { .. } => None,
-            })
-            .is_some_and(|expression| matches!(expression.kind, AstExprKind::Latest { .. }));
-        if child_is_latest {
-            updates.extend(
-                child_node
-                    .children
-                    .iter()
-                    .filter_map(|grandchild| match grandchild {
-                        OwnerStatementChild::Local { statement } => Some(*statement),
-                        OwnerStatementChild::Owner { .. } => None,
-                    })
-                    .flat_map(|grandchild| owner_statement_update_values(graph, grandchild)),
-            );
-        } else {
-            updates.extend(owner_statement_update_values(graph, child));
-        }
-        if continuation && update_start > 0 && updates.len() > update_start {
-            updates.remove(update_start - 1);
-        }
-    }
-    updates
-}
-
 fn infer_owner_expression_flush_types(
     syntax: &OwnerSyntaxInput,
     flows: &[FlowType],
+    flush_types: &[Option<Type>],
     diagnostics: &mut Vec<OwnerDiagnosticTemplate>,
 ) -> Result<Vec<Option<Type>>, OwnerBodyInferenceError> {
-    fn infer(
-        syntax: &OwnerSyntaxInput,
-        graph: &OwnerSyntaxGraph,
-        flows: &[FlowType],
-        expression: OwnerExpressionId,
-        memo: &mut [Option<Type>],
-        completed: &mut [bool],
-        active: &mut [bool],
-        diagnostics: &mut Vec<OwnerDiagnosticTemplate>,
-    ) -> Option<Type> {
-        let index = expression.0 as usize;
-        if *completed.get(index)? {
-            return memo[index].clone();
-        }
-        if std::mem::replace(active.get_mut(index)?, true) {
-            return None;
-        }
-        let input = syntax.expressions.get(index)?;
-        let inferred = match &input.kind {
+    if syntax.expressions.len() != flows.len() || syntax.expressions.len() > flush_types.len() {
+        return Err(OwnerBodyInferenceError::new(
+            "owner FLUSH propagation inputs do not match the expression table",
+        ));
+    }
+    for input in &syntax.expressions {
+        match &input.kind {
             AstExprKind::Flush {
                 payload: Some(payload),
             } => {
-                let payload = OwnerExpressionId(u32::try_from(*payload).ok()?);
-                let payload_flow = flows.get(payload.0 as usize).cloned().unwrap_or(FlowType {
+                let payload_flow = flows.get(*payload).cloned().unwrap_or(FlowType {
                     mode: FlowMode::Continuous,
                     ty: Type::Unknown,
                 });
@@ -621,7 +544,7 @@ fn infer_owner_expression_flush_types(
                 {
                     let site = syntax
                         .expressions
-                        .get(payload.0 as usize)
+                        .get(*payload)
                         .map(|payload| payload.stable_key.clone())
                         .unwrap_or_else(|| input.stable_key.clone());
                     diagnostics.push(OwnerDiagnosticTemplate {
@@ -635,142 +558,48 @@ fn infer_owner_expression_flush_types(
                         role: None,
                     });
                 }
-                let mut ty = (!matches!(
-                    payload_flow.ty,
-                    Type::Unknown | Type::UnresolvedShape { .. } | Type::Absent
-                ))
-                .then_some(payload_flow.ty);
-                let nested = infer(
-                    syntax,
-                    graph,
-                    flows,
-                    payload,
-                    memo,
-                    completed,
-                    active,
-                    diagnostics,
-                );
-                merge_owner_flush_type(&mut ty, nested);
-                ty
             }
-            AstExprKind::Flush { payload: None } => {
-                diagnostics.push(OwnerDiagnosticTemplate {
-                    severity: DiagnosticSeverity::Error,
-                    code: "missing_flush_payload".to_owned(),
-                    message: "`FLUSH` requires exactly one payload expression".to_owned(),
-                    site: OwnerSourceAnchorSite::Expression {
-                        expression: input.stable_key.clone(),
-                    },
-                    role: None,
-                });
-                None
-            }
-            AstExprKind::Block { .. }
-            | AstExprKind::Object(_)
-            | AstExprKind::TaggedObject { .. } => {
-                for child in graph
-                    .expression_inputs(expression)
-                    .unwrap_or_default()
-                    .iter()
-                    .filter_map(|child| match child {
-                        OwnerExpressionRef::Local { expression } => Some(*expression),
-                        OwnerExpressionRef::Child { .. } => None,
-                    })
-                {
-                    let _ = infer(
-                        syntax,
-                        graph,
-                        flows,
-                        child,
-                        memo,
-                        completed,
-                        active,
-                        diagnostics,
-                    );
-                }
-                None
-            }
+            AstExprKind::Flush { payload: None } => diagnostics.push(OwnerDiagnosticTemplate {
+                severity: DiagnosticSeverity::Error,
+                code: "missing_flush_payload".to_owned(),
+                message: "`FLUSH` requires exactly one payload expression".to_owned(),
+                site: OwnerSourceAnchorSite::Expression {
+                    expression: input.stable_key.clone(),
+                },
+                role: None,
+            }),
             AstExprKind::Hold { initial, .. } => {
-                if *initial < syntax.expressions.len() {
-                    let _ = infer(
-                        syntax,
-                        graph,
-                        flows,
-                        OwnerExpressionId(*initial as u32),
-                        memo,
-                        completed,
-                        active,
-                        diagnostics,
-                    );
+                let initial = input
+                    .linked_input
+                    .or_else(|| u32::try_from(*initial).ok())
+                    .unwrap_or(u32::MAX);
+                if flush_types
+                    .get(initial as usize)
+                    .is_some_and(Option::is_some)
+                {
+                    let expression = syntax
+                        .expressions
+                        .get(initial as usize)
+                        .map(|expression| expression.stable_key.clone())
+                        .or_else(|| {
+                            syntax
+                                .external_expression(initial as usize)
+                                .map(|external| external.expression.clone())
+                        })
+                        .unwrap_or_else(|| input.stable_key.clone());
+                    diagnostics.push(OwnerDiagnosticTemplate {
+                        severity: DiagnosticSeverity::Error,
+                        code: "hold_initializer_flush".to_owned(),
+                        message: "a `HOLD` initializer must produce a valid storable value and cannot `FLUSH`".to_owned(),
+                        site: OwnerSourceAnchorSite::Expression { expression },
+                        role: None,
+                    });
                 }
-                let mut ty = None;
-                for update in owner_hold_update_expressions(syntax, graph, expression) {
-                    let update = infer(
-                        syntax,
-                        graph,
-                        flows,
-                        update,
-                        memo,
-                        completed,
-                        active,
-                        diagnostics,
-                    );
-                    merge_owner_flush_type(&mut ty, update);
-                }
-                ty
             }
-            _ => {
-                let mut ty = None;
-                let children = graph
-                    .expression_inputs(expression)
-                    .unwrap_or_default()
-                    .iter()
-                    .filter_map(|child| match child {
-                        OwnerExpressionRef::Local { expression } => Some(*expression),
-                        OwnerExpressionRef::Child { .. } => None,
-                    })
-                    .collect::<Vec<_>>();
-                for child in children {
-                    let child = infer(
-                        syntax,
-                        graph,
-                        flows,
-                        child,
-                        memo,
-                        completed,
-                        active,
-                        diagnostics,
-                    );
-                    merge_owner_flush_type(&mut ty, child);
-                }
-                ty
-            }
-        };
-        active[index] = false;
-        completed[index] = true;
-        memo[index] = inferred.clone();
-        inferred
+            _ => {}
+        }
     }
-
-    let graph = OwnerSyntaxGraph::build(syntax)
-        .map_err(|error| OwnerBodyInferenceError::new(error.to_string()))?;
-    let mut memo = vec![None; syntax.expressions.len()];
-    let mut completed = vec![false; syntax.expressions.len()];
-    let mut active = vec![false; syntax.expressions.len()];
-    for index in 0..syntax.expressions.len() {
-        let expression = OwnerExpressionId(checked_u32(index, "flush expression id")?);
-        let _ = infer(
-            syntax,
-            &graph,
-            flows,
-            expression,
-            &mut memo,
-            &mut completed,
-            &mut active,
-            diagnostics,
-        );
-    }
-    Ok(memo)
+    Ok(flush_types[..syntax.expressions.len()].to_vec())
 }
 
 fn push_invalid_syntax_diagnostics(
@@ -1340,13 +1169,16 @@ struct InstantiatedCallParameter {
     kind: OwnerParameterKind,
     ordinal: u32,
     flow_type: FlowType,
+    requirement: CheckedParameterRequirement,
     evaluation_scope: OwnerInterfaceEvaluationScope,
 }
 
 #[derive(Clone)]
 struct InstantiatedCallSignature {
+    kind: CheckedCallableKind,
     parameters: Vec<InstantiatedCallParameter>,
     result: FlowType,
+    result_flush_type: Option<Type>,
     context: Option<Type>,
     effect: CheckedEffectSummary,
     target: InferredOwnerCallableTarget,
@@ -1357,9 +1189,13 @@ struct InferredCallDraft {
     plan: BodyCallPlan,
     target: InferredOwnerCallableTarget,
     effect: CheckedEffectSummary,
+    actual_inputs: BTreeMap<u32, Type>,
+    signature_result: FlowType,
+    resolved_result: Option<FlowType>,
     type_substitutions: Vec<(TypeVar, Type)>,
     contextual_type_variables: Vec<TypeVar>,
     syntax_discriminated_result: bool,
+    valid: bool,
 }
 
 #[derive(Clone)]
@@ -1434,6 +1270,10 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
             mode: interface.result.mode,
             ty: apply_checked_type_substitution_lookup(&instantiated_result, &substitutions),
         };
+        let result_flush_type = interface.result_flush_type.as_ref().map(|flush_type| {
+            let flush_type = instantiate_type(flush_type, self.unifier, &mut variables);
+            apply_checked_type_substitution_lookup(&flush_type, &substitutions)
+        });
         let fallbacks = match &interface.result_transfer {
             OwnerResultTransfer::Principal | OwnerResultTransfer::Parameter { .. } => {
                 BTreeMap::new()
@@ -1518,7 +1358,7 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
         };
         self.active_owners.remove(owner);
 
-        let value = if let Some(mut evaluated) = evaluated {
+        let mut value = if let Some(mut evaluated) = evaluated {
             let selected = evaluated.syntax_selected
                 && crate::type_has_concrete_outer_shape(&evaluated.flow_type.ty);
             evaluated.flow_type.ty = if selected {
@@ -1536,6 +1376,13 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
                 static_number: None,
             }
         };
+        if let Some(flush_type) = result_flush_type {
+            value.flow_type.ty =
+                boon_checked::canonical_union_type(vec![value.flow_type.ty, flush_type]);
+            if value.flow_type.mode == FlowMode::Absent {
+                value.flow_type.mode = FlowMode::Continuous;
+            }
+        }
         Some(EvaluatedOwnerResult {
             value,
             type_substitutions,
@@ -2279,10 +2126,12 @@ fn transfer_input_for_parameter<'a>(
         OwnerConstraintEdgeRole::CallArgument {
             kind: argument_kind,
             name: actual_name,
+            ..
         }
         | OwnerConstraintEdgeRole::PipeArgument {
             kind: argument_kind,
             name: actual_name,
+            ..
         } => {
             actual_name == name
                 && matches!(
@@ -2315,10 +2164,12 @@ fn transfer_input_for_abi_parameter<'a>(
         OwnerConstraintEdgeRole::CallArgument {
             kind: argument_kind,
             name: actual_name,
+            ..
         }
         | OwnerConstraintEdgeRole::PipeArgument {
             kind: argument_kind,
             name: actual_name,
+            ..
         } => {
             actual_name == name
                 && matches!(
@@ -2362,6 +2213,7 @@ fn instantiate_call_signature(
     if let BodyCallableResolution::Owner(target) = &call.resolution {
         let interface = interfaces.get(target)?;
         return Some(InstantiatedCallSignature {
+            kind: CheckedCallableKind::User,
             parameters: interface
                 .parameters
                 .iter()
@@ -2373,6 +2225,7 @@ fn instantiate_call_signature(
                         mode: parameter.flow_type.mode,
                         ty: instantiate_type(&parameter.flow_type.ty, unifier, &mut variables),
                     },
+                    requirement: parameter.requirement.clone(),
                     evaluation_scope: parameter.evaluation_scope,
                 })
                 .collect(),
@@ -2380,6 +2233,10 @@ fn instantiate_call_signature(
                 mode: interface.result.mode,
                 ty: instantiate_type(&interface.result.ty, unifier, &mut variables),
             },
+            result_flush_type: interface
+                .result_flush_type
+                .as_ref()
+                .map(|ty| instantiate_type(ty, unifier, &mut variables)),
             context: interface
                 .context
                 .as_ref()
@@ -2395,6 +2252,7 @@ fn instantiate_call_signature(
     }
     abi.callable(&call.function)
         .map(|signature| InstantiatedCallSignature {
+            kind: signature.kind,
             parameters: signature
                 .parameters
                 .iter()
@@ -2409,6 +2267,7 @@ fn instantiate_call_signature(
                         mode: parameter.flow_type.mode,
                         ty: instantiate_type(&parameter.flow_type.ty, unifier, &mut variables),
                     },
+                    requirement: parameter.requirement.clone(),
                     evaluation_scope: match parameter.evaluation_scope {
                         OwnerAbiEvaluationScope::Parent => OwnerInterfaceEvaluationScope::Parent,
                         OwnerAbiEvaluationScope::Output { parameter_ordinal } => {
@@ -2421,6 +2280,7 @@ fn instantiate_call_signature(
                 mode: signature.result.mode,
                 ty: instantiate_type(&signature.result.ty, unifier, &mut variables),
             },
+            result_flush_type: None,
             context: None,
             effect: signature.effect,
             target: InferredOwnerCallableTarget::Authoritative,
@@ -2434,8 +2294,8 @@ fn instantiated_body_input_for_parameter(
 ) -> Option<u32> {
     call.inputs.iter().find_map(|(role, expression)| {
         let matches_parameter = match role {
-            OwnerConstraintEdgeRole::CallArgument { kind, name }
-            | OwnerConstraintEdgeRole::PipeArgument { kind, name } => {
+            OwnerConstraintEdgeRole::CallArgument { kind, name, .. }
+            | OwnerConstraintEdgeRole::PipeArgument { kind, name, .. } => {
                 name == &parameter.name
                     && matches!(
                         (parameter.kind, kind),
@@ -2592,6 +2452,220 @@ fn bind_output_scoped_call_inputs(
     }
 }
 
+fn push_owner_call_diagnostic(
+    diagnostics: &mut Vec<OwnerDiagnosticTemplate>,
+    call: &BodyCallPlan,
+    code: &str,
+    message: String,
+    role: Option<OwnerSourceAnchorRole>,
+) {
+    diagnostics.push(OwnerDiagnosticTemplate {
+        severity: DiagnosticSeverity::Error,
+        code: code.to_owned(),
+        message,
+        site: OwnerSourceAnchorSite::Expression {
+            expression: call.stable_expression.clone(),
+        },
+        role,
+    });
+}
+
+fn owner_call_argument(
+    role: &OwnerConstraintEdgeRole,
+) -> Option<(u32, OwnerArgumentKind, &str, OwnerSourceAnchorRole)> {
+    match role {
+        OwnerConstraintEdgeRole::CallArgument {
+            ordinal,
+            kind,
+            name,
+        } => Some((
+            *ordinal,
+            *kind,
+            name,
+            OwnerSourceAnchorRole::CallArgument { ordinal: *ordinal },
+        )),
+        OwnerConstraintEdgeRole::PipeArgument {
+            ordinal,
+            kind,
+            name,
+        } => Some((
+            *ordinal,
+            *kind,
+            name,
+            OwnerSourceAnchorRole::PipeArgument { ordinal: *ordinal },
+        )),
+        _ => None,
+    }
+}
+
+fn validate_owner_call_shape(
+    call: &BodyCallPlan,
+    parameters: &[InstantiatedCallParameter],
+    target: &InferredOwnerCallableTarget,
+    target_kind: Option<CheckedCallableKind>,
+    callee_context: Option<&Type>,
+    caller_has_context: bool,
+    caller_is_callable: bool,
+    diagnostics: &mut Vec<OwnerDiagnosticTemplate>,
+) -> bool {
+    let pipe_input = call
+        .inputs
+        .iter()
+        .any(|(role, _)| matches!(role, OwnerConstraintEdgeRole::PipeInput));
+    let piped_parameter = pipe_input.then(|| {
+        parameters
+            .iter()
+            .filter(|parameter| parameter.kind == OwnerParameterKind::Value)
+            .min_by_key(|parameter| parameter.ordinal)
+    });
+    let piped_parameter = piped_parameter.flatten();
+    let mut valid = true;
+    if pipe_input && piped_parameter.is_none() {
+        push_owner_call_diagnostic(
+            diagnostics,
+            call,
+            "pipe_without_value_input",
+            format!("`{}` has no ordinary input for the pipe", call.function),
+            None,
+        );
+        valid = false;
+    }
+
+    let expected = parameters
+        .iter()
+        .filter(|parameter| piped_parameter.is_none_or(|piped| parameter.ordinal != piped.ordinal))
+        .collect::<Vec<_>>();
+    let mut expected_index = 0usize;
+    for (call_index, (ordinal, kind, name, role)) in call
+        .inputs
+        .iter()
+        .filter_map(|(role, _)| owner_call_argument(role))
+        .enumerate()
+    {
+        while let Some(parameter) = expected.get(expected_index).copied()
+            && parameter.name != name
+            && parameter.requirement.is_optional()
+        {
+            expected_index += 1;
+        }
+        let Some(parameter) = expected.get(expected_index).copied() else {
+            push_owner_call_diagnostic(
+                diagnostics,
+                call,
+                "unexpected_call_entry",
+                format!(
+                    "`{}` has an unexpected extra call entry `{name}`",
+                    call.function
+                ),
+                Some(role),
+            );
+            valid = false;
+            continue;
+        };
+        if parameter.name != name {
+            push_owner_call_diagnostic(
+                diagnostics,
+                call,
+                "misordered_call_entry",
+                format!(
+                    "`{}` call entry {} must be `{}`, found `{name}`; arguments keep declaration names and order",
+                    call.function,
+                    call_index + 1,
+                    parameter.name,
+                ),
+                Some(role),
+            );
+            expected_index += 1;
+            valid = false;
+            continue;
+        }
+        expected_index += 1;
+        if parameter.kind == OwnerParameterKind::Value && kind == OwnerArgumentKind::BareBinding {
+            push_owner_call_diagnostic(
+                diagnostics,
+                call,
+                "bare_ordinary_input",
+                format!(
+                    "bare `{name}` cannot fill ordinary input `{}`; write `{}: expression`",
+                    parameter.name, parameter.name
+                ),
+                Some(role),
+            );
+            valid = false;
+        }
+        debug_assert_eq!(ordinal as usize, call_index);
+    }
+    for parameter in expected.iter().skip(expected_index) {
+        if parameter.requirement.is_optional() {
+            continue;
+        }
+        push_owner_call_diagnostic(
+            diagnostics,
+            call,
+            "missing_call_entry",
+            format!(
+                "`{}` is missing call entry `{}`",
+                call.function, parameter.name
+            ),
+            None,
+        );
+        valid = false;
+    }
+
+    let explicit_pass = call.inputs.iter().find_map(|(role, _)| match role {
+        OwnerConstraintEdgeRole::CallPass { .. } => Some(OwnerSourceAnchorRole::CallPass),
+        OwnerConstraintEdgeRole::PipePass { .. } => Some(OwnerSourceAnchorRole::PipePass),
+        _ => None,
+    });
+    if let Some(role) = explicit_pass
+        && matches!(target, InferredOwnerCallableTarget::Authoritative)
+    {
+        push_owner_call_diagnostic(
+            diagnostics,
+            call,
+            "pass_on_authoritative_callable",
+            format!(
+                "`PASS:` is only valid on user callable calls; `{}` is {}",
+                call.function,
+                match target_kind {
+                    Some(CheckedCallableKind::Builtin) => "a built-in callable",
+                    Some(CheckedCallableKind::External) => "an external callable",
+                    Some(CheckedCallableKind::User) | None => "authoritative",
+                }
+            ),
+            Some(role),
+        );
+        valid = false;
+    }
+    if callee_context.is_some()
+        && explicit_pass.is_none()
+        && !caller_has_context
+        && matches!(target, InferredOwnerCallableTarget::Owner { .. })
+    {
+        push_owner_call_diagnostic(
+            diagnostics,
+            call,
+            "missing_pass_context",
+            format!(
+                "{}",
+                if caller_is_callable {
+                    format!(
+                        "call to `FUNCTION {}` requires explicit or inherited PASS context",
+                        call.function
+                    )
+                } else {
+                    format!(
+                        "root call to `FUNCTION {}` requires a final `PASS:` clause",
+                        call.function
+                    )
+                }
+            ),
+            None,
+        );
+    }
+    valid
+}
+
 fn bind_calls(
     calls: Vec<BodyCallPlan>,
     seed: &OwnerConstraintSeed,
@@ -2599,9 +2673,13 @@ fn bind_calls(
     unifier: &mut TypeUnifier,
     expressions: &[TypeVar],
     external_expressions: &[TypeVar],
+    call_flushes: &[TypeVar],
     modes: &mut [Option<FlowMode>],
     direct_effects: &mut [CheckedEffectSummary],
     abi: &OwnerCallableAbiEnvironment,
+    pre_call_actual_types: &[Type],
+    caller_has_context: bool,
+    caller_is_callable: bool,
     diagnostics: &mut Vec<OwnerDiagnosticTemplate>,
     work: &mut OwnerBodyInferenceWork,
 ) -> Vec<InferredCallDraft> {
@@ -2611,13 +2689,25 @@ fn bind_calls(
             work.calls = work.calls.saturating_add(1);
             let signature = instantiate_call_signature(&call, interfaces, unifier, abi);
             let call_variable = expressions[call.expression];
-            let (parameters, result, context, effect, target) = match signature {
+            let (
+                parameters,
+                result,
+                result_flush_type,
+                context,
+                effect,
+                target,
+                target_kind,
+                mut valid,
+            ) = match signature {
                 Some(signature) => (
                     signature.parameters,
                     signature.result,
+                    signature.result_flush_type,
                     signature.context,
                     signature.effect,
                     signature.target,
+                    Some(signature.kind),
+                    true,
                 ),
                 None => {
                     let (code, message, target) = match &call.resolution {
@@ -2672,13 +2762,39 @@ fn bind_calls(
                             ty: Type::Unknown,
                         },
                         None,
+                        None,
                         CheckedEffectSummary::default(),
                         target,
+                        None,
+                        false,
                     )
                 }
             };
+            if valid {
+                valid = validate_owner_call_shape(
+                    &call,
+                    &parameters,
+                    &target,
+                    target_kind,
+                    context.as_ref(),
+                    caller_has_context,
+                    caller_is_callable,
+                    diagnostics,
+                );
+            }
+            let actual_inputs = call
+                .inputs
+                .iter()
+                .filter_map(|(_, reference)| {
+                    pre_call_actual_types
+                        .get(*reference as usize)
+                        .cloned()
+                        .map(|actual| (*reference, actual))
+                })
+                .collect::<BTreeMap<_, _>>();
+            let signature_result = result.clone();
 
-            if let Some(field) = call.function.strip_prefix("Field/") {
+            if valid && let Some(field) = call.function.strip_prefix("Field/") {
                 if let Some(input) = call.inputs.iter().find_map(|(role, input)| {
                     matches!(role, OwnerConstraintEdgeRole::PipeInput).then_some(*input)
                 }) && let Some(input) =
@@ -2687,7 +2803,7 @@ fn bind_calls(
                     let projected = bind_projection(unifier, input, &[field.to_owned()]);
                     unifier.unify(Type::Var(call_variable), Type::Var(projected));
                 }
-            } else if !matches!(call.resolution, BodyCallableResolution::Owner(_)) {
+            } else if !matches!(call.resolution, BodyCallableResolution::Owner(_)) || !valid {
                 // A user callable's principal result is intentionally allowed
                 // to be wider than this occurrence (for example a syntax-
                 // dispatched function). Bind user results only after the
@@ -2695,7 +2811,7 @@ fn bind_calls(
                 unifier.bind_var(call_variable, result.ty);
             }
 
-            for (role, input) in &call.inputs {
+            for (role, input) in call.inputs.iter().filter(|_| valid) {
                 let Some(input) = expression_variable(expressions, external_expressions, *input)
                 else {
                     continue;
@@ -2709,8 +2825,8 @@ fn bind_calls(
                             unifier.unify(Type::Var(input), expected.flow_type.ty.clone());
                         }
                     }
-                    OwnerConstraintEdgeRole::CallArgument { kind, name }
-                    | OwnerConstraintEdgeRole::PipeArgument { kind, name } => {
+                    OwnerConstraintEdgeRole::CallArgument { kind, name, .. }
+                    | OwnerConstraintEdgeRole::PipeArgument { kind, name, .. } => {
                         if let Some(expected) =
                             parameters.iter().find(|parameter| parameter.name == *name)
                             && matches!(
@@ -2732,25 +2848,47 @@ fn bind_calls(
                     _ => {}
                 }
             }
-            bind_output_scoped_call_inputs(
-                &call,
-                &parameters,
-                seed,
-                unifier,
-                expressions,
-                external_expressions,
-            );
+            if valid {
+                bind_output_scoped_call_inputs(
+                    &call,
+                    &parameters,
+                    seed,
+                    unifier,
+                    expressions,
+                    external_expressions,
+                );
+            }
             modes[call.expression] = flow_mode_join(modes[call.expression], Some(result.mode));
-            direct_effects[call.expression] =
-                merge_effects(direct_effects[call.expression], effect);
+            if valid {
+                direct_effects[call.expression] =
+                    merge_effects(direct_effects[call.expression], effect);
+            }
+            if let Some(call_flush) = call_flushes.get(call.expression).copied() {
+                unifier.bind_var(
+                    call_flush,
+                    if valid {
+                        result_flush_type.unwrap_or(Type::Absent)
+                    } else {
+                        Type::Absent
+                    },
+                );
+            }
             work.interface_imports = work.interface_imports.saturating_add(1);
             InferredCallDraft {
                 plan: call,
                 target,
-                effect,
+                effect: if valid {
+                    effect
+                } else {
+                    CheckedEffectSummary::default()
+                },
+                actual_inputs,
+                signature_result,
+                resolved_result: None,
                 type_substitutions: Vec::new(),
                 contextual_type_variables: Vec::new(),
                 syntax_discriminated_result: false,
+                valid,
             }
         })
         .collect()
@@ -2763,8 +2901,8 @@ fn body_input_for_parameter(
 ) -> Option<u32> {
     call.inputs.iter().find_map(|(role, expression)| {
         let matches_parameter = match role {
-            OwnerConstraintEdgeRole::CallArgument { kind, name }
-            | OwnerConstraintEdgeRole::PipeArgument { kind, name } => {
+            OwnerConstraintEdgeRole::CallArgument { kind, name, .. }
+            | OwnerConstraintEdgeRole::PipeArgument { kind, name, .. } => {
                 name == &parameter.name
                     && matches!(
                         (parameter.kind, kind),
@@ -2861,6 +2999,10 @@ fn refine_owner_call_at(
         Some(2) | None => return,
         Some(1) => return,
         Some(0) | Some(_) => states[call_index] = 1,
+    }
+    if !drafts[call_index].valid {
+        states[call_index] = 2;
+        return;
     }
     let plan = drafts[call_index].plan.clone();
     for (_, input) in &plan.inputs {
@@ -2959,6 +3101,7 @@ fn refine_owner_call_at(
         );
         modes[plan.expression] = Some(evaluated.value.flow_type.mode);
         let draft = &mut drafts[call_index];
+        draft.resolved_result = Some(evaluated.value.flow_type.clone());
         draft.type_substitutions = evaluated.type_substitutions;
         draft.contextual_type_variables = evaluated.contextual_type_variables;
         draft.syntax_discriminated_result = evaluated.value.syntax_selected;
@@ -3001,6 +3144,344 @@ fn refine_owner_call_transfers(
             caller_context,
             modes,
         );
+    }
+}
+
+fn body_input_for_abi_parameter(
+    call: &BodyCallPlan,
+    parameter: &crate::OwnerAbiParameterContract,
+    parameters: &[crate::OwnerAbiParameterContract],
+) -> Option<u32> {
+    call.inputs.iter().find_map(|(role, expression)| {
+        let matches_parameter = match role {
+            OwnerConstraintEdgeRole::CallArgument { kind, name, .. }
+            | OwnerConstraintEdgeRole::PipeArgument { kind, name, .. } => {
+                name == &parameter.name
+                    && matches!(
+                        (parameter.kind, kind),
+                        (CheckedParameterKind::Value, OwnerArgumentKind::Named)
+                            | (CheckedParameterKind::Out, OwnerArgumentKind::Named)
+                            | (CheckedParameterKind::Out, OwnerArgumentKind::BareBinding)
+                    )
+            }
+            OwnerConstraintEdgeRole::PipeInput => {
+                parameter.kind == CheckedParameterKind::Value
+                    && parameters
+                        .iter()
+                        .filter(|candidate| candidate.kind == CheckedParameterKind::Value)
+                        .min_by_key(|candidate| candidate.ordinal)
+                        .is_some_and(|candidate| candidate.ordinal == parameter.ordinal)
+            }
+            _ => false,
+        };
+        matches_parameter.then_some(*expression)
+    })
+}
+
+fn body_call_parameter_diagnostic_role(
+    call: &BodyCallPlan,
+    name: &str,
+) -> Option<OwnerSourceAnchorRole> {
+    call.inputs.iter().find_map(|(role, _)| match role {
+        OwnerConstraintEdgeRole::CallArgument {
+            name: candidate,
+            ordinal,
+            ..
+        } if candidate == name => Some(OwnerSourceAnchorRole::CallArgument { ordinal: *ordinal }),
+        OwnerConstraintEdgeRole::PipeArgument {
+            name: candidate,
+            ordinal,
+            ..
+        } if candidate == name => Some(OwnerSourceAnchorRole::PipeArgument { ordinal: *ordinal }),
+        _ => None,
+    })
+}
+
+fn body_expression_type(
+    reference: u32,
+    unifier: &mut TypeUnifier,
+    expressions: &[TypeVar],
+    external_expressions: &[TypeVar],
+) -> Option<Type> {
+    expression_variable(expressions, external_expressions, reference)
+        .map(|variable| unifier.resolve(&Type::Var(variable)))
+}
+
+fn normalized_type_substitutions(
+    substitutions: BTreeMap<TypeVar, Type>,
+) -> BTreeMap<TypeVar, Type> {
+    let lookup = substitutions.clone();
+    substitutions
+        .into_iter()
+        .map(|(variable, value)| {
+            (
+                variable,
+                apply_checked_type_substitution_lookup(&value, &lookup),
+            )
+        })
+        .collect()
+}
+
+fn push_user_argument_type_diagnostic(
+    diagnostics: &mut Vec<OwnerDiagnosticTemplate>,
+    call: &BodyCallPlan,
+    name: &str,
+    actual: &Type,
+    expected: &Type,
+) {
+    if crate::type_is_assignable_to(actual, expected) {
+        return;
+    }
+    let message = if let Some(field) = crate::missing_field_name(actual, expected) {
+        format!(
+            "object is missing field `{field}`\nexpected: {}\nfound: {}",
+            crate::boon_facing_type_label(expected),
+            crate::boon_facing_type_label(actual)
+        )
+    } else if let Some(field) = crate::incompatible_field_name(actual, expected) {
+        format!(
+            "object field `{field}` has incompatible type\nexpected: {}\nfound: {}",
+            crate::boon_facing_type_label(expected),
+            crate::boon_facing_type_label(actual)
+        )
+    } else {
+        format!(
+            "`FUNCTION {}` argument `{name}` does not satisfy the required structural shape\nexpected: {}\nfound: {}",
+            call.function,
+            crate::boon_facing_type_label(expected),
+            crate::boon_facing_type_label(actual)
+        )
+    };
+    push_owner_call_diagnostic(
+        diagnostics,
+        call,
+        "user_call_argument_type",
+        message,
+        body_call_parameter_diagnostic_role(call, name),
+    );
+}
+
+fn push_pass_type_diagnostic(
+    diagnostics: &mut Vec<OwnerDiagnosticTemplate>,
+    call: &BodyCallPlan,
+    actual: &Type,
+    expected: &Type,
+) {
+    if crate::type_is_assignable_to(actual, expected) {
+        return;
+    }
+    let detail = if let Some(field) = crate::missing_field_name(actual, expected) {
+        format!("missing required field `{field}`")
+    } else if let Some(field) = crate::incompatible_field_name(actual, expected) {
+        format!("field `{field}` has an incompatible type")
+    } else {
+        "context value has an incompatible type".to_owned()
+    };
+    let role = call.inputs.iter().find_map(|(role, _)| match role {
+        OwnerConstraintEdgeRole::CallPass { .. } => Some(OwnerSourceAnchorRole::CallPass),
+        OwnerConstraintEdgeRole::PipePass { .. } => Some(OwnerSourceAnchorRole::PipePass),
+        _ => None,
+    });
+    push_owner_call_diagnostic(
+        diagnostics,
+        call,
+        "pass_context_type",
+        format!(
+            "`FUNCTION {}` PASS context {detail}\nexpected: {}\nfound: {}",
+            call.function,
+            crate::boon_facing_type_label(expected),
+            crate::boon_facing_type_label(actual)
+        ),
+        role,
+    );
+}
+
+fn push_contextual_argument_type_diagnostic(
+    diagnostics: &mut Vec<OwnerDiagnosticTemplate>,
+    call: &BodyCallPlan,
+    name: &str,
+    actual: &Type,
+    expected: &Type,
+) {
+    if crate::type_is_assignable_to(actual, expected) {
+        return;
+    }
+    push_owner_call_diagnostic(
+        diagnostics,
+        call,
+        "contextual_call_argument_type",
+        format!(
+            "`{}` argument `{name}` has incompatible contextual type\nexpected: {}\nfound: {}",
+            call.function,
+            crate::boon_facing_type_label(expected),
+            crate::boon_facing_type_label(actual)
+        ),
+        body_call_parameter_diagnostic_role(call, name),
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_owner_call_types(
+    drafts: &mut [InferredCallDraft],
+    interfaces: &BTreeMap<StableCheckOwnerKey, &OwnerPublicInterface>,
+    abi: &OwnerCallableAbiEnvironment,
+    unifier: &mut TypeUnifier,
+    expressions: &[TypeVar],
+    external_expressions: &[TypeVar],
+    caller_context: Option<TypeVar>,
+    diagnostics: &mut Vec<OwnerDiagnosticTemplate>,
+) {
+    let mut call_results = BTreeMap::new();
+    for draft in drafts.iter().filter(|draft| draft.valid) {
+        let result = draft.resolved_result.as_ref().map_or_else(
+            || FlowType {
+                mode: draft.signature_result.mode,
+                ty: unifier.resolve(&draft.signature_result.ty),
+            },
+            Clone::clone,
+        );
+        call_results.insert(draft.plan.expression, result.ty);
+    }
+    for draft in drafts.iter_mut().filter(|draft| draft.valid) {
+        let call = &draft.plan;
+        let explicit_context = call.inputs.iter().find_map(|(role, reference)| {
+            matches!(
+                role,
+                OwnerConstraintEdgeRole::CallPass { .. } | OwnerConstraintEdgeRole::PipePass { .. }
+            )
+            .then_some(*reference)
+        });
+        match &draft.target {
+            InferredOwnerCallableTarget::Owner { owner } => {
+                let Some(interface) = interfaces.get(owner).copied() else {
+                    continue;
+                };
+                let substitutions = normalized_type_substitutions(
+                    draft.type_substitutions.iter().cloned().collect(),
+                );
+                let mut actuals = BTreeMap::new();
+                let mut exact_actuals = BTreeMap::new();
+                for parameter in &interface.parameters {
+                    let Some(reference) =
+                        body_input_for_parameter(call, parameter, interface.parameters.as_ref())
+                    else {
+                        continue;
+                    };
+                    let Some(actual) =
+                        body_expression_type(reference, unifier, expressions, external_expressions)
+                    else {
+                        continue;
+                    };
+                    actuals.insert(parameter.ordinal, actual);
+                    if let Some(exact) = ((reference as usize) < expressions.len())
+                        .then(|| call_results.get(&(reference as usize)).cloned())
+                        .flatten()
+                        .or_else(|| draft.actual_inputs.get(&reference).cloned())
+                    {
+                        exact_actuals.insert(parameter.ordinal, unifier.resolve(&exact));
+                    }
+                }
+                let exact_context_actual = explicit_context
+                    .and_then(|reference| {
+                        ((reference as usize) < expressions.len())
+                            .then(|| call_results.get(&(reference as usize)).cloned())
+                            .flatten()
+                            .or_else(|| draft.actual_inputs.get(&reference).cloned())
+                    })
+                    .map(|actual| unifier.resolve(&actual))
+                    .or_else(|| {
+                        caller_context.map(|variable| unifier.resolve(&Type::Var(variable)))
+                    });
+                for parameter in interface
+                    .parameters
+                    .iter()
+                    .filter(|parameter| parameter.kind == OwnerParameterKind::Value)
+                {
+                    let Some(actual) = exact_actuals.get(&parameter.ordinal) else {
+                        continue;
+                    };
+                    let expected =
+                        crate::substitute_checked_type(&parameter.flow_type.ty, &substitutions);
+                    push_user_argument_type_diagnostic(
+                        diagnostics,
+                        call,
+                        &parameter.name,
+                        actual,
+                        &expected,
+                    );
+                    if matches!(
+                        parameter.evaluation_scope,
+                        OwnerInterfaceEvaluationScope::Output { .. }
+                    ) && let Some(contextual_actual) = actuals.get(&parameter.ordinal)
+                    {
+                        push_contextual_argument_type_diagnostic(
+                            diagnostics,
+                            call,
+                            &parameter.name,
+                            contextual_actual,
+                            &expected,
+                        );
+                    }
+                }
+                if explicit_context.is_some()
+                    && let (Some(context), Some(actual)) =
+                        (&interface.context, exact_context_actual)
+                {
+                    let expected =
+                        crate::substitute_checked_type(&context.flow_type.ty, &substitutions);
+                    push_pass_type_diagnostic(diagnostics, call, &actual, &expected);
+                }
+            }
+            InferredOwnerCallableTarget::Authoritative => {
+                let Some(contract) = abi.callable(&call.function) else {
+                    continue;
+                };
+                let mut substitutions = BTreeMap::new();
+                let mut actuals = BTreeMap::new();
+                for parameter in &contract.parameters {
+                    let Some(reference) =
+                        body_input_for_abi_parameter(call, parameter, &contract.parameters)
+                    else {
+                        continue;
+                    };
+                    let Some(actual) =
+                        body_expression_type(reference, unifier, expressions, external_expressions)
+                    else {
+                        continue;
+                    };
+                    crate::unify_checked_type_pattern(
+                        &parameter.flow_type.ty,
+                        &actual,
+                        &mut substitutions,
+                    );
+                    actuals.insert(parameter.ordinal, actual);
+                }
+                substitutions = normalized_type_substitutions(substitutions);
+                for parameter in contract.parameters.iter().filter(|parameter| {
+                    parameter.kind == CheckedParameterKind::Value
+                        && matches!(
+                            parameter.evaluation_scope,
+                            OwnerAbiEvaluationScope::Output { .. }
+                        )
+                }) {
+                    let Some(actual) = actuals.get(&parameter.ordinal) else {
+                        continue;
+                    };
+                    let expected =
+                        crate::substitute_checked_type(&parameter.flow_type.ty, &substitutions);
+                    push_contextual_argument_type_diagnostic(
+                        diagnostics,
+                        call,
+                        &parameter.name,
+                        actual,
+                        &expected,
+                    );
+                }
+                draft.type_substitutions = substitutions.into_iter().collect();
+            }
+            InferredOwnerCallableTarget::Unresolved
+            | InferredOwnerCallableTarget::Ambiguous { .. } => continue,
+        }
     }
 }
 
@@ -3120,7 +3601,7 @@ pub fn infer_owner_body<'a>(
             let provider = providers[&interface.owner];
             Ok(OwnerBodyInterfaceImport {
                 owner: interface.owner.clone(),
-                interface_fingerprint_v1: interface_fingerprint(interface)?,
+                interface_fingerprint_v1: owner_body_interface_fingerprint_v1(interface)?,
                 provider_scc: provider.key.clone(),
                 provider_fingerprint_v1: provider.fingerprint_v1(),
                 provider_type_variable_count: provider.type_variable_count,
@@ -3138,9 +3619,73 @@ pub fn infer_owner_body<'a>(
     let expressions = (0..seed.expressions.len())
         .map(|_| unifier.fresh())
         .collect::<Vec<_>>();
+    let expression_flushes = (0..seed.expressions.len())
+        .map(|_| unifier.fresh())
+        .collect::<Vec<_>>();
     let external_expressions = (0..seed.external_expressions.len())
         .map(|_| unifier.fresh())
         .collect::<Vec<_>>();
+    let external_expression_flushes = (0..seed.external_expressions.len())
+        .map(|_| unifier.fresh())
+        .collect::<Vec<_>>();
+    let call_flushes = (0..seed.expressions.len())
+        .map(|_| unifier.fresh())
+        .collect::<Vec<_>>();
+
+    for ((external, variable), flush_variable) in seed
+        .external_expressions
+        .iter()
+        .zip(&external_expressions)
+        .zip(&external_expression_flushes)
+    {
+        let interface = interfaces[&external.owner];
+        let mut variables = BTreeMap::new();
+        let ty = instantiate_type(&interface.result.ty, &mut unifier, &mut variables);
+        unifier.bind_var(*variable, ty);
+        let flush_type = interface
+            .result_flush_type
+            .as_ref()
+            .map_or(Type::Absent, |ty| {
+                instantiate_type(ty, &mut unifier, &mut variables)
+            });
+        unifier.bind_var(*flush_variable, flush_type);
+        work.interface_imports = work.interface_imports.saturating_add(1);
+    }
+    for (index, plan) in seed.expression_flush_plans.iter().enumerate() {
+        let mut candidates = Vec::new();
+        candidates.extend(
+            plan.value_inputs
+                .iter()
+                .filter_map(|input| {
+                    expression_variable(&expressions, &external_expressions, *input)
+                })
+                .map(Type::Var),
+        );
+        candidates.extend(
+            plan.escape_inputs
+                .iter()
+                .filter_map(|input| {
+                    expression_variable(&expression_flushes, &external_expression_flushes, *input)
+                })
+                .map(Type::Var),
+        );
+        if matches!(
+            seed.expressions[index].kind,
+            OwnerConstraintNodeKind::Call { .. } | OwnerConstraintNodeKind::Pipe { .. }
+        ) {
+            candidates.push(Type::Var(call_flushes[index]));
+        } else {
+            unifier.bind_var(call_flushes[index], Type::Absent);
+        }
+        unifier.bind_var(
+            expression_flushes[index],
+            if candidates.is_empty() {
+                Type::Absent
+            } else {
+                boon_checked::canonical_union_type(candidates)
+            },
+        );
+    }
     let mut local_roots = BTreeMap::new();
     let mut own_variables = BTreeMap::new();
     let mut own_parameter_variables = Vec::with_capacity(own_interface.parameters.len());
@@ -3167,8 +3712,14 @@ pub fn infer_owner_body<'a>(
         else {
             continue;
         };
-        let Some(variable) = expression_variable(&expressions, &external_expressions, *expression)
-        else {
+        let Some(variable) = body_expression_boundary_variable(
+            &expressions,
+            &external_expressions,
+            &expression_flushes,
+            &external_expression_flushes,
+            *expression,
+            &mut unifier,
+        ) else {
             continue;
         };
         for name in &declaration.names {
@@ -3183,9 +3734,14 @@ pub fn infer_owner_body<'a>(
             let OwnerConstraintEdgeRole::BlockBinding { name } = &input.role else {
                 continue;
             };
-            if let Some(variable) =
-                expression_variable(&expressions, &external_expressions, input.expression)
-            {
+            if let Some(variable) = body_expression_boundary_variable(
+                &expressions,
+                &external_expressions,
+                &expression_flushes,
+                &external_expression_flushes,
+                input.expression,
+                &mut unifier,
+            ) {
                 add_local_root(&mut local_roots, name.clone(), variable);
             }
         }
@@ -3208,13 +3764,6 @@ pub fn infer_owner_body<'a>(
         &mut work,
     );
 
-    for (external, variable) in seed.external_expressions.iter().zip(&external_expressions) {
-        let interface = interfaces[&external.owner];
-        let mut variables = BTreeMap::new();
-        let ty = instantiate_type(&interface.result.ty, &mut unifier, &mut variables);
-        unifier.bind_var(*variable, ty);
-        work.interface_imports = work.interface_imports.saturating_add(1);
-    }
     let expression_by_key = seed
         .expressions
         .iter()
@@ -3239,9 +3788,13 @@ pub fn infer_owner_body<'a>(
         let result = bind_projection(&mut unifier, result, &resolved.projection);
         unifier.unify(Type::Var(expressions[index]), Type::Var(result));
         modes[index] = flow_mode_join(modes[index], Some(interface.result.mode));
-        direct_effects[index] = merge_effects(direct_effects[index], interface.effect);
         work.interface_imports = work.interface_imports.saturating_add(1);
     }
+    let pre_call_actual_types = expressions
+        .iter()
+        .chain(&external_expressions)
+        .map(|variable| unifier.resolve(&Type::Var(*variable)))
+        .collect::<Vec<_>>();
 
     let mut diagnostics = Vec::new();
     push_invalid_syntax_diagnostics(seed, &mut diagnostics);
@@ -3252,9 +3805,13 @@ pub fn infer_owner_body<'a>(
         &mut unifier,
         &expressions,
         &external_expressions,
+        &call_flushes,
         &mut modes,
         &mut direct_effects,
         abi,
+        &pre_call_actual_types,
+        context.is_some(),
+        own_interface.declaration_kind == Some(crate::OwnerDeclarationKind::Function),
         &mut diagnostics,
         &mut work,
     );
@@ -3269,6 +3826,16 @@ pub fn infer_owner_body<'a>(
         &external_expressions,
         context,
         &mut modes,
+    );
+    validate_owner_call_types(
+        &mut call_drafts,
+        &interfaces,
+        abi,
+        &mut unifier,
+        &expressions,
+        &external_expressions,
+        context,
+        &mut diagnostics,
     );
 
     let mut alpha_variables = BTreeMap::new();
@@ -3305,8 +3872,24 @@ pub fn infer_owner_body<'a>(
             ),
         })
         .collect::<Vec<_>>();
-    let flush_types =
-        infer_owner_expression_flush_types(syntax, &inferred_flows, &mut diagnostics)?;
+    let normalized_flush_types = expression_flushes
+        .iter()
+        .chain(&external_expression_flushes)
+        .map(|variable| {
+            let ty = unifier.resolve(&Type::Var(*variable));
+            (!matches!(
+                ty,
+                Type::Unknown | Type::UnresolvedShape { .. } | Type::Absent
+            ))
+            .then(|| alpha_normalize_type(&ty, &mut alpha_variables, &mut next_alpha))
+        })
+        .collect::<Vec<_>>();
+    let flush_types = infer_owner_expression_flush_types(
+        syntax,
+        &inferred_flows,
+        &normalized_flush_types,
+        &mut diagnostics,
+    )?;
     let inferred_expressions = syntax
         .expressions
         .iter()
@@ -3357,6 +3940,7 @@ pub fn infer_owner_body<'a>(
                     .into_boxed_slice(),
                 contextual_type_variables: draft.contextual_type_variables.into_boxed_slice(),
                 syntax_discriminated_result: draft.syntax_discriminated_result,
+                valid: draft.valid,
                 result: inferred_expressions[draft.plan.expression]
                     .flow_type
                     .clone(),
@@ -3853,7 +4437,7 @@ mod tests {
             &value_seed,
             [ResolvedOwnerSymbolReference {
                 reference,
-                owner: leaf,
+                owner: leaf.clone(),
                 projection: Box::new([]),
                 parameters: Box::new([]),
             }],
@@ -3908,6 +4492,100 @@ mod tests {
         assert!(matches!(oracle.result.ty, Type::Var(_)));
         assert!(oracle.type_substitutions.is_empty());
         assert!(oracle.contextual_substitutions.is_empty());
+    }
+
+    #[test]
+    fn user_argument_and_pass_diagnostics_use_pre_contract_actual_types() {
+        let source = concat!(
+            "FUNCTION needs(input) {\n",
+            "    input.required\n",
+            "}\n",
+            "value: needs(input: [other: 1])\n",
+        );
+        let unit = link(source);
+        let value = owner_named(&unit, "value");
+        let needs = owner_named(&unit, "needs");
+        let (value_syntax, _, value_seed) = inputs(&unit, &value);
+        let (_, _, needs_seed) = inputs(&unit, &needs);
+        let reference = value_seed
+            .references
+            .iter()
+            .find(|reference| reference.kind == OwnerReferenceKind::Callable)
+            .cloned()
+            .unwrap();
+        let parameters = needs_seed
+            .declarations
+            .iter()
+            .find(|declaration| declaration.public)
+            .unwrap()
+            .parameters
+            .clone();
+        let value_summary = resolve_owner_constraint_seed(
+            &value_seed,
+            [ResolvedOwnerSymbolReference {
+                reference,
+                owner: needs,
+                projection: Box::new([]),
+                parameters,
+            }],
+        )
+        .unwrap();
+        let needs_summary = resolve_owner_constraint_seed(&needs_seed, []).unwrap();
+        let interfaces = solve(
+            &[value_seed.clone(), needs_seed],
+            &[value_summary.clone(), needs_summary],
+        );
+        let body = infer(&value_syntax, &value_seed, &value_summary, &interfaces);
+        assert!(body.calls[0].valid);
+        assert!(body.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "user_call_argument_type"
+                && diagnostic.message.contains("missing field `required`")
+        }));
+
+        let pass_source = concat!(
+            "FUNCTION leaf() {\n",
+            "    PASSED.store.count + 1\n",
+            "}\n",
+            "value: leaf(PASS: [store: [count: TEXT { wrong }]])\n",
+        );
+        let pass_unit = link(pass_source);
+        let pass_value = owner_named(&pass_unit, "value");
+        let leaf = owner_named(&pass_unit, "leaf");
+        let (pass_syntax, _, pass_seed) = inputs(&pass_unit, &pass_value);
+        let (_, _, leaf_seed) = inputs(&pass_unit, &leaf);
+        let reference = pass_seed
+            .references
+            .iter()
+            .find(|reference| reference.kind == OwnerReferenceKind::Callable)
+            .cloned()
+            .unwrap();
+        let pass_summary = resolve_owner_constraint_seed(
+            &pass_seed,
+            [ResolvedOwnerSymbolReference {
+                reference,
+                owner: leaf.clone(),
+                projection: Box::new([]),
+                parameters: Box::new([]),
+            }],
+        )
+        .unwrap();
+        let leaf_summary = resolve_owner_constraint_seed(&leaf_seed, []).unwrap();
+        let interfaces = solve(
+            &[pass_seed.clone(), leaf_seed],
+            &[pass_summary.clone(), leaf_summary],
+        );
+        let body = infer(&pass_syntax, &pass_seed, &pass_summary, &interfaces);
+        assert!(body.calls[0].valid);
+        assert!(
+            body.diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == "pass_context_type"
+                    && diagnostic
+                        .message
+                        .contains("field `store.count` has an incompatible type")
+            }),
+            "{:#?}",
+            body.diagnostics
+        );
     }
 
     #[test]
@@ -3985,6 +4663,80 @@ mod tests {
             call.contextual_type_variables
                 .contains(&substitution.variable)
                 && substitution.value == Type::Number
+        }));
+    }
+
+    #[test]
+    fn callable_flush_control_survives_frozen_interface_and_occurrence_transfer() {
+        let source = concat!(
+            "FUNCTION leaf() {\n",
+            "    FLUSH { Error }\n",
+            "}\n",
+            "FUNCTION wrapper() {\n",
+            "    leaf()\n",
+            "}\n",
+        );
+        let unit = link(source);
+        let wrapper = owner_named(&unit, "wrapper");
+        let leaf = owner_named(&unit, "leaf");
+        let (wrapper_syntax, _, wrapper_seed) = inputs(&unit, &wrapper);
+        let (_, _, leaf_seed) = inputs(&unit, &leaf);
+        let reference = wrapper_seed
+            .references
+            .iter()
+            .find(|reference| reference.kind == OwnerReferenceKind::Callable)
+            .cloned()
+            .unwrap();
+        let wrapper_summary = resolve_owner_constraint_seed(
+            &wrapper_seed,
+            [ResolvedOwnerSymbolReference {
+                reference,
+                owner: leaf,
+                projection: Box::new([]),
+                parameters: Box::new([]),
+            }],
+        )
+        .unwrap();
+        let leaf_summary = resolve_owner_constraint_seed(&leaf_seed, []).unwrap();
+        let interfaces = solve(
+            &[wrapper_seed.clone(), leaf_seed],
+            &[wrapper_summary.clone(), leaf_summary],
+        );
+        let body = infer(
+            &wrapper_syntax,
+            &wrapper_seed,
+            &wrapper_summary,
+            &interfaces,
+        );
+        let error = Type::VariantSet(vec![Variant::Tag("Error".to_owned())].into());
+        assert_eq!(body.calls[0].result.ty, error);
+        let call_expression = body
+            .expressions
+            .iter()
+            .find(|expression| expression.stable_key == body.calls[0].expression)
+            .unwrap();
+        assert_eq!(call_expression.flush_type, Some(error));
+    }
+
+    #[test]
+    fn hold_initializer_flush_crosses_the_enclosing_owner_boundary() {
+        let unit = link("state:\n    FLUSH { Error }\n    |> HOLD held {}\n");
+        let state = owner_named(&unit, "state");
+        let held = owner_named(&unit, "held");
+        let (_, _, state_seed) = inputs(&unit, &state);
+        let (held_syntax, _, held_seed) = inputs(&unit, &held);
+        let state_summary = resolve_owner_constraint_seed(&state_seed, []).unwrap();
+        let held_summary = resolve_owner_constraint_seed(&held_seed, []).unwrap();
+        let interfaces = solve(
+            &[state_seed, held_seed.clone()],
+            &[state_summary, held_summary.clone()],
+        );
+        let body = infer(&held_syntax, &held_seed, &held_summary, &interfaces);
+
+        assert!(body.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "hold_initializer_flush"
+                && diagnostic.message
+                    == "a `HOLD` initializer must produce a valid storable value and cannot `FLUSH`"
         }));
     }
 
@@ -4229,6 +4981,52 @@ mod tests {
             }
         );
         assert_eq!(body.diagnostics[0].code, "ambiguous_callable");
+    }
+
+    #[test]
+    fn invalid_call_shapes_keep_exact_diagnostics_and_cannot_be_published() {
+        for (source, code) in [
+            (
+                "value: Number/to_text(radix: 10, value: 1)\n",
+                "misordered_call_entry",
+            ),
+            (
+                "value: Number/to_text(value: 1, extra: 2)\n",
+                "unexpected_call_entry",
+            ),
+            ("value: Number/to_text()\n", "missing_call_entry"),
+        ] {
+            let unit = link(source);
+            let owner = owner_named(&unit, "value");
+            let (syntax, _, seed) = inputs(&unit, &owner);
+            let summary = resolve_owner_constraint_seed(&seed, []).unwrap();
+            let interfaces = solve(&[seed.clone()], &[summary.clone()]);
+            let body = infer(&syntax, &seed, &summary, &interfaces);
+
+            assert_eq!(body.calls.len(), 1, "{source}");
+            assert!(!body.calls[0].valid, "{source}");
+            assert!(
+                body.diagnostics
+                    .iter()
+                    .any(|diagnostic| diagnostic.code == code),
+                "{source}: {:#?}",
+                body.diagnostics
+            );
+        }
+
+        let source = "value: Number/to_text(value: 1, PASS: [])\n";
+        let unit = link(source);
+        let owner = owner_named(&unit, "value");
+        let (syntax, _, seed) = inputs(&unit, &owner);
+        let summary = resolve_owner_constraint_seed(&seed, []).unwrap();
+        let interfaces = solve(&[seed.clone()], &[summary.clone()]);
+        let body = infer(&syntax, &seed, &summary, &interfaces);
+        assert!(!body.calls[0].valid);
+        assert!(
+            body.diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "pass_on_authoritative_callable")
+        );
     }
 
     #[test]

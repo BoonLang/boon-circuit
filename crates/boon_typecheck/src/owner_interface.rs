@@ -124,6 +124,10 @@ pub struct OwnerPublicInterface {
     pub names: Box<[String]>,
     pub parameters: Box<[OwnerInterfaceParameter]>,
     pub result: FlowType,
+    /// Control payload escaping the callable/declaration boundary before it is
+    /// unioned into `result`. Kept separately so occurrence-specialized result
+    /// transfers cannot accidentally discard a FLUSH alternative.
+    pub result_flush_type: Option<Type>,
     pub result_transfer: OwnerResultTransfer,
     pub context: Option<OwnerContextInterface>,
     pub effect: CheckedEffectSummary,
@@ -272,7 +276,7 @@ impl TypeUnifier {
                     })
                     .collect(),
             ),
-            Type::Union(members) => Type::Union(
+            Type::Union(members) => boon_checked::canonical_union_type(
                 members
                     .iter()
                     .map(|member| self.resolve_inner(member, active))
@@ -469,9 +473,12 @@ struct OwnerSolveState<'a> {
     parameters: Vec<OwnerSolveParameter>,
     context: TypeVar,
     result: TypeVar,
+    result_flush: TypeVar,
     expressions: Vec<TypeVar>,
+    expression_flushes: Vec<TypeVar>,
     expression_by_key: BTreeMap<StableExpressionKey, usize>,
     external_expressions: Vec<TypeVar>,
+    external_expression_flushes: Vec<TypeVar>,
     local_roots: BTreeMap<String, Option<TypeVar>>,
     modes: Vec<Option<FlowMode>>,
     effect: CheckedEffectSummary,
@@ -485,6 +492,7 @@ struct CrossCall {
     function: String,
     inputs: Box<[(OwnerConstraintEdgeRole, u32)]>,
     stable_expression: StableExpressionKey,
+    flush: TypeVar,
 }
 
 #[derive(Clone)]
@@ -493,7 +501,78 @@ struct InstantiatedInterfaceParameter {
     kind: OwnerParameterKind,
     ordinal: u32,
     ty: Type,
+    requirement: CheckedParameterRequirement,
     evaluation_scope: OwnerInterfaceEvaluationScope,
+}
+
+fn interface_call_shape_is_valid(
+    call: &CrossCall,
+    parameters: &[InstantiatedInterfaceParameter],
+    authoritative: bool,
+) -> bool {
+    let pipe_input = call
+        .inputs
+        .iter()
+        .any(|(role, _)| matches!(role, OwnerConstraintEdgeRole::PipeInput));
+    let piped_parameter = pipe_input
+        .then(|| {
+            parameters
+                .iter()
+                .filter(|parameter| parameter.kind == OwnerParameterKind::Value)
+                .min_by_key(|parameter| parameter.ordinal)
+        })
+        .flatten();
+    if pipe_input && piped_parameter.is_none() {
+        return false;
+    }
+    let expected = parameters
+        .iter()
+        .filter(|parameter| piped_parameter.is_none_or(|piped| parameter.ordinal != piped.ordinal))
+        .collect::<Vec<_>>();
+    let mut expected_index = 0usize;
+    for (role, _) in call.inputs.iter().filter(|(role, _)| {
+        matches!(
+            role,
+            OwnerConstraintEdgeRole::CallArgument { .. }
+                | OwnerConstraintEdgeRole::PipeArgument { .. }
+        )
+    }) {
+        let (kind, name) = match role {
+            OwnerConstraintEdgeRole::CallArgument { kind, name, .. }
+            | OwnerConstraintEdgeRole::PipeArgument { kind, name, .. } => (*kind, name),
+            _ => unreachable!("filtered call argument role"),
+        };
+        while let Some(parameter) = expected.get(expected_index).copied()
+            && parameter.name != *name
+            && parameter.requirement.is_optional()
+        {
+            expected_index += 1;
+        }
+        let Some(parameter) = expected.get(expected_index).copied() else {
+            return false;
+        };
+        if parameter.name != *name
+            || (parameter.kind == OwnerParameterKind::Value
+                && kind == OwnerArgumentKind::BareBinding)
+        {
+            return false;
+        }
+        expected_index += 1;
+    }
+    if expected
+        .iter()
+        .skip(expected_index)
+        .any(|parameter| !parameter.requirement.is_optional())
+    {
+        return false;
+    }
+    !(authoritative
+        && call.inputs.iter().any(|(role, _)| {
+            matches!(
+                role,
+                OwnerConstraintEdgeRole::CallPass { .. } | OwnerConstraintEdgeRole::PipePass { .. }
+            )
+        }))
 }
 
 pub(crate) fn add_local_root(
@@ -613,6 +692,71 @@ fn expression_variable(state: &OwnerSolveState<'_>, reference: u32) -> Option<Ty
             .get(reference.checked_sub(state.expressions.len())?)
             .copied()
     })
+}
+
+fn expression_flush_variable(state: &OwnerSolveState<'_>, reference: u32) -> Option<TypeVar> {
+    let reference = reference as usize;
+    state
+        .expression_flushes
+        .get(reference)
+        .copied()
+        .or_else(|| {
+            state
+                .external_expression_flushes
+                .get(reference.checked_sub(state.expression_flushes.len())?)
+                .copied()
+        })
+}
+
+fn expression_boundary_variable(
+    state: &OwnerSolveState<'_>,
+    reference: u32,
+    unifier: &mut TypeUnifier,
+) -> Option<TypeVar> {
+    let value = expression_variable(state, reference)?;
+    let flush = expression_flush_variable(state, reference)?;
+    let boundary = unifier.fresh();
+    unifier.bind_var(
+        boundary,
+        boon_checked::canonical_union_type(vec![Type::Var(value), Type::Var(flush)]),
+    );
+    Some(boundary)
+}
+
+fn resolved_expression_flush_type(
+    state: &OwnerSolveState<'_>,
+    reference: u32,
+    unifier: &mut TypeUnifier,
+) -> Option<Type> {
+    let ty = expression_flush_variable(state, reference)
+        .map(|variable| unifier.resolve(&Type::Var(variable)))?;
+    (!matches!(
+        ty,
+        Type::Unknown | Type::UnresolvedShape { .. } | Type::Absent
+    ))
+    .then_some(ty)
+}
+
+fn resolved_expression_boundary(
+    state: &OwnerSolveState<'_>,
+    reference: u32,
+    unifier: &mut TypeUnifier,
+    raw_mode: FlowMode,
+) -> FlowType {
+    let value = expression_variable(state, reference)
+        .map(|variable| unifier.resolve(&Type::Var(variable)))
+        .unwrap_or(Type::Absent);
+    let flush = resolved_expression_flush_type(state, reference, unifier);
+    FlowType {
+        mode: if raw_mode == FlowMode::Absent && flush.is_some() {
+            FlowMode::Continuous
+        } else {
+            raw_mode
+        },
+        ty: flush.map_or(value.clone(), |flush| {
+            boon_checked::canonical_union_type(vec![value, flush])
+        }),
+    }
 }
 
 fn direct_owner_parameter_ordinal(state: &OwnerSolveState<'_>, reference: u32) -> Option<u32> {
@@ -978,6 +1122,7 @@ fn solver_surface_snapshot(
     Vec<Type>,
     Type,
     Type,
+    Type,
     CheckedEffectSummary,
     Vec<Option<FlowMode>>,
     Vec<OwnerInterfaceEvaluationScope>,
@@ -993,6 +1138,7 @@ fn solver_surface_snapshot(
                     .map(|parameter| unifier.resolve(&Type::Var(parameter.variable)))
                     .collect(),
                 unifier.resolve(&Type::Var(state.result)),
+                unifier.resolve(&Type::Var(state.result_flush)),
                 unifier.resolve(&Type::Var(state.context)),
                 state.effect,
                 state.modes.clone(),
@@ -1378,7 +1524,13 @@ pub fn solve_owner_interface_scc<'a>(
         let expressions = (0..seed.expressions.len())
             .map(|_| unifier.fresh())
             .collect::<Vec<_>>();
+        let expression_flushes = (0..seed.expressions.len())
+            .map(|_| unifier.fresh())
+            .collect::<Vec<_>>();
         let external_expressions = (0..seed.external_expressions.len())
+            .map(|_| unifier.fresh())
+            .collect::<Vec<_>>();
+        let external_expression_flushes = (0..seed.external_expressions.len())
             .map(|_| unifier.fresh())
             .collect::<Vec<_>>();
         let expression_by_key = seed
@@ -1388,6 +1540,7 @@ pub fn solve_owner_interface_scc<'a>(
             .map(|(index, expression)| (expression.expression.clone(), index))
             .collect();
         let result = unifier.fresh();
+        let result_flush = unifier.fresh();
         let context = unifier.fresh();
         let mut effect = CheckedEffectSummary::default();
         if seed.effect_seed.declares_source {
@@ -1409,9 +1562,12 @@ pub fn solve_owner_interface_scc<'a>(
                 parameters,
                 context,
                 result,
+                result_flush,
                 expressions,
+                expression_flushes,
                 expression_by_key,
                 external_expressions,
+                external_expression_flushes,
                 local_roots,
                 modes: vec![None; seed.expressions.len()],
                 effect,
@@ -1432,7 +1588,8 @@ pub fn solve_owner_interface_scc<'a>(
             else {
                 continue;
             };
-            let Some(variable) = expression_variable(state, *expression) else {
+            let Some(variable) = expression_boundary_variable(state, *expression, &mut unifier)
+            else {
                 continue;
             };
             for name in &declaration.names {
@@ -1548,6 +1705,9 @@ pub fn solve_owner_interface_scc<'a>(
                 | OwnerConstraintNodeKind::Pipe {
                     operation: function,
                 } => {
+                    if boon_effect_schema::host_effect_spec(function).is_some() {
+                        state.effect.invokes_host = true;
+                    }
                     calls.push(CrossCall {
                         caller: state.seed.owner.clone(),
                         expression: index,
@@ -1564,6 +1724,7 @@ pub fn solve_owner_interface_scc<'a>(
                             .map(|input| (input.role.clone(), input.expression))
                             .collect(),
                         stable_expression: expression.expression.clone(),
+                        flush: unifier.fresh(),
                     });
                     mode = None;
                 }
@@ -1594,6 +1755,8 @@ pub fn solve_owner_interface_scc<'a>(
                             unifier.unify(Type::Var(variable), Type::Var(input));
                         }
                     }
+                    state.effect.reads_state = true;
+                    state.effect.writes_state = true;
                     mode = None;
                 }
                 OwnerConstraintNodeKind::When => {
@@ -1762,34 +1925,38 @@ pub fn solve_owner_interface_scc<'a>(
             state.modes[index] = flow_mode_join(state.modes[index], mode);
             work.local_constraints = work.local_constraints.saturating_add(1);
         }
-        if let Some(expression) = owner_result_expression(state)
-            && let Some(expression) = expression_variable(state, expression)
-        {
-            unifier.unify(Type::Var(state.result), Type::Var(expression));
-        } else {
-            unifier.bind_var(state.result, Type::Absent);
-        }
     }
 
     // Child expression boundaries and resolved value reads consume the exact
     // interface result instead of a copied child body.
     let internal_results = states
         .iter()
-        .map(|(owner, state)| (owner.clone(), state.result))
+        .map(|(owner, state)| (owner.clone(), (state.result, state.result_flush)))
         .collect::<BTreeMap<_, _>>();
     for state in states.values() {
-        for (external, variable) in state
+        for ((external, variable), flush_variable) in state
             .seed
             .external_expressions
             .iter()
             .zip(&state.external_expressions)
+            .zip(&state.external_expression_flushes)
         {
-            if let Some(result) = internal_results.get(&external.owner) {
+            if let Some((result, result_flush)) = internal_results.get(&external.owner) {
                 unifier.unify(Type::Var(*variable), Type::Var(*result));
+                unifier.unify(Type::Var(*flush_variable), Type::Var(*result_flush));
             } else if let Some(interface) = dependency_interfaces.get(&external.owner) {
                 let mut variables = BTreeMap::new();
                 let ty = instantiate_type(&interface.result.ty, &mut unifier, &mut variables);
                 unifier.bind_var(*variable, ty);
+                let flush_type = interface
+                    .result_flush_type
+                    .as_ref()
+                    .map_or(Type::Absent, |ty| {
+                        instantiate_type(ty, &mut unifier, &mut variables)
+                    });
+                unifier.bind_var(*flush_variable, flush_type);
+            } else {
+                unifier.bind_var(*flush_variable, Type::Absent);
             }
             work.cross_owner_constraints = work.cross_owner_constraints.saturating_add(1);
         }
@@ -1805,7 +1972,7 @@ pub fn solve_owner_interface_scc<'a>(
             else {
                 continue;
             };
-            if let Some(result) = internal_results.get(&resolved.owner) {
+            if let Some((result, _)) = internal_results.get(&resolved.owner) {
                 let result = bind_projection(&mut unifier, *result, &resolved.projection);
                 unifier.unify(Type::Var(expression), Type::Var(result));
             } else if let Some(interface) = dependency_interfaces.get(&resolved.owner) {
@@ -1817,6 +1984,53 @@ pub fn solve_owner_interface_scc<'a>(
                 unifier.unify(Type::Var(expression), Type::Var(result));
             }
             work.cross_owner_constraints = work.cross_owner_constraints.saturating_add(1);
+        }
+    }
+
+    // Solve the parallel FLUSH-control graph before publishing boundary result
+    // variables. Static edges come from the owner projection; a call adds its
+    // callee escape through a per-occurrence variable that is instantiated in
+    // the same substitution namespace as the call result below.
+    for state in states.values() {
+        for (index, plan) in state.seed.expression_flush_plans.iter().enumerate() {
+            let mut candidates = Vec::new();
+            candidates.extend(
+                plan.value_inputs
+                    .iter()
+                    .filter_map(|input| expression_variable(state, *input))
+                    .map(Type::Var),
+            );
+            candidates.extend(
+                plan.escape_inputs
+                    .iter()
+                    .filter_map(|input| expression_flush_variable(state, *input))
+                    .map(Type::Var),
+            );
+            candidates.extend(
+                calls
+                    .iter()
+                    .filter(|call| call.caller == state.seed.owner && call.expression == index)
+                    .map(|call| Type::Var(call.flush)),
+            );
+            unifier.bind_var(
+                state.expression_flushes[index],
+                if candidates.is_empty() {
+                    Type::Absent
+                } else {
+                    boon_checked::canonical_union_type(candidates)
+                },
+            );
+        }
+        if let Some(expression) = owner_result_expression(state) {
+            if let Some(boundary) = expression_boundary_variable(state, expression, &mut unifier) {
+                unifier.unify(Type::Var(state.result), Type::Var(boundary));
+            }
+            if let Some(flush) = expression_flush_variable(state, expression) {
+                unifier.unify(Type::Var(state.result_flush), Type::Var(flush));
+            }
+        } else {
+            unifier.bind_var(state.result, Type::Absent);
+            unifier.bind_var(state.result_flush, Type::Absent);
         }
     }
 
@@ -1837,134 +2051,173 @@ pub fn solve_owner_interface_scc<'a>(
             })?;
             let variables = &mut call_variables[call_index];
             let context_variables = &mut call_context_variables[call_index];
-            let (parameters, result, result_mode, context, effect) = if let Some(target) =
-                &call.target
-            {
-                if let Some(callee) = states.get(target) {
-                    let parameters = callee
-                        .parameters
-                        .iter()
-                        .map(|parameter| InstantiatedInterfaceParameter {
-                            name: parameter.name.clone(),
-                            kind: parameter.kind,
-                            ordinal: parameter.ordinal,
-                            ty: instantiate_type(
-                                &unifier.resolve(&Type::Var(parameter.variable)),
+            let (parameters, result, result_flush, result_mode, context, effect, signature_found) =
+                if let Some(target) = &call.target {
+                    if let Some(callee) = states.get(target) {
+                        let parameters = callee
+                            .parameters
+                            .iter()
+                            .map(|parameter| InstantiatedInterfaceParameter {
+                                name: parameter.name.clone(),
+                                kind: parameter.kind,
+                                ordinal: parameter.ordinal,
+                                ty: instantiate_type(
+                                    &unifier.resolve(&Type::Var(parameter.variable)),
+                                    &mut unifier,
+                                    &mut *variables,
+                                ),
+                                requirement: CheckedParameterRequirement::Required,
+                                evaluation_scope: parameter.evaluation_scope,
+                            })
+                            .collect::<Vec<_>>();
+                        let result = instantiate_type(
+                            &unifier.resolve(&Type::Var(callee.result)),
+                            &mut unifier,
+                            &mut *variables,
+                        );
+                        let result_flush = instantiate_type(
+                            &unifier.resolve(&Type::Var(callee.result_flush)),
+                            &mut unifier,
+                            &mut *variables,
+                        );
+                        let context = instantiate_type(
+                            &unifier.resolve(&Type::Var(callee.context)),
+                            &mut unifier,
+                            &mut *context_variables,
+                        );
+                        let result_mode = owner_result_expression(callee)
+                            .map(|expression| {
+                                let raw_mode = callee
+                                    .modes
+                                    .get(expression as usize)
+                                    .copied()
+                                    .flatten()
+                                    .unwrap_or(FlowMode::Continuous);
+                                resolved_expression_boundary(
+                                    callee,
+                                    expression,
+                                    &mut unifier,
+                                    raw_mode,
+                                )
+                                .mode
+                            })
+                            .unwrap_or(FlowMode::Continuous);
+                        (
+                            parameters,
+                            result,
+                            result_flush,
+                            result_mode,
+                            Some(context),
+                            callee.effect,
+                            true,
+                        )
+                    } else if let Some(callee) = dependency_interfaces.get(target) {
+                        let parameters = callee
+                            .parameters
+                            .iter()
+                            .map(|parameter| InstantiatedInterfaceParameter {
+                                name: parameter.name.clone(),
+                                kind: parameter.kind,
+                                ordinal: parameter.ordinal,
+                                ty: instantiate_type(
+                                    &parameter.flow_type.ty,
+                                    &mut unifier,
+                                    &mut *variables,
+                                ),
+                                requirement: parameter.requirement.clone(),
+                                evaluation_scope: parameter.evaluation_scope,
+                            })
+                            .collect();
+                        let result =
+                            instantiate_type(&callee.result.ty, &mut unifier, &mut *variables);
+                        let result_flush = callee
+                            .result_flush_type
+                            .as_ref()
+                            .map_or(Type::Absent, |ty| {
+                                instantiate_type(ty, &mut unifier, &mut *variables)
+                            });
+                        let context = callee.context.as_ref().map(|context| {
+                            instantiate_type(
+                                &context.flow_type.ty,
                                 &mut unifier,
-                                &mut *variables,
-                            ),
-                            evaluation_scope: parameter.evaluation_scope,
-                        })
-                        .collect::<Vec<_>>();
-                    let result = instantiate_type(
-                        &unifier.resolve(&Type::Var(callee.result)),
-                        &mut unifier,
-                        &mut *variables,
-                    );
-                    let context = instantiate_type(
-                        &unifier.resolve(&Type::Var(callee.context)),
-                        &mut unifier,
-                        &mut *context_variables,
-                    );
-                    let result_mode = owner_result_expression(callee)
-                        .and_then(|expression| {
-                            callee.modes.get(expression as usize).copied().flatten()
-                        })
-                        .unwrap_or(FlowMode::Continuous);
-                    (
-                        parameters,
-                        result,
-                        result_mode,
-                        Some(context),
-                        callee.effect,
-                    )
-                } else if let Some(callee) = dependency_interfaces.get(target) {
-                    let parameters = callee
+                                &mut *context_variables,
+                            )
+                        });
+                        (
+                            parameters,
+                            result,
+                            result_flush,
+                            callee.result.mode,
+                            context,
+                            callee.effect,
+                            true,
+                        )
+                    } else {
+                        (
+                            Vec::new(),
+                            Type::Unknown,
+                            Type::Absent,
+                            FlowMode::Continuous,
+                            None,
+                            CheckedEffectSummary::default(),
+                            false,
+                        )
+                    }
+                } else if let Some(signature) = abi.callable(&call.function) {
+                    let parameters = signature
                         .parameters
                         .iter()
-                        .map(|parameter| InstantiatedInterfaceParameter {
+                        .enumerate()
+                        .map(|(ordinal, parameter)| InstantiatedInterfaceParameter {
                             name: parameter.name.clone(),
-                            kind: parameter.kind,
-                            ordinal: parameter.ordinal,
+                            kind: match parameter.kind {
+                                CheckedParameterKind::Value => OwnerParameterKind::Value,
+                                CheckedParameterKind::Out => OwnerParameterKind::Out,
+                            },
+                            ordinal: ordinal as u32,
                             ty: instantiate_type(
                                 &parameter.flow_type.ty,
                                 &mut unifier,
                                 &mut *variables,
                             ),
-                            evaluation_scope: parameter.evaluation_scope,
+                            requirement: parameter.requirement.clone(),
+                            evaluation_scope: match parameter.evaluation_scope {
+                                crate::OwnerAbiEvaluationScope::Parent => {
+                                    OwnerInterfaceEvaluationScope::Parent
+                                }
+                                crate::OwnerAbiEvaluationScope::Output { parameter_ordinal } => {
+                                    OwnerInterfaceEvaluationScope::Output { parameter_ordinal }
+                                }
+                            },
                         })
                         .collect();
-                    let result = instantiate_type(&callee.result.ty, &mut unifier, &mut *variables);
-                    let context = callee.context.as_ref().map(|context| {
-                        instantiate_type(
-                            &context.flow_type.ty,
-                            &mut unifier,
-                            &mut *context_variables,
-                        )
-                    });
+                    let result =
+                        instantiate_type(&signature.result.ty, &mut unifier, &mut *variables);
                     (
                         parameters,
                         result,
-                        callee.result.mode,
-                        context,
-                        callee.effect,
+                        Type::Absent,
+                        signature.result.mode,
+                        None,
+                        signature.effect,
+                        true,
                     )
                 } else {
                     (
                         Vec::new(),
                         Type::Unknown,
+                        Type::Absent,
                         FlowMode::Continuous,
                         None,
                         CheckedEffectSummary::default(),
+                        false,
                     )
-                }
-            } else if let Some(signature) = abi.callable(&call.function) {
-                let parameters = signature
-                    .parameters
-                    .iter()
-                    .enumerate()
-                    .map(|(ordinal, parameter)| InstantiatedInterfaceParameter {
-                        name: parameter.name.clone(),
-                        kind: match parameter.kind {
-                            CheckedParameterKind::Value => OwnerParameterKind::Value,
-                            CheckedParameterKind::Out => OwnerParameterKind::Out,
-                        },
-                        ordinal: ordinal as u32,
-                        ty: instantiate_type(
-                            &parameter.flow_type.ty,
-                            &mut unifier,
-                            &mut *variables,
-                        ),
-                        evaluation_scope: match parameter.evaluation_scope {
-                            crate::OwnerAbiEvaluationScope::Parent => {
-                                OwnerInterfaceEvaluationScope::Parent
-                            }
-                            crate::OwnerAbiEvaluationScope::Output { parameter_ordinal } => {
-                                OwnerInterfaceEvaluationScope::Output { parameter_ordinal }
-                            }
-                        },
-                    })
-                    .collect();
-                let result = instantiate_type(&signature.result.ty, &mut unifier, &mut *variables);
-                (
-                    parameters,
-                    result,
-                    signature.result.mode,
-                    None,
-                    signature.effect,
-                )
-            } else {
-                (
-                    Vec::new(),
-                    Type::Unknown,
-                    FlowMode::Continuous,
-                    None,
-                    CheckedEffectSummary::default(),
-                )
-            };
+                };
+            let call_valid = signature_found
+                && interface_call_shape_is_valid(call, &parameters, call.target.is_none());
 
             let mut evaluation_scope_updates = Vec::new();
-            for parameter in &parameters {
+            for parameter in parameters.iter().filter(|_| call_valid) {
                 let OwnerInterfaceEvaluationScope::Output {
                     parameter_ordinal: output_ordinal,
                 } = parameter.evaluation_scope
@@ -2002,10 +2255,13 @@ pub fn solve_owner_interface_scc<'a>(
                         | OwnerConstraintEdgeRole::PipePass { .. }
                 )
             });
-            if !has_explicit_pass && let Some(context) = &context {
+            if call_valid
+                && !has_explicit_pass
+                && let Some(context) = &context
+            {
                 unifier.unify(Type::Var(caller.context), context.clone());
             }
-            if let Some(field) = call.function.strip_prefix("Field/") {
+            if call_valid && let Some(field) = call.function.strip_prefix("Field/") {
                 if let Some((_, input)) = call
                     .inputs
                     .iter()
@@ -2018,7 +2274,7 @@ pub fn solve_owner_interface_scc<'a>(
             } else {
                 unifier.bind_var(call_variable, result);
             }
-            for (role, input) in &call.inputs {
+            for (role, input) in call.inputs.iter().filter(|_| call_valid) {
                 let Some(input) = expression_variable(caller, *input) else {
                     continue;
                 };
@@ -2031,8 +2287,8 @@ pub fn solve_owner_interface_scc<'a>(
                             unifier.unify(Type::Var(input), expected.ty.clone());
                         }
                     }
-                    OwnerConstraintEdgeRole::CallArgument { kind, name }
-                    | OwnerConstraintEdgeRole::PipeArgument { kind, name } => {
+                    OwnerConstraintEdgeRole::CallArgument { kind, name, .. }
+                    | OwnerConstraintEdgeRole::PipeArgument { kind, name, .. } => {
                         if let Some(parameter) =
                             parameters.iter().find(|parameter| parameter.name == *name)
                         {
@@ -2055,8 +2311,18 @@ pub fn solve_owner_interface_scc<'a>(
                     _ => {}
                 }
             }
+            unifier.bind_var(
+                call.flush,
+                if call_valid {
+                    result_flush
+                } else {
+                    Type::Absent
+                },
+            );
             if let Some(state) = states.get_mut(&call.caller) {
-                state.effect = merge_effects(state.effect, effect);
+                if call_valid {
+                    state.effect = merge_effects(state.effect, effect);
+                }
                 state.modes[call.expression] =
                     flow_mode_join(state.modes[call.expression], Some(result_mode));
                 for (ordinal, incoming) in evaluation_scope_updates {
@@ -2124,18 +2390,31 @@ pub fn solve_owner_interface_scc<'a>(
                 }
             })
             .collect::<Vec<_>>();
-        let result_ty = unifier.resolve(&Type::Var(state.result));
-        let result_mode = owner_result_expression(state)
+        let result_expression = owner_result_expression(state);
+        let raw_result_mode = result_expression
             .and_then(|expression| {
                 ((expression as usize) < state.expressions.len())
                     .then(|| state.modes[expression as usize])
                     .flatten()
             })
             .unwrap_or(FlowMode::Continuous);
+        let resolved_result = result_expression.map_or(
+            FlowType {
+                mode: FlowMode::Continuous,
+                ty: Type::Absent,
+            },
+            |expression| {
+                resolved_expression_boundary(state, expression, &mut unifier, raw_result_mode)
+            },
+        );
+        let resolved_result_flush_type = result_expression
+            .and_then(|expression| resolved_expression_flush_type(state, expression, &mut unifier));
         let result = FlowType {
-            mode: result_mode,
-            ty: alpha_normalize_type(&result_ty, &mut alpha_variables, &mut next_alpha),
+            mode: resolved_result.mode,
+            ty: alpha_normalize_type(&resolved_result.ty, &mut alpha_variables, &mut next_alpha),
         };
+        let result_flush_type = resolved_result_flush_type
+            .map(|ty| alpha_normalize_type(&ty, &mut alpha_variables, &mut next_alpha));
         let context_ty = unifier.resolve(&Type::Var(state.context));
         let context = (!matches!(context_ty, Type::Var(_) | Type::Unknown)).then(|| {
             let flow_type = FlowType {
@@ -2163,6 +2442,9 @@ pub fn solve_owner_interface_scc<'a>(
             collect_type_variables(&parameter.flow_type.ty, &mut type_variables);
         }
         collect_type_variables(&result.ty, &mut type_variables);
+        if let Some(flush_type) = &result_flush_type {
+            collect_type_variables(flush_type, &mut type_variables);
+        }
         if let Some(context) = &context {
             collect_type_variables(&context.flow_type.ty, &mut type_variables);
         }
@@ -2177,6 +2459,7 @@ pub fn solve_owner_interface_scc<'a>(
             names: state.names.clone(),
             parameters: parameters.into_boxed_slice(),
             result,
+            result_flush_type,
             result_transfer,
             context,
             effect: state.effect,
@@ -2490,6 +2773,27 @@ mod tests {
         assert_eq!(interface.parameters[0].flow_type.ty, Type::Number);
         assert_eq!(interface.result.ty, Type::Number);
         assert!(interface.type_variables.is_empty());
+    }
+
+    #[test]
+    fn flush_control_is_frozen_separately_and_unionized_at_callable_boundary() {
+        let source = "FUNCTION stop() {\n    FLUSH { Error }\n}\n";
+        assert_checked_interface_parity(source, "stop");
+        let unit = link(source);
+        let owner = owner_named(&unit, "stop");
+        let seed = seed(&unit, &owner);
+        let summary = resolve_owner_constraint_seed(&seed, []).unwrap();
+        let results = solve(&[seed], &[summary]);
+        let interface = results[0].owner(&owner).unwrap();
+        let error = Type::VariantSet(vec![Variant::Tag("Error".to_owned())].into());
+        assert_eq!(interface.result_flush_type, Some(error.clone()));
+        assert_eq!(
+            interface.result,
+            FlowType {
+                mode: FlowMode::Continuous,
+                ty: error,
+            }
+        );
     }
 
     #[test]

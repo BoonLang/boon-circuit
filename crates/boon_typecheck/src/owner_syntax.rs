@@ -55,11 +55,12 @@ pub struct OwnerExpressionInput {
     pub kind: AstExprKind,
 }
 
-/// A reference from this owner's retained syntax into a descendant owner.
+/// A reference from this owner's retained syntax across an owner boundary.
 ///
-/// The syntax expression identity and its owning shard are both stable across
-/// revisions. The child body is deliberately absent, so changing that body
-/// cannot change the parent owner's syntax fingerprint.
+/// Ordinary structural references point into descendant owners. A normalized
+/// pipeline `linked_input` may instead point into an enclosing owner (notably a
+/// `HOLD` initializer). The syntax expression identity and its owning shard are
+/// both stable across revisions; the other body is deliberately absent.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct OwnerExternalExpressionInput {
     pub owner: StableCheckOwnerKey,
@@ -251,16 +252,33 @@ impl<'a> ExpressionProjection<'a> {
         }
     }
 
-    fn mapped(
+    fn mapped_with_enclosing(
         &mut self,
         expression: usize,
         context: &str,
+        allow_enclosing: bool,
     ) -> Result<u32, OwnerSyntaxProjectionError> {
         if let Some(local) = self.local_by_syntax.get(&expression) {
             return Ok(*local);
         }
         if let Some(external) = self.external_by_syntax.get(&expression) {
-            return Ok(*external);
+            let external_index = (*external as usize)
+                .checked_sub(self.local_by_syntax.len())
+                .and_then(|index| self.external_expressions.get(index))
+                .ok_or_else(|| {
+                    OwnerSyntaxProjectionError::new(
+                        "owner external-expression interner is inconsistent",
+                    )
+                })?;
+            let permitted = is_descendant_owner(self.owner, &external_index.owner)
+                || (allow_enclosing && is_descendant_owner(&external_index.owner, self.owner));
+            if permitted {
+                return Ok(*external);
+            }
+            return Err(OwnerSyntaxProjectionError::new(format!(
+                "owner {:?} {context} references expression {expression} owned outside its permitted boundary by {:?}",
+                self.owner, external_index.owner
+            )));
         }
         let external_owner = self
             .view
@@ -271,9 +289,11 @@ impl<'a> ExpressionProjection<'a> {
                     self.owner
                 ))
             })?;
-        if !is_descendant_owner(self.owner, &external_owner) {
+        let permitted = is_descendant_owner(self.owner, &external_owner)
+            || (allow_enclosing && is_descendant_owner(&external_owner, self.owner));
+        if !permitted {
             return Err(OwnerSyntaxProjectionError::new(format!(
-                "owner {:?} {context} references expression {expression} owned outside its descendants by {external_owner:?}",
+                "owner {:?} {context} references expression {expression} owned outside its permitted boundary by {external_owner:?}",
                 self.owner
             )));
         }
@@ -301,6 +321,22 @@ impl<'a> ExpressionProjection<'a> {
             });
         self.external_by_syntax.insert(expression, reference);
         Ok(reference)
+    }
+
+    fn mapped(
+        &mut self,
+        expression: usize,
+        context: &str,
+    ) -> Result<u32, OwnerSyntaxProjectionError> {
+        self.mapped_with_enclosing(expression, context, false)
+    }
+
+    fn mapped_linked_input(
+        &mut self,
+        expression: usize,
+        context: &str,
+    ) -> Result<u32, OwnerSyntaxProjectionError> {
+        self.mapped_with_enclosing(expression, context, true)
     }
 
     fn remap(
@@ -883,7 +919,7 @@ pub fn project_owner_syntax_input(
         );
         let linked_input = expression
             .linked_input
-            .map(|input| expression_projection.mapped(input, "linked input"))
+            .map(|input| expression_projection.mapped_linked_input(input, "linked input"))
             .transpose()?;
         let mut kind = expression.kind.clone();
         normalize_expression_kind(

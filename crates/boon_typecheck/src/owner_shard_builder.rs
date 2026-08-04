@@ -21,15 +21,16 @@ use boon_checked::{
     OwnerCallContextRow, OwnerCallEntry, OwnerCallId, OwnerCallResultPathRow, OwnerCallRow,
     OwnerCallableContextRow, OwnerCallableRow, OwnerCheckedReceiptSet, OwnerCheckedRowDomain,
     OwnerContextBinding, OwnerContextFormalId, OwnerContextFormalRef, OwnerContextFormalRow,
-    OwnerDeclarationId, OwnerDeclarationRef, OwnerDeclarationRow, OwnerDeclarationStableKey,
-    OwnerEvaluationScope, OwnerExpressionId, OwnerExpressionKind, OwnerExpressionRef,
-    OwnerExpressionRow, OwnerInterfaceMemberRef, OwnerListId, OwnerListRow, OwnerOccurrenceRow,
-    OwnerParameterRow, OwnerPatternBindingRow, OwnerRecordField, OwnerRelocationTarget,
-    OwnerResourceBinding, OwnerResourceProjectionSeedRow, OwnerScopeId, OwnerScopeRef,
-    OwnerScopeRow, OwnerScopeStableKey, OwnerSemanticPath, OwnerSourceId, OwnerSourceRow,
-    OwnerSourceSite, OwnerSourceStableKey, OwnerStateId, OwnerStateRow, OwnerStatementChild,
-    OwnerStatementId, OwnerStatementKind, OwnerStatementRow, OwnerStatementScopeRole,
-    OwnerTextSegment, OwnerTypeSubstitution, ProgramRole, SemanticOccurrenceKind, Type, Variant,
+    OwnerContextTypeSubstitution, OwnerDeclarationId, OwnerDeclarationRef, OwnerDeclarationRow,
+    OwnerDeclarationStableKey, OwnerEvaluationScope, OwnerExpressionId, OwnerExpressionKind,
+    OwnerExpressionRef, OwnerExpressionRow, OwnerInterfaceMemberRef, OwnerListId, OwnerListRow,
+    OwnerOccurrenceRow, OwnerParameterRow, OwnerPatternBindingRow, OwnerRecordField,
+    OwnerRelocationTarget, OwnerResourceBinding, OwnerResourceProjectionSeedRow, OwnerScopeId,
+    OwnerScopeRef, OwnerScopeRow, OwnerScopeStableKey, OwnerSemanticPath, OwnerSourceId,
+    OwnerSourceRow, OwnerSourceSite, OwnerSourceStableKey, OwnerStateId, OwnerStateRow,
+    OwnerStatementChild, OwnerStatementId, OwnerStatementKind, OwnerStatementRow,
+    OwnerStatementScopeRole, OwnerTextSegment, OwnerTypeSubstitution, ProgramRole,
+    SemanticOccurrenceKind, Type, Variant,
 };
 use boon_data::{Bits, ExactNumber};
 use boon_syntax::{
@@ -171,6 +172,136 @@ fn validate_inputs(
     Ok(())
 }
 
+fn validated_frozen_interfaces<'a>(
+    body: &OwnerBodyInferenceShard,
+    own_scc: &'a OwnerInterfaceSccResult,
+    imported_sccs: impl IntoIterator<Item = &'a OwnerInterfaceSccResult>,
+) -> Result<BTreeMap<StableCheckOwnerKey, &'a OwnerPublicInterface>, CheckedOwnerBuildError> {
+    let mut expected = BTreeMap::new();
+    if expected
+        .insert(body.basis.own_scc.key.clone(), &body.basis.own_scc)
+        .is_some()
+    {
+        return Err(CheckedOwnerBuildError::new(
+            "checked owner body repeats its own frozen interface SCC",
+        ));
+    }
+    for frozen in &body.basis.imports {
+        if expected.insert(frozen.key.clone(), frozen).is_some() {
+            return Err(CheckedOwnerBuildError::new(format!(
+                "checked owner body repeats frozen interface SCC {:?}",
+                frozen.key
+            )));
+        }
+    }
+
+    if own_scc.key != body.basis.own_scc.key {
+        return Err(CheckedOwnerBuildError::new(format!(
+            "checked owner {:?} received the wrong own interface SCC",
+            body.owner()
+        )));
+    }
+    let mut actual = BTreeMap::new();
+    actual.insert(own_scc.key.clone(), own_scc);
+    for result in imported_sccs {
+        if actual.insert(result.key.clone(), result).is_some() {
+            return Err(CheckedOwnerBuildError::new(format!(
+                "checked owner {:?} received duplicate interface SCC {:?}",
+                body.owner(),
+                result.key
+            )));
+        }
+    }
+    if actual.keys().collect::<Vec<_>>() != expected.keys().collect::<Vec<_>>() {
+        return Err(CheckedOwnerBuildError::new(format!(
+            "checked owner {:?} did not receive its exact frozen interface SCC set",
+            body.owner()
+        )));
+    }
+
+    let mut expected_owners = BTreeSet::new();
+    for (key, frozen) in &expected {
+        let result = actual[key];
+        if result.fingerprint_v1() != frozen.result_fingerprint_v1
+            || result.type_variable_count != frozen.type_variable_count
+        {
+            return Err(CheckedOwnerBuildError::new(format!(
+                "checked owner {:?} interface SCC {key:?} differs from its frozen body basis",
+                body.owner()
+            )));
+        }
+        let mut referenced = BTreeSet::new();
+        for owner in &frozen.referenced_owners {
+            if !referenced.insert(owner.clone())
+                || !key.members.contains(owner)
+                || result.owner(owner).is_none()
+            {
+                return Err(CheckedOwnerBuildError::new(format!(
+                    "checked owner {:?} has an invalid frozen interface member {owner:?}",
+                    body.owner()
+                )));
+            }
+            if !expected_owners.insert(owner.clone()) {
+                return Err(CheckedOwnerBuildError::new(format!(
+                    "checked owner {:?} freezes interface {owner:?} through multiple SCCs",
+                    body.owner()
+                )));
+            }
+        }
+    }
+
+    let mut imports = BTreeMap::new();
+    for import in &body.interface_imports {
+        if imports.insert(import.owner.clone(), import).is_some() {
+            return Err(CheckedOwnerBuildError::new(format!(
+                "checked owner {:?} repeats interface import {:?}",
+                body.owner(),
+                import.owner
+            )));
+        }
+    }
+    if imports.keys().cloned().collect::<BTreeSet<_>>() != expected_owners {
+        return Err(CheckedOwnerBuildError::new(format!(
+            "checked owner {:?} interface imports differ from its frozen SCC members",
+            body.owner()
+        )));
+    }
+
+    let mut interfaces = BTreeMap::new();
+    for (owner, import) in imports {
+        let result = actual.get(&import.provider_scc).copied().ok_or_else(|| {
+            CheckedOwnerBuildError::new(format!(
+                "checked owner {:?} import {owner:?} has no frozen provider SCC",
+                body.owner()
+            ))
+        })?;
+        if result.fingerprint_v1() != import.provider_fingerprint_v1
+            || result.type_variable_count != import.provider_type_variable_count
+        {
+            return Err(CheckedOwnerBuildError::new(format!(
+                "checked owner {:?} import {owner:?} has a stale provider SCC",
+                body.owner()
+            )));
+        }
+        let interface = result.owner(&owner).ok_or_else(|| {
+            CheckedOwnerBuildError::new(format!(
+                "checked owner {:?} provider does not publish interface {owner:?}",
+                body.owner()
+            ))
+        })?;
+        let fingerprint = crate::owner_body::owner_body_interface_fingerprint_v1(interface)
+            .map_err(|error| CheckedOwnerBuildError::new(error.to_string()))?;
+        if fingerprint != import.interface_fingerprint_v1 {
+            return Err(CheckedOwnerBuildError::new(format!(
+                "checked owner {:?} interface {owner:?} differs from the inferred body import",
+                body.owner()
+            )));
+        }
+        interfaces.insert(owner, interface);
+    }
+    Ok(interfaces)
+}
+
 #[derive(Clone)]
 struct ScopeSpec {
     stable_key: OwnerScopeStableKey,
@@ -217,6 +348,7 @@ struct PreparedCallTarget {
     intrinsic: Option<CheckedIntrinsicV1>,
     parameters: Vec<PreparedCallParameter>,
     contexts: Vec<PreparedCallContext>,
+    context_formal: Option<OwnerContextFormalRef>,
     requires_pass: bool,
     role: ProgramRole,
 }
@@ -256,7 +388,9 @@ struct OwnerRowConstruction<'a> {
     call_ids: BTreeMap<StableExpressionKey, OwnerCallId>,
     call_rows: Vec<OwnerCallRow>,
     call_context_rows: Vec<OwnerCallContextRow>,
+    expression_call_contexts: BTreeMap<OwnerExpressionId, BTreeMap<String, OwnerDeclarationId>>,
     call_occurrences: Vec<OwnerOccurrenceRow>,
+    diagnostics: Vec<crate::OwnerDiagnosticTemplate>,
 }
 
 impl<'a> OwnerRowConstruction<'a> {
@@ -308,7 +442,9 @@ impl<'a> OwnerRowConstruction<'a> {
             call_ids: BTreeMap::new(),
             call_rows: Vec::new(),
             call_context_rows: Vec::new(),
+            expression_call_contexts: BTreeMap::new(),
             call_occurrences: Vec::new(),
+            diagnostics: body.diagnostics.to_vec(),
         };
         construction.reserve_authored_declarations()?;
         construction.reserve_lexical_scopes()?;
@@ -544,6 +680,14 @@ impl<'a> OwnerRowConstruction<'a> {
                     .and_then(|value| self.expression_flow_type(value))
                     .unwrap_or_else(unknown_flow_type)
             };
+            let flow_type = if declaration.kind == OwnerDeclarationKind::Function {
+                flow_type
+            } else {
+                value
+                    .as_ref()
+                    .map(|value| self.finalize_declaration_flow_type(value, flow_type.clone()))
+                    .unwrap_or(flow_type)
+            };
             self.define_declaration(
                 id,
                 DeclarationSpec {
@@ -618,6 +762,29 @@ impl<'a> OwnerRowConstruction<'a> {
                 .get(owner)
                 .map(|interface| interface.result.clone()),
         }
+    }
+
+    fn finalize_declaration_flow_type(
+        &self,
+        reference: &OwnerExpressionRef,
+        mut flow_type: FlowType,
+    ) -> FlowType {
+        let OwnerExpressionRef::Local { expression } = reference else {
+            return flow_type;
+        };
+        let Some(flush_type) = self
+            .body
+            .expressions
+            .get(expression.0 as usize)
+            .and_then(|expression| expression.flush_type.as_ref())
+        else {
+            return flow_type;
+        };
+        flow_type.ty = crate::union_structural_type(&flow_type.ty, flush_type);
+        if flow_type.mode == FlowMode::Absent {
+            flow_type.mode = FlowMode::Continuous;
+        }
+        flow_type
     }
 
     fn lexical_declaration_for_scope(&self, scope: &OwnerScopeRef) -> Option<OwnerDeclarationRef> {
@@ -916,6 +1083,17 @@ impl<'a> OwnerRowConstruction<'a> {
                     intrinsic: None,
                     parameters,
                     contexts: Vec::new(),
+                    context_formal: interface.context.as_ref().map(|_| {
+                        if owner == &self.syntax.owner {
+                            OwnerContextFormalRef::Local {
+                                formal: OwnerContextFormalId(0),
+                            }
+                        } else {
+                            OwnerContextFormalRef::Imported {
+                                owner: owner.clone(),
+                            }
+                        }
+                    }),
                     requires_pass: interface.context.is_some(),
                     role: self.abi.role,
                 }))
@@ -971,6 +1149,7 @@ impl<'a> OwnerRowConstruction<'a> {
                             flow_type: context.flow_type.clone(),
                         })
                         .collect(),
+                    context_formal: None,
                     requires_pass: false,
                     role: contract.role,
                 }))
@@ -1010,8 +1189,105 @@ impl<'a> OwnerRowConstruction<'a> {
         Ok(local_declaration_ref(declaration))
     }
 
+    fn body_calls_outer_first(&self) -> Result<Vec<InferredOwnerCall>, CheckedOwnerBuildError> {
+        let calls = self.body.calls.iter().cloned().collect::<Vec<_>>();
+        let expression_indexes = self
+            .syntax
+            .expressions
+            .iter()
+            .enumerate()
+            .map(|(index, expression)| {
+                Ok((
+                    expression.stable_key.clone(),
+                    OwnerExpressionId(checked_u32(index, "owner call expression")?),
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>, CheckedOwnerBuildError>>()?;
+        let mut call_by_expression = BTreeMap::new();
+        for (call_index, call) in calls.iter().enumerate() {
+            let expression = expression_indexes
+                .get(&call.expression)
+                .copied()
+                .ok_or_else(|| {
+                    CheckedOwnerBuildError::new(format!(
+                        "owner call `{}` has no local expression",
+                        call.function
+                    ))
+                })?;
+            call_by_expression.insert(expression, call_index);
+        }
+
+        let mut children = vec![BTreeSet::new(); calls.len()];
+        let mut indegree = vec![0usize; calls.len()];
+        for (outer, call) in calls.iter().enumerate() {
+            let root = *expression_indexes.get(&call.expression).ok_or_else(|| {
+                CheckedOwnerBuildError::new("owner call expression index disappeared")
+            })?;
+            let mut pending = self
+                .graph
+                .expression_inputs(root)
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|input| match input {
+                    OwnerExpressionRef::Local { expression } => Some(*expression),
+                    OwnerExpressionRef::Child { .. } => None,
+                })
+                .collect::<Vec<_>>();
+            let mut visited = BTreeSet::new();
+            while let Some(expression) = pending.pop() {
+                if !visited.insert(expression) {
+                    continue;
+                }
+                if let Some(inner) = call_by_expression.get(&expression).copied()
+                    && inner != outer
+                {
+                    if children[outer].insert(inner) {
+                        indegree[inner] = indegree[inner].saturating_add(1);
+                    }
+                    continue;
+                }
+                pending.extend(
+                    self.graph
+                        .expression_inputs(expression)
+                        .unwrap_or_default()
+                        .iter()
+                        .filter_map(|input| match input {
+                            OwnerExpressionRef::Local { expression } => Some(*expression),
+                            OwnerExpressionRef::Child { .. } => None,
+                        }),
+                );
+            }
+        }
+
+        let mut ready = indegree
+            .iter()
+            .enumerate()
+            .filter(|(_, degree)| **degree == 0)
+            .map(|(index, _)| (calls[index].expression.clone(), index))
+            .collect::<BTreeSet<_>>();
+        let mut ordered = Vec::with_capacity(calls.len());
+        while let Some((key, index)) = ready.pop_first() {
+            let _ = key;
+            ordered.push(calls[index].clone());
+            for child in &children[index] {
+                indegree[*child] = indegree[*child].checked_sub(1).ok_or_else(|| {
+                    CheckedOwnerBuildError::new("owner call containment indegree underflowed")
+                })?;
+                if indegree[*child] == 0 {
+                    ready.insert((calls[*child].expression.clone(), *child));
+                }
+            }
+        }
+        if ordered.len() != calls.len() {
+            return Err(CheckedOwnerBuildError::new(
+                "owner call containment graph contains a cycle",
+            ));
+        }
+        Ok(ordered)
+    }
+
     fn prepare_calls(&mut self) -> Result<(), CheckedOwnerBuildError> {
-        for call in self.body.calls.iter().cloned() {
+        for call in self.body_calls_outer_first()? {
             let Some(target) = self.prepare_call_target(&call)? else {
                 continue;
             };
@@ -1028,21 +1304,22 @@ impl<'a> OwnerRowConstruction<'a> {
                 })?;
             let expression_id =
                 OwnerExpressionId(checked_u32(expression, "owner call expression")?);
-            let call_id = OwnerCallId(checked_u32(self.call_rows.len(), "owner call id")?);
-            if self
-                .call_ids
-                .insert(call.expression.clone(), call_id)
-                .is_some()
-            {
-                return Err(CheckedOwnerBuildError::new(
-                    "owner body contains duplicate call expression identity",
-                ));
-            }
+            let matched_parameters = shape_valid_parameter_ordinals(&call, &target.parameters);
+            let mut publish_call = call.valid;
 
             let mut entries = Vec::new();
             let mut values_by_formal = BTreeMap::<u32, OwnerExpressionRef>::new();
             let mut output_bindings = BTreeMap::<u32, (OwnerDeclarationId, OwnerScopeId)>::new();
             for parameter in &target.parameters {
+                if !matched_parameters.contains(&parameter.ordinal) {
+                    if parameter.requirement.is_optional() || !call.valid {
+                        continue;
+                    }
+                    return Err(CheckedOwnerBuildError::new(format!(
+                        "owner call `{}` lost required input `{}` after body validation",
+                        call.function, parameter.name
+                    )));
+                }
                 let Some((input, from_pipe, argument_kind)) =
                     call_input_for_parameter(&call, parameter, &target.parameters)
                 else {
@@ -1165,36 +1442,77 @@ impl<'a> OwnerRowConstruction<'a> {
                         }
                     }
                     (CheckedParameterKind::Out, OwnerArgumentKind::Named) => {
-                        let argument_source = call_argument_source(&call, parameter)?.ok_or_else(
-                            || {
-                                CheckedOwnerBuildError::new(format!(
-                                    "owner call `{}` has no stable argument site for forwarded OUT `{}`",
-                                    call.function, parameter.name
-                                ))
-                            },
-                        )?;
-                        let target_name = self.single_expression_name(&value).ok_or_else(|| {
-                            CheckedOwnerBuildError::new(format!(
-                                "forwarded OUT `{}` does not name one binding",
-                                parameter.name
-                            ))
+                        let argument_source = call_argument_source(&call, parameter)?;
+                        let target_name = self.single_expression_name(&value);
+                        let target_declaration = match (&value, target_name.as_deref()) {
+                            (OwnerExpressionRef::Local { expression }, Some(name)) => self
+                                .local_declaration_for_name(*expression, name)
+                                .filter(|declaration| {
+                                    self.declaration_specs
+                                        .get(declaration.0 as usize)
+                                        .and_then(Option::as_ref)
+                                        .is_some_and(|declaration| {
+                                            matches!(
+                                                declaration.kind,
+                                                CheckedDeclarationKind::OutParameter
+                                                    | CheckedDeclarationKind::FreshOut
+                                            )
+                                        })
+                                }),
+                            _ => None,
+                        };
+                        let Some(target_declaration) = target_declaration else {
+                            let (code, message) = target_name.map_or_else(
+                                || {
+                                    (
+                                        "invalid_forward_out_target",
+                                        format!(
+                                            "output parameter `{}` must be bare for a fresh output or name one existing OUT",
+                                            parameter.name
+                                        ),
+                                    )
+                                },
+                                |name| {
+                                    (
+                                        "missing_enclosing_out",
+                                        format!(
+                                            "no enclosing OUT named `{name}` exists for output parameter `{}`",
+                                            parameter.name
+                                        ),
+                                    )
+                                },
+                            );
+                            self.diagnostics.push(crate::OwnerDiagnosticTemplate {
+                                severity: boon_checked::DiagnosticSeverity::Error,
+                                code: code.to_owned(),
+                                message,
+                                site: OwnerSourceAnchorSite::Expression {
+                                    expression: call.expression.clone(),
+                                },
+                                role: call_argument_anchor_role(&call, parameter),
+                            });
+                            publish_call = false;
+                            continue;
+                        };
+                        let target_name = target_name.ok_or_else(|| {
+                            CheckedOwnerBuildError::new(
+                                "validated forwarded OUT lost its binding name",
+                            )
                         })?;
-                        let target_declaration = self
-                            .own_interface
-                            .parameters
-                            .iter()
-                            .find(|candidate| {
-                                candidate.kind == OwnerParameterKind::Out
-                                    && candidate.name == target_name
-                            })
-                            .and_then(|candidate| {
-                                self.parameter_declarations.get(&candidate.ordinal).copied()
-                            })
-                            .ok_or_else(|| {
-                                CheckedOwnerBuildError::new(format!(
-                                    "forwarded OUT `{target_name}` has no enclosing formal"
-                                ))
-                            })?;
+                        let Some(argument_source) = argument_source else {
+                            return Err(CheckedOwnerBuildError::new(format!(
+                                "owner call `{}` has no stable argument site for forwarded OUT `{}`",
+                                call.function, parameter.name
+                            )));
+                        };
+                        if let Some(scope) = self
+                            .declaration_specs
+                            .get(target_declaration.0 as usize)
+                            .and_then(Option::as_ref)
+                            .and_then(|declaration| declaration.body_scope)
+                        {
+                            output_bindings.insert(parameter.ordinal, (target_declaration, scope));
+                        }
                         self.call_occurrences.push(OwnerOccurrenceRow {
                             target: local_declaration_ref(target_declaration),
                             kind: SemanticOccurrenceKind::ForwardOut,
@@ -1242,11 +1560,26 @@ impl<'a> OwnerRowConstruction<'a> {
                 }
             }
 
+            if !publish_call {
+                continue;
+            }
+            let call_id = OwnerCallId(checked_u32(self.call_rows.len(), "owner call id")?);
+            if self
+                .call_ids
+                .insert(call.expression.clone(), call_id)
+                .is_some()
+            {
+                return Err(CheckedOwnerBuildError::new(
+                    "owner body contains duplicate call expression identity",
+                ));
+            }
+
             let mut contexts = Vec::new();
             for (context_ordinal, context) in target.contexts.iter().enumerate() {
-                if !values_by_formal.contains_key(&context.provider_ordinal) {
+                let Some(provider_value) = values_by_formal.get(&context.provider_ordinal).cloned()
+                else {
                     continue;
-                }
+                };
                 let ordinal = checked_u32(context_ordinal, "owner call context ordinal")?;
                 let declaration_key = OwnerDeclarationStableKey::CallContext {
                     call: call.expression.clone(),
@@ -1290,6 +1623,14 @@ impl<'a> OwnerRowConstruction<'a> {
                     context_ordinal: ordinal,
                     scope_id: scope,
                 });
+                for entry in &entries {
+                    let OwnerCallEntry::Input { value, .. } = entry else {
+                        continue;
+                    };
+                    if value != &provider_value {
+                        self.assign_expression_call_context(value, &context.name, declaration);
+                    }
+                }
             }
 
             let explicit_pass = call.inputs.iter().find_map(|input| {
@@ -1347,6 +1688,24 @@ impl<'a> OwnerRowConstruction<'a> {
                     source,
                 });
             }
+            let contextual_substitutions = target
+                .context_formal
+                .as_ref()
+                .into_iter()
+                .flat_map(|formal| {
+                    call.type_substitutions
+                        .iter()
+                        .filter(|substitution| {
+                            call.contextual_type_variables
+                                .contains(&substitution.variable)
+                        })
+                        .map(move |substitution| OwnerContextTypeSubstitution {
+                            formal: formal.clone(),
+                            variable: substitution.variable,
+                            value: substitution.value.clone(),
+                        })
+                })
+                .collect();
             self.call_rows.push(OwnerCallRow {
                 id: call_id,
                 stable_key: call.expression.clone(),
@@ -1358,7 +1717,7 @@ impl<'a> OwnerRowConstruction<'a> {
                 entries,
                 contexts,
                 context_binding,
-                contextual_substitutions: Vec::new(),
+                contextual_substitutions,
                 type_substitutions: call
                     .type_substitutions
                     .iter()
@@ -1374,6 +1733,38 @@ impl<'a> OwnerRowConstruction<'a> {
             });
         }
         Ok(())
+    }
+
+    fn assign_expression_call_context(
+        &mut self,
+        root: &OwnerExpressionRef,
+        name: &str,
+        declaration: OwnerDeclarationId,
+    ) {
+        let OwnerExpressionRef::Local { expression } = root else {
+            return;
+        };
+        let mut pending = vec![*expression];
+        let mut visited = BTreeSet::new();
+        while let Some(expression) = pending.pop() {
+            if !visited.insert(expression) {
+                continue;
+            }
+            self.expression_call_contexts
+                .entry(expression)
+                .or_default()
+                .insert(name.to_owned(), declaration);
+            pending.extend(
+                self.graph
+                    .expression_inputs(expression)
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(|input| match input {
+                        OwnerExpressionRef::Local { expression } => Some(*expression),
+                        OwnerExpressionRef::Child { .. } => None,
+                    }),
+            );
+        }
     }
 
     fn rebase_expression_tree(
@@ -2526,6 +2917,33 @@ impl<'a> OwnerRowConstruction<'a> {
         })
     }
 
+    fn normalize_source_ref(
+        &self,
+        source: &boon_checked::OwnerSourceRef,
+        rows: &CheckedOwnerRows,
+        relocations: &mut Vec<OwnerRelocationTarget>,
+    ) -> Result<Value, CheckedOwnerBuildError> {
+        Ok(match source {
+            boon_checked::OwnerSourceRef::Local { source } => {
+                let stable_key = &rows
+                    .sources
+                    .get(source.0 as usize)
+                    .filter(|row| row.id == *source)
+                    .ok_or_else(|| {
+                        CheckedOwnerBuildError::new("owner source read seed is missing")
+                    })?
+                    .stable_key;
+                json!({"kind": "local", "source": stable_key})
+            }
+            boon_checked::OwnerSourceRef::Imported { source } => {
+                relocations.push(OwnerRelocationTarget::Source {
+                    source: source.clone(),
+                });
+                json!({"kind": "imported", "source": source})
+            }
+        })
+    }
+
     fn normalize_record_fields(
         &self,
         fields: &[OwnerRecordField],
@@ -2552,6 +2970,7 @@ impl<'a> OwnerRowConstruction<'a> {
     fn normalize_expression_kind(
         &self,
         kind: &OwnerExpressionKind,
+        rows: &CheckedOwnerRows,
         relocations: &mut Vec<OwnerRelocationTarget>,
     ) -> Result<Value, CheckedOwnerBuildError> {
         let expressions = |values: &[OwnerExpressionRef], relocations: &mut Vec<_>| {
@@ -2569,7 +2988,19 @@ impl<'a> OwnerRowConstruction<'a> {
                 "kind": "read",
                 "target": self.normalize_declaration_ref(target, relocations)?,
                 "projection": projection,
-                "source_seed": source_seed,
+                "source_seed": source_seed
+                    .as_ref()
+                    .map(|seed| {
+                        Ok::<Value, CheckedOwnerBuildError>(json!({
+                            "source": self.normalize_source_ref(
+                                &seed.source,
+                                rows,
+                                relocations,
+                            )?,
+                            "payload_projection": seed.payload_projection,
+                        }))
+                    })
+                    .transpose()?,
             }),
             OwnerExpressionKind::Passed {
                 formal,
@@ -2918,10 +3349,15 @@ impl<'a> OwnerRowConstruction<'a> {
                     "kind": "local",
                     "statement": self.local_statement_key(*statement)?,
                 })),
-                boon_checked::OwnerStatementChild::Owner { owner } => Ok(json!({
-                    "kind": "owner",
-                    "owner": owner,
-                })),
+                boon_checked::OwnerStatementChild::Owner { owner } => {
+                    relocations.push(OwnerRelocationTarget::ChildOwner {
+                        owner: owner.clone(),
+                    });
+                    Ok(json!({
+                        "kind": "owner",
+                        "owner": owner,
+                    }))
+                }
             })
             .collect::<Result<Vec<_>, CheckedOwnerBuildError>>()?;
         let resources = row
@@ -2994,6 +3430,7 @@ impl<'a> OwnerRowConstruction<'a> {
     fn normalized_expression_payload(
         &self,
         row: &OwnerExpressionRow,
+        rows: &CheckedOwnerRows,
         relocations: &mut Vec<OwnerRelocationTarget>,
     ) -> Result<Value, CheckedOwnerBuildError> {
         Ok(json!({
@@ -3006,7 +3443,7 @@ impl<'a> OwnerRowConstruction<'a> {
             "flow_type": row.flow_type,
             "flush_type": row.flush_type,
             "effect": row.effect,
-            "kind": self.normalize_expression_kind(&row.kind, relocations)?,
+            "kind": self.normalize_expression_kind(&row.kind, rows, relocations)?,
             "source": row.source,
         }))
     }
@@ -3105,7 +3542,20 @@ impl<'a> OwnerRowConstruction<'a> {
                 })))
                 .collect::<Result<Vec<_>, CheckedOwnerBuildError>>()?,
             "context_binding": self.normalize_context_binding(&row.context_binding, relocations)?,
-            "contextual_substitutions": row.contextual_substitutions,
+            "contextual_substitutions": row
+                .contextual_substitutions
+                .iter()
+                .map(|substitution| {
+                    Ok(json!({
+                        "formal": self.normalize_context_formal_ref(
+                            &substitution.formal,
+                            relocations,
+                        )?,
+                        "variable": substitution.variable,
+                        "value": substitution.value,
+                    }))
+                })
+                .collect::<Result<Vec<_>, CheckedOwnerBuildError>>()?,
             "type_substitutions": row.type_substitutions,
             "syntax_discriminated_result": row.syntax_discriminated_result,
             "result": row.result,
@@ -3132,7 +3582,14 @@ impl<'a> OwnerRowConstruction<'a> {
 
     fn build_base_rows(
         self,
-    ) -> Result<(CheckedOwnerRows, OwnerCheckedReceiptSet), CheckedOwnerBuildError> {
+    ) -> Result<
+        (
+            CheckedOwnerRows,
+            OwnerCheckedReceiptSet,
+            Box<[crate::OwnerDiagnosticTemplate]>,
+        ),
+        CheckedOwnerBuildError,
+    > {
         let mut statements = self.build_statement_rows()?;
         let expressions = self.build_expression_rows()?;
         let mut derived = self.derive_resource_rows(&mut statements, &expressions)?;
@@ -3227,7 +3684,7 @@ impl<'a> OwnerRowConstruction<'a> {
         }
         for row in &rows.expressions {
             let mut relocations = Vec::new();
-            let payload = self.normalized_expression_payload(row, &mut relocations)?;
+            let payload = self.normalized_expression_payload(row, &rows, &mut relocations)?;
             sink.record(
                 OwnerCheckedRowDomain::Expression,
                 &row.stable_key,
@@ -3411,7 +3868,7 @@ impl<'a> OwnerRowConstruction<'a> {
                 relocations,
             )?;
         }
-        for diagnostic in &self.body.diagnostics {
+        for diagnostic in &self.diagnostics {
             let site = self.normalized_diagnostic_site(&diagnostic.site)?;
             let stable_key = json!({
                 "site": site,
@@ -3436,7 +3893,7 @@ impl<'a> OwnerRowConstruction<'a> {
         let receipts = sink.finish()?;
         rows.relocations = receipts.relocations.to_vec();
         rows.receipts = receipts.row_receipts.to_vec();
-        Ok((rows, receipts))
+        Ok((rows, receipts, self.diagnostics.into_boxed_slice()))
     }
 
     fn build_callable_rows(&self) -> Result<Vec<OwnerCallableRow>, CheckedOwnerBuildError> {
@@ -3607,6 +4064,7 @@ impl<'a> OwnerRowConstruction<'a> {
             .map(|(index, expression)| {
                 let inferred = &self.body.expressions[index];
                 let id = OwnerExpressionId(checked_u32(index, "owner expression row")?);
+                let kind = self.lower_expression_kind(id, &expression.kind)?;
                 Ok(OwnerExpressionRow {
                     id,
                     stable_key: expression.stable_key.clone(),
@@ -3615,7 +4073,7 @@ impl<'a> OwnerRowConstruction<'a> {
                     flow_type: inferred.flow_type.clone(),
                     flush_type: inferred.flush_type.clone(),
                     effect: inferred.direct_effect,
-                    kind: self.lower_expression_kind(id, &expression.kind)?,
+                    kind,
                     source: expression_source(expression),
                 })
             })
@@ -3864,7 +4322,8 @@ impl<'a> OwnerRowConstruction<'a> {
         expression: OwnerExpressionId,
         name: &str,
     ) -> Option<OwnerDeclarationId> {
-        let mut scope = self.expression_scopes.get(expression.0 as usize)?.clone();
+        let origin = self.expression_scopes.get(expression.0 as usize)?.clone();
+        let mut scope = origin.clone();
         let mut visited = BTreeSet::new();
         loop {
             if let Some(declaration) =
@@ -3874,8 +4333,16 @@ impl<'a> OwnerRowConstruction<'a> {
                     .rev()
                     .find_map(|(index, declaration)| {
                         let declaration = declaration.as_ref()?;
-                        (declaration.scope == scope && declaration.name == name)
-                            .then(|| OwnerDeclarationId(index as u32))
+                        if declaration.scope != scope || declaration.name != name {
+                            return None;
+                        }
+                        if declaration.kind == CheckedDeclarationKind::FreshOut {
+                            let body_scope = declaration.body_scope?;
+                            if !self.scope_descends_from(&origin, &local_scope_ref(body_scope)) {
+                                return None;
+                            }
+                        }
+                        Some(OwnerDeclarationId(index as u32))
                     })
             {
                 return Some(declaration);
@@ -3892,6 +4359,66 @@ impl<'a> OwnerRowConstruction<'a> {
                 .and_then(Option::as_ref)
                 .and_then(|scope| scope.parent.clone())?;
         }
+    }
+
+    fn scope_descends_from(&self, scope: &OwnerScopeRef, ancestor: &OwnerScopeRef) -> bool {
+        let mut scope = scope.clone();
+        let mut visited = BTreeSet::new();
+        loop {
+            if &scope == ancestor {
+                return true;
+            }
+            let OwnerScopeRef::Local { scope: local } = scope else {
+                return false;
+            };
+            if !visited.insert(local) {
+                return false;
+            }
+            let Some(parent) = self
+                .scope_specs
+                .get(local.0 as usize)
+                .and_then(Option::as_ref)
+                .and_then(|scope| scope.parent.clone())
+            else {
+                return false;
+            };
+            scope = parent;
+        }
+    }
+
+    fn declaration_is_inside_call_context(
+        &self,
+        declaration: OwnerDeclarationId,
+        context: OwnerDeclarationId,
+    ) -> bool {
+        let Some(declaration_scope) = self
+            .declaration_specs
+            .get(declaration.0 as usize)
+            .and_then(Option::as_ref)
+            .map(|declaration| &declaration.scope)
+        else {
+            return false;
+        };
+        let Some(OwnerScopeRef::Local {
+            scope: context_scope,
+        }) = self
+            .declaration_specs
+            .get(context.0 as usize)
+            .and_then(Option::as_ref)
+            .map(|declaration| &declaration.scope)
+        else {
+            return false;
+        };
+        let Some(context_parent) = self
+            .scope_specs
+            .get(context_scope.0 as usize)
+            .and_then(Option::as_ref)
+            .and_then(|scope| scope.parent.as_ref())
+        else {
+            return false;
+        };
+        declaration_scope != context_parent
+            && self.scope_descends_from(declaration_scope, context_parent)
     }
 
     fn lower_read(
@@ -3927,22 +4454,38 @@ impl<'a> OwnerRowConstruction<'a> {
                 }
             });
         }
-        if let Some((root, projection)) = parts.split_first()
-            && let Some(declaration) = self.local_declaration_for_name(id, root)
-        {
-            let target = local_declaration_ref(declaration);
-            return Ok(if drain {
-                OwnerExpressionKind::Drain {
-                    target,
-                    projection: projection.to_vec(),
+        if let Some((root, projection)) = parts.split_first() {
+            let lexical = self.local_declaration_for_name(id, root);
+            let contextual = self
+                .expression_call_contexts
+                .get(&id)
+                .and_then(|contexts| contexts.get(root))
+                .copied();
+            let declaration = match (lexical, contextual) {
+                (Some(lexical), Some(contextual))
+                    if self.declaration_is_inside_call_context(lexical, contextual) =>
+                {
+                    Some(lexical)
                 }
-            } else {
-                OwnerExpressionKind::Read {
-                    target,
-                    projection: projection.to_vec(),
-                    source_seed: None,
-                }
-            });
+                (_, Some(contextual)) => Some(contextual),
+                (Some(lexical), None) => Some(lexical),
+                (None, None) => None,
+            };
+            if let Some(declaration) = declaration {
+                let target = local_declaration_ref(declaration);
+                return Ok(if drain {
+                    OwnerExpressionKind::Drain {
+                        target,
+                        projection: projection.to_vec(),
+                    }
+                } else {
+                    OwnerExpressionKind::Read {
+                        target,
+                        projection: projection.to_vec(),
+                        source_seed: None,
+                    }
+                });
+            }
         }
         if let Some(resolved) = self
             .summary
@@ -4037,10 +4580,10 @@ fn call_input_for_parameter<'a>(
 ) -> Option<(&'a OwnerInferenceExpressionRef, bool, OwnerArgumentKind)> {
     call.inputs.iter().find_map(|input| {
         let matched = match &input.role {
-            OwnerConstraintEdgeRole::CallArgument { kind, name } => {
+            OwnerConstraintEdgeRole::CallArgument { kind, name, .. } => {
                 (name == &parameter.name).then_some((false, *kind))
             }
-            OwnerConstraintEdgeRole::PipeArgument { kind, name } => {
+            OwnerConstraintEdgeRole::PipeArgument { kind, name, .. } => {
                 (name == &parameter.name).then_some((false, *kind))
             }
             OwnerConstraintEdgeRole::PipeInput
@@ -4059,19 +4602,72 @@ fn call_input_for_parameter<'a>(
     })
 }
 
+fn shape_valid_parameter_ordinals(
+    call: &InferredOwnerCall,
+    parameters: &[PreparedCallParameter],
+) -> BTreeSet<u32> {
+    let piped = call
+        .inputs
+        .iter()
+        .any(|input| matches!(input.role, OwnerConstraintEdgeRole::PipeInput))
+        .then(|| {
+            parameters
+                .iter()
+                .filter(|parameter| parameter.kind == CheckedParameterKind::Value)
+                .min_by_key(|parameter| parameter.ordinal)
+        })
+        .flatten();
+    let mut matched = piped
+        .iter()
+        .map(|parameter| parameter.ordinal)
+        .collect::<BTreeSet<_>>();
+    let expected = parameters
+        .iter()
+        .filter(|parameter| piped.is_none_or(|piped| parameter.ordinal != piped.ordinal))
+        .collect::<Vec<_>>();
+    let mut expected_index = 0usize;
+    for input in &call.inputs {
+        let (kind, name) = match &input.role {
+            OwnerConstraintEdgeRole::CallArgument { kind, name, .. }
+            | OwnerConstraintEdgeRole::PipeArgument { kind, name, .. } => (*kind, name),
+            _ => continue,
+        };
+        while let Some(parameter) = expected.get(expected_index).copied()
+            && parameter.name != *name
+            && parameter.requirement.is_optional()
+        {
+            expected_index += 1;
+        }
+        let Some(parameter) = expected.get(expected_index).copied() else {
+            continue;
+        };
+        expected_index += 1;
+        if parameter.name != *name {
+            continue;
+        }
+        if matches!(
+            (parameter.kind, kind),
+            (CheckedParameterKind::Value, OwnerArgumentKind::Named)
+                | (CheckedParameterKind::Out, OwnerArgumentKind::Named)
+                | (CheckedParameterKind::Out, OwnerArgumentKind::BareBinding)
+        ) {
+            matched.insert(parameter.ordinal);
+        }
+    }
+    matched
+}
+
 fn call_argument_source(
     call: &InferredOwnerCall,
     parameter: &PreparedCallParameter,
 ) -> Result<Option<OwnerSourceSite>, CheckedOwnerBuildError> {
-    let mut ordinal = 0usize;
     for input in &call.inputs {
-        let (name, pipe) = match &input.role {
-            OwnerConstraintEdgeRole::CallArgument { name, .. } => (name, false),
-            OwnerConstraintEdgeRole::PipeArgument { name, .. } => (name, true),
+        let (name, pipe, ordinal) = match &input.role {
+            OwnerConstraintEdgeRole::CallArgument { name, ordinal, .. } => (name, false, *ordinal),
+            OwnerConstraintEdgeRole::PipeArgument { name, ordinal, .. } => (name, true, *ordinal),
             _ => continue,
         };
         if name == &parameter.name {
-            let ordinal = checked_u32(ordinal, "owner call argument ordinal")?;
             return Ok(Some(if pipe {
                 OwnerSourceSite::PipeArgument {
                     expression: call.expression.clone(),
@@ -4084,11 +4680,23 @@ fn call_argument_source(
                 }
             }));
         }
-        ordinal = ordinal.checked_add(1).ok_or_else(|| {
-            CheckedOwnerBuildError::new("owner call argument ordinal exceeds usize")
-        })?;
     }
     Ok(None)
+}
+
+fn call_argument_anchor_role(
+    call: &InferredOwnerCall,
+    parameter: &PreparedCallParameter,
+) -> Option<crate::OwnerSourceAnchorRole> {
+    call.inputs.iter().find_map(|input| match &input.role {
+        OwnerConstraintEdgeRole::CallArgument { name, ordinal, .. } if name == &parameter.name => {
+            Some(crate::OwnerSourceAnchorRole::CallArgument { ordinal: *ordinal })
+        }
+        OwnerConstraintEdgeRole::PipeArgument { name, ordinal, .. } if name == &parameter.name => {
+            Some(crate::OwnerSourceAnchorRole::PipeArgument { ordinal: *ordinal })
+        }
+        _ => None,
+    })
 }
 
 fn abi_callable_key(
@@ -4339,21 +4947,12 @@ pub fn build_checked_owner_shard<'a>(
     summary: &OwnerConstraintSummary,
     body: &OwnerBodyInferenceShard,
     abi: &OwnerAbiEnvironment,
-    own_scc: &OwnerInterfaceSccResult,
+    own_scc: &'a OwnerInterfaceSccResult,
     imported_sccs: impl IntoIterator<Item = &'a OwnerInterfaceSccResult>,
 ) -> Result<CheckedOwnerShard, CheckedOwnerBuildError> {
     validate_inputs(syntax, seed, summary, body, abi, own_scc)?;
 
-    let mut interfaces = own_scc
-        .owners
-        .iter()
-        .chain(
-            imported_sccs
-                .into_iter()
-                .flat_map(|result| result.owners.iter()),
-        )
-        .map(|interface| (interface.owner.clone(), interface))
-        .collect::<std::collections::BTreeMap<_, &OwnerPublicInterface>>();
+    let mut interfaces = validated_frozen_interfaces(body, own_scc, imported_sccs)?;
     let own_interface = interfaces.remove(&syntax.owner).ok_or_else(|| {
         CheckedOwnerBuildError::new(format!(
             "checked owner {:?} has no frozen public interface",
@@ -4370,7 +4969,7 @@ pub fn build_checked_owner_shard<'a>(
         authoritative_abi_fingerprint_v1: abi.fingerprint_v1(),
     };
 
-    let (rows, receipts) =
+    let (rows, receipts, diagnostics) =
         OwnerRowConstruction::new(syntax, seed, summary, body, own_interface, abi, interfaces)?
             .build_base_rows()?;
 
@@ -4378,7 +4977,13 @@ pub fn build_checked_owner_shard<'a>(
     // boundary.  Keep this fail-closed while it is incomplete: returning an
     // empty shard would let a session accidentally publish a semantically
     // partial checked owner.
-    let _ = (basis, rows, receipts, CHECKED_OWNER_SHARD_DOMAIN_V1);
+    let _ = (
+        basis,
+        rows,
+        receipts,
+        diagnostics,
+        CHECKED_OWNER_SHARD_DOMAIN_V1,
+    );
     Err(CheckedOwnerBuildError::new(
         "checked owner row construction is not complete",
     ))
@@ -4476,7 +5081,7 @@ mod tests {
 
     fn built_rows(fixture: &Fixture) -> (CheckedOwnerRows, OwnerCheckedReceiptSet) {
         let own = fixture.interface.owner(&fixture.syntax.owner).unwrap();
-        OwnerRowConstruction::new(
+        let (rows, receipts, _) = OwnerRowConstruction::new(
             &fixture.syntax,
             &fixture.seed,
             &fixture.summary,
@@ -4487,7 +5092,8 @@ mod tests {
         )
         .unwrap()
         .build_base_rows()
-        .unwrap()
+        .unwrap();
+        (rows, receipts)
     }
 
     fn rows(fixture: &Fixture) -> CheckedOwnerRows {
@@ -4563,6 +5169,77 @@ mod tests {
             })
             .count();
         assert!(authoritative_relocations >= 2);
+    }
+
+    #[test]
+    fn render_call_contexts_bind_dependent_argument_reads() {
+        let fixture = fixture(
+            concat!(
+                "view: Element/text(\n",
+                "    element: []\n",
+                "    style: [active: element.hovered]\n",
+                "    text: TEXT { Hello }\n",
+                ")\n",
+            ),
+            "view",
+        );
+        let rows = rows(&fixture);
+        let call = rows
+            .calls
+            .iter()
+            .find(|call| call.function == "Element/text")
+            .expect("render call must be published");
+        let context = call
+            .contexts
+            .first()
+            .expect("element constructor must materialize its call context");
+        assert!(rows.expressions.iter().any(|expression| {
+            matches!(
+                expression.kind,
+                OwnerExpressionKind::Read {
+                    target: OwnerDeclarationRef::Local { declaration },
+                    ref projection,
+                    ..
+                } if declaration == context.declaration && projection == &["hovered"]
+            )
+        }));
+        assert!(rows.occurrences.iter().any(|occurrence| {
+            occurrence.kind == SemanticOccurrenceKind::Read
+                && occurrence.target == local_declaration_ref(context.declaration)
+        }));
+    }
+
+    #[test]
+    fn invalid_call_shapes_emit_diagnostics_without_checked_call_rows() {
+        let invalid = fixture("value: Number/to_text(radix: 10, value: 1)\n", "value");
+        let (invalid_rows, receipts) = built_rows(&invalid);
+        assert!(invalid_rows.calls.is_empty());
+        assert!(matches!(
+            invalid_rows.expressions.last().unwrap().kind,
+            OwnerExpressionKind::Invalid { .. }
+        ));
+        assert!(
+            invalid
+                .body
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "misordered_call_entry")
+        );
+        assert!(
+            receipts.construction.domain_counts.iter().any(|count| {
+                count.domain == OwnerCheckedRowDomain::Diagnostic && count.rows > 0
+            })
+        );
+
+        let host = fixture("value: Clock/wall(PASS: [])\n", "value");
+        let host_rows = rows(&host);
+        assert!(host_rows.calls.is_empty());
+        let host_call = host_rows.expressions.last().unwrap();
+        assert!(matches!(
+            host_call.kind,
+            OwnerExpressionKind::Invalid { .. }
+        ));
+        assert!(host_call.effect.invokes_host);
     }
 
     #[test]
@@ -4679,6 +5356,70 @@ mod tests {
                         && receipt.relocations.len > 0
                 })
         );
+
+        let forwarded = fixture(
+            concat!(
+                "FUNCTION wrap(list, row: OUT) {\n",
+                "    list |> List/sort_by(item: row, key: row.rank, direction: Ascending)\n",
+                "}\n",
+            ),
+            "wrap",
+        );
+        let forwarded_rows = rows(&forwarded);
+        let row = forwarded_rows.callables[0].parameters[1].declaration;
+        assert!(forwarded_rows.occurrences.iter().any(|occurrence| {
+            occurrence.kind == SemanticOccurrenceKind::ForwardOut
+                && occurrence.target == local_declaration_ref(row)
+                && matches!(
+                    occurrence.source,
+                    OwnerSourceSite::PipeArgument { ordinal: 0, .. }
+                )
+        }));
+
+        let nested = fixture(
+            concat!(
+                "ordered: LIST { [rank: 1] }\n",
+                "    |> List/sort_by(\n",
+                "        item,\n",
+                "        key: LIST { [rank: 1] }\n",
+                "            |> List/find(item: item, if: True),\n",
+                "        direction: Ascending,\n",
+                "    )\n",
+            ),
+            "ordered",
+        );
+        let nested_rows = rows(&nested);
+        let outer_output = nested_rows
+            .calls
+            .iter()
+            .find(|call| call.function == "List/sort_by")
+            .and_then(|call| {
+                call.entries.iter().find_map(|entry| match entry {
+                    OwnerCallEntry::FreshOut { output, .. } => Some(*output),
+                    _ => None,
+                })
+            })
+            .unwrap();
+        assert!(nested_rows.calls.iter().any(|call| {
+            call.function == "List/find"
+                && call.entries.iter().any(|entry| {
+                    matches!(
+                        entry,
+                        OwnerCallEntry::ForwardOut {
+                            target: OwnerDeclarationRef::Local { declaration },
+                            ..
+                        } if *declaration == outer_output
+                    )
+                })
+        }));
+        assert!(nested_rows.occurrences.iter().any(|occurrence| {
+            occurrence.kind == SemanticOccurrenceKind::ForwardOut
+                && occurrence.target == local_declaration_ref(outer_output)
+                && matches!(
+                    occurrence.source,
+                    OwnerSourceSite::PipeArgument { ordinal: 0, .. }
+                )
+        }));
     }
 
     #[test]
@@ -4696,6 +5437,16 @@ mod tests {
                 vec![Variant::Tag("Error".to_owned())].into()
             ))
         );
+        let declaration = rows
+            .declarations
+            .iter()
+            .find(|declaration| declaration.name == "value")
+            .unwrap();
+        assert_eq!(
+            declaration.flow_type.ty,
+            crate::union_structural_type(&flush.flow_type.ty, flush.flush_type.as_ref().unwrap())
+        );
+        assert_eq!(declaration.flow_type.mode, FlowMode::Continuous);
         assert!(fixture.body.diagnostics.is_empty());
     }
 
@@ -4770,6 +5521,12 @@ mod tests {
         let update_rows = rows(&update_authority);
         let update_body = fixture(update_source, "state");
         let (update_body_rows, update_body_receipts) = built_rows(&update_body);
+        let latest = update_body_rows
+            .expressions
+            .iter()
+            .find(|expression| matches!(expression.kind, OwnerExpressionKind::Latest { .. }))
+            .unwrap();
+        assert!(latest.effect.reads_state && latest.effect.writes_state);
         assert!(update_rows.states.is_empty());
         assert_eq!(update_body_rows.states.len(), 1);
         assert_eq!(update_body_rows.states[0].kind, CheckedStateKind::Hold);

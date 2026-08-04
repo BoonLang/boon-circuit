@@ -2,6 +2,7 @@ use crate::{
     OwnerExpressionInput, OwnerExternalExpressionInput, OwnerSyntaxInput,
     stable_check_owner_key_fingerprint_v1,
 };
+use boon_checked::{OwnerExpressionId, OwnerExpressionRef, OwnerStatementChild, OwnerStatementId};
 use boon_compilation_db::{
     DenseProjectionGraphBuilder, ProjectionGraphDigestDomains, ProjectionGraphStats, ProjectionId,
 };
@@ -181,6 +182,7 @@ pub enum OwnerConstraintEdgeRole {
     },
     FlushPayload,
     CallArgument {
+        ordinal: u32,
         kind: OwnerArgumentKind,
         name: String,
     },
@@ -189,6 +191,7 @@ pub enum OwnerConstraintEdgeRole {
     },
     PipeInput,
     PipeArgument {
+        ordinal: u32,
         kind: OwnerArgumentKind,
         name: String,
     },
@@ -238,6 +241,18 @@ pub struct OwnerExpressionConstraint {
     pub inputs: Box<[OwnerConstraintEdge]>,
 }
 
+/// Static FLUSH-control edges for one local expression.
+///
+/// `value_inputs` contribute their ordinary value type (the direct FLUSH
+/// payload). `escape_inputs` contribute the child's FLUSH channel. References
+/// use the same local-plus-external u32 namespace as ordinary expression
+/// constraints; callable-result FLUSH edges are added after symbol resolution.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct OwnerFlushConstraint {
+    pub value_inputs: Box<[u32]>,
+    pub escape_inputs: Box<[u32]>,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct OwnerEffectConstraintSeed {
     pub declares_source: bool,
@@ -264,6 +279,9 @@ pub struct OwnerConstraintSeed {
     pub declarations: Box<[OwnerDeclarationConstraint]>,
     pub statement_values: Box<[(u32, u32)]>,
     pub expressions: Box<[OwnerExpressionConstraint]>,
+    /// Per-expression FLUSH-control graph. Declaration/callable boundaries
+    /// union the parallel escape channel into the ordinary public flow.
+    pub expression_flush_plans: Box<[OwnerFlushConstraint]>,
     pub references: Box<[OwnerSymbolReference]>,
     pub external_expressions: Box<[OwnerExternalExpressionInput]>,
     pub result_static_numbers: Box<[OwnerResultStaticNumber]>,
@@ -745,8 +763,8 @@ fn append_callable_interface_dependencies(
                     ));
                 }
             }
-            OwnerConstraintEdgeRole::CallArgument { kind, name }
-            | OwnerConstraintEdgeRole::PipeArgument { kind, name } => {
+            OwnerConstraintEdgeRole::CallArgument { kind, name, .. }
+            | OwnerConstraintEdgeRole::PipeArgument { kind, name, .. } => {
                 let Some(parameter) = parameters.iter().find(|parameter| parameter.name == *name)
                 else {
                     continue;
@@ -1171,10 +1189,11 @@ fn project_expression(
                 kind: OwnerReferenceKind::Callable,
                 parts: function.split('/').map(str::to_owned).collect(),
             });
-            for argument in args {
+            for (ordinal, argument) in args.iter().enumerate() {
                 push_edge(
                     &mut inputs,
                     OwnerConstraintEdgeRole::CallArgument {
+                        ordinal: checked_u32(ordinal, "call argument ordinal")?,
                         kind: argument_kind(argument.kind),
                         name: argument.name.clone(),
                     },
@@ -1207,10 +1226,11 @@ fn project_expression(
                 parts: op.split('/').map(str::to_owned).collect(),
             });
             push_edge(&mut inputs, OwnerConstraintEdgeRole::PipeInput, *input)?;
-            for argument in args {
+            for (ordinal, argument) in args.iter().enumerate() {
                 push_edge(
                     &mut inputs,
                     OwnerConstraintEdgeRole::PipeArgument {
+                        ordinal: checked_u32(ordinal, "pipe argument ordinal")?,
                         kind: argument_kind(argument.kind),
                         name: argument.name.clone(),
                     },
@@ -1447,9 +1467,11 @@ fn project_result_static_numbers(
                 OwnerConstraintEdgeRole::CallArgument {
                     kind: OwnerArgumentKind::Named,
                     name,
+                    ..
                 } | OwnerConstraintEdgeRole::PipeArgument {
                     kind: OwnerArgumentKind::Named,
                     name,
+                    ..
                 } if name == width_name
             )
         }) {
@@ -1467,6 +1489,188 @@ fn project_result_static_numbers(
         .map(|(expression, literal)| OwnerResultStaticNumber {
             expression,
             literal,
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice()
+}
+
+fn flush_reference_index(input: &OwnerSyntaxInput, reference: &OwnerExpressionRef) -> Option<u32> {
+    match reference {
+        OwnerExpressionRef::Local { expression } => Some(expression.0),
+        OwnerExpressionRef::Child { owner, expression } => {
+            let external = input.external_expressions.iter().position(|candidate| {
+                &candidate.owner == owner && &candidate.expression == expression
+            })?;
+            u32::try_from(input.expressions.len().checked_add(external)?).ok()
+        }
+    }
+}
+
+fn flush_index_reference(input: &OwnerSyntaxInput, reference: usize) -> Option<OwnerExpressionRef> {
+    if reference < input.expressions.len() {
+        return Some(OwnerExpressionRef::Local {
+            expression: OwnerExpressionId(u32::try_from(reference).ok()?),
+        });
+    }
+    let external = input.external_expression(reference)?;
+    Some(OwnerExpressionRef::Child {
+        owner: external.owner.clone(),
+        expression: external.expression.clone(),
+    })
+}
+
+fn child_owner_flush_values(
+    input: &OwnerSyntaxInput,
+    owner: &StableCheckOwnerKey,
+) -> Vec<OwnerExpressionRef> {
+    input
+        .external_expressions
+        .iter()
+        .filter(|external| &external.owner == owner)
+        .map(|external| OwnerExpressionRef::Child {
+            owner: external.owner.clone(),
+            expression: external.expression.clone(),
+        })
+        .collect()
+}
+
+fn flush_child_update_values(
+    input: &OwnerSyntaxInput,
+    graph: &crate::OwnerSyntaxGraph,
+    child: &OwnerStatementChild,
+) -> Vec<OwnerExpressionRef> {
+    match child {
+        OwnerStatementChild::Local { statement } => {
+            flush_statement_update_values(input, graph, *statement)
+        }
+        OwnerStatementChild::Owner { owner } => child_owner_flush_values(input, owner),
+    }
+}
+
+fn flush_statement_update_values(
+    input: &OwnerSyntaxInput,
+    graph: &crate::OwnerSyntaxGraph,
+    statement: OwnerStatementId,
+) -> Vec<OwnerExpressionRef> {
+    let Some(statement) = graph.statement(statement) else {
+        return Vec::new();
+    };
+    if let Some(value) = &statement.canonical_value {
+        return vec![value.clone()];
+    }
+    statement
+        .children
+        .iter()
+        .flat_map(|child| flush_child_update_values(input, graph, child))
+        .collect()
+}
+
+fn hold_flush_update_expressions(
+    input: &OwnerSyntaxInput,
+    graph: &crate::OwnerSyntaxGraph,
+    expression: OwnerExpressionId,
+) -> Vec<OwnerExpressionRef> {
+    let Some(statement) = input
+        .statements
+        .iter()
+        .find(|statement| statement.expression == Some(expression.0))
+        .map(|statement| OwnerStatementId(statement.id))
+    else {
+        return Vec::new();
+    };
+    let Some(statement) = graph.statement(statement) else {
+        return Vec::new();
+    };
+    let mut updates = Vec::new();
+    for child in &statement.children {
+        let OwnerStatementChild::Local { statement: child } = child else {
+            updates.extend(flush_child_update_values(input, graph, child));
+            continue;
+        };
+        let Some(child_node) = graph.statement(*child) else {
+            continue;
+        };
+        let continuation = input
+            .statements
+            .get(child.0 as usize)
+            .and_then(|statement| statement.expression)
+            .and_then(|expression| input.expressions.get(expression as usize))
+            .is_some_and(|expression| expression.linked_input.is_some());
+        let update_start = updates.len();
+        let child_is_latest = child_node
+            .direct_value
+            .as_ref()
+            .and_then(|value| match value {
+                OwnerExpressionRef::Local { expression } => {
+                    input.expressions.get(expression.0 as usize)
+                }
+                OwnerExpressionRef::Child { .. } => None,
+            })
+            .is_some_and(|expression| matches!(expression.kind, AstExprKind::Latest { .. }));
+        if child_is_latest {
+            updates.extend(
+                child_node
+                    .children
+                    .iter()
+                    .flat_map(|grandchild| flush_child_update_values(input, graph, grandchild)),
+            );
+        } else {
+            updates.extend(flush_statement_update_values(input, graph, *child));
+        }
+        if continuation && update_start > 0 && updates.len() > update_start {
+            updates.remove(update_start - 1);
+        }
+    }
+    updates
+}
+
+fn project_expression_flush_plans(
+    input: &OwnerSyntaxInput,
+    graph: &crate::OwnerSyntaxGraph,
+) -> Box<[OwnerFlushConstraint]> {
+    input
+        .expressions
+        .iter()
+        .enumerate()
+        .map(|(index, expression)| {
+            let mut value_inputs = Vec::new();
+            let escape_references = match &expression.kind {
+                AstExprKind::Flush {
+                    payload: Some(payload),
+                } => {
+                    if let Ok(payload) = u32::try_from(*payload) {
+                        value_inputs.push(payload);
+                    }
+                    flush_index_reference(input, *payload)
+                        .into_iter()
+                        .collect::<Vec<_>>()
+                }
+                AstExprKind::Flush { payload: None }
+                | AstExprKind::Block { .. }
+                | AstExprKind::Object(_)
+                | AstExprKind::TaggedObject { .. } => Vec::new(),
+                AstExprKind::Hold { .. } => hold_flush_update_expressions(
+                    input,
+                    graph,
+                    OwnerExpressionId(u32::try_from(index).expect("owner expression id is u32")),
+                ),
+                _ => graph
+                    .expression_inputs(OwnerExpressionId(
+                        u32::try_from(index).expect("owner expression id is u32"),
+                    ))
+                    .unwrap_or_default()
+                    .to_vec(),
+            };
+            let escape_inputs = escape_references
+                .iter()
+                .filter_map(|reference| flush_reference_index(input, reference))
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            OwnerFlushConstraint {
+                value_inputs: value_inputs.into_boxed_slice(),
+                escape_inputs: escape_inputs.into_boxed_slice(),
+            }
         })
         .collect::<Vec<_>>()
         .into_boxed_slice()
@@ -1522,6 +1726,7 @@ pub fn project_owner_constraint_seed(
         .iter()
         .map(|expression| project_expression(expression, &mut references))
         .collect::<Result<Vec<_>, _>>()?;
+    let expression_flush_plans = project_expression_flush_plans(input, &syntax_graph);
     // Preserve the compact namespace order: expression edges address external
     // values after the local-expression range. `OwnerSyntaxInput` already
     // interns each referenced syntax expression exactly once.
@@ -1557,6 +1762,7 @@ pub fn project_owner_constraint_seed(
             &declarations,
             &statement_values,
             &expressions,
+            &expression_flush_plans,
             &references,
             &external_expressions,
             &result_static_numbers,
@@ -1568,6 +1774,7 @@ pub fn project_owner_constraint_seed(
         declarations: declarations.into_boxed_slice(),
         statement_values: statement_values.into_boxed_slice(),
         expressions: expressions.into_boxed_slice(),
+        expression_flush_plans,
         references: references.into_boxed_slice(),
         external_expressions: external_expressions.into_boxed_slice(),
         result_static_numbers,

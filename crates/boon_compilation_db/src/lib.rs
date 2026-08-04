@@ -7,6 +7,14 @@ use std::fmt;
 
 pub type RequestFingerprint = [u8; 32];
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[repr(transparent)]
+pub struct RequestInputFingerprint(pub RequestFingerprint);
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[repr(transparent)]
+pub struct RequestOutputFingerprint(pub RequestFingerprint);
+
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
 pub struct Revision(pub u64);
 
@@ -91,70 +99,115 @@ impl RequestMemo {
 /// result fingerprint, so its previous `changed_at` revision was retained.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RequestEvaluationStats {
+    pub demanded: usize,
     pub executed: usize,
     pub reused: usize,
     pub backdated: usize,
     pub changed: usize,
+    pub failed: usize,
+    pub canceled: usize,
+    pub superseded: usize,
     pub removed: usize,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RequestDisposition {
-    Executed,
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RequestStart {
+    Execute(RequestEvaluationTicket),
     Reused,
 }
 
-/// Borrowed typed result of one evaluator request.
-pub struct RequestEvaluation<'a, V> {
-    value: &'a V,
-    disposition: RequestDisposition,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RequestAbortReason {
+    Failed,
+    Canceled,
 }
 
-impl<'a, V> RequestEvaluation<'a, V> {
-    pub const fn value(&self) -> &'a V {
-        self.value
-    }
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct RequestNodeId(u32);
 
-    pub const fn disposition(&self) -> RequestDisposition {
-        self.disposition
-    }
-
-    pub const fn was_reused(&self) -> bool {
-        matches!(self.disposition, RequestDisposition::Reused)
+impl RequestNodeId {
+    pub const fn as_usize(self) -> usize {
+        self.0 as usize
     }
 }
 
-struct TypedRequestSlot<K, V> {
-    memo: RequestMemo,
-    dependencies: Vec<K>,
-    value: V,
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct RequestNodeIdentity {
+    pub family: &'static str,
+    pub key_fingerprint: RequestFingerprint,
 }
 
-/// Revisioned evaluator for one language-owned typed key/result family.
-///
-/// The generic instantiation remains owned by the language component; this
-/// crate never erases values through `Any` or serializes them into a second
-/// semantic authority. Callers evaluate dependencies first and pass their
-/// exact typed keys. The evaluator verifies those dependencies at the current
-/// revision, records the span, reuses green values, backdates equal results,
-/// and exposes exact reverse cones for invalidation and evidence.
-pub struct TypedRequestEvaluator<K, V> {
+impl fmt::Display for RequestNodeIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}:", self.family)?;
+        for byte in &self.key_fingerprint[..6] {
+            write!(formatter, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RequestNodeState {
+    Vacant,
+    Published,
+    Computing {
+        revision: Revision,
+        generation: u64,
+        stack_index: usize,
+    },
+    Failed {
+        revision: Revision,
+    },
+    Removed,
+}
+
+struct RequestNode {
+    identity: RequestNodeIdentity,
+    state: RequestNodeState,
+    memo: Option<RequestMemo>,
+    dependencies: Vec<RequestNodeId>,
+    reverse_dependents: BTreeSet<RequestNodeId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RequestEvaluationTicket {
+    node: RequestNodeId,
     revision: Revision,
     generation: u64,
-    slots: BTreeMap<K, TypedRequestSlot<K, V>>,
-    stats: RequestEvaluationStats,
+    stack_index: usize,
+    input_fingerprint: RequestInputFingerprint,
+    dependencies: Vec<RequestNodeId>,
+    had_publication: bool,
 }
 
-impl<K, V> TypedRequestEvaluator<K, V>
-where
-    K: Clone + Ord,
-{
+/// Shared currentness and evaluation-edge graph for language-owned typed
+/// request tables.
+///
+/// Values never enter this graph. Each [`TypedRequestTable`] owns exactly one
+/// request family's Rust keys and values; this graph owns revisions,
+/// automatically captured cross-family edges, reverse cones, cycle paths,
+/// backdating, and generation-checked publication.
+pub struct RequestEvaluatorGraph {
+    revision: Revision,
+    generation: u64,
+    identities: BTreeMap<RequestNodeIdentity, RequestNodeId>,
+    nodes: Vec<RequestNode>,
+    active: Vec<RequestNodeId>,
+    stats: RequestEvaluationStats,
+    revision_stats: RequestEvaluationStats,
+}
+
+impl RequestEvaluatorGraph {
     pub fn new(revision: Revision) -> Self {
         Self {
             revision,
             generation: 0,
-            slots: BTreeMap::new(),
+            identities: BTreeMap::new(),
+            nodes: Vec::new(),
+            active: Vec::new(),
             stats: RequestEvaluationStats::default(),
+            revision_stats: RequestEvaluationStats::default(),
         }
     }
 
@@ -170,12 +223,17 @@ where
         self.stats
     }
 
-    pub fn request_count(&self) -> usize {
-        self.slots.len()
+    pub const fn revision_stats(&self) -> RequestEvaluationStats {
+        self.revision_stats
     }
 
-    /// Advance to a newer source revision. Values remain retained but cease to
-    /// be current until their request is explicitly verified or executed.
+    pub fn request_count(&self) -> usize {
+        self.nodes
+            .iter()
+            .filter(|node| node.state != RequestNodeState::Removed)
+            .count()
+    }
+
     pub fn advance_to(&mut self, revision: Revision) -> Result<(), CompilationDbError> {
         if revision <= self.revision {
             return Err(CompilationDbError::new(format!(
@@ -188,181 +246,564 @@ where
             .generation
             .checked_add(1)
             .ok_or_else(|| CompilationDbError::new("compilation evaluator generation overflow"))?;
+        for node in self.active.drain(..) {
+            let slot = self
+                .nodes
+                .get_mut(node.as_usize())
+                .expect("active request node exists");
+            slot.state = if slot.memo.is_some() {
+                RequestNodeState::Published
+            } else {
+                RequestNodeState::Vacant
+            };
+            self.stats.superseded = self.stats.superseded.saturating_add(1);
+        }
+        self.revision_stats = RequestEvaluationStats::default();
         Ok(())
     }
 
-    /// Return a value only when it has been verified for the current revision.
-    pub fn current_value(&self, key: &K) -> Option<&V> {
-        let slot = self.slots.get(key)?;
-        (slot.memo.verified_at == self.revision).then_some(&slot.value)
+    pub fn identity(&self, node: RequestNodeId) -> Option<&RequestNodeIdentity> {
+        self.nodes.get(node.as_usize()).map(|node| &node.identity)
     }
 
-    pub fn memo(&self, key: &K) -> Option<&RequestMemo> {
-        self.slots.get(key).map(|slot| &slot.memo)
+    pub fn memo(&self, node: RequestNodeId) -> Option<&RequestMemo> {
+        self.nodes.get(node.as_usize())?.memo.as_ref()
     }
 
-    pub fn dependencies(&self, key: &K) -> Option<&[K]> {
-        self.slots.get(key).map(|slot| slot.dependencies.as_slice())
+    pub fn dependencies(&self, node: RequestNodeId) -> Option<&[RequestNodeId]> {
+        self.nodes
+            .get(node.as_usize())
+            .map(|node| node.dependencies.as_slice())
     }
 
-    /// Remove requests outside a language-owned live key set. Any surviving
-    /// request whose dependency span changes will execute on its next demand.
-    pub fn retain_requests(&mut self, mut retain: impl FnMut(&K) -> bool) {
-        let before = self.slots.len();
-        self.slots.retain(|key, _| retain(key));
-        self.stats.removed = self
-            .stats
-            .removed
-            .saturating_add(before.saturating_sub(self.slots.len()));
+    fn is_current(&self, node: RequestNodeId) -> bool {
+        self.nodes.get(node.as_usize()).is_some_and(|node| {
+            node.state == RequestNodeState::Published
+                && node
+                    .memo
+                    .as_ref()
+                    .is_some_and(|memo| memo.verified_at == self.revision)
+        })
     }
 
-    /// Compute the exact retained reverse dependency cone, including roots.
-    pub fn reverse_cone(&self, roots: impl IntoIterator<Item = K>) -> BTreeSet<K> {
-        let mut reverse = BTreeMap::<&K, Vec<&K>>::new();
-        for (request, slot) in &self.slots {
-            for dependency in &slot.dependencies {
-                reverse.entry(dependency).or_default().push(request);
-            }
-        }
+    pub fn reverse_cone(
+        &self,
+        roots: impl IntoIterator<Item = RequestNodeId>,
+    ) -> BTreeSet<RequestNodeId> {
         let mut cone = BTreeSet::new();
         let mut pending = roots.into_iter().collect::<VecDeque<_>>();
-        while let Some(key) = pending.pop_front() {
-            if !cone.insert(key.clone()) {
+        while let Some(node) = pending.pop_front() {
+            if !cone.insert(node) {
                 continue;
             }
-            if let Some(dependents) = reverse.get(&key) {
-                pending.extend(dependents.iter().map(|dependent| (*dependent).clone()));
+            if let Some(node) = self.nodes.get(node.as_usize()) {
+                pending.extend(node.reverse_dependents.iter().copied());
             }
         }
         cone
     }
 
-    /// Verify or execute one typed request.
-    ///
-    /// Every supplied dependency must already be current. Dependency order is
-    /// canonicalized, so evaluation scheduling cannot perturb fingerprints or
-    /// currentness. A request may be demanded repeatedly in one revision only
-    /// with the same input and dependency span.
-    pub fn evaluate<E>(
+    fn register(
         &mut self,
-        key: K,
-        input_fingerprint: RequestFingerprint,
-        dependencies: impl IntoIterator<Item = K>,
-        execute: impl FnOnce() -> Result<(V, RequestFingerprint), E>,
-    ) -> Result<RequestEvaluation<'_, V>, E>
-    where
-        E: From<CompilationDbError>,
-    {
-        let mut dependencies = dependencies.into_iter().collect::<Vec<_>>();
-        dependencies.sort();
-        dependencies.dedup();
-        if dependencies.binary_search(&key).is_ok() {
+        identity: RequestNodeIdentity,
+    ) -> Result<RequestNodeId, CompilationDbError> {
+        if let Some(node) = self.identities.get(&identity).copied() {
+            if self.nodes[node.as_usize()].state == RequestNodeState::Removed {
+                self.nodes[node.as_usize()].state = RequestNodeState::Vacant;
+            }
+            return Ok(node);
+        }
+        let node =
+            RequestNodeId(u32::try_from(self.nodes.len()).map_err(|_| {
+                CompilationDbError::new("compilation request graph exceeds u32 nodes")
+            })?);
+        self.identities.insert(identity.clone(), node);
+        self.nodes.push(RequestNode {
+            identity,
+            state: RequestNodeState::Vacant,
+            memo: None,
+            dependencies: Vec::new(),
+            reverse_dependents: BTreeSet::new(),
+        });
+        Ok(node)
+    }
+
+    fn cycle_error(&self, stack_index: usize, repeated: RequestNodeId) -> CompilationDbError {
+        let mut path = self.active[stack_index..]
+            .iter()
+            .filter_map(|node| self.identity(*node))
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        if let Some(identity) = self.identity(repeated) {
+            path.push(identity.to_string());
+        }
+        CompilationDbError::new(format!("compilation request cycle: {}", path.join(" -> ")))
+    }
+
+    fn begin(
+        &mut self,
+        node: RequestNodeId,
+        input_fingerprint: RequestInputFingerprint,
+    ) -> Result<RequestStart, CompilationDbError> {
+        self.stats.demanded = self.stats.demanded.saturating_add(1);
+        self.revision_stats.demanded = self.revision_stats.demanded.saturating_add(1);
+        let state = self
+            .nodes
+            .get(node.as_usize())
+            .ok_or_else(|| CompilationDbError::new("compilation request node is missing"))?
+            .state;
+        if let RequestNodeState::Computing { stack_index, .. } = state {
+            return Err(self.cycle_error(stack_index, node));
+        }
+        if state == RequestNodeState::Removed {
             return Err(CompilationDbError::new(
-                "compilation evaluator request directly depends on itself",
-            )
-            .into());
+                "removed compilation request was not re-registered",
+            ));
+        }
+
+        if let Some(memo) = self.nodes[node.as_usize()]
+            .memo
+            .as_ref()
+            .filter(|memo| memo.verified_at == self.revision)
+        {
+            if memo.input_fingerprint != input_fingerprint.0 {
+                return Err(CompilationDbError::new(
+                    "compilation request input changed after publication in one revision",
+                ));
+            }
+            self.stats.reused = self.stats.reused.saturating_add(1);
+            self.revision_stats.reused = self.revision_stats.reused.saturating_add(1);
+            return Ok(RequestStart::Reused);
+        }
+
+        let green = self.nodes[node.as_usize()]
+            .memo
+            .as_ref()
+            .is_some_and(|memo| {
+                memo.input_fingerprint == input_fingerprint.0
+                    && self.nodes[node.as_usize()]
+                        .dependencies
+                        .iter()
+                        .all(|dependency| {
+                            self.nodes
+                                .get(dependency.as_usize())
+                                .and_then(|dependency| dependency.memo.as_ref())
+                                .is_some_and(|dependency| {
+                                    dependency.verified_at == self.revision
+                                        && dependency.changed_at <= memo.verified_at
+                                })
+                        })
+            });
+        if green {
+            let memo = self.nodes[node.as_usize()]
+                .memo
+                .as_mut()
+                .expect("green request has a memo");
+            memo.verified_at = self.revision;
+            memo.dependencies_verified_at = self.revision;
+            self.nodes[node.as_usize()].state = RequestNodeState::Published;
+            self.stats.reused = self.stats.reused.saturating_add(1);
+            self.revision_stats.reused = self.revision_stats.reused.saturating_add(1);
+            return Ok(RequestStart::Reused);
+        }
+
+        let stack_index = self.active.len();
+        self.active.push(node);
+        self.nodes[node.as_usize()].state = RequestNodeState::Computing {
+            revision: self.revision,
+            generation: self.generation,
+            stack_index,
+        };
+        self.stats.executed = self.stats.executed.saturating_add(1);
+        self.revision_stats.executed = self.revision_stats.executed.saturating_add(1);
+        Ok(RequestStart::Execute(RequestEvaluationTicket {
+            node,
+            revision: self.revision,
+            generation: self.generation,
+            stack_index,
+            input_fingerprint,
+            dependencies: Vec::new(),
+            had_publication: self.nodes[node.as_usize()].memo.is_some(),
+        }))
+    }
+}
+
+impl RequestEvaluatorGraph {
+    fn validate_ticket(&self, ticket: &RequestEvaluationTicket) -> Result<(), CompilationDbError> {
+        if ticket.revision != self.revision || ticket.generation != self.generation {
+            return Err(CompilationDbError::new(
+                "compilation evaluator rejected a superseded generation ticket",
+            ));
+        }
+        if self.active.get(ticket.stack_index) != Some(&ticket.node)
+            || self.active.len() != ticket.stack_index + 1
+        {
+            return Err(CompilationDbError::new(
+                "compilation request tickets must publish or abort in stack order",
+            ));
+        }
+        match self
+            .nodes
+            .get(ticket.node.as_usize())
+            .map(|node| node.state)
+        {
+            Some(RequestNodeState::Computing {
+                revision,
+                generation,
+                stack_index,
+            }) if revision == ticket.revision
+                && generation == ticket.generation
+                && stack_index == ticket.stack_index =>
+            {
+                Ok(())
+            }
+            _ => Err(CompilationDbError::new(
+                "compilation request ticket is not the active computation",
+            )),
+        }
+    }
+
+    fn require(
+        &self,
+        ticket: &mut RequestEvaluationTicket,
+        dependency: RequestNodeId,
+    ) -> Result<(), CompilationDbError> {
+        self.validate_ticket(ticket)?;
+        if dependency == ticket.node {
+            return Err(self.cycle_error(ticket.stack_index, dependency));
+        }
+        let dependency_node = self.nodes.get(dependency.as_usize()).ok_or_else(|| {
+            CompilationDbError::new("compilation evaluator dependency node is missing")
+        })?;
+        if let RequestNodeState::Computing { stack_index, .. } = dependency_node.state {
+            return Err(self.cycle_error(stack_index, dependency));
+        }
+        if !self.is_current(dependency) {
+            let verified_at = dependency_node.memo.as_ref().map(|memo| memo.verified_at.0);
+            return Err(CompilationDbError::new(match verified_at {
+                Some(revision) => format!(
+                    "compilation evaluator dependency is verified at revision {revision}, expected {}",
+                    self.revision.0
+                ),
+                None => "compilation evaluator dependency has no published value".to_owned(),
+            }));
+        }
+        ticket.dependencies.push(dependency);
+        Ok(())
+    }
+
+    fn replace_dependencies(&mut self, node: RequestNodeId, dependencies: Vec<RequestNodeId>) {
+        let old_dependencies = std::mem::take(&mut self.nodes[node.as_usize()].dependencies);
+        for dependency in old_dependencies {
+            if let Some(dependency) = self.nodes.get_mut(dependency.as_usize()) {
+                dependency.reverse_dependents.remove(&node);
+            }
         }
         for dependency in &dependencies {
-            let Some(slot) = self.slots.get(dependency) else {
-                return Err(CompilationDbError::new(
-                    "compilation evaluator dependency has no published value",
-                )
-                .into());
-            };
-            if slot.memo.verified_at != self.revision {
-                return Err(CompilationDbError::new(format!(
-                    "compilation evaluator dependency is verified at revision {}, expected {}",
-                    slot.memo.verified_at.0, self.revision.0,
-                ))
-                .into());
-            }
+            self.nodes[dependency.as_usize()]
+                .reverse_dependents
+                .insert(node);
         }
+        self.nodes[node.as_usize()].dependencies = dependencies;
+    }
 
-        if let Some(slot) = self.slots.get(&key) {
-            if slot.memo.verified_at == self.revision {
-                if slot.memo.input_fingerprint != input_fingerprint
-                    || slot.dependencies != dependencies
-                {
-                    return Err(CompilationDbError::new(
-                        "compilation evaluator request changed after publication in one revision",
-                    )
-                    .into());
-                }
-                self.stats.reused = self.stats.reused.saturating_add(1);
-                let value = &self.slots.get(&key).expect("request remains present").value;
-                return Ok(RequestEvaluation {
-                    value,
-                    disposition: RequestDisposition::Reused,
-                });
-            }
-
-            let dependencies_are_green = dependencies.iter().all(|dependency| {
-                self.slots
-                    .get(dependency)
-                    .is_some_and(|dependency| dependency.memo.changed_at <= slot.memo.verified_at)
-            });
-            if slot.memo.input_fingerprint == input_fingerprint
-                && slot.dependencies == dependencies
-                && dependencies_are_green
-            {
-                let slot = self.slots.get_mut(&key).expect("request remains present");
-                slot.memo.verified_at = self.revision;
-                slot.memo.dependencies_verified_at = self.revision;
-                self.stats.reused = self.stats.reused.saturating_add(1);
-                return Ok(RequestEvaluation {
-                    value: &slot.value,
-                    disposition: RequestDisposition::Reused,
-                });
-            }
-        }
-
-        let generation = self.generation;
-        let (value, result_fingerprint) = execute()?;
-        if generation != self.generation {
+    fn publish(
+        &mut self,
+        mut ticket: RequestEvaluationTicket,
+        result_fingerprint: RequestOutputFingerprint,
+    ) -> Result<bool, CompilationDbError> {
+        self.validate_ticket(&ticket)?;
+        ticket.dependencies.sort_unstable();
+        ticket.dependencies.dedup();
+        if ticket.dependencies.binary_search(&ticket.node).is_ok() {
             return Err(CompilationDbError::new(
-                "compilation evaluator rejected a superseded generation publication",
-            )
-            .into());
+                "compilation evaluator request directly depends on itself",
+            ));
         }
-        self.stats.executed = self.stats.executed.saturating_add(1);
-
-        if let Some(slot) = self.slots.get_mut(&key) {
-            let changed = slot
-                .memo
-                .publish(
-                    self.revision,
-                    self.revision,
-                    input_fingerprint,
-                    result_fingerprint,
-                )
-                .map_err(E::from)?;
-            slot.dependencies = dependencies;
-            if changed {
-                slot.value = value;
-                self.stats.changed = self.stats.changed.saturating_add(1);
-            } else {
-                self.stats.backdated = self.stats.backdated.saturating_add(1);
+        for dependency in &ticket.dependencies {
+            if !self.is_current(*dependency) {
+                return Err(CompilationDbError::new(
+                    "compilation request dependency became stale before publication",
+                ));
             }
-        } else {
-            self.slots.insert(
-                key.clone(),
-                TypedRequestSlot {
-                    memo: RequestMemo::new(self.revision, input_fingerprint, result_fingerprint),
-                    dependencies,
-                    value,
-                },
-            );
-            self.stats.changed = self.stats.changed.saturating_add(1);
         }
-        let value = &self
-            .slots
-            .get(&key)
-            .expect("published request is present")
-            .value;
-        Ok(RequestEvaluation {
-            value,
-            disposition: RequestDisposition::Executed,
+
+        let changed = if let Some(memo) = self.nodes[ticket.node.as_usize()].memo.as_mut() {
+            memo.publish(
+                self.revision,
+                self.revision,
+                ticket.input_fingerprint.0,
+                result_fingerprint.0,
+            )?
+        } else {
+            self.nodes[ticket.node.as_usize()].memo = Some(RequestMemo::new(
+                self.revision,
+                ticket.input_fingerprint.0,
+                result_fingerprint.0,
+            ));
+            true
+        };
+        self.replace_dependencies(ticket.node, ticket.dependencies);
+        self.nodes[ticket.node.as_usize()].state = RequestNodeState::Published;
+        self.active.pop();
+        if changed {
+            self.stats.changed = self.stats.changed.saturating_add(1);
+            self.revision_stats.changed = self.revision_stats.changed.saturating_add(1);
+        } else {
+            self.stats.backdated = self.stats.backdated.saturating_add(1);
+            self.revision_stats.backdated = self.revision_stats.backdated.saturating_add(1);
+        }
+        Ok(changed)
+    }
+
+    fn abort(
+        &mut self,
+        ticket: RequestEvaluationTicket,
+        reason: RequestAbortReason,
+    ) -> Result<(), CompilationDbError> {
+        self.validate_ticket(&ticket)?;
+        self.active.pop();
+        self.nodes[ticket.node.as_usize()].state = match reason {
+            RequestAbortReason::Failed => RequestNodeState::Failed {
+                revision: self.revision,
+            },
+            RequestAbortReason::Canceled if ticket.had_publication => RequestNodeState::Published,
+            RequestAbortReason::Canceled => RequestNodeState::Vacant,
+        };
+        match reason {
+            RequestAbortReason::Failed => {
+                self.stats.failed = self.stats.failed.saturating_add(1);
+                self.revision_stats.failed = self.revision_stats.failed.saturating_add(1);
+            }
+            RequestAbortReason::Canceled => {
+                self.stats.canceled = self.stats.canceled.saturating_add(1);
+                self.revision_stats.canceled = self.revision_stats.canceled.saturating_add(1);
+            }
+        }
+        Ok(())
+    }
+
+    fn remove_nodes(&mut self, nodes: &[RequestNodeId]) -> Result<(), CompilationDbError> {
+        if !self.active.is_empty() {
+            return Err(CompilationDbError::new(
+                "cannot remove compilation requests while evaluation is active",
+            ));
+        }
+        for node in nodes {
+            let dependencies = std::mem::take(&mut self.nodes[node.as_usize()].dependencies);
+            for dependency in dependencies {
+                self.nodes[dependency.as_usize()]
+                    .reverse_dependents
+                    .remove(node);
+            }
+            let slot = &mut self.nodes[node.as_usize()];
+            if slot.state != RequestNodeState::Removed {
+                slot.state = RequestNodeState::Removed;
+                slot.memo = None;
+                self.stats.removed = self.stats.removed.saturating_add(1);
+                self.revision_stats.removed = self.revision_stats.removed.saturating_add(1);
+            }
+        }
+        Ok(())
+    }
+}
+
+pub trait RequestFamily {
+    type Key: Clone + fmt::Debug + Ord;
+    type Value;
+
+    const NAME: &'static str;
+
+    fn key_fingerprint(key: &Self::Key) -> RequestFingerprint;
+
+    fn output_fingerprint(
+        value: &Self::Value,
+    ) -> Result<RequestOutputFingerprint, CompilationDbError>;
+}
+
+struct TypedRequestCell<V> {
+    node: RequestNodeId,
+    value: Option<V>,
+}
+
+/// Language-owned values for one statically typed request family.
+///
+/// A parse key can only publish a parse value because the family associates
+/// both types. Cross-family dependencies are captured by [`require`](Self::require)
+/// into the shared [`RequestEvaluatorGraph`]; no `Any`, sum-value enum, or
+/// caller-declared dependency list is involved.
+pub struct TypedRequestTable<F: RequestFamily> {
+    cells: BTreeMap<F::Key, TypedRequestCell<F::Value>>,
+    keys_by_node: BTreeMap<RequestNodeId, F::Key>,
+}
+
+impl<F: RequestFamily> Default for TypedRequestTable<F> {
+    fn default() -> Self {
+        Self {
+            cells: BTreeMap::new(),
+            keys_by_node: BTreeMap::new(),
+        }
+    }
+}
+
+impl<F: RequestFamily> TypedRequestTable<F> {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn request_count(&self) -> usize {
+        self.cells.len()
+    }
+
+    fn ensure_node(
+        &mut self,
+        graph: &mut RequestEvaluatorGraph,
+        key: &F::Key,
+    ) -> Result<RequestNodeId, CompilationDbError> {
+        if let Some(cell) = self.cells.get(key) {
+            return Ok(cell.node);
+        }
+        let node = graph.register(RequestNodeIdentity {
+            family: F::NAME,
+            key_fingerprint: F::key_fingerprint(key),
+        })?;
+        if let Some(previous) = self.keys_by_node.get(&node)
+            && previous != key
+        {
+            return Err(CompilationDbError::new(format!(
+                "request family {} key fingerprint collision between {previous:?} and {key:?}",
+                F::NAME
+            )));
+        }
+        self.keys_by_node.insert(node, key.clone());
+        self.cells
+            .insert(key.clone(), TypedRequestCell { node, value: None });
+        Ok(node)
+    }
+
+    pub fn begin(
+        &mut self,
+        graph: &mut RequestEvaluatorGraph,
+        key: F::Key,
+        input_fingerprint: RequestInputFingerprint,
+    ) -> Result<RequestStart, CompilationDbError> {
+        let node = self.ensure_node(graph, &key)?;
+        graph.begin(node, input_fingerprint)
+    }
+
+    pub fn require<'a>(
+        &'a self,
+        graph: &RequestEvaluatorGraph,
+        ticket: &mut RequestEvaluationTicket,
+        key: &F::Key,
+    ) -> Result<&'a F::Value, CompilationDbError> {
+        let cell = self.cells.get(key).ok_or_else(|| {
+            CompilationDbError::new(format!(
+                "request family {} dependency key is absent",
+                F::NAME
+            ))
+        })?;
+        graph.require(ticket, cell.node)?;
+        cell.value.as_ref().ok_or_else(|| {
+            CompilationDbError::new(format!(
+                "request family {} dependency has no typed value",
+                F::NAME
+            ))
         })
+    }
+
+    pub fn publish(
+        &mut self,
+        graph: &mut RequestEvaluatorGraph,
+        ticket: RequestEvaluationTicket,
+        value: F::Value,
+    ) -> Result<(), CompilationDbError> {
+        let key = self
+            .keys_by_node
+            .get(&ticket.node)
+            .cloned()
+            .ok_or_else(|| {
+                CompilationDbError::new(format!(
+                    "request family {} ticket has no typed key",
+                    F::NAME
+                ))
+            })?;
+        let result_fingerprint = match F::output_fingerprint(&value) {
+            Ok(result_fingerprint) => result_fingerprint,
+            Err(error) => {
+                graph.abort(ticket, RequestAbortReason::Failed)?;
+                return Err(error);
+            }
+        };
+        let changed = graph.publish(ticket, result_fingerprint)?;
+        let cell = self
+            .cells
+            .get_mut(&key)
+            .expect("ticket typed key remains present");
+        if changed || cell.value.is_none() {
+            cell.value = Some(value);
+        }
+        Ok(())
+    }
+
+    pub fn abort(
+        &mut self,
+        graph: &mut RequestEvaluatorGraph,
+        ticket: RequestEvaluationTicket,
+        reason: RequestAbortReason,
+    ) -> Result<(), CompilationDbError> {
+        graph.abort(ticket, reason)
+    }
+
+    pub fn current_value<'a>(
+        &'a self,
+        graph: &RequestEvaluatorGraph,
+        key: &F::Key,
+    ) -> Result<Option<&'a F::Value>, CompilationDbError> {
+        if !graph.active.is_empty() {
+            return Err(CompilationDbError::new(format!(
+                "request family {} cannot read a current value during evaluation; use require",
+                F::NAME
+            )));
+        }
+        let Some(cell) = self.cells.get(key) else {
+            return Ok(None);
+        };
+        Ok(graph
+            .is_current(cell.node)
+            .then(|| cell.value.as_ref())
+            .flatten())
+    }
+
+    pub fn memo<'a>(
+        &self,
+        graph: &'a RequestEvaluatorGraph,
+        key: &F::Key,
+    ) -> Option<&'a RequestMemo> {
+        graph.memo(self.cells.get(key)?.node)
+    }
+
+    pub fn node_id(&self, key: &F::Key) -> Option<RequestNodeId> {
+        self.cells.get(key).map(|cell| cell.node)
+    }
+
+    pub fn retain(
+        &mut self,
+        graph: &mut RequestEvaluatorGraph,
+        mut retain: impl FnMut(&F::Key) -> bool,
+    ) -> Result<(), CompilationDbError> {
+        let removed = self
+            .cells
+            .iter()
+            .filter_map(|(key, cell)| (!retain(key)).then_some((key.clone(), cell.node)))
+            .collect::<Vec<_>>();
+        let nodes = removed.iter().map(|(_, node)| *node).collect::<Vec<_>>();
+        graph.remove_nodes(&nodes)?;
+        for (key, node) in removed {
+            self.cells.remove(&key);
+            self.keys_by_node.remove(&node);
+        }
+        Ok(())
     }
 }
 
@@ -1073,6 +1514,49 @@ mod tests {
         [value; 32]
     }
 
+    struct NumberRequest;
+
+    impl RequestFamily for NumberRequest {
+        type Key = u8;
+        type Value = u32;
+
+        const NAME: &'static str = "test.number";
+
+        fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
+            digest(*key)
+        }
+
+        fn output_fingerprint(
+            value: &Self::Value,
+        ) -> Result<RequestOutputFingerprint, CompilationDbError> {
+            let mut fingerprint = [0; 32];
+            fingerprint[..4].copy_from_slice(&value.to_le_bytes());
+            Ok(RequestOutputFingerprint(fingerprint))
+        }
+    }
+
+    struct TextRequest;
+
+    impl RequestFamily for TextRequest {
+        type Key = u8;
+        type Value = String;
+
+        const NAME: &'static str = "test.text";
+
+        fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
+            digest(*key)
+        }
+
+        fn output_fingerprint(
+            value: &Self::Value,
+        ) -> Result<RequestOutputFingerprint, CompilationDbError> {
+            let mut hasher = Sha256::new();
+            hasher.update(b"test.text.output.v1\0");
+            hasher.update(value.as_bytes());
+            Ok(RequestOutputFingerprint(hasher.finalize().into()))
+        }
+    }
+
     struct TestGraph {
         sealed: SealedDenseProjectionGraph,
         ids: BTreeMap<u8, ProjectionId>,
@@ -1225,52 +1709,80 @@ mod tests {
     }
 
     #[test]
-    fn typed_evaluator_reuses_green_dependencies_and_backdates_equal_results() {
-        let mut evaluator = TypedRequestEvaluator::<&'static str, u32>::new(Revision(0));
-        let parsed = evaluator
-            .evaluate("parse", digest(1), std::iter::empty(), || {
-                Ok::<_, CompilationDbError>((10, digest(10)))
-            })
-            .unwrap();
-        assert_eq!(*parsed.value(), 10);
-        assert_eq!(parsed.disposition(), RequestDisposition::Executed);
-        let linked = evaluator
-            .evaluate("link", digest(20), ["parse"], || {
-                Ok::<_, CompilationDbError>((20, digest(20)))
-            })
-            .unwrap();
-        assert_eq!(*linked.value(), 20);
+    fn request_tables_capture_cross_family_dependencies_and_backdate() {
+        let mut graph = RequestEvaluatorGraph::new(Revision(0));
+        let mut numbers = TypedRequestTable::<NumberRequest>::new();
+        let mut texts = TypedRequestTable::<TextRequest>::new();
 
-        evaluator.advance_to(Revision(1)).unwrap();
-        let parsed = evaluator
-            .evaluate::<CompilationDbError>("parse", digest(1), std::iter::empty(), || {
-                panic!("green parse request executed")
-            })
-            .unwrap();
-        assert!(parsed.was_reused());
-        let linked = evaluator
-            .evaluate::<CompilationDbError>("link", digest(20), ["parse"], || {
-                panic!("green link request executed")
-            })
-            .unwrap();
-        assert!(linked.was_reused());
+        let RequestStart::Execute(number_ticket) = numbers
+            .begin(&mut graph, 1, RequestInputFingerprint(digest(1)))
+            .unwrap()
+        else {
+            panic!("new number request executes");
+        };
+        numbers.publish(&mut graph, number_ticket, 10).unwrap();
 
-        evaluator.advance_to(Revision(2)).unwrap();
-        evaluator
-            .evaluate("parse", digest(2), std::iter::empty(), || {
-                Ok::<_, CompilationDbError>((999, digest(10)))
-            })
+        let RequestStart::Execute(mut text_ticket) = texts
+            .begin(&mut graph, 2, RequestInputFingerprint(digest(2)))
+            .unwrap()
+        else {
+            panic!("new text request executes");
+        };
+        let omitted_edge = numbers
+            .current_value(&graph, &1)
+            .expect_err("raw value reads during evaluation must fail closed");
+        assert!(omitted_edge.to_string().contains("use require"));
+        let number = numbers
+            .require(&graph, &mut text_ticket, &1)
+            .copied()
             .unwrap();
-        assert_eq!(evaluator.memo(&"parse").unwrap().changed_at, Revision(0));
-        let linked = evaluator
-            .evaluate::<CompilationDbError>("link", digest(20), ["parse"], || {
-                panic!("backdated dependency dirtied its dependent")
-            })
+        texts
+            .publish(&mut graph, text_ticket, format!("value={number}"))
             .unwrap();
-        assert!(linked.was_reused());
-        assert_eq!(*linked.value(), 20);
 
-        let stats = evaluator.stats();
+        let number_node = numbers.node_id(&1).unwrap();
+        let text_node = texts.node_id(&2).unwrap();
+        assert_eq!(
+            graph.dependencies(text_node),
+            Some([number_node].as_slice())
+        );
+        assert_eq!(
+            graph.reverse_cone([number_node]),
+            BTreeSet::from([number_node, text_node])
+        );
+
+        graph.advance_to(Revision(1)).unwrap();
+        assert!(matches!(
+            numbers
+                .begin(&mut graph, 1, RequestInputFingerprint(digest(1)))
+                .unwrap(),
+            RequestStart::Reused
+        ));
+        assert!(matches!(
+            texts
+                .begin(&mut graph, 2, RequestInputFingerprint(digest(2)))
+                .unwrap(),
+            RequestStart::Reused
+        ));
+
+        graph.advance_to(Revision(2)).unwrap();
+        let RequestStart::Execute(number_ticket) = numbers
+            .begin(&mut graph, 1, RequestInputFingerprint(digest(3)))
+            .unwrap()
+        else {
+            panic!("changed number input executes");
+        };
+        numbers.publish(&mut graph, number_ticket, 10).unwrap();
+        assert_eq!(graph.memo(number_node).unwrap().changed_at, Revision(0));
+        assert!(matches!(
+            texts
+                .begin(&mut graph, 2, RequestInputFingerprint(digest(2)))
+                .unwrap(),
+            RequestStart::Reused
+        ));
+
+        let stats = graph.stats();
+        assert_eq!(stats.demanded, 6);
         assert_eq!(stats.executed, 3);
         assert_eq!(stats.reused, 3);
         assert_eq!(stats.backdated, 1);
@@ -1278,55 +1790,111 @@ mod tests {
     }
 
     #[test]
-    fn typed_evaluator_exposes_exact_reverse_cones_and_current_values() {
-        let mut evaluator = TypedRequestEvaluator::<u8, u8>::new(Revision(0));
-        for (key, dependencies) in [(1, vec![]), (2, vec![1]), (3, vec![2]), (4, vec![])] {
-            evaluator
-                .evaluate(key, digest(key), dependencies, || {
-                    Ok::<_, CompilationDbError>((key, digest(key + 10)))
-                })
+    fn request_graph_replaces_edges_and_keeps_removed_dependencies_stale() {
+        let mut graph = RequestEvaluatorGraph::new(Revision(0));
+        let mut requests = TypedRequestTable::<NumberRequest>::new();
+        for key in [1, 3] {
+            let RequestStart::Execute(ticket) = requests
+                .begin(&mut graph, key, RequestInputFingerprint(digest(key)))
+                .unwrap()
+            else {
+                panic!("new leaf executes");
+            };
+            requests
+                .publish(&mut graph, ticket, u32::from(key))
                 .unwrap();
         }
-        assert_eq!(
-            evaluator.reverse_cone([1]).into_iter().collect::<Vec<_>>(),
-            vec![1, 2, 3]
-        );
-        assert_eq!(evaluator.current_value(&4), Some(&4));
+        let RequestStart::Execute(mut ticket) = requests
+            .begin(&mut graph, 2, RequestInputFingerprint(digest(2)))
+            .unwrap()
+        else {
+            panic!("new dependent executes");
+        };
+        requests.require(&graph, &mut ticket, &1).unwrap();
+        requests.publish(&mut graph, ticket, 2).unwrap();
 
-        evaluator.advance_to(Revision(1)).unwrap();
-        assert_eq!(evaluator.current_value(&4), None);
-        evaluator.retain_requests(|key| *key != 2 && *key != 3);
+        let first = requests.node_id(&1).unwrap();
+        let dependent = requests.node_id(&2).unwrap();
+        let replacement = requests.node_id(&3).unwrap();
+        graph.advance_to(Revision(1)).unwrap();
+        for key in [1, 3] {
+            assert!(matches!(
+                requests
+                    .begin(&mut graph, key, RequestInputFingerprint(digest(key)))
+                    .unwrap(),
+                RequestStart::Reused
+            ));
+        }
+        let RequestStart::Execute(mut ticket) = requests
+            .begin(&mut graph, 2, RequestInputFingerprint(digest(4)))
+            .unwrap()
+        else {
+            panic!("changed dependent executes");
+        };
+        requests.require(&graph, &mut ticket, &3).unwrap();
+        requests.publish(&mut graph, ticket, 2).unwrap();
+        assert_eq!(graph.reverse_cone([first]), BTreeSet::from([first]));
         assert_eq!(
-            evaluator.reverse_cone([1]).into_iter().collect::<Vec<_>>(),
-            vec![1]
+            graph.reverse_cone([replacement]),
+            BTreeSet::from([dependent, replacement])
         );
-        assert_eq!(evaluator.stats().removed, 2);
+
+        graph.advance_to(Revision(2)).unwrap();
+        requests.retain(&mut graph, |key| *key != 3).unwrap();
+        assert_eq!(requests.current_value(&graph, &2).unwrap(), None);
+        assert_eq!(
+            graph.reverse_cone([replacement]),
+            BTreeSet::from([dependent, replacement])
+        );
     }
 
     #[test]
-    fn typed_evaluator_rejects_unverified_and_self_dependencies() {
-        let mut evaluator = TypedRequestEvaluator::<u8, u8>::new(Revision(0));
-        let error = evaluator
-            .evaluate(1, digest(1), [1], || {
-                Ok::<_, CompilationDbError>((1, digest(11)))
-            })
-            .err()
-            .expect("self dependency fails closed");
-        assert!(error.to_string().contains("directly depends on itself"));
-
-        evaluator
-            .evaluate(1, digest(1), std::iter::empty(), || {
-                Ok::<_, CompilationDbError>((1, digest(11)))
-            })
+    fn request_graph_reports_indirect_cycles_and_rejects_stale_tickets() {
+        let mut graph = RequestEvaluatorGraph::new(Revision(0));
+        let mut requests = TypedRequestTable::<NumberRequest>::new();
+        let RequestStart::Execute(first) = requests
+            .begin(&mut graph, 1, RequestInputFingerprint(digest(1)))
+            .unwrap()
+        else {
+            panic!("first request executes");
+        };
+        let RequestStart::Execute(second) = requests
+            .begin(&mut graph, 2, RequestInputFingerprint(digest(2)))
+            .unwrap()
+        else {
+            panic!("second request executes");
+        };
+        let RequestStart::Execute(third) = requests
+            .begin(&mut graph, 3, RequestInputFingerprint(digest(3)))
+            .unwrap()
+        else {
+            panic!("third request executes");
+        };
+        let cycle = requests
+            .begin(&mut graph, 1, RequestInputFingerprint(digest(1)))
+            .unwrap_err();
+        assert!(cycle.to_string().contains("compilation request cycle"));
+        assert!(cycle.to_string().contains("test.number"));
+        requests
+            .abort(&mut graph, third, RequestAbortReason::Canceled)
             .unwrap();
-        evaluator.advance_to(Revision(1)).unwrap();
-        let error = evaluator
-            .evaluate(2, digest(2), [1], || {
-                Ok::<_, CompilationDbError>((2, digest(12)))
-            })
-            .err()
-            .expect("stale dependency fails closed");
-        assert!(error.to_string().contains("verified at revision 0"));
+        requests
+            .abort(&mut graph, second, RequestAbortReason::Canceled)
+            .unwrap();
+        requests
+            .abort(&mut graph, first, RequestAbortReason::Canceled)
+            .unwrap();
+
+        let RequestStart::Execute(stale) = requests
+            .begin(&mut graph, 4, RequestInputFingerprint(digest(4)))
+            .unwrap()
+        else {
+            panic!("new request executes");
+        };
+        graph.advance_to(Revision(1)).unwrap();
+        let error = requests.publish(&mut graph, stale, 4).unwrap_err();
+        assert!(error.to_string().contains("superseded generation"));
+        assert_eq!(graph.stats().superseded, 1);
     }
 
     #[test]

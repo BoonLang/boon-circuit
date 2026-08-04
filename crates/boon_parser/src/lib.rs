@@ -339,7 +339,9 @@ pub fn project_unit_link_keys(
     let namespaces = project_syntax_namespaces(units.iter().map(|(id, _)| id.clone()))?;
     let mut functions_by_module = BTreeMap::<String, BTreeSet<String>>::new();
     for (source_unit_id, functions) in &units {
-        if let Some(module) = module_name_for_project_file(entrypoint, source_unit_id.as_str()) {
+        if let Some(module) =
+            project_module_name_for_source_unit(entrypoint, source_unit_id.as_str())
+        {
             functions_by_module
                 .entry(module)
                 .or_default()
@@ -348,7 +350,7 @@ pub fn project_unit_link_keys(
     }
     let mut keys = BTreeMap::new();
     for (source_unit_id, _) in units {
-        let module = module_name_for_project_file(entrypoint, source_unit_id.as_str());
+        let module = project_module_name_for_source_unit(entrypoint, source_unit_id.as_str());
         let module_functions = module
             .as_ref()
             .and_then(|module| functions_by_module.get(module))
@@ -2556,7 +2558,7 @@ fn assemble_canonical_parsed_source_units(
 
     let modules = units
         .iter()
-        .map(|unit| module_name_for_project_file(&entrypoint, &unit.path))
+        .map(|unit| project_module_name_for_source_unit(&entrypoint, &unit.path))
         .collect::<Vec<_>>();
     let mut functions_by_module = BTreeMap::<String, BTreeSet<String>>::new();
     for (unit, module) in units.iter().zip(&modules) {
@@ -2957,7 +2959,13 @@ fn project_source_error(
     error
 }
 
-fn module_name_for_project_file(entry_path: &str, file_path: &str) -> Option<String> {
+/// Return the authored module namespace contributed by one project source unit.
+///
+/// The entrypoint is the root program and therefore has no module namespace.
+/// Other files contribute a module only when their file stem starts with an
+/// uppercase character. Compiler request planning uses this same function so
+/// its per-module dependency partitions cannot drift from parser linking.
+pub fn project_module_name_for_source_unit(entry_path: &str, file_path: &str) -> Option<String> {
     if entry_path == file_path {
         return None;
     }

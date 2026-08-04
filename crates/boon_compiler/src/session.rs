@@ -4,18 +4,19 @@ use crate::{
     check_runtime_project_syntax_source, finish_checked_machine_plan_with_cancellation,
 };
 use boon_compilation_db::{
-    RequestEvaluationStats, RequestFingerprint, Revision as EvaluationRevision,
-    TypedRequestEvaluator,
+    RequestAbortReason, RequestEvaluationStats, RequestEvaluatorGraph, RequestFamily,
+    RequestFingerprint, RequestInputFingerprint, RequestOutputFingerprint, RequestStart,
+    Revision as EvaluationRevision, TypedRequestTable,
 };
 use boon_parser::{
     ParseWorkCounters, ParsedSourceUnit, ProjectSyntaxSnapshot, ProjectUnitLinkKey,
     UnitSyntaxSnapshot, link_project_source_unit_profiled, parse_project_source_unit_profiled,
-    project_unit_link_keys,
+    project_module_name_for_source_unit, project_syntax_namespaces,
 };
 use boon_plan::{
     ApplicationIdentity, MigrationPredecessorBinding, PlanError, ProgramRole, TargetProfile,
 };
-use boon_syntax::SourceUnitId;
+use boon_syntax::{SourceUnitId, SyntaxUnitNamespace};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{
@@ -173,7 +174,13 @@ pub struct CompilerSession {
 struct ProjectState {
     source: CompilerProject,
     revision: Revision,
-    syntax_requests: TypedRequestEvaluator<SessionSyntaxRequestKey, SessionSyntaxRequestValue>,
+    syntax_evaluator: RequestEvaluatorGraph,
+    parse_requests: TypedRequestTable<ParseUnitRequest>,
+    unit_link_summary_requests: TypedRequestTable<UnitLinkSummaryRequest>,
+    project_namespace_requests: TypedRequestTable<ProjectNamespaceRequest>,
+    project_module_requests: TypedRequestTable<ProjectModuleRequest>,
+    unit_link_overlay_requests: TypedRequestTable<UnitLinkOverlayRequest>,
+    link_requests: TypedRequestTable<LinkUnitRequest>,
     checked: Option<CheckedSourceFromSource>,
     compiled: Option<(Revision, CompiledSealedMachinePlanFromSource)>,
     request_graph: Option<(
@@ -182,38 +189,164 @@ struct ProjectState {
     )>,
 }
 
+struct ParseUnitRequest;
+
+impl RequestFamily for ParseUnitRequest {
+    type Key = SourceUnitId;
+    type Value = Arc<ParsedSourceUnit>;
+
+    const NAME: &'static str = "boon.compiler.parse-unit.v1";
+
+    fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
+        source_unit_key_fingerprint(b"boon.compiler.parse-unit-key.v1\0", key)
+    }
+
+    fn output_fingerprint(
+        value: &Self::Value,
+    ) -> Result<RequestOutputFingerprint, boon_compilation_db::CompilationDbError> {
+        Ok(RequestOutputFingerprint(source_unit_request_fingerprint(
+            &value.path,
+            &value.source,
+        )))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct UnitLinkSummary {
+    source_unit_id: SourceUnitId,
+    declared_functions: Vec<String>,
+}
+
+struct UnitLinkSummaryRequest;
+
+impl RequestFamily for UnitLinkSummaryRequest {
+    type Key = SourceUnitId;
+    type Value = UnitLinkSummary;
+
+    const NAME: &'static str = "boon.compiler.unit-link-summary.v1";
+
+    fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
+        source_unit_key_fingerprint(b"boon.compiler.unit-link-summary-key.v1\0", key)
+    }
+
+    fn output_fingerprint(
+        value: &Self::Value,
+    ) -> Result<RequestOutputFingerprint, boon_compilation_db::CompilationDbError> {
+        let mut hasher = Sha256::new();
+        hasher.update(b"boon.compiler.unit-link-summary-result.v1\0");
+        update_request_fingerprint_part(&mut hasher, value.source_unit_id.as_str().as_bytes());
+        hasher.update((value.declared_functions.len() as u64).to_le_bytes());
+        for function in &value.declared_functions {
+            update_request_fingerprint_part(&mut hasher, function.as_bytes());
+        }
+        Ok(RequestOutputFingerprint(hasher.finalize().into()))
+    }
+}
+
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-enum SessionSyntaxRequestKey {
-    Parse(SourceUnitId),
-    Link(SourceUnitId),
-}
+struct ProjectNamespaceKey;
 
-impl SessionSyntaxRequestKey {
-    fn source_unit_id(&self) -> &SourceUnitId {
-        match self {
-            Self::Parse(source_unit_id) | Self::Link(source_unit_id) => source_unit_id,
+struct ProjectNamespaceRequest;
+
+impl RequestFamily for ProjectNamespaceRequest {
+    type Key = ProjectNamespaceKey;
+    type Value = Arc<BTreeMap<SourceUnitId, SyntaxUnitNamespace>>;
+
+    const NAME: &'static str = "boon.compiler.project-namespace-plan.v1";
+
+    fn key_fingerprint(_key: &Self::Key) -> RequestFingerprint {
+        request_fingerprint(
+            b"boon.compiler.project-namespace-plan-key.v1\0",
+            std::iter::empty(),
+        )
+    }
+
+    fn output_fingerprint(
+        value: &Self::Value,
+    ) -> Result<RequestOutputFingerprint, boon_compilation_db::CompilationDbError> {
+        let mut hasher = Sha256::new();
+        hasher.update(b"boon.compiler.project-namespace-plan-result.v1\0");
+        hasher.update((value.len() as u64).to_le_bytes());
+        for (source_unit_id, namespace) in value.iter() {
+            update_request_fingerprint_part(&mut hasher, source_unit_id.as_str().as_bytes());
+            hasher.update(namespace.get().to_le_bytes());
         }
+        Ok(RequestOutputFingerprint(hasher.finalize().into()))
     }
 }
 
-enum SessionSyntaxRequestValue {
-    Parsed(Arc<ParsedSourceUnit>),
-    Linked(Arc<UnitSyntaxSnapshot>),
-}
+struct ProjectModuleRequest;
 
-impl SessionSyntaxRequestValue {
-    fn parsed(&self) -> Option<&Arc<ParsedSourceUnit>> {
-        match self {
-            Self::Parsed(parsed) => Some(parsed),
-            Self::Linked(_) => None,
-        }
+impl RequestFamily for ProjectModuleRequest {
+    type Key = String;
+    type Value = Arc<Vec<String>>;
+
+    const NAME: &'static str = "boon.compiler.project-module-index.v1";
+
+    fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
+        request_fingerprint(
+            b"boon.compiler.project-module-index-key.v1\0",
+            [key.as_bytes()],
+        )
     }
 
-    fn linked(&self) -> Option<&Arc<UnitSyntaxSnapshot>> {
-        match self {
-            Self::Parsed(_) => None,
-            Self::Linked(linked) => Some(linked),
+    fn output_fingerprint(
+        value: &Self::Value,
+    ) -> Result<RequestOutputFingerprint, boon_compilation_db::CompilationDbError> {
+        let mut hasher = Sha256::new();
+        hasher.update(b"boon.compiler.project-module-index-result.v1\0");
+        hasher.update((value.len() as u64).to_le_bytes());
+        for function in value.iter() {
+            update_request_fingerprint_part(&mut hasher, function.as_bytes());
         }
+        Ok(RequestOutputFingerprint(hasher.finalize().into()))
+    }
+}
+
+struct UnitLinkOverlayRequest;
+
+impl RequestFamily for UnitLinkOverlayRequest {
+    type Key = SourceUnitId;
+    type Value = ProjectUnitLinkKey;
+
+    const NAME: &'static str = "boon.compiler.unit-link-overlay.v1";
+
+    fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
+        source_unit_key_fingerprint(b"boon.compiler.unit-link-overlay-key.v1\0", key)
+    }
+
+    fn output_fingerprint(
+        value: &Self::Value,
+    ) -> Result<RequestOutputFingerprint, boon_compilation_db::CompilationDbError> {
+        Ok(RequestOutputFingerprint(project_link_request_fingerprint(
+            value,
+        )))
+    }
+}
+
+struct LinkUnitRequest;
+
+impl RequestFamily for LinkUnitRequest {
+    type Key = SourceUnitId;
+    type Value = Arc<UnitSyntaxSnapshot>;
+
+    const NAME: &'static str = "boon.compiler.link-unit.v1";
+
+    fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
+        source_unit_key_fingerprint(b"boon.compiler.link-unit-key.v1\0", key)
+    }
+
+    fn output_fingerprint(
+        value: &Self::Value,
+    ) -> Result<RequestOutputFingerprint, boon_compilation_db::CompilationDbError> {
+        Ok(RequestOutputFingerprint(request_fingerprint(
+            b"boon.compiler.link-unit-result.v1\0",
+            [
+                value.path.as_bytes(),
+                value.source.as_bytes(),
+                project_link_request_fingerprint(value.link_key()).as_slice(),
+            ],
+        )))
     }
 }
 
@@ -224,14 +357,23 @@ impl CompilerSession {
 
     pub fn open_project(&mut self, project: CompilerProject) -> CompilerResult<ProjectId> {
         validate_project(&project)?;
-        self.next_project = self.next_project.saturating_add(1);
+        self.next_project = self
+            .next_project
+            .checked_add(1)
+            .ok_or_else(|| session_error("compiler session project id overflow"))?;
         let id = ProjectId(self.next_project);
         self.projects.insert(
             id,
             ProjectState {
                 source: project,
                 revision: Revision(0),
-                syntax_requests: TypedRequestEvaluator::new(EvaluationRevision(0)),
+                syntax_evaluator: RequestEvaluatorGraph::new(EvaluationRevision(0)),
+                parse_requests: TypedRequestTable::new(),
+                unit_link_summary_requests: TypedRequestTable::new(),
+                project_namespace_requests: TypedRequestTable::new(),
+                project_module_requests: TypedRequestTable::new(),
+                unit_link_overlay_requests: TypedRequestTable::new(),
+                link_requests: TypedRequestTable::new(),
                 checked: None,
                 compiled: None,
                 request_graph: None,
@@ -304,7 +446,7 @@ impl CompilerSession {
             session_error(format!("compiler project {} revision overflow", project.0))
         })?;
         state
-            .syntax_requests
+            .syntax_evaluator
             .advance_to(EvaluationRevision(next_revision))?;
         for update in updates {
             let unit = state
@@ -424,6 +566,7 @@ impl CompilerSession {
         }
 
         let mut surviving_sources = BTreeSet::new();
+        let mut surviving_modules = BTreeSet::new();
         for unit in &candidate.units {
             let source_unit_id = SourceUnitId::from_path(&unit.path).map_err(|error| {
                 session_error(format!(
@@ -431,17 +574,44 @@ impl CompilerSession {
                     project.0, unit.path
                 ))
             })?;
+            if let Some(module) =
+                project_module_name_for_source_unit(&candidate.entrypoint, source_unit_id.as_str())
+            {
+                surviving_modules.insert(module);
+            }
             surviving_sources.insert(source_unit_id);
         }
         let next_revision = state.revision.0.checked_add(1).ok_or_else(|| {
             session_error(format!("compiler project {} revision overflow", project.0))
         })?;
         state
-            .syntax_requests
+            .syntax_evaluator
             .advance_to(EvaluationRevision(next_revision))?;
         state
-            .syntax_requests
-            .retain_requests(|key| surviving_sources.contains(key.source_unit_id()));
+            .parse_requests
+            .retain(&mut state.syntax_evaluator, |key| {
+                surviving_sources.contains(key)
+            })?;
+        state
+            .unit_link_summary_requests
+            .retain(&mut state.syntax_evaluator, |key| {
+                surviving_sources.contains(key)
+            })?;
+        state
+            .project_module_requests
+            .retain(&mut state.syntax_evaluator, |key| {
+                surviving_modules.contains(key)
+            })?;
+        state
+            .unit_link_overlay_requests
+            .retain(&mut state.syntax_evaluator, |key| {
+                surviving_sources.contains(key)
+            })?;
+        state
+            .link_requests
+            .retain(&mut state.syntax_evaluator, |key| {
+                surviving_sources.contains(key)
+            })?;
         state.source = candidate;
         state.revision = Revision(next_revision);
         state.checked = None;
@@ -497,7 +667,7 @@ impl CompilerSession {
             .projects
             .get(&project)
             .ok_or_else(|| session_error(format!("unknown compiler project {}", project.0)))?;
-        Ok(state.syntax_requests.stats())
+        Ok(state.syntax_evaluator.stats())
     }
 
     /// Returns the retained context-independent syntax artifact for one unit,
@@ -514,9 +684,8 @@ impl CompilerSession {
         let source_unit_id = SourceUnitId::from_path(path)
             .map_err(|error| session_error(format!("invalid source unit `{path}`: {error}")))?;
         Ok(state
-            .syntax_requests
-            .current_value(&SessionSyntaxRequestKey::Link(source_unit_id))
-            .and_then(SessionSyntaxRequestValue::linked)
+            .link_requests
+            .current_value(&state.syntax_evaluator, &source_unit_id)?
             .map(Arc::clone))
     }
 
@@ -632,97 +801,291 @@ fn parse_project_snapshot(
                 unit.path
             ))
         })?;
-        let request_key = SessionSyntaxRequestKey::Parse(source_unit_id);
-        let input_fingerprint = source_unit_request_fingerprint(&unit.path, &unit.source);
-        let mut executed_work = None;
-        let evaluation = state
-            .syntax_requests
-            .evaluate::<Box<dyn std::error::Error>>(
-                request_key.clone(),
-                input_fingerprint,
-                std::iter::empty(),
-                || {
-                    let (parsed, profile) =
-                        parse_project_source_unit_profiled(unit.path.clone(), unit.source.clone());
-                    executed_work = Some(profile.work_counters);
-                    Ok((
-                        SessionSyntaxRequestValue::Parsed(Arc::new(parsed?)),
-                        input_fingerprint,
-                    ))
-                },
-            )?;
-        if evaluation.was_reused() {
-            work.record_reused_source_units(1);
-        } else {
-            work.accumulate(
-                executed_work.expect("executed parser request publishes exact work counters"),
-            );
+        let input_fingerprint =
+            RequestInputFingerprint(source_unit_request_fingerprint(&unit.path, &unit.source));
+        match state.parse_requests.begin(
+            &mut state.syntax_evaluator,
+            source_unit_id.clone(),
+            input_fingerprint,
+        )? {
+            RequestStart::Reused => work.record_reused_source_units(1),
+            RequestStart::Execute(ticket) => {
+                let (parsed, profile) =
+                    parse_project_source_unit_profiled(unit.path.clone(), unit.source.clone());
+                let parsed = match parsed {
+                    Ok(parsed) => Arc::new(parsed),
+                    Err(error) => {
+                        state.parse_requests.abort(
+                            &mut state.syntax_evaluator,
+                            ticket,
+                            RequestAbortReason::Failed,
+                        )?;
+                        return Err(error.into());
+                    }
+                };
+                work.accumulate(profile.work_counters);
+                state
+                    .parse_requests
+                    .publish(&mut state.syntax_evaluator, ticket, parsed)?;
+            }
         }
         let parsed = Arc::clone(
-            evaluation
-                .value()
-                .parsed()
-                .expect("parse request publishes parsed syntax"),
+            state
+                .parse_requests
+                .current_value(&state.syntax_evaluator, &source_unit_id)
+                .expect("request value read occurs outside evaluation")
+                .expect("parse request publishes current parsed syntax"),
         );
-        let result_fingerprint = state
-            .syntax_requests
-            .memo(&request_key)
-            .expect("parse request publishes memo currentness")
-            .result_fingerprint;
-        parsed_units.push((parsed, request_key, result_fingerprint));
+        parsed_units.push((source_unit_id, parsed));
     }
 
-    let link_keys = project_unit_link_keys(
-        &state.source.entrypoint,
+    let summary_input = RequestInputFingerprint(request_fingerprint(
+        b"boon.compiler.unit-link-summary-input.v1\0",
+        std::iter::empty(),
+    ));
+    for (source_unit_id, _) in &parsed_units {
+        match state.unit_link_summary_requests.begin(
+            &mut state.syntax_evaluator,
+            source_unit_id.clone(),
+            summary_input,
+        )? {
+            RequestStart::Reused => {}
+            RequestStart::Execute(mut ticket) => {
+                let summary = match state.parse_requests.require(
+                    &state.syntax_evaluator,
+                    &mut ticket,
+                    source_unit_id,
+                ) {
+                    Ok(parsed) => UnitLinkSummary {
+                        source_unit_id: parsed.source_unit_id.clone(),
+                        declared_functions: parsed.declared_functions.clone(),
+                    },
+                    Err(error) => {
+                        state.unit_link_summary_requests.abort(
+                            &mut state.syntax_evaluator,
+                            ticket,
+                            RequestAbortReason::Failed,
+                        )?;
+                        return Err(error.into());
+                    }
+                };
+                state.unit_link_summary_requests.publish(
+                    &mut state.syntax_evaluator,
+                    ticket,
+                    summary,
+                )?;
+            }
+        }
+    }
+
+    let project_namespace_key = ProjectNamespaceKey;
+    let project_namespace_input = RequestInputFingerprint(project_namespace_input_fingerprint(
         parsed_units
             .iter()
-            .map(|(unit, _, _)| (unit.source_unit_id.clone(), unit.declared_functions.clone())),
-    )?;
+            .map(|(source_unit_id, _)| source_unit_id),
+    ));
+    match state.project_namespace_requests.begin(
+        &mut state.syntax_evaluator,
+        project_namespace_key.clone(),
+        project_namespace_input,
+    )? {
+        RequestStart::Reused => {}
+        RequestStart::Execute(ticket) => {
+            let namespaces = project_syntax_namespaces(
+                parsed_units
+                    .iter()
+                    .map(|(source_unit_id, _)| source_unit_id.clone()),
+            );
+            let namespaces = match namespaces {
+                Ok(namespaces) => Arc::new(namespaces),
+                Err(error) => {
+                    state.project_namespace_requests.abort(
+                        &mut state.syntax_evaluator,
+                        ticket,
+                        RequestAbortReason::Failed,
+                    )?;
+                    return Err(error.into());
+                }
+            };
+            state.project_namespace_requests.publish(
+                &mut state.syntax_evaluator,
+                ticket,
+                namespaces,
+            )?;
+        }
+    }
+
+    let mut unit_modules = BTreeMap::new();
+    let mut module_members = BTreeMap::<String, Vec<SourceUnitId>>::new();
+    for (source_unit_id, _) in &parsed_units {
+        let module =
+            project_module_name_for_source_unit(&state.source.entrypoint, source_unit_id.as_str());
+        if let Some(module) = &module {
+            module_members
+                .entry(module.clone())
+                .or_default()
+                .push(source_unit_id.clone());
+        }
+        unit_modules.insert(source_unit_id.clone(), module);
+    }
+
+    for (module, members) in &module_members {
+        let module_input = RequestInputFingerprint(project_module_input_fingerprint(members));
+        match state.project_module_requests.begin(
+            &mut state.syntax_evaluator,
+            module.clone(),
+            module_input,
+        )? {
+            RequestStart::Reused => {}
+            RequestStart::Execute(mut ticket) => {
+                let module_functions = (|| -> CompilerResult<_> {
+                    let mut functions = BTreeSet::new();
+                    for source_unit_id in members {
+                        let summary = state.unit_link_summary_requests.require(
+                            &state.syntax_evaluator,
+                            &mut ticket,
+                            source_unit_id,
+                        )?;
+                        functions.extend(summary.declared_functions.iter().cloned());
+                    }
+                    Ok(Arc::new(functions.into_iter().collect::<Vec<_>>()))
+                })();
+                let module_functions = match module_functions {
+                    Ok(module_functions) => module_functions,
+                    Err(error) => {
+                        state.project_module_requests.abort(
+                            &mut state.syntax_evaluator,
+                            ticket,
+                            RequestAbortReason::Failed,
+                        )?;
+                        return Err(error);
+                    }
+                };
+                state.project_module_requests.publish(
+                    &mut state.syntax_evaluator,
+                    ticket,
+                    module_functions,
+                )?;
+            }
+        }
+    }
+
+    let overlay_input_for = |module: Option<&str>| {
+        RequestInputFingerprint(request_fingerprint(
+            b"boon.compiler.unit-link-overlay-input.v1\0",
+            module.into_iter().map(str::as_bytes),
+        ))
+    };
+    for (source_unit_id, _) in &parsed_units {
+        let module = unit_modules
+            .get(source_unit_id)
+            .expect("every parsed source has a module classification");
+        match state.unit_link_overlay_requests.begin(
+            &mut state.syntax_evaluator,
+            source_unit_id.clone(),
+            overlay_input_for(module.as_deref()),
+        )? {
+            RequestStart::Reused => {}
+            RequestStart::Execute(mut ticket) => {
+                let link_key = (|| -> CompilerResult<_> {
+                    let namespaces = state.project_namespace_requests.require(
+                        &state.syntax_evaluator,
+                        &mut ticket,
+                        &project_namespace_key,
+                    )?;
+                    let namespace = *namespaces.get(source_unit_id).ok_or_else(|| {
+                        session_error(format!(
+                            "compiler project source unit `{source_unit_id}` has no syntax namespace"
+                        ))
+                    })?;
+                    let module_functions = match module {
+                        Some(module) => state
+                            .project_module_requests
+                            .require(&state.syntax_evaluator, &mut ticket, module)?
+                            .as_ref()
+                            .clone(),
+                        None => Vec::new(),
+                    };
+                    Ok(ProjectUnitLinkKey {
+                        namespace,
+                        module: module.clone(),
+                        module_functions,
+                    })
+                })();
+                let link_key = match link_key {
+                    Ok(link_key) => link_key,
+                    Err(error) => {
+                        state.unit_link_overlay_requests.abort(
+                            &mut state.syntax_evaluator,
+                            ticket,
+                            RequestAbortReason::Failed,
+                        )?;
+                        return Err(error);
+                    }
+                };
+                state.unit_link_overlay_requests.publish(
+                    &mut state.syntax_evaluator,
+                    ticket,
+                    link_key,
+                )?;
+            }
+        }
+    }
+
     let mut linked_units = Vec::with_capacity(parsed_units.len());
-    for (parsed, parse_request, parse_result_fingerprint) in parsed_units {
-        let source_unit_id = parsed.source_unit_id.clone();
-        let link_key = link_keys.get(&source_unit_id).cloned().ok_or_else(|| {
-            session_error(format!(
-                "compiler project source unit `{}` has no project link context",
-                parsed.path
-            ))
-        })?;
-        let request_key = SessionSyntaxRequestKey::Link(source_unit_id);
-        let input_fingerprint = project_link_request_fingerprint(&link_key);
-        let result_fingerprint = dependent_request_fingerprint(
-            b"boon.compiler-session.unit-link-result.v1\0",
-            parse_result_fingerprint,
-            input_fingerprint,
-        );
-        let mut executed_work = None;
-        let evaluation = state
-            .syntax_requests
-            .evaluate::<Box<dyn std::error::Error>>(
-                request_key,
-                input_fingerprint,
-                [parse_request],
-                || {
+    let link_input = RequestInputFingerprint(request_fingerprint(
+        b"boon.compiler.link-unit-input.v1\0",
+        std::iter::empty(),
+    ));
+    for (source_unit_id, _) in parsed_units {
+        match state.link_requests.begin(
+            &mut state.syntax_evaluator,
+            source_unit_id.clone(),
+            link_input,
+        )? {
+            RequestStart::Reused => {}
+            RequestStart::Execute(mut ticket) => {
+                let linked = (|| -> CompilerResult<_> {
+                    let parsed = Arc::clone(state.parse_requests.require(
+                        &state.syntax_evaluator,
+                        &mut ticket,
+                        &source_unit_id,
+                    )?);
+                    let link_key = state.unit_link_overlay_requests.require(
+                        &state.syntax_evaluator,
+                        &mut ticket,
+                        &source_unit_id,
+                    )?;
                     let (linked, profile) = link_project_source_unit_profiled(
                         parsed.as_ref().clone(),
                         link_key.clone(),
                     );
-                    executed_work = Some(profile.work_counters);
-                    Ok((
-                        SessionSyntaxRequestValue::Linked(Arc::new(linked?)),
-                        result_fingerprint,
-                    ))
-                },
-            )?;
-        if !evaluation.was_reused() {
-            work.accumulate(
-                executed_work.expect("executed link request publishes exact work counters"),
-            );
+                    let linked = Arc::new(linked?);
+                    Ok((linked, profile.work_counters))
+                })();
+                let (linked, link_work) = match linked {
+                    Ok(linked) => linked,
+                    Err(error) => {
+                        state.link_requests.abort(
+                            &mut state.syntax_evaluator,
+                            ticket,
+                            RequestAbortReason::Failed,
+                        )?;
+                        return Err(error);
+                    }
+                };
+                work.accumulate(link_work);
+                state
+                    .link_requests
+                    .publish(&mut state.syntax_evaluator, ticket, linked)?;
+            }
         }
         let linked = Arc::clone(
-            evaluation
-                .value()
-                .linked()
-                .expect("link request publishes linked unit syntax"),
+            state
+                .link_requests
+                .current_value(&state.syntax_evaluator, &source_unit_id)
+                .expect("request value read occurs outside evaluation")
+                .expect("link request publishes current linked unit syntax"),
         );
         linked_units.push(linked);
     }
@@ -737,6 +1100,36 @@ fn source_unit_request_fingerprint(path: &str, source: &str) -> RequestFingerpri
         b"boon.compiler-session.source-unit-parse.v1\0",
         [path.as_bytes(), source.as_bytes()],
     )
+}
+
+fn source_unit_key_fingerprint(domain: &[u8], source_unit_id: &SourceUnitId) -> RequestFingerprint {
+    request_fingerprint(domain, [source_unit_id.as_str().as_bytes()])
+}
+
+fn project_namespace_input_fingerprint<'a>(
+    source_unit_ids: impl IntoIterator<Item = &'a SourceUnitId>,
+) -> RequestFingerprint {
+    let mut source_unit_ids = source_unit_ids.into_iter().collect::<Vec<_>>();
+    source_unit_ids.sort();
+    let mut hasher = Sha256::new();
+    hasher.update(b"boon.compiler.project-namespace-plan-input.v1\0");
+    hasher.update((source_unit_ids.len() as u64).to_le_bytes());
+    for source_unit_id in source_unit_ids {
+        update_request_fingerprint_part(&mut hasher, source_unit_id.as_str().as_bytes());
+    }
+    hasher.finalize().into()
+}
+
+fn project_module_input_fingerprint(source_unit_ids: &[SourceUnitId]) -> RequestFingerprint {
+    let mut source_unit_ids = source_unit_ids.iter().collect::<Vec<_>>();
+    source_unit_ids.sort();
+    let mut hasher = Sha256::new();
+    hasher.update(b"boon.compiler.project-module-index-input.v1\0");
+    hasher.update((source_unit_ids.len() as u64).to_le_bytes());
+    for source_unit_id in source_unit_ids {
+        update_request_fingerprint_part(&mut hasher, source_unit_id.as_str().as_bytes());
+    }
+    hasher.finalize().into()
 }
 
 fn project_link_request_fingerprint(link_key: &ProjectUnitLinkKey) -> RequestFingerprint {
@@ -755,14 +1148,6 @@ fn project_link_request_fingerprint(link_key: &ProjectUnitLinkKey) -> RequestFin
         update_request_fingerprint_part(&mut hasher, function.as_bytes());
     }
     hasher.finalize().into()
-}
-
-fn dependent_request_fingerprint(
-    domain: &[u8],
-    dependency: RequestFingerprint,
-    local: RequestFingerprint,
-) -> RequestFingerprint {
-    request_fingerprint(domain, [dependency.as_slice(), local.as_slice()])
 }
 
 fn request_fingerprint<'a>(
@@ -1082,9 +1467,10 @@ mod tests {
             assert_eq!(first.profile.parse_work.nodes_rebased, 0);
         }
         let first_stats = session.syntax_request_stats(project).unwrap();
-        assert_eq!(first_stats.executed, 4);
+        assert_eq!(first_stats.demanded, 10);
+        assert_eq!(first_stats.executed, 10);
         assert_eq!(first_stats.reused, 0);
-        assert_eq!(first_stats.changed, 4);
+        assert_eq!(first_stats.changed, 10);
         let retained_a = session
             .unit_syntax_snapshot(project, "A.bn")
             .unwrap()
@@ -1120,9 +1506,11 @@ mod tests {
             second.profile.parse_work
         };
         let second_stats = session.syntax_request_stats(project).unwrap();
-        assert_eq!(second_stats.executed, 6);
-        assert_eq!(second_stats.reused, 2);
-        assert_eq!(second_stats.changed, 6);
+        assert_eq!(second_stats.demanded, 20);
+        assert_eq!(second_stats.executed, 13);
+        assert_eq!(second_stats.reused, 7);
+        assert_eq!(second_stats.backdated, 1);
+        assert_eq!(second_stats.changed, 12);
 
         let mut isolated = CompilerSession::new();
         let isolated_project = isolated
@@ -1163,6 +1551,101 @@ mod tests {
             .unwrap();
         assert!(Arc::ptr_eq(&retained_a, &current_a));
         assert!(!Arc::ptr_eq(&replaced_run, &current_run));
+    }
+
+    #[test]
+    fn module_interface_changes_relink_only_that_module_while_body_edits_stay_local() {
+        let first_source = "FUNCTION first(input) {\n    input\n}\n";
+        let first_with_export = concat!(
+            "FUNCTION first(input) {\n    input\n}\n",
+            "FUNCTION third(input) {\n    input\n}\n",
+        );
+        let first_body_edit = concat!(
+            "FUNCTION first(input) {\n    input + 0\n}\n",
+            "FUNCTION third(input) {\n    input\n}\n",
+        );
+        let mut session = CompilerSession::new();
+        let project = session
+            .open_project(CompilerProject::new(
+                "RUN.bn",
+                vec![
+                    CompilerSourceUnit {
+                        path: "left/Math.bn".to_owned(),
+                        source: first_source.to_owned(),
+                    },
+                    CompilerSourceUnit {
+                        path: "right/Math.bn".to_owned(),
+                        source: "FUNCTION second(input) {\n    input\n}\n".to_owned(),
+                    },
+                    CompilerSourceUnit {
+                        path: "RUN.bn".to_owned(),
+                        source: "value: 1\n".to_owned(),
+                    },
+                ],
+                TargetProfile::SoftwareDefault,
+                ProgramRole::Server,
+                ApplicationIdentity::compiler_default(),
+            ))
+            .unwrap();
+        parse_project_snapshot(session.projects.get_mut(&project).unwrap()).unwrap();
+        let original_math = session
+            .unit_syntax_snapshot(project, "right/Math.bn")
+            .unwrap()
+            .unwrap();
+        let original_run = session
+            .unit_syntax_snapshot(project, "RUN.bn")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            original_math.link_key().module_functions,
+            ["first", "second"]
+        );
+        let cold_stats = session.syntax_request_stats(project).unwrap();
+
+        session
+            .apply_update(project, UnitUpdate::new("left/Math.bn", first_with_export))
+            .unwrap();
+        parse_project_snapshot(session.projects.get_mut(&project).unwrap()).unwrap();
+        let exported_math = session
+            .unit_syntax_snapshot(project, "right/Math.bn")
+            .unwrap()
+            .unwrap();
+        let retained_run = session
+            .unit_syntax_snapshot(project, "RUN.bn")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            exported_math.link_key().module_functions,
+            ["first", "second", "third"]
+        );
+        assert!(!Arc::ptr_eq(&original_math, &exported_math));
+        assert!(Arc::ptr_eq(&original_run, &retained_run));
+        let interface_stats = session.syntax_request_stats(project).unwrap();
+        assert_eq!(interface_stats.demanded - cold_stats.demanded, 14);
+        assert_eq!(interface_stats.executed - cold_stats.executed, 7);
+        assert_eq!(interface_stats.reused - cold_stats.reused, 7);
+        assert_eq!(interface_stats.changed - cold_stats.changed, 7);
+
+        session
+            .apply_update(project, UnitUpdate::new("left/Math.bn", first_body_edit))
+            .unwrap();
+        parse_project_snapshot(session.projects.get_mut(&project).unwrap()).unwrap();
+        let body_edit_math = session
+            .unit_syntax_snapshot(project, "right/Math.bn")
+            .unwrap()
+            .unwrap();
+        let body_edit_run = session
+            .unit_syntax_snapshot(project, "RUN.bn")
+            .unwrap()
+            .unwrap();
+        assert!(Arc::ptr_eq(&exported_math, &body_edit_math));
+        assert!(Arc::ptr_eq(&retained_run, &body_edit_run));
+        let body_stats = session.syntax_request_stats(project).unwrap();
+        assert_eq!(body_stats.demanded - interface_stats.demanded, 14);
+        assert_eq!(body_stats.executed - interface_stats.executed, 3);
+        assert_eq!(body_stats.reused - interface_stats.reused, 11);
+        assert_eq!(body_stats.backdated - interface_stats.backdated, 1);
+        assert_eq!(body_stats.changed - interface_stats.changed, 2);
     }
 
     #[test]

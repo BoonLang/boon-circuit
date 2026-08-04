@@ -1,6 +1,7 @@
 # Boon Compiler Macro-Architecture Research
 
-Status: selected post-`e510726` architecture refinement; subordinate to
+Status: selected architecture refinement, reconciled through unit-native
+checkpoint `a48f488`; subordinate to
 `BOON_COMPILER_PERFORMANCE_PLAN.md` and additive to
 `BOON_COMPILER_DEFINITION_ARTIFACT_RESEARCH.md`.
 
@@ -32,69 +33,91 @@ compiler architecture:
    `MachinePlan` export are explicit debug/evidence requests rather than the
    normal preview path.
 
-The immediate implementation order changes accordingly. Do not build checked
-definition shards on top of revision-global expression ids that will be deleted
-later. First remove global syntax assembly from the persistent compiler route,
-then implement typed request currentness and definition shards, then delete the
-checked handoff and downstream whole owners.
+The immediate implementation order changes accordingly. Global syntax assembly
+is removed at `a48f488`; do not now build checked definition shards on the
+remaining packed/dense identity ambiguity. Install the typed identity firewall
+and immutable project-link overlay, then implement real request currentness and
+definition shards, delete the checked handoff, and continue through downstream
+whole-owner deletion.
 
 ## Fresh Current-Tree Evidence
 
-All measurements below are directional debug observations from the current
-`e510726` source and prebuilt compiler. They rank owners; they are not release
-acceptance and their costs are not assumed to add independently.
+The historical measurements in the owner descriptions came from `e510726`.
+The post-M1 measurements and traces below come from `a48f488` and its prebuilt
+debug compiler. They rank owners; they are not release acceptance and their
+costs are not assumed to add independently.
 
 ### Whole request
 
 | Phase | Current observation |
 | --- | ---: |
-| verified request | 4,251.545 ms |
-| peak RSS | 282,756 KiB |
-| parse | 120.640 ms |
-| typecheck | 708.498 ms |
-| semantic | 2,266.805 ms |
-| contract verification | 0.500 ms |
-| IR erasure | 43.910 ms |
-| backend | 917.666 ms |
-| plan validation | 106.305 ms |
-| pretty serialization/hash in the scored producer | 535.917 ms |
+| verified request | 4,205.547 ms |
+| peak RSS | 284,152 KiB |
+| parse | 106.718 ms |
+| typecheck, including deferred checked publication | 763.335 ms |
+| semantic | 2,275.520 ms |
+| contract verification | 0.511 ms |
+| IR erasure and validation | 56.130 ms |
+| backend | 831.825 ms |
+| plan validation | 102.257 ms |
+| explicit export serialization/hash in the producer | 531.321 ms |
 
 The canonical plan hash remains
 `db18f345676378b8633829c0bbd7870c0a1dc5a2459649c9bbfdd6b8969374ab`.
 
 ### Syntax ownership
 
-The eight unit-local AST parses total roughly 45 ms in the current parser trace.
-After they finish, canonical bundle validation takes another 18.000 ms and unit
-assembly takes 36.017 ms. `CompilerSession` retains each `ParsedSourceUnit`, but
-`parse_project_snapshot` still clones every retained unit, rebases every dense
-id/span/line into a global arena, reconstructs one source string, and validates
-the complete bundle for every request.
+M1 is now real: `CompilerSession` builds `ProjectSyntaxSnapshot` from retained
+`Arc<UnitSyntaxSnapshot>` values, production checking consumes it directly,
+and the current NovyWave sample reports `nodes_rebased=0`. Exact diagnostics
+and the verified plan artifact match the independent assembled-syntax oracle.
 
-The structural occurrence route checkpoint adds about 16--24 ms because routes
-are currently derived by a post-parse tree traversal. That cost is visible debt,
-but tuning its vectors and maps is lower leverage than deleting global assembly:
-the target unit representation can emit compact parent/slot metadata while
-parsing and never allocate revision-global routes at all.
+The remaining parser owner is no longer global assembly. The eight traced AST
+parses total about 45.5 ms, while the measured parse phase is about 107 ms and
+reports 1,050,467 validation visits. A freshly parsed unit first builds boundary
+indexes, item routes, and occurrence routes; project linking then mutates the
+AST to namespace functions, rebuilds a full validation index, revalidates the
+unit, walks it again to pack project syntax IDs, and `ProjectSyntaxSnapshot`
+walks statements and item metadata again. This is a second unit-wide linking
+pass, not a map-container problem.
+
+The larger replacement is a parser-native immutable unit with typed local node
+keys and construction-time parent/item metadata. Project linking publishes a
+small module/name-resolution overlay and source-layout index; it does not
+rewrite, repack, or revalidate the AST. That representation also removes the
+need for packed project IDs and makes the identity firewall below enforceable.
 
 ### Checked ownership
 
-The current diagnostics trace divides typechecking into two very different
-owners:
+The post-M1 diagnostics trace divides typechecking into two different owners:
 
 | Checked owner | Current observation |
 | --- | ---: |
-| actual checked-program construction and validation | about 210.149 ms |
-| ordered diagnostic projection | 26.724 ms |
-| `assemble_report` | 408.603 ms |
+| checker initialization | 44.953 ms |
+| checked construction, inference, validation, and ordered diagnostics | 261.421 ms |
+| remaining output/table/report work | about 44.5 ms |
+| diagnostics `assemble_report` | 1.335 ms |
 
-`assemble_report` calls `checked_image_handoff` after the checked scopes,
+Diagnostics no longer call `checked_image_handoff`; that intent split is
+landed. Verified publication still calls it after the checked scopes,
 declarations, statements, expressions, callables, calls, resources, and
-metadata already exist. That scanner canonical-serializes a second checked
-projection with 63,657 rows. `DiagnosticsOwned` still builds it so a later
-verified request can consume the same whole `CheckedProgram`; therefore the
-diagnostics intent is coupled to runtime publication even when the user only
-needs diagnostics.
+metadata already exist. It canonical-serializes a second checked projection
+with 63,657 rows and accounts for roughly the 400 ms difference between the
+350.876 ms diagnostics typecheck phase and the 763.335 ms verified typecheck
+phase.
+
+M1 also exposed a correctness boundary hidden by the assembled arena.
+Unit-native syntax IDs are tagged/packed project lookup values, while
+`CheckedExprId` is a dense output slot, but many internal APIs still carry the
+former as `usize` and convert between both planes implicitly.
+`TypecheckExpressionArena::get` accepts either a packed syntax ID or a dense
+slot through a fallback. During M1 this ambiguity produced a lexical-scope
+cycle and a false seven-round inference fixed point before explicit conversions
+restored the canonical 36-round result. The immediate M2 precondition is a
+typed identity firewall: syntax lookup keys, checked slots, stable definition
+keys, and linked-image IDs are distinct types; every translation is explicit
+and owned by one phase boundary; no accessor accepts more than one identity
+plane.
 
 The replacement is not a lazy wrapper around the same scanner. Checker requests
 publish `CheckedDefinitionShard`s and definition-level receipts while they own
@@ -113,17 +136,17 @@ Manifest, and request-graph products. The trace exposes the multiplier:
 | verified intent | 20.349 ms |
 | OUT graph plus resolve/validate | 151.038 ms |
 | contextual materializations | 138.697 ms |
-| semantic execution graph | 521.630 ms |
-| execution normalization/finalization | 50.003 ms |
-| resource graph | 183.945 ms |
-| reactive graph | 94.308 ms |
-| lowering contract | 42.772 ms |
-| storage graph | 190.920 ms |
-| view plus memory graphs | 18.792 ms |
-| canonical core | 43.110 ms |
-| execution receipt rescan | 286.195 ms |
-| dependency Manifest/request graph | 422.191 ms |
-| semantic whole-artifact digest | 99.994 ms |
+| semantic execution graph | 515.404 ms |
+| execution normalization/finalization | 50.762 ms |
+| resource graph | 186.061 ms |
+| reactive graph | 92.586 ms |
+| lowering contract | 44.645 ms |
+| storage graph | 197.181 ms |
+| view plus memory graphs | 18.791 ms |
+| canonical core | 40.530 ms |
+| execution receipt rescan | 277.448 ms |
+| dependency Manifest/request graph | 415.396 ms |
+| semantic whole-artifact digest | 98.929 ms |
 
 The execution image contains 16,525 expressions and 3,494 call occurrences.
 Its handoff emits 30,771 rows and 9,037 relocations. Manifest then combines
@@ -134,8 +157,8 @@ representations, not merely running one expensive algorithm.
 
 ### Backend and publication ownership
 
-Backend tracing reports 764.193 ms before document lowering, 103.572 ms in the
-document backend, and 29.743 ms in finalization. Production contains three
+Backend tracing reports 751.219 ms before document lowering, 103.966 ms in the
+document backend, and 29.143 ms in finalization. Production contains three
 independent recursive ordinary-call lowerers:
 
 - `ExecutableMigrationExpressionLowerer`;
@@ -156,12 +179,14 @@ export.
 
 ## Root Architectural Problems
 
-### 1. Retained units still feed a batch-shaped global AST
+### 1. Unit syntax still crosses an untyped identity and relinking boundary
 
-`ParsedSourceUnit` is now reusable, but every semantic consumer still addresses
-nodes by revision-global dense ids. Reassembly is therefore unavoidable and a
-one-unit edit invalidates every downstream key. This prevents the retained
-syntax work from becoming true incremental compilation.
+Global AST assembly is deleted from the persistent production route, but the
+unit AST is still rewritten and fully revalidated during project linking, and
+packed syntax IDs coexist with dense checked slots behind integer/fallback
+APIs. This both spends cold work and prevents request keys from becoming
+statically definition-local. A project overlay plus typed identity firewall is
+the remaining syntax-side prerequisite for a trustworthy evaluator.
 
 ### 2. Request intents meet too late
 
@@ -178,6 +203,14 @@ Export      -> runnable image -> explicit canonical/debug serialization
 
 All intents share memoized definition results. They do not share one eagerly
 completed whole-program artifact.
+
+The current crate named `boon_compilation_db` does not yet provide this
+evaluation model. It seals a cold proof/request topology and initializes
+revision metadata after semantic construction. `CompilerSession` retains that
+snapshot but never consults it to decide which parse, interface, body,
+semantic, proof, or plan request to execute; every source update clears the
+whole checked product. M2 must therefore install an evaluator and typed result
+slots, not add another facade around `SealedRequestGraphSnapshot`.
 
 ### 3. Semantic domains own representations instead of facts
 
@@ -272,6 +305,26 @@ the authority; the section store carries bytes once.
 
 The table is a prioritization, not a promise that times subtract linearly.
 Every exit requires fresh measured samples and exact semantic/proof parity.
+
+### Post-M1 ranking at `a48f488`
+
+M1 removes rank 1's global project assembly from the production session, but
+fresh traces and the identity failure it exposed refine the next work:
+
+| Rank | Current macro cut | Why it precedes local tuning |
+| ---: | --- | --- |
+| 1 | typed unit/checked identity firewall plus immutable project-link overlay | removes ambiguous integer IDs, prevents invalid fixed points, and targets the roughly 63 ms between traced AST construction and the complete parse phase |
+| 2 | real typed request evaluator plus interface SCC/body requests | `CompilationDb` is currently a post-build snapshot; this cut owns the 16.7/100 ms warm gates and replaces global 36-round/body-wide invalidation |
+| 3 | construction-owned checked receipts and the first demanded definition artifact | deletes the roughly 400 ms verified-only checked rescan and establishes one vertical unit of semantic and plan-code reuse |
+| 4 | demand worklist plus normalized semantic fact sections | attacks 515 ms execution expansion, 277 ms receipt reconstruction, 415 ms Manifest construction, 1.61 GB of allocation churn, and overlapping rich graph lifetimes |
+| 5 | shared definition plan code plus thin link | replaces 751 ms of pre-document work and three recursive ordinary-body lowerers; 3,494 semantic call instances become compact frames over justified variants |
+| 6 | compositional link/runnable seals and explicit export | removes retrospective whole-image digest/validation and keeps the roughly 531 ms explicit serializer off normal preview |
+| 7 | measured crate extraction | follows owner deletion so stable model edits do not rebuild volatile builders and downstream runtimes |
+
+This order deliberately combines cold and warm architecture. A memo table that
+retains the current whole checker would help neither cold diagnostics nor exact
+invalidation; a faster checked scanner would help neither warm checking nor the
+semantic multiplier.
 
 ## Normalized Facts And Incremental Views
 
@@ -368,11 +421,11 @@ A fresh verified sample remains 4,198.712 ms/282,604 KiB and preserves plan
 hash `db18f345676378b8633829c0bbd7870c0a1dc5a2459649c9bbfdd6b8969374ab`.
 These are directional debug observations, not release acceptance.
 
-This precursor does not close M1 or M2. The global parsed arena and whole
-checked construction remain, and verified publication still runs the complete
-63,657-row handoff scanner. M1 remains next; M2 must replace that deferred
-whole scan with construction-owned definition receipts rather than merely
-keeping it off the diagnostics path.
+At that precursor checkpoint, neither M1 nor M2 was closed: the global parsed
+arena and whole checked construction remained, and verified publication still
+ran the complete 63,657-row handoff scanner. M1 has since landed at `a48f488`;
+M2 must still replace the deferred whole scan with construction-owned
+definition receipts rather than merely keeping it off the diagnostics path.
 
 The touched checked-result API caused a one-invocation, two-job debug CLI build
 to recompile `boon_semantic`, `boon_typecheck`, `boon_verify`, `boon_ir`,
@@ -382,7 +435,7 @@ seam is complete, measure separating stable checked semantic/image types from
 diagnostics/construction/service results so a service-output edit does not
 invalidate semantic verification and runtime crates.
 
-### M1. Delete production global syntax assembly
+### M1. Delete production global syntax assembly (landed at `a48f488`)
 
 - Add opaque `ProjectSyntaxSnapshot` over `Arc<UnitSyntaxSnapshot>` plus a
   body-insensitive `ProjectItemIndex`.
@@ -400,21 +453,37 @@ Exit: one-unit warm edits parse only that unit, perform zero cloning/rebasing or
 whole-bundle validation, preserve ordered diagnostics and the exact verified
 artifact, and expose zero global syntax ids to later request keys.
 
+The production session now satisfies the core unit-native and zero-rebase
+boundary, and focused changed-unit plus exact artifact/diagnostic parity tests
+pass. The cold unit-link pass, packed lookup representation, and untyped
+syntax/checked conversions remain explicit M2 prerequisites; they may not enter
+persistent request keys.
+
 ### M2. Install typed request currentness and definition checking
 
+- Replace packed/slot integer polymorphism with typed `UnitSyntaxExprKey`,
+  checked definition-local slot, stable definition/occurrence key, and linked
+  image ID families. Delete every syntax-arena dense-slot fallback.
+- Keep parsed units immutable after construction. Project linking publishes
+  module/name-resolution and source-layout overlays rather than mutating,
+  repacking, and fully revalidating each AST.
 - Implement typed request slots, generations, evaluation edges, reverse cones,
   backdating, cancellation, and publication counters in `CompilationDb`.
 - Build body-insensitive interface SCC requests and immutable checked-definition
   requests keyed by stable definition identity.
+- Replace the whole-program fixed point with interface-SCC convergence plus
+  definition-body evaluation under frozen interfaces. Cross-definition
+  contextual constraints must be explicit SCC edges, not global cache resets.
 - Make diagnostics aggregate definition-local diagnostics without constructing
   executable handoff rows.
 - Emit definition receipts during checking and delete production
   `checked_image_handoff` plus its 63,657-row projection.
 
-Exit: a body/constant edit with an unchanged public interface checks only its
-affected definition cone; diagnostics report zero runtime artifact rows; a
-verified request reuses those exact checked shards; `assemble_report` no longer
-contains a whole-program handoff scan.
+Exit: no API accepts both syntax and checked identities; project linking does
+not mutate/revalidate unit ASTs; a body/constant edit with an unchanged public
+interface checks only its affected definition cone; diagnostics report zero
+runtime artifact rows; a verified request reuses those exact checked shards;
+`assemble_report` no longer contains a whole-program handoff scan.
 
 ### M3. Carry one definition through normalized semantic facts and plan code
 
@@ -474,6 +543,8 @@ Rust rebuild and Boon compilation reports prove the claimed improvements.
 Add counters and hard assertions for:
 
 - unit parses, unit clones/rebases, and global syntax materializations;
+- unit-link AST rewrites/revalidations, implicit identity conversions, and
+  multi-plane lookup fallbacks (all must reach zero in production);
 - interface/definition requests executed, reused, backdated, canceled, and
   superseded;
 - diagnostics-only executable rows (must be zero);
@@ -499,6 +570,12 @@ Reject an implementation that:
   it for every request;
 - introduces stable keys but translates them immediately to revision-global ids
   before checking;
+- permits one integer/newtype or accessor to mean either a syntax key or a
+  checked/result slot;
+- keeps a project-link pass that mutates and fully revalidates an otherwise
+  reusable unit AST;
+- stores a sealed request graph after compilation but does not use it to drive
+  request execution on the next revision;
 - makes diagnostics fast by discarding checked work and repeating it for
   verified preview;
 - retains a mutable whole checker across revisions;
@@ -526,9 +603,16 @@ Reject an implementation that:
 - [Salsa red/green evaluation](https://salsa-rs.github.io/salsa/reference/algorithm.html)
   records actual request dependencies and backdates unchanged results across
   revisions.
-- [Swift request evaluation](https://www.swift.org/blog/swift-5.2-released/)
-  replaced coarse eager declaration validation with immutable declarations and
-  fine-grained lazy cached requests shared with code generation.
+- [rustc incremental compilation](https://rustc-dev-guide.rust-lang.org/queries/incremental-compilation-in-detail.html)
+  separates stable owner/local identities from session-local dense IDs and uses
+  projection queries as change-propagation firewalls rather than hashing one
+  monolithic collection repeatedly.
+- [Swift request evaluation](https://github.com/swiftlang/swift/blob/main/docs/RequestEvaluator.md)
+  centralizes fine-grained lazy requests, cache ownership, dependency capture,
+  and cycle detection instead of ad-hoc mutable-AST callbacks.
+- [TypeScript builder programs](https://github.com/microsoft/TypeScript/wiki/Using-the-Compiler-API#writing-an-incremental-program-watcher)
+  retain per-file snapshots and update diagnostics/emit only for affected files;
+  Boon's interaction gate requires the same principle at definition granularity.
 - [LLVM ThinLTO](https://blog.llvm.org/2016/06/thinlto-scalable-and-incremental-lto.html)
   performs a small summary-only thin link and redoes a backend only when its
   module, imports/exports, imported bodies, or relevant global result changes.
@@ -546,4 +630,6 @@ Reject an implementation that:
 
 These references justify architecture choices, not Boon performance claims.
 Only current Boon harness reports and independent adversarial review can close
-the plan.
+the plan. Jai remains an outcome comparison rather than a design reference
+because its compiler implementation and reproducible architecture evidence are
+not public enough to serve as this repository's engineering contract.

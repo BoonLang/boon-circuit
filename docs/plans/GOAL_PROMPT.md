@@ -86,13 +86,15 @@ Authority and conflict rules:
   dependency inversions. Its intermediate directional exits never replace the
   performance plan's complete scored Clear End Condition.
 - `BOON_COMPILER_MACRO_ARCHITECTURE_RESEARCH.md` refines that implementation
-  order after structural occurrence identity: eliminate production global
-  syntax assembly before definition checking; make compiler intents request
-  roots; publish normalized semantic fact sections once; use definition plan-
-  code modules, thin linking, compositional phase seals, and one consuming
-  runnable builder; and split model/builder/link crates only after measured
-  one-way seams exist. It does not replace the mandatory artifact spine or any
-  performance/evidence budget.
+  order after structural occurrence identity. Unit-native production checking
+  is landed; next enforce distinct syntax/checked/stable/linked identity types,
+  replace AST-rewriting project link with an immutable overlay, and make the
+  database a real typed evaluator. Then make compiler intents request roots;
+  publish normalized semantic fact sections once; use definition plan-code
+  modules, thin linking, compositional phase seals, and one consuming runnable
+  builder; and split model/builder/link crates only after measured one-way seams
+  exist. It does not replace the mandatory artifact spine or any performance/
+  evidence budget.
 - Compiler scaling evidence uses actual parser inspections and
   typechecker/semantic/proof/backend work, never final AST/call/graph sizes as
   substitutes. Build one current two-job release producer explicitly and invoke
@@ -705,15 +707,18 @@ Current checkpoints to preserve and audit rather than redo:
   definition artifacts, emit checked receipts during construction, and delete
   the approximately 392 ms checked-image rescan before revisiting compact route
   storage;
-- follow the post-`e510726` macro-architecture audit in
-  `BOON_COMPILER_MACRO_ARCHITECTURE_RESEARCH.md`. The fresh trace ranks a
-  54.017 ms canonical syntax assembly/validation owner, 408.603 ms checked
-  report handoff, 286.195 ms execution receipt rescan, 422.191 ms Manifest,
-  764.193 ms pre-document backend, 106.305 ms plan validation, and 535.917 ms
-  scored export serialization. Do not tune the structural-route containers.
-  First make the persistent compiler unit-native and delete global syntax
-  assembly; then install typed interface/definition requests and delete the
-  checked handoff; then migrate normalized domain facts, shared plan-code,
+- follow the post-`e510726` macro-architecture audit, reconciled through
+  `a48f488`, in
+  `BOON_COMPILER_MACRO_ARCHITECTURE_RESEARCH.md`. The historical trace exposed
+  global syntax assembly and checked-report ownership; the current post-M1
+  trace reports zero rebased nodes but still spends about 763 ms in verified
+  typecheck, 2,276 ms in semantic construction, 832 ms in backend work, 102 ms
+  in plan validation, and 531 ms in explicit export serialization. It allocates
+  about 1.61 GB cumulatively. Do not tune the structural-route containers.
+  Next delete the packed-syntax/dense-checked fallback identity plane and make
+  project linking an immutable overlay; then install a real typed evaluator,
+  interface SCC/definition requests, and direct receipts that delete the
+  checked handoff. Continue through normalized domain facts, shared plan-code,
   thin link, compositional phase seals, and consuming runnable publication;
 - preserve the landed diagnostics/runtime capability split. Diagnostics owns a
   completed `CheckedProgramConstruction` and performs no checked-image handoff;
@@ -723,10 +728,16 @@ Current checkpoints to preserve and audit rather than redo:
   422.445 ms/92,432 KiB (120.842 ms parse, 292.423 ms typecheck), and traced
   `assemble_report` is 2.083/2.133 ms instead of 408.603 ms. The verified plan
   hash remains `db18f345676378b8633829c0bbd7870c0a1dc5a2459649c9bbfdd6b8969374ab`.
-  Do not call this M2 or latency closure: checking and syntax are whole-project,
-  verified publication still runs the 63,657-row scanner, and the warm gates
-  remain red. Continue with unit-native M1, then definition receipts that
-  delete the deferred scan rather than rechecking after diagnostics;
+  At that checkpoint this was not M1/M2 or latency closure: checking and syntax
+  were whole-project, verified publication still ran the 63,657-row scanner,
+  and the warm gates remained red. M1 is now checkpointed at `a48f488`; retain
+  its exact diagnostics/artifact parity and zero-rebase result. Do not build M2
+  on the remaining ambiguous ID APIs. Establish typed unit syntax, checked
+  local, stable owner, and linked-image identities; make project linking an
+  overlay; then make `CompilationDb` execute and retain typed requests rather
+  than merely storing a post-build graph. Definition checking must emit
+  receipts that delete the deferred scan rather than rechecking after
+  diagnostics;
 - treat the 16.7 ms diagnostics and 100 ms replacement-preview gates as warm
   incremental contracts. A faster full rebuild cannot satisfy them. Record
   executed/reused/backdated requests and require zero unrelated parse/check/

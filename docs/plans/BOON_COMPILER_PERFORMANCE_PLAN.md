@@ -143,6 +143,13 @@ one current release producer before a large rewrite. The 20.68-second full-plan
 baseline remains the relevant evidence for later semantic, proof, and backend
 work; the two scopes must never be presented as the same measurement.
 
+Current post-M1 directional context supersedes those owner rankings without
+turning a one-sample debug trace into acceptance: NovyWave diagnostics is about
+467--489 ms/100--102 MiB with zero rebasing; verified compilation is about
+4.21--4.24 seconds/278--286 MiB and preserves plan hash
+`db18f345676378b8633829c0bbd7870c0a1dc5a2459649c9bbfdd6b8969374ab`.
+The complete current resumption evidence and sequence are recorded below.
+
 ## Performance Contract
 
 ### Cold Budgets
@@ -1040,10 +1047,36 @@ Current cold-diagnostics candidate evidence:
   ms instead of the earlier 408.603 ms. Verified output remains
   4,198.712 ms/282,604 KiB with canonical plan hash
   `db18f345676378b8633829c0bbd7870c0a1dc5a2459649c9bbfdd6b8969374ab`.
-  This is not M2 closure: verified publication still derives the full 63,657-
-  row handoff, checking is still whole-project, and the warm 16.7/100 ms gates
-  remain red. Continue with M1 unit-native syntax, then construction-owned
-  definition receipts and deletion of the deferred whole handoff scanner.
+  At that checkpoint this was not M1/M2 closure: verified publication still
+  derived the full 63,657-row handoff, checking was whole-project, and the warm
+  16.7/100 ms gates remained red. M1 is now recorded in the next bullet; M2
+  still requires construction-owned definition receipts and deletion of the
+  deferred whole handoff scanner.
+- Unit-native M1 is now checkpointed at `a48f488`. Production
+  `CompilerSession` checking consumes retained `ProjectSyntaxSnapshot` units
+  directly, reports zero rebased nodes, reparses only the changed unit in the
+  focused warm oracle, and preserves exact ordered diagnostics plus canonical
+  plan hash
+  `db18f345676378b8633829c0bbd7870c0a1dc5a2459649c9bbfdd6b8969374ab`
+  against assembled syntax. Fresh directional diagnostics is 467--489 ms at
+  about 100--102 MiB, with about 107 ms parse and 351--368 ms typecheck. A
+  fresh verified trace is 4,205.547 ms/284,152 KiB, with 763.335 ms typecheck,
+  2,275.520 ms semantic, 831.825 ms backend, 102.257 ms plan validation, and
+  531.321 ms explicit serialization. This is an M1 owner checkpoint, not a
+  cold or warm gate pass.
+
+  The post-M1 audit forbids returning to local route/cache tuning. Packed unit
+  syntax IDs and dense checked slots still share integer/fallback APIs; this
+  caused a real scope cycle and false fixed-point convergence during M1. Make
+  those identity planes distinct types and replace unit-wide project AST
+  rewrite/revalidation with an immutable link overlay. Then turn
+  `CompilationDb` from a post-build graph snapshot into the typed evaluator
+  that actually retains results and drives next-revision work. Extract
+  interface SCC and definition-body requests, emit checked receipts during
+  construction, and delete the deferred 63,657-row scan. The detailed current
+  sequence is the Tenth Audit in
+  `BOON_COMPILER_ARCHITECTURE_REFACTOR_PLAN.md` and the post-M1 ranking in
+  `BOON_COMPILER_MACRO_ARCHITECTURE_RESEARCH.md`.
 - Do not preserve V3's 208k subject cardinality as a production V4/V5 proof
   requirement. The independent test oracle must map every historical subject
   to exactly one canonical finalized shard row and classifier field/domain and prove
@@ -1662,10 +1695,10 @@ counter-only loop before changing the measured parser/typechecker owners.
 
 ### Current Resumption Point: Definition Artifacts, Thin Link, Sealed Runnable
 
-Continue from local checkpoint `d177af9`, which preserves `d113544`'s whole-
-program ownership audit, `96b1611`'s compact execution receipts, `c870358`'s
-compilation database, compact-proof/sealed-plan checkpoint `38e6541`, and
-activation/effect checkpoint `32bcf40`. Follow the detailed sequence in
+Continue from local checkpoint `a48f488`, which adds unit-native production
+checking to the earlier whole-program ownership, compact execution receipt,
+request-graph, compact-proof/sealed-plan, and activation/effect checkpoints.
+Follow the detailed sequence in
 [`BOON_COMPILER_ARCHITECTURE_REFACTOR_PLAN.md`](BOON_COMPILER_ARCHITECTURE_REFACTOR_PLAN.md)
 and the selected post-checkpoint design in
 [`BOON_COMPILER_DEFINITION_ARTIFACT_RESEARCH.md`](BOON_COMPILER_DEFINITION_ARTIFACT_RESEARCH.md).
@@ -1674,25 +1707,25 @@ semantic/proof multiplication, duplicate representation lifetimes, whole-
 project invalidation, and rebuild fan-out dominate.
 
 The post-`d177af9` research supersedes any wording below that treats one sealed
-semantic proof graph as the complete request evaluator. Use one database and
-stable identity registry with separate typed evaluation/currentness edges and
-proof/link relocations. Start with parser-owned stable item/occurrence routes,
-retained unit item indexes, real request revision/backdating, interface SCCs,
-and immutable checked definition shards. Delete the production checked-image
-rescan while introducing those results; then migrate demanded definition
-artifacts, thin link, runnable publication, and distributed deltas. Do not tune
-the retained snapshot or split the current phase crates before those ownership
-seams exist.
+semantic proof graph as the complete request evaluator. Preserve the landed
+parser-owned item/occurrence routes and retained unit item indexes. Use one
+database and stable identity registry with separate typed evaluation/
+currentness edges and proof/link relocations; add real request revision/
+backdating, interface SCCs, and immutable checked definition shards. Delete the
+production checked-image rescan while introducing those results; then migrate
+demanded definition artifacts, thin link, runnable publication, and distributed
+deltas. Do not tune the retained snapshot or split the current phase crates
+before those ownership seams exist.
 
-The post-`e510726` macro audit further supersedes an implementation that creates
-definition shards on revision-global assembled syntax. First replace the
-persistent compiler's global `ParsedProgram` with unit-native
-`ProjectSyntaxSnapshot` and migrate checker keys/source mapping; delete canonical
-bundle clone/rebase/validation from session requests. Then add typed request
-currentness and checked definition shards, delete `checked_image_handoff`, and
-continue through normalized fact sections, shared plan-code modules, thin link,
-compositional phase seals, and consuming runnable publication. The exact
-sequence, measurements, and rejection rules are in
+The post-`e510726` macro audit supersedes an implementation that creates
+definition shards on revision-global assembled syntax. That unit-native cut is
+now landed. The post-M1 audit makes the next boundary explicit: eliminate
+packed-syntax/dense-checked fallback APIs and unit-wide project relinking, then
+install a real typed request evaluator plus interface SCC/checked definition
+shards, delete `checked_image_handoff`, and continue through normalized fact
+sections, shared plan-code modules, thin link, compositional phase seals, and
+consuming runnable publication. The exact sequence, measurements, and rejection
+rules are in
 [`BOON_COMPILER_MACRO_ARCHITECTURE_RESEARCH.md`](BOON_COMPILER_MACRO_ARCHITECTURE_RESEARCH.md).
 
 The post-`ac2b234` high-level audit makes the next tranche more precise than
@@ -1704,8 +1737,9 @@ hashes every execution row into an execution handoff, reimports the handoff and
 all remaining rich graphs into Manifest V7, maps the graphs into a second
 canonical core, and later rebuilds runnable indexes per trusted consumer.
 
-Execute the phase-seal architecture in the refactor plan before further local
-reactive/container work:
+After the typed identity/evaluator/interface-definition boundary and first
+definition artifact are real, execute the phase-seal architecture in the
+refactor plan before further local reactive/container work:
 
 1. normalize inline list authorities during execution construction and publish
    immutable `ExecutionSealed` columns;
@@ -1746,10 +1780,13 @@ Rust rebuild closure; keep that evidence separate from Boon latency.
    persistence identity, and dense IDs. Normalize typed row payloads to stable
    references while the demand builder replaces the post-hoc scanner; do not
    tune the checkpoint containers or add a production compatibility adapter.
-4. Retain immutable parser-owned unit snapshots and body-insensitive item
-   indexes with atomic upsert/remove/rename. Give definitions and occurrences
-   parser-owned structural routes, keep evaluation edges separate from proof
-   relocations, and extract interface SCC plus immutable checked-definition
+4. Preserve `a48f488`'s immutable parser-owned unit snapshots,
+   body-insensitive indexes, structural definition/occurrence routes, atomic
+   upsert/remove/rename, zero rebasing, and exact parity. Finish the boundary by
+   replacing packed-syntax/dense-checked fallbacks with distinct typed IDs and
+   unit-wide AST relinking with an immutable overlay. Keep evaluation edges
+   separate from proof relocations; make `CompilationDb` execute and retain
+   typed values; extract interface SCC plus immutable checked-definition
    results. Emit checked receipts while checking and delete the production
    checked-image rescan. After complete diagnostics, collect verified intents
    and demand canonical definition variants before OUT or contextual occurrence

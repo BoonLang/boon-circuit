@@ -2,7 +2,8 @@
 
 Date: 2026-08-03
 
-Status: selected architecture direction after checkpoint `d177af9`; subordinate
+Status: selected architecture direction, reconciled through unit-native
+checkpoint `a48f488`; subordinate
 to [`BOON_COMPILER_PERFORMANCE_PLAN.md`](BOON_COMPILER_PERFORMANCE_PLAN.md) and
 the sequencing in
 [`BOON_COMPILER_ARCHITECTURE_REFACTOR_PLAN.md`](BOON_COMPILER_ARCHITECTURE_REFACTOR_PLAN.md).
@@ -27,10 +28,10 @@ It is not an entire parsed, checked, semantic, or `MachinePlan` phase product.
 Cold and warm compilation invoke the same request evaluator; an empty database
 is simply its cold initial state.
 
-Checkpoint `d177af9` is a necessary bridge, not the finished database. Its
-`SealedRequestGraphSnapshot` is the authoritative revision-zero proof and
-currentness snapshot for the semantic rows that already exist. It must not be
-mistaken for the complete compiler query graph:
+The current `SealedRequestGraphSnapshot` is a necessary bridge, not the
+finished database. It is the authoritative revision-zero proof and currentness
+snapshot for the semantic rows that already exist. It must not be mistaken for
+the complete compiler query graph:
 
 - its nodes are predominantly proof projections rather than parse, interface,
   body, code, and link requests;
@@ -38,8 +39,9 @@ mistaken for the complete compiler query graph:
   compiler evaluation dependencies;
 - every memo starts with the same local input/result fingerprint, and
   production has not yet published later revisions through `RequestMemo`;
-- `CompilerSession` still invalidates one whole checked result for any source
-  edit and does not retain parser or checker results.
+- `CompilerSession` now retains parser-unit syntax, but still invalidates one
+  whole checked result for any source edit and never consults the stored graph
+  to drive request execution.
 
 The selected architecture therefore keeps one database and one stable identity
 registry, but gives each request two typed dependency planes:
@@ -56,26 +58,37 @@ runtime/proof SCC from becoming one indivisible compiler invalidation unit.
 
 ## Current-Tree Evidence
 
-The current directional debug evidence after `d177af9` is:
+The current directional debug evidence at `a48f488` is:
 
 | Owner | Current evidence | Architectural consequence |
 | --- | ---: | --- |
-| complete verified request | 4,112.475 ms, 260,660 KiB RSS | no local micro-optimization can close the gap |
-| parse | 96.450 ms | unit parsing is already plausible; global assembly is the wrong retained owner |
-| typecheck | 680.846 ms | the checker must publish reusable definition results instead of being consumed wholesale |
-| semantic construction | 2,289.956 ms | repeated whole-program semantic representations remain the largest multiplier |
-| backend | 807.949 ms | ordinary bodies are lowered by multiple independent owners |
-| plan validation / pretty serialization | 104.371 / 534.427 ms | normal in-memory preview must not pay debug artifact costs |
+| complete verified request | 4,205.547 ms, 284,152 KiB RSS | no local micro-optimization can close the gap |
+| parse | 106.718 ms, zero rebased nodes | M1 removed global assembly; unit linking still performs a second whole-AST pass |
+| diagnostics typecheck | 350.876 ms | the checker must publish reusable definition results instead of being consumed wholesale |
+| verified typecheck | 763.335 ms | deferred 63,657-row checked publication adds roughly 400 ms |
+| semantic construction | 2,275.520 ms | repeated whole-program semantic representations remain the largest multiplier |
+| backend | 831.825 ms | ordinary bodies are lowered by multiple independent owners |
+| plan validation / explicit serialization | 102.257 / 531.321 ms | normal in-memory preview must not pay debug artifact costs |
 | retained proof graph | 8,315 nodes / 29,131 edges | useful proof snapshot, but not yet a language request database |
 
-The typechecker trace further isolates a high-leverage ownership cut. Parser,
-checker construction/inference, and diagnostic projection finish before
-`assemble_report`; `assemble_report` then calls `checked_image_handoff`, which
-rescans and canonical-serializes the already-built checked scopes,
-declarations, statements, expressions, callables, calls, resources, and
-metadata. That post-hoc handoff costs about 392 ms in the current directional
-sample. The replacement checker must emit the final checked definition receipts
-while it owns the data; speeding up the scanner would preserve the wrong owner.
+The diagnostics/runtime capability split is now landed: diagnostics
+`assemble_report` is about 1.3 ms and retains the exact checked construction.
+A later verified request still calls `checked_image_handoff`, rescanning and
+canonical-serializing the already-built checked scopes, declarations,
+statements, expressions, callables, calls, resources, and metadata. The roughly
+400 ms diagnostics/verified typecheck delta is therefore still the same
+post-hoc owner. The replacement checker must emit final checked definition
+receipts while it owns the data; speeding up the scanner would preserve the
+wrong owner.
+
+M1 exposed another prerequisite. Unit syntax uses tagged project lookup IDs;
+checked output uses dense `CheckedExprId` slots. Internal typechecker APIs still
+carry syntax IDs as `usize`, and the unit-native expression arena accepts a
+packed syntax ID or silently falls back to a dense slot. This ambiguity caused
+an actual scope cycle and false fixed-point convergence during the cutover.
+Persistent request keys cannot be built on that boundary. Syntax keys, checked
+definition-local slots, stable owner/occurrence keys, and linked-image IDs must
+be distinct types with one explicit translation table per phase.
 
 The rest of the trace shows the same multiplier at later boundaries:
 
@@ -140,9 +153,9 @@ DefinitionVariantKey = StableDefinitionKey + execution-domain/layout/control/
 
 Cross-revision compiler keys must not contain global dense IDs, byte offsets,
 line numbers, revision-local arena IDs, or exact authored source substrings.
-The current authored-call identity includes a source substring, so formatting
-can unnecessarily rekey a call site; parser-owned structural routes replace
-that dependency.
+Parser-owned structural routes now replace the former authored-source call
+identity. The remaining rule is stronger: packed unit lookup IDs and dense
+checked slots also may not share an API or request-key representation.
 
 Each definition has separate fingerprints:
 
@@ -282,40 +295,47 @@ measurements.
 
 ## Implementation Sequence
 
-Step 1 is now implemented as identity/currentness infrastructure: parser units
+Step 1 is now implemented through the unit-native M1 checkpoint: parser units
 own body-insensitive item indexes, stable definition routes, and structural
 call/pipe occurrence routes, while `CompilerSession` retains them by
 `SourceUnitId`, invalidates only changed units, and applies unit topology
-changes atomically. The typechecker uses those occurrence routes instead of
-raw authored source slices and no longer performs the identical-source count/
-reverse-ordinal pass. Producer format V4 and the warm verifier expose and
-enforce exact attempted/parsed/reused unit counts. Canonical assembly still
-rebuilds the global syntax product and checking remains whole-project; those
-are the open parts of steps 2--3 rather than hidden completion claims.
+changes atomically, and production checking consumes `ProjectSyntaxSnapshot`
+without global AST assembly or rebasing. The typechecker uses occurrence routes
+instead of raw authored source slices and no longer performs the
+identical-source count/reverse-ordinal pass. Producer format V4 and the warm
+verifier expose and enforce exact attempted/parsed/reused unit counts. Checking
+remains whole-project, and project linking still rewrites/revalidates the unit
+AST and packs lookup IDs; those are open prerequisites to steps 2--3 rather
+than hidden completion claims.
 
-The first route implementation deliberately remains visible as architectural
-debt. It is a post-parse tree traversal with allocated route segments and adds
-roughly 16--24 ms to directional NovyWave debug parsing. A current verified
-debug sample is 4,251.545 ms at 282,756 KiB, with 120.640 ms parsing and
-708.498 ms typechecking; the canonical plan hash remains
+The parser trace now measures about 45.5 ms in the eight AST builders versus a
+106.7 ms complete parse phase and 1,050,467 validation visits. The larger
+correction is not compacting the route vectors: emit typed local node keys and
+parent/item metadata during parsing, then make module/name resolution a small
+project overlay instead of mutating, repacking, and fully revalidating each
+unit. The canonical plan hash remains
 `db18f345676378b8633829c0bbd7870c0a1dc5a2459649c9bbfdd6b8969374ab`.
-Do not micro-tune that traversal before deleting the approximately 392 ms
-checked handoff and the larger whole-program semantic/backend owners. When the
-macro cut makes parser routing material, fuse route emission into parsing or
-retain compact parent/slot metadata rather than adding another identity owner.
+Do not micro-tune that traversal. Land the identity/overlay boundary as the
+first part of the real evaluator tranche, then delete the checked handoff and
+the larger whole-program semantic/backend owners.
 
 1. **Stable syntax and item ownership.** Retain `Arc<UnitSyntaxSnapshot>` and a
    body-insensitive `UnitItemIndex` in `CompilerSession`; add structural item
    and occurrence routes plus atomic unit upsert/remove/rename. Prove unchanged
    units are not reparsed.
-2. **Real typed request currentness.** Add session-owned request slots and
+2. **Typed identity firewall and real request currentness.** Replace packed/
+   dense fallback APIs with distinct unit syntax, checked local, stable owner,
+   and linked-image IDs. Make project linking an immutable overlay. Add
+   session-owned request slots and
    evaluation-edge spans; separate evaluation edges from proof relocations;
    implement exact reverse cones, backdating, generation-checked publication,
    work counters, and bounded cancellation.
 3. **Interface and definition checking.** Extract interface SCC results and
    immutable checked definition shards. Emit checked receipts during checking
-   and delete production `checked_image_handoff`. Prove body-only edits with an
-   unchanged interface cause zero unrelated checks.
+   and delete production `checked_image_handoff`. Replace global fixed-point
+   passes with interface-SCC convergence plus body requests under frozen
+   interfaces. Prove body-only edits with an unchanged interface cause zero
+   unrelated checks.
 4. **First end-to-end definition artifact.** Carry one ordinary definition from
    checked shard through semantic rows and plan code. Replace its old OUT/
    contextual and document/row/migration body traversals in the same tranche;
@@ -395,7 +415,7 @@ architecture descriptions:
   stable fingerprints and red/green reuse;
 - [Salsa's red/green algorithm](https://salsa-rs.github.io/salsa/reference/algorithm.html):
   revisions, dependency verification, and result backdating;
-- [Swift's request evaluator](https://www.swift.org/blog/swift-5.2-released/):
+- [Swift's request evaluator](https://github.com/swiftlang/swift/blob/main/docs/RequestEvaluator.md):
   self-contained fine-grained requests, immutable declarations, lazy
   evaluation, caching, and dependency tracking;
 - [TypeScript builder programs](https://github.com/microsoft/TypeScript/wiki/Using-the-Compiler-API):

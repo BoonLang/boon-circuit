@@ -518,17 +518,20 @@ stronger three-reviewer performance closure defined below.
    definition artifacts, then delete the approximately 392 ms checked-image
    rescan before considering route-container tuning.
 
-   The post-`e510726` macro audit is recorded in
+   The post-`e510726` macro audit, reconciled through `a48f488`, is recorded in
    `BOON_COMPILER_MACRO_ARCHITECTURE_RESEARCH.md`. It keeps definition artifacts
    and thin linking but corrects three remaining batch owners: production must
    stop assembling a global `ParsedProgram`; semantic domains must publish one
    normalized fact/relocation store instead of overlapping rich graphs; and
    trusted phase proof must use construction-owned compositional seals rather
-   than rescanning completed snapshots. Begin by migrating the persistent
-   checker to unit-native syntax and deleting canonical bundle assembly, then
-   implement interface/definition requests and delete the 408.603 ms checked
-   handoff. Continue through shared plan-code, domain deltas, thin link, one
-   consuming runnable builder, distributed deltas, and measured crate seams.
+   than rescanning completed snapshots. Unit-native production checking and
+   zero rebasing are now landed. Next make syntax lookup keys and checked slots
+   distinct types, replace project AST rewrite/revalidation with an immutable
+   link overlay, and turn `CompilationDb` into the evaluator that actually
+   executes/reuses typed requests. Then implement interface SCC/definition
+   requests and delete the deferred checked handoff. Continue through shared
+   plan-code, domain deltas, thin link, one consuming runnable builder,
+   distributed deltas, and measured crate seams.
 
    Preserve the landed checked-capability split while doing that work.
    Diagnostics retains a completed `CheckedProgramConstruction` and skips the
@@ -538,9 +541,22 @@ stronger three-reviewer performance closure defined below.
    diagnostics is 422.445 ms/92,432 KiB, with traced `assemble_report` reduced
    from 408.603 ms to 2.083/2.133 ms; the verified plan hash remains
    `db18f345676378b8633829c0bbd7870c0a1dc5a2459649c9bbfdd6b8969374ab`.
-   This is not M1/M2 closure: global syntax, whole checking, and the verified-
-   only 63,657-row handoff still exist. Delete those owners in the planned
-   order, and never regain reuse by re-typechecking after diagnostics.
+   At that checkpoint this was not M1/M2 closure: global syntax, whole checking,
+   and the verified-only 63,657-row handoff still existed. M1 is now
+   checkpointed at `a48f488`; whole checking and the verified handoff remain.
+   Preserve exact assembled/unit-native diagnostic and artifact parity while
+   deleting those owners, and never regain reuse by re-typechecking after
+   diagnostics.
+
+   The post-M1 high-level audit found that `SealedRequestGraphSnapshot` is
+   currently created after semantic work and stored but never used by
+   `CompilerSession` to choose next-revision work. It is proof/currentness
+   metadata, not yet a compiler evaluator. It also found that packed syntax IDs
+   and dense checked slots share fallback lookup APIs; this caused a real scope
+   cycle and false inference convergence during M1. The next checkpoint must
+   delete that identity ambiguity and install evaluator-owned request slots,
+   dependency capture, cycles, backdating, generation publication, and typed
+   values before claiming any warm progress.
 
    The post-`ac2b234` high-level audit supersedes a mutating post-resource
    execution seal. Move inline list-authority synthesis into execution

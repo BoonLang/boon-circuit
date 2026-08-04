@@ -2,9 +2,10 @@
 
 Date: 2026-08-03
 
-Status: active high-leverage execution map, reconciled through the post-`e510726`
-unit-native/fact-store/compositional-seal research after the definition-artifact/
-thin-link and structural-identity tranches, while preserving whole-program audit
+Status: active high-leverage execution map, reconciled through unit-native
+checkpoint `a48f488` and the post-M1 identity/evaluator/fact-store/
+compositional-seal research after the definition-artifact/thin-link and
+structural-identity tranches, while preserving whole-program audit
 checkpoint `d113544`, compact execution-receipt checkpoint `96b1611`,
 shared-request-graph checkpoint `c870358`, compact-proof/sealed-plan checkpoint
 `38e6541`, and activation/effect checkpoint `32bcf40`, subordinate to
@@ -1909,15 +1910,16 @@ construction is 422.191 ms, backend pre-document work is 764.193 ms, plan
 validation is 106.305 ms, and the scored explicit export serializer is
 535.917 ms. These times overlap and are not additive promises.
 
-The new resumption order is therefore: delete production global syntax
+The audit's resumption order was therefore: delete production global syntax
 assembly and revision-global syntax keys; implement typed interface/definition
 requests and delete `checked_image_handoff`; carry a definition through one
 normalized semantic/plan-code artifact while deleting all matching recursive
 body owners; migrate domains to delta fact sections; thin-link and verify an
 opaque linked image; consume it into one runnable machine; then land
-distributed deltas and measured model/builder/link crate seams. Do not split
-crates or tune structural route storage before the owner boundary it serves is
-real.
+distributed deltas and measured model/builder/link crate seams. The first cut
+is now landed; the Tenth Audit below refines its identity/request boundary. Do
+not split crates or tune structural route storage before the owner boundary it
+serves is real.
 
 The first safe intent cut is now landed ahead of M1: diagnostics publishes a
 completed `CheckedProgramConstruction`, not a runtime `CheckedProgram`, and
@@ -1929,11 +1931,104 @@ parse or type solve occurs. A fresh debug NovyWave empty-session diagnostic is
 than the earlier 408.603 ms. The canonical verified plan hash remains
 `db18f345676378b8633829c0bbd7870c0a1dc5a2459649c9bbfdd6b8969374ab`.
 
-This does not reorder the remaining architecture. The session still constructs
-global syntax and a whole checked graph; verified publication still runs the
-63,657-row scanner. Proceed with M1, then make definition construction emit the
-receipts that delete that deferred scanner entirely. Do not regress by dropping
-the checked construction and re-typechecking after diagnostics.
+At that checkpoint the session still constructed global syntax and a whole
+checked graph, and verified publication still ran the 63,657-row scanner. M1
+has since removed the first owner; the post-M1 audit below supersedes the old
+resumption sentence. Do not regress by dropping the checked construction and
+re-typechecking after diagnostics.
+
+### Tenth High-Level Audit: Typed Identity, Real Requests, Demand-Owned Images
+
+Checkpoint `a48f488` completes the production unit-native syntax cut. The
+persistent session now checks `ProjectSyntaxSnapshot` directly, reports zero
+rebased nodes, reuses unchanged `Arc<UnitSyntaxSnapshot>` values, and preserves
+exact diagnostics plus the canonical verified NovyWave plan artifact against
+the assembled-syntax oracle. M1 is therefore an architecture checkpoint, not a
+performance exit: fresh directional diagnostics remains about 467--489 ms and
+verified compilation about 4.21--4.24 seconds.
+
+The cut exposed a more important boundary than another parser or solver
+micro-optimization. Tagged unit syntax lookup IDs and dense `CheckedExprId`
+slots still pass through integer-shaped APIs. `TypecheckExpressionArena::get`
+accepts either plane by trying a syntax lookup and then a dense-slot fallback.
+During M1, mixing the planes caused a lexical-scope cycle and a false
+seven-round inference fixed point; explicit checked-to-syntax conversions
+restored the canonical 36-round result and artifact. The next tranche must make
+that class of bug unrepresentable before it persists request keys:
+
+- unit syntax expression/statement keys, checked definition-local slots,
+  stable definition/occurrence keys, and linked image IDs are distinct types;
+- one construction-owned translation table crosses each phase boundary;
+- syntax arenas never accept dense checked slots, and checked tables never
+  accept packed syntax lookup IDs;
+- no revision-local dense value enters evaluation identity, a stable
+  fingerprint, proof relocation identity, or persistence identity.
+
+The parser trace also changes the M1 follow-up. Eight NovyWave AST builders take
+about 45.5 ms, but the complete parse phase takes about 106.7 ms and reports
+1,050,467 validation visits. Project linking currently namespaces functions by
+mutating the AST, rebuilds a full validation index, revalidates it, walks it to
+pack project IDs, and then walks statements/items again for the project
+snapshot. Replace that unit-wide relinking pass with parser-native typed local
+IDs and parent/item metadata plus an immutable module/name-resolution and
+source-layout overlay. Optimizing the current route maps while retaining those
+passes is rejected.
+
+The name `CompilationDb` must not obscure the current state. Production builds
+a `SealedRequestGraphSnapshot` only after semantic/Manifest construction,
+initializes cold memos, stores it in `CompilerSession`, and never consults it to
+decide what to execute after an edit. Any source update clears the complete
+checked result; verified compilation reconstructs the whole pipeline. The next
+database tranche is therefore a real typed evaluator, not another receipt
+graph:
+
+1. request keys and typed result slots exist before evaluation;
+2. the evaluator records evaluation dependencies while requests run, detects
+   cycles, owns generation-checked publication, and retains values plus stable
+   fingerprints across revisions;
+3. backdating and reverse cones drive actual parse/interface/body/semantic/
+   plan work; proof/link relocations remain a separate typed edge plane;
+4. diagnostics, verified preview, debug views, and export enter through
+   different roots over the same memoized definition results.
+
+Fresh current-tree traces rank the vertical owner deletions after that
+foundation. Diagnostics is 106.694 ms parse plus 350.876 ms typecheck. Checked
+construction spends about 45 ms initializing global indexes, 56 ms on
+contextual schemes, 88 ms in the 36-round checked fixed point, and 28 ms on
+ordered diagnostics. Verified publication adds the 63,657-row checked handoff,
+raising the typecheck phase to about 763 ms. Replace this with interface-SCC
+requests and definition-body requests under frozen interfaces; construction
+emits checked rows/receipts directly and diagnostics only aggregates local
+diagnostics.
+
+Semantic construction remains the dominant 2.28-second owner. Verified intent
+exists, but production deliberately retains all 312 eligible ordinary
+definitions; 1,821 checked call sites become 3,494 OUT call instances, a
+16,525-expression execution image, a 30,771-row execution handoff, and an
+8,315-node/29,131-edge Manifest graph. `SemanticProgram` simultaneously owns
+the sealed image plus OUT, resource, reactive, lowering, storage, view, memory,
+canonical-core, Manifest, and request-graph products. It then spends about
+515 ms building execution, 277 ms reconstructing execution receipts, 415 ms
+re-importing receipts/rich domains into Manifest, and 99 ms hashing the whole
+semantic product.
+
+The selected post-M2 vertical slice is one demand-rooted
+`DefinitionExecutableArtifact`. It owns a checked-body receipt, semantic fact
+rows, definition plan code, source map, evaluation edges, and proof/link
+relocations. Occurrences own compact resolved frames. Land it through one
+representative ordinary definition and delete that definition's matching OUT/
+contextual expansion and document, row/scalar, and migration recursive body
+lowerers in the same flag-day tranche. Then expand the normalized fact store by
+domain, delete each rich graph and Manifest inventory, thin-link summaries and
+relocations, and consume the verified link into one runnable image.
+
+This is the path that can change the asymptotics and the 1.61 GB/approximately
+11.9 million allocation churn of one NovyWave verified request. Crate splits
+remain valuable only after these owner seams exist: checked model versus
+checker/evaluator, semantic artifact model versus builders, thin-link model
+versus linker, and runnable model versus builder/executor. Each split still
+requires a measured Rust rebuild-cone reduction and cannot stand in for Boon
+latency evidence.
 
 ## Architectural Decisions
 
@@ -2233,20 +2328,28 @@ compiler latency.
    clean-full oracles while changing ownership; do not resume game or later
    product work. The complete real-host migration/restart/provenance matrix is
    still a phase-acceptance gate, not a reason to delay the compiler cut.
-2. Retain immutable parser-unit snapshots and a body-insensitive item index.
-   Specify parser-owned source/interface/definition/occurrence/top-level/link
-   keys; separate public, implementation, proof, and source-map fingerprints;
-   support atomic unit upsert/remove/rename. Raw text, offsets, lines, global
-   dense IDs, and revision-local arena IDs are not cross-revision keys.
-3. Turn `CompilationDb` into a typed request-currentness service. Keep compiler
+2. Preserve `a48f488`'s unit-native production route, then finish its typed
+   identity boundary. Retain immutable parser-unit snapshots and a body-
+   insensitive item index; emit typed local node keys and compact parent/item
+   metadata during parsing; make project module/name resolution an immutable
+   overlay rather than an AST rewrite/revalidation pass. Distinguish syntax
+   keys, checked definition-local slots, stable owner/occurrence keys, and
+   linked IDs at the type level. Raw text, offsets, lines, packed/dense fallback
+   IDs, and revision-local arena IDs are not cross-revision keys.
+3. Turn `CompilationDb` into a typed request evaluator and currentness service,
+   not a post-build graph snapshot. Keep compiler
    evaluation/reverse-cone edges distinct from proof/link relocations, while
-   publishing both from one artifact. Add revisions, backdating, generation-
-   checked publication, work counters, and bounded cancellation. Do not wrap
-   the old whole phases in a query facade.
+   publishing both from one artifact. Add typed result slots, evaluator-owned
+   dependency capture/cycle detection, revisions, backdating, generation-
+   checked publication, work counters, and bounded cancellation. The next
+   revision must actually use these memos to choose work. Do not wrap the old
+   whole phases in a query facade.
 4. Extract interface SCCs and immutable checked-definition shards from the
-   fresh monolithic checker. Emit checked receipts while constructing those
-   shards and delete production `checked_image_handoff`; prove a body edit with
-   a backdated interface performs zero unrelated checks.
+   fresh monolithic checker. Converge cross-definition interface constraints at
+   SCC granularity and evaluate bodies under frozen interfaces instead of
+   rerunning a program-wide fixed point. Emit checked receipts while
+   constructing those shards and delete production `checked_image_handoff`;
+   prove a body edit with a backdated interface performs zero unrelated checks.
 5. Migrate one ordinary definition end to end into a demanded
    `DefinitionExecutableArtifact`: checked body, diagnostics/source map,
    semantic rows, proof relocations, and normalized plan code. Encode calls as

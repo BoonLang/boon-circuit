@@ -95,7 +95,9 @@ const DEPENDENCY_PROJECTION_COMPONENT_DOMAIN_V4: &[u8] =
 #[cfg(test)]
 const DEPENDENCY_PROJECTION_IMPLEMENTATION_DOMAIN_V4: &[u8] =
     b"boon.callable-dependency-projection-implementation.v4\0";
+#[cfg(test)]
 const DEPENDENCY_CALLABLE_SET_DOMAIN_V4: &[u8] = b"boon.callable-dependency-callable-set.v4\0";
+#[cfg(test)]
 const DEPENDENCY_PROGRAM_ROOT_ENTRY_DOMAIN_V4: &[u8] =
     b"boon.callable-dependency-program-root-entry.v4\0";
 #[cfg(test)]

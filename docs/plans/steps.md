@@ -206,8 +206,9 @@ stronger three-reviewer performance closure defined below.
    red until V3 records source/old/new identities, the real-host NovyWave
    behavior trace, migration/restart evidence, and focused negative cases.
 
-   Continue from local checkpoint `174eb4b`, which preserves `c870358`'s
-   compilation database, compact-proof/sealed-plan checkpoint `38e6541`, and
+   Continue from local checkpoint `9540262`, which preserves `174eb4b`'s
+   checked/execution ownership boundary, `c870358`'s compilation database,
+   compact-proof/sealed-plan checkpoint `38e6541`, and
    activation/effect checkpoint `32bcf40`, and follow
    `BOON_COMPILER_ARCHITECTURE_REFACTOR_PLAN.md`. The canonical list-dataflow,
    sparse durable-overlay lifecycle, `boon_behavior_harness`, real local host,
@@ -308,6 +309,35 @@ stronger three-reviewer performance closure defined below.
    intent before OUT/contextual expansion, one demanded definition plus compact
    occurrence frames, and deletion of the replaced scanner/owner. Do not stop
    at this checkpoint or optimize its containers.
+
+   The post-`9540262` multiplier audit supersedes the earlier identity model
+   and micro-optimization order. Keep deterministic snapshot routes, session-
+   local syntax lineage, public semantic/persistence identity, and dense image
+   IDs separate. Even free finalization plus Manifest V6 would leave about
+   2.45 seconds. The next flag-day slice therefore combines verified-intent
+   roots, canonical definition specializations, compact invocation frames,
+   demanded OUT/contextual topology, and typed normalized row emission; it
+   deletes a recursive OUT/contextual owner and the corresponding post-hoc
+   scanner and proves that NovyWave call instances and execution rows fall.
+   Direct proof sealing and the shared plan-code linker precede persistent
+   currentness, compact bundle linking, two-worker scheduling, and crate
+   extraction. Do not split or parallelize the current eager ownership.
+
+   The first demanded-definition cut is now directionally proven but does not
+   close this step. It shares 312 retainable definitions, preserves sparse
+   context-overlay ancestry for the 190 definitions that reach render
+   contexts, and reduces NovyWave from 5,147 to 3,494 OUT calls, 49,283 to
+   47,296 execution rows, and 119,671 to 82,364 projection edges. Two release
+   runs are about 3.45 seconds/271 MiB with deterministic plan hash
+   `db18f345676378b8633829c0bbd7870c0a1dc5a2459649c9bbfdd6b8969374ab`;
+   the retained/flat stable-contract and persistence oracle passes. Continue
+   from `VerifiedSemanticIntentV1`, which now validates and publishes every
+   planned root category before OUT, supplies the exact program schedule, and
+   shares retained definitions with contextual expansion. Make those roots
+   drive construction-time row/relocation emission, delete the execution-image
+   scanner and Manifest re-import owner, and then land the shared plan-code
+   linker. Do not tune the compact overlay maps or declare a performance phase
+   exit.
 
    Receipt callbacks alone are too small: removing all 1,813.236 ms of manifest
    work from the 4,052.379 ms directional sample would still leave about 2.24

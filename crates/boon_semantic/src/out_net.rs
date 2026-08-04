@@ -695,6 +695,7 @@ impl<Contract> OutNet<Contract> {
     /// Builds an `OutNet` while allowing richer checked contracts and producer
     /// capabilities to be supplied by a later schema without changing the
     /// current `CheckedProgram` adapter.
+    #[cfg(test)]
     pub(crate) fn build_with<MakeContract, IsProducer>(
         program: &CheckedProgramFields,
         producer_roots: Vec<ProducerRootSpec>,
@@ -706,18 +707,97 @@ impl<Contract> OutNet<Contract> {
         IsProducer:
             FnMut(CheckedCallableKind, &CheckedCall, usize, &CheckedCallEntry, &Contract) -> bool,
     {
+        Self::build_with_retained_definitions(
+            program,
+            producer_roots,
+            &BTreeSet::new(),
+            make_contract,
+            is_structural_producer,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn build_with_retained_definitions<MakeContract, IsProducer>(
+        program: &CheckedProgramFields,
+        producer_roots: Vec<ProducerRootSpec>,
+        retained_definitions: &BTreeSet<DeclId>,
+        make_contract: MakeContract,
+        is_structural_producer: IsProducer,
+    ) -> OutNetBuild<Contract>
+    where
+        MakeContract: FnMut(&CheckedCall, usize, &CheckedCallEntry) -> Contract,
+        IsProducer:
+            FnMut(CheckedCallableKind, &CheckedCall, usize, &CheckedCallEntry, &Contract) -> bool,
+    {
+        let intent = crate::verified_intent::VerifiedSemanticIntentV1::build(
+            program,
+            &producer_roots,
+            retained_definitions.clone(),
+        )
+        .expect("checked OUT test fixture has valid verified intent");
         OutNetBuilder::new(
             program,
             producer_roots,
+            &intent,
             make_contract,
             is_structural_producer,
         )
         .build()
     }
 
+    #[cfg(test)]
     pub(crate) fn try_build_with<MakeContract, IsProducer, BuildError>(
         program: &CheckedProgramFields,
         producer_roots: Vec<ProducerRootSpec>,
+        make_contract: MakeContract,
+        is_structural_producer: IsProducer,
+    ) -> Result<OutNetBuild<Contract>, BuildError>
+    where
+        MakeContract: FnMut(&CheckedCall, usize, &CheckedCallEntry) -> Result<Contract, BuildError>,
+        IsProducer:
+            FnMut(CheckedCallableKind, &CheckedCall, usize, &CheckedCallEntry, &Contract) -> bool,
+    {
+        Self::try_build_with_retained_definitions(
+            program,
+            producer_roots,
+            &BTreeSet::new(),
+            make_contract,
+            is_structural_producer,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_build_with_retained_definitions<MakeContract, IsProducer, BuildError>(
+        program: &CheckedProgramFields,
+        producer_roots: Vec<ProducerRootSpec>,
+        retained_definitions: &BTreeSet<DeclId>,
+        make_contract: MakeContract,
+        is_structural_producer: IsProducer,
+    ) -> Result<OutNetBuild<Contract>, BuildError>
+    where
+        MakeContract: FnMut(&CheckedCall, usize, &CheckedCallEntry) -> Result<Contract, BuildError>,
+        IsProducer:
+            FnMut(CheckedCallableKind, &CheckedCall, usize, &CheckedCallEntry, &Contract) -> bool,
+    {
+        let intent = crate::verified_intent::VerifiedSemanticIntentV1::build(
+            program,
+            &producer_roots,
+            retained_definitions.clone(),
+        )
+        .expect("checked OUT test fixture has valid verified intent");
+        Self::try_build_with_intent(
+            program,
+            producer_roots,
+            &intent,
+            make_contract,
+            is_structural_producer,
+        )
+    }
+
+    pub(crate) fn try_build_with_intent<MakeContract, IsProducer, BuildError>(
+        program: &CheckedProgramFields,
+        producer_roots: Vec<ProducerRootSpec>,
+        intent: &crate::verified_intent::VerifiedSemanticIntentV1,
         make_contract: MakeContract,
         mut is_structural_producer: IsProducer,
     ) -> Result<OutNetBuild<Contract>, BuildError>
@@ -726,16 +806,18 @@ impl<Contract> OutNet<Contract> {
         IsProducer:
             FnMut(CheckedCallableKind, &CheckedCall, usize, &CheckedCallEntry, &Contract) -> bool,
     {
-        let build = OutNet::<Result<Contract, BuildError>>::build_with(
+        let build = OutNetBuilder::new(
             program,
             producer_roots,
+            intent,
             make_contract,
-            |kind, call, entry_ordinal, entry, contract| {
+            |kind, call, entry_ordinal, entry, contract: &Result<Contract, BuildError>| {
                 contract.as_ref().is_ok_and(|contract| {
                     is_structural_producer(kind, call, entry_ordinal, entry, contract)
                 })
             },
-        );
+        )
+        .build();
         let OutNetBuild { graph, diagnostics } = build;
         let OutNet {
             call_instances,
@@ -928,6 +1010,16 @@ struct OutNetBuilder<'program, Contract, MakeContract, IsProducer> {
     producer_root_specs: Vec<ProducerRootSpec>,
     producer_roots: Vec<ProducerRoot>,
     producer_identity_by_call: BTreeMap<OutCallInstanceId, [u8; 32]>,
+    retained_definitions: BTreeSet<DeclId>,
+    retained_overlay_definitions: BTreeSet<DeclId>,
+    retained_frame_expansion_skips: usize,
+    retained_direct_call_sites_not_instantiated: usize,
+    retained_overlay_frames: usize,
+    retained_overlay_call_sites_instantiated: usize,
+    expanded_frames: usize,
+    lexical_call_sites_considered: usize,
+    demanded_call_sites_instantiated: usize,
+    conservative_effect_frames: usize,
     make_contract: MakeContract,
     is_structural_producer: IsProducer,
     call_instances: Vec<OutCallInstance>,
@@ -947,6 +1039,7 @@ where
     fn new(
         program: &'program CheckedProgramFields,
         producer_root_specs: Vec<ProducerRootSpec>,
+        intent: &crate::verified_intent::VerifiedSemanticIntentV1,
         make_contract: MakeContract,
         is_structural_producer: IsProducer,
     ) -> Self {
@@ -972,6 +1065,9 @@ where
         }
 
         let resource_owning_callables = resource_owning_callables(program, &signature_by_id);
+        let retained_definitions = intent.retained_definitions();
+        let retained_overlay_definitions =
+            retained_overlay_definitions(program, retained_definitions, &signature_by_id);
         let declaration_by_id = program
             .declarations
             .iter()
@@ -987,22 +1083,7 @@ where
             .iter()
             .map(|scope| (scope.id, function_owner_for_scope(program, scope.id)))
             .collect::<BTreeMap<_, _>>();
-        let root_expressions = program
-            .statements
-            .iter()
-            .filter(|statement| {
-                function_owner_by_scope
-                    .get(&statement.scope_id)
-                    .copied()
-                    .flatten()
-                    .is_none()
-                    && !matches!(
-                        statement.kind,
-                        boon_checked::CheckedStatementKind::Function { .. }
-                    )
-            })
-            .filter_map(|statement| statement.value)
-            .collect();
+        let root_expressions = intent.program_schedule_roots().to_vec();
         Self {
             program,
             signature_by_id,
@@ -1016,6 +1097,16 @@ where
             producer_root_specs,
             producer_roots: Vec::new(),
             producer_identity_by_call: BTreeMap::new(),
+            retained_definitions: retained_definitions.clone(),
+            retained_overlay_definitions,
+            retained_frame_expansion_skips: 0,
+            retained_direct_call_sites_not_instantiated: 0,
+            retained_overlay_frames: 0,
+            retained_overlay_call_sites_instantiated: 0,
+            expanded_frames: 0,
+            lexical_call_sites_considered: 0,
+            demanded_call_sites_instantiated: 0,
+            conservative_effect_frames: 0,
             make_contract,
             is_structural_producer,
             call_instances: Vec::new(),
@@ -1094,7 +1185,7 @@ where
     }
 
     fn reachable_call_indices(
-        &self,
+        &mut self,
         owner_callable: Option<DeclId>,
         frame: Option<OutCallInstanceId>,
     ) -> Vec<usize> {
@@ -1103,6 +1194,8 @@ where
             .get(&owner_callable)
             .cloned()
             .unwrap_or_default();
+        self.expanded_frames += 1;
+        self.lexical_call_sites_considered += all_calls.len();
         if owner_callable.is_some_and(|owner| {
             self.resource_owning_callables.contains(&owner)
                 || self.signature_by_id.get(&owner).is_some_and(|callable| {
@@ -1115,6 +1208,8 @@ where
             // rooted by statement scheduling rather than their result value.
             // Keep their complete lexical call inventory until that scheduling
             // is represented by the same explicit expression roots.
+            self.conservative_effect_frames += 1;
+            self.demanded_call_sites_instantiated += all_calls.len();
             return all_calls;
         }
 
@@ -1249,10 +1344,50 @@ where
                 | CheckedExpressionKind::Invalid { .. } => {}
             }
         }
-        all_calls
+        let mut demanded = all_calls
             .into_iter()
             .filter(|call| reachable.contains(call))
-            .collect()
+            .collect::<Vec<_>>();
+        if owner_callable.is_some_and(|owner| self.retained_definitions.contains(&owner)) {
+            self.retained_overlay_frames += 1;
+            let reachable_count = demanded.len();
+            demanded.retain(|index| self.retained_call_site_requires_overlay(*index));
+            self.retained_direct_call_sites_not_instantiated +=
+                reachable_count.saturating_sub(demanded.len());
+            self.retained_overlay_call_sites_instantiated += demanded.len();
+        }
+        self.demanded_call_sites_instantiated += demanded.len();
+        demanded
+    }
+
+    fn retained_call_site_requires_overlay(&self, call_index: usize) -> bool {
+        let Some(call) = self.program.calls.get(call_index) else {
+            return true;
+        };
+        if !call.contexts.is_empty()
+            || call
+                .entries
+                .iter()
+                .any(|entry| !matches!(entry, CheckedCallEntry::Input { .. }))
+        {
+            return true;
+        }
+        let Some(callable) = self.signature_by_id.get(&call.callable).copied() else {
+            return true;
+        };
+        match callable.kind {
+            CheckedCallableKind::User => {
+                !self.retained_definitions.contains(&callable.decl_id)
+                    || self
+                        .retained_overlay_definitions
+                        .contains(&callable.decl_id)
+            }
+            CheckedCallableKind::Builtin | CheckedCallableKind::External => {
+                callable.effect != boon_checked::CheckedEffectSummary::default()
+                    || !callable.contexts.is_empty()
+                    || callable.context_formal.is_some()
+            }
+        }
     }
 
     fn call_is_callable_result_output(
@@ -1990,6 +2125,15 @@ where
             if pending.kind != Some(CheckedCallableKind::User) {
                 continue;
             }
+            if self.retained_definitions.contains(&pending.callable) {
+                if !self
+                    .retained_overlay_definitions
+                    .contains(&pending.callable)
+                {
+                    self.retained_frame_expansion_skips += 1;
+                    continue;
+                }
+            }
             if active_callables.contains(&pending.callable) {
                 self.diagnostics
                     .push(OutNetDiagnostic::RecursiveContextualCall {
@@ -2037,6 +2181,22 @@ where
     }
 
     fn finish(mut self) -> OutNetBuild<Contract> {
+        if std::env::var_os("BOON_SEMANTIC_TRACE").is_some() {
+            eprintln!(
+                "boon_semantic out_demand checked_call_sites={} retained_definitions={} retained_overlay_definitions={} expanded_frames={} frame_expansion_skips={} retained_overlay_frames={} lexical_call_sites_considered={} demanded_call_sites_instantiated={} retained_overlay_call_sites_instantiated={} conservative_effect_frames={} direct_body_call_sites_not_instantiated={}",
+                self.program.calls.len(),
+                self.retained_definitions.len(),
+                self.retained_overlay_definitions.len(),
+                self.expanded_frames,
+                self.retained_frame_expansion_skips,
+                self.retained_overlay_frames,
+                self.lexical_call_sites_considered,
+                self.demanded_call_sites_instantiated,
+                self.retained_overlay_call_sites_instantiated,
+                self.conservative_effect_frames,
+                self.retained_direct_call_sites_not_instantiated,
+            );
+        }
         let mut grouped = BTreeMap::<usize, PendingUnifiedNet>::new();
         for port in &self.ports {
             let root = self.union_find.find(port.union_node);
@@ -2528,6 +2688,68 @@ fn resource_owning_callables(
     owners
 }
 
+/// Retained pure bodies are shared, but a concrete invocation still needs a
+/// sparse occurrence path to any call-local host context below it. Keep only
+/// the retained user-call chain that reaches such a context; context-free
+/// builtin work remains exclusively in the canonical definition body.
+fn retained_overlay_definitions(
+    program: &CheckedProgramFields,
+    retained: &BTreeSet<DeclId>,
+    signatures: &BTreeMap<DeclId, &CheckedCallableSignature>,
+) -> BTreeSet<DeclId> {
+    let mut required = BTreeSet::new();
+    let mut retained_dependencies = BTreeMap::<DeclId, BTreeSet<DeclId>>::new();
+
+    for call in &program.calls {
+        let Some(owner) = call.owner_callable.filter(|owner| retained.contains(owner)) else {
+            continue;
+        };
+        let Some(target) = signatures.get(&call.callable).copied() else {
+            required.insert(owner);
+            continue;
+        };
+        let direct_overlay = !call.contexts.is_empty()
+            || call
+                .entries
+                .iter()
+                .any(|entry| !matches!(entry, CheckedCallEntry::Input { .. }))
+            || match target.kind {
+                CheckedCallableKind::User => !retained.contains(&target.decl_id),
+                CheckedCallableKind::Builtin | CheckedCallableKind::External => {
+                    target.effect != boon_checked::CheckedEffectSummary::default()
+                        || !target.contexts.is_empty()
+                        || target.context_formal.is_some()
+                }
+            };
+        if direct_overlay {
+            required.insert(owner);
+        } else if target.kind == CheckedCallableKind::User {
+            retained_dependencies
+                .entry(owner)
+                .or_default()
+                .insert(target.decl_id);
+        }
+    }
+
+    loop {
+        let newly_required = retained_dependencies
+            .iter()
+            .filter(|(owner, dependencies)| {
+                !required.contains(owner)
+                    && dependencies
+                        .iter()
+                        .any(|dependency| required.contains(dependency))
+            })
+            .map(|(owner, _)| *owner)
+            .collect::<Vec<_>>();
+        if newly_required.is_empty() {
+            break;
+        }
+        required.extend(newly_required);
+    }
+    required
+}
+
 fn alias_cycle_diagnostics(program: &CheckedProgramFields) -> Vec<OutNetDiagnostic> {
     let edges = program
         .calls
@@ -2648,6 +2870,190 @@ mod tests {
             output.report.diagnostics
         );
         output.program.expect("fixture typechecks")
+    }
+
+    fn retained_definition_build(program: &CheckedProgramFields) -> OutNetBuild {
+        let retained = crate::contextual_expansion::ordinary_callable_declarations(program);
+        OutNet::build_with_retained_definitions(
+            program,
+            Vec::new(),
+            &retained,
+            |_, _, _| (),
+            |kind, _, _, _, _| kind == CheckedCallableKind::Builtin,
+        )
+    }
+
+    #[test]
+    fn retained_pure_definition_bodies_are_not_reinstantiated_per_call() {
+        let program = checked_program(
+            "out-net-retained-pure-definitions.bn",
+            r#"
+FUNCTION increment(value) {
+    value + 1
+}
+
+FUNCTION wrapped(value) {
+    increment(value: value)
+}
+
+first: wrapped(value: 1)
+second: wrapped(value: 2)
+"#,
+        );
+        let expanded = OutNet::build(&program);
+        let retained = retained_definition_build(&program);
+        assert!(!expanded.has_errors(), "{:#?}", expanded.diagnostics);
+        assert!(!retained.has_errors(), "{:#?}", retained.diagnostics);
+        assert_eq!(expanded.graph.call_instances.len(), 4);
+        assert_eq!(retained.graph.call_instances.len(), 2);
+        assert_eq!(retained.graph.ports, expanded.graph.ports);
+        assert_eq!(retained.graph.nets, expanded.graph.nets);
+        assert_eq!(retained.graph.static_owners, expanded.graph.static_owners);
+        assert!(retained.graph.call_instances.iter().all(|instance| {
+            instance
+                .provenance
+                .call_id
+                .and_then(|call| program.calls.iter().find(|candidate| candidate.id == call))
+                .is_some_and(|call| call.function.ends_with("wrapped"))
+        }));
+    }
+
+    #[test]
+    fn retained_render_definitions_keep_only_the_concrete_context_overlay_path() {
+        let program = checked_program(
+            "out-net-retained-render-overlay.bn",
+            r#"
+FUNCTION identity(value) {
+    value
+}
+
+FUNCTION label(value) {
+    Scene/Element/text(
+        element: []
+        style: []
+        text: identity(value: value)
+    )
+}
+
+FUNCTION outer(value) {
+    label(value: value)
+}
+
+result: outer(value: TEXT { hello })
+"#,
+        );
+        let retained_definitions =
+            crate::contextual_expansion::ordinary_callable_declarations(&program);
+        for name in ["identity", "label", "outer"] {
+            let callable = program
+                .callables
+                .iter()
+                .find(|callable| callable.name.ends_with(name))
+                .unwrap_or_else(|| panic!("missing `{name}` callable"));
+            assert!(retained_definitions.contains(&callable.decl_id));
+        }
+
+        let expanded = OutNet::build(&program);
+        let demanded = retained_definition_build(&program);
+        assert!(!expanded.has_errors(), "{:#?}", expanded.diagnostics);
+        assert!(!demanded.has_errors(), "{:#?}", demanded.diagnostics);
+        assert_eq!(expanded.graph.call_instances.len(), 4);
+        assert_eq!(demanded.graph.call_instances.len(), 3);
+
+        let functions = demanded
+            .graph
+            .call_instances
+            .iter()
+            .map(|instance| {
+                let call = instance.provenance.call_id.expect("authored call overlay");
+                let function = program
+                    .calls
+                    .iter()
+                    .find(|candidate| candidate.id == call)
+                    .expect("overlay call exists")
+                    .function
+                    .as_str();
+                (function, instance.parent)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            functions,
+            vec![
+                ("outer", None),
+                ("label", Some(OutCallInstanceId(0))),
+                ("Scene/Element/text", Some(OutCallInstanceId(1))),
+            ]
+        );
+        assert!(
+            demanded.graph.call_instances.iter().all(|instance| {
+                instance
+                    .provenance
+                    .call_id
+                    .and_then(|call| program.calls.iter().find(|candidate| candidate.id == call))
+                    .is_none_or(|call| call.function != "identity")
+            }),
+            "context-free identity must stay only in the shared body"
+        );
+        let text_call = program
+            .calls
+            .iter()
+            .find(|call| call.function == "Scene/Element/text")
+            .expect("text call");
+        assert!(!text_call.contexts.is_empty());
+    }
+
+    #[test]
+    fn retained_definition_demand_keeps_out_and_resource_owning_bodies_concrete() {
+        let out_program = checked_program(
+            "out-net-retained-out-owner.bn",
+            r#"
+FUNCTION mapped(list, row: OUT, new) {
+    list |> List/map(item: row, new: new)
+}
+
+rows: LIST { [value: 1] }
+result: rows |> mapped(row, new: row.value + 1)
+"#,
+        );
+        let retained_out =
+            crate::contextual_expansion::ordinary_callable_declarations(&out_program);
+        let mapped = out_program
+            .callables
+            .iter()
+            .find(|callable| callable.name.ends_with("mapped"))
+            .expect("mapped callable");
+        assert!(!retained_out.contains(&mapped.decl_id));
+        let expanded = OutNet::build(&out_program);
+        let demanded = retained_definition_build(&out_program);
+        assert!(!expanded.has_errors(), "{:#?}", expanded.diagnostics);
+        assert!(!demanded.has_errors(), "{:#?}", demanded.diagnostics);
+        assert_eq!(demanded.graph, expanded.graph);
+
+        let resource_program = checked_program(
+            "out-net-retained-resource-owner.bn",
+            r#"
+FUNCTION controls() {
+    [press: SOURCE]
+}
+
+result: controls()
+"#,
+        );
+        let retained_resource =
+            crate::contextual_expansion::ordinary_callable_declarations(&resource_program);
+        let controls = resource_program
+            .callables
+            .iter()
+            .find(|callable| callable.name.ends_with("controls"))
+            .expect("controls callable");
+        assert!(!retained_resource.contains(&controls.decl_id));
+        let demanded = retained_definition_build(&resource_program);
+        assert!(!demanded.has_errors(), "{:#?}", demanded.diagnostics);
+        assert_eq!(demanded.graph.call_instances.len(), 1);
+        assert_eq!(
+            demanded.graph.call_instances[0].provenance.callable,
+            controls.decl_id
+        );
     }
 
     #[test]

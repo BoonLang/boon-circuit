@@ -644,6 +644,7 @@ fn push_default_order_direction(
 pub(crate) fn derive_contextual_materializations(
     program: &CheckedProgramFields,
     out_net: &OutNet,
+    retained_ordinary_declarations: &BTreeSet<DeclId>,
     retain_ordinary_calls: bool,
 ) -> Result<
     (
@@ -777,7 +778,8 @@ pub(crate) fn derive_contextual_materializations(
     let mut arena = SemanticExpressionArena::default();
     let mut item_types_by_owner = BTreeMap::new();
     let mut required_ordinary_definitions = BTreeSet::new();
-    let builder_indexes = SemanticExpressionBuilderIndexes::new(program, out_net);
+    let builder_indexes =
+        SemanticExpressionBuilderIndexes::new(program, out_net, retained_ordinary_declarations);
     for (id, candidate) in candidates.iter().cloned().enumerate() {
         let materialization_id = SemanticMaterializationId(id);
         let inherited_candidates = inherited_order_candidates[id]
@@ -4633,7 +4635,7 @@ fn ordinary_statement_child_values(
     values
 }
 
-fn ordinary_callable_declarations(program: &CheckedProgramFields) -> BTreeSet<DeclId> {
+pub(crate) fn ordinary_callable_declarations(program: &CheckedProgramFields) -> BTreeSet<DeclId> {
     let trace = std::env::var_os("BOON_SEMANTIC_TRACE").is_some();
     let started = trace.then(std::time::Instant::now);
     let lookup = CheckedProgramLookup::new(program);
@@ -4741,7 +4743,11 @@ impl StaticSelectorValue {
 }
 
 impl SemanticExpressionBuilderIndexes {
-    fn new(program: &CheckedProgramFields, out_net: &OutNet) -> Self {
+    fn new(
+        program: &CheckedProgramFields,
+        out_net: &OutNet,
+        retained_ordinary_declarations: &BTreeSet<DeclId>,
+    ) -> Self {
         let callable_ids = program
             .callables
             .iter()
@@ -4764,8 +4770,9 @@ impl SemanticExpressionBuilderIndexes {
                     .map(|callable| (producer.spec.function, callable))
             })
             .collect::<BTreeMap<_, _>>();
-        let ordinary_callable_ids = ordinary_callable_declarations(program)
-            .into_iter()
+        let ordinary_callable_ids = retained_ordinary_declarations
+            .iter()
+            .copied()
             .filter_map(|callable| callable_ids.get(&callable).copied())
             .collect();
         Self {

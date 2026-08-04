@@ -773,8 +773,7 @@ Current cold-diagnostics candidate evidence:
   text/path and rich DTO payloads containing dense IDs and spans still enter
   snapshot receipts. Owner-local row ordinals are removed, CSR arithmetic and
   V6 count accounting fail closed, and receipt aggregation domains are now
-  separated. One
-  final two-job release rebuild takes 3m00s; its direct optimized NovyWave
+  separated. One final two-job release rebuild takes 3m00s; its direct optimized NovyWave
   sample is 3,549.342 ms at 274,896 KiB with the unchanged plan hash. Semantic
   work is 2,480.719 ms; execution-image finalization falls to 375.894 ms,
   manifest work to 727.061 ms, and allocated bytes to 1,805,377,118. This is
@@ -788,6 +787,39 @@ Current cold-diagnostics candidate evidence:
   definition body plus compact occurrence frames and delete the corresponding
   scan/rich owner in the same slice. Do not optimize the new maps or declare
   Phase 1 complete.
+- The post-`9540262` multiplier audit is now authoritative for the next cut.
+  Keep deterministic snapshot routes, session-only syntax lineage, public
+  semantic/persistence identity, and revision-local dense IDs as four separate
+  planes; conservative warm misses are allowed, false reuse is not. Even free
+  image finalization plus Manifest V6 would leave about 2.45 seconds, so the
+  next flag-day slice combines verified-intent demand, canonical definition
+  specializations, compact invocation frames, demanded OUT/contextual topology,
+  and typed normalized row emission. It must delete a recursive OUT/contextual
+  owner and its post-hoc scanner and materially reduce NovyWave call instances
+  and execution rows. Direct proof sealing, the shared plan-code linker,
+  persistent red/green currentness, compact bundle linking, at-most-two-worker
+  scheduling, and low-fanout crate extraction follow in that order. Do not
+  begin with crate splitting, generic query machinery, or parallel eager work.
+- The first demanded-definition working-tree cut is semantically valid but is
+  not the tranche exit. It computes 312 retainable definitions once and keeps
+  concrete chains only for the 190 definitions that reach call-local render
+  contexts. NovyWave OUT calls fall from 5,147 to 3,494, execution rows from
+  49,283 to 47,296, legacy rows from 78,336 to 73,162, and projection edges
+  from 119,671 to 82,364. Two direct release runs are 3,451.075/3,462.779 ms at
+  271,128/270,692 KiB with deterministic plan hash
+  `db18f345676378b8633829c0bbd7870c0a1dc5a2459649c9bbfdd6b8969374ab`;
+  the retained-versus-flat NovyWave contract/persistence oracle passes. An
+  unsafe 1,251-call prototype was rejected by the full backend because it
+  erased `Scene/Element/text` context ancestry; the sparse overlay is the
+  corrected contract. Do not tune its maps or the remaining three prunable
+  lexical calls. `VerifiedSemanticIntentV1` now publishes every planned root
+  kind before OUT, validates its checked identities, supplies OUT's exact
+  program schedule, and shares the retained-definition set with OUT and
+  contextual expansion. The next cut must make the non-schedule intent kinds
+  drive normalized rows and relocations during construction and delete the
+  post-hoc execution-image scanner plus Manifest re-import owner. Then link
+  ordinary/render code once across backend domains. Current edit-loop evidence
+  is directional only; no cold phase or acceptance gate is closed.
 - Do not preserve V3's 208k subject cardinality as a production V4/V5 proof
   requirement. The independent test oracle must map every historical subject
   to exactly one canonical finalized shard row and classifier field/domain and prove
@@ -1051,12 +1083,12 @@ Boon's `HOLD`, hidden row identity, migration, and activation contracts remain
 the semantic authority; this precedent only reinforces that a view name must
 not automatically imply durable storage.
 
-The post-`174eb4b` implementation order is therefore: preserve the landed
+The post-`9540262` implementation order is therefore: preserve the landed
 list-dataflow, durable-overlay, exact-activation, effect-transcript, and
 headless-harness cuts; preserve and complete the real-host NovyWave oracle
-before phase acceptance without delaying compiler work; replace ordinal V1/V5
-identity and re-import with stable structural occurrences plus the single dense
-row/relocation image; collect verified demand before occurrence expansion;
+before phase acceptance without delaying compiler work; preserve the dense
+snapshot checkpoint while separating canonical snapshot, session lineage,
+semantic/persistence, and dense identities; collect verified demand before occurrence expansion;
 delete the remaining rich graph owners into that image; converge distributed
 links over compact summaries; link plan code once across document, row/scalar,
 and migration domains; and publish one sealed runnable image with runtime
@@ -1406,8 +1438,9 @@ counter-only loop before changing the measured parser/typechecker owners.
 
 ### Current Resumption Point: Dense Demand-First Image And Sealed Runnable
 
-Continue from local checkpoint `174eb4b`, which preserves `c870358`'s
-compilation database, compact-proof/sealed-plan checkpoint `38e6541`, and
+Continue from local checkpoint `9540262`, which preserves `174eb4b`'s checked/
+execution ownership boundary, `c870358`'s compilation database,
+compact-proof/sealed-plan checkpoint `38e6541`, and
 activation/effect checkpoint `32bcf40`, and follow the detailed sequence in
 [`BOON_COMPILER_ARCHITECTURE_REFACTOR_PLAN.md`](BOON_COMPILER_ARCHITECTURE_REFACTOR_PLAN.md).
 Do not return to the historical contextual-scheme micro-tranche while verified
@@ -1427,14 +1460,12 @@ project invalidation, and rebuild fan-out dominate.
    production proof schema at checkpoint `38e6541`. The remaining oracle does
    not delay the active compiler architecture cut and is not permission to
    restore V3 production.
-3. Preserve `174eb4b`'s opaque checked seal and sole resource mutation window,
-   then replace its provisional V1/V5 representation rather than tuning it.
-   Use parser-derived structural occurrence identities, one collision-checked
-   owner/path/projection registry, typed row columns, parent-pointer paths, and
-   CSR relocations. Keep stable-key, local-row, linked-projection, and dense-
-   image digests separate. Manifest V6 consumes those rows directly. Delete
-   the V1 handoff builders, V5 import/index, and rich-key graph path in the same
-   vertical migration; do not leave a production compatibility adapter.
+3. Preserve `9540262`'s dense checked/execution V2 and Manifest V6 snapshot
+   boundary without mistaking its raw DTO receipts for currentness. Separate
+   canonical snapshot routes, session syntax lineage, public semantic/
+   persistence identity, and dense IDs. Normalize typed row payloads to stable
+   references while the demand builder replaces the post-hoc scanner; do not
+   tune the checkpoint containers or add a production compatibility adapter.
 4. Retain immutable parser-owned unit snapshots with atomic upsert/remove/
    rename and exact cached project assembly. After complete checking, collect
    verified intents and demand canonical definition variants before OUT or

@@ -11,6 +11,7 @@ mod reactive;
 mod resource;
 mod semantic_image;
 mod storage_contract;
+mod verified_intent;
 mod view_contract;
 
 #[doc(hidden)]
@@ -2755,11 +2756,24 @@ fn elaborate_with_representation(
         "resolve_producer_roots",
         resolve_producer_roots(&checked_program, &producer_materializations)
     )?;
+    let verified_intent = elaboration_phase!("verified_semantic_intent", {
+        let retained_definitions = retain_ordinary_calls
+            .then(|| contextual_expansion::ordinary_callable_declarations(&checked_program))
+            .unwrap_or_default();
+        verified_intent::VerifiedSemanticIntentV1::build(
+            &checked_program,
+            &producer_roots,
+            retained_definitions,
+        )
+    })
+    .map_err(SemanticError::new)?;
+    verified_intent.trace();
     let out_net = elaboration_phase!(
         "out_net",
-        out_net::OutNet::<OutPortContractV1>::try_build_with(
+        out_net::OutNet::<OutPortContractV1>::try_build_with_intent(
             &checked_program,
             producer_roots,
+            &verified_intent,
             |call, _, entry| provisional_out_port_contract(&checked_program, call, entry),
             |kind, _, _, _, _| kind == boon_checked::CheckedCallableKind::Builtin,
         )
@@ -2821,6 +2835,7 @@ fn elaborate_with_representation(
         contextual_expansion::derive_contextual_materializations(
             &checked_program,
             &resolved_out_graph,
+            verified_intent.retained_definitions(),
             retain_ordinary_calls,
         )
     )

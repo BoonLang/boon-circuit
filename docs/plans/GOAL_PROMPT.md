@@ -72,8 +72,9 @@ Authority and conflict rules:
   evidence soundness, runtime persistence identity, native presentation
   semantics, or the mandatory verified artifact spine.
 - `BOON_COMPILER_ARCHITECTURE_REFACTOR_PLAN.md` is subordinate to those budgets
-  and owns the current post-`174eb4b` decision: immutable source snapshots;
-  stable interface, definition, structural occurrence, top-level-authority,
+  and owns the current post-`9540262` multiplier decision: immutable source
+  snapshots; separate canonical-snapshot, session-lineage, semantic/persistence,
+  and dense identity planes; stable interface, definition, top-level-authority,
   and link shards; verified demand before occurrence expansion; one dense
   construction-owned semantic image and direct proof seal; compact bundle link
   summaries; a shared plan-code linker across document, row, and migration
@@ -401,8 +402,9 @@ Current checkpoints to preserve and audit rather than redo:
   invariants remain exact. Budget V2 stays red until the V3 provenance report,
   real-host NovyWave behavior scenario, migration/restart matrix, and negative
   cases are complete;
-- continue the performance goal from local checkpoint `174eb4b`, which
-  preserves `c870358`'s compilation database, compact-proof/sealed-plan
+- continue the performance goal from local checkpoint `9540262`, which
+  preserves `174eb4b`'s checked/execution ownership boundary,
+  `c870358`'s compilation database, compact-proof/sealed-plan
   checkpoint `38e6541`, and activation/effect checkpoint `32bcf40`, and follow
   `BOON_COMPILER_ARCHITECTURE_REFACTOR_PLAN.md`. The canonical list-dataflow,
   sparse durable-overlay lifecycle, product-faithful `boon_behavior_harness`,
@@ -524,6 +526,32 @@ Current checkpoints to preserve and audit rather than redo:
   superseded scanner/owner with parser structural occurrence routes, typed
   normalized row payloads, the first demanded definition, and compact
   occurrence frames; do not tune the dense containers or claim Phase 1;
+- follow the post-`9540262` multiplier audit before further compiler edits.
+  Separate deterministic snapshot routes, session-local syntax lineage,
+  language-owned semantic/persistence identity, and revision-local dense IDs;
+  never force one digest to serve all four. The selected next flag-day slice
+  combines verified-intent roots, one demanded definition-specialization
+  worklist, compact invocation frames, demanded OUT/contextual topology, and
+  typed normalized image rows. Delete a recursive OUT/contextual owner and its
+  post-hoc scanner in that slice and prove fewer NovyWave call instances and
+  execution rows. Direct proof sealing and one plan-code linker follow before
+  persistent currentness, compact bundle linking, bounded parallelism, or
+  crate extraction. Do not parallelize or split the current eager ownership;
+- preserve the first demanded-definition working-tree cut without mistaking it
+  for tranche completion. It computes 312 retainable definitions once and
+  keeps sparse concrete ancestry for the 190 definitions reaching call-local
+  render contexts. NovyWave has 3,494 rather than 5,147 OUT calls, 47,296
+  rather than 49,283 execution rows, and 82,364 rather than 119,671 projection
+  edges; two direct runs are about 3.45 seconds/271 MiB with deterministic plan
+  hash `db18f345676378b8633829c0bbd7870c0a1dc5a2459649c9bbfdd6b8969374ab`,
+  and the independent flat artifact oracle passes the stable contract and
+  persistence comparison. Preserve `VerifiedSemanticIntentV1`, which now
+  publishes and validates all planned checked root categories before OUT,
+  supplies OUT's exact program schedule, and shares retained definitions with
+  contextual expansion. Continue by making those roots drive construction-time
+  normalized rows/relocations. Delete the post-hoc image scanner and Manifest
+  re-import owner, then land the shared plan-code linker; do not return to
+  reachability/map micro-tuning or claim a performance exit;
 - move verified-intent demand collection before occurrence expansion and
   backend lowering. Split top-level authority/interface summaries from the
   final program-link sink, and version the callable interface schema before
@@ -688,11 +716,13 @@ Blocking compiler-performance prerequisite:
 
 - Complete `BOON_COMPILER_PERFORMANCE_PLAN.md` before resuming the remaining
   simplification/native-recovery closure or any later production phase.
-- Begin from checkpoint `174eb4b`, which preserves `c870358`'s compilation
-  database, `38e6541`'s compact-proof/sealed-plan work, and `32bcf40`'s
-  activation/effect boundary. Follow the refactor
-  plan's corrected shard/image sequence: immutable source snapshots; stable
-  interface, definition, invocation, top-level-authority, and link identities;
+- Begin from checkpoint `9540262`, which preserves `174eb4b`'s checked/
+  execution ownership boundary, `c870358`'s compilation database, `38e6541`'s
+  compact-proof/sealed-plan work, and `32bcf40`'s activation/effect boundary.
+  Follow the refactor plan's post-checkpoint multiplier sequence: immutable
+  source snapshots; separate canonical snapshot, session lineage, semantic/
+  persistence, and dense identities; stable interface, definition, top-level-
+  authority, and link identities;
   finalization-time receipts in one cold/warm projection graph; one sealed
   semantic image; one all-domain plan-code linker; and one consuming
   `SealedRunnableMachine` builder with dense executor indexes built once.

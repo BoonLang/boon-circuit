@@ -1552,7 +1552,7 @@ impl<'a> DocumentCompiler<'a> {
                         .map(|occurrence| (occurrence.id, occurrence.parent))
                         .collect::<Vec<_>>();
                     return Err(PlanError::new(format!(
-                        "document call {} owns contexts but has no concrete invocation below {:?}; candidates={candidates:?}",
+                        "document call {} `{function}` at executable expression {compiler_id} owns contexts but has no concrete invocation below {:?}; candidates={candidates:?}",
                         checked_call.0, context.call_instance
                     )));
                 }

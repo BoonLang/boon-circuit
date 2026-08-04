@@ -514,7 +514,7 @@ IDs; [Salsa](https://salsa-rs.github.io/salsa/overview.html) uses interning and
 tracked deterministic queries; [Swift's request evaluator](https://github.com/swiftlang/swift/blob/main/docs/RequestEvaluator.md)
 centralizes fine-grained dependency caching and cycle handling; and the
 [TypeScript native port](https://devblogs.microsoft.com/typescript/typescript-native-port/)
-plus [TypeScript 7 RC](https://devblogs.microsoft.com/typescript/announcing-typescript-7-0-rc/)
+plus [TypeScript 7](https://devblogs.microsoft.com/typescript/announcing-typescript-7-0/)
 show the benefit and memory tradeoff of parallel checking. For Boon, the
 measured 18.66 million allocations and repeated body/image/proof ownership must
 fall before parallel compilation is allowed to amplify the remaining work.
@@ -599,9 +599,185 @@ demanded definition and occurrence through the image, and delete its replaced
 scanner/owner; it must then migrate the remaining legacy domains rather than
 tune the V2 containers.
 
+### Post-`9540262` Multiplier Audit and Selected Refactor (2026-08-03)
+
+The dense snapshot checkpoint makes the remaining architectural multipliers
+measurable. Its final direct release sample is 3,549.342 ms. Semantic
+elaboration alone is 2,480.719 ms: OUT takes 194.246 ms, contextual candidate
+materialization 69.822 ms, execution expansion 293.237 ms, execution-image
+finalization 375.894 ms, reactive/lowering/storage construction 478.702 ms,
+and Manifest V6 727.061 ms. The backend adds 382.323 ms, plan validation
+92.826 ms, and serialization 83.503 ms. The run still creates 5,147 OUT call
+instances, 49,283 execution rows, and 78,336 legacy proof rows and performs
+12,517,443 allocations totalling 1,805,377,118 bytes.
+
+This changes the optimization order. Even an impossible zero-cost replacement
+for both execution-image finalization and Manifest V6 would leave about 2.45
+seconds. Parallelizing the same eager work, changing map implementations,
+splitting files, or shaving individual hashes cannot reach the one-second
+runnable gate. The next production tranche must remove the occurrence and row
+multipliers before those downstream phases execute.
+
+#### Separate four identity planes
+
+The first V2 cut exposed an incorrect assumption in the earlier design: one
+digest cannot safely serve deterministic artifacts, edit lineage, persistence,
+and dense storage. Indistinguishable duplicate syntax cannot have a
+deterministic cross-process identity that survives every arbitrary sibling
+insertion without either edit history or an authored semantic anchor. Replace
+that requirement with four explicit planes:
+
+1. `CanonicalSyntaxRoute` is deterministic within one source snapshot. It uses
+   canonical `SourceUnitId`, grammar roles, named declaration/statement
+   anchors, and a snapshot-local duplicate discriminator. It owns diagnostics,
+   reproducible artifact bytes, and cold differential tests; it is not a warm
+   lineage or persistence key.
+2. `SyntaxLineageId` is compiler-session local and is reused only when the
+   incremental parser matches an immutable syntax node across revisions. It
+   may drive exact warm request reuse, is never serialized, and a missed match
+   causes conservative recomputation rather than false currentness.
+3. `SemanticIdentity` is the public stable identity for declarations, state,
+   sources, effects, resources, persistence, migrations, distributed ports,
+   and authored occurrence semantics. It derives from language-owned names and
+   explicit semantic structure, never source offsets, raw formatting, or an
+   incremental allocator.
+4. `DenseId` values are revision-local table indexes. They own image encoding
+   and runtime locality and never enter the other three identity planes.
+
+Request keys combine the narrow semantic owner with a session lineage ID when
+available; result fingerprints normalize every reference to canonical syntax
+or semantic identity. Cold artifacts remain deterministic even though lineage
+IDs differ. Identical syntax that lacks an authored semantic anchor may miss a
+warm cache after an ambiguous edit, but it must never reuse the wrong state,
+effect, migration, or proof row.
+
+This follows the useful separation visible in
+[Roslyn's immutable, structurally shared syntax snapshots](https://github.com/dotnet/roslyn/blob/main/docs/wiki/Roslyn-Overview.md),
+[rust-analyzer's file-local syntax plus body-stable `ItemTree`](https://rust-analyzer.github.io/book/contributing/architecture.html),
+and [Salsa's distinction between identity fields and tracked fields](https://salsa-rs.github.io/salsa/overview.html).
+It does not require adopting their public APIs or importing a generic query
+framework before Boon's request and row boundaries are correct.
+
+#### Ranked high-level opportunities
+
+1. **Demanded semantic linker and canonical definition bodies.** Immediately
+   after complete checking, publish `VerifiedIntent` roots for top-level
+   statements, outputs, state/source/resource/effect schedules, host ports,
+   persistence/migration entries, producer roots, and distributed crossings.
+   One worklist keyed by definition, execution domain, resolved layout,
+   overlay/control shape, and capability contract builds each compatible body
+   once and represents calls with compact invocation frames. Integrate OUT
+   constraints and contextual list operations into that worklist. Delete
+   recursive `OutNetBuilder::instantiate_frame`, candidate-local expression
+   builders, and the late backend demand pass together. This is first because
+   it reduces every downstream domain rather than only its own measured phase.
+2. **Construction-owned all-domain image with direct proof sealing.** The same
+   linker finalizes typed normalized rows and exact relocation spans. Resource,
+   reactive, lowering, storage, view, and memory algorithms append/finalize
+   columns in that owner. Register each invocation-path node once. Replace
+   `DenseManifestProjectionIndexV6`, legacy inventories, and the second proof
+   graph with a borrowed proof view over image rows and CSR edges. This removes
+   the measured 375.894 ms post-hoc image scan and most of the 727.061 ms
+   manifest replay while preventing a new facade.
+3. **One plan-code linker and consuming runnable publication.** Compile each
+   demanded ordinary specialization once across document, row/scalar, and
+   migration domains. Verification returns a token borrowing the sealed image;
+   the consuming linker assigns final plan IDs and runtime indexes and returns
+   `SealedRunnableMachine`. Delete the three recursive ordinary-body lowerers,
+   `CanonicalProgramCoreV1`/`ErasedProgram` duplicate authority, post-plan
+   rewrites, and executor `Metadata::new` reconstruction.
+4. **Persistent red/green currentness.** Only after the first three products
+   expose normalized request inputs/results, retain parse, summary,
+   definition-specialization, proof, plan-fragment, and runnable requests in
+   `CompilerSession`. `apply_updates` invalidates exact source-unit/semantic
+   cones instead of dropping the whole checked result. Backdate unchanged
+   results and prove clean-full parity, cancellation, and stale-generation
+   rejection. The existing unused `RequestMemo` is a primitive, not a database.
+5. **Compact three-role link fixed point.** Exchange only exports,
+   requirements, producer/external-event facts, relocations, and digests; do
+   not retain or re-elaborate three full `SemanticProgram` values per round.
+6. **Bounded parallelism and crate seams.** After demand and dependencies are
+   exact, schedule at most two independent source/body/SCC requests. Extract
+   `boon_semantic_image` and `boon_machine_image` only when their schemas stop
+   changing, and invert `boon_verify`/`boon_ir` onto those low-fanout contracts.
+   TypeScript 7 demonstrates that native shared-memory parallelism can be a
+   large multiplier, but Boon's Rust implementation is already native; its
+   first problem is duplicated work and ownership, not a missing language port.
+
+#### Selected next vertical tranche
+
+Implement items 1 and the row-emission edge of item 2 as one flag-day slice.
+The slice is complete only when a checked definition/effect summary publishes
+real `VerifiedIntent` roots; a single worklist carries ordinary and contextual
+definitions plus compact frames through demanded OUT topology into typed image
+rows; at least one existing OUT/contextual recursive owner and its post-hoc
+image scanner are deleted; and the resulting counters show fewer eager call
+instances and execution rows on NovyWave. Preserve full diagnostics and all
+state/source/effect/OUT/PASSED/FLUSH/DRAIN/currentness semantics. Do not start
+with crate splitting, generic query-framework integration, two-worker
+scheduling, Manifest map tuning, or another receipt wrapper.
+
+Required new counters are intent roots by kind, definitions discovered,
+specializations built/reused, frames built/reused, queue pushes/pops, statically
+pruned branches, OUT instances avoided, contextual builders avoided, rows by
+domain emitted/reused, and peak live artifact owners. Scaling fixtures vary
+call depth, repeated call sites, contextual sites, dead branches, and dependency
+cone width independently. A fresh adversarial review must prove both the
+deleted-owner ledger and that effectful or stateful work was not pruned merely
+because it is absent from a callable result.
+
+#### First demanded-definition and compact-overlay evidence
+
+The first working-tree cut computes the closed pure-definition set once before
+OUT and shares it with contextual expansion. OUT no longer recursively copies
+context-free bodies per occurrence. A deliberately aggressive prototype fell
+from 5,147 to 1,251 OUT calls, but the full compiler correctly rejected it:
+`Scene/Element/text` contexts inside retained bodies had lost their concrete
+invocation route. The production candidate therefore computes a transitive
+overlay-demand set and retains only user-call chains that reach real call-local
+host contexts. Focused tests prove that context-free nested calls disappear,
+render-context ancestry remains exact, and OUT/resource-owning functions stay
+concrete. This is the compact-frame contract, not a Boon-level workaround.
+
+On NovyWave, 312 definitions are retainable and 190 of them require a concrete
+context-overlay route. OUT call instances fall from 5,147 to 3,494, cumulative
+type substitutions from 80,743 to 39,431, execution rows from 49,283 to 47,296,
+legacy proof rows from 78,336 to 73,162, and the projection graph from
+13,261/119,671 nodes/edges to 11,608/82,364. The optimized full compiler emits
+the same new plan hash twice,
+`db18f345676378b8633829c0bbd7870c0a1dc5a2459649c9bbfdd6b8969374ab`.
+One directional run is 3,451.075 ms at 271,128 KiB and another is 3,462.779 ms
+at 270,692 KiB; allocated bytes fall to about 1.782 billion. The independent
+retained-versus-flat NovyWave artifact oracle passes the stable contract and
+persistence-type comparison, so the changed representation is intentional.
+These are edit-loop results, not acceptance evidence.
+
+The modest wall-time gain is itself the architectural result. The remaining
+release run still spends about 351 ms rescanning finished execution columns
+into the V2 image, 679 ms replaying all rich owners into Manifest V6, 511 ms
+constructing reactive/lowering/storage graphs, and 368 ms in separately
+recursive backends. The same cut now publishes `VerifiedSemanticIntentV1`
+immediately after producer-root discovery. It validates and categorizes program
+schedule, retained visual output, host output, source/state/list authority,
+state initializer, consequential effect, external-call, and producer-function
+roots. OUT consumes its exact schedule roots, while OUT and contextual
+expansion share its retained-definition set; NovyWave retains the same 3,494
+OUT calls, 47,296 execution rows, and 11,608/82,364 projection graph after this
+ownership change. This is a production demand seam, not a trace-only counter,
+but the non-schedule categories do not yet independently drive normalized row
+construction.
+
+Do not spend the next slice filtering the remaining three currently
+unreachable lexical calls or tuning the overlay maps. Make those categorized
+intent roots feed the construction-owned row/relocation arena, then replace
+Manifest V6 re-import with a borrowed direct proof seal. The shared plan-code
+linker follows immediately so render-context overlay routes and ordinary code
+are assigned once rather than rediscovered by each backend. The selected
+tranche remains incomplete until a scanner/owner is deleted.
+
 The following second and third audit sections remain evidence and detailed
 design rationale. Where they name a "next" action or staging order, the
-post-`174eb4b` decision above supersedes it.
+post-`9540262` multiplier audit above supersedes it.
 
 ### Second Whole-Pipeline Reassessment: Owner Compilation Units
 

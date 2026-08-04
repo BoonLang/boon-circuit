@@ -278,6 +278,13 @@ fn required_source_specs() -> Vec<SourceSpecV1> {
             additional_types: Vec::new(),
         },
         SourceSpecV1 {
+            path: "crates/boon_semantic/src/semantic_image.rs".to_owned(),
+            selection: SourceSelectionV1::AllPublic,
+            prefixes: Vec::new(),
+            explicit_types: Vec::new(),
+            additional_types: Vec::new(),
+        },
+        SourceSpecV1 {
             path: "crates/boon_semantic/src/lib.rs".to_owned(),
             selection: SourceSelectionV1::AllPublic,
             prefixes: Vec::new(),
@@ -334,10 +341,26 @@ fn required_source_specs() -> Vec<SourceSpecV1> {
             additional_types: Vec::new(),
         },
         SourceSpecV1 {
-            path: "crates/boon_typecheck/src/lib.rs".to_owned(),
+            path: "crates/boon_checked/src/lib.rs".to_owned(),
             selection: SourceSelectionV1::AllPublic,
             prefixes: Vec::new(),
             explicit_types: Vec::new(),
+            additional_types: Vec::new(),
+        },
+        SourceSpecV1 {
+            path: "crates/boon_typecheck/src/lib.rs".to_owned(),
+            selection: SourceSelectionV1::Explicit,
+            prefixes: Vec::new(),
+            explicit_types: [
+                "BuiltinSignatureRegistry",
+                "RenderContractRegistry",
+                "RuntimeRootContract",
+                "TypeCheckProfile",
+                "TypeVarStore",
+            ]
+            .into_iter()
+            .map(ToOwned::to_owned)
+            .collect(),
             additional_types: Vec::new(),
         },
         SourceSpecV1 {

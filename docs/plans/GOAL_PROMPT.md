@@ -109,7 +109,8 @@ Authority and conflict rules:
     -> MachinePlan
     -> PhysicalPlan or CoreHardwareIR
 
-  `boon_typecheck` owns `CheckedProgram`; `boon_semantic` owns contextual
+  `boon_checked` owns the opaque `CheckedProgram` representation and
+  `boon_typecheck` is its sole audited issuer; `boon_semantic` owns contextual
   expansion, OutNet validation, semantic ownership, typed views, dependency
   manifests, and proof obligations; `boon_verify` produces the mandatory
   `ContractVerifiedProgram`; `boon_ir` erases WHERE/OUT/PASS/transparent
@@ -477,6 +478,22 @@ Current checkpoints to preserve and audit rather than redo:
   `SemanticProgram`'s checked/execution owners and their production inventories,
   and keep the old artifacts only as independent test oracles. A receipt
   sidecar or callback beneath the same rich owners is rejected;
+- preserve the resulting checked/execution ownership checkpoint without
+  mistaking its first representation for a speed result. The typechecker now
+  owns one opaque checked seal, resource owns the only pending-execution
+  mutation window, production `SemanticProgram` drops both prior owners, and
+  Manifest V5 imports finalized receipts with source-owner parity oracles.
+  Focused tests and architecture checks pass, but one direct optimized
+  NovyWave sample regresses to 5,665.819 ms/507,428 KiB because full stable
+  projection keys and invocation-path vectors are cloned into row routes and
+  119,441 edges; execution-image finalization alone costs 1,142.939 ms. After
+  checkpointing this required seam, `/goal` must first perform a fresh
+  whole-pipeline architecture audit and implement the highest-leverage
+  replacement: intern projection/path identity once behind dense IDs and one
+  relocation arena, avoid reconstructing final row fingerprints, delete the
+  next complete rich-domain owner, and move verified demand before expansion
+  when the audit confirms it. Do not respond to this regression with isolated
+  map, hash, allocator, or serializer tweaks;
 - move verified-intent demand collection before occurrence expansion and
   backend lowering. Split top-level authority/interface summaries from the
   final program-link sink, and version the callable interface schema before

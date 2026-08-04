@@ -6,7 +6,7 @@
 
 use crate::{
     SemanticBindingId, SemanticCallId, SemanticCallableId, SemanticCallableKind, SemanticCaptureId,
-    SemanticExecutionGraphV1, SemanticExprId, SemanticExpression, SemanticExpressionKind,
+    SemanticExecutionImageColumnsV1, SemanticExprId, SemanticExpression, SemanticExpressionKind,
     SemanticLoweringContractV1, SemanticOutputContractId, SemanticOutputContractKindV1,
     SemanticReactiveGraphV1, SemanticReadBindingV1, SemanticReadId, SemanticReadTargetV1,
     SemanticResourceGraphV1, SemanticRowBinding, SemanticScopeId, SemanticScopeStorageGraphV1,
@@ -208,7 +208,7 @@ impl fmt::Display for SemanticViewBindingError {
 impl Error for SemanticViewBindingError {}
 
 pub fn build_semantic_view_binding_graph(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV1,
     reactive: &SemanticReactiveGraphV1,
     storage: &SemanticScopeStorageGraphV1,
@@ -223,7 +223,7 @@ pub fn build_semantic_view_binding_graph(
 impl SemanticViewBindingGraphV1 {
     pub fn validate(
         &self,
-        execution: &SemanticExecutionGraphV1,
+        execution: &SemanticExecutionImageColumnsV1,
         resources: &SemanticResourceGraphV1,
         reactive: &SemanticReactiveGraphV1,
         storage: &SemanticScopeStorageGraphV1,
@@ -268,7 +268,7 @@ struct ResolvedViewCaptureRoute {
 }
 
 fn exact_event_source_leaves(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV1,
     storage: &SemanticScopeStorageGraphV1,
     read: &SemanticReadBindingV1,
@@ -616,7 +616,7 @@ fn semantic_read_diagnostic_path(
 }
 
 fn derive_semantic_view_binding_graph(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV1,
     reactive: &SemanticReactiveGraphV1,
     storage: &SemanticScopeStorageGraphV1,
@@ -994,7 +994,7 @@ struct ViewConstructorCallIdentity<'a> {
 }
 
 fn validate_constructor_call(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     identity: ViewConstructorCallIdentity<'_>,
 ) -> Result<(), SemanticViewBindingError> {
     let ViewConstructorCallIdentity {
@@ -1047,7 +1047,7 @@ fn validate_constructor_call(
 }
 
 fn reachable_expressions(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     root: SemanticExprId,
 ) -> Result<BTreeSet<SemanticExprId>, SemanticViewBindingError> {
     let mut reachable = BTreeSet::new();
@@ -1085,7 +1085,7 @@ impl BindingInputReachability {
 }
 
 fn binding_input_reachability(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     root: SemanticExprId,
     contract: SemanticOutputContractKindV1,
 ) -> Result<BindingInputReachability, SemanticViewBindingError> {
@@ -1140,7 +1140,7 @@ enum BindingLeafMode {
 }
 
 struct BindingLeafTraversal<'a> {
-    execution: &'a SemanticExecutionGraphV1,
+    execution: &'a SemanticExecutionImageColumnsV1,
     capture: SemanticExprId,
     capture_ancestors: &'a BTreeSet<SemanticExprId>,
     capture_target: SemanticViewCaptureTargetV1,
@@ -1152,7 +1152,7 @@ struct BindingLeafTraversal<'a> {
 }
 
 fn binding_leaf_metadata(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     root: SemanticExprId,
     capture: SemanticExprId,
     capture_ancestors: &BTreeSet<SemanticExprId>,
@@ -1393,7 +1393,7 @@ fn canonical_event_attribute(attribute: &str) -> &str {
 }
 
 fn expression_children(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     kind: &SemanticExpressionKind,
 ) -> Result<Vec<SemanticExprId>, SemanticViewBindingError> {
     execution.expression_children(kind).ok_or_else(|| {
@@ -1504,7 +1504,7 @@ fn exact_view_constructor(contract: SemanticOutputContractKindV1, function: &str
 }
 
 fn expression_route_scope(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     expression: SemanticExprId,
 ) -> Result<SemanticScopeId, SemanticViewBindingError> {
     execution
@@ -1513,7 +1513,7 @@ fn expression_route_scope(
 }
 
 fn require_expression(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     id: SemanticExprId,
 ) -> Result<&SemanticExpression, SemanticViewBindingError> {
     execution
@@ -1522,7 +1522,7 @@ fn require_expression(
 }
 
 fn require_callable(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     id: SemanticCallableId,
 ) -> Result<&crate::SemanticCallable, SemanticViewBindingError> {
     execution

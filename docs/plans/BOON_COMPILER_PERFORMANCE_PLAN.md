@@ -723,6 +723,25 @@ Current cold-diagnostics candidate evidence:
   inventories still take 378/477/272 ms and receipt folding 502 ms. The two-job
   release rebuild remains 2m43s. Continue with finalized shard rows and delete
   those inventories; do not tune the now-small SCC kernel.
+- The checked/execution owner-deletion checkpoint is now real but its first
+  representation is a measured regression, not an optimization result.
+  `SemanticProgram` drops its production checked/execution owners, resource is
+  the sole execution mutation window, Manifest V5 imports finalized handoffs,
+  and the old checked/execution inventories are test-only. Architecture,
+  owner-oracle, 19 focused manifest, minimal-manifest, and ignored NovyWave
+  occurrence checks pass. One direct optimized NovyWave sample takes
+  5,665.819 ms at 507,428 KiB, with 4,357.397 ms semantics, 1,142.939 ms image
+  finalization, 1,534.308 ms manifest work, 18,656,831 allocations, and
+  2,989,230,512 allocated bytes. The stable plan hash remains
+  `890eff63ce7eff16c5597093179b6878fc8f8ed3e9f49555e73333d71d7bcb42`.
+  Full stable projection keys and invocation-path vectors are cloned through
+  row routes and 119,441 edges, while 78,336 legacy-domain rows remain. Treat
+  this as the required boundary checkpoint allowed by optimization-loop step
+  6, then immediately replace the representation through a whole-pipeline
+  audit: one interned projection/path registry, dense relocation spans, one
+  typed final-row fingerprint, remaining rich-domain owner deletion, and
+  pre-expansion demand. Do not polish maps, serializers, or the 156-node
+  maximum SCC as the next task.
 - Do not preserve V3's 208k subject cardinality as a production V4/V5 proof
   requirement. The independent test oracle must map every historical subject
   to exactly one canonical finalized shard row and classifier field/domain and prove

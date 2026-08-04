@@ -8,9 +8,9 @@
 use crate::{
     ProducerFunctionId, ProducerMaterializationMode, ResolvedOutGraph, SemanticActivationId,
     SemanticBindingId, SemanticCallId, SemanticCaptureId, SemanticContextualOperationKind,
-    SemanticDependencyUseId, SemanticDerivedValueId, SemanticExecutionGraphV1, SemanticExprId,
-    SemanticExpression, SemanticExpressionKind, SemanticExternalDependencyId, SemanticFieldId,
-    SemanticHostEffectScheduleId, SemanticListId, SemanticListMutationId,
+    SemanticDependencyUseId, SemanticDerivedValueId, SemanticExecutionImageColumnsV1,
+    SemanticExprId, SemanticExpression, SemanticExpressionKind, SemanticExternalDependencyId,
+    SemanticFieldId, SemanticHostEffectScheduleId, SemanticListId, SemanticListMutationId,
     SemanticListResourceOriginV1, SemanticLocalBindingId, SemanticMaterializationId,
     SemanticMaterializationLocalId, SemanticParameterId, SemanticPulseBatchId, SemanticReadId,
     SemanticResourceGraphV1, SemanticRootKindV1, SemanticRowBinding, SemanticRowScopeId,
@@ -566,7 +566,7 @@ impl From<String> for SemanticReactiveError {
 /// Every output ID is dense and every relationship is resolved by semantic or
 /// resolved-OUT identity.  There is no name/path fallback.
 pub fn build_semantic_reactive_graph(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV1,
     out_net: &ResolvedOutGraph,
 ) -> Result<SemanticReactiveGraphV1, SemanticReactiveError> {
@@ -574,7 +574,7 @@ pub fn build_semantic_reactive_graph(
 }
 
 pub fn build_semantic_reactive_graph_with_external_events(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV1,
     out_net: &ResolvedOutGraph,
     external_event_identities: &[CheckedExternalDeclarationIdentityV1],
@@ -601,7 +601,7 @@ pub fn build_semantic_reactive_graph_with_external_events(
 /// downstream component builders from re-deriving the same graphs merely to
 /// prove inputs that were just validated by the orchestrating elaboration.
 pub(crate) fn build_semantic_reactive_graph_from_validated_inputs(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV1,
     out_net: &ResolvedOutGraph,
     external_event_identities: &[CheckedExternalDeclarationIdentityV1],
@@ -671,7 +671,7 @@ impl SemanticReactiveGraphV1 {
     /// immutable semantic inputs.
     pub fn validate(
         &self,
-        execution: &SemanticExecutionGraphV1,
+        execution: &SemanticExecutionImageColumnsV1,
         resources: &SemanticResourceGraphV1,
         out_net: &ResolvedOutGraph,
     ) -> Result<(), SemanticReactiveError> {
@@ -940,7 +940,7 @@ impl ReactiveReachabilityIndex {
     }
 
     fn insert_reverse_edges(
-        execution: &SemanticExecutionGraphV1,
+        execution: &SemanticExecutionImageColumnsV1,
         parents: &mut [Vec<SemanticExprId>],
         expression: SemanticExprId,
         children: impl IntoIterator<Item = SemanticExprId>,
@@ -1011,7 +1011,7 @@ fn semantic_pulse_batch_digest_v1(
 }
 
 fn reachable_reactive_expressions(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
 ) -> Result<BTreeSet<SemanticExprId>, SemanticReactiveError> {
     let child_statements = execution
         .statements
@@ -1066,7 +1066,7 @@ fn reachable_reactive_expressions(
 }
 
 struct ReactiveBuilder<'a> {
-    execution: &'a SemanticExecutionGraphV1,
+    execution: &'a SemanticExecutionImageColumnsV1,
     resources: &'a SemanticResourceGraphV1,
     out_net: &'a ResolvedOutGraph,
     reachable_expressions: BTreeSet<SemanticExprId>,
@@ -1077,7 +1077,7 @@ struct ReactiveBuilder<'a> {
 
 impl<'a> ReactiveBuilder<'a> {
     fn new(
-        execution: &'a SemanticExecutionGraphV1,
+        execution: &'a SemanticExecutionImageColumnsV1,
         resources: &'a SemanticResourceGraphV1,
         out_net: &'a ResolvedOutGraph,
         external_event_identities: BTreeSet<CheckedExternalDeclarationIdentityV1>,
@@ -4073,7 +4073,7 @@ struct RawDerivedValue {
 }
 
 struct TriggerResolver<'a> {
-    execution: &'a SemanticExecutionGraphV1,
+    execution: &'a SemanticExecutionImageColumnsV1,
     resources: &'a SemanticResourceGraphV1,
     out_net: &'a ResolvedOutGraph,
     bindings: &'a [SemanticBindingV1],
@@ -4087,7 +4087,7 @@ struct TriggerResolver<'a> {
 }
 
 fn lexical_owner_distance(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     descendant: Option<StaticOwnerId>,
     ancestor: Option<StaticOwnerId>,
 ) -> Result<Option<usize>, SemanticReactiveError> {
@@ -4155,7 +4155,7 @@ fn lexical_call_frame_distance(
 }
 
 fn lexical_binding_for_decl<'a>(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV1,
     out_net: &ResolvedOutGraph,
     bindings: &'a [SemanticBindingV1],
@@ -4238,7 +4238,7 @@ fn lexical_binding_for_decl<'a>(
 impl<'a> TriggerResolver<'a> {
     #[allow(clippy::too_many_arguments)]
     fn new(
-        execution: &'a SemanticExecutionGraphV1,
+        execution: &'a SemanticExecutionImageColumnsV1,
         resources: &'a SemanticResourceGraphV1,
         out_net: &'a ResolvedOutGraph,
         bindings: &'a [SemanticBindingV1],
@@ -4942,7 +4942,7 @@ impl<'a> TriggerResolver<'a> {
 
 fn semantic_expression_children(
     kind: &SemanticExpressionKind,
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
 ) -> Result<Vec<SemanticExprId>, SemanticReactiveError> {
     execution.expression_children(kind).ok_or_else(|| {
         let SemanticExpressionKind::Materialize { materialization } = kind else {
@@ -4955,7 +4955,7 @@ fn semantic_expression_children(
 }
 
 fn exact_call_argument_at_ordinal(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     callable: crate::SemanticCallableId,
     arguments: &[crate::SemanticCallArgument],
     ordinal: usize,
@@ -4990,7 +4990,7 @@ fn exact_call_argument_at_ordinal(
 }
 
 fn exact_unique_list_argument(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     callable: crate::SemanticCallableId,
     arguments: &[crate::SemanticCallArgument],
     expression: SemanticExprId,
@@ -5023,7 +5023,7 @@ fn unique_binding_for_target<'a>(
     bindings: &'a [SemanticBindingV1],
     target: SemanticBindingTargetV1,
     expression: &SemanticExpression,
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
 ) -> Result<&'a SemanticBindingV1, SemanticReactiveError> {
     let origin = execution.origin(expression.id)?;
     let matches = bindings
@@ -5060,7 +5060,7 @@ fn require_trigger(
 
 fn materialization_local_read_scope(
     read: &SemanticReadBindingV1,
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
 ) -> Result<Option<SemanticRowScopeId>, SemanticReactiveError> {
     let SemanticReadTargetV1::MaterializationLocal { owner, local, .. } = read.target else {
         return Ok(None);
@@ -5123,7 +5123,7 @@ fn trigger_row_scope(
 
 fn validate_semantic_reactive_shape(
     graph: &SemanticReactiveGraphV1,
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV1,
 ) -> Result<(), SemanticReactiveError> {
     if graph.schema != SEMANTIC_REACTIVE_GRAPH_SCHEMA_V1 {
@@ -5386,7 +5386,7 @@ mod tests {
         }
     }
 
-    fn graph(expressions: Vec<SemanticExpression>) -> SemanticExecutionGraphV1 {
+    fn graph(expressions: Vec<SemanticExpression>) -> SemanticExecutionImageColumnsV1 {
         let origins = expressions
             .iter()
             .map(|expression| SemanticExpressionOrigin {
@@ -5402,7 +5402,7 @@ mod tests {
                 call_instance: None,
             })
             .collect();
-        SemanticExecutionGraphV1 {
+        SemanticExecutionImageColumnsV1 {
             expressions,
             scopes: vec![SemanticScope {
                 id: SemanticScopeId(0),
@@ -5418,7 +5418,7 @@ mod tests {
             }],
             static_owners: Vec::<SemanticStaticOwner>::new(),
             checked_expression_origins: origins,
-            ..SemanticExecutionGraphV1::default()
+            ..SemanticExecutionImageColumnsV1::default()
         }
     }
 
@@ -5502,9 +5502,9 @@ mod tests {
 
     #[test]
     fn call_argument_identity_uses_formal_and_ordinal_not_diagnostic_name() {
-        let execution = SemanticExecutionGraphV1 {
+        let execution = SemanticExecutionImageColumnsV1 {
             callables: vec![append_callable()],
-            ..SemanticExecutionGraphV1::default()
+            ..SemanticExecutionImageColumnsV1::default()
         };
         let mut arguments = vec![
             crate::SemanticCallArgument {

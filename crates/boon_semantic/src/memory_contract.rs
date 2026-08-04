@@ -8,15 +8,18 @@
 
 use crate::{
     SemanticBindingId, SemanticBindingTargetV1, SemanticContextualOperationKind,
-    SemanticExecutionGraphV1, SemanticExprId, SemanticExpression, SemanticExpressionKind,
+    SemanticExecutionImageColumnsV1, SemanticExprId, SemanticExpression, SemanticExpressionKind,
     SemanticListId, SemanticLoweringContractV1, SemanticMaterializationId, SemanticMigrationId,
     SemanticReactiveGraphV1, SemanticReadTargetV1, SemanticResourceGraphV1, SemanticRowBinding,
     SemanticScopeStorageGraphV1, SemanticSelectKind, SemanticSourceUnitId, SemanticStateId,
     SemanticStatementKind, SemanticStorageBindingTargetV1, SemanticStorageFieldId,
     SemanticValueOrigin, StaticOwnerId,
 };
+#[cfg(test)]
+use boon_checked::CheckedProgram;
 use boon_checked::{
-    CheckedExpression, CheckedExpressionKind, CheckedPassedAccess, CheckedProgram, Type, Variant,
+    CheckedExpression, CheckedExpressionKind, CheckedPassedAccess, CheckedProgramFields, Type,
+    Variant,
 };
 use boon_contract::SourceBundleDigestV1;
 use serde::{Deserialize, Serialize};
@@ -280,8 +283,8 @@ struct DrainUse {
 }
 
 pub(crate) fn build_semantic_memory_graph(
-    checked: &CheckedProgram,
-    execution: &SemanticExecutionGraphV1,
+    checked: &CheckedProgramFields,
+    execution: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV1,
     reactive: &SemanticReactiveGraphV1,
     storage: &SemanticScopeStorageGraphV1,
@@ -322,10 +325,11 @@ pub(crate) fn build_semantic_memory_graph(
 }
 
 impl SemanticMemoryGraphV1 {
+    #[cfg(test)]
     pub(crate) fn validate(
         &self,
-        checked: &CheckedProgram,
-        execution: &SemanticExecutionGraphV1,
+        checked: &CheckedProgramFields,
+        execution: &SemanticExecutionImageColumnsV1,
         resources: &SemanticResourceGraphV1,
         reactive: &SemanticReactiveGraphV1,
         storage: &SemanticScopeStorageGraphV1,
@@ -344,7 +348,7 @@ impl SemanticMemoryGraphV1 {
 }
 
 fn build_memories(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     reachable: &BTreeSet<SemanticExprId>,
     resources: &SemanticResourceGraphV1,
     reactive: &SemanticReactiveGraphV1,
@@ -596,7 +600,7 @@ fn build_memories(
 }
 
 fn collection_structural_owner_rows(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV1,
     reactive: &SemanticReactiveGraphV1,
     target: SemanticExprId,
@@ -686,7 +690,7 @@ fn collection_structural_owner_rows(
 }
 
 fn collection_statement_path(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     expression: SemanticExprId,
 ) -> Result<Option<String>, SemanticMemoryError> {
     let mut candidates = Vec::<(String, SemanticExprId)>::new();
@@ -738,7 +742,7 @@ fn collection_statement_path(
 }
 
 fn expression_structural_route(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     root: SemanticExprId,
     target: SemanticExprId,
 ) -> Result<Vec<String>, SemanticMemoryError> {
@@ -1048,7 +1052,7 @@ fn type_is_closed_memory_data(data_type: &Type) -> bool {
 }
 
 fn reachable_semantic_expressions(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
 ) -> Result<BTreeSet<SemanticExprId>, SemanticMemoryError> {
     let child_statements = execution
         .statements
@@ -1095,8 +1099,8 @@ fn reachable_semantic_expressions(
 }
 
 fn validate_checked_marker_equivalence(
-    checked: &CheckedProgram,
-    execution: &SemanticExecutionGraphV1,
+    checked: &CheckedProgramFields,
+    execution: &SemanticExecutionImageColumnsV1,
     reachable: &BTreeSet<SemanticExprId>,
 ) -> Result<(), SemanticMemoryError> {
     for expression in execution
@@ -1171,7 +1175,7 @@ fn validate_checked_drain_marker(
 }
 
 fn attach_draining_markers(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     reactive: &SemanticReactiveGraphV1,
     storage: &SemanticScopeStorageGraphV1,
     reachable: &BTreeSet<SemanticExprId>,
@@ -1281,7 +1285,7 @@ fn attach_draining_markers(
 }
 
 fn require_expression(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     expression: SemanticExprId,
 ) -> Result<&SemanticExpression, SemanticMemoryError> {
     execution
@@ -1290,7 +1294,7 @@ fn require_expression(
 }
 
 fn require_checked_expression(
-    checked: &CheckedProgram,
+    checked: &CheckedProgramFields,
     expression: boon_checked::CheckedExprId,
 ) -> Result<&CheckedExpression, SemanticMemoryError> {
     checked
@@ -1306,7 +1310,7 @@ fn require_checked_expression(
 }
 
 fn expression_children(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     kind: &SemanticExpressionKind,
 ) -> Result<Vec<SemanticExprId>, SemanticMemoryError> {
     execution.expression_children(kind).ok_or_else(|| {
@@ -1320,7 +1324,7 @@ fn expression_children(
 }
 
 fn expression_reaches(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     root: SemanticExprId,
     target: SemanticExprId,
 ) -> Result<bool, SemanticMemoryError> {
@@ -1340,7 +1344,7 @@ fn expression_reaches(
 }
 
 fn expression_subtree(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     root: SemanticExprId,
 ) -> Result<BTreeSet<SemanticExprId>, SemanticMemoryError> {
     let mut pending = vec![root];
@@ -1356,7 +1360,7 @@ fn expression_subtree(
 }
 
 fn collect_drains(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV1,
     reactive: &SemanticReactiveGraphV1,
     storage: &SemanticScopeStorageGraphV1,
@@ -1422,7 +1426,7 @@ fn collect_drains(
 }
 
 fn resolve_drain_binding<'a>(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     reactive: &'a SemanticReactiveGraphV1,
     expression: &SemanticExpression,
 ) -> Result<&'a crate::SemanticBindingV1, SemanticMemoryError> {
@@ -1599,7 +1603,7 @@ struct DestinationCandidate {
 }
 
 fn exact_drain_destination_candidates(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV1,
     memories: &[SemanticMemoryV1],
     drain: SemanticExprId,
@@ -1794,7 +1798,7 @@ fn projection_contains(ancestor: &[String], descendant: &[String]) -> bool {
 }
 
 fn validate_no_ordinary_draining_reads(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     reactive: &SemanticReactiveGraphV1,
     storage: &SemanticScopeStorageGraphV1,
     reachable: &BTreeSet<SemanticExprId>,
@@ -1888,7 +1892,7 @@ fn validate_no_ordinary_draining_reads(
 }
 
 fn lower_migration_edges(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV1,
     memories: &[SemanticMemoryV1],
     drains: &[DrainUse],
@@ -2061,7 +2065,7 @@ fn lower_migration_edges(
 }
 
 fn state_transform(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     destination: &SemanticMemoryV1,
     initializer: SemanticMigrationInitializerV1,
     inputs: &[SemanticMigrationDrainV1],
@@ -2299,7 +2303,7 @@ fn indexed_memory_schema(
 }
 
 fn validate_pure_transform(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     root: SemanticExprId,
     allowed_drains: &BTreeSet<SemanticExprId>,
 ) -> Result<(), SemanticMemoryError> {
@@ -2330,7 +2334,7 @@ fn validate_pure_transform(
 }
 
 struct SemanticMigrationPurityChecker<'a> {
-    execution: &'a SemanticExecutionGraphV1,
+    execution: &'a SemanticExecutionImageColumnsV1,
     allowed_drains: &'a BTreeSet<SemanticExprId>,
     seen_drains: BTreeSet<SemanticExprId>,
     active_expressions: BTreeSet<SemanticExprId>,
@@ -2666,7 +2670,7 @@ fn migration_cycle_from(
 
 fn validate_memory_shape(
     graph: &SemanticMemoryGraphV1,
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV1,
     reactive: &SemanticReactiveGraphV1,
     storage: &SemanticScopeStorageGraphV1,
@@ -3088,7 +3092,10 @@ mod tests {
         (checked, semantic)
     }
 
-    fn graph(checked: &CheckedProgram, semantic: &crate::SemanticProgram) -> SemanticMemoryGraphV1 {
+    fn graph(
+        checked: &CheckedProgramFields,
+        semantic: &crate::SemanticProgram,
+    ) -> SemanticMemoryGraphV1 {
         build_semantic_memory_graph(
             checked,
             semantic.execution_graph(),

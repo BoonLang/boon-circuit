@@ -5,8 +5,8 @@ use crate::{
     SemanticCallId, SemanticCallable, SemanticCallableId, SemanticCallableKind,
     SemanticContextualMaterialization, SemanticContextualOperationKind, SemanticContextualOrderKey,
     SemanticContextualRowPredecessor, SemanticDependencyTargetV1, SemanticDependencyTimingV1,
-    SemanticDerivedValueKindV1, SemanticEventCauseV1, SemanticExecutionGraphV1, SemanticExprId,
-    SemanticExpression, SemanticExpressionKind, SemanticFieldId, SemanticFunction,
+    SemanticDerivedValueKindV1, SemanticEventCauseV1, SemanticExecutionImageColumnsV1,
+    SemanticExprId, SemanticExpression, SemanticExpressionKind, SemanticFieldId, SemanticFunction,
     SemanticFunctionParameter, SemanticInitialValueV1, SemanticListId, SemanticListInitializerV1,
     SemanticListKeyPolicyV1, SemanticListMutationKindV1, SemanticListProjectionKindV1,
     SemanticLocalBindingId, SemanticLoweringContractV1, SemanticMaterializationId,
@@ -654,7 +654,7 @@ pub(super) struct MappedSemanticStorage {
 
 impl SemanticToExecutableMap {
     fn allocate_with_external_events(
-        graph: &SemanticExecutionGraphV1,
+        graph: &SemanticExecutionImageColumnsV1,
         resources: &SemanticResourceGraphV1,
         external_event_identities: &[CheckedExternalDeclarationIdentityV1],
     ) -> Result<Self, String> {
@@ -1046,7 +1046,7 @@ fn require_unique_allocation<T: Ord>(
 }
 
 fn allocate_call_expressions(
-    graph: &SemanticExecutionGraphV1,
+    graph: &SemanticExecutionImageColumnsV1,
 ) -> Result<Vec<Vec<ExecutableExprId>>, String> {
     let mut allocated = vec![Vec::new(); graph.calls.len()];
     for expression in &graph.expressions {
@@ -1074,7 +1074,7 @@ fn allocate_call_expressions(
 }
 
 fn semantic_callable(
-    graph: &SemanticExecutionGraphV1,
+    graph: &SemanticExecutionImageColumnsV1,
     id: SemanticCallableId,
 ) -> Result<&SemanticCallable, String> {
     graph
@@ -1085,7 +1085,7 @@ fn semantic_callable(
 }
 
 fn semantic_call(
-    graph: &SemanticExecutionGraphV1,
+    graph: &SemanticExecutionImageColumnsV1,
     id: SemanticCallId,
 ) -> Result<&SemanticCall, String> {
     graph
@@ -1096,7 +1096,7 @@ fn semantic_call(
 }
 
 fn allocate_local_bindings(
-    graph: &SemanticExecutionGraphV1,
+    graph: &SemanticExecutionImageColumnsV1,
 ) -> Result<BTreeMap<SemanticLocalBindingId, ExecutableLocalBindingId>, String> {
     let mut definitions = BTreeMap::new();
     let mut references = BTreeSet::new();
@@ -1138,7 +1138,7 @@ fn allocate_local_bindings(
 }
 
 fn allocate_call_identities(
-    graph: &SemanticExecutionGraphV1,
+    graph: &SemanticExecutionImageColumnsV1,
 ) -> Result<AllocatedCallIdentities, String> {
     let mut call_instances = BTreeMap::new();
     let mut context_definitions = BTreeSet::new();
@@ -1292,7 +1292,7 @@ fn allocate_call_identities(
 }
 
 fn allocate_materialization_locals(
-    graph: &SemanticExecutionGraphV1,
+    graph: &SemanticExecutionImageColumnsV1,
 ) -> Result<BTreeMap<(StaticOwnerId, SemanticMaterializationLocalId), MaterializationLocalId>, String>
 {
     let mut definitions = BTreeMap::new();
@@ -1359,7 +1359,7 @@ fn allocate_materialization_locals(
 }
 
 fn require_semantic_owner(
-    graph: &SemanticExecutionGraphV1,
+    graph: &SemanticExecutionImageColumnsV1,
     owner: StaticOwnerId,
     context: &str,
 ) -> Result<(), String> {
@@ -1374,7 +1374,7 @@ fn require_semantic_owner(
 }
 
 fn allocate_runtime_resource_ids(
-    graph: &SemanticExecutionGraphV1,
+    graph: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV1,
 ) -> Result<AllocatedRuntimeResourceIds, String> {
     if resources.sources.len() != graph.sources.len() {
@@ -1441,7 +1441,7 @@ fn allocate_runtime_resource_ids(
 }
 
 fn allocate_external_event_source_ids(
-    graph: &SemanticExecutionGraphV1,
+    graph: &SemanticExecutionImageColumnsV1,
     local_source_count: usize,
     external_event_identities: &[CheckedExternalDeclarationIdentityV1],
 ) -> Result<
@@ -1533,7 +1533,7 @@ fn allocate_external_event_source_ids(
 }
 
 pub(super) fn map_semantic_execution_with_reactive(
-    graph: &SemanticExecutionGraphV1,
+    graph: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV1,
     reactive: &SemanticReactiveGraphV1,
 ) -> Result<MappedSemanticExecution, String> {
@@ -1545,7 +1545,7 @@ pub(super) fn map_semantic_execution_with_reactive(
 }
 
 fn map_semantic_execution_with_external_events(
-    graph: &SemanticExecutionGraphV1,
+    graph: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV1,
     external_event_identities: &[CheckedExternalDeclarationIdentityV1],
 ) -> Result<MappedSemanticExecution, String> {
@@ -1641,7 +1641,7 @@ fn map_semantic_execution_with_external_events(
 }
 
 pub(super) fn map_semantic_resources(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     graph: &SemanticResourceGraphV1,
     ids: &SemanticToExecutableMap,
 ) -> Result<MappedSemanticResources, String> {
@@ -1877,7 +1877,7 @@ impl SemanticReactiveToMappedMap {
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn map_semantic_reactive(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     resource_graph: &SemanticResourceGraphV1,
     graph: &SemanticReactiveGraphV1,
     ids: &SemanticToExecutableMap,
@@ -2042,7 +2042,7 @@ pub(super) fn map_semantic_reactive(
 }
 
 fn semantic_execution_statement(
-    graph: &SemanticExecutionGraphV1,
+    graph: &SemanticExecutionImageColumnsV1,
     id: SemanticStatementId,
 ) -> Result<&SemanticStatement, String> {
     graph
@@ -2053,7 +2053,7 @@ fn semantic_execution_statement(
 }
 
 fn semantic_execution_expression(
-    graph: &SemanticExecutionGraphV1,
+    graph: &SemanticExecutionImageColumnsV1,
     id: SemanticExprId,
 ) -> Result<&SemanticExpression, String> {
     graph
@@ -2086,7 +2086,7 @@ fn semantic_state_resource(
 }
 
 fn mapped_owner_ancestry(
-    graph: &SemanticExecutionGraphV1,
+    graph: &SemanticExecutionImageColumnsV1,
     owner: Option<StaticOwnerId>,
 ) -> Result<Vec<StaticOwnerId>, String> {
     // Executable storage uses canonical root-to-leaf ancestry, with the
@@ -2113,7 +2113,7 @@ fn mapped_owner_ancestry(
 }
 
 fn map_reactive_field(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     ids: &SemanticToExecutableMap,
     reactive_ids: &SemanticReactiveToMappedMap,
     field: &crate::SemanticFieldV1,
@@ -2173,7 +2173,7 @@ fn map_reactive_field(
 }
 
 fn semantic_field_producer_matches_statement(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     statement: &SemanticStatement,
     declaration: DeclId,
     producer: SemanticExprId,
@@ -2238,7 +2238,7 @@ fn unique_mapped_field_for_statement<'a>(
 }
 
 fn map_reactive_binding(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV1,
     ids: &SemanticToExecutableMap,
     reactive_ids: &SemanticReactiveToMappedMap,
@@ -2426,7 +2426,7 @@ fn map_reactive_binding(
 }
 
 fn map_reactive_sources(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV1,
     ids: &SemanticToExecutableMap,
     bindings: &[MappedSemanticBinding],
@@ -2490,7 +2490,7 @@ fn mapped_binding(
 }
 
 fn map_reactive_read(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV1,
     ids: &SemanticToExecutableMap,
     reactive_ids: &SemanticReactiveToMappedMap,
@@ -2665,7 +2665,7 @@ fn semantic_event_cause_path(
 }
 
 fn map_reactive_trigger(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     ids: &SemanticToExecutableMap,
     reactive_ids: &SemanticReactiveToMappedMap,
     trigger: &crate::SemanticTriggerOwnedArmV1,
@@ -2768,7 +2768,7 @@ fn validate_value_producer(
 }
 
 fn map_reactive_list_mutation(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     graph: &SemanticReactiveGraphV1,
     ids: &SemanticToExecutableMap,
     reactive_ids: &SemanticReactiveToMappedMap,
@@ -2857,7 +2857,7 @@ fn map_reactive_list_mutation(
 }
 
 struct ReactiveDerivedMappingContext<'a> {
-    execution: &'a SemanticExecutionGraphV1,
+    execution: &'a SemanticExecutionImageColumnsV1,
     resource_graph: &'a SemanticResourceGraphV1,
     graph: &'a SemanticReactiveGraphV1,
     ids: &'a SemanticToExecutableMap,
@@ -3106,7 +3106,7 @@ fn map_dependency_timing(
 }
 
 fn map_reactive_dependency_use(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     graph: &SemanticReactiveGraphV1,
     ids: &SemanticToExecutableMap,
     reactive_ids: &SemanticReactiveToMappedMap,
@@ -3185,7 +3185,7 @@ fn map_reactive_dependency_use(
 }
 
 fn map_reactive_producer_instance(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV1,
     ids: &SemanticToExecutableMap,
     fields: &[MappedSemanticField],
@@ -3339,7 +3339,7 @@ fn map_reactive_producer_instance(
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn map_semantic_storage_join(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     resource_graph: &SemanticResourceGraphV1,
     reactive_graph: &SemanticReactiveGraphV1,
     storage_graph: &SemanticScopeStorageGraphV1,
@@ -3819,7 +3819,7 @@ impl SemanticStorageToErasedMap {
 }
 
 fn map_storage_owners(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     storage: &SemanticScopeStorageGraphV1,
     ids: &SemanticToExecutableMap,
 ) -> Result<Vec<ErasedOwnerDef>, String> {
@@ -3885,7 +3885,7 @@ const fn map_storage_field_role(role: SemanticStorageFieldRoleV1) -> ErasedField
 }
 
 fn map_storage_fields(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV1,
     storage: &SemanticScopeStorageGraphV1,
     ids: &SemanticToExecutableMap,
@@ -4166,7 +4166,7 @@ fn map_storage_local_member_forwarding(
 }
 
 fn map_storage_locals(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     storage: &SemanticScopeStorageGraphV1,
     ids: &SemanticToExecutableMap,
     storage_ids: &SemanticStorageToErasedMap,
@@ -4681,7 +4681,7 @@ fn map_storage_sources(
 }
 
 fn map_storage_external_references(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     reactive_graph: &SemanticReactiveGraphV1,
     storage: &SemanticScopeStorageGraphV1,
     ids: &SemanticToExecutableMap,
@@ -5631,7 +5631,7 @@ fn map_initial_value(value: &SemanticInitialValueV1) -> InitialValue {
 }
 
 fn map_source_resource(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     ids: &SemanticToExecutableMap,
     source: &crate::SemanticSourceResourceV1,
 ) -> Result<SourcePort, String> {
@@ -5688,7 +5688,7 @@ fn map_source_payload_schema(source: &crate::SemanticSourceResourceV1) -> Source
 }
 
 fn map_state_resource(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     ids: &SemanticToExecutableMap,
     state: &crate::SemanticStateResourceV1,
 ) -> Result<StateCell, String> {
@@ -5732,7 +5732,7 @@ fn map_state_resource(
 }
 
 fn semantic_expression(
-    graph: &SemanticExecutionGraphV1,
+    graph: &SemanticExecutionImageColumnsV1,
     id: SemanticExprId,
 ) -> Result<&SemanticExpression, String> {
     graph
@@ -5753,7 +5753,7 @@ fn runtime_checked_expression_id(id: boon_checked::CheckedExprId) -> Result<Expr
 }
 
 fn map_expression(
-    graph: &SemanticExecutionGraphV1,
+    graph: &SemanticExecutionImageColumnsV1,
     ids: &SemanticToExecutableMap,
     expression: &SemanticExpression,
 ) -> Result<ExecutableExpression, String> {
@@ -5778,7 +5778,7 @@ fn map_expression(
 }
 
 fn map_expression_kind(
-    graph: &SemanticExecutionGraphV1,
+    graph: &SemanticExecutionImageColumnsV1,
     ids: &SemanticToExecutableMap,
     expression: &SemanticExpression,
 ) -> Result<ExecutableExpressionKind, String> {
@@ -6121,7 +6121,7 @@ fn map_expression_kind(
 }
 
 fn executable_parameter_for_occurrence(
-    graph: &SemanticExecutionGraphV1,
+    graph: &SemanticExecutionImageColumnsV1,
     ids: &SemanticToExecutableMap,
     expression: &SemanticExpression,
     parameter: SemanticParameterId,
@@ -6178,7 +6178,7 @@ fn executable_parameter_for_occurrence(
 }
 
 fn map_provenance(
-    graph: &SemanticExecutionGraphV1,
+    graph: &SemanticExecutionImageColumnsV1,
     ids: &SemanticToExecutableMap,
     provenance: &SemanticValueProvenance,
 ) -> Result<ExecutableValueProvenance, String> {
@@ -6192,7 +6192,7 @@ fn map_provenance(
 }
 
 fn map_value_member(
-    graph: &SemanticExecutionGraphV1,
+    graph: &SemanticExecutionImageColumnsV1,
     ids: &SemanticToExecutableMap,
     member: &SemanticValueMember,
 ) -> Result<ExecutableValueMember, String> {
@@ -6236,7 +6236,7 @@ fn map_value_member(
 }
 
 fn map_source_read(
-    graph: &SemanticExecutionGraphV1,
+    graph: &SemanticExecutionImageColumnsV1,
     source: &SemanticSourceRead,
 ) -> Result<boon_checked::CheckedSourceRead, String> {
     Ok(boon_checked::CheckedSourceRead {
@@ -6246,7 +6246,7 @@ fn map_source_read(
 }
 
 fn checked_source_id(
-    graph: &SemanticExecutionGraphV1,
+    graph: &SemanticExecutionImageColumnsV1,
     source: SemanticSourceId,
 ) -> Result<boon_checked::CheckedSourceId, String> {
     let definition = graph
@@ -6264,7 +6264,7 @@ fn checked_source_id(
 }
 
 fn checked_state_id(
-    graph: &SemanticExecutionGraphV1,
+    graph: &SemanticExecutionImageColumnsV1,
     state: SemanticStateId,
 ) -> Result<boon_checked::CheckedStateId, String> {
     graph
@@ -6459,7 +6459,7 @@ fn map_state(
 }
 
 fn map_root(
-    graph: &SemanticExecutionGraphV1,
+    graph: &SemanticExecutionImageColumnsV1,
     ids: &SemanticToExecutableMap,
     root: &SemanticRoot,
 ) -> Result<ExecutableRoot, String> {
@@ -6478,7 +6478,7 @@ fn map_root(
 }
 
 fn map_function(
-    graph: &SemanticExecutionGraphV1,
+    graph: &SemanticExecutionImageColumnsV1,
     ids: &SemanticToExecutableMap,
     function: &SemanticFunction,
 ) -> Result<ExecutableFunction, String> {
@@ -7110,7 +7110,7 @@ fn map_pulse_batches(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_canonical_program_core(
-    execution_graph: &SemanticExecutionGraphV1,
+    execution_graph: &SemanticExecutionImageColumnsV1,
     resource_graph: &SemanticResourceGraphV1,
     reactive_graph: &SemanticReactiveGraphV1,
     lowering_contract: &SemanticLoweringContractV1,
@@ -7136,7 +7136,7 @@ pub(crate) fn build_canonical_program_core(
 
 #[allow(clippy::too_many_arguments)]
 fn finish_canonical_program_core(
-    execution_graph: &SemanticExecutionGraphV1,
+    execution_graph: &SemanticExecutionImageColumnsV1,
     resource_graph: &SemanticResourceGraphV1,
     reactive_graph: &SemanticReactiveGraphV1,
     lowering_contract: &SemanticLoweringContractV1,
@@ -7321,7 +7321,7 @@ fn finish_canonical_program_core(
 type ExternalReferenceMap = BTreeMap<SemanticStorageExternalReferenceId, usize>;
 
 fn map_distributed_references(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     mapped: &MappedSemanticExecution,
     storage: &MappedSemanticStorage,
 ) -> Result<
@@ -8116,7 +8116,7 @@ fn map_semantic_field_entries(
 }
 
 fn map_semantic_memory(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     reactive: &SemanticReactiveGraphV1,
     graph: &crate::SemanticMemoryGraphV1,
     ids: &SemanticToExecutableMap,

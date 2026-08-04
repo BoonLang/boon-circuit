@@ -6,18 +6,22 @@
 //! Downstream lowering must use the semantic identities emitted by this module
 //! and must not repeat these checked/name-based joins.
 
+#[cfg(test)]
+use crate::ResolvedOutGraph;
 use crate::{
-    ResolvedOutGraph, SemanticBindingId, SemanticBindingTargetV1, SemanticCallableId,
-    SemanticExecutionGraphV1, SemanticExprId, SemanticExpressionKind, SemanticFieldId,
+    SemanticBindingId, SemanticBindingTargetV1, SemanticCallableId,
+    SemanticExecutionImageColumnsV1, SemanticExprId, SemanticExpressionKind, SemanticFieldId,
     SemanticListId, SemanticLocalBindingId, SemanticParameterId, SemanticReactiveGraphV1,
     SemanticResourceGraphV1, SemanticRootKindV1, SemanticSourceId, SemanticSourceOrigin,
     SemanticStateId, SemanticStatementId, SemanticStatementOrigin, SemanticValueId,
     SemanticValueListAuthorityId, checked_semantic_root_specs_v1,
 };
+#[cfg(test)]
+use boon_checked::CheckedProgram;
 use boon_checked::{
-    CheckedCallableKind, CheckedEffectSummary, CheckedExprId, CheckedProgram, CheckedSourceId,
-    CheckedStatementId, DeclId, DiagnosticSeverity, FlowType, NamedValueTypeOrigin, Type,
-    TypeDiagnostic, Variant,
+    CheckedCallableKind, CheckedEffectSummary, CheckedExprId, CheckedProgramFields,
+    CheckedSourceId, CheckedStatementId, DeclId, DiagnosticSeverity, FlowType,
+    NamedValueTypeOrigin, Type, TypeDiagnostic, Variant,
 };
 use boon_contract::SourceBundleDigestV1;
 use serde::{Deserialize, Serialize};
@@ -492,9 +496,10 @@ impl std::error::Error for SemanticLoweringContractError {}
 
 /// Build the deterministic semantic A-C authority from the opaque checked
 /// artifact and already-normalized semantic graphs.
+#[cfg(test)]
 pub(crate) fn build_semantic_lowering_contract(
-    checked: &CheckedProgram,
-    execution: &SemanticExecutionGraphV1,
+    checked: &CheckedProgramFields,
+    execution: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV1,
     reactive: &SemanticReactiveGraphV1,
     out_net: &ResolvedOutGraph,
@@ -513,8 +518,8 @@ pub(crate) fn build_semantic_lowering_contract(
 }
 
 pub(crate) fn build_semantic_lowering_contract_from_validated_inputs(
-    checked: &CheckedProgram,
-    execution: &SemanticExecutionGraphV1,
+    checked: &CheckedProgramFields,
+    execution: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV1,
     reactive: &SemanticReactiveGraphV1,
 ) -> Result<SemanticLoweringContractV1, SemanticLoweringContractError> {
@@ -567,10 +572,11 @@ pub(crate) fn build_semantic_lowering_contract_from_validated_inputs(
 impl SemanticLoweringContractV1 {
     /// Fail closed by re-deriving all checked-to-semantic joins and both
     /// canonical digests.
+    #[cfg(test)]
     pub(crate) fn validate(
         &self,
-        checked: &CheckedProgram,
-        execution: &SemanticExecutionGraphV1,
+        checked: &CheckedProgramFields,
+        execution: &SemanticExecutionImageColumnsV1,
         resources: &SemanticResourceGraphV1,
         reactive: &SemanticReactiveGraphV1,
         out_net: &ResolvedOutGraph,
@@ -587,8 +593,8 @@ impl SemanticLoweringContractV1 {
 }
 
 fn build_lowering_metadata(
-    checked: &CheckedProgram,
-    execution: &SemanticExecutionGraphV1,
+    checked: &CheckedProgramFields,
+    execution: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV1,
     reactive: &SemanticReactiveGraphV1,
 ) -> Result<SemanticLoweringMetadataV1, SemanticLoweringContractError> {
@@ -675,8 +681,8 @@ fn validate_source_units(
 }
 
 fn build_expression_types(
-    checked: &CheckedProgram,
-    execution: &SemanticExecutionGraphV1,
+    checked: &CheckedProgramFields,
+    execution: &SemanticExecutionImageColumnsV1,
 ) -> Result<Vec<SemanticSourceExpressionTypeV1>, SemanticLoweringContractError> {
     let lowering = &checked.lowering_metadata;
     let mut occurrences_by_checked = vec![Vec::new(); checked.expressions.len()];
@@ -771,8 +777,8 @@ fn build_expression_types(
 }
 
 fn build_function_types(
-    checked: &CheckedProgram,
-    execution: &SemanticExecutionGraphV1,
+    checked: &CheckedProgramFields,
+    execution: &SemanticExecutionImageColumnsV1,
 ) -> Result<Vec<SemanticFunctionTypeV1>, SemanticLoweringContractError> {
     let user_callables = execution
         .callables
@@ -856,8 +862,8 @@ fn build_function_types(
 }
 
 fn build_named_value_types(
-    checked: &CheckedProgram,
-    execution: &SemanticExecutionGraphV1,
+    checked: &CheckedProgramFields,
+    execution: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV1,
     reactive: &SemanticReactiveGraphV1,
 ) -> Result<Vec<SemanticNamedValueTypeV1>, SemanticLoweringContractError> {
@@ -957,7 +963,7 @@ fn build_named_value_types(
 
 fn build_named_value_origin(
     origin: &NamedValueTypeOrigin,
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV1,
     reactive: &SemanticReactiveGraphV1,
 ) -> Result<SemanticNamedValueTypeOriginV1, SemanticLoweringContractError> {
@@ -1155,8 +1161,8 @@ fn build_named_value_origin(
 }
 
 fn build_render_slots(
-    checked: &CheckedProgram,
-    execution: &SemanticExecutionGraphV1,
+    checked: &CheckedProgramFields,
+    execution: &SemanticExecutionImageColumnsV1,
     diagnostics: &mut Vec<SemanticTypeDiagnosticV1>,
 ) -> Result<Vec<SemanticRenderSlotV1>, SemanticLoweringContractError> {
     let mut slots = checked
@@ -1243,7 +1249,7 @@ fn build_render_slots(
 }
 
 fn build_source_payload_shapes(
-    checked: &CheckedProgram,
+    checked: &CheckedProgramFields,
     resources: &SemanticResourceGraphV1,
 ) -> Result<Vec<SemanticSourcePayloadShapeV1>, SemanticLoweringContractError> {
     let entries = &checked.lowering_metadata.source_payload_shape_table;
@@ -1405,7 +1411,7 @@ fn build_source_payload_shapes(
 }
 
 fn validate_source_payload_shape_identity_coverage(
-    checked: &CheckedProgram,
+    checked: &CheckedProgramFields,
     entries: &[boon_checked::SourcePayloadShapeEntry],
 ) -> Result<(), SemanticLoweringContractError> {
     let expected = checked
@@ -1502,8 +1508,8 @@ struct RawOutputContract {
 }
 
 fn build_output_contracts(
-    checked: &CheckedProgram,
-    execution: &SemanticExecutionGraphV1,
+    checked: &CheckedProgramFields,
+    execution: &SemanticExecutionImageColumnsV1,
     reactive: &SemanticReactiveGraphV1,
     render_slots: &[SemanticRenderSlotV1],
 ) -> Result<Vec<SemanticOutputContractV1>, SemanticLoweringContractError> {
@@ -1558,7 +1564,7 @@ fn build_output_contracts(
 fn bind_output_contract(
     id: SemanticOutputContractId,
     declaration: RawOutputContract,
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     reactive: &SemanticReactiveGraphV1,
     render_slots: &[SemanticRenderSlotV1],
 ) -> Result<SemanticOutputContractV1, SemanticLoweringContractError> {
@@ -1669,7 +1675,7 @@ fn bind_output_contract(
 }
 
 fn build_host_ports(
-    checked: &CheckedProgram,
+    checked: &CheckedProgramFields,
     resources: &SemanticResourceGraphV1,
     outputs: &[SemanticOutputContractV1],
 ) -> Result<Vec<SemanticHostPortBindingV1>, SemanticLoweringContractError> {
@@ -1709,7 +1715,7 @@ fn build_host_ports(
 }
 
 fn resolve_host_source(
-    checked: &CheckedProgram,
+    checked: &CheckedProgramFields,
     resources: &SemanticResourceGraphV1,
     binding: &boon_checked::CheckedHostSourcePortBinding,
 ) -> Result<SemanticHostSourceBindingV1, SemanticLoweringContractError> {
@@ -1797,7 +1803,7 @@ fn resolve_host_output(
 }
 
 fn exact_checked_statement(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     checked_statement: CheckedStatementId,
 ) -> Result<SemanticStatementId, SemanticLoweringContractError> {
     let matches = execution
@@ -1824,7 +1830,7 @@ fn exact_checked_statement(
 }
 
 fn require_checked_statement(
-    checked: &CheckedProgram,
+    checked: &CheckedProgramFields,
     id: CheckedStatementId,
 ) -> Result<&boon_checked::CheckedStatement, SemanticLoweringContractError> {
     let matches = checked
@@ -1843,7 +1849,7 @@ fn require_checked_statement(
 }
 
 fn require_statement(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     id: SemanticStatementId,
 ) -> Result<&crate::SemanticStatement, SemanticLoweringContractError> {
     execution
@@ -1852,7 +1858,7 @@ fn require_statement(
 }
 
 fn require_expression(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     id: SemanticExprId,
 ) -> Result<&crate::SemanticExpression, SemanticLoweringContractError> {
     execution
@@ -1861,7 +1867,7 @@ fn require_expression(
 }
 
 fn exact_visual_contract_known(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     root_statement: SemanticStatementId,
     root: SemanticExprId,
     contract: SemanticOutputContractKindV1,
@@ -2042,7 +2048,7 @@ enum TransientCollectionTerminal {
 }
 
 fn transient_local_values(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
 ) -> Result<BTreeMap<SemanticLocalBindingId, SemanticExprId>, SemanticLoweringContractError> {
     let mut local_values = BTreeMap::new();
     for expression in &execution.expressions {
@@ -2062,7 +2068,7 @@ fn transient_local_values(
 }
 
 fn reachable_lowering_expressions(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     local_values: &BTreeMap<SemanticLocalBindingId, SemanticExprId>,
 ) -> Result<BTreeSet<SemanticExprId>, SemanticLoweringContractError> {
     let child_statements = execution
@@ -2127,7 +2133,7 @@ fn reachable_lowering_expressions(
 }
 
 fn build_transient_collections(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV1,
 ) -> Result<Vec<SemanticTransientCollectionV1>, SemanticLoweringContractError> {
     let local_values = transient_local_values(execution)?;
@@ -2423,7 +2429,7 @@ fn build_transient_collections(
 }
 
 fn trace_transient_authority(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     local_values: &BTreeMap<SemanticLocalBindingId, SemanticExprId>,
     expression_id: SemanticExprId,
     kind: SemanticTransientCollectionKindV1,
@@ -2503,7 +2509,7 @@ fn trace_transient_authority(
 }
 
 fn transient_collection_step(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     local_values: &BTreeMap<SemanticLocalBindingId, SemanticExprId>,
     expression: SemanticExprId,
     kind: SemanticTransientCollectionKindV1,
@@ -2621,7 +2627,7 @@ fn transient_named_input(
 }
 
 fn transient_operand_is_safe(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     local_values: &BTreeMap<SemanticLocalBindingId, SemanticExprId>,
     root: SemanticExprId,
 ) -> bool {
@@ -2708,7 +2714,7 @@ fn type_contains_collection(data_type: &Type) -> bool {
 }
 
 fn statement_descends_from(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     candidate: SemanticStatementId,
     root: SemanticStatementId,
 ) -> Result<bool, SemanticLoweringContractError> {
@@ -2842,7 +2848,7 @@ mod tests {
     }
 
     fn contract_for(
-        checked: &CheckedProgram,
+        checked: &CheckedProgramFields,
         semantic: &crate::SemanticProgram,
     ) -> SemanticLoweringContractV1 {
         build_semantic_lowering_contract(

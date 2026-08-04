@@ -9,7 +9,7 @@ use boon_checked::{
     CheckedCall, CheckedCallEntry, CheckedCallId, CheckedCallableKind, CheckedCallableSignature,
     CheckedContextBinding, CheckedDeclaration, CheckedDeclarationKind, CheckedEvaluationScope,
     CheckedExprId, CheckedExpressionKind, CheckedMatchPattern, CheckedPassedAccess,
-    CheckedPatternBinding, CheckedProgram, CheckedScopeKind, CheckedTypeSubstitution,
+    CheckedPatternBinding, CheckedProgramFields, CheckedScopeKind, CheckedTypeSubstitution,
     CheckedTypeSubstitutionLookup, ContextFormalId, DeclId, FlowType, LexicalScopeId, Type,
     TypeVar, apply_checked_type_environment, apply_checked_type_substitution_lookup,
 };
@@ -413,7 +413,7 @@ impl<Contract> OutNet<Contract> {
 
     pub fn distributed_call_occurrence(
         &self,
-        program: &CheckedProgram,
+        program: &CheckedProgramFields,
         instance: OutCallInstanceId,
     ) -> Result<(DistributedCallOccurrenceRoot, String), String> {
         let mut ancestry = Vec::new();
@@ -503,7 +503,7 @@ fn producer_identity_text(identity: [u8; 32]) -> String {
 }
 
 pub fn checked_call_occurrence_segment(
-    program: &CheckedProgram,
+    program: &CheckedProgramFields,
     call_id: CheckedCallId,
 ) -> Result<String, String> {
     program
@@ -673,13 +673,13 @@ fn insert_unique_index<K: Ord, V: Copy + Eq>(index: &mut BTreeMap<K, Option<V>>,
 
 impl OutNet<()> {
     #[cfg(test)]
-    pub(crate) fn build(program: &CheckedProgram) -> OutNetBuild {
+    pub(crate) fn build(program: &CheckedProgramFields) -> OutNetBuild {
         Self::build_with_producer_roots(program, Vec::new())
     }
 
     #[cfg(test)]
     pub(crate) fn build_with_producer_roots(
-        program: &CheckedProgram,
+        program: &CheckedProgramFields,
         producer_roots: Vec<ProducerRootSpec>,
     ) -> OutNetBuild {
         Self::build_with(
@@ -696,7 +696,7 @@ impl<Contract> OutNet<Contract> {
     /// capabilities to be supplied by a later schema without changing the
     /// current `CheckedProgram` adapter.
     pub(crate) fn build_with<MakeContract, IsProducer>(
-        program: &CheckedProgram,
+        program: &CheckedProgramFields,
         producer_roots: Vec<ProducerRootSpec>,
         make_contract: MakeContract,
         is_structural_producer: IsProducer,
@@ -716,7 +716,7 @@ impl<Contract> OutNet<Contract> {
     }
 
     pub(crate) fn try_build_with<MakeContract, IsProducer, BuildError>(
-        program: &CheckedProgram,
+        program: &CheckedProgramFields,
         producer_roots: Vec<ProducerRootSpec>,
         make_contract: MakeContract,
         mut is_structural_producer: IsProducer,
@@ -916,7 +916,7 @@ fn pop_type_environment_overlay(
 }
 
 struct OutNetBuilder<'program, Contract, MakeContract, IsProducer> {
-    program: &'program CheckedProgram,
+    program: &'program CheckedProgramFields,
     signature_by_id: BTreeMap<DeclId, &'program CheckedCallableSignature>,
     calls_by_owner: BTreeMap<Option<DeclId>, Vec<usize>>,
     call_index_by_id: BTreeMap<CheckedCallId, usize>,
@@ -945,7 +945,7 @@ where
         FnMut(CheckedCallableKind, &CheckedCall, usize, &CheckedCallEntry, &Contract) -> bool,
 {
     fn new(
-        program: &'program CheckedProgram,
+        program: &'program CheckedProgramFields,
         producer_root_specs: Vec<ProducerRootSpec>,
         make_contract: MakeContract,
         is_structural_producer: IsProducer,
@@ -2463,7 +2463,10 @@ impl UnionFind {
     }
 }
 
-fn function_owner_for_scope(program: &CheckedProgram, mut scope: LexicalScopeId) -> Option<DeclId> {
+fn function_owner_for_scope(
+    program: &CheckedProgramFields,
+    mut scope: LexicalScopeId,
+) -> Option<DeclId> {
     loop {
         let checked = program
             .scopes
@@ -2477,7 +2480,7 @@ fn function_owner_for_scope(program: &CheckedProgram, mut scope: LexicalScopeId)
 }
 
 fn resource_owning_callables(
-    program: &CheckedProgram,
+    program: &CheckedProgramFields,
     signatures: &BTreeMap<DeclId, &CheckedCallableSignature>,
 ) -> BTreeSet<DeclId> {
     let calls = program
@@ -2525,7 +2528,7 @@ fn resource_owning_callables(
     owners
 }
 
-fn alias_cycle_diagnostics(program: &CheckedProgram) -> Vec<OutNetDiagnostic> {
+fn alias_cycle_diagnostics(program: &CheckedProgramFields) -> Vec<OutNetDiagnostic> {
     let edges = program
         .calls
         .iter()

@@ -313,6 +313,66 @@ a timing exit. The next flag-day cut remains finalized checked/execution rows
 and deletion of their 378/477 ms post-hoc inventories; lowering inventory and
 receipt folding remain separately red at 272/502 ms.
 
+### Checked/Execution Sealed-Image Ownership Checkpoint (2026-08-03)
+
+The first complete checked-plus-execution ownership cut is now implemented as
+a required architecture checkpoint, not a performance exit. `CheckedProgram`
+is an opaque `boon_checked` product issued through one audited unsafe seal in
+`boon_typecheck`; `boon_semantic` has no production dependency on the
+typechecker. The typechecker final seal emits stable checked shard receipts
+after lowering/report metadata is complete. Semantic construction owns one
+`SemanticImageBuilder<ExecutionPending>`, permits execution mutation only
+through resource construction, validates the post-resource state, and consumes
+it into `ExecutionFinalized` before sealing the execution handoff.
+
+Outside tests, `SemanticProgram` no longer stores `CheckedProgramFields` or a
+second execution graph. Manifest V5 imports the checked and execution handoffs
+and has no production caller for `inventory_checked` or
+`inventory_execution`; V3/V4 reconstruction remains test-only. Ordinary
+invocations are attributed to their concrete program root, producer
+invocations to the producer callable, and static occurrence identity owns the
+final row while an ancestor frame remains provenance. A test-only independent
+owner reconstruction compares every checked/execution owner table against the
+construction-owned image routes. The architecture gate, the 19 focused
+dependency-manifest tests, the minimal stable-manifest test, the distributed
+bundle freeze/mutation oracle, and the ignored NovyWave occurrence oracle pass.
+Those oracles exposed and closed a missing OUT-net static-owner route, an
+incorrect callee-definition ownership rule, and a checked-solver path that
+erased a known sealed cross-role value type to `Unknown`. A fresh-context
+adversarial review also confirmed that bundle validation borrows rather than
+clones the three sealed images and that expression-origin/frame plus
+activation-local state relocations are present before this checkpoint.
+
+The representation used to establish that boundary is deliberately recorded
+as red. One current two-job release rebuild takes 4m09s. One direct optimized
+NovyWave verified sample, not acceptance evidence, takes 5,665.819 ms at
+507,428 KiB peak RSS, including 480.066 ms typecheck, 4,357.397 ms semantic,
+1,142.939 ms execution-image finalization, and 1,534.308 ms manifest work. It
+performs 18,656,831 allocations totalling 2,989,230,512 bytes. The plan hash
+remains the prior current hash
+`890eff63ce7eff16c5597093179b6878fc8f8ed3e9f49555e73333d71d7bcb42`,
+so this is an ownership/representation regression rather than a semantic
+shortcut.
+
+The trace explains why this checkpoint cannot be extended with local hashing
+tweaks. It seals 63,657 checked rows and 49,283 execution rows, then imports
+full recursively owned stable projection keys and call-path vectors into row
+routes and 119,441 graph edges. Final receipt folding still handles 78,336
+legacy-domain rows. The resulting graph has 13,261 nodes and a maximum SCC of
+156, so SCC explosion is no longer the dominant problem; repeated stable-key
+ownership, serialization, and remaining eager demand are. This violates the
+target representation in this plan even though the owner-deletion seam is now
+real.
+
+The immediate post-checkpoint work is therefore a fresh whole-pipeline design
+audit followed by a larger replacement slice: intern stable projection keys
+and invocation paths once behind dense IDs and one relocation arena; make
+typed builders stream or reuse one final row fingerprint instead of rebuilding
+full key trees per row; migrate the remaining OUT/resource/reactive/lowering/
+storage/view/memory owners into the image; and move verified-intent demand
+before occurrence expansion. Do not optimize `BTreeMap` operations or the
+already-small SCC kernel while these representation multipliers remain.
+
 ### Second Whole-Pipeline Reassessment: Owner Compilation Units
 
 A fresh post-checkpoint directional sample completes in 4,052.379 ms at
@@ -571,8 +631,8 @@ attached at the typechecker's final seal.
 
 This slice is complete only when all of the following are true:
 
-- `SemanticProgram` no longer owns `CheckedProgram` or
-  `SemanticExecutionGraphV1`;
+- `SemanticProgram` no longer owns `CheckedProgram` or a separate
+  `SemanticExecutionImageColumnsV1` field outside the sealed image;
 - production contextual/resource construction writes callable interfaces,
   definitions, invocations, expressions, statements, scopes, sources, states,
   roots, producer functions, materializations, owners, and origins directly

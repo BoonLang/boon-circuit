@@ -6,18 +6,22 @@
 //! complete pre-backend storage-field identity and retains exact joins back to
 //! every reactive field and producer result.
 
+#[cfg(test)]
+use crate::ResolvedOutGraph;
 use crate::{
-    ResolvedOutGraph, SemanticBindingId, SemanticBindingTargetV1, SemanticCallId,
-    SemanticContextualMaterialization, SemanticContextualOperationKind,
-    SemanticContextualRowPredecessor, SemanticExecutionGraphV1, SemanticExprId,
-    SemanticExpressionKind, SemanticFieldId, SemanticListId, SemanticLoweringContractV1,
-    SemanticMaterializationLocalId, SemanticNamedValueId, SemanticReactiveGraphV1, SemanticReadId,
-    SemanticReadTargetV1, SemanticResourceGraphV1, SemanticRowBinding, SemanticSourceId,
-    SemanticSourceOrigin, SemanticStateId, SemanticStatementId, SemanticValueId,
-    SemanticValueListAuthorityId, SemanticValueOrigin, SemanticValueProvenance, StaticOwnerId,
+    SemanticBindingId, SemanticBindingTargetV1, SemanticCallId, SemanticContextualMaterialization,
+    SemanticContextualOperationKind, SemanticContextualRowPredecessor,
+    SemanticExecutionImageColumnsV1, SemanticExprId, SemanticExpressionKind, SemanticFieldId,
+    SemanticListId, SemanticLoweringContractV1, SemanticMaterializationLocalId,
+    SemanticNamedValueId, SemanticReactiveGraphV1, SemanticReadId, SemanticReadTargetV1,
+    SemanticResourceGraphV1, SemanticRowBinding, SemanticSourceId, SemanticSourceOrigin,
+    SemanticStateId, SemanticStatementId, SemanticValueId, SemanticValueListAuthorityId,
+    SemanticValueOrigin, SemanticValueProvenance, StaticOwnerId,
 };
+#[cfg(test)]
+use boon_checked::CheckedProgram;
 use boon_checked::{
-    CheckedExternalDeclarationIdentityV1, CheckedProgram, DeclId, FlowMode, FlowType, Type,
+    CheckedExternalDeclarationIdentityV1, CheckedProgramFields, DeclId, FlowMode, FlowType, Type,
 };
 use boon_contract::SourceBundleDigestV1;
 use serde::{Deserialize, Serialize};
@@ -466,9 +470,10 @@ impl fmt::Display for SemanticScopeStorageError {
 
 impl std::error::Error for SemanticScopeStorageError {}
 
+#[cfg(test)]
 pub(crate) fn build_semantic_scope_storage_graph(
-    checked: &CheckedProgram,
-    execution: &SemanticExecutionGraphV1,
+    checked: &CheckedProgramFields,
+    execution: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV1,
     reactive: &SemanticReactiveGraphV1,
     lowering: &SemanticLoweringContractV1,
@@ -490,8 +495,8 @@ pub(crate) fn build_semantic_scope_storage_graph(
 }
 
 pub(crate) fn build_semantic_scope_storage_graph_from_validated_inputs(
-    checked: &CheckedProgram,
-    execution: &SemanticExecutionGraphV1,
+    checked: &CheckedProgramFields,
+    execution: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV1,
     reactive: &SemanticReactiveGraphV1,
     lowering: &SemanticLoweringContractV1,
@@ -534,10 +539,11 @@ pub(crate) fn build_semantic_scope_storage_graph_from_validated_inputs(
 }
 
 impl SemanticScopeStorageGraphV1 {
+    #[cfg(test)]
     pub(crate) fn validate(
         &self,
-        checked: &CheckedProgram,
-        execution: &SemanticExecutionGraphV1,
+        checked: &CheckedProgramFields,
+        execution: &SemanticExecutionImageColumnsV1,
         resources: &SemanticResourceGraphV1,
         reactive: &SemanticReactiveGraphV1,
         lowering: &SemanticLoweringContractV1,
@@ -556,7 +562,7 @@ impl SemanticScopeStorageGraphV1 {
 }
 
 fn build_owners(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV1,
 ) -> Result<Vec<SemanticStorageOwnerV1>, SemanticScopeStorageError> {
     execution
@@ -590,8 +596,8 @@ fn build_owners(
 }
 
 fn build_storage_fields(
-    checked: &CheckedProgram,
-    execution: &SemanticExecutionGraphV1,
+    checked: &CheckedProgramFields,
+    execution: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV1,
     reactive: &SemanticReactiveGraphV1,
 ) -> Result<Vec<SemanticStorageFieldV1>, SemanticScopeStorageError> {
@@ -737,7 +743,7 @@ fn append_state_authority_fields(
 }
 
 fn nearest_parent_storage_field(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     statement: SemanticStatementId,
     reactive_by_statement: &BTreeMap<SemanticStatementId, &crate::SemanticFieldV1>,
     reactive_storage: &BTreeMap<SemanticFieldId, SemanticStorageFieldId>,
@@ -768,7 +774,7 @@ fn nearest_parent_storage_field(
 }
 
 fn append_list_authority_fields(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV1,
     reactive: &SemanticReactiveGraphV1,
     reactive_by_statement: &BTreeMap<SemanticStatementId, &crate::SemanticFieldV1>,
@@ -939,7 +945,7 @@ fn append_list_authority_fields(
 }
 
 fn list_mutation_value_types(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     reactive: &SemanticReactiveGraphV1,
 ) -> Result<BTreeMap<(SemanticListId, Vec<String>), Type>, SemanticScopeStorageError> {
     let mut result = BTreeMap::new();
@@ -1181,7 +1187,7 @@ fn flattened_type_fields(data_type: &Type) -> Vec<(Vec<String>, Type)> {
 }
 
 fn append_materialized_value_fields(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV1,
     fields: &mut Vec<SemanticStorageFieldV1>,
 ) -> Result<(), SemanticScopeStorageError> {
@@ -1352,7 +1358,7 @@ fn append_materialized_value_fields(
 }
 
 fn collect_materialized_output_field_candidates(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     expression: SemanticExprId,
     field_name: &str,
     fallback_owner: Option<StaticOwnerId>,
@@ -1474,7 +1480,7 @@ fn collect_materialized_output_field_candidates(
 }
 
 fn append_record_projection_fields(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     fields: &mut Vec<SemanticStorageFieldV1>,
 ) -> Result<(), SemanticScopeStorageError> {
     let mut parent_index = 0;
@@ -1528,7 +1534,7 @@ fn append_record_projection_fields(
 }
 
 fn build_storage_locals(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV1,
     fields: &[SemanticStorageFieldV1],
 ) -> Result<Vec<SemanticStorageLocalV1>, SemanticScopeStorageError> {
@@ -1574,7 +1580,7 @@ fn build_storage_locals(
 }
 
 fn local_members_for_row(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV1,
     fields: &[SemanticStorageFieldV1],
     row: SemanticRowBinding,
@@ -1706,7 +1712,7 @@ fn local_members_for_row(
 }
 
 fn materialization_constructor_path_for_local(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     materialization: &SemanticContextualMaterialization,
     source_path: &[String],
 ) -> Result<Option<Vec<String>>, SemanticScopeStorageError> {
@@ -1835,7 +1841,7 @@ fn insert_local_member(
 }
 
 fn resolve_local_forwarding(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV1,
     locals: &mut [SemanticStorageLocalV1],
 ) -> Result<(), SemanticScopeStorageError> {
@@ -1938,7 +1944,7 @@ struct CaptureRequestKey {
 }
 
 fn discover_detached_captures(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV1,
     reactive: &SemanticReactiveGraphV1,
     owners: &[SemanticStorageOwnerV1],
@@ -2019,7 +2025,7 @@ fn discover_detached_captures(
 }
 
 fn nearest_target_materialization(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     owners: &[SemanticStorageOwnerV1],
     mut owner: StaticOwnerId,
     row: SemanticRowBinding,
@@ -2085,7 +2091,7 @@ fn nearest_target_materialization(
 
 #[allow(clippy::too_many_arguments)]
 fn collect_capture_requests(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     owners: &[SemanticStorageOwnerV1],
     locals: &[SemanticStorageLocalV1],
     expression: SemanticExprId,
@@ -2181,7 +2187,7 @@ fn collect_capture_requests(
 }
 
 fn target_materialization_drains_predecessor(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     owner: StaticOwnerId,
     local: SemanticMaterializationLocalId,
 ) -> Result<bool, SemanticScopeStorageError> {
@@ -2205,7 +2211,7 @@ fn target_materialization_drains_predecessor(
 }
 
 fn target_constructor_carries_local_projection(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     owner: StaticOwnerId,
     local: SemanticMaterializationLocalId,
     projection: &[String],
@@ -2330,7 +2336,7 @@ fn append_capture_fields(
 }
 
 fn classify_resource_only_fields(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV1,
     locals: &[SemanticStorageLocalV1],
     fields: &mut [SemanticStorageFieldV1],
@@ -2400,7 +2406,7 @@ fn source_for_resource_origin(
 }
 
 struct StorageProvenanceResolver<'a> {
-    execution: &'a SemanticExecutionGraphV1,
+    execution: &'a SemanticExecutionImageColumnsV1,
     resources: &'a SemanticResourceGraphV1,
     locals: &'a [SemanticStorageLocalV1],
     fields: &'a [SemanticStorageFieldV1],
@@ -2843,7 +2849,7 @@ fn list_initializer_path_is_resource_only(
 }
 
 fn build_storage_bindings(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV1,
     reactive: &SemanticReactiveGraphV1,
     fields: &[SemanticStorageFieldV1],
@@ -3042,7 +3048,7 @@ fn build_storage_sources(
 }
 
 fn build_row_values(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV1,
     locals: &[SemanticStorageLocalV1],
 ) -> Result<Vec<SemanticStorageRowValueV1>, SemanticScopeStorageError> {
@@ -3317,7 +3323,7 @@ fn build_row_values(
 }
 
 fn build_row_source_projections(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV1,
     locals: &[SemanticStorageLocalV1],
 ) -> Result<Vec<SemanticStorageRowSourceProjectionV1>, SemanticScopeStorageError> {
@@ -3454,7 +3460,7 @@ fn insert_row_source_projection(
 }
 
 fn build_external_references(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     reactive: &SemanticReactiveGraphV1,
 ) -> Result<Vec<SemanticStorageExternalReferenceV1>, SemanticScopeStorageError> {
     let mut raw = Vec::new();
@@ -3584,8 +3590,8 @@ fn build_producer_result_fields(
 }
 
 fn build_named_value_storage(
-    checked: &CheckedProgram,
-    execution: &SemanticExecutionGraphV1,
+    checked: &CheckedProgramFields,
+    execution: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV1,
     reactive: &SemanticReactiveGraphV1,
     lowering: &SemanticLoweringContractV1,
@@ -3685,8 +3691,8 @@ fn build_named_value_storage(
 }
 
 fn named_value_targets(
-    checked: &CheckedProgram,
-    execution: &SemanticExecutionGraphV1,
+    checked: &CheckedProgramFields,
+    execution: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV1,
     reactive: &SemanticReactiveGraphV1,
     fields: &[SemanticStorageFieldV1],
@@ -3920,7 +3926,7 @@ fn named_value_target_from_binding(
 }
 
 fn named_value_target_flow_type(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV1,
     reactive: &SemanticReactiveGraphV1,
     fields: &[SemanticStorageFieldV1],
@@ -3985,7 +3991,7 @@ fn named_value_target_flow_type(
 }
 
 fn build_named_value_projection(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     fields: &[SemanticStorageFieldV1],
     target: &SemanticNamedValueStorageTargetV1,
     root_type: &Type,
@@ -4074,7 +4080,7 @@ fn build_named_value_projection(
 }
 
 fn named_value_storable_root_flow(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     fields: &[SemanticStorageFieldV1],
     target: &SemanticNamedValueStorageTargetV1,
     public_root_flow: &FlowType,
@@ -4113,7 +4119,7 @@ fn named_value_storable_root_flow(
 }
 
 fn named_value_origin_contract_flow(
-    checked: &CheckedProgram,
+    checked: &CheckedProgramFields,
     origin: &crate::SemanticNamedValueTypeOriginV1,
     target: &SemanticNamedValueStorageTargetV1,
     root_flow: &FlowType,
@@ -4266,12 +4272,12 @@ fn named_value_origin_contract_flow(
 }
 
 fn named_value_origin_exposes_flush_boundary(
-    checked: &CheckedProgram,
+    checked: &CheckedProgramFields,
     origin: &crate::SemanticNamedValueTypeOriginV1,
 ) -> Result<bool, SemanticScopeStorageError> {
     if let Some(statement) = origin.checked.statement {
         fn statement_contains_flush(
-            checked: &CheckedProgram,
+            checked: &CheckedProgramFields,
             statement: boon_checked::CheckedStatementId,
             visited: &mut BTreeSet<boon_checked::CheckedStatementId>,
         ) -> Result<bool, SemanticScopeStorageError> {
@@ -4344,7 +4350,7 @@ fn named_value_origin_exposes_flush_boundary(
 }
 
 fn named_value_origin_is_structural_container(
-    checked: &CheckedProgram,
+    checked: &CheckedProgramFields,
     origin: &crate::SemanticNamedValueTypeOriginV1,
 ) -> Result<bool, SemanticScopeStorageError> {
     let (Some(statement_id), Some(value_id)) = (origin.checked.statement, origin.checked.value)
@@ -4518,8 +4524,8 @@ fn require_reactive_binding(
 
 fn validate_storage_shape(
     graph: &SemanticScopeStorageGraphV1,
-    checked: &CheckedProgram,
-    execution: &SemanticExecutionGraphV1,
+    checked: &CheckedProgramFields,
+    execution: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV1,
     reactive: &SemanticReactiveGraphV1,
     lowering: &SemanticLoweringContractV1,
@@ -4654,7 +4660,7 @@ fn validate_storage_shape(
 
 fn validate_named_value_storage_shape(
     graph: &SemanticScopeStorageGraphV1,
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV1,
     reactive: &SemanticReactiveGraphV1,
     lowering: &SemanticLoweringContractV1,
@@ -4810,7 +4816,7 @@ fn require_storage_field(
 }
 
 fn require_statement(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     id: SemanticStatementId,
 ) -> Result<&crate::SemanticStatement, SemanticScopeStorageError> {
     execution
@@ -4819,7 +4825,7 @@ fn require_statement(
 }
 
 fn require_expression(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     id: SemanticExprId,
 ) -> Result<&crate::SemanticExpression, SemanticScopeStorageError> {
     execution
@@ -4898,7 +4904,7 @@ fn owner_descends_from(
 }
 
 fn expression_children(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     kind: &SemanticExpressionKind,
 ) -> Result<Vec<SemanticExprId>, SemanticScopeStorageError> {
     execution.expression_children(kind).ok_or_else(|| {
@@ -4979,7 +4985,7 @@ mod tests {
     }
 
     fn graph(
-        checked: &CheckedProgram,
+        checked: &CheckedProgramFields,
         semantic: &crate::SemanticProgram,
     ) -> SemanticScopeStorageGraphV1 {
         build_semantic_scope_storage_graph(

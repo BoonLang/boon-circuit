@@ -646,10 +646,14 @@ fn verified_semantic_compiler_spine(workspace: &Path) -> Result<String, String> 
             ));
         }
     }
-    if !semantic_dependencies.contains("boon_typecheck")
+    if !semantic_dependencies.contains("boon_checked")
         || !semantic_dependencies.contains("boon_contract")
+        || semantic_dependencies.contains("boon_typecheck")
     {
-        return Err("boon_semantic must depend on boon_typecheck and boon_contract".to_owned());
+        return Err(
+            "boon_semantic must consume boon_checked/boon_contract without a production typechecker dependency"
+                .to_owned(),
+        );
     }
     if !verify_dependencies.contains("boon_semantic")
         || !verify_dependencies.contains("boon_contract")
@@ -670,17 +674,32 @@ fn verified_semantic_compiler_spine(workspace: &Path) -> Result<String, String> 
     let ir = read_text(&workspace.join("crates/boon_ir/src/lib.rs"))?;
     let parser = read_text(&workspace.join("crates/boon_parser/src/lib.rs"))?;
     let syntax = read_text(&workspace.join("crates/boon_syntax/src/lib.rs"))?;
+    let checked = read_text(&workspace.join("crates/boon_checked/src/lib.rs"))?;
     let typecheck = read_text(&workspace.join("crates/boon_typecheck/src/lib.rs"))?;
     let compiler = read_text(&workspace.join("crates/boon_compiler/src/lib.rs"))?;
     let distributed =
         read_text(&workspace.join("crates/boon_compiler/src/distributed_compiler.rs"))?;
 
     verify_semantic_core_ownership_boundary(workspace)?;
-    verify_opaque_artifact(&parser, "ParsedProgram", true)?;
-    verify_opaque_artifact(&typecheck, "CheckedProgram", true)?;
-    verify_opaque_artifact(&semantic, "SemanticProgram", false)?;
-    verify_opaque_artifact(&verify, "ContractVerifiedProgram", false)?;
-    verify_opaque_artifact(&ir, "ErasedProgram", true)?;
+    verify_opaque_artifact(&parser, "ParsedProgram", true, None)?;
+    verify_opaque_artifact(
+        &checked,
+        "CheckedProgram",
+        true,
+        Some("from_typechecker_parts_unchecked"),
+    )?;
+    verify_opaque_artifact(&semantic, "SemanticProgram", false, None)?;
+    verify_opaque_artifact(&verify, "ContractVerifiedProgram", false, None)?;
+    verify_opaque_artifact(&ir, "ErasedProgram", true, None)?;
+    if typecheck
+        .matches("CheckedProgram::from_typechecker_parts_unchecked(")
+        .count()
+        != 1
+    {
+        return Err(
+            "typechecker must cross the unsafe CheckedProgram seal exactly once".to_owned(),
+        );
+    }
     verify_required_direct_field(
         &syntax,
         "ParsedProgramFields",
@@ -688,7 +707,7 @@ fn verified_semantic_compiler_spine(workspace: &Path) -> Result<String, String> 
         "SourceBundleDigestV1",
     )?;
     verify_required_direct_field(
-        &typecheck,
+        &checked,
         "CheckedProgramFields",
         "source_bundle_digest_v1",
         "SourceBundleDigestV1",
@@ -704,6 +723,12 @@ fn verified_semantic_compiler_spine(workspace: &Path) -> Result<String, String> 
         "SemanticProgram",
         "canonical_core",
         "CanonicalProgramCoreV1",
+    )?;
+    verify_required_direct_field(
+        &semantic,
+        "SemanticProgram",
+        "semantic_image",
+        "SealedSemanticImageV1",
     )?;
     verify_required_direct_field(&ir, "ErasedProgram", "fields", "CanonicalProgramCoreV1")?;
     verify_required_direct_field(
@@ -747,7 +772,9 @@ fn verified_semantic_compiler_spine(workspace: &Path) -> Result<String, String> 
     for required in [
         "pub struct SemanticProgram",
         "pub fn elaborate(",
-        "CallableDependencyManifestV4",
+        "CallableDependencyManifestV5",
+        "#[cfg(test)]\n    checked_program: CheckedProgramFields",
+        "#[cfg(test)]\n    execution_graph: SemanticExecutionImageColumnsV1",
     ] {
         if !semantic.contains(required) {
             return Err(format!("boon_semantic omits `{required}`"));
@@ -887,6 +914,7 @@ fn verify_opaque_artifact(
     source: &str,
     artifact: &str,
     must_serialize: bool,
+    allowed_public_unsafe_constructor: Option<&str>,
 ) -> Result<(), String> {
     use syn::parse::Parser as _;
 
@@ -928,7 +956,27 @@ fn verify_opaque_artifact(
                 .map(|segment| segment.ident.to_string())
         }));
     }
-    if must_serialize && !derives.contains("Serialize") {
+    let has_manual_serialize_impl = syntax.items.iter().any(|item| {
+        let syn::Item::Impl(implementation) = item else {
+            return false;
+        };
+        let syn::Type::Path(self_type) = implementation.self_ty.as_ref() else {
+            return false;
+        };
+        let Some((_, trait_path, _)) = &implementation.trait_ else {
+            return false;
+        };
+        self_type
+            .path
+            .segments
+            .last()
+            .is_some_and(|segment| segment.ident == artifact)
+            && trait_path
+                .segments
+                .last()
+                .is_some_and(|segment| segment.ident == "Serialize")
+    });
+    if must_serialize && !derives.contains("Serialize") && !has_manual_serialize_impl {
         return Err(format!("opaque artifact `{artifact}` is not serializable"));
     }
     for forbidden in ["Deserialize", "Default"] {
@@ -939,6 +987,7 @@ fn verify_opaque_artifact(
         }
     }
 
+    let mut allowed_public_unsafe_constructor_seen = false;
     for item in &syntax.items {
         let syn::Item::Impl(implementation) = item else {
             continue;
@@ -974,6 +1023,12 @@ fn verify_opaque_artifact(
                 if matches!(function.vis, syn::Visibility::Public(_))
                     && function.sig.receiver().is_none()
                 {
+                    if allowed_public_unsafe_constructor.is_some_and(|allowed| {
+                        function.sig.ident == allowed && function.sig.unsafety.is_some()
+                    }) {
+                        allowed_public_unsafe_constructor_seen = true;
+                        continue;
+                    }
                     return Err(format!(
                         "opaque artifact `{artifact}` exposes public associated constructor `{}`",
                         function.sig.ident
@@ -981,6 +1036,13 @@ fn verify_opaque_artifact(
                 }
             }
         }
+    }
+    if let Some(constructor) = allowed_public_unsafe_constructor
+        && !allowed_public_unsafe_constructor_seen
+    {
+        return Err(format!(
+            "opaque artifact `{artifact}` omits allowed unsafe constructor `{constructor}`"
+        ));
     }
     Ok(())
 }
@@ -1061,6 +1123,7 @@ fn verify_semantic_core_ownership_boundary(workspace: &Path) -> Result<(), Strin
     for forbidden in [
         "mod semantic_mapping",
         "SemanticExecutionGraphV1",
+        "SemanticExecutionImageColumnsV1",
         "SemanticResourceGraphV1",
         "SemanticReactiveGraphV1",
         "map_semantic_execution",
@@ -1090,7 +1153,7 @@ fn verify_semantic_core_ownership_boundary(workspace: &Path) -> Result<(), Strin
     for required in [
         "mod core_lowering;",
         "canonical_core: program_core::CanonicalProgramCoreV1",
-        "canonical_core: &'a program_core::CanonicalProgramCoreV1",
+        "canonical_core_digest: [u8; 32]",
         "validate_canonical_core_handoff(self)?;",
         "core_lowering::build_canonical_program_core(",
     ] {
@@ -1292,6 +1355,11 @@ fn verify_exhaustive_boundary_callers(workspace: &Path) -> Result<(), String> {
     let expected = [
         BoundaryReference {
             file: "crates/boon_compiler/src/lib.rs".to_owned(),
+            path: "boon_semantic::elaborate".to_owned(),
+            kind: "expression",
+        },
+        BoundaryReference {
+            file: "crates/boon_compiler/src/lib.rs".to_owned(),
             path: "boon_semantic::elaborate_with_external_event_identities".to_owned(),
             kind: "expression",
         },
@@ -1303,6 +1371,16 @@ fn verify_exhaustive_boundary_callers(workspace: &Path) -> Result<(), String> {
         BoundaryReference {
             file: "crates/boon_compiler/src/lib.rs".to_owned(),
             path: "boon_verify::verify_explicit_contracts".to_owned(),
+            kind: "expression",
+        },
+        BoundaryReference {
+            file: "crates/boon_compiler/src/lib.rs".to_owned(),
+            path: "boon_verify::verify_explicit_contracts".to_owned(),
+            kind: "expression",
+        },
+        BoundaryReference {
+            file: "crates/boon_compiler/src/lib.rs".to_owned(),
+            path: "boon_ir::erase_and_lower".to_owned(),
             kind: "expression",
         },
         BoundaryReference {
@@ -1854,11 +1932,11 @@ impl Artifact {
     pub fn fields(&self) -> &Fields { &self.fields }
 }
 "#;
-        verify_opaque_artifact(valid, "Artifact", true).unwrap();
+        verify_opaque_artifact(valid, "Artifact", true, None).unwrap();
 
         let deserializable = valid.replace("Serialize", "Serialize, Deserialize");
         assert!(
-            verify_opaque_artifact(&deserializable, "Artifact", true)
+            verify_opaque_artifact(&deserializable, "Artifact", true, None)
                 .unwrap_err()
                 .contains("Deserialize")
         );
@@ -1868,10 +1946,16 @@ impl Artifact {
             "pub fn forge(fields: Fields) -> Self { Self { fields } }\n    pub fn fields(&self)",
         );
         assert!(
-            verify_opaque_artifact(&constructible, "Artifact", true)
+            verify_opaque_artifact(&constructible, "Artifact", true, None)
                 .unwrap_err()
                 .contains("public associated constructor")
         );
+
+        let unsafe_seal = valid.replace(
+            "pub fn fields(&self)",
+            "pub unsafe fn seal(fields: Fields) -> Self { Self { fields } }\n    pub fn fields(&self)",
+        );
+        verify_opaque_artifact(&unsafe_seal, "Artifact", true, Some("seal")).unwrap();
 
         verify_required_direct_field(
             "struct Provenance { digest: Digest }",

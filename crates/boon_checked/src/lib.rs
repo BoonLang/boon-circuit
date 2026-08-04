@@ -1683,10 +1683,139 @@ pub fn type_is_recursively_closed(ty: &Type) -> bool {
 ///     CheckedProgram { fields }
 /// }
 /// ```
+pub const CHECKED_IMAGE_HANDOFF_SCHEMA_V1: &str = "boon.checked-image-handoff.v1";
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckedShardCallableKindV1 {
+    User,
+    Builtin,
+    External,
+}
+
+impl From<CheckedCallableKind> for CheckedShardCallableKindV1 {
+    fn from(kind: CheckedCallableKind) -> Self {
+        match kind {
+            CheckedCallableKind::User => Self::User,
+            CheckedCallableKind::Builtin => Self::Builtin,
+            CheckedCallableKind::External => Self::External,
+        }
+    }
+}
+
+/// Revision-stable checked owner used before semantic dense IDs exist.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CheckedShardOwnerKeyV1 {
+    ProgramTopLevel {
+        role: ProgramRole,
+    },
+    Callable {
+        role: ProgramRole,
+        callable_kind: CheckedShardCallableKindV1,
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        external_identity: Option<CheckedExternalDeclarationIdentityV1>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CheckedShardRegionV1 {
+    Interface,
+    Definition,
+    Invocation { owner_local_ordinal: u32 },
+    TopLevelAuthority { canonical_path: String },
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct CheckedShardProjectionKeyV1 {
+    pub owner: CheckedShardOwnerKeyV1,
+    pub region: CheckedShardRegionV1,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckedImageRowDomainV1 {
+    Header,
+    Scope,
+    Declaration,
+    Statement,
+    Expression,
+    Callable,
+    ContextFormal,
+    Call,
+    CallResultPath,
+    OrderChain,
+    PatternBinding,
+    ResourceProjection,
+    Source,
+    State,
+    List,
+    Occurrence,
+    SourceUnitMetadata,
+    SourcePayloadShape,
+    HostPort,
+    OutputRootType,
+    ExpressionType,
+    FunctionType,
+    NamedValueType,
+    RenderSlot,
+    Diagnostic,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct CheckedImageRowKeyV1 {
+    pub projection: CheckedShardProjectionKeyV1,
+    pub domain: CheckedImageRowDomainV1,
+    pub owner_local_ordinal: u32,
+}
+
+/// A local row receipt commits the final payload once and names unresolved
+/// stable projection targets without importing semantic dense IDs.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CheckedImageRowReceiptV1 {
+    pub key: CheckedImageRowKeyV1,
+    pub payload_digest: [u8; 32],
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relocations: Vec<CheckedShardProjectionKeyV1>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CheckedShardReceiptV1 {
+    pub projection: CheckedShardProjectionKeyV1,
+    pub local_content_digest: [u8; 32],
+    pub row_count: u32,
+    pub dependency_row_count: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relocations: Vec<CheckedShardProjectionKeyV1>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CheckedImageEntityRouteV1 {
+    pub domain: CheckedImageRowDomainV1,
+    pub dense_index: u32,
+    pub projection: CheckedShardProjectionKeyV1,
+}
+
+/// Consuming typechecker handoff. Semantic elaboration imports these receipts
+/// directly; it must not rescan the rich checked DTO to rediscover them.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CheckedImageHandoffV1 {
+    pub schema: String,
+    pub source_bundle_digest_v1: SourceBundleDigestV1,
+    pub role: ProgramRole,
+    pub shards: Vec<CheckedShardReceiptV1>,
+    pub entity_routes: Vec<CheckedImageEntityRouteV1>,
+    pub local_image_digest: [u8; 32],
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct CheckedProgram {
     #[serde(flatten)]
     fields: CheckedProgramFields,
+    #[serde(skip)]
+    image_handoff: CheckedImageHandoffV1,
 }
 
 /// Public read-only schema projected by an opaque [`CheckedProgram`].
@@ -1723,12 +1852,85 @@ pub struct CheckedProgramFields {
 }
 
 impl CheckedProgramFields {
+    pub fn context_formal(&self, id: ContextFormalId) -> Option<&CheckedContextFormal> {
+        self.context_formals.iter().find(|formal| formal.id == id)
+    }
+
+    pub fn callable_context_formal(&self, callable: DeclId) -> Option<&CheckedContextFormal> {
+        self.context_formals
+            .iter()
+            .find(|formal| formal.callable == callable)
+    }
+
+    pub fn order_chain_for_call(&self, call: CheckedCallId) -> Option<CheckedOrderChain> {
+        self.order_chains
+            .iter()
+            .find(|candidate| candidate.call == call)
+            .map(|candidate| candidate.chain.clone())
+    }
+
+    pub fn result_path_for_call(&self, call: CheckedCallId) -> Option<&CheckedSemanticPath> {
+        self.call_result_paths
+            .iter()
+            .find(|candidate| candidate.call == call)
+            .map(|candidate| &candidate.path)
+    }
+
     #[doc(hidden)]
     pub fn source_expression(&self, read: &CheckedSourceRead) -> Option<CheckedExprId> {
         self.sources
             .get(read.source.0 as usize)
             .filter(|source| source.id == read.source)
             .map(|source| source.expression)
+    }
+
+    pub fn declaration_path(&self, declaration: DeclId) -> Option<String> {
+        self.declarations
+            .iter()
+            .find(|candidate| candidate.id == declaration)
+            .and_then(|declaration| checked_declaration_canonical_path(self, declaration))
+    }
+
+    pub fn semantic_path(&self, path: &CheckedSemanticPath) -> Option<String> {
+        let declaration = self
+            .declarations
+            .iter()
+            .find(|candidate| candidate.id == path.anchor)?;
+        if declaration.kind == CheckedDeclarationKind::Function {
+            return (!path.projection.is_empty()).then(|| path.projection.join("."));
+        }
+        let mut segments = vec![declaration.name.clone()];
+        let mut scope = declaration.scope_id;
+        let mut visited = BTreeSet::new();
+        while scope != self.root_scope && visited.insert(scope) {
+            let current = self.scopes.iter().find(|candidate| candidate.id == scope)?;
+            if current.kind == CheckedScopeKind::Function {
+                break;
+            }
+            if let Some(owner) = current.owner
+                && let Some(owner) = self
+                    .declarations
+                    .iter()
+                    .find(|candidate| candidate.id == owner)
+                && matches!(
+                    owner.kind,
+                    CheckedDeclarationKind::Field
+                        | CheckedDeclarationKind::Source
+                        | CheckedDeclarationKind::Hold
+                        | CheckedDeclarationKind::List
+                )
+            {
+                segments.push(owner.name.clone());
+            }
+            scope = current.parent?;
+        }
+        segments.reverse();
+        let mut result = segments.join(".");
+        if !path.projection.is_empty() {
+            result.push('.');
+            result.push_str(&path.projection.join("."));
+        }
+        Some(result)
     }
 }
 
@@ -1741,7 +1943,7 @@ impl std::ops::Deref for CheckedProgram {
 }
 
 fn checked_declaration_canonical_path(
-    program: &CheckedProgram,
+    program: &CheckedProgramFields,
     declaration: &CheckedDeclaration,
 ) -> Option<String> {
     if !matches!(
@@ -1839,94 +2041,26 @@ impl CheckedProgram {
     /// and lowering table is complete and internally consistent. The fields
     /// must carry the exact parser-produced `SourceBundleDigestV1`; this seam
     /// must never synthesize an empty or sentinel digest.
-    pub unsafe fn from_typechecker_fields_unchecked(fields: CheckedProgramFields) -> Self {
-        Self { fields }
+    pub unsafe fn from_typechecker_parts_unchecked(
+        fields: CheckedProgramFields,
+        image_handoff: CheckedImageHandoffV1,
+    ) -> Self {
+        Self {
+            fields,
+            image_handoff,
+        }
     }
 
     /// Consume the sealed wrapper back into its inspectable DTO.
     ///
     /// This does not create another proof-bearing product; resealing modified
     /// fields still requires the unsafe typechecker invariant boundary.
-    pub fn into_fields(self) -> CheckedProgramFields {
-        self.fields
+    pub fn into_parts(self) -> (CheckedProgramFields, CheckedImageHandoffV1) {
+        (self.fields, self.image_handoff)
     }
 
-    pub fn context_formal(&self, id: ContextFormalId) -> Option<&CheckedContextFormal> {
-        self.context_formals.iter().find(|formal| formal.id == id)
-    }
-
-    pub fn callable_context_formal(&self, callable: DeclId) -> Option<&CheckedContextFormal> {
-        self.context_formals
-            .iter()
-            .find(|formal| formal.callable == callable)
-    }
-
-    pub fn order_chain_for_call(&self, call: CheckedCallId) -> Option<CheckedOrderChain> {
-        self.order_chains
-            .iter()
-            .find(|candidate| candidate.call == call)
-            .map(|candidate| candidate.chain.clone())
-    }
-
-    pub fn result_path_for_call(&self, call: CheckedCallId) -> Option<&CheckedSemanticPath> {
-        self.call_result_paths
-            .iter()
-            .find(|candidate| candidate.call == call)
-            .map(|candidate| &candidate.path)
-    }
-
-    #[doc(hidden)]
-    pub fn source_expression(&self, read: &CheckedSourceRead) -> Option<CheckedExprId> {
-        self.fields.source_expression(read)
-    }
-
-    pub fn declaration_path(&self, declaration: DeclId) -> Option<String> {
-        self.declarations
-            .iter()
-            .find(|candidate| candidate.id == declaration)
-            .and_then(|declaration| checked_declaration_canonical_path(self, declaration))
-    }
-
-    pub fn semantic_path(&self, path: &CheckedSemanticPath) -> Option<String> {
-        let declaration = self
-            .declarations
-            .iter()
-            .find(|candidate| candidate.id == path.anchor)?;
-        if declaration.kind == CheckedDeclarationKind::Function {
-            return (!path.projection.is_empty()).then(|| path.projection.join("."));
-        }
-        let mut segments = vec![declaration.name.clone()];
-        let mut scope = declaration.scope_id;
-        let mut visited = BTreeSet::new();
-        while scope != self.root_scope && visited.insert(scope) {
-            let current = self.scopes.iter().find(|candidate| candidate.id == scope)?;
-            if current.kind == CheckedScopeKind::Function {
-                break;
-            }
-            if let Some(owner) = current.owner
-                && let Some(owner) = self
-                    .declarations
-                    .iter()
-                    .find(|candidate| candidate.id == owner)
-                && matches!(
-                    owner.kind,
-                    CheckedDeclarationKind::Field
-                        | CheckedDeclarationKind::Source
-                        | CheckedDeclarationKind::Hold
-                        | CheckedDeclarationKind::List
-                )
-            {
-                segments.push(owner.name.clone());
-            }
-            scope = current.parent?;
-        }
-        segments.reverse();
-        let mut result = segments.join(".");
-        if !path.projection.is_empty() {
-            result.push('.');
-            result.push_str(&path.projection.join("."));
-        }
-        Some(result)
+    pub fn image_handoff(&self) -> &CheckedImageHandoffV1 {
+        &self.image_handoff
     }
 }
 

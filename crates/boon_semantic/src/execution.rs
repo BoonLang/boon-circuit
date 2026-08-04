@@ -14,7 +14,7 @@ use boon_checked::{
     CheckedContextTypeSubstitution, CheckedContextualOperation, CheckedEffectSummary,
     CheckedEvaluationScope, CheckedExprId, CheckedExternalDeclarationIdentityV1,
     CheckedIntrinsicV1, CheckedMatchPattern, CheckedParameterKind, CheckedParameterRequirement,
-    CheckedProgram, CheckedResourceBinding, CheckedScopeKind, CheckedSourceId, CheckedSpan,
+    CheckedProgramFields, CheckedResourceBinding, CheckedScopeKind, CheckedSourceId, CheckedSpan,
     CheckedStateId, CheckedStatementId, CheckedStatementKind, CheckedTypeSubstitution,
     ContextFormalId, DeclId, FlowType, LexicalScopeId, ProgramRole, Type,
 };
@@ -660,7 +660,7 @@ impl SemanticExpressionKind {
     /// `Materialize` is deliberately a leaf here because its expression roots
     /// belong to the referenced materialization rather than to the expression
     /// node itself. Passes that traverse through materializations use
-    /// [`SemanticExecutionGraphV1::expression_children`] instead.
+    /// [`SemanticExecutionImageColumnsV1::expression_children`] instead.
     pub(crate) fn direct_children(&self) -> Vec<SemanticExprId> {
         match self {
             Self::CanonicalRead { .. }
@@ -738,7 +738,7 @@ pub enum SemanticMaterializationResultKind {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-pub struct SemanticExecutionGraphV1 {
+pub struct SemanticExecutionImageColumnsV1 {
     pub expressions: Vec<SemanticExpression>,
     pub statements: Vec<SemanticStatement>,
     pub scopes: Vec<SemanticScope>,
@@ -764,7 +764,7 @@ pub struct SemanticExecutionGraphV1 {
     pub checked_expression_origins: Vec<SemanticExpressionOrigin>,
 }
 
-impl SemanticExecutionGraphV1 {
+impl SemanticExecutionImageColumnsV1 {
     pub(crate) fn expression(&self, id: SemanticExprId) -> Result<&SemanticExpression, String> {
         self.expressions
             .get(id.as_usize())
@@ -1205,7 +1205,7 @@ pub(crate) struct CheckedSemanticRootSpecV1 {
 }
 
 pub(crate) fn checked_semantic_root_specs_v1(
-    checked: &CheckedProgram,
+    checked: &CheckedProgramFields,
 ) -> Result<Vec<CheckedSemanticRootSpecV1>, String> {
     let require_statement = |id: CheckedStatementId| {
         let matches = checked
@@ -1580,7 +1580,7 @@ impl SemanticContextualMaterialization {
     }
 }
 
-impl SemanticExecutionGraphV1 {
+impl SemanticExecutionImageColumnsV1 {
     pub fn validate(&self, out_net: &ResolvedOutGraph) -> Result<(), String> {
         self.validate_static_owners(out_net)?;
         self.validate_dense_ids()?;
@@ -1781,7 +1781,10 @@ impl SemanticExecutionGraphV1 {
         Ok(())
     }
 
-    pub(crate) fn validate_checked_roots(&self, checked: &CheckedProgram) -> Result<(), String> {
+    pub(crate) fn validate_checked_roots(
+        &self,
+        checked: &CheckedProgramFields,
+    ) -> Result<(), String> {
         let expected = checked_semantic_root_specs_v1(checked)?;
         if self.roots.len() != expected.len() {
             return Err(format!(
@@ -3018,8 +3021,8 @@ mod tests {
         crate::elaborate(checked, &[]).expect("empty program elaborates")
     }
 
-    fn one_expression_graph() -> SemanticExecutionGraphV1 {
-        SemanticExecutionGraphV1 {
+    fn one_expression_graph() -> SemanticExecutionImageColumnsV1 {
+        SemanticExecutionImageColumnsV1 {
             expressions: vec![SemanticExpression {
                 id: SemanticExprId(0),
                 value_id: SemanticValueId(0),
@@ -3050,7 +3053,7 @@ mod tests {
                 kind: CheckedScopeKind::Root,
                 span: CheckedSpan::default(),
             }],
-            ..SemanticExecutionGraphV1::default()
+            ..SemanticExecutionImageColumnsV1::default()
         }
     }
 
@@ -3141,7 +3144,7 @@ mod tests {
     #[test]
     fn valid_empty_graph_is_accepted() {
         let semantic = empty_semantic_program();
-        SemanticExecutionGraphV1::default()
+        SemanticExecutionImageColumnsV1::default()
             .validate(semantic.resolved_out_graph())
             .unwrap();
     }

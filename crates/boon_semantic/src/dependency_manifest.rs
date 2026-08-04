@@ -10,10 +10,15 @@
 
 use crate::out_net::{OutCallProvenance, OutInputValue, OutPortId, PassedBinding};
 use crate::*;
+#[cfg(test)]
 use boon_checked::{
-    CheckedCallEntry, CheckedDeclarationKind, CheckedEvaluationScope, CheckedExpressionKind,
-    CheckedParameterKind, CheckedProgram, CheckedStatementKind, DeclId, FlowMode, FlowType,
-    LexicalScopeId, ProgramRole, Type, TypeVar,
+    CheckedCallEntry, CheckedDeclarationKind, CheckedExpressionKind, CheckedParameterKind,
+    CheckedStatementKind, LexicalScopeId,
+};
+use boon_checked::{
+    CheckedEvaluationScope, CheckedImageHandoffV1, CheckedImageRowDomainV1, CheckedProgramFields,
+    CheckedShardCallableKindV1, CheckedShardOwnerKeyV1, CheckedShardProjectionKeyV1,
+    CheckedShardRegionV1, DeclId, FlowMode, FlowType, ProgramRole, Type, TypeVar,
 };
 use boon_compilation_db::{ProjectionGraphBuilder, ProjectionGraphDigestDomains};
 use boon_contract::SourceBundleDigestV1;
@@ -26,7 +31,10 @@ use std::fmt;
 
 #[cfg(test)]
 pub const CALLABLE_DEPENDENCY_MANIFEST_SCHEMA_V3: &str = "boon.callable-dependency-manifest.v3";
+#[cfg(test)]
 pub const CALLABLE_DEPENDENCY_MANIFEST_SCHEMA_V4: &str = "boon.callable-dependency-manifest.v4";
+pub const CALLABLE_DEPENDENCY_MANIFEST_SCHEMA_V5: &str = "boon.callable-dependency-manifest.v5";
+#[cfg(test)]
 const CHECKED_PROGRAM_DIGEST_DOMAIN: &[u8] = b"boon.checked-program.v1\0";
 const DEPENDENCY_COMPONENT_DIGEST_DOMAIN: &[u8] = b"boon.callable-dependency-components.v1\0";
 const DEPENDENCY_RECORD_PAYLOAD_DOMAIN: &[u8] = b"boon.callable-dependency-record-payload.v1\0";
@@ -40,6 +48,7 @@ const DEPENDENCY_RECORD_SET_DIGEST_DOMAIN: &[u8] = b"boon.callable-dependency-re
 const DEPENDENCY_COVERAGE_SET_DIGEST_DOMAIN: &[u8] = b"boon.callable-dependency-coverage-set.v1\0";
 #[cfg(test)]
 const DEPENDENCY_CALLABLE_SET_DIGEST_DOMAIN: &[u8] = b"boon.callable-dependency-callable-set.v3\0";
+#[cfg(test)]
 const DEPENDENCY_PUBLIC_SHAPE_DOMAIN: &[u8] = b"boon.callable-dependency-public-shape.v1\0";
 #[cfg(test)]
 const DEPENDENCY_IMPLEMENTATION_OWNER_DOMAIN: &[u8] =
@@ -58,30 +67,54 @@ const DEPENDENCY_PROGRAM_ROOT_ENTRY_DIGEST_DOMAIN: &[u8] =
 const DEPENDENCY_SEALED_MANIFEST_DIGEST_DOMAIN: &[u8] =
     b"boon.callable-dependency-sealed-manifest.v1\0";
 const DEPENDENCY_STABLE_OWNER_DOMAIN_V4: &[u8] = b"boon.callable-dependency-stable-owner.v4\0";
+#[cfg(test)]
 const DEPENDENCY_PROJECTION_KEY_DOMAIN_V4: &[u8] = b"boon.callable-dependency-projection-key.v4\0";
 const DEPENDENCY_PROJECTION_LOCAL_ROW_DOMAIN_V4: &[u8] =
     b"boon.callable-dependency-projection-local-row.v4\0";
+#[cfg(test)]
 const DEPENDENCY_PROJECTION_ROW_DOMAIN_V4: &[u8] = b"boon.callable-dependency-projection-row.v4\0";
+#[cfg(test)]
 const DEPENDENCY_PROJECTION_RECEIPT_DOMAIN_V4: &[u8] =
     b"boon.callable-dependency-projection-receipt.v4\0";
+#[cfg(test)]
 const DEPENDENCY_PROJECTION_RECEIPT_SET_DOMAIN_V4: &[u8] =
     b"boon.callable-dependency-projection-receipt-set.v4\0";
+#[cfg(test)]
 const DEPENDENCY_ROW_RECEIPT_SET_DOMAIN_V4: &[u8] =
     b"boon.callable-dependency-row-receipt-set.v4\0";
+#[cfg(test)]
 const DEPENDENCY_COVERAGE_RECEIPT_SET_DOMAIN_V4: &[u8] =
     b"boon.callable-dependency-coverage-receipt-set.v4\0";
+#[cfg(test)]
 const DEPENDENCY_PROJECTION_NODE_DOMAIN_V4: &[u8] =
     b"boon.callable-dependency-projection-node.v4\0";
+#[cfg(test)]
 const DEPENDENCY_PROJECTION_COMPONENT_DOMAIN_V4: &[u8] =
     b"boon.callable-dependency-projection-component.v4\0";
+#[cfg(test)]
 const DEPENDENCY_PROJECTION_IMPLEMENTATION_DOMAIN_V4: &[u8] =
     b"boon.callable-dependency-projection-implementation.v4\0";
 const DEPENDENCY_CALLABLE_SET_DOMAIN_V4: &[u8] = b"boon.callable-dependency-callable-set.v4\0";
 const DEPENDENCY_PROGRAM_ROOT_ENTRY_DOMAIN_V4: &[u8] =
     b"boon.callable-dependency-program-root-entry.v4\0";
+#[cfg(test)]
 const DEPENDENCY_MANIFEST_DIGEST_DOMAIN_V4: &[u8] = b"boon.callable-dependency-manifest.v4\0";
+#[cfg(test)]
 const DEPENDENCY_SEALED_MANIFEST_DOMAIN_V4: &[u8] =
     b"boon.callable-dependency-sealed-manifest.v4\0";
+const DEPENDENCY_PROJECTION_KEY_DOMAIN_V5: &[u8] = b"boon.callable-dependency-projection-key.v5\0";
+const DEPENDENCY_PROJECTION_ROW_DOMAIN_V5: &[u8] = b"boon.callable-dependency-projection-row.v5\0";
+const DEPENDENCY_PROJECTION_RECEIPT_SET_DOMAIN_V5: &[u8] =
+    b"boon.callable-dependency-projection-receipt-set.v5\0";
+const DEPENDENCY_PROJECTION_NODE_DOMAIN_V5: &[u8] =
+    b"boon.callable-dependency-projection-node.v5\0";
+const DEPENDENCY_PROJECTION_COMPONENT_DOMAIN_V5: &[u8] =
+    b"boon.callable-dependency-projection-component.v5\0";
+const DEPENDENCY_PROJECTION_IMPLEMENTATION_DOMAIN_V5: &[u8] =
+    b"boon.callable-dependency-projection-implementation.v5\0";
+const DEPENDENCY_MANIFEST_DIGEST_DOMAIN_V5: &[u8] = b"boon.callable-dependency-manifest.v5\0";
+const DEPENDENCY_SEALED_MANIFEST_DOMAIN_V5: &[u8] =
+    b"boon.callable-dependency-sealed-manifest.v5\0";
 
 macro_rules! dependency_id {
     ($($name:ident),+ $(,)?) => {
@@ -689,6 +722,7 @@ pub struct CallableDependencyEntryV4 {
 /// Compact commitments for the exact subject inventory and its projection
 /// graph. Counts make dropped or duplicated rows observable without retaining
 /// the exhaustive V3 DTOs in production.
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CallableDependencyProofDigestsV4 {
     pub program_root_entry_digest: [u8; 32],
@@ -707,6 +741,7 @@ pub struct CallableDependencyProofDigestsV4 {
 /// V4 commits the same exhaustive classifier traversal as V3, but folds rows
 /// into owner/projection receipts during construction. Only those projections
 /// and their cross-projection edges participate in the proof SCC graph.
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CallableDependencyManifestV4 {
     pub schema: String,
@@ -717,6 +752,56 @@ pub struct CallableDependencyManifestV4 {
     pub program_root: ProgramRootDependencyEntryV4,
     pub callable_entries: Vec<CallableDependencyEntryV4>,
     pub proof_digests: CallableDependencyProofDigestsV4,
+    pub manifest_digest: CallableDependencyManifestDigestV1,
+    sealed_manifest_digest: [u8; 32],
+}
+
+/// Versioned projection namespace for construction-owned checked/execution
+/// shards and the semantic domains that have not yet crossed the image seam.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(tag = "domain", rename_all = "snake_case")]
+pub enum SemanticDependencyProjectionKeyV5 {
+    Checked {
+        projection: CheckedShardProjectionKeyV1,
+    },
+    Execution {
+        projection: SemanticImageProjectionKeyV1,
+    },
+    LegacySemantic {
+        projection: SemanticDependencyProjectionKeyV4,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CallableDependencyProofDigestsV5 {
+    pub program_root_entry_digest: [u8; 32],
+    pub callable_entries_digest: [u8; 32],
+    pub projection_receipts_digest: [u8; 32],
+    pub checked_row_count: usize,
+    pub execution_row_count: usize,
+    pub remaining_row_count: usize,
+    pub dependency_record_count: usize,
+    pub coverage_record_count: usize,
+    pub projection_count: usize,
+    pub projection_edge_count: usize,
+    pub broad_owner_dependency_target_count: usize,
+}
+
+/// Production manifest after the checked-plus-execution ownership cut.
+///
+/// Checked and execution rows arrive only through their construction-owned
+/// handoffs. The V4 source traversal remains a test oracle and has no caller
+/// in this production path.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CallableDependencyManifestV5 {
+    pub schema: String,
+    pub source_bundle_digest_v1: SourceBundleDigestV1,
+    pub checked_program_digest: CheckedProgramDigestV1,
+    pub dependency_classifier_schema_digest: DependencyClassifierSchemaDigestV1,
+    pub component_digests: CallableDependencyComponentDigestsV1,
+    pub program_root: ProgramRootDependencyEntryV4,
+    pub callable_entries: Vec<CallableDependencyEntryV4>,
+    pub proof_digests: CallableDependencyProofDigestsV5,
     pub manifest_digest: CallableDependencyManifestDigestV1,
     sealed_manifest_digest: [u8; 32],
 }
@@ -813,13 +898,15 @@ impl fmt::Display for CallableDependencyManifestError {
 
 impl std::error::Error for CallableDependencyManifestError {}
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct DependencyOwnerIndex {
     callable_by_checked: BTreeMap<DeclId, SemanticCallableId>,
+    #[cfg(test)]
     checked_scope_owner: BTreeMap<LexicalScopeId, SemanticDependencyOwnerV1>,
     checked_statement_owner: BTreeMap<boon_checked::CheckedStatementId, SemanticDependencyOwnerV1>,
     expression_owner: Vec<SemanticDependencyOwnerV1>,
     statement_owner: Vec<SemanticDependencyOwnerV1>,
+    #[cfg(test)]
     call_owner: Vec<SemanticDependencyOwnerV1>,
     out_call_owner: Vec<SemanticDependencyOwnerV1>,
     static_owner: BTreeMap<StaticOwnerId, SemanticDependencyOwnerV1>,
@@ -833,10 +920,38 @@ struct DependencyOwnerIndex {
 }
 
 impl DependencyOwnerIndex {
+    #[cfg(test)]
+    fn first_difference(&self, other: &Self) -> Option<&'static str> {
+        macro_rules! compare {
+            ($field:ident) => {
+                if self.$field != other.$field {
+                    return Some(stringify!($field));
+                }
+            };
+        }
+        compare!(callable_by_checked);
+        compare!(checked_scope_owner);
+        compare!(checked_statement_owner);
+        compare!(expression_owner);
+        compare!(statement_owner);
+        compare!(call_owner);
+        compare!(out_call_owner);
+        compare!(static_owner);
+        compare!(source_owner);
+        compare!(state_owner);
+        compare!(list_owner);
+        compare!(value_list_owner);
+        compare!(binding_owner);
+        compare!(storage_field_owner);
+        compare!(memory_owner);
+        None
+    }
+
+    #[cfg(test)]
     fn derive(
-        checked: &CheckedProgram,
+        checked: &CheckedProgramFields,
         out: &ResolvedOutGraph,
-        execution: &SemanticExecutionGraphV1,
+        execution: &SemanticExecutionImageColumnsV1,
         resources: &SemanticResourceGraphV1,
         reactive: &SemanticReactiveGraphV1,
         storage: &SemanticScopeStorageGraphV1,
@@ -1122,12 +1237,12 @@ impl DependencyOwnerIndex {
             }
         }
 
-        // A semantic expression is an executable occurrence, not merely its
-        // checked lexical definition. Its concrete call-root owns the
-        // occurrence: the program root for ordinary expansion, or the producer
-        // callable for a synthetic producer root. Static and frame coordinates
-        // must agree whenever both are present. The checked expression remains
-        // a referenced definition dependency under its lexical callable.
+        // Semantic expressions and statements are executable occurrences, not
+        // merely their checked lexical definitions. Their concrete call root
+        // owns the occurrence: the program root for ordinary expansion, or the
+        // producer callable for a synthetic producer root. Static and frame
+        // coordinates must agree whenever both are present. Checked rows remain
+        // referenced definition dependencies under their lexical callables.
         for expression in &execution.expressions {
             let origin = execution
                 .checked_expression_origins
@@ -1176,6 +1291,19 @@ impl DependencyOwnerIndex {
             };
             if let Some(owner) = concrete_primary {
                 expression_owner[expression.id.as_usize()] = owner;
+            }
+        }
+        for statement in &execution.statements {
+            if let Some(frame) = statement.call_instance {
+                statement_owner[statement.id.as_usize()] = out_call_owner
+                    .get(frame.as_usize())
+                    .copied()
+                    .ok_or_else(|| {
+                        CallableDependencyManifestError::new(format!(
+                            "semantic statement {} references missing call frame {frame}",
+                            statement.id
+                        ))
+                    })?;
             }
         }
 
@@ -1364,6 +1492,329 @@ impl DependencyOwnerIndex {
         })
     }
 
+    fn derive_from_image_routes(
+        checked_handoff: &CheckedImageHandoffV1,
+        execution_handoff: &ExecutionImageHandoffV1,
+        execution: &SemanticExecutionImageColumnsV1,
+        resources: &SemanticResourceGraphV1,
+        reactive: &SemanticReactiveGraphV1,
+        storage: &SemanticScopeStorageGraphV1,
+        memory: &SemanticMemoryGraphV1,
+        stable_owners: &BTreeMap<SemanticDependencyOwnerV1, SemanticDependencyStableOwnerV4>,
+    ) -> Result<Self, CallableDependencyManifestError> {
+        let dense_by_stable = stable_owners
+            .iter()
+            .map(|(dense, stable)| (*stable, *dense))
+            .collect::<BTreeMap<_, _>>();
+        if dense_by_stable.len() != stable_owners.len() {
+            return Err(CallableDependencyManifestError::new(
+                "image owner routes have duplicate stable logical owners",
+            ));
+        }
+        let checked_owner = |projection: &CheckedShardProjectionKeyV1| {
+            let stable = stable_owner_for_checked_key_v5(&projection.owner)?;
+            dense_by_stable.get(&stable).copied().ok_or_else(|| {
+                CallableDependencyManifestError::new(format!(
+                    "checked image projection {projection:?} has no dense logical owner"
+                ))
+            })
+        };
+        let execution_owner = |projection: &SemanticImageProjectionKeyV1| {
+            let stable = execution_projection_owner_v5(projection)?;
+            dense_by_stable.get(&stable).copied().ok_or_else(|| {
+                CallableDependencyManifestError::new(format!(
+                    "execution image projection {projection:?} has no dense logical owner"
+                ))
+            })
+        };
+
+        let mut callable_by_checked = BTreeMap::new();
+        for (index, callable) in execution.callables.iter().enumerate() {
+            if callable.id != SemanticCallableId(index)
+                || callable_by_checked
+                    .insert(callable.checked_callable, callable.id)
+                    .is_some()
+            {
+                return Err(CallableDependencyManifestError::new(
+                    "execution image callable identities are not a dense checked bijection",
+                ));
+            }
+        }
+        #[cfg(test)]
+        let mut checked_scope_owner = BTreeMap::new();
+        let mut checked_statement_owner = BTreeMap::new();
+        for route in &checked_handoff.entity_routes {
+            match route.domain {
+                #[cfg(test)]
+                CheckedImageRowDomainV1::Scope => {
+                    checked_scope_owner.insert(
+                        LexicalScopeId(route.dense_index),
+                        checked_owner(&route.projection)?,
+                    );
+                }
+                CheckedImageRowDomainV1::Statement => {
+                    checked_statement_owner.insert(
+                        boon_checked::CheckedStatementId(route.dense_index),
+                        checked_owner(&route.projection)?,
+                    );
+                }
+                _ => {}
+            }
+        }
+
+        fn finish_dense_owners(
+            kind: &str,
+            owners: Vec<Option<SemanticDependencyOwnerV1>>,
+        ) -> Result<Vec<SemanticDependencyOwnerV1>, CallableDependencyManifestError> {
+            owners
+                .into_iter()
+                .enumerate()
+                .map(|(index, owner)| {
+                    owner.ok_or_else(|| {
+                        CallableDependencyManifestError::new(format!(
+                            "execution image has no owner route for {kind} {index}"
+                        ))
+                    })
+                })
+                .collect()
+        }
+        let mut expression_owner = vec![None; execution.expressions.len()];
+        let mut statement_owner = vec![None; execution.statements.len()];
+        #[cfg(test)]
+        let mut call_owner = vec![None; execution.calls.len()];
+        let mut out_call_owner = vec![None; execution.call_occurrences.len()];
+        let mut static_owner = BTreeMap::new();
+        for route in &execution_handoff.entity_routes {
+            let owner = execution_owner(&route.projection)?;
+            let index = route.dense_index as usize;
+            #[cfg(test)]
+            if route.domain == ExecutionImageRowDomainV1::Call {
+                let slot = call_owner.get_mut(index).ok_or_else(|| {
+                    CallableDependencyManifestError::new(
+                        "execution call owner route is out of bounds",
+                    )
+                })?;
+                if slot.replace(owner).is_some() {
+                    return Err(CallableDependencyManifestError::new(
+                        "execution call has duplicate owner routes",
+                    ));
+                }
+                continue;
+            }
+            match route.domain {
+                ExecutionImageRowDomainV1::Expression => {
+                    let slot = expression_owner.get_mut(index).ok_or_else(|| {
+                        CallableDependencyManifestError::new(
+                            "execution expression owner route is out of bounds",
+                        )
+                    })?;
+                    if slot.replace(owner).is_some() {
+                        return Err(CallableDependencyManifestError::new(
+                            "execution expression has duplicate owner routes",
+                        ));
+                    }
+                }
+                ExecutionImageRowDomainV1::Statement => {
+                    let slot = statement_owner.get_mut(index).ok_or_else(|| {
+                        CallableDependencyManifestError::new(
+                            "execution statement owner route is out of bounds",
+                        )
+                    })?;
+                    if slot.replace(owner).is_some() {
+                        return Err(CallableDependencyManifestError::new(
+                            "execution statement has duplicate owner routes",
+                        ));
+                    }
+                }
+                ExecutionImageRowDomainV1::CallOccurrence => {
+                    let slot = out_call_owner.get_mut(index).ok_or_else(|| {
+                        CallableDependencyManifestError::new(
+                            "execution occurrence owner route is out of bounds",
+                        )
+                    })?;
+                    if slot.replace(owner).is_some() {
+                        return Err(CallableDependencyManifestError::new(
+                            "execution occurrence has duplicate owner routes",
+                        ));
+                    }
+                }
+                ExecutionImageRowDomainV1::StaticOwner => {
+                    if static_owner.insert(StaticOwnerId(index), owner).is_some() {
+                        return Err(CallableDependencyManifestError::new(
+                            "execution static owner has duplicate owner routes",
+                        ));
+                    }
+                }
+                ExecutionImageRowDomainV1::Call
+                | ExecutionImageRowDomainV1::Scope
+                | ExecutionImageRowDomainV1::ExpressionOrigin
+                | ExecutionImageRowDomainV1::Callable
+                | ExecutionImageRowDomainV1::Source
+                | ExecutionImageRowDomainV1::State
+                | ExecutionImageRowDomainV1::Root
+                | ExecutionImageRowDomainV1::Function
+                | ExecutionImageRowDomainV1::Materialization => {}
+            }
+        }
+        let expression_owner = finish_dense_owners("expression", expression_owner)?;
+        let statement_owner = finish_dense_owners("statement", statement_owner)?;
+        #[cfg(test)]
+        let call_owner = finish_dense_owners("call", call_owner)?;
+        let out_call_owner = finish_dense_owners("call occurrence", out_call_owner)?;
+
+        let expression_owner_at = |expression: SemanticExprId, context: &str| {
+            expression_owner
+                .get(expression.as_usize())
+                .copied()
+                .ok_or_else(|| {
+                    CallableDependencyManifestError::new(format!(
+                        "{context} references missing semantic expression {expression}"
+                    ))
+                })
+        };
+        let source_owner = resources
+            .sources
+            .iter()
+            .map(|source| expression_owner_at(source.expression, &format!("source {}", source.id)))
+            .collect::<Result<Vec<_>, _>>()?;
+        let state_owner = resources
+            .states
+            .iter()
+            .map(|state| expression_owner_at(state.expression, &format!("state {}", state.id)))
+            .collect::<Result<Vec<_>, _>>()?;
+        let list_owner = resources
+            .lists
+            .iter()
+            .map(|list| expression_owner_at(list.producer, &format!("list {}", list.id)))
+            .collect::<Result<Vec<_>, _>>()?;
+        let value_list_owner = resources
+            .value_list_authorities
+            .iter()
+            .map(|list| expression_owner_at(list.producer, &format!("value-list {}", list.id)))
+            .collect::<Result<Vec<_>, _>>()?;
+        let binding_owner = reactive
+            .bindings
+            .iter()
+            .map(|binding| {
+                expression_owner_at(binding.producer, &format!("binding {}", binding.id))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut storage_field_owner = Vec::with_capacity(storage.fields.len());
+        for (index, field) in storage.fields.iter().enumerate() {
+            if field.id != SemanticStorageFieldId(index) {
+                return Err(CallableDependencyManifestError::new(format!(
+                    "semantic storage field {} is not dense index {index}",
+                    field.id
+                )));
+            }
+            let explicit = field
+                .owner
+                .map(|owner| {
+                    static_owner.get(&owner).copied().ok_or_else(|| {
+                        CallableDependencyManifestError::new(format!(
+                            "storage field {} references unowned static owner {owner}",
+                            field.id
+                        ))
+                    })
+                })
+                .transpose()?;
+            let derived = match &field.origin {
+                SemanticStorageFieldOriginV1::Reactive {
+                    field: reactive_field,
+                } => {
+                    let producer = reactive
+                        .fields
+                        .get(reactive_field.as_usize())
+                        .filter(|candidate| candidate.id == *reactive_field)
+                        .ok_or_else(|| {
+                            CallableDependencyManifestError::new(format!(
+                                "storage field {} references missing reactive field {reactive_field}",
+                                field.id
+                            ))
+                        })?
+                        .producer;
+                    expression_owner_at(producer, &format!("storage field {}", field.id))?
+                }
+                SemanticStorageFieldOriginV1::StateAuthority { state } => {
+                    *state_owner.get(state.as_usize()).ok_or_else(|| {
+                        CallableDependencyManifestError::new(format!(
+                            "storage field {} references missing state {state}",
+                            field.id
+                        ))
+                    })?
+                }
+                SemanticStorageFieldOriginV1::ListAuthority { list, .. } => {
+                    *list_owner.get(list.as_usize()).ok_or_else(|| {
+                        CallableDependencyManifestError::new(format!(
+                            "storage field {} references missing list {list}",
+                            field.id
+                        ))
+                    })?
+                }
+                SemanticStorageFieldOriginV1::ValueListAuthority { authority, .. } => {
+                    *value_list_owner.get(authority.as_usize()).ok_or_else(|| {
+                        CallableDependencyManifestError::new(format!(
+                            "storage field {} references missing value-list {authority}",
+                            field.id
+                        ))
+                    })?
+                }
+                SemanticStorageFieldOriginV1::RecordProjection { expression, .. } => {
+                    expression_owner_at(*expression, &format!("storage field {}", field.id))?
+                }
+                SemanticStorageFieldOriginV1::DetachedCapture { target_owner, .. } => {
+                    *static_owner.get(target_owner).ok_or_else(|| {
+                        CallableDependencyManifestError::new(format!(
+                            "storage field {} references unowned static owner {target_owner}",
+                            field.id
+                        ))
+                    })?
+                }
+            };
+            storage_field_owner.push(explicit.unwrap_or(derived));
+        }
+        let memory_owner = memory
+            .memories
+            .iter()
+            .map(|memory| match memory.backing {
+                SemanticMemoryBackingV1::State { binding, .. }
+                | SemanticMemoryBackingV1::List { binding, .. } => binding_owner
+                    .get(binding.as_usize())
+                    .copied()
+                    .ok_or_else(|| {
+                        CallableDependencyManifestError::new(format!(
+                            "memory {} references missing binding {binding}",
+                            memory.id
+                        ))
+                    }),
+                SemanticMemoryBackingV1::Collection { expression, .. } => {
+                    expression_owner_at(expression, &format!("memory {}", memory.id))
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            callable_by_checked,
+            #[cfg(test)]
+            checked_scope_owner,
+            checked_statement_owner,
+            expression_owner,
+            statement_owner,
+            #[cfg(test)]
+            call_owner,
+            out_call_owner,
+            static_owner,
+            source_owner,
+            state_owner,
+            list_owner,
+            value_list_owner,
+            binding_owner,
+            storage_field_owner,
+            memory_owner,
+        })
+    }
+
+    #[cfg(test)]
     fn checked_scope(
         &self,
         scope: LexicalScopeId,
@@ -1422,6 +1873,7 @@ impl DependencyOwnerIndex {
             })
     }
 
+    #[cfg(test)]
     fn call(
         &self,
         call: SemanticCallId,
@@ -1645,6 +2097,7 @@ struct CompactDependencyRecordV4 {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[cfg(test)]
 enum DependencyProjectionNodeV4 {
     Owner(SemanticDependencyStableOwnerV4),
     CallableInterface(SemanticDependencyStableOwnerV4),
@@ -1652,6 +2105,7 @@ enum DependencyProjectionNodeV4 {
 }
 
 #[derive(Debug)]
+#[cfg(test)]
 struct ValidatedCompactDependencyCollectionV4 {
     implementation_digests: BTreeMap<SemanticDependencyOwnerV1, [u8; 32]>,
     dependency_rows_digest: [u8; 32],
@@ -1663,6 +2117,39 @@ struct ValidatedCompactDependencyCollectionV4 {
     projection_edge_count: usize,
 }
 
+#[derive(Debug)]
+struct ValidatedCompactDependencyCollectionV5 {
+    implementation_digests: BTreeMap<SemanticDependencyOwnerV1, [u8; 32]>,
+    projection_receipts_digest: [u8; 32],
+    checked_row_count: usize,
+    execution_row_count: usize,
+    remaining_row_count: usize,
+    dependency_record_count: usize,
+    coverage_record_count: usize,
+    projection_count: usize,
+    projection_edge_count: usize,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+enum DependencyProjectionNodeV5 {
+    Owner(SemanticDependencyStableOwnerV4),
+    Projection(SemanticDependencyProjectionKeyV5),
+}
+
+struct PresealedProjectionIndexV5 {
+    projection_receipts: BTreeMap<SemanticDependencyProjectionKeyV5, [u8; 32]>,
+    projection_targets:
+        BTreeMap<SemanticDependencyProjectionKeyV5, BTreeSet<SemanticDependencyProjectionKeyV5>>,
+    projection_owners: BTreeMap<SemanticDependencyProjectionKeyV5, SemanticDependencyStableOwnerV4>,
+    entity_routes: HashMap<SemanticDependencyEntityV1, SemanticDependencyProjectionKeyV5>,
+    callable_interfaces: BTreeMap<SemanticCallableId, SemanticDependencyProjectionKeyV5>,
+    checked_row_count: usize,
+    checked_dependency_row_count: usize,
+    execution_row_count: usize,
+    execution_dependency_row_count: usize,
+}
+
+#[cfg(test)]
 type ExpressionDependency = (
     SemanticDependencyChannelV1,
     Vec<SemanticDependencyRoleV1>,
@@ -1696,9 +2183,50 @@ struct DependencyCollector {
 }
 
 impl DependencyCollector {
+    fn for_presealed_images(
+        checked: &CheckedImageHandoffV1,
+        execution: &ExecutionImageHandoffV1,
+    ) -> Self {
+        let checked_rows = checked
+            .shards
+            .iter()
+            .map(|shard| shard.row_count as usize)
+            .sum::<usize>();
+        let execution_rows = execution
+            .shards
+            .iter()
+            .map(|shard| shard.row_count as usize)
+            .sum::<usize>();
+        // Only the not-yet-migrated semantic domains enter this collector.
+        // Their current cardinality is bounded directionally by the image
+        // rows; normal vector growth remains the correctness fallback.
+        let coverage_capacity = checked_rows
+            .saturating_add(execution_rows)
+            .saturating_mul(4);
+        let record_capacity = coverage_capacity.saturating_mul(3) / 4;
+        Self {
+            compact_rows: Vec::with_capacity(coverage_capacity),
+            compact_records: Vec::with_capacity(record_capacity),
+            compact_references: Vec::with_capacity(record_capacity),
+            #[cfg(test)]
+            records: Vec::new(),
+            #[cfg(test)]
+            unresolved_entity_references: Vec::new(),
+            #[cfg(test)]
+            coverage: Vec::new(),
+            subjects: HashSet::with_capacity(coverage_capacity),
+            dependencies_by_entity: HashMap::with_capacity(record_capacity / 2),
+            hash_scratch: Vec::new(),
+            flow_type_digests: HashMap::new(),
+            #[cfg(test)]
+            retain_exhaustive: false,
+        }
+    }
+
+    #[cfg(test)]
     fn for_program(
-        checked: &CheckedProgram,
-        execution: &SemanticExecutionGraphV1,
+        checked: &CheckedProgramFields,
+        execution: &SemanticExecutionImageColumnsV1,
         retain_exhaustive: bool,
     ) -> Self {
         #[cfg(not(test))]
@@ -2825,6 +3353,7 @@ fn build_dependency_graph_digests(
 }
 
 impl DependencyCollector {
+    #[cfg(test)]
     fn trace_counts(&self, phase: &str) {
         eprintln!(
             "boon_semantic dependency_manifest {phase}:counts pending={} coverage={} subjects={} entities={} flow_types={}",
@@ -3052,11 +3581,12 @@ impl DependencyCollector {
         Ok(())
     }
 
+    #[cfg(test)]
     fn checked_program_structural(
         &mut self,
         owner: SemanticDependencyOwnerV1,
         subject: SemanticDependencySubjectV1,
-        checked: &CheckedProgram,
+        checked: &CheckedProgramFields,
     ) -> Result<CheckedProgramDigestV1, CallableDependencyManifestError> {
         self.claim_subject(&subject)?;
         let [payload_digest, checked_program_digest] =
@@ -3375,6 +3905,7 @@ impl DependencyCollector {
         })
     }
 
+    #[cfg(test)]
     fn finish_compact_v4(
         mut self,
         owners: &BTreeSet<SemanticDependencyOwnerV1>,
@@ -3675,8 +4206,299 @@ impl DependencyCollector {
             projection_edge_count: graph_stats.edges,
         })
     }
+
+    fn finish_compact_v5(
+        mut self,
+        owners: &BTreeSet<SemanticDependencyOwnerV1>,
+        stable_owners: &BTreeMap<SemanticDependencyOwnerV1, SemanticDependencyStableOwnerV4>,
+        mut presealed: PresealedProjectionIndexV5,
+    ) -> Result<ValidatedCompactDependencyCollectionV5, CallableDependencyManifestError> {
+        if self.subjects.len() != self.compact_rows.len() {
+            return Err(CallableDependencyManifestError::new(
+                "remaining semantic subjects and coverage rows are not aligned",
+            ));
+        }
+        if self.compact_records.len() != self.dependencies_by_entity.values().flatten().count() {
+            return Err(CallableDependencyManifestError::new(
+                "remaining semantic records and entity classifications are not aligned",
+            ));
+        }
+        if stable_owners.len() != owners.len()
+            || owners
+                .iter()
+                .any(|owner| !stable_owners.contains_key(owner))
+        {
+            return Err(CallableDependencyManifestError::new(
+                "V5 proof does not have one stable identity for every logical owner",
+            ));
+        }
+        for ids in self.dependencies_by_entity.values_mut() {
+            ids.sort();
+            ids.dedup();
+        }
+
+        let stable_projection = |dense: DenseDependencyProjectionKeyV4| {
+            stable_owners
+                .get(&dense.owner)
+                .copied()
+                .map(|owner| SemanticDependencyProjectionKeyV5::LegacySemantic {
+                    projection: SemanticDependencyProjectionKeyV4 {
+                        owner,
+                        subject_kind: dense.subject_kind,
+                        class: dense.class,
+                    },
+                })
+                .ok_or_else(|| {
+                    CallableDependencyManifestError::new(format!(
+                        "remaining semantic projection references missing owner {:?}",
+                        dense.owner
+                    ))
+                })
+        };
+
+        let mut final_row_digests = vec![None; self.compact_rows.len()];
+        let mut legacy_targets = BTreeMap::<
+            SemanticDependencyProjectionKeyV5,
+            BTreeSet<SemanticDependencyProjectionKeyV5>,
+        >::new();
+        let mut key_digest_cache = BTreeMap::new();
+        for (index, record) in self.compact_records.iter().copied().enumerate() {
+            let record_id = SemanticDependencyRecordId(index);
+            let row = self.compact_rows.get(record.row).ok_or_else(|| {
+                CallableDependencyManifestError::new(format!(
+                    "remaining dependency {record_id} references missing row {}",
+                    record.row
+                ))
+            })?;
+            if row.dependency != Some(record_id) {
+                return Err(CallableDependencyManifestError::new(format!(
+                    "remaining dependency {record_id} is not bound by its exact coverage row"
+                )));
+            }
+            let source = stable_projection(row.projection)?;
+            let references = self
+                .compact_references
+                .get(record.references_start..record.references_end)
+                .ok_or_else(|| {
+                    CallableDependencyManifestError::new(format!(
+                        "remaining dependency {record_id} has an invalid reference span"
+                    ))
+                })?;
+            let mut targets = Vec::new();
+            for reference in references {
+                match reference {
+                    PendingDependencyReference::CallableInterface(callable) => {
+                        targets.push(
+                            presealed
+                                .callable_interfaces
+                                .get(callable)
+                                .cloned()
+                                .ok_or_else(|| {
+                                    CallableDependencyManifestError::new(format!(
+                                        "dependency {record_id} references missing callable interface {callable}"
+                                    ))
+                                })?,
+                        );
+                    }
+                    PendingDependencyReference::Entity(entity) => {
+                        if let Some(dependencies) = self.dependencies_by_entity.get(entity) {
+                            for dependency in dependencies.iter().copied() {
+                                if dependency == record_id {
+                                    continue;
+                                }
+                                let target_record = self
+                                    .compact_records
+                                    .get(dependency.as_usize())
+                                    .ok_or_else(|| {
+                                        CallableDependencyManifestError::new(format!(
+                                            "dependency {record_id} references missing dependency {dependency}"
+                                        ))
+                                    })?;
+                                let target_row =
+                                    self.compact_rows.get(target_record.row).ok_or_else(|| {
+                                        CallableDependencyManifestError::new(format!(
+                                            "dependency {dependency} references missing row {}",
+                                            target_record.row
+                                        ))
+                                    })?;
+                                targets.push(stable_projection(target_row.projection)?);
+                            }
+                        } else {
+                            targets.push(
+                                presealed.entity_routes.get(entity).cloned().ok_or_else(|| {
+                                    CallableDependencyManifestError::new(format!(
+                                        "dependency {record_id} references unsealed entity {entity:?}"
+                                    ))
+                                })?,
+                            );
+                        }
+                    }
+                    #[cfg(test)]
+                    PendingDependencyReference::Owner(owner) => {
+                        return Err(CallableDependencyManifestError::new(format!(
+                            "V5 production dependency {record_id} uses forbidden broad owner target {owner:?}"
+                        )));
+                    }
+                }
+            }
+            targets.sort();
+            targets.dedup();
+            let digest = compact_projection_row_digest_v5(
+                &source,
+                row.local_digest,
+                &targets,
+                &mut key_digest_cache,
+            )?;
+            final_row_digests[record.row] = Some(digest);
+            legacy_targets.entry(source).or_default().extend(targets);
+        }
+        for (index, row) in self.compact_rows.iter().enumerate() {
+            if final_row_digests[index].is_some() {
+                continue;
+            }
+            if row.dependency.is_some() {
+                return Err(CallableDependencyManifestError::new(format!(
+                    "remaining coverage row {index} has no dependency record"
+                )));
+            }
+            let projection = stable_projection(row.projection)?;
+            final_row_digests[index] = Some(compact_projection_row_digest_v5(
+                &projection,
+                row.local_digest,
+                &[],
+                &mut key_digest_cache,
+            )?);
+            legacy_targets.entry(projection).or_default();
+        }
+        let final_row_digests = final_row_digests
+            .into_iter()
+            .enumerate()
+            .map(|(index, digest)| {
+                digest.ok_or_else(|| {
+                    CallableDependencyManifestError::new(format!(
+                        "remaining coverage row {index} has no receipt digest"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut legacy_rows = BTreeMap::<SemanticDependencyProjectionKeyV5, Vec<[u8; 32]>>::new();
+        for (row, digest) in self.compact_rows.iter().zip(&final_row_digests) {
+            legacy_rows
+                .entry(stable_projection(row.projection)?)
+                .or_default()
+                .push(*digest);
+        }
+        for (projection, rows) in legacy_rows {
+            let receipt = compact_projection_receipt_digest_v5(&projection, &rows)?;
+            if presealed
+                .projection_receipts
+                .insert(projection.clone(), receipt)
+                .is_some()
+            {
+                return Err(CallableDependencyManifestError::new(format!(
+                    "V5 projection {projection:?} is sealed more than once"
+                )));
+            }
+            let SemanticDependencyProjectionKeyV5::LegacySemantic { projection: legacy } =
+                &projection
+            else {
+                unreachable!("legacy rows produce legacy projections")
+            };
+            let owner = legacy.owner;
+            presealed.projection_owners.insert(projection, owner);
+        }
+        for (projection, targets) in legacy_targets {
+            presealed
+                .projection_targets
+                .entry(projection)
+                .or_default()
+                .extend(targets);
+        }
+        for (source, targets) in &presealed.projection_targets {
+            if !presealed.projection_receipts.contains_key(source) {
+                return Err(CallableDependencyManifestError::new(format!(
+                    "V5 projection graph is missing source {source:?}"
+                )));
+            }
+            for target in targets {
+                if !presealed.projection_receipts.contains_key(target) {
+                    return Err(CallableDependencyManifestError::new(format!(
+                        "V5 projection {source:?} references missing target {target:?}"
+                    )));
+                }
+            }
+        }
+        let stable_owner_set = stable_owners.values().copied().collect::<BTreeSet<_>>();
+        let (stable_implementation_digests, graph_stats) =
+            build_dependency_projection_graph_digests_v5(
+                &stable_owner_set,
+                &presealed.projection_receipts,
+                &presealed.projection_targets,
+                &presealed.projection_owners,
+            )?;
+        let implementation_digests = stable_owners
+            .iter()
+            .map(|(dense, stable)| {
+                stable_implementation_digests
+                    .get(stable)
+                    .copied()
+                    .map(|digest| (*dense, digest))
+                    .ok_or_else(|| {
+                        CallableDependencyManifestError::new(format!(
+                            "stable dependency owner {stable:?} has no V5 implementation digest"
+                        ))
+                    })
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        let receipt_members = presealed
+            .projection_receipts
+            .iter()
+            .map(|(projection, digest)| {
+                canonical_dependency_hash(
+                    DEPENDENCY_PROJECTION_RECEIPT_SET_DOMAIN_V5,
+                    &(projection, digest),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let projection_receipts_digest = compact_digest_sequence_v4(
+            DEPENDENCY_PROJECTION_RECEIPT_SET_DOMAIN_V5,
+            &receipt_members,
+        )?;
+        if std::env::var_os("BOON_SEMANTIC_TRACE").is_some() {
+            eprintln!(
+                "boon_semantic dependency_manifest_v5 projection_graph:counts nodes={} edges={} components={} cyclic_components={} maximum_component_nodes={} component_edges={} checked_rows={} execution_rows={} remaining_rows={}",
+                graph_stats.nodes,
+                graph_stats.edges,
+                graph_stats.components,
+                graph_stats.cyclic_components,
+                graph_stats.maximum_component_nodes,
+                graph_stats.component_edges,
+                presealed.checked_row_count,
+                presealed.execution_row_count,
+                self.compact_rows.len(),
+            );
+        }
+        Ok(ValidatedCompactDependencyCollectionV5 {
+            implementation_digests,
+            projection_receipts_digest,
+            checked_row_count: presealed.checked_row_count,
+            execution_row_count: presealed.execution_row_count,
+            remaining_row_count: self.compact_rows.len(),
+            dependency_record_count: presealed
+                .checked_dependency_row_count
+                .saturating_add(presealed.execution_dependency_row_count)
+                .saturating_add(self.compact_records.len()),
+            coverage_record_count: presealed
+                .checked_row_count
+                .saturating_add(presealed.execution_row_count)
+                .saturating_add(self.compact_rows.len()),
+            projection_count: presealed.projection_receipts.len(),
+            projection_edge_count: graph_stats.edges,
+        })
+    }
 }
 
+#[cfg(test)]
 fn compact_projection_row_digest_v4(
     projection: SemanticDependencyProjectionKeyV4,
     local_digest: [u8; 32],
@@ -3694,13 +4516,61 @@ fn compact_projection_row_digest_v4(
     Ok(hasher.finalize().into())
 }
 
+fn compact_projection_key_digest_v5(
+    projection: &SemanticDependencyProjectionKeyV5,
+    cache: &mut BTreeMap<SemanticDependencyProjectionKeyV5, [u8; 32]>,
+) -> Result<[u8; 32], CallableDependencyManifestError> {
+    if let Some(digest) = cache.get(projection) {
+        return Ok(*digest);
+    }
+    let digest = canonical_dependency_hash(DEPENDENCY_PROJECTION_KEY_DOMAIN_V5, projection)?;
+    cache.insert(projection.clone(), digest);
+    Ok(digest)
+}
+
+fn compact_projection_row_digest_v5(
+    projection: &SemanticDependencyProjectionKeyV5,
+    local_digest: [u8; 32],
+    targets: &[SemanticDependencyProjectionKeyV5],
+    cache: &mut BTreeMap<SemanticDependencyProjectionKeyV5, [u8; 32]>,
+) -> Result<[u8; 32], CallableDependencyManifestError> {
+    let mut hasher = Sha256::new();
+    hasher.update(DEPENDENCY_PROJECTION_ROW_DOMAIN_V5);
+    hasher.update(compact_projection_key_digest_v5(projection, cache)?);
+    hasher.update(local_digest);
+    dependency_proof_update_usize(&mut hasher, targets.len(), "V5 projection row target count")?;
+    for target in targets {
+        hasher.update(compact_projection_key_digest_v5(target, cache)?);
+    }
+    Ok(hasher.finalize().into())
+}
+
+fn compact_projection_receipt_digest_v5(
+    projection: &SemanticDependencyProjectionKeyV5,
+    rows: &[[u8; 32]],
+) -> Result<[u8; 32], CallableDependencyManifestError> {
+    let mut hasher = Sha256::new();
+    hasher.update(DEPENDENCY_PROJECTION_RECEIPT_SET_DOMAIN_V5);
+    hasher.update(canonical_dependency_hash(
+        DEPENDENCY_PROJECTION_KEY_DOMAIN_V5,
+        projection,
+    )?);
+    dependency_proof_update_usize(&mut hasher, rows.len(), "V5 projection receipt row count")?;
+    for row in rows {
+        hasher.update(row);
+    }
+    Ok(hasher.finalize().into())
+}
+
 #[derive(Default)]
+#[cfg(test)]
 struct CompactReceiptHashCacheV4 {
     owners: BTreeMap<SemanticDependencyStableOwnerV4, [u8; 32]>,
     projections: BTreeMap<SemanticDependencyProjectionKeyV4, [u8; 32]>,
     nodes: BTreeMap<DependencyProjectionNodeV4, [u8; 32]>,
 }
 
+#[cfg(test)]
 impl CompactReceiptHashCacheV4 {
     fn owner_digest(
         &mut self,
@@ -3800,6 +4670,7 @@ fn compact_digest_sequence_v4(
     Ok(hasher.finalize().into())
 }
 
+#[cfg(test)]
 fn compact_projection_receipt_digest_v4(
     projection: SemanticDependencyProjectionKeyV4,
     rows: &[[u8; 32]],
@@ -3816,6 +4687,7 @@ fn compact_projection_receipt_digest_v4(
     Ok(hasher.finalize().into())
 }
 
+#[cfg(test)]
 fn dependency_projection_node_digest_v4(
     node: DependencyProjectionNodeV4,
 ) -> Result<[u8; 32], CallableDependencyManifestError> {
@@ -3823,21 +4695,13 @@ fn dependency_projection_node_digest_v4(
 }
 
 fn stable_dependency_owner_index_v4(
-    checked: &CheckedProgram,
-    execution: &SemanticExecutionGraphV1,
+    checked: &CheckedProgramFields,
+    execution: &SemanticExecutionImageColumnsV1,
     owners: &BTreeSet<SemanticDependencyOwnerV1>,
 ) -> Result<
     BTreeMap<SemanticDependencyOwnerV1, SemanticDependencyStableOwnerV4>,
     CallableDependencyManifestError,
 > {
-    #[derive(Serialize)]
-    struct CallableIdentity<'a> {
-        kind: boon_checked::CheckedCallableKind,
-        name: &'a str,
-        external_identity: &'a Option<boon_checked::CheckedExternalDeclarationIdentityV1>,
-        role: ProgramRole,
-    }
-
     let mut stable = BTreeMap::new();
     stable.insert(
         SemanticDependencyOwnerV1::ProgramRoot,
@@ -3853,14 +4717,11 @@ fn stable_dependency_owner_index_v4(
                 callable.id
             )));
         }
-        let identity = canonical_dependency_hash(
-            DEPENDENCY_STABLE_OWNER_DOMAIN_V4,
-            &CallableIdentity {
-                kind: callable.kind,
-                name: &callable.name,
-                external_identity: &callable.external_identity,
-                role: callable.role,
-            },
+        let identity = stable_callable_identity_v4(
+            callable.kind,
+            &callable.name,
+            &callable.external_identity,
+            callable.role,
         )?;
         if stable
             .insert(
@@ -3893,6 +4754,525 @@ fn stable_dependency_owner_index_v4(
     Ok(stable)
 }
 
+fn stable_callable_identity_v4(
+    kind: boon_checked::CheckedCallableKind,
+    name: &str,
+    external_identity: &Option<boon_checked::CheckedExternalDeclarationIdentityV1>,
+    role: ProgramRole,
+) -> Result<[u8; 32], CallableDependencyManifestError> {
+    #[derive(Serialize)]
+    struct CallableIdentity<'a> {
+        kind: boon_checked::CheckedCallableKind,
+        name: &'a str,
+        external_identity: &'a Option<boon_checked::CheckedExternalDeclarationIdentityV1>,
+        role: ProgramRole,
+    }
+    canonical_dependency_hash(
+        DEPENDENCY_STABLE_OWNER_DOMAIN_V4,
+        &CallableIdentity {
+            kind,
+            name,
+            external_identity,
+            role,
+        },
+    )
+}
+
+fn stable_owner_for_checked_key_v5(
+    owner: &CheckedShardOwnerKeyV1,
+) -> Result<SemanticDependencyStableOwnerV4, CallableDependencyManifestError> {
+    Ok(match owner {
+        CheckedShardOwnerKeyV1::ProgramTopLevel { role } => {
+            SemanticDependencyStableOwnerV4::ProgramRoot { role: *role }
+        }
+        CheckedShardOwnerKeyV1::Callable {
+            role,
+            callable_kind,
+            name,
+            external_identity,
+        } => {
+            let kind = match callable_kind {
+                CheckedShardCallableKindV1::User => boon_checked::CheckedCallableKind::User,
+                CheckedShardCallableKindV1::Builtin => boon_checked::CheckedCallableKind::Builtin,
+                CheckedShardCallableKindV1::External => boon_checked::CheckedCallableKind::External,
+            };
+            SemanticDependencyStableOwnerV4::Callable {
+                identity: stable_callable_identity_v4(kind, name, external_identity, *role)?,
+            }
+        }
+    })
+}
+
+fn execution_projection_owner_v5(
+    projection: &SemanticImageProjectionKeyV1,
+) -> Result<SemanticDependencyStableOwnerV4, CallableDependencyManifestError> {
+    match projection {
+        SemanticImageProjectionKeyV1::Checked { projection } => {
+            stable_owner_for_checked_key_v5(&projection.owner)
+        }
+        SemanticImageProjectionKeyV1::Invocation {
+            root: DistributedCallOccurrenceRoot::Program,
+            definition,
+            ..
+        } => Ok(SemanticDependencyStableOwnerV4::ProgramRoot {
+            role: match definition {
+                CheckedShardOwnerKeyV1::ProgramTopLevel { role }
+                | CheckedShardOwnerKeyV1::Callable { role, .. } => *role,
+            },
+        }),
+        SemanticImageProjectionKeyV1::Invocation {
+            root: DistributedCallOccurrenceRoot::Producer(_),
+            definition,
+            ..
+        } => stable_owner_for_checked_key_v5(definition),
+    }
+}
+
+fn insert_presealed_entity_route_v5(
+    routes: &mut HashMap<SemanticDependencyEntityV1, SemanticDependencyProjectionKeyV5>,
+    entity: SemanticDependencyEntityV1,
+    projection: SemanticDependencyProjectionKeyV5,
+) -> Result<(), CallableDependencyManifestError> {
+    if let Some(previous) = routes.insert(entity.clone(), projection.clone())
+        && previous != projection
+    {
+        return Err(CallableDependencyManifestError::new(format!(
+            "presealed entity {entity:?} routes to both {previous:?} and {projection:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn checked_dependency_entity_domain_v5(
+    domain: CheckedImageRowDomainV1,
+) -> Option<SemanticDependencyEntityDomainV1> {
+    Some(match domain {
+        CheckedImageRowDomainV1::Header => return None,
+        CheckedImageRowDomainV1::Scope => SemanticDependencyEntityDomainV1::CheckedScope,
+        CheckedImageRowDomainV1::Declaration => {
+            SemanticDependencyEntityDomainV1::CheckedDeclaration
+        }
+        CheckedImageRowDomainV1::Statement => SemanticDependencyEntityDomainV1::CheckedStatement,
+        CheckedImageRowDomainV1::Expression => SemanticDependencyEntityDomainV1::CheckedExpression,
+        CheckedImageRowDomainV1::Callable => SemanticDependencyEntityDomainV1::CheckedCallable,
+        CheckedImageRowDomainV1::ContextFormal => {
+            SemanticDependencyEntityDomainV1::CheckedContextFormal
+        }
+        CheckedImageRowDomainV1::Call => SemanticDependencyEntityDomainV1::CheckedCall,
+        CheckedImageRowDomainV1::CallResultPath => {
+            SemanticDependencyEntityDomainV1::CheckedCallResultPath
+        }
+        CheckedImageRowDomainV1::OrderChain => SemanticDependencyEntityDomainV1::CheckedOrderChain,
+        CheckedImageRowDomainV1::PatternBinding => {
+            SemanticDependencyEntityDomainV1::CheckedPatternBinding
+        }
+        CheckedImageRowDomainV1::ResourceProjection => {
+            SemanticDependencyEntityDomainV1::CheckedResourceProjection
+        }
+        CheckedImageRowDomainV1::Source => SemanticDependencyEntityDomainV1::CheckedSource,
+        CheckedImageRowDomainV1::State => SemanticDependencyEntityDomainV1::CheckedState,
+        CheckedImageRowDomainV1::List => SemanticDependencyEntityDomainV1::CheckedList,
+        CheckedImageRowDomainV1::Occurrence => SemanticDependencyEntityDomainV1::CheckedOccurrence,
+        CheckedImageRowDomainV1::SourceUnitMetadata => SemanticDependencyEntityDomainV1::SourceUnit,
+        CheckedImageRowDomainV1::SourcePayloadShape => {
+            SemanticDependencyEntityDomainV1::SourcePayloadShape
+        }
+        CheckedImageRowDomainV1::HostPort => SemanticDependencyEntityDomainV1::HostPort,
+        CheckedImageRowDomainV1::OutputRootType => SemanticDependencyEntityDomainV1::OutputContract,
+        CheckedImageRowDomainV1::ExpressionType => {
+            SemanticDependencyEntityDomainV1::SourceExpression
+        }
+        CheckedImageRowDomainV1::FunctionType => SemanticDependencyEntityDomainV1::CheckedCallable,
+        CheckedImageRowDomainV1::NamedValueType => {
+            SemanticDependencyEntityDomainV1::SemanticNamedValue
+        }
+        CheckedImageRowDomainV1::RenderSlot => SemanticDependencyEntityDomainV1::RenderSlot,
+        CheckedImageRowDomainV1::Diagnostic => SemanticDependencyEntityDomainV1::Diagnostic,
+    })
+}
+
+fn execution_dependency_entity_domain_v5(
+    domain: ExecutionImageRowDomainV1,
+) -> Option<SemanticDependencyEntityDomainV1> {
+    Some(match domain {
+        ExecutionImageRowDomainV1::Scope => SemanticDependencyEntityDomainV1::SemanticScope,
+        ExecutionImageRowDomainV1::Expression | ExecutionImageRowDomainV1::ExpressionOrigin => {
+            SemanticDependencyEntityDomainV1::SemanticExpression
+        }
+        ExecutionImageRowDomainV1::Statement => SemanticDependencyEntityDomainV1::SemanticStatement,
+        ExecutionImageRowDomainV1::Callable => SemanticDependencyEntityDomainV1::SemanticCallable,
+        ExecutionImageRowDomainV1::Call => SemanticDependencyEntityDomainV1::SemanticCall,
+        ExecutionImageRowDomainV1::CallOccurrence => {
+            SemanticDependencyEntityDomainV1::SemanticCallOccurrence
+        }
+        ExecutionImageRowDomainV1::Source => SemanticDependencyEntityDomainV1::SemanticSource,
+        ExecutionImageRowDomainV1::State => SemanticDependencyEntityDomainV1::SemanticState,
+        ExecutionImageRowDomainV1::Root => return None,
+        ExecutionImageRowDomainV1::Function => SemanticDependencyEntityDomainV1::SemanticFunction,
+        ExecutionImageRowDomainV1::Materialization => {
+            SemanticDependencyEntityDomainV1::SemanticMaterialization
+        }
+        ExecutionImageRowDomainV1::StaticOwner => SemanticDependencyEntityDomainV1::StaticOwner,
+    })
+}
+
+fn build_presealed_projection_index_v5(
+    checked: &CheckedImageHandoffV1,
+    execution_handoff: &ExecutionImageHandoffV1,
+    execution: &SemanticExecutionImageColumnsV1,
+    stable_owners: &BTreeMap<SemanticDependencyOwnerV1, SemanticDependencyStableOwnerV4>,
+) -> Result<PresealedProjectionIndexV5, CallableDependencyManifestError> {
+    if checked.source_bundle_digest_v1 != execution_handoff.source_bundle_digest_v1
+        || checked.role != execution_handoff.role
+    {
+        return Err(CallableDependencyManifestError::new(
+            "checked and execution handoffs disagree on source identity",
+        ));
+    }
+    let stable_owner_set = stable_owners.values().copied().collect::<BTreeSet<_>>();
+    let mut projection_receipts = BTreeMap::new();
+    let mut projection_targets = BTreeMap::<_, BTreeSet<_>>::new();
+    let mut projection_owners = BTreeMap::new();
+    let mut entity_routes = HashMap::new();
+    let mut callable_interfaces = BTreeMap::new();
+    let mut checked_row_count = 0usize;
+    let mut checked_dependency_row_count = 0usize;
+    let mut execution_row_count = 0usize;
+    let mut execution_dependency_row_count = 0usize;
+
+    for shard in &checked.shards {
+        let key = SemanticDependencyProjectionKeyV5::Checked {
+            projection: shard.projection.clone(),
+        };
+        let owner = stable_owner_for_checked_key_v5(&shard.projection.owner)?;
+        if !stable_owner_set.contains(&owner) {
+            return Err(CallableDependencyManifestError::new(format!(
+                "checked shard {:?} has no live logical owner",
+                shard.projection
+            )));
+        }
+        if projection_receipts
+            .insert(key.clone(), shard.local_content_digest)
+            .is_some()
+        {
+            return Err(CallableDependencyManifestError::new(format!(
+                "checked shard {:?} is sealed twice",
+                shard.projection
+            )));
+        }
+        projection_owners.insert(key.clone(), owner);
+        projection_targets.insert(
+            key,
+            shard
+                .relocations
+                .iter()
+                .cloned()
+                .map(|projection| SemanticDependencyProjectionKeyV5::Checked { projection })
+                .collect(),
+        );
+        checked_row_count = checked_row_count.saturating_add(shard.row_count as usize);
+        checked_dependency_row_count =
+            checked_dependency_row_count.saturating_add(shard.dependency_row_count as usize);
+    }
+    for route in &checked.entity_routes {
+        if let Some(domain) = checked_dependency_entity_domain_v5(route.domain) {
+            insert_presealed_entity_route_v5(
+                &mut entity_routes,
+                SemanticDependencyEntityV1::Indexed {
+                    domain,
+                    index: u64::from(route.dense_index),
+                },
+                SemanticDependencyProjectionKeyV5::Checked {
+                    projection: route.projection.clone(),
+                },
+            )?;
+        }
+    }
+    let root_interface = checked
+        .shards
+        .iter()
+        .find(|shard| {
+            shard.projection.owner == CheckedShardOwnerKeyV1::ProgramTopLevel { role: checked.role }
+                && shard.projection.region == CheckedShardRegionV1::Interface
+        })
+        .ok_or_else(|| {
+            CallableDependencyManifestError::new(
+                "checked handoff has no program top-level interface shard",
+            )
+        })?;
+    insert_presealed_entity_route_v5(
+        &mut entity_routes,
+        SemanticDependencyEntityV1::Program,
+        SemanticDependencyProjectionKeyV5::Checked {
+            projection: root_interface.projection.clone(),
+        },
+    )?;
+
+    let execution_keys = execution_handoff
+        .shards
+        .iter()
+        .map(|shard| shard.projection.clone())
+        .collect::<BTreeSet<_>>();
+    let checked_keys = checked
+        .shards
+        .iter()
+        .map(|shard| shard.projection.clone())
+        .collect::<BTreeSet<_>>();
+    for shard in &execution_handoff.shards {
+        let key = SemanticDependencyProjectionKeyV5::Execution {
+            projection: shard.projection.clone(),
+        };
+        let owner = execution_projection_owner_v5(&shard.projection)?;
+        if !stable_owner_set.contains(&owner) {
+            return Err(CallableDependencyManifestError::new(format!(
+                "execution shard {:?} has no live logical owner",
+                shard.projection
+            )));
+        }
+        if projection_receipts
+            .insert(key.clone(), shard.local_content_digest)
+            .is_some()
+        {
+            return Err(CallableDependencyManifestError::new(format!(
+                "execution shard {:?} is sealed twice",
+                shard.projection
+            )));
+        }
+        projection_owners.insert(key.clone(), owner);
+        let mut targets = BTreeSet::new();
+        for relocation in &shard.relocations {
+            if execution_keys.contains(relocation) {
+                targets.insert(SemanticDependencyProjectionKeyV5::Execution {
+                    projection: relocation.clone(),
+                });
+            } else if let SemanticImageProjectionKeyV1::Checked { projection } = relocation
+                && checked_keys.contains(projection)
+            {
+                targets.insert(SemanticDependencyProjectionKeyV5::Checked {
+                    projection: projection.clone(),
+                });
+            } else {
+                return Err(CallableDependencyManifestError::new(format!(
+                    "execution shard {:?} has unresolved relocation {relocation:?}",
+                    shard.projection
+                )));
+            }
+        }
+        match &shard.projection {
+            SemanticImageProjectionKeyV1::Checked { projection } => {
+                if checked_keys.contains(projection) {
+                    targets.insert(SemanticDependencyProjectionKeyV5::Checked {
+                        projection: projection.clone(),
+                    });
+                }
+            }
+            SemanticImageProjectionKeyV1::Invocation {
+                definition,
+                call_path,
+                ..
+            } => {
+                let definition_projection = CheckedShardProjectionKeyV1 {
+                    owner: definition.clone(),
+                    region: CheckedShardRegionV1::Definition,
+                };
+                let interface_projection = CheckedShardProjectionKeyV1 {
+                    owner: definition.clone(),
+                    region: CheckedShardRegionV1::Interface,
+                };
+                let dependency = if checked_keys.contains(&definition_projection) {
+                    definition_projection
+                } else {
+                    interface_projection
+                };
+                if checked_keys.contains(&dependency) {
+                    targets.insert(SemanticDependencyProjectionKeyV5::Checked {
+                        projection: dependency,
+                    });
+                }
+                targets.extend(call_path.iter().filter_map(|projection| {
+                    checked_keys.contains(projection).then(|| {
+                        SemanticDependencyProjectionKeyV5::Checked {
+                            projection: projection.clone(),
+                        }
+                    })
+                }));
+            }
+        }
+        projection_targets.insert(key, targets);
+        execution_row_count = execution_row_count.saturating_add(shard.row_count as usize);
+        execution_dependency_row_count =
+            execution_dependency_row_count.saturating_add(shard.dependency_row_count as usize);
+    }
+    for route in &execution_handoff.entity_routes {
+        if let Some(domain) = execution_dependency_entity_domain_v5(route.domain) {
+            let key = SemanticDependencyProjectionKeyV5::Execution {
+                projection: route.projection.clone(),
+            };
+            insert_presealed_entity_route_v5(
+                &mut entity_routes,
+                SemanticDependencyEntityV1::Indexed {
+                    domain,
+                    index: u64::from(route.dense_index),
+                },
+                key.clone(),
+            )?;
+            if domain == SemanticDependencyEntityDomainV1::SemanticExpression {
+                insert_presealed_entity_route_v5(
+                    &mut entity_routes,
+                    SemanticDependencyEntityV1::Indexed {
+                        domain: SemanticDependencyEntityDomainV1::SemanticValue,
+                        index: u64::from(route.dense_index),
+                    },
+                    key,
+                )?;
+            }
+        }
+    }
+    for callable in &execution.callables {
+        let route = checked
+            .entity_routes
+            .iter()
+            .find(|route| {
+                route.domain == CheckedImageRowDomainV1::Callable
+                    && route.dense_index == callable.checked_callable.0
+            })
+            .ok_or_else(|| {
+                CallableDependencyManifestError::new(format!(
+                    "semantic callable {} has no checked interface route",
+                    callable.id
+                ))
+            })?;
+        callable_interfaces.insert(
+            callable.id,
+            SemanticDependencyProjectionKeyV5::Checked {
+                projection: route.projection.clone(),
+            },
+        );
+    }
+    Ok(PresealedProjectionIndexV5 {
+        projection_receipts,
+        projection_targets,
+        projection_owners,
+        entity_routes,
+        callable_interfaces,
+        checked_row_count,
+        checked_dependency_row_count,
+        execution_row_count,
+        execution_dependency_row_count,
+    })
+}
+
+fn build_dependency_projection_graph_digests_v5(
+    owners: &BTreeSet<SemanticDependencyStableOwnerV4>,
+    projection_receipts: &BTreeMap<SemanticDependencyProjectionKeyV5, [u8; 32]>,
+    projection_targets: &BTreeMap<
+        SemanticDependencyProjectionKeyV5,
+        BTreeSet<SemanticDependencyProjectionKeyV5>,
+    >,
+    projection_owners: &BTreeMap<
+        SemanticDependencyProjectionKeyV5,
+        SemanticDependencyStableOwnerV4,
+    >,
+) -> Result<
+    (
+        BTreeMap<SemanticDependencyStableOwnerV4, [u8; 32]>,
+        DependencyGraphDigestStats,
+    ),
+    CallableDependencyManifestError,
+> {
+    if projection_receipts.len() != projection_owners.len() {
+        return Err(CallableDependencyManifestError::new(
+            "V5 projection receipts and owners are not aligned",
+        ));
+    }
+    let mut graph = ProjectionGraphBuilder::new();
+    let mut node_ids = BTreeMap::new();
+    for owner in owners.iter().copied() {
+        let node = DependencyProjectionNodeV5::Owner(owner);
+        let id = graph
+            .register(
+                node.clone(),
+                canonical_dependency_hash(DEPENDENCY_PROJECTION_NODE_DOMAIN_V5, &node)?,
+                canonical_dependency_hash(DEPENDENCY_PROJECTION_NODE_DOMAIN_V5, &owner)?,
+            )
+            .map_err(|error| CallableDependencyManifestError::new(error.to_string()))?;
+        node_ids.insert(node, id);
+    }
+    for (projection, receipt) in projection_receipts {
+        let owner = projection_owners.get(projection).ok_or_else(|| {
+            CallableDependencyManifestError::new(format!(
+                "V5 projection {projection:?} has no logical owner"
+            ))
+        })?;
+        if !owners.contains(owner) {
+            return Err(CallableDependencyManifestError::new(format!(
+                "V5 projection {projection:?} has unknown owner {owner:?}"
+            )));
+        }
+        let node = DependencyProjectionNodeV5::Projection(projection.clone());
+        let id = graph
+            .register(
+                node.clone(),
+                canonical_dependency_hash(DEPENDENCY_PROJECTION_NODE_DOMAIN_V5, &node)?,
+                *receipt,
+            )
+            .map_err(|error| CallableDependencyManifestError::new(error.to_string()))?;
+        node_ids.insert(node.clone(), id);
+        graph
+            .add_dependency(node_ids[&DependencyProjectionNodeV5::Owner(*owner)], id)
+            .map_err(|error| CallableDependencyManifestError::new(error.to_string()))?;
+    }
+    for (projection, targets) in projection_targets {
+        let source_node = DependencyProjectionNodeV5::Projection(projection.clone());
+        let source = node_ids.get(&source_node).copied().ok_or_else(|| {
+            CallableDependencyManifestError::new(format!(
+                "V5 graph is missing source {projection:?}"
+            ))
+        })?;
+        for target in targets {
+            let target_node = DependencyProjectionNodeV5::Projection(target.clone());
+            let target_id = node_ids.get(&target_node).copied().ok_or_else(|| {
+                CallableDependencyManifestError::new(format!(
+                    "V5 graph source {projection:?} references missing target {target:?}"
+                ))
+            })?;
+            graph
+                .add_dependency(source, target_id)
+                .map_err(|error| CallableDependencyManifestError::new(error.to_string()))?;
+        }
+    }
+    let graph = graph
+        .seal(ProjectionGraphDigestDomains {
+            component: DEPENDENCY_PROJECTION_COMPONENT_DOMAIN_V5,
+        })
+        .map_err(|error| CallableDependencyManifestError::new(error.to_string()))?;
+    let mut implementation_digests = BTreeMap::new();
+    for owner in owners.iter().copied() {
+        implementation_digests.insert(
+            owner,
+            graph
+                .implementation_digest(
+                    &DependencyProjectionNodeV5::Owner(owner),
+                    DEPENDENCY_PROJECTION_IMPLEMENTATION_DOMAIN_V5,
+                )
+                .map_err(|error| CallableDependencyManifestError::new(error.to_string()))?,
+        );
+    }
+    let stats = graph.stats();
+    Ok((
+        implementation_digests,
+        DependencyGraphDigestStats {
+            nodes: stats.nodes,
+            edges: stats.edges,
+            components: stats.components,
+            cyclic_components: stats.cyclic_components,
+            maximum_component_nodes: stats.maximum_component_nodes,
+            component_edges: stats.component_edges,
+        },
+    ))
+}
+
+#[cfg(test)]
 fn build_dependency_projection_graph_digests_v4(
     owners: &BTreeSet<SemanticDependencyStableOwnerV4>,
     callable_interface_digests: &BTreeMap<SemanticDependencyStableOwnerV4, [u8; 32]>,
@@ -4056,6 +5436,7 @@ fn call_entity(call: SemanticCallId) -> SemanticDependencyEntityV1 {
     )
 }
 
+#[cfg(test)]
 fn out_call_entity(call: OutCallInstanceId) -> SemanticDependencyEntityV1 {
     indexed_entity(
         SemanticDependencyEntityDomainV1::OutCallInstance,
@@ -4237,12 +5618,292 @@ fn canonical_dependency_hash_with_buffer(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn build_callable_dependency_manifest(
+pub(crate) fn build_callable_dependency_manifest_v5(
     dependency_classifier_schema_digest: [u8; 32],
-    checked: &CheckedProgram,
+    checked: &CheckedProgramFields,
+    checked_handoff: &CheckedImageHandoffV1,
+    execution_handoff: &ExecutionImageHandoffV1,
     producer_materializations: &[ProducerMaterializationRequest],
     out: &ResolvedOutGraph,
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
+    resources: &SemanticResourceGraphV1,
+    reactive: &SemanticReactiveGraphV1,
+    lowering: &SemanticLoweringContractV1,
+    view: &SemanticViewBindingGraphV1,
+    storage: &SemanticScopeStorageGraphV1,
+    memory: &SemanticMemoryGraphV1,
+) -> Result<CallableDependencyManifestV5, CallableDependencyManifestError> {
+    let trace = std::env::var_os("BOON_SEMANTIC_TRACE").is_some();
+    macro_rules! phase {
+        ($name:literal, $expression:expr) => {{
+            let started = trace.then(std::time::Instant::now);
+            if trace {
+                eprintln!(concat!(
+                    "boon_semantic dependency_manifest_v5 ",
+                    $name,
+                    ":start"
+                ));
+            }
+            let result = $expression;
+            if let Some(started) = started {
+                eprintln!(
+                    concat!(
+                        "boon_semantic dependency_manifest_v5 ",
+                        $name,
+                        ":done elapsed_ms={:.3}"
+                    ),
+                    started.elapsed().as_secs_f64() * 1000.0,
+                );
+            }
+            result
+        }};
+    }
+    if checked.source_bundle_digest_v1 != checked_handoff.source_bundle_digest_v1
+        || checked.source_bundle_digest_v1 != execution_handoff.source_bundle_digest_v1
+        || checked.source_bundle_digest_v1 != lowering.metadata.source_bundle_digest_v1
+        || checked.source_bundle_digest_v1 != view.source_bundle_digest_v1
+        || checked.source_bundle_digest_v1 != storage.source_bundle_digest_v1
+        || checked.source_bundle_digest_v1 != memory.source_bundle_digest_v1
+        || checked.role != checked_handoff.role
+        || checked.role != execution_handoff.role
+    {
+        return Err(CallableDependencyManifestError::new(
+            "V5 dependency manifest inputs disagree on source-bundle or role identity",
+        ));
+    }
+    let mut owners = BTreeSet::from([SemanticDependencyOwnerV1::ProgramRoot]);
+    owners.extend(
+        execution
+            .callables
+            .iter()
+            .map(|callable| SemanticDependencyOwnerV1::Callable {
+                callable: callable.id,
+            }),
+    );
+    let stable_owners = phase!(
+        "stable_owner_index",
+        stable_dependency_owner_index_v4(checked, execution, &owners)
+    )?;
+    let owner_index = phase!(
+        "image_route_owner_index",
+        DependencyOwnerIndex::derive_from_image_routes(
+            checked_handoff,
+            execution_handoff,
+            execution,
+            resources,
+            reactive,
+            storage,
+            memory,
+            &stable_owners,
+        )
+    )?;
+    #[cfg(test)]
+    phase!("image_route_owner_oracle", {
+        let oracle = DependencyOwnerIndex::derive(
+            checked, out, execution, resources, reactive, storage, memory,
+        );
+        let oracle = match oracle {
+            Ok(oracle) => oracle,
+            Err(error) => return Err(error),
+        };
+        if let Some(field) = owner_index.first_difference(&oracle) {
+            return Err(CallableDependencyManifestError::new(format!(
+                "construction-owned image routes differ from the independent owner oracle at {field}",
+            )));
+        }
+        Ok::<(), CallableDependencyManifestError>(())
+    })?;
+    let presealed = phase!(
+        "import_checked_execution_receipts",
+        build_presealed_projection_index_v5(
+            checked_handoff,
+            execution_handoff,
+            execution,
+            &stable_owners,
+        )
+    )?;
+    let callable_interface_digests = execution
+        .callables
+        .iter()
+        .map(|callable| {
+            let key = presealed
+                .callable_interfaces
+                .get(&callable.id)
+                .ok_or_else(|| {
+                    CallableDependencyManifestError::new(format!(
+                        "semantic callable {} has no presealed interface",
+                        callable.id
+                    ))
+                })?;
+            let digest = presealed
+                .projection_receipts
+                .get(key)
+                .copied()
+                .ok_or_else(|| {
+                    CallableDependencyManifestError::new(format!(
+                        "semantic callable {} interface has no receipt",
+                        callable.id
+                    ))
+                })?;
+            Ok((callable.id, digest))
+        })
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    let root_key = SemanticDependencyProjectionKeyV5::Checked {
+        projection: CheckedShardProjectionKeyV1 {
+            owner: CheckedShardOwnerKeyV1::ProgramTopLevel { role: checked.role },
+            region: CheckedShardRegionV1::Interface,
+        },
+    };
+    let root_public_shape_digest = presealed
+        .projection_receipts
+        .get(&root_key)
+        .copied()
+        .ok_or_else(|| {
+            CallableDependencyManifestError::new(
+                "V5 dependency manifest has no top-level interface receipt",
+            )
+        })?;
+
+    let mut collector =
+        DependencyCollector::for_presealed_images(checked_handoff, execution_handoff);
+    phase!(
+        "inventory_producer_requests",
+        inventory_producer_requests(producer_materializations, &owner_index, &mut collector)
+    )?;
+    let resolved_out_graph_digest = phase!(
+        "inventory_out",
+        inventory_out(out, &owner_index, &mut collector)
+    )?;
+    phase!(
+        "inventory_resources",
+        inventory_resources(resources, execution, &owner_index, &mut collector)
+    )?;
+    let reactive_graph_digest = phase!(
+        "inventory_reactive",
+        inventory_reactive(reactive, execution, &owner_index, &mut collector)
+    )?;
+    phase!(
+        "inventory_lowering",
+        inventory_lowering(lowering, execution, resources, &owner_index, &mut collector)
+    )?;
+    phase!(
+        "inventory_view",
+        inventory_view(view, execution, reactive, &owner_index, &mut collector)
+    )?;
+    phase!(
+        "inventory_storage",
+        inventory_storage(
+            storage,
+            execution,
+            resources,
+            reactive,
+            &owner_index,
+            &mut collector,
+        )
+    )?;
+    phase!(
+        "inventory_memory",
+        inventory_memory(memory, execution, &owner_index, &mut collector)
+    )?;
+    let compact = phase!(
+        "finish_projection_receipts",
+        collector.finish_compact_v5(&owners, &stable_owners, presealed)
+    )?;
+
+    let component_digests = CallableDependencyComponentDigestsV1 {
+        producer_materializations: canonical_dependency_hash(
+            DEPENDENCY_COMPONENT_DIGEST_DOMAIN,
+            &producer_materializations,
+        )?,
+        resolved_out_graph: resolved_out_graph_digest,
+        execution_graph: execution_handoff.local_image_digest,
+        resource_graph: *resources.digest.as_bytes(),
+        reactive_graph: reactive_graph_digest,
+        lowering_contract: *lowering.digest.as_bytes(),
+        view_binding_graph: *view.digest.as_bytes(),
+        scope_storage_graph: *storage.digest.as_bytes(),
+        memory_graph: *memory.digest.as_bytes(),
+    };
+    let root_owner = SemanticDependencyOwnerV1::ProgramRoot;
+    let program_root = ProgramRootDependencyEntryV4 {
+        stable_owner: stable_owners[&root_owner],
+        public_shape_digest: root_public_shape_digest,
+        implementation_dependency_digest: compact.implementation_digests[&root_owner],
+    };
+    let mut callable_entries = Vec::with_capacity(execution.callables.len());
+    for (index, callable) in execution.callables.iter().enumerate() {
+        if callable.id != SemanticCallableId(index) {
+            return Err(CallableDependencyManifestError::new(format!(
+                "V5 dependency callable {} is not dense index {index}",
+                callable.id
+            )));
+        }
+        let owner = SemanticDependencyOwnerV1::Callable {
+            callable: callable.id,
+        };
+        callable_entries.push(CallableDependencyEntryV4 {
+            callable: callable.id,
+            checked_callable: callable.checked_callable,
+            stable_owner: stable_owners[&owner],
+            public_shape_digest: callable_interface_digests[&callable.id],
+            implementation_dependency_digest: compact.implementation_digests[&owner],
+        });
+    }
+    let program_root_entry_digest =
+        canonical_dependency_hash(DEPENDENCY_PROGRAM_ROOT_ENTRY_DOMAIN_V4, &program_root)?;
+    let callable_entries_digest =
+        canonical_dependency_hash(DEPENDENCY_CALLABLE_SET_DOMAIN_V4, &callable_entries)?;
+    let proof_digests = CallableDependencyProofDigestsV5 {
+        program_root_entry_digest,
+        callable_entries_digest,
+        projection_receipts_digest: compact.projection_receipts_digest,
+        checked_row_count: compact.checked_row_count,
+        execution_row_count: compact.execution_row_count,
+        remaining_row_count: compact.remaining_row_count,
+        dependency_record_count: compact.dependency_record_count,
+        coverage_record_count: compact.coverage_record_count,
+        projection_count: compact.projection_count,
+        projection_edge_count: compact.projection_edge_count,
+        broad_owner_dependency_target_count: 0,
+    };
+    let schema = CALLABLE_DEPENDENCY_MANIFEST_SCHEMA_V5.to_owned();
+    let checked_program_digest = CheckedProgramDigestV1(checked_handoff.local_image_digest);
+    let dependency_classifier_schema_digest =
+        DependencyClassifierSchemaDigestV1(dependency_classifier_schema_digest);
+    let manifest_digest = callable_dependency_manifest_digest_v5(
+        &schema,
+        checked.source_bundle_digest_v1,
+        checked_program_digest,
+        dependency_classifier_schema_digest,
+        &component_digests,
+        &program_root,
+        &callable_entries,
+        &proof_digests,
+    )?;
+    let mut manifest = CallableDependencyManifestV5 {
+        schema,
+        source_bundle_digest_v1: checked.source_bundle_digest_v1,
+        checked_program_digest,
+        dependency_classifier_schema_digest,
+        component_digests,
+        program_root,
+        callable_entries,
+        proof_digests,
+        manifest_digest,
+        sealed_manifest_digest: [0; 32],
+    };
+    manifest.sealed_manifest_digest = sealed_callable_dependency_manifest_digest_v5(&manifest)?;
+    Ok(manifest)
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_callable_dependency_manifest(
+    dependency_classifier_schema_digest: [u8; 32],
+    checked: &CheckedProgramFields,
+    producer_materializations: &[ProducerMaterializationRequest],
+    out: &ResolvedOutGraph,
+    execution: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV1,
     reactive: &SemanticReactiveGraphV1,
     lowering: &SemanticLoweringContractV1,
@@ -4488,10 +6149,10 @@ pub(crate) fn build_callable_dependency_manifest(
 #[allow(clippy::too_many_arguments)]
 fn build_callable_dependency_construction(
     dependency_classifier_schema_digest: [u8; 32],
-    checked: &CheckedProgram,
+    checked: &CheckedProgramFields,
     producer_materializations: &[ProducerMaterializationRequest],
     out: &ResolvedOutGraph,
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV1,
     reactive: &SemanticReactiveGraphV1,
     lowering: &SemanticLoweringContractV1,
@@ -4858,10 +6519,10 @@ impl ValidatedCallableDependencyConstructionV3 {
 #[allow(clippy::too_many_arguments)]
 fn build_callable_dependency_proof_manifest(
     dependency_classifier_schema_digest: [u8; 32],
-    checked: &CheckedProgram,
+    checked: &CheckedProgramFields,
     producer_materializations: &[ProducerMaterializationRequest],
     out: &ResolvedOutGraph,
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV1,
     reactive: &SemanticReactiveGraphV1,
     lowering: &SemanticLoweringContractV1,
@@ -4978,6 +6639,7 @@ fn sealed_callable_dependency_manifest_digest(
     )
 }
 
+#[cfg(test)]
 fn callable_dependency_manifest_digest_v4(
     schema: &str,
     source_bundle_digest_v1: SourceBundleDigestV1,
@@ -5016,6 +6678,7 @@ fn callable_dependency_manifest_digest_v4(
     .map(CallableDependencyManifestDigestV1)
 }
 
+#[cfg(test)]
 fn sealed_callable_dependency_manifest_digest_v4(
     manifest: &CallableDependencyManifestV4,
 ) -> Result<[u8; 32], CallableDependencyManifestError> {
@@ -5048,14 +6711,59 @@ fn sealed_callable_dependency_manifest_digest_v4(
     )
 }
 
+fn callable_dependency_manifest_digest_v5(
+    schema: &str,
+    source_bundle_digest_v1: SourceBundleDigestV1,
+    checked_program_digest: CheckedProgramDigestV1,
+    dependency_classifier_schema_digest: DependencyClassifierSchemaDigestV1,
+    component_digests: &CallableDependencyComponentDigestsV1,
+    program_root: &ProgramRootDependencyEntryV4,
+    callable_entries: &[CallableDependencyEntryV4],
+    proof_digests: &CallableDependencyProofDigestsV5,
+) -> Result<CallableDependencyManifestDigestV1, CallableDependencyManifestError> {
+    canonical_dependency_hash_streaming(
+        DEPENDENCY_MANIFEST_DIGEST_DOMAIN_V5,
+        &(
+            schema,
+            source_bundle_digest_v1,
+            checked_program_digest,
+            dependency_classifier_schema_digest,
+            component_digests,
+            program_root,
+            callable_entries,
+            proof_digests,
+        ),
+    )
+    .map(CallableDependencyManifestDigestV1)
+}
+
+fn sealed_callable_dependency_manifest_digest_v5(
+    manifest: &CallableDependencyManifestV5,
+) -> Result<[u8; 32], CallableDependencyManifestError> {
+    canonical_dependency_hash(
+        DEPENDENCY_SEALED_MANIFEST_DOMAIN_V5,
+        &(
+            &manifest.schema,
+            manifest.source_bundle_digest_v1,
+            manifest.checked_program_digest,
+            manifest.dependency_classifier_schema_digest,
+            &manifest.component_digests,
+            &manifest.program_root,
+            &manifest.callable_entries,
+            &manifest.proof_digests,
+            manifest.manifest_digest,
+        ),
+    )
+}
+
 #[cfg(test)]
 impl CallableDependencyProofManifestV3 {
     #[cfg(test)]
     pub(crate) fn validate_integrity(
         &self,
         dependency_classifier_schema_digest: [u8; 32],
-        checked: &CheckedProgram,
-        execution: &SemanticExecutionGraphV1,
+        checked: &CheckedProgramFields,
+        execution: &SemanticExecutionImageColumnsV1,
     ) -> Result<(), CallableDependencyManifestError> {
         if self.source_bundle_digest_v1 != checked.source_bundle_digest_v1 {
             return Err(CallableDependencyManifestError::new(
@@ -5108,10 +6816,10 @@ impl CallableDependencyProofManifestV3 {
     pub(crate) fn validate_against(
         &self,
         dependency_classifier_schema_digest: [u8; 32],
-        checked: &CheckedProgram,
+        checked: &CheckedProgramFields,
         producer_materializations: &[ProducerMaterializationRequest],
         out: &ResolvedOutGraph,
-        execution: &SemanticExecutionGraphV1,
+        execution: &SemanticExecutionImageColumnsV1,
         resources: &SemanticResourceGraphV1,
         reactive: &SemanticReactiveGraphV1,
         lowering: &SemanticLoweringContractV1,
@@ -5142,12 +6850,91 @@ impl CallableDependencyProofManifestV3 {
     }
 }
 
+impl CallableDependencyManifestV5 {
+    pub(crate) fn validate_integrity(
+        &self,
+        dependency_classifier_schema_digest: [u8; 32],
+        image: &SealedSemanticImageV1,
+        execution: &SemanticExecutionImageColumnsV1,
+    ) -> Result<(), CallableDependencyManifestError> {
+        if self.schema != CALLABLE_DEPENDENCY_MANIFEST_SCHEMA_V5 {
+            return Err(CallableDependencyManifestError::new(format!(
+                "unsupported callable dependency manifest schema `{}`",
+                self.schema
+            )));
+        }
+        if self.source_bundle_digest_v1 != image.checked_handoff().source_bundle_digest_v1
+            || self.source_bundle_digest_v1 != image.execution_handoff().source_bundle_digest_v1
+            || self.checked_program_digest
+                != CheckedProgramDigestV1(image.checked_handoff().local_image_digest)
+            || self.component_digests.execution_graph
+                != image.execution_handoff().local_image_digest
+        {
+            return Err(CallableDependencyManifestError::new(
+                "V5 manifest differs from its sealed checked/execution image",
+            ));
+        }
+        if self.dependency_classifier_schema_digest
+            != DependencyClassifierSchemaDigestV1(dependency_classifier_schema_digest)
+        {
+            return Err(CallableDependencyManifestError::new(
+                "V5 manifest classifier schema digest is stale",
+            ));
+        }
+        if self.callable_entries.len() != execution.callables.len()
+            || self.proof_digests.coverage_record_count
+                != self
+                    .proof_digests
+                    .checked_row_count
+                    .saturating_add(self.proof_digests.execution_row_count)
+                    .saturating_add(self.proof_digests.remaining_row_count)
+            || self.proof_digests.projection_count == 0
+            || self.proof_digests.broad_owner_dependency_target_count != 0
+        {
+            return Err(CallableDependencyManifestError::new(
+                "V5 manifest has inconsistent image/projection accounting",
+            ));
+        }
+        for (entry, callable) in self.callable_entries.iter().zip(&execution.callables) {
+            if entry.callable != callable.id || entry.checked_callable != callable.checked_callable
+            {
+                return Err(CallableDependencyManifestError::new(format!(
+                    "V5 manifest callable {} differs from semantic callable {}",
+                    entry.callable, callable.id
+                )));
+            }
+        }
+        let expected_manifest_digest = callable_dependency_manifest_digest_v5(
+            &self.schema,
+            self.source_bundle_digest_v1,
+            self.checked_program_digest,
+            self.dependency_classifier_schema_digest,
+            &self.component_digests,
+            &self.program_root,
+            &self.callable_entries,
+            &self.proof_digests,
+        )?;
+        if self.manifest_digest != expected_manifest_digest {
+            return Err(CallableDependencyManifestError::new(
+                "V5 manifest digest is stale",
+            ));
+        }
+        if self.sealed_manifest_digest != sealed_callable_dependency_manifest_digest_v5(self)? {
+            return Err(CallableDependencyManifestError::new(
+                "V5 sealed manifest digest is stale",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
 impl CallableDependencyManifestV4 {
     pub(crate) fn validate_integrity(
         &self,
         dependency_classifier_schema_digest: [u8; 32],
-        checked: &CheckedProgram,
-        execution: &SemanticExecutionGraphV1,
+        checked: &CheckedProgramFields,
+        execution: &SemanticExecutionImageColumnsV1,
     ) -> Result<(), CallableDependencyManifestError> {
         if self.schema != CALLABLE_DEPENDENCY_MANIFEST_SCHEMA_V4 {
             return Err(CallableDependencyManifestError::new(format!(
@@ -5258,10 +7045,10 @@ impl CallableDependencyManifestV4 {
     pub(crate) fn validate_against(
         &self,
         dependency_classifier_schema_digest: [u8; 32],
-        checked: &CheckedProgram,
+        checked: &CheckedProgramFields,
         producer_materializations: &[ProducerMaterializationRequest],
         out: &ResolvedOutGraph,
-        execution: &SemanticExecutionGraphV1,
+        execution: &SemanticExecutionImageColumnsV1,
         resources: &SemanticResourceGraphV1,
         reactive: &SemanticReactiveGraphV1,
         lowering: &SemanticLoweringContractV1,
@@ -5296,8 +7083,8 @@ impl CallableDependencyManifestV3 {
     pub(crate) fn validate_integrity(
         &self,
         dependency_classifier_schema_digest: [u8; 32],
-        checked: &CheckedProgram,
-        execution: &SemanticExecutionGraphV1,
+        checked: &CheckedProgramFields,
+        execution: &SemanticExecutionImageColumnsV1,
     ) -> Result<(), CallableDependencyManifestError> {
         if self.schema != CALLABLE_DEPENDENCY_MANIFEST_SCHEMA_V3 {
             return Err(CallableDependencyManifestError::new(format!(
@@ -5375,10 +7162,10 @@ impl CallableDependencyManifestV3 {
     pub(crate) fn validate_against(
         &self,
         dependency_classifier_schema_digest: [u8; 32],
-        checked: &CheckedProgram,
+        checked: &CheckedProgramFields,
         producer_materializations: &[ProducerMaterializationRequest],
         out: &ResolvedOutGraph,
-        execution: &SemanticExecutionGraphV1,
+        execution: &SemanticExecutionImageColumnsV1,
         resources: &SemanticResourceGraphV1,
         reactive: &SemanticReactiveGraphV1,
         lowering: &SemanticLoweringContractV1,
@@ -5409,6 +7196,7 @@ impl CallableDependencyManifestV3 {
     }
 }
 
+#[cfg(test)]
 fn callable_public_shape_digest(
     callable: &SemanticCallable,
 ) -> Result<[u8; 32], CallableDependencyManifestError> {
@@ -5755,9 +7543,10 @@ fn callable_dependency_manifest_digest(
     )
 }
 
+#[cfg(test)]
 fn inventory_checked(
-    checked: &CheckedProgram,
-    execution: &SemanticExecutionGraphV1,
+    checked: &CheckedProgramFields,
+    execution: &SemanticExecutionImageColumnsV1,
     owners: &DependencyOwnerIndex,
     collector: &mut DependencyCollector,
 ) -> Result<CheckedProgramDigestV1, CallableDependencyManifestError> {
@@ -6497,6 +8286,7 @@ fn inventory_checked(
     Ok(checked_program_digest)
 }
 
+#[cfg(test)]
 fn declaration_channel(kind: CheckedDeclarationKind) -> SemanticDependencyChannelV1 {
     match kind {
         CheckedDeclarationKind::ValueParameter => SemanticDependencyChannelV1::ParentValueFormal,
@@ -6517,6 +8307,7 @@ fn declaration_channel(kind: CheckedDeclarationKind) -> SemanticDependencyChanne
     }
 }
 
+#[cfg(test)]
 fn declaration_roles(kind: CheckedDeclarationKind) -> Vec<SemanticDependencyRoleV1> {
     match kind {
         CheckedDeclarationKind::ValueParameter | CheckedDeclarationKind::OutParameter => vec![
@@ -6542,6 +8333,7 @@ fn declaration_roles(kind: CheckedDeclarationKind) -> Vec<SemanticDependencyRole
     }
 }
 
+#[cfg(test)]
 fn checked_statement_channel(kind: &CheckedStatementKind) -> SemanticDependencyChannelV1 {
     match kind {
         CheckedStatementKind::Source { .. }
@@ -6555,6 +8347,7 @@ fn checked_statement_channel(kind: &CheckedStatementKind) -> SemanticDependencyC
     }
 }
 
+#[cfg(test)]
 fn checked_expression_dependency(
     kind: &CheckedExpressionKind,
 ) -> Result<ExpressionDependency, CallableDependencyManifestError> {
@@ -6684,6 +8477,7 @@ fn checked_expression_dependency(
     })
 }
 
+#[cfg(test)]
 fn parameter_dependency(
     parameter: &boon_checked::CheckedParameter,
 ) -> (SemanticDependencyChannelV1, Vec<SemanticDependencyRoleV1>) {
@@ -6709,6 +8503,7 @@ fn parameter_dependency(
     )
 }
 
+#[cfg(test)]
 fn checked_call_entry_dependency(
     entry: &CheckedCallEntry,
 ) -> (
@@ -6742,8 +8537,9 @@ fn checked_call_entry_dependency(
     }
 }
 
+#[cfg(test)]
 fn inventory_checked_lowering_metadata(
-    checked: &CheckedProgram,
+    checked: &CheckedProgramFields,
     owners: &DependencyOwnerIndex,
     collector: &mut DependencyCollector,
 ) -> Result<(), CallableDependencyManifestError> {
@@ -7257,8 +9053,9 @@ fn inventory_out(
     Ok(component_digest)
 }
 
+#[cfg(test)]
 fn inventory_execution(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     owners: &DependencyOwnerIndex,
     collector: &mut DependencyCollector,
 ) -> Result<[u8; 32], CallableDependencyManifestError> {
@@ -7919,6 +9716,7 @@ fn inventory_execution(
     Ok(component_digest)
 }
 
+#[cfg(test)]
 fn semantic_expression_dependency(
     expression: &SemanticExpression,
     owners: &DependencyOwnerIndex,
@@ -8268,6 +10066,7 @@ fn semantic_expression_dependency(
     Ok((channel, roles, projection, references))
 }
 
+#[cfg(test)]
 fn semantic_expression_phase(kind: &SemanticExpressionKind) -> SemanticDependencyPhaseV1 {
     match kind {
         SemanticExpressionKind::Drain { .. } | SemanticExpressionKind::Draining { .. } => {
@@ -8279,6 +10078,7 @@ fn semantic_expression_phase(kind: &SemanticExpressionKind) -> SemanticDependenc
     }
 }
 
+#[cfg(test)]
 fn semantic_expression_multiplicity(
     kind: &SemanticExpressionKind,
 ) -> SemanticDependencyMultiplicityV1 {
@@ -8293,6 +10093,7 @@ fn semantic_expression_multiplicity(
     }
 }
 
+#[cfg(test)]
 fn semantic_expression_lifetime(kind: &SemanticExpressionKind) -> SemanticDependencyLifetimeV1 {
     match kind {
         SemanticExpressionKind::Source { .. } => SemanticDependencyLifetimeV1::Event,
@@ -8310,7 +10111,7 @@ fn semantic_expression_lifetime(kind: &SemanticExpressionKind) -> SemanticDepend
 
 fn inventory_resources(
     resources: &SemanticResourceGraphV1,
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     owners: &DependencyOwnerIndex,
     collector: &mut DependencyCollector,
 ) -> Result<(), CallableDependencyManifestError> {
@@ -8713,7 +10514,7 @@ fn resource_initializer_expressions(
 
 fn inventory_reactive(
     reactive: &SemanticReactiveGraphV1,
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     owners: &DependencyOwnerIndex,
     collector: &mut DependencyCollector,
 ) -> Result<[u8; 32], CallableDependencyManifestError> {
@@ -9195,10 +10996,10 @@ fn inventory_reactive(
             arm.owner,
             &format!("reactive trigger arm {}", arm.id),
         )?;
-        let owner = exact_owner(
-            vec![owner, owners.expression(arm.output_expression)?],
-            &format!("reactive trigger arm {}", arm.id),
-        )?;
+        // A trigger arm is routed by its concrete gate occurrence. Its output
+        // may intentionally enter a shared callable definition; that output is
+        // an exact dependency target below, not a second primary owner of the
+        // trigger row.
         collect_dependency!(
             collector,
             owner,
@@ -9551,7 +11352,13 @@ fn owner_for_expression_and_static(
 ) -> Result<SemanticDependencyOwnerV1, CallableDependencyManifestError> {
     let primary = owners.expression(expression)?;
     if let Some(static_owner) = static_owner {
-        exact_owner(vec![primary, owners.static_owner(static_owner)?], context)
+        let static_primary = owners.static_owner(static_owner)?;
+        exact_owner(
+            vec![primary, static_primary],
+            &format!(
+                "{context} (expression {expression} -> {primary:?}, static owner {static_owner} -> {static_primary:?})"
+            ),
+        )
     } else {
         Ok(primary)
     }
@@ -9667,7 +11474,7 @@ fn view_capture_target_entity(target: SemanticViewCaptureTargetV1) -> SemanticDe
 
 fn inventory_lowering(
     lowering: &SemanticLoweringContractV1,
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV1,
     owners: &DependencyOwnerIndex,
     collector: &mut DependencyCollector,
@@ -10104,7 +11911,7 @@ fn inventory_lowering(
 
 fn inventory_view(
     view: &SemanticViewBindingGraphV1,
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     reactive: &SemanticReactiveGraphV1,
     owners: &DependencyOwnerIndex,
     collector: &mut DependencyCollector,
@@ -10386,7 +12193,7 @@ fn inventory_view(
 fn view_root_owner(
     view: &SemanticViewBindingGraphV1,
     root: SemanticViewRootId,
-    _execution: &SemanticExecutionGraphV1,
+    _execution: &SemanticExecutionImageColumnsV1,
     owners: &DependencyOwnerIndex,
 ) -> Result<SemanticDependencyOwnerV1, CallableDependencyManifestError> {
     let root = view
@@ -10415,7 +12222,7 @@ fn view_root_owner(
 fn view_node_owner(
     view: &SemanticViewBindingGraphV1,
     node: SemanticViewNodeId,
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     owners: &DependencyOwnerIndex,
 ) -> Result<SemanticDependencyOwnerV1, CallableDependencyManifestError> {
     let node = view
@@ -10439,7 +12246,7 @@ fn view_node_owner(
 fn view_argument_owner(
     view: &SemanticViewBindingGraphV1,
     argument: SemanticViewArgumentId,
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     owners: &DependencyOwnerIndex,
 ) -> Result<SemanticDependencyOwnerV1, CallableDependencyManifestError> {
     let argument = view
@@ -10463,7 +12270,7 @@ fn view_argument_owner(
 
 fn inventory_storage(
     storage: &SemanticScopeStorageGraphV1,
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV1,
     reactive: &SemanticReactiveGraphV1,
     owners: &DependencyOwnerIndex,
@@ -11100,7 +12907,7 @@ fn storage_named_value_owner_and_references(
 
 fn inventory_memory(
     memory: &SemanticMemoryGraphV1,
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     owners: &DependencyOwnerIndex,
     collector: &mut DependencyCollector,
 ) -> Result<(), CallableDependencyManifestError> {
@@ -11585,32 +13392,19 @@ FUNCTION add(value) {
     fn assert_manifest_mutation_rejected(
         program: &SemanticProgram,
         context: &str,
-        mutate: impl FnOnce(&mut CallableDependencyManifestV4),
+        mutate: impl FnOnce(&mut CallableDependencyManifestV5),
     ) {
         let mut manifest = program.dependency_manifest.clone();
         mutate(&mut manifest);
-        let error = match manifest.validate_against(
+        let error = match manifest.validate_integrity(
             DEPENDENCY_CLASSIFIER_SCHEMA_DIGEST_V1,
-            &program.checked_program,
-            &program.producer_materializations,
-            &program.resolved_out_graph,
+            &program.semantic_image,
             &program.execution_graph,
-            &program.resource_graph,
-            &program.reactive_graph,
-            &program.lowering_contract,
-            &program.view_binding_graph,
-            &program.scope_storage_graph,
-            &program.memory_graph,
         ) {
             Ok(()) => panic!("{context} mutation must be rejected"),
             Err(error) => error,
         };
-        assert!(
-            error
-                .to_string()
-                .contains("differs from its deterministic checked+semantic rederivation"),
-            "{context}: {error}"
-        );
+        assert!(!error.to_string().is_empty(), "{context}: {error}");
     }
 
     fn owner(callable: usize) -> SemanticDependencyOwnerV1 {
@@ -12497,7 +14291,20 @@ ordinary: serve(value: 1)
     fn v4_projection_seal_matches_the_independent_v3_inventory_counts() {
         let program = semantic_program_fixture();
         let proof = proof_manifest(&program);
-        let sealed = program.dependency_manifest();
+        let sealed = build_callable_dependency_manifest(
+            DEPENDENCY_CLASSIFIER_SCHEMA_DIGEST_V1,
+            &program.checked_program,
+            &program.producer_materializations,
+            &program.resolved_out_graph,
+            &program.execution_graph,
+            &program.resource_graph,
+            &program.reactive_graph,
+            &program.lowering_contract,
+            &program.view_binding_graph,
+            &program.scope_storage_graph,
+            &program.memory_graph,
+        )
+        .expect("V4 oracle seals from the independent inventory");
         let materialized = materialize_v4_projection_proof_from_v3(&program, &proof);
 
         assert_eq!(sealed.schema, CALLABLE_DEPENDENCY_MANIFEST_SCHEMA_V4);

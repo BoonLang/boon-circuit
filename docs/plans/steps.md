@@ -264,6 +264,22 @@ stronger three-reviewer performance closure defined below.
    checkpoint another wrapper that leaves completed-plan rewrites or executor
    metadata reconstruction alive.
 
+   That checked/execution owner-deletion boundary is now implemented and is a
+   local checkpoint prerequisite, not the step exit. `CheckedProgram` is
+   sealed once by the typechecker; `SemanticImageBuilder` owns pending/final
+   execution across the resource boundary; production `SemanticProgram` drops
+   checked/execution fields; and Manifest V5 imports their receipts while old
+   inventories remain test-only. Focused owner/manifest/NovyWave oracles and
+   the architecture gate pass. The first representation is intentionally red:
+   one optimized NovyWave sample is 5,665.819 ms/507,428 KiB, with 1,142.939 ms
+   image finalization and 18.66 million allocations. After the local commit,
+   perform a new high-level audit before more implementation. The next selected
+   tranche must eliminate recursively cloned stable projection/path keys with
+   one interned dense registry and relocation arena, then choose between
+   remaining rich-domain owner deletion and pre-expansion demand according to
+   measured whole-pipeline leverage. Do not treat map/hash micro-tuning as
+   progress on this regression.
+
    Receipt callbacks alone are too small: removing all 1,813.236 ms of manifest
    work from the 4,052.379 ms directional sample would still leave about 2.24
    seconds. Expand definition/invocation shards through OUT/resource/reactive/

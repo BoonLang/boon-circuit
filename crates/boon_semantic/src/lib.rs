@@ -9,6 +9,7 @@ mod memory_contract;
 pub mod program_core;
 mod reactive;
 mod resource;
+mod semantic_image;
 mod storage_contract;
 mod view_contract;
 
@@ -26,10 +27,13 @@ pub use out_net::{
 };
 pub use reactive::*;
 pub use resource::*;
+pub use semantic_image::*;
 pub use storage_contract::*;
 pub use view_contract::*;
 
-use boon_checked::{CheckedExternalDeclarationIdentityV1, CheckedProgram, DeclId};
+use boon_checked::{
+    CheckedExternalDeclarationIdentityV1, CheckedProgram, CheckedProgramFields, DeclId,
+};
 use boon_contract::SourceBundleDigestV1;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -39,8 +43,8 @@ use std::fmt;
 pub const SEMANTIC_PROGRAM_SCHEMA_V1: &str = "boon.semantic-program.v1";
 pub const BUNDLE_SEMANTIC_PROGRAM_SCHEMA_V1: &str = "boon.bundle-semantic-program.v1";
 pub const DEPENDENCY_CLASSIFIER_SCHEMA_DIGEST_V1: [u8; 32] = [
-    0x87, 0x13, 0xb0, 0xe2, 0xa1, 0xb5, 0xf7, 0x1f, 0x0e, 0x71, 0x71, 0xaf, 0x7a, 0xce, 0x30, 0x34,
-    0x1d, 0x0b, 0x4b, 0x4c, 0x81, 0x20, 0xd5, 0x00, 0xf9, 0xf8, 0xf6, 0x36, 0x1a, 0x24, 0x45, 0x5e,
+    0x41, 0xed, 0x0e, 0x1d, 0x47, 0xfc, 0x91, 0xeb, 0xc3, 0x26, 0x1b, 0x39, 0xe2, 0x25, 0xd7, 0x01,
+    0x49, 0x08, 0x05, 0x53, 0xb8, 0xf6, 0x65, 0x74, 0xe0, 0xcb, 0xa7, 0xe2, 0x96, 0x93, 0x78, 0xad,
 ];
 pub const MAX_BUNDLE_SEMANTIC_PRODUCER_REQUESTS_V1: usize = 4_096;
 pub const MAX_BUNDLE_SEMANTIC_PRODUCER_REQUEST_BYTES_V1: usize = 4 * 1024 * 1024;
@@ -607,18 +611,20 @@ pub fn distributed_value_occurrences(
 
 /// The single pre-backend semantic artifact.
 ///
-/// The checked graph remains encapsulated so consumers cannot reinterpret a
-/// `CheckedProgram` as executable IR. Phase 1 moves resolved OUT/contextual
-/// graphs into this crate incrementally; the whole checked graph is already
-/// digest-bound here so no dependency-bearing checked field can disappear from
-/// verification identity during that extraction.
+/// Checked and execution construction state is consumed into one sealed image.
+/// Remaining domain graphs are migrated into that image in dependency order;
+/// none may recreate or retain the rich checked program.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SemanticProgram {
     source_bundle_digest_v1: SourceBundleDigestV1,
-    checked_program: CheckedProgram,
+    role: boon_checked::ProgramRole,
+    semantic_image: SealedSemanticImageV1,
+    #[cfg(test)]
+    checked_program: CheckedProgramFields,
+    #[cfg(test)]
+    execution_graph: SemanticExecutionImageColumnsV1,
     producer_materializations: Vec<ProducerMaterializationRequest>,
     resolved_out_graph: ResolvedOutGraph,
-    execution_graph: SemanticExecutionGraphV1,
     resource_graph: SemanticResourceGraphV1,
     reactive_graph: SemanticReactiveGraphV1,
     lowering_contract: SemanticLoweringContractV1,
@@ -626,7 +632,7 @@ pub struct SemanticProgram {
     scope_storage_graph: SemanticScopeStorageGraphV1,
     memory_graph: SemanticMemoryGraphV1,
     canonical_core: program_core::CanonicalProgramCoreV1,
-    dependency_manifest: CallableDependencyManifestV4,
+    dependency_manifest: CallableDependencyManifestV5,
     digest: SemanticProgramDigestV1,
 }
 
@@ -764,7 +770,7 @@ pub struct BundleSemanticProgramV1 {
 
 impl SemanticProgram {
     pub fn role(&self) -> boon_checked::ProgramRole {
-        self.checked_program.role
+        self.role
     }
 
     pub const fn source_bundle_digest_v1(&self) -> SourceBundleDigestV1 {
@@ -775,7 +781,7 @@ impl SemanticProgram {
         self.digest
     }
 
-    pub const fn dependency_manifest(&self) -> &CallableDependencyManifestV4 {
+    pub const fn dependency_manifest(&self) -> &CallableDependencyManifestV5 {
         &self.dependency_manifest
     }
 
@@ -787,8 +793,19 @@ impl SemanticProgram {
         &self.resolved_out_graph
     }
 
-    pub const fn execution_graph(&self) -> &SemanticExecutionGraphV1 {
-        &self.execution_graph
+    pub const fn semantic_image(&self) -> &SealedSemanticImageV1 {
+        &self.semantic_image
+    }
+
+    pub const fn execution_graph(&self) -> &SemanticExecutionImageColumnsV1 {
+        #[cfg(test)]
+        {
+            &self.execution_graph
+        }
+        #[cfg(not(test))]
+        {
+            self.semantic_image.execution()
+        }
     }
 
     pub const fn resource_graph(&self) -> &SemanticResourceGraphV1 {
@@ -824,7 +841,7 @@ impl SemanticProgram {
         local_function: &str,
     ) -> Result<SemanticCallableId, SemanticError> {
         let matches = self
-            .execution_graph
+            .execution_graph()
             .callables
             .iter()
             .filter(|callable| {
@@ -843,93 +860,100 @@ impl SemanticProgram {
     }
 
     pub fn validate(&self) -> Result<(), SemanticError> {
-        if self.source_bundle_digest_v1 != self.checked_program.source_bundle_digest_v1 {
-            return Err(SemanticError::new(
-                "semantic source bundle digest does not match its checked program",
-            ));
-        }
-        validate_contextual_bindings(&self.checked_program)?;
-        validate_out_contracts(&self.checked_program, &self.resolved_out_graph)?;
-        contextual_expansion::validate_checked_callable_and_call_inventory(
-            &self.checked_program,
-            &self.execution_graph,
-        )
-        .map_err(SemanticError::new)?;
-        self.execution_graph
-            .validate_checked_roots(&self.checked_program)
+        self.semantic_image
+            .validate_identity(self.source_bundle_digest_v1, self.role)
             .map_err(SemanticError::new)?;
-        self.execution_graph
+        let execution = self.execution_graph();
+        #[cfg(test)]
+        {
+            if self.source_bundle_digest_v1 != self.checked_program.source_bundle_digest_v1 {
+                return Err(SemanticError::new(
+                    "semantic source bundle digest does not match its checked oracle",
+                ));
+            }
+            validate_contextual_bindings(&self.checked_program)?;
+            validate_out_contracts(&self.checked_program, &self.resolved_out_graph)?;
+            contextual_expansion::validate_checked_callable_and_call_inventory(
+                &self.checked_program,
+                execution,
+            )
+            .map_err(SemanticError::new)?;
+            execution
+                .validate_checked_roots(&self.checked_program)
+                .map_err(SemanticError::new)?;
+        }
+        execution
             .validate(&self.resolved_out_graph)
             .map_err(SemanticError::new)?;
         self.resource_graph
-            .validate(&self.execution_graph, &self.resolved_out_graph)
+            .validate(execution, &self.resolved_out_graph)
             .map_err(SemanticError::new)?;
         self.reactive_graph
-            .validate(
-                &self.execution_graph,
-                &self.resource_graph,
-                &self.resolved_out_graph,
-            )
+            .validate(execution, &self.resource_graph, &self.resolved_out_graph)
             .map_err(|error| SemanticError::new(error.to_string()))?;
-        self.lowering_contract
-            .validate(
-                &self.checked_program,
-                &self.execution_graph,
-                &self.resource_graph,
-                &self.reactive_graph,
-                &self.resolved_out_graph,
-            )
-            .map_err(|error| SemanticError::new(error.to_string()))?;
-        self.scope_storage_graph
-            .validate(
-                &self.checked_program,
-                &self.execution_graph,
-                &self.resource_graph,
-                &self.reactive_graph,
-                &self.lowering_contract,
-                &self.resolved_out_graph,
-            )
-            .map_err(|error| SemanticError::new(error.to_string()))?;
+        #[cfg(test)]
+        {
+            self.lowering_contract
+                .validate(
+                    &self.checked_program,
+                    execution,
+                    &self.resource_graph,
+                    &self.reactive_graph,
+                    &self.resolved_out_graph,
+                )
+                .map_err(|error| SemanticError::new(error.to_string()))?;
+            self.scope_storage_graph
+                .validate(
+                    &self.checked_program,
+                    execution,
+                    &self.resource_graph,
+                    &self.reactive_graph,
+                    &self.lowering_contract,
+                    &self.resolved_out_graph,
+                )
+                .map_err(|error| SemanticError::new(error.to_string()))?;
+        }
         self.view_binding_graph
             .validate(
-                &self.execution_graph,
+                execution,
                 &self.resource_graph,
                 &self.reactive_graph,
                 &self.scope_storage_graph,
                 &self.lowering_contract,
             )
             .map_err(|error| SemanticError::new(error.to_string()))?;
-        self.memory_graph
-            .validate(
+        #[cfg(test)]
+        {
+            self.memory_graph
+                .validate(
+                    &self.checked_program,
+                    execution,
+                    &self.resource_graph,
+                    &self.reactive_graph,
+                    &self.scope_storage_graph,
+                    &self.lowering_contract,
+                )
+                .map_err(|error| SemanticError::new(error.to_string()))?;
+            resource::validate_checked_list_classification(
                 &self.checked_program,
-                &self.execution_graph,
+                execution,
                 &self.resource_graph,
-                &self.reactive_graph,
-                &self.scope_storage_graph,
-                &self.lowering_contract,
             )
-            .map_err(|error| SemanticError::new(error.to_string()))?;
-        resource::validate_checked_list_classification(
-            &self.checked_program,
-            &self.execution_graph,
-            &self.resource_graph,
-        )
-        .map_err(SemanticError::new)?;
-        resource::validate_checked_resource_provenance(
-            &self.checked_program,
-            &self.execution_graph,
-            &self.resource_graph,
-        )
-        .map_err(SemanticError::new)?;
+            .map_err(SemanticError::new)?;
+            resource::validate_checked_resource_provenance(
+                &self.checked_program,
+                execution,
+                &self.resource_graph,
+            )
+            .map_err(SemanticError::new)?;
+        }
         self.validate_integrity_handoff()
     }
 
     fn validate_freshly_constructed(&self) -> Result<(), SemanticError> {
-        if self.source_bundle_digest_v1 != self.checked_program.source_bundle_digest_v1 {
-            return Err(SemanticError::new(
-                "semantic source bundle digest does not match its checked program",
-            ));
-        }
+        self.semantic_image
+            .validate_identity(self.source_bundle_digest_v1, self.role)
+            .map_err(SemanticError::new)?;
         // Every component builder has just validated its inputs and exact
         // output shape, and the manifest/digest builders consumed those same
         // immutable values directly. Preserve the independent public deep
@@ -942,8 +966,8 @@ impl SemanticProgram {
         self.dependency_manifest
             .validate_integrity(
                 DEPENDENCY_CLASSIFIER_SCHEMA_DIGEST_V1,
-                &self.checked_program,
-                &self.execution_graph,
+                &self.semantic_image,
+                self.execution_graph(),
             )
             .map_err(|error| SemanticError::new(error.to_string()))?;
         validate_canonical_core_handoff(self)?;
@@ -978,7 +1002,7 @@ impl SemanticProgram {
 
 fn validate_canonical_core_handoff(program: &SemanticProgram) -> Result<(), SemanticError> {
     let core = &program.canonical_core;
-    let execution = &program.execution_graph;
+    let execution = program.execution_graph();
     let external_event_identities = program
         .reactive_graph
         .external_event_identities
@@ -1164,11 +1188,17 @@ impl BundleSemanticProgramV1 {
         for program in &self.programs {
             program.validate()?;
         }
-        let expected_programs = canonical_bundle_programs(self.programs.clone())?;
-        if expected_programs != self.programs {
-            return Err(SemanticError::new(
-                "bundle semantic programs are not in canonical role order",
-            ));
+        let expected_roles = [
+            boon_checked::ProgramRole::Client,
+            boon_checked::ProgramRole::Session,
+            boon_checked::ProgramRole::Server,
+        ];
+        for (program, expected_role) in self.programs.iter().zip(expected_roles) {
+            if program.role() != expected_role {
+                return Err(SemanticError::new(
+                    "bundle semantic programs are not in canonical role order",
+                ));
+            }
         }
         let (role_digests, producer_requests, call_crossings, value_crossings) =
             derive_bundle_call_closure(&self.programs)?;
@@ -1353,10 +1383,7 @@ fn exact_call_expression_for_occurrence<'a>(
         let Some(instance) = *instance else {
             continue;
         };
-        let (root, occurrence_path) = program
-            .resolved_out_graph()
-            .distributed_call_occurrence(&program.checked_program, instance)
-            .map_err(SemanticError::new)?;
+        let (root, occurrence_path) = semantic_distributed_call_occurrence(program, instance)?;
         if root == occurrence.root && occurrence_path == occurrence.occurrence_path {
             let origin = program
                 .execution_graph()
@@ -1380,6 +1407,76 @@ fn exact_call_expression_for_occurrence<'a>(
         )));
     };
     Ok(*matched)
+}
+
+fn semantic_distributed_call_occurrence(
+    program: &SemanticProgram,
+    frame: OutCallInstanceId,
+) -> Result<(DistributedCallOccurrenceRoot, String), SemanticError> {
+    let out = program.resolved_out_graph();
+    let mut ancestry = Vec::new();
+    let mut next = Some(frame);
+    let mut remaining = out.call_instances.len().saturating_add(1);
+    while let Some(call) = next {
+        if remaining == 0 {
+            return Err(SemanticError::new(format!(
+                "distributed call frame {frame} has cyclic OUT ancestry"
+            )));
+        }
+        remaining -= 1;
+        let instance = out
+            .call_instances
+            .get(call.as_usize())
+            .filter(|candidate| candidate.id == call)
+            .ok_or_else(|| {
+                SemanticError::new(format!(
+                    "distributed call frame ancestry references missing OUT call {call}"
+                ))
+            })?;
+        ancestry.push(call);
+        next = instance.parent;
+    }
+    ancestry.reverse();
+
+    let producer_root = ancestry.first().and_then(|root| {
+        out.producer_roots()
+            .iter()
+            .find(|producer| producer.call == *root)
+    });
+    let root = producer_root
+        .map(|producer| DistributedCallOccurrenceRoot::Producer(producer.spec.identity))
+        .unwrap_or(DistributedCallOccurrenceRoot::Program);
+    let mut path = match root {
+        DistributedCallOccurrenceRoot::Program => "program".to_owned(),
+        DistributedCallOccurrenceRoot::Producer(identity) => {
+            format!("producer:{}", digest_hex(&identity))
+        }
+    };
+    let first_static = usize::from(producer_root.is_some());
+    for call in ancestry.into_iter().skip(first_static) {
+        let checked_call = out.call_instances[call.as_usize()]
+            .provenance
+            .call_id
+            .ok_or_else(|| {
+                SemanticError::new(format!(
+                    "distributed non-root OUT call {call} has no checked call identity"
+                ))
+            })?;
+        let semantic_call = program
+            .execution_graph()
+            .calls
+            .get(checked_call.0 as usize)
+            .filter(|candidate| candidate.checked_call == checked_call)
+            .ok_or_else(|| {
+                SemanticError::new(format!(
+                    "distributed OUT call {call} references missing checked call {}",
+                    checked_call.0
+                ))
+            })?;
+        path.push('/');
+        path.push_str(&semantic_call.occurrence_segment);
+    }
+    Ok((root, path))
 }
 
 fn exact_bundle_call_arguments(
@@ -2417,7 +2514,8 @@ fn derive_bundle_call_closure(
             // the public data type itself must still match exactly.
             if producer_expression_definition.flow_type.ty != expression.flow_type.ty {
                 return Err(SemanticError::new(format!(
-                    "external value read `{canonical_path}` data type differs from sealed producer value"
+                    "external value read `{canonical_path}` data type {:?} differs from sealed producer value {:?}",
+                    expression.flow_type.ty, producer_expression_definition.flow_type.ty
                 )));
             }
             let consumer_origin = consumer
@@ -2640,7 +2738,11 @@ fn elaborate_with_representation(
         }};
     }
 
+    let (checked_program, checked_handoff) = checked_program.into_parts();
     let source_bundle_digest_v1 = checked_program.source_bundle_digest_v1;
+    let role = checked_program.role;
+    #[cfg(test)]
+    let checked_program_oracle = checked_program.clone();
     let producer_materializations = elaboration_phase!(
         "canonical_producer_requests",
         canonical_producer_requests(producer_materializations)
@@ -2723,10 +2825,11 @@ fn elaborate_with_representation(
         )
     )
     .map_err(|error| SemanticError::new(error.to_string()))?;
-    let mut execution_graph = elaboration_phase!(
+    let mut semantic_image_builder = elaboration_phase!(
         "derive_semantic_execution_graph",
         contextual_expansion::derive_semantic_execution_graph(
             &checked_program,
+            checked_handoff,
             &resolved_out_graph,
             &materializations,
             materialization_expressions,
@@ -2736,6 +2839,7 @@ fn elaborate_with_representation(
         )
     )
     .map_err(|error| SemanticError::new(error.to_string()))?;
+    let execution_graph = semantic_image_builder.execution();
     if trace_elaboration {
         eprintln!(
             "boon_semantic artifact execution_graph scopes={} expressions={} statements={} callables={} calls={} functions={} materializations={}",
@@ -2771,15 +2875,23 @@ fn elaborate_with_representation(
         resource::build_semantic_resource_graph(
             &checked_program,
             &resolved_out_graph,
-            &mut execution_graph,
+            &mut semantic_image_builder,
         )
     )
     .map_err(SemanticError::new)?;
     elaboration_phase!(
         "validate_execution_graph_after_resources",
-        execution_graph.validate(&resolved_out_graph)
+        semantic_image_builder
+            .execution()
+            .validate(&resolved_out_graph)
     )
     .map_err(SemanticError::new)?;
+    let semantic_image_builder = elaboration_phase!(
+        "finalize_execution_image",
+        semantic_image_builder.finalize_execution(&resolved_out_graph)
+    )
+    .map_err(SemanticError::new)?;
+    let execution_graph = semantic_image_builder.execution();
     let reactive_graph = elaboration_phase!(
         "build_semantic_reactive_graph",
         reactive::build_semantic_reactive_graph_from_validated_inputs(
@@ -2836,9 +2948,11 @@ fn elaborate_with_representation(
     .map_err(|error| SemanticError::new(error.to_string()))?;
     let dependency_manifest = elaboration_phase!(
         "build_callable_dependency_manifest",
-        build_callable_dependency_manifest(
+        build_callable_dependency_manifest_v5(
             DEPENDENCY_CLASSIFIER_SCHEMA_DIGEST_V1,
             &checked_program,
+            semantic_image_builder.checked_handoff(),
+            semantic_image_builder.execution_handoff(),
             &producer_materializations,
             &resolved_out_graph,
             &execution_graph,
@@ -2864,12 +2978,20 @@ fn elaborate_with_representation(
         )
     )
     .map_err(SemanticError::new)?;
+    #[cfg(test)]
+    let execution_graph_oracle = (*execution_graph).clone();
+    let semantic_image = elaboration_phase!("seal_semantic_image", semantic_image_builder.seal())
+        .map_err(SemanticError::new)?;
     let mut semantic = SemanticProgram {
         source_bundle_digest_v1,
-        checked_program,
+        role,
+        semantic_image,
+        #[cfg(test)]
+        checked_program: checked_program_oracle,
+        #[cfg(test)]
+        execution_graph: execution_graph_oracle,
         producer_materializations,
         resolved_out_graph,
-        execution_graph,
         resource_graph,
         reactive_graph,
         lowering_contract,
@@ -2892,7 +3014,7 @@ fn elaborate_with_representation(
 }
 
 fn provisional_out_port_contract(
-    program: &CheckedProgram,
+    program: &CheckedProgramFields,
     call: &boon_checked::CheckedCall,
     entry: &boon_checked::CheckedCallEntry,
 ) -> Result<OutPortContractV1, SemanticError> {
@@ -3060,7 +3182,7 @@ fn out_contract_resolution_order(graph: &ResolvedOutGraph) -> Result<Vec<usize>,
 }
 
 fn resolve_out_contracts(
-    program: &CheckedProgram,
+    program: &CheckedProgramFields,
     graph: &mut ResolvedOutGraph,
 ) -> Result<(), SemanticError> {
     let resolution_order = out_contract_resolution_order(graph)?;
@@ -3264,7 +3386,7 @@ fn resolve_out_contracts(
 }
 
 fn concrete_checked_expression_type(
-    program: &CheckedProgram,
+    program: &CheckedProgramFields,
     graph: &ResolvedOutGraph,
     scoped: ScopedCheckedExpr,
     active_substitutions: &BTreeMap<boon_checked::TypeVar, boon_checked::Type>,
@@ -3950,7 +4072,7 @@ fn concrete_checked_expression_type(
 }
 
 fn concrete_checked_branch_expression_type(
-    program: &CheckedProgram,
+    program: &CheckedProgramFields,
     graph: &ResolvedOutGraph,
     scoped: ScopedCheckedExpr,
     branches: &[boon_checked::CheckedExprId],
@@ -4041,7 +4163,7 @@ fn concrete_checked_branch_expression_type(
 }
 
 fn exact_checked_resource_projection_type(
-    program: &CheckedProgram,
+    program: &CheckedProgramFields,
     expression: boon_checked::CheckedExprId,
     substitutions: &BTreeMap<boon_checked::TypeVar, boon_checked::Type>,
 ) -> Result<Option<boon_checked::Type>, SemanticError> {
@@ -4438,7 +4560,7 @@ fn merge_out_contract_substitutions(
     }
 }
 
-fn validate_contextual_bindings(program: &CheckedProgram) -> Result<(), SemanticError> {
+fn validate_contextual_bindings(program: &CheckedProgramFields) -> Result<(), SemanticError> {
     let callables = program
         .callables
         .iter()
@@ -4611,7 +4733,7 @@ fn validate_contextual_bindings(program: &CheckedProgram) -> Result<(), Semantic
 }
 
 fn validate_out_contracts(
-    program: &CheckedProgram,
+    program: &CheckedProgramFields,
     graph: &ResolvedOutGraph,
 ) -> Result<(), SemanticError> {
     for net in &graph.nets {
@@ -4769,7 +4891,7 @@ fn canonical_producer_requests(
 }
 
 fn resolve_producer_roots(
-    program: &CheckedProgram,
+    program: &CheckedProgramFields,
     requests: &[ProducerMaterializationRequest],
 ) -> Result<Vec<out_net::ProducerRootSpec>, SemanticError> {
     let first_statement = program
@@ -4868,7 +4990,7 @@ fn resolve_producer_roots(
 }
 
 fn exact_producer_callable<'a>(
-    program: &'a CheckedProgram,
+    program: &'a CheckedProgramFields,
     request: &ProducerMaterializationRequest,
 ) -> Result<&'a boon_checked::CheckedCallableSignature, SemanticError> {
     let Some(callable) = program.callables.get(request.callable.as_usize()) else {
@@ -4889,7 +5011,7 @@ fn exact_producer_callable<'a>(
 }
 
 pub(crate) fn temporally_gated_checked_expressions(
-    program: &CheckedProgram,
+    program: &CheckedProgramFields,
 ) -> BTreeSet<boon_checked::CheckedExprId> {
     let expressions = program
         .expressions
@@ -6238,9 +6360,8 @@ result:
         let checked = boon_typecheck::check_program(&parsed)
             .program
             .expect("valid wrapped OUT fixture has one checked program");
-        let semantic =
-            elaborate(checked, &[]).expect("valid wrapped OUT fixture has semantic contracts");
-        let checked = semantic.checked_program.clone();
+        let semantic = elaborate(checked.clone(), &[])
+            .expect("valid wrapped OUT fixture has semantic contracts");
         let graph = semantic.resolved_out_graph.clone();
         let port = graph
             .nets
@@ -6685,7 +6806,7 @@ FUNCTION lane_row(row) {
     }
 
     fn assert_contract_rejection(
-        checked: &CheckedProgram,
+        checked: &CheckedProgramFields,
         graph: &ResolvedOutGraph,
         port: usize,
         dimension: &str,
@@ -6822,9 +6943,11 @@ seed: 0
             &semantic.lowering_contract,
         )
         .expect("mutated OUT owner has a fresh deterministic memory graph");
-        semantic.dependency_manifest = build_callable_dependency_manifest(
+        semantic.dependency_manifest = build_callable_dependency_manifest_v5(
             DEPENDENCY_CLASSIFIER_SCHEMA_DIGEST_V1,
             &semantic.checked_program,
+            semantic.semantic_image.checked_handoff(),
+            semantic.semantic_image.execution_handoff(),
             &semantic.producer_materializations,
             &semantic.resolved_out_graph,
             &semantic.execution_graph,

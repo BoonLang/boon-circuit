@@ -5,18 +5,19 @@
 //! Executable lowering may map these identities, but must not rediscover them.
 
 use crate::{
-    OutCallInstanceId, ProducerFunctionId, ProducerMaterializationMode, ResolvedOutGraph,
-    SemanticBlockBinding, SemanticCallableId, SemanticContextualOperationKind,
-    SemanticContextualRowPredecessor, SemanticExecutionGraphV1, SemanticExprId,
-    SemanticExpressionKind, SemanticListId, SemanticLocalBindingId, SemanticMaterializationId,
-    SemanticMaterializationResultKind, SemanticRowBinding, SemanticRowScopeId, SemanticSourceId,
-    SemanticSourceOrigin, SemanticStateId, SemanticStatement, SemanticStatementId,
-    SemanticStatementKind, SemanticStatementOrigin, SemanticValueId, SemanticValueListAuthorityId,
-    StaticOwnerId,
+    ExecutionPending, OutCallInstanceId, ProducerFunctionId, ProducerMaterializationMode,
+    ResolvedOutGraph, SemanticBlockBinding, SemanticCallableId, SemanticContextualOperationKind,
+    SemanticContextualRowPredecessor, SemanticExecutionImageColumnsV1, SemanticExprId,
+    SemanticExpressionKind, SemanticImageBuilder, SemanticListId, SemanticLocalBindingId,
+    SemanticMaterializationId, SemanticMaterializationResultKind, SemanticRowBinding,
+    SemanticRowScopeId, SemanticSourceId, SemanticSourceOrigin, SemanticStateId, SemanticStatement,
+    SemanticStatementId, SemanticStatementKind, SemanticStatementOrigin, SemanticValueId,
+    SemanticValueListAuthorityId, StaticOwnerId,
 };
 use boon_checked::{
-    CheckedListId, CheckedListKeyPolicy, CheckedProgram, CheckedResourceBinding, CheckedSourceId,
-    CheckedSpan, CheckedStateId, CheckedStateKind, CheckedStatementId, DeclId, FlowType, Type,
+    CheckedListId, CheckedListKeyPolicy, CheckedProgramFields, CheckedResourceBinding,
+    CheckedSourceId, CheckedSpan, CheckedStateId, CheckedStateKind, CheckedStatementId, DeclId,
+    FlowType, Type,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -380,7 +381,7 @@ pub struct SemanticProducerResourceV1 {
 impl SemanticResourceGraphV1 {
     pub fn validate(
         &self,
-        execution: &SemanticExecutionGraphV1,
+        execution: &SemanticExecutionImageColumnsV1,
         out_net: &ResolvedOutGraph,
     ) -> Result<(), String> {
         if self.schema != SEMANTIC_RESOURCE_GRAPH_SCHEMA_V1 {
@@ -407,10 +408,11 @@ impl SemanticResourceGraphV1 {
 }
 
 pub(crate) fn build_semantic_resource_graph(
-    checked: &CheckedProgram,
+    checked: &CheckedProgramFields,
     out_net: &ResolvedOutGraph,
-    execution: &mut SemanticExecutionGraphV1,
+    image: &mut SemanticImageBuilder<ExecutionPending>,
 ) -> Result<SemanticResourceGraphV1, String> {
+    let execution = image.execution_for_resource();
     let trace_resources = std::env::var_os("BOON_SEMANTIC_TRACE").is_some();
     macro_rules! resource_phase {
         ($name:literal, $expression:expr) => {{
@@ -543,8 +545,8 @@ type DiscoveredListResources = (
 );
 
 fn discover_list_resources(
-    checked: &CheckedProgram,
-    execution: &mut SemanticExecutionGraphV1,
+    checked: &CheckedProgramFields,
+    execution: &mut SemanticExecutionImageColumnsV1,
 ) -> Result<DiscoveredListResources, String> {
     let targets = typed_list_targets(checked, execution)?;
     let mut row_scopes = Vec::with_capacity(targets.len());
@@ -616,8 +618,8 @@ fn discover_list_resources(
 }
 
 fn typed_list_targets(
-    checked: &CheckedProgram,
-    execution: &mut SemanticExecutionGraphV1,
+    checked: &CheckedProgramFields,
+    execution: &mut SemanticExecutionImageColumnsV1,
 ) -> Result<Vec<ListTarget>, String> {
     let direct = direct_storage_statements(execution);
     let mut targets = Vec::new();
@@ -844,7 +846,7 @@ fn typed_list_targets(
 }
 
 fn checked_scope_function_owner(
-    checked: &CheckedProgram,
+    checked: &CheckedProgramFields,
     mut scope: boon_checked::LexicalScopeId,
 ) -> Result<Option<DeclId>, String> {
     let mut visited = BTreeSet::new();
@@ -881,7 +883,7 @@ fn checked_scope_function_owner(
 }
 
 fn contextual_list_authority_statements(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     owner: Option<StaticOwnerId>,
 ) -> Result<BTreeSet<SemanticStatementId>, String> {
     for owner in owner_ancestry(owner, &execution.static_owners)? {
@@ -950,7 +952,7 @@ fn contextual_list_authority_statements(
 }
 
 fn checked_scope_is_function_local(
-    checked: &CheckedProgram,
+    checked: &CheckedProgramFields,
     scope: boon_checked::LexicalScopeId,
 ) -> Result<bool, String> {
     checked_scope_function_owner(checked, scope).map(|owner| owner.is_some())
@@ -989,8 +991,8 @@ fn canonical_inline_list_authority_candidate(
 }
 
 fn synthesize_inline_checked_list_targets(
-    checked: &CheckedProgram,
-    execution: &mut SemanticExecutionGraphV1,
+    checked: &CheckedProgramFields,
+    execution: &mut SemanticExecutionImageColumnsV1,
     checked_list: &boon_checked::CheckedList,
     path: &str,
 ) -> Result<Vec<ListTarget>, String> {
@@ -1293,7 +1295,7 @@ fn synthesize_inline_checked_list_targets(
 }
 
 fn direct_storage_statements(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
 ) -> BTreeSet<SemanticStatementId> {
     let parents = execution
         .statements
@@ -1342,7 +1344,7 @@ fn statement_name_path(kind: &SemanticStatementKind) -> Option<(&str, &str)> {
 }
 
 fn direct_list_alias_target(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     statement: &crate::SemanticStatement,
 ) -> Option<DeclId> {
     let value = statement.value?;
@@ -1376,7 +1378,7 @@ fn ordered_object_fields(item_type: &Type) -> Vec<String> {
 }
 
 fn expression_record_field_names(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     root: SemanticExprId,
 ) -> Result<Vec<String>, String> {
     let mut fields = Vec::new();
@@ -1455,7 +1457,7 @@ fn expression_record_field_names(
 }
 
 fn semantic_list_initializer(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     producer: SemanticExprId,
     path: &str,
 ) -> Result<SemanticListInitializerV1, String> {
@@ -1530,7 +1532,7 @@ fn semantic_list_initializer(
 }
 
 fn semantic_initial_record(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     expression_id: SemanticExprId,
 ) -> Result<SemanticListInitialRowV1, String> {
     let value = expression(execution, expression_id)?;
@@ -1594,7 +1596,7 @@ fn semantic_initial_record(
 }
 
 fn semantic_initial_value(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     expression_id: SemanticExprId,
 ) -> Result<SemanticInitialValueV1, String> {
     if let Some(path) = semantic_root_initial_path(execution, expression_id) {
@@ -1623,7 +1625,7 @@ fn semantic_initial_value(
 }
 
 fn semantic_initializer_is_resource_only(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     expression_id: SemanticExprId,
     visiting: &mut BTreeSet<SemanticExprId>,
 ) -> Result<bool, String> {
@@ -1703,7 +1705,7 @@ fn semantic_initial_value_from_data(value: boon_data::Value) -> SemanticInitialV
 }
 
 fn semantic_root_initial_path(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     expression_id: SemanticExprId,
 ) -> Option<String> {
     let mut current = expression_id;
@@ -1795,7 +1797,7 @@ enum StaticTask {
 }
 
 fn semantic_static_data(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     root: SemanticExprId,
 ) -> Result<boon_data::Value, String> {
     let statement_values = execution
@@ -2106,7 +2108,7 @@ fn semantic_static_data(
 }
 
 fn expression_at(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     id: SemanticExprId,
 ) -> Result<&crate::SemanticExpression, String> {
     expression(execution, id)
@@ -2166,7 +2168,7 @@ fn static_projection(
 }
 
 fn inline_list_authority_root(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     root: SemanticExprId,
 ) -> Result<Option<SemanticExprId>, String> {
     let mut next = Some(root);
@@ -2221,7 +2223,7 @@ fn inline_list_authority_root(
 }
 
 fn materialization_target_lists(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     lists: &[SemanticListResourceV1],
 ) -> Result<BTreeMap<StaticOwnerId, SemanticListId>, String> {
     let mut targets = BTreeMap::new();
@@ -2285,7 +2287,7 @@ fn materialization_target_lists(
 }
 
 fn bind_materialization_targets(
-    execution: &mut SemanticExecutionGraphV1,
+    execution: &mut SemanticExecutionImageColumnsV1,
     lists: &[SemanticListResourceV1],
     targets: &BTreeMap<StaticOwnerId, SemanticListId>,
 ) -> Result<(), String> {
@@ -2301,7 +2303,7 @@ fn bind_materialization_targets(
 }
 
 fn bind_materialization_sources(
-    execution: &mut SemanticExecutionGraphV1,
+    execution: &mut SemanticExecutionImageColumnsV1,
     lists: &[SemanticListResourceV1],
 ) -> Result<(), String> {
     let storage_scopes = semantic_storage_scopes(execution, lists)?;
@@ -2408,7 +2410,7 @@ fn bind_materialization_sources(
 /// no stored source or target row is an authority boundary rather than a
 /// reason to guess at an ancestor row.
 fn contextual_resource_row(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     owner: Option<StaticOwnerId>,
 ) -> Result<Option<SemanticRowBinding>, String> {
     let mut current = owner;
@@ -2476,7 +2478,7 @@ struct StatementValueOccurrence {
 }
 
 fn statement_value_occurrences(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
 ) -> Result<BTreeMap<DeclId, Vec<StatementValueOccurrence>>, String> {
     let mut values = BTreeMap::<DeclId, Vec<StatementValueOccurrence>>::new();
     for statement in &execution.statements {
@@ -2582,7 +2584,7 @@ fn statement_value_occurrences(
 }
 
 fn statement_value_occurrence_path(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     occurrence: &StatementValueOccurrence,
 ) -> Result<Option<String>, String> {
     let value = expression(execution, occurrence.value)?;
@@ -2635,7 +2637,7 @@ fn path_prefix_specificity(candidate: &str, consumer: &str) -> Option<usize> {
 }
 
 fn statement_value_for_expression(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     values: &BTreeMap<DeclId, Vec<StatementValueOccurrence>>,
     declaration: DeclId,
     consumer: SemanticExprId,
@@ -2737,7 +2739,7 @@ fn statement_value_for_expression(
 }
 
 fn semantic_storage_scopes(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     lists: &[SemanticListResourceV1],
 ) -> Result<Vec<BTreeSet<SemanticRowScopeId>>, String> {
     let mut scopes_by_declaration = BTreeMap::new();
@@ -2828,7 +2830,7 @@ fn semantic_storage_scopes(
 
 #[allow(clippy::too_many_arguments)]
 fn semantic_expression_storage_scopes(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     id: SemanticExprId,
     scopes: &[BTreeSet<SemanticRowScopeId>],
     statement_values: &BTreeMap<DeclId, Vec<StatementValueOccurrence>>,
@@ -3011,7 +3013,7 @@ fn semantic_expression_storage_scopes(
 
 #[allow(clippy::too_many_arguments)]
 fn semantic_projected_storage_scopes(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     root: SemanticExprId,
     projection: Vec<String>,
     scopes: &[BTreeSet<SemanticRowScopeId>],
@@ -3240,7 +3242,7 @@ fn semantic_projected_storage_scopes(
 }
 
 fn semantic_chunk_item_storage_scopes(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     consumer: SemanticExprId,
     chunk_scopes: BTreeSet<SemanticRowScopeId>,
     scopes: &[BTreeSet<SemanticRowScopeId>],
@@ -3316,7 +3318,7 @@ enum LineageLeaf {
 }
 
 fn bind_materialization_lineage(
-    execution: &mut SemanticExecutionGraphV1,
+    execution: &mut SemanticExecutionImageColumnsV1,
     lists: &[SemanticListResourceV1],
 ) -> Result<(), String> {
     let statement_values = statement_value_occurrences(execution)?;
@@ -3475,7 +3477,7 @@ fn bind_materialization_lineage(
 }
 
 fn bind_list_lineage(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     lists: &mut [SemanticListResourceV1],
 ) -> Result<(), String> {
     let statement_values = statement_value_occurrences(execution)?;
@@ -3529,7 +3531,7 @@ fn bind_list_lineage(
 
 fn validate_list_lineage(
     graph: &SemanticResourceGraphV1,
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
 ) -> Result<(), String> {
     let mut expected = graph.lists.clone();
     bind_list_lineage(execution, &mut expected)?;
@@ -3584,7 +3586,7 @@ fn type_may_supply_projection(ty: &Type, projection: &[String]) -> bool {
 }
 
 fn collect_lineage_leaves(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     root: SemanticExprId,
     statement_values: &BTreeMap<DeclId, Vec<StatementValueOccurrence>>,
     statement_rows: &BTreeMap<DeclId, SemanticRowBinding>,
@@ -3937,7 +3939,7 @@ fn verify_semantic_materialization_lineage(
 }
 
 fn exact_semantic_record_projection(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     mut expression_id: SemanticExprId,
     projection: &[String],
 ) -> Result<(SemanticExprId, Vec<String>), String> {
@@ -3970,7 +3972,7 @@ fn exact_semantic_record_projection(
 }
 
 fn validate_checked_source_statement(
-    checked: &CheckedProgram,
+    checked: &CheckedProgramFields,
     id: CheckedSourceId,
     source: &boon_checked::CheckedSource,
 ) -> Result<(), String> {
@@ -4001,7 +4003,7 @@ fn validate_checked_source_statement(
 }
 
 fn validate_checked_state_statement(
-    checked: &CheckedProgram,
+    checked: &CheckedProgramFields,
     id: CheckedStateId,
     state: &boon_checked::CheckedState,
 ) -> Result<(), String> {
@@ -4032,8 +4034,8 @@ fn validate_checked_state_statement(
 }
 
 fn build_source_resources(
-    checked: &CheckedProgram,
-    execution: &SemanticExecutionGraphV1,
+    checked: &CheckedProgramFields,
+    execution: &SemanticExecutionImageColumnsV1,
     lists: &[SemanticListResourceV1],
     aliases: &mut Vec<SemanticResourceAliasV1>,
 ) -> Result<Vec<SemanticSourceResourceV1>, String> {
@@ -4163,8 +4165,8 @@ fn build_source_resources(
 }
 
 fn build_state_resources(
-    checked: &CheckedProgram,
-    execution: &SemanticExecutionGraphV1,
+    checked: &CheckedProgramFields,
+    execution: &SemanticExecutionImageColumnsV1,
     lists: &[SemanticListResourceV1],
     aliases: &mut Vec<SemanticResourceAliasV1>,
 ) -> Result<Vec<SemanticStateResourceV1>, String> {
@@ -4296,7 +4298,7 @@ fn build_state_resources(
 }
 
 fn semantic_state_is_published(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     state: &crate::SemanticStateDef,
 ) -> Result<bool, String> {
     for candidate in &execution.states {
@@ -4312,7 +4314,7 @@ fn semantic_state_is_published(
 }
 
 fn semantic_state_initial_expression(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     root: SemanticExprId,
 ) -> Result<SemanticExprId, String> {
     let mut current = root;
@@ -4342,7 +4344,7 @@ fn semantic_state_initial_expression(
 }
 
 fn semantic_state_hold_name(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     state: &crate::SemanticStateDef,
     statement: SemanticStatementId,
     published: bool,
@@ -4384,7 +4386,7 @@ fn semantic_state_hold_name(
 
 fn build_producer_resources(
     out_net: &ResolvedOutGraph,
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
 ) -> Result<Vec<SemanticProducerResourceV1>, String> {
     let mut resources = Vec::with_capacity(out_net.producer_roots().len());
     for root in out_net.producer_roots() {
@@ -4463,7 +4465,7 @@ fn build_producer_resources(
 }
 
 fn discover_list_projections(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     lists: &[SemanticListResourceV1],
 ) -> Result<Vec<SemanticListProjectionV1>, String> {
     let declaration_lists = lists
@@ -4527,7 +4529,7 @@ fn discover_list_projections(
 }
 
 fn terminal_chunk_expression(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     root: SemanticExprId,
 ) -> Result<Option<SemanticExprId>, String> {
     let mut colors = vec![0_u8; execution.expressions.len()];
@@ -4641,7 +4643,7 @@ fn exact_terminal_chunk_branches(
 }
 
 pub(super) fn semantic_list_id(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     lists_by_declaration: &BTreeMap<DeclId, SemanticListId>,
     local_bindings: &BTreeMap<SemanticLocalBindingId, (DeclId, SemanticExprId)>,
     root: SemanticExprId,
@@ -4724,7 +4726,7 @@ pub(super) fn semantic_list_id(
 
 fn validate_dense_resource_ids(
     graph: &SemanticResourceGraphV1,
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
 ) -> Result<(), String> {
     if graph.row_scopes.len() != graph.lists.len() {
         return Err(format!(
@@ -5079,8 +5081,8 @@ fn validate_dense_resource_ids(
 }
 
 pub(crate) fn validate_checked_list_classification(
-    checked: &CheckedProgram,
-    execution: &SemanticExecutionGraphV1,
+    checked: &CheckedProgramFields,
+    execution: &SemanticExecutionImageColumnsV1,
     graph: &SemanticResourceGraphV1,
 ) -> Result<(), String> {
     let mut snapshot = execution.clone();
@@ -5100,8 +5102,8 @@ pub(crate) fn validate_checked_list_classification(
 }
 
 pub(crate) fn validate_checked_resource_provenance(
-    checked: &CheckedProgram,
-    execution: &SemanticExecutionGraphV1,
+    checked: &CheckedProgramFields,
+    execution: &SemanticExecutionImageColumnsV1,
     graph: &SemanticResourceGraphV1,
 ) -> Result<(), String> {
     let mut expected_aliases = Vec::new();
@@ -5133,7 +5135,7 @@ pub(crate) fn validate_checked_resource_provenance(
 
 fn validate_materialization_bindings(
     graph: &SemanticResourceGraphV1,
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
 ) -> Result<(), String> {
     verify_semantic_materialization_lineage(&execution.materializations)?;
     if graph.materialization_bindings.len() != execution.materializations.len() {
@@ -5231,7 +5233,7 @@ fn validate_row_binding(
 
 fn validate_list_projections(
     graph: &SemanticResourceGraphV1,
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
 ) -> Result<(), String> {
     let expected = discover_list_projections(execution, &graph.lists)?;
     if graph.list_projections != expected {
@@ -5255,7 +5257,7 @@ fn validate_list_projections(
 
 fn validate_resource_owners(
     graph: &SemanticResourceGraphV1,
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
 ) -> Result<(), String> {
     for (owner, ancestry, label) in graph
         .sources
@@ -5371,7 +5373,7 @@ fn validate_resource_aliases(graph: &SemanticResourceGraphV1) -> Result<(), Stri
 
 fn validate_producer_resources(
     graph: &SemanticResourceGraphV1,
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     out_net: &ResolvedOutGraph,
 ) -> Result<(), String> {
     if graph.producer_resources.len() != out_net.producer_roots().len() {
@@ -5514,7 +5516,7 @@ fn resource_graph_digest(
 }
 
 fn semantic_local_values(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
 ) -> Result<BTreeMap<SemanticLocalBindingId, (DeclId, SemanticExprId)>, String> {
     let mut locals = BTreeMap::new();
     for expression in &execution.expressions {
@@ -5540,7 +5542,7 @@ fn semantic_local_values(
 }
 
 fn expression(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     id: SemanticExprId,
 ) -> Result<&crate::SemanticExpression, String> {
     execution.expression(id)
@@ -5656,7 +5658,7 @@ fn payload_fields(data_type: &Type) -> Vec<SemanticPayloadFieldV1> {
 }
 
 fn exact_statement_origin(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     target: SemanticExprId,
     kind: &str,
 ) -> Result<SemanticStatementId, String> {
@@ -5682,7 +5684,7 @@ fn exact_statement_origin(
 }
 
 fn reachable_expression_members(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     root: SemanticExprId,
 ) -> Result<Vec<SemanticExprId>, String> {
     let mut pending = vec![root];
@@ -5710,7 +5712,7 @@ fn reachable_expression_members(
 }
 
 fn expression_reaches(
-    execution: &SemanticExecutionGraphV1,
+    execution: &SemanticExecutionImageColumnsV1,
     root: SemanticExprId,
     target: SemanticExprId,
 ) -> Result<bool, String> {
@@ -6186,7 +6188,7 @@ kept: mapped |> List/retain(item, if: True)
             field_order: Vec::new(),
             open: false,
         });
-        let execution = SemanticExecutionGraphV1 {
+        let execution = SemanticExecutionImageColumnsV1 {
             expressions: vec![
                 synthetic_expression(
                     0,
@@ -6252,7 +6254,7 @@ kept: mapped |> List/retain(item, if: True)
                     },
                 ),
             ],
-            ..SemanticExecutionGraphV1::default()
+            ..SemanticExecutionImageColumnsV1::default()
         };
         let statement_values = BTreeMap::new();
         let statement_rows = BTreeMap::new();
@@ -6322,7 +6324,7 @@ kept: mapped |> List/retain(item, if: True)
                 arms: Vec::new(),
             },
         ] {
-            let mut execution = SemanticExecutionGraphV1::default();
+            let mut execution = SemanticExecutionImageColumnsV1::default();
             execution.expressions.push(synthetic_expression(
                 0,
                 Type::List(Type::shared(Type::Unknown)),
@@ -6387,7 +6389,7 @@ kept: mapped |> List/retain(item, if: True)
         let rows_a = DeclId(10);
         let rows_b = DeclId(20);
         let result = DeclId(30);
-        let mut execution = SemanticExecutionGraphV1::default();
+        let mut execution = SemanticExecutionImageColumnsV1::default();
         execution.expressions = vec![
             synthetic_expression(
                 0,
@@ -6601,7 +6603,7 @@ kept: mapped |> List/retain(item, if: True)
         let list_type = Type::List(Type::shared(row_type.clone()));
         let rows = DeclId(10);
         let chunks = DeclId(20);
-        let mut execution = SemanticExecutionGraphV1::default();
+        let mut execution = SemanticExecutionImageColumnsV1::default();
         execution.expressions = vec![
             synthetic_expression(
                 0,
@@ -7408,7 +7410,7 @@ chunks: rows |> List/chunk(size: 2)
     #[test]
     fn iterative_authority_walk_handles_deep_default_stack_graph() {
         const DEPTH: usize = 8_192;
-        let mut graph = SemanticExecutionGraphV1::default();
+        let mut graph = SemanticExecutionImageColumnsV1::default();
         graph.expressions.push(crate::SemanticExpression {
             id: SemanticExprId(0),
             value_id: crate::SemanticValueId(0),

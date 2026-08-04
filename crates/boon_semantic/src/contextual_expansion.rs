@@ -5,7 +5,7 @@ use crate::execution::{
     SemanticCallable, SemanticCallableContext, SemanticCallableContextParameter,
     SemanticCallableId, SemanticCallableKind, SemanticCallableParameter,
     SemanticContextualMaterialization, SemanticContextualOperationKind, SemanticContextualOrderKey,
-    SemanticExecutionGraphV1, SemanticExprId, SemanticExpression, SemanticExpressionKind,
+    SemanticExecutionImageColumnsV1, SemanticExprId, SemanticExpression, SemanticExpressionKind,
     SemanticExpressionOrigin, SemanticFunction, SemanticFunctionParameter, SemanticLocalBindingId,
     SemanticMaterializationId, SemanticMaterializationLocalId, SemanticMaterializationResultKind,
     SemanticParameterId, SemanticPatternBinding, SemanticRecordField, SemanticRoot, SemanticScope,
@@ -17,15 +17,16 @@ use crate::execution::{
     checked_semantic_root_specs_v1,
 };
 use crate::{
-    OutCallInstanceId, OutInputValue, OutNetId, ResolvedOutGraph as OutNet, ScopedCheckedExpr,
-    StaticOwnerId,
+    ExecutionPending, OutCallInstanceId, OutInputValue, OutNetId, ResolvedOutGraph as OutNet,
+    ScopedCheckedExpr, SemanticImageBuilder, StaticOwnerId,
 };
 use boon_checked::{
     CheckedCallEntry, CheckedCallId, CheckedCallableKind, CheckedContextBinding,
     CheckedContextualOperation, CheckedDeclarationKind, CheckedExprId, CheckedExpression,
-    CheckedExpressionKind, CheckedMatchPattern, CheckedParameterKind, CheckedParameterRequirement,
-    CheckedPassedAccess, CheckedProgram, CheckedResourceBinding, CheckedTextSegment,
-    CheckedValueUse, ContextFormalId, DeclId, FlowMode, FlowType, Type, is_renderable_type,
+    CheckedExpressionKind, CheckedImageHandoffV1, CheckedMatchPattern, CheckedParameterKind,
+    CheckedParameterRequirement, CheckedPassedAccess, CheckedProgramFields, CheckedResourceBinding,
+    CheckedTextSegment, CheckedValueUse, ContextFormalId, DeclId, FlowMode, FlowType, Type,
+    is_renderable_type,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -290,7 +291,7 @@ struct CheckedProgramLookup {
 }
 
 impl CheckedProgramLookup {
-    fn new(program: &CheckedProgram) -> Self {
+    fn new(program: &CheckedProgramFields) -> Self {
         let mut expressions_by_id = BTreeMap::new();
         for (index, expression) in program.expressions.iter().enumerate() {
             expressions_by_id
@@ -380,7 +381,7 @@ impl CheckedProgramLookup {
 
     fn expression<'a>(
         &self,
-        program: &'a CheckedProgram,
+        program: &'a CheckedProgramFields,
         expression: CheckedExprId,
     ) -> Option<&'a CheckedExpression> {
         self.expressions_by_id
@@ -393,7 +394,7 @@ impl CheckedProgramLookup {
 
     fn declaration<'a>(
         &self,
-        program: &'a CheckedProgram,
+        program: &'a CheckedProgramFields,
         declaration: DeclId,
     ) -> Option<&'a boon_checked::CheckedDeclaration> {
         self.declarations_by_id
@@ -406,7 +407,7 @@ impl CheckedProgramLookup {
 
     fn statement<'a>(
         &self,
-        program: &'a CheckedProgram,
+        program: &'a CheckedProgramFields,
         statement: boon_checked::CheckedStatementId,
     ) -> Option<&'a boon_checked::CheckedStatement> {
         self.statements_by_id
@@ -419,7 +420,7 @@ impl CheckedProgramLookup {
 
     fn scope<'a>(
         &self,
-        program: &'a CheckedProgram,
+        program: &'a CheckedProgramFields,
         scope: boon_checked::LexicalScopeId,
     ) -> Option<&'a boon_checked::CheckedScope> {
         self.scopes_by_id
@@ -432,7 +433,7 @@ impl CheckedProgramLookup {
 
     fn call<'a>(
         &self,
-        program: &'a CheckedProgram,
+        program: &'a CheckedProgramFields,
         call: CheckedCallId,
     ) -> Option<&'a boon_checked::CheckedCall> {
         self.calls_by_id
@@ -445,7 +446,7 @@ impl CheckedProgramLookup {
 
     fn callable<'a>(
         &self,
-        program: &'a CheckedProgram,
+        program: &'a CheckedProgramFields,
         declaration: DeclId,
     ) -> Option<&'a boon_checked::CheckedCallableSignature> {
         self.callables_by_declaration
@@ -470,7 +471,7 @@ impl CheckedProgramLookup {
 
     fn pattern_binding<'a>(
         &self,
-        program: &'a CheckedProgram,
+        program: &'a CheckedProgramFields,
         declaration: DeclId,
     ) -> Option<&'a boon_checked::CheckedPatternBinding> {
         self.pattern_bindings_by_declaration
@@ -490,7 +491,7 @@ impl CheckedProgramLookup {
 
     fn element_context<'a>(
         &self,
-        program: &'a CheckedProgram,
+        program: &'a CheckedProgramFields,
         declaration: DeclId,
     ) -> Option<(
         &'a boon_checked::CheckedCall,
@@ -641,7 +642,7 @@ fn push_default_order_direction(
 }
 
 pub(crate) fn derive_contextual_materializations(
-    program: &CheckedProgram,
+    program: &CheckedProgramFields,
     out_net: &OutNet,
     retain_ordinary_calls: bool,
 ) -> Result<
@@ -1218,7 +1219,7 @@ fn concrete_structural_type(
 }
 
 fn semantic_callable_inventory(
-    program: &CheckedProgram,
+    program: &CheckedProgramFields,
     semantic_scope_ids: &BTreeMap<boon_checked::LexicalScopeId, SemanticScopeId>,
 ) -> Result<(Vec<SemanticCallable>, BTreeMap<DeclId, SemanticCallableId>), ExpansionError> {
     let mut callable_ids = BTreeMap::new();
@@ -1296,7 +1297,7 @@ fn semantic_callable_inventory(
 }
 
 fn semantic_call_inventory(
-    program: &CheckedProgram,
+    program: &CheckedProgramFields,
     semantic_scope_ids: &BTreeMap<boon_checked::LexicalScopeId, SemanticScopeId>,
     callable_ids: &BTreeMap<DeclId, SemanticCallableId>,
 ) -> Result<(Vec<SemanticCall>, BTreeMap<CheckedCallId, SemanticCallId>), ExpansionError> {
@@ -1459,8 +1460,8 @@ fn semantic_call_inventory(
 }
 
 pub(crate) fn validate_checked_callable_and_call_inventory(
-    program: &CheckedProgram,
-    execution: &SemanticExecutionGraphV1,
+    program: &CheckedProgramFields,
+    execution: &SemanticExecutionImageColumnsV1,
 ) -> Result<(), String> {
     let semantic_scope_ids = program
         .scopes
@@ -1492,14 +1493,15 @@ pub(crate) fn validate_checked_callable_and_call_inventory(
 }
 
 pub(crate) fn derive_semantic_execution_graph(
-    program: &CheckedProgram,
+    program: &CheckedProgramFields,
+    checked_handoff: CheckedImageHandoffV1,
     out_net: &OutNet,
     materializations: &[SemanticContextualMaterialization],
     mut arena: SemanticExpressionArena,
     builder_indexes: &SemanticExpressionBuilderIndexes,
     required_ordinary_definitions: &BTreeSet<SemanticCallableId>,
     retain_ordinary_calls: bool,
-) -> Result<SemanticExecutionGraphV1, ExpansionError> {
+) -> Result<SemanticImageBuilder<ExecutionPending>, ExpansionError> {
     let lookup = CheckedProgramLookup::new(program);
     let semantic_scope_ids = program
         .scopes
@@ -2429,7 +2431,7 @@ pub(crate) fn derive_semantic_execution_graph(
         &semantic_source_by_checked_instance,
         &semantic_state_by_checked_instance,
     )?;
-    Ok(SemanticExecutionGraphV1 {
+    let execution = SemanticExecutionImageColumnsV1 {
         materializations: materializations.to_vec(),
         expressions: arena.expressions,
         statements,
@@ -2447,7 +2449,9 @@ pub(crate) fn derive_semantic_execution_graph(
             .map(SemanticStaticOwner::from)
             .collect(),
         checked_expression_origins: arena.checked_expression_origins,
-    })
+    };
+    SemanticImageBuilder::execution_pending(checked_handoff, execution)
+        .map_err(ExpansionError::InvalidLocalBindings)
 }
 
 struct ExactResourceInstanceContext<'a> {
@@ -2946,7 +2950,7 @@ fn arena_expression_children(kind: &SemanticExpressionKind) -> Vec<SemanticExprI
 
 #[allow(clippy::too_many_arguments)]
 fn ensure_resource_definition_statement(
-    program: &CheckedProgram,
+    program: &CheckedProgramFields,
     lookup: &CheckedProgramLookup,
     semantic_scope_ids: &BTreeMap<boon_checked::LexicalScopeId, SemanticScopeId>,
     arena: &mut SemanticExpressionArena,
@@ -3242,7 +3246,7 @@ fn ensure_resource_definition_statement(
 }
 
 fn remap_checked_resource_ids(
-    program: &CheckedProgram,
+    program: &CheckedProgramFields,
     expressions: &mut [SemanticExpression],
     origins: &[SemanticExpressionOrigin],
     semantic_sources: &BTreeMap<
@@ -3444,7 +3448,7 @@ fn executable_latest_has_initial(
 }
 
 fn synthesize_statement_owned_states(
-    program: &CheckedProgram,
+    program: &CheckedProgramFields,
     lookup: &CheckedProgramLookup,
     arena: &mut SemanticExpressionArena,
     statements: &mut [SemanticStatement],
@@ -3851,7 +3855,7 @@ fn contextual_operation_formals(
 }
 
 fn checked_scope(
-    program: &CheckedProgram,
+    program: &CheckedProgramFields,
     scope: boon_checked::LexicalScopeId,
 ) -> Option<&boon_checked::CheckedScope> {
     program
@@ -3869,7 +3873,7 @@ fn declaration_in_exact_scope(
 }
 
 fn declaration_in_lexical_scope(
-    program: &CheckedProgram,
+    program: &CheckedProgramFields,
     lookup: &CheckedProgramLookup,
     mut scope: boon_checked::LexicalScopeId,
     name: &str,
@@ -3885,7 +3889,7 @@ fn declaration_in_lexical_scope(
 }
 
 fn declaration_is_function_local(
-    program: &CheckedProgram,
+    program: &CheckedProgramFields,
     mut scope: boon_checked::LexicalScopeId,
 ) -> bool {
     let mut visited = BTreeSet::new();
@@ -3905,7 +3909,7 @@ fn declaration_is_function_local(
 }
 
 fn canonical_declaration_path(
-    program: &CheckedProgram,
+    program: &CheckedProgramFields,
     lookup: &CheckedProgramLookup,
     target: DeclId,
 ) -> Option<String> {
@@ -3937,7 +3941,7 @@ fn canonical_declaration_path(
 }
 
 fn resource_declaration(
-    program: &CheckedProgram,
+    program: &CheckedProgramFields,
     lookup: &CheckedProgramLookup,
     expression: CheckedExprId,
 ) -> Option<DeclId> {
@@ -4339,7 +4343,7 @@ fn ordinary_template_boundary_type_inner(ty: &Type) -> bool {
 }
 
 fn enclosing_function_owner(
-    program: &CheckedProgram,
+    program: &CheckedProgramFields,
     lookup: &CheckedProgramLookup,
     mut scope: boon_checked::LexicalScopeId,
 ) -> Option<DeclId> {
@@ -4355,14 +4359,14 @@ fn enclosing_function_owner(
 }
 
 fn ordinary_callable_base_candidate(
-    program: &CheckedProgram,
+    program: &CheckedProgramFields,
     callable: &boon_checked::CheckedCallableSignature,
 ) -> bool {
     ordinary_callable_base_rejection(program, callable).is_none()
 }
 
 fn ordinary_callable_base_rejection(
-    program: &CheckedProgram,
+    program: &CheckedProgramFields,
     callable: &boon_checked::CheckedCallableSignature,
 ) -> Option<&'static str> {
     if callable.kind != CheckedCallableKind::User {
@@ -4409,7 +4413,7 @@ fn ordinary_callable_base_rejection(
 }
 
 fn ordinary_callable_body_dependencies(
-    program: &CheckedProgram,
+    program: &CheckedProgramFields,
     lookup: &CheckedProgramLookup,
     callable: &boon_checked::CheckedCallableSignature,
     candidates: &BTreeSet<DeclId>,
@@ -4594,7 +4598,7 @@ fn ordinary_callable_body_dependencies(
 /// arm statement's children and are part of the callable body just as much as
 /// an ordinary object expression's fields are.
 fn ordinary_statement_child_values(
-    program: &CheckedProgram,
+    program: &CheckedProgramFields,
     lookup: &CheckedProgramLookup,
     parent_expression: CheckedExprId,
 ) -> Vec<CheckedExprId> {
@@ -4629,7 +4633,7 @@ fn ordinary_statement_child_values(
     values
 }
 
-fn ordinary_callable_declarations(program: &CheckedProgram) -> BTreeSet<DeclId> {
+fn ordinary_callable_declarations(program: &CheckedProgramFields) -> BTreeSet<DeclId> {
     let trace = std::env::var_os("BOON_SEMANTIC_TRACE").is_some();
     let started = trace.then(std::time::Instant::now);
     let lookup = CheckedProgramLookup::new(program);
@@ -4737,7 +4741,7 @@ impl StaticSelectorValue {
 }
 
 impl SemanticExpressionBuilderIndexes {
-    fn new(program: &CheckedProgram, out_net: &OutNet) -> Self {
+    fn new(program: &CheckedProgramFields, out_net: &OutNet) -> Self {
         let callable_ids = program
             .callables
             .iter()
@@ -4774,7 +4778,7 @@ impl SemanticExpressionBuilderIndexes {
 }
 
 pub(crate) struct SemanticExpressionBuilder<'a> {
-    program: &'a CheckedProgram,
+    program: &'a CheckedProgramFields,
     lookup: &'a CheckedProgramLookup,
     out_net: &'a OutNet,
     indexes: &'a SemanticExpressionBuilderIndexes,
@@ -4803,7 +4807,7 @@ pub(crate) struct SemanticExpressionBuilder<'a> {
 
 impl<'a> SemanticExpressionBuilder<'a> {
     fn new(
-        program: &'a CheckedProgram,
+        program: &'a CheckedProgramFields,
         lookup: &'a CheckedProgramLookup,
         out_net: &'a OutNet,
         indexes: &'a SemanticExpressionBuilderIndexes,
@@ -7457,7 +7461,7 @@ mod tests {
         Project(Box<BodyShape>, Vec<String>),
     }
 
-    fn semantic_graph(source: &str) -> SemanticExecutionGraphV1 {
+    fn semantic_graph(source: &str) -> SemanticExecutionImageColumnsV1 {
         let parsed = boon_parser::parse_source("semantic-contextual-expansion.bn", source).unwrap();
         let checked = boon_typecheck::check_program(&parsed);
         assert!(
@@ -7476,7 +7480,10 @@ mod tests {
         .clone()
     }
 
-    fn body_shape(graph: &SemanticExecutionGraphV1, expression: SemanticExprId) -> BodyShape {
+    fn body_shape(
+        graph: &SemanticExecutionImageColumnsV1,
+        expression: SemanticExprId,
+    ) -> BodyShape {
         match &graph.expressions[expression.as_usize()].kind {
             SemanticExpressionKind::Number(value) => BodyShape::Number(value.clone()),
             SemanticExpressionKind::Infix { left, op, right } => BodyShape::Infix(
@@ -7495,7 +7502,7 @@ mod tests {
     }
 
     fn only_materialization(
-        graph: &SemanticExecutionGraphV1,
+        graph: &SemanticExecutionImageColumnsV1,
     ) -> &SemanticContextualMaterialization {
         let [materialization] = graph.materializations.as_slice() else {
             panic!(
@@ -8150,7 +8157,7 @@ result: range()
 
     #[test]
     fn static_dispatch_does_not_expand_unselected_callable_bodies() {
-        fn dispatch_graph(branch_count: usize) -> SemanticExecutionGraphV1 {
+        fn dispatch_graph(branch_count: usize) -> SemanticExecutionImageColumnsV1 {
             let mut source = String::new();
             for index in 0..branch_count {
                 source.push_str(&format!(

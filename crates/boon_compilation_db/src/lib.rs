@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt;
 
@@ -80,6 +81,288 @@ impl RequestMemo {
         self.input_fingerprint = input_fingerprint;
         self.result_fingerprint = result_fingerprint;
         Ok(changed)
+    }
+}
+
+/// Work performed by a typed request evaluator across all revisions.
+///
+/// `reused` means a request was verified green without executing. `backdated`
+/// means it executed after conservative invalidation but published the same
+/// result fingerprint, so its previous `changed_at` revision was retained.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RequestEvaluationStats {
+    pub executed: usize,
+    pub reused: usize,
+    pub backdated: usize,
+    pub changed: usize,
+    pub removed: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RequestDisposition {
+    Executed,
+    Reused,
+}
+
+/// Borrowed typed result of one evaluator request.
+pub struct RequestEvaluation<'a, V> {
+    value: &'a V,
+    disposition: RequestDisposition,
+}
+
+impl<'a, V> RequestEvaluation<'a, V> {
+    pub const fn value(&self) -> &'a V {
+        self.value
+    }
+
+    pub const fn disposition(&self) -> RequestDisposition {
+        self.disposition
+    }
+
+    pub const fn was_reused(&self) -> bool {
+        matches!(self.disposition, RequestDisposition::Reused)
+    }
+}
+
+struct TypedRequestSlot<K, V> {
+    memo: RequestMemo,
+    dependencies: Vec<K>,
+    value: V,
+}
+
+/// Revisioned evaluator for one language-owned typed key/result family.
+///
+/// The generic instantiation remains owned by the language component; this
+/// crate never erases values through `Any` or serializes them into a second
+/// semantic authority. Callers evaluate dependencies first and pass their
+/// exact typed keys. The evaluator verifies those dependencies at the current
+/// revision, records the span, reuses green values, backdates equal results,
+/// and exposes exact reverse cones for invalidation and evidence.
+pub struct TypedRequestEvaluator<K, V> {
+    revision: Revision,
+    generation: u64,
+    slots: BTreeMap<K, TypedRequestSlot<K, V>>,
+    stats: RequestEvaluationStats,
+}
+
+impl<K, V> TypedRequestEvaluator<K, V>
+where
+    K: Clone + Ord,
+{
+    pub fn new(revision: Revision) -> Self {
+        Self {
+            revision,
+            generation: 0,
+            slots: BTreeMap::new(),
+            stats: RequestEvaluationStats::default(),
+        }
+    }
+
+    pub const fn revision(&self) -> Revision {
+        self.revision
+    }
+
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub const fn stats(&self) -> RequestEvaluationStats {
+        self.stats
+    }
+
+    pub fn request_count(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// Advance to a newer source revision. Values remain retained but cease to
+    /// be current until their request is explicitly verified or executed.
+    pub fn advance_to(&mut self, revision: Revision) -> Result<(), CompilationDbError> {
+        if revision <= self.revision {
+            return Err(CompilationDbError::new(format!(
+                "compilation evaluator revision {} is not newer than {}",
+                revision.0, self.revision.0,
+            )));
+        }
+        self.revision = revision;
+        self.generation = self
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| CompilationDbError::new("compilation evaluator generation overflow"))?;
+        Ok(())
+    }
+
+    /// Return a value only when it has been verified for the current revision.
+    pub fn current_value(&self, key: &K) -> Option<&V> {
+        let slot = self.slots.get(key)?;
+        (slot.memo.verified_at == self.revision).then_some(&slot.value)
+    }
+
+    pub fn memo(&self, key: &K) -> Option<&RequestMemo> {
+        self.slots.get(key).map(|slot| &slot.memo)
+    }
+
+    pub fn dependencies(&self, key: &K) -> Option<&[K]> {
+        self.slots.get(key).map(|slot| slot.dependencies.as_slice())
+    }
+
+    /// Remove requests outside a language-owned live key set. Any surviving
+    /// request whose dependency span changes will execute on its next demand.
+    pub fn retain_requests(&mut self, mut retain: impl FnMut(&K) -> bool) {
+        let before = self.slots.len();
+        self.slots.retain(|key, _| retain(key));
+        self.stats.removed = self
+            .stats
+            .removed
+            .saturating_add(before.saturating_sub(self.slots.len()));
+    }
+
+    /// Compute the exact retained reverse dependency cone, including roots.
+    pub fn reverse_cone(&self, roots: impl IntoIterator<Item = K>) -> BTreeSet<K> {
+        let mut reverse = BTreeMap::<&K, Vec<&K>>::new();
+        for (request, slot) in &self.slots {
+            for dependency in &slot.dependencies {
+                reverse.entry(dependency).or_default().push(request);
+            }
+        }
+        let mut cone = BTreeSet::new();
+        let mut pending = roots.into_iter().collect::<VecDeque<_>>();
+        while let Some(key) = pending.pop_front() {
+            if !cone.insert(key.clone()) {
+                continue;
+            }
+            if let Some(dependents) = reverse.get(&key) {
+                pending.extend(dependents.iter().map(|dependent| (*dependent).clone()));
+            }
+        }
+        cone
+    }
+
+    /// Verify or execute one typed request.
+    ///
+    /// Every supplied dependency must already be current. Dependency order is
+    /// canonicalized, so evaluation scheduling cannot perturb fingerprints or
+    /// currentness. A request may be demanded repeatedly in one revision only
+    /// with the same input and dependency span.
+    pub fn evaluate<E>(
+        &mut self,
+        key: K,
+        input_fingerprint: RequestFingerprint,
+        dependencies: impl IntoIterator<Item = K>,
+        execute: impl FnOnce() -> Result<(V, RequestFingerprint), E>,
+    ) -> Result<RequestEvaluation<'_, V>, E>
+    where
+        E: From<CompilationDbError>,
+    {
+        let mut dependencies = dependencies.into_iter().collect::<Vec<_>>();
+        dependencies.sort();
+        dependencies.dedup();
+        if dependencies.binary_search(&key).is_ok() {
+            return Err(CompilationDbError::new(
+                "compilation evaluator request directly depends on itself",
+            )
+            .into());
+        }
+        for dependency in &dependencies {
+            let Some(slot) = self.slots.get(dependency) else {
+                return Err(CompilationDbError::new(
+                    "compilation evaluator dependency has no published value",
+                )
+                .into());
+            };
+            if slot.memo.verified_at != self.revision {
+                return Err(CompilationDbError::new(format!(
+                    "compilation evaluator dependency is verified at revision {}, expected {}",
+                    slot.memo.verified_at.0, self.revision.0,
+                ))
+                .into());
+            }
+        }
+
+        if let Some(slot) = self.slots.get(&key) {
+            if slot.memo.verified_at == self.revision {
+                if slot.memo.input_fingerprint != input_fingerprint
+                    || slot.dependencies != dependencies
+                {
+                    return Err(CompilationDbError::new(
+                        "compilation evaluator request changed after publication in one revision",
+                    )
+                    .into());
+                }
+                self.stats.reused = self.stats.reused.saturating_add(1);
+                let value = &self.slots.get(&key).expect("request remains present").value;
+                return Ok(RequestEvaluation {
+                    value,
+                    disposition: RequestDisposition::Reused,
+                });
+            }
+
+            let dependencies_are_green = dependencies.iter().all(|dependency| {
+                self.slots
+                    .get(dependency)
+                    .is_some_and(|dependency| dependency.memo.changed_at <= slot.memo.verified_at)
+            });
+            if slot.memo.input_fingerprint == input_fingerprint
+                && slot.dependencies == dependencies
+                && dependencies_are_green
+            {
+                let slot = self.slots.get_mut(&key).expect("request remains present");
+                slot.memo.verified_at = self.revision;
+                slot.memo.dependencies_verified_at = self.revision;
+                self.stats.reused = self.stats.reused.saturating_add(1);
+                return Ok(RequestEvaluation {
+                    value: &slot.value,
+                    disposition: RequestDisposition::Reused,
+                });
+            }
+        }
+
+        let generation = self.generation;
+        let (value, result_fingerprint) = execute()?;
+        if generation != self.generation {
+            return Err(CompilationDbError::new(
+                "compilation evaluator rejected a superseded generation publication",
+            )
+            .into());
+        }
+        self.stats.executed = self.stats.executed.saturating_add(1);
+
+        if let Some(slot) = self.slots.get_mut(&key) {
+            let changed = slot
+                .memo
+                .publish(
+                    self.revision,
+                    self.revision,
+                    input_fingerprint,
+                    result_fingerprint,
+                )
+                .map_err(E::from)?;
+            slot.dependencies = dependencies;
+            if changed {
+                slot.value = value;
+                self.stats.changed = self.stats.changed.saturating_add(1);
+            } else {
+                self.stats.backdated = self.stats.backdated.saturating_add(1);
+            }
+        } else {
+            self.slots.insert(
+                key.clone(),
+                TypedRequestSlot {
+                    memo: RequestMemo::new(self.revision, input_fingerprint, result_fingerprint),
+                    dependencies,
+                    value,
+                },
+            );
+            self.stats.changed = self.stats.changed.saturating_add(1);
+        }
+        let value = &self
+            .slots
+            .get(&key)
+            .expect("published request is present")
+            .value;
+        Ok(RequestEvaluation {
+            value,
+            disposition: RequestDisposition::Executed,
+        })
     }
 }
 
@@ -939,6 +1222,111 @@ mod tests {
             memo.publish(Revision(4), Revision(3), digest(6), digest(7))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn typed_evaluator_reuses_green_dependencies_and_backdates_equal_results() {
+        let mut evaluator = TypedRequestEvaluator::<&'static str, u32>::new(Revision(0));
+        let parsed = evaluator
+            .evaluate("parse", digest(1), std::iter::empty(), || {
+                Ok::<_, CompilationDbError>((10, digest(10)))
+            })
+            .unwrap();
+        assert_eq!(*parsed.value(), 10);
+        assert_eq!(parsed.disposition(), RequestDisposition::Executed);
+        let linked = evaluator
+            .evaluate("link", digest(20), ["parse"], || {
+                Ok::<_, CompilationDbError>((20, digest(20)))
+            })
+            .unwrap();
+        assert_eq!(*linked.value(), 20);
+
+        evaluator.advance_to(Revision(1)).unwrap();
+        let parsed = evaluator
+            .evaluate::<CompilationDbError>("parse", digest(1), std::iter::empty(), || {
+                panic!("green parse request executed")
+            })
+            .unwrap();
+        assert!(parsed.was_reused());
+        let linked = evaluator
+            .evaluate::<CompilationDbError>("link", digest(20), ["parse"], || {
+                panic!("green link request executed")
+            })
+            .unwrap();
+        assert!(linked.was_reused());
+
+        evaluator.advance_to(Revision(2)).unwrap();
+        evaluator
+            .evaluate("parse", digest(2), std::iter::empty(), || {
+                Ok::<_, CompilationDbError>((999, digest(10)))
+            })
+            .unwrap();
+        assert_eq!(evaluator.memo(&"parse").unwrap().changed_at, Revision(0));
+        let linked = evaluator
+            .evaluate::<CompilationDbError>("link", digest(20), ["parse"], || {
+                panic!("backdated dependency dirtied its dependent")
+            })
+            .unwrap();
+        assert!(linked.was_reused());
+        assert_eq!(*linked.value(), 20);
+
+        let stats = evaluator.stats();
+        assert_eq!(stats.executed, 3);
+        assert_eq!(stats.reused, 3);
+        assert_eq!(stats.backdated, 1);
+        assert_eq!(stats.changed, 2);
+    }
+
+    #[test]
+    fn typed_evaluator_exposes_exact_reverse_cones_and_current_values() {
+        let mut evaluator = TypedRequestEvaluator::<u8, u8>::new(Revision(0));
+        for (key, dependencies) in [(1, vec![]), (2, vec![1]), (3, vec![2]), (4, vec![])] {
+            evaluator
+                .evaluate(key, digest(key), dependencies, || {
+                    Ok::<_, CompilationDbError>((key, digest(key + 10)))
+                })
+                .unwrap();
+        }
+        assert_eq!(
+            evaluator.reverse_cone([1]).into_iter().collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(evaluator.current_value(&4), Some(&4));
+
+        evaluator.advance_to(Revision(1)).unwrap();
+        assert_eq!(evaluator.current_value(&4), None);
+        evaluator.retain_requests(|key| *key != 2 && *key != 3);
+        assert_eq!(
+            evaluator.reverse_cone([1]).into_iter().collect::<Vec<_>>(),
+            vec![1]
+        );
+        assert_eq!(evaluator.stats().removed, 2);
+    }
+
+    #[test]
+    fn typed_evaluator_rejects_unverified_and_self_dependencies() {
+        let mut evaluator = TypedRequestEvaluator::<u8, u8>::new(Revision(0));
+        let error = evaluator
+            .evaluate(1, digest(1), [1], || {
+                Ok::<_, CompilationDbError>((1, digest(11)))
+            })
+            .err()
+            .expect("self dependency fails closed");
+        assert!(error.to_string().contains("directly depends on itself"));
+
+        evaluator
+            .evaluate(1, digest(1), std::iter::empty(), || {
+                Ok::<_, CompilationDbError>((1, digest(11)))
+            })
+            .unwrap();
+        evaluator.advance_to(Revision(1)).unwrap();
+        let error = evaluator
+            .evaluate(2, digest(2), [1], || {
+                Ok::<_, CompilationDbError>((2, digest(12)))
+            })
+            .err()
+            .expect("stale dependency fails closed");
+        assert!(error.to_string().contains("verified at revision 0"));
     }
 
     #[test]

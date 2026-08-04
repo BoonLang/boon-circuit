@@ -3,14 +3,20 @@ use crate::{
     CompilerResult, CompilerSourceUnit, check_diagnostics_project_syntax_source,
     check_runtime_project_syntax_source, finish_checked_machine_plan_with_cancellation,
 };
+use boon_compilation_db::{
+    RequestEvaluationStats, RequestFingerprint, Revision as EvaluationRevision,
+    TypedRequestEvaluator,
+};
 use boon_parser::{
-    ParseWorkCounters, ParsedSourceUnit, ProjectSyntaxSnapshot, UnitSyntaxSnapshot,
-    link_project_source_unit_profiled, parse_project_source_unit_profiled, project_unit_link_keys,
+    ParseWorkCounters, ParsedSourceUnit, ProjectSyntaxSnapshot, ProjectUnitLinkKey,
+    UnitSyntaxSnapshot, link_project_source_unit_profiled, parse_project_source_unit_profiled,
+    project_unit_link_keys,
 };
 use boon_plan::{
     ApplicationIdentity, MigrationPredecessorBinding, PlanError, ProgramRole, TargetProfile,
 };
 use boon_syntax::SourceUnitId;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{
     Arc,
@@ -167,7 +173,7 @@ pub struct CompilerSession {
 struct ProjectState {
     source: CompilerProject,
     revision: Revision,
-    parsed_units: BTreeMap<SourceUnitId, RetainedUnitSyntax>,
+    syntax_requests: TypedRequestEvaluator<SessionSyntaxRequestKey, SessionSyntaxRequestValue>,
     checked: Option<CheckedSourceFromSource>,
     compiled: Option<(Revision, CompiledSealedMachinePlanFromSource)>,
     request_graph: Option<(
@@ -176,9 +182,39 @@ struct ProjectState {
     )>,
 }
 
-struct RetainedUnitSyntax {
-    parsed: Arc<ParsedSourceUnit>,
-    linked: Option<Arc<UnitSyntaxSnapshot>>,
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum SessionSyntaxRequestKey {
+    Parse(SourceUnitId),
+    Link(SourceUnitId),
+}
+
+impl SessionSyntaxRequestKey {
+    fn source_unit_id(&self) -> &SourceUnitId {
+        match self {
+            Self::Parse(source_unit_id) | Self::Link(source_unit_id) => source_unit_id,
+        }
+    }
+}
+
+enum SessionSyntaxRequestValue {
+    Parsed(Arc<ParsedSourceUnit>),
+    Linked(Arc<UnitSyntaxSnapshot>),
+}
+
+impl SessionSyntaxRequestValue {
+    fn parsed(&self) -> Option<&Arc<ParsedSourceUnit>> {
+        match self {
+            Self::Parsed(parsed) => Some(parsed),
+            Self::Linked(_) => None,
+        }
+    }
+
+    fn linked(&self) -> Option<&Arc<UnitSyntaxSnapshot>> {
+        match self {
+            Self::Parsed(_) => None,
+            Self::Linked(linked) => Some(linked),
+        }
+    }
 }
 
 impl CompilerSession {
@@ -195,7 +231,7 @@ impl CompilerSession {
             ProjectState {
                 source: project,
                 revision: Revision(0),
-                parsed_units: BTreeMap::new(),
+                syntax_requests: TypedRequestEvaluator::new(EvaluationRevision(0)),
                 checked: None,
                 compiled: None,
                 request_graph: None,
@@ -264,6 +300,12 @@ impl CompilerSession {
         if !changed {
             return Ok(state.revision);
         }
+        let next_revision = state.revision.0.checked_add(1).ok_or_else(|| {
+            session_error(format!("compiler project {} revision overflow", project.0))
+        })?;
+        state
+            .syntax_requests
+            .advance_to(EvaluationRevision(next_revision))?;
         for update in updates {
             let unit = state
                 .source
@@ -277,17 +319,10 @@ impl CompilerSession {
                     ))
                 })?;
             if unit.source != update.source {
-                let source_unit_id = SourceUnitId::from_path(&unit.path).map_err(|error| {
-                    session_error(format!(
-                        "compiler project {} has invalid source unit `{}`: {error}",
-                        project.0, unit.path
-                    ))
-                })?;
-                state.parsed_units.remove(&source_unit_id);
                 unit.source = update.source;
             }
         }
-        state.revision = Revision(state.revision.0.saturating_add(1));
+        state.revision = Revision(next_revision);
         state.checked = None;
         // Keep the last verified artifact alive while the replacement revision
         // checks and verifies. Invalid or canceled source must not blank a
@@ -388,7 +423,7 @@ impl CompilerSession {
             return Ok(state.revision);
         }
 
-        let mut surviving_sources = BTreeMap::new();
+        let mut surviving_sources = BTreeSet::new();
         for unit in &candidate.units {
             let source_unit_id = SourceUnitId::from_path(&unit.path).map_err(|error| {
                 session_error(format!(
@@ -396,15 +431,19 @@ impl CompilerSession {
                     project.0, unit.path
                 ))
             })?;
-            surviving_sources.insert(source_unit_id, unit.source.as_str());
+            surviving_sources.insert(source_unit_id);
         }
-        state.parsed_units.retain(|source_unit_id, snapshot| {
-            surviving_sources
-                .get(source_unit_id)
-                .is_some_and(|source| *source == snapshot.parsed.source.as_str())
-        });
+        let next_revision = state.revision.0.checked_add(1).ok_or_else(|| {
+            session_error(format!("compiler project {} revision overflow", project.0))
+        })?;
+        state
+            .syntax_requests
+            .advance_to(EvaluationRevision(next_revision))?;
+        state
+            .syntax_requests
+            .retain_requests(|key| surviving_sources.contains(key.source_unit_id()));
         state.source = candidate;
-        state.revision = Revision(state.revision.0.saturating_add(1));
+        state.revision = Revision(next_revision);
         state.checked = None;
         Ok(state.revision)
     }
@@ -449,6 +488,18 @@ impl CompilerSession {
             .map(|(revision, graph)| (*revision, Arc::clone(graph))))
     }
 
+    /// Cumulative typed parser/link request work for this session project.
+    pub fn syntax_request_stats(
+        &self,
+        project: ProjectId,
+    ) -> CompilerResult<RequestEvaluationStats> {
+        let state = self
+            .projects
+            .get(&project)
+            .ok_or_else(|| session_error(format!("unknown compiler project {}", project.0)))?;
+        Ok(state.syntax_requests.stats())
+    }
+
     /// Returns the retained context-independent syntax artifact for one unit,
     /// if that unit has been parsed by a request in this session.
     pub fn unit_syntax_snapshot(
@@ -463,9 +514,10 @@ impl CompilerSession {
         let source_unit_id = SourceUnitId::from_path(path)
             .map_err(|error| session_error(format!("invalid source unit `{path}`: {error}")))?;
         Ok(state
-            .parsed_units
-            .get(&source_unit_id)
-            .and_then(|unit| unit.linked.as_ref().map(Arc::clone)))
+            .syntax_requests
+            .current_value(&SessionSyntaxRequestKey::Link(source_unit_id))
+            .and_then(SessionSyntaxRequestValue::linked)
+            .map(Arc::clone))
     }
 
     pub fn request<'a>(
@@ -580,38 +632,54 @@ fn parse_project_snapshot(
                 unit.path
             ))
         })?;
-        if let Some(snapshot) = state
-            .parsed_units
-            .get(&source_unit_id)
-            .filter(|snapshot| snapshot.parsed.source == unit.source)
-        {
+        let request_key = SessionSyntaxRequestKey::Parse(source_unit_id);
+        let input_fingerprint = source_unit_request_fingerprint(&unit.path, &unit.source);
+        let mut executed_work = None;
+        let evaluation = state
+            .syntax_requests
+            .evaluate::<Box<dyn std::error::Error>>(
+                request_key.clone(),
+                input_fingerprint,
+                std::iter::empty(),
+                || {
+                    let (parsed, profile) =
+                        parse_project_source_unit_profiled(unit.path.clone(), unit.source.clone());
+                    executed_work = Some(profile.work_counters);
+                    Ok((
+                        SessionSyntaxRequestValue::Parsed(Arc::new(parsed?)),
+                        input_fingerprint,
+                    ))
+                },
+            )?;
+        if evaluation.was_reused() {
             work.record_reused_source_units(1);
-            parsed_units.push(Arc::clone(&snapshot.parsed));
-            continue;
+        } else {
+            work.accumulate(
+                executed_work.expect("executed parser request publishes exact work counters"),
+            );
         }
-
-        let (parsed, profile) =
-            parse_project_source_unit_profiled(unit.path.clone(), unit.source.clone());
-        work.accumulate(profile.work_counters);
-        let snapshot = Arc::new(parsed?);
-        state.parsed_units.insert(
-            source_unit_id,
-            RetainedUnitSyntax {
-                parsed: Arc::clone(&snapshot),
-                linked: None,
-            },
+        let parsed = Arc::clone(
+            evaluation
+                .value()
+                .parsed()
+                .expect("parse request publishes parsed syntax"),
         );
-        parsed_units.push(snapshot);
+        let result_fingerprint = state
+            .syntax_requests
+            .memo(&request_key)
+            .expect("parse request publishes memo currentness")
+            .result_fingerprint;
+        parsed_units.push((parsed, request_key, result_fingerprint));
     }
 
     let link_keys = project_unit_link_keys(
         &state.source.entrypoint,
         parsed_units
             .iter()
-            .map(|unit| (unit.source_unit_id.clone(), unit.declared_functions.clone())),
+            .map(|(unit, _, _)| (unit.source_unit_id.clone(), unit.declared_functions.clone())),
     )?;
     let mut linked_units = Vec::with_capacity(parsed_units.len());
-    for parsed in parsed_units {
+    for (parsed, parse_request, parse_result_fingerprint) in parsed_units {
         let source_unit_id = parsed.source_unit_id.clone();
         let link_key = link_keys.get(&source_unit_id).cloned().ok_or_else(|| {
             session_error(format!(
@@ -619,29 +687,99 @@ fn parse_project_snapshot(
                 parsed.path
             ))
         })?;
-        let retained = state
-            .parsed_units
-            .get_mut(&source_unit_id)
-            .expect("parsed project unit is retained before linking");
-        if let Some(linked) = retained
-            .linked
-            .as_ref()
-            .filter(|linked| linked.link_key() == &link_key)
-        {
-            linked_units.push(Arc::clone(linked));
-            continue;
+        let request_key = SessionSyntaxRequestKey::Link(source_unit_id);
+        let input_fingerprint = project_link_request_fingerprint(&link_key);
+        let result_fingerprint = dependent_request_fingerprint(
+            b"boon.compiler-session.unit-link-result.v1\0",
+            parse_result_fingerprint,
+            input_fingerprint,
+        );
+        let mut executed_work = None;
+        let evaluation = state
+            .syntax_requests
+            .evaluate::<Box<dyn std::error::Error>>(
+                request_key,
+                input_fingerprint,
+                [parse_request],
+                || {
+                    let (linked, profile) = link_project_source_unit_profiled(
+                        parsed.as_ref().clone(),
+                        link_key.clone(),
+                    );
+                    executed_work = Some(profile.work_counters);
+                    Ok((
+                        SessionSyntaxRequestValue::Linked(Arc::new(linked?)),
+                        result_fingerprint,
+                    ))
+                },
+            )?;
+        if !evaluation.was_reused() {
+            work.accumulate(
+                executed_work.expect("executed link request publishes exact work counters"),
+            );
         }
-        let (linked, profile) =
-            link_project_source_unit_profiled(parsed.as_ref().clone(), link_key);
-        work.accumulate(profile.work_counters);
-        let linked = Arc::new(linked?);
-        retained.linked = Some(Arc::clone(&linked));
+        let linked = Arc::clone(
+            evaluation
+                .value()
+                .linked()
+                .expect("link request publishes linked unit syntax"),
+        );
         linked_units.push(linked);
     }
 
     let project =
         ProjectSyntaxSnapshot::from_unit_snapshots(&state.source.entrypoint, linked_units)?;
     Ok((project, work, started.elapsed().as_secs_f64() * 1_000.0))
+}
+
+fn source_unit_request_fingerprint(path: &str, source: &str) -> RequestFingerprint {
+    request_fingerprint(
+        b"boon.compiler-session.source-unit-parse.v1\0",
+        [path.as_bytes(), source.as_bytes()],
+    )
+}
+
+fn project_link_request_fingerprint(link_key: &ProjectUnitLinkKey) -> RequestFingerprint {
+    let mut hasher = Sha256::new();
+    hasher.update(b"boon.compiler-session.source-unit-link.v1\0");
+    hasher.update(link_key.namespace.get().to_le_bytes());
+    match link_key.module.as_deref() {
+        Some(module) => {
+            hasher.update([1]);
+            update_request_fingerprint_part(&mut hasher, module.as_bytes());
+        }
+        None => hasher.update([0]),
+    }
+    hasher.update((link_key.module_functions.len() as u64).to_le_bytes());
+    for function in &link_key.module_functions {
+        update_request_fingerprint_part(&mut hasher, function.as_bytes());
+    }
+    hasher.finalize().into()
+}
+
+fn dependent_request_fingerprint(
+    domain: &[u8],
+    dependency: RequestFingerprint,
+    local: RequestFingerprint,
+) -> RequestFingerprint {
+    request_fingerprint(domain, [dependency.as_slice(), local.as_slice()])
+}
+
+fn request_fingerprint<'a>(
+    domain: &[u8],
+    parts: impl IntoIterator<Item = &'a [u8]>,
+) -> RequestFingerprint {
+    let mut hasher = Sha256::new();
+    hasher.update(domain);
+    for part in parts {
+        update_request_fingerprint_part(&mut hasher, part);
+    }
+    hasher.finalize().into()
+}
+
+fn update_request_fingerprint_part(hasher: &mut Sha256, part: &[u8]) {
+    hasher.update((part.len() as u64).to_le_bytes());
+    hasher.update(part);
 }
 
 fn validate_project(project: &CompilerProject) -> CompilerResult<()> {
@@ -689,6 +827,7 @@ fn session_error(message: impl Into<String>) -> Box<dyn std::error::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     fn project(source: &str) -> CompilerProject {
         CompilerProject::new(
@@ -942,6 +1081,10 @@ mod tests {
             assert_eq!(first.profile.parse_work.source_units_reused, 0);
             assert_eq!(first.profile.parse_work.nodes_rebased, 0);
         }
+        let first_stats = session.syntax_request_stats(project).unwrap();
+        assert_eq!(first_stats.executed, 4);
+        assert_eq!(first_stats.reused, 0);
+        assert_eq!(first_stats.changed, 4);
         let retained_a = session
             .unit_syntax_snapshot(project, "A.bn")
             .unwrap()
@@ -976,6 +1119,10 @@ mod tests {
             assert_eq!(second.profile.parse_work.nodes_rebased, 0);
             second.profile.parse_work
         };
+        let second_stats = session.syntax_request_stats(project).unwrap();
+        assert_eq!(second_stats.executed, 6);
+        assert_eq!(second_stats.reused, 2);
+        assert_eq!(second_stats.changed, 6);
 
         let mut isolated = CompilerSession::new();
         let isolated_project = isolated
@@ -1016,6 +1163,91 @@ mod tests {
             .unwrap();
         assert!(Arc::ptr_eq(&retained_a, &current_a));
         assert!(!Arc::ptr_eq(&replaced_run, &current_run));
+    }
+
+    #[test]
+    fn todo_text_edit_warm_diagnostics_match_a_clean_session() {
+        const SOURCE: &str = "TEXT { Walk the dog }";
+        const EDITED: &str = "TEXT { Walk the dogs }";
+        let (entrypoint, units) =
+            crate::compiler_source_project_for_path(Path::new("examples/todo_mvc_physical/RUN.bn"))
+                .unwrap();
+        let edit_path = "examples/todo_mvc_physical/RUN.bn";
+        let edited_source = units
+            .iter()
+            .find(|unit| unit.path == edit_path)
+            .unwrap()
+            .source
+            .replacen(SOURCE, EDITED, 1);
+
+        let project_for = |units| {
+            CompilerProject::new(
+                entrypoint.clone(),
+                units,
+                TargetProfile::SoftwareDefault,
+                ProgramRole::Client,
+                ApplicationIdentity::compiler_default(),
+            )
+        };
+        let mut warm = CompilerSession::new();
+        let warm_project = warm.open_project(project_for(units.clone())).unwrap();
+        let base_revision = warm.revision(warm_project).unwrap();
+        warm.request(
+            warm_project,
+            base_revision,
+            CompileIntent::Diagnostics,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        let edited_revision = warm
+            .apply_update(
+                warm_project,
+                UnitUpdate::new(edit_path, edited_source.clone()),
+            )
+            .unwrap();
+        let warm_diagnostics = warm
+            .request(
+                warm_project,
+                edited_revision,
+                CompileIntent::Diagnostics,
+                &CancellationToken::new(),
+            )
+            .unwrap()
+            .diagnostics()
+            .unwrap()
+            .output
+            .report
+            .clone();
+
+        let mut edited_units = units;
+        edited_units
+            .iter_mut()
+            .find(|unit| unit.path == edit_path)
+            .unwrap()
+            .source = edited_source;
+        let mut clean = CompilerSession::new();
+        let clean_project = clean.open_project(project_for(edited_units)).unwrap();
+        let clean_revision = clean.revision(clean_project).unwrap();
+        let clean_diagnostics = clean
+            .request(
+                clean_project,
+                clean_revision,
+                CompileIntent::Diagnostics,
+                &CancellationToken::new(),
+            )
+            .unwrap()
+            .diagnostics()
+            .unwrap()
+            .output
+            .report
+            .clone();
+
+        assert_eq!(warm_diagnostics, clean_diagnostics);
+        assert!(
+            !warm_diagnostics.has_errors(),
+            "text-only TodoMVC edit produced diagnostics: {:#?}",
+            warm_diagnostics.diagnostics,
+        );
     }
 
     #[test]

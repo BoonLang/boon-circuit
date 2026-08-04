@@ -215,6 +215,24 @@ impl TypecheckSyntaxProgram {
         )
     }
 
+    /// Cross the unit-native syntax/checked identity boundary explicitly.
+    ///
+    /// Packed syntax ids are stable inside their source unit. Checked program
+    /// expressions use a dense artifact projection instead, so indexing the
+    /// latter with a syntax id is never valid even though both representations
+    /// are currently integer-backed.
+    fn checked_expression_for_syntax<'a>(
+        &self,
+        program: &'a CheckedProgramFields,
+        syntax_id: usize,
+    ) -> Option<&'a CheckedExpression> {
+        let checked_slot = self.expression_slot(syntax_id)?;
+        program
+            .expressions
+            .get(checked_slot)
+            .filter(|expression| expression.id.0 as usize == checked_slot)
+    }
+
     fn checked_span(
         &self,
         syntax_id: usize,
@@ -20270,7 +20288,7 @@ impl CheckedProgramDatabase {
                     (
                         self.program
                             .statement_id_for_slot(statement.id.0 as usize)
-                            .unwrap_or(statement.id.0 as usize),
+                            .expect("checked statement has a unit-native syntax projection"),
                         value,
                     )
                 })
@@ -20335,10 +20353,9 @@ impl CheckedProgramDatabase {
             // actually query, using the finalized checked flow table as their
             // single type owner.
             for (path, expression) in &self.declaration_exprs.exact {
-                if let Some(flow_type) = program
-                    .expressions
-                    .get(*expression)
-                    .filter(|entry| entry.id.0 as usize == *expression)
+                if let Some(flow_type) = self
+                    .program
+                    .checked_expression_for_syntax(program, *expression)
                     .map(|entry| entry.flow_type.ty.clone())
                 {
                     self.name_bindings.insert(path.clone(), flow_type);
@@ -20348,10 +20365,9 @@ impl CheckedProgramDatabase {
                 let Some(expression) = expression else {
                     continue;
                 };
-                if let Some(flow_type) = program
-                    .expressions
-                    .get(*expression)
-                    .filter(|entry| entry.id.0 as usize == *expression)
+                if let Some(flow_type) = self
+                    .program
+                    .checked_expression_for_syntax(program, *expression)
                     .map(|entry| entry.flow_type.ty.clone())
                 {
                     self.name_bindings.insert(suffix.clone(), flow_type);
@@ -20865,10 +20881,9 @@ impl CheckedProgramDatabase {
             host_port_table,
             full_document_typecheck_coverage: document_root(&self.program).is_none_or(|root| {
                 statement_expr_ids(root).into_iter().all(|expr_id| {
-                    checked_program
-                        .expressions
-                        .get(expr_id)
-                        .is_some_and(|expression| expression.id.0 as usize == expr_id)
+                    self.program
+                        .checked_expression_for_syntax(&checked_program, expr_id)
+                        .is_some()
                 })
             }),
             output_root_types,
@@ -24152,10 +24167,7 @@ impl CheckedProgramDatabase {
         }
         if self.checked_diagnostic_replay
             && let Some(program) = self.checked_program_for_diagnostics.as_ref()
-            && let Some(expression) = program
-                .expressions
-                .get(expr_id)
-                .filter(|expression| expression.id.0 as usize == expr_id)
+            && let Some(expression) = self.program.checked_expression_for_syntax(program, expr_id)
             && let Some((target, projection)) = match &expression.kind {
                 CheckedExpressionKind::Read {
                     target, projection, ..

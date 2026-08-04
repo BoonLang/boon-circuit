@@ -386,6 +386,18 @@ stronger three-reviewer performance closure defined below.
    compact-invocation-overlay refactor; do not tune resource rows or call this
    a performance exit.
 
+   The subsequent execution multiplier trace fixes the next implementation
+   unit. The current handoff rebuilds 47,296 rows/routes and 6,483 projections;
+   expression/origin rows cost 890.791 ms and final sealing costs 340.185 ms of
+   a 1,869.164 ms phase. Yet 11,257/16,525 expressions are definition-routed and
+   only 5,268 are invocation-routed. Introduce checked-definition receipts,
+   compact invocation overlays, definition-owned diagnostic source maps plus
+   occurrence routes, and direct executable-row/CSR publication. Delete the
+   post-hoc handoff and Manifest execution import when parity passes. Follow
+   with one compact domain-summary linker and a retained immutable
+   `CompilerSession` snapshot/request database; the current whole-checked-slot
+   invalidation is not a warm compiler.
+
    The post-`ac2b234` high-level audit supersedes a mutating post-resource
    execution seal. Move inline list-authority synthesis into execution
    construction, seal immutable execution once, and make the resource typed

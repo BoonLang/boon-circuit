@@ -2742,6 +2742,21 @@ fn elaborate_with_representation(
     let (checked_program, checked_handoff) = checked_program.into_parts();
     let source_bundle_digest_v1 = checked_program.source_bundle_digest_v1;
     let role = checked_program.role;
+    if trace_elaboration {
+        eprintln!(
+            "boon_semantic artifact checked_program scopes={} declarations={} statements={} expressions={} callables={} calls={} sources={} states={} lists={} handoff_projections={}",
+            checked_program.scopes.len(),
+            checked_program.declarations.len(),
+            checked_program.statements.len(),
+            checked_program.expressions.len(),
+            checked_program.callables.len(),
+            checked_program.calls.len(),
+            checked_program.sources.len(),
+            checked_program.states.len(),
+            checked_program.lists.len(),
+            checked_handoff.projections.len(),
+        );
+    }
     #[cfg(test)]
     let checked_program_oracle = checked_program.clone();
     let producer_materializations = elaboration_phase!(
@@ -2862,14 +2877,20 @@ fn elaborate_with_representation(
     let execution_graph = semantic_image_builder.execution();
     if trace_elaboration {
         eprintln!(
-            "boon_semantic artifact execution_graph scopes={} expressions={} statements={} callables={} calls={} functions={} materializations={}",
+            "boon_semantic artifact execution_graph scopes={} expressions={} origins={} statements={} callables={} calls={} call_occurrences={} sources={} states={} roots={} functions={} materializations={} static_owners={}",
             execution_graph.scopes.len(),
             execution_graph.expressions.len(),
+            execution_graph.checked_expression_origins.len(),
             execution_graph.statements.len(),
             execution_graph.callables.len(),
             execution_graph.calls.len(),
+            execution_graph.call_occurrences.len(),
+            execution_graph.sources.len(),
+            execution_graph.states.len(),
+            execution_graph.roots.len(),
             execution_graph.functions.len(),
             execution_graph.materializations.len(),
+            execution_graph.static_owners.len(),
         );
     }
     elaboration_phase!(

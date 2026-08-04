@@ -608,6 +608,17 @@ Current checkpoints to preserve and audit rather than redo:
   proof that the next work is the larger definition-receipt/compact-invocation
   execution architecture and direct row/CSR publication, not resource-row or
   serialization-buffer micro-tuning;
+- implement the post-`210b1a9` execution multiplier audit as the next flag-day
+  refactor. The current handoff rebuilds 47,296 row fingerprints/routes and
+  costs 1,869.164 ms; expression/origin mirroring is 890.791 ms and final
+  sealing is 340.185 ms. Because 11,257 of 16,525 expressions are stable-
+  definition routed, replace rich row mirroring with checked-definition
+  receipts, compact invocation overlays, split definition/occurrence source
+  provenance, final executable row receipts, and one compact domain-summary/
+  relocation linker. Connect the same request graph and immutable unit results
+  to `CompilerSession`; its current whole-checked-slot invalidation cannot pass
+  warm gates. Preserve full-handoff and clean-full paths only as independent
+  test oracles, never production fallbacks;
 - move verified-intent demand collection before occurrence expansion and
   backend lowering. Split top-level authority/interface summaries from the
   final program-link sink, and version the callable interface schema before

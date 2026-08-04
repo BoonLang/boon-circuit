@@ -1340,6 +1340,100 @@ This supersedes the earlier statement that execution's exact seal belongs
 after a mutating resource builder. It preserves the same semantic facts and
 oracles while assigning each fact to one phase and publishing it once.
 
+### Fifth Whole-Pipeline Audit: Compile Definitions, Link Overlays, Retain Snapshots
+
+The post-`210b1a9` trace rejects treating execution finalization as a hashing
+utility problem. NovyWave has 17,721 checked expressions and 16,525 execution
+expressions. Of those execution expressions, 11,257 route directly to stable
+checked definitions and only 5,268 route to concrete invocation projections.
+Nevertheless `execution_image_handoff` constructs 47,296 row fingerprints,
+47,296 entity routes, 6,483 projections, 3,494 invocation paths, and 16,834 raw
+relocations after execution has already been built. One projection contains
+18,509 rows, which is both a cold serialization hotspot and an unusably coarse
+warm invalidation unit.
+
+The measured execution finalization is 1,869.164 ms:
+
+| work | debug NovyWave time |
+| --- | ---: |
+| expression plus duplicated origin rows | 890.791 ms |
+| final projection/path/relocation canonicalization and whole-handoff hash | 340.185 ms |
+| calls plus call occurrences | 188.654 ms |
+| projection/path setup | 93.477 ms |
+| scopes, statements, callables, and remaining domains | 356.057 ms |
+
+This identifies the replacement representation. A stable checked-definition
+receipt commits authored opcode, literal/interface shape, source definition,
+and dependency-relevant checked facts once. A compact invocation overlay
+commits only concrete type/layout substitutions, parameter/PASSED/context
+bindings, owner/resource/effect/render coordinates, and dense plan-code
+relocations. Diagnostic provenance splits into a definition-owned source map
+and a compact occurrence route; it does not clone checked scope/span data into
+every execution row. Final executable rows, not rich semantic DTO mirrors, are
+the row-fingerprint authority.
+
+The cold pipeline becomes a thin-link shape:
+
+```text
+immutable unit snapshots
+  -> checked interface + definition receipts
+  -> demanded definition variants + compact invocation overlays
+  -> construction-owned resource/reactive/storage/view/memory tables
+  -> compact summary index + relocation/SCC link
+  -> consuming runnable-image builder
+  -> SealedRunnableMachine + optional proof/debug materializers
+```
+
+The compact summary link may inspect public/effect/resource/storage/view/
+migration summaries and exact inter-shard relocations. It must not import all
+rich rows into a monolithic Manifest compiler. This follows ThinLTO's useful
+separation between per-unit products and a compact combined summary index,
+without adopting LLVM IR or deferring Boon's mandatory verifier. The local
+receipt/result fingerprint is also the red/green query result: unchanged
+definition or interface output is backdated and keeps downstream shards green.
+
+The warm architecture is currently absent, not merely inefficient.
+`CompilerSession::apply_updates` replaces source strings and sets the entire
+checked slot to `None`; `boon_compilation_db` is not retained by the session and
+currently stores no parsed, checked, semantic, or runnable values across
+edits. The same flag-day program therefore adds an immutable `ProjectSnapshot`
+with structurally shared unit products and a persistent request database. Unit,
+interface, definition, invocation, domain, link, and runnable requests retain
+values plus exact dependencies, `changed_at`, and `verified_at`. A successful
+new revision publishes atomically while the last verified runnable image stays
+live. A whole-project artifact cache is not an incremental compiler.
+
+The implementation order is therefore stricter than “remove the scanner”:
+
+1. define checked-definition, invocation-overlay, diagnostic-source-map, and
+   compact relocation schemas with independent local/link/image digests;
+2. publish expression/origin/call rows at their construction sites and compare
+   them against the current full execution handoff under tests;
+3. make compact executable rows plus domain seals the production proof input,
+   then delete `execution_image_handoff`, its 47,296-row mirror, and Manifest's
+   execution re-import in the same cut;
+4. replace the remaining Manifest inventories with the compact summary linker
+   and fold the semantic program digest from existing domain/link receipts;
+5. connect retained immutable unit/definition results and the same dependency
+   graph to `CompilerSession`; prove clean-full parity and exact cones before
+   enabling bounded parallel evaluation;
+6. split model/build crates only at the resulting one-way seams. The likely
+   durable cuts are dependency-bottom semantic-image contracts, semantic
+   construction/proof, dependency-bottom runnable-image contracts, and the
+   persistent compiler service.
+
+Primary architecture references supporting these choices:
+
+- [rustc red/green incremental queries](https://rustc-dev-guide.rust-lang.org/queries/incremental-compilation.html)
+- [Salsa result backdating and durability](https://salsa-rs.github.io/salsa/reference/algorithm.html)
+- [TypeScript incremental builder programs](https://github.com/microsoft/TypeScript/wiki/Using-the-Compiler-API)
+- [Roslyn immutable workspace snapshots](https://learn.microsoft.com/en-us/dotnet/csharp/roslyn-sdk/work-with-workspace)
+- [LLVM ThinLTO compact summary index](https://clang.llvm.org/docs/ThinLTO.html)
+
+The trace-only phase/count instrumentation remains in the semantic compiler so
+future measurements distinguish row families and representation cardinality.
+It is evidence tooling, not an optimization or an acceptance gate.
+
 ## Architectural Decisions
 
 ### 1. Activation Is A First-Class Output, Not An Empty Mount

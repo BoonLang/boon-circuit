@@ -873,6 +873,18 @@ Current cold-diagnostics candidate evidence:
   compact invocation overlays and construction-owned relocations. Reusing a
   serialization buffer or tuning the new resource rows is explicitly not the
   architectural exit.
+- The post-resource execution audit now quantifies the next flag-day owner.
+  NovyWave's execution handoff mirrors 47,296 rows and routes after construction
+  even though 11,257 of 16,525 execution expressions are stable-definition
+  routed and only 5,268 are invocation routed. Expression/origin mirroring
+  costs 890.791 ms and final projection/whole-handoff sealing costs 340.185 ms
+  of a 1,869.164 ms phase. Replace the mirror with checked-definition receipts,
+  compact invocation overlays, split definition/occurrence provenance, and
+  final executable row receipts emitted at construction. Then use one compact
+  summary/relocation linker across domain seals. `CompilerSession` must retain
+  immutable unit and request results; clearing the whole checked slot on every
+  update cannot satisfy any warm gate. See the architecture plan's fifth audit
+  for the schema and flag-day order.
 - Do not preserve V3's 208k subject cardinality as a production V4/V5 proof
   requirement. The independent test oracle must map every historical subject
   to exactly one canonical finalized shard row and classifier field/domain and prove

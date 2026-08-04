@@ -707,6 +707,45 @@ impl<'a> ExecutionImageHandoffBuilderV2<'a> {
         source_bundle_digest_v1: SourceBundleDigestV1,
         role: ProgramRole,
     ) -> Result<ExecutionImageHandoffV2, String> {
+        if std::env::var_os("BOON_SEMANTIC_TRACE").is_some() {
+            let checked_projections = self
+                .projections
+                .iter()
+                .filter(|projection| {
+                    matches!(
+                        projection.identity,
+                        SemanticImageProjectionIdentityV2::Checked { .. }
+                    )
+                })
+                .count();
+            let row_count = self
+                .projections
+                .iter()
+                .map(|projection| projection.row_digests.len())
+                .sum::<usize>();
+            let raw_relocation_count = self
+                .projections
+                .iter()
+                .map(|projection| projection.relocations.len())
+                .sum::<usize>();
+            let maximum_projection_rows = self
+                .projections
+                .iter()
+                .map(|projection| projection.row_digests.len())
+                .max()
+                .unwrap_or_default();
+            eprintln!(
+                "boon_semantic execution_handoff pending paths={} projections={} checked_projections={} invocation_projections={} rows={} entity_routes={} raw_relocations={} maximum_projection_rows={}",
+                self.paths.len(),
+                self.projections.len(),
+                checked_projections,
+                self.projections.len() - checked_projections,
+                row_count,
+                self.entity_routes.len(),
+                raw_relocation_count,
+                maximum_projection_rows,
+            );
+        }
         let Self {
             checked: _,
             definition_by_checked_projection: _,
@@ -1136,14 +1175,27 @@ fn function_projection(
     )
 }
 
+fn trace_execution_handoff_phase(enabled: bool, name: &str, started: &mut std::time::Instant) {
+    if enabled {
+        eprintln!(
+            "boon_semantic execution_handoff phase={name} elapsed_ms={:.3}",
+            started.elapsed().as_secs_f64() * 1_000.0
+        );
+        *started = std::time::Instant::now();
+    }
+}
+
 fn execution_image_handoff(
     checked: &CheckedImageHandoffV2,
     out: &ResolvedOutGraph,
     execution: &SemanticExecutionImageColumnsV1,
 ) -> Result<ExecutionImageHandoffV2, String> {
+    let trace_handoff = std::env::var_os("BOON_SEMANTIC_TRACE").is_some();
+    let mut trace_started = std::time::Instant::now();
     let mut builder = ExecutionImageHandoffBuilderV2::new(checked)?;
     let invocations = call_instance_projections(&mut builder, out)?;
     let owner_projections = owner_projections(out, &invocations)?;
+    trace_execution_handoff_phase(trace_handoff, "projection_setup", &mut trace_started);
 
     let expression_routes = execution
         .expressions
@@ -1164,6 +1216,23 @@ fn execution_image_handoff(
             .copied()
             .ok_or_else(|| format!("execution image references missing expression {id}"))
     };
+    if trace_handoff {
+        let checked_routes = expression_routes
+            .iter()
+            .filter(|route| {
+                matches!(
+                    builder.identity(**route),
+                    Ok(SemanticImageProjectionIdentityV2::Checked { .. })
+                )
+            })
+            .count();
+        eprintln!(
+            "boon_semantic execution_handoff expression_routes checked={} invocation={}",
+            checked_routes,
+            expression_routes.len() - checked_routes,
+        );
+    }
+    trace_execution_handoff_phase(trace_handoff, "expression_routes", &mut trace_started);
     let statement_routes = execution
         .statements
         .iter()
@@ -1191,6 +1260,7 @@ fn execution_image_handoff(
             .copied()
             .ok_or_else(|| format!("execution image references missing statement {id}"))
     };
+    trace_execution_handoff_phase(trace_handoff, "statement_routes", &mut trace_started);
 
     for scope in &execution.scopes {
         let projection = checked_execution_projection(
@@ -1210,6 +1280,7 @@ fn execution_image_handoff(
             projection,
         )?;
     }
+    trace_execution_handoff_phase(trace_handoff, "scope_rows", &mut trace_started);
     for expression in &execution.expressions {
         let projection = expression_projection(expression.id)?;
         let mut relocations = execution
@@ -1282,6 +1353,11 @@ fn execution_image_handoff(
             projection,
         )?;
     }
+    trace_execution_handoff_phase(
+        trace_handoff,
+        "expression_and_origin_rows",
+        &mut trace_started,
+    );
     for statement in &execution.statements {
         let projection = statement_projection(statement.id)?;
         let mut relocations = statement
@@ -1313,6 +1389,7 @@ fn execution_image_handoff(
             projection,
         )?;
     }
+    trace_execution_handoff_phase(trace_handoff, "statement_rows", &mut trace_started);
     for callable in &execution.callables {
         let projection = checked_execution_projection(
             &mut builder,
@@ -1337,6 +1414,7 @@ fn execution_image_handoff(
             projection,
         )?;
     }
+    trace_execution_handoff_phase(trace_handoff, "callable_rows", &mut trace_started);
     for call in &execution.calls {
         let projection = checked_execution_projection(
             &mut builder,
@@ -1370,6 +1448,7 @@ fn execution_image_handoff(
             projection,
         )?;
     }
+    trace_execution_handoff_phase(trace_handoff, "call_rows", &mut trace_started);
     for occurrence in &execution.call_occurrences {
         let projection = invocations
             .get(occurrence.id.as_usize())
@@ -1411,6 +1490,7 @@ fn execution_image_handoff(
             projection,
         )?;
     }
+    trace_execution_handoff_phase(trace_handoff, "call_occurrence_rows", &mut trace_started);
     for source in &execution.sources {
         let projection = route_for_frame(
             source.call_instance,
@@ -1430,6 +1510,7 @@ fn execution_image_handoff(
             projection,
         )?;
     }
+    trace_execution_handoff_phase(trace_handoff, "source_rows", &mut trace_started);
     for state in &execution.states {
         let projection = route_for_frame(
             state.call_instance,
@@ -1456,6 +1537,7 @@ fn execution_image_handoff(
             projection,
         )?;
     }
+    trace_execution_handoff_phase(trace_handoff, "state_rows", &mut trace_started);
     for root in &execution.roots {
         let projection = expression_projection(root.expression)?;
         builder.push(
@@ -1466,6 +1548,7 @@ fn execution_image_handoff(
         )?;
         builder.route(ExecutionImageRowDomainV2::Root, root.ordinal, projection)?;
     }
+    trace_execution_handoff_phase(trace_handoff, "root_rows", &mut trace_started);
     for (index, function) in execution.functions.iter().enumerate() {
         let projection = function_projection(&mut builder, execution, function)?;
         let mut relocations = vec![expression_projection(function.root)?];
@@ -1480,6 +1563,7 @@ fn execution_image_handoff(
         )?;
         builder.route(ExecutionImageRowDomainV2::Function, index, projection)?;
     }
+    trace_execution_handoff_phase(trace_handoff, "function_rows", &mut trace_started);
     for materialization in &execution.materializations {
         let projection = owner_projections
             .get(&materialization.owner)
@@ -1502,6 +1586,7 @@ fn execution_image_handoff(
             projection,
         )?;
     }
+    trace_execution_handoff_phase(trace_handoff, "materialization_rows", &mut trace_started);
     for owner in &execution.static_owners {
         let projection = owner_projections
             .get(&owner.id)
@@ -1524,8 +1609,11 @@ fn execution_image_handoff(
             projection,
         )?;
     }
+    trace_execution_handoff_phase(trace_handoff, "static_owner_rows", &mut trace_started);
 
-    builder.finish(checked.source_bundle_digest_v1, checked.role)
+    let handoff = builder.finish(checked.source_bundle_digest_v1, checked.role);
+    trace_execution_handoff_phase(trace_handoff, "finish", &mut trace_started);
+    handoff
 }
 
 fn semantic_image_seal_digest(

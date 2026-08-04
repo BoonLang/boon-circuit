@@ -83,6 +83,7 @@ pub enum OwnerResultCallTarget {
 pub struct OwnerResultTransferNode {
     pub expression: StableExpressionKey,
     pub flow_type: FlowType,
+    pub static_number: Option<String>,
     pub kind: OwnerConstraintNodeKind,
     pub inputs: Box<[OwnerResultTransferInput]>,
     pub parameter_read: Option<OwnerResultParameterRead>,
@@ -110,13 +111,12 @@ pub enum OwnerResultTransfer {
     },
 }
 
-/// Preparatory alpha-normalized public surface of one authored check owner.
+/// Alpha-normalized public currentness surface of one authored check owner.
 ///
-/// Source positions, literal payloads, dense IDs, and body-only fingerprints
-/// are absent. Parameter requirements/scopes and exact context projections are
-/// explicit, but this does not become the production currentness firewall
-/// until the result/mode specialization transfer and frozen project ABI input
-/// are present and the normalized monolithic oracle passes.
+/// Source positions, body-only literal payloads, dense IDs, and implementation
+/// fingerprints are absent. Parameters, exact context projections, effects,
+/// and the minimal result-specialization transfer are frozen against the
+/// project ABI, so callers never inspect the callee body.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct OwnerPublicInterface {
     pub owner: StableCheckOwnerKey,
@@ -582,13 +582,24 @@ pub(crate) fn bind_projection(
     let mut current = root;
     for field in fields {
         let next = unifier.fresh();
-        unifier.bind_var(
-            current,
-            Type::object(ObjectShape::from_ordered_fields(
-                [(field.clone(), Type::Var(next))],
-                true,
-            )),
-        );
+        let existing = match unifier.resolve(&Type::Var(current)) {
+            Type::Object(shape) => shape.fields.get(field).cloned(),
+            _ => None,
+        };
+        if let Some(existing) = existing {
+            // Reading a known field must not merge an open projection shape
+            // back into an already closed object. Preserve the object surface
+            // and only connect the projected value.
+            unifier.unify(Type::Var(next), existing);
+        } else {
+            unifier.bind_var(
+                current,
+                Type::object(ObjectShape::from_ordered_fields(
+                    [(field.clone(), Type::Var(next))],
+                    true,
+                )),
+            );
+        }
         current = next;
     }
     current
@@ -939,6 +950,13 @@ fn build_owner_result_transfer(
                         next_alpha,
                     ),
                 },
+                static_number: state
+                    .seed
+                    .result_static_numbers
+                    .binary_search_by(|number| number.expression.cmp(&expression.expression))
+                    .ok()
+                    .and_then(|index| state.seed.result_static_numbers.get(index))
+                    .map(|number| number.literal.clone()),
                 kind: expression.kind.clone(),
                 inputs: inputs.into_boxed_slice(),
                 parameter_read: owner_result_parameter_read(state, expression),

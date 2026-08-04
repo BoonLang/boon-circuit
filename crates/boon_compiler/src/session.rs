@@ -24,8 +24,8 @@ use boon_typecheck::{
     OwnerConstraintSummary, OwnerDeclarationKind, OwnerInterfaceScc, OwnerInterfaceSccKey,
     OwnerInterfaceSccResult, OwnerInterfaceTopology, OwnerReferenceKind, OwnerSourceMap,
     OwnerSymbolReference, OwnerSymbolResolution, OwnerSyntaxInput, build_owner_interface_topology,
-    infer_owner_body, project_owner_abi_environment, project_owner_constraint_seed,
-    project_owner_source_map, project_owner_syntax_input,
+    infer_owner_body, owner_body_required_interface_owners, project_owner_abi_environment,
+    project_owner_constraint_seed, project_owner_source_map, project_owner_syntax_input,
     resolve_owner_constraint_seed_with_resolutions, solve_owner_interface_scc,
     stable_check_owner_key_fingerprint_v1,
 };
@@ -2419,20 +2419,9 @@ fn owner_body_inference_interface_plan(
     topology: &OwnerInterfaceTopology,
     seed: &OwnerConstraintSeed,
     summary: &OwnerConstraintSummary,
+    interfaces: &BTreeMap<StableCheckOwnerKey, &boon_typecheck::OwnerPublicInterface>,
 ) -> CompilerResult<BTreeMap<StableCheckOwnerKey, OwnerInterfaceSccKey>> {
-    let required = std::iter::once(seed.owner.clone())
-        .chain(
-            seed.external_expressions
-                .iter()
-                .map(|external| external.owner.clone()),
-        )
-        .chain(
-            summary
-                .resolved_references
-                .iter()
-                .map(|resolved| resolved.owner.clone()),
-        )
-        .collect::<BTreeSet<_>>();
+    let required = owner_body_required_interface_owners(seed, summary, interfaces)?;
     required
         .into_iter()
         .map(|owner| {
@@ -2475,6 +2464,30 @@ fn evaluate_owner_body_inference_requests(
         .current_value(&state.syntax_evaluator, &abi_key)?
         .ok_or_else(|| session_error("project owner callable ABI was not published"))?
         .fingerprint_v1();
+    // Snapshot the already-solved interface table once. Exact body import
+    // planning then walks only each owner's minimal result-transfer closure;
+    // it must not rescan or clone the project interface registry per owner.
+    let interface_results = topology
+        .sccs
+        .iter()
+        .map(|scc| {
+            state
+                .owner_interface_scc_requests
+                .current_value(&state.syntax_evaluator, &scc.key)?
+                .cloned()
+                .ok_or_else(|| {
+                    session_error(format!(
+                        "owner body inference has no current interface SCC {:?}",
+                        scc.key
+                    ))
+                })
+        })
+        .collect::<CompilerResult<Vec<_>>>()?;
+    let interfaces = interface_results
+        .iter()
+        .flat_map(|result| result.owners.iter())
+        .map(|interface| (interface.owner.clone(), interface))
+        .collect::<BTreeMap<_, _>>();
     let owners = topology
         .sccs
         .iter()
@@ -2501,7 +2514,7 @@ fn evaluate_owner_body_inference_requests(
                     ))
                 })?,
         );
-        let plan = owner_body_inference_interface_plan(topology, &seed, &summary)?;
+        let plan = owner_body_inference_interface_plan(topology, &seed, &summary, &interfaces)?;
         match state.owner_body_inference_requests.begin(
             &mut state.syntax_evaluator,
             owner.clone(),
@@ -3297,6 +3310,52 @@ mod tests {
             .unwrap();
         assert_eq!(body_memo.changed_at, EvaluationRevision(1));
         assert_eq!(body_memo.verified_at, EvaluationRevision(1));
+    }
+
+    #[test]
+    fn owner_body_request_freezes_transitive_result_transfer_interfaces() {
+        let source = concat!(
+            "FUNCTION leaf() {\n",
+            "    PASSED.store.count\n",
+            "}\n",
+            "FUNCTION inherited() {\n",
+            "    leaf()\n",
+            "}\n",
+            "value: inherited(PASS: [store: [count: 1]])\n",
+        );
+        let mut session = CompilerSession::new();
+        let project = session.open_project(project(source)).unwrap();
+        parse_project_snapshot(session.projects.get_mut(&project).unwrap()).unwrap();
+        let unit = session
+            .unit_syntax_snapshot(project, "RUN.bn")
+            .unwrap()
+            .unwrap();
+        let owner_named = |name: &str| {
+            unit.stable_check_owner_keys()
+                .find(|owner| {
+                    matches!(
+                        owner,
+                        StableCheckOwnerKey::Item(owner)
+                            if owner.item_route.segments().last().is_some_and(|segment| segment.names == [name])
+                    )
+                })
+                .unwrap()
+        };
+        let value = owner_named("value");
+        let inherited = owner_named("inherited");
+        let leaf = owner_named("leaf");
+        let body = session
+            .owner_body_inference(project, &value)
+            .unwrap()
+            .unwrap();
+        let imported = body
+            .interface_imports
+            .iter()
+            .map(|interface| interface.owner.clone())
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(imported, BTreeSet::from([value, inherited, leaf]));
+        assert_eq!(body.calls[0].result.ty, boon_checked::Type::Number);
     }
 
     #[test]

@@ -1,5 +1,6 @@
 use crate::{
-    OwnerExternalExpressionInput, OwnerSyntaxInput, stable_check_owner_key_fingerprint_v1,
+    OwnerExpressionInput, OwnerExternalExpressionInput, OwnerSyntaxInput,
+    stable_check_owner_key_fingerprint_v1,
 };
 use boon_compilation_db::{
     DenseProjectionGraphBuilder, ProjectionGraphDigestDomains, ProjectionGraphStats, ProjectionId,
@@ -244,12 +245,19 @@ pub struct OwnerEffectConstraintSeed {
     pub declares_list: bool,
 }
 
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct OwnerResultStaticNumber {
+    pub expression: StableExpressionKey,
+    pub literal: String,
+}
+
 /// Interface-relevant constraints for one owner.
 ///
-/// Literal payloads and source positions are deliberately absent. A text or
-/// numeric payload edit therefore re-executes this projection after its owner
-/// input changes, then backdates when the type/effect/dependency constraints
-/// are identical.
+/// Source positions and body-only literal payloads are deliberately absent.
+/// The sole payload exception is `result_static_numbers`: exact numeric leaves
+/// needed to determine a public function's static Bits result. Other literal
+/// edits re-execute this projection and backdate when the interface surface is
+/// identical.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OwnerConstraintSeed {
     pub owner: StableCheckOwnerKey,
@@ -258,6 +266,7 @@ pub struct OwnerConstraintSeed {
     pub expressions: Box<[OwnerExpressionConstraint]>,
     pub references: Box<[OwnerSymbolReference]>,
     pub external_expressions: Box<[OwnerExternalExpressionInput]>,
+    pub result_static_numbers: Box<[OwnerResultStaticNumber]>,
     pub effect_seed: OwnerEffectConstraintSeed,
     fingerprint_v1: [u8; 32],
     topology_fingerprint_v1: [u8; 32],
@@ -1341,6 +1350,116 @@ fn project_expression(
     })
 }
 
+fn static_bits_width_argument(function: &str) -> Option<&'static str> {
+    match function {
+        "Bits/slice" => Some("count"),
+        "Bits/zero_extend" | "Bits/sign_extend" | "Bits/truncate" | "Number/to_bits"
+        | "Bytes/to_bits" => Some("width"),
+        _ => None,
+    }
+}
+
+fn collect_static_number_leaves(
+    reference: u32,
+    input: &OwnerSyntaxInput,
+    expressions: &[OwnerExpressionConstraint],
+    numbers: &mut BTreeMap<StableExpressionKey, String>,
+    active: &mut BTreeSet<u32>,
+) {
+    let Some(expression) = expressions.get(reference as usize) else {
+        return;
+    };
+    if !active.insert(reference) {
+        return;
+    }
+    if let Some(OwnerExpressionInput {
+        kind: AstExprKind::Number(literal),
+        ..
+    }) = input.expressions.get(reference as usize)
+    {
+        numbers.insert(expression.expression.clone(), literal.clone());
+    }
+    for child in &expression.inputs {
+        collect_static_number_leaves(child.expression, input, expressions, numbers, active);
+    }
+    active.remove(&reference);
+}
+
+fn project_result_static_numbers(
+    input: &OwnerSyntaxInput,
+    declarations: &[OwnerDeclarationConstraint],
+    statement_values: &[(u32, u32)],
+    expressions: &[OwnerExpressionConstraint],
+) -> Box<[OwnerResultStaticNumber]> {
+    let Some(public) = declarations.iter().find(|declaration| {
+        declaration.public && declaration.kind == OwnerDeclarationKind::Function
+    }) else {
+        return Box::new([]);
+    };
+    let Some(root) = statement_values
+        .iter()
+        .find(|(statement, _)| *statement == public.statement)
+        .or_else(|| statement_values.last())
+        .map(|(_, expression)| *expression)
+    else {
+        return Box::new([]);
+    };
+    let mut reachable = BTreeSet::new();
+    let mut pending = vec![root];
+    while let Some(reference) = pending.pop() {
+        let Some(expression) = expressions.get(reference as usize) else {
+            continue;
+        };
+        if !reachable.insert(reference) {
+            continue;
+        }
+        pending.extend(expression.inputs.iter().map(|input| input.expression));
+    }
+
+    let mut numbers = BTreeMap::new();
+    for reference in reachable {
+        let expression = &expressions[reference as usize];
+        let function = match &expression.kind {
+            OwnerConstraintNodeKind::Call { function }
+            | OwnerConstraintNodeKind::Pipe {
+                operation: function,
+            } => function,
+            _ => continue,
+        };
+        let Some(width_name) = static_bits_width_argument(function) else {
+            continue;
+        };
+        for width in expression.inputs.iter().filter(|input| {
+            matches!(
+                &input.role,
+                OwnerConstraintEdgeRole::CallArgument {
+                    kind: OwnerArgumentKind::Named,
+                    name,
+                } | OwnerConstraintEdgeRole::PipeArgument {
+                    kind: OwnerArgumentKind::Named,
+                    name,
+                } if name == width_name
+            )
+        }) {
+            collect_static_number_leaves(
+                width.expression,
+                input,
+                expressions,
+                &mut numbers,
+                &mut BTreeSet::new(),
+            );
+        }
+    }
+    numbers
+        .into_iter()
+        .map(|(expression, literal)| OwnerResultStaticNumber {
+            expression,
+            literal,
+        })
+        .collect::<Vec<_>>()
+        .into_boxed_slice()
+}
+
 pub fn project_owner_constraint_seed(
     input: &OwnerSyntaxInput,
 ) -> Result<OwnerConstraintSeed, OwnerConstraintSeedError> {
@@ -1396,6 +1515,8 @@ pub fn project_owner_constraint_seed(
     // interns each referenced syntax expression exactly once.
     let external_expressions = input.external_expressions.to_vec();
     let references = references.into_iter().collect::<Vec<_>>();
+    let result_static_numbers =
+        project_result_static_numbers(input, &declarations, &statement_values, &expressions);
     let topology_references = references
         .iter()
         .map(|reference| (reference.kind, reference.parts.clone()))
@@ -1426,6 +1547,7 @@ pub fn project_owner_constraint_seed(
             &expressions,
             &references,
             &external_expressions,
+            &result_static_numbers,
             effect_seed,
         ),
     )?;
@@ -1436,6 +1558,7 @@ pub fn project_owner_constraint_seed(
         expressions: expressions.into_boxed_slice(),
         references: references.into_boxed_slice(),
         external_expressions: external_expressions.into_boxed_slice(),
+        result_static_numbers,
         effect_seed,
         fingerprint_v1,
         topology_fingerprint_v1,
@@ -1487,6 +1610,43 @@ mod tests {
             summary(&before, &before_owner),
             summary(&after, &after_owner)
         );
+    }
+
+    #[test]
+    fn only_result_relevant_static_bits_numbers_enter_the_interface_seed() {
+        let width_four = link(concat!(
+            "FUNCTION take(bits) {\n",
+            "    ignored: 11\n",
+            "    bits |> Bits/slice(from: 1, count: 2 + 2)\n",
+            "}\n",
+        ));
+        let width_five = link(concat!(
+            "FUNCTION take(bits) {\n",
+            "    ignored: 99\n",
+            "    bits |> Bits/slice(from: 7, count: 2 + 3)\n",
+            "}\n",
+        ));
+        let owner = owner_named(&width_four, "take");
+        let changed_owner = owner_named(&width_five, "take");
+        assert_eq!(owner, changed_owner);
+        let width_four = summary(&width_four, &owner);
+        let width_five = summary(&width_five, &changed_owner);
+
+        let mut four_literals = width_four
+            .result_static_numbers
+            .iter()
+            .map(|number| number.literal.as_str())
+            .collect::<Vec<_>>();
+        four_literals.sort_unstable();
+        let mut five_literals = width_five
+            .result_static_numbers
+            .iter()
+            .map(|number| number.literal.as_str())
+            .collect::<Vec<_>>();
+        five_literals.sort_unstable();
+        assert_eq!(four_literals, ["2", "2"]);
+        assert_eq!(five_literals, ["2", "3"]);
+        assert_ne!(width_four.fingerprint_v1(), width_five.fingerprint_v1());
     }
 
     #[test]

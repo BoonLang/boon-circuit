@@ -3,23 +3,26 @@ use crate::owner_interface::{
     instantiate_type, merge_effects, pattern_type, true_false_type,
 };
 use crate::{
-    OwnerAbiCallableContract, OwnerArgumentKind, OwnerCallableAbiEnvironment, OwnerCollectionKind,
-    OwnerConstraintEdgeRole, OwnerConstraintNodeKind, OwnerConstraintSeed, OwnerConstraintSummary,
-    OwnerInterfaceSccKey, OwnerInterfaceSccResult, OwnerParameterKind, OwnerPublicInterface,
-    OwnerReferenceKind, OwnerResultCallTarget, OwnerResultExpressionRef, OwnerResultTransfer,
-    OwnerResultTransferNode, OwnerSourceAnchorRole, OwnerSourceAnchorSite, OwnerSourceMap,
-    OwnerSymbolResolution, OwnerSyntaxInput, infix_returns_bool,
+    OwnerAbiCallableContract, OwnerAbiEvaluationScope, OwnerArgumentKind,
+    OwnerCallableAbiEnvironment, OwnerCollectionKind, OwnerConstraintEdgeRole,
+    OwnerConstraintNodeKind, OwnerConstraintSeed, OwnerConstraintSummary,
+    OwnerInterfaceEvaluationScope, OwnerInterfaceSccKey, OwnerInterfaceSccResult,
+    OwnerParameterKind, OwnerPublicInterface, OwnerReferenceKind, OwnerResultCallTarget,
+    OwnerResultExpressionRef, OwnerResultTransfer, OwnerResultTransferNode, OwnerSourceAnchorRole,
+    OwnerSourceAnchorSite, OwnerSourceMap, OwnerSymbolResolution, OwnerSyntaxInput,
+    infix_returns_bool,
 };
 use boon_checked::{
     BytesType, CheckedEffectSummary, CheckedParameterKind, CheckedTypeSubstitution,
     DiagnosticSeverity, FlowMode, FlowType, ObjectShape, Type, TypeDiagnostic, TypeVar, Variant,
     apply_checked_type_substitution_lookup, specialize_checked_call_result, widen_structural_type,
 };
+use boon_data::{ExactNumber, MAX_BITS_WIDTH};
 use boon_syntax::{
     AstExprKind, AstStatementKind, StableCheckOwnerKey, StableExpressionKey, StableStatementKey,
 };
 use serde::Serialize;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error;
 use std::fmt;
 
@@ -532,7 +535,7 @@ fn insert_interface<'a>(
     Ok(())
 }
 
-fn required_interface_owners(
+fn directly_required_interface_owners(
     seed: &OwnerConstraintSeed,
     summary: &OwnerConstraintSummary,
 ) -> BTreeSet<StableCheckOwnerKey> {
@@ -549,6 +552,64 @@ fn required_interface_owners(
                 .map(|resolved| resolved.owner.clone()),
         )
         .collect()
+}
+
+fn collect_result_expression_ref_owner(
+    reference: &OwnerResultExpressionRef,
+    dependencies: &mut BTreeSet<StableCheckOwnerKey>,
+) {
+    if let OwnerResultExpressionRef::Child { owner, .. } = reference {
+        dependencies.insert(owner.clone());
+    }
+}
+
+fn owner_result_transfer_dependencies(
+    transfer: &OwnerResultTransfer,
+) -> BTreeSet<StableCheckOwnerKey> {
+    let OwnerResultTransfer::Expression { root, nodes } = transfer else {
+        return BTreeSet::new();
+    };
+    let mut dependencies = BTreeSet::new();
+    collect_result_expression_ref_owner(root, &mut dependencies);
+    for node in nodes {
+        if let Some(OwnerResultCallTarget::Owner { owner }) = &node.call_target {
+            dependencies.insert(owner.clone());
+        }
+        for input in &node.inputs {
+            collect_result_expression_ref_owner(&input.expression, &mut dependencies);
+        }
+    }
+    dependencies
+}
+
+/// Exact frozen-interface closure needed to infer one owner body.
+///
+/// Direct syntax imports are only the first frontier. A callable's public
+/// result-transfer slice may itself invoke another callable, so callers also
+/// freeze the transitive interfaces reachable through those minimal slices.
+/// Unrelated calls in a callee body are absent from the transfer and therefore
+/// cannot enlarge this dependency set or backdate the caller.
+pub fn owner_body_required_interface_owners(
+    seed: &OwnerConstraintSeed,
+    summary: &OwnerConstraintSummary,
+    interfaces: &BTreeMap<StableCheckOwnerKey, &OwnerPublicInterface>,
+) -> Result<BTreeSet<StableCheckOwnerKey>, OwnerBodyInferenceError> {
+    let mut required = directly_required_interface_owners(seed, summary);
+    let mut pending = required.iter().cloned().collect::<VecDeque<_>>();
+    while let Some(owner) = pending.pop_front() {
+        let interface = interfaces.get(&owner).ok_or_else(|| {
+            OwnerBodyInferenceError::new(format!(
+                "owner body inference {:?} is missing required interface {owner:?}",
+                seed.owner
+            ))
+        })?;
+        for dependency in owner_result_transfer_dependencies(&interface.result_transfer) {
+            if required.insert(dependency.clone()) {
+                pending.push_back(dependency);
+            }
+        }
+    }
+    Ok(required)
 }
 
 fn frozen_scc_ref(
@@ -935,8 +996,17 @@ fn bind_local_constraints(
 }
 
 #[derive(Clone)]
+struct InstantiatedCallParameter {
+    name: String,
+    kind: OwnerParameterKind,
+    ordinal: u32,
+    flow_type: FlowType,
+    evaluation_scope: OwnerInterfaceEvaluationScope,
+}
+
+#[derive(Clone)]
 struct InstantiatedCallSignature {
-    parameters: Vec<(String, OwnerParameterKind, FlowType)>,
+    parameters: Vec<InstantiatedCallParameter>,
     result: FlowType,
     context: Option<Type>,
     effect: CheckedEffectSummary,
@@ -958,6 +1028,7 @@ struct EvaluatedResultValue {
     flow_type: FlowType,
     parameter_derived: bool,
     syntax_selected: bool,
+    static_number: Option<ExactNumber>,
 }
 
 struct EvaluatedOwnerResult {
@@ -1066,6 +1137,7 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
                     flow_type: principal,
                     parameter_derived: arguments.values().any(|value| value.parameter_derived),
                     syntax_selected: false,
+                    static_number: None,
                 },
                 type_substitutions,
                 contextual_type_variables: contextual_type_variables.into_iter().collect(),
@@ -1087,6 +1159,11 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
                         },
                         parameter_derived: true,
                         syntax_selected: actual.syntax_selected,
+                        static_number: read
+                            .projection
+                            .is_empty()
+                            .then(|| actual.static_number.clone())
+                            .flatten(),
                     })
                 })
             }
@@ -1117,6 +1194,7 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
                 flow_type: principal,
                 parameter_derived: arguments.values().any(|value| value.parameter_derived),
                 syntax_selected: false,
+                static_number: None,
             }
         };
         Some(EvaluatedOwnerResult {
@@ -1144,6 +1222,7 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
                     flow_type: interface.result.clone(),
                     parameter_derived: false,
                     syntax_selected: false,
+                    static_number: None,
                 })
             }
             OwnerResultExpressionRef::Local { expression } => {
@@ -1198,6 +1277,11 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
                     },
                     parameter_derived: true,
                     syntax_selected: actual.syntax_selected,
+                    static_number: read
+                        .projection
+                        .is_empty()
+                        .then(|| actual.static_number.clone())
+                        .flatten(),
                 });
             }
         }
@@ -1219,6 +1303,10 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
                     },
                     parameter_derived: value.parameter_derived,
                     syntax_selected: value.syntax_selected,
+                    static_number: projection
+                        .is_empty()
+                        .then(|| value.static_number.clone())
+                        .flatten(),
                 });
             }
         }
@@ -1230,6 +1318,29 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
             } => self.evaluate_call_node(
                 node, function, nodes, arguments, context, fallbacks, lexical, active,
             ),
+            OwnerConstraintNodeKind::Infix { operation } => {
+                let left = node
+                    .inputs
+                    .iter()
+                    .find(|input| matches!(input.role, OwnerConstraintEdgeRole::InfixLeft))
+                    .and_then(|input| evaluate(self, &input.expression, lexical, active))?;
+                let right = node
+                    .inputs
+                    .iter()
+                    .find(|input| matches!(input.role, OwnerConstraintEdgeRole::InfixRight))
+                    .and_then(|input| evaluate(self, &input.expression, lexical, active))?;
+                let static_number = left
+                    .static_number
+                    .as_ref()
+                    .zip(right.static_number.as_ref())
+                    .and_then(|(left, right)| static_number_infix(left, operation, right));
+                Some(EvaluatedResultValue {
+                    static_number,
+                    parameter_derived: left.parameter_derived || right.parameter_derived,
+                    syntax_selected: left.syntax_selected || right.syntax_selected,
+                    ..fallback
+                })
+            }
             OwnerConstraintNodeKind::Record { tag } => {
                 let mut fields = Vec::new();
                 let mut parameter_derived = false;
@@ -1266,6 +1377,7 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
                     },
                     parameter_derived,
                     syntax_selected,
+                    static_number: None,
                 })
             }
             OwnerConstraintNodeKind::When => {
@@ -1347,6 +1459,7 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
                     },
                     parameter_derived,
                     syntax_selected,
+                    static_number: None,
                 })
             }
             OwnerConstraintNodeKind::Latest => {
@@ -1372,6 +1485,7 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
                     },
                     parameter_derived: values.iter().any(|value| value.parameter_derived),
                     syntax_selected: values.iter().any(|value| value.syntax_selected),
+                    static_number: None,
                 })
             }
             OwnerConstraintNodeKind::Draining | OwnerConstraintNodeKind::Hold { .. } => node
@@ -1425,6 +1539,7 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
                     },
                     parameter_derived: key.parameter_derived || value.parameter_derived,
                     syntax_selected: key.syntax_selected || value.syntax_selected,
+                    static_number: None,
                 })
             }
             OwnerConstraintNodeKind::Source => Some(EvaluatedResultValue {
@@ -1527,6 +1642,9 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
             result.flow_type.ty = widen_structural_type(&result.flow_type.ty, &next.flow_type.ty);
             result.parameter_derived |= next.parameter_derived;
             result.syntax_selected |= next.syntax_selected;
+            if result.static_number != next.static_number {
+                result.static_number = None;
+            }
             result
         });
         Some(EvaluatedResultValue {
@@ -1537,6 +1655,7 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
             parameter_derived: selector.parameter_derived || result.parameter_derived,
             syntax_selected: result.syntax_selected
                 || (selector.parameter_derived && selector_is_concrete),
+            static_number: result.static_number,
         })
     }
 
@@ -1669,6 +1788,24 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
             }
         }
         let mut ty = apply_checked_type_substitution_lookup(&contract.result.ty, &instantiation);
+        let named_type = |name: &str| {
+            abi_actual_by_name(contract, &actuals, name).map(|value| value.flow_type.ty.clone())
+        };
+        let width_arg = |name: &str| {
+            abi_actual_by_name(contract, &actuals, name)
+                .and_then(|value| value.static_number.as_ref())
+                .and_then(|value| value.to_u64_exact().ok())
+                .and_then(|value| u32::try_from(value).ok())
+                .filter(|width| (1..=MAX_BITS_WIDTH).contains(width))
+        };
+        if let Some(static_result) = crate::resolved_bits_builtin_result(
+            function,
+            named_type("bits"),
+            &named_type,
+            &width_arg,
+        ) {
+            ty = static_result;
+        }
         if let Some(field) = function.strip_prefix("Field/")
             && let Some(input) = actuals.values().next()
         {
@@ -1694,7 +1831,23 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
             flow_type: FlowType { mode, ty },
             parameter_derived: actuals.values().any(|value| value.parameter_derived),
             syntax_selected: actuals.values().any(|value| value.syntax_selected),
+            static_number: None,
         })
+    }
+}
+
+fn static_number_infix(
+    left: &ExactNumber,
+    operation: &str,
+    right: &ExactNumber,
+) -> Option<ExactNumber> {
+    match operation {
+        "+" => left.checked_add(right).ok(),
+        "-" => left.checked_sub(right).ok(),
+        "*" => left.checked_mul(right).ok(),
+        "/" => left.checked_div(right).ok(),
+        "%" => left.checked_rem(right).ok(),
+        _ => None,
     }
 }
 
@@ -1706,6 +1859,10 @@ fn transfer_fallback(
         flow_type: fallbacks.get(&node.expression)?.clone(),
         parameter_derived: false,
         syntax_selected: false,
+        static_number: node
+            .static_number
+            .as_deref()
+            .and_then(|literal| ExactNumber::parse_strict(literal, None).ok()),
     })
 }
 
@@ -1758,6 +1915,7 @@ fn extend_owner_pattern_bindings(
                             },
                             parameter_derived: selector.parameter_derived,
                             syntax_selected: selector.syntax_selected,
+                            static_number: selector.static_number.clone(),
                         },
                     );
                 }
@@ -1868,15 +2026,15 @@ fn instantiate_call_signature(
             parameters: interface
                 .parameters
                 .iter()
-                .map(|parameter| {
-                    (
-                        parameter.name.clone(),
-                        parameter.kind,
-                        FlowType {
-                            mode: parameter.flow_type.mode,
-                            ty: instantiate_type(&parameter.flow_type.ty, unifier, &mut variables),
-                        },
-                    )
+                .map(|parameter| InstantiatedCallParameter {
+                    name: parameter.name.clone(),
+                    kind: parameter.kind,
+                    ordinal: parameter.ordinal,
+                    flow_type: FlowType {
+                        mode: parameter.flow_type.mode,
+                        ty: instantiate_type(&parameter.flow_type.ty, unifier, &mut variables),
+                    },
+                    evaluation_scope: parameter.evaluation_scope,
                 })
                 .collect(),
             result: FlowType {
@@ -1901,18 +2059,23 @@ fn instantiate_call_signature(
             parameters: signature
                 .parameters
                 .iter()
-                .map(|parameter| {
-                    (
-                        parameter.name.clone(),
-                        match parameter.kind {
-                            CheckedParameterKind::Value => OwnerParameterKind::Value,
-                            CheckedParameterKind::Out => OwnerParameterKind::Out,
-                        },
-                        FlowType {
-                            mode: parameter.flow_type.mode,
-                            ty: instantiate_type(&parameter.flow_type.ty, unifier, &mut variables),
-                        },
-                    )
+                .map(|parameter| InstantiatedCallParameter {
+                    name: parameter.name.clone(),
+                    kind: match parameter.kind {
+                        CheckedParameterKind::Value => OwnerParameterKind::Value,
+                        CheckedParameterKind::Out => OwnerParameterKind::Out,
+                    },
+                    ordinal: parameter.ordinal,
+                    flow_type: FlowType {
+                        mode: parameter.flow_type.mode,
+                        ty: instantiate_type(&parameter.flow_type.ty, unifier, &mut variables),
+                    },
+                    evaluation_scope: match parameter.evaluation_scope {
+                        OwnerAbiEvaluationScope::Parent => OwnerInterfaceEvaluationScope::Parent,
+                        OwnerAbiEvaluationScope::Output { parameter_ordinal } => {
+                            OwnerInterfaceEvaluationScope::Output { parameter_ordinal }
+                        }
+                    },
                 })
                 .collect(),
             result: FlowType {
@@ -1925,8 +2088,174 @@ fn instantiate_call_signature(
         })
 }
 
+fn instantiated_body_input_for_parameter(
+    call: &BodyCallPlan,
+    parameter: &InstantiatedCallParameter,
+    parameters: &[InstantiatedCallParameter],
+) -> Option<u32> {
+    call.inputs.iter().find_map(|(role, expression)| {
+        let matches_parameter = match role {
+            OwnerConstraintEdgeRole::CallArgument { kind, name }
+            | OwnerConstraintEdgeRole::PipeArgument { kind, name } => {
+                name == &parameter.name
+                    && matches!(
+                        (parameter.kind, kind),
+                        (OwnerParameterKind::Value, OwnerArgumentKind::Named)
+                            | (OwnerParameterKind::Out, OwnerArgumentKind::Named)
+                            | (OwnerParameterKind::Out, OwnerArgumentKind::BareBinding)
+                    )
+            }
+            OwnerConstraintEdgeRole::PipeInput => {
+                parameter.kind == OwnerParameterKind::Value
+                    && parameters
+                        .iter()
+                        .filter(|candidate| candidate.kind == OwnerParameterKind::Value)
+                        .min_by_key(|candidate| candidate.ordinal)
+                        .is_some_and(|candidate| candidate.ordinal == parameter.ordinal)
+            }
+            _ => false,
+        };
+        matches_parameter.then_some(*expression)
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bind_output_scope_expression(
+    reference: u32,
+    output_name: &str,
+    output_variable: TypeVar,
+    seed: &OwnerConstraintSeed,
+    unifier: &mut TypeUnifier,
+    expressions: &[TypeVar],
+    external_expressions: &[TypeVar],
+    active: &mut BTreeSet<u32>,
+) {
+    let Some(variable) = expression_variable(expressions, external_expressions, reference) else {
+        return;
+    };
+    let Some(expression) = seed.expressions.get(reference as usize) else {
+        return;
+    };
+    if !active.insert(reference) {
+        return;
+    }
+    if let OwnerConstraintNodeKind::Reference { parts } | OwnerConstraintNodeKind::Drain { parts } =
+        &expression.kind
+        && let Some((root, projection)) = parts.split_first()
+        && root == output_name
+    {
+        let projected = bind_projection(unifier, output_variable, projection);
+        unifier.unify(Type::Var(variable), Type::Var(projected));
+    }
+
+    // A block binding shadows the fresh OUT only for the following block
+    // inputs. Its initializer still evaluates in the enclosing output scope.
+    if matches!(expression.kind, OwnerConstraintNodeKind::Block) {
+        let mut shadowed = false;
+        for input in &expression.inputs {
+            if !shadowed {
+                bind_output_scope_expression(
+                    input.expression,
+                    output_name,
+                    output_variable,
+                    seed,
+                    unifier,
+                    expressions,
+                    external_expressions,
+                    active,
+                );
+            }
+            if matches!(
+                &input.role,
+                OwnerConstraintEdgeRole::BlockBinding { name } if name == output_name
+            ) {
+                shadowed = true;
+            }
+        }
+    } else {
+        for input in &expression.inputs {
+            bind_output_scope_expression(
+                input.expression,
+                output_name,
+                output_variable,
+                seed,
+                unifier,
+                expressions,
+                external_expressions,
+                active,
+            );
+        }
+    }
+    active.remove(&reference);
+}
+
+fn bind_output_scoped_call_inputs(
+    call: &BodyCallPlan,
+    parameters: &[InstantiatedCallParameter],
+    seed: &OwnerConstraintSeed,
+    unifier: &mut TypeUnifier,
+    expressions: &[TypeVar],
+    external_expressions: &[TypeVar],
+) {
+    let fresh_outputs = parameters
+        .iter()
+        .filter(|parameter| parameter.kind == OwnerParameterKind::Out)
+        .filter_map(|parameter| {
+            let reference = instantiated_body_input_for_parameter(call, parameter, parameters)?;
+            let input = call.inputs.iter().find(|(role, expression)| {
+                *expression == reference
+                    && matches!(
+                        role,
+                        OwnerConstraintEdgeRole::CallArgument {
+                            kind: OwnerArgumentKind::BareBinding,
+                            ..
+                        } | OwnerConstraintEdgeRole::PipeArgument {
+                            kind: OwnerArgumentKind::BareBinding,
+                            ..
+                        }
+                    )
+            })?;
+            let expression = seed.expressions.get(reference as usize)?;
+            let OwnerConstraintNodeKind::Reference { parts } = &expression.kind else {
+                return None;
+            };
+            let [name] = parts.as_ref() else {
+                return None;
+            };
+            let variable = expression_variable(expressions, external_expressions, input.1)?;
+            Some((parameter.ordinal, (name.clone(), variable)))
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    for parameter in parameters {
+        let OwnerInterfaceEvaluationScope::Output { parameter_ordinal } =
+            parameter.evaluation_scope
+        else {
+            continue;
+        };
+        let Some((output_name, output_variable)) = fresh_outputs.get(&parameter_ordinal) else {
+            continue;
+        };
+        let Some(reference) = instantiated_body_input_for_parameter(call, parameter, parameters)
+        else {
+            continue;
+        };
+        bind_output_scope_expression(
+            reference,
+            output_name,
+            *output_variable,
+            seed,
+            unifier,
+            expressions,
+            external_expressions,
+            &mut BTreeSet::new(),
+        );
+    }
+}
+
 fn bind_calls(
     calls: Vec<BodyCallPlan>,
+    seed: &OwnerConstraintSeed,
     interfaces: &BTreeMap<StableCheckOwnerKey, &OwnerPublicInterface>,
     unifier: &mut TypeUnifier,
     expressions: &[TypeVar],
@@ -2034,25 +2363,25 @@ fn bind_calls(
                 };
                 match role {
                     OwnerConstraintEdgeRole::PipeInput => {
-                        if let Some((_, _, expected)) = parameters
+                        if let Some(expected) = parameters
                             .iter()
-                            .find(|(_, kind, _)| *kind == OwnerParameterKind::Value)
+                            .find(|parameter| parameter.kind == OwnerParameterKind::Value)
                         {
-                            unifier.unify(Type::Var(input), expected.ty.clone());
+                            unifier.unify(Type::Var(input), expected.flow_type.ty.clone());
                         }
                     }
                     OwnerConstraintEdgeRole::CallArgument { kind, name }
                     | OwnerConstraintEdgeRole::PipeArgument { kind, name } => {
-                        if let Some((_, parameter_kind, expected)) = parameters
-                            .iter()
-                            .find(|(parameter, _, _)| parameter == name)
+                        if let Some(expected) =
+                            parameters.iter().find(|parameter| parameter.name == *name)
                             && matches!(
-                                (parameter_kind, kind),
+                                (expected.kind, kind),
                                 (OwnerParameterKind::Value, OwnerArgumentKind::Named)
                                     | (OwnerParameterKind::Out, OwnerArgumentKind::Named)
+                                    | (OwnerParameterKind::Out, OwnerArgumentKind::BareBinding)
                             )
                         {
-                            unifier.unify(Type::Var(input), expected.ty.clone());
+                            unifier.unify(Type::Var(input), expected.flow_type.ty.clone());
                         }
                     }
                     OwnerConstraintEdgeRole::CallPass { .. }
@@ -2064,6 +2393,14 @@ fn bind_calls(
                     _ => {}
                 }
             }
+            bind_output_scoped_call_inputs(
+                &call,
+                &parameters,
+                seed,
+                unifier,
+                expressions,
+                external_expressions,
+            );
             modes[call.expression] = flow_mode_join(modes[call.expression], Some(result.mode));
             direct_effects[call.expression] =
                 merge_effects(direct_effects[call.expression], effect);
@@ -2113,6 +2450,7 @@ fn body_input_for_parameter(
 
 fn body_expression_result_value(
     reference: u32,
+    syntax: &OwnerSyntaxInput,
     seed: &OwnerConstraintSeed,
     interfaces: &BTreeMap<StableCheckOwnerKey, &OwnerPublicInterface>,
     unifier: &mut TypeUnifier,
@@ -2138,7 +2476,30 @@ fn body_expression_result_value(
         },
         parameter_derived: false,
         syntax_selected: false,
+        static_number: syntax_static_number(syntax, reference, &mut BTreeSet::new()),
     })
+}
+
+fn syntax_static_number(
+    syntax: &OwnerSyntaxInput,
+    reference: u32,
+    active: &mut BTreeSet<u32>,
+) -> Option<ExactNumber> {
+    let expression = syntax.expressions.get(reference as usize)?;
+    if !active.insert(reference) {
+        return None;
+    }
+    let result = (|| match &expression.kind {
+        AstExprKind::Number(literal) => ExactNumber::parse_strict(literal, None).ok(),
+        AstExprKind::Infix { left, op, right } => {
+            let left = syntax_static_number(syntax, u32::try_from(*left).ok()?, active)?;
+            let right = syntax_static_number(syntax, u32::try_from(*right).ok()?, active)?;
+            static_number_infix(&left, op, &right)
+        }
+        _ => None,
+    })();
+    active.remove(&reference);
+    result
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2147,6 +2508,7 @@ fn refine_owner_call_at(
     call_by_expression: &BTreeMap<usize, usize>,
     states: &mut [u8],
     drafts: &mut [InferredCallDraft],
+    syntax: &OwnerSyntaxInput,
     seed: &OwnerConstraintSeed,
     interfaces: &BTreeMap<StableCheckOwnerKey, &OwnerPublicInterface>,
     abi: &OwnerCallableAbiEnvironment,
@@ -2172,6 +2534,7 @@ fn refine_owner_call_at(
                 call_by_expression,
                 states,
                 drafts,
+                syntax,
                 seed,
                 interfaces,
                 abi,
@@ -2201,6 +2564,7 @@ fn refine_owner_call_at(
         };
         if let Some(actual) = body_expression_result_value(
             reference,
+            syntax,
             seed,
             interfaces,
             unifier,
@@ -2223,6 +2587,7 @@ fn refine_owner_call_at(
         .and_then(|(_, reference)| {
             body_expression_result_value(
                 *reference,
+                syntax,
                 seed,
                 interfaces,
                 unifier,
@@ -2238,6 +2603,7 @@ fn refine_owner_call_at(
         },
         parameter_derived: false,
         syntax_selected: false,
+        static_number: None,
     });
     let evaluated = {
         let mut evaluator = OwnerResultTransferEvaluator::new(interfaces, abi, unifier);
@@ -2264,6 +2630,7 @@ fn refine_owner_call_at(
 #[allow(clippy::too_many_arguments)]
 fn refine_owner_call_transfers(
     drafts: &mut [InferredCallDraft],
+    syntax: &OwnerSyntaxInput,
     seed: &OwnerConstraintSeed,
     interfaces: &BTreeMap<StableCheckOwnerKey, &OwnerPublicInterface>,
     abi: &OwnerCallableAbiEnvironment,
@@ -2285,6 +2652,7 @@ fn refine_owner_call_transfers(
             &call_by_expression,
             &mut states,
             drafts,
+            syntax,
             seed,
             interfaces,
             abi,
@@ -2335,7 +2703,8 @@ fn validate_inputs(
 /// This function never descends another owner body and never allocates a
 /// project-global checked identity. The caller must provide exactly the own,
 /// child-value, value-read, and callable interfaces named by the resolved
-/// owner inputs.
+/// owner inputs plus the exact transitive dependencies of their public result
+/// transfer slices.
 pub fn infer_owner_body<'a>(
     syntax: &OwnerSyntaxInput,
     seed: &OwnerConstraintSeed,
@@ -2345,11 +2714,9 @@ pub fn infer_owner_body<'a>(
     imported_sccs: impl IntoIterator<Item = &'a OwnerInterfaceSccResult>,
 ) -> Result<OwnerBodyInferenceShard, OwnerBodyInferenceError> {
     validate_inputs(syntax, seed, summary, own_scc)?;
-    let required = required_interface_owners(seed, summary);
-    let mut interfaces = BTreeMap::new();
-    let mut providers = BTreeMap::new();
     let mut supplied_keys = BTreeSet::new();
-    let mut frozen_results = Vec::new();
+    let mut supplied_results = Vec::new();
+    let mut available_interfaces = BTreeMap::new();
     for result in std::iter::once(own_scc).chain(imported_sccs) {
         if !supplied_keys.insert(result.key.clone()) {
             return Err(OwnerBodyInferenceError::new(format!(
@@ -2357,6 +2724,16 @@ pub fn infer_owner_body<'a>(
                 result.key
             )));
         }
+        for interface in &result.owners {
+            insert_interface(&mut available_interfaces, interface)?;
+        }
+        supplied_results.push(result);
+    }
+    let required = owner_body_required_interface_owners(seed, summary, &available_interfaces)?;
+    let mut interfaces = BTreeMap::new();
+    let mut providers = BTreeMap::new();
+    let mut frozen_results = Vec::new();
+    for result in supplied_results {
         let frozen = frozen_scc_ref(result, &required)?;
         for owner in &frozen.referenced_owners {
             let interface = result.owner(owner).ok_or_else(|| {
@@ -2528,6 +2905,7 @@ pub fn infer_owner_body<'a>(
     push_invalid_syntax_diagnostics(seed, &mut diagnostics);
     let mut call_drafts = bind_calls(
         calls,
+        seed,
         &interfaces,
         &mut unifier,
         &expressions,
@@ -2540,6 +2918,7 @@ pub fn infer_owner_body<'a>(
     );
     refine_owner_call_transfers(
         &mut call_drafts,
+        syntax,
         seed,
         &interfaces,
         abi,
@@ -3095,6 +3474,334 @@ mod tests {
             oracle.syntax_discriminated_result
         );
         assert!(call.syntax_discriminated_result);
+    }
+
+    #[test]
+    fn passed_context_call_transfer_resolves_the_legacy_open_result() {
+        let source = concat!(
+            "FUNCTION leaf() {\n",
+            "    PASSED.store.count\n",
+            "}\n",
+            "value: leaf(PASS: [store: [count: 1]])\n",
+        );
+        let unit = link(source);
+        let value = owner_named(&unit, "value");
+        let leaf = owner_named(&unit, "leaf");
+        let (value_syntax, _, value_seed) = inputs(&unit, &value);
+        let (_, _, leaf_seed) = inputs(&unit, &leaf);
+        let reference = value_seed
+            .references
+            .iter()
+            .find(|reference| reference.kind == OwnerReferenceKind::Callable)
+            .cloned()
+            .unwrap();
+        let value_summary = resolve_owner_constraint_seed(
+            &value_seed,
+            [ResolvedOwnerSymbolReference {
+                reference,
+                owner: leaf,
+                parameters: Box::new([]),
+            }],
+        )
+        .unwrap();
+        let leaf_summary = resolve_owner_constraint_seed(&leaf_seed, []).unwrap();
+        let interfaces = solve(
+            &[value_seed.clone(), leaf_seed],
+            &[value_summary.clone(), leaf_summary],
+        );
+        let body = infer(&value_syntax, &value_seed, &value_summary, &interfaces);
+        let call = &body.calls[0];
+
+        let parsed = boon_parser::parse_project(
+            "app/RUN.bn",
+            [("app/RUN.bn".to_owned(), source.to_owned())],
+        )
+        .unwrap();
+        let checked = crate::check_program(&parsed);
+        assert!(checked.report.diagnostics.is_empty());
+        let oracle = checked
+            .program
+            .as_ref()
+            .unwrap()
+            .calls
+            .iter()
+            .find(|call| call.function == "leaf")
+            .unwrap();
+
+        assert_eq!(
+            call.result,
+            FlowType {
+                mode: FlowMode::Continuous,
+                ty: Type::Number,
+            }
+        );
+        assert!(!call.contextual_type_variables.is_empty());
+        assert_eq!(
+            call.type_substitutions
+                .iter()
+                .filter(|substitution| {
+                    call.contextual_type_variables
+                        .contains(&substitution.variable)
+                })
+                .map(|substitution| &substitution.value)
+                .collect::<Vec<_>>(),
+            vec![&Type::Number]
+        );
+        // The whole-project oracle never applied the explicit PASSED value to
+        // this call occurrence. The owner-local replacement deliberately
+        // closes that legacy hole instead of preserving an unresolved result.
+        assert!(matches!(oracle.result.ty, Type::Var(_)));
+        assert!(oracle.type_substitutions.is_empty());
+        assert!(oracle.contextual_substitutions.is_empty());
+    }
+
+    #[test]
+    fn inherited_passed_context_transfers_through_owner_calls() {
+        let source = concat!(
+            "FUNCTION leaf() {\n",
+            "    PASSED.store.count\n",
+            "}\n",
+            "FUNCTION inherited() {\n",
+            "    leaf()\n",
+            "}\n",
+            "value: inherited(PASS: [store: [count: 1]])\n",
+        );
+        let unit = link(source);
+        let value = owner_named(&unit, "value");
+        let inherited = owner_named(&unit, "inherited");
+        let leaf = owner_named(&unit, "leaf");
+        let (value_syntax, _, value_seed) = inputs(&unit, &value);
+        let (_, _, inherited_seed) = inputs(&unit, &inherited);
+        let (_, _, leaf_seed) = inputs(&unit, &leaf);
+
+        let inherited_reference = inherited_seed
+            .references
+            .iter()
+            .find(|reference| reference.kind == OwnerReferenceKind::Callable)
+            .cloned()
+            .unwrap();
+        let value_reference = value_seed
+            .references
+            .iter()
+            .find(|reference| reference.kind == OwnerReferenceKind::Callable)
+            .cloned()
+            .unwrap();
+        let leaf_summary = resolve_owner_constraint_seed(&leaf_seed, []).unwrap();
+        let inherited_summary = resolve_owner_constraint_seed(
+            &inherited_seed,
+            [ResolvedOwnerSymbolReference {
+                reference: inherited_reference,
+                owner: leaf,
+                parameters: Box::new([]),
+            }],
+        )
+        .unwrap();
+        let value_summary = resolve_owner_constraint_seed(
+            &value_seed,
+            [ResolvedOwnerSymbolReference {
+                reference: value_reference,
+                owner: inherited,
+                parameters: Box::new([]),
+            }],
+        )
+        .unwrap();
+        let interfaces = solve(
+            &[value_seed.clone(), inherited_seed, leaf_seed],
+            &[value_summary.clone(), inherited_summary, leaf_summary],
+        );
+        let body = infer(&value_syntax, &value_seed, &value_summary, &interfaces);
+        let call = body
+            .calls
+            .iter()
+            .find(|call| call.function == "inherited")
+            .unwrap();
+
+        assert_eq!(
+            call.result,
+            FlowType {
+                mode: FlowMode::Continuous,
+                ty: Type::Number,
+            }
+        );
+        assert!(!call.contextual_type_variables.is_empty());
+        assert!(call.type_substitutions.iter().any(|substitution| {
+            call.contextual_type_variables
+                .contains(&substitution.variable)
+                && substitution.value == Type::Number
+        }));
+    }
+
+    #[test]
+    fn output_scoped_call_transfer_matches_the_whole_checker_oracle() {
+        let source = concat!(
+            "FUNCTION sorted(list, entry: OUT, key) {\n",
+            "    list |> List/sort_by(item: entry, key: key, direction: Ascending)\n",
+            "}\n",
+            "rows: LIST { [rank: 1] }\n",
+            "ordered: rows |> sorted(entry, key: entry.rank)\n",
+        );
+        let unit = link(source);
+        let ordered = owner_named(&unit, "ordered");
+        let rows = owner_named(&unit, "rows");
+        let sorted = owner_named(&unit, "sorted");
+        let (ordered_syntax, _, ordered_seed) = inputs(&unit, &ordered);
+        let (_, _, rows_seed) = inputs(&unit, &rows);
+        let (_, _, sorted_seed) = inputs(&unit, &sorted);
+        let sorted_parameters = sorted_seed
+            .declarations
+            .iter()
+            .find(|declaration| declaration.public)
+            .unwrap()
+            .parameters
+            .clone();
+        let ordered_resolutions = ordered_seed
+            .references
+            .iter()
+            .filter_map(
+                |reference| match reference.parts.first().map(String::as_str) {
+                    Some("rows") => Some(ResolvedOwnerSymbolReference {
+                        reference: reference.clone(),
+                        owner: rows.clone(),
+                        parameters: Box::new([]),
+                    }),
+                    Some("sorted") => Some(ResolvedOwnerSymbolReference {
+                        reference: reference.clone(),
+                        owner: sorted.clone(),
+                        parameters: sorted_parameters.clone(),
+                    }),
+                    _ => None,
+                },
+            )
+            .collect::<Vec<_>>();
+        let ordered_summary =
+            resolve_owner_constraint_seed(&ordered_seed, ordered_resolutions).unwrap();
+        let rows_summary = resolve_owner_constraint_seed(&rows_seed, []).unwrap();
+        let sorted_summary = resolve_owner_constraint_seed(&sorted_seed, []).unwrap();
+        let interfaces = solve(
+            &[ordered_seed.clone(), rows_seed, sorted_seed],
+            &[ordered_summary.clone(), rows_summary, sorted_summary],
+        );
+        let body = infer(
+            &ordered_syntax,
+            &ordered_seed,
+            &ordered_summary,
+            &interfaces,
+        );
+        let call = body
+            .calls
+            .iter()
+            .find(|call| call.function == "sorted")
+            .unwrap();
+
+        let parsed = boon_parser::parse_project(
+            "app/RUN.bn",
+            [("app/RUN.bn".to_owned(), source.to_owned())],
+        )
+        .unwrap();
+        let checked = crate::check_program(&parsed);
+        assert!(
+            checked.report.diagnostics.is_empty(),
+            "OUT oracle diagnostics: {:#?}",
+            checked.report.diagnostics
+        );
+        let oracle = checked
+            .program
+            .as_ref()
+            .unwrap()
+            .calls
+            .iter()
+            .find(|call| call.function == "sorted")
+            .unwrap();
+
+        assert_eq!(call.result, oracle.result);
+        assert_eq!(
+            call.type_substitutions
+                .iter()
+                .map(|substitution| &substitution.value)
+                .collect::<Vec<_>>(),
+            oracle
+                .type_substitutions
+                .iter()
+                .map(|substitution| &substitution.value)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn static_bits_arithmetic_transfers_through_user_calls() {
+        let source = concat!(
+            "FUNCTION take(bits) {\n",
+            "    bits |> Bits/slice(from: 1, count: 2 + 2)\n",
+            "}\n",
+            "value: take(bits: BITS[8] { 2u10101010 })\n",
+        );
+        let unit = link(source);
+        let value = owner_named(&unit, "value");
+        let take = owner_named(&unit, "take");
+        let (value_syntax, _, value_seed) = inputs(&unit, &value);
+        let (_, _, take_seed) = inputs(&unit, &take);
+        let reference = value_seed
+            .references
+            .iter()
+            .find(|reference| reference.kind == OwnerReferenceKind::Callable)
+            .cloned()
+            .unwrap();
+        let parameters = take_seed
+            .declarations
+            .iter()
+            .find(|declaration| declaration.public)
+            .unwrap()
+            .parameters
+            .clone();
+        let value_summary = resolve_owner_constraint_seed(
+            &value_seed,
+            [ResolvedOwnerSymbolReference {
+                reference,
+                owner: take,
+                parameters,
+            }],
+        )
+        .unwrap();
+        let take_summary = resolve_owner_constraint_seed(&take_seed, []).unwrap();
+        let interfaces = solve(
+            &[value_seed.clone(), take_seed],
+            &[value_summary.clone(), take_summary],
+        );
+        let body = infer(&value_syntax, &value_seed, &value_summary, &interfaces);
+        let call = body
+            .calls
+            .iter()
+            .find(|call| call.function == "take")
+            .unwrap();
+
+        let parsed = boon_parser::parse_project(
+            "app/RUN.bn",
+            [("app/RUN.bn".to_owned(), source.to_owned())],
+        )
+        .unwrap();
+        let checked = crate::check_program(&parsed);
+        assert!(
+            checked.report.diagnostics.is_empty(),
+            "Bits oracle diagnostics: {:#?}",
+            checked.report.diagnostics
+        );
+        let oracle = checked
+            .program
+            .as_ref()
+            .unwrap()
+            .calls
+            .iter()
+            .find(|call| call.function == "take")
+            .unwrap();
+
+        assert_eq!(
+            call.result,
+            FlowType {
+                mode: FlowMode::Continuous,
+                ty: Type::Bits { width: 4 },
+            }
+        );
+        assert_eq!(call.result, oracle.result);
     }
 
     #[test]

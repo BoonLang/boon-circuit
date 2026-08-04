@@ -608,40 +608,29 @@ Current checkpoints to preserve and audit rather than redo:
   proof that the next work is the larger definition-receipt/compact-invocation
   execution architecture and direct row/CSR publication, not resource-row or
   serialization-buffer micro-tuning;
-- implement the post-`210b1a9` execution multiplier audit as the next flag-day
-  refactor. The current handoff rebuilds 47,296 row fingerprints/routes and
-  costs 1,869.164 ms; expression/origin mirroring is 890.791 ms and final
-  sealing is 340.185 ms. Because 11,257 of 16,525 expressions are stable-
-  definition routed, replace rich row mirroring with checked-definition
-  receipts, compact invocation overlays, split definition/occurrence source
-  provenance, final executable row receipts, and one compact domain-summary/
-  relocation linker. Connect the same request graph and immutable unit results
-  to `CompilerSession`; its current whole-checked-slot invalidation cannot pass
-  warm gates. Preserve full-handoff and clean-full paths only as independent
-  test oracles, never production fallbacks;
-- preserve the landed V3 construction route spine: stable checked-definition
-  routes and dense parent-linked invocation overlays are prepared before
-  semantic rows under independent V3 digest domains, consumed by the V2 oracle,
-  and discarded after sealing. Continue directly into compact executable-row
-  and CSR publication and delete the V2 47,296-row mirror; the route checkpoint
-  alone is not a speed result or phase exit;
-- preserve the construction-bound entity-route checkpoint: after resource
-  authority normalization completes the final semantic row set, every dense
-  expression, statement, and static owner is assigned once to the V3 spine.
-  Production consumes these routes and legacy route rediscovery is test-only
-  parity evidence. Do not score this as speed progress while the V2 proof-row
-  mirror still exists;
+- preserve the completed V3 executable-receipt cut. Stable checked-definition
+  routes, dense parent-linked invocation overlays, construction-bound entity
+  routes, final executable-row receipts, and one CSR relocation arena now seal
+  `SealedSemanticImageV3`. Production publishes 30,771 rows, 4,158 projections,
+  and 9,037 relocations instead of the V2 47,296/6,483/16,834; the cumulative
+  path arena, rich V2 mirror, duplicate expression-origin receipts, and legacy
+  owner rediscovery are `cfg(test)` parity oracles only. Manifest follows direct
+  definition, authored-call-site, and parent-overlay edges. The exact ignored
+  NovyWave V2/V3 owner oracle and architecture gate pass, and the direct debug
+  verified sample keeps plan hash
+  `db18f345676378b8633829c0bbd7870c0a1dc5a2459649c9bbfdd6b8969374ab`;
 - follow the post-`addb056` whole-system architecture, not a sequence of local
   loop or hashing tweaks. Cold and warm compilation use one persistent
   definition-to-runnable request graph: immutable per-unit syntax snapshots,
   stable interfaces and definition receipts, demanded executable definition
   shards, compact invocation overlays, construction-owned domain summaries,
-  one relocation/SCC link, and a consuming runnable builder. Delete the V2
-  execution mirror and Manifest import as the first vertical cut; then connect
-  parser unit artifacts and request backdating to `CompilerSession`, make
-  verified intent the sole demand queue, delete repeated ordinary-body
-  lowerers, and replace repeated distributed-role elaboration with delta
-  linking. A whole-program cache beside the old passes is rejected;
+  one relocation/SCC link, and a consuming runnable builder. The V2 mirror is
+  deleted from production; next remove Manifest's compact receipt re-import by
+  making the shared summary/link graph authoritative, then connect parser unit
+  artifacts and request backdating to `CompilerSession`, make verified intent
+  the sole demand queue, delete repeated ordinary-body lowerers, and replace
+  repeated distributed-role elaboration with delta linking. A whole-program
+  cache beside the old passes is rejected;
 - treat the 16.7 ms diagnostics and 100 ms replacement-preview gates as warm
   incremental contracts. A faster full rebuild cannot satisfy them. Record
   executed/reused/backdated requests and require zero unrelated parse/check/

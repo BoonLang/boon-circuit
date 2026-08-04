@@ -15065,6 +15065,83 @@ reviewed = true
 fields = []
 
 [[records]]
+kind = "enum"
+source = "crates/boon_semantic/src/semantic_image.rs"
+name = "ExecutionImageRowDomainV3"
+
+[[records.variants]]
+name = "Scope"
+disposition = "a-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = []
+
+[[records.variants]]
+name = "Expression"
+disposition = "a-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = []
+
+[[records.variants]]
+name = "Statement"
+disposition = "a-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = []
+
+[[records.variants]]
+name = "Callable"
+disposition = "a-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = []
+
+[[records.variants]]
+name = "Call"
+disposition = "a-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = []
+
+[[records.variants]]
+name = "CallOccurrence"
+disposition = "a-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = []
+
+[[records.variants]]
+name = "Source"
+disposition = "a-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = []
+
+[[records.variants]]
+name = "State"
+disposition = "a-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = []
+
+[[records.variants]]
+name = "Root"
+disposition = "a-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = []
+
+[[records.variants]]
+name = "Function"
+disposition = "a-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = []
+
+[[records.variants]]
+name = "Materialization"
+disposition = "a-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = []
+
+[[records.variants]]
+name = "StaticOwner"
+disposition = "a-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = []
+
+[[records]]
 kind = "struct"
 source = "crates/boon_semantic/src/semantic_image.rs"
 name = "ExecutionInvocationPathIdV2"
@@ -15192,6 +15269,61 @@ fields = [
 [[records]]
 kind = "struct"
 source = "crates/boon_semantic/src/semantic_image.rs"
+name = "ExecutionImageProjectionIdV3"
+fields = [
+  { name = "0", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_semantic/src/semantic_image.rs"
+name = "ExecutionImageRelocationSpanV3"
+fields = [
+  { name = "start", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "len", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_semantic/src/semantic_image.rs"
+name = "ExecutionImageProjectionV3"
+fields = [
+  { name = "identity", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "stable_key_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "local_content_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "row_count", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "dependency_row_count", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "relocation_span", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_semantic/src/semantic_image.rs"
+name = "ExecutionImageEntityRouteV3"
+fields = [
+  { name = "domain", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "dense_index", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "projection", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_semantic/src/semantic_image.rs"
+name = "ExecutionImageHandoffV3"
+fields = [
+  { name = "schema", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "source_bundle_digest_v1", disposition = "a-frca-priv-sp-id-pc-n", reviewed = true },
+  { name = "role", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "invocation_overlays", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "projections", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "relocations", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "entity_routes", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "local_image_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_semantic/src/semantic_image.rs"
 name = "ExecutionImageHandoffV2"
 fields = [
   { name = "schema", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
@@ -15207,7 +15339,7 @@ fields = [
 [[records]]
 kind = "struct"
 source = "crates/boon_semantic/src/semantic_image.rs"
-name = "SealedSemanticImageV2"
+name = "SealedSemanticImageV3"
 fields = [
   { name = "schema", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
   { name = "checked_handoff", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },

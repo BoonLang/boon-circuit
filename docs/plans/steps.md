@@ -426,6 +426,22 @@ stronger three-reviewer performance closure defined below.
    distributed fixed point and only then split crates at measured one-way
    contract/build/service seams. Warm edits must prove zero unrelated work.
 
+   The first sixth-audit production cut now deletes the V2 executable mirror.
+   `SealedSemanticImageV3` fingerprints final executable rows, retains one
+   3,494-entry parent-linked overlay table, and publishes 30,771 rows, 4,158
+   projections, and 9,037 relocations instead of 47,296/6,483/16,834. Manifest
+   consumes direct definition/call-site/parent edges; the cumulative V2 path
+   arena and duplicate expression-origin receipts are test-only parity code.
+   One direct debug NovyWave verified sample is 4,100.898 ms total,
+   2,328.883 ms semantic, and 258,232 KiB RSS with unchanged plan hash.
+   Execution sealing falls from the prior 1,829.237 ms trace to
+   38.109 + 277.995 ms, and Manifest falls from 1,701.115 ms to 410.015 ms.
+   The exact ignored V2/V3 owner oracle and architecture gate pass. This does
+   not close step 1: compact Manifest import, cold product disposal, whole-slot
+   session invalidation, repeated backend lowering, and distributed full-role
+   rebuilds remain. Continue with the persistent unit/definition request graph
+   and compact summary linker, not local hashing tweaks.
+
    The post-`ac2b234` high-level audit supersedes a mutating post-resource
    execution seal. Move inline list-authority synthesis into execution
    construction, seal immutable execution once, and make the resource typed

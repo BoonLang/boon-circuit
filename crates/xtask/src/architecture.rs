@@ -728,7 +728,7 @@ fn verified_semantic_compiler_spine(workspace: &Path) -> Result<String, String> 
         &semantic,
         "SemanticProgram",
         "semantic_image",
-        "SealedSemanticImageV2",
+        "SealedSemanticImageV3",
     )?;
     verify_required_direct_field(&ir, "ErasedProgram", "fields", "CanonicalProgramCoreV2")?;
     verify_required_direct_field(

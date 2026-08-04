@@ -23,21 +23,36 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
 
-pub const SEMANTIC_IMAGE_SCHEMA_V2: &str = "boon.semantic-image.v2";
+pub const SEMANTIC_IMAGE_SCHEMA_V3: &str = "boon.semantic-image.v3";
+#[cfg(test)]
 pub const EXECUTION_IMAGE_HANDOFF_SCHEMA_V2: &str = "boon.execution-image-handoff.v2";
+pub const EXECUTION_IMAGE_HANDOFF_SCHEMA_V3: &str = "boon.execution-image-handoff.v3";
 pub const EXECUTION_CONSTRUCTION_ROUTES_SCHEMA_V3: &str = "boon.execution-construction-routes.v3";
 
+// The parent/call-site path is a stable logical identity shared by the V2
+// oracle and V3 overlays; changing the container must not re-key that identity.
 const EXECUTION_INVOCATION_PATH_DOMAIN_V2: &[u8] = b"boon.execution-invocation-path.v2\0";
+#[cfg(test)]
 const EXECUTION_IMAGE_PROJECTION_KEY_DOMAIN_V2: &[u8] = b"boon.execution-image-projection-key.v2\0";
+#[cfg(test)]
 const EXECUTION_IMAGE_ROW_PAYLOAD_DOMAIN_V2: &[u8] = b"boon.execution-image-row-payload.v2\0";
+#[cfg(test)]
 const EXECUTION_IMAGE_ROW_DOMAIN_V2: &[u8] = b"boon.execution-image-row.v2\0";
+#[cfg(test)]
 const EXECUTION_IMAGE_SHARD_DOMAIN_V2: &[u8] = b"boon.execution-image-shard.v2\0";
+#[cfg(test)]
 const EXECUTION_IMAGE_HANDOFF_DOMAIN_V2: &[u8] = b"boon.execution-image-handoff.v2\0";
-const SEMANTIC_IMAGE_SEAL_DOMAIN_V2: &[u8] = b"boon.semantic-image-seal.v2\0";
-const EXECUTION_INVOCATION_PATH_DOMAIN_V3: &[u8] = b"boon.execution-invocation-path.v3\0";
+const EXECUTION_IMAGE_PROJECTION_KEY_DOMAIN_V3: &[u8] = b"boon.execution-image-projection-key.v3\0";
+const EXECUTION_IMAGE_ROW_PAYLOAD_DOMAIN_V3: &[u8] = b"boon.execution-image-row-payload.v3\0";
+const EXECUTION_IMAGE_ROW_DOMAIN_V3: &[u8] = b"boon.execution-image-row.v3\0";
+const EXECUTION_IMAGE_SHARD_DOMAIN_V3: &[u8] = b"boon.execution-image-shard.v3\0";
+const EXECUTION_IMAGE_HANDOFF_DOMAIN_V3: &[u8] = b"boon.execution-image-handoff.v3\0";
+const SEMANTIC_IMAGE_SEAL_DOMAIN_V3: &[u8] = b"boon.semantic-image-seal.v3\0";
 const EXECUTION_INVOCATION_OVERLAY_DOMAIN_V3: &[u8] = b"boon.execution-invocation-overlay.v3\0";
+#[cfg(test)]
 const EXECUTION_CONSTRUCTION_ROUTES_DOMAIN_V3: &[u8] = b"boon.execution-construction-routes.v3\0";
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionImageRowDomainV2 {
@@ -57,29 +72,52 @@ pub enum ExecutionImageRowDomainV2 {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionImageRowDomainV3 {
+    Scope,
+    Expression,
+    Statement,
+    Callable,
+    Call,
+    CallOccurrence,
+    Source,
+    State,
+    Root,
+    Function,
+    Materialization,
+    StaticOwner,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct ExecutionInvocationPathIdV2(pub u32);
 
+#[cfg(test)]
 impl ExecutionInvocationPathIdV2 {
     pub const fn as_usize(self) -> usize {
         self.0 as usize
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub struct ExecutionImageProjectionIdV2(pub u32);
 
+#[cfg(test)]
 impl ExecutionImageProjectionIdV2 {
     pub const fn as_usize(self) -> usize {
         self.0 as usize
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ExecutionImageRelocationSpanV2 {
     pub start: u32,
     pub len: u32,
 }
 
+#[cfg(test)]
 impl ExecutionImageRelocationSpanV2 {
     pub fn checked_range(self) -> Option<std::ops::Range<usize>> {
         let end = self.start.checked_add(self.len)?;
@@ -89,6 +127,7 @@ impl ExecutionImageRelocationSpanV2 {
 
 /// Collision-checked parent-pointer invocation path. Cumulative logical depth
 /// never becomes an owned vector in a row or projection key.
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ExecutionInvocationPathNodeV2 {
     pub parent: Option<ExecutionInvocationPathIdV2>,
@@ -98,6 +137,7 @@ pub struct ExecutionInvocationPathNodeV2 {
 
 /// Snapshot-local projection identity. Its separate stable-key digest commits
 /// checked stable identities and invocation-path digests, never these dense IDs.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SemanticImageProjectionIdentityV2 {
@@ -112,6 +152,7 @@ pub enum SemanticImageProjectionIdentityV2 {
     },
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ExecutionImageProjectionV2 {
     pub identity: SemanticImageProjectionIdentityV2,
@@ -122,6 +163,7 @@ pub struct ExecutionImageProjectionV2 {
     pub relocation_span: ExecutionImageRelocationSpanV2,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ExecutionImageEntityRouteV2 {
     pub domain: ExecutionImageRowDomainV2,
@@ -150,7 +192,7 @@ pub struct ExecutionInvocationOverlayV3 {
 /// Snapshot-local construction owner. Stable identity is always obtained from
 /// the referenced checked projection or invocation overlay receipt; these
 /// dense IDs never cross revisions on their own.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ExecutionConstructionProjectionV3 {
     Checked {
@@ -163,6 +205,100 @@ pub enum ExecutionConstructionProjectionV3 {
         identity: [u8; 32],
         definition: CheckedImageProjectionIdV2,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct ExecutionImageProjectionIdV3(pub u32);
+
+impl ExecutionImageProjectionIdV3 {
+    pub const fn as_usize(self) -> usize {
+        self.0 as usize
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ExecutionImageRelocationSpanV3 {
+    pub start: u32,
+    pub len: u32,
+}
+
+impl ExecutionImageRelocationSpanV3 {
+    pub fn checked_range(self) -> Option<std::ops::Range<usize>> {
+        let end = self.start.checked_add(self.len)?;
+        Some(self.start as usize..end as usize)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ExecutionImageProjectionV3 {
+    pub identity: ExecutionConstructionProjectionV3,
+    pub stable_key_digest: [u8; 32],
+    pub local_content_digest: [u8; 32],
+    pub row_count: u32,
+    pub dependency_row_count: u32,
+    pub relocation_span: ExecutionImageRelocationSpanV3,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ExecutionImageEntityRouteV3 {
+    pub domain: ExecutionImageRowDomainV3,
+    pub dense_index: u32,
+    pub projection: ExecutionImageProjectionIdV3,
+}
+
+/// Compact executable receipt set. Invocation ancestry is owned by the V3
+/// parent-linked overlays; it is never expanded into a second path arena.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ExecutionImageHandoffV3 {
+    pub schema: String,
+    pub source_bundle_digest_v1: SourceBundleDigestV1,
+    pub role: ProgramRole,
+    pub invocation_overlays: Vec<ExecutionInvocationOverlayV3>,
+    pub projections: Vec<ExecutionImageProjectionV3>,
+    pub relocations: Vec<ExecutionImageProjectionIdV3>,
+    pub entity_routes: Vec<ExecutionImageEntityRouteV3>,
+    pub local_image_digest: [u8; 32],
+}
+
+impl ExecutionImageHandoffV3 {
+    pub fn projection(
+        &self,
+        id: ExecutionImageProjectionIdV3,
+    ) -> Option<&ExecutionImageProjectionV3> {
+        self.projections.get(id.as_usize())
+    }
+
+    pub fn projection_relocations(
+        &self,
+        id: ExecutionImageProjectionIdV3,
+    ) -> Option<&[ExecutionImageProjectionIdV3]> {
+        let projection = self.projection(id)?;
+        self.relocations
+            .get(projection.relocation_span.checked_range()?)
+    }
+
+    pub fn entity_projection(
+        &self,
+        domain: ExecutionImageRowDomainV3,
+        dense_index: usize,
+    ) -> Option<ExecutionImageProjectionIdV3> {
+        let dense_index = u32::try_from(dense_index).ok()?;
+        self.entity_routes
+            .binary_search_by_key(&(domain, dense_index), |route| {
+                (route.domain, route.dense_index)
+            })
+            .ok()
+            .map(|index| self.entity_routes[index].projection)
+    }
+
+    pub fn invocation(
+        &self,
+        occurrence: OutCallInstanceId,
+    ) -> Option<&ExecutionInvocationOverlayV3> {
+        self.invocation_overlays
+            .get(occurrence.as_usize())
+            .filter(|overlay| overlay.occurrence == occurrence)
+    }
 }
 
 #[derive(Serialize)]
@@ -180,6 +316,7 @@ pub(crate) struct ExecutionConstructionRoutesV3 {
     definition_by_checked_projection: Vec<CheckedImageProjectionIdV2>,
     invocations: Vec<ExecutionInvocationOverlayV3>,
     owner_occurrences: Vec<OutCallInstanceId>,
+    #[cfg(test)]
     local_digest: [u8; 32],
 }
 
@@ -262,6 +399,7 @@ impl ExecutionConstructionImageV3 {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ExecutionImageHandoffV2 {
     pub schema: String,
@@ -274,6 +412,7 @@ pub struct ExecutionImageHandoffV2 {
     pub local_image_digest: [u8; 32],
 }
 
+#[cfg(test)]
 impl ExecutionImageHandoffV2 {
     pub fn projection(
         &self,
@@ -307,20 +446,20 @@ impl ExecutionImageHandoffV2 {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SealedSemanticImageV2 {
+pub struct SealedSemanticImageV3 {
     schema: String,
     checked_handoff: CheckedImageHandoffV2,
-    execution_handoff: ExecutionImageHandoffV2,
+    execution_handoff: ExecutionImageHandoffV3,
     execution: SemanticExecutionImageColumnsV1,
     seal_digest: [u8; 32],
 }
 
-impl SealedSemanticImageV2 {
+impl SealedSemanticImageV3 {
     pub const fn checked_handoff(&self) -> &CheckedImageHandoffV2 {
         &self.checked_handoff
     }
 
-    pub const fn execution_handoff(&self) -> &ExecutionImageHandoffV2 {
+    pub const fn execution_handoff(&self) -> &ExecutionImageHandoffV3 {
         &self.execution_handoff
     }
 
@@ -337,9 +476,9 @@ impl SealedSemanticImageV2 {
         source_bundle_digest_v1: SourceBundleDigestV1,
         role: ProgramRole,
     ) -> Result<(), String> {
-        if self.schema != SEMANTIC_IMAGE_SCHEMA_V2
+        if self.schema != SEMANTIC_IMAGE_SCHEMA_V3
             || self.checked_handoff.schema != CHECKED_IMAGE_HANDOFF_SCHEMA_V2
-            || self.execution_handoff.schema != EXECUTION_IMAGE_HANDOFF_SCHEMA_V2
+            || self.execution_handoff.schema != EXECUTION_IMAGE_HANDOFF_SCHEMA_V3
         {
             return Err("semantic image contains an unsupported schema".to_owned());
         }
@@ -376,7 +515,9 @@ pub(crate) struct SemanticImageBuilder<State> {
     execution_routes_v3: Option<ExecutionConstructionRoutesV3>,
     execution_image_v3: Option<ExecutionConstructionImageV3>,
     execution: SemanticExecutionImageColumnsV1,
-    execution_handoff: Option<ExecutionImageHandoffV2>,
+    execution_handoff: Option<ExecutionImageHandoffV3>,
+    #[cfg(test)]
+    execution_handoff_v2_oracle: Option<ExecutionImageHandoffV2>,
     state: PhantomData<State>,
 }
 
@@ -398,6 +539,8 @@ impl SemanticImageBuilder<ExecutionPending> {
             execution_image_v3: None,
             execution,
             execution_handoff: None,
+            #[cfg(test)]
+            execution_handoff_v2_oracle: None,
             state: PhantomData,
         })
     }
@@ -440,7 +583,7 @@ impl SemanticImageBuilder<ExecutionPending> {
     fn finish_execution(
         self,
         _witness: PostResourceValidatedV2,
-        out: &ResolvedOutGraph,
+        _out: &ResolvedOutGraph,
     ) -> Result<SemanticImageBuilder<ExecutionFinalized>, String> {
         if self.execution_routes_v3.is_some() {
             return Err("execution V3 routes were not bound after normalization".to_owned());
@@ -448,18 +591,21 @@ impl SemanticImageBuilder<ExecutionPending> {
         let execution_image_v3 = self
             .execution_image_v3
             .ok_or_else(|| "execution V3 image was not constructed".to_owned())?;
-        let execution_handoff = execution_image_handoff(
+        #[cfg(test)]
+        let execution_handoff_v2_oracle = Some(execution_image_handoff_v2_oracle(
             &self.checked_handoff,
             &execution_image_v3,
-            out,
+            _out,
             &self.execution,
-        )?;
+        )?);
         Ok(SemanticImageBuilder {
             checked_handoff: self.checked_handoff,
             execution_routes_v3: None,
             execution_image_v3: Some(execution_image_v3),
             execution: self.execution,
-            execution_handoff: Some(execution_handoff),
+            execution_handoff: None,
+            #[cfg(test)]
+            execution_handoff_v2_oracle,
             state: PhantomData,
         })
     }
@@ -474,23 +620,48 @@ impl SemanticImageBuilder<ExecutionFinalized> {
         &self.checked_handoff
     }
 
-    pub(crate) fn execution_handoff(&self) -> &ExecutionImageHandoffV2 {
+    pub(crate) fn execution_handoff(&self) -> &ExecutionImageHandoffV3 {
         self.execution_handoff
             .as_ref()
-            .expect("execution-finalized typestate always carries a handoff")
+            .expect("executable receipts are finalized before handoff access")
     }
 
-    pub(crate) fn seal(self) -> Result<SealedSemanticImageV2, String> {
+    pub(crate) fn finalize_executable_receipts(
+        &mut self,
+        core: &crate::program_core::CanonicalProgramCoreV2,
+    ) -> Result<(), String> {
+        if self.execution_handoff.is_some() {
+            return Err("execution V3 handoff was already finalized".to_owned());
+        }
+        let construction_image = self
+            .execution_image_v3
+            .as_ref()
+            .ok_or_else(|| "finalized execution builder has no V3 construction image".to_owned())?;
+        let handoff = execution_image_handoff_v3(
+            &self.checked_handoff,
+            construction_image,
+            &self.execution,
+            core,
+        )?;
+        #[cfg(test)]
+        if let Some(oracle) = &self.execution_handoff_v2_oracle {
+            validate_v3_routes_against_v2_oracle(&handoff, oracle, &self.checked_handoff)?;
+        }
+        self.execution_handoff = Some(handoff);
+        Ok(())
+    }
+
+    pub(crate) fn seal(self) -> Result<SealedSemanticImageV3, String> {
         let execution_handoff = self
             .execution_handoff
-            .ok_or_else(|| "finalized execution builder has no handoff".to_owned())?;
-        let schema = SEMANTIC_IMAGE_SCHEMA_V2.to_owned();
+            .ok_or_else(|| "finalized execution builder has no V3 handoff".to_owned())?;
+        let schema = SEMANTIC_IMAGE_SCHEMA_V3.to_owned();
         let seal_digest =
             semantic_image_seal_digest(&schema, &self.checked_handoff, &execution_handoff)?;
         let _execution_image_v3 = self
             .execution_image_v3
             .ok_or_else(|| "finalized execution builder has no V3 image".to_owned())?;
-        Ok(SealedSemanticImageV2 {
+        Ok(SealedSemanticImageV3 {
             schema,
             checked_handoff: self.checked_handoff,
             execution_handoff,
@@ -500,6 +671,374 @@ impl SemanticImageBuilder<ExecutionFinalized> {
     }
 }
 
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum ExecutionProjectionStableFingerprintV3 {
+    Checked {
+        definition_digest: [u8; 32],
+    },
+    Invocation {
+        overlay_digest: [u8; 32],
+    },
+    Producer {
+        identity: [u8; 32],
+        definition_digest: [u8; 32],
+    },
+}
+
+#[derive(Serialize)]
+struct ExecutionImageRowFingerprintV3<'a> {
+    projection_stable_key_digest: [u8; 32],
+    domain: ExecutionImageRowDomainV3,
+    payload_digest: [u8; 32],
+    relocation_stable_key_digests: &'a [[u8; 32]],
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct PendingExecutionProjectionIdV3(u32);
+
+impl PendingExecutionProjectionIdV3 {
+    const fn as_usize(self) -> usize {
+        self.0 as usize
+    }
+}
+
+struct PendingExecutionProjectionV3 {
+    identity: ExecutionConstructionProjectionV3,
+    stable_key_digest: [u8; 32],
+    row_digests: Vec<[u8; 32]>,
+    dependency_row_count: u32,
+    relocations: Vec<PendingExecutionProjectionIdV3>,
+}
+
+struct ExecutionImageHandoffBuilderV3<'a> {
+    checked: &'a CheckedImageHandoffV2,
+    construction_image: &'a ExecutionConstructionImageV3,
+    ids: BTreeMap<ExecutionConstructionProjectionV3, PendingExecutionProjectionIdV3>,
+    stable_digest_ids: BTreeMap<[u8; 32], PendingExecutionProjectionIdV3>,
+    projections: Vec<PendingExecutionProjectionV3>,
+    entity_routes: Vec<(
+        ExecutionImageRowDomainV3,
+        u32,
+        PendingExecutionProjectionIdV3,
+    )>,
+}
+
+impl<'a> ExecutionImageHandoffBuilderV3<'a> {
+    fn new(
+        checked: &'a CheckedImageHandoffV2,
+        construction_image: &'a ExecutionConstructionImageV3,
+    ) -> Result<Self, String> {
+        if construction_image
+            .routes
+            .definition_by_checked_projection
+            .len()
+            != checked.projections.len()
+        {
+            return Err(
+                "execution V3 definition routes do not cover checked projections".to_owned(),
+            );
+        }
+        Ok(Self {
+            checked,
+            construction_image,
+            ids: BTreeMap::new(),
+            stable_digest_ids: BTreeMap::new(),
+            projections: Vec::new(),
+            entity_routes: Vec::new(),
+        })
+    }
+
+    fn checked_projection(
+        &self,
+        id: CheckedImageProjectionIdV2,
+    ) -> Result<&boon_checked::CheckedImageProjectionV2, String> {
+        self.checked.projection(id).ok_or_else(|| {
+            format!(
+                "execution V3 references missing checked projection {}",
+                id.0
+            )
+        })
+    }
+
+    fn normalized_identity(
+        &self,
+        identity: ExecutionConstructionProjectionV3,
+    ) -> Result<ExecutionConstructionProjectionV3, String> {
+        Ok(match identity {
+            ExecutionConstructionProjectionV3::Checked { projection } => {
+                ExecutionConstructionProjectionV3::Checked {
+                    projection: self.construction_image.definition_projection(projection)?,
+                }
+            }
+            other => other,
+        })
+    }
+
+    fn stable_fingerprint(
+        &self,
+        identity: ExecutionConstructionProjectionV3,
+    ) -> Result<ExecutionProjectionStableFingerprintV3, String> {
+        Ok(match identity {
+            ExecutionConstructionProjectionV3::Checked { projection } => {
+                ExecutionProjectionStableFingerprintV3::Checked {
+                    definition_digest: self.checked_projection(projection)?.stable_key_digest,
+                }
+            }
+            ExecutionConstructionProjectionV3::Invocation { occurrence } => {
+                ExecutionProjectionStableFingerprintV3::Invocation {
+                    overlay_digest: self
+                        .construction_image
+                        .invocation(occurrence)?
+                        .stable_key_digest,
+                }
+            }
+            ExecutionConstructionProjectionV3::Producer {
+                identity,
+                definition,
+            } => ExecutionProjectionStableFingerprintV3::Producer {
+                identity,
+                definition_digest: self.checked_projection(definition)?.stable_key_digest,
+            },
+        })
+    }
+
+    fn intern(
+        &mut self,
+        identity: ExecutionConstructionProjectionV3,
+    ) -> Result<PendingExecutionProjectionIdV3, String> {
+        let identity = self.normalized_identity(identity)?;
+        if let Some(id) = self.ids.get(&identity) {
+            return Ok(*id);
+        }
+        let stable_key_digest = boon_contract::canonical_serde_hash_v1(
+            EXECUTION_IMAGE_PROJECTION_KEY_DOMAIN_V3,
+            &self.stable_fingerprint(identity)?,
+        )
+        .map_err(|error| format!("failed to hash execution V3 projection key: {error}"))?;
+        if let Some(previous) = self.stable_digest_ids.get(&stable_key_digest).copied() {
+            let previous_identity = self
+                .projections
+                .get(previous.as_usize())
+                .map(|projection| projection.identity)
+                .ok_or_else(|| "execution V3 projection digest registry is stale".to_owned())?;
+            if previous_identity != identity {
+                return Err(format!(
+                    "execution V3 projection digest collision between {previous_identity:?} and {identity:?}"
+                ));
+            }
+            return Ok(previous);
+        }
+        let id = PendingExecutionProjectionIdV3(
+            u32::try_from(self.projections.len())
+                .map_err(|_| "execution V3 projection registry exceeds u32".to_owned())?,
+        );
+        self.ids.insert(identity, id);
+        self.stable_digest_ids.insert(stable_key_digest, id);
+        self.projections.push(PendingExecutionProjectionV3 {
+            identity,
+            stable_key_digest,
+            row_digests: Vec::new(),
+            dependency_row_count: 0,
+            relocations: Vec::new(),
+        });
+        Ok(id)
+    }
+
+    fn push<T: Serialize>(
+        &mut self,
+        projection: PendingExecutionProjectionIdV3,
+        domain: ExecutionImageRowDomainV3,
+        payload: &T,
+        mut relocations: Vec<PendingExecutionProjectionIdV3>,
+    ) -> Result<(), String> {
+        let stable_key_digests = &self.projections;
+        relocations
+            .sort_unstable_by_key(|target| stable_key_digests[target.as_usize()].stable_key_digest);
+        relocations.dedup_by_key(|target| stable_key_digests[target.as_usize()].stable_key_digest);
+        relocations.retain(|target| *target != projection);
+        let payload_digest =
+            boon_contract::canonical_serde_hash_v1(EXECUTION_IMAGE_ROW_PAYLOAD_DOMAIN_V3, payload)
+                .map_err(|error| format!("failed to hash execution V3 row payload: {error}"))?;
+        let relocation_stable_key_digests = relocations
+            .iter()
+            .map(|target| self.projections[target.as_usize()].stable_key_digest)
+            .collect::<Vec<_>>();
+        let projection_stable_key_digest =
+            self.projections[projection.as_usize()].stable_key_digest;
+        let digest = boon_contract::canonical_serde_hash_v1(
+            EXECUTION_IMAGE_ROW_DOMAIN_V3,
+            &ExecutionImageRowFingerprintV3 {
+                projection_stable_key_digest,
+                domain,
+                payload_digest,
+                relocation_stable_key_digests: &relocation_stable_key_digests,
+            },
+        )
+        .map_err(|error| format!("failed to hash execution V3 row: {error}"))?;
+        let has_relocations = !relocations.is_empty();
+        let pending = &mut self.projections[projection.as_usize()];
+        pending.row_digests.push(digest);
+        if has_relocations {
+            pending.dependency_row_count = pending
+                .dependency_row_count
+                .checked_add(1)
+                .ok_or_else(|| "execution V3 dependency row count overflow".to_owned())?;
+        }
+        pending.relocations.extend(relocations);
+        Ok(())
+    }
+
+    fn route(
+        &mut self,
+        domain: ExecutionImageRowDomainV3,
+        dense_index: usize,
+        projection: PendingExecutionProjectionIdV3,
+    ) -> Result<(), String> {
+        self.entity_routes.push((
+            domain,
+            u32::try_from(dense_index)
+                .map_err(|_| "execution V3 entity index exceeds u32".to_owned())?,
+            projection,
+        ));
+        Ok(())
+    }
+
+    fn finish(
+        self,
+        source_bundle_digest_v1: SourceBundleDigestV1,
+        role: ProgramRole,
+    ) -> Result<ExecutionImageHandoffV3, String> {
+        let Self {
+            checked: _,
+            construction_image,
+            ids: _,
+            stable_digest_ids,
+            mut projections,
+            mut entity_routes,
+        } = self;
+        let mut canonical_projection_by_pending =
+            vec![ExecutionImageProjectionIdV3(u32::MAX); projections.len()];
+        for (canonical_index, pending_id) in stable_digest_ids.values().copied().enumerate() {
+            canonical_projection_by_pending[pending_id.as_usize()] = ExecutionImageProjectionIdV3(
+                u32::try_from(canonical_index)
+                    .map_err(|_| "execution V3 canonical projection index exceeds u32")?,
+            );
+        }
+        let stable_key_digests = projections
+            .iter()
+            .map(|projection| projection.stable_key_digest)
+            .collect::<Vec<_>>();
+        let mut sealed_projections = Vec::with_capacity(projections.len());
+        let mut relocation_arena = Vec::new();
+        for pending_id in stable_digest_ids.values().copied() {
+            let pending = &mut projections[pending_id.as_usize()];
+            if pending.row_digests.is_empty() {
+                return Err(format!(
+                    "execution V3 projection {:?} has no final rows",
+                    pending.identity
+                ));
+            }
+            pending.relocations.sort_unstable_by(|left, right| {
+                stable_key_digests[left.as_usize()].cmp(&stable_key_digests[right.as_usize()])
+            });
+            pending.relocations.dedup();
+            let relocation_start = u32::try_from(relocation_arena.len())
+                .map_err(|_| "execution V3 relocation arena exceeds u32")?;
+            let relocation_len = u32::try_from(pending.relocations.len())
+                .map_err(|_| "execution V3 relocation span exceeds u32")?;
+            relocation_start
+                .checked_add(relocation_len)
+                .ok_or_else(|| "execution V3 relocation arena exceeds u32".to_owned())?;
+            relocation_arena.extend(
+                pending
+                    .relocations
+                    .iter()
+                    .map(|target| canonical_projection_by_pending[target.as_usize()]),
+            );
+            let local_content_digest = boon_contract::canonical_serde_hash_v1(
+                EXECUTION_IMAGE_SHARD_DOMAIN_V3,
+                &(pending.stable_key_digest, &pending.row_digests),
+            )
+            .map_err(|error| format!("failed to hash execution V3 shard: {error}"))?;
+            sealed_projections.push(ExecutionImageProjectionV3 {
+                identity: pending.identity,
+                stable_key_digest: pending.stable_key_digest,
+                local_content_digest,
+                row_count: u32::try_from(pending.row_digests.len())
+                    .map_err(|_| "execution V3 shard row count exceeds u32")?,
+                dependency_row_count: pending.dependency_row_count,
+                relocation_span: ExecutionImageRelocationSpanV3 {
+                    start: relocation_start,
+                    len: relocation_len,
+                },
+            });
+        }
+        entity_routes.sort_unstable_by(|left, right| {
+            (left.0, left.1, stable_key_digests[left.2.as_usize()]).cmp(&(
+                right.0,
+                right.1,
+                stable_key_digests[right.2.as_usize()],
+            ))
+        });
+        if entity_routes
+            .windows(2)
+            .any(|pair| (pair[0].0, pair[0].1) == (pair[1].0, pair[1].1))
+        {
+            return Err("execution V3 routes an entity more than once".to_owned());
+        }
+        let entity_routes = entity_routes
+            .into_iter()
+            .map(
+                |(domain, dense_index, projection)| ExecutionImageEntityRouteV3 {
+                    domain,
+                    dense_index,
+                    projection: canonical_projection_by_pending[projection.as_usize()],
+                },
+            )
+            .collect::<Vec<_>>();
+        let invocation_overlays = construction_image.routes.invocations.clone();
+        let local_image_digest = boon_contract::canonical_serde_hash_v1(
+            EXECUTION_IMAGE_HANDOFF_DOMAIN_V3,
+            &(
+                EXECUTION_IMAGE_HANDOFF_SCHEMA_V3,
+                source_bundle_digest_v1,
+                role,
+                &invocation_overlays,
+                &sealed_projections,
+                &relocation_arena,
+                &entity_routes,
+            ),
+        )
+        .map_err(|error| format!("failed to hash execution V3 handoff: {error}"))?;
+        if std::env::var_os("BOON_SEMANTIC_TRACE").is_some() {
+            let row_count = sealed_projections
+                .iter()
+                .map(|projection| projection.row_count as usize)
+                .sum::<usize>();
+            eprintln!(
+                "boon_semantic execution_handoff_v3 overlays={} projections={} rows={} entity_routes={} relocations={}",
+                invocation_overlays.len(),
+                sealed_projections.len(),
+                row_count,
+                entity_routes.len(),
+                relocation_arena.len(),
+            );
+        }
+        Ok(ExecutionImageHandoffV3 {
+            schema: EXECUTION_IMAGE_HANDOFF_SCHEMA_V3.to_owned(),
+            source_bundle_digest_v1,
+            role,
+            invocation_overlays,
+            projections: sealed_projections,
+            relocations: relocation_arena,
+            entity_routes,
+            local_image_digest,
+        })
+    }
+}
+
+#[cfg(test)]
 #[derive(Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum ExecutionProjectionStableFingerprintV2 {
@@ -513,6 +1052,7 @@ enum ExecutionProjectionStableFingerprintV2 {
     },
 }
 
+#[cfg(test)]
 #[derive(Serialize)]
 struct ExecutionImageRowFingerprintV2<'a> {
     projection_stable_key_digest: [u8; 32],
@@ -521,21 +1061,25 @@ struct ExecutionImageRowFingerprintV2<'a> {
     relocation_stable_key_digests: &'a [[u8; 32]],
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct PendingExecutionProjectionIdV2(u32);
 
+#[cfg(test)]
 impl PendingExecutionProjectionIdV2 {
     const fn as_usize(self) -> usize {
         self.0 as usize
     }
 }
 
+#[cfg(test)]
 struct PendingInvocationPathV2 {
     parent: Option<ExecutionInvocationPathIdV2>,
     call_site: CheckedImageProjectionIdV2,
     stable_path_digest: [u8; 32],
 }
 
+#[cfg(test)]
 struct PendingExecutionProjectionV2 {
     identity: SemanticImageProjectionIdentityV2,
     stable_key_digest: [u8; 32],
@@ -544,6 +1088,7 @@ struct PendingExecutionProjectionV2 {
     relocations: Vec<PendingExecutionProjectionIdV2>,
 }
 
+#[cfg(test)]
 struct ExecutionImageHandoffBuilderV2<'a> {
     checked: &'a CheckedImageHandoffV2,
     construction_image: &'a ExecutionConstructionImageV3,
@@ -566,6 +1111,7 @@ struct ExecutionImageHandoffBuilderV2<'a> {
     )>,
 }
 
+#[cfg(test)]
 impl<'a> ExecutionImageHandoffBuilderV2<'a> {
     fn new(
         checked: &'a CheckedImageHandoffV2,
@@ -1164,7 +1710,7 @@ pub(crate) fn execution_construction_routes_v3(
                 ));
             }
             let digest = boon_contract::canonical_serde_hash_v1(
-                EXECUTION_INVOCATION_PATH_DOMAIN_V3,
+                EXECUTION_INVOCATION_PATH_DOMAIN_V2,
                 &(parent_path_digest, projection_record.stable_key_digest),
             )
             .map_err(|error| format!("failed to hash execution V3 invocation path: {error}"))?;
@@ -1218,6 +1764,7 @@ pub(crate) fn execution_construction_routes_v3(
             stable_key_digest,
         });
     }
+    #[cfg(test)]
     let local_digest = boon_contract::canonical_serde_hash_v1(
         EXECUTION_CONSTRUCTION_ROUTES_DOMAIN_V3,
         &(
@@ -1235,6 +1782,7 @@ pub(crate) fn execution_construction_routes_v3(
         definition_by_checked_projection,
         invocations,
         owner_occurrences,
+        #[cfg(test)]
         local_digest,
     };
     if let Some(started) = trace_started {
@@ -1421,6 +1969,7 @@ pub(crate) fn execution_construction_image_v3(
     Ok(image)
 }
 
+#[cfg(test)]
 fn checked_execution_projection(
     builder: &mut ExecutionImageHandoffBuilderV2<'_>,
     domain: CheckedImageRowDomainV2,
@@ -1430,6 +1979,7 @@ fn checked_execution_projection(
     builder.checked(checked)
 }
 
+#[cfg(test)]
 fn call_instance_projections(
     builder: &mut ExecutionImageHandoffBuilderV2<'_>,
 ) -> Result<Vec<PendingExecutionProjectionIdV2>, String> {
@@ -1475,6 +2025,7 @@ fn call_instance_projections(
     Ok(projections)
 }
 
+#[cfg(test)]
 fn v2_projection_for_construction_route(
     builder: &mut ExecutionImageHandoffBuilderV2<'_>,
     invocations: &[PendingExecutionProjectionIdV2],
@@ -1499,6 +2050,7 @@ fn v2_projection_for_construction_route(
     }
 }
 
+#[cfg(test)]
 fn route_for_frame(
     frame: Option<OutCallInstanceId>,
     fallback: PendingExecutionProjectionIdV2,
@@ -1651,6 +2203,7 @@ fn route_for_expression(
     }
 }
 
+#[cfg(test)]
 fn function_projection(
     builder: &mut ExecutionImageHandoffBuilderV2<'_>,
     execution: &SemanticExecutionImageColumnsV1,
@@ -1679,6 +2232,602 @@ fn function_projection(
     )
 }
 
+fn checked_execution_projection_v3(
+    builder: &mut ExecutionImageHandoffBuilderV3<'_>,
+    domain: CheckedImageRowDomainV2,
+    dense_index: usize,
+) -> Result<PendingExecutionProjectionIdV3, String> {
+    let projection = checked_projection(builder.checked, domain, dense_index)?;
+    builder.intern(ExecutionConstructionProjectionV3::Checked { projection })
+}
+
+fn projection_for_construction_route_v3(
+    builder: &mut ExecutionImageHandoffBuilderV3<'_>,
+    route: ExecutionConstructionProjectionV3,
+) -> Result<PendingExecutionProjectionIdV3, String> {
+    builder.intern(route)
+}
+
+fn function_projection_v3(
+    builder: &mut ExecutionImageHandoffBuilderV3<'_>,
+    execution: &SemanticExecutionImageColumnsV1,
+    function: &SemanticFunction,
+) -> Result<PendingExecutionProjectionIdV3, String> {
+    let callable = execution
+        .callables
+        .get(function.callable.as_usize())
+        .filter(|candidate| candidate.id == function.callable)
+        .ok_or_else(|| {
+            format!(
+                "producer function `{}` references missing callable {}",
+                function.name, function.callable
+            )
+        })?;
+    let callable_projection = checked_projection(
+        builder.checked,
+        CheckedImageRowDomainV2::Callable,
+        callable.checked_callable.0 as usize,
+    )?;
+    let definition = builder
+        .construction_image
+        .definition_projection(callable_projection)?;
+    builder.intern(ExecutionConstructionProjectionV3::Producer {
+        identity: function.identity,
+        definition,
+    })
+}
+
+fn execution_image_handoff_v3(
+    checked: &CheckedImageHandoffV2,
+    construction_image: &ExecutionConstructionImageV3,
+    execution: &SemanticExecutionImageColumnsV1,
+    core: &crate::program_core::CanonicalProgramCoreV2,
+) -> Result<ExecutionImageHandoffV3, String> {
+    let trace = std::env::var_os("BOON_SEMANTIC_TRACE").is_some();
+    let mut trace_started = std::time::Instant::now();
+    let executable = &core.executable;
+    if executable.expressions.len() != execution.expressions.len()
+        || executable.statements.len() != execution.statements.len()
+        || executable.sources.len() != execution.sources.len()
+        || executable.states.len() != execution.states.len()
+        || executable.roots.len() != execution.roots.len()
+        || executable.functions.len() != execution.functions.len()
+        || executable.call_occurrences.len() != execution.call_occurrences.len()
+        || core.materializations.len() != execution.materializations.len()
+        || core.scope_index.owners.len() != execution.static_owners.len()
+    {
+        return Err("execution V3 receipts do not exactly cover final executable rows".to_owned());
+    }
+
+    let mut builder = ExecutionImageHandoffBuilderV3::new(checked, construction_image)?;
+    let invocation_projections = construction_image
+        .routes
+        .invocations
+        .iter()
+        .map(|overlay| {
+            builder.intern(ExecutionConstructionProjectionV3::Invocation {
+                occurrence: overlay.occurrence,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let expression_routes = execution
+        .expressions
+        .iter()
+        .map(|expression| construction_image.expression_route(expression.id))
+        .map(|route| projection_for_construction_route_v3(&mut builder, route?))
+        .collect::<Result<Vec<_>, _>>()?;
+    let statement_routes = execution
+        .statements
+        .iter()
+        .map(|statement| construction_image.statement_route(statement.id))
+        .map(|route| projection_for_construction_route_v3(&mut builder, route?))
+        .collect::<Result<Vec<_>, _>>()?;
+    let owner_routes = execution
+        .static_owners
+        .iter()
+        .map(|owner| {
+            let occurrence = construction_image.owner_occurrence(owner.id)?;
+            invocation_projections
+                .get(occurrence.as_usize())
+                .copied()
+                .ok_or_else(|| format!("static owner route has missing invocation {occurrence}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let expression_projection = |id: SemanticExprId| {
+        expression_routes
+            .get(id.as_usize())
+            .copied()
+            .ok_or_else(|| format!("execution V3 references missing expression {id}"))
+    };
+    let statement_projection = |id: SemanticStatementId| {
+        statement_routes
+            .get(id.as_usize())
+            .copied()
+            .ok_or_else(|| format!("execution V3 references missing statement {id}"))
+    };
+    trace_execution_handoff_phase(trace, "v3_projection_setup", &mut trace_started);
+
+    for scope in &execution.scopes {
+        let projection = checked_execution_projection_v3(
+            &mut builder,
+            CheckedImageRowDomainV2::Scope,
+            scope.checked_scope.0 as usize,
+        )?;
+        builder.push(
+            projection,
+            ExecutionImageRowDomainV3::Scope,
+            scope,
+            Vec::new(),
+        )?;
+        builder.route(
+            ExecutionImageRowDomainV3::Scope,
+            scope.id.as_usize(),
+            projection,
+        )?;
+    }
+    trace_execution_handoff_phase(trace, "v3_scope_rows", &mut trace_started);
+
+    for (semantic, executable) in execution.expressions.iter().zip(&executable.expressions) {
+        if executable.id.as_usize() != semantic.id.as_usize() {
+            return Err(format!(
+                "execution expression {} maps to non-dense executable {}",
+                semantic.id, executable.id
+            ));
+        }
+        let projection = expression_projection(semantic.id)?;
+        let mut relocations = execution
+            .expression_children(&semantic.kind)
+            .ok_or_else(|| {
+                format!(
+                    "execution expression {} has a missing materialization child",
+                    semantic.id
+                )
+            })?
+            .into_iter()
+            .map(expression_projection)
+            .collect::<Result<Vec<_>, _>>()?;
+        if let crate::SemanticExpressionKind::Call { callable, .. } = semantic.kind {
+            let callable = execution
+                .callables
+                .get(callable.as_usize())
+                .filter(|candidate| candidate.id == callable)
+                .ok_or_else(|| {
+                    format!("expression {} has missing callable {callable}", semantic.id)
+                })?;
+            relocations.push(checked_execution_projection_v3(
+                &mut builder,
+                CheckedImageRowDomainV2::Callable,
+                callable.checked_callable.0 as usize,
+            )?);
+        }
+        builder.push(
+            projection,
+            ExecutionImageRowDomainV3::Expression,
+            executable,
+            relocations,
+        )?;
+        builder.route(
+            ExecutionImageRowDomainV3::Expression,
+            semantic.id.as_usize(),
+            projection,
+        )?;
+    }
+    trace_execution_handoff_phase(trace, "v3_expression_rows", &mut trace_started);
+
+    for (semantic, executable) in execution.statements.iter().zip(&executable.statements) {
+        if executable.id.as_usize() != semantic.id.as_usize() {
+            return Err(format!(
+                "execution statement {} maps to non-dense executable {}",
+                semantic.id, executable.id
+            ));
+        }
+        let projection = statement_projection(semantic.id)?;
+        let mut relocations = semantic
+            .value
+            .into_iter()
+            .chain(semantic.children.iter().filter_map(|child| {
+                execution
+                    .statements
+                    .get(child.as_usize())
+                    .and_then(|statement| statement.value)
+            }))
+            .map(expression_projection)
+            .collect::<Result<Vec<_>, _>>()?;
+        if let Some(parent) = semantic.parent
+            && let Some(parent) = execution.statements.get(parent.as_usize())
+            && let Some(value) = parent.value
+        {
+            relocations.push(expression_projection(value)?);
+        }
+        builder.push(
+            projection,
+            ExecutionImageRowDomainV3::Statement,
+            executable,
+            relocations,
+        )?;
+        builder.route(
+            ExecutionImageRowDomainV3::Statement,
+            semantic.id.as_usize(),
+            projection,
+        )?;
+    }
+    trace_execution_handoff_phase(trace, "v3_statement_rows", &mut trace_started);
+
+    for callable in &execution.callables {
+        let projection = checked_execution_projection_v3(
+            &mut builder,
+            CheckedImageRowDomainV2::Callable,
+            callable.checked_callable.0 as usize,
+        )?;
+        let relocations = callable
+            .semantic_root
+            .map(expression_projection)
+            .transpose()?
+            .into_iter()
+            .collect();
+        builder.push(
+            projection,
+            ExecutionImageRowDomainV3::Callable,
+            callable,
+            relocations,
+        )?;
+        builder.route(
+            ExecutionImageRowDomainV3::Callable,
+            callable.id.as_usize(),
+            projection,
+        )?;
+    }
+    for call in &execution.calls {
+        let projection = checked_execution_projection_v3(
+            &mut builder,
+            CheckedImageRowDomainV2::Call,
+            call.checked_call.0 as usize,
+        )?;
+        let callable = execution
+            .callables
+            .get(call.callable.as_usize())
+            .filter(|candidate| candidate.id == call.callable)
+            .ok_or_else(|| format!("execution call {} has missing callable", call.id))?;
+        let relocations = vec![checked_execution_projection_v3(
+            &mut builder,
+            CheckedImageRowDomainV2::Callable,
+            callable.checked_callable.0 as usize,
+        )?];
+        builder.push(
+            projection,
+            ExecutionImageRowDomainV3::Call,
+            call,
+            relocations,
+        )?;
+        builder.route(
+            ExecutionImageRowDomainV3::Call,
+            call.id.as_usize(),
+            projection,
+        )?;
+    }
+    trace_execution_handoff_phase(trace, "v3_callable_call_rows", &mut trace_started);
+
+    for (semantic, executable) in execution
+        .call_occurrences
+        .iter()
+        .zip(&executable.call_occurrences)
+    {
+        if executable.id != semantic.id.as_usize() {
+            return Err(format!(
+                "call occurrence {} maps to executable {}",
+                semantic.id, executable.id
+            ));
+        }
+        let projection = invocation_projections
+            .get(semantic.id.as_usize())
+            .copied()
+            .ok_or_else(|| format!("call occurrence {} has no V3 overlay", semantic.id))?;
+        let mut relocations = semantic
+            .parent
+            .and_then(|parent| invocation_projections.get(parent.as_usize()).copied())
+            .into_iter()
+            .collect::<Vec<_>>();
+        if let Some(call) = semantic.call {
+            let call = execution
+                .calls
+                .get(call.as_usize())
+                .filter(|candidate| candidate.id == call)
+                .ok_or_else(|| format!("call occurrence {} has missing call", semantic.id))?;
+            relocations.push(checked_execution_projection_v3(
+                &mut builder,
+                CheckedImageRowDomainV2::Call,
+                call.checked_call.0 as usize,
+            )?);
+        }
+        builder.push(
+            projection,
+            ExecutionImageRowDomainV3::CallOccurrence,
+            executable,
+            relocations,
+        )?;
+        builder.route(
+            ExecutionImageRowDomainV3::CallOccurrence,
+            semantic.id.as_usize(),
+            projection,
+        )?;
+    }
+    trace_execution_handoff_phase(trace, "v3_occurrence_rows", &mut trace_started);
+
+    for (semantic, executable) in execution.sources.iter().zip(&executable.sources) {
+        let fallback = expression_projection(semantic.expression)?;
+        let projection = semantic.call_instance.map_or(Ok(fallback), |occurrence| {
+            invocation_projections
+                .get(occurrence.as_usize())
+                .copied()
+                .ok_or_else(|| format!("source {} has missing invocation", semantic.id))
+        })?;
+        builder.push(
+            projection,
+            ExecutionImageRowDomainV3::Source,
+            executable,
+            vec![fallback],
+        )?;
+        builder.route(
+            ExecutionImageRowDomainV3::Source,
+            semantic.id.as_usize(),
+            projection,
+        )?;
+    }
+    for (semantic, executable) in execution.states.iter().zip(&executable.states) {
+        let fallback = expression_projection(semantic.expression)?;
+        let projection = semantic.call_instance.map_or(Ok(fallback), |occurrence| {
+            invocation_projections
+                .get(occurrence.as_usize())
+                .copied()
+                .ok_or_else(|| format!("state {} has missing invocation", semantic.id))
+        })?;
+        let mut relocations = vec![fallback, expression_projection(semantic.initial)?];
+        if let crate::SemanticStateLifetimeV1::ActivationLocal { then_expression } =
+            semantic.lifetime
+        {
+            relocations.push(expression_projection(then_expression)?);
+        }
+        builder.push(
+            projection,
+            ExecutionImageRowDomainV3::State,
+            executable,
+            relocations,
+        )?;
+        builder.route(
+            ExecutionImageRowDomainV3::State,
+            semantic.id.as_usize(),
+            projection,
+        )?;
+    }
+    trace_execution_handoff_phase(trace, "v3_resource_rows", &mut trace_started);
+
+    for (semantic, executable) in execution.roots.iter().zip(&executable.roots) {
+        let projection = expression_projection(semantic.expression)?;
+        builder.push(
+            projection,
+            ExecutionImageRowDomainV3::Root,
+            executable,
+            vec![projection],
+        )?;
+        builder.route(
+            ExecutionImageRowDomainV3::Root,
+            semantic.ordinal,
+            projection,
+        )?;
+    }
+    for (index, (semantic, executable)) in execution
+        .functions
+        .iter()
+        .zip(&executable.functions)
+        .enumerate()
+    {
+        let projection = function_projection_v3(&mut builder, execution, semantic)?;
+        let mut relocations = vec![expression_projection(semantic.root)?];
+        if let Some(source) = semantic.invocation_source {
+            relocations.push(expression_projection(source)?);
+        }
+        builder.push(
+            projection,
+            ExecutionImageRowDomainV3::Function,
+            executable,
+            relocations,
+        )?;
+        builder.route(ExecutionImageRowDomainV3::Function, index, projection)?;
+    }
+    for (semantic, executable) in execution
+        .materializations
+        .iter()
+        .zip(&core.materializations)
+    {
+        let projection = owner_routes
+            .get(semantic.owner.as_usize())
+            .copied()
+            .unwrap_or(expression_projection(semantic.source)?);
+        let relocations = semantic
+            .expression_roots()
+            .into_iter()
+            .map(expression_projection)
+            .collect::<Result<Vec<_>, _>>()?;
+        builder.push(
+            projection,
+            ExecutionImageRowDomainV3::Materialization,
+            executable,
+            relocations,
+        )?;
+        builder.route(
+            ExecutionImageRowDomainV3::Materialization,
+            semantic.id.as_usize(),
+            projection,
+        )?;
+    }
+    for (semantic, executable) in execution.static_owners.iter().zip(&core.scope_index.owners) {
+        if (semantic.id, semantic.parent, semantic.child_ordinal)
+            != (executable.id, executable.parent, executable.child_ordinal)
+        {
+            return Err(format!(
+                "static owner {} disagrees with executable owner",
+                semantic.id
+            ));
+        }
+        let projection = owner_routes
+            .get(semantic.id.as_usize())
+            .copied()
+            .ok_or_else(|| format!("static owner {} has no V3 route", semantic.id))?;
+        let relocations = semantic
+            .parent
+            .and_then(|parent| owner_routes.get(parent.as_usize()).copied())
+            .into_iter()
+            .collect();
+        builder.push(
+            projection,
+            ExecutionImageRowDomainV3::StaticOwner,
+            executable,
+            relocations,
+        )?;
+        builder.route(
+            ExecutionImageRowDomainV3::StaticOwner,
+            semantic.id.as_usize(),
+            projection,
+        )?;
+    }
+    trace_execution_handoff_phase(trace, "v3_final_domains", &mut trace_started);
+    builder.finish(checked.source_bundle_digest_v1, checked.role)
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ExecutionRouteOracleOwner {
+    Checked(boon_checked::CheckedShardOwnerKeyV2),
+    Invocation {
+        root: DistributedCallOccurrenceRoot,
+        definition: boon_checked::CheckedShardOwnerKeyV2,
+        path_digest: Option<[u8; 32]>,
+    },
+}
+
+#[cfg(test)]
+fn checked_route_oracle_owner(
+    checked: &CheckedImageHandoffV2,
+    projection: CheckedImageProjectionIdV2,
+) -> Result<boon_checked::CheckedShardOwnerKeyV2, String> {
+    checked
+        .projection(projection)
+        .map(|projection| projection.stable_key.owner.clone())
+        .ok_or_else(|| format!("route oracle has no checked projection {}", projection.0))
+}
+
+#[cfg(test)]
+fn v3_route_oracle_owner(
+    handoff: &ExecutionImageHandoffV3,
+    checked: &CheckedImageHandoffV2,
+    projection: ExecutionImageProjectionIdV3,
+) -> Result<ExecutionRouteOracleOwner, String> {
+    let projection = handoff
+        .projection(projection)
+        .ok_or_else(|| "route oracle has no V3 projection".to_owned())?;
+    Ok(match projection.identity {
+        ExecutionConstructionProjectionV3::Checked { projection } => {
+            ExecutionRouteOracleOwner::Checked(checked_route_oracle_owner(checked, projection)?)
+        }
+        ExecutionConstructionProjectionV3::Invocation { occurrence } => {
+            let overlay = handoff
+                .invocation(occurrence)
+                .ok_or_else(|| format!("route oracle has no V3 overlay {occurrence}"))?;
+            ExecutionRouteOracleOwner::Invocation {
+                root: overlay.root,
+                definition: checked_route_oracle_owner(checked, overlay.definition)?,
+                path_digest: overlay.stable_path_digest,
+            }
+        }
+        ExecutionConstructionProjectionV3::Producer {
+            identity,
+            definition,
+        } => ExecutionRouteOracleOwner::Invocation {
+            root: DistributedCallOccurrenceRoot::Producer(identity),
+            definition: checked_route_oracle_owner(checked, definition)?,
+            path_digest: None,
+        },
+    })
+}
+
+#[cfg(test)]
+fn v2_route_oracle_owner(
+    handoff: &ExecutionImageHandoffV2,
+    checked: &CheckedImageHandoffV2,
+    projection: ExecutionImageProjectionIdV2,
+) -> Result<ExecutionRouteOracleOwner, String> {
+    let projection = handoff
+        .projection(projection)
+        .ok_or_else(|| "route oracle has no V2 projection".to_owned())?;
+    Ok(match projection.identity {
+        SemanticImageProjectionIdentityV2::Checked { projection } => {
+            ExecutionRouteOracleOwner::Checked(checked_route_oracle_owner(checked, projection)?)
+        }
+        SemanticImageProjectionIdentityV2::Invocation {
+            root,
+            definition,
+            call_path,
+        } => ExecutionRouteOracleOwner::Invocation {
+            root,
+            definition: checked_route_oracle_owner(checked, definition)?,
+            path_digest: call_path
+                .map(|path| {
+                    handoff
+                        .invocation_paths
+                        .get(path.as_usize())
+                        .map(|path| path.stable_path_digest)
+                        .ok_or_else(|| format!("route oracle has no V2 path {}", path.0))
+                })
+                .transpose()?,
+        },
+    })
+}
+
+#[cfg(test)]
+fn v3_domain_in_v2(domain: ExecutionImageRowDomainV3) -> ExecutionImageRowDomainV2 {
+    match domain {
+        ExecutionImageRowDomainV3::Scope => ExecutionImageRowDomainV2::Scope,
+        ExecutionImageRowDomainV3::Expression => ExecutionImageRowDomainV2::Expression,
+        ExecutionImageRowDomainV3::Statement => ExecutionImageRowDomainV2::Statement,
+        ExecutionImageRowDomainV3::Callable => ExecutionImageRowDomainV2::Callable,
+        ExecutionImageRowDomainV3::Call => ExecutionImageRowDomainV2::Call,
+        ExecutionImageRowDomainV3::CallOccurrence => ExecutionImageRowDomainV2::CallOccurrence,
+        ExecutionImageRowDomainV3::Source => ExecutionImageRowDomainV2::Source,
+        ExecutionImageRowDomainV3::State => ExecutionImageRowDomainV2::State,
+        ExecutionImageRowDomainV3::Root => ExecutionImageRowDomainV2::Root,
+        ExecutionImageRowDomainV3::Function => ExecutionImageRowDomainV2::Function,
+        ExecutionImageRowDomainV3::Materialization => ExecutionImageRowDomainV2::Materialization,
+        ExecutionImageRowDomainV3::StaticOwner => ExecutionImageRowDomainV2::StaticOwner,
+    }
+}
+
+#[cfg(test)]
+fn validate_v3_routes_against_v2_oracle(
+    handoff: &ExecutionImageHandoffV3,
+    oracle: &ExecutionImageHandoffV2,
+    checked: &CheckedImageHandoffV2,
+) -> Result<(), String> {
+    for route in &handoff.entity_routes {
+        let oracle_projection = oracle
+            .entity_projection(v3_domain_in_v2(route.domain), route.dense_index as usize)
+            .ok_or_else(|| {
+                format!(
+                    "V2 route oracle has no {:?} {}",
+                    route.domain, route.dense_index
+                )
+            })?;
+        let actual = v3_route_oracle_owner(handoff, checked, route.projection)?;
+        let expected = v2_route_oracle_owner(oracle, checked, oracle_projection)?;
+        if actual != expected {
+            return Err(format!(
+                "V3 {:?} {} route owner differs from the V2 oracle: expected {expected:?}, got {actual:?}",
+                route.domain, route.dense_index
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn trace_execution_handoff_phase(enabled: bool, name: &str, started: &mut std::time::Instant) {
     if enabled {
         eprintln!(
@@ -1689,7 +2838,8 @@ fn trace_execution_handoff_phase(enabled: bool, name: &str, started: &mut std::t
     }
 }
 
-fn execution_image_handoff(
+#[cfg(test)]
+fn execution_image_handoff_v2_oracle(
     checked: &CheckedImageHandoffV2,
     construction_image: &ExecutionConstructionImageV3,
     _out: &ResolvedOutGraph,
@@ -2171,10 +3321,10 @@ fn execution_image_handoff(
 fn semantic_image_seal_digest(
     schema: &str,
     checked: &CheckedImageHandoffV2,
-    execution: &ExecutionImageHandoffV2,
+    execution: &ExecutionImageHandoffV3,
 ) -> Result<[u8; 32], String> {
     boon_contract::canonical_serde_hash_v1(
-        SEMANTIC_IMAGE_SEAL_DOMAIN_V2,
+        SEMANTIC_IMAGE_SEAL_DOMAIN_V3,
         &(
             schema,
             checked.local_image_digest,

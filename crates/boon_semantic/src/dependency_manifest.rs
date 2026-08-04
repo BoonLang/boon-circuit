@@ -1505,7 +1505,7 @@ impl DependencyOwnerIndex {
 
     fn derive_from_image_routes(
         checked_handoff: &CheckedImageHandoffV2,
-        execution_handoff: &ExecutionImageHandoffV2,
+        execution_handoff: &ExecutionImageHandoffV3,
         execution: &SemanticExecutionImageColumnsV1,
         resources: &SemanticResourceGraphV1,
         reactive: &SemanticReactiveGraphV1,
@@ -1536,13 +1536,17 @@ impl DependencyOwnerIndex {
                 ))
             })
         };
-        let execution_owner = |projection: ExecutionImageProjectionIdV2| {
+        let execution_owner = |projection: ExecutionImageProjectionIdV3| {
             let projection = execution_handoff.projection(projection).ok_or_else(|| {
                 CallableDependencyManifestError::new(
                     "execution image owner route references a missing projection",
                 )
             })?;
-            let stable = execution_projection_owner_v7(checked_handoff, &projection.identity)?;
+            let stable = execution_projection_owner_v7(
+                checked_handoff,
+                execution_handoff,
+                &projection.identity,
+            )?;
             dense_by_stable.get(&stable).copied().ok_or_else(|| {
                 CallableDependencyManifestError::new(format!(
                     "execution image projection {:?} has no dense logical owner",
@@ -1611,7 +1615,7 @@ impl DependencyOwnerIndex {
             let owner = execution_owner(route.projection)?;
             let index = route.dense_index as usize;
             #[cfg(test)]
-            if route.domain == ExecutionImageRowDomainV2::Call {
+            if route.domain == ExecutionImageRowDomainV3::Call {
                 let slot = call_owner.get_mut(index).ok_or_else(|| {
                     CallableDependencyManifestError::new(
                         "execution call owner route is out of bounds",
@@ -1625,7 +1629,7 @@ impl DependencyOwnerIndex {
                 continue;
             }
             match route.domain {
-                ExecutionImageRowDomainV2::Expression => {
+                ExecutionImageRowDomainV3::Expression => {
                     let slot = expression_owner.get_mut(index).ok_or_else(|| {
                         CallableDependencyManifestError::new(
                             "execution expression owner route is out of bounds",
@@ -1637,7 +1641,7 @@ impl DependencyOwnerIndex {
                         ));
                     }
                 }
-                ExecutionImageRowDomainV2::Statement => {
+                ExecutionImageRowDomainV3::Statement => {
                     let slot = statement_owner.get_mut(index).ok_or_else(|| {
                         CallableDependencyManifestError::new(
                             "execution statement owner route is out of bounds",
@@ -1649,7 +1653,7 @@ impl DependencyOwnerIndex {
                         ));
                     }
                 }
-                ExecutionImageRowDomainV2::CallOccurrence => {
+                ExecutionImageRowDomainV3::CallOccurrence => {
                     let slot = out_call_owner.get_mut(index).ok_or_else(|| {
                         CallableDependencyManifestError::new(
                             "execution occurrence owner route is out of bounds",
@@ -1661,22 +1665,21 @@ impl DependencyOwnerIndex {
                         ));
                     }
                 }
-                ExecutionImageRowDomainV2::StaticOwner => {
+                ExecutionImageRowDomainV3::StaticOwner => {
                     if static_owner.insert(StaticOwnerId(index), owner).is_some() {
                         return Err(CallableDependencyManifestError::new(
                             "execution static owner has duplicate owner routes",
                         ));
                     }
                 }
-                ExecutionImageRowDomainV2::Call
-                | ExecutionImageRowDomainV2::Scope
-                | ExecutionImageRowDomainV2::ExpressionOrigin
-                | ExecutionImageRowDomainV2::Callable
-                | ExecutionImageRowDomainV2::Source
-                | ExecutionImageRowDomainV2::State
-                | ExecutionImageRowDomainV2::Root
-                | ExecutionImageRowDomainV2::Function
-                | ExecutionImageRowDomainV2::Materialization => {}
+                ExecutionImageRowDomainV3::Call
+                | ExecutionImageRowDomainV3::Scope
+                | ExecutionImageRowDomainV3::Callable
+                | ExecutionImageRowDomainV3::Source
+                | ExecutionImageRowDomainV3::State
+                | ExecutionImageRowDomainV3::Root
+                | ExecutionImageRowDomainV3::Function
+                | ExecutionImageRowDomainV3::Materialization => {}
             }
         }
         let expression_owner = finish_dense_owners("expression", expression_owner)?;
@@ -2635,7 +2638,7 @@ struct DependencyCollector {
 impl DependencyCollector {
     fn for_presealed_images(
         checked: &CheckedImageHandoffV2,
-        execution: &ExecutionImageHandoffV2,
+        execution: &ExecutionImageHandoffV3,
     ) -> Self {
         let checked_rows = checked
             .projections
@@ -5381,7 +5384,8 @@ fn stable_owner_for_checked_key_v7(
 
 fn execution_projection_owner_v7(
     checked: &CheckedImageHandoffV2,
-    projection: &SemanticImageProjectionIdentityV2,
+    execution: &ExecutionImageHandoffV3,
+    projection: &ExecutionConstructionProjectionV3,
 ) -> Result<SemanticDependencyStableOwnerV4, CallableDependencyManifestError> {
     let checked_owner = |projection: CheckedImageProjectionIdV2| {
         checked
@@ -5395,22 +5399,28 @@ fn execution_projection_owner_v7(
             })
     };
     match projection {
-        SemanticImageProjectionIdentityV2::Checked { projection } => {
+        ExecutionConstructionProjectionV3::Checked { projection } => {
             stable_owner_for_checked_key_v7(checked_owner(*projection)?)
         }
-        SemanticImageProjectionIdentityV2::Invocation {
-            root: DistributedCallOccurrenceRoot::Program,
-            definition,
-            ..
-        } => {
-            checked_owner(*definition)?;
-            Ok(SemanticDependencyStableOwnerV4::ProgramRoot { role: checked.role })
+        ExecutionConstructionProjectionV3::Invocation { occurrence } => {
+            let overlay = execution.invocation(*occurrence).ok_or_else(|| {
+                CallableDependencyManifestError::new(format!(
+                    "execution projection references missing invocation {occurrence}"
+                ))
+            })?;
+            match overlay.root {
+                DistributedCallOccurrenceRoot::Program => {
+                    checked_owner(overlay.definition)?;
+                    Ok(SemanticDependencyStableOwnerV4::ProgramRoot { role: checked.role })
+                }
+                DistributedCallOccurrenceRoot::Producer(_) => {
+                    stable_owner_for_checked_key_v7(checked_owner(overlay.definition)?)
+                }
+            }
         }
-        SemanticImageProjectionIdentityV2::Invocation {
-            root: DistributedCallOccurrenceRoot::Producer(_),
-            definition,
-            ..
-        } => stable_owner_for_checked_key_v7(checked_owner(*definition)?),
+        ExecutionConstructionProjectionV3::Producer { definition, .. } => {
+            stable_owner_for_checked_key_v7(checked_owner(*definition)?)
+        }
     }
 }
 
@@ -5479,33 +5489,33 @@ fn checked_dependency_entity_domain_v7(
 }
 
 fn execution_dependency_entity_domain_v7(
-    domain: ExecutionImageRowDomainV2,
+    domain: ExecutionImageRowDomainV3,
 ) -> Option<SemanticDependencyEntityDomainV1> {
     Some(match domain {
-        ExecutionImageRowDomainV2::Scope => SemanticDependencyEntityDomainV1::SemanticScope,
-        ExecutionImageRowDomainV2::Expression | ExecutionImageRowDomainV2::ExpressionOrigin => {
+        ExecutionImageRowDomainV3::Scope => SemanticDependencyEntityDomainV1::SemanticScope,
+        ExecutionImageRowDomainV3::Expression => {
             SemanticDependencyEntityDomainV1::SemanticExpression
         }
-        ExecutionImageRowDomainV2::Statement => SemanticDependencyEntityDomainV1::SemanticStatement,
-        ExecutionImageRowDomainV2::Callable => SemanticDependencyEntityDomainV1::SemanticCallable,
-        ExecutionImageRowDomainV2::Call => SemanticDependencyEntityDomainV1::SemanticCall,
-        ExecutionImageRowDomainV2::CallOccurrence => {
+        ExecutionImageRowDomainV3::Statement => SemanticDependencyEntityDomainV1::SemanticStatement,
+        ExecutionImageRowDomainV3::Callable => SemanticDependencyEntityDomainV1::SemanticCallable,
+        ExecutionImageRowDomainV3::Call => SemanticDependencyEntityDomainV1::SemanticCall,
+        ExecutionImageRowDomainV3::CallOccurrence => {
             SemanticDependencyEntityDomainV1::SemanticCallOccurrence
         }
-        ExecutionImageRowDomainV2::Source => SemanticDependencyEntityDomainV1::SemanticSource,
-        ExecutionImageRowDomainV2::State => SemanticDependencyEntityDomainV1::SemanticState,
-        ExecutionImageRowDomainV2::Root => return None,
-        ExecutionImageRowDomainV2::Function => SemanticDependencyEntityDomainV1::SemanticFunction,
-        ExecutionImageRowDomainV2::Materialization => {
+        ExecutionImageRowDomainV3::Source => SemanticDependencyEntityDomainV1::SemanticSource,
+        ExecutionImageRowDomainV3::State => SemanticDependencyEntityDomainV1::SemanticState,
+        ExecutionImageRowDomainV3::Root => return None,
+        ExecutionImageRowDomainV3::Function => SemanticDependencyEntityDomainV1::SemanticFunction,
+        ExecutionImageRowDomainV3::Materialization => {
             SemanticDependencyEntityDomainV1::SemanticMaterialization
         }
-        ExecutionImageRowDomainV2::StaticOwner => SemanticDependencyEntityDomainV1::StaticOwner,
+        ExecutionImageRowDomainV3::StaticOwner => SemanticDependencyEntityDomainV1::StaticOwner,
     })
 }
 
 fn build_dense_projection_index_v7(
     checked: &CheckedImageHandoffV2,
-    execution_handoff: &ExecutionImageHandoffV2,
+    execution_handoff: &ExecutionImageHandoffV3,
     execution: &SemanticExecutionImageColumnsV1,
     stable_owners: &BTreeMap<SemanticDependencyOwnerV1, SemanticDependencyStableOwnerV4>,
 ) -> Result<DenseManifestProjectionIndexV7, CallableDependencyManifestError> {
@@ -5628,7 +5638,8 @@ fn build_dense_projection_index_v7(
         let key = SemanticDependencyProjectionKeyV7::Execution {
             stable_key_digest: projection.stable_key_digest,
         };
-        let owner = execution_projection_owner_v7(checked, &projection.identity)?;
+        let owner =
+            execution_projection_owner_v7(checked, execution_handoff, &projection.identity)?;
         if !stable_owner_set.contains(&owner) {
             return Err(CallableDependencyManifestError::new(format!(
                 "execution projection {:?} has no live logical owner",
@@ -5651,8 +5662,24 @@ fn build_dense_projection_index_v7(
                 CallableDependencyManifestError::new("execution dependency row count overflow")
             })?;
     }
+    let mut execution_manifest_by_identity = BTreeMap::new();
+    for (projection, manifest) in execution_handoff
+        .projections
+        .iter()
+        .zip(execution_manifest_ids.iter().copied())
+    {
+        if execution_manifest_by_identity
+            .insert(projection.identity, manifest)
+            .is_some()
+        {
+            return Err(CallableDependencyManifestError::new(format!(
+                "execution image repeats projection identity {:?}",
+                projection.identity
+            )));
+        }
+    }
     for (ordinal, source) in execution_manifest_ids.iter().copied().enumerate() {
-        let execution_id = ExecutionImageProjectionIdV2(u32::try_from(ordinal).map_err(|_| {
+        let execution_id = ExecutionImageProjectionIdV3(u32::try_from(ordinal).map_err(|_| {
             CallableDependencyManifestError::new("execution image index exceeds u32")
         })?);
         let projection = execution_handoff.projection(execution_id).ok_or_else(|| {
@@ -5680,7 +5707,7 @@ fn build_dense_projection_index_v7(
             index.add_target(source, target)?;
         }
         match projection.identity {
-            SemanticImageProjectionIdentityV2::Checked { projection } => {
+            ExecutionConstructionProjectionV3::Checked { projection } => {
                 let target = checked_manifest_ids
                     .get(projection.as_usize())
                     .copied()
@@ -5692,51 +5719,59 @@ fn build_dense_projection_index_v7(
                     })?;
                 index.add_target(source, target)?;
             }
-            SemanticImageProjectionIdentityV2::Invocation {
-                definition,
-                call_path,
-                ..
-            } => {
+            ExecutionConstructionProjectionV3::Invocation { occurrence } => {
+                let overlay = execution_handoff.invocation(occurrence).ok_or_else(|| {
+                    CallableDependencyManifestError::new(format!(
+                        "execution projection {ordinal} references missing invocation {occurrence}"
+                    ))
+                })?;
+                let definition = checked_manifest_ids
+                    .get(overlay.definition.as_usize())
+                    .copied()
+                    .ok_or_else(|| {
+                        CallableDependencyManifestError::new(format!(
+                            "execution projection {ordinal} references missing definition {}",
+                            overlay.definition.0
+                        ))
+                    })?;
+                index.add_target(source, definition)?;
+                if let Some(call_site) = overlay.authored_call_site {
+                    let call_site = checked_manifest_ids
+                        .get(call_site.as_usize())
+                        .copied()
+                        .ok_or_else(|| {
+                            CallableDependencyManifestError::new(format!(
+                                "execution invocation {occurrence} references missing checked call site {}",
+                                call_site.0
+                            ))
+                        })?;
+                    index.add_target(source, call_site)?;
+                }
+                if let Some(parent) = overlay.parent {
+                    let parent = execution_manifest_by_identity
+                        .get(&ExecutionConstructionProjectionV3::Invocation {
+                            occurrence: parent,
+                        })
+                        .copied()
+                        .ok_or_else(|| {
+                            CallableDependencyManifestError::new(format!(
+                                "execution invocation {occurrence} references missing parent {parent}"
+                            ))
+                        })?;
+                    index.add_target(source, parent)?;
+                }
+            }
+            ExecutionConstructionProjectionV3::Producer { definition, .. } => {
                 let definition = checked_manifest_ids
                     .get(definition.as_usize())
                     .copied()
                     .ok_or_else(|| {
                         CallableDependencyManifestError::new(format!(
-                            "execution projection {ordinal} references missing definition {}",
+                            "execution projection {ordinal} references missing producer definition {}",
                             definition.0
                         ))
                     })?;
                 index.add_target(source, definition)?;
-                let mut path = call_path;
-                let mut visited = 0usize;
-                while let Some(path_id) = path {
-                    if visited >= execution_handoff.invocation_paths.len() {
-                        return Err(CallableDependencyManifestError::new(format!(
-                            "execution projection {ordinal} has a cyclic invocation path"
-                        )));
-                    }
-                    let node = execution_handoff
-                        .invocation_paths
-                        .get(path_id.as_usize())
-                        .ok_or_else(|| {
-                            CallableDependencyManifestError::new(format!(
-                                "execution projection {ordinal} references missing invocation path {}",
-                                path_id.0
-                            ))
-                        })?;
-                    let call_site = checked_manifest_ids
-                        .get(node.call_site.as_usize())
-                        .copied()
-                        .ok_or_else(|| {
-                            CallableDependencyManifestError::new(format!(
-                                "execution invocation path {} references missing checked call site {}",
-                                path_id.0, node.call_site.0
-                            ))
-                        })?;
-                    index.add_target(source, call_site)?;
-                    path = node.parent;
-                    visited = visited.saturating_add(1);
-                }
             }
         }
     }
@@ -6230,7 +6265,7 @@ pub(crate) fn build_callable_dependency_manifest_v7(
     dependency_classifier_schema_digest: [u8; 32],
     checked: &CheckedProgramFields,
     checked_handoff: &CheckedImageHandoffV2,
-    execution_handoff: &ExecutionImageHandoffV2,
+    execution_handoff: &ExecutionImageHandoffV3,
     producer_materializations: &[ProducerMaterializationRequest],
     out: &ResolvedOutGraph,
     execution: &SemanticExecutionImageColumnsV1,
@@ -7480,7 +7515,7 @@ impl CallableDependencyManifestV7 {
     pub(crate) fn validate_integrity(
         &self,
         dependency_classifier_schema_digest: [u8; 32],
-        image: &SealedSemanticImageV2,
+        image: &SealedSemanticImageV3,
         execution: &SemanticExecutionImageColumnsV1,
     ) -> Result<(), CallableDependencyManifestError> {
         if self.schema != CALLABLE_DEPENDENCY_MANIFEST_SCHEMA_V7 {

@@ -887,7 +887,8 @@ Current cold-diagnostics candidate evidence:
   for the schema and flag-day order.
 - The first V3 execution implementation slice now constructs stable checked-
   definition routes and dense parent-linked invocation overlays before semantic
-  rows, under separate versioned path/overlay/table digest domains. The V2
+  rows, under one version-stable path identity and separate V3 overlay/table
+  digest domains. The V2
   oracle consumes that construction table and no longer rediscovers invocation
   ancestry; the table is discarded after sealing. Focused compilation and the
   exact ignored NovyWave oracle pass. Do not score this identity checkpoint:
@@ -915,6 +916,22 @@ Current cold-diagnostics candidate evidence:
   Distributed closure becomes a delta link rather than repeated three-role
   semantic rebuilds. See the architecture plan's sixth audit; crate splits and
   bounded parallel evaluation occur only at the one-way seams it creates.
+- The first sixth-audit vertical cut is now measured. Production no longer
+  constructs the V2 invocation-path arena, 47,296-row executable mirror, or
+  duplicated expression-origin receipts. `SealedSemanticImageV3` fingerprints
+  final runnable rows against 3,494 parent-linked overlays and publishes
+  30,771 rows, 4,158 projections, and 9,037 relocations; V2 remains test-only.
+  Manifest follows direct definition, authored-call-site, and parent-overlay
+  edges. A direct debug NovyWave verified sample reports 4,100.898 ms total,
+  2,328.883 ms semantic, and 258,232 KiB peak RSS with unchanged plan hash
+  `db18f345676378b8633829c0bbd7870c0a1dc5a2459649c9bbfdd6b8969374ab`.
+  Execution sealing is 38.109 + 277.995 ms versus the prior 1,829.237 ms V2
+  trace, and Manifest is 410.015 ms versus 1,701.115 ms. The exact ignored
+  V2/V3 route-owner oracle and architecture gate pass. This is substantial
+  cold progress but remains far above the 1,000 ms verified budget, and it
+  does not create warm reuse. Continue with the compact summary linker and
+  persistent unit/definition request cells; do not resume map or hash-loop
+  tuning.
 - Do not preserve V3's 208k subject cardinality as a production V4/V5 proof
   requirement. The independent test oracle must map every historical subject
   to exactly one canonical finalized shard row and classifier field/domain and prove

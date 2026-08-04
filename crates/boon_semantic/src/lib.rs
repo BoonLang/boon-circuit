@@ -44,8 +44,8 @@ use std::fmt;
 pub const SEMANTIC_PROGRAM_SCHEMA_V1: &str = "boon.semantic-program.v1";
 pub const BUNDLE_SEMANTIC_PROGRAM_SCHEMA_V1: &str = "boon.bundle-semantic-program.v1";
 pub const DEPENDENCY_CLASSIFIER_SCHEMA_DIGEST_V1: [u8; 32] = [
-    0x41, 0xda, 0x1c, 0xa9, 0x97, 0xa1, 0xe1, 0x20, 0x9e, 0x1e, 0x92, 0x77, 0x72, 0x83, 0x31, 0xae,
-    0xb4, 0xf7, 0x9a, 0x82, 0xbc, 0xf6, 0x49, 0x9f, 0xbf, 0xf8, 0x6b, 0xcc, 0x3e, 0xf0, 0x40, 0x71,
+    0x81, 0xd2, 0x22, 0x72, 0xee, 0xba, 0x12, 0xf1, 0xbf, 0x5e, 0xc4, 0x3c, 0xad, 0x88, 0x8f, 0x33,
+    0x2d, 0xd9, 0x6b, 0x73, 0x79, 0xa9, 0x6d, 0xdf, 0x49, 0x5c, 0x3d, 0x17, 0xcb, 0xf0, 0xd6, 0x25,
 ];
 pub const MAX_BUNDLE_SEMANTIC_PRODUCER_REQUESTS_V1: usize = 4_096;
 pub const MAX_BUNDLE_SEMANTIC_PRODUCER_REQUEST_BYTES_V1: usize = 4 * 1024 * 1024;
@@ -619,7 +619,7 @@ pub fn distributed_value_occurrences(
 pub struct SemanticProgram {
     source_bundle_digest_v1: SourceBundleDigestV1,
     role: boon_checked::ProgramRole,
-    semantic_image: SealedSemanticImageV2,
+    semantic_image: SealedSemanticImageV3,
     #[cfg(test)]
     checked_program: CheckedProgramFields,
     #[cfg(test)]
@@ -794,7 +794,7 @@ impl SemanticProgram {
         &self.resolved_out_graph
     }
 
-    pub const fn semantic_image(&self) -> &SealedSemanticImageV2 {
+    pub const fn semantic_image(&self) -> &SealedSemanticImageV3 {
         &self.semantic_image
     }
 
@@ -2992,27 +2992,6 @@ fn elaborate_with_representation(
         )
     )
     .map_err(|error| SemanticError::new(error.to_string()))?;
-    let dependency_manifest = elaboration_phase!(
-        "build_callable_dependency_manifest",
-        build_callable_dependency_manifest_v7(
-            DEPENDENCY_CLASSIFIER_SCHEMA_DIGEST_V1,
-            &checked_program,
-            semantic_image_builder.checked_handoff(),
-            semantic_image_builder.execution_handoff(),
-            &producer_materializations,
-            &resolved_out_graph,
-            &execution_graph,
-            &resource_graph,
-            &resource_dependency_rows,
-            &reactive_graph,
-            &lowering_contract,
-            &lowering_dependency_rows,
-            &view_binding_graph,
-            &scope_storage_graph,
-            &memory_graph,
-        )
-    )
-    .map_err(|error| SemanticError::new(error.to_string()))?;
     let canonical_core = elaboration_phase!(
         "build_canonical_program_core",
         core_lowering::build_canonical_program_core(
@@ -3026,6 +3005,34 @@ fn elaborate_with_representation(
         )
     )
     .map_err(SemanticError::new)?;
+    let mut semantic_image_builder = semantic_image_builder;
+    elaboration_phase!(
+        "finalize_executable_receipts",
+        semantic_image_builder.finalize_executable_receipts(&canonical_core)
+    )
+    .map_err(SemanticError::new)?;
+    let execution_graph = semantic_image_builder.execution();
+    let dependency_manifest = elaboration_phase!(
+        "build_callable_dependency_manifest",
+        build_callable_dependency_manifest_v7(
+            DEPENDENCY_CLASSIFIER_SCHEMA_DIGEST_V1,
+            &checked_program,
+            semantic_image_builder.checked_handoff(),
+            semantic_image_builder.execution_handoff(),
+            &producer_materializations,
+            &resolved_out_graph,
+            execution_graph,
+            &resource_graph,
+            &resource_dependency_rows,
+            &reactive_graph,
+            &lowering_contract,
+            &lowering_dependency_rows,
+            &view_binding_graph,
+            &scope_storage_graph,
+            &memory_graph,
+        )
+    )
+    .map_err(|error| SemanticError::new(error.to_string()))?;
     #[cfg(test)]
     let execution_graph_oracle = (*execution_graph).clone();
     let semantic_image = elaboration_phase!("seal_semantic_image", semantic_image_builder.seal())

@@ -394,11 +394,11 @@ in internally verifiable tranches without a production fallback:
 complete checked diagnostics + stable interfaces/definitions
   -> VerifiedIntent roots
   -> demanded definition specializations + compact invocation frames
-  -> SemanticImageBuilderV2<Local>
+  -> SemanticImageBuilder<Local>
   -> compact role/bundle link summaries + relocation fixed point
-  -> SemanticImageBuilderV2<Linked>
+  -> SemanticImageBuilder<Linked>
   -> narrow proof view + verification receipt
-  -> SealedSemanticImageV2
+  -> SealedSemanticImage
   -> shared all-domain plan-code linker
   -> SealedRunnableMachine(plan image + runtime indexes + receipt)
 ```
@@ -1438,7 +1438,8 @@ The first fifth-audit implementation slice now establishes that route spine.
 `ExecutionConstructionRoutesV3` is created before semantic execution rows. It
 resolves each checked projection to its stable definition/interface owner once
 and publishes one dense, parent-linked invocation overlay for every OUT call
-occurrence, with separate V3 path, overlay, and table digest domains. The
+occurrence, with one version-stable logical path identity and separate V3
+overlay/table digest domains. The
 transitional V2 handoff consumes these routes instead of rediscovering call
 ancestry and definition ownership, after which the V3 construction table is
 discarded rather than retained as a second image. The exact ignored NovyWave
@@ -1457,6 +1458,28 @@ authority rows from falling outside the route image. It still deliberately
 does not count as a performance result: V2 continues to allocate and hash the
 47,296-row proof mirror, so the next architectural cut remains construction-
 owned compact executable receipts followed by deletion of that mirror.
+
+That compact executable-receipt cut is now implemented. Production seals
+`SealedSemanticImageV3` from the final `CanonicalProgramCoreV2` rows, one
+parent-linked invocation-overlay table, one compact projection table, and one
+CSR relocation arena. The cumulative V2 path arena, rich V2 row mirror, and
+duplicated expression-origin receipt family compile only under `cfg(test)` as
+an independent parity oracle. Manifest V7 now consumes V3 identities through
+direct checked-definition, authored-call-site, and parent-invocation edges; it
+does not reconstruct cumulative paths.
+
+One direct debug NovyWave verified sample records 30,771 execution rows, 4,158
+projections, and 9,037 relocations, down from 47,296, 6,483, and 16,834. The
+production execution seal is 38.109 ms of finalization plus 277.995 ms of V3
+receipt publication, versus the preceding 1,829.237 ms V2 finalization trace.
+Manifest falls from 1,701.115 ms to 410.015 ms. The complete directional sample
+is 4,100.898 ms, with 2,328.883 ms in semantic construction, 258,232 KiB peak
+RSS, and unchanged plan hash
+`db18f345676378b8633829c0bbd7870c0a1dc5a2459649c9bbfdd6b8969374ab`.
+The exact ignored V2/V3 NovyWave route-owner oracle and architecture gate pass.
+This closes the production V2 mirror, not the persistent-compiler phase:
+Manifest still imports compact checked/execution receipts into its own graph,
+and all cold products are still discarded after the request.
 
 ### Sixth Whole-System Audit: One Persistent Definition-to-Runnable Graph
 

@@ -846,6 +846,20 @@ Current cold-diagnostics candidate evidence:
   ownership, and deleting the resource/reactive/storage/view/memory replay
   scanners as their construction-owned table/CSR spans become directly sealed.
   Do not optimize the 1,885 transitional rows or retain a compatibility adapter.
+- The first reactive ownership cut reuses the exact canonical/local binding
+  resolution already emitted by read construction and deletes trigger-time
+  lexical/owner/call-ancestry rediscovery. A build-local trigger-plan index
+  materializes each exact `(root, terminal)` subplan once, rejects cycles, and
+  cannot survive a revision because its keys are dense image IDs. The exact
+  ignored NovyWave oracle passes; two samples put state-update-arm construction
+  at 295.4--309.5 ms, down from about 962.0 ms, and the full reactive phase at
+  496.9--513.2 ms, down from about 1,172.9 ms. This is directional debug
+  evidence, not a scored gate. Do not tune the residual cache: execution-image
+  finalization and Manifest remain about 1,824.5--1,848.1 and
+  1,695.0--1,714.8 ms. Delete those adjacent scan/re-import owners next. If
+  reactive work later dominates, replace recursive trigger expansion with a
+  normalized dependency graph, SCC/worklist publication, and shared immutable
+  arm spans rather than more per-expression memo layers.
 - Do not preserve V3's 208k subject cardinality as a production V4/V5 proof
   requirement. The independent test oracle must map every historical subject
   to exactly one canonical finalized shard row and classifier field/domain and prove

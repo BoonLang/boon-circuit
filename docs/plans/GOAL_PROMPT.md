@@ -571,6 +571,19 @@ Current checkpoints to preserve and audit rather than redo:
   construction/sealing of resource/reactive/storage/view/memory table and CSR
   spans; delete each replay scanner and rich duplicate owner without a
   compatibility path;
+- preserve the first reactive owner deletion: read construction now publishes
+  exact trigger routes instead of making trigger planning rediscover lexical,
+  owner, and call ancestry. Its build-local exact `(root, terminal)` trigger-
+  plan index reduces NovyWave state-arm work from about 962.0 to
+  295.4--309.5 ms and the reactive phase from about 1,172.9 to
+  496.9--513.2 ms while the exact oracle
+  passes. It is revision-local and cycle-rejecting, not a persistent whole-
+  project cache. Do not micro-tune its residual cost. Delete the roughly
+  1,824.5--1,848.1 ms execution-image finalization scan and roughly
+  1,695.0--1,714.8 ms Manifest
+  re-import owner next; if trigger planning later dominates, replace its
+  recursive expansion with one normalized dependency/SCC plan and shared arm
+  spans;
 - move verified-intent demand collection before occurrence expansion and
   backend lowering. Split top-level authority/interface summaries from the
   final program-link sink, and version the callable interface schema before

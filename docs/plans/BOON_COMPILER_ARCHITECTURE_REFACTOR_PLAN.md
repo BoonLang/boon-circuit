@@ -851,6 +851,30 @@ the primary retained authority and land the shared plan-code linker. No
 compatibility adapter may resurrect the checked tables, preserve the lowering
 named-value inventory permanently, or keep rich graphs beside the replacement.
 
+The first reactive owner cut confirms that this ordering must remain
+architectural. Read construction already resolves every canonical/local read
+to one exact binding, but trigger construction discarded that authority and
+repeated lexical binding, owner-ancestry, and call-ancestry searches from each
+state arm. `TriggerReadRoute` now carries that exact construction-owned route
+into trigger planning. A transaction-local trigger-plan index materializes an
+exact `(root expression, terminal boundary)` plan once, rejects cyclic plan
+dependencies, and is intentionally discarded with the immutable semantic
+build; revision-local dense IDs never enter a persistent cache. The exact
+NovyWave semantic oracle remains unchanged while two current-tree samples put
+state-update-arm construction at 295.4--309.5 ms, down from about 962.0 ms, and
+the complete reactive phase at 496.9--513.2 ms, down from about 1,172.9 ms. This
+is a coherent duplicate-owner deletion, not
+a phase exit or a reason to tune the residual map/clone cost.
+
+The new trace makes the next larger cut unambiguous: execution-image
+finalization still takes about 1,824.5--1,848.1 ms and Manifest V7 still takes
+about 1,695.0--1,714.8 ms. Replace their adjacent full-image scans with construction-owned
+typed rows, dependency spans, relocation sealing, and a narrow final cross-
+table validator. If reactive planning later becomes the largest owner again,
+replace the remaining recursive walk with one normalized trigger-dependency
+graph plus SCC/worklist publication and shared immutable arm spans; do not add
+another layer of expression-specific caches first.
+
 The following second and third audit sections remain evidence and detailed
 design rationale. Where they name a "next" action or staging order, the
 post-`9540262` multiplier audit above supersedes it.

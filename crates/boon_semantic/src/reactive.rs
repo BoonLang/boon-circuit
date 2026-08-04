@@ -1583,9 +1583,8 @@ impl<'a> ReactiveBuilder<'a> {
             TriggerResolver::new(
                 self.execution,
                 self.resources,
-                self.out_net,
+                &reads,
                 &bindings,
-                &self.local_values,
                 &self.parameter_inputs,
                 &pulse_by_expression,
                 &pulse_states,
@@ -4072,18 +4071,31 @@ struct RawDerivedValue {
     startup_recompute: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TriggerReadRoute {
+    Producer {
+        expression: SemanticExprId,
+        suppress_unprojected_provenance: bool,
+    },
+    Cause(SemanticEventCauseV1),
+    NonValue,
+}
+
 struct TriggerResolver<'a> {
     execution: &'a SemanticExecutionImageColumnsV1,
     resources: &'a SemanticResourceGraphV1,
-    out_net: &'a ResolvedOutGraph,
-    bindings: &'a [SemanticBindingV1],
-    local_values: &'a BTreeMap<SemanticLocalBindingId, (DeclId, SemanticExprId)>,
     parameter_inputs: &'a BTreeMap<SemanticExprId, Vec<SemanticExprId>>,
     pulse_by_expression: &'a BTreeMap<SemanticExprId, SemanticPulseBatchId>,
     pulse_states: &'a BTreeMap<SemanticPulseBatchId, SemanticStateId>,
     pulse_activation_expressions: &'a BTreeSet<SemanticExprId>,
     external_event_identities: &'a BTreeSet<CheckedExternalDeclarationIdentityV1>,
+    read_routes: Vec<Option<TriggerReadRoute>>,
     causes_cache: BTreeMap<SemanticExprId, BTreeSet<SemanticEventCauseV1>>,
+    // This index belongs to one immutable semantic-image construction. It is
+    // deliberately not retained across revisions, where dense expression IDs
+    // have no stable identity.
+    trigger_plan_cache: BTreeMap<(SemanticExprId, Option<SemanticExprId>), Vec<RawTriggerArm>>,
+    active_trigger_plans: BTreeSet<(SemanticExprId, Option<SemanticExprId>)>,
 }
 
 fn lexical_owner_distance(
@@ -4240,9 +4252,8 @@ impl<'a> TriggerResolver<'a> {
     fn new(
         execution: &'a SemanticExecutionImageColumnsV1,
         resources: &'a SemanticResourceGraphV1,
-        out_net: &'a ResolvedOutGraph,
+        reads: &'a [SemanticReadBindingV1],
         bindings: &'a [SemanticBindingV1],
-        local_values: &'a BTreeMap<SemanticLocalBindingId, (DeclId, SemanticExprId)>,
         parameter_inputs: &'a BTreeMap<SemanticExprId, Vec<SemanticExprId>>,
         pulse_by_expression: &'a BTreeMap<SemanticExprId, SemanticPulseBatchId>,
         pulse_states: &'a BTreeMap<SemanticPulseBatchId, SemanticStateId>,
@@ -4255,19 +4266,97 @@ impl<'a> TriggerResolver<'a> {
         for state in &resources.states {
             execution.state(state.id)?;
         }
+        let mut read_routes = vec![None; execution.expressions.len()];
+        for read in reads {
+            let expression = execution.expression(read.expression)?;
+            if expression.value_id != read.value {
+                return Err(SemanticReactiveError::new(format!(
+                    "semantic read {} value differs from expression {}",
+                    read.id, read.expression
+                )));
+            }
+            let route = match &read.target {
+                SemanticReadTargetV1::Binding { binding, .. } => {
+                    let binding = bindings
+                        .get(binding.as_usize())
+                        .filter(|candidate| candidate.id == *binding)
+                        .ok_or_else(|| {
+                            SemanticReactiveError::new(format!(
+                                "semantic read {} references missing binding {binding}",
+                                read.id
+                            ))
+                        })?;
+                    match binding.target {
+                        SemanticBindingTargetV1::Source { source } => {
+                            TriggerReadRoute::Cause(SemanticEventCauseV1::Source(source))
+                        }
+                        SemanticBindingTargetV1::State { state } => {
+                            TriggerReadRoute::Cause(SemanticEventCauseV1::State(state))
+                        }
+                        SemanticBindingTargetV1::Field { .. }
+                        | SemanticBindingTargetV1::List { .. } => TriggerReadRoute::Producer {
+                            expression: binding.producer,
+                            suppress_unprojected_provenance: true,
+                        },
+                    }
+                }
+                SemanticReadTargetV1::SourcePayload { source, .. } => {
+                    TriggerReadRoute::Cause(SemanticEventCauseV1::Source(*source))
+                }
+                SemanticReadTargetV1::StateProjection { state, .. } => {
+                    TriggerReadRoute::Cause(SemanticEventCauseV1::State(*state))
+                }
+                SemanticReadTargetV1::Local { producer, .. } => TriggerReadRoute::Producer {
+                    expression: *producer,
+                    suppress_unprojected_provenance: false,
+                },
+                SemanticReadTargetV1::External { .. }
+                | SemanticReadTargetV1::ElementState { .. }
+                | SemanticReadTargetV1::MaterializationLocal { .. }
+                | SemanticReadTargetV1::FunctionParameter { .. } => TriggerReadRoute::NonValue,
+            };
+            let slot = read_routes
+                .get_mut(read.expression.as_usize())
+                .ok_or_else(|| {
+                    SemanticReactiveError::new(format!(
+                        "semantic read {} has an out-of-range expression {}",
+                        read.id, read.expression
+                    ))
+                })?;
+            if slot.replace(route).is_some() {
+                return Err(SemanticReactiveError::new(format!(
+                    "semantic expression {} has multiple resolved read routes",
+                    read.expression
+                )));
+            }
+        }
         Ok(Self {
             execution,
             resources,
-            out_net,
-            bindings,
-            local_values,
             parameter_inputs,
             pulse_by_expression,
             pulse_states,
             pulse_activation_expressions,
             external_event_identities,
+            read_routes,
             causes_cache: BTreeMap::new(),
+            trigger_plan_cache: BTreeMap::new(),
+            active_trigger_plans: BTreeSet::new(),
         })
+    }
+
+    fn read_route(
+        &self,
+        expression: SemanticExprId,
+    ) -> Result<TriggerReadRoute, SemanticReactiveError> {
+        self.read_routes
+            .get(expression.as_usize())
+            .and_then(|route| *route)
+            .ok_or_else(|| {
+                SemanticReactiveError::new(format!(
+                    "semantic trigger expression {expression} has no exact resolved read route"
+                ))
+            })
     }
 
     fn event_causes_for_expression(
@@ -4311,17 +4400,28 @@ impl<'a> TriggerResolver<'a> {
             } if self.pulse_activation_expressions.contains(&id) => {
                 self.collect_event_causes(*output, Some(*input), visited, causes)?;
             }
-            SemanticExpressionKind::CanonicalRead { target, .. } => {
-                let binding = self.exact_binding_for_decl(*target, expression)?;
-                self.collect_event_causes(binding.producer, terminal, visited, causes)?;
+            SemanticExpressionKind::CanonicalRead { .. } => {
+                let TriggerReadRoute::Producer {
+                    expression: producer,
+                    ..
+                } = self.read_route(id)?
+                else {
+                    return Err(SemanticReactiveError::new(format!(
+                        "cause-free canonical read {id} has no resolved producer"
+                    )));
+                };
+                self.collect_event_causes(producer, terminal, visited, causes)?;
             }
-            SemanticExpressionKind::LocalRead { binding, .. } => {
-                let (_, producer) = self.local_values.get(binding).copied().ok_or_else(|| {
-                    SemanticReactiveError::new(format!(
-                        "semantic local read {} references missing binding {}",
-                        id, binding
-                    ))
-                })?;
+            SemanticExpressionKind::LocalRead { .. } => {
+                let TriggerReadRoute::Producer {
+                    expression: producer,
+                    ..
+                } = self.read_route(id)?
+                else {
+                    return Err(SemanticReactiveError::new(format!(
+                        "semantic local read {id} has no resolved producer"
+                    )));
+                };
                 self.collect_event_causes(producer, terminal, visited, causes)?;
             }
             SemanticExpressionKind::FunctionParameter { parameter, .. } => {
@@ -4382,34 +4482,23 @@ impl<'a> TriggerResolver<'a> {
             causes.insert(SemanticEventCauseV1::Pulse(pulse));
             return Ok(causes);
         }
-        if let SemanticExpressionKind::CanonicalRead {
-            target,
-            projection,
-            source,
-            ..
-        } = &expression.kind
-        {
-            if let Some(source) = source {
-                causes.insert(SemanticEventCauseV1::Source(source.source));
-                return Ok(causes);
-            }
-            let binding = self.exact_binding_for_decl(*target, expression)?;
-            match binding.target {
-                SemanticBindingTargetV1::Source { source } => {
-                    causes.insert(SemanticEventCauseV1::Source(source));
-                }
-                SemanticBindingTargetV1::State { state } => {
-                    causes.insert(SemanticEventCauseV1::State(state));
-                }
-                SemanticBindingTargetV1::Field { .. } | SemanticBindingTargetV1::List { .. }
-                    if projection.is_empty() =>
-                {
+        if let SemanticExpressionKind::CanonicalRead { projection, .. } = &expression.kind {
+            match self.read_route(expression.id)? {
+                TriggerReadRoute::Cause(cause) => {
+                    causes.insert(cause);
                     return Ok(causes);
                 }
-                SemanticBindingTargetV1::Field { .. } | SemanticBindingTargetV1::List { .. } => {}
-            }
-            if !causes.is_empty() {
-                return Ok(causes);
+                TriggerReadRoute::Producer {
+                    suppress_unprojected_provenance: true,
+                    ..
+                } if projection.is_empty() => return Ok(causes),
+                TriggerReadRoute::Producer { .. } => {}
+                TriggerReadRoute::NonValue => {
+                    return Err(SemanticReactiveError::new(format!(
+                        "semantic canonical read {} has a non-value read route",
+                        expression.id
+                    )));
+                }
             }
         }
         for member in &expression.provenance.members {
@@ -4703,16 +4792,23 @@ impl<'a> TriggerResolver<'a> {
                     })?;
                 self.collect_trigger_arms(materialization.body, terminal, visited, arms)?;
             }
-            SemanticExpressionKind::CanonicalRead {
-                target, projection, ..
-            } => {
-                if !self.direct_causes(expression)?.is_empty() {
-                    for cause in self.direct_causes(expression)? {
+            SemanticExpressionKind::CanonicalRead { projection, .. } => {
+                let direct = self.direct_causes(expression)?;
+                if !direct.is_empty() {
+                    for cause in direct {
                         arms.insert(self.arm(cause, id, id)?);
                     }
                     return Ok(());
                 }
-                let producer = self.exact_binding_for_decl(*target, expression)?.producer;
+                let TriggerReadRoute::Producer {
+                    expression: producer,
+                    ..
+                } = self.read_route(id)?
+                else {
+                    return Err(SemanticReactiveError::new(format!(
+                        "cause-free canonical read {id} has no resolved producer"
+                    )));
+                };
                 let producer_arms = self.trigger_arms_before(producer, terminal)?;
                 if producer_arms.is_empty() {
                     for cause in self.event_causes_for_expression(producer)? {
@@ -4736,17 +4832,16 @@ impl<'a> TriggerResolver<'a> {
                     }
                 }
             }
-            SemanticExpressionKind::LocalRead {
-                binding,
-                projection,
-                ..
-            } => {
-                let (_, producer) = self.local_values.get(binding).copied().ok_or_else(|| {
-                    SemanticReactiveError::new(format!(
-                        "trigger traversal references missing local binding {}",
-                        binding
-                    ))
-                })?;
+            SemanticExpressionKind::LocalRead { projection, .. } => {
+                let TriggerReadRoute::Producer {
+                    expression: producer,
+                    ..
+                } = self.read_route(id)?
+                else {
+                    return Err(SemanticReactiveError::new(format!(
+                        "semantic local read {id} has no resolved producer"
+                    )));
+                };
                 let producer_arms = self.trigger_arms_before(producer, terminal)?;
                 if producer_arms.is_empty() {
                     for cause in self.event_causes_for_expression(producer)? {
@@ -4807,9 +4902,25 @@ impl<'a> TriggerResolver<'a> {
         root: SemanticExprId,
         terminal: Option<SemanticExprId>,
     ) -> Result<Vec<RawTriggerArm>, SemanticReactiveError> {
-        let mut arms = BTreeSet::new();
-        self.collect_trigger_arms(root, terminal, &mut BTreeSet::new(), &mut arms)?;
-        Ok(arms.into_iter().collect())
+        let key = (root, terminal);
+        if let Some(cached) = self.trigger_plan_cache.get(&key) {
+            return Ok(cached.clone());
+        }
+        if !self.active_trigger_plans.insert(key) {
+            return Err(SemanticReactiveError::new(format!(
+                "semantic trigger plan {root} before {terminal:?} has a cyclic dependency"
+            )));
+        }
+        let result = (|| {
+            let mut arms = BTreeSet::new();
+            self.collect_trigger_arms(root, terminal, &mut BTreeSet::new(), &mut arms)?;
+            Ok::<_, SemanticReactiveError>(arms)
+        })();
+        self.active_trigger_plans.remove(&key);
+        let arms = result?;
+        let arms = arms.into_iter().collect::<Vec<_>>();
+        self.trigger_plan_cache.insert(key, arms.clone());
+        Ok(arms)
     }
 
     fn trigger_arms_before_expression(
@@ -4919,24 +5030,6 @@ impl<'a> TriggerResolver<'a> {
                 gate.id
             ))),
         }
-    }
-
-    fn exact_binding_for_decl(
-        &self,
-        declaration: DeclId,
-        expression: &SemanticExpression,
-    ) -> Result<&SemanticBindingV1, SemanticReactiveError> {
-        let origin = self.execution.origin(expression.id)?;
-        lexical_binding_for_decl(
-            self.execution,
-            self.resources,
-            self.out_net,
-            self.bindings,
-            declaration,
-            expression,
-            origin.call_instance,
-            "reactive expression",
-        )
     }
 }
 

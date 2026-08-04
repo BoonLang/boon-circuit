@@ -360,6 +360,20 @@ stronger three-reviewer performance closure defined below.
    the resource/reactive/storage/view/memory replay scanners and rich duplicate
    owners as their construction-owned table/CSR spans are sealed directly.
 
+   The first reactive owner cut is now directionally proven. Read construction
+   owns exact canonical/local trigger routes, so trigger planning no longer
+   repeats lexical binding plus owner/call ancestry resolution. A build-local,
+   cycle-rejecting `(root, terminal)` plan index materializes shared subplans
+   once and is discarded before any later revision. The exact NovyWave oracle
+   passes while two samples put state-update-arm work at 295.4--309.5 ms, down
+   from about 962.0 ms, and the whole reactive phase at 496.9--513.2 ms, down
+   from about 1,172.9 ms. Do not tune the remaining map/clone cost. Execution-
+   image finalization and Manifest remain about 1,824.5--1,848.1 and
+   1,695.0--1,714.8 ms and are the next adjacent rich-owner deletion.
+   If reactive planning later becomes dominant, replace recursive expansion
+   with a normalized trigger dependency graph, SCC/worklist publication, and
+   shared immutable arm spans rather than more caches.
+
    Receipt callbacks alone are too small: removing all 1,813.236 ms of manifest
    work from the 4,052.379 ms directional sample would still leave about 2.24
    seconds. Expand definition/invocation shards through OUT/resource/reactive/

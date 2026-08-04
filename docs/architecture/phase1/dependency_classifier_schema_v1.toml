@@ -14959,7 +14959,7 @@ fields = [
 [[records]]
 kind = "enum"
 source = "crates/boon_semantic/src/dependency_manifest.rs"
-name = "SemanticDependencyProjectionKeyV6"
+name = "SemanticDependencyProjectionKeyV7"
 
 [[records.variants]]
 name = "Checked"
@@ -14978,6 +14978,15 @@ fields = [
 ]
 
 [[records.variants]]
+name = "ConstructionSemantic"
+disposition = "r-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = [
+  { name = "construction_domain", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "projection", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+]
+
+[[records.variants]]
 name = "LegacySemantic"
 disposition = "r-fca-priv-sp-id-pc-n"
 reviewed = true
@@ -14988,13 +14997,14 @@ fields = [
 [[records]]
 kind = "struct"
 source = "crates/boon_semantic/src/dependency_manifest.rs"
-name = "CallableDependencyProofDigestsV6"
+name = "CallableDependencyProofDigestsV7"
 fields = [
   { name = "program_root_entry_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
   { name = "callable_entries_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
   { name = "projection_receipts_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
   { name = "checked_row_count", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
   { name = "execution_row_count", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "construction_row_count", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
   { name = "remaining_row_count", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
   { name = "dependency_record_count", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
   { name = "coverage_record_count", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
@@ -15006,7 +15016,7 @@ fields = [
 [[records]]
 kind = "struct"
 source = "crates/boon_semantic/src/dependency_manifest.rs"
-name = "CallableDependencyManifestV6"
+name = "CallableDependencyManifestV7"
 fields = [
   { name = "schema", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
   { name = "source_bundle_digest_v1", disposition = "a-frca-priv-sp-id-pc-n", reviewed = true },
@@ -15019,6 +15029,17 @@ fields = [
   { name = "manifest_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
   { name = "sealed_manifest_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
 ]
+
+[[records]]
+kind = "enum"
+source = "crates/boon_semantic/src/dependency_manifest.rs"
+name = "ConstructionDependencyDomainV1"
+
+[[records.variants]]
+name = "Lowering"
+disposition = "r-fca-priv-sp-id-pc-n"
+reviewed = true
+fields = []
 
 [[records]]
 kind = "struct"

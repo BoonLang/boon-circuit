@@ -552,6 +552,17 @@ Current checkpoints to preserve and audit rather than redo:
   normalized rows/relocations. Delete the post-hoc image scanner and Manifest
   re-import owner, then land the shared plan-code linker; do not return to
   reachability/map micro-tuning or claim a performance exit;
+- preserve Manifest V7's first construction-owned domain as a transition, not
+  the target proof shape. Production lowering replay is deleted; 36,979 rows
+  are emitted by lowering and V7 leaves 36,183 legacy rows. The focused debug
+  oracle and architecture gate pass, and reuse of sealed aggregate digests
+  removes about 434 ms of duplicate debug serialization. The remaining roughly
+  737 ms exposes a checked-type-table round trip: expression/function/named-
+  value tables are copied into lowering DTOs, reconstructed in canonical core,
+  and scanned again downstream. Replace them with optional diagnostic source-
+  map rows, typed semantic interface rows, and execution/storage-owned types;
+  migrate storage/distributed/backend consumers and delete the checked tables,
+  lowering DTO inventories, and their proof rows without a compatibility path;
 - move verified-intent demand collection before occurrence expansion and
   backend lowering. Split top-level authority/interface summaries from the
   final program-link sink, and version the callable interface schema before

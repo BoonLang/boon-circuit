@@ -8,8 +8,18 @@
 
 #[cfg(test)]
 use crate::ResolvedOutGraph;
+use crate::dependency_manifest::{
+    ConstructionDependencyDomainV1, ConstructionDependencyOwnerV1,
+    ConstructionDependencyRowBuilderV1, ConstructionDependencyRowV1, ConstructionDependencyRowsV1,
+    binding_entity, callable_entity, child_subject, dependency_entity, expression_entity,
+    field_entity, indexed_entity, list_entity, source_entity, state_entity, statement_entity,
+    top_subject,
+};
 use crate::{
-    SemanticBindingId, SemanticBindingTargetV1, SemanticCallableId,
+    CallableDependencyManifestError, SemanticBindingId, SemanticBindingTargetV1,
+    SemanticCallableId, SemanticDependencyChannelV1, SemanticDependencyEntityDomainV1,
+    SemanticDependencyEntityV1, SemanticDependencyLifetimeV1, SemanticDependencyRoleV1,
+    SemanticDependencySemanticsV1, SemanticDependencySubjectKindV1, SemanticDependencyVisibilityV1,
     SemanticExecutionImageColumnsV1, SemanticExprId, SemanticExpressionKind, SemanticFieldId,
     SemanticListId, SemanticLocalBindingId, SemanticParameterId, SemanticReactiveGraphV1,
     SemanticResourceGraphV1, SemanticRootKindV1, SemanticSourceId, SemanticSourceOrigin,
@@ -124,6 +134,15 @@ pub struct SemanticLoweringContractV1 {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub transient_collections: Vec<SemanticTransientCollectionV1>,
     pub digest: SemanticLoweringContractDigestV1,
+}
+
+/// Production construction product. The normalized dependency rows are
+/// sealed by Manifest V7 and then dropped; the rich lowering contract remains
+/// available to code generation until the all-domain semantic image migration
+/// makes its typed columns the sole owner.
+pub(crate) struct SemanticLoweringContractBuildV1 {
+    pub(crate) contract: SemanticLoweringContractV1,
+    pub(crate) dependency_rows: ConstructionDependencyRowsV1,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -514,15 +533,16 @@ pub(crate) fn build_semantic_lowering_contract(
         .validate(execution, resources, out_net)
         .map_err(|error| SemanticLoweringContractError::new(error.to_string()))?;
 
-    build_semantic_lowering_contract_from_validated_inputs(checked, execution, resources, reactive)
+    build_semantic_lowering_contract_with_dependency_rows(checked, execution, resources, reactive)
+        .map(|build| build.contract)
 }
 
-pub(crate) fn build_semantic_lowering_contract_from_validated_inputs(
+pub(crate) fn build_semantic_lowering_contract_with_dependency_rows(
     checked: &CheckedProgramFields,
     execution: &SemanticExecutionImageColumnsV1,
     resources: &SemanticResourceGraphV1,
     reactive: &SemanticReactiveGraphV1,
-) -> Result<SemanticLoweringContractV1, SemanticLoweringContractError> {
+) -> Result<SemanticLoweringContractBuildV1, SemanticLoweringContractError> {
     let trace = std::env::var_os("BOON_SEMANTIC_TRACE").is_some();
     macro_rules! lowering_phase {
         ($name:literal, $expression:expr) => {{
@@ -541,17 +561,48 @@ pub(crate) fn build_semantic_lowering_contract_from_validated_inputs(
             result
         }};
     }
+    let mut dependency_builder = ConstructionDependencyRowBuilderV1::new();
     let metadata = lowering_phase!(
         "metadata",
         build_lowering_metadata(checked, execution, resources, reactive)
+    )?;
+    let mut metadata_dependency_rows = Vec::new();
+    lowering_phase!(
+        "metadata_dependency_rows",
+        append_lowering_metadata_dependency_rows(
+            &mut dependency_builder,
+            &mut metadata_dependency_rows,
+            &metadata,
+        )
+        .map_err(|error| SemanticLoweringContractError::new(error.to_string()))
     )?;
     let output_contracts = lowering_phase!(
         "output_contracts",
         build_output_contracts(checked, execution, reactive, &metadata.render_slots)
     )?;
+    let mut output_dependency_rows = Vec::new();
+    lowering_phase!(
+        "output_dependency_rows",
+        append_lowering_output_dependency_rows(
+            &mut dependency_builder,
+            &mut output_dependency_rows,
+            &output_contracts,
+        )
+        .map_err(|error| SemanticLoweringContractError::new(error.to_string()))
+    )?;
     let host_ports = lowering_phase!(
         "host_ports",
         build_host_ports(checked, resources, &output_contracts)
+    )?;
+    let mut host_port_dependency_rows = Vec::new();
+    lowering_phase!(
+        "host_port_dependency_rows",
+        append_lowering_host_port_dependency_rows(
+            &mut dependency_builder,
+            &mut host_port_dependency_rows,
+            &host_ports,
+        )
+        .map_err(|error| SemanticLoweringContractError::new(error.to_string()))
     )?;
     let transient_collections = lowering_phase!(
         "transient_collections",
@@ -566,7 +617,489 @@ pub(crate) fn build_semantic_lowering_contract_from_validated_inputs(
         digest: SemanticLoweringContractDigestV1([0; 32]),
     };
     contract.digest = lowering_phase!("digest", lowering_contract_digest(&contract))?;
-    Ok(contract)
+    let contract_dependency_row = lowering_phase!(
+        "contract_dependency_row",
+        lowering_contract_dependency_row(&mut dependency_builder, &contract)
+            .map_err(|error| SemanticLoweringContractError::new(error.to_string()))
+    )?;
+    let dependency_row_count = 1
+        + metadata_dependency_rows.len()
+        + output_dependency_rows.len()
+        + host_port_dependency_rows.len();
+    let mut rows = Vec::with_capacity(dependency_row_count);
+    rows.push(contract_dependency_row);
+    rows.append(&mut metadata_dependency_rows);
+    rows.append(&mut output_dependency_rows);
+    rows.append(&mut host_port_dependency_rows);
+    let dependency_rows =
+        ConstructionDependencyRowsV1::from_rows(ConstructionDependencyDomainV1::Lowering, rows);
+    Ok(SemanticLoweringContractBuildV1 {
+        contract,
+        dependency_rows,
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn lowering_dependency_rows(
+    lowering: &SemanticLoweringContractV1,
+) -> Result<ConstructionDependencyRowsV1, CallableDependencyManifestError> {
+    let mut builder = ConstructionDependencyRowBuilderV1::new();
+    let mut rows = Vec::new();
+    rows.push(lowering_contract_dependency_row(&mut builder, lowering)?);
+    append_lowering_metadata_dependency_rows(&mut builder, &mut rows, &lowering.metadata)?;
+    append_lowering_output_dependency_rows(&mut builder, &mut rows, &lowering.output_contracts)?;
+    append_lowering_host_port_dependency_rows(&mut builder, &mut rows, &lowering.host_ports)?;
+    Ok(ConstructionDependencyRowsV1::from_rows(
+        ConstructionDependencyDomainV1::Lowering,
+        rows,
+    ))
+}
+
+fn lowering_contract_dependency_row(
+    builder: &mut ConstructionDependencyRowBuilderV1,
+    lowering: &SemanticLoweringContractV1,
+) -> Result<ConstructionDependencyRowV1, CallableDependencyManifestError> {
+    // The lowering digest already commits the complete contract under its
+    // versioned domain. Hash that fixed commitment into the dependency row
+    // instead of serializing the whole contract a second time.
+    builder.structural(
+        ConstructionDependencyOwnerV1::ProgramRoot,
+        top_subject(
+            SemanticDependencySubjectKindV1::LoweringContract,
+            SemanticDependencyEntityV1::Program,
+        ),
+        &lowering.digest,
+    )
+}
+
+fn append_lowering_metadata_dependency_rows(
+    builder: &mut ConstructionDependencyRowBuilderV1,
+    rows: &mut Vec<ConstructionDependencyRowV1>,
+    metadata: &SemanticLoweringMetadataV1,
+) -> Result<(), CallableDependencyManifestError> {
+    let program = ConstructionDependencyOwnerV1::ProgramRoot;
+    rows.push(builder.dependency(
+        program.clone(),
+        SemanticDependencyChannelV1::TypeAndFlowInstance,
+        vec![
+            SemanticDependencyRoleV1::FixedDefinition,
+            SemanticDependencyRoleV1::AssuranceOrActivation,
+        ],
+        top_subject(
+            SemanticDependencySubjectKindV1::LoweringMetadata,
+            indexed_entity(SemanticDependencyEntityDomainV1::Diagnostic, 1),
+        ),
+        SemanticDependencySemanticsV1::default(),
+        // The metadata digest was sealed immediately after metadata
+        // construction. The child rows below retain per-table granularity;
+        // this aggregate row only needs to commit that canonical root.
+        &metadata.digest,
+        Vec::new(),
+    )?);
+
+    for unit in &metadata.source_units {
+        rows.push(builder.structural(
+            program.clone(),
+            top_subject(
+                SemanticDependencySubjectKindV1::LoweringSourceUnit,
+                indexed_entity(
+                    SemanticDependencyEntityDomainV1::SourceUnit,
+                    unit.id.as_usize(),
+                ),
+            ),
+            unit,
+        )?);
+    }
+
+    for source_expression in &metadata.expression_types {
+        let entity = indexed_entity(
+            SemanticDependencyEntityDomainV1::SourceExpression,
+            source_expression.id.as_usize(),
+        );
+        rows.push(builder.dependency(
+            program.clone(),
+            SemanticDependencyChannelV1::TypeAndFlowInstance,
+            vec![
+                SemanticDependencyRoleV1::FixedDefinition,
+                SemanticDependencyRoleV1::AssuranceOrActivation,
+            ],
+            top_subject(
+                SemanticDependencySubjectKindV1::LoweringExpressionType,
+                entity.clone(),
+            ),
+            SemanticDependencySemanticsV1 {
+                flow_type: Some(source_expression.flow_type.clone()),
+                ..SemanticDependencySemanticsV1::default()
+            },
+            source_expression,
+            Vec::new(),
+        )?);
+        for (ordinal, occurrence) in source_expression.occurrences.iter().enumerate() {
+            rows.push(builder.dependency(
+                ConstructionDependencyOwnerV1::Expression(occurrence.expression),
+                SemanticDependencyChannelV1::TypeAndFlowInstance,
+                vec![
+                    SemanticDependencyRoleV1::FixedDefinition,
+                    SemanticDependencyRoleV1::AssuranceOrActivation,
+                ],
+                child_subject(
+                    SemanticDependencySubjectKindV1::LoweringExpressionOccurrence,
+                    entity.clone(),
+                    ordinal,
+                ),
+                SemanticDependencySemanticsV1 {
+                    flow_type: Some(occurrence.flow_type.clone()),
+                    ..SemanticDependencySemanticsV1::default()
+                },
+                occurrence,
+                vec![dependency_entity(expression_entity(occurrence.expression))],
+            )?);
+        }
+    }
+
+    for function in &metadata.function_types {
+        let owner = ConstructionDependencyOwnerV1::Callable(function.callable);
+        let entity = callable_entity(function.callable);
+        rows.push(builder.dependency(
+            owner.clone(),
+            SemanticDependencyChannelV1::TypeAndFlowInstance,
+            vec![
+                SemanticDependencyRoleV1::FixedDefinition,
+                SemanticDependencyRoleV1::AssuranceOrActivation,
+            ],
+            top_subject(
+                SemanticDependencySubjectKindV1::LoweringFunctionType,
+                entity.clone(),
+            ),
+            SemanticDependencySemanticsV1 {
+                flow_type: Some(function.result.clone()),
+                visibility: SemanticDependencyVisibilityV1::Public,
+                ..SemanticDependencySemanticsV1::default()
+            },
+            function,
+            vec![dependency_entity(callable_entity(function.callable))],
+        )?);
+        for (ordinal, parameter) in function.parameters.iter().enumerate() {
+            rows.push(builder.dependency(
+                owner.clone(),
+                SemanticDependencyChannelV1::TypeAndFlowInstance,
+                vec![
+                    SemanticDependencyRoleV1::FormulaBinder,
+                    SemanticDependencyRoleV1::AssuranceOrActivation,
+                ],
+                child_subject(
+                    SemanticDependencySubjectKindV1::LoweringFunctionParameter,
+                    entity.clone(),
+                    ordinal,
+                ),
+                SemanticDependencySemanticsV1 {
+                    flow_type: Some(parameter.flow_type.clone()),
+                    visibility: SemanticDependencyVisibilityV1::Public,
+                    ..SemanticDependencySemanticsV1::default()
+                },
+                parameter,
+                Vec::new(),
+            )?);
+        }
+    }
+
+    for named in &metadata.named_value_types {
+        let owner = ConstructionDependencyOwnerV1::CheckedStatement(named.checked_statement);
+        let entity = indexed_entity(
+            SemanticDependencyEntityDomainV1::SemanticNamedValue,
+            named.id.as_usize(),
+        );
+        rows.push(builder.dependency(
+            owner.clone(),
+            SemanticDependencyChannelV1::TypeAndFlowInstance,
+            vec![
+                SemanticDependencyRoleV1::FixedDefinition,
+                SemanticDependencyRoleV1::AssuranceOrActivation,
+            ],
+            top_subject(
+                SemanticDependencySubjectKindV1::LoweringNamedValue,
+                entity.clone(),
+            ),
+            SemanticDependencySemanticsV1 {
+                flow_type: Some(named.flow_type.clone()),
+                ..SemanticDependencySemanticsV1::default()
+            },
+            named,
+            vec![dependency_entity(SemanticDependencyEntityV1::checked(
+                SemanticDependencyEntityDomainV1::CheckedStatement,
+                named.checked_statement.0,
+            ))],
+        )?);
+        for (ordinal, origin) in named.origins.iter().enumerate() {
+            let mut references = Vec::new();
+            references.extend(
+                origin
+                    .statements
+                    .iter()
+                    .copied()
+                    .map(statement_entity)
+                    .map(dependency_entity),
+            );
+            references.extend(
+                origin
+                    .expressions
+                    .iter()
+                    .copied()
+                    .map(expression_entity)
+                    .map(dependency_entity),
+            );
+            references.extend(
+                origin
+                    .bindings
+                    .iter()
+                    .copied()
+                    .map(binding_entity)
+                    .map(dependency_entity),
+            );
+            references.extend(
+                origin
+                    .sources
+                    .iter()
+                    .copied()
+                    .map(source_entity)
+                    .map(dependency_entity),
+            );
+            references.extend(
+                origin
+                    .states
+                    .iter()
+                    .copied()
+                    .map(state_entity)
+                    .map(dependency_entity),
+            );
+            references.extend(
+                origin
+                    .lists
+                    .iter()
+                    .copied()
+                    .map(list_entity)
+                    .map(dependency_entity),
+            );
+            rows.push(builder.dependency(
+                owner.clone(),
+                SemanticDependencyChannelV1::TypeAndFlowInstance,
+                vec![
+                    SemanticDependencyRoleV1::FixedDefinition,
+                    SemanticDependencyRoleV1::AssuranceOrActivation,
+                ],
+                child_subject(
+                    SemanticDependencySubjectKindV1::LoweringNamedValue,
+                    entity.clone(),
+                    ordinal,
+                ),
+                SemanticDependencySemanticsV1 {
+                    flow_type: Some(named.flow_type.clone()),
+                    ..SemanticDependencySemanticsV1::default()
+                },
+                origin,
+                references,
+            )?);
+        }
+    }
+
+    for slot in &metadata.render_slots {
+        let mut owner_routes = vec![ConstructionDependencyOwnerV1::Statement(slot.statement)];
+        owner_routes.extend(slot.value.map(ConstructionDependencyOwnerV1::Expression));
+        let mut references = vec![dependency_entity(statement_entity(slot.statement))];
+        references.extend(slot.value.map(expression_entity).map(dependency_entity));
+        rows.push(builder.dependency(
+            ConstructionDependencyOwnerV1::Exact(owner_routes),
+            SemanticDependencyChannelV1::StructuralRepresentation,
+            vec![
+                SemanticDependencyRoleV1::FixedDefinition,
+                SemanticDependencyRoleV1::AssuranceOrActivation,
+            ],
+            top_subject(
+                SemanticDependencySubjectKindV1::LoweringRenderSlot,
+                indexed_entity(
+                    SemanticDependencyEntityDomainV1::RenderSlot,
+                    slot.id.as_usize(),
+                ),
+            ),
+            SemanticDependencySemanticsV1 {
+                visibility: SemanticDependencyVisibilityV1::Public,
+                ..SemanticDependencySemanticsV1::default()
+            },
+            slot,
+            references,
+        )?);
+    }
+
+    for payload in &metadata.source_payload_shapes {
+        let entity = indexed_entity(
+            SemanticDependencyEntityDomainV1::SourcePayloadShape,
+            payload.id.as_usize(),
+        );
+        rows.push(
+            builder.dependency(
+                program.clone(),
+                SemanticDependencyChannelV1::TypeAndFlowInstance,
+                vec![
+                    SemanticDependencyRoleV1::ResourceOrProviderBehavior,
+                    SemanticDependencyRoleV1::AssuranceOrActivation,
+                ],
+                top_subject(
+                    SemanticDependencySubjectKindV1::LoweringSourcePayload,
+                    entity.clone(),
+                ),
+                SemanticDependencySemanticsV1::default(),
+                payload,
+                payload
+                    .sources
+                    .iter()
+                    .copied()
+                    .map(source_entity)
+                    .map(dependency_entity)
+                    .collect(),
+            )?,
+        );
+        for (ordinal, field) in payload.fields.iter().enumerate() {
+            rows.push(builder.structural(
+                program.clone(),
+                child_subject(
+                    SemanticDependencySubjectKindV1::LoweringSourcePayloadField,
+                    entity.clone(),
+                    ordinal,
+                ),
+                field,
+            )?);
+        }
+    }
+
+    for diagnostic in &metadata.diagnostics {
+        rows.push(builder.diagnostic(
+            program.clone(),
+            top_subject(
+                SemanticDependencySubjectKindV1::LoweringDiagnostic,
+                indexed_entity(
+                    SemanticDependencyEntityDomainV1::Diagnostic,
+                    diagnostic.id.as_usize(),
+                ),
+            ),
+            diagnostic,
+        )?);
+    }
+
+    Ok(())
+}
+
+fn append_lowering_output_dependency_rows(
+    builder: &mut ConstructionDependencyRowBuilderV1,
+    rows: &mut Vec<ConstructionDependencyRowV1>,
+    output_contracts: &[SemanticOutputContractV1],
+) -> Result<(), CallableDependencyManifestError> {
+    for output in output_contracts {
+        let mut references = vec![
+            dependency_entity(statement_entity(output.statement)),
+            dependency_entity(expression_entity(output.expression)),
+            dependency_entity(binding_entity(output.binding)),
+        ];
+        references.extend(output.field.map(field_entity).map(dependency_entity));
+        rows.push(builder.dependency(
+            ConstructionDependencyOwnerV1::Exact(vec![
+                ConstructionDependencyOwnerV1::Statement(output.statement),
+                ConstructionDependencyOwnerV1::Expression(output.expression),
+                ConstructionDependencyOwnerV1::Binding(output.binding),
+            ]),
+            SemanticDependencyChannelV1::AssuranceInput,
+            vec![
+                SemanticDependencyRoleV1::CoverageOrRouting,
+                SemanticDependencyRoleV1::AssuranceOrActivation,
+            ],
+            top_subject(
+                SemanticDependencySubjectKindV1::LoweringOutputContract,
+                indexed_entity(
+                    SemanticDependencyEntityDomainV1::OutputContract,
+                    output.id.as_usize(),
+                ),
+            ),
+            SemanticDependencySemanticsV1 {
+                visibility: SemanticDependencyVisibilityV1::Public,
+                ..SemanticDependencySemanticsV1::default()
+            },
+            output,
+            references,
+        )?);
+    }
+
+    Ok(())
+}
+
+fn append_lowering_host_port_dependency_rows(
+    builder: &mut ConstructionDependencyRowBuilderV1,
+    rows: &mut Vec<ConstructionDependencyRowV1>,
+    host_ports: &[SemanticHostPortBindingV1],
+) -> Result<(), CallableDependencyManifestError> {
+    let program = ConstructionDependencyOwnerV1::ProgramRoot;
+    for port in host_ports {
+        let mut references = Vec::new();
+        match &port.kind {
+            SemanticHostPortKindV1::HttpServer {
+                request,
+                disconnect,
+                response,
+            } => {
+                references.push(dependency_entity(source_entity(request.source)));
+                references.extend(
+                    disconnect
+                        .as_ref()
+                        .map(|binding| source_entity(binding.source))
+                        .map(dependency_entity),
+                );
+                references.push(dependency_entity(indexed_entity(
+                    SemanticDependencyEntityDomainV1::OutputContract,
+                    response.output.as_usize(),
+                )));
+            }
+            SemanticHostPortKindV1::WebSocketServer {
+                open,
+                message,
+                close,
+                error,
+                actions,
+            } => {
+                references.extend(
+                    [open.source, message.source, close.source, error.source]
+                        .into_iter()
+                        .map(source_entity)
+                        .map(dependency_entity),
+                );
+                references.push(dependency_entity(indexed_entity(
+                    SemanticDependencyEntityDomainV1::OutputContract,
+                    actions.output.as_usize(),
+                )));
+            }
+        }
+        rows.push(builder.dependency(
+            program.clone(),
+            SemanticDependencyChannelV1::RuntimeIntrinsicOrHostEffect,
+            vec![
+                SemanticDependencyRoleV1::ResourceOrProviderBehavior,
+                SemanticDependencyRoleV1::AssuranceOrActivation,
+            ],
+            top_subject(
+                SemanticDependencySubjectKindV1::LoweringHostPort,
+                indexed_entity(
+                    SemanticDependencyEntityDomainV1::HostPort,
+                    port.id.as_usize(),
+                ),
+            ),
+            SemanticDependencySemanticsV1 {
+                visibility: SemanticDependencyVisibilityV1::Public,
+                lifetime: SemanticDependencyLifetimeV1::Activation,
+                ..SemanticDependencySemanticsV1::default()
+            },
+            port,
+            references,
+        )?);
+    }
+
+    Ok(())
 }
 
 impl SemanticLoweringContractV1 {

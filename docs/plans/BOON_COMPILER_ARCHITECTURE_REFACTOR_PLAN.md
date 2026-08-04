@@ -775,6 +775,57 @@ linker follows immediately so render-context overlay routes and ordinary code
 are assigned once rather than rediscovered by each backend. The selected
 tranche remains incomplete until a scanner/owner is deleted.
 
+#### First construction-owned domain and the lowering round-trip audit
+
+The first row-emission cut now deletes the production `inventory_lowering`
+replay owner. Lowering construction emits normalized metadata, output, and host
+port proof rows at their owning stages; Manifest V7 resolves those routes and
+seals them in an explicit `ConstructionSemantic::Lowering` namespace. V7 is an
+intentional schema and digest-domain bump because construction-owned and legacy
+semantic projections must never be interpreted under the same cache/proof
+contract. The exhaustive lowering inventory remains `cfg(test)` only as an
+independent source-driven oracle.
+
+On the focused debug NovyWave oracle, 36,979 rows move to construction ownership
+and the legacy count falls from 73,162 to 36,183 while graph topology remains
+11,608 nodes and 82,364 edges. Reusing the already sealed lowering-metadata and
+lowering-contract digests for their aggregate proof rows removes two duplicate
+whole-graph serializations: traced aggregate work falls by roughly 434 ms in
+that debug run, with the contract row itself falling from 217.162 ms to 0.019
+ms. The architecture gate and exact semantic oracle pass. This is directional
+debug evidence, not a release speed gate, and the remaining roughly 737 ms of
+metadata-row construction shows why construction callbacks alone are not the
+final architecture.
+
+The higher-level consumer audit identifies that remaining multiplier precisely.
+`SemanticLoweringMetadataV1` copies the checked expression, function, and named-
+value type tables into semantic DTOs; `build_canonical_program_core` then maps
+them back into `boon_checked` tables; `ErasedProgram` retains those tables; and
+distributed and backend code scans them again for signatures, expression types,
+and exportable named values. The expression table also carries occurrence rows
+that already exist in the execution image. Preserving one proof row per member
+of that round trip would make the historical bridge permanent.
+
+The next flag-day slice therefore replaces this round trip with three narrow
+products owned by the sealed semantic image:
+
+1. diagnostic source-map rows own source units, original-expression coverage,
+   and diagnostics without entering the runnable authority unless explicitly
+   requested;
+2. typed interface rows own callable exports/requirements, named value exports,
+   host/output contracts, and distributed crossings by semantic identity; and
+3. execution/storage rows remain the sole owner of expression flow types and
+   normalized named-value targets.
+
+Migrate storage, distributed linking, verification, and the machine-plan
+backend to those rows, then delete `map_expression_types`, `map_function_types`,
+`map_named_value_types`, the three checked tables from `CanonicalProgramCoreV1`
+and `ErasedProgram`, and their lowering DTO/proof inventories. Seal proof roots
+directly over the resulting typed table rows and CSR spans. No compatibility
+adapter may keep the checked tables alive in production. This owner deletion
+precedes another attempt to tune the 36,979 rows, crate splitting, or parallel
+execution.
+
 The following second and third audit sections remain evidence and detailed
 design rationale. Where they name a "next" action or staging order, the
 post-`9540262` multiplier audit above supersedes it.

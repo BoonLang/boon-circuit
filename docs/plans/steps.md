@@ -339,6 +339,18 @@ stronger three-reviewer performance closure defined below.
    linker. Do not tune the compact overlay maps or declare a performance phase
    exit.
 
+   Manifest V7 now completes the first construction-owned domain: production
+   lowering replay is deleted, 36,979 lowering rows are emitted at their owning
+   stages, and 36,183 legacy rows remain. The focused debug oracle keeps the
+   11,608/82,364 projection topology and the architecture gate passes. Reusing
+   sealed metadata/contract digests removes about 434 ms of duplicate debug
+   serialization, but roughly 737 ms remains in fine-grained metadata rows.
+   Treat that as evidence to delete the checked expression/function/named-value
+   table round trip, not as a new micro-optimization loop. Publish optional
+   diagnostic source-map rows and typed interface rows, keep execution/storage
+   as the type authority, migrate every downstream consumer, and delete the
+   checked tables plus their semantic DTO/proof inventories without a fallback.
+
    Receipt callbacks alone are too small: removing all 1,813.236 ms of manifest
    work from the 4,052.379 ms directional sample would still leave about 2.24
    seconds. Expand definition/invocation shards through OUT/resource/reactive/

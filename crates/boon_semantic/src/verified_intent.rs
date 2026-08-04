@@ -79,22 +79,6 @@ impl VerifiedSemanticIntentV1 {
         let mut seen_program_roots = BTreeSet::new();
         for statement in &program.statements {
             let owner_callable = scope_owners.get(&statement.scope_id).copied().flatten();
-            if owner_callable.is_none()
-                && !matches!(statement.kind, CheckedStatementKind::Function { .. })
-                && let Some(expression) = statement.value
-            {
-                if seen_program_roots.insert(expression) {
-                    program_schedule_roots.push(expression);
-                }
-                roots.push(VerifiedIntentRootV1 {
-                    kind: VerifiedIntentRootKindV1::ProgramSchedule,
-                    expression,
-                    owner_callable: None,
-                    declaration: statement_declaration(&statement.kind),
-                    statement: Some(statement.id),
-                });
-            }
-
             let Some(expression) = statement.value else {
                 continue;
             };
@@ -104,6 +88,30 @@ impl VerifiedSemanticIntentV1 {
                     statement.id.0, expression.0
                 )
             })?;
+            let is_program_schedule_root = owner_callable.is_none()
+                && !matches!(statement.kind, CheckedStatementKind::Function { .. })
+                && (statement.scope_id == program.root_scope
+                    || checked_expression.effect != boon_checked::CheckedEffectSummary::default()
+                    || matches!(
+                        statement.kind,
+                        CheckedStatementKind::Source { .. }
+                            | CheckedStatementKind::Hold { .. }
+                            | CheckedStatementKind::List { .. }
+                    ));
+            if is_program_schedule_root {
+                push_program_schedule_root(
+                    &mut program_schedule_roots,
+                    &mut seen_program_roots,
+                    expression,
+                );
+                roots.push(VerifiedIntentRootV1 {
+                    kind: VerifiedIntentRootKindV1::ProgramSchedule,
+                    expression,
+                    owner_callable: None,
+                    declaration: statement_declaration(&statement.kind),
+                    statement: Some(statement.id),
+                });
+            }
             if checked_expression.effect != boon_checked::CheckedEffectSummary::default() {
                 roots.push(VerifiedIntentRootV1 {
                     kind: VerifiedIntentRootKindV1::ConsequentialEffect,
@@ -281,6 +289,16 @@ impl VerifiedSemanticIntentV1 {
     }
 }
 
+fn push_program_schedule_root(
+    roots: &mut Vec<CheckedExprId>,
+    seen: &mut BTreeSet<CheckedExprId>,
+    expression: CheckedExprId,
+) {
+    if seen.insert(expression) {
+        roots.push(expression);
+    }
+}
+
 fn statement_declaration(kind: &CheckedStatementKind) -> Option<DeclId> {
     match kind {
         CheckedStatementKind::Function { declaration }
@@ -344,7 +362,12 @@ document: Document/new(root: [])
         );
         let (program, _) = checked.program.unwrap().into_parts();
         let intent = VerifiedSemanticIntentV1::build(&program, &[], BTreeSet::new()).unwrap();
-        assert_eq!(intent.program_schedule_roots().len(), 4);
+        assert_eq!(
+            intent.program_schedule_roots().len(),
+            3,
+            "schedule roots: {:#?}",
+            intent.program_schedule_roots()
+        );
         let kinds = intent
             .roots()
             .iter()

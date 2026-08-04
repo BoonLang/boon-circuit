@@ -820,6 +820,21 @@ Current cold-diagnostics candidate evidence:
   post-hoc execution-image scanner plus Manifest re-import owner. Then link
   ordinary/render code once across backend domains. Current edit-loop evidence
   is directional only; no cold phase or acceptance gate is closed.
+- The first construction-owned domain now removes production lowering replay
+  and bumps the proof contract to Manifest V7. Lowering emits 36,979 normalized
+  rows at its metadata/output/host construction stages; V7 seals them under an
+  explicit lowering namespace, leaving 36,183 legacy rows. The focused debug
+  NovyWave oracle preserves the 11,608-node/82,364-edge topology and passes.
+  Committing the already sealed metadata/contract digests eliminates two
+  duplicate aggregate serializations (about 434 ms in that debug trace), but
+  fine-grained metadata-row generation still costs about 737 ms. This exposes
+  a larger bridge: lowering copies checked expression/function/named-value type
+  tables into semantic DTOs, canonical-core lowering maps them back to checked
+  tables, and distributed/backend consumers scan them again. Replace that
+  round trip with diagnostic source-map rows, typed semantic interface rows,
+  and the existing execution/storage type owners; then delete all three checked
+  tables from the runnable core and their DTO/proof inventories. Do not optimize
+  the 36,979 transitional rows or retain a production compatibility adapter.
 - Do not preserve V3's 208k subject cardinality as a production V4/V5 proof
   requirement. The independent test oracle must map every historical subject
   to exactly one canonical finalized shard row and classifier field/domain and prove
@@ -1474,12 +1489,15 @@ project invalidation, and rebuild fan-out dominate.
    Delete eager body cloning and the late backend demand owner as parity gates
    pass.
 5. Migrate OUT/resource/reactive/lowering/storage/view/memory into the same
-   image in dependency order. Delete each rich graph and the duplicate
-   canonical-core mapping immediately after its independent source-driven
-   omission/mutation oracle and final consumer move. Iterate distributed
-   closure over compact summaries and relocations, never full semantic role
-   re-elaboration. Give verification only borrowed proof views and a receipt
-   after bundle link closure.
+   image in dependency order. Manifest V7's construction-owned lowering rows
+   are only the first transition edge: replace the lowering checked-type-table
+   round trip with diagnostic source-map rows, typed interface rows, and the
+   existing execution/storage type owners, then delete those DTOs and proof
+   inventories. Delete each rich graph and the duplicate canonical-core mapping
+   immediately after its independent source-driven omission/mutation oracle and
+   final consumer move. Iterate distributed closure over compact summaries and
+   relocations, never full semantic role re-elaboration. Give verification only
+   borrowed proof views and a receipt after bundle link closure.
 6. Carry ordinary executable definitions through one shared plan-code linker
    across document, row/scalar, and migration domains. Key verified variants by
    execution domain, resolved layout, overlay/control shape, and capability

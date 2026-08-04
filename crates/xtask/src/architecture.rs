@@ -772,7 +772,7 @@ fn verified_semantic_compiler_spine(workspace: &Path) -> Result<String, String> 
     for required in [
         "pub struct SemanticProgram",
         "pub fn elaborate(",
-        "CallableDependencyManifestV6",
+        "CallableDependencyManifestV7",
         "#[cfg(test)]\n    checked_program: CheckedProgramFields",
         "#[cfg(test)]\n    execution_graph: SemanticExecutionImageColumnsV1",
     ] {

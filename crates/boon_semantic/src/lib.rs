@@ -44,8 +44,8 @@ use std::fmt;
 pub const SEMANTIC_PROGRAM_SCHEMA_V1: &str = "boon.semantic-program.v1";
 pub const BUNDLE_SEMANTIC_PROGRAM_SCHEMA_V1: &str = "boon.bundle-semantic-program.v1";
 pub const DEPENDENCY_CLASSIFIER_SCHEMA_DIGEST_V1: [u8; 32] = [
-    0xf5, 0x34, 0x79, 0x17, 0xe4, 0x97, 0x74, 0xa8, 0x2a, 0xac, 0xa6, 0xb2, 0xa0, 0x80, 0xf2, 0x34,
-    0xcf, 0x45, 0x2a, 0x8e, 0x3a, 0x2f, 0xe4, 0xa5, 0xeb, 0xa4, 0x9b, 0x43, 0x10, 0x82, 0x62, 0x7d,
+    0x05, 0x79, 0xa8, 0x96, 0x2f, 0xad, 0xb8, 0x2a, 0x63, 0x8a, 0x6c, 0x01, 0x79, 0x73, 0x70, 0xd5,
+    0x2a, 0x35, 0xde, 0x5a, 0x9a, 0x52, 0xd7, 0x69, 0x34, 0x29, 0x10, 0x20, 0x7b, 0xda, 0xf0, 0x5d,
 ];
 pub const MAX_BUNDLE_SEMANTIC_PRODUCER_REQUESTS_V1: usize = 4_096;
 pub const MAX_BUNDLE_SEMANTIC_PRODUCER_REQUEST_BYTES_V1: usize = 4 * 1024 * 1024;
@@ -633,7 +633,7 @@ pub struct SemanticProgram {
     scope_storage_graph: SemanticScopeStorageGraphV1,
     memory_graph: SemanticMemoryGraphV1,
     canonical_core: program_core::CanonicalProgramCoreV1,
-    dependency_manifest: CallableDependencyManifestV6,
+    dependency_manifest: CallableDependencyManifestV7,
     digest: SemanticProgramDigestV1,
 }
 
@@ -782,7 +782,7 @@ impl SemanticProgram {
         self.digest
     }
 
-    pub const fn dependency_manifest(&self) -> &CallableDependencyManifestV6 {
+    pub const fn dependency_manifest(&self) -> &CallableDependencyManifestV7 {
         &self.dependency_manifest
     }
 
@@ -2917,9 +2917,9 @@ fn elaborate_with_representation(
         )
     )
     .map_err(|error| SemanticError::new(error.to_string()))?;
-    let lowering_contract = elaboration_phase!(
+    let lowering_build = elaboration_phase!(
         "build_semantic_lowering_contract",
-        lowering_contract::build_semantic_lowering_contract_from_validated_inputs(
+        lowering_contract::build_semantic_lowering_contract_with_dependency_rows(
             &checked_program,
             &execution_graph,
             &resource_graph,
@@ -2927,6 +2927,14 @@ fn elaborate_with_representation(
         )
     )
     .map_err(|error| SemanticError::new(error.to_string()))?;
+    let lowering_contract = lowering_build.contract;
+    let lowering_dependency_rows = lowering_build.dependency_rows;
+    if trace_elaboration {
+        eprintln!(
+            "boon_semantic construction_rows domain=lowering rows={}",
+            lowering_dependency_rows.len()
+        );
+    }
     let scope_storage_graph = elaboration_phase!(
         "build_semantic_scope_storage_graph",
         storage_contract::build_semantic_scope_storage_graph_from_validated_inputs(
@@ -2963,7 +2971,7 @@ fn elaborate_with_representation(
     .map_err(|error| SemanticError::new(error.to_string()))?;
     let dependency_manifest = elaboration_phase!(
         "build_callable_dependency_manifest",
-        build_callable_dependency_manifest_v6(
+        build_callable_dependency_manifest_v7(
             DEPENDENCY_CLASSIFIER_SCHEMA_DIGEST_V1,
             &checked_program,
             semantic_image_builder.checked_handoff(),
@@ -2974,6 +2982,7 @@ fn elaborate_with_representation(
             &resource_graph,
             &reactive_graph,
             &lowering_contract,
+            &lowering_dependency_rows,
             &view_binding_graph,
             &scope_storage_graph,
             &memory_graph,
@@ -6958,7 +6967,10 @@ seed: 0
             &semantic.lowering_contract,
         )
         .expect("mutated OUT owner has a fresh deterministic memory graph");
-        semantic.dependency_manifest = build_callable_dependency_manifest_v6(
+        let lowering_dependency_rows =
+            lowering_contract::lowering_dependency_rows(&semantic.lowering_contract)
+                .expect("mutated lowering contract has construction dependency rows");
+        semantic.dependency_manifest = build_callable_dependency_manifest_v7(
             DEPENDENCY_CLASSIFIER_SCHEMA_DIGEST_V1,
             &semantic.checked_program,
             semantic.semantic_image.checked_handoff(),
@@ -6969,6 +6981,7 @@ seed: 0
             &semantic.resource_graph,
             &semantic.reactive_graph,
             &semantic.lowering_contract,
+            &lowering_dependency_rows,
             &semantic.view_binding_graph,
             &semantic.scope_storage_graph,
             &semantic.memory_graph,

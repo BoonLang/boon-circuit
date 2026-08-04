@@ -619,6 +619,12 @@ Current checkpoints to preserve and audit rather than redo:
   to `CompilerSession`; its current whole-checked-slot invalidation cannot pass
   warm gates. Preserve full-handoff and clean-full paths only as independent
   test oracles, never production fallbacks;
+- preserve the landed V3 construction route spine: stable checked-definition
+  routes and dense parent-linked invocation overlays are prepared before
+  semantic rows under independent V3 digest domains, consumed by the V2 oracle,
+  and discarded after sealing. Continue directly into compact executable-row
+  and CSR publication and delete the V2 47,296-row mirror; the route checkpoint
+  alone is not a speed result or phase exit;
 - move verified-intent demand collection before occurrence expansion and
   backend lowering. Split top-level authority/interface summaries from the
   final program-link sink, and version the callable interface schema before

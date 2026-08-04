@@ -398,6 +398,15 @@ stronger three-reviewer performance closure defined below.
    `CompilerSession` snapshot/request database; the current whole-checked-slot
    invalidation is not a warm compiler.
 
+   V3 construction routes now complete the first prerequisite: checked
+   projections resolve to stable definition/interface owners once, and every
+   OUT occurrence has one dense parent-linked invocation overlay with versioned
+   path/key/table receipts before semantic rows are built. The transitional V2
+   handoff consumes this table and the table is discarded after sealing. The
+   exact NovyWave oracle and semantic test compilation pass. Continue into
+   direct compact executable rows and CSR relocations; do not score the route
+   checkpoint while the V2 47,296-row mirror remains.
+
    The post-`ac2b234` high-level audit supersedes a mutating post-resource
    execution seal. Move inline list-authority synthesis into execution
    construction, seal immutable execution once, and make the resource typed

@@ -885,6 +885,14 @@ Current cold-diagnostics candidate evidence:
   immutable unit and request results; clearing the whole checked slot on every
   update cannot satisfy any warm gate. See the architecture plan's fifth audit
   for the schema and flag-day order.
+- The first V3 execution implementation slice now constructs stable checked-
+  definition routes and dense parent-linked invocation overlays before semantic
+  rows, under separate versioned path/overlay/table digest domains. The V2
+  oracle consumes that construction table and no longer rediscovers invocation
+  ancestry; the table is discarded after sealing. Focused compilation and the
+  exact ignored NovyWave oracle pass. Do not score this identity checkpoint:
+  direct executable row/CSR publication and deletion of the V2 rich-row mirror
+  are still required before remeasurement counts as progress toward a gate.
 - Do not preserve V3's 208k subject cardinality as a production V4/V5 proof
   requirement. The independent test oracle must map every historical subject
   to exactly one canonical finalized shard row and classifier field/domain and prove

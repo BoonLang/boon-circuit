@@ -15148,6 +15148,20 @@ fields = [
 [[records]]
 kind = "struct"
 source = "crates/boon_semantic/src/semantic_image.rs"
+name = "ExecutionInvocationOverlayV3"
+fields = [
+  { name = "occurrence", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "parent", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "root", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "authored_call_site", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "definition", disposition = "r-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "stable_path_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+  { name = "stable_key_digest", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },
+]
+
+[[records]]
+kind = "struct"
+source = "crates/boon_semantic/src/semantic_image.rs"
 name = "ExecutionImageHandoffV2"
 fields = [
   { name = "schema", disposition = "a-fca-priv-sp-id-pc-n", reviewed = true },

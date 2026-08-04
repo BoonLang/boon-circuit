@@ -25,6 +25,7 @@ use std::marker::PhantomData;
 
 pub const SEMANTIC_IMAGE_SCHEMA_V2: &str = "boon.semantic-image.v2";
 pub const EXECUTION_IMAGE_HANDOFF_SCHEMA_V2: &str = "boon.execution-image-handoff.v2";
+pub const EXECUTION_CONSTRUCTION_ROUTES_SCHEMA_V3: &str = "boon.execution-construction-routes.v3";
 
 const EXECUTION_INVOCATION_PATH_DOMAIN_V2: &[u8] = b"boon.execution-invocation-path.v2\0";
 const EXECUTION_IMAGE_PROJECTION_KEY_DOMAIN_V2: &[u8] = b"boon.execution-image-projection-key.v2\0";
@@ -33,6 +34,9 @@ const EXECUTION_IMAGE_ROW_DOMAIN_V2: &[u8] = b"boon.execution-image-row.v2\0";
 const EXECUTION_IMAGE_SHARD_DOMAIN_V2: &[u8] = b"boon.execution-image-shard.v2\0";
 const EXECUTION_IMAGE_HANDOFF_DOMAIN_V2: &[u8] = b"boon.execution-image-handoff.v2\0";
 const SEMANTIC_IMAGE_SEAL_DOMAIN_V2: &[u8] = b"boon.semantic-image-seal.v2\0";
+const EXECUTION_INVOCATION_PATH_DOMAIN_V3: &[u8] = b"boon.execution-invocation-path.v3\0";
+const EXECUTION_INVOCATION_OVERLAY_DOMAIN_V3: &[u8] = b"boon.execution-invocation-overlay.v3\0";
+const EXECUTION_CONSTRUCTION_ROUTES_DOMAIN_V3: &[u8] = b"boon.execution-construction-routes.v3\0";
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -123,6 +127,70 @@ pub struct ExecutionImageEntityRouteV2 {
     pub domain: ExecutionImageRowDomainV2,
     pub dense_index: u32,
     pub projection: ExecutionImageProjectionIdV2,
+}
+
+/// One concrete invocation overlay prepared before semantic row construction.
+/// Stable checked definitions remain owned by the checked image; this record
+/// carries only occurrence ancestry and the exact definition route needed by
+/// execution-owned rows.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ExecutionInvocationOverlayV3 {
+    pub occurrence: OutCallInstanceId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<OutCallInstanceId>,
+    pub root: DistributedCallOccurrenceRoot,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authored_call_site: Option<CheckedImageProjectionIdV2>,
+    pub definition: CheckedImageProjectionIdV2,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stable_path_digest: Option<[u8; 32]>,
+    pub stable_key_digest: [u8; 32],
+}
+
+#[derive(Serialize)]
+struct ExecutionInvocationOverlayFingerprintV3 {
+    root: DistributedCallOccurrenceRoot,
+    definition_digest: [u8; 32],
+    path_digest: Option<[u8; 32]>,
+}
+
+/// Construction-time definition and invocation routes. This table is built
+/// before execution rows and is deliberately discarded after the transitional
+/// V2 handoff seals. It becomes the route spine for direct V3 row publication;
+/// it is not retained beside the final image as a duplicate owner.
+pub(crate) struct ExecutionConstructionRoutesV3 {
+    definition_by_checked_projection: Vec<CheckedImageProjectionIdV2>,
+    invocations: Vec<ExecutionInvocationOverlayV3>,
+    local_digest: [u8; 32],
+}
+
+impl ExecutionConstructionRoutesV3 {
+    fn definition_projection(
+        &self,
+        projection: CheckedImageProjectionIdV2,
+    ) -> Result<CheckedImageProjectionIdV2, String> {
+        self.definition_by_checked_projection
+            .get(projection.as_usize())
+            .copied()
+            .ok_or_else(|| {
+                format!(
+                    "execution construction routes have no definition for checked projection {}",
+                    projection.0
+                )
+            })
+    }
+
+    fn invocation(
+        &self,
+        occurrence: OutCallInstanceId,
+    ) -> Result<&ExecutionInvocationOverlayV3, String> {
+        self.invocations
+            .get(occurrence.as_usize())
+            .filter(|overlay| overlay.occurrence == occurrence)
+            .ok_or_else(|| {
+                format!("execution construction routes have no dense invocation {occurrence}")
+            })
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -236,6 +304,7 @@ struct PostResourceValidatedV2;
 
 pub(crate) struct SemanticImageBuilder<State> {
     checked_handoff: CheckedImageHandoffV2,
+    execution_routes: ExecutionConstructionRoutesV3,
     execution: SemanticExecutionImageColumnsV1,
     execution_handoff: Option<ExecutionImageHandoffV2>,
     state: PhantomData<State>,
@@ -244,6 +313,7 @@ pub(crate) struct SemanticImageBuilder<State> {
 impl SemanticImageBuilder<ExecutionPending> {
     pub(crate) fn execution_pending(
         checked_handoff: CheckedImageHandoffV2,
+        execution_routes: ExecutionConstructionRoutesV3,
         execution: SemanticExecutionImageColumnsV1,
     ) -> Result<Self, String> {
         if checked_handoff.schema != CHECKED_IMAGE_HANDOFF_SCHEMA_V2 {
@@ -254,6 +324,7 @@ impl SemanticImageBuilder<ExecutionPending> {
         }
         Ok(Self {
             checked_handoff,
+            execution_routes,
             execution,
             execution_handoff: None,
             state: PhantomData,
@@ -289,10 +360,15 @@ impl SemanticImageBuilder<ExecutionPending> {
         _witness: PostResourceValidatedV2,
         out: &ResolvedOutGraph,
     ) -> Result<SemanticImageBuilder<ExecutionFinalized>, String> {
-        let execution_handoff =
-            execution_image_handoff(&self.checked_handoff, out, &self.execution)?;
+        let execution_handoff = execution_image_handoff(
+            &self.checked_handoff,
+            &self.execution_routes,
+            out,
+            &self.execution,
+        )?;
         Ok(SemanticImageBuilder {
             checked_handoff: self.checked_handoff,
+            execution_routes: self.execution_routes,
             execution: self.execution,
             execution_handoff: Some(execution_handoff),
             state: PhantomData,
@@ -322,6 +398,7 @@ impl SemanticImageBuilder<ExecutionFinalized> {
         let schema = SEMANTIC_IMAGE_SCHEMA_V2.to_owned();
         let seal_digest =
             semantic_image_seal_digest(&schema, &self.checked_handoff, &execution_handoff)?;
+        let _execution_routes = self.execution_routes;
         Ok(SealedSemanticImageV2 {
             schema,
             checked_handoff: self.checked_handoff,
@@ -378,7 +455,7 @@ struct PendingExecutionProjectionV2 {
 
 struct ExecutionImageHandoffBuilderV2<'a> {
     checked: &'a CheckedImageHandoffV2,
-    definition_by_checked_projection: Vec<CheckedImageProjectionIdV2>,
+    construction_routes: &'a ExecutionConstructionRoutesV3,
     path_ids: BTreeMap<
         (
             Option<ExecutionInvocationPathIdV2>,
@@ -399,45 +476,19 @@ struct ExecutionImageHandoffBuilderV2<'a> {
 }
 
 impl<'a> ExecutionImageHandoffBuilderV2<'a> {
-    fn new(checked: &'a CheckedImageHandoffV2) -> Result<Self, String> {
-        let mut by_owner = BTreeMap::<
-            &boon_checked::CheckedShardOwnerKeyV2,
-            (
-                Option<CheckedImageProjectionIdV2>,
-                Option<CheckedImageProjectionIdV2>,
-            ),
-        >::new();
-        for (index, projection) in checked.projections.iter().enumerate() {
-            let id = CheckedImageProjectionIdV2(
-                u32::try_from(index).map_err(|_| "checked image projection index exceeds u32")?,
+    fn new(
+        checked: &'a CheckedImageHandoffV2,
+        construction_routes: &'a ExecutionConstructionRoutesV3,
+    ) -> Result<Self, String> {
+        if construction_routes.definition_by_checked_projection.len() != checked.projections.len() {
+            return Err(
+                "execution construction definition routes do not cover checked projections"
+                    .to_owned(),
             );
-            let entry = by_owner.entry(&projection.stable_key.owner).or_default();
-            let slot = match projection.stable_key.region {
-                CheckedShardRegionV2::Definition => &mut entry.0,
-                CheckedShardRegionV2::Interface => &mut entry.1,
-                _ => continue,
-            };
-            if slot.replace(id).is_some() {
-                return Err(format!(
-                    "checked owner {:?} has duplicate interface/definition projections",
-                    projection.stable_key.owner
-                ));
-            }
         }
-        let definition_by_checked_projection = checked
-            .projections
-            .iter()
-            .enumerate()
-            .map(|(index, projection)| {
-                by_owner
-                    .get(&projection.stable_key.owner)
-                    .and_then(|(definition, interface)| (*definition).or(*interface))
-                    .unwrap_or(CheckedImageProjectionIdV2(index as u32))
-            })
-            .collect();
         Ok(Self {
             checked,
-            definition_by_checked_projection,
+            construction_routes,
             path_ids: BTreeMap::new(),
             path_digest_ids: BTreeMap::new(),
             paths: Vec::new(),
@@ -464,15 +515,7 @@ impl<'a> ExecutionImageHandoffBuilderV2<'a> {
         &self,
         projection: CheckedImageProjectionIdV2,
     ) -> Result<CheckedImageProjectionIdV2, String> {
-        self.definition_by_checked_projection
-            .get(projection.as_usize())
-            .copied()
-            .ok_or_else(|| {
-                format!(
-                    "execution image has no definition route for checked projection {}",
-                    projection.0
-                )
-            })
+        self.construction_routes.definition_projection(projection)
     }
 
     fn append_path(
@@ -748,7 +791,7 @@ impl<'a> ExecutionImageHandoffBuilderV2<'a> {
         }
         let Self {
             checked: _,
-            definition_by_checked_projection: _,
+            construction_routes: _,
             path_ids: _,
             path_digest_ids,
             paths,
@@ -908,6 +951,204 @@ fn checked_projection(
         })
 }
 
+fn checked_definition_routes(
+    checked: &CheckedImageHandoffV2,
+) -> Result<Vec<CheckedImageProjectionIdV2>, String> {
+    let mut by_owner = BTreeMap::<
+        &boon_checked::CheckedShardOwnerKeyV2,
+        (
+            Option<CheckedImageProjectionIdV2>,
+            Option<CheckedImageProjectionIdV2>,
+        ),
+    >::new();
+    for (index, projection) in checked.projections.iter().enumerate() {
+        let id = CheckedImageProjectionIdV2(
+            u32::try_from(index).map_err(|_| "checked image projection index exceeds u32")?,
+        );
+        let entry = by_owner.entry(&projection.stable_key.owner).or_default();
+        let slot = match projection.stable_key.region {
+            CheckedShardRegionV2::Definition => &mut entry.0,
+            CheckedShardRegionV2::Interface => &mut entry.1,
+            _ => continue,
+        };
+        if slot.replace(id).is_some() {
+            return Err(format!(
+                "checked owner {:?} has duplicate interface/definition projections",
+                projection.stable_key.owner
+            ));
+        }
+    }
+    Ok(checked
+        .projections
+        .iter()
+        .enumerate()
+        .map(|(index, projection)| {
+            by_owner
+                .get(&projection.stable_key.owner)
+                .and_then(|(definition, interface)| (*definition).or(*interface))
+                .unwrap_or(CheckedImageProjectionIdV2(index as u32))
+        })
+        .collect())
+}
+
+pub(crate) fn execution_construction_routes_v3(
+    checked: &CheckedImageHandoffV2,
+    out: &ResolvedOutGraph,
+) -> Result<ExecutionConstructionRoutesV3, String> {
+    let trace_started = std::env::var_os("BOON_SEMANTIC_TRACE")
+        .is_some()
+        .then(std::time::Instant::now);
+    let definition_by_checked_projection = checked_definition_routes(checked)?;
+    let producer_roots = out
+        .producer_roots()
+        .iter()
+        .map(|root| (root.call, root.spec.identity))
+        .collect::<BTreeMap<_, _>>();
+    let mut invocations =
+        Vec::<ExecutionInvocationOverlayV3>::with_capacity(out.call_instances.len());
+    let mut stable_digest_owner = BTreeMap::<[u8; 32], OutCallInstanceId>::new();
+    for instance in &out.call_instances {
+        if instance.id.as_usize() != invocations.len() {
+            return Err(format!(
+                "OUT call instance {} is not dense while preparing execution routes",
+                instance.id
+            ));
+        }
+        let (root, parent_path_digest) = match instance.parent {
+            Some(parent) => {
+                let parent_overlay = invocations.get(parent.as_usize()).ok_or_else(|| {
+                    format!("OUT call {} has missing parent {parent}", instance.id)
+                })?;
+                (parent_overlay.root, parent_overlay.stable_path_digest)
+            }
+            None => (
+                producer_roots
+                    .get(&instance.id)
+                    .copied()
+                    .map(DistributedCallOccurrenceRoot::Producer)
+                    .unwrap_or(DistributedCallOccurrenceRoot::Program),
+                None,
+            ),
+        };
+        let (authored_call_site, stable_path_digest) = if producer_roots.contains_key(&instance.id)
+        {
+            if instance.parent.is_some() {
+                return Err(format!(
+                    "producer-root OUT call {} unexpectedly has a parent",
+                    instance.id
+                ));
+            }
+            (None, None)
+        } else {
+            let checked_call = instance.provenance.call_id.ok_or_else(|| {
+                format!(
+                    "non-producer OUT call {} has no checked call identity",
+                    instance.id
+                )
+            })?;
+            let projection = checked_projection(
+                checked,
+                CheckedImageRowDomainV2::Call,
+                checked_call.0 as usize,
+            )?;
+            let projection_record = checked.projection(projection).ok_or_else(|| {
+                format!(
+                    "execution route references missing checked call projection {}",
+                    projection.0
+                )
+            })?;
+            if !matches!(
+                projection_record.stable_key.region,
+                CheckedShardRegionV2::Invocation { .. }
+            ) {
+                return Err(format!(
+                    "checked call {} does not route to an invocation shard",
+                    checked_call.0
+                ));
+            }
+            let digest = boon_contract::canonical_serde_hash_v1(
+                EXECUTION_INVOCATION_PATH_DOMAIN_V3,
+                &(parent_path_digest, projection_record.stable_key_digest),
+            )
+            .map_err(|error| format!("failed to hash execution V3 invocation path: {error}"))?;
+            (Some(projection), Some(digest))
+        };
+        let callable_projection = checked_projection(
+            checked,
+            CheckedImageRowDomainV2::Callable,
+            instance.provenance.callable.0 as usize,
+        )?;
+        let definition = definition_by_checked_projection
+            .get(callable_projection.as_usize())
+            .copied()
+            .ok_or_else(|| {
+                format!(
+                    "execution route has no definition for checked callable projection {}",
+                    callable_projection.0
+                )
+            })?;
+        let definition_digest = checked
+            .projection(definition)
+            .ok_or_else(|| {
+                format!(
+                    "execution route references missing checked definition projection {}",
+                    definition.0
+                )
+            })?
+            .stable_key_digest;
+        let stable_key_digest = boon_contract::canonical_serde_hash_v1(
+            EXECUTION_INVOCATION_OVERLAY_DOMAIN_V3,
+            &ExecutionInvocationOverlayFingerprintV3 {
+                root,
+                definition_digest,
+                path_digest: stable_path_digest,
+            },
+        )
+        .map_err(|error| format!("failed to hash execution V3 invocation overlay: {error}"))?;
+        if let Some(previous) = stable_digest_owner.insert(stable_key_digest, instance.id) {
+            return Err(format!(
+                "execution V3 invocation overlay digest collides between {previous} and {}",
+                instance.id
+            ));
+        }
+        invocations.push(ExecutionInvocationOverlayV3 {
+            occurrence: instance.id,
+            parent: instance.parent,
+            root,
+            authored_call_site,
+            definition,
+            stable_path_digest,
+            stable_key_digest,
+        });
+    }
+    let local_digest = boon_contract::canonical_serde_hash_v1(
+        EXECUTION_CONSTRUCTION_ROUTES_DOMAIN_V3,
+        &(
+            EXECUTION_CONSTRUCTION_ROUTES_SCHEMA_V3,
+            checked.source_bundle_digest_v1,
+            checked.role,
+            checked.local_image_digest,
+            &definition_by_checked_projection,
+            &invocations,
+        ),
+    )
+    .map_err(|error| format!("failed to hash execution V3 construction routes: {error}"))?;
+    let routes = ExecutionConstructionRoutesV3 {
+        definition_by_checked_projection,
+        invocations,
+        local_digest,
+    };
+    if let Some(started) = trace_started {
+        eprintln!(
+            "boon_semantic execution_routes_v3 definitions={} invocations={} elapsed_ms={:.3}",
+            routes.definition_by_checked_projection.len(),
+            routes.invocations.len(),
+            started.elapsed().as_secs_f64() * 1_000.0,
+        );
+    }
+    Ok(routes)
+}
+
 fn checked_execution_projection(
     builder: &mut ExecutionImageHandoffBuilderV2<'_>,
     domain: CheckedImageRowDomainV2,
@@ -919,80 +1160,45 @@ fn checked_execution_projection(
 
 fn call_instance_projections(
     builder: &mut ExecutionImageHandoffBuilderV2<'_>,
-    out: &ResolvedOutGraph,
 ) -> Result<Vec<PendingExecutionProjectionIdV2>, String> {
-    let producer_roots = out
-        .producer_roots()
-        .iter()
-        .map(|root| (root.call, root.spec.identity))
-        .collect::<BTreeMap<_, _>>();
-    let mut projections: Vec<PendingExecutionProjectionIdV2> =
-        Vec::with_capacity(out.call_instances.len());
-    for instance in &out.call_instances {
-        if instance.id.as_usize() != projections.len() {
+    let invocation_count = builder.construction_routes.invocations.len();
+    let mut projections = Vec::<PendingExecutionProjectionIdV2>::with_capacity(invocation_count);
+    let mut paths = Vec::<Option<ExecutionInvocationPathIdV2>>::with_capacity(invocation_count);
+    for index in 0..invocation_count {
+        let occurrence = OutCallInstanceId(index);
+        let (overlay_occurrence, parent, root, authored_call_site, definition) = {
+            let overlay = builder.construction_routes.invocation(occurrence)?;
+            (
+                overlay.occurrence,
+                overlay.parent,
+                overlay.root,
+                overlay.authored_call_site,
+                overlay.definition,
+            )
+        };
+        if overlay_occurrence != occurrence {
             return Err(format!(
-                "OUT call instance {} is not dense while sealing execution image",
-                instance.id
+                "execution construction invocation {overlay_occurrence} is noncanonical at {index}"
             ));
         }
-        let (root, mut call_path) = match instance.parent {
-            Some(parent) => {
-                let parent_projection = projections.get(parent.as_usize()).ok_or_else(|| {
-                    format!("OUT call {} has missing parent {parent}", instance.id)
-                })?;
-                let SemanticImageProjectionIdentityV2::Invocation {
-                    root,
-                    definition: _,
-                    call_path,
-                } = builder.identity(*parent_projection)?
-                else {
-                    return Err(format!(
-                        "OUT call {} parent does not have an invocation projection",
-                        instance.id
-                    ));
-                };
-                (root, call_path)
-            }
-            None => (
-                producer_roots
-                    .get(&instance.id)
-                    .copied()
-                    .map(DistributedCallOccurrenceRoot::Producer)
-                    .unwrap_or(DistributedCallOccurrenceRoot::Program),
-                None,
-            ),
-        };
-        if !producer_roots.contains_key(&instance.id) {
-            let checked_call = instance.provenance.call_id.ok_or_else(|| {
-                format!(
-                    "non-producer OUT call {} has no checked call identity",
-                    instance.id
-                )
-            })?;
-            let projection = checked_projection(
-                builder.checked,
-                CheckedImageRowDomainV2::Call,
-                checked_call.0 as usize,
-            )?;
-            let projection_record = builder.checked_projection(projection)?;
-            if !matches!(
-                projection_record.stable_key.region,
-                CheckedShardRegionV2::Invocation { .. }
-            ) {
-                return Err(format!(
-                    "checked call {} does not route to an invocation shard",
-                    checked_call.0
-                ));
-            }
-            call_path = Some(builder.append_path(call_path, projection)?);
+        let parent_path = parent
+            .map(|parent| {
+                paths.get(parent.as_usize()).copied().ok_or_else(|| {
+                    format!("execution invocation {occurrence} has missing parent {parent}")
+                })
+            })
+            .transpose()?
+            .flatten();
+        let call_path = authored_call_site
+            .map(|call_site| builder.append_path(parent_path, call_site))
+            .transpose()?;
+        if authored_call_site.is_none() && parent.is_some() {
+            return Err(format!(
+                "execution invocation {occurrence} has a parent but no authored call site"
+            ));
         }
-        let callable_projection = checked_projection(
-            builder.checked,
-            CheckedImageRowDomainV2::Callable,
-            instance.provenance.callable.0 as usize,
-        )?;
-        let definition_projection = builder.definition_projection(callable_projection)?;
-        projections.push(builder.invocation(root, definition_projection, call_path)?);
+        paths.push(call_path);
+        projections.push(builder.invocation(root, definition, call_path)?);
     }
     Ok(projections)
 }
@@ -1187,13 +1393,23 @@ fn trace_execution_handoff_phase(enabled: bool, name: &str, started: &mut std::t
 
 fn execution_image_handoff(
     checked: &CheckedImageHandoffV2,
+    construction_routes: &ExecutionConstructionRoutesV3,
     out: &ResolvedOutGraph,
     execution: &SemanticExecutionImageColumnsV1,
 ) -> Result<ExecutionImageHandoffV2, String> {
     let trace_handoff = std::env::var_os("BOON_SEMANTIC_TRACE").is_some();
     let mut trace_started = std::time::Instant::now();
-    let mut builder = ExecutionImageHandoffBuilderV2::new(checked)?;
-    let invocations = call_instance_projections(&mut builder, out)?;
+    if trace_handoff {
+        eprintln!(
+            "boon_semantic execution_routes_v3 receipt_prefix={:02x}{:02x}{:02x}{:02x}",
+            construction_routes.local_digest[0],
+            construction_routes.local_digest[1],
+            construction_routes.local_digest[2],
+            construction_routes.local_digest[3],
+        );
+    }
+    let mut builder = ExecutionImageHandoffBuilderV2::new(checked, construction_routes)?;
+    let invocations = call_instance_projections(&mut builder)?;
     let owner_projections = owner_projections(out, &invocations)?;
     trace_execution_handoff_phase(trace_handoff, "projection_setup", &mut trace_started);
 

@@ -1434,6 +1434,19 @@ The trace-only phase/count instrumentation remains in the semantic compiler so
 future measurements distinguish row families and representation cardinality.
 It is evidence tooling, not an optimization or an acceptance gate.
 
+The first fifth-audit implementation slice now establishes that route spine.
+`ExecutionConstructionRoutesV3` is created before semantic execution rows. It
+resolves each checked projection to its stable definition/interface owner once
+and publishes one dense, parent-linked invocation overlay for every OUT call
+occurrence, with separate V3 path, overlay, and table digest domains. The
+transitional V2 handoff consumes these routes instead of rediscovering call
+ancestry and definition ownership, after which the V3 construction table is
+discarded rather than retained as a second image. The exact ignored NovyWave
+semantic oracle and `boon_semantic --tests` compiler check pass. This is the
+identity/route prerequisite for construction-owned executable rows; it is not
+yet a cold or warm speed result and the V2 full-row mirror still must be
+deleted.
+
 ## Architectural Decisions
 
 ### 1. Activation Is A First-Class Output, Not An Empty Mount

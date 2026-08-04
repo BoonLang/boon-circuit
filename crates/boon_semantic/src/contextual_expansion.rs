@@ -18,7 +18,7 @@ use crate::execution::{
 };
 use crate::{
     ExecutionPending, OutCallInstanceId, OutInputValue, OutNetId, ResolvedOutGraph as OutNet,
-    ScopedCheckedExpr, SemanticImageBuilder, StaticOwnerId,
+    ScopedCheckedExpr, SemanticImageBuilder, StaticOwnerId, execution_construction_routes_v3,
 };
 use boon_checked::{
     CheckedCallEntry, CheckedCallId, CheckedCallableKind, CheckedContextBinding,
@@ -1499,6 +1499,8 @@ pub(crate) fn derive_semantic_execution_graph(
     required_ordinary_definitions: &BTreeSet<SemanticCallableId>,
     retain_ordinary_calls: bool,
 ) -> Result<SemanticImageBuilder<ExecutionPending>, ExpansionError> {
+    let execution_routes = execution_construction_routes_v3(&checked_handoff, out_net)
+        .map_err(ExpansionError::InvalidLocalBindings)?;
     let lookup = CheckedProgramLookup::new(program);
     let semantic_scope_ids = program
         .scopes
@@ -2447,7 +2449,7 @@ pub(crate) fn derive_semantic_execution_graph(
             .collect(),
         checked_expression_origins: arena.checked_expression_origins,
     };
-    SemanticImageBuilder::execution_pending(checked_handoff, execution)
+    SemanticImageBuilder::execution_pending(checked_handoff, execution_routes, execution)
         .map_err(ExpansionError::InvalidLocalBindings)
 }
 

@@ -390,6 +390,8 @@ pub struct ParsedProgramFields {
     pub operators: Vec<String>,
     #[serde(skip)]
     pub occurrence_routes: Vec<Option<StableOccurrenceRoute>>,
+    #[serde(skip)]
+    pub expression_route_digests_v1: Vec<Option<[u8; 32]>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -572,12 +574,31 @@ pub struct UnitItemIndex {
 }
 
 impl UnitItemIndex {
+    pub fn owners(&self) -> impl Iterator<Item = &UnitItemIndexEntry> {
+        self.entries.iter()
+    }
+
     pub fn definitions(&self) -> impl Iterator<Item = &UnitItemIndexEntry> {
         self.entries.iter().filter(|entry| entry.is_definition())
     }
 }
 
+/// Stable compiler identity of one authored executable owner.
+///
+/// Fields, sources, holds, lists, and functions are all owners. This keeps
+/// top-level document state and list initializers out of a monolithic program
+/// root and gives persistent checking/lowering requests a body-insensitive key.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct StableOwnerKey {
+    pub source_unit_id: SourceUnitId,
+    pub item_route: StableItemRoute,
+}
+
 /// Stable compiler identity of one authored definition.
+///
+/// This function-only key remains distinct from [`StableOwnerKey`]: callers
+/// that accept a definition must not accidentally accept an arbitrary authored
+/// state/list owner.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct StableDefinitionKey {
     pub source_unit_id: SourceUnitId,
@@ -661,6 +682,19 @@ pub struct StableOccurrenceKey {
     pub route: StableOccurrenceRoute,
 }
 
+/// Stable compiler identity for one syntax expression across source revisions.
+///
+/// The digest commits only the parser-owned structural route: authored item
+/// owner, statement route, and expression parent/child roles. Source text,
+/// byte/line positions, packed syntax ids, and checked dense slots are not
+/// part of this identity. The parser collision-checks every digest inside its
+/// source unit before publishing the opaque artifact.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct StableExpressionKey {
+    pub source_unit_id: SourceUnitId,
+    pub route_digest_v1: [u8; 32],
+}
+
 /// Public read-only schema projected by an opaque parser-produced source unit.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct ParsedSourceUnitFields {
@@ -672,6 +706,8 @@ pub struct ParsedSourceUnitFields {
     pub item_index: UnitItemIndex,
     #[serde(skip)]
     pub occurrence_routes: Vec<Option<StableOccurrenceRoute>>,
+    #[serde(skip)]
+    pub expression_route_digests_v1: Vec<Option<[u8; 32]>>,
 }
 
 impl ParsedSourceFile {

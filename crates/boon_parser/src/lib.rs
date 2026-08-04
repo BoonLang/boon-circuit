@@ -196,6 +196,12 @@ fn into_unit_syntax_snapshot_with_work(
     link_key: ProjectUnitLinkKey,
     work: &ParseWorkRecorder,
 ) -> Result<UnitSyntaxSnapshot, ParseError> {
+    // `ParsedSourceUnit` is an opaque, parser-produced validation seal. Project
+    // linking changes only module spellings and the syntax lookup encoding;
+    // neither operation can change token policy, delimiter balance, list
+    // capacities, reducer syntax, hidden identities, or AST topology. Rebuilding
+    // `ValidationIndex` and replaying every source policy here used to turn a
+    // reusable unit into another whole-unit validation pass.
     if let Some(module) = link_key.module.as_deref() {
         let functions_by_module = BTreeMap::from([(
             module.to_owned(),
@@ -203,32 +209,6 @@ fn into_unit_syntax_snapshot_with_work(
         )]);
         namespace_source_unit_module(&mut parsed.fields.ast, module, &functions_by_module, work);
     }
-    let validation_index = ValidationIndex::build(&parsed.fields.ast, work);
-    validate_source_syntax_with_work(
-        &parsed.fields.path,
-        &parsed.fields.ast,
-        &validation_index,
-        work,
-    )?;
-    validate_balanced_brackets_with_work(&parsed.fields.path, &parsed.fields.ast, work)?;
-    validate_list_capacities_with_work(
-        &parsed.fields.path,
-        &parsed.fields.ast,
-        &validation_index,
-        work,
-    )?;
-    validate_no_reducer_style_update_with_work(
-        &parsed.fields.path,
-        &parsed.fields.ast,
-        &validation_index,
-        work,
-    )?;
-    validate_no_hidden_identity_leak_with_work(
-        &parsed.fields.path,
-        &parsed.fields.ast,
-        &validation_index,
-        work,
-    )?;
     pack_source_unit_syntax_ids(
         &parsed.fields.path,
         &mut parsed.fields.ast,
@@ -242,8 +222,9 @@ fn into_unit_syntax_snapshot_with_work(
     })
 }
 
-/// Project-link one freshly parsed unit and return deterministic validation /
-/// namespace work. Session cache hits never call this function.
+/// Project-link one freshly parsed unit and return deterministic namespace work.
+/// Source validation belongs to the opaque parser artifact and is not replayed;
+/// session cache hits never call this function.
 pub fn link_project_source_unit_profiled(
     parsed: ParsedSourceUnit,
     link_key: ProjectUnitLinkKey,
@@ -1039,10 +1020,6 @@ impl<'a> ProjectExpressionArena<'a> {
         (expression.id == expression_id).then_some(expression)
     }
 
-    pub fn get_slot(self, slot: usize) -> Option<&'a AstExpr> {
-        self.get(self.project.expression_id_for_slot(slot)?)
-    }
-
     pub fn iter(self) -> ProjectExpressionIter<'a> {
         ProjectExpressionIter {
             units: self.project.fields.units.iter(),
@@ -1691,13 +1668,14 @@ fn parse_project_syntax_with_work(
         reject_reserved_module_path(unit.path())?;
         let source_unit_id = SourceUnitId::from_path(unit.path())
             .map_err(|error| source_unit_parse_error(unit.path(), error))?;
-        let (parsed, _) = parse_normalized_source_unit_syntax(
+        let (parsed, validation_index) = parse_normalized_source_unit_syntax(
             source_unit_id,
             unit.source().to_owned(),
             ParserTrace::from_environment(),
-            ValidationIndexScope::Boundary,
+            ValidationIndexScope::Full,
             work,
         )?;
+        validate_project_source_unit_with_work(&parsed, &validation_index, work)?;
         raw_units.push(parsed);
     }
     drop(bundle);
@@ -1734,14 +1712,15 @@ fn parse_project_source_unit_with_work(
         .map_err(|error| source_unit_parse_error(&input_path, error))?;
     let path = source_unit_id.as_str().to_owned();
     reject_reserved_module_path(&path)?;
-    parse_normalized_source_unit_syntax(
+    let (parsed, validation_index) = parse_normalized_source_unit_syntax(
         source_unit_id,
         source,
         ParserTrace::from_environment(),
-        ValidationIndexScope::Boundary,
+        ValidationIndexScope::Full,
         work,
-    )
-    .map(|(unit, _validation_index)| unit)
+    )?;
+    validate_project_source_unit_with_work(&parsed, &validation_index, work)?;
+    Ok(parsed)
 }
 
 fn parse_source_unit_with_work(
@@ -1770,11 +1749,27 @@ fn parse_source_unit_with_work(
     Ok(parsed)
 }
 
+/// Complete the source-policy checks owned by a project parser unit before it
+/// can become an opaque [`ParsedSourceUnit`]. Project linking is deliberately
+/// absent from this function: module qualification and packed lookup ids are
+/// structure-preserving projections over this already-validated artifact.
+fn validate_project_source_unit_with_work(
+    parsed: &ParsedSourceUnit,
+    validation_index: &ValidationIndex,
+    work: &ParseWorkRecorder,
+) -> Result<(), ParseError> {
+    validate_source_syntax_with_work(&parsed.path, &parsed.ast, validation_index, work)?;
+    validate_list_capacities_with_work(&parsed.path, &parsed.ast, validation_index, work)?;
+    validate_no_reducer_style_update_with_work(&parsed.path, &parsed.ast, validation_index, work)?;
+    validate_no_hidden_identity_leak_with_work(&parsed.path, &parsed.ast, validation_index, work)?;
+    Ok(())
+}
+
 /// Parses context-independent syntax for one already-normalized source unit.
 ///
-/// Project parsing deliberately defers source-policy validation until all raw
-/// units have been namespaced and assembled. This preserves the historical
-/// entrypoint-owned project policy without reparsing a concatenated bundle.
+/// The caller chooses a boundary-only index for the independent assembled
+/// oracle or a complete index for the unit-native parser seal. In both cases,
+/// source-unit boundary validation happens here before any project linking.
 fn parse_normalized_source_unit_syntax(
     source_unit_id: SourceUnitId,
     source: String,
@@ -8879,6 +8874,35 @@ document:
             .unwrap();
         assert_ne!(before_layout.start_line, after_layout.start_line);
         assert_ne!(before_layout.start_byte, after_layout.start_byte);
+    }
+
+    #[test]
+    fn project_link_reuses_the_parser_unit_validation_seal() {
+        let (parsed, parse_profile) = parse_project_source_unit_profiled(
+            "app/Math.bn",
+            "FUNCTION double(input) {\n    input + input\n}\n".to_owned(),
+        );
+        let parsed = parsed.unwrap();
+        assert!(parse_profile.work_counters.validation_visits > 0);
+
+        let link_key = project_unit_link_keys(
+            "app/RUN.bn",
+            [(
+                parsed.source_unit_id.clone(),
+                parsed.declared_functions.clone(),
+            )],
+        )
+        .unwrap()
+        .remove(&parsed.source_unit_id)
+        .unwrap();
+        let (linked, link_profile) = link_project_source_unit_profiled(parsed, link_key);
+        let linked = linked.unwrap();
+
+        assert_eq!(linked.module(), Some("Math"));
+        assert_eq!(link_profile.work_counters.validation_visits, 0);
+        assert_eq!(link_profile.work_counters.token_inspections, 0);
+        assert!(link_profile.work_counters.statement_visits > 0);
+        assert!(link_profile.work_counters.expression_visits > 0);
     }
 
     #[test]

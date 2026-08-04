@@ -1,6 +1,27 @@
 use super::*;
 
 #[test]
+fn unit_native_syntax_lookup_rejects_dense_checked_slots() {
+    let project = boon_parser::parse_project_syntax(
+        "app/RUN.bn",
+        [("app/RUN.bn".to_owned(), "value: 1\n".to_owned())],
+    )
+    .expect("unit-native identity fixture parses");
+    let syntax_id = project
+        .units()
+        .first()
+        .and_then(|unit| unit.ast.expressions.first())
+        .map(|expression| expression.id)
+        .expect("fixture has an expression");
+    let program = TypecheckSyntaxProgram::UnitNative(project);
+    let checked = program.checked_expr_id(syntax_id);
+
+    assert!(program.expressions().get(syntax_id).is_some());
+    assert!(program.expressions().get(checked.0 as usize).is_none());
+    assert_eq!(program.syntax_expr_id(checked), syntax_id);
+}
+
+#[test]
 fn unit_native_project_check_matches_assembled_project_exactly() {
     let files = vec![
         (

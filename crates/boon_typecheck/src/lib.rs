@@ -142,13 +142,7 @@ impl TypecheckSyntaxProgram {
     fn stable_occurrence_key(&self, expression_id: usize) -> Option<StableOccurrenceKey> {
         match self {
             Self::Assembled(program) => program.stable_occurrence_key(expression_id),
-            Self::UnitNative(program) => {
-                program.stable_occurrence_key(expression_id).or_else(|| {
-                    program
-                        .expression_id_for_slot(expression_id)
-                        .and_then(|syntax_id| program.stable_occurrence_key(syntax_id))
-                })
-            }
+            Self::UnitNative(program) => program.stable_occurrence_key(expression_id),
         }
     }
 
@@ -200,7 +194,6 @@ impl TypecheckSyntaxProgram {
         CheckedExprId(
             u32::try_from(
                 self.expression_slot(syntax_id)
-                    .or_else(|| (syntax_id < self.expressions().len()).then_some(syntax_id))
                     .expect("validated syntax expression has a checked projection slot"),
             )
             .expect("checked expression slot fits u32"),
@@ -216,13 +209,6 @@ impl TypecheckSyntaxProgram {
         CheckedStatementId(
             u32::try_from(
                 self.statement_slot(syntax_id)
-                    .or_else(|| {
-                        let statement_count = match self {
-                            Self::Assembled(_) => usize::MAX,
-                            Self::UnitNative(program) => program.statement_count(),
-                        };
-                        (syntax_id < statement_count).then_some(syntax_id)
-                    })
                     .expect("validated syntax statement has a checked projection slot"),
             )
             .expect("checked statement slot fits u32"),
@@ -333,9 +319,7 @@ impl<'a> TypecheckExpressionArena<'a> {
     fn get(self, expression_id: usize) -> Option<&'a AstExpr> {
         match self {
             Self::Assembled(expressions) => expressions.get(expression_id),
-            Self::UnitNative(expressions) => expressions
-                .get(expression_id)
-                .or_else(|| expressions.get_slot(expression_id)),
+            Self::UnitNative(expressions) => expressions.get(expression_id),
         }
     }
 
@@ -3017,7 +3001,7 @@ impl CheckedProgramDatabase {
         let mut pending = vec![
             self.program
                 .expression_id_for_slot(expression.0 as usize)
-                .unwrap_or(expression.0 as usize),
+                .expect("checked expression has a syntax projection"),
         ];
         let mut visited = BTreeSet::new();
         while let Some(expression) = pending.pop() {
@@ -11609,7 +11593,7 @@ impl CheckedProgramDatabase {
                     let syntax_value = self
                         .program
                         .expression_id_for_slot(value.0 as usize)
-                        .unwrap_or(value.0 as usize);
+                        .expect("checked call input has a syntax projection");
                     self.assign_expression_evaluation_scope(syntax_value, scope_id);
                 }
             }
@@ -11787,7 +11771,7 @@ impl CheckedProgramDatabase {
         let syntax_expression = self
             .program
             .expression_id_for_slot(expression.0 as usize)
-            .unwrap_or(expression.0 as usize);
+            .expect("checked expression has a syntax projection");
         visit(
             &self.program,
             syntax_expression,
@@ -15257,7 +15241,7 @@ fn checked_structural_call_site(
     call: &CheckedCall,
 ) -> Result<CheckedStructuralCallSiteV3, String> {
     let occurrence = parsed
-        .stable_occurrence_key(call.expression.0 as usize)
+        .stable_occurrence_key(parsed.syntax_expr_id(call.expression))
         .ok_or_else(|| {
             format!(
                 "checked call {} expression {} has no parser-owned structural occurrence key",
@@ -21552,7 +21536,11 @@ impl CheckedProgramDatabase {
             .iter()
             .filter_map(|expr_id| {
                 self.expr_type_cache
-                    .get(self.program.expression_slot(*expr_id).unwrap_or(*expr_id))
+                    .get(
+                        self.program
+                            .expression_slot(*expr_id)
+                            .expect("call-site syntax expression has a checked slot"),
+                    )
                     .and_then(|entry| entry.as_ref())
                     .map(|flow| flow.ty.clone())
                     .filter(type_has_known_user_shape)
@@ -21735,7 +21723,10 @@ impl CheckedProgramDatabase {
                 self.project_checked_expression_diagnostics(expr_id);
             }
         }
-        let checked_slot = self.program.expression_slot(expr_id).unwrap_or(expr_id);
+        let checked_slot = self
+            .program
+            .expression_slot(expr_id)
+            .expect("diagnostic syntax expression has a checked slot");
         let existing = self
             .checked_diagnostic_replay
             .then(|| {
@@ -21782,7 +21773,7 @@ impl CheckedProgramDatabase {
         let checked_slot = self
             .program
             .expression_slot(expression)
-            .unwrap_or(expression);
+            .expect("finalized syntax expression has a checked slot");
         self.checked_program_for_diagnostics
             .as_ref()?
             .expressions
@@ -27732,7 +27723,9 @@ fn resolved_constant_table(program: &TypecheckSyntaxProgram) -> ResolvedConstant
             continue;
         };
         entries.push(ResolvedConstantEntry {
-            expr_id: program.expression_slot(expr.id).unwrap_or(expr.id),
+            expr_id: program
+                .expression_slot(expr.id)
+                .expect("constant syntax expression has a checked slot"),
             value,
         });
     }
@@ -37465,7 +37458,7 @@ impl<'a> TypeHintExprIndex<'a> {
         for entry in &table.entries {
             let syntax_id = program
                 .expression_id_for_slot(entry.expr_id)
-                .unwrap_or(entry.expr_id);
+                .expect("type table expression has a syntax projection");
             entries.insert(syntax_id, &entry.flow_type.ty);
         }
         Self { entries }
@@ -37641,8 +37634,11 @@ fn type_hint_entry_for_labels(
         .and_then(|expression| program.global_byte(expression, end))
         .unwrap_or(end);
     TypeHintEntry {
-        expr_id: expr_id
-            .map(|expression| program.expression_slot(expression).unwrap_or(expression)),
+        expr_id: expr_id.map(|expression| {
+            program
+                .expression_slot(expression)
+                .expect("type-hint syntax expression has a checked slot")
+        }),
         line,
         start,
         end,
@@ -37683,7 +37679,11 @@ fn collect_call_argument_type_hints(
             "call_arg",
             ty,
         );
-        entry.expr_id = Some(program.expression_slot(arg.value).unwrap_or(arg.value));
+        entry.expr_id = Some(
+            program
+                .expression_slot(arg.value)
+                .expect("call-argument syntax expression has a checked slot"),
+        );
         entries.push(entry);
     }
 }

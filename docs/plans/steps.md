@@ -643,6 +643,29 @@ stronger three-reviewer performance closure defined below.
    row-initialization kernels after the safe architecture deletions, with a
    safe A/B oracle and invariant, parity, Miri/fuzz, and whole-run evidence.
 
+   The 2026-08-04 adversarial correction keeps the first
+   `OwnerDiagnosticsAggregate` internal rather than replacing public
+   `CompileIntent::Diagnostics`. It globalizes owner-local diagnostics through
+   project source layouts before deduplication, seals exact owner/body/source-
+   map coverage, and proves that the staged root requests zero construction
+   ABIs, checked shards, compatibility rows, or executable products. Public
+   diagnostics still uses complete checked assembly, so the transient roughly
+   3.72-second lean NovyWave probe is not an accepted score; 6,118.881 ms and
+   335,496 KiB remain the latest comparable public-path observation.
+
+   Continue by building one per-owner lexical/import plan with a single scope
+   walk for parameters, BLOCK and order-independent record bindings, patterns,
+   OUT, and call contexts. Resolve exact projections and shadowing before any
+   project/ABI lookup, publish compact direct interface imports, and memoize
+   SCC/result-transfer closures once instead of rebuilding them in session and
+   body evaluation. Then add construction-independent owner/project diagnostic
+   facts for forwarded OUT, order, output, render, host, and the complete
+   invalid-program oracle, plus an honest optional editor-presentation sidecar.
+   Cut public diagnostics over and rescore only after multi-unit parity and
+   editor projection pass. Profile for narrow unsafe kernels only after these
+   architecture deletions; never use unsafe to speed work still scheduled for
+   removal.
+
    Documentation, instrumentation, a crate split, a focused test pass, or an
    authorized checkpoint commit is not this step's exit. After each checkpoint,
    continue with the next red or missing performance gate in the same goal run.

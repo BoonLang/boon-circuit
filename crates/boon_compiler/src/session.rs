@@ -26,13 +26,13 @@ use boon_typecheck::{
     OwnerCallableAbiEnvironment, OwnerCallableAbiLookup, OwnerCallableAbiLookupOutcome,
     OwnerConstraintSeed, OwnerConstraintSummary, OwnerConstructionAbiEnvironment,
     OwnerConstructionCallableAbiLookup, OwnerConstructionValueAbiLookup, OwnerDeclarationKind,
-    OwnerInferenceAbiEnvironment, OwnerInterfaceScc, OwnerInterfaceSccEvaluation,
-    OwnerInterfaceSccKey, OwnerInterfaceSccResult, OwnerInterfaceTopology,
-    OwnerParameterRequirementKey, OwnerParameterRequirementLookup, OwnerReferenceKind,
-    OwnerSourceMap, OwnerSourcePayloadAbiLookup, OwnerSymbolReference, OwnerSymbolResolution,
-    OwnerSyntaxInput, OwnerValueAbiLookup, assemble_checked_owner_project,
-    build_checked_owner_shard, build_owner_interface_topology, evaluate_owner_body,
-    evaluate_owner_interface_scc, owner_body_required_interface_owners,
+    OwnerDiagnosticsAggregate, OwnerInferenceAbiEnvironment, OwnerInterfaceScc,
+    OwnerInterfaceSccEvaluation, OwnerInterfaceSccKey, OwnerInterfaceSccResult,
+    OwnerInterfaceTopology, OwnerParameterRequirementKey, OwnerParameterRequirementLookup,
+    OwnerReferenceKind, OwnerSourceMap, OwnerSourcePayloadAbiLookup, OwnerSymbolReference,
+    OwnerSymbolResolution, OwnerSyntaxInput, OwnerValueAbiLookup, aggregate_owner_diagnostics,
+    assemble_checked_owner_project, build_checked_owner_shard, build_owner_interface_topology,
+    evaluate_owner_body, evaluate_owner_interface_scc, owner_body_required_interface_owners,
     project_owner_abi_environment, project_owner_constraint_seed, project_owner_source_map,
     project_owner_syntax_input, resolve_owner_constraint_seed_with_resolutions,
     stable_check_owner_key_fingerprint_v1,
@@ -257,6 +257,10 @@ struct ProjectState {
     owner_body_inference_evaluation_requests:
         TypedRequestTable<OwnerBodyInferenceEvaluationRequest>,
     owner_body_inference_requests: TypedRequestTable<OwnerBodyInferenceRequest>,
+    // Staged request root: kept off the public Diagnostics path until its
+    // diagnostic and presentation authorities are complete.
+    #[allow(dead_code)]
+    owner_diagnostics_aggregate_requests: TypedRequestTable<OwnerDiagnosticsAggregateRequest>,
     checked_owner_shard_requests: TypedRequestTable<CheckedOwnerShardRequest>,
     checked_owner_project_assembly_requests: TypedRequestTable<CheckedOwnerProjectAssemblyRequest>,
     checked: Option<CheckedSourceFromSource>,
@@ -1020,6 +1024,31 @@ impl RequestFamily for CheckedOwnerShardRequest {
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct OwnerDiagnosticsAggregateKey;
+
+struct OwnerDiagnosticsAggregateRequest;
+
+impl RequestFamily for OwnerDiagnosticsAggregateRequest {
+    type Key = OwnerDiagnosticsAggregateKey;
+    type Value = Arc<OwnerDiagnosticsAggregate>;
+
+    const NAME: &'static str = "boon.compiler.owner-diagnostics-aggregate.v1";
+
+    fn key_fingerprint(_key: &Self::Key) -> RequestFingerprint {
+        request_fingerprint(
+            b"boon.compiler.owner-diagnostics-aggregate-key.v1\0",
+            std::iter::empty(),
+        )
+    }
+
+    fn output_fingerprint(
+        value: &Self::Value,
+    ) -> Result<RequestOutputFingerprint, boon_compilation_db::CompilationDbError> {
+        Ok(RequestOutputFingerprint(value.fingerprint_v1()))
+    }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct CheckedOwnerProjectAssemblyKey;
 
 struct CheckedOwnerProjectAssemblyRequest;
@@ -1089,6 +1118,7 @@ impl CompilerSession {
                 owner_interface_scc_requests: TypedRequestTable::new(),
                 owner_body_inference_evaluation_requests: TypedRequestTable::new(),
                 owner_body_inference_requests: TypedRequestTable::new(),
+                owner_diagnostics_aggregate_requests: TypedRequestTable::new(),
                 checked_owner_shard_requests: TypedRequestTable::new(),
                 checked_owner_project_assembly_requests: TypedRequestTable::new(),
                 checked: None,
@@ -1628,6 +1658,11 @@ impl CompilerSession {
         }
         if intent == CompileIntent::Diagnostics {
             if state.checked.is_none() {
+                // The lean owner aggregate is intentionally not the public
+                // diagnostics result until every project diagnostic and the
+                // editor projection have owner-backed authorities. Keep the
+                // complete checked assembly as the production contract while
+                // the smaller request root is proven independently below.
                 let (parsed, assembly, parse_work, parse_ms, typecheck_ms) =
                     parse_project_snapshot(state)?;
                 state.checked = Some(checked_source_from_owner_assembly(
@@ -1710,15 +1745,9 @@ impl CompilerSession {
     }
 }
 
-fn parse_project_snapshot(
+fn parse_project_syntax_snapshot(
     state: &mut ProjectState,
-) -> CompilerResult<(
-    ProjectSyntaxSnapshot,
-    Arc<CheckedOwnerProjectAssembly>,
-    ParseWorkCounters,
-    f64,
-    f64,
-)> {
+) -> CompilerResult<(ProjectSyntaxSnapshot, ParseWorkCounters, f64)> {
     let started = Instant::now();
     let mut work = ParseWorkCounters::default();
     let mut parsed_units = Vec::with_capacity(state.source.units.len());
@@ -2022,6 +2051,19 @@ fn parse_project_snapshot(
     let project =
         ProjectSyntaxSnapshot::from_unit_snapshots(&state.source.entrypoint, linked_units)?;
     let parse_ms = started.elapsed().as_secs_f64() * 1_000.0;
+    Ok((project, work, parse_ms))
+}
+
+fn parse_project_snapshot(
+    state: &mut ProjectState,
+) -> CompilerResult<(
+    ProjectSyntaxSnapshot,
+    Arc<CheckedOwnerProjectAssembly>,
+    ParseWorkCounters,
+    f64,
+    f64,
+)> {
+    let (project, work, parse_ms) = parse_project_syntax_snapshot(state)?;
     let typecheck_started = Instant::now();
     evaluate_owner_requests(state, project.units())?;
     let owner_requests_ms = typecheck_started.elapsed().as_secs_f64() * 1_000.0;
@@ -2048,7 +2090,38 @@ fn parse_project_snapshot(
     Ok((project, assembly, work, parse_ms, typecheck_ms))
 }
 
-fn evaluate_owner_requests(
+#[allow(dead_code)]
+fn parse_project_diagnostics_snapshot(
+    state: &mut ProjectState,
+) -> CompilerResult<(
+    ProjectSyntaxSnapshot,
+    Arc<OwnerDiagnosticsAggregate>,
+    ParseWorkCounters,
+    f64,
+    f64,
+)> {
+    let (project, work, parse_ms) = parse_project_syntax_snapshot(state)?;
+    let typecheck_started = Instant::now();
+    evaluate_owner_body_requests(state, project.units())?;
+    evaluate_owner_diagnostics_aggregate_request(state, &project)?;
+    let aggregate = Arc::clone(
+        state
+            .owner_diagnostics_aggregate_requests
+            .current_value(&state.syntax_evaluator, &OwnerDiagnosticsAggregateKey)?
+            .ok_or_else(|| session_error("owner diagnostics aggregate was not published"))?,
+    );
+    let typecheck_ms = typecheck_started.elapsed().as_secs_f64() * 1_000.0;
+    if std::env::var_os("BOON_OWNER_REQUEST_TRACE").is_some() {
+        eprintln!(
+            "boon owner requests phase=diagnostics-aggregate items={} diagnostics={} total_ms={typecheck_ms:.3}",
+            aggregate.owner_count(),
+            aggregate.diagnostics().len(),
+        );
+    }
+    Ok((project, aggregate, work, parse_ms, typecheck_ms))
+}
+
+fn evaluate_owner_body_requests(
     state: &mut ProjectState,
     linked_units: &[Arc<UnitSyntaxSnapshot>],
 ) -> CompilerResult<()> {
@@ -2191,8 +2264,22 @@ fn evaluate_owner_requests(
     }
     trace.checkpoint("owner-input-and-source-map", owners.len());
     evaluate_owner_constraint_requests(state, linked_units, &owners)?;
-    trace.checkpoint("constraints-through-checked-shards", owners.len());
+    trace.checkpoint("constraints-through-owner-bodies", owners.len());
     Ok(())
+}
+
+fn evaluate_owner_requests(
+    state: &mut ProjectState,
+    linked_units: &[Arc<UnitSyntaxSnapshot>],
+) -> CompilerResult<()> {
+    evaluate_owner_body_requests(state, linked_units)?;
+    let topology = Arc::clone(
+        state
+            .project_owner_interface_topology_requests
+            .current_value(&state.syntax_evaluator, &ProjectOwnerInterfaceTopologyKey)?
+            .ok_or_else(|| session_error("owner interface topology was not published"))?,
+    );
+    evaluate_checked_owner_shard_requests(state, &topology)
 }
 
 fn project_owner_abi_input_fingerprint(
@@ -3599,9 +3686,74 @@ fn evaluate_owner_body_inference_requests(
         );
     }
     trace.checkpoint("owner-body-results", topology.stats.nodes);
-    evaluate_checked_owner_shard_requests(state, topology)?;
-    trace.checkpoint("checked-owner-shards", topology.stats.nodes);
     Ok(())
+}
+
+#[allow(dead_code)]
+fn evaluate_owner_diagnostics_aggregate_request(
+    state: &mut ProjectState,
+    project: &ProjectSyntaxSnapshot,
+) -> CompilerResult<()> {
+    let owners = project.stable_check_owner_keys().collect::<Vec<_>>();
+    let owner_fingerprints = owners
+        .iter()
+        .map(stable_check_owner_key_fingerprint_v1)
+        .collect::<Vec<_>>();
+    let source_digest = project.source_bundle_digest_v1().to_string();
+    let input = RequestInputFingerprint(request_fingerprint(
+        b"boon.compiler.owner-diagnostics-aggregate-dependencies.v1\0",
+        std::iter::once(source_digest.as_bytes())
+            .chain(owner_fingerprints.iter().map(<[u8; 32]>::as_slice)),
+    ));
+    let key = OwnerDiagnosticsAggregateKey;
+    match state.owner_diagnostics_aggregate_requests.begin(
+        &mut state.syntax_evaluator,
+        key,
+        input,
+    )? {
+        RequestStart::Reused => Ok(()),
+        RequestStart::Execute(mut ticket) => {
+            let aggregate = (|| -> CompilerResult<_> {
+                let mut bodies = Vec::with_capacity(owners.len());
+                let mut source_maps = Vec::with_capacity(owners.len());
+                for owner in &owners {
+                    bodies.push(Arc::clone(state.owner_body_inference_requests.require(
+                        &state.syntax_evaluator,
+                        &mut ticket,
+                        owner,
+                    )?));
+                    source_maps.push(Arc::clone(state.owner_source_map_requests.require(
+                        &state.syntax_evaluator,
+                        &mut ticket,
+                        owner,
+                    )?));
+                }
+                Ok(Arc::new(aggregate_owner_diagnostics(
+                    project,
+                    owners.iter(),
+                    bodies.iter().map(Arc::as_ref),
+                    source_maps.iter().map(Arc::as_ref),
+                )?))
+            })();
+            let aggregate = match aggregate {
+                Ok(aggregate) => aggregate,
+                Err(error) => {
+                    state.owner_diagnostics_aggregate_requests.abort(
+                        &mut state.syntax_evaluator,
+                        ticket,
+                        RequestAbortReason::Failed,
+                    )?;
+                    return Err(error);
+                }
+            };
+            state.owner_diagnostics_aggregate_requests.publish(
+                &mut state.syntax_evaluator,
+                ticket,
+                aggregate,
+            )?;
+            Ok(())
+        }
+    }
 }
 
 fn evaluate_owner_construction_abi_requests(
@@ -4134,6 +4286,97 @@ mod tests {
             ProgramRole::Server,
             ApplicationIdentity::compiler_default(),
         )
+    }
+
+    #[test]
+    fn owner_diagnostics_aggregate_globalizes_equal_local_diagnostics_before_dedup() {
+        let source = "value: mystery(input: 1)\n";
+        let mut session = CompilerSession::new();
+        let project = session
+            .open_project(CompilerProject::new(
+                "RUN.bn",
+                vec![
+                    CompilerSourceUnit {
+                        path: "RUN.bn".to_owned(),
+                        source: source.to_owned(),
+                    },
+                    CompilerSourceUnit {
+                        path: "Second.bn".to_owned(),
+                        source: source.to_owned(),
+                    },
+                ],
+                TargetProfile::SoftwareDefault,
+                ProgramRole::Server,
+                ApplicationIdentity::compiler_default(),
+            ))
+            .unwrap();
+        let (_, aggregate, _, _, _) =
+            parse_project_diagnostics_snapshot(session.projects.get_mut(&project).unwrap())
+                .unwrap();
+        let diagnostics = aggregate
+            .diagnostics()
+            .iter()
+            .filter(|diagnostic| diagnostic.message == "unknown function `mystery`")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            diagnostics.len(),
+            2,
+            "aggregate diagnostics: {aggregate:#?}"
+        );
+        assert_ne!(diagnostics[0].line, diagnostics[1].line);
+        assert_ne!(diagnostics[0].start, diagnostics[1].start);
+        assert_ne!(diagnostics[0].end, diagnostics[1].end);
+    }
+
+    #[test]
+    fn owner_diagnostics_aggregate_stops_before_checked_shards_and_verified_builds_them_once() {
+        let mut session = CompilerSession::new();
+        let project = session.open_project(project("value: 1")).unwrap();
+        let revision = session.revision(project).unwrap();
+        let token = CancellationToken::new();
+        let (_, aggregate, _, _, _) = session
+            .projects
+            .get_mut(&project)
+            .map(parse_project_diagnostics_snapshot)
+            .expect("project")
+            .unwrap();
+        assert!(
+            aggregate.diagnostics().is_empty(),
+            "lean owner diagnostics: {:#?}",
+            aggregate.diagnostics()
+        );
+        {
+            let state = session.projects.get(&project).unwrap();
+            assert_eq!(
+                state.owner_diagnostics_aggregate_requests.request_count(),
+                1
+            );
+            assert_eq!(state.owner_construction_abi_requests.request_count(), 0);
+            assert_eq!(state.checked_owner_shard_requests.request_count(), 0);
+            assert_eq!(
+                state
+                    .checked_owner_project_assembly_requests
+                    .request_count(),
+                0
+            );
+        }
+        let first_plan = session
+            .request(project, revision, CompileIntent::VerifiedPreview, &token)
+            .unwrap()
+            .compiled()
+            .unwrap()
+            .plan
+            .plan()
+            .clone();
+        let second_plan = session
+            .request(project, revision, CompileIntent::VerifiedPreview, &token)
+            .unwrap()
+            .compiled()
+            .unwrap()
+            .plan
+            .plan()
+            .clone();
+        assert_eq!(first_plan, second_plan);
     }
 
     #[test]

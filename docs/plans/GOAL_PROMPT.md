@@ -742,6 +742,22 @@ Current checkpoints to preserve and audit rather than redo:
   unsafe `TypeUnifier`/CSR/packed-row kernels only afterward if a fresh profile
   proves safe mechanics dominate and a safe A/B oracle, invariants, parity,
   Miri/fuzz evidence, and material whole-run improvement all pass;
+- preserve the 2026-08-04 staged `OwnerDiagnosticsAggregate` correction. The
+  internal request globalizes owner-local spans through project source layouts,
+  seals exact owner/body/source-map coverage, and proves zero construction ABI,
+  checked-shard, compatibility, or executable requests. Independent reviews
+  rejected the initial public cutover because project-level forward-OUT/order/
+  output/render/host diagnostics and editor presentation facts were absent, and
+  because speculative record/pattern/context scope scans were not semantically
+  sound. Public `CompileIntent::Diagnostics` therefore still uses complete
+  checked assembly; the transient approximately 3.72-second lean NovyWave probe
+  is not an accepted score. Build one authoritative per-owner lexical/import
+  plan with exact projection and shadowing before project/ABI resolution,
+  memoize compact SCC/result-transfer dependency slices once, then publish
+  construction-independent owner/project diagnostic facts and an honest
+  optional editor-presentation sidecar. Cut over and rescore only after the
+  complete multi-unit invalid oracle and editor projection pass. Consider
+  narrow profiled unsafe kernels only after those architectural deletions;
 - follow the post-`e510726` macro-architecture audit, reconciled through
   `a48f488`, in
   `BOON_COMPILER_MACRO_ARCHITECTURE_RESEARCH.md`. The historical trace exposed

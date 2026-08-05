@@ -1776,6 +1776,51 @@ receipt CSR slicing, immutable packed-row offsets, and exact-size local row
 initialization; stable-key/currentness logic, diagnostics, serialization, and
 the compilation database remain safe.
 
+#### 2026-08-04 adversarial correction: stage the aggregate before cutover
+
+The first implementation attempt proved that a diagnostics request can stop
+after owner bodies and a small aggregate, but three independent reviews found
+that it was not yet a semantics-preserving public cutover. Owner diagnostics
+were still unit-local before aggregation, later compatibility stages still own
+forward-OUT, order-chain, output-root, render-slot, and host-port errors, and a
+lean `TypeCheckReport` represented unavailable editor/presentation facts as
+empty proven facts. The attempted record/pattern/call-context repairs also
+introduced overlapping lexical scans and incorrect shadow/projection cases.
+Those repairs are not part of the accepted checkpoint.
+
+The corrected checkpoint therefore lands only a staged
+`OwnerDiagnosticsAggregate` request with exact owner/body/source-map coverage,
+project-layout globalization before sort/dedup, a sealed fingerprint, a
+two-unit collision oracle, and proof that this internal request constructs zero
+construction ABIs, checked shards, compatibility rows, or executable products.
+Public `CompileIntent::Diagnostics` deliberately remains on the complete
+checked assembly. Consequently, the earlier 6,118.881 ms/335,496 KiB NovyWave
+observation remains the latest comparable public-path evidence; the transient
+approximately 3.72 second lean prototype is architectural evidence only and is
+not an accepted score or delivered latency reduction.
+
+Resume with one construction-owned per-owner lexical/import plan rather than
+more post-resolution tree scans. A single scope walk must classify parameter,
+BLOCK, order-independent record, pattern, OUT, and call-context bindings with
+exact projections and shadowing; the same fact must remove lexical references
+before project/ABI lookup and publish direct interface imports. Memoize compact
+SCC/result-transfer dependency slices once instead of rebuilding transitive
+`BTreeMap`/`BTreeSet` closures in both the session and every owner body. Then
+publish construction-independent `OwnerDiagnosticFacts` plus
+`ProjectDiagnosticFacts`, port every error family currently emitted by checked
+shard/compatibility construction, and add an honest compiler-level diagnostics
+DTO with optional presentation facts. Only after multi-unit invalid parity and
+an owner-backed editor presentation sidecar pass may the public diagnostics
+intent switch to the staged aggregate and be rescored.
+
+Do not use `unsafe` to accelerate the current broad imports, repeated scope
+discovery, or later-to-be-deleted compatibility work. After the lexical/import
+and diagnostic-authority cutovers, profile again. Retain a narrowly
+encapsulated unsafe implementation only when a safe A/B oracle proves that one
+low-level `TypeUnifier`, CSR, packed-offset, or exact-size initialization kernel
+dominates, with documented invariants, parity, Miri/fuzz coverage, and material
+whole-run improvement.
+
 Checkpoint `a48f488` remains the unit-native M1 ancestor of `42c1aa9`; preserve
 its production checking, compact execution receipt, proof/sealed-plan, and
 activation/effect contracts while continuing from the newer checkpoint.

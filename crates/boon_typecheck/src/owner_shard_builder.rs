@@ -6,13 +6,14 @@
 //! deliberately deferred to the non-checking compatibility assembler.
 
 use crate::{
-    InferredOwnerCall, InferredOwnerCallableTarget, OwnerAbiCallableContract, OwnerAbiEnvironment,
+    InferredOwnerCall, InferredOwnerCallableTarget, OwnerAbiCallableContract,
     OwnerAbiEvaluationScope, OwnerAbiValueContract, OwnerArgumentKind,
     OwnerBodyInferenceCurrentnessReceipt, OwnerBodyInferenceShard, OwnerCheckedReceiptSink,
     OwnerConstraintEdgeRole, OwnerConstraintSeed, OwnerConstraintSummary,
-    OwnerContainingScopeInput, OwnerDeclarationKind, OwnerInferenceExpressionRef,
-    OwnerInterfaceEvaluationScope, OwnerInterfaceSccResult, OwnerParameterKind,
-    OwnerPublicInterface, OwnerSourceAnchorSite, OwnerSyntaxGraph, OwnerSyntaxInput,
+    OwnerConstructionAbiEnvironment, OwnerContainingScopeInput, OwnerDeclarationKind,
+    OwnerInferenceAbiEnvironment, OwnerInferenceExpressionRef, OwnerInterfaceEvaluationScope,
+    OwnerInterfaceSccResult, OwnerParameterKind, OwnerPublicInterface, OwnerSourceAnchorSite,
+    OwnerSyntaxGraph, OwnerSyntaxInput,
 };
 use boon_checked::{
     CheckedCallContextKind, CheckedCallableKind, CheckedDeclarationKind, CheckedIntrinsicV1,
@@ -44,7 +45,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt;
 
-const CHECKED_OWNER_SHARD_DOMAIN_V1: &[u8] = b"boon.checked-owner-shard.v1\0";
+const CHECKED_OWNER_SHARD_DOMAIN_V2: &[u8] = b"boon.checked-owner-shard.v2\0";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct CheckedOwnerShardBasis {
@@ -55,7 +56,7 @@ pub struct CheckedOwnerShardBasis {
     pub body_fingerprint_v1: [u8; 32],
     pub body_currentness_fingerprint_v1: [u8; 32],
     pub own_interface_scc_fingerprint_v1: [u8; 32],
-    pub authoritative_abi_fingerprint_v1: [u8; 32],
+    pub construction_abi_fingerprint_v1: [u8; 32],
 }
 
 /// Complete span-free checked result for one stable authored owner.
@@ -116,7 +117,8 @@ fn validate_inputs(
     summary: &OwnerConstraintSummary,
     body: &OwnerBodyInferenceShard,
     body_currentness: &OwnerBodyInferenceCurrentnessReceipt,
-    abi: &OwnerAbiEnvironment,
+    inference_abi: &OwnerInferenceAbiEnvironment,
+    construction_abi: &OwnerConstructionAbiEnvironment,
     own_scc: &OwnerInterfaceSccResult,
 ) -> Result<(), CheckedOwnerBuildError> {
     let owner = &syntax.owner;
@@ -129,43 +131,45 @@ fn validate_inputs(
             "checked owner inputs disagree on stable owner {owner:?}"
         )));
     }
-    let parameter_requirements = seed
-        .parameter_requirement_keys()
-        .into_vec()
-        .into_iter()
-        .map(|key| {
-            let (function, parameter) = seed
-                .parameter_requirement_names(key.parameter_ordinal())
-                .ok_or_else(|| {
-                CheckedOwnerBuildError::new(
-                    "checked owner parameter requirement key has no declaration",
-                )
-            })?;
-            abi.parameter_requirement_lookup(key, function, parameter)
-                .map_err(|error| CheckedOwnerBuildError::new(error.to_string()))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let inference_abi_fingerprint_v1 = abi
-        .complete_inference_environment_with_requirements(
-            [owner.clone()],
-            summary.authoritative_abi_names().into_vec(),
-            summary.authoritative_value_abi_paths().into_vec(),
-            seed.source_payload_abi_paths().into_vec(),
-            parameter_requirements,
-        )
-        .map_err(|error| {
-            CheckedOwnerBuildError::new(format!(
-                "cannot validate checked owner inference ABI: {error}"
-            ))
-        })?
-        .fingerprint_v1();
+    if inference_abi.subjects() != std::slice::from_ref(owner) {
+        return Err(CheckedOwnerBuildError::new(
+            "checked owner inference ABI does not match its exact owner",
+        ));
+    }
+    if construction_abi.owner() != owner {
+        return Err(CheckedOwnerBuildError::new(
+            "checked owner construction ABI does not match its exact owner",
+        ));
+    }
+    let expected_callable_names = summary.authoritative_abi_names().into_vec();
+    let actual_callable_names = construction_abi
+        .callable_lookups()
+        .iter()
+        .map(|lookup| lookup.canonical_name().to_owned())
+        .collect::<Vec<_>>();
+    if actual_callable_names != expected_callable_names {
+        return Err(CheckedOwnerBuildError::new(
+            "checked owner construction ABI does not match its exact callable lookup set",
+        ));
+    }
+    let expected_value_paths = summary.authoritative_value_abi_paths().into_vec();
+    let actual_value_paths = construction_abi
+        .value_lookups()
+        .iter()
+        .map(|lookup| lookup.canonical_path().to_owned())
+        .collect::<Vec<_>>();
+    if actual_value_paths != expected_value_paths {
+        return Err(CheckedOwnerBuildError::new(
+            "checked owner construction ABI does not match its exact value lookup set",
+        ));
+    }
     let body_basis = body_currentness.basis();
     if body_currentness.result_fingerprint_v1() != body.fingerprint_v1()
         || body_basis.owner != *owner
         || seed.fingerprint_v1() != body_basis.seed_fingerprint_v1
         || summary.fingerprint_v1() != body_basis.summary_fingerprint_v1
         || syntax.fingerprint_v1() != body_basis.syntax_fingerprint_v1
-        || inference_abi_fingerprint_v1 != body_basis.inference_abi_fingerprint_v1
+        || inference_abi.fingerprint_v1() != body_basis.inference_abi_fingerprint_v1
         || own_scc.fingerprint_v1() != body_basis.own_scc.result_fingerprint_v1
     {
         return Err(CheckedOwnerBuildError::new(format!(
@@ -407,7 +411,7 @@ struct OwnerRowConstruction<'a> {
     summary: &'a OwnerConstraintSummary,
     body: &'a OwnerBodyInferenceShard,
     own_interface: &'a OwnerPublicInterface,
-    abi: &'a OwnerAbiEnvironment,
+    abi: &'a OwnerConstructionAbiEnvironment,
     graph: OwnerSyntaxGraph,
     imported_interfaces: BTreeMap<StableCheckOwnerKey, &'a OwnerPublicInterface>,
     containing_scope: OwnerScopeRef,
@@ -438,7 +442,7 @@ impl<'a> OwnerRowConstruction<'a> {
         summary: &'a OwnerConstraintSummary,
         body: &'a OwnerBodyInferenceShard,
         own_interface: &'a OwnerPublicInterface,
-        abi: &'a OwnerAbiEnvironment,
+        abi: &'a OwnerConstructionAbiEnvironment,
         imported_interfaces: BTreeMap<StableCheckOwnerKey, &'a OwnerPublicInterface>,
     ) -> Result<Self, CheckedOwnerBuildError> {
         let graph = OwnerSyntaxGraph::build(syntax)
@@ -1133,7 +1137,7 @@ impl<'a> OwnerRowConstruction<'a> {
                         }
                     }),
                     requires_pass: interface.context.is_some(),
-                    role: self.abi.role,
+                    role: self.abi.role(),
                 }))
             }
             InferredOwnerCallableTarget::Authoritative => {
@@ -4009,7 +4013,7 @@ impl<'a> OwnerRowConstruction<'a> {
                 .as_ref()
                 .map(|_| OwnerContextFormalId(0)),
             result: self.own_interface.result.clone(),
-            role: self.abi.role,
+            role: self.abi.role(),
             effect: self.own_interface.effect,
             body: Some(OwnerStatementId(root.id)),
             result_expression,
@@ -4561,7 +4565,7 @@ impl<'a> OwnerRowConstruction<'a> {
         let declaration = self
             .abi
             .value(&canonical_path)
-            .map(|contract| abi_value_key(self.abi.role, contract))
+            .map(|contract| abi_value_key(self.abi.role(), contract))
             .transpose()?;
         Ok(OwnerExpressionKind::ExternalRead {
             canonical_path,
@@ -4985,11 +4989,21 @@ pub fn build_checked_owner_shard<'a>(
     summary: &OwnerConstraintSummary,
     body: &OwnerBodyInferenceShard,
     body_currentness: &OwnerBodyInferenceCurrentnessReceipt,
-    abi: &OwnerAbiEnvironment,
+    inference_abi: &OwnerInferenceAbiEnvironment,
+    construction_abi: &OwnerConstructionAbiEnvironment,
     own_scc: &'a OwnerInterfaceSccResult,
     imported_sccs: impl IntoIterator<Item = &'a OwnerInterfaceSccResult>,
 ) -> Result<CheckedOwnerShard, CheckedOwnerBuildError> {
-    validate_inputs(syntax, seed, summary, body, body_currentness, abi, own_scc)?;
+    validate_inputs(
+        syntax,
+        seed,
+        summary,
+        body,
+        body_currentness,
+        inference_abi,
+        construction_abi,
+        own_scc,
+    )?;
 
     let mut interfaces =
         validated_frozen_interfaces(body, body_currentness, own_scc, imported_sccs)?;
@@ -5007,14 +5021,21 @@ pub fn build_checked_owner_shard<'a>(
         body_fingerprint_v1: body.fingerprint_v1(),
         body_currentness_fingerprint_v1: body_currentness.fingerprint_v1(),
         own_interface_scc_fingerprint_v1: own_scc.fingerprint_v1(),
-        authoritative_abi_fingerprint_v1: abi.fingerprint_v1(),
+        construction_abi_fingerprint_v1: construction_abi.fingerprint_v1(),
     };
 
-    let (rows, receipts, diagnostics) =
-        OwnerRowConstruction::new(syntax, seed, summary, body, own_interface, abi, interfaces)?
-            .build_base_rows()?;
+    let (rows, receipts, diagnostics) = OwnerRowConstruction::new(
+        syntax,
+        seed,
+        summary,
+        body,
+        own_interface,
+        construction_abi,
+        interfaces,
+    )?
+    .build_base_rows()?;
     let fingerprint_v1 = boon_contract::canonical_serde_hash_v1(
-        CHECKED_OWNER_SHARD_DOMAIN_V1,
+        CHECKED_OWNER_SHARD_DOMAIN_V2,
         &(&basis, &rows, &diagnostics, &receipts),
     )
     .map_err(|error| {
@@ -5048,7 +5069,8 @@ mod tests {
         syntax: OwnerSyntaxInput,
         seed: OwnerConstraintSeed,
         summary: OwnerConstraintSummary,
-        abi: OwnerAbiEnvironment,
+        inference_abi: OwnerInferenceAbiEnvironment,
+        construction_abi: OwnerConstructionAbiEnvironment,
         interface: OwnerInterfaceSccResult,
         body: OwnerBodyInferenceShard,
         body_currentness: OwnerBodyInferenceCurrentnessReceipt,
@@ -5134,11 +5156,19 @@ mod tests {
         let body_evaluation =
             evaluate_owner_body(&syntax, &seed, &summary, &inference_abi, &interface, []).unwrap();
         let body = Arc::unwrap_or_clone(body_evaluation.result);
+        let construction_abi = abi
+            .construction_environment(
+                seed.owner.clone(),
+                summary.authoritative_abi_names().into_vec(),
+                summary.authoritative_value_abi_paths().into_vec(),
+            )
+            .unwrap();
         Fixture {
             syntax,
             seed,
             summary,
-            abi,
+            inference_abi,
+            construction_abi,
             interface,
             body,
             body_currentness: body_evaluation.currentness,
@@ -5153,7 +5183,7 @@ mod tests {
             &fixture.summary,
             &fixture.body,
             own,
-            &fixture.abi,
+            &fixture.construction_abi,
             BTreeMap::new(),
         )
         .unwrap()
@@ -5175,7 +5205,8 @@ mod tests {
             &fixture.summary,
             &fixture.body,
             &fixture.body_currentness,
-            &fixture.abi,
+            &fixture.inference_abi,
+            &fixture.construction_abi,
             &fixture.interface,
             [],
         )
@@ -5187,6 +5218,10 @@ mod tests {
             fixture.body_currentness.fingerprint_v1()
         );
         assert_eq!(
+            shard.basis.construction_abi_fingerprint_v1,
+            fixture.construction_abi.fingerprint_v1()
+        );
+        assert_eq!(
             shard.receipts.row_receipts.as_ref(),
             shard.rows.receipts.as_slice()
         );
@@ -5195,6 +5230,39 @@ mod tests {
             shard.rows.relocations.as_slice()
         );
         assert_ne!(shard.fingerprint_v1(), [0; 32]);
+    }
+
+    #[test]
+    fn checked_owner_shard_rejects_an_incomplete_construction_abi() {
+        let fixture = fixture(
+            "FUNCTION keep(input) {\n    Number/to_text(value: input)\n}\n",
+            "keep",
+        );
+        let incomplete = OwnerConstructionAbiEnvironment::new(
+            fixture.syntax.owner.clone(),
+            ProgramRole::Client,
+            [],
+            [],
+        )
+        .unwrap();
+        let error = build_checked_owner_shard(
+            &fixture.syntax,
+            &fixture.seed,
+            &fixture.summary,
+            &fixture.body,
+            &fixture.body_currentness,
+            &fixture.inference_abi,
+            &incomplete,
+            &fixture.interface,
+            [],
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("does not match its exact callable lookup set")
+        );
     }
 
     #[test]

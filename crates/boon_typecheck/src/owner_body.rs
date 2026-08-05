@@ -3,11 +3,11 @@ use crate::owner_interface::{
     instantiate_type, merge_effects, pattern_type, true_false_type,
 };
 use crate::{
-    OwnerAbiCallableContract, OwnerAbiEvaluationScope, OwnerArgumentKind,
-    OwnerCallableAbiEnvironment, OwnerCollectionKind, OwnerConstraintEdgeRole,
+    OwnerAbiEvaluationScope, OwnerArgumentKind, OwnerCollectionKind, OwnerConstraintEdgeRole,
     OwnerConstraintNodeKind, OwnerConstraintSeed, OwnerConstraintSummary,
-    OwnerInterfaceEvaluationScope, OwnerInterfaceSccKey, OwnerInterfaceSccResult,
-    OwnerParameterKind, OwnerPublicInterface, OwnerReferenceKind, OwnerResultCallTarget,
+    OwnerInferenceAbiEnvironment, OwnerInterfaceEvaluationScope, OwnerInterfaceSccKey,
+    OwnerInterfaceSccResult, OwnerParameterKind, OwnerPublicInterface, OwnerReferenceKind,
+    OwnerResultAbiContract, OwnerResultAbiParameterContract, OwnerResultCallTarget,
     OwnerResultExpressionRef, OwnerResultTransfer, OwnerResultTransferNode, OwnerSourceAnchorRole,
     OwnerSourceAnchorSite, OwnerSourceMap, OwnerSymbolResolution, OwnerSyntaxInput,
     infix_returns_bool,
@@ -1274,7 +1274,6 @@ struct EvaluatedOwnerResult {
 
 struct OwnerResultTransferEvaluator<'a, 'unifier> {
     interfaces: &'a BTreeMap<StableCheckOwnerKey, &'a OwnerPublicInterface>,
-    abi: &'a OwnerCallableAbiEnvironment,
     unifier: &'unifier mut TypeUnifier,
     active_owners: BTreeSet<StableCheckOwnerKey>,
 }
@@ -1282,12 +1281,10 @@ struct OwnerResultTransferEvaluator<'a, 'unifier> {
 impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
     fn new(
         interfaces: &'a BTreeMap<StableCheckOwnerKey, &'a OwnerPublicInterface>,
-        abi: &'a OwnerCallableAbiEnvironment,
         unifier: &'unifier mut TypeUnifier,
     ) -> Self {
         Self {
             interfaces,
-            abi,
             unifier,
             active_owners: BTreeSet::new(),
         }
@@ -1558,12 +1555,9 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
         }
 
         match &node.kind {
-            OwnerConstraintNodeKind::Call { function }
-            | OwnerConstraintNodeKind::Pipe {
-                operation: function,
-            } => self.evaluate_call_node(
-                node, function, nodes, arguments, context, fallbacks, lexical, active,
-            ),
+            OwnerConstraintNodeKind::Call { .. } | OwnerConstraintNodeKind::Pipe { .. } => {
+                self.evaluate_call_node(node, nodes, arguments, context, fallbacks, lexical, active)
+            }
             OwnerConstraintNodeKind::Infix { operation } => {
                 let left = node
                     .inputs
@@ -1909,7 +1903,6 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
     fn evaluate_call_node(
         &mut self,
         node: &OwnerResultTransferNode,
-        function: &str,
         nodes: &[OwnerResultTransferNode],
         arguments: &BTreeMap<u32, EvaluatedResultValue>,
         context: Option<&EvaluatedResultValue>,
@@ -1970,22 +1963,20 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
             }
             OwnerResultCallTarget::Abi {
                 canonical_name,
-                contract_fingerprint_v1,
-            } => {
-                let contract = self.abi.callable(canonical_name)?;
-                let current_fingerprint = boon_contract::canonical_serde_hash_v1(
-                    b"boon.owner-result-abi-call.v1\0",
+                contract,
+            } => self
+                .evaluate_abi_call(
+                    node,
+                    canonical_name,
                     contract,
+                    nodes,
+                    arguments,
+                    context,
+                    fallbacks,
+                    lexical,
+                    active,
                 )
-                .ok()?;
-                if &current_fingerprint != contract_fingerprint_v1 {
-                    return None;
-                }
-                self.evaluate_abi_call(
-                    node, function, contract, nodes, arguments, context, fallbacks, lexical, active,
-                )
-                .or(Some(fallback))
-            }
+                .or(Some(fallback)),
             OwnerResultCallTarget::Unresolved | OwnerResultCallTarget::Ambiguous { .. } => {
                 Some(fallback)
             }
@@ -1997,7 +1988,7 @@ impl<'a, 'unifier> OwnerResultTransferEvaluator<'a, 'unifier> {
         &mut self,
         node: &OwnerResultTransferNode,
         function: &str,
-        contract: &OwnerAbiCallableContract,
+        contract: &OwnerResultAbiContract,
         nodes: &[OwnerResultTransferNode],
         arguments: &BTreeMap<u32, EvaluatedResultValue>,
         context: Option<&EvaluatedResultValue>,
@@ -2218,7 +2209,7 @@ fn transfer_input_for_abi_parameter<'a>(
     name: &str,
     kind: CheckedParameterKind,
     ordinal: u32,
-    parameters: &[crate::OwnerAbiParameterContract],
+    parameters: &[OwnerResultAbiParameterContract],
 ) -> Option<&'a crate::OwnerResultTransferInput> {
     inputs.iter().find(|input| match &input.role {
         OwnerConstraintEdgeRole::CallArgument {
@@ -2252,7 +2243,7 @@ fn transfer_input_for_abi_parameter<'a>(
 }
 
 fn abi_actual_by_name<'a>(
-    contract: &OwnerAbiCallableContract,
+    contract: &OwnerResultAbiContract,
     actuals: &'a BTreeMap<u32, EvaluatedResultValue>,
     name: &str,
 ) -> Option<&'a EvaluatedResultValue> {
@@ -2267,7 +2258,7 @@ fn instantiate_call_signature(
     call: &BodyCallPlan,
     interfaces: &BTreeMap<StableCheckOwnerKey, &OwnerPublicInterface>,
     unifier: &mut TypeUnifier,
-    abi: &OwnerCallableAbiEnvironment,
+    abi: &OwnerInferenceAbiEnvironment,
 ) -> Option<InstantiatedCallSignature> {
     let mut variables = BTreeMap::new();
     if let BodyCallableResolution::Owner(target) = &call.resolution {
@@ -2736,7 +2727,7 @@ fn bind_calls(
     call_flushes: &[TypeVar],
     modes: &mut [Option<FlowMode>],
     direct_effects: &mut [CheckedEffectSummary],
-    abi: &OwnerCallableAbiEnvironment,
+    abi: &OwnerInferenceAbiEnvironment,
     pre_call_actual_types: &[Type],
     caller_has_context: bool,
     caller_is_callable: bool,
@@ -3048,7 +3039,6 @@ fn refine_owner_call_at(
     syntax: &OwnerSyntaxInput,
     seed: &OwnerConstraintSeed,
     interfaces: &BTreeMap<StableCheckOwnerKey, &OwnerPublicInterface>,
-    abi: &OwnerCallableAbiEnvironment,
     unifier: &mut TypeUnifier,
     expressions: &[TypeVar],
     external_expressions: &[TypeVar],
@@ -3078,7 +3068,6 @@ fn refine_owner_call_at(
                 syntax,
                 seed,
                 interfaces,
-                abi,
                 unifier,
                 expressions,
                 external_expressions,
@@ -3147,7 +3136,7 @@ fn refine_owner_call_at(
         static_number: None,
     });
     let evaluated = {
-        let mut evaluator = OwnerResultTransferEvaluator::new(interfaces, abi, unifier);
+        let mut evaluator = OwnerResultTransferEvaluator::new(interfaces, unifier);
         evaluator.evaluate_owner(
             target_owner,
             &arguments,
@@ -3175,7 +3164,6 @@ fn refine_owner_call_transfers(
     syntax: &OwnerSyntaxInput,
     seed: &OwnerConstraintSeed,
     interfaces: &BTreeMap<StableCheckOwnerKey, &OwnerPublicInterface>,
-    abi: &OwnerCallableAbiEnvironment,
     unifier: &mut TypeUnifier,
     expressions: &[TypeVar],
     external_expressions: &[TypeVar],
@@ -3197,7 +3185,6 @@ fn refine_owner_call_transfers(
             syntax,
             seed,
             interfaces,
-            abi,
             unifier,
             expressions,
             external_expressions,
@@ -3384,7 +3371,7 @@ fn push_contextual_argument_type_diagnostic(
 fn validate_owner_call_types(
     drafts: &mut [InferredCallDraft],
     interfaces: &BTreeMap<StableCheckOwnerKey, &OwnerPublicInterface>,
-    abi: &OwnerCallableAbiEnvironment,
+    abi: &OwnerInferenceAbiEnvironment,
     unifier: &mut TypeUnifier,
     expressions: &[TypeVar],
     external_expressions: &[TypeVar],
@@ -3589,11 +3576,27 @@ pub fn evaluate_owner_body<'a>(
     syntax: &OwnerSyntaxInput,
     seed: &OwnerConstraintSeed,
     summary: &OwnerConstraintSummary,
-    abi: &OwnerCallableAbiEnvironment,
+    abi: &OwnerInferenceAbiEnvironment,
     own_scc: &'a OwnerInterfaceSccResult,
     imported_sccs: impl IntoIterator<Item = &'a OwnerInterfaceSccResult>,
 ) -> Result<OwnerBodyInferenceEvaluation, OwnerBodyInferenceError> {
     validate_inputs(syntax, seed, summary, own_scc)?;
+    if abi.subjects() != std::slice::from_ref(&seed.owner) {
+        return Err(OwnerBodyInferenceError::new(
+            "owner body inference ABI does not match its exact owner",
+        ));
+    }
+    let expected_abi_names = summary.authoritative_abi_names().into_vec();
+    let actual_abi_names = abi
+        .lookups()
+        .iter()
+        .map(|lookup| lookup.canonical_name().to_owned())
+        .collect::<Vec<_>>();
+    if actual_abi_names != expected_abi_names {
+        return Err(OwnerBodyInferenceError::new(
+            "owner body inference ABI does not match its exact callable lookup set",
+        ));
+    }
     let mut supplied_keys = BTreeSet::new();
     let mut supplied_results = Vec::new();
     let mut available_interfaces = BTreeMap::new();
@@ -3879,7 +3882,6 @@ pub fn evaluate_owner_body<'a>(
         syntax,
         seed,
         &interfaces,
-        abi,
         &mut unifier,
         &expressions,
         &external_expressions,
@@ -4097,7 +4099,7 @@ pub fn infer_owner_body<'a>(
     syntax: &OwnerSyntaxInput,
     seed: &OwnerConstraintSeed,
     summary: &OwnerConstraintSummary,
-    abi: &OwnerCallableAbiEnvironment,
+    abi: &OwnerInferenceAbiEnvironment,
     own_scc: &'a OwnerInterfaceSccResult,
     imported_sccs: impl IntoIterator<Item = &'a OwnerInterfaceSccResult>,
 ) -> Result<OwnerBodyInferenceShard, OwnerBodyInferenceError> {
@@ -4157,7 +4159,7 @@ mod tests {
         (syntax, source_map, seed)
     }
 
-    fn test_abi() -> OwnerCallableAbiEnvironment {
+    fn test_abi() -> crate::OwnerCallableAbiEnvironment {
         let unit = link("value: 1\n");
         let project =
             ProjectSyntaxSnapshot::from_unit_snapshots("app/RUN.bn", vec![Arc::new(unit)]).unwrap();
@@ -4174,7 +4176,7 @@ mod tests {
         seeds: &[OwnerConstraintSeed],
         summaries: &[OwnerConstraintSummary],
     ) -> Vec<crate::OwnerInterfaceSccResult> {
-        let abi = test_abi();
+        let abi_provider = test_abi();
         let topology = build_owner_interface_topology(summaries.iter()).unwrap();
         let seeds = seeds
             .iter()
@@ -4186,6 +4188,15 @@ mod tests {
             .collect::<BTreeMap<_, _>>();
         let mut results = BTreeMap::new();
         for scc in &topology.sccs {
+            let abi = abi_provider
+                .inference_environment(
+                    scc.key.members.iter().cloned(),
+                    scc.key
+                        .members
+                        .iter()
+                        .flat_map(|owner| summaries[owner].authoritative_abi_names().into_vec()),
+                )
+                .unwrap();
             let dependencies = scc
                 .dependencies
                 .iter()
@@ -4214,7 +4225,12 @@ mod tests {
         summary: &OwnerConstraintSummary,
         results: &[OwnerInterfaceSccResult],
     ) -> OwnerBodyInferenceShard {
-        let abi = test_abi();
+        let abi = test_abi()
+            .inference_environment(
+                [seed.owner.clone()],
+                summary.authoritative_abi_names().into_vec(),
+            )
+            .unwrap();
         let own_scc = results
             .iter()
             .find(|result| result.key.members.contains(&seed.owner))

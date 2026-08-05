@@ -130,7 +130,10 @@ fn validate_inputs(
         )));
     }
     let inference_abi_fingerprint_v1 = abi
-        .callable_environment()
+        .inference_environment(
+            [owner.clone()],
+            summary.authoritative_abi_names().into_vec(),
+        )
         .map_err(|error| {
             CheckedOwnerBuildError::new(format!(
                 "cannot validate checked owner inference ABI: {error}"
@@ -5076,18 +5079,23 @@ mod tests {
             &ExternalTypeEnvironment::empty(ProgramRole::Client),
         )
         .unwrap();
-        let callable_abi = abi.callable_environment().unwrap();
+        let inference_abi = abi
+            .inference_environment(
+                [seed.owner.clone()],
+                summary.authoritative_abi_names().into_vec(),
+            )
+            .unwrap();
         let topology = build_owner_interface_topology([&summary]).unwrap();
         let interface = solve_owner_interface_scc(
             topology.sccs.first().unwrap(),
-            &callable_abi,
+            &inference_abi,
             [&seed],
             [&summary],
             [],
         )
         .unwrap();
         let body =
-            infer_owner_body(&syntax, &seed, &summary, &callable_abi, &interface, []).unwrap();
+            infer_owner_body(&syntax, &seed, &summary, &inference_abi, &interface, []).unwrap();
         Fixture {
             syntax,
             seed,

@@ -1,8 +1,8 @@
 use crate::{
     AuthoritativeCallableSignature, AuthoritativeParameter, BuiltinSignatureRegistry,
-    OwnerArgumentKind, OwnerCallableAbiEnvironment, OwnerCollectionKind, OwnerConstraintEdgeRole,
-    OwnerConstraintNodeKind, OwnerConstraintSeed, OwnerConstraintSeedError, OwnerConstraintSummary,
-    OwnerDeclarationKind, OwnerInterfaceScc, OwnerInterfaceSccKey, OwnerParameterKind,
+    OwnerArgumentKind, OwnerCollectionKind, OwnerConstraintEdgeRole, OwnerConstraintNodeKind,
+    OwnerConstraintSeed, OwnerConstraintSeedError, OwnerConstraintSummary, OwnerDeclarationKind,
+    OwnerInferenceAbiEnvironment, OwnerInterfaceScc, OwnerInterfaceSccKey, OwnerParameterKind,
     OwnerPatternConstraint, OwnerReferenceKind, OwnerSymbolResolution, RenderContractRegistry,
     host_effect_signature, infix_returns_bool, session_info_intrinsic_type,
 };
@@ -67,6 +67,44 @@ pub struct OwnerResultParameterRead {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct OwnerResultAbiParameterContract {
+    pub name: String,
+    pub kind: CheckedParameterKind,
+    pub ordinal: u32,
+    pub flow_type: FlowType,
+}
+
+/// Minimal authoritative contract required to specialize an imported result
+/// transfer. Identity, role, intrinsic, effect, context, requirement, and
+/// construction metadata remain outside this public inference boundary.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct OwnerResultAbiContract {
+    pub kind: boon_checked::CheckedCallableKind,
+    pub parameters: Box<[OwnerResultAbiParameterContract]>,
+    pub result: FlowType,
+}
+
+impl From<&crate::OwnerAbiCallableContract> for OwnerResultAbiContract {
+    fn from(contract: &crate::OwnerAbiCallableContract) -> Self {
+        Self {
+            kind: contract.kind,
+            parameters: contract
+                .parameters
+                .iter()
+                .map(|parameter| OwnerResultAbiParameterContract {
+                    name: parameter.name.clone(),
+                    kind: parameter.kind,
+                    ordinal: parameter.ordinal,
+                    flow_type: parameter.flow_type.clone(),
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            result: contract.result.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum OwnerResultCallTarget {
     Owner {
@@ -74,7 +112,7 @@ pub enum OwnerResultCallTarget {
     },
     Abi {
         canonical_name: String,
-        contract_fingerprint_v1: [u8; 32],
+        contract: OwnerResultAbiContract,
     },
     Unresolved,
     Ambiguous {
@@ -1020,7 +1058,7 @@ fn owner_result_parameter_read(
 
 fn owner_result_call_target(
     state: &OwnerSolveState<'_>,
-    abi: &OwnerCallableAbiEnvironment,
+    abi: &OwnerInferenceAbiEnvironment,
     expression: &crate::OwnerExpressionConstraint,
 ) -> Result<Option<OwnerResultCallTarget>, OwnerConstraintSeedError> {
     let function = match &expression.kind {
@@ -1046,18 +1084,9 @@ fn owner_result_call_target(
                     state.seed.owner
                 ))
             })?;
-            let contract_fingerprint_v1 = boon_contract::canonical_serde_hash_v1(
-                b"boon.owner-result-abi-call.v1\0",
-                contract,
-            )
-            .map_err(|error| {
-                OwnerConstraintSeedError::new(format!(
-                    "cannot fingerprint owner result ABI call `{function}`: {error}"
-                ))
-            })?;
             OwnerResultCallTarget::Abi {
                 canonical_name: function.clone(),
-                contract_fingerprint_v1,
+                contract: OwnerResultAbiContract::from(contract),
             }
         }
         Some(OwnerSymbolResolution::Ambiguous { candidates, .. }) => {
@@ -1129,7 +1158,7 @@ fn owner_result_parameter_alias(
 
 fn build_owner_result_transfer(
     state: &OwnerSolveState<'_>,
-    abi: &OwnerCallableAbiEnvironment,
+    abi: &OwnerInferenceAbiEnvironment,
     unifier: &mut TypeUnifier,
     alpha_variables: &mut BTreeMap<TypeVar, TypeVar>,
     next_alpha: &mut u32,
@@ -1537,7 +1566,7 @@ pub(crate) fn alpha_normalize_type(
 /// Evaluate one dependency-first tagged interface SCC atomically.
 pub fn evaluate_owner_interface_scc<'a>(
     scc: &OwnerInterfaceScc,
-    abi: &OwnerCallableAbiEnvironment,
+    abi: &OwnerInferenceAbiEnvironment,
     seeds: impl IntoIterator<Item = &'a OwnerConstraintSeed>,
     summaries: impl IntoIterator<Item = &'a OwnerConstraintSummary>,
     dependency_results: impl IntoIterator<Item = &'a OwnerInterfaceSccResult>,
@@ -1551,6 +1580,25 @@ pub fn evaluate_owner_interface_scc<'a>(
         .map(|summary| (summary.owner.clone(), summary))
         .collect::<BTreeMap<_, _>>();
     let expected = scc.key.members.iter().cloned().collect::<BTreeSet<_>>();
+    if abi.subjects().iter().cloned().collect::<BTreeSet<_>>() != expected {
+        return Err(OwnerConstraintSeedError::new(
+            "interface SCC inference ABI does not match its exact member set",
+        ));
+    }
+    let expected_abi_names = summaries
+        .values()
+        .flat_map(|summary| summary.authoritative_abi_names().into_vec())
+        .collect::<BTreeSet<_>>();
+    let actual_abi_names = abi
+        .lookups()
+        .iter()
+        .map(|lookup| lookup.canonical_name().to_owned())
+        .collect::<BTreeSet<_>>();
+    if actual_abi_names != expected_abi_names {
+        return Err(OwnerConstraintSeedError::new(
+            "interface SCC inference ABI does not match its exact callable lookup set",
+        ));
+    }
     if seeds.keys().cloned().collect::<BTreeSet<_>>() != expected
         || summaries.keys().cloned().collect::<BTreeSet<_>>() != expected
     {
@@ -2647,7 +2695,7 @@ pub fn evaluate_owner_interface_scc<'a>(
 /// semantic result as two request families.
 pub fn solve_owner_interface_scc<'a>(
     scc: &OwnerInterfaceScc,
-    abi: &OwnerCallableAbiEnvironment,
+    abi: &OwnerInferenceAbiEnvironment,
     seeds: impl IntoIterator<Item = &'a OwnerConstraintSeed>,
     summaries: impl IntoIterator<Item = &'a OwnerConstraintSummary>,
     dependency_results: impl IntoIterator<Item = &'a OwnerInterfaceSccResult>,
@@ -2701,7 +2749,7 @@ mod tests {
         project_owner_constraint_seed(&syntax).unwrap()
     }
 
-    fn test_abi() -> OwnerCallableAbiEnvironment {
+    fn test_abi() -> crate::OwnerCallableAbiEnvironment {
         let unit = link("value: 1\n");
         let project =
             ProjectSyntaxSnapshot::from_unit_snapshots("app/RUN.bn", vec![Arc::new(unit)]).unwrap();
@@ -2718,7 +2766,7 @@ mod tests {
         seeds: &[OwnerConstraintSeed],
         summaries: &[OwnerConstraintSummary],
     ) -> Vec<OwnerInterfaceSccResult> {
-        let abi = test_abi();
+        let abi_provider = test_abi();
         let topology = build_owner_interface_topology(summaries.iter()).unwrap();
         let seeds = seeds
             .iter()
@@ -2730,6 +2778,15 @@ mod tests {
             .collect::<BTreeMap<_, _>>();
         let mut results = BTreeMap::new();
         for scc in &topology.sccs {
+            let abi = abi_provider
+                .inference_environment(
+                    scc.key.members.iter().cloned(),
+                    scc.key
+                        .members
+                        .iter()
+                        .flat_map(|owner| summaries[owner].authoritative_abi_names().into_vec()),
+                )
+                .unwrap();
             let dependencies = scc
                 .dependencies
                 .iter()

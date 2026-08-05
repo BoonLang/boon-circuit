@@ -11,6 +11,7 @@ use boon_checked::{
     CheckedParameterRequirement, ExternalTypeEnvironment, FlowType, ProgramRole, Type,
 };
 use boon_parser::ProjectSyntaxSnapshot;
+use boon_syntax::StableCheckOwnerKey;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
@@ -18,6 +19,9 @@ use std::fmt;
 
 const OWNER_ABI_ENVIRONMENT_DOMAIN_V1: &[u8] = b"boon.owner-abi-environment.v1\0";
 const OWNER_CALLABLE_ABI_ENVIRONMENT_DOMAIN_V1: &[u8] = b"boon.owner-callable-abi-environment.v1\0";
+const OWNER_CALLABLE_ABI_LOOKUP_DOMAIN_V1: &[u8] = b"boon.owner-callable-abi-lookup.v1\0";
+const OWNER_INFERENCE_ABI_ENVIRONMENT_DOMAIN_V1: &[u8] =
+    b"boon.owner-inference-abi-environment.v1\0";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OwnerAbiEnvironmentError {
@@ -210,6 +214,226 @@ pub struct OwnerCallableAbiEnvironment {
     fingerprint_v1: [u8; 32],
 }
 
+/// Exact authoritative lookup state for one canonical callable name.
+///
+/// Missing and conflicting providers are values rather than absent dependency
+/// edges, so adding or removing one contract invalidates precisely the owners
+/// that asked for that name.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum OwnerCallableAbiLookupOutcome {
+    Found {
+        contract: OwnerAbiCallableContract,
+    },
+    Missing,
+    Conflict {
+        contracts: Box<[OwnerAbiCallableContract]>,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct OwnerCallableAbiLookup {
+    canonical_name: String,
+    outcome: OwnerCallableAbiLookupOutcome,
+    #[serde(skip)]
+    fingerprint_v1: [u8; 32],
+}
+
+impl OwnerCallableAbiLookup {
+    fn new(
+        canonical_name: String,
+        outcome: OwnerCallableAbiLookupOutcome,
+    ) -> Result<Self, OwnerAbiEnvironmentError> {
+        if canonical_name.is_empty() {
+            return Err(OwnerAbiEnvironmentError::new(
+                "owner callable ABI lookup name is empty",
+            ));
+        }
+        let contracts = match &outcome {
+            OwnerCallableAbiLookupOutcome::Found { contract } => std::slice::from_ref(contract),
+            OwnerCallableAbiLookupOutcome::Missing => &[],
+            OwnerCallableAbiLookupOutcome::Conflict { contracts } => {
+                if contracts.len() < 2 {
+                    return Err(OwnerAbiEnvironmentError::new(format!(
+                        "owner callable ABI conflict `{canonical_name}` has fewer than two contracts"
+                    )));
+                }
+                contracts
+            }
+        };
+        if contracts
+            .iter()
+            .any(|contract| contract.name != canonical_name)
+        {
+            return Err(OwnerAbiEnvironmentError::new(format!(
+                "owner callable ABI lookup `{canonical_name}` contains a differently named contract"
+            )));
+        }
+        let fingerprint_v1 = boon_contract::canonical_serde_hash_v1(
+            OWNER_CALLABLE_ABI_LOOKUP_DOMAIN_V1,
+            &(&canonical_name, &outcome),
+        )
+        .map_err(|error| {
+            OwnerAbiEnvironmentError::new(format!(
+                "cannot fingerprint owner callable ABI lookup `{canonical_name}`: {error}"
+            ))
+        })?;
+        Ok(Self {
+            canonical_name,
+            outcome,
+            fingerprint_v1,
+        })
+    }
+
+    pub fn found(
+        canonical_name: impl Into<String>,
+        contract: OwnerAbiCallableContract,
+    ) -> Result<Self, OwnerAbiEnvironmentError> {
+        Self::new(
+            canonical_name.into(),
+            OwnerCallableAbiLookupOutcome::Found { contract },
+        )
+    }
+
+    pub fn missing(canonical_name: impl Into<String>) -> Result<Self, OwnerAbiEnvironmentError> {
+        Self::new(
+            canonical_name.into(),
+            OwnerCallableAbiLookupOutcome::Missing,
+        )
+    }
+
+    pub fn conflict(
+        canonical_name: impl Into<String>,
+        contracts: impl IntoIterator<Item = OwnerAbiCallableContract>,
+    ) -> Result<Self, OwnerAbiEnvironmentError> {
+        Self::new(
+            canonical_name.into(),
+            OwnerCallableAbiLookupOutcome::Conflict {
+                contracts: contracts.into_iter().collect::<Vec<_>>().into_boxed_slice(),
+            },
+        )
+    }
+
+    pub fn canonical_name(&self) -> &str {
+        &self.canonical_name
+    }
+
+    pub const fn outcome(&self) -> &OwnerCallableAbiLookupOutcome {
+        &self.outcome
+    }
+
+    pub fn contract(&self) -> Option<&OwnerAbiCallableContract> {
+        match &self.outcome {
+            OwnerCallableAbiLookupOutcome::Found { contract } => Some(contract),
+            OwnerCallableAbiLookupOutcome::Missing
+            | OwnerCallableAbiLookupOutcome::Conflict { .. } => None,
+        }
+    }
+
+    pub const fn fingerprint_v1(&self) -> [u8; 32] {
+        self.fingerprint_v1
+    }
+}
+
+/// Exact callable ABI surface consumed by one owner or one interface SCC.
+///
+/// This value contains only requested names, including explicit missing or
+/// conflict outcomes. Its fingerprint therefore does not change when an
+/// unrelated builtin, field projection, host function, or external callable
+/// is added elsewhere in the project.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct OwnerInferenceAbiEnvironment {
+    subjects: Box<[StableCheckOwnerKey]>,
+    lookups: Box<[OwnerCallableAbiLookup]>,
+    #[serde(skip)]
+    fingerprint_v1: [u8; 32],
+}
+
+impl OwnerInferenceAbiEnvironment {
+    pub fn from_lookups(
+        subjects: impl IntoIterator<Item = StableCheckOwnerKey>,
+        lookups: impl IntoIterator<Item = OwnerCallableAbiLookup>,
+    ) -> Result<Self, OwnerAbiEnvironmentError> {
+        let mut subjects = subjects.into_iter().collect::<Vec<_>>();
+        subjects.sort();
+        subjects.dedup();
+        if subjects.is_empty() {
+            return Err(OwnerAbiEnvironmentError::new(
+                "owner inference ABI environment has no subjects",
+            ));
+        }
+
+        let mut by_name = BTreeMap::new();
+        for lookup in lookups {
+            match by_name.entry(lookup.canonical_name.clone()) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(lookup);
+                }
+                std::collections::btree_map::Entry::Occupied(entry) if entry.get() == &lookup => {}
+                std::collections::btree_map::Entry::Occupied(entry) => {
+                    return Err(OwnerAbiEnvironmentError::new(format!(
+                        "owner inference ABI environment has inconsistent duplicate lookup `{}`",
+                        entry.key()
+                    )));
+                }
+            }
+        }
+        let lookups = by_name.into_values().collect::<Vec<_>>();
+        let fingerprint_v1 = boon_contract::canonical_serde_hash_v1(
+            OWNER_INFERENCE_ABI_ENVIRONMENT_DOMAIN_V1,
+            &(&subjects, &lookups),
+        )
+        .map_err(|error| {
+            OwnerAbiEnvironmentError::new(format!(
+                "cannot fingerprint owner inference ABI environment: {error}"
+            ))
+        })?;
+        Ok(Self {
+            subjects: subjects.into_boxed_slice(),
+            lookups: lookups.into_boxed_slice(),
+            fingerprint_v1,
+        })
+    }
+
+    pub fn merge<'a>(
+        environments: impl IntoIterator<Item = &'a Self>,
+    ) -> Result<Self, OwnerAbiEnvironmentError> {
+        let environments = environments.into_iter().collect::<Vec<_>>();
+        Self::from_lookups(
+            environments
+                .iter()
+                .flat_map(|environment| environment.subjects.iter().cloned()),
+            environments
+                .iter()
+                .flat_map(|environment| environment.lookups.iter().cloned()),
+        )
+    }
+
+    pub fn subjects(&self) -> &[StableCheckOwnerKey] {
+        &self.subjects
+    }
+
+    pub fn lookups(&self) -> &[OwnerCallableAbiLookup] {
+        &self.lookups
+    }
+
+    pub fn lookup(&self, canonical_name: &str) -> Option<&OwnerCallableAbiLookup> {
+        self.lookups
+            .binary_search_by(|lookup| lookup.canonical_name.as_str().cmp(canonical_name))
+            .ok()
+            .and_then(|index| self.lookups.get(index))
+    }
+
+    pub fn callable(&self, canonical_name: &str) -> Option<&OwnerAbiCallableContract> {
+        self.lookup(canonical_name)
+            .and_then(OwnerCallableAbiLookup::contract)
+    }
+
+    pub const fn fingerprint_v1(&self) -> [u8; 32] {
+        self.fingerprint_v1
+    }
+}
+
 impl OwnerCallableAbiEnvironment {
     pub const fn fingerprint_v1(&self) -> [u8; 32] {
         self.fingerprint_v1
@@ -220,6 +444,32 @@ impl OwnerCallableAbiEnvironment {
             .binary_search_by(|contract| contract.name.as_str().cmp(name))
             .ok()
             .and_then(|index| self.callables.get(index))
+    }
+
+    pub fn lookup(
+        &self,
+        canonical_name: &str,
+    ) -> Result<OwnerCallableAbiLookup, OwnerAbiEnvironmentError> {
+        self.callable(canonical_name).cloned().map_or_else(
+            || OwnerCallableAbiLookup::missing(canonical_name),
+            |contract| OwnerCallableAbiLookup::found(canonical_name, contract),
+        )
+    }
+
+    pub fn inference_environment(
+        &self,
+        subjects: impl IntoIterator<Item = StableCheckOwnerKey>,
+        canonical_names: impl IntoIterator<Item = String>,
+    ) -> Result<OwnerInferenceAbiEnvironment, OwnerAbiEnvironmentError> {
+        OwnerInferenceAbiEnvironment::from_lookups(
+            subjects,
+            canonical_names
+                .into_iter()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .map(|name| self.lookup(&name))
+                .collect::<Result<Vec<_>, _>>()?,
+        )
     }
 }
 
@@ -273,6 +523,15 @@ impl OwnerAbiEnvironment {
             callables: self.callables.clone(),
             fingerprint_v1,
         })
+    }
+
+    pub fn inference_environment(
+        &self,
+        subjects: impl IntoIterator<Item = StableCheckOwnerKey>,
+        canonical_names: impl IntoIterator<Item = String>,
+    ) -> Result<OwnerInferenceAbiEnvironment, OwnerAbiEnvironmentError> {
+        self.callable_environment()?
+            .inference_environment(subjects, canonical_names)
     }
 }
 
@@ -776,6 +1035,32 @@ mod tests {
         ProjectSyntaxSnapshot::from_unit_snapshots("app/RUN.bn", vec![Arc::new(unit)]).unwrap()
     }
 
+    fn owner(source: &str, name: &str) -> StableCheckOwnerKey {
+        let parsed = parse_project_source_unit("app/RUN.bn", source).unwrap();
+        let source_unit_id = parsed.source_unit_id.clone();
+        let link_key = project_unit_link_keys(
+            "app/RUN.bn",
+            [(source_unit_id.clone(), parsed.declared_functions.clone())],
+        )
+        .unwrap()
+        .remove(&source_unit_id)
+        .unwrap();
+        parsed
+            .into_unit_syntax_snapshot(link_key)
+            .unwrap()
+            .stable_check_owner_keys()
+            .find(|owner| {
+                matches!(
+                    owner,
+                    StableCheckOwnerKey::Item(owner)
+                        if owner.item_route.segments().last().is_some_and(|segment| {
+                            segment.names.as_ref() == [name]
+                        })
+                )
+            })
+            .unwrap()
+    }
+
     #[test]
     fn abi_environment_is_canonical_complete_and_role_sensitive() {
         let project = project("document: Document/new(title: TEXT { Demo })\n");
@@ -860,5 +1145,82 @@ mod tests {
             second.value("Server.value").unwrap().flow_type.ty,
             Type::Text
         );
+    }
+
+    #[test]
+    fn exact_inference_abi_ignores_unrequested_callable_additions() {
+        let before = concat!(
+            "FUNCTION keep(input) {\n",
+            "    Number/to_text(value: input)\n",
+            "}\n",
+            "other: Field/known(input: [known: 1])\n",
+        );
+        let after = concat!(
+            "FUNCTION keep(input) {\n",
+            "    Number/to_text(value: input)\n",
+            "}\n",
+            "other: Field/unrelated(input: [unrelated: 2])\n",
+        );
+        let before_provider = project_owner_abi_environment(
+            &project(before),
+            &ExternalTypeEnvironment::empty(ProgramRole::Client),
+        )
+        .unwrap()
+        .callable_environment()
+        .unwrap();
+        let after_provider = project_owner_abi_environment(
+            &project(after),
+            &ExternalTypeEnvironment::empty(ProgramRole::Client),
+        )
+        .unwrap()
+        .callable_environment()
+        .unwrap();
+        assert_ne!(
+            before_provider.fingerprint_v1(),
+            after_provider.fingerprint_v1()
+        );
+
+        let subject = owner(before, "keep");
+        assert_eq!(subject, owner(after, "keep"));
+        let names = ["Number/to_text".to_owned(), "Missing/function".to_owned()];
+        let before = before_provider
+            .inference_environment([subject.clone()], names.clone())
+            .unwrap();
+        let after = after_provider
+            .inference_environment([subject], names)
+            .unwrap();
+
+        assert_eq!(before.fingerprint_v1(), after.fingerprint_v1());
+        assert!(matches!(
+            before.lookup("Number/to_text").unwrap().outcome(),
+            OwnerCallableAbiLookupOutcome::Found { .. }
+        ));
+        assert!(matches!(
+            before.lookup("Missing/function").unwrap().outcome(),
+            OwnerCallableAbiLookupOutcome::Missing
+        ));
+        assert!(before.lookup("Field/unrelated").is_none());
+    }
+
+    #[test]
+    fn callable_lookup_conflict_is_an_explicit_fingerprinted_outcome() {
+        let provider = project_owner_abi_environment(
+            &project("value: 1\n"),
+            &ExternalTypeEnvironment::empty(ProgramRole::Client),
+        )
+        .unwrap()
+        .callable_environment()
+        .unwrap();
+        let contract = provider.callable("Number/to_text").unwrap().clone();
+        let found = OwnerCallableAbiLookup::found("Number/to_text", contract.clone()).unwrap();
+        let conflict =
+            OwnerCallableAbiLookup::conflict("Number/to_text", [contract.clone(), contract])
+                .unwrap();
+
+        assert!(matches!(
+            conflict.outcome(),
+            OwnerCallableAbiLookupOutcome::Conflict { contracts } if contracts.len() == 2
+        ));
+        assert_ne!(found.fingerprint_v1(), conflict.fingerprint_v1());
     }
 }

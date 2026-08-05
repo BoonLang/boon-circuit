@@ -298,6 +298,21 @@ impl OwnerConstraintSeed {
     pub const fn topology_fingerprint_v1(&self) -> [u8; 32] {
         self.topology_fingerprint_v1
     }
+
+    /// Canonical authoritative callable names queried by this owner.
+    ///
+    /// The explicit sorted set is the request key surface for exact ABI lookup
+    /// dependencies; missing names remain queries rather than disappearing.
+    pub fn callable_abi_names(&self) -> Box<[String]> {
+        self.references
+            .iter()
+            .filter(|reference| reference.kind == OwnerReferenceKind::Callable)
+            .map(|reference| reference.parts.join("/"))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -459,6 +474,27 @@ impl OwnerConstraintSummary {
 
     pub const fn topology_fingerprint_v1(&self) -> [u8; 32] {
         self.topology_fingerprint_v1
+    }
+
+    /// Exact authoritative ABI lookup names retained by symbol resolution.
+    /// Project-resolved and project-ambiguous callables deliberately do not
+    /// enter this surface; unresolved names remain explicit missing lookups.
+    pub fn authoritative_abi_names(&self) -> Box<[String]> {
+        self.symbol_resolutions
+            .iter()
+            .filter(|resolution| {
+                resolution.reference().kind == OwnerReferenceKind::Callable
+                    && matches!(
+                        resolution,
+                        OwnerSymbolResolution::Authoritative { .. }
+                            | OwnerSymbolResolution::Unresolved { .. }
+                    )
+            })
+            .map(|resolution| resolution.reference().parts.join("/"))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
     }
 }
 

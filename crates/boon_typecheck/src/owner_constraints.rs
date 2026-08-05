@@ -496,6 +496,23 @@ impl OwnerConstraintSummary {
             .collect::<Vec<_>>()
             .into_boxed_slice()
     }
+
+    /// Exact role-qualified external value paths consumed by this owner.
+    /// Missing and forbidden values remain explicit ABI lookups so later
+    /// policy or provider changes cannot leave a cached owner falsely green.
+    pub fn authoritative_value_abi_paths(&self) -> Box<[String]> {
+        self.symbol_resolutions
+            .iter()
+            .filter(|resolution| {
+                resolution.reference().kind == OwnerReferenceKind::Value
+                    && matches!(resolution, OwnerSymbolResolution::Authoritative { .. })
+            })
+            .map(|resolution| boon_syntax::canonical_value_path(&resolution.reference().parts))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
+    }
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -890,10 +907,15 @@ pub fn resolve_owner_constraint_seed(
         .collect::<BTreeMap<_, _>>();
     for reference in &seed.references {
         resolutions.entry(reference.clone()).or_insert_with(|| {
-            if reference.kind == OwnerReferenceKind::Callable
+            if (reference.kind == OwnerReferenceKind::Callable
                 && crate::owner_interface::is_authoritative_callable_name(
                     &reference.parts.join("/"),
-                )
+                ))
+                || (reference.kind == OwnerReferenceKind::Value
+                    && reference
+                        .parts
+                        .first()
+                        .is_some_and(|part| boon_syntax::is_program_role_root(part)))
             {
                 OwnerSymbolResolution::Authoritative {
                     reference: reference.clone(),

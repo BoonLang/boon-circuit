@@ -10,7 +10,7 @@ use crate::{
     OwnerResultAbiContract, OwnerResultAbiParameterContract, OwnerResultCallTarget,
     OwnerResultExpressionRef, OwnerResultTransfer, OwnerResultTransferNode, OwnerSourceAnchorRole,
     OwnerSourceAnchorSite, OwnerSourceMap, OwnerSymbolResolution, OwnerSyntaxInput,
-    infix_returns_bool,
+    OwnerValueAbiForbiddenReason, OwnerValueAbiLookupOutcome, infix_returns_bool,
 };
 use boon_checked::{
     BytesType, CheckedCallableKind, CheckedEffectSummary, CheckedParameterKind,
@@ -692,6 +692,74 @@ fn push_invalid_syntax_diagnostics(
     }
 }
 
+fn push_external_value_diagnostics(
+    summary: &OwnerConstraintSummary,
+    abi: &OwnerInferenceAbiEnvironment,
+    diagnostics: &mut Vec<OwnerDiagnosticTemplate>,
+) {
+    for resolution in &summary.symbol_resolutions {
+        let OwnerSymbolResolution::Authoritative { reference } = resolution else {
+            continue;
+        };
+        if reference.kind != OwnerReferenceKind::Value {
+            continue;
+        }
+        let canonical_path = boon_syntax::canonical_value_path(&reference.parts);
+        let Some(lookup) = abi.value_lookup(&canonical_path) else {
+            continue;
+        };
+        let (code, message) = match lookup.outcome() {
+            OwnerValueAbiLookupOutcome::Found { .. }
+            | OwnerValueAbiLookupOutcome::Missing {
+                allow_unresolved: true,
+            } => continue,
+            OwnerValueAbiLookupOutcome::Missing {
+                allow_unresolved: false,
+            } => (
+                "unknown_external_value",
+                format!("unknown qualified external value `{canonical_path}`"),
+            ),
+            OwnerValueAbiLookupOutcome::Forbidden {
+                reason: OwnerValueAbiForbiddenReason::NonStoreRoot { producer },
+            } => (
+                "invalid_external_value_root",
+                format!(
+                    "qualified external value `{canonical_path}` must use `{}/store.<value>`; role outputs are host boundaries, not distributed application state",
+                    producer.namespace()
+                ),
+            ),
+            OwnerValueAbiLookupOutcome::Forbidden {
+                reason: OwnerValueAbiForbiddenReason::SameRole { role },
+            } => (
+                "same_role_external_value",
+                format!(
+                    "same-role qualification `{canonical_path}` is not allowed in {}; use an unqualified local name",
+                    role.namespace()
+                ),
+            ),
+            OwnerValueAbiLookupOutcome::Forbidden {
+                reason: OwnerValueAbiForbiddenReason::DependencyDirection { consumer, producer },
+            } => (
+                "forbidden_external_value_dependency",
+                format!(
+                    "{} cannot depend on {} through `{canonical_path}`",
+                    consumer.namespace(),
+                    producer.namespace()
+                ),
+            ),
+        };
+        diagnostics.push(OwnerDiagnosticTemplate {
+            severity: DiagnosticSeverity::Error,
+            code: code.to_owned(),
+            message,
+            site: OwnerSourceAnchorSite::Expression {
+                expression: reference.expression.clone(),
+            },
+            role: None,
+        });
+    }
+}
+
 fn collect_relocations(
     seed: &OwnerConstraintSeed,
     summary: &OwnerConstraintSummary,
@@ -868,6 +936,7 @@ fn frozen_scc_ref(
 fn bind_local_constraints(
     seed: &OwnerConstraintSeed,
     summary: &OwnerConstraintSummary,
+    abi: &OwnerInferenceAbiEnvironment,
     unifier: &mut TypeUnifier,
     expressions: &[TypeVar],
     external_expressions: &[TypeVar],
@@ -916,9 +985,25 @@ fn bind_local_constraints(
             }
             OwnerConstraintNodeKind::Reference { parts }
             | OwnerConstraintNodeKind::Drain { parts } => {
-                if !resolved.contains_key(&expression.expression)
-                    && let Some((root, projection)) = parts.split_first()
-                {
+                if resolved.contains_key(&expression.expression) {
+                    // Cross-owner value reads are wired after all interfaces
+                    // have been instantiated into this body namespace.
+                } else if matches!(
+                    symbol_resolutions.get(&expression.expression),
+                    Some(OwnerSymbolResolution::Authoritative { reference })
+                        if reference.kind == OwnerReferenceKind::Value
+                ) {
+                    let canonical_path = boon_syntax::canonical_value_path(parts);
+                    if let Some(flow_type) = abi
+                        .value_lookup(&canonical_path)
+                        .and_then(crate::OwnerValueAbiLookup::flow_type)
+                    {
+                        let mut variables = BTreeMap::new();
+                        let ty = instantiate_type(&flow_type.ty, unifier, &mut variables);
+                        unifier.bind_var(variable, ty);
+                        mode = Some(flow_type.mode);
+                    }
+                } else if let Some((root, projection)) = parts.split_first() {
                     let local = if root == "PASSED" {
                         context
                     } else {
@@ -3597,6 +3682,17 @@ pub fn evaluate_owner_body<'a>(
             "owner body inference ABI does not match its exact callable lookup set",
         ));
     }
+    let expected_value_paths = summary.authoritative_value_abi_paths().into_vec();
+    let actual_value_paths = abi
+        .value_lookups()
+        .iter()
+        .map(|lookup| lookup.canonical_path().to_owned())
+        .collect::<Vec<_>>();
+    if actual_value_paths != expected_value_paths {
+        return Err(OwnerBodyInferenceError::new(
+            "owner body inference ABI does not match its exact external value lookup set",
+        ));
+    }
     let mut supplied_keys = BTreeSet::new();
     let mut supplied_results = Vec::new();
     let mut available_interfaces = BTreeMap::new();
@@ -3815,6 +3911,7 @@ pub fn evaluate_owner_body<'a>(
     bind_local_constraints(
         seed,
         summary,
+        abi,
         &mut unifier,
         &expressions,
         &external_expressions,
@@ -3860,6 +3957,7 @@ pub fn evaluate_owner_body<'a>(
 
     let mut diagnostics = Vec::new();
     push_invalid_syntax_diagnostics(seed, &mut diagnostics);
+    push_external_value_diagnostics(summary, abi, &mut diagnostics);
     let mut call_drafts = bind_calls(
         calls,
         seed,
@@ -4159,7 +4257,7 @@ mod tests {
         (syntax, source_map, seed)
     }
 
-    fn test_abi() -> crate::OwnerCallableAbiEnvironment {
+    fn test_abi() -> crate::OwnerAbiEnvironment {
         let unit = link("value: 1\n");
         let project =
             ProjectSyntaxSnapshot::from_unit_snapshots("app/RUN.bn", vec![Arc::new(unit)]).unwrap();
@@ -4168,8 +4266,6 @@ mod tests {
             &boon_checked::ExternalTypeEnvironment::empty(boon_checked::ProgramRole::Client),
         )
         .unwrap()
-        .callable_environment()
-        .unwrap()
     }
 
     fn solve(
@@ -4177,6 +4273,14 @@ mod tests {
         summaries: &[OwnerConstraintSummary],
     ) -> Vec<crate::OwnerInterfaceSccResult> {
         let abi_provider = test_abi();
+        solve_with_abi(seeds, summaries, &abi_provider)
+    }
+
+    fn solve_with_abi(
+        seeds: &[OwnerConstraintSeed],
+        summaries: &[OwnerConstraintSummary],
+        abi_provider: &crate::OwnerAbiEnvironment,
+    ) -> Vec<crate::OwnerInterfaceSccResult> {
         let topology = build_owner_interface_topology(summaries.iter()).unwrap();
         let seeds = seeds
             .iter()
@@ -4189,12 +4293,15 @@ mod tests {
         let mut results = BTreeMap::new();
         for scc in &topology.sccs {
             let abi = abi_provider
-                .inference_environment(
+                .exact_inference_environment(
                     scc.key.members.iter().cloned(),
                     scc.key
                         .members
                         .iter()
                         .flat_map(|owner| summaries[owner].authoritative_abi_names().into_vec()),
+                    scc.key.members.iter().flat_map(|owner| {
+                        summaries[owner].authoritative_value_abi_paths().into_vec()
+                    }),
                 )
                 .unwrap();
             let dependencies = scc
@@ -4225,10 +4332,22 @@ mod tests {
         summary: &OwnerConstraintSummary,
         results: &[OwnerInterfaceSccResult],
     ) -> OwnerBodyInferenceShard {
-        let abi = test_abi()
-            .inference_environment(
+        let abi_provider = test_abi();
+        infer_with_abi(syntax, seed, summary, results, &abi_provider)
+    }
+
+    fn infer_with_abi(
+        syntax: &OwnerSyntaxInput,
+        seed: &OwnerConstraintSeed,
+        summary: &OwnerConstraintSummary,
+        results: &[OwnerInterfaceSccResult],
+        abi_provider: &crate::OwnerAbiEnvironment,
+    ) -> OwnerBodyInferenceShard {
+        let abi = abi_provider
+            .exact_inference_environment(
                 [seed.owner.clone()],
                 summary.authoritative_abi_names().into_vec(),
+                summary.authoritative_value_abi_paths().into_vec(),
             )
             .unwrap();
         let own_scc = results
@@ -5173,6 +5292,68 @@ mod tests {
                     expression.stable_key,
                 );
             }
+        }
+    }
+
+    #[test]
+    fn external_value_flow_matches_the_independent_whole_checker_oracle() {
+        let source = "value: Session/store.count\n";
+        let unit = link(source);
+        let owner = owner_named(&unit, "value");
+        let (syntax, _, seed) = inputs(&unit, &owner);
+        let summary = resolve_owner_constraint_seed(&seed, []).unwrap();
+        assert_eq!(
+            summary.authoritative_value_abi_paths().as_ref(),
+            ["Session/store.count"]
+        );
+
+        let mut external =
+            boon_checked::ExternalTypeEnvironment::empty(boon_checked::ProgramRole::Client);
+        external.values.insert(
+            "Session/store.count".to_owned(),
+            FlowType {
+                mode: FlowMode::Continuous,
+                ty: Type::Number,
+            },
+        );
+        let project =
+            ProjectSyntaxSnapshot::from_unit_snapshots("app/RUN.bn", vec![Arc::new(unit.clone())])
+                .unwrap();
+        let abi = crate::project_owner_abi_environment(&project, &external).unwrap();
+        let interfaces = solve_with_abi(&[seed.clone()], &[summary.clone()], &abi);
+        let body = infer_with_abi(&syntax, &seed, &summary, &interfaces, &abi);
+        assert!(body.diagnostics.is_empty());
+        assert_eq!(interfaces[0].owners[0].result.ty, Type::Number);
+        assert_eq!(body.expressions.last().unwrap().flow_type.ty, Type::Number);
+
+        let parsed = boon_parser::parse_project(
+            "app/RUN.bn",
+            [("app/RUN.bn".to_owned(), source.to_owned())],
+        )
+        .unwrap();
+        let syntax_ids = parsed
+            .expressions
+            .iter()
+            .filter_map(|expression| {
+                parsed
+                    .stable_expression_key(expression.id)
+                    .map(|stable| (stable, expression.id))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let oracle = crate::check_program_with_external_types(&parsed, &external);
+        assert!(oracle.report.diagnostics.is_empty());
+        let oracle_types = oracle
+            .report
+            .expr_type_table
+            .entries
+            .iter()
+            .map(|entry| (entry.expr_id, entry.flow_type.clone()))
+            .collect::<BTreeMap<_, _>>();
+        for expression in &body.expressions {
+            assert_eq!(
+                expression.flow_type,
+                oracle_types[&syntax_ids[&expression.stable_key]]
+            );
         }
     }
 }

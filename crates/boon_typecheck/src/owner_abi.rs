@@ -20,8 +20,9 @@ use std::fmt;
 const OWNER_ABI_ENVIRONMENT_DOMAIN_V1: &[u8] = b"boon.owner-abi-environment.v1\0";
 const OWNER_CALLABLE_ABI_ENVIRONMENT_DOMAIN_V1: &[u8] = b"boon.owner-callable-abi-environment.v1\0";
 const OWNER_CALLABLE_ABI_LOOKUP_DOMAIN_V1: &[u8] = b"boon.owner-callable-abi-lookup.v1\0";
-const OWNER_INFERENCE_ABI_ENVIRONMENT_DOMAIN_V1: &[u8] =
-    b"boon.owner-inference-abi-environment.v1\0";
+const OWNER_VALUE_ABI_LOOKUP_DOMAIN_V1: &[u8] = b"boon.owner-value-abi-lookup.v1\0";
+const OWNER_INFERENCE_ABI_ENVIRONMENT_DOMAIN_V2: &[u8] =
+    b"boon.owner-inference-abi-environment.v2\0";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct OwnerAbiEnvironmentError {
@@ -394,6 +395,96 @@ impl OwnerCallableAbiLookup {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "reason", rename_all = "snake_case")]
+pub enum OwnerValueAbiForbiddenReason {
+    NonStoreRoot {
+        producer: ProgramRole,
+    },
+    SameRole {
+        role: ProgramRole,
+    },
+    DependencyDirection {
+        consumer: ProgramRole,
+        producer: ProgramRole,
+    },
+}
+
+/// Exact inference result for one role-qualified external value path.
+///
+/// `Missing` retains the active provisional policy so changing that policy
+/// invalidates only owners which actually depend on an absent external value.
+/// Source-bound declaration identity is deliberately absent; it belongs to
+/// checked-shard construction and linking rather than type inference.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum OwnerValueAbiLookupOutcome {
+    Found {
+        flow_type: FlowType,
+    },
+    Missing {
+        allow_unresolved: bool,
+    },
+    Forbidden {
+        reason: OwnerValueAbiForbiddenReason,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct OwnerValueAbiLookup {
+    canonical_path: String,
+    outcome: OwnerValueAbiLookupOutcome,
+    #[serde(skip)]
+    fingerprint_v1: [u8; 32],
+}
+
+impl OwnerValueAbiLookup {
+    fn new(
+        canonical_path: String,
+        outcome: OwnerValueAbiLookupOutcome,
+    ) -> Result<Self, OwnerAbiEnvironmentError> {
+        if canonical_path.is_empty() {
+            return Err(OwnerAbiEnvironmentError::new(
+                "owner value ABI lookup path is empty",
+            ));
+        }
+        let fingerprint_v1 = boon_contract::canonical_serde_hash_v1(
+            OWNER_VALUE_ABI_LOOKUP_DOMAIN_V1,
+            &(&canonical_path, &outcome),
+        )
+        .map_err(|error| {
+            OwnerAbiEnvironmentError::new(format!(
+                "cannot fingerprint owner value ABI lookup `{canonical_path}`: {error}"
+            ))
+        })?;
+        Ok(Self {
+            canonical_path,
+            outcome,
+            fingerprint_v1,
+        })
+    }
+
+    pub fn canonical_path(&self) -> &str {
+        &self.canonical_path
+    }
+
+    pub const fn outcome(&self) -> &OwnerValueAbiLookupOutcome {
+        &self.outcome
+    }
+
+    pub fn flow_type(&self) -> Option<&FlowType> {
+        match &self.outcome {
+            OwnerValueAbiLookupOutcome::Found { flow_type } => Some(flow_type),
+            OwnerValueAbiLookupOutcome::Missing { .. }
+            | OwnerValueAbiLookupOutcome::Forbidden { .. } => None,
+        }
+    }
+
+    pub const fn fingerprint_v1(&self) -> [u8; 32] {
+        self.fingerprint_v1
+    }
+}
+
 /// Exact callable ABI surface consumed by one owner or one interface SCC.
 ///
 /// This value contains only requested names, including explicit missing or
@@ -404,6 +495,7 @@ impl OwnerCallableAbiLookup {
 pub struct OwnerInferenceAbiEnvironment {
     subjects: Box<[StableCheckOwnerKey]>,
     lookups: Box<[OwnerCallableAbiLookup]>,
+    value_lookups: Box<[OwnerValueAbiLookup]>,
     #[serde(skip)]
     fingerprint_v1: [u8; 32],
 }
@@ -412,6 +504,14 @@ impl OwnerInferenceAbiEnvironment {
     pub fn from_lookups(
         subjects: impl IntoIterator<Item = StableCheckOwnerKey>,
         lookups: impl IntoIterator<Item = OwnerCallableAbiLookup>,
+    ) -> Result<Self, OwnerAbiEnvironmentError> {
+        Self::from_lookup_sets(subjects, lookups, [])
+    }
+
+    pub fn from_lookup_sets(
+        subjects: impl IntoIterator<Item = StableCheckOwnerKey>,
+        lookups: impl IntoIterator<Item = OwnerCallableAbiLookup>,
+        value_lookups: impl IntoIterator<Item = OwnerValueAbiLookup>,
     ) -> Result<Self, OwnerAbiEnvironmentError> {
         let mut subjects = subjects.into_iter().collect::<Vec<_>>();
         subjects.sort();
@@ -438,9 +538,25 @@ impl OwnerInferenceAbiEnvironment {
             }
         }
         let lookups = by_name.into_values().collect::<Vec<_>>();
+        let mut values_by_path = BTreeMap::new();
+        for lookup in value_lookups {
+            match values_by_path.entry(lookup.canonical_path.clone()) {
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    entry.insert(lookup);
+                }
+                std::collections::btree_map::Entry::Occupied(entry) if entry.get() == &lookup => {}
+                std::collections::btree_map::Entry::Occupied(entry) => {
+                    return Err(OwnerAbiEnvironmentError::new(format!(
+                        "owner inference ABI environment has inconsistent duplicate value lookup `{}`",
+                        entry.key()
+                    )));
+                }
+            }
+        }
+        let value_lookups = values_by_path.into_values().collect::<Vec<_>>();
         let fingerprint_v1 = boon_contract::canonical_serde_hash_v1(
-            OWNER_INFERENCE_ABI_ENVIRONMENT_DOMAIN_V1,
-            &(&subjects, &lookups),
+            OWNER_INFERENCE_ABI_ENVIRONMENT_DOMAIN_V2,
+            &(&subjects, &lookups, &value_lookups),
         )
         .map_err(|error| {
             OwnerAbiEnvironmentError::new(format!(
@@ -450,6 +566,7 @@ impl OwnerInferenceAbiEnvironment {
         Ok(Self {
             subjects: subjects.into_boxed_slice(),
             lookups: lookups.into_boxed_slice(),
+            value_lookups: value_lookups.into_boxed_slice(),
             fingerprint_v1,
         })
     }
@@ -458,13 +575,16 @@ impl OwnerInferenceAbiEnvironment {
         environments: impl IntoIterator<Item = &'a Self>,
     ) -> Result<Self, OwnerAbiEnvironmentError> {
         let environments = environments.into_iter().collect::<Vec<_>>();
-        Self::from_lookups(
+        Self::from_lookup_sets(
             environments
                 .iter()
                 .flat_map(|environment| environment.subjects.iter().cloned()),
             environments
                 .iter()
                 .flat_map(|environment| environment.lookups.iter().cloned()),
+            environments
+                .iter()
+                .flat_map(|environment| environment.value_lookups.iter().cloned()),
         )
     }
 
@@ -481,6 +601,17 @@ impl OwnerInferenceAbiEnvironment {
             .binary_search_by(|lookup| lookup.canonical_name.as_str().cmp(canonical_name))
             .ok()
             .and_then(|index| self.lookups.get(index))
+    }
+
+    pub fn value_lookups(&self) -> &[OwnerValueAbiLookup] {
+        &self.value_lookups
+    }
+
+    pub fn value_lookup(&self, canonical_path: &str) -> Option<&OwnerValueAbiLookup> {
+        self.value_lookups
+            .binary_search_by(|lookup| lookup.canonical_path.as_str().cmp(canonical_path))
+            .ok()
+            .and_then(|index| self.value_lookups.get(index))
     }
 
     pub fn callable(&self, canonical_name: &str) -> Option<&OwnerInferenceCallableContract> {
@@ -556,6 +687,52 @@ impl OwnerAbiEnvironment {
             .and_then(|index| self.values.get(index))
     }
 
+    pub fn value_lookup(
+        &self,
+        canonical_path: &str,
+    ) -> Result<OwnerValueAbiLookup, OwnerAbiEnvironmentError> {
+        let (namespace, suffix) = canonical_path.split_once('/').ok_or_else(|| {
+            OwnerAbiEnvironmentError::new(format!(
+                "owner value ABI lookup `{canonical_path}` is not role-qualified"
+            ))
+        })?;
+        let producer = match boon_syntax::program_role_root(namespace) {
+            Some(boon_syntax::ProgramRoleRoot::Client) => ProgramRole::Client,
+            Some(boon_syntax::ProgramRoleRoot::Session) => ProgramRole::Session,
+            Some(boon_syntax::ProgramRoleRoot::Server) => ProgramRole::Server,
+            None => {
+                return Err(OwnerAbiEnvironmentError::new(format!(
+                    "owner value ABI lookup `{canonical_path}` has no role namespace"
+                )));
+            }
+        };
+        let outcome = if suffix.split('.').next() != Some("store") {
+            OwnerValueAbiLookupOutcome::Forbidden {
+                reason: OwnerValueAbiForbiddenReason::NonStoreRoot { producer },
+            }
+        } else if self.role == producer {
+            OwnerValueAbiLookupOutcome::Forbidden {
+                reason: OwnerValueAbiForbiddenReason::SameRole { role: self.role },
+            }
+        } else if !self.role.can_depend_on(producer) {
+            OwnerValueAbiLookupOutcome::Forbidden {
+                reason: OwnerValueAbiForbiddenReason::DependencyDirection {
+                    consumer: self.role,
+                    producer,
+                },
+            }
+        } else if let Some(contract) = self.value(canonical_path) {
+            OwnerValueAbiLookupOutcome::Found {
+                flow_type: contract.flow_type.clone(),
+            }
+        } else {
+            OwnerValueAbiLookupOutcome::Missing {
+                allow_unresolved: self.policy.allow_unresolved_external,
+            }
+        };
+        OwnerValueAbiLookup::new(canonical_path.to_owned(), outcome)
+    }
+
     pub fn source_payload(&self, canonical_path: &str) -> Option<&OwnerAbiSourcePayloadContract> {
         self.source_payloads
             .binary_search_by(|contract| contract.canonical_path.as_str().cmp(canonical_path))
@@ -594,8 +771,31 @@ impl OwnerAbiEnvironment {
         subjects: impl IntoIterator<Item = StableCheckOwnerKey>,
         canonical_names: impl IntoIterator<Item = String>,
     ) -> Result<OwnerInferenceAbiEnvironment, OwnerAbiEnvironmentError> {
-        self.callable_environment()?
-            .inference_environment(subjects, canonical_names)
+        self.exact_inference_environment(subjects, canonical_names, [])
+    }
+
+    pub fn exact_inference_environment(
+        &self,
+        subjects: impl IntoIterator<Item = StableCheckOwnerKey>,
+        canonical_names: impl IntoIterator<Item = String>,
+        canonical_value_paths: impl IntoIterator<Item = String>,
+    ) -> Result<OwnerInferenceAbiEnvironment, OwnerAbiEnvironmentError> {
+        let callable_provider = self.callable_environment()?;
+        OwnerInferenceAbiEnvironment::from_lookup_sets(
+            subjects,
+            canonical_names
+                .into_iter()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .map(|name| callable_provider.lookup(&name))
+                .collect::<Result<Vec<_>, _>>()?,
+            canonical_value_paths
+                .into_iter()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .map(|path| self.value_lookup(&path))
+                .collect::<Result<Vec<_>, _>>()?,
+        )
     }
 }
 
@@ -1319,5 +1519,70 @@ mod tests {
         assert_ne!(contract, &construction_changed);
         assert_eq!(before.outcome(), after.outcome());
         assert_eq!(before.fingerprint_v1(), after.fingerprint_v1());
+    }
+
+    #[test]
+    fn external_value_lookup_is_exact_typed_and_access_checked() {
+        let syntax = project("value: 1\n");
+        let mut external = ExternalTypeEnvironment::empty(ProgramRole::Client);
+        external.values.insert(
+            "Session/store.count".to_owned(),
+            FlowType {
+                mode: boon_checked::FlowMode::Continuous,
+                ty: Type::Number,
+            },
+        );
+        let abi = project_owner_abi_environment(&syntax, &external).unwrap();
+        assert!(matches!(
+            abi.value_lookup("Session/store.count").unwrap().outcome(),
+            OwnerValueAbiLookupOutcome::Found { flow_type }
+                if flow_type.ty == Type::Number
+        ));
+        assert!(matches!(
+            abi.value_lookup("Session/store.missing").unwrap().outcome(),
+            OwnerValueAbiLookupOutcome::Missing {
+                allow_unresolved: false
+            }
+        ));
+        assert!(matches!(
+            abi.value_lookup("Session/output.count").unwrap().outcome(),
+            OwnerValueAbiLookupOutcome::Forbidden {
+                reason: OwnerValueAbiForbiddenReason::NonStoreRoot {
+                    producer: ProgramRole::Session
+                }
+            }
+        ));
+        assert!(matches!(
+            abi.value_lookup("Client/store.count").unwrap().outcome(),
+            OwnerValueAbiLookupOutcome::Forbidden {
+                reason: OwnerValueAbiForbiddenReason::SameRole {
+                    role: ProgramRole::Client
+                }
+            }
+        ));
+        assert!(matches!(
+            abi.value_lookup("Server/store.count").unwrap().outcome(),
+            OwnerValueAbiLookupOutcome::Forbidden {
+                reason: OwnerValueAbiForbiddenReason::DependencyDirection {
+                    consumer: ProgramRole::Client,
+                    producer: ProgramRole::Server
+                }
+            }
+        ));
+
+        external.allow_unresolved = true;
+        let provisional = project_owner_abi_environment(&syntax, &external).unwrap();
+        let strict_missing = abi.value_lookup("Session/store.missing").unwrap();
+        let provisional_missing = provisional.value_lookup("Session/store.missing").unwrap();
+        assert!(matches!(
+            provisional_missing.outcome(),
+            OwnerValueAbiLookupOutcome::Missing {
+                allow_unresolved: true
+            }
+        ));
+        assert_ne!(
+            strict_missing.fingerprint_v1(),
+            provisional_missing.fingerprint_v1()
+        );
     }
 }

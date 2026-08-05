@@ -130,9 +130,10 @@ fn validate_inputs(
         )));
     }
     let inference_abi_fingerprint_v1 = abi
-        .inference_environment(
+        .exact_inference_environment(
             [owner.clone()],
             summary.authoritative_abi_names().into_vec(),
+            summary.authoritative_value_abi_paths().into_vec(),
         )
         .map_err(|error| {
             CheckedOwnerBuildError::new(format!(
@@ -5083,9 +5084,10 @@ mod tests {
         )
         .unwrap();
         let inference_abi = abi
-            .inference_environment(
+            .exact_inference_environment(
                 [seed.owner.clone()],
                 summary.authoritative_abi_names().into_vec(),
+                summary.authoritative_value_abi_paths().into_vec(),
             )
             .unwrap();
         let topology = build_owner_interface_topology([&summary]).unwrap();

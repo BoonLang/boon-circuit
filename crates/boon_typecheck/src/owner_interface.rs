@@ -1599,6 +1599,20 @@ pub fn evaluate_owner_interface_scc<'a>(
             "interface SCC inference ABI does not match its exact callable lookup set",
         ));
     }
+    let expected_value_paths = summaries
+        .values()
+        .flat_map(|summary| summary.authoritative_value_abi_paths().into_vec())
+        .collect::<BTreeSet<_>>();
+    let actual_value_paths = abi
+        .value_lookups()
+        .iter()
+        .map(|lookup| lookup.canonical_path().to_owned())
+        .collect::<BTreeSet<_>>();
+    if actual_value_paths != expected_value_paths {
+        return Err(OwnerConstraintSeedError::new(
+            "interface SCC inference ABI does not match its exact external value lookup set",
+        ));
+    }
     if seeds.keys().cloned().collect::<BTreeSet<_>>() != expected
         || summaries.keys().cloned().collect::<BTreeSet<_>>() != expected
     {
@@ -1823,6 +1837,12 @@ pub fn evaluate_owner_interface_scc<'a>(
             .iter()
             .map(|resolved| (resolved.reference.expression.clone(), resolved))
             .collect::<BTreeMap<_, _>>();
+        let symbol_resolutions = state
+            .summary
+            .symbol_resolutions
+            .iter()
+            .map(|resolution| (resolution.reference().expression.clone(), resolution))
+            .collect::<BTreeMap<_, _>>();
         for (index, expression) in state.seed.expressions.iter().enumerate() {
             let variable = state.expressions[index];
             let mut mode = Some(FlowMode::Continuous);
@@ -1855,6 +1875,21 @@ pub fn evaluate_owner_interface_scc<'a>(
                         if target.reference.kind == OwnerReferenceKind::Value {
                             // Cross-owner value reads are wired after all local
                             // interfaces exist.
+                        }
+                    } else if matches!(
+                        symbol_resolutions.get(&expression.expression),
+                        Some(OwnerSymbolResolution::Authoritative { reference })
+                            if reference.kind == OwnerReferenceKind::Value
+                    ) {
+                        let canonical_path = boon_syntax::canonical_value_path(parts);
+                        if let Some(flow_type) = abi
+                            .value_lookup(&canonical_path)
+                            .and_then(crate::OwnerValueAbiLookup::flow_type)
+                        {
+                            let mut variables = BTreeMap::new();
+                            let ty = instantiate_type(&flow_type.ty, &mut unifier, &mut variables);
+                            unifier.bind_var(variable, ty);
+                            mode = Some(flow_type.mode);
                         }
                     } else if let Some((root, projection)) = parts.split_first() {
                         let local = if root == "PASSED" {

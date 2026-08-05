@@ -27,8 +27,8 @@ use boon_typecheck::{
     OwnerDeclarationKind, OwnerInferenceAbiEnvironment, OwnerInterfaceScc,
     OwnerInterfaceSccEvaluation, OwnerInterfaceSccKey, OwnerInterfaceSccResult,
     OwnerInterfaceTopology, OwnerReferenceKind, OwnerSourceMap, OwnerSymbolReference,
-    OwnerSymbolResolution, OwnerSyntaxInput, build_owner_interface_topology, evaluate_owner_body,
-    evaluate_owner_interface_scc, owner_body_required_interface_owners,
+    OwnerSymbolResolution, OwnerSyntaxInput, OwnerValueAbiLookup, build_owner_interface_topology,
+    evaluate_owner_body, evaluate_owner_interface_scc, owner_body_required_interface_owners,
     project_owner_abi_environment, project_owner_constraint_seed, project_owner_source_map,
     project_owner_syntax_input, resolve_owner_constraint_seed_with_resolutions,
     stable_check_owner_key_fingerprint_v1,
@@ -204,6 +204,7 @@ struct ProjectState {
     project_owner_abi_requests: TypedRequestTable<ProjectOwnerAbiRequest>,
     project_owner_callable_abi_requests: TypedRequestTable<ProjectOwnerCallableAbiRequest>,
     owner_callable_abi_lookup_requests: TypedRequestTable<OwnerCallableAbiLookupRequest>,
+    owner_value_abi_lookup_requests: TypedRequestTable<OwnerValueAbiLookupRequest>,
     owner_inference_abi_requests: TypedRequestTable<OwnerInferenceAbiRequest>,
     project_owner_symbol_requests: TypedRequestTable<ProjectOwnerSymbolRequest>,
     owner_constraint_requests: TypedRequestTable<OwnerConstraintRequest>,
@@ -510,13 +511,35 @@ impl RequestFamily for OwnerCallableAbiLookupRequest {
     }
 }
 
+struct OwnerValueAbiLookupRequest;
+
+impl RequestFamily for OwnerValueAbiLookupRequest {
+    type Key = String;
+    type Value = Arc<OwnerValueAbiLookup>;
+
+    const NAME: &'static str = "boon.compiler.owner-value-abi-lookup.v1";
+
+    fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
+        request_fingerprint(
+            b"boon.compiler.owner-value-abi-lookup-key.v1\0",
+            [key.as_bytes()],
+        )
+    }
+
+    fn output_fingerprint(
+        value: &Self::Value,
+    ) -> Result<RequestOutputFingerprint, boon_compilation_db::CompilationDbError> {
+        Ok(RequestOutputFingerprint(value.fingerprint_v1()))
+    }
+}
+
 struct OwnerInferenceAbiRequest;
 
 impl RequestFamily for OwnerInferenceAbiRequest {
     type Key = StableCheckOwnerKey;
     type Value = Arc<OwnerInferenceAbiEnvironment>;
 
-    const NAME: &'static str = "boon.compiler.owner-inference-abi.v1";
+    const NAME: &'static str = "boon.compiler.owner-inference-abi.v2";
 
     fn key_fingerprint(key: &Self::Key) -> RequestFingerprint {
         stable_check_owner_key_fingerprint_v1(key)
@@ -854,6 +877,7 @@ impl CompilerSession {
                 project_owner_abi_requests: TypedRequestTable::new(),
                 project_owner_callable_abi_requests: TypedRequestTable::new(),
                 owner_callable_abi_lookup_requests: TypedRequestTable::new(),
+                owner_value_abi_lookup_requests: TypedRequestTable::new(),
                 owner_inference_abi_requests: TypedRequestTable::new(),
                 project_owner_symbol_requests: TypedRequestTable::new(),
                 owner_constraint_requests: TypedRequestTable::new(),
@@ -2144,6 +2168,31 @@ fn owner_authoritative_callable_names(
         .into_boxed_slice()
 }
 
+fn owner_authoritative_value_paths(
+    owner: &StableCheckOwnerKey,
+    seed: &OwnerConstraintSeed,
+    symbols: &ProjectOwnerSymbolIndex,
+) -> Box<[String]> {
+    seed.references
+        .iter()
+        .filter(|reference| {
+            reference.kind == OwnerReferenceKind::Value
+                && reference
+                    .parts
+                    .first()
+                    .is_some_and(|part| boon_syntax::is_program_role_root(part))
+                && matches!(
+                    symbols.resolve(owner, reference),
+                    ProjectOwnerSymbolLookup::Unresolved
+                )
+        })
+        .map(|reference| boon_syntax::canonical_value_path(&reference.parts))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>()
+        .into_boxed_slice()
+}
+
 fn evaluate_owner_inference_abi_requests(
     state: &mut ProjectState,
     owners: &[StableCheckOwnerKey],
@@ -2169,10 +2218,32 @@ fn evaluate_owner_inference_abi_requests(
         .into_iter()
         .flatten()
         .collect::<BTreeSet<_>>();
+    let value_paths = owners
+        .iter()
+        .map(|owner| {
+            state
+                .owner_constraint_seed_requests
+                .current_value(&state.syntax_evaluator, owner)?
+                .map(|seed| owner_authoritative_value_paths(owner, seed, symbols).into_vec())
+                .ok_or_else(|| {
+                    session_error(format!(
+                        "owner inference ABI {owner:?} has no current constraint seed"
+                    ))
+                })
+        })
+        .collect::<CompilerResult<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect::<BTreeSet<_>>();
     state
         .owner_callable_abi_lookup_requests
         .retain(&mut state.syntax_evaluator, |name| {
             callable_names.contains(name)
+        })?;
+    state
+        .owner_value_abi_lookup_requests
+        .retain(&mut state.syntax_evaluator, |path| {
+            value_paths.contains(path)
         })?;
 
     let lookup_input = RequestInputFingerprint(request_fingerprint(
@@ -2215,8 +2286,48 @@ fn evaluate_owner_inference_abi_requests(
         }
     }
 
+    let value_lookup_input = RequestInputFingerprint(request_fingerprint(
+        b"boon.compiler.owner-value-abi-lookup-dependencies.v1\0",
+        std::iter::empty(),
+    ));
+    for path in &value_paths {
+        match state.owner_value_abi_lookup_requests.begin(
+            &mut state.syntax_evaluator,
+            path.clone(),
+            value_lookup_input,
+        )? {
+            RequestStart::Reused => {}
+            RequestStart::Execute(mut ticket) => {
+                let lookup = (|| -> CompilerResult<_> {
+                    let abi = state.project_owner_abi_requests.require(
+                        &state.syntax_evaluator,
+                        &mut ticket,
+                        &ProjectOwnerAbiKey,
+                    )?;
+                    Ok(Arc::new(abi.value_lookup(path)?))
+                })();
+                let lookup = match lookup {
+                    Ok(lookup) => lookup,
+                    Err(error) => {
+                        state.owner_value_abi_lookup_requests.abort(
+                            &mut state.syntax_evaluator,
+                            ticket,
+                            RequestAbortReason::Failed,
+                        )?;
+                        return Err(error);
+                    }
+                };
+                state.owner_value_abi_lookup_requests.publish(
+                    &mut state.syntax_evaluator,
+                    ticket,
+                    lookup,
+                )?;
+            }
+        }
+    }
+
     let owner_input = RequestInputFingerprint(request_fingerprint(
-        b"boon.compiler.owner-inference-abi-dependencies.v1\0",
+        b"boon.compiler.owner-inference-abi-dependencies.v2\0",
         std::iter::empty(),
     ));
     for owner in owners {
@@ -2248,9 +2359,20 @@ fn evaluate_owner_inference_abi_requests(
                                 .map_err(Into::into)
                         })
                         .collect::<CompilerResult<Vec<_>>>()?;
-                    Ok(Arc::new(OwnerInferenceAbiEnvironment::from_lookups(
+                    let value_lookups = owner_authoritative_value_paths(owner, seed, symbols)
+                        .iter()
+                        .map(|path| {
+                            state
+                                .owner_value_abi_lookup_requests
+                                .require(&state.syntax_evaluator, &mut ticket, path)
+                                .map(|lookup| lookup.as_ref().clone())
+                                .map_err(Into::into)
+                        })
+                        .collect::<CompilerResult<Vec<_>>>()?;
+                    Ok(Arc::new(OwnerInferenceAbiEnvironment::from_lookup_sets(
                         [owner.clone()],
                         lookups,
+                        value_lookups,
                     )?))
                 })();
                 let environment = match environment {
@@ -2434,6 +2556,26 @@ fn evaluate_owner_constraint_requests(
                                         })
                                         .collect::<Vec<_>>()
                                         .into_boxed_slice(),
+                                }
+                            }
+                            ProjectOwnerSymbolLookup::Unresolved
+                                if reference.kind == OwnerReferenceKind::Value
+                                    && reference
+                                        .parts
+                                        .first()
+                                        .is_some_and(|part| {
+                                            boon_syntax::is_program_role_root(part)
+                                        }) =>
+                            {
+                                let canonical_path =
+                                    boon_syntax::canonical_value_path(&reference.parts);
+                                abi.value_lookup(&canonical_path).ok_or_else(|| {
+                                    session_error(format!(
+                                        "owner constraint {owner:?} has no exact external value ABI lookup for `{canonical_path}`"
+                                    ))
+                                })?;
+                                OwnerSymbolResolution::Authoritative {
+                                    reference: reference.clone(),
                                 }
                             }
                             ProjectOwnerSymbolLookup::Unresolved
@@ -3921,6 +4063,64 @@ mod tests {
             .unwrap();
         assert_eq!(keep_abi_memo.changed_at, EvaluationRevision(0));
         assert_eq!(keep_abi_memo.verified_at, EvaluationRevision(1));
+    }
+
+    #[test]
+    fn role_qualified_external_value_has_an_exact_missing_lookup() {
+        let mut session = CompilerSession::new();
+        let project = session
+            .open_project(project("value: Session/store.missing\n"))
+            .unwrap();
+        parse_project_snapshot(session.projects.get_mut(&project).unwrap()).unwrap();
+        let unit = session
+            .unit_syntax_snapshot(project, "RUN.bn")
+            .unwrap()
+            .unwrap();
+        let owner = unit
+            .stable_check_owner_keys()
+            .find(|owner| {
+                matches!(
+                    owner,
+                    StableCheckOwnerKey::Item(owner)
+                        if owner.item_route.segments().last().is_some_and(|segment| segment.names == ["value"])
+                )
+            })
+            .unwrap();
+        let summary = session
+            .owner_constraint_summary(project, &owner)
+            .unwrap()
+            .unwrap();
+        let body = session
+            .owner_body_inference(project, &owner)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            summary.authoritative_value_abi_paths().as_ref(),
+            ["Session/store.missing"]
+        );
+        assert!(body.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "unknown_external_value"
+                && diagnostic.message.contains("Session/store.missing")
+        }));
+
+        let state = session.projects.get(&project).unwrap();
+        let lookup = state
+            .owner_value_abi_lookup_requests
+            .current_value(&state.syntax_evaluator, &"Session/store.missing".to_owned())
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            lookup.outcome(),
+            boon_typecheck::OwnerValueAbiLookupOutcome::Missing {
+                allow_unresolved: false
+            }
+        ));
+        let abi = state
+            .owner_inference_abi_requests
+            .current_value(&state.syntax_evaluator, &owner)
+            .unwrap()
+            .unwrap();
+        assert_eq!(abi.value_lookups(), std::slice::from_ref(lookup.as_ref()));
     }
 
     #[test]
